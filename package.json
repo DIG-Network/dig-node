@@ -1,0 +1,30 @@
+{
+  "name": "@dignetwork/dig-companion",
+  "version": "0.1.0",
+  "description": "Localhost companion server for the DIG Chrome extension — a local DIG RPC endpoint (blind ciphertext retrieval + proofs) the browser resolves chia:// content through.",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "dig-companion": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "dig",
+    "dig-network",
+    "chia",
+    "dig-companion",
+    "localhost",
+    "rpc"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DIG-Network/dig-companion.git"
+  }
+}
