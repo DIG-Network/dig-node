@@ -1,15 +1,18 @@
 {
   "name": "@dignetwork/dig-companion",
-  "version": "0.1.0",
-  "description": "Localhost companion server for the DIG Chrome extension — a local DIG RPC endpoint (blind ciphertext retrieval + proofs) the browser resolves chia:// content through.",
+  "version": "0.2.0",
+  "description": "Localhost companion server for the DIG Chrome extension — a local DIG node that blind-fetches ciphertext + proofs, verifies + decrypts locally (same dig_client WASM the extension uses), and caches on disk. Twin of the native DIG Browser's in-process dig-node.",
   "type": "module",
   "main": "src/server.js",
   "bin": {
     "dig-companion": "src/server.js"
   },
+  "files": [
+    "src/"
+  ],
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test"
+    "test": "node --test test/"
   },
   "engines": {
     "node": ">=18"
