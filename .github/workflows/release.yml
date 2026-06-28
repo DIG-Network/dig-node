@@ -43,7 +43,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust (stable + components)
         run: |
-          rustup toolchain install stable --component rustfmt clippy
+          rustup toolchain install stable --component rustfmt --component clippy
           rustup default stable
           rustc --version
       - uses: actions/cache@v4
