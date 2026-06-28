@@ -1,4 +1,11 @@
+# Rust (the shipped service binary)
+/target/
+
+# Node reference implementation (node/)
 node_modules/
+node/node_modules/
+
+# Misc
 *.log
 .env
 .DS_Store
