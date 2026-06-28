@@ -1,0 +1,157 @@
+name: Release dig-companion
+
+# On a version tag (v*), build the self-contained `dig-companion` service binary for
+# every supported OS/arch and attach them to a GitHub Release. Mirrors the
+# tag-driven, per-OS matrix pattern of digstore's release workflow, but the artifact
+# here is the plain installable binary (no Tauri installer): users download it and
+# run `dig-companion install`.
+#
+#   * windows-x64   → dig-companion-<ver>-windows-x64.exe
+#   * linux-x64     → dig-companion-<ver>-linux-x64
+#   * macos-arm64   → dig-companion-<ver>-macos-arm64
+#   * macos-x64     → dig-companion-<ver>-macos-x64
+#
+# A push to main also builds (no publish) so a broken build is caught before tagging.
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: fmt + clippy + tests on Linux, once. A tag that doesn't pass the gate
+  # never produces release binaries.
+  # ---------------------------------------------------------------------------
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust (stable + components)
+        run: |
+          rustup toolchain install stable --component rustfmt clippy
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-companion-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-companion-check-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  # ---------------------------------------------------------------------------
+  # Build the binary per OS/arch.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.out_name }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: dig-companion.exe
+            out_name: windows-x64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: dig-companion
+            out_name: linux-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: dig-companion
+            out_name: macos-arm64
+          - os: macos-13 # Intel runner
+            target: x86_64-apple-darwin
+            bin: dig-companion
+            out_name: macos-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust + target
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-companion-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-companion-build-${{ matrix.target }}-
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-companion
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="g$(git rev-parse --short HEAD)"
+          mkdir -p dist
+          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
+          DEST="dist/dig-companion-${VER}-${{ matrix.out_name }}"
+          cp "$SRC" "$DEST"
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          ls -la dist
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dig-companion-${{ matrix.out_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # One publish job after all builds, so there is no race to create the Release.
+  # Only on a tag push.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+      - name: Create / update the release and attach binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

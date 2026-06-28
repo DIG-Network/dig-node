@@ -1,0 +1,67 @@
+[package]
+name = "dig-companion"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "The localhost DIG node for the DIG Chrome extension, as a self-contained, cross-platform Rust binary installable as an OS service. Exposes the rpc.dig.net JSON-RPC contract (dig.getContent, dig.getProof, dig.getAnchoredRoot, cache.*) on 127.0.0.1 by routing to digstore's in-process dig-node — the same local-first read path the native DIG Browser runs."
+repository = "https://github.com/DIG-Network/dig-companion"
+readme = "README.md"
+# Keep the binary name stable across the Node→Rust migration: clients install
+# and invoke `dig-companion` regardless of the implementation behind it.
+default-run = "dig-companion"
+
+[[bin]]
+name = "dig-companion"
+path = "src/main.rs"
+
+[lib]
+name = "dig_companion"
+path = "src/lib.rs"
+
+[dependencies]
+# The DIG read path. dig-node IS the rpc.dig.net-compatible local node the native
+# DIG Browser runs in-process (handle_rpc): local-first serve from cached .dig
+# modules, blind ciphertext+proof proxy to rpc.dig.net on a miss, on-chain
+# anchored-root resolution, and the cache.* config surface. Pinned to the digstore
+# release tag so the companion's read path is reproducible. dig-node builds as a
+# clean dependency: the guest-wasm build prerequisite is digstore-cli's alone (its
+# build.rs), and dig-node does not depend on digstore-cli.
+dig-node = { git = "https://github.com/DIG-Network/digstore.git", tag = "v0.5.29" }
+
+# HTTP stack: the same axum/tokio dig-node itself uses, so there is one async
+# runtime and one server framework across the read path and the companion shell.
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI + OS-service registration.
+clap = { version = "4", features = ["derive"] }
+# Cross-platform service manager: Windows SCM, Linux systemd, macOS launchd behind
+# one API. User-level install where the platform allows it (per-user service),
+# falling back to system-level with documented elevation.
+service-manager = "0.7"
+
+# HTTP client for the blind-passthrough fallback: dig_node::handle_rpc resolves
+# only dig.getContent / dig.getAnchoredRoot / cache.*, returning "method not found"
+# for everything else. The companion relays those (dig.getProof, dig.listCapsules,
+# dig.getManifest, …) verbatim to the upstream so it stays a correct transparent
+# proxy, matching the Node reference server's documented surface. rustls-tls keeps
+# the binary self-contained (no system OpenSSL), same as the digstore crates.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Windows Service Control Protocol. service-manager only REGISTERS the service in
+# the SCM; the binary the SCM launches must itself speak the service protocol
+# (StartServiceCtrlDispatcher → report RUNNING/STOPPED) or the SCM kills it with
+# error 1053 ("did not respond in a timely fashion"). The companion's hidden
+# `run-service` entrypoint uses this to be a real Windows service. (systemd/launchd
+# exec the foreground process directly, so they need no equivalent.)
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
+# Match digstore's release hardening: keep overflow checks on in release. The read
+# path does offset/length arithmetic over untrusted serialized input (it pulls in
+# digstore-core, which is built under this same profile in its own workspace).
+[profile.release]
+overflow-checks = true
