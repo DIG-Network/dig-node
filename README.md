@@ -1,66 +1,55 @@
 # dig-companion
 
-The **localhost companion server** for the [DIG Chrome extension](https://github.com/DIG-Network/dig-chrome-extension).
+The **localhost DIG node** for the [DIG Chrome extension](https://github.com/DIG-Network/dig-chrome-extension),
+shipped as a **self-contained, cross-platform Rust binary** that installs as an **OS service**
+(Windows, Linux, macOS).
 
-The extension resolves `chia://` (DIG) URLs by fetching encrypted, Merkle-proven content over a
-DIG RPC. By default it talks to `rpc.dig.net`, but it can be pointed at a **local** RPC endpoint via
-its `server.host` setting. `dig-companion` is that local endpoint — and as of v0.2 it is a real
-**local DIG node**, not just a proxy.
+The extension resolves `chia://` (DIG) URLs by fetching encrypted, Merkle-proven content over a DIG
+RPC and then **verifying + decrypting it in the extension**. By default it talks to `rpc.dig.net`;
+pointing its `server.host` setting at `dig-companion` makes that RPC **local**. The companion speaks
+the **same wire contract as `rpc.dig.net`** — because it routes every request to digstore's
+`dig_node::handle_rpc`, the exact local-first node the native [DIG Browser](https://github.com/DIG-Network/DIG_Browser)
+runs in-process. So the extension works against it byte-for-byte, with the bonus that any `.dig`
+store the node has cached locally is served without leaving the machine.
 
-It is the standalone-server twin of the native [DIG Browser](https://github.com/DIG-Network/DIG_Browser)'s
-**in-process dig-node**: the same blind-retrieval-then-local-verify/decrypt read path, packaged as a
-companion app for the extension on non-DIG browsers.
+> **v0.3 — now a Rust OS-service binary.** The previous Node implementation (v0.2) is retained as a
+> documented reference under [`node/`](node/), but the **shipped artifact is the Rust `dig-companion`
+> binary**. A single binary has no runtime dependency (no Node install required) and installs cleanly
+> as a Windows/Linux/macOS service — which a Node process does not do reliably, especially on Windows.
 
-> A **local** companion legitimately verifies and decrypts content — it is the user's own machine,
-> exactly like the native browser's in-process dig-node. The "blind host" property only constrains
-> **remote** hosts (`rpc.dig.net` / `cdn.dig.net`), which still only ever see ciphertext + proofs.
+## Install as a service
 
-## What it does
-
-It runs a small HTTP server on `127.0.0.1` (default port `8080`) exposing two things:
-
-1. **A local DIG node** that resolves content on your machine:
-   - blind-fetches ciphertext + a Merkle inclusion proof from the upstream,
-   - **verifies** inclusion against the anchored root,
-   - **decrypts** locally (AES-256-GCM-SIV) using the **same `dig_client` read-crypto WASM** the
-     extension uses (vendored — see [`src/vendor/PROVENANCE.md`](src/vendor/PROVENANCE.md), SRI-verified
-     at startup, fails closed on mismatch),
-   - **caches** the decrypted resource on disk and serves it from cache on repeat.
-
-2. **`GET /health`** — `{ status, version, upstream, mode, cache }` liveness probe.
-
-CORS allows `chrome-extension://` origins so the extension can call it.
-
-### JSON-RPC surface
-
-`POST /` speaks JSON-RPC 2.0, mirroring the native dig-node's FFI method surface
-(`dig::CallDigRpc` in digstore `crates/dig-node`):
-
-| Method | Behaviour |
-|---|---|
-| `dig.getContent` / `dig.getCapsule` | **Local verified retrieval**: fetch → verify → decrypt → cache. Returns `{ urn, content_type, data (base64 plaintext), total_length, verified, source, complete }`. `source` is `local` (cache hit) or `remote` (freshly fetched). |
-| `dig.getProof` | Inclusion proof for a resource — forwarded to the upstream (proof generation needs the host's tree). |
-| `dig.getAnchoredRoot` | Store's chain-anchored tip root — forwarded to the upstream (the companion has no chain client of its own; the native node resolves this directly from coinset.org). |
-| `cache.getConfig` | `{ cap_bytes, used_bytes }`. |
-| `cache.setCapBytes` | `{ cap_bytes }` (floored at 64 MiB, same as the native node). |
-| `cache.clear` | `{}` — drops all cached resources. |
-| *anything else* | **Blind passthrough** to the upstream (e.g. `dig.listCapsules`, `dig.getManifest`), so the companion stays a correct transparent proxy for methods it does not resolve locally. |
-
-Request params for content methods accept either an explicit `urn` (a `chia://` / `urn:dig:`
-string) **or** the wire shape the extension/native node use: `store_id` [+ `root`] [+
-`resource`/`resource_key`] [+ `salt`].
-
-## Run
+Download (or build — see below) the `dig-companion` binary for your OS, then:
 
 ```bash
-# Node 18+ (uses the built-in fetch + http server + WebAssembly — zero runtime dependencies)
-node src/server.js
-# or
-npm start
-
-# custom port / upstream / cache
-DIG_COMPANION_PORT=8080 DIG_RPC_UPSTREAM=https://rpc.dig.net node src/server.js
+dig-companion install     # register as an auto-starting OS service on 127.0.0.1:8080
+dig-companion start       # start it now
+dig-companion status      # confirm it's serving (probes /health)
 ```
+
+To remove it:
+
+```bash
+dig-companion stop
+dig-companion uninstall
+```
+
+### Per-OS notes
+
+| OS | Service backend | Privilege | Runs as |
+|---|---|---|---|
+| **Windows** | Service Control Manager (SCM) | **Administrator required** for `install`/`uninstall` | `LocalSystem` |
+| **Linux** | systemd (user unit) | no root needed | the installing user |
+| **macOS** | launchd (user agent) | no root needed | the installing user |
+
+- **Windows:** the SCM has no per-user services, so `install`/`uninstall` must run from an **elevated
+  (Run as administrator)** terminal. `dig-companion` detects a non-elevated console and tells you,
+  rather than failing deep inside `sc.exe`. The installed service runs the binary's internal
+  `run-service` entrypoint, which speaks the Windows Service Control Protocol (so the SCM does not
+  kill it with error 1053). After install it auto-starts on boot.
+- **Linux / macOS:** the service installs at **user level** (systemd `--user` / a launchd GUI agent),
+  so no `sudo` is needed and it runs as you. (systemd user services start at login; enable
+  linger — `loginctl enable-linger $USER` — if you want it running without an active session.)
 
 ## Point the extension at it
 
@@ -71,69 +60,99 @@ localhost:8080
 ```
 
 (The extension defaults to `localhost:80`; port 80 needs elevated privileges on most OSes, so the
-companion defaults to `8080` — set the extension to match, or run the companion on `80` if you can.)
+companion defaults to `8080`. Set the extension to match, or run the companion on `80` if you can.)
+
+## Run in the foreground (no service)
+
+```bash
+dig-companion run         # serve on 127.0.0.1:8080 until Ctrl-C
+# or simply:
+dig-companion             # bare invocation == run
+```
 
 ## Configuration
+
+All knobs are environment variables (read at startup; `install` records the current values into the
+service's environment so the service serves identically):
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `DIG_COMPANION_PORT` | `8080` | Port the companion listens on (`127.0.0.1`). |
-| `DIG_COMPANION_HOST` | `127.0.0.1` | Bind address. |
-| `DIG_RPC_UPSTREAM` | `https://rpc.dig.net` | Upstream DIG RPC the node blind-fetches ciphertext/proofs from and passes unhandled methods through to. |
-| `DIG_COMPANION_CACHE_DIR` | `<tmp>/dig-companion-cache` | Disk cache directory. |
-| `DIG_COMPANION_CACHE_CAP_BYTES` | `512 MiB` | Cache size cap (floored at 64 MiB). LRU eviction keeps usage under the cap. |
+| `DIG_COMPANION_HOST` | `127.0.0.1` | Bind address (loopback — the companion is a same-machine endpoint). |
+| `DIG_RPC_UPSTREAM` | `https://rpc.dig.net` | Upstream DIG RPC the embedded node proxies ciphertext/proof requests to on a local cache miss, and relays unhandled methods to. |
+| `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). |
+| `DIG_NODE_CACHE_CAP` | `1 GiB` | Cache size cap (floored at 64 MiB), LRU-evicted. Also settable via the `cache.setCapBytes` RPC. |
 
-## Cache
+## JSON-RPC surface
 
-Resolved resources are cached on disk keyed by `storeId:root:retrievalKey` (a rootless "latest"
-URN and a pinned-root URN are distinct entries, because "latest" can move). Each entry is the
-**decrypted** bytes plus small metadata. The cache is LRU-evicted to stay under the cap and can be
-cleared via the `cache.clear` RPC. (Unlike the native node, which caches whole compiled `.dig`
-*modules* keyed by capsule, the companion caches per-*resource* blobs — the granularity the
-extension read path produces. The `cache.*` config contract is identical.)
+`POST /` speaks JSON-RPC 2.0, the same contract `rpc.dig.net` and the native DIG Browser's
+in-process node expose:
 
-## Tests
+| Method | Behaviour |
+|---|---|
+| `dig.getContent` / `dig.getCapsule` | **Verified retrieval** — returns blind **ciphertext + a Merkle inclusion proof + chunk lengths** (`{ ciphertext, root, complete, next_offset?, inclusion_proof, chunk_lens, …, source }`). Served **local-first** from a cached `.dig` module, else proxied to the upstream verbatim (so the proxy path carries `total_length` / `offset` too) and the window cached. `source` is `local` or `remote`. **The client (extension/hub/browser) verifies + decrypts** — the companion mirrors the ciphertext contract, it does not return plaintext. |
+| `dig.getAnchoredRoot` | The store's **chain-anchored tip root**, resolved on-chain by walking the DataStore singleton lineage on coinset.org (the trusted root for the extension's `dig://` root-pinning). |
+| `cache.getConfig` / `cache.setCapBytes` / `cache.clear` | On-disk cache config (`cap_bytes` floored at 64 MiB). |
+| `cache.listCached` / `cache.removeCached` / `cache.fetchAndCache` | Cached-capsule manager (`storeId:rootHash`). |
+| `dig.getProof`, `dig.listCapsules`, `dig.getManifest`, *anything else* | **Blind passthrough** — relayed verbatim to the upstream, so the companion stays a correct transparent proxy for methods it doesn't resolve locally. |
+
+`GET /health` → `{ status, version, mode, upstream, cache: { cap_bytes, used_bytes } }`.
+
+CORS reflects `chrome-extension://` (and `http://localhost`) origins so the extension can call it.
+
+## How the read path is wired (the important design decision)
+
+The companion does **not** reimplement the DIG read path — it depends on digstore's **`dig-node`**
+crate (pinned to the `v0.5.29` release tag) and routes every request to `dig_node::handle_rpc`. This
+is the **same node the native DIG Browser runs in-process**, so the companion and the browser share
+one read path and one cache contract.
+
+- `dig-node` is a **clean Cargo dependency**: the guest-wasm build prerequisite that gates
+  `digstore-cli` (its `build.rs` embeds the compiled guest) does **not** apply to `dig-node`, which
+  depends only on `digstore-host` / `-core` / `-remote` / `-chain`. No special build step is needed.
+- All TLS is `rustls` (no system OpenSSL), so the binary is genuinely self-contained.
+- The companion adds only the **shell** around that node: the HTTP server, CORS, `/health`, request
+  normalisation, a **blind-passthrough fallback** (`dig-node` answers only `dig.getContent` /
+  `dig.getAnchoredRoot` / `cache.*` and returns "method not found" for the rest; the companion
+  relays those to the upstream), and the OS-service install/management.
+
+## Build from source
+
+Requires Rust (the repo pins `1.94.1`).
 
 ```bash
-npm test          # node --test test/
+cargo build --release          # → target/release/dig-companion[.exe]
+cargo test                     # routing, config, cache-key, service helpers + an in-process server test
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 ```
 
-Covers the pure parts (cache-key derivation, RPC routing, URN handling), the LRU disk cache, the
-SRI-verified WASM loader (read-crypto values locked to the canonical digest), the RPC router against
-a mock upstream, and a server `/health` + CORS + cache-RPC smoke test.
+The first build fetches the `dig-node` git dependency (and its digstore/wasmtime tree), so it takes
+a few minutes; subsequent builds are fast.
 
 ## Architecture
 
 ```
 src/
-  server.js     HTTP server: /health, CORS, routes POST → handleRpc, proxy fallback
-  rpc.js        JSON-RPC router (pure routeMethod + urnFromParams; handleRpc dispatch)
-  node.js       DigNode — local verified retrieval (fetch → verify → decrypt → cache) + getAnchoredRoot
-  cache.js      DiskCache — LRU disk cache keyed by storeId:root:retrievalKey (+ pure cacheKey)
-  dig-client.js Node loader for the vendored read-crypto WASM (SRI-verified, fail-closed)
-  urn.js        parseURN (shared parser) + canonical URN / selection helpers
-  vendor/       vendored dig_client WASM + shared URN parser (see PROVENANCE.md)
+  main.rs         CLI (run / run-service / install / uninstall / start / stop / status)
+  lib.rs          module wiring
+  config.rs       env-driven Config (port/host/upstream) — pure, tested
+  rpc.rs          JSON-RPC routing + request normalisation — pure, tested
+  server.rs       axum HTTP server: /health, CORS, POST / → dig_node::handle_rpc, passthrough fallback
+  service.rs      OS-service install/uninstall/start/stop/status (service-manager) + /health status probe
+  win_service.rs  Windows Service Control Protocol entrypoint (windows-service; Windows only)
+node/             the Node v0.2 reference implementation (documentation only — NOT the shipped artifact)
 ```
 
 ## Relationship to the rest of the ecosystem
 
-- The read path (URN → retrieval key → ciphertext + proof → verify → decrypt) is byte-identical to
-  the extension's `fetchContentViaRPC` and the hub's `dig-client`. The companion vendors the same
-  `dig_client` WASM artifact and asserts the same SHA-256 (see `SYSTEM.md`).
-- It mirrors the native dig-node's `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` method
-  surface so clients see one consistent local-node API across the extension and the native browser.
-
-## Remaining gaps (vs. the native in-process dig-node)
-
-- **Anchored-root + proof are delegated to the upstream**, not resolved on-chain locally. The native
-  node walks the DataStore singleton lineage on coinset.org for `dig.getAnchoredRoot` and generates
-  proofs from its local tree; the companion has no chain/§21 client of its own yet, so it forwards
-  those. This means rootless ("latest") URN root-pinning still trusts the upstream's reported root.
-- **No §21 authenticated whole-store sync.** The native node can clone/sync a whole `.dig` module and
-  serve it fully offline; the companion fetches per-resource ciphertext on a cache miss (then serves
-  locally from cache thereafter), so a cold resource still needs the upstream.
-- Caching granularity is per-resource, not per-module/capsule.
+- The wire contract is identical to `rpc.dig.net` and to the native browser's in-process node,
+  because all three are (or route to) `dig_node::handle_rpc`. Clients see one consistent local-node
+  API across the extension and the native browser.
+- The verify/decrypt read-crypto lives in the **extension** (the same `dig_client` WASM the hub uses);
+  the companion serves the ciphertext + proof the extension consumes. See the repo `SYSTEM.md`.
 
 ## License
 
-See the DIG Network organization.
+MIT (the binary). The bundled `dig-node` read path is GPL-2.0-only (digstore). See the DIG Network
+organization.
