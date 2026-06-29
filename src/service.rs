@@ -19,11 +19,13 @@
 use std::ffi::OsString;
 use std::str::FromStr;
 
+use serde_json::json;
 use service_manager::{
     ServiceInstallCtx, ServiceLabel, ServiceLevel, ServiceManager, ServiceStartCtx, ServiceStopCtx,
     ServiceUninstallCtx,
 };
 
+use crate::cli::Outcome;
 use crate::config::Config;
 
 /// The reverse-DNS service label. On Windows this becomes the SCM service name
@@ -89,11 +91,11 @@ fn is_elevated() -> bool {
 /// `dig-companion run` on the configured loopback port. The service's environment
 /// carries the resolved port/host/upstream so it serves identically to a manual
 /// `run`.
-pub fn install(config: &Config) -> std::io::Result<()> {
+pub fn install(config: &Config) -> std::io::Result<Outcome> {
     if cfg!(windows) && !is_elevated() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "dig-companion: installing a Windows service requires an elevated \
+            "dig-node: installing a Windows service requires an elevated \
              (Administrator) console. Re-run this in a terminal opened with \
              \"Run as administrator\".",
         ));
@@ -129,24 +131,35 @@ pub fn install(config: &Config) -> std::io::Result<()> {
     })?;
 
     let scope = if user_level { "user" } else { "system" };
-    println!(
-        "dig-companion: installed as a {scope}-level service \"{SERVICE_LABEL}\"\n  \
-         program: {}\n  serves:  http://{}\n  Set the DIG Chrome extension's \"server host\" to {}.\n  \
+    let addr = config.bind_addr();
+    let summary = format!(
+        "dig-node: installed as a {scope}-level service \"{SERVICE_LABEL}\"\n  \
+         program: {}\n  serves:  http://{addr}\n  Set the DIG Chrome extension's \"server host\" to {addr}.\n  \
          Start it now with: dig-companion start",
         program.display(),
-        config.bind_addr(),
-        config.bind_addr(),
     );
-    Ok(())
+    Ok(Outcome::new(
+        summary,
+        json!({
+            "installed": true,
+            "registered": true,
+            "started": false,
+            "label": SERVICE_LABEL,
+            "scope": scope,
+            "program": program.display().to_string(),
+            "addr": addr,
+            "upstream": config.upstream,
+        }),
+    ))
 }
 
 /// Uninstall the companion service. Stops it first (best-effort) so the uninstall
 /// is clean.
-pub fn uninstall() -> std::io::Result<()> {
+pub fn uninstall() -> std::io::Result<Outcome> {
     if cfg!(windows) && !is_elevated() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "dig-companion: uninstalling a Windows service requires an elevated \
+            "dig-node: uninstalling a Windows service requires an elevated \
              (Administrator) console.",
         ));
     }
@@ -154,61 +167,63 @@ pub fn uninstall() -> std::io::Result<()> {
     // Best-effort stop before removal (ignore "not running" errors).
     let _ = mgr.stop(ServiceStopCtx { label: label()? });
     mgr.uninstall(ServiceUninstallCtx { label: label()? })?;
-    println!("dig-companion: uninstalled service \"{SERVICE_LABEL}\"");
-    Ok(())
+    Ok(Outcome::new(
+        format!("dig-node: uninstalled service \"{SERVICE_LABEL}\""),
+        json!({ "installed": false, "registered": false, "label": SERVICE_LABEL }),
+    ))
 }
 
 /// Start the installed service.
-pub fn start() -> std::io::Result<()> {
+pub fn start() -> std::io::Result<Outcome> {
     let (mgr, _user) = manager()?;
     mgr.start(ServiceStartCtx { label: label()? })?;
-    println!("dig-companion: start requested for \"{SERVICE_LABEL}\"");
-    Ok(())
+    Ok(Outcome::new(
+        format!("dig-node: start requested for \"{SERVICE_LABEL}\""),
+        json!({ "started": true, "label": SERVICE_LABEL }),
+    ))
 }
 
 /// Stop the running service.
-pub fn stop() -> std::io::Result<()> {
+pub fn stop() -> std::io::Result<Outcome> {
     let (mgr, _user) = manager()?;
     mgr.stop(ServiceStopCtx { label: label()? })?;
-    println!("dig-companion: stop requested for \"{SERVICE_LABEL}\"");
-    Ok(())
+    Ok(Outcome::new(
+        format!("dig-node: stop requested for \"{SERVICE_LABEL}\""),
+        json!({ "stopped": true, "label": SERVICE_LABEL }),
+    ))
 }
 
-/// Report whether the companion is actually serving on the configured port, by
-/// probing `GET /health`. This is the meaningful "is it up?" check (the
-/// `service-manager` trait exposes no status query), and it works the same whether
-/// the companion runs as an installed service or a manual `run`.
+/// Report whether the node is actually serving on the configured port, by probing
+/// `GET /health`. This is the meaningful "is it up?" check (the `service-manager`
+/// trait exposes no status query), and it works the same whether the node runs as
+/// an installed service or a manual `run`.
 ///
-/// Returns `Ok(true)` if `/health` responds with a 2xx, `Ok(false)` otherwise.
-pub fn status(config: &Config) -> std::io::Result<bool> {
-    let url = format!("http://{}/health", config.bind_addr());
+/// Returns an [`Outcome`] whose `result.serving` boolean is the answer; the caller
+/// maps `serving:false` to a non-zero exit so scripts can gate on it.
+pub fn status(config: &Config) -> std::io::Result<Outcome> {
+    let addr = config.bind_addr();
+    let url = format!("http://{addr}/health");
     // A tiny blocking probe with a std TcpStream + manual HTTP keeps `status` free
     // of an async runtime and an HTTP client dependency in the binary path. A
     // 2-second connect/read timeout is plenty for loopback.
-    match probe_health(&config.bind_addr()) {
-        Ok(true) => {
-            println!(
-                "dig-companion: SERVING on http://{} ({url})",
-                config.bind_addr()
-            );
-            Ok(true)
-        }
-        Ok(false) => {
-            println!(
-                "dig-companion: NOT responding on http://{} \
-                 (the service may be stopped or not installed)",
-                config.bind_addr()
-            );
-            Ok(false)
-        }
-        Err(e) => {
-            println!(
-                "dig-companion: could not probe http://{}: {e}",
-                config.bind_addr()
-            );
-            Ok(false)
-        }
-    }
+    let (serving, summary) = match probe_health(&addr) {
+        Ok(true) => (true, format!("dig-node: SERVING on http://{addr} ({url})")),
+        Ok(false) => (
+            false,
+            format!(
+                "dig-node: NOT responding on http://{addr} \
+                 (the service may be stopped or not installed)"
+            ),
+        ),
+        Err(e) => (
+            false,
+            format!("dig-node: could not probe http://{addr}: {e}"),
+        ),
+    };
+    Ok(Outcome::new(
+        summary,
+        json!({ "serving": serving, "addr": addr, "health_url": url }),
+    ))
 }
 
 /// Minimal blocking HTTP/1.0 `GET /health` probe over loopback. Returns whether
@@ -272,8 +287,8 @@ mod tests {
             port: 1, // privileged + unbound in this test context → connect refused
             ..Config::default()
         };
-        let serving = status(&cfg).expect("status never hard-errors on a closed port");
-        assert!(!serving);
+        let outcome = status(&cfg).expect("status never hard-errors on a closed port");
+        assert_eq!(outcome.result["serving"], serde_json::json!(false));
     }
 
     #[test]

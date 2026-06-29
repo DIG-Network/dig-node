@@ -22,6 +22,8 @@ use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::config::Config;
+use crate::meta;
+use crate::meta::ErrorCode;
 use crate::rpc::{normalize_request, request_id, rpc_error};
 
 /// The companion binary version, surfaced by `/health`.
@@ -36,16 +38,26 @@ pub struct AppState {
     node: Arc<Node>,
     upstream: String,
     http: reqwest::Client,
+    /// The loopback `host:port` the server is bound to, surfaced in `/health` and
+    /// the well-known document so an agent learns where the node serves.
+    addr: String,
 }
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
 /// `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` and returns this for
 /// anything else; the companion treats that as the cue to blind-passthrough the
 /// request to the upstream.
-const METHOD_NOT_FOUND: i64 = -32601;
+const METHOD_NOT_FOUND: i64 = ErrorCode::MethodNotFound.code();
 
-/// Build the companion's axum router (health + RPC + CORS). Split out from
-/// [`serve`] so it can be exercised by an in-process test without binding a port.
+/// Build the companion's axum router. Beside `POST /` (JSON-RPC) and `GET /health`
+/// it exposes the self-describing discovery surface so an agent can introspect the
+/// node with zero out-of-band knowledge:
+///   * `GET /version`                    — build/commit/version fingerprint
+///   * `GET /openrpc.json`               — the OpenRPC method+error spec
+///   * `GET /.well-known/dig-node.json`  — addr + cache + methods + errors + spec links
+///
+/// Split out from [`serve`] so it can be exercised by an in-process test without
+/// binding a port.
 pub fn router(state: AppState) -> Router {
     // The extension calls from a `chrome-extension://` origin; a same-machine dev
     // page calls from `http://localhost`. Reflect those (and any origin in dev) so
@@ -64,6 +76,9 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(health).post(rpc))
         .route("/health", get(health))
+        .route("/version", get(version))
+        .route("/openrpc.json", get(openrpc))
+        .route("/.well-known/dig-node.json", get(well_known))
         .layer(cors)
         .with_state(state)
 }
@@ -79,22 +94,56 @@ pub fn build_state(config: &Config) -> AppState {
             .user_agent(concat!("dig-companion/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("dig-companion: build http client"),
+        addr: config.bind_addr(),
     }
 }
 
-/// `GET /health` (and `GET /`) — liveness + mode + cache stats. Shape mirrors the
-/// Node companion's health body so existing probes keep parsing it.
+/// `GET /health` (and `GET /`) — liveness + mode + cache stats + discovery hooks.
+/// Shape extends the Node companion's health body (existing probes keep parsing
+/// `status`/`version`/`mode`/`upstream`/`cache`) with agent-friendly additions:
+/// `service` (the canonical `dig-node` name), `commit`, the bound `addr`, the
+/// cache `dir`, and the `methods` catalogue — so a single `/health` fetch reveals
+/// what the node is and what it serves.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
+        "service": meta::SERVICE_NAME,
         "version": VERSION,
+        "commit": meta::GIT_SHA,
         "mode": "local-node",
+        "addr": state.addr,
         "upstream": state.upstream,
         "cache": {
+            "dir": meta::cache_dir().display().to_string(),
             "cap_bytes": cache_cap_bytes(),
             "used_bytes": cache_used_bytes(),
         },
+        "methods": meta::method_names(),
     }))
+}
+
+/// `GET /version` — the build/commit/version fingerprint, so an agent can correlate
+/// a running node to an exact source revision (see [`meta::build_info`]).
+async fn version() -> impl IntoResponse {
+    Json(meta::build_info())
+}
+
+/// `GET /openrpc.json` — the OpenRPC document for the node's JSON-RPC surface,
+/// generated from the method catalogue + error enum (see [`meta::openrpc_document`]).
+async fn openrpc() -> impl IntoResponse {
+    Json(meta::openrpc_document())
+}
+
+/// `GET /.well-known/dig-node.json` — the canonical discovery document: service
+/// identity, bound addr, cache dir + live stats, the method + error catalogues,
+/// and pointers to the OpenRPC/health/version endpoints.
+async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
+    Json(meta::well_known_document(
+        &state.addr,
+        &state.upstream,
+        cache_cap_bytes(),
+        cache_used_bytes(),
+    ))
 }
 
 /// `POST /` — JSON-RPC. Normalises the request params for dig-node, dispatches via
@@ -115,12 +164,27 @@ async fn rpc(State(state): State<AppState>, Json(req): Json<Value>) -> impl Into
             StatusCode::OK,
             Json(rpc_error(
                 id,
-                -32600,
-                "dig-companion: expected a single JSON-RPC request object",
+                ErrorCode::InvalidRequest,
+                "dig-node: expected a single JSON-RPC request object",
             )),
         );
     }
     let id = request_id(&req);
+
+    // `rpc.discover` is answered by the shell itself (the standard OpenRPC
+    // method-discovery method): return the OpenRPC document so an agent can
+    // introspect the whole surface over the wire with no out-of-band knowledge.
+    if req.get("method").and_then(|m| m.as_str()) == Some("rpc.discover") {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": meta::openrpc_document(),
+            })),
+        );
+    }
+
     // Keep the original request for a possible passthrough relay (the upstream must
     // see exactly what the client sent, not the dig-node-normalised form).
     let original = req.clone();
@@ -134,8 +198,8 @@ async fn rpc(State(state): State<AppState>, Json(req): Json<Value>) -> impl Into
         Ok(v) => v,
         Err(e) => rpc_error(
             id.clone(),
-            -32000,
-            format!("dig-companion: dispatch failed: {e}"),
+            ErrorCode::DispatchFailed,
+            format!("dig-node: dispatch failed: {e}"),
         ),
     };
 
@@ -149,7 +213,11 @@ async fn rpc(State(state): State<AppState>, Json(req): Json<Value>) -> impl Into
         let relayed = proxy(&state.http, &state.upstream, &original)
             .await
             .unwrap_or_else(|e| {
-                rpc_error(id, -32010, format!("dig-companion upstream error: {e}"))
+                rpc_error(
+                    id,
+                    ErrorCode::UpstreamError,
+                    format!("dig-node upstream error: {e}"),
+                )
             });
         return (StatusCode::OK, Json(relayed));
     }
@@ -190,11 +258,13 @@ where
     let state = build_state(&config);
     let app = router(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|e| {
-        std::io::Error::new(e.kind(), format!("dig-companion: cannot bind {addr}: {e}"))
-    })?;
-    println!(
-        "dig-companion v{VERSION} (local-node) listening on http://{addr}\n  \
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| std::io::Error::new(e.kind(), format!("dig-node: cannot bind {addr}: {e}")))?;
+    // Operational log line → stderr, so `run --json` leaves stdout for the single
+    // structured object (prose-to-stderr convention).
+    eprintln!(
+        "dig-node v{VERSION} (local-node) listening on http://{addr}\n  \
          upstream: {}\n  Point the DIG Chrome extension's \"server host\" at {addr}.",
         config.upstream
     );
@@ -227,5 +297,5 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
-    println!("dig-companion: shutting down");
+    eprintln!("dig-node: shutting down");
 }
