@@ -48,7 +48,7 @@ define_windows_service!(ffi_service_main, service_main);
 fn service_main(_args: Vec<OsString>) {
     if let Err(e) = run_service() {
         // Best-effort: nothing to log to, but the non-zero exit is reported below.
-        eprintln!("dig-companion service error: {e}");
+        eprintln!("dig-node service error: {e}");
     }
 }
 

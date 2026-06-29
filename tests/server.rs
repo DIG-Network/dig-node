@@ -117,6 +117,101 @@ async fn health_reports_ok_version_mode_and_cache() {
     assert_eq!(resp["upstream"], json!(upstream));
     assert!(resp["cache"]["cap_bytes"].as_u64().is_some());
     assert!(resp["cache"]["used_bytes"].as_u64().is_some());
+    // Agent-friendly additions: service name, commit, configured addr, cache dir, methods.
+    // (`addr` reflects the configured bind addr — the test binds an ephemeral port via
+    // config.port=0, so it is "127.0.0.1:0", distinct from the live socket `addr`.)
+    assert_eq!(resp["service"], json!("dig-node"));
+    assert!(resp["commit"].is_string());
+    assert_eq!(resp["addr"], json!("127.0.0.1:0"));
+    assert!(resp["cache"]["dir"].is_string());
+    let methods = resp["methods"].as_array().expect("methods array");
+    assert!(methods.iter().any(|m| m == &json!("dig.getContent")));
+    assert!(methods.iter().any(|m| m == &json!("rpc.discover")));
+}
+
+#[tokio::test]
+async fn version_endpoint_reports_build_fingerprint() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let addr = start_companion(&upstream).await;
+
+    let resp: Value = client()
+        .get(format!("http://{addr}/version"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["service"], json!("dig-node"));
+    assert_eq!(resp["version"], json!(dig_companion::VERSION));
+    assert!(resp["commit"].is_string());
+    assert!(resp["dig_node_version"].is_string());
+    assert_eq!(resp["protocol"], json!("21"));
+}
+
+#[tokio::test]
+async fn well_known_document_is_a_discovery_surface() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let addr = start_companion(&upstream).await;
+
+    let resp: Value = client()
+        .get(format!("http://{addr}/.well-known/dig-node.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["service"], json!("dig-node"));
+    assert_eq!(resp["addr"], json!("127.0.0.1:0"));
+    assert!(resp["cache"]["dir"].is_string());
+    assert!(resp["methods"].is_array());
+    assert!(resp["errors"].is_array());
+    assert_eq!(resp["rpc"]["openrpc"], json!("/openrpc.json"));
+    assert_eq!(resp["rpc"]["discover"], json!("rpc.discover"));
+}
+
+#[tokio::test]
+async fn openrpc_endpoint_serves_the_spec() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let addr = start_companion(&upstream).await;
+
+    let resp: Value = client()
+        .get(format!("http://{addr}/openrpc.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["openrpc"], json!("1.2.6"));
+    let methods = resp["methods"].as_array().expect("methods");
+    assert!(methods.iter().any(|m| m["name"] == json!("dig.getContent")));
+    assert!(methods.iter().any(|m| m["name"] == json!("rpc.discover")));
+}
+
+#[tokio::test]
+async fn rpc_discover_returns_the_openrpc_document() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let addr = start_companion(&upstream).await;
+
+    let resp: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "rpc.discover" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Answered by the shell (not relayed to the upstream), returns the spec.
+    assert_eq!(resp["id"], json!(1));
+    assert_eq!(resp["result"]["openrpc"], json!("1.2.6"));
+    assert!(resp["result"]["methods"].is_array());
 }
 
 #[tokio::test]
@@ -206,4 +301,7 @@ async fn non_object_body_returns_jsonrpc_error_not_transport_error() {
     assert!(resp.status().is_success());
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], json!(-32600));
+    // The error carries the stable symbolic code an agent branches on.
+    assert_eq!(body["error"]["data"]["code"], json!("INVALID_REQUEST"));
+    assert_eq!(body["error"]["data"]["origin"], json!("shell"));
 }

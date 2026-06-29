@@ -1,18 +1,29 @@
 //! dig-companion CLI — the entrypoint for both manual runs and the OS service.
+//! (The shipped binary is named `dig-companion` for install stability, but it is
+//! the local **dig-node** service — see the canonical-terminology note in SYSTEM.md.)
 //!
 //! Subcommands:
-//!   run        Run the companion in the foreground (the service entrypoint too).
-//!   install    Register the companion as an auto-starting OS service.
+//!   run        Run the node in the foreground (the service entrypoint too).
+//!   install    Register the node as an auto-starting OS service.
 //!   uninstall  Remove the OS service.
 //!   start      Start the installed service.
 //!   stop       Stop the running service.
-//!   status     Report whether the companion is serving (probes /health).
+//!   status     Report whether the node is serving (probes /health).
 //!
-//! With no subcommand, `dig-companion` runs in the foreground (equivalent to
-//! `run`), so a bare invocation just serves — the least-surprise default for a
-//! localhost endpoint.
+//! With no subcommand, the binary runs in the foreground (equivalent to `run`), so
+//! a bare invocation just serves — the least-surprise default for a localhost
+//! endpoint.
+//!
+//! ## Machine-readable output (`--json`)
+//!
+//! Every subcommand accepts the global `--json` flag: on success it emits ONE
+//! structured object to **stdout** (`{ ok:true, action, ... }`) and routes human
+//! prose to **stderr**; on failure it emits `{ ok:false, error:{ code, exit_code,
+//! message, hint } }` to stdout and still exits with the differentiated code. The
+//! exit-code table is documented in [`dig_companion::cli`] and the README.
 
 use clap::{Parser, Subcommand};
+use dig_companion::cli::{error_envelope, success_envelope, ExitCode, Outcome};
 use dig_companion::config::Config;
 use dig_companion::{serve, service, VERSION};
 
@@ -20,24 +31,29 @@ use dig_companion::{serve, service, VERSION};
 #[command(
     name = "dig-companion",
     version = VERSION,
-    about = "Localhost DIG node for the DIG Chrome extension (installable as an OS service)",
+    about = "Local DIG node for the DIG Chrome extension (installable as an OS service)",
     long_about = None,
 )]
 struct Cli {
+    /// Emit a single machine-readable JSON object to stdout (human prose → stderr).
+    /// Errors are emitted as `{ok:false,error:{code,exit_code,message,hint}}`.
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the companion in the foreground (also the unix-service entrypoint).
+    /// Run the node in the foreground (also the unix-service entrypoint).
     Run,
     /// Internal: the Windows-service entrypoint (speaks the SCM service protocol).
     /// Installed by `install` on Windows; not meant to be run by hand. On non-Windows
     /// it behaves like `run`.
     #[command(hide = true)]
     RunService,
-    /// Register the companion as an auto-starting OS service.
+    /// Register the node as an auto-starting OS service.
     Install,
     /// Remove the OS service.
     Uninstall,
@@ -45,36 +61,121 @@ enum Command {
     Start,
     /// Stop the running service.
     Stop,
-    /// Report whether the companion is serving (probes /health).
+    /// Report whether the node is serving (probes /health).
     Status,
+}
+
+impl Command {
+    /// The action name used in the `--json` envelope.
+    fn action(&self) -> &'static str {
+        match self {
+            Command::Run | Command::RunService => "run",
+            Command::Install => "install",
+            Command::Uninstall => "uninstall",
+            Command::Start => "start",
+            Command::Stop => "stop",
+            Command::Status => "status",
+        }
+    }
 }
 
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
     let config = Config::from_env();
+    let command = cli.command.unwrap_or(Command::Run);
+    let action = command.action();
 
-    let result: std::io::Result<()> = match cli.command.unwrap_or(Command::Run) {
-        Command::Run => run(config),
-        Command::RunService => run_service(config),
-        Command::Install => service::install(&config),
-        Command::Uninstall => service::uninstall(),
-        Command::Start => service::start(),
-        Command::Stop => service::stop(),
-        // `status` returns whether it is serving; map "not serving" to a non-zero
-        // exit so scripts can gate on it, while still printing the human message.
-        Command::Status => match service::status(&config) {
-            Ok(true) => Ok(()),
-            Ok(false) => return std::process::ExitCode::from(1),
-            Err(e) => Err(e),
-        },
+    // `run` / `run-service` serve indefinitely — they have no terminal Outcome.
+    // Everything else returns an Outcome we render as JSON or prose.
+    let exit = match command {
+        Command::Run => render_serve(run(config), action, json),
+        Command::RunService => render_serve(run_service(config), action, json),
+        Command::Install => render(service::install(&config), action, json),
+        Command::Uninstall => render(service::uninstall(), action, json),
+        Command::Start => render(service::start(), action, json),
+        Command::Stop => render(service::stop(), action, json),
+        Command::Status => render_status(service::status(&config), action, json),
     };
+    std::process::ExitCode::from(exit.code())
+}
 
+/// Render a one-shot subcommand outcome: under `--json` emit the success/error
+/// envelope to stdout; otherwise print the human summary (success → stdout, errors
+/// → stderr). Returns the exit code.
+fn render(result: std::io::Result<Outcome>, action: &str, json: bool) -> ExitCode {
     match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::ExitCode::FAILURE
+        Ok(outcome) => {
+            if json {
+                println!("{}", success_envelope(action, outcome.result));
+            } else {
+                println!("{}", outcome.summary);
+            }
+            ExitCode::Ok
         }
+        Err(e) => emit_error(&e, action, json),
+    }
+}
+
+/// Render `status`: success either way, but `serving:false` maps to exit 1
+/// (`NOT_SERVING`) so scripts can gate on liveness.
+fn render_status(result: std::io::Result<Outcome>, action: &str, json: bool) -> ExitCode {
+    match result {
+        Ok(outcome) => {
+            let serving = outcome.result["serving"].as_bool().unwrap_or(false);
+            if json {
+                println!("{}", success_envelope(action, outcome.result));
+            } else {
+                println!("{}", outcome.summary);
+            }
+            if serving {
+                ExitCode::Ok
+            } else {
+                ExitCode::NotServing
+            }
+        }
+        Err(e) => emit_error(&e, action, json),
+    }
+}
+
+/// Render the `run`/`run-service` path. These block until shutdown; a clean exit
+/// is success, a bind/IO error is the typed failure. (No success object is printed
+/// — the process simply runs; the startup log goes to stderr from `serve`.)
+fn render_serve(result: std::io::Result<()>, action: &str, json: bool) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::Ok,
+        Err(e) => emit_error(&e, action, json),
+    }
+}
+
+/// Emit a failure: under `--json` the structured error envelope to stdout, else the
+/// `error: …` line to stderr. Maps the io::Error to the differentiated exit code.
+fn emit_error(e: &std::io::Error, action: &str, json: bool) -> ExitCode {
+    let exit = ExitCode::from_io_error(e);
+    let message = e.to_string();
+    let hint = hint_for(exit);
+    if json {
+        println!("{}", error_envelope(action, exit, &message, hint));
+    } else {
+        eprintln!("error: {message}");
+        if let Some(h) = hint {
+            eprintln!("hint: {h}");
+        }
+    }
+    exit
+}
+
+/// A remediation hint for an exit class (shown to humans, carried in the JSON
+/// error envelope's `hint`).
+fn hint_for(exit: ExitCode) -> Option<&'static str> {
+    match exit {
+        ExitCode::PermissionDenied => {
+            Some("Re-run in a terminal opened with \"Run as administrator\" (Windows).")
+        }
+        ExitCode::BindFailed => {
+            Some("The port is in use or unavailable; set DIG_COMPANION_PORT to a free port.")
+        }
+        _ => None,
     }
 }
 
