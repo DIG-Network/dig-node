@@ -124,9 +124,38 @@ async fn health_reports_ok_version_mode_and_cache() {
     assert!(resp["commit"].is_string());
     assert_eq!(resp["addr"], json!("127.0.0.1:0"));
     assert!(resp["cache"]["dir"].is_string());
+    // #96: health reflects whether the cache is the shared canonical dir (true) or
+    // a process-private fallback (false) — sourced from dig-node's resolver.
+    assert!(
+        resp["cache"]["shared"].is_boolean(),
+        "cache.shared must be a bool"
+    );
     let methods = resp["methods"].as_array().expect("methods array");
     assert!(methods.iter().any(|m| m == &json!("dig.getContent")));
     assert!(methods.iter().any(|m| m == &json!("rpc.discover")));
+}
+
+#[tokio::test]
+async fn cache_get_config_reports_dir_and_shared_from_dig_node() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let addr = start_companion(&upstream).await;
+
+    // #96 additive fields on the dig-node `cache.getConfig` RPC: the effective
+    // resolved cache dir + whether it is the shared canonical one. The companion
+    // routes this straight to dig_node::handle_rpc, so this asserts the new crate
+    // contract reaches clients through the companion unchanged.
+    let resp: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "cache.getConfig" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(resp["result"]["cache_dir"].is_string());
+    assert!(resp["result"]["shared"].is_boolean());
 }
 
 #[tokio::test]

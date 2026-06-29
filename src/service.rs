@@ -107,11 +107,19 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
     // Pass the effective config to the service as env vars so the running service
     // matches what `install` was told (the service process does not inherit the
     // installing shell's environment).
-    let environment = vec![
+    let mut environment = vec![
         ("DIG_COMPANION_PORT".to_string(), config.port.to_string()),
         ("DIG_COMPANION_HOST".to_string(), config.host.to_string()),
         ("DIG_RPC_UPSTREAM".to_string(), config.upstream.clone()),
     ];
+    // Only record DIG_NODE_CACHE when an explicit dir was set: omitting it lets the
+    // service resolve dig-node's shared canonical default — the SAME dir the DIG
+    // Browser's in-process node uses — so the two share ONE cache (#96). Recording
+    // a path here pins the service to it, so an operator pointing the service at a
+    // dedicated cache must set the SAME path for the browser to keep sharing.
+    if let Some(dir) = crate::config::cache_dir_env_value(config.cache_dir.as_deref()) {
+        environment.push(("DIG_NODE_CACHE".to_string(), dir));
+    }
 
     // The SCM-launched program must speak the Windows service protocol, so on
     // Windows the installed service runs the hidden `run-service` entrypoint

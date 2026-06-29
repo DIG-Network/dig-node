@@ -102,8 +102,9 @@ pub fn build_state(config: &Config) -> AppState {
 /// Shape extends the Node companion's health body (existing probes keep parsing
 /// `status`/`version`/`mode`/`upstream`/`cache`) with agent-friendly additions:
 /// `service` (the canonical `dig-node` name), `commit`, the bound `addr`, the
-/// cache `dir`, and the `methods` catalogue — so a single `/health` fetch reveals
-/// what the node is and what it serves.
+/// cache `dir` + `shared` flag (#96 — is the cache the shared canonical dir or a
+/// private fallback), and the `methods` catalogue — so a single `/health` fetch
+/// reveals what the node is and what it serves.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "ok",
@@ -117,6 +118,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "dir": meta::cache_dir().display().to_string(),
             "cap_bytes": cache_cap_bytes(),
             "used_bytes": cache_used_bytes(),
+            // #96: whether the cache is the shared canonical dir (the dir the DIG
+            // Browser's in-process node also uses) or a process-private fallback.
+            "shared": meta::cache_shared(),
         },
         "methods": meta::method_names(),
     }))
