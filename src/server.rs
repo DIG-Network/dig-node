@@ -12,9 +12,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::State,
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
-    response::IntoResponse,
+    extract::{Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -22,7 +23,7 @@ use dig_node::{cache_cap_bytes, cache_used_bytes, handle_rpc, Node};
 use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
-use crate::config::Config;
+use crate::config::{host_is_allowed, Config};
 use crate::control::{self, ControlCtx};
 use crate::meta;
 use crate::meta::ErrorCode;
@@ -75,16 +76,14 @@ const METHOD_NOT_FOUND: i64 = ErrorCode::MethodNotFound.code();
 /// Split out from [`serve`] so it can be exercised by an in-process test without
 /// binding a port.
 pub fn router(state: AppState) -> Router {
-    // The extension calls from a `chrome-extension://` origin; a same-machine dev
-    // page calls from `http://localhost`. Reflect those (and any origin in dev) so
-    // the browser's CORS preflight passes. The companion is loopback-only, so a
-    // permissive reflected origin here is not a public-exposure risk.
+    // The extension calls from a `chrome-extension://` origin; a same-machine page
+    // calls from `http://localhost`, `http://dig.local`, or a loopback IP (#91 —
+    // the dual listener means a page can be served from any of the canonical local
+    // names). Reflect those so the browser's CORS preflight passes. The companion is
+    // loopback-only, so reflecting these local origins is not a public-exposure risk.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
-            origin
-                .to_str()
-                .map(|o| o.starts_with("chrome-extension://") || o.starts_with("http://localhost"))
-                .unwrap_or(false)
+            origin.to_str().map(is_local_origin).unwrap_or(false)
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         // CONTENT_TYPE for the JSON body; the control-token header so a same-host
@@ -100,8 +99,62 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .route("/openrpc.json", get(openrpc))
         .route("/.well-known/dig-node.json", get(well_known))
+        // Host-header allowlist (#91): both loopback listeners share this router,
+        // so a single guard accepts the canonical local names (dig.local /
+        // localhost / 127.0.0.1 / 127.0.0.2 [+ :port]) and rejects a foreign Host
+        // (the DNS-rebinding vector) before any handler runs. Applied UNDER the CORS
+        // layer so a CORS preflight (OPTIONS) is still answered for an allowed host.
+        .layer(middleware::from_fn(host_guard))
         .layer(cors)
         .with_state(state)
+}
+
+/// Whether a CORS `Origin` is a same-machine local origin we reflect (#91): the
+/// extension's `chrome-extension://` scheme, or an `http://` page served from one
+/// of the canonical local names (`localhost` / `dig.local` / `127.0.0.1` /
+/// `127.0.0.2`, with or without a `:port`). PURE so the policy is unit-testable.
+fn is_local_origin(origin: &str) -> bool {
+    if origin.starts_with("chrome-extension://") {
+        return true;
+    }
+    let Some(rest) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    // `rest` is `host[:port]`. An empty host is not a valid origin (host_is_allowed
+    // treats a blank Host as "no header" and allows it; for an Origin that is wrong).
+    if rest.trim().is_empty() {
+        return false;
+    }
+    host_is_allowed(Some(rest))
+}
+
+/// Axum middleware enforcing the [`host_is_allowed`] allowlist (#91). A request
+/// whose `Host` header is not a canonical local name is rejected `421 Misdirected
+/// Request` with a catalogued JSON-RPC-style error body, so even though the node
+/// binds loopback-only it never serves a foreign-named (rebinding) request. Allowed
+/// requests pass through untouched. `OPTIONS` (CORS preflight) is exempt so the
+/// browser's preflight to an allowed origin always succeeds.
+async fn host_guard(req: Request, next: Next) -> Response {
+    if req.method() == Method::OPTIONS {
+        return next.run(req).await;
+    }
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok());
+    if host_is_allowed(host) {
+        return next.run(req).await;
+    }
+    (
+        StatusCode::MISDIRECTED_REQUEST,
+        Json(rpc_error(
+            Value::Null,
+            ErrorCode::InvalidRequest,
+            "dig-node: Host not allowed — this loopback node answers only to \
+             dig.local / localhost / 127.0.0.1 / 127.0.0.2",
+        )),
+    )
+        .into_response()
 }
 
 /// Construct the shared state from config: apply the upstream to dig-node's env,
@@ -349,6 +402,22 @@ pub async fn serve(config: Config) -> std::io::Result<()> {
 /// Like [`serve`], but the caller supplies the shutdown future. The Windows
 /// service entrypoint uses this to drive graceful shutdown from the SCM `Stop`
 /// control event (which is not a unix signal), instead of the OS-signal future.
+///
+/// ## Dual loopback listeners (#91)
+///
+/// The node opens TWO loopback listeners for the SAME app:
+///
+/// 1. **`127.0.0.1:<port>`** (default 8080) — `http://localhost:<port>`. **Always
+///    on** (unprivileged, conflict-free). A failure to bind this is FATAL — the
+///    node has no endpoint, so `serve` returns the error (mapped to `BIND_FAILED`).
+/// 2. **`127.0.0.2:80`** — bare `http://dig.local` (no port), matching the
+///    dig-installer hosts entry. **Best-effort**: binding the privileged port 80
+///    (and, on macOS, the `127.0.0.2` loopback alias) may fail; if so the node logs
+///    a structured warning and serves localhost-only — it NEVER aborts for this.
+///    Skipped entirely when `DIG_NODE_DIGLOCAL=0` ([`Config::dig_local`]).
+///
+/// Neither listener binds `0.0.0.0` — both are loopback IPs, so the node is never
+/// LAN-exposed. The shared shutdown future drives BOTH to a graceful stop.
 pub async fn serve_with_shutdown<F>(config: Config, shutdown: F) -> std::io::Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -357,20 +426,91 @@ where
     let state = build_state(&config);
     let app = router(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr)
+    // (1) The ALWAYS-ON localhost listener. A failure here is fatal: no endpoint.
+    let localhost = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| std::io::Error::new(e.kind(), format!("dig-node: cannot bind {addr}: {e}")))?;
+
+    // (2) The BEST-EFFORT bare-dig.local listener (127.0.0.2:80). Try to bind; on
+    // failure, log a structured warning and continue with localhost-only.
+    let dig_local = match config.dig_local_addr() {
+        Some(dl_addr) => match tokio::net::TcpListener::bind(&dl_addr).await {
+            Ok(l) => {
+                eprintln!("dig-node: bare http://dig.local enabled (listening on {dl_addr})");
+                Some(l)
+            }
+            Err(e) => {
+                warn_dig_local_bind_failed(&dl_addr, &e);
+                None
+            }
+        },
+        None => {
+            eprintln!("dig-node: bare http://dig.local listener disabled (DIG_NODE_DIGLOCAL=0)");
+            None
+        }
+    };
+
     // Operational log line → stderr, so `run --json` leaves stdout for the single
     // structured object (prose-to-stderr convention).
+    let dig_local_note = if dig_local.is_some() {
+        "  Also reachable at http://dig.local (no port).\n"
+    } else {
+        ""
+    };
     eprintln!(
         "dig-node v{VERSION} (local-node) listening on http://{addr}\n  \
-         upstream: {}\n  Point the DIG Chrome extension's \"server host\" at {addr}.",
+         upstream: {}\n{dig_local_note}  \
+         Point the DIG Chrome extension's \"server host\" at {addr}.",
         config.upstream
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
+    // A single shutdown signal fanned out to both listeners: when it fires, both
+    // axum::serve loops stop gracefully. (The caller's future resolves once; we
+    // notify both servers from it.)
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    {
+        let n = shutdown_notify.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            n.notify_waiters();
+        });
+    }
+
+    let localhost_srv = {
+        let app = app.clone();
+        let n = shutdown_notify.clone();
+        axum::serve(localhost, app).with_graceful_shutdown(async move { n.notified().await })
+    };
+
+    // Drive both servers concurrently; return the first error (there normally is
+    // none — they run until the shared shutdown). When dig.local is absent we just
+    // await the localhost server.
+    match dig_local {
+        Some(dl_listener) => {
+            let n = shutdown_notify.clone();
+            let dig_local_srv = axum::serve(dl_listener, app)
+                .with_graceful_shutdown(async move { n.notified().await });
+            tokio::try_join!(localhost_srv, dig_local_srv).map(|_| ())
+        }
+        None => localhost_srv.await,
+    }
+}
+
+/// Log the structured warning when the best-effort `127.0.0.2:80` (dig.local) bind
+/// fails (#91). Split out so the message is one place and the policy ("warn +
+/// continue, never abort") is obvious at the call site. The hint is platform-aware:
+/// `:80` is privileged on Linux (root / CAP_NET_BIND_SERVICE) and on macOS also
+/// needs the `127.0.0.2` loopback alias.
+fn warn_dig_local_bind_failed(dl_addr: &str, e: &std::io::Error) {
+    eprintln!(
+        "dig-node: WARN could not bind {dl_addr} for bare http://dig.local ({e}); \
+         continuing with localhost-only (http only via the configured port). \
+         This is non-fatal. Causes: the privileged port 80 needs elevation \
+         (Linux: run as root or grant CAP_NET_BIND_SERVICE; the installed service \
+         runs elevated), the port is already in use, or — on macOS — the 127.0.0.2 \
+         loopback alias is missing (sudo ifconfig lo0 alias 127.0.0.2). \
+         Set DIG_NODE_DIGLOCAL=0 to silence this and skip the attempt."
+    );
 }
 
 /// Resolve when the process receives Ctrl-C (all platforms) or SIGTERM (unix),
@@ -397,4 +537,42 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
     eprintln!("dig-node: shutting down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_origin;
+
+    #[test]
+    fn local_origins_are_reflected_for_cors() {
+        // The extension + every canonical local page origin (#91) is reflected.
+        for ok in [
+            "chrome-extension://abcdefghijklmnop",
+            "http://localhost",
+            "http://localhost:8080",
+            "http://dig.local",
+            "http://dig.local:80",
+            "http://127.0.0.1:8080",
+            "http://127.0.0.2",
+        ] {
+            assert!(
+                is_local_origin(ok),
+                "{ok:?} must be a reflected local origin"
+            );
+        }
+    }
+
+    #[test]
+    fn non_local_origins_are_not_reflected() {
+        for bad in [
+            "http://evil.example.com",
+            "https://localhost", // https scheme is not a local http page origin
+            "http://",           // empty host
+            "http://dig.local.evil.com",
+            "ws://localhost",
+            "",
+        ] {
+            assert!(!is_local_origin(bad), "{bad:?} must NOT be reflected");
+        }
+    }
 }

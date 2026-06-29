@@ -255,6 +255,118 @@ async fn rpc_discover_returns_the_openrpc_document() {
     assert!(resp["result"]["methods"].is_array());
 }
 
+// ===========================================================================
+// #91 — Host-header allowlist + the bare-dig.local dual listener.
+// The node binds loopback-only and answers to dig.local / localhost / 127.0.0.1
+// / 127.0.0.2 (the four canonical local names) so http://dig.local (no port) and
+// http://localhost:<port> both work; a foreign Host (the DNS-rebinding vector) is
+// rejected even on loopback.
+// ===========================================================================
+
+#[tokio::test]
+async fn host_allowlist_accepts_dig_local_and_localhost() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let addr = start_companion(&upstream).await;
+
+    // Each canonical local Host (the loopback bind makes the actual socket the
+    // same; we override the Host header to prove the allowlist accepts the name).
+    for host in [
+        "dig.local",
+        "dig.local:80",
+        "localhost:8080",
+        "127.0.0.1",
+        "127.0.0.2:80",
+    ] {
+        let resp = client()
+            .get(format!("http://{addr}/health"))
+            .header("Host", host)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_success(),
+            "Host {host:?} must be served, got {}",
+            resp.status()
+        );
+    }
+}
+
+#[tokio::test]
+async fn host_allowlist_rejects_a_foreign_host() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let addr = start_companion(&upstream).await;
+
+    // A foreign Host (e.g. a public name rebinding-pointed at the loopback bind)
+    // is rejected with 421 + a catalogued error body, before any handler runs.
+    let resp = client()
+        .get(format!("http://{addr}/health"))
+        .header("Host", "evil.example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 421, "foreign Host must be rejected");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["data"]["code"], json!("INVALID_REQUEST"));
+}
+
+#[tokio::test]
+async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
+    // The bind-fallback contract: with dig.local ENABLED the node tries to bind the
+    // privileged 127.0.0.2:80 — which fails in CI (no privilege / no loopback alias
+    // / possibly in use) — and MUST still serve on localhost rather than aborting.
+    let (upstream, _calls) = start_mock_upstream().await;
+
+    // Grab a free loopback port, then hand it to serve_with_shutdown explicitly so
+    // we know where to probe (serve_with_shutdown binds config.bind_addr directly).
+    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = free.local_addr().unwrap().port();
+    drop(free); // release it so the server can bind the same port
+
+    let config = dig_companion::Config {
+        upstream: upstream.to_string(),
+        port,
+        dig_local: true, // attempt the privileged 127.0.0.2:80 bind (expected to fail in CI)
+        ..dig_companion::Config::default()
+    };
+
+    // Drive serve under the env lock (build_state reads env at node construction).
+    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let stop_for_server = stop.clone();
+    let server = {
+        let _g = env_guard().lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("dig-companion-dual-{}", std::process::id()));
+        std::env::set_var("DIG_NODE_CACHE", &tmp);
+        std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        tokio::spawn(async move {
+            dig_companion::server::serve_with_shutdown(config, async move {
+                stop_for_server.notified().await;
+            })
+            .await
+        })
+    };
+
+    // Poll until localhost is serving (the server starts asynchronously).
+    let url = format!("http://127.0.0.1:{port}/health");
+    let mut served = false;
+    for _ in 0..50 {
+        if let Ok(r) = client().get(&url).send().await {
+            if r.status().is_success() {
+                served = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    assert!(
+        served,
+        "localhost must keep serving even when the dig.local (:80) bind fails"
+    );
+
+    // Clean shutdown.
+    stop.notify_waiters();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+}
+
 #[tokio::test]
 async fn cors_reflects_chrome_extension_origin() {
     let (upstream, _calls) = start_mock_upstream().await;

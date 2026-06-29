@@ -58,10 +58,27 @@ Once installed, `dig-node` runs on `127.0.0.1:8080` (configurable — see the en
 README) and auto-starts on boot/login. It is **loopback-only**: it is a same-machine endpoint for
 the browser/extension, never a public server.
 
+It opens **two loopback listeners for the same app** (#91), so it is reachable two ways at once:
+
+- **`http://localhost:<port>`** (default `localhost:8080`, on `127.0.0.1`) — **always on**
+  (unprivileged, conflict-free); the guaranteed fallback.
+- **`http://dig.local`** (no port, on `127.0.0.2:80`) — **best-effort**: the dig-installer writes a
+  hosts entry `127.0.0.2  dig.local` and the node binds `127.0.0.2:80`, so the bare port-free URL
+  works. Binding the privileged `:80` (and, on macOS, a `127.0.0.2` loopback alias) may fail; if so
+  the node logs a structured warning and serves **localhost-only**, never aborting. Disable the
+  attempt with `DIG_NODE_DIGLOCAL=0`.
+
+Neither listener binds `0.0.0.0` (loopback-only, never LAN-exposed), and both enforce a **Host
+allowlist** — they answer only to `dig.local` / `localhost` / `127.0.0.1` / `127.0.0.2` (a foreign
+`Host`, the DNS-rebinding vector, is rejected `421`). See the README → *Addressing* for the
+per-platform `:80` privilege / macOS-alias caveats.
+
 ### 3. The extension (or browser) points at it
 
-In the DIG Chrome extension's options, the **server host** is set to `localhost:8080`. From then on
-the extension resolves `chia://` URLs through the local node instead of `rpc.dig.net`.
+In the DIG Chrome extension's options, the **server host** is set to `dig.local` (port-free, when
+the `:80` listener is up) or `localhost:8080` (the always-on fallback). From then on the extension
+resolves `chia://` URLs through the local node instead of `rpc.dig.net`. (The extension's resolver
+already tries `dig.local` first, then `localhost:<port>`.)
 
 ### 4. Resolving `chia://` content (the read path)
 
@@ -89,10 +106,10 @@ transparent proxy.
 1 GiB, floored at 64 MiB, LRU-evicted) and settable live via `cache.setCapBytes`. The cache dir is
 reported in `/health` and `/.well-known/dig-node.json` so an operator/agent can find it.
 
-> **Note (future work):** task #91 (dual loopback listener `127.0.0.2:80` + `localhost` with a
-> `dig.local` Host allowlist) and task #96 (shared `.dig` cache across the browser/node) will change
-> this repo's networking/cache. They are **out of scope** for the agent-friendly pass documented
-> here.
+> **Status:** task #91 (dual loopback listener `127.0.0.2:80` + `localhost:<port>` with a
+> `dig.local` Host allowlist) and task #96 (shared `.dig` cache across the browser/node) are now
+> **implemented** — see step 2 (*The service runs* → dual listeners) and the *Shared `.dig` cache*
+> section above / in the README.
 
 ### 6. Control the node from a controller UI (the DIG Browser "My Node")
 
