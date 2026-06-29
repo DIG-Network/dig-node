@@ -15,16 +15,31 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-/// dig-node reads `DIG_NODE_UPSTREAM` (and the cache-dir env) ONCE, at
-/// `Node::from_env()` construction, from the process-global environment. Tests run
-/// concurrently in one process, so without serialization one test's `set_var`
-/// could be clobbered by another's between set and construct — a TOCTOU race that
-/// wires a node to the wrong mock upstream. This mutex makes "set env → build node"
-/// atomic across tests; it is held only for that brief construction window.
-fn env_guard() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// Serializes every test that builds a companion server. dig-node reads
+/// `DIG_NODE_UPSTREAM` and the cache/config/token paths from the PROCESS-GLOBAL
+/// environment — at construction AND live on each request. Tests run concurrently in
+/// one process, so without serialization one test's `set_var` (+ its dir teardown) is
+/// observed mid-request by another, racing the upstream wiring and the control-token
+/// file (→ flaky UNAUTHORIZED / cache-dir-not-writable fallbacks). The lock is held
+/// for the WHOLE test (via [`EnvHold`]), not just the build window, so those global
+/// reads stay consistent for that test's lifetime.
+///
+/// A `tokio::sync::Mutex` (not `std::sync::Mutex`) because the guard is held across
+/// `.await` points; its guard is await-safe, whereas a std guard trips
+/// `clippy::await_holding_lock`. `Arc` + `lock_owned()` yields a `'static` guard the
+/// helpers can return.
+fn env_guard() -> Arc<tokio::sync::Mutex<()>> {
+    static LOCK: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
+    LOCK.get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
+
+/// Monotonic sequence giving each `start_companion_full` call a UNIQUE cache/config
+/// dir, so the per-server control-token file + pin registry (and pinned-store list a
+/// test asserts on) are never shared between tests. This + the [`EnvHold`] lock
+/// together remove the flaky UNAUTHORIZED: the lock makes the global-env reads
+/// consistent, the unique dir keeps each server's on-disk state isolated.
+static TEST_DIR_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Start a mock upstream DIG RPC on a random loopback port. It records every
 /// request and answers `dig.getAnchoredRoot` / `dig.listCapsules` / echoes the
@@ -62,32 +77,70 @@ async fn start_mock_upstream() -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), calls)
 }
 
+/// A held serialization guard returned by the start helpers. The companion server
+/// reads the PROCESS-GLOBAL `DIG_NODE_CACHE` (and the config/token paths derived from
+/// it) LIVE on every request — so two tests running concurrently with different cache
+/// dirs race (one test's `set_var` + dir teardown is observed mid-request by another,
+/// surfacing as cache-dir-not-writable fallbacks or token mismatches → flaky
+/// UNAUTHORIZED). Production is single-process/single-config and correct; only the
+/// concurrent test harness must serialize. A test binds this guard (`_hold`) so the
+/// global env stays pinned to ITS dir for the whole test, then releases it on drop.
+/// (Per-test unique dirs alone are not enough precisely because the reads are live
+/// and global — the lock is what makes them consistent.)
+#[must_use]
+struct EnvHold(
+    // Held purely for its Drop (RAII release of the serialization lock). The field is
+    // never read — the value's lifetime IS its purpose — so silence dead_code.
+    #[allow(dead_code)] tokio::sync::OwnedMutexGuard<()>,
+);
+
 /// Start the companion app on a random loopback port pointed at the given upstream
-/// and an isolated cache dir. Returns the companion's base URL.
-async fn start_companion(upstream: &str) -> SocketAddr {
-    start_companion_full(upstream).await.0
+/// and an isolated cache dir. Returns the companion's base URL and the [`EnvHold`]
+/// serialization guard the caller must keep alive for the test's duration.
+async fn start_companion(upstream: &str) -> (SocketAddr, EnvHold) {
+    let (addr, _token, hold) = start_companion_full(upstream).await;
+    (addr, hold)
 }
 
 /// Like [`start_companion`] but also returns the local control token the server
 /// generated, so the control-plane tests can authorize `control.*` calls (a same-
 /// host controller reads it from `<config_dir>/control-token`; here the test reads
 /// the same on-disk token the server wrote, mirroring exactly that controller flow).
-async fn start_companion_full(upstream: &str) -> (SocketAddr, String) {
+async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
     let config = dig_companion::Config {
         upstream: upstream.to_string(),
         port: 0, // bind ephemeral
         ..dig_companion::Config::default()
     };
 
-    // Build the node under the env lock so set-env → from_env() is atomic w.r.t.
-    // other concurrent tests (see env_guard). build_state both applies the upstream
-    // to DIG_NODE_UPSTREAM and constructs the node, so the whole call is guarded.
+    // Hold the env lock for the WHOLE test (returned as EnvHold), not just the build
+    // window: build_state applies the upstream to DIG_NODE_UPSTREAM and constructs the
+    // node, but the server then reads DIG_NODE_CACHE/config_path LIVE per request, so
+    // the lock must outlive construction to keep those reads consistent (see EnvHold).
+    let hold = env_guard().lock_owned().await;
     let (state, token) = {
-        let _g = env_guard().lock().unwrap();
-        // Isolate dig-node's on-disk cache so the test never touches the real cache,
-        // and pin a small cap (must be set before from_env reads it).
-        let tmp = std::env::temp_dir().join(format!("dig-companion-test-{}", std::process::id()));
-        std::env::set_var("DIG_NODE_CACHE", &tmp);
+        // Isolate dig-node's on-disk state PER CALL so the test never touches the
+        // real cache AND no two concurrent tests share state.
+        //
+        // The control-token file + config.json pin registry live in the PARENT of
+        // DIG_NODE_CACHE: dig-node's `config_path()` is `cache_dir().parent()/
+        // config.json` and the token sits beside it. So pointing DIG_NODE_CACHE at a
+        // PID-only (or even per-seq) dir directly under the system temp dir leaves the
+        // PARENT shared — every test then read/wrote the SAME `<temp>/control-token`,
+        // and on Windows a concurrent reader could hit that file mid-write, error,
+        // and fall back to a random in-memory token → intermittent UNAUTHORIZED on a
+        // token-gated control.* call (the flaky failure this guards). Give each call
+        // its own PARENT dir (`<temp>/dig-companion-test-<pid>-<seq>/cache`) so the
+        // token + config.json are unique per server. (Set before from_env reads it.)
+        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "dig-companion-test-{}-{}",
+            std::process::id(),
+            unique
+        ));
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).expect("create test cache dir");
+        std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
         let state = dig_companion::server::build_state(&config);
         // The token the server wrote (read from disk, exactly as a real controller
@@ -102,7 +155,7 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, token)
+    (addr, token, EnvHold(hold))
 }
 
 fn client() -> reqwest::Client {
@@ -112,7 +165,7 @@ fn client() -> reqwest::Client {
 #[tokio::test]
 async fn health_reports_ok_version_mode_and_cache() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/health"))
@@ -150,7 +203,7 @@ async fn health_reports_ok_version_mode_and_cache() {
 #[tokio::test]
 async fn cache_get_config_reports_dir_and_shared_from_dig_node() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     // #96 additive fields on the dig-node `cache.getConfig` RPC: the effective
     // resolved cache dir + whether it is the shared canonical one. The companion
@@ -173,7 +226,7 @@ async fn cache_get_config_reports_dir_and_shared_from_dig_node() {
 #[tokio::test]
 async fn version_endpoint_reports_build_fingerprint() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/version"))
@@ -194,7 +247,7 @@ async fn version_endpoint_reports_build_fingerprint() {
 #[tokio::test]
 async fn well_known_document_is_a_discovery_surface() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/.well-known/dig-node.json"))
@@ -217,7 +270,7 @@ async fn well_known_document_is_a_discovery_surface() {
 #[tokio::test]
 async fn openrpc_endpoint_serves_the_spec() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     let resp: Value = client()
         .get(format!("http://{addr}/openrpc.json"))
@@ -237,7 +290,7 @@ async fn openrpc_endpoint_serves_the_spec() {
 #[tokio::test]
 async fn rpc_discover_returns_the_openrpc_document() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     let resp: Value = client()
         .post(format!("http://{addr}/"))
@@ -266,7 +319,7 @@ async fn rpc_discover_returns_the_openrpc_document() {
 #[tokio::test]
 async fn host_allowlist_accepts_dig_local_and_localhost() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     // Each canonical local Host (the loopback bind makes the actual socket the
     // same; we override the Host header to prove the allowlist accepts the name).
@@ -294,7 +347,7 @@ async fn host_allowlist_accepts_dig_local_and_localhost() {
 #[tokio::test]
 async fn host_allowlist_rejects_a_foreign_host() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     // A foreign Host (e.g. a public name rebinding-pointed at the loopback bind)
     // is rejected with 421 + a catalogued error body, before any handler runs.
@@ -329,11 +382,13 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
         ..dig_companion::Config::default()
     };
 
-    // Drive serve under the env lock (build_state reads env at node construction).
+    // Drive serve under the env lock, held for the whole test (the server reads
+    // DIG_NODE_CACHE/config live per request — see EnvHold). Bound to `_hold` so it
+    // outlives the spawned server below.
+    let _hold = EnvHold(env_guard().lock_owned().await);
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_for_server = stop.clone();
     let server = {
-        let _g = env_guard().lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("dig-companion-dual-{}", std::process::id()));
         std::env::set_var("DIG_NODE_CACHE", &tmp);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
@@ -370,7 +425,7 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
 #[tokio::test]
 async fn cors_reflects_chrome_extension_origin() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     let origin = "chrome-extension://abcdefghijklmnop";
     let resp = client()
@@ -396,7 +451,7 @@ async fn cors_reflects_chrome_extension_origin() {
 #[tokio::test]
 async fn cache_get_config_reports_cap_and_used() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     let resp: Value = client()
         .post(format!("http://{addr}/"))
@@ -415,7 +470,7 @@ async fn cache_get_config_reports_cap_and_used() {
 #[tokio::test]
 async fn anchored_root_and_passthrough_relay_to_upstream() {
     let (upstream, calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     // Unknown method → blind passthrough to the upstream, relayed verbatim.
     let resp: Value = client()
@@ -443,7 +498,7 @@ async fn anchored_root_and_passthrough_relay_to_upstream() {
 #[tokio::test]
 async fn non_object_body_returns_jsonrpc_error_not_transport_error() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let addr = start_companion(&upstream).await;
+    let (addr, _hold) = start_companion(&upstream).await;
 
     let resp = client()
         .post(format!("http://{addr}/"))
@@ -478,7 +533,7 @@ async fn post_rpc(addr: &SocketAddr, body: Value, token: Option<&str>) -> Value 
 #[tokio::test]
 async fn control_method_without_token_is_rejected_with_unauthorized() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -496,7 +551,7 @@ async fn control_method_without_token_is_rejected_with_unauthorized() {
 #[tokio::test]
 async fn control_method_with_wrong_token_is_rejected() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -510,7 +565,7 @@ async fn control_method_with_wrong_token_is_rejected() {
 #[tokio::test]
 async fn control_status_with_token_returns_rich_status() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -534,7 +589,7 @@ async fn control_status_with_token_returns_rich_status() {
 #[tokio::test]
 async fn control_token_via_params_is_also_accepted() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     // No header — present the token in params._control_token instead.
     let resp = post_rpc(
@@ -555,7 +610,7 @@ async fn control_token_via_params_is_also_accepted() {
 #[tokio::test]
 async fn read_methods_are_unaffected_by_the_control_gate() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
 
     // A read method with NO token must still work (the gate is control.* only).
     let resp = post_rpc(
@@ -571,7 +626,7 @@ async fn read_methods_are_unaffected_by_the_control_gate() {
 #[tokio::test]
 async fn control_config_get_reports_addr_upstream_and_cache() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -589,7 +644,7 @@ async fn control_config_get_reports_addr_upstream_and_cache() {
 #[tokio::test]
 async fn control_pin_unpin_roundtrips_in_hosted_stores() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     let store = "a1".repeat(32); // 64-hex
     let cap = format!("{store}:{}", "b2".repeat(32));
@@ -649,7 +704,7 @@ async fn control_pin_unpin_roundtrips_in_hosted_stores() {
 #[tokio::test]
 async fn control_pin_rejects_a_malformed_store_ref() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -666,7 +721,7 @@ async fn control_pin_rejects_a_malformed_store_ref() {
 #[tokio::test]
 async fn control_sync_status_reports_availability() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -685,7 +740,7 @@ async fn control_sync_status_reports_availability() {
 #[tokio::test]
 async fn control_unknown_method_is_method_not_found() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, token) = start_companion_full(&upstream).await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
 
     let resp = post_rpc(
         &addr,
@@ -701,7 +756,7 @@ async fn control_methods_are_not_passed_through_to_upstream() {
     // A control.* method without a token must be rejected by the SHELL, never
     // relayed to the upstream (it is not a read method).
     let (upstream, calls) = start_mock_upstream().await;
-    let (addr, _token) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
 
     let _ = post_rpc(
         &addr,
@@ -722,7 +777,7 @@ async fn control_methods_are_not_passed_through_to_upstream() {
 #[tokio::test]
 async fn control_cors_preflight_allows_the_control_token_header() {
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
 
     let resp = client()
         .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
