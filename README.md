@@ -85,8 +85,32 @@ service's environment so the service serves identically):
 | `DIG_COMPANION_PORT` | `8080` | Port the companion listens on (`127.0.0.1`). |
 | `DIG_COMPANION_HOST` | `127.0.0.1` | Bind address (loopback — the companion is a same-machine endpoint). |
 | `DIG_RPC_UPSTREAM` | `https://rpc.dig.net` | Upstream DIG RPC the embedded node proxies ciphertext/proof requests to on a local cache miss, and relays unhandled methods to. |
-| `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). |
+| `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). **Leave it unset to share one cache with the DIG Browser** — see below. |
 | `DIG_NODE_CACHE_CAP` | `1 GiB` | Cache size cap (floored at 64 MiB), LRU-evicted. Also settable via the `cache.setCapBytes` RPC. |
+
+### Shared `.dig` cache with the DIG Browser (#96)
+
+`dig-companion` and the native [DIG Browser](https://github.com/DIG-Network/DIG_Browser) both embed
+digstore's `dig-node`, and **both default to the SAME on-disk cache dir**
+(`%LOCALAPPDATA%\DigNode\cache` on Windows, `$HOME/DigNode/cache` on Linux/macOS). So when both are
+installed they **share ONE cache** — a capsule fetched by the browser is served from disk by the
+standalone service and vice-versa, with **no double-store**.
+
+- **Omit `DIG_NODE_CACHE`** (the default) to keep that sharing — the companion does **not** invent a
+  path, it leaves dig-node to resolve its shared canonical default. dig-node makes that shared dir
+  safe for two processes at once: atomic content-addressed module writes (so two writers converge
+  with no partial files) plus a cross-process advisory lock around eviction and the config
+  read-modify-write. (Requires the `dig-node` crate at the #95/#96 Pass A revision this repo pins.)
+- **Set `DIG_NODE_CACHE`** only to move that shared cache to an explicit location (a service data
+  dir, or a volume shared between machines). If you do, set the **same** value for the browser's
+  launch environment so the two keep sharing one cache; pointing them at different dirs gives each
+  its own (un-shared) cache. `install` records an explicit `DIG_NODE_CACHE` into the service
+  environment so the installed service uses the same dir you installed it with.
+- **Is the cache actually shared right now?** `GET /health` and `cache.getConfig` report a
+  `cache.shared` boolean: `true` = the shared canonical dir, `false` = dig-node fell back to a
+  process-private dir because the canonical dir was unwritable (it logs a one-shot warning and keeps
+  serving, just un-shared for that session). `cache.getConfig` also returns the effective
+  `cache_dir` path.
 
 ## JSON-RPC surface
 
@@ -97,7 +121,7 @@ in-process node expose:
 |---|---|
 | `dig.getContent` / `dig.getCapsule` | **Verified retrieval** — returns blind **ciphertext + a Merkle inclusion proof + chunk lengths** (`{ ciphertext, root, complete, next_offset?, inclusion_proof, chunk_lens, …, source }`). Served **local-first** from a cached `.dig` module, else proxied to the upstream verbatim (so the proxy path carries `total_length` / `offset` too) and the window cached. `source` is `local` or `remote`. **The client (extension/hub/browser) verifies + decrypts** — the companion mirrors the ciphertext contract, it does not return plaintext. |
 | `dig.getAnchoredRoot` | The store's **chain-anchored tip root**, resolved on-chain by walking the DataStore singleton lineage on coinset.org (the trusted root for the extension's `dig://` root-pinning). |
-| `cache.getConfig` / `cache.setCapBytes` / `cache.clear` | On-disk cache config (`cap_bytes` floored at 64 MiB). |
+| `cache.getConfig` / `cache.setCapBytes` / `cache.clear` | On-disk cache config: `{ cap_bytes (floored at 64 MiB), used_bytes, cache_dir, shared }` — `cache_dir` is the effective dir and `shared` whether it is the canonical dir shared with the DIG Browser (#96). |
 | `cache.listCached` / `cache.removeCached` / `cache.fetchAndCache` | Cached-capsule manager (`storeId:rootHash`). |
 | `rpc.discover` | **Method discovery** — returns this node's OpenRPC document (the standard OpenRPC discovery method), so a client can introspect every method + error over the wire with no out-of-band knowledge. |
 | `dig.getProof`, `dig.listCapsules`, `dig.getManifest`, *anything else* | **Blind passthrough** — relayed verbatim to the upstream, so the node stays a correct transparent proxy for methods it doesn't resolve locally. |
@@ -108,10 +132,10 @@ A single fetch tells an agent what the node is, where it serves, and what it spe
 
 | Endpoint | Returns |
 |---|---|
-| `GET /health` | `{ status, service:"dig-node", version, commit, mode, addr, upstream, cache:{ dir, cap_bytes, used_bytes }, methods:[…] }` — extends the original health body (existing probes keep parsing `status`/`version`/`mode`/`upstream`/`cache`). |
+| `GET /health` | `{ status, service:"dig-node", version, commit, mode, addr, upstream, cache:{ dir, cap_bytes, used_bytes, shared }, methods:[…] }` — extends the original health body (existing probes keep parsing `status`/`version`/`mode`/`upstream`/`cache`). `cache.shared` (#96) tells whether the cache is the dir shared with the DIG Browser. |
 | `GET /version` | `{ service:"dig-node", version, commit, dig_node_version, protocol }` — the build fingerprint, to correlate a running node to an exact source revision. |
 | `GET /openrpc.json` | The OpenRPC document for the JSON-RPC surface (methods + error catalogue), generated from the method/error source so it cannot drift. |
-| `GET /.well-known/dig-node.json` | The canonical discovery doc: identity, bound `addr`, cache (`dir`/`cap_bytes`/`used_bytes`), the method catalogue, the error catalogue, and pointers to the OpenRPC/health/version endpoints. |
+| `GET /.well-known/dig-node.json` | The canonical discovery doc: identity, bound `addr`, cache (`dir`/`cap_bytes`/`used_bytes`/`shared`), the method catalogue, the error catalogue, and pointers to the OpenRPC/health/version endpoints. |
 
 CORS reflects `chrome-extension://` (and `http://localhost`) origins so the extension can call it.
 
@@ -166,9 +190,11 @@ distinguishing companion-shell errors from upstream/boundary ones), beside the n
 ## How the read path is wired (the important design decision)
 
 The companion does **not** reimplement the DIG read path — it depends on digstore's **`dig-node`**
-crate (pinned to the `v0.5.29` release tag) and routes every request to `dig_node::handle_rpc`. This
-is the **same node the native DIG Browser runs in-process**, so the companion and the browser share
-one read path and one cache contract.
+crate (pinned to the #95/#96 **Pass A** commit, `b2632c4`, which ships the shared-cache work; no
+release tag contains it yet, so the dep is pinned to a `rev`) and routes every request to
+`dig_node::handle_rpc`. This is the **same node the native DIG Browser runs in-process**, so the
+companion and the browser share one read path, one cache, and one cache contract (see "Shared `.dig`
+cache" above).
 
 - `dig-node` is a **clean Cargo dependency**: the guest-wasm build prerequisite that gates
   `digstore-cli` (its `build.rs` embeds the compiled guest) does **not** apply to `dig-node`, which

@@ -22,11 +22,19 @@ path = "src/lib.rs"
 # The DIG read path. dig-node IS the rpc.dig.net-compatible local node the native
 # DIG Browser runs in-process (handle_rpc): local-first serve from cached .dig
 # modules, blind ciphertext+proof proxy to rpc.dig.net on a miss, on-chain
-# anchored-root resolution, and the cache.* config surface. Pinned to the digstore
-# release tag so the companion's read path is reproducible. dig-node builds as a
+# anchored-root resolution, and the cache.* config surface. dig-node builds as a
 # clean dependency: the guest-wasm build prerequisite is digstore-cli's alone (its
 # build.rs), and dig-node does not depend on digstore-cli.
-dig-node = { git = "https://github.com/DIG-Network/digstore.git", tag = "v0.5.29" }
+#
+# Pinned to the #95/#96 Pass A commit (the shared-.dig-cache work — atomic
+# content-addressed writes + a cross-process advisory lock + a `directories`-based
+# dir resolver with a writability fallback + the additive `cache.getConfig` fields
+# `cache_dir`/`shared`). This is what makes the companion's on-disk cache SAFE to
+# share with the DIG Browser's in-process node when both are installed (see the
+# `DIG_NODE_CACHE` note in `config.rs` + the README). Pinned to a `rev`, not a tag,
+# because no release tag yet contains Pass A (it is the tip of digstore `main`);
+# bump to a tag once one ships that includes it.
+dig-node = { git = "https://github.com/DIG-Network/digstore.git", rev = "b2632c43bdb61673f69cdf38a4bda24a07be12ae" }
 
 # HTTP stack: the same axum/tokio dig-node itself uses, so there is one async
 # runtime and one server framework across the read path and the companion shell.
