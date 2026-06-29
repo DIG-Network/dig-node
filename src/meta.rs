@@ -34,11 +34,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// running node back to an exact source revision.
 pub const GIT_SHA: &str = env!("DIG_COMPANION_GIT_SHA");
 
-/// The embedded dig-node read-path version: the digstore release tag the `dig-node`
+/// The embedded dig-node read-path version: the digstore git ref the `dig-node`
 /// crate is pinned to (the same local-first node the native DIG Browser runs
-/// in-process). Sourced from `Cargo.toml` so it cannot drift from the actual dep.
-/// Kept in sync with the `tag = "..."` on the `dig-node` git dependency.
-pub const DIG_NODE_VERSION: &str = "v0.5.29";
+/// in-process). Currently the #95/#96 Pass A commit (shared `.dig` cache: atomic
+/// content-addressed writes + cross-process lock + the additive
+/// `cache.getConfig` `cache_dir`/`shared` fields) — no release tag contains it yet,
+/// so this is the short `rev`. Kept in sync with the `rev`/`tag` on the `dig-node`
+/// git dependency in `Cargo.toml`.
+pub const DIG_NODE_VERSION: &str = "b2632c4";
 
 /// The DIG read protocol the node speaks (the rpc.dig.net §21 JSON-RPC read
 /// contract). Bumped only when the wire contract changes.
@@ -235,15 +238,24 @@ impl ErrorCode {
     }
 }
 
-/// The cache directory dig-node uses, resolved from the SAME env contract dig-node
-/// itself reads (`DIG_NODE_CACHE`, else `%LOCALAPPDATA%`/`$HOME` + `DigNode/cache`).
-/// dig-node keeps this private, so the companion mirrors the documented logic to
+/// The CANONICAL cache directory dig-node uses, resolved from the SAME env
+/// contract dig-node itself reads (`DIG_NODE_CACHE`, else
+/// `%LOCALAPPDATA%`/`$HOME` + `DigNode/cache`). This is the *intended* shared dir —
+/// the same path the DIG Browser's in-process node uses, so omitting
+/// `DIG_NODE_CACHE` shares ONE cache between the standalone service and the browser
+/// (see [`crate::config`] → "Shared `.dig` cache").
+///
+/// dig-node keeps its effective resolver private (it may fall back to a
+/// process-private dir when the canonical one is unwritable — surfaced as
+/// [`cache_shared`]`== false`); the companion mirrors the canonical-path logic to
 /// surface it in `/health` and the well-known document for operator/agent
-/// discoverability. Kept in lockstep with dig-node's `cache_dir()`.
+/// discoverability. The AUTHORITATIVE effective dir + shared flag are available on
+/// the `cache.getConfig` RPC (the `cache_dir`/`shared` fields dig-node returns).
 pub fn cache_dir() -> std::path::PathBuf {
     use std::path::PathBuf;
     std::env::var("DIG_NODE_CACHE")
         .ok()
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let root = std::env::var("LOCALAPPDATA")
@@ -251,6 +263,15 @@ pub fn cache_dir() -> std::path::PathBuf {
                 .unwrap_or_else(|_| ".".to_string());
             PathBuf::from(root).join("DigNode").join("cache")
         })
+}
+
+/// Whether dig-node's EFFECTIVE cache dir is the shared canonical one (`true`) or a
+/// process-private fallback because the canonical dir was unwritable (`false`).
+/// Delegates to dig-node's resolver ([`dig_node::cache_dir_is_shared`]) so the
+/// value is authoritative — the companion never re-implements the writability
+/// probe. Surfaced additively in `/health` + the well-known document (#96).
+pub fn cache_shared() -> bool {
+    dig_node::cache_dir_is_shared()
 }
 
 /// The `GET /version` body: service identity + build provenance + the embedded
@@ -319,6 +340,7 @@ pub fn well_known_document(addr: &str, upstream: &str, cap_bytes: u64, used_byte
             "dir": cache_dir().display().to_string(),
             "cap_bytes": cap_bytes,
             "used_bytes": used_bytes,
+            "shared": cache_shared(),
         },
         "rpc": {
             "endpoint": "/",
@@ -508,6 +530,9 @@ mod tests {
         assert_eq!(doc["addr"], json!("127.0.0.1:8080"));
         assert!(doc["cache"]["dir"].is_string());
         assert_eq!(doc["cache"]["cap_bytes"], json!(1024));
+        // #96: the discovery doc reports whether the cache is the shared canonical
+        // dir (vs a process-private fallback), from dig-node's resolver.
+        assert!(doc["cache"]["shared"].is_boolean());
         assert!(doc["methods"].is_array());
         assert!(doc["errors"].is_array());
         assert_eq!(doc["rpc"]["openrpc"], json!("/openrpc.json"));
