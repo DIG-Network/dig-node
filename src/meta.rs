@@ -55,10 +55,16 @@ pub struct MethodInfo {
     /// Where the method is resolved: `local` = answered by the embedded dig-node
     /// (local-first, blind-fetch+verify+decrypt+cache), `passthrough` = relayed
     /// verbatim to the upstream DIG RPC, `shell` = answered by the companion shell
-    /// itself (discovery methods).
+    /// itself (discovery methods), `control` = the CONTROL/admin surface answered by
+    /// the shell, loopback-only AND gated behind the local control token.
     pub served: &'static str,
     /// Human/agent one-liner describing what the method does.
     pub summary: &'static str,
+    /// Whether the method requires the local control token (the `control.*`
+    /// surface). Read/discovery methods are `false`; mutating/management control
+    /// methods are `true`. Surfaced in the catalogue + OpenRPC so a controller
+    /// learns the auth requirement without trial and error.
+    pub requires_auth: bool,
 }
 
 /// The full JSON-RPC method catalogue. Single source of truth for `rpc.discover`,
@@ -71,66 +77,162 @@ pub fn methods() -> &'static [MethodInfo] {
             served: "local",
             summary: "Verified retrieval: blind ciphertext + Merkle inclusion proof \
                       + chunk lengths (local-first from cache, else proxied).",
+            requires_auth: false,
         },
         MethodInfo {
             name: "dig.getCapsule",
             served: "local",
             summary: "Alias of dig.getContent for a capsule (storeId:rootHash).",
+            requires_auth: false,
         },
         MethodInfo {
             name: "dig.getAnchoredRoot",
             served: "local",
             summary: "The store's chain-anchored tip root (DataStore singleton lineage).",
+            requires_auth: false,
         },
         MethodInfo {
             name: "cache.getConfig",
             served: "local",
             summary: "On-disk cache config: { cap_bytes, used_bytes }.",
+            requires_auth: false,
         },
         MethodInfo {
             name: "cache.setCapBytes",
             served: "local",
             summary: "Set the on-disk cache size cap (floored at 64 MiB).",
+            requires_auth: false,
         },
         MethodInfo {
             name: "cache.clear",
             served: "local",
             summary: "Delete all locally cached DIG content.",
+            requires_auth: false,
         },
         MethodInfo {
             name: "cache.listCached",
             served: "local",
             summary: "List cached capsules (storeId:rootHash).",
+            requires_auth: false,
         },
         MethodInfo {
             name: "cache.removeCached",
             served: "local",
             summary: "Remove one cached capsule.",
+            requires_auth: false,
         },
         MethodInfo {
             name: "cache.fetchAndCache",
             served: "local",
             summary: "Pre-fetch and cache a capsule.",
+            requires_auth: false,
         },
         MethodInfo {
             name: "rpc.discover",
             served: "shell",
             summary: "Return this node's OpenRPC document (method/error discovery).",
+            requires_auth: false,
         },
         MethodInfo {
             name: "dig.getProof",
             served: "passthrough",
             summary: "Inclusion proof for a resource — relayed verbatim to the upstream.",
+            requires_auth: false,
         },
         MethodInfo {
             name: "dig.listCapsules",
             served: "passthrough",
             summary: "List a store's capsules — relayed verbatim to the upstream.",
+            requires_auth: false,
         },
         MethodInfo {
             name: "dig.getManifest",
             served: "passthrough",
             summary: "A capsule's manifest — relayed verbatim to the upstream.",
+            requires_auth: false,
+        },
+        // -- CONTROL / admin surface (loopback-only + local-token gated) ----------
+        // The DIG Browser "My Node" controller drives these to MANAGE the node.
+        // Every `control.*` method requires the local control token (requires_auth).
+        MethodInfo {
+            name: "control.status",
+            served: "control",
+            summary: "Rich node status: running, version, uptime, cache, upstream, \
+                      hosted-store count, §21 sync capability.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.config.get",
+            served: "control",
+            summary: "Node config: bound loopback addr/port, cache dir + shared flag, \
+                      upstream, §21 identity present.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.config.setUpstream",
+            served: "control",
+            summary: "Set the upstream DIG RPC (DIG_RPC_UPSTREAM); persisted, takes \
+                      effect on next node start (requires_restart).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.cache.get",
+            served: "control",
+            summary: "Cache view: cap_bytes, used_bytes, dir, shared.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.cache.setCap",
+            served: "control",
+            summary: "Set the on-disk cache size cap in bytes (floored at 64 MiB).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.cache.clear",
+            served: "control",
+            summary: "Delete all locally cached DIG content.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.hostedStores.list",
+            served: "control",
+            summary: "List hosted/pinned stores: each store's pinned flag + its cached \
+                      capsules (storeId:rootHash), sizes, last-used.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.hostedStores.pin",
+            served: "control",
+            summary: "Pin a store (storeId[:rootHash]): record it in the pin registry \
+                      and pre-fetch+cache the capsule via §21 sync.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.hostedStores.unpin",
+            served: "control",
+            summary: "Unpin a store: remove it from the pin registry and evict its \
+                      cached capsule(s).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.hostedStores.status",
+            served: "control",
+            summary: "Per-store status: pinned flag, cached capsules, total bytes.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.sync.status",
+            served: "control",
+            summary: "§21 sync status: whether authenticated whole-store sync is \
+                      available (a §21 identity is loaded) + pinned-store coverage.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.sync.trigger",
+            served: "control",
+            summary: "Trigger a §21 sync for a capsule (storeId + root); reports \
+                      NOT_SUPPORTED if no §21 identity / not eligible.",
+            requires_auth: true,
         },
     ]
 }
@@ -167,6 +269,22 @@ pub enum ErrorCode {
     /// (unreachable / non-JSON). Companion-shell error distinguishing a local
     /// proxy failure from an upstream-returned JSON-RPC error.
     UpstreamError,
+    /// `-32020` — a `control.*` (CONTROL/admin) method was called without a valid
+    /// local control token. The control surface is loopback-only AND locally
+    /// authorized: a same-host controller (the DIG Browser "My Node" UI) must read
+    /// the node's control token from its config dir and present it. Read methods
+    /// are NOT gated; only the mutating/management control namespace is. Shell error.
+    Unauthorized,
+    /// `-32021` — a control operation the embedded dig-node cannot perform on this
+    /// build (e.g. whole-store §21 sync when no §21 identity is loaded, or a feature
+    /// the pinned crate revision does not expose). Reported with this STABLE code
+    /// rather than a generic failure so a controller can branch on "not supported"
+    /// vs a transient error. Shell error.
+    NotSupported,
+    /// `-32022` — a `control.*` operation failed at runtime (e.g. could not write
+    /// the pin registry / config, or the cache op errored). Distinct from
+    /// `INVALID_PARAMS` (bad input) and `NOT_SUPPORTED` (capability absent). Shell.
+    ControlError,
 }
 
 impl ErrorCode {
@@ -179,6 +297,9 @@ impl ErrorCode {
             ErrorCode::InvalidParams => -32602,
             ErrorCode::DispatchFailed => -32000,
             ErrorCode::UpstreamError => -32010,
+            ErrorCode::Unauthorized => -32020,
+            ErrorCode::NotSupported => -32021,
+            ErrorCode::ControlError => -32022,
         }
     }
 
@@ -192,6 +313,9 @@ impl ErrorCode {
             ErrorCode::InvalidParams => "INVALID_PARAMS",
             ErrorCode::DispatchFailed => "DISPATCH_FAILED",
             ErrorCode::UpstreamError => "UPSTREAM_ERROR",
+            ErrorCode::Unauthorized => "UNAUTHORIZED",
+            ErrorCode::NotSupported => "NOT_SUPPORTED",
+            ErrorCode::ControlError => "CONTROL_ERROR",
         }
     }
 
@@ -203,6 +327,9 @@ impl ErrorCode {
             ErrorCode::InvalidRequest
             | ErrorCode::DispatchFailed
             | ErrorCode::UpstreamError
+            | ErrorCode::Unauthorized
+            | ErrorCode::NotSupported
+            | ErrorCode::ControlError
             | ErrorCode::ParseError => "shell",
             ErrorCode::MethodNotFound => "boundary",
             ErrorCode::InvalidParams => "upstream",
@@ -222,6 +349,13 @@ impl ErrorCode {
             ErrorCode::UpstreamError => {
                 "The blind-passthrough relay to the upstream DIG RPC failed."
             }
+            ErrorCode::Unauthorized => {
+                "A control.* method was called without a valid local control token."
+            }
+            ErrorCode::NotSupported => {
+                "The requested control operation is not supported on this node build."
+            }
+            ErrorCode::ControlError => "A control operation failed at runtime.",
         }
     }
 
@@ -234,6 +368,9 @@ impl ErrorCode {
             ErrorCode::InvalidParams,
             ErrorCode::DispatchFailed,
             ErrorCode::UpstreamError,
+            ErrorCode::Unauthorized,
+            ErrorCode::NotSupported,
+            ErrorCode::ControlError,
         ]
     }
 }
@@ -316,6 +453,7 @@ fn methods_json() -> Value {
                     "name": m.name,
                     "served": m.served,
                     "summary": m.summary,
+                    "requires_auth": m.requires_auth,
                 })
             })
             .collect(),
@@ -368,10 +506,22 @@ pub fn openrpc_document() -> Value {
     let method_objs: Vec<Value> = methods()
         .iter()
         .map(|m| {
+            // Control methods document the local-auth requirement in the description
+            // and via the machine-readable `x-requires-auth` extension, so a
+            // controller learns the gate from the spec rather than by trial.
+            let auth_note = if m.requires_auth {
+                " CONTROL method: requires the local control token (loopback-only + \
+                  locally authorized — present it as the X-Dig-Control-Token header or \
+                  params._control_token; read it from <config_dir>/control-token)."
+            } else {
+                ""
+            };
             json!({
                 "name": m.name,
                 "summary": m.summary,
+                "description": format!("{}{}", m.summary, auth_note),
                 "tags": [{ "name": m.served }],
+                "x-requires-auth": m.requires_auth,
                 "params": [
                     {
                         "name": "params",
@@ -394,10 +544,24 @@ pub fn openrpc_document() -> Value {
         "info": {
             "title": "dig-node JSON-RPC",
             "version": VERSION,
-            "description": "The local DIG node's JSON-RPC read surface (rpc.dig.net-compatible). \
-                            Served at POST /. The canonical dig RPC param/result schemas are \
-                            published by docs.dig.net; this document is the discoverable method \
-                            and error catalogue for the local node.",
+            "description": "The local DIG node's JSON-RPC surface (rpc.dig.net-compatible), \
+                            served at POST /. The read methods (dig.*/cache.*) are open to local \
+                            consumers; the CONTROL/admin methods (control.*) MANAGE the node and \
+                            are loopback-only AND locally authorized — present the local control \
+                            token (the X-Dig-Control-Token header or params._control_token, read \
+                            from <config_dir>/control-token). The canonical dig RPC param/result \
+                            schemas are published by docs.dig.net; this document is the \
+                            discoverable method + error catalogue for the local node.",
+            "x-control-auth": {
+                "scheme": "local-token",
+                "header": "X-Dig-Control-Token",
+                "param": "_control_token",
+                "token_file": "<config_dir>/control-token",
+                "applies_to": "control.*",
+                "description": "A random token generated at first run into the node's config \
+                                dir (next to config.json), readable only by same-host processes. \
+                                A same-host controller reads it and presents it on control.* calls.",
+            },
         },
         "servers": [
             { "name": "loopback", "url": "http://127.0.0.1:8080/" }
@@ -497,12 +661,85 @@ mod tests {
             "rpc.discover",
             "dig.getProof",
             "dig.listCapsules",
+            // CONTROL surface (#101a).
+            "control.status",
+            "control.config.get",
+            "control.config.setUpstream",
+            "control.cache.get",
+            "control.cache.setCap",
+            "control.cache.clear",
+            "control.hostedStores.list",
+            "control.hostedStores.pin",
+            "control.hostedStores.unpin",
+            "control.hostedStores.status",
+            "control.sync.status",
+            "control.sync.trigger",
         ] {
             assert!(
                 names.contains(&required),
                 "method catalogue missing {required}"
             );
         }
+    }
+
+    #[test]
+    fn control_methods_require_auth_and_read_methods_do_not() {
+        for m in methods() {
+            if m.name.starts_with("control.") {
+                assert!(
+                    m.requires_auth,
+                    "control method {} must require auth",
+                    m.name
+                );
+                assert_eq!(m.served, "control", "{} must be served=control", m.name);
+            } else {
+                assert!(
+                    !m.requires_auth,
+                    "non-control method {} must NOT require auth",
+                    m.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn control_error_codes_are_catalogued() {
+        // The local-auth gate + control surface mint these stable codes.
+        assert_eq!(ErrorCode::Unauthorized.code(), -32020);
+        assert_eq!(ErrorCode::Unauthorized.name(), "UNAUTHORIZED");
+        assert_eq!(ErrorCode::NotSupported.code(), -32021);
+        assert_eq!(ErrorCode::NotSupported.name(), "NOT_SUPPORTED");
+        assert_eq!(ErrorCode::ControlError.code(), -32022);
+        assert_eq!(ErrorCode::ControlError.name(), "CONTROL_ERROR");
+        // All are shell-origin (minted by the companion control plane).
+        for e in [
+            ErrorCode::Unauthorized,
+            ErrorCode::NotSupported,
+            ErrorCode::ControlError,
+        ] {
+            assert_eq!(e.origin(), "shell");
+        }
+    }
+
+    #[test]
+    fn openrpc_marks_control_methods_with_requires_auth() {
+        let doc = openrpc_document();
+        let methods = doc["methods"].as_array().expect("methods array");
+        let status = methods
+            .iter()
+            .find(|m| m["name"] == json!("control.status"))
+            .expect("control.status present in OpenRPC");
+        assert_eq!(status["x-requires-auth"], json!(true));
+        let get_content = methods
+            .iter()
+            .find(|m| m["name"] == json!("dig.getContent"))
+            .expect("dig.getContent present");
+        assert_eq!(get_content["x-requires-auth"], json!(false));
+        // The control-auth scheme is documented in info for discoverability.
+        assert_eq!(
+            doc["info"]["x-control-auth"]["header"],
+            json!("X-Dig-Control-Token")
+        );
     }
 
     #[test]

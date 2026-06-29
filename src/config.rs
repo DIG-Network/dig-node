@@ -84,9 +84,18 @@ impl Config {
             .and_then(|s| s.parse::<IpAddr>().ok())
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
 
+        // Upstream precedence: explicit DIG_RPC_UPSTREAM env > the persisted
+        // override (set via the control plane's `control.config.setUpstream`,
+        // stored in dig-node's config.json) > the default. The env var still wins
+        // so a deploy/CI override is never silently overridden by a saved setting;
+        // the persisted value is the "I set this in the controller UI" choice that
+        // takes effect on the next start (the running node captured its upstream at
+        // construction — see `control.config.setUpstream` → `requires_restart`).
         let upstream = std::env::var("DIG_RPC_UPSTREAM")
             .ok()
             .map(|s| normalize_upstream(&s))
+            .filter(|s| !s.is_empty())
+            .or_else(|| crate::control::read_upstream_override().map(|s| normalize_upstream(&s)))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
 

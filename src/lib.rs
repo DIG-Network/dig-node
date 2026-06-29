@@ -21,12 +21,15 @@
 //!   `/.well-known/dig-node.json` documents.
 //! - [`cli`] — the `--json` envelopes + the differentiated exit-code table.
 //! - [`rpc`] — pure JSON-RPC routing + request normalisation (the testable core).
+//! - [`control`] — the CONTROL/admin RPC surface (`control.*`): manage hosted
+//!   stores, cache, §21 sync, config — loopback-only + local-token gated.
 //! - [`server`] — the axum HTTP server (`/health`, `/version`, `/openrpc.json`,
-//!   `/.well-known/dig-node.json`, CORS, `POST /` → `handle_rpc`).
+//!   `/.well-known/dig-node.json`, CORS, `POST /` → read RPC + the control plane).
 //! - [`service`] — OS-service install/uninstall/start/stop/status.
 
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod meta;
 pub mod rpc;
 pub mod server;

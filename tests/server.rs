@@ -65,6 +65,14 @@ async fn start_mock_upstream() -> (String, Arc<Mutex<Vec<Value>>>) {
 /// Start the companion app on a random loopback port pointed at the given upstream
 /// and an isolated cache dir. Returns the companion's base URL.
 async fn start_companion(upstream: &str) -> SocketAddr {
+    start_companion_full(upstream).await.0
+}
+
+/// Like [`start_companion`] but also returns the local control token the server
+/// generated, so the control-plane tests can authorize `control.*` calls (a same-
+/// host controller reads it from `<config_dir>/control-token`; here the test reads
+/// the same on-disk token the server wrote, mirroring exactly that controller flow).
+async fn start_companion_full(upstream: &str) -> (SocketAddr, String) {
     let config = dig_companion::Config {
         upstream: upstream.to_string(),
         port: 0, // bind ephemeral
@@ -74,14 +82,18 @@ async fn start_companion(upstream: &str) -> SocketAddr {
     // Build the node under the env lock so set-env → from_env() is atomic w.r.t.
     // other concurrent tests (see env_guard). build_state both applies the upstream
     // to DIG_NODE_UPSTREAM and constructs the node, so the whole call is guarded.
-    let state = {
+    let (state, token) = {
         let _g = env_guard().lock().unwrap();
         // Isolate dig-node's on-disk cache so the test never touches the real cache,
         // and pin a small cap (must be set before from_env reads it).
         let tmp = std::env::temp_dir().join(format!("dig-companion-test-{}", std::process::id()));
         std::env::set_var("DIG_NODE_CACHE", &tmp);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
-        dig_companion::server::build_state(&config)
+        let state = dig_companion::server::build_state(&config);
+        // The token the server wrote (read from disk, exactly as a real controller
+        // would). config_path() resolves under the temp DIG_NODE_CACHE we just set.
+        let token = dig_companion::control::load_or_create_token().unwrap();
+        (state, token)
     };
     let app = dig_companion::server::router(state);
 
@@ -90,7 +102,7 @@ async fn start_companion(upstream: &str) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    addr
+    (addr, token)
 }
 
 fn client() -> reqwest::Client {
@@ -333,4 +345,290 @@ async fn non_object_body_returns_jsonrpc_error_not_transport_error() {
     // The error carries the stable symbolic code an agent branches on.
     assert_eq!(body["error"]["data"]["code"], json!("INVALID_REQUEST"));
     assert_eq!(body["error"]["data"]["origin"], json!("shell"));
+}
+
+// ===========================================================================
+// CONTROL plane (#101a) — loopback-only + locally-authorized admin RPC.
+// The gate contract: a control.* call WITHOUT the token is rejected; WITH it,
+// allowed; READ calls are unaffected (no token needed).
+// ===========================================================================
+
+/// POST a JSON-RPC request, optionally with the control-token header. Returns the
+/// parsed response body.
+async fn post_rpc(addr: &SocketAddr, body: Value, token: Option<&str>) -> Value {
+    let mut req = client().post(format!("http://{addr}/")).json(&body);
+    if let Some(t) = token {
+        req = req.header("X-Dig-Control-Token", t);
+    }
+    req.send().await.unwrap().json().await.unwrap()
+}
+
+#[tokio::test]
+async fn control_method_without_token_is_rejected_with_unauthorized() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.status" }),
+        None, // no token
+    )
+    .await;
+
+    assert_eq!(resp["error"]["code"], json!(-32020));
+    assert_eq!(resp["error"]["data"]["code"], json!("UNAUTHORIZED"));
+    assert_eq!(resp["error"]["data"]["origin"], json!("shell"));
+    assert!(resp.get("result").is_none(), "no result on a rejected call");
+}
+
+#[tokio::test]
+async fn control_method_with_wrong_token_is_rejected() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.status" }),
+        Some("the-wrong-token"),
+    )
+    .await;
+    assert_eq!(resp["error"]["data"]["code"], json!("UNAUTHORIZED"));
+}
+
+#[tokio::test]
+async fn control_status_with_token_returns_rich_status() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 7, "method": "control.status" }),
+        Some(&token),
+    )
+    .await;
+
+    assert_eq!(resp["id"], json!(7));
+    let r = &resp["result"];
+    assert_eq!(r["running"], json!(true));
+    assert_eq!(r["service"], json!("dig-node"));
+    assert_eq!(r["version"], json!(dig_companion::VERSION));
+    assert!(r["uptime_secs"].is_u64());
+    assert!(r["cache"]["cap_bytes"].is_u64());
+    assert!(r["hosted_store_count"].is_u64());
+    assert!(r["pinned_store_count"].is_u64());
+    assert!(r["sync"]["available"].is_boolean());
+}
+
+#[tokio::test]
+async fn control_token_via_params_is_also_accepted() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token) = start_companion_full(&upstream).await;
+
+    // No header — present the token in params._control_token instead.
+    let resp = post_rpc(
+        &addr,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "control.cache.get",
+            "params": { "_control_token": token }
+        }),
+        None,
+    )
+    .await;
+    assert!(resp["result"]["cap_bytes"].is_u64());
+    assert!(resp["result"]["used_bytes"].is_u64());
+    assert!(resp["result"]["dir"].is_string());
+    assert!(resp["result"]["shared"].is_boolean());
+}
+
+#[tokio::test]
+async fn read_methods_are_unaffected_by_the_control_gate() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token) = start_companion_full(&upstream).await;
+
+    // A read method with NO token must still work (the gate is control.* only).
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "cache.getConfig" }),
+        None,
+    )
+    .await;
+    assert!(resp["result"]["cap_bytes"].is_u64());
+    assert!(resp.get("error").is_none(), "read method must not be gated");
+}
+
+#[tokio::test]
+async fn control_config_get_reports_addr_upstream_and_cache() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.config.get" }),
+        Some(&token),
+    )
+    .await;
+    let r = &resp["result"];
+    assert_eq!(r["upstream"], json!(upstream));
+    assert!(r["addr"].is_string());
+    assert!(r["cache_dir"].is_string());
+    assert!(r["sync_available"].is_boolean());
+}
+
+#[tokio::test]
+async fn control_pin_unpin_roundtrips_in_hosted_stores() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token) = start_companion_full(&upstream).await;
+
+    let store = "a1".repeat(32); // 64-hex
+    let cap = format!("{store}:{}", "b2".repeat(32));
+
+    // Pin (store-level — no fetch since no concrete root would be served by the mock).
+    let pin = post_rpc(
+        &addr,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "control.hostedStores.pin",
+            "params": { "store": store }
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(pin["result"]["pinned"], json!(true));
+    assert_eq!(pin["result"]["store_id"], json!(store));
+
+    // It shows up in the hosted-store list as pinned.
+    let list = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "control.hostedStores.list" }),
+        Some(&token),
+    )
+    .await;
+    let stores = list["result"]["stores"].as_array().unwrap();
+    let entry = stores
+        .iter()
+        .find(|s| s["store_id"] == json!(store))
+        .expect("pinned store listed");
+    assert_eq!(entry["pinned"], json!(true));
+
+    // A capsule-form pin is also accepted (parses storeId:rootHash).
+    let pin_cap = post_rpc(
+        &addr,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "control.hostedStores.pin",
+            "params": { "store": cap }
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(pin_cap["result"]["pinned"], json!(true));
+
+    // Unpin removes it.
+    let unpin = post_rpc(
+        &addr,
+        json!({
+            "jsonrpc": "2.0", "id": 4, "method": "control.hostedStores.unpin",
+            "params": { "store": store }
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(unpin["result"]["unpinned"], json!(true));
+}
+
+#[tokio::test]
+async fn control_pin_rejects_a_malformed_store_ref() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "control.hostedStores.pin",
+            "params": { "store": "not-a-valid-hex-store-id" }
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(resp["error"]["data"]["code"], json!("INVALID_PARAMS"));
+}
+
+#[tokio::test]
+async fn control_sync_status_reports_availability() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.sync.status" }),
+        Some(&token),
+    )
+    .await;
+    assert!(resp["result"]["available"].is_boolean());
+    assert_eq!(
+        resp["result"]["method"],
+        json!("section-21-whole-store-sync")
+    );
+    assert!(resp["result"]["pinned_total"].is_u64());
+}
+
+#[tokio::test]
+async fn control_unknown_method_is_method_not_found() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.does.not.exist" }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(resp["error"]["data"]["code"], json!("METHOD_NOT_FOUND"));
+}
+
+#[tokio::test]
+async fn control_methods_are_not_passed_through_to_upstream() {
+    // A control.* method without a token must be rejected by the SHELL, never
+    // relayed to the upstream (it is not a read method).
+    let (upstream, calls) = start_mock_upstream().await;
+    let (addr, _token) = start_companion_full(&upstream).await;
+
+    let _ = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.status" }),
+        None,
+    )
+    .await;
+    let seen = calls.lock().unwrap();
+    assert!(
+        !seen.iter().any(|c| c["method"]
+            .as_str()
+            .map(|m| m.starts_with("control."))
+            .unwrap_or(false)),
+        "control.* must never reach the upstream"
+    );
+}
+
+#[tokio::test]
+async fn control_cors_preflight_allows_the_control_token_header() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token) = start_companion_full(&upstream).await;
+
+    let resp = client()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
+        .header("Origin", "chrome-extension://abcdefghijklmnop")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "x-dig-control-token")
+        .send()
+        .await
+        .unwrap();
+
+    let allow_headers = resp
+        .headers()
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        allow_headers.contains("x-dig-control-token"),
+        "preflight must allow the control-token header, got: {allow_headers}"
+    );
 }

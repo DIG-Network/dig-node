@@ -10,3 +10,8 @@ node/node_modules/
 .env
 .DS_Store
 dist/
+
+# Runtime node state — never commit (control token is a local secret generated at
+# runtime into the OS config dir; config.json is local node config).
+control-token
+config.json
