@@ -124,7 +124,66 @@ in-process node expose:
 | `cache.getConfig` / `cache.setCapBytes` / `cache.clear` | On-disk cache config: `{ cap_bytes (floored at 64 MiB), used_bytes, cache_dir, shared }` — `cache_dir` is the effective dir and `shared` whether it is the canonical dir shared with the DIG Browser (#96). |
 | `cache.listCached` / `cache.removeCached` / `cache.fetchAndCache` | Cached-capsule manager (`storeId:rootHash`). |
 | `rpc.discover` | **Method discovery** — returns this node's OpenRPC document (the standard OpenRPC discovery method), so a client can introspect every method + error over the wire with no out-of-band knowledge. |
+| `control.*` | **CONTROL / admin surface** (loopback-only + **local-token gated** — see below). Manage the node: hosted/pinned stores, cache, §21 sync, config. Read methods above stay open; only `control.*` requires the token. |
 | `dig.getProof`, `dig.listCapsules`, `dig.getManifest`, *anything else* | **Blind passthrough** — relayed verbatim to the upstream, so the node stays a correct transparent proxy for methods it doesn't resolve locally. |
+
+## Control / admin surface (`control.*`) — manage the node
+
+Beside the open **read** RPC, the node exposes a **CONTROL / admin** surface so a same-host
+controller — the DIG Browser **"My Node"** UI, or any local tool — can MANAGE the node. This is the
+server side of SYSTEM.md → *"the browser is also the dig-node's CONTROLLER UI"* (dig-node =
+**serve + be-controllable**; the browser = **consume + control**).
+
+### Security — loopback-only + locally authorized
+
+Two layers gate the control surface (the read methods are **not** gated):
+
+1. **Loopback-only** — the whole server binds `127.0.0.1`, so nothing off-machine can reach any method.
+2. **Local authorization** for the mutating `control.*` namespace. A random **control token** (32 bytes,
+   64-hex) is generated at first run into the node's config dir at **`<config_dir>/control-token`**
+   (next to dig-node's `config.json`; `0600` on Unix). A same-host controller reads that file — it can,
+   because it runs as the same user on the same machine — and presents the token on every `control.*`
+   call, as the **`X-Dig-Control-Token`** request header **or** a **`params._control_token`** field. A
+   call without a valid token is rejected with **`UNAUTHORIZED`** (`-32020`). Token verification is
+   constant-time; the token is generated at runtime and **never committed**.
+
+This is the standard local-capability-file pattern (cf. Chia's daemon / Bitcoin's cookie auth):
+possession of the on-disk token *is* authorization, so a random web page (which cannot read a local
+file) is rejected even though it can reach loopback, while the legitimate local controller is allowed.
+
+### Methods
+
+All `control.*` methods require the local control token. Params are a JSON object; `store` is a
+capsule reference `storeId` or `storeId:rootHash` (each part lowercase 64-hex).
+
+| Method | Params | Result |
+|---|---|---|
+| `control.status` | — | `{ running, service, version, commit, dig_node_version, protocol, uptime_secs, addr, upstream, cache:{cap_bytes,used_bytes,dir,shared}, hosted_store_count, cached_capsule_count, pinned_store_count, sync:{available} }` |
+| `control.config.get` | — | `{ addr, port, upstream, upstream_override, cache_dir, cache_shared, config_path, sync_available }` |
+| `control.config.setUpstream` | `{ upstream }` | `{ upstream, requires_restart:true }` — persisted; the running node captured its upstream at startup, so the change takes effect on the next start. A blank `upstream` clears the override. |
+| `control.cache.get` | — | `{ cap_bytes, used_bytes, dir, shared }` |
+| `control.cache.setCap` | `{ cap_bytes }` | `{ cap_bytes }` (floored at 64 MiB) |
+| `control.cache.clear` | — | `{ cleared:true }` |
+| `control.hostedStores.list` | — | `{ stores:[ { store_id, pinned, capsule_count, total_bytes, capsules:[{capsule,root,size_bytes,last_used_unix_ms}] } ] }` |
+| `control.hostedStores.pin` | `{ store }` | `{ store_id, root, pinned:true, fetch:{status,…} }` — records the pin; pre-fetches the capsule via §21 sync when a concrete root is given. |
+| `control.hostedStores.unpin` | `{ store }` | `{ store_id, unpinned, evicted_capsules }` — removes the pin and evicts the store's cached capsules. |
+| `control.hostedStores.status` | `{ store }` | `{ store_id, pinned, capsule_count, total_bytes, capsules:[…] }` |
+| `control.sync.status` | — | `{ available, method:"section-21-whole-store-sync", pinned_total, pinned_synced, whole_store_trigger_supported }` |
+| `control.sync.trigger` | `{ store }` (= `storeId:rootHash`) or `{ store_id, root }` | `{ store_id, root, status:"synced", size_bytes, served_root }`, or `NOT_SUPPORTED` (`-32021`) if no §21 identity. |
+
+**What's proxied vs. owned.** Cache + sync operations proxy to digstore's `dig-node` crate
+(`cache_*`, `clear_cache`, `set_cache_cap_bytes`, `Node::cache_fetch_and_cache` / `cache_remove_cached`
+/ `cache_list_cached`) — the companion never duplicates the cache/read logic. The shell owns only the
+small state the crate does not model: the **pin registry** (`pinned_stores`) and the **upstream
+override** (`upstream_override`), persisted under the companion's own keys in dig-node's shared
+`config.json` (atomic temp+rename writes that never clobber dig-node's keys).
+
+### Driving it from the DIG Browser controller (part b)
+
+The DIG Browser "My Node" UI calls these methods over loopback (`http://localhost:<port>/`), reading
+the token from `<config_dir>/control-token` and sending it as `X-Dig-Control-Token`. Discover the
+whole surface — methods, `x-requires-auth` flags, the `info.x-control-auth` token scheme, and the
+error catalogue — from **`GET /openrpc.json`** or **`rpc.discover`**.
 
 ## Discovery & health endpoints
 
@@ -186,6 +245,9 @@ distinguishing companion-shell errors from upstream/boundary ones), beside the n
 | -32602 | `INVALID_PARAMS` | upstream | Invalid or missing method parameters. |
 | -32000 | `DISPATCH_FAILED` | shell | The node failed to dispatch the request. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay to the upstream failed. |
+| -32020 | `UNAUTHORIZED` | shell | A `control.*` method was called without a valid local control token. |
+| -32021 | `NOT_SUPPORTED` | shell | A control op the node build can't perform (e.g. §21 sync with no identity). |
+| -32022 | `CONTROL_ERROR` | shell | A control operation failed at runtime (e.g. could not persist the pin registry). |
 
 ## How the read path is wired (the important design decision)
 
@@ -231,8 +293,10 @@ src/
                   OpenRPC + /.well-known/dig-node.json documents — pure, tested
   cli.rs          --json envelopes + the differentiated ExitCode table — pure, tested
   rpc.rs          JSON-RPC routing + request normalisation + catalogued error envelopes — pure, tested
+  control.rs      CONTROL/admin surface (control.*): hosted-stores/cache/sync/config management +
+                  the loopback-only local-token auth gate + pin registry — pure helpers tested
   server.rs       axum HTTP server: /health, /version, /openrpc.json, /.well-known/dig-node.json, CORS,
-                  POST / → dig_node::handle_rpc (+ rpc.discover), passthrough fallback
+                  POST / → dig_node::handle_rpc (+ rpc.discover) + the gated control plane, passthrough fallback
   service.rs      OS-service install/uninstall/start/stop/status (service-manager) + /health status probe
   win_service.rs  Windows Service Control Protocol entrypoint (windows-service; Windows only)
 node/             the Node v0.2 reference implementation (documentation only — NOT the shipped artifact)

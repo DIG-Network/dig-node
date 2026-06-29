@@ -94,7 +94,23 @@ reported in `/health` and `/.well-known/dig-node.json` so an operator/agent can 
 > this repo's networking/cache. They are **out of scope** for the agent-friendly pass documented
 > here.
 
-### 6. Manage / uninstall
+### 6. Control the node from a controller UI (the DIG Browser "My Node")
+
+When a local `dig-node` is present, the DIG Browser's **"My Node"** surface drives the node's
+**CONTROL / admin** RPCs (`control.*`) so the user runs *and* manages their node from the browser:
+list/pin/unpin hosted stores, view/clear/cap the cache, check §21 sync status / trigger a sync, and
+get/set config (upstream). This is the server side of SYSTEM.md → *"the browser is also the
+dig-node's CONTROLLER UI"* — dig-node = **serve + be-controllable**; the browser = **consume +
+control**.
+
+The control surface is **loopback-only + locally authorized**: a random **control token** is
+generated at first run into `<config_dir>/control-token` (next to `config.json`). The controller
+reads that file (same user, same machine) and presents the token on every `control.*` call as the
+`X-Dig-Control-Token` header (or `params._control_token`). Read methods are **not** gated; a
+`control.*` call without the token is rejected `UNAUTHORIZED` (-32020). See the README → *Control /
+admin surface* for the full method/param/result table.
+
+### 7. Manage / uninstall
 
 ```bash
 dig-companion stop
@@ -114,7 +130,7 @@ every subcommand (machine output to stdout, prose to stderr).
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /` | JSON-RPC 2.0 — the read path (`dig.getContent`, `dig.getAnchoredRoot`, `cache.*`, passthrough, `rpc.discover`). |
+| `POST /` | JSON-RPC 2.0 — the read path (`dig.getContent`, `dig.getAnchoredRoot`, `cache.*`, passthrough, `rpc.discover`) **and** the gated `control.*` admin surface. |
 | `GET /health` | Liveness + mode + cache stats, plus `service`, `commit`, bound `addr`, cache `dir`, and the `methods` catalogue. |
 | `GET /version` | Build fingerprint: `{ service, version, commit, dig_node_version, protocol }`. |
 | `GET /openrpc.json` | The OpenRPC document for the JSON-RPC surface (methods + error catalogue). |
@@ -128,10 +144,12 @@ every subcommand (machine output to stdout, prose to stderr).
   `2 USAGE`, `3 PERMISSION_DENIED`, `4 SERVICE_FAILED`, `5 BIND_FAILED`, `6 IO_ERROR`.
 - **Stable JSON-RPC error codes** (UPPER_SNAKE in `error.data.code`): `PARSE_ERROR` (-32700),
   `INVALID_REQUEST` (-32600), `METHOD_NOT_FOUND` (-32601), `INVALID_PARAMS` (-32602),
-  `DISPATCH_FAILED` (-32000, shell), `UPSTREAM_ERROR` (-32010, shell). The `data.origin` field
-  distinguishes companion-shell errors from upstream/boundary ones.
+  `DISPATCH_FAILED` (-32000, shell), `UPSTREAM_ERROR` (-32010, shell), and the control-plane codes
+  `UNAUTHORIZED` (-32020), `NOT_SUPPORTED` (-32021), `CONTROL_ERROR` (-32022). The `data.origin`
+  field distinguishes companion-shell errors from upstream/boundary ones.
 - **`rpc.discover`**: returns the OpenRPC document over the wire, so an agent can introspect the
-  full method + error surface with no out-of-band knowledge.
+  full method + error surface (including `x-requires-auth` per method and the `info.x-control-auth`
+  token scheme) with no out-of-band knowledge.
 
 ---
 
@@ -144,6 +162,7 @@ every subcommand (machine output to stdout, prose to stderr).
 | **dig-node → rpc.dig.net (upstream)** | On a cache miss / unhandled method, `dig-node` blind-fetches ciphertext + proof and relays passthrough methods over the same JSON-RPC read contract. |
 | **dig-node ↔ digstore (`dig-node` crate)** | The read path **is** digstore's `dig_node::handle_rpc`, pinned to a digstore release tag — the same node the native DIG Browser runs in-process. One read path, one cache contract across the ecosystem. |
 | **dig-node ↔ DIG Browser (native)** | Same wire contract and cache semantics; `dig-node` is the standalone-service form for users who run the extension in a normal browser rather than the native fork. |
+| **DIG Browser "My Node" controller → dig-node** | The browser drives the `control.*` admin surface over loopback, reading the control token from `<config_dir>/control-token` and sending it as `X-Dig-Control-Token`. The contract (methods/params/results, `x-requires-auth`, error codes) is discoverable via `/openrpc.json` / `rpc.discover`. |
 | **docs.dig.net** | The canonical dig-RPC param/result schemas are published by docs.dig.net; this node's `/openrpc.json` is the local method+error **discovery** surface that aligns with it. |
 
 See the repo `README.md` for the full configuration table and `SYSTEM.md` (ecosystem root) for the

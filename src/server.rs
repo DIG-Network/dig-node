@@ -9,10 +9,11 @@
 //! `.dig` modules the node has cached.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     extract::State,
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::get,
     Json, Router,
@@ -22,6 +23,7 @@ use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::config::Config;
+use crate::control::{self, ControlCtx};
 use crate::meta;
 use crate::meta::ErrorCode;
 use crate::rpc::{normalize_request, request_id, rpc_error};
@@ -41,6 +43,20 @@ pub struct AppState {
     /// The loopback `host:port` the server is bound to, surfaced in `/health` and
     /// the well-known document so an agent learns where the node serves.
     addr: String,
+    /// The node's config.json path — where the companion's pin registry + upstream
+    /// override live (the CONTROL plane reads/writes here).
+    config_path: std::path::PathBuf,
+    /// The local control token: a same-host controller must present it on every
+    /// `control.*` call. Generated at startup into `<config_dir>/control-token`
+    /// (loopback-only + locally-authorized gate — see [`crate::control`]).
+    control_token: String,
+    /// Whether authenticated §21 whole-store sync is available (a §21 identity is
+    /// loaded). `Node::from_env` creates/loads the §21.9 identity at construction, so
+    /// this is normally `true`; the AUTHORITATIVE per-capsule result is still
+    /// reported in-band by the sync/pin operations.
+    sync_available: bool,
+    /// Process start instant, for `control.status` uptime.
+    started: Instant,
 }
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
@@ -71,7 +87,12 @@ pub fn router(state: AppState) -> Router {
                 .unwrap_or(false)
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
+        // CONTENT_TYPE for the JSON body; the control-token header so a same-host
+        // controller (the DIG Browser "My Node" UI) can authorize control.* calls.
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static("x-dig-control-token"),
+        ]);
 
     Router::new()
         .route("/", get(health).post(rpc))
@@ -84,17 +105,56 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// Construct the shared state from config: apply the upstream to dig-node's env,
-/// then build the node from the environment (cache dir/cap, §21 identity).
+/// then build the node from the environment (cache dir/cap, §21 identity), and
+/// generate/load the local control token into the node's config dir.
 pub fn build_state(config: &Config) -> AppState {
     config.apply_to_env();
+    let node = Node::from_env();
+    let config_path = dig_node::config_path();
+    // Generate (or read) the control token into <config_dir>/control-token. A
+    // failure to persist it (e.g. unwritable dir) is non-fatal: fall back to an
+    // in-memory token so the control plane is still gated (a controller that can't
+    // read the file simply can't authorize — fail-closed). The read plane is
+    // unaffected either way.
+    let control_token = control::load_or_create_token().unwrap_or_else(|e| {
+        eprintln!(
+            "dig-node: WARN could not persist control token ({e}); using an in-memory \
+             token (control.* will be unauthorizable until the config dir is writable)"
+        );
+        // A random in-memory token nothing can present → control plane fails closed.
+        control::load_or_create_token_at(
+            &std::env::temp_dir().join(format!("dig-node-control-token-{}", std::process::id())),
+        )
+        .unwrap_or_default()
+    });
     AppState {
-        node: Node::from_env(),
+        node,
         upstream: config.upstream.clone(),
         http: reqwest::Client::builder()
             .user_agent(concat!("dig-companion/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("dig-companion: build http client"),
         addr: config.bind_addr(),
+        config_path,
+        control_token,
+        // Node::from_env loads/creates the §21.9 identity, enabling authenticated
+        // whole-store sync; we report it available and let the per-capsule fetch
+        // surface a real NOT_SUPPORTED/failure in-band if a given store isn't served.
+        sync_available: true,
+        started: Instant::now(),
+    }
+}
+
+/// The [`ControlCtx`] for one request — borrows the long-lived node + config and
+/// snapshots the per-state fields the control plane needs.
+fn control_ctx(state: &AppState) -> ControlCtx {
+    ControlCtx {
+        node: state.node.clone(),
+        config_path: state.config_path.clone(),
+        addr: state.addr.clone(),
+        upstream: state.upstream.clone(),
+        started: state.started,
+        sync_available: state.sync_available,
     }
 }
 
@@ -161,7 +221,11 @@ async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
 /// `dig.getManifest`) the companion relays the ORIGINAL request to the upstream so
 /// it stays a correct transparent proxy — matching the Node reference server and
 /// the surface clients expect from an rpc.dig.net endpoint.
-async fn rpc(State(state): State<AppState>, Json(req): Json<Value>) -> impl IntoResponse {
+async fn rpc(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<Value>,
+) -> impl IntoResponse {
     if !req.is_object() {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         return (
@@ -174,11 +238,16 @@ async fn rpc(State(state): State<AppState>, Json(req): Json<Value>) -> impl Into
         );
     }
     let id = request_id(&req);
+    let method = req
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // `rpc.discover` is answered by the shell itself (the standard OpenRPC
     // method-discovery method): return the OpenRPC document so an agent can
     // introspect the whole surface over the wire with no out-of-band knowledge.
-    if req.get("method").and_then(|m| m.as_str()) == Some("rpc.discover") {
+    if method == "rpc.discover" {
         return (
             StatusCode::OK,
             Json(json!({
@@ -187,6 +256,32 @@ async fn rpc(State(state): State<AppState>, Json(req): Json<Value>) -> impl Into
                 "result": meta::openrpc_document(),
             })),
         );
+    }
+
+    // CONTROL plane: the `control.*` (admin/management) methods are loopback-only
+    // (the whole server binds 127.0.0.1) AND locally authorized — a same-host
+    // controller must present the local control token (the X-Dig-Control-Token
+    // header or params._control_token). The READ methods below are NOT gated.
+    if control::is_control_method(&method) {
+        let header_tok = headers
+            .get(control::CONTROL_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let presented = control::presented_token(header_tok, &req);
+        if !control::is_authorized(&method, presented.as_deref(), &state.control_token) {
+            return (
+                StatusCode::OK,
+                Json(control::control_error(
+                    id,
+                    ErrorCode::Unauthorized,
+                    "control.* requires the local control token (X-Dig-Control-Token \
+                     header or params._control_token, from <config_dir>/control-token)",
+                )),
+            );
+        }
+        let params = req.get("params").cloned().unwrap_or(json!({}));
+        let ctx = control_ctx(&state);
+        let resp = control::dispatch_control(&ctx, id, &method, &params).await;
+        return (StatusCode::OK, Json(resp));
     }
 
     // Keep the original request for a possible passthrough relay (the upstream must
