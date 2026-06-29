@@ -15,12 +15,19 @@
 //! Node v0.2 reference implementation is retained under `node/` for documentation.
 //!
 //! Layout:
-//! - [`config`]  — env-driven [`Config`] (port/host/upstream).
-//! - [`rpc`]     — pure JSON-RPC routing + request normalisation (the testable core).
-//! - [`server`]  — the axum HTTP server (`/health`, CORS, `POST /` → `handle_rpc`).
+//! - [`config`] — env-driven [`Config`] (port/host/upstream).
+//! - [`meta`] — the self-describing discovery surface: version/build info, the
+//!   JSON-RPC method catalogue, the stable error-code catalogue, and the OpenRPC +
+//!   `/.well-known/dig-node.json` documents.
+//! - [`cli`] — the `--json` envelopes + the differentiated exit-code table.
+//! - [`rpc`] — pure JSON-RPC routing + request normalisation (the testable core).
+//! - [`server`] — the axum HTTP server (`/health`, `/version`, `/openrpc.json`,
+//!   `/.well-known/dig-node.json`, CORS, `POST /` → `handle_rpc`).
 //! - [`service`] — OS-service install/uninstall/start/stop/status.
 
+pub mod cli;
 pub mod config;
+pub mod meta;
 pub mod rpc;
 pub mod server;
 pub mod service;
@@ -30,5 +37,7 @@ pub mod service;
 #[cfg(windows)]
 pub mod win_service;
 
+pub use cli::{ExitCode, Outcome};
 pub use config::Config;
+pub use meta::ErrorCode;
 pub use server::{serve, VERSION};

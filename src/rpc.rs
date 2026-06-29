@@ -18,6 +18,8 @@
 
 use serde_json::{json, Value};
 
+use crate::meta::ErrorCode;
+
 /// How the companion handles a given JSON-RPC method. Informational/structural —
 /// dispatch itself is `dig_node::handle_rpc`; this classification drives request
 /// normalisation and keeps the routing intent documented and tested.
@@ -49,12 +51,22 @@ pub fn route_method(method: &str) -> Route {
     }
 }
 
-/// A JSON-RPC error envelope. PURE.
-pub fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
+/// A JSON-RPC error envelope carrying a CATALOGUED, stable error code. PURE.
+///
+/// The error object includes the numeric JSON-RPC `code` AND a `data.code` stable
+/// UPPER_SNAKE symbolic name (+ `data.origin`) drawn from [`ErrorCode`], so an
+/// agent branches on the symbolic name rather than scraping the human `message`.
+/// This is the only way the companion shell mints an error — every shell error is
+/// therefore catalogued and discoverable via `rpc.discover` / `/openrpc.json`.
+pub fn rpc_error(id: Value, code: ErrorCode, message: impl Into<String>) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": { "code": code, "message": message.into() },
+        "error": {
+            "code": code.code(),
+            "message": message.into(),
+            "data": { "code": code.name(), "origin": code.origin() },
+        },
     })
 }
 
@@ -192,5 +204,15 @@ mod tests {
     fn request_id_defaults_to_null() {
         assert_eq!(request_id(&json!({"method": "x"})), Value::Null);
         assert_eq!(request_id(&json!({"id": 7})), json!(7));
+    }
+
+    #[test]
+    fn rpc_error_carries_numeric_and_symbolic_code() {
+        let env = rpc_error(json!(1), ErrorCode::InvalidRequest, "nope");
+        assert_eq!(env["error"]["code"], json!(-32600));
+        assert_eq!(env["error"]["data"]["code"], json!("INVALID_REQUEST"));
+        assert_eq!(env["error"]["data"]["origin"], json!("shell"));
+        assert_eq!(env["error"]["message"], json!("nope"));
+        assert_eq!(env["id"], json!(1));
     }
 }
