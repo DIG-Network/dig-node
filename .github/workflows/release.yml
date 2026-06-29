@@ -6,10 +6,37 @@ name: Release dig-companion
 # here is the plain installable binary (no Tauri installer): users download it and
 # run `dig-companion install`.
 #
-#   * windows-x64   → dig-companion-<ver>-windows-x64.exe
-#   * linux-x64     → dig-companion-<ver>-linux-x64
-#   * macos-arm64   → dig-companion-<ver>-macos-arm64
-#   * macos-x64     → dig-companion-<ver>-macos-x64
+# DUAL ASSET NAMING — every per-OS/arch binary is published under TWO names so both
+# downstream consumers resolve it with NO change on their side:
+#
+#   * `dig-node-<ver>-<os>-<arch>[.exe]`      ← the CANONICAL name the dig-installer
+#       thin-shim PREFERS (its dig-node Repo stem is `dig-node`; see
+#       dig-installer/src/asset.rs::select_asset + release.rs::Repo::dig_node).
+#   * `dig-companion-<ver>-<os>-<arch>[.exe]` ← the legacy name. apt.dig.net's
+#       packaging resolves the Linux binary by this exact template
+#       (`dig-companion-{ver}-linux-{x64,arm64}`, ARCHIVE_BIN_PATH="" = bare binary;
+#       see apt.dig.net/packaging/config.sh::PKG_dig_node_ASSET_TEMPLATE) and the
+#       installer keeps it as its pre-rename fallback (Repo::dig_node_legacy).
+#
+# The binary itself is identical; only the filename differs. The repo was renamed
+# dig-companion → dig-node but the BINARY name stays `dig-companion` (Cargo.toml
+# default-run), so publishing both names keeps every matcher byte-exact across the
+# rename without editing the consumer repos.
+#
+# Per OS/arch (each emitted under both stems above):
+#   * windows-x64   (x86_64-pc-windows-msvc,  windows-latest)
+#   * linux-x64     (x86_64-unknown-linux-gnu, ubuntu-latest)
+#   * macos-arm64   (aarch64-apple-darwin,     macos-14)
+#   * macos-x64     (x86_64-apple-darwin,      macos-14, cross-compiled — see below)
+#
+# NO linux-arm64 asset is published: the active Linux build graph pulls in
+# `openssl-sys` (via the Chia wallet SDK `datalayer-driver` + `native-tls`, NOT via
+# reqwest, which uses rustls here), so an aarch64-Linux cross-compile would also have
+# to cross-compile OpenSSL — fragile and slow. No consumer requests it today: the
+# dig-installer's Linux os_arch_tokens are x64-only and it REJECTS an `arm64`/
+# `aarch64` token as a competing arch, and apt.dig.net treats arm64 as best-effort
+# (build-deb.sh resolves the asset, finds none, and SKIPS arm64 non-fatally). Revisit
+# if/when an arm64-Linux consumer appears (would need vendored/cross OpenSSL).
 #
 # A push to main also builds (no publish) so a broken build is caught before tagging.
 
@@ -125,7 +152,7 @@ jobs:
           restore-keys: ${{ runner.os }}-companion-build-${{ matrix.target }}-
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-companion
-      - name: Stage artifact
+      - name: Stage artifact (dual-named)
         id: stage
         shell: bash
         run: |
@@ -134,14 +161,18 @@ jobs:
           mkdir -p dist
           SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
           test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
-          DEST="dist/dig-companion-${VER}-${{ matrix.out_name }}"
-          cp "$SRC" "$DEST"
+          # On Windows out_name already ends in .exe; on unix there is no extension.
+          # Publish the SAME binary under both the canonical dig-node-* name (dig-
+          # installer's preferred stem) and the legacy dig-companion-* name (apt's
+          # template + the installer's pre-rename fallback). See the header comment.
+          cp "$SRC" "dist/dig-node-${VER}-${{ matrix.out_name }}"
+          cp "$SRC" "dist/dig-companion-${VER}-${{ matrix.out_name }}"
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
           ls -la dist
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dig-companion-${{ matrix.out_name }}
+          name: dig-node-${{ matrix.out_name }}
           path: dist/*
           if-no-files-found: error
 
