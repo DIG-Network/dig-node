@@ -151,6 +151,21 @@ pub fn methods() -> &'static [MethodInfo] {
             summary: "A capsule's manifest — relayed verbatim to the upstream.",
             requires_auth: false,
         },
+        MethodInfo {
+            name: "dig.getCollection",
+            served: "passthrough",
+            summary: "Public collection facts (creator DID, item count, uniform royalty) \
+                      for a set of NFT launcher ids — relayed verbatim to the upstream.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "dig.listCollectionItems",
+            served: "passthrough",
+            summary: "A paginated page of a collection's NFT items resolved to their \
+                      CURRENT on-chain owner + royalty + CHIP-0007 metadata — relayed \
+                      verbatim to the upstream.",
+            requires_auth: false,
+        },
         // -- CONTROL / admin surface (loopback-only + local-token gated) ----------
         // The DIG Browser "My Node" controller drives these to MANAGE the node.
         // Every `control.*` method requires the local control token (requires_auth).
@@ -661,6 +676,9 @@ mod tests {
             "rpc.discover",
             "dig.getProof",
             "dig.listCapsules",
+            // #39 public collection reads (passthrough to the upstream dig-node).
+            "dig.getCollection",
+            "dig.listCollectionItems",
             // CONTROL surface (#101a).
             "control.status",
             "control.config.get",
@@ -678,6 +696,29 @@ mod tests {
             assert!(
                 names.contains(&required),
                 "method catalogue missing {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_read_methods_are_catalogued_passthrough_no_auth() {
+        // #39: dig.getCollection / dig.listCollectionItems are public reads — served by
+        // passthrough to the upstream dig-node, never auth-gated — and they appear in the
+        // generated OpenRPC so rpc.discover / /openrpc.json stay correct.
+        for name in ["dig.getCollection", "dig.listCollectionItems"] {
+            let m = methods()
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the method catalogue"));
+            assert_eq!(m.served, "passthrough", "{name} must be a passthrough read");
+            assert!(!m.requires_auth, "{name} is a public read (no control token)");
+        }
+        let doc = openrpc_document();
+        let methods = doc["methods"].as_array().expect("methods array");
+        for name in ["dig.getCollection", "dig.listCollectionItems"] {
+            assert!(
+                methods.iter().any(|m| m["name"] == json!(name)),
+                "{name} missing from the OpenRPC document"
             );
         }
     }
