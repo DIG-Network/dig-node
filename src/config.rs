@@ -39,6 +39,27 @@ pub const DEFAULT_PORT: u16 = 8080;
 /// Default upstream DIG RPC the embedded node proxies to on a local cache miss.
 pub const DEFAULT_UPSTREAM: &str = "https://rpc.dig.net";
 
+/// The loopback IP the bare-`http://dig.local` listener binds to (#91). The
+/// dig-installer writes a hosts entry `127.0.0.2  dig.local`, so binding this IP on
+/// the privileged port 80 makes `http://dig.local` (NO port) reach the node. A
+/// distinct loopback IP (`.2`, not `.1`) is used so the port-80 bind can never
+/// collide with an unrelated `localhost:80` service the user already runs. On macOS
+/// the loopback alias must exist first (`sudo ifconfig lo0 alias 127.0.0.2`); the
+/// installer/service handles that — see the README.
+pub const DIG_LOCAL_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
+
+/// The privileged port the bare-`http://dig.local` listener binds to (#91). Port 80
+/// means the URL carries no `:port`, which is the whole point. Binding it is
+/// privileged (root / `CAP_NET_BIND_SERVICE` on Linux; Administrator/LocalSystem on
+/// Windows — the installed service runs elevated, so it works there). The bind is
+/// BEST-EFFORT: if it fails the localhost listener still serves (see `server`).
+pub const DIG_LOCAL_PORT: u16 = 80;
+
+/// The canonical hostname the bare-`http://dig.local` listener answers to (#91).
+/// Matches the dig-installer hosts entry and the extension's resolver base-domain
+/// list (`dig.local` / `localhost` / `127.0.0.1`).
+pub const DIG_LOCAL_HOST: &str = "dig.local";
+
 /// Resolved companion configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -55,6 +76,15 @@ pub struct Config {
     /// so the two share ONE cache (see the module-level "Shared `.dig` cache"
     /// note). `Some(path)` moves that shared cache to an explicit location.
     pub cache_dir: Option<String>,
+    /// Whether to ALSO open the bare-`http://dig.local` loopback listener
+    /// (`127.0.0.2:80`) beside the always-on `localhost:<port>` one (#91). From
+    /// `DIG_NODE_DIGLOCAL` (`1`/`true`/`yes`/`on` ⇒ enabled, `0`/`false`/… ⇒
+    /// disabled); **default `true`** — auto-attempt with graceful fallback. The
+    /// attempt is BEST-EFFORT: if the privileged `:80` bind fails (no privilege,
+    /// port in use, or — on macOS — the `127.0.0.2` loopback alias is missing) the
+    /// node logs a structured warning and serves localhost-only, never aborting.
+    /// Set `DIG_NODE_DIGLOCAL=0` to skip the attempt entirely.
+    pub dig_local: bool,
 }
 
 impl Default for Config {
@@ -64,6 +94,9 @@ impl Default for Config {
             port: DEFAULT_PORT,
             upstream: DEFAULT_UPSTREAM.to_string(),
             cache_dir: None,
+            // Auto-attempt the bare-dig.local listener by default (graceful
+            // fallback if the privileged bind fails) — see the field doc + #91.
+            dig_local: true,
         }
     }
 }
@@ -105,11 +138,16 @@ impl Config {
         // treated as unset → shared default (see resolve_cache_dir).
         let cache_dir = resolve_cache_dir(std::env::var("DIG_NODE_CACHE").ok());
 
+        // The bare-dig.local listener is on by default (auto-attempt + graceful
+        // fallback); DIG_NODE_DIGLOCAL=0/false/no/off turns it off entirely.
+        let dig_local = parse_dig_local_flag(std::env::var("DIG_NODE_DIGLOCAL").ok());
+
         Config {
             host,
             port,
             upstream,
             cache_dir,
+            dig_local,
         }
     }
 
@@ -133,10 +171,61 @@ impl Config {
         }
     }
 
-    /// The `host:port` socket string for binding / logging.
+    /// The `host:port` socket string for the always-on localhost listener
+    /// (binding / logging).
     pub fn bind_addr(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
+
+    /// The `host:port` socket string for the BEST-EFFORT bare-`http://dig.local`
+    /// listener (`127.0.0.2:80`), or `None` when `dig_local` is disabled (#91).
+    /// `serve` tries to bind this in ADDITION to [`bind_addr`]; a failure is
+    /// logged and ignored (localhost keeps serving).
+    pub fn dig_local_addr(&self) -> Option<String> {
+        self.dig_local
+            .then(|| format!("{DIG_LOCAL_IP}:{DIG_LOCAL_PORT}"))
+    }
+}
+
+/// Parse the `DIG_NODE_DIGLOCAL` toggle. Truthy (`1`/`true`/`yes`/`on`) ⇒ enable
+/// the bare-dig.local listener; falsy (`0`/`false`/`no`/`off`) ⇒ disable; **unset
+/// or unrecognised ⇒ the default `true`** (auto-attempt with graceful fallback).
+/// Case/whitespace-insensitive. PURE so the toggle policy is unit-testable.
+pub fn parse_dig_local_flag(raw: Option<String>) -> bool {
+    match raw.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
+        Some(ref v) if matches!(v.as_str(), "0" | "false" | "no" | "off") => false,
+        Some(ref v) if matches!(v.as_str(), "1" | "true" | "yes" | "on") => true,
+        // Unset, blank, or anything unrecognised → the default-on behaviour.
+        _ => true,
+    }
+}
+
+/// Whether a request `Host` header is allowed (#91). The node is loopback-only and
+/// answers to the canonical local names — bare `dig.local`, `localhost`, the two
+/// loopback IPs `127.0.0.1`/`127.0.0.2` — with or without a `:port` suffix; a
+/// missing Host is allowed (HTTP/1.0 / health probes). Any OTHER host (e.g. a
+/// public domain pointed at the machine, the classic DNS-rebinding vector) is
+/// rejected, so even though the listeners are loopback-only the node never serves a
+/// foreign-named request. PURE: takes the raw header value, returns the decision.
+pub fn host_is_allowed(host_header: Option<&str>) -> bool {
+    // No Host header at all (HTTP/1.0, some probes) → allow: it cannot be a
+    // rebinding attack (there is no attacker-chosen name) and the loopback bind
+    // already constrains reachability.
+    let Some(raw) = host_header else {
+        return true;
+    };
+    let host = raw.trim();
+    if host.is_empty() {
+        return true;
+    }
+    // Strip a trailing `:port` (IPv4 / hostname forms only — the node binds IPv4
+    // loopback, never `[::1]`). `dig.local:80`, `localhost:8080`, `127.0.0.1` all
+    // reduce to their hostname for the allowlist check.
+    let name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    matches!(
+        name,
+        DIG_LOCAL_HOST | "localhost" | "127.0.0.1" | "127.0.0.2"
+    )
 }
 
 /// Normalise an upstream URL: trim, strip trailing slashes, and default a bare
@@ -252,5 +341,84 @@ mod tests {
         );
         assert_eq!(resolve_cache_dir(Some("   ".to_string())), None);
         assert_eq!(resolve_cache_dir(None), None);
+    }
+
+    // ----- #91: the dig.local listener flag + addressing -----------------------
+
+    #[test]
+    fn dig_local_is_on_by_default() {
+        // Auto-attempt with graceful fallback: a default Config wants the
+        // bare-dig.local listener, addressed 127.0.0.2:80.
+        let c = Config::default();
+        assert!(c.dig_local);
+        assert_eq!(c.dig_local_addr().as_deref(), Some("127.0.0.2:80"));
+    }
+
+    #[test]
+    fn dig_local_addr_is_none_when_disabled() {
+        let c = Config {
+            dig_local: false,
+            ..Config::default()
+        };
+        assert_eq!(c.dig_local_addr(), None);
+    }
+
+    #[test]
+    fn parse_dig_local_flag_honours_truthy_and_falsy_values() {
+        // Falsy turns it off.
+        for off in ["0", "false", "FALSE", "no", " off ", "Off"] {
+            assert!(
+                !parse_dig_local_flag(Some(off.to_string())),
+                "{off:?} should disable dig.local"
+            );
+        }
+        // Truthy keeps it on.
+        for on in ["1", "true", "YES", "on", " On "] {
+            assert!(
+                parse_dig_local_flag(Some(on.to_string())),
+                "{on:?} should enable dig.local"
+            );
+        }
+        // Unset / blank / unrecognised → default ON (auto-attempt + fallback).
+        assert!(parse_dig_local_flag(None));
+        assert!(parse_dig_local_flag(Some(String::new())));
+        assert!(parse_dig_local_flag(Some("maybe".to_string())));
+    }
+
+    #[test]
+    fn host_allowlist_accepts_the_canonical_local_names() {
+        // The four canonical names, bare and with a :port suffix, plus a missing
+        // Host (probes / HTTP/1.0) are all allowed.
+        for ok in [
+            "dig.local",
+            "dig.local:80",
+            "localhost",
+            "localhost:8080",
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "127.0.0.2",
+            "127.0.0.2:80",
+            "  dig.local  ",
+        ] {
+            assert!(host_is_allowed(Some(ok)), "{ok:?} must be allowed");
+        }
+        assert!(host_is_allowed(None), "a missing Host must be allowed");
+        assert!(host_is_allowed(Some("")), "an empty Host must be allowed");
+    }
+
+    #[test]
+    fn host_allowlist_rejects_foreign_hosts() {
+        // Anything not on the loopback allowlist (the DNS-rebinding vector) is
+        // rejected even though the listeners are loopback-only.
+        for bad in [
+            "evil.example.com",
+            "example.com:80",
+            "dig.local.evil.com",
+            "169.254.1.1",
+            "0.0.0.0",
+            "attacker",
+        ] {
+            assert!(!host_is_allowed(Some(bad)), "{bad:?} must be rejected");
+        }
     }
 }

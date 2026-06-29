@@ -67,6 +67,43 @@ localhost:8080
 (The extension defaults to `localhost:80`; port 80 needs elevated privileges on most OSes, so the
 companion defaults to `8080`. Set the extension to match, or run the companion on `80` if you can.)
 
+## Addressing — `http://dig.local` (no port) + `http://localhost:<port>` (#91)
+
+The node opens **two loopback listeners for the same app** so it is reachable two ways at once:
+
+| Address | Listener | Always on? |
+|---|---|---|
+| **`http://localhost:<port>`** (default `localhost:8080`) | `127.0.0.1:<port>` | **Yes** — unprivileged, conflict-free. The guaranteed fallback. |
+| **`http://dig.local`** (no port) | `127.0.0.2:80` | **Best-effort** — needs the privileged `:80` bind (+ on macOS a loopback alias). Falls back gracefully if it can't bind. |
+
+- The bare `http://dig.local` URL (no `:port`) works because [`dig-installer`](https://github.com/DIG-Network/dig-installer)
+  writes a hosts entry **`127.0.0.2  dig.local`** and the node binds **`127.0.0.2:80`**. A distinct
+  loopback IP (`.2`, not `.1`) is used so the port-80 bind can never collide with an unrelated
+  `localhost:80` service.
+- **Neither listener binds `0.0.0.0`** — both are loopback IPs, so the node is **never LAN-exposed**.
+- **Graceful fallback (never aborts):** binding `127.0.0.2:80` is privileged and may fail (no
+  privilege, port in use, or — on macOS — a missing loopback alias). If it fails, the node logs a
+  **structured warning** and serves **localhost-only**; it never aborts. `localhost:<port>` is the
+  guaranteed fallback. Set **`DIG_NODE_DIGLOCAL=0`** to skip the `dig.local` attempt entirely.
+- **Host-header allowlist.** Both listeners answer only to the canonical local names — **`dig.local`**,
+  **`localhost`**, **`127.0.0.1`**, **`127.0.0.2`** (with or without a `:port`). A request with any
+  other `Host` (the classic DNS-rebinding vector — a public name pointed at the loopback bind) is
+  rejected **`421 Misdirected Request`** with a catalogued `INVALID_REQUEST` error body, even though
+  the bind is already loopback-only. A missing `Host` (HTTP/1.0 / health probes) is allowed.
+
+### Platform caveats for the `dig.local` (`:80`) listener
+
+| Platform | What it needs for `127.0.0.2:80` | Notes |
+|---|---|---|
+| **Windows** | The installed service runs as `LocalSystem` (elevated), so the `:80` bind works. A manual `dig-companion run` from a non-elevated shell will fail the bind → localhost-only. | — |
+| **Linux** | **root** or the `CAP_NET_BIND_SERVICE` capability on the binary (`sudo setcap cap_net_bind_service=+ep $(command -v dig-companion)`). A systemd **user** service has neither by default → localhost-only unless granted. | `127.0.0.2` is part of the always-up `127.0.0.0/8` loopback range — no alias needed. |
+| **macOS** | The `127.0.0.2` loopback **alias must exist first**: `sudo ifconfig lo0 alias 127.0.0.2`. Binding `:80` also needs elevation. The installer/service can add the alias (it does not persist across reboot unless made a launchd/`networksetup` step). | `.local` is RFC-6762 mDNS-reserved (mDNSResponder); a `/etc/hosts` entry normally wins, but verify resolution if a `dig.local` name does not resolve. |
+
+> `.local` is RFC-6762 (mDNS) reserved. A `hosts`/`/etc/hosts` entry for `dig.local` (written by the
+> installer) normally takes precedence over mDNS on all three platforms, so the name resolves to
+> `127.0.0.2` without a multicast lookup. On macOS, where mDNSResponder is the resolver, confirm the
+> hosts entry wins if `dig.local` ever fails to resolve.
+
 ## Run in the foreground (no service)
 
 ```bash
@@ -87,6 +124,7 @@ service's environment so the service serves identically):
 | `DIG_RPC_UPSTREAM` | `https://rpc.dig.net` | Upstream DIG RPC the embedded node proxies ciphertext/proof requests to on a local cache miss, and relays unhandled methods to. |
 | `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). **Leave it unset to share one cache with the DIG Browser** — see below. |
 | `DIG_NODE_CACHE_CAP` | `1 GiB` | Cache size cap (floored at 64 MiB), LRU-evicted. Also settable via the `cache.setCapBytes` RPC. |
+| `DIG_NODE_DIGLOCAL` | `1` (on) | Whether to ALSO open the bare-`http://dig.local` listener (`127.0.0.2:80`) beside `localhost:<port>`. Auto-attempt with graceful fallback (see [Addressing](#addressing--httpdiglocal-no-port--httplocalhostport-91)). Set to `0`/`false` to skip the attempt. |
 
 ### Shared `.dig` cache with the DIG Browser (#96)
 
@@ -196,7 +234,9 @@ A single fetch tells an agent what the node is, where it serves, and what it spe
 | `GET /openrpc.json` | The OpenRPC document for the JSON-RPC surface (methods + error catalogue), generated from the method/error source so it cannot drift. |
 | `GET /.well-known/dig-node.json` | The canonical discovery doc: identity, bound `addr`, cache (`dir`/`cap_bytes`/`used_bytes`/`shared`), the method catalogue, the error catalogue, and pointers to the OpenRPC/health/version endpoints. |
 
-CORS reflects `chrome-extension://` (and `http://localhost`) origins so the extension can call it.
+CORS reflects `chrome-extension://` and the local page origins `http://localhost` / `http://dig.local`
+/ `http://127.0.0.1` / `http://127.0.0.2` (with or without a `:port`), so the extension and any page
+served from a canonical local name can call it.
 
 ## Machine-readable contracts (agent-friendly)
 
