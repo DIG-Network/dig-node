@@ -711,7 +711,10 @@ mod tests {
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} missing from the method catalogue"));
             assert_eq!(m.served, "passthrough", "{name} must be a passthrough read");
-            assert!(!m.requires_auth, "{name} is a public read (no control token)");
+            assert!(
+                !m.requires_auth,
+                "{name} is a public read (no control token)"
+            );
         }
         let doc = openrpc_document();
         let methods = doc["methods"].as_array().expect("methods array");
