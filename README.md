@@ -158,7 +158,7 @@ in-process node expose:
 | Method | Behaviour |
 |---|---|
 | `dig.getContent` / `dig.getCapsule` | **Verified retrieval** — returns blind **ciphertext + a Merkle inclusion proof + chunk lengths** (`{ ciphertext, root, complete, next_offset?, inclusion_proof, chunk_lens, …, source }`). Served **local-first** from a cached `.dig` module, else proxied to the upstream verbatim (so the proxy path carries `total_length` / `offset` too) and the window cached. `source` is `local` or `remote`. **The client (extension/hub/browser) verifies + decrypts** — the companion mirrors the ciphertext contract, it does not return plaintext. |
-| `dig.getAnchoredRoot` | The store's **chain-anchored tip root**, resolved on-chain by walking the DataStore singleton lineage on coinset.org (the trusted root for the extension's `dig://` root-pinning). |
+| `dig.getAnchoredRoot` | The store's **chain-anchored tip root**, resolved on-chain by walking the DataStore singleton lineage on coinset.org (the trusted root for the extension's `chia://` root-pinning). |
 | `cache.getConfig` / `cache.setCapBytes` / `cache.clear` | On-disk cache config: `{ cap_bytes (floored at 64 MiB), used_bytes, cache_dir, shared }` — `cache_dir` is the effective dir and `shared` whether it is the canonical dir shared with the DIG Browser (#96). |
 | `cache.listCached` / `cache.removeCached` / `cache.fetchAndCache` | Cached-capsule manager (`storeId:rootHash`). |
 | `rpc.discover` | **Method discovery** — returns this node's OpenRPC document (the standard OpenRPC discovery method), so a client can introspect every method + error over the wire with no out-of-band knowledge. |
@@ -350,6 +350,13 @@ USER_JOURNEY.md   the dig-node user/operator/agent journey, surfaces, and ecosys
   API across the extension and the native browser.
 - The verify/decrypt read-crypto lives in the **extension** (the same `dig_client` WASM the hub uses);
   the companion serves the ciphertext + proof the extension consumes. See the repo `SYSTEM.md`.
+
+## Docs & help
+
+- **Docs:** [https://docs.dig.net/docs/run-a-node](https://docs.dig.net/docs/run-a-node) — running a
+  local `dig-node` (install, configure, point a client at it).
+- **Discord:** [https://discord.gg/dignetwork](https://discord.gg/dignetwork) — questions, help, and
+  the rest of the DIG Network community.
 
 ## License
 
