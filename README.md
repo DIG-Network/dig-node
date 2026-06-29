@@ -1,8 +1,13 @@
-# dig-companion
+# dig-companion (the **dig-node** service)
 
 The **localhost DIG node** for the [DIG Chrome extension](https://github.com/DIG-Network/dig-chrome-extension),
 shipped as a **self-contained, cross-platform Rust binary** that installs as an **OS service**
 (Windows, Linux, macOS).
+
+> **Naming.** The binary is `dig-companion` (kept stable so existing installs/clients keep
+> working), but the **service it runs is `dig-node`** — the canonical, user-facing name for the
+> local DIG node (per the ecosystem `SYSTEM.md`). Every machine-readable surface (`/health`,
+> `/version`, `--json`) identifies itself as `dig-node`. See [`USER_JOURNEY.md`](USER_JOURNEY.md).
 
 The extension resolves `chia://` (DIG) URLs by fetching encrypted, Merkle-proven content over a DIG
 RPC and then **verifying + decrypting it in the extension**. By default it talks to `rpc.dig.net`;
@@ -94,11 +99,69 @@ in-process node expose:
 | `dig.getAnchoredRoot` | The store's **chain-anchored tip root**, resolved on-chain by walking the DataStore singleton lineage on coinset.org (the trusted root for the extension's `dig://` root-pinning). |
 | `cache.getConfig` / `cache.setCapBytes` / `cache.clear` | On-disk cache config (`cap_bytes` floored at 64 MiB). |
 | `cache.listCached` / `cache.removeCached` / `cache.fetchAndCache` | Cached-capsule manager (`storeId:rootHash`). |
-| `dig.getProof`, `dig.listCapsules`, `dig.getManifest`, *anything else* | **Blind passthrough** — relayed verbatim to the upstream, so the companion stays a correct transparent proxy for methods it doesn't resolve locally. |
+| `rpc.discover` | **Method discovery** — returns this node's OpenRPC document (the standard OpenRPC discovery method), so a client can introspect every method + error over the wire with no out-of-band knowledge. |
+| `dig.getProof`, `dig.listCapsules`, `dig.getManifest`, *anything else* | **Blind passthrough** — relayed verbatim to the upstream, so the node stays a correct transparent proxy for methods it doesn't resolve locally. |
 
-`GET /health` → `{ status, version, mode, upstream, cache: { cap_bytes, used_bytes } }`.
+## Discovery & health endpoints
+
+A single fetch tells an agent what the node is, where it serves, and what it speaks:
+
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | `{ status, service:"dig-node", version, commit, mode, addr, upstream, cache:{ dir, cap_bytes, used_bytes }, methods:[…] }` — extends the original health body (existing probes keep parsing `status`/`version`/`mode`/`upstream`/`cache`). |
+| `GET /version` | `{ service:"dig-node", version, commit, dig_node_version, protocol }` — the build fingerprint, to correlate a running node to an exact source revision. |
+| `GET /openrpc.json` | The OpenRPC document for the JSON-RPC surface (methods + error catalogue), generated from the method/error source so it cannot drift. |
+| `GET /.well-known/dig-node.json` | The canonical discovery doc: identity, bound `addr`, cache (`dir`/`cap_bytes`/`used_bytes`), the method catalogue, the error catalogue, and pointers to the OpenRPC/health/version endpoints. |
 
 CORS reflects `chrome-extension://` (and `http://localhost`) origins so the extension can call it.
+
+## Machine-readable contracts (agent-friendly)
+
+### CLI `--json`
+
+Every subcommand accepts the global `--json` flag: machine output goes to **stdout**, human prose
+to **stderr**.
+
+```bash
+dig-companion status --json
+# {"ok":true,"action":"status","service":"dig-node","version":"0.3.0","serving":false,"addr":"127.0.0.1:8080",…}
+
+dig-companion install --json
+# {"ok":true,"action":"install","installed":true,"registered":true,"started":false,"label":"…","scope":"system","addr":"127.0.0.1:8080",…}
+```
+
+On failure: `{ "ok":false, "action":…, "error":{ "code", "exit_code", "message", "hint" } }`.
+
+### Exit-code table
+
+Each failure class maps to a **distinct** process exit code (not a generic `1`), backed by the
+typed `ExitCode` enum in `src/cli.rs`:
+
+| Exit | Code (`UPPER_SNAKE`) | Meaning |
+|---|---|---|
+| 0 | `OK` | Success. |
+| 1 | `NOT_SERVING` | `status`: the node is not responding (scriptable "is it up?"). |
+| 2 | `USAGE` | Bad arguments / usage error. |
+| 3 | `PERMISSION_DENIED` | `install`/`uninstall` need an elevated (Administrator) console (Windows). |
+| 4 | `SERVICE_FAILED` | A service operation failed (register/start/stop/uninstall). |
+| 5 | `BIND_FAILED` | `run`: could not bind the loopback address. |
+| 6 | `IO_ERROR` | Other I/O error. |
+
+### JSON-RPC error-code catalogue
+
+Wire errors carry a stable UPPER_SNAKE symbolic name in `error.data.code` (+ `error.data.origin`
+distinguishing companion-shell errors from upstream/boundary ones), beside the numeric JSON-RPC
+`code`. Catalogued in `src/meta.rs` (the `ErrorCode` enum), embedded in `/openrpc.json` and
+`/.well-known/dig-node.json`:
+
+| JSON-RPC code | Name | Origin | Meaning |
+|---|---|---|---|
+| -32700 | `PARSE_ERROR` | shell | Request body was not valid JSON. |
+| -32600 | `INVALID_REQUEST` | shell | Not a single JSON-RPC object (batch arrays unsupported). |
+| -32601 | `METHOD_NOT_FOUND` | boundary | Not resolved locally or by the upstream. |
+| -32602 | `INVALID_PARAMS` | upstream | Invalid or missing method parameters. |
+| -32000 | `DISPATCH_FAILED` | shell | The node failed to dispatch the request. |
+| -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay to the upstream failed. |
 
 ## How the read path is wired (the important design decision)
 
@@ -133,15 +196,21 @@ a few minutes; subsequent builds are fast.
 ## Architecture
 
 ```
+build.rs          captures the git commit SHA at build time (the /version `commit` field)
 src/
-  main.rs         CLI (run / run-service / install / uninstall / start / stop / status)
+  main.rs         CLI (run / run-service / install / uninstall / start / stop / status) + --json rendering
   lib.rs          module wiring
   config.rs       env-driven Config (port/host/upstream) — pure, tested
-  rpc.rs          JSON-RPC routing + request normalisation — pure, tested
-  server.rs       axum HTTP server: /health, CORS, POST / → dig_node::handle_rpc, passthrough fallback
+  meta.rs         self-describing surface: version/build info, method catalogue, ErrorCode catalogue,
+                  OpenRPC + /.well-known/dig-node.json documents — pure, tested
+  cli.rs          --json envelopes + the differentiated ExitCode table — pure, tested
+  rpc.rs          JSON-RPC routing + request normalisation + catalogued error envelopes — pure, tested
+  server.rs       axum HTTP server: /health, /version, /openrpc.json, /.well-known/dig-node.json, CORS,
+                  POST / → dig_node::handle_rpc (+ rpc.discover), passthrough fallback
   service.rs      OS-service install/uninstall/start/stop/status (service-manager) + /health status probe
   win_service.rs  Windows Service Control Protocol entrypoint (windows-service; Windows only)
 node/             the Node v0.2 reference implementation (documentation only — NOT the shipped artifact)
+USER_JOURNEY.md   the dig-node user/operator/agent journey, surfaces, and ecosystem hand-offs
 ```
 
 ## Relationship to the rest of the ecosystem

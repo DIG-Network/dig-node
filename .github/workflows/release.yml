@@ -20,6 +20,8 @@ on:
     branches: [main]
     paths:
       - "src/**"
+      - "tests/**"
+      - "build.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/release.yml"
