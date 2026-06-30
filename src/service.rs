@@ -1,9 +1,9 @@
-//! OS-service registration for the companion, across Windows (SCM), Linux
+//! OS-service registration for dig-node, across Windows (SCM), Linux
 //! (systemd) and macOS (launchd) via the `service-manager` crate.
 //!
 //! The whole point of the Rust rewrite: a self-contained binary that installs
 //! cleanly as an OS service, with no Node runtime to depend on. `install` registers
-//! `dig-companion run` to auto-start and serve on the loopback port; `uninstall`
+//! `dig-node run` to auto-start and serve on the loopback port; `uninstall`
 //! removes it; `start`/`stop` control the registered service; `status` reports
 //! whether it is registered and actually serving.
 //!
@@ -29,9 +29,9 @@ use crate::cli::Outcome;
 use crate::config::Config;
 
 /// The reverse-DNS service label. On Windows this becomes the SCM service name
-/// `net-dignetwork-dig_companion`; on launchd the plist label; on systemd the unit
+/// `net-dignetwork-dig_node`; on launchd the plist label; on systemd the unit
 /// name. Kept stable so install/uninstall/start/stop all address the same service.
-pub const SERVICE_LABEL: &str = "net.dignetwork.dig-companion";
+pub const SERVICE_LABEL: &str = "net.dignetwork.dig-node";
 
 /// Whether user-level (no-elevation) install is supported on this OS. Windows SCM
 /// is system-only; systemd/launchd support a user domain.
@@ -59,7 +59,7 @@ fn manager() -> std::io::Result<(Box<dyn ServiceManager>, bool)> {
     Ok((mgr, user_level))
 }
 
-/// Absolute path to the currently-running `dig-companion` executable, so the
+/// Absolute path to the currently-running `dig-node` executable, so the
 /// installed service points at THIS binary (not a PATH lookup that might resolve
 /// to a different/absent copy).
 fn current_exe() -> std::io::Result<std::path::PathBuf> {
@@ -87,8 +87,8 @@ fn is_elevated() -> bool {
     true
 }
 
-/// Install the companion as an auto-starting OS service that runs
-/// `dig-companion run` on the configured loopback port. The service's environment
+/// Install dig-node as an auto-starting OS service that runs
+/// `dig-node run` on the configured loopback port. The service's environment
 /// carries the resolved port/host/upstream so it serves identically to a manual
 /// `run`.
 pub fn install(config: &Config) -> std::io::Result<Outcome> {
@@ -143,7 +143,7 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
     let summary = format!(
         "dig-node: installed as a {scope}-level service \"{SERVICE_LABEL}\"\n  \
          program: {}\n  serves:  http://{addr}\n  Set the DIG Chrome extension's \"server host\" to {addr}.\n  \
-         Start it now with: dig-companion start",
+         Start it now with: dig-node start",
         program.display(),
     );
     Ok(Outcome::new(
@@ -161,7 +161,7 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
     ))
 }
 
-/// Uninstall the companion service. Stops it first (best-effort) so the uninstall
+/// Uninstall the dig-node service. Stops it first (best-effort) so the uninstall
 /// is clean.
 pub fn uninstall() -> std::io::Result<Outcome> {
     if cfg!(windows) && !is_elevated() {
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn service_label_parses() {
         let l = label().expect("constant label must parse");
-        assert_eq!(l.application, "dig-companion");
+        assert_eq!(l.application, "dig-node");
     }
 
     #[test]

@@ -1,18 +1,20 @@
-//! dig-companion — the localhost DIG node for the DIG Chrome extension, as a
+//! dig-node — the localhost DIG node for the DIG Chrome extension, as a
 //! self-contained cross-platform Rust binary installable as an OS service.
 //!
 //! The DIG Chrome extension resolves `chia://` (DIG) URLs by calling a DIG RPC for
 //! encrypted, merkle-proven content, then verifying + decrypting it **in the
 //! extension**. By default it talks to `rpc.dig.net`; pointing its `server.host`
-//! at this companion makes that RPC **local**. The companion routes every request
-//! to digstore's `dig_node::handle_rpc` — the SAME local-first node the native DIG
-//! Browser runs in-process — so the wire contract is byte-identical to rpc.dig.net
-//! (ciphertext + inclusion proof + chunk lengths), with the bonus that any `.dig`
-//! store the node has cached is served without leaving the machine.
+//! at this dig-node makes that RPC **local**. This service routes every request
+//! to digstore's `dig-node` read-path crate (`digstore_node::handle_rpc`) — the
+//! SAME local-first node the native DIG Browser runs in-process — so the wire
+//! contract is byte-identical to rpc.dig.net (ciphertext + inclusion proof + chunk
+//! lengths), with the bonus that any `.dig` store the node has cached is served
+//! without leaving the machine.
 //!
 //! Why Rust, not the previous Node server: a single self-contained binary has no
 //! runtime dependency and installs cleanly as a Windows/Linux/macOS service. The
-//! Node v0.2 reference implementation is retained under `node/` for documentation.
+//! original JavaScript v0.2 reference implementation is retained under `node/` for
+//! documentation.
 //!
 //! Layout:
 //! - [`config`] — env-driven [`Config`] (port/host/upstream).

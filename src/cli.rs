@@ -4,7 +4,7 @@
 //! Beside the human-prose output (the default), every subcommand can emit ONE
 //! structured JSON object to stdout under `--json` (human prose then goes to
 //! stderr), and every failure maps to a DISTINCT, documented exit code rather than
-//! a single generic `1`. So a script/agent driving `dig-companion` can branch on
+//! a single generic `1`. So a script/agent driving `dig-node` can branch on
 //! the exit code AND parse the result without scraping prose.
 //!
 //! The exit-code table (also documented in the README and emitted by

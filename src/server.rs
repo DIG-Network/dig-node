@@ -1,9 +1,9 @@
-//! The companion's HTTP server: `/health`, CORS, and `POST /` → the embedded
-//! dig-node's `handle_rpc`.
+//! The dig-node service's HTTP server: `/health`, CORS, and `POST /` → the embedded
+//! dig-node read path's `handle_rpc`.
 //!
 //! This is the localhost endpoint the DIG Chrome extension points its `server.host`
 //! setting at. It speaks the SAME wire contract as rpc.dig.net (because it routes
-//! to `dig_node::handle_rpc`), so the extension's `fetchContentViaRPC` pipeline —
+//! to `digstore_node::handle_rpc`), so the extension's `fetchContentViaRPC` pipeline —
 //! `dig.getContent` → verify → decrypt, all done in the extension — works against
 //! it byte-for-byte, with the bonus that resources are served local-first from any
 //! `.dig` modules the node has cached.
@@ -19,7 +19,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use dig_node::{cache_cap_bytes, cache_used_bytes, handle_rpc, Node};
+use digstore_node::{cache_cap_bytes, cache_used_bytes, handle_rpc, Node};
 use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -29,7 +29,7 @@ use crate::meta;
 use crate::meta::ErrorCode;
 use crate::rpc::{normalize_request, request_id, rpc_error};
 
-/// The companion binary version, surfaced by `/health`.
+/// The dig-node binary version, surfaced by `/health`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Shared server state: the embedded dig-node plus the resolved upstream and an
@@ -44,7 +44,7 @@ pub struct AppState {
     /// The loopback `host:port` the server is bound to, surfaced in `/health` and
     /// the well-known document so an agent learns where the node serves.
     addr: String,
-    /// The node's config.json path — where the companion's pin registry + upstream
+    /// The node's config.json path — where the service's pin registry + upstream
     /// override live (the CONTROL plane reads/writes here).
     config_path: std::path::PathBuf,
     /// The local control token: a same-host controller must present it on every
@@ -62,11 +62,11 @@ pub struct AppState {
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
 /// `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` and returns this for
-/// anything else; the companion treats that as the cue to blind-passthrough the
+/// anything else; this service treats that as the cue to blind-passthrough the
 /// request to the upstream.
 const METHOD_NOT_FOUND: i64 = ErrorCode::MethodNotFound.code();
 
-/// Build the companion's axum router. Beside `POST /` (JSON-RPC) and `GET /health`
+/// Build the dig-node service's axum router. Beside `POST /` (JSON-RPC) and `GET /health`
 /// it exposes the self-describing discovery surface so an agent can introspect the
 /// node with zero out-of-band knowledge:
 ///   * `GET /version`                    — build/commit/version fingerprint
@@ -79,7 +79,7 @@ pub fn router(state: AppState) -> Router {
     // The extension calls from a `chrome-extension://` origin; a same-machine page
     // calls from `http://localhost`, `http://dig.local`, or a loopback IP (#91 —
     // the dual listener means a page can be served from any of the canonical local
-    // names). Reflect those so the browser's CORS preflight passes. The companion is
+    // names). Reflect those so the browser's CORS preflight passes. The node is
     // loopback-only, so reflecting these local origins is not a public-exposure risk.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
@@ -163,7 +163,7 @@ async fn host_guard(req: Request, next: Next) -> Response {
 pub fn build_state(config: &Config) -> AppState {
     config.apply_to_env();
     let node = Node::from_env();
-    let config_path = dig_node::config_path();
+    let config_path = digstore_node::config_path();
     // Generate (or read) the control token into <config_dir>/control-token. A
     // failure to persist it (e.g. unwritable dir) is non-fatal: fall back to an
     // in-memory token so the control plane is still gated (a controller that can't
@@ -184,9 +184,9 @@ pub fn build_state(config: &Config) -> AppState {
         node,
         upstream: config.upstream.clone(),
         http: reqwest::Client::builder()
-            .user_agent(concat!("dig-companion/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("dig-node/", env!("CARGO_PKG_VERSION")))
             .build()
-            .expect("dig-companion: build http client"),
+            .expect("dig-node: build http client"),
         addr: config.bind_addr(),
         config_path,
         control_token,
@@ -212,7 +212,7 @@ fn control_ctx(state: &AppState) -> ControlCtx {
 }
 
 /// `GET /health` (and `GET /`) — liveness + mode + cache stats + discovery hooks.
-/// Shape extends the Node companion's health body (existing probes keep parsing
+/// Shape extends the Node reference server's health body (existing probes keep parsing
 /// `status`/`version`/`mode`/`upstream`/`cache`) with agent-friendly additions:
 /// `service` (the canonical `dig-node` name), `commit`, the bound `addr`, the
 /// cache `dir` + `shared` flag (#96 — is the cache the shared canonical dir or a
@@ -271,7 +271,7 @@ async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
 /// Blind-passthrough fallback: dig-node resolves only `dig.getContent` /
 /// `dig.getAnchoredRoot` / `cache.*` and returns `-32601 method not found` for
 /// everything else. For those (e.g. `dig.getProof`, `dig.listCapsules`,
-/// `dig.getManifest`) the companion relays the ORIGINAL request to the upstream so
+/// `dig.getManifest`) this service relays the ORIGINAL request to the upstream so
 /// it stays a correct transparent proxy — matching the Node reference server and
 /// the surface clients expect from an rpc.dig.net endpoint.
 async fn rpc(
@@ -391,9 +391,9 @@ async fn proxy(http: &reqwest::Client, upstream: &str, req: &Value) -> Result<Va
         .map_err(|e| format!("upstream returned non-JSON: {e}"))
 }
 
-/// Run the companion HTTP server until the process is asked to stop. Binds the
+/// Run the dig-node HTTP server until the process is asked to stop. Binds the
 /// configured loopback address and serves until Ctrl-C / SIGTERM (so the OS
-/// service manager's stop is graceful). This is the body of `dig-companion run`
+/// service manager's stop is graceful). This is the body of `dig-node run`
 /// and the unix-service entrypoint (systemd/launchd send SIGTERM to stop).
 pub async fn serve(config: Config) -> std::io::Result<()> {
     serve_with_shutdown(config, shutdown_signal()).await
