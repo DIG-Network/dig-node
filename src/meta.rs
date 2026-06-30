@@ -41,6 +41,17 @@ pub const GIT_SHA: &str = env!("DIG_COMPANION_GIT_SHA");
 /// `cache.getConfig` `cache_dir`/`shared` fields) — no release tag contains it yet,
 /// so this is the short `rev`. Kept in sync with the `rev`/`tag` on the `dig-node`
 /// git dependency in `Cargo.toml`.
+///
+/// NOTE on what this rev serves LOCALLY vs RELAYS: at this pin `handle_rpc` resolves
+/// `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` locally and returns
+/// `-32601` for everything else (so the companion relays it to the upstream). The
+/// in-process local-deploy stage (`dig.stage`) and locally-computed collection reads
+/// (`dig.getCollection`/`dig.listCollectionItems`) land in a LATER dig-node rev that
+/// pulls `digstore-stage` (a guest-wasm build prereq the thin companion deliberately
+/// avoids). The catalogue below reflects THIS pin: collection reads are relayed
+/// (`passthrough`). When the companion bumps to a stage-capable dig-node, flip those
+/// to `served: local` (the drift-guard test in `tests/openrpc_drift_guard.rs`
+/// enforces the match either way).
 pub const DIG_NODE_VERSION: &str = "b2632c4";
 
 /// The DIG read protocol the node speaks (the rpc.dig.net §21 JSON-RPC read
@@ -80,21 +91,28 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
+            // RELAYED, not served locally: the embedded dig-node's handle_rpc
+            // resolves ONLY dig.getContent (not this alias), so a dig.getCapsule
+            // request returns -32601 from the node and the companion shell relays it
+            // to the upstream. A caller wanting a local-first read uses
+            // dig.getContent with {store_id, root, retrieval_key}.
             name: "dig.getCapsule",
-            served: "local",
-            summary: "Alias of dig.getContent for a capsule (storeId:rootHash).",
+            served: "passthrough",
+            summary: "Capsule read (storeId:rootHash) — relayed verbatim to the upstream \
+                      (the local node serves dig.getContent; use that for local-first).",
             requires_auth: false,
         },
         MethodInfo {
             name: "dig.getAnchoredRoot",
             served: "local",
-            summary: "The store's chain-anchored tip root (DataStore singleton lineage).",
+            summary: "The store's chain-anchored tip root (DataStore singleton lineage). \
+                      Params { store_id }; result { store_id, root }.",
             requires_auth: false,
         },
         MethodInfo {
             name: "cache.getConfig",
             served: "local",
-            summary: "On-disk cache config: { cap_bytes, used_bytes }.",
+            summary: "On-disk cache config: { cap_bytes, used_bytes, cache_dir, shared }.",
             requires_auth: false,
         },
         MethodInfo {
@@ -152,18 +170,24 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
+            // #39 public collection reads. At THIS dig-node pin they are RELAYED to
+            // the upstream (handle_rpc returns -32601 → the companion passthrough
+            // relays); a later stage-capable dig-node serves them locally from
+            // coinset data (see DIG_NODE_VERSION note). Result shape is the upstream's.
             name: "dig.getCollection",
             served: "passthrough",
-            summary: "Public collection facts (creator DID, item count, uniform royalty) \
-                      for a set of NFT launcher ids — relayed verbatim to the upstream.",
+            summary: "Public collection facts for a set of NFT launcher ids. Params \
+                      { launcher_ids, did? }; result { did, declared_did, item_count, \
+                      resolved_count, royalty_basis_points }.",
             requires_auth: false,
         },
         MethodInfo {
             name: "dig.listCollectionItems",
             served: "passthrough",
             summary: "A paginated page of a collection's NFT items resolved to their \
-                      CURRENT on-chain owner + royalty + CHIP-0007 metadata — relayed \
-                      verbatim to the upstream.",
+                      CURRENT on-chain owner + royalty + CHIP-0007 metadata. Params \
+                      { launcher_ids, offset?, limit? }; result { items, offset, limit, \
+                      total, next_offset }.",
             requires_auth: false,
         },
         // -- CONTROL / admin surface (loopback-only + local-token gated) ----------
@@ -280,6 +304,13 @@ pub enum ErrorCode {
     /// `-32000` — the companion shell failed to dispatch the request to the node.
     /// Companion-shell error.
     DispatchFailed,
+    /// `-32004` — the requested resource is not available at the requested root (a
+    /// genuine content miss for that capsule, distinct from a transport failure).
+    /// Returned by the upstream DIG RPC (`rpc.dig.net`) for the content/proof read
+    /// methods and recognized by dig-node's §21 remote client; relayed through the
+    /// companion on a passthrough. Catalogued so a client can branch on "not at this
+    /// root" rather than scraping the message.
+    ResourceNotAvailableAtRoot,
     /// `-32010` — the blind-passthrough relay to the upstream DIG RPC failed
     /// (unreachable / non-JSON). Companion-shell error distinguishing a local
     /// proxy failure from an upstream-returned JSON-RPC error.
@@ -311,6 +342,7 @@ impl ErrorCode {
             ErrorCode::MethodNotFound => -32601,
             ErrorCode::InvalidParams => -32602,
             ErrorCode::DispatchFailed => -32000,
+            ErrorCode::ResourceNotAvailableAtRoot => -32004,
             ErrorCode::UpstreamError => -32010,
             ErrorCode::Unauthorized => -32020,
             ErrorCode::NotSupported => -32021,
@@ -327,6 +359,7 @@ impl ErrorCode {
             ErrorCode::MethodNotFound => "METHOD_NOT_FOUND",
             ErrorCode::InvalidParams => "INVALID_PARAMS",
             ErrorCode::DispatchFailed => "DISPATCH_FAILED",
+            ErrorCode::ResourceNotAvailableAtRoot => "RESOURCE_NOT_AVAILABLE_AT_ROOT",
             ErrorCode::UpstreamError => "UPSTREAM_ERROR",
             ErrorCode::Unauthorized => "UNAUTHORIZED",
             ErrorCode::NotSupported => "NOT_SUPPORTED",
@@ -335,8 +368,9 @@ impl ErrorCode {
     }
 
     /// Where the error originates: `shell` = minted by the companion shell,
-    /// `boundary` = the dig-node/upstream method-not-found cue, `upstream` =
-    /// proxied from the upstream DIG RPC / dig-node.
+    /// `boundary` = the dig-node/upstream method-not-found cue, `node` = minted by
+    /// the embedded local dig-node (a locally-served method's own error),
+    /// `upstream` = returned by the upstream DIG RPC (relayed on a passthrough).
     pub fn origin(self) -> &'static str {
         match self {
             ErrorCode::InvalidRequest
@@ -347,7 +381,12 @@ impl ErrorCode {
             | ErrorCode::ControlError
             | ErrorCode::ParseError => "shell",
             ErrorCode::MethodNotFound => "boundary",
-            ErrorCode::InvalidParams => "upstream",
+            // INVALID_PARAMS is returned by the embedded dig-node's locally-served
+            // read methods (bad store_id / retrieval_key) before any I/O.
+            ErrorCode::InvalidParams => "node",
+            // The upstream DIG RPC returns -32004 for a genuine content miss at the
+            // requested root; the companion relays it on a passthrough.
+            ErrorCode::ResourceNotAvailableAtRoot => "upstream",
         }
     }
 
@@ -361,6 +400,9 @@ impl ErrorCode {
             ErrorCode::MethodNotFound => "Method is not resolved locally or by the upstream.",
             ErrorCode::InvalidParams => "Invalid or missing method parameters.",
             ErrorCode::DispatchFailed => "The node failed to dispatch the request.",
+            ErrorCode::ResourceNotAvailableAtRoot => {
+                "The requested resource is not available at the requested root."
+            }
             ErrorCode::UpstreamError => {
                 "The blind-passthrough relay to the upstream DIG RPC failed."
             }
@@ -382,6 +424,7 @@ impl ErrorCode {
             ErrorCode::MethodNotFound,
             ErrorCode::InvalidParams,
             ErrorCode::DispatchFailed,
+            ErrorCode::ResourceNotAvailableAtRoot,
             ErrorCode::UpstreamError,
             ErrorCode::Unauthorized,
             ErrorCode::NotSupported,
@@ -676,7 +719,7 @@ mod tests {
             "rpc.discover",
             "dig.getProof",
             "dig.listCapsules",
-            // #39 public collection reads (passthrough to the upstream dig-node).
+            // #39 public collection reads (relayed to the upstream at this dig-node pin).
             "dig.getCollection",
             "dig.listCollectionItems",
             // CONTROL surface (#101a).
@@ -702,15 +745,21 @@ mod tests {
 
     #[test]
     fn collection_read_methods_are_catalogued_passthrough_no_auth() {
-        // #39: dig.getCollection / dig.listCollectionItems are public reads — served by
-        // passthrough to the upstream dig-node, never auth-gated — and they appear in the
-        // generated OpenRPC so rpc.discover / /openrpc.json stay correct.
+        // #39: dig.getCollection / dig.listCollectionItems are public reads. At this
+        // dig-node pin they are RELAYED to the upstream (handle_rpc returns -32601 →
+        // the companion passthrough relays), never auth-gated — and they appear in the
+        // generated OpenRPC so rpc.discover / /openrpc.json stay correct. (A later
+        // stage-capable dig-node serves them locally; the drift-guard test enforces
+        // whichever is true.)
         for name in ["dig.getCollection", "dig.listCollectionItems"] {
             let m = methods()
                 .iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} missing from the method catalogue"));
-            assert_eq!(m.served, "passthrough", "{name} must be a passthrough read");
+            assert_eq!(
+                m.served, "passthrough",
+                "{name} is relayed at this dig-node pin"
+            );
             assert!(
                 !m.requires_auth,
                 "{name} is a public read (no control token)"
