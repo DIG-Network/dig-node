@@ -1,6 +1,6 @@
 //! CLI contract tests against the BUILT binary: `--json` machine output and the
 //! differentiated exit-code table. Cargo provides the binary path via
-//! `CARGO_BIN_EXE_dig-companion`, so these exercise the real invocation surface an
+//! `CARGO_BIN_EXE_dig-node`, so these exercise the real invocation surface an
 //! agent drives — not just the lib functions.
 
 use std::process::Command;
@@ -8,7 +8,7 @@ use std::process::Command;
 use serde_json::Value;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_dig-companion"))
+    Command::new(env!("CARGO_BIN_EXE_dig-node"))
 }
 
 /// `status --json` against a port nothing listens on: success envelope to stdout,
@@ -20,7 +20,7 @@ fn status_json_reports_not_serving_with_exit_one() {
         // A port nothing is bound to in CI → not serving.
         .env("DIG_COMPANION_PORT", "1")
         .output()
-        .expect("run dig-companion status --json");
+        .expect("run dig-node status --json");
 
     // Exit code 1 == NOT_SERVING (distinct from the generic failure codes).
     assert_eq!(out.status.code(), Some(1), "status not-serving must exit 1");
@@ -41,7 +41,7 @@ fn status_human_prose_still_exits_one_when_not_serving() {
         .arg("status")
         .env("DIG_COMPANION_PORT", "1")
         .output()
-        .expect("run dig-companion status");
+        .expect("run dig-node status");
 
     assert_eq!(out.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -60,7 +60,7 @@ fn unknown_subcommand_is_a_usage_error() {
     let out = bin()
         .arg("definitely-not-a-command")
         .output()
-        .expect("run dig-companion with a bad arg");
+        .expect("run dig-node with a bad arg");
     assert!(!out.status.success(), "bad arg must fail");
 }
 

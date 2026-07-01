@@ -37,16 +37,16 @@
 //!
 //! Cache + sync operations proxy to digstore's `dig-node` crate (`cache_*`,
 //! `clear_cache`, `set_cache_cap_bytes`, `Node::cache_fetch_and_cache` /
-//! `cache_remove_cached` / `cache_list_cached`) — the companion never duplicates the
+//! `cache_remove_cached` / `cache_list_cached`) — this service never duplicates the
 //! read/cache logic. The shell owns only the small amount of state the crate does
 //! not model: the **pin registry** (which stores the operator chose to host, so they
 //! survive being listed even before/after caching) and the **upstream override**,
-//! both persisted in the companion's own keys inside dig-node's shared `config.json`.
+//! both persisted in this service's own keys inside the shared `config.json`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use dig_node::Node;
+use digstore_node::Node;
 use serde_json::{json, Value};
 
 use crate::meta::ErrorCode;
@@ -88,7 +88,7 @@ pub fn control_token_path(config_path: &Path) -> PathBuf {
 /// the dir) read the same value. Written with owner-only permissions on Unix
 /// (`0600`) so another user on the box cannot read it. Never committed.
 pub fn load_or_create_token() -> std::io::Result<String> {
-    let path = control_token_path(&dig_node::config_path());
+    let path = control_token_path(&digstore_node::config_path());
     load_or_create_token_at(&path)
 }
 
@@ -247,19 +247,20 @@ pub fn control_ok(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-// -- Pin registry (companion-owned config state) -----------------------------
+// -- Pin registry (service-owned config state) -------------------------------
 //
-// dig-node models the cache as a set of capsules but has no concept of a "pinned"
-// store the operator deliberately hosts. The companion owns that small registry,
-// persisted under its OWN key (`pinned_stores`) in dig-node's shared `config.json`
-// (read-modify-write via an atomic temp+rename write), so a pin survives listing
-// and an LRU eviction (the controller can re-trigger a sync for a pinned store).
+// The embedded dig-node read path models the cache as a set of capsules but has no
+// concept of a "pinned" store the operator deliberately hosts. This service owns
+// that small registry, persisted under its OWN key (`pinned_stores`) in the shared
+// `config.json` (read-modify-write via an atomic temp+rename write), so a pin
+// survives listing and an LRU eviction (the controller can re-trigger a sync for a
+// pinned store).
 
-/// The config.json key the companion stores the pinned-store list under. Namespaced
+/// The config.json key this service stores the pinned-store list under. Namespaced
 /// so it never collides with dig-node's own keys (`cache_cap_bytes`, `wc_project_id`).
 const PINNED_KEY: &str = "pinned_stores";
 
-/// The companion config.json key for the persisted upstream override (set via
+/// The config.json key for the persisted upstream override (set via
 /// `control.config.setUpstream`; read by `Config::from_env` on next start).
 pub const UPSTREAM_OVERRIDE_KEY: &str = "upstream_override";
 
@@ -267,7 +268,7 @@ pub const UPSTREAM_OVERRIDE_KEY: &str = "upstream_override";
 /// canonical lowercase 64-hex store id (optionally with a pinned root, kept as a
 /// `{store_id, root?}` object). Missing/blank config → empty list.
 pub fn read_pins() -> Vec<Value> {
-    read_pins_from(&dig_node::config_path())
+    read_pins_from(&digstore_node::config_path())
 }
 
 /// [`read_pins`] for an explicit config path (tests).
@@ -297,13 +298,13 @@ pub fn read_upstream_override_from(config_path: &Path) -> Option<String> {
 
 /// Read the persisted upstream override from the real config path.
 pub fn read_upstream_override() -> Option<String> {
-    read_upstream_override_from(&dig_node::config_path())
+    read_upstream_override_from(&digstore_node::config_path())
 }
 
 /// Read-modify-write the node's config.json, applying `mutate` to the parsed JSON
 /// and writing it back atomically (temp file in the same dir + rename). Mirrors
 /// dig-node's own `write_atomic` so the shared config is never observed torn. Used
-/// for the companion's `pinned_stores` / `upstream_override` keys ONLY — it never
+/// for this service's `pinned_stores` / `upstream_override` keys ONLY — it never
 /// touches dig-node's keys.
 fn update_config(config_path: &Path, mutate: impl FnOnce(&mut Value)) -> std::io::Result<()> {
     if let Some(dir) = config_path.parent() {
@@ -441,7 +442,7 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
         "control.cache.get" => control_ok(id, cache_get()),
         "control.cache.setCap" => cache_set_cap(id, params),
         "control.cache.clear" => {
-            dig_node::clear_cache();
+            digstore_node::clear_cache();
             control_ok(id, json!({ "cleared": true }))
         }
         "control.hostedStores.list" => control_ok(id, hosted_list(ctx).await),
@@ -530,8 +531,8 @@ fn config_set_upstream(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 /// Cache view (cap/used/dir/shared) — reuses the dig-node crate's resolvers.
 fn cache_get() -> Value {
     json!({
-        "cap_bytes": dig_node::cache_cap_bytes(),
-        "used_bytes": dig_node::cache_used_bytes(),
+        "cap_bytes": digstore_node::cache_cap_bytes(),
+        "used_bytes": digstore_node::cache_used_bytes(),
         "dir": crate::meta::cache_dir().display().to_string(),
         "shared": crate::meta::cache_shared(),
     })
@@ -547,7 +548,7 @@ fn cache_set_cap(id: Value, params: &Value) -> Value {
         );
     };
     let floored = cap.max(64 * 1024 * 1024);
-    match dig_node::set_cache_cap_bytes(floored) {
+    match digstore_node::set_cache_cap_bytes(floored) {
         Ok(()) => control_ok(id, json!({ "cap_bytes": floored })),
         Err(e) => control_error(
             id,
@@ -838,7 +839,7 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 }
 
 /// Count distinct store ids among the cached capsules. PURE-ish (reads the slice).
-fn distinct_store_count(cached: &[dig_node::CachedCapsule]) -> usize {
+fn distinct_store_count(cached: &[digstore_node::CachedCapsule]) -> usize {
     cached
         .iter()
         .map(|c| c.store_id.as_str())
@@ -920,7 +921,7 @@ mod tests {
     #[test]
     fn load_or_create_token_persists_and_is_stable() {
         let dir = std::env::temp_dir().join(format!(
-            "dig-companion-token-test-{}-{}",
+            "dig-node-token-test-{}-{}",
             std::process::id(),
             line!()
         ));
@@ -949,7 +950,7 @@ mod tests {
     #[test]
     fn pin_registry_roundtrips_and_is_idempotent() {
         let dir = std::env::temp_dir().join(format!(
-            "dig-companion-pins-test-{}-{}",
+            "dig-node-pins-test-{}-{}",
             std::process::id(),
             line!()
         ));
@@ -976,10 +977,10 @@ mod tests {
 
     #[test]
     fn update_config_preserves_dig_node_keys() {
-        // The companion's pin/upstream writes must NOT clobber dig-node's own keys
+        // This service's pin/upstream writes must NOT clobber dig-node's own keys
         // in the shared config.json (cache_cap_bytes, wc_project_id).
         let dir = std::env::temp_dir().join(format!(
-            "dig-companion-config-merge-test-{}-{}",
+            "dig-node-config-merge-test-{}-{}",
             std::process::id(),
             line!()
         ));
@@ -1009,7 +1010,7 @@ mod tests {
     #[test]
     fn upstream_override_roundtrips_and_clears() {
         let dir = std::env::temp_dir().join(format!(
-            "dig-companion-upstream-test-{}-{}",
+            "dig-node-upstream-test-{}-{}",
             std::process::id(),
             line!()
         ));

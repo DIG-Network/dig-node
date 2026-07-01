@@ -1,6 +1,6 @@
-//! dig-companion CLI — the entrypoint for both manual runs and the OS service.
-//! (The shipped binary is named `dig-companion` for install stability, but it is
-//! the local **dig-node** service — see the canonical-terminology note in SYSTEM.md.)
+//! dig-node CLI — the entrypoint for both manual runs and the OS service.
+//! (The binary, crate, and service all carry the canonical `dig-node` name; this is
+//! the local **dig-node** service the DIG Chrome extension points `server.host` at.)
 //!
 //! Subcommands:
 //!   run        Run the node in the foreground (the service entrypoint too).
@@ -20,16 +20,16 @@
 //! structured object to **stdout** (`{ ok:true, action, ... }`) and routes human
 //! prose to **stderr**; on failure it emits `{ ok:false, error:{ code, exit_code,
 //! message, hint } }` to stdout and still exits with the differentiated code. The
-//! exit-code table is documented in [`dig_companion::cli`] and the README.
+//! exit-code table is documented in [`dig_node::cli`] and the README.
 
 use clap::{Parser, Subcommand};
-use dig_companion::cli::{error_envelope, success_envelope, ExitCode, Outcome};
-use dig_companion::config::Config;
-use dig_companion::{serve, service, VERSION};
+use dig_node::cli::{error_envelope, success_envelope, ExitCode, Outcome};
+use dig_node::config::Config;
+use dig_node::{serve, service, VERSION};
 
 #[derive(Parser)]
 #[command(
-    name = "dig-companion",
+    name = "dig-node",
     version = VERSION,
     about = "Local DIG node for the DIG Chrome extension (installable as an OS service)",
     long_about = None,
@@ -193,7 +193,7 @@ fn run(config: Config) -> std::io::Result<()> {
 /// non-Windows there is no SCM, so this just runs in the foreground like `run`.
 #[cfg(windows)]
 fn run_service(_config: Config) -> std::io::Result<()> {
-    dig_companion::win_service::run()
+    dig_node::win_service::run()
 }
 #[cfg(not(windows))]
 fn run_service(config: Config) -> std::io::Result<()> {

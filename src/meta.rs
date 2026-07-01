@@ -10,7 +10,7 @@
 //!   and `/.well-known/dig-node.json`).
 //! * [`ErrorCode`] — the catalogued, stable, machine-readable error codes on the
 //!   JSON-RPC/wire boundary (UPPER_SNAKE symbolic strings + the numeric JSON-RPC
-//!   code), with the companion-shell vs proxied-upstream distinction.
+//!   code), with the dig-node-shell vs proxied-upstream distinction.
 //! * [`openrpc_document`] — the OpenRPC 3.0 spec for the node's RPC surface.
 //! * [`well_known_document`] — `/.well-known/dig-node.json` (addr + cache + the
 //!   method/spec/error pointers an agent discovers first).
@@ -21,18 +21,16 @@
 use serde_json::{json, Value};
 
 /// Service identity reported everywhere. `dig-node` is the canonical, user-facing
-/// name for the local node (renamed from `dig-companion`, per SYSTEM.md → canonical
-/// terminology). The binary/crate name stays `dig-companion` for install stability,
-/// but the *service* an agent discovers identifies itself as `dig-node`.
+/// name for the local node (the binary, crate, and service all carry this name).
 pub const SERVICE_NAME: &str = "dig-node";
 
-/// The companion binary version (Cargo package version).
+/// The dig-node binary version (Cargo package version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The git commit the binary was built from (captured by `build.rs`), or
 /// `"unknown"` when built outside a git checkout. Lets an agent correlate a
 /// running node back to an exact source revision.
-pub const GIT_SHA: &str = env!("DIG_COMPANION_GIT_SHA");
+pub const GIT_SHA: &str = env!("DIG_NODE_GIT_SHA");
 
 /// The embedded dig-node read-path version: the digstore git ref the `dig-node`
 /// crate is pinned to (the same local-first node the native DIG Browser runs
@@ -44,12 +42,12 @@ pub const GIT_SHA: &str = env!("DIG_COMPANION_GIT_SHA");
 ///
 /// NOTE on what this rev serves LOCALLY vs RELAYS: at this pin `handle_rpc` resolves
 /// `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` locally and returns
-/// `-32601` for everything else (so the companion relays it to the upstream). The
+/// `-32601` for everything else (so this service relays it to the upstream). The
 /// in-process local-deploy stage (`dig.stage`) and locally-computed collection reads
 /// (`dig.getCollection`/`dig.listCollectionItems`) land in a LATER dig-node rev that
-/// pulls `digstore-stage` (a guest-wasm build prereq the thin companion deliberately
+/// pulls `digstore-stage` (a guest-wasm build prereq this thin service deliberately
 /// avoids). The catalogue below reflects THIS pin: collection reads are relayed
-/// (`passthrough`). When the companion bumps to a stage-capable dig-node, flip those
+/// (`passthrough`). When this service bumps to a stage-capable dig-node, flip those
 /// to `served: local` (the drift-guard test in `tests/openrpc_drift_guard.rs`
 /// enforces the match either way).
 pub const DIG_NODE_VERSION: &str = "b2632c4";
@@ -64,10 +62,10 @@ pub struct MethodInfo {
     /// The JSON-RPC method name (e.g. `dig.getContent`).
     pub name: &'static str,
     /// Where the method is resolved: `local` = answered by the embedded dig-node
-    /// (local-first, blind-fetch+verify+decrypt+cache), `passthrough` = relayed
-    /// verbatim to the upstream DIG RPC, `shell` = answered by the companion shell
-    /// itself (discovery methods), `control` = the CONTROL/admin surface answered by
-    /// the shell, loopback-only AND gated behind the local control token.
+    /// read path (local-first, blind-fetch+verify+decrypt+cache), `passthrough` =
+    /// relayed verbatim to the upstream DIG RPC, `shell` = answered by the dig-node
+    /// service shell itself (discovery methods), `control` = the CONTROL/admin surface
+    /// answered by the shell, loopback-only AND gated behind the local control token.
     pub served: &'static str,
     /// Human/agent one-liner describing what the method does.
     pub summary: &'static str,
@@ -91,9 +89,9 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
-            // RELAYED, not served locally: the embedded dig-node's handle_rpc
+            // RELAYED, not served locally: the embedded read path's handle_rpc
             // resolves ONLY dig.getContent (not this alias), so a dig.getCapsule
-            // request returns -32601 from the node and the companion shell relays it
+            // request returns -32601 from the node and the dig-node shell relays it
             // to the upstream. A caller wanting a local-first read uses
             // dig.getContent with {store_id, root, retrieval_key}.
             name: "dig.getCapsule",
@@ -171,7 +169,7 @@ pub fn methods() -> &'static [MethodInfo] {
         },
         MethodInfo {
             // #39 public collection reads. At THIS dig-node pin they are RELAYED to
-            // the upstream (handle_rpc returns -32601 → the companion passthrough
+            // the upstream (handle_rpc returns -32601 → the service passthrough
             // relays); a later stage-capable dig-node serves them locally from
             // coinset data (see DIG_NODE_VERSION note). Result shape is the upstream's.
             name: "dig.getCollection",
@@ -285,34 +283,34 @@ pub fn method_names() -> Vec<&'static str> {
 /// The catalogued, stable error codes the node emits on the JSON-RPC/wire boundary.
 ///
 /// Each variant carries a numeric JSON-RPC `code` AND a stable UPPER_SNAKE symbolic
-/// `name` — agents branch on the symbolic name (never on prose). The companion owns
-/// the `-320xx` shell range (errors it mints itself); codes proxied from
-/// dig-node/upstream are catalogued separately so a client can tell a local-shell
-/// failure from an upstream one.
+/// `name` — agents branch on the symbolic name (never on prose). The dig-node shell
+/// owns the `-320xx` shell range (errors it mints itself); codes proxied from
+/// the read path/upstream are catalogued separately so a client can tell a
+/// local-shell failure from an upstream one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCode {
     /// `-32700` — request body was not valid JSON.
     ParseError,
     /// `-32600` — the request was not a single JSON-RPC object (e.g. a batch
-    /// array, which the node does not support). Companion-shell error.
+    /// array, which the node does not support). Dig-node-shell error.
     InvalidRequest,
     /// `-32601` — method not found (dig-node's cue to passthrough; surfaced to the
     /// client only when the upstream also rejects it). Boundary code.
     MethodNotFound,
     /// `-32602` — invalid params (e.g. missing store_id / urn). From dig-node.
     InvalidParams,
-    /// `-32000` — the companion shell failed to dispatch the request to the node.
-    /// Companion-shell error.
+    /// `-32000` — the dig-node shell failed to dispatch the request to the node.
+    /// Dig-node-shell error.
     DispatchFailed,
     /// `-32004` — the requested resource is not available at the requested root (a
     /// genuine content miss for that capsule, distinct from a transport failure).
     /// Returned by the upstream DIG RPC (`rpc.dig.net`) for the content/proof read
-    /// methods and recognized by dig-node's §21 remote client; relayed through the
-    /// companion on a passthrough. Catalogued so a client can branch on "not at this
-    /// root" rather than scraping the message.
+    /// methods and recognized by the read path's §21 remote client; relayed through
+    /// this service on a passthrough. Catalogued so a client can branch on "not at
+    /// this root" rather than scraping the message.
     ResourceNotAvailableAtRoot,
     /// `-32010` — the blind-passthrough relay to the upstream DIG RPC failed
-    /// (unreachable / non-JSON). Companion-shell error distinguishing a local
+    /// (unreachable / non-JSON). Dig-node-shell error distinguishing a local
     /// proxy failure from an upstream-returned JSON-RPC error.
     UpstreamError,
     /// `-32020` — a `control.*` (CONTROL/admin) method was called without a valid
@@ -367,9 +365,9 @@ impl ErrorCode {
         }
     }
 
-    /// Where the error originates: `shell` = minted by the companion shell,
-    /// `boundary` = the dig-node/upstream method-not-found cue, `node` = minted by
-    /// the embedded local dig-node (a locally-served method's own error),
+    /// Where the error originates: `shell` = minted by the dig-node service shell,
+    /// `boundary` = the read-path/upstream method-not-found cue, `node` = minted by
+    /// the embedded local read path (a locally-served method's own error),
     /// `upstream` = returned by the upstream DIG RPC (relayed on a passthrough).
     pub fn origin(self) -> &'static str {
         match self {
@@ -381,11 +379,11 @@ impl ErrorCode {
             | ErrorCode::ControlError
             | ErrorCode::ParseError => "shell",
             ErrorCode::MethodNotFound => "boundary",
-            // INVALID_PARAMS is returned by the embedded dig-node's locally-served
+            // INVALID_PARAMS is returned by the embedded read path's locally-served
             // read methods (bad store_id / retrieval_key) before any I/O.
             ErrorCode::InvalidParams => "node",
             // The upstream DIG RPC returns -32004 for a genuine content miss at the
-            // requested root; the companion relays it on a passthrough.
+            // requested root; this service relays it on a passthrough.
             ErrorCode::ResourceNotAvailableAtRoot => "upstream",
         }
     }
@@ -440,12 +438,12 @@ impl ErrorCode {
 /// `DIG_NODE_CACHE` shares ONE cache between the standalone service and the browser
 /// (see [`crate::config`] → "Shared `.dig` cache").
 ///
-/// dig-node keeps its effective resolver private (it may fall back to a
+/// The read path keeps its effective resolver private (it may fall back to a
 /// process-private dir when the canonical one is unwritable — surfaced as
-/// [`cache_shared`]`== false`); the companion mirrors the canonical-path logic to
+/// [`cache_shared`]`== false`); this service mirrors the canonical-path logic to
 /// surface it in `/health` and the well-known document for operator/agent
 /// discoverability. The AUTHORITATIVE effective dir + shared flag are available on
-/// the `cache.getConfig` RPC (the `cache_dir`/`shared` fields dig-node returns).
+/// the `cache.getConfig` RPC (the `cache_dir`/`shared` fields the read path returns).
 pub fn cache_dir() -> std::path::PathBuf {
     use std::path::PathBuf;
     std::env::var("DIG_NODE_CACHE")
@@ -462,11 +460,11 @@ pub fn cache_dir() -> std::path::PathBuf {
 
 /// Whether dig-node's EFFECTIVE cache dir is the shared canonical one (`true`) or a
 /// process-private fallback because the canonical dir was unwritable (`false`).
-/// Delegates to dig-node's resolver ([`dig_node::cache_dir_is_shared`]) so the
-/// value is authoritative — the companion never re-implements the writability
+/// Delegates to dig-node's resolver ([`digstore_node::cache_dir_is_shared`]) so the
+/// value is authoritative — this service never re-implements the writability
 /// probe. Surfaced additively in `/health` + the well-known document (#96).
 pub fn cache_shared() -> bool {
-    dig_node::cache_dir_is_shared()
+    digstore_node::cache_dir_is_shared()
 }
 
 /// The `GET /version` body: service identity + build provenance + the embedded
@@ -747,7 +745,7 @@ mod tests {
     fn collection_read_methods_are_catalogued_passthrough_no_auth() {
         // #39: dig.getCollection / dig.listCollectionItems are public reads. At this
         // dig-node pin they are RELAYED to the upstream (handle_rpc returns -32601 →
-        // the companion passthrough relays), never auth-gated — and they appear in the
+        // the service passthrough relays), never auth-gated — and they appear in the
         // generated OpenRPC so rpc.discover / /openrpc.json stay correct. (A later
         // stage-capable dig-node serves them locally; the drift-guard test enforces
         // whichever is true.)
@@ -804,7 +802,7 @@ mod tests {
         assert_eq!(ErrorCode::NotSupported.name(), "NOT_SUPPORTED");
         assert_eq!(ErrorCode::ControlError.code(), -32022);
         assert_eq!(ErrorCode::ControlError.name(), "CONTROL_ERROR");
-        // All are shell-origin (minted by the companion control plane).
+        // All are shell-origin (minted by the dig-node control plane).
         for e in [
             ErrorCode::Unauthorized,
             ErrorCode::NotSupported,
