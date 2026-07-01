@@ -1,28 +1,29 @@
-//! The companion's JSON-RPC surface — pure routing/normalisation, kept free of
-//! I/O so it is unit-testable and is the single source of truth for dispatch.
+//! The dig-node service's JSON-RPC surface — pure routing/normalisation, kept free
+//! of I/O so it is unit-testable and is the single source of truth for dispatch.
 //!
-//! The companion is a thin shell around digstore's `dig_node::handle_rpc`, which
-//! IS the rpc.dig.net-compatible local node the native DIG Browser runs
-//! in-process: `dig.getContent` returns blind ciphertext + a merkle inclusion
-//! proof + chunk lengths (local-first from cached `.dig` modules, else proxied to
-//! the upstream), `dig.getAnchoredRoot` resolves the chain-anchored tip root, and
-//! the `cache.*` methods configure the on-disk cache. The CALLER (the extension /
-//! hub / browser) does the verify + decrypt locally — so the companion must mirror
-//! dig-node's ciphertext contract exactly, NOT return plaintext.
+//! This service is a thin shell around digstore's `dig-node` read-path crate
+//! (`digstore_node::handle_rpc`), which IS the rpc.dig.net-compatible local node the
+//! native DIG Browser runs in-process: `dig.getContent` returns blind ciphertext +
+//! a merkle inclusion proof + chunk lengths (local-first from cached `.dig` modules,
+//! else proxied to the upstream), `dig.getAnchoredRoot` resolves the chain-anchored
+//! tip root, and the `cache.*` methods configure the on-disk cache. The CALLER (the
+//! extension / hub / browser) does the verify + decrypt locally — so this service
+//! must mirror the read path's ciphertext contract exactly, NOT return plaintext.
 //!
-//! What this module owns is the small amount of *request shaping* dig-node needs:
-//! the extension always sends the canonical `{store_id, root, retrieval_key, …}`
-//! params, but other callers may send a `urn` or `resource` form. [`normalize_request`]
-//! maps those onto the field names dig-node reads, so any well-formed DIG request
-//! reaches the node, and everything else passes through untouched.
+//! What this module owns is the small amount of *request shaping* the read path
+//! needs: the extension always sends the canonical `{store_id, root, retrieval_key,
+//! …}` params, but other callers may send a `urn` or `resource` form.
+//! [`normalize_request`] maps those onto the field names the read path reads, so any
+//! well-formed DIG request reaches the node, and everything else passes through
+//! untouched.
 
 use serde_json::{json, Value};
 
 use crate::meta::ErrorCode;
 
-/// How the companion handles a given JSON-RPC method. Informational/structural —
-/// dispatch itself is `dig_node::handle_rpc`; this classification drives request
-/// normalisation and keeps the routing intent documented and tested.
+/// How the dig-node service handles a given JSON-RPC method. Informational/
+/// structural — dispatch itself is `digstore_node::handle_rpc`; this classification
+/// drives request normalisation and keeps the routing intent documented and tested.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Route {
     /// `dig.getContent` / `dig.getCapsule` — verified content retrieval (returns
@@ -35,8 +36,8 @@ pub enum Route {
     /// `cache.getConfig` / `setCapBytes` / `clear` / `listCached` / `removeCached`
     /// / `fetchAndCache` — the on-disk cache config + manager surface.
     Cache,
-    /// Anything else — relayed verbatim (dig-node passes unknown methods through
-    /// to the upstream, so the companion stays a correct transparent proxy).
+    /// Anything else — relayed verbatim (the read path passes unknown methods
+    /// through to the upstream, so this service stays a correct transparent proxy).
     Passthrough,
 }
 
@@ -56,7 +57,7 @@ pub fn route_method(method: &str) -> Route {
 /// The error object includes the numeric JSON-RPC `code` AND a `data.code` stable
 /// UPPER_SNAKE symbolic name (+ `data.origin`) drawn from [`ErrorCode`], so an
 /// agent branches on the symbolic name rather than scraping the human `message`.
-/// This is the only way the companion shell mints an error — every shell error is
+/// This is the only way the dig-node shell mints an error — every shell error is
 /// therefore catalogued and discoverable via `rpc.discover` / `/openrpc.json`.
 pub fn rpc_error(id: Value, code: ErrorCode, message: impl Into<String>) -> Value {
     json!({
@@ -78,9 +79,9 @@ pub fn rpc_error(id: Value, code: ErrorCode, message: impl Into<String>) -> Valu
 /// field is absent (never overwriting an explicit value):
 ///   * `storeId` → `store_id`
 ///   * `resource_key` / `resourceKey` → `retrieval_key` (a pre-hashed key)
-///   * a `"latest"` (or empty) root is left as-is — dig-node treats a non-64-hex
-///     root as rootless and proxies, which is the correct behaviour for the
-///     companion (it has no chain client to resolve "latest" to a concrete root).
+///   * a `"latest"` (or empty) root is left as-is — the read path treats a non-64-hex
+///     root as rootless and proxies, which is the correct behaviour for this service
+///     (it has no chain client to resolve "latest" to a concrete root).
 ///
 /// Returns the (possibly cloned-and-edited) request Value. PURE — no I/O.
 pub fn normalize_request(mut req: Value) -> Value {

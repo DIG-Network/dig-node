@@ -1,10 +1,10 @@
-name: Release dig-companion
+name: Release dig-node
 
-# On a version tag (v*), build the self-contained `dig-companion` service binary for
+# On a version tag (v*), build the self-contained `dig-node` service binary for
 # every supported OS/arch and attach them to a GitHub Release. Mirrors the
 # tag-driven, per-OS matrix pattern of digstore's release workflow, but the artifact
 # here is the plain installable binary (no Tauri installer): users download it and
-# run `dig-companion install`.
+# run `dig-node install`.
 #
 # DUAL ASSET NAMING — every per-OS/arch binary is published under TWO names so both
 # downstream consumers resolve it with NO change on their side:
@@ -18,10 +18,11 @@ name: Release dig-companion
 #       see apt.dig.net/packaging/config.sh::PKG_dig_node_ASSET_TEMPLATE) and the
 #       installer keeps it as its pre-rename fallback (Repo::dig_node_legacy).
 #
-# The binary itself is identical; only the filename differs. The repo was renamed
-# dig-companion → dig-node but the BINARY name stays `dig-companion` (Cargo.toml
-# default-run), so publishing both names keeps every matcher byte-exact across the
-# rename without editing the consumer repos.
+# The binary itself is identical; only the filename differs. The repo + Cargo binary
+# were renamed dig-companion → dig-node, so the build now emits `dig-node` and the
+# CANONICAL asset matches the produced binary; the legacy `dig-companion-*` asset is
+# still published (a copy of the same bytes) so apt.dig.net + the installer fallback
+# keep resolving byte-exact across the rename without editing the consumer repos.
 #
 # Per OS/arch (each emitted under both stems above):
 #   * windows-x64   (x86_64-pc-windows-msvc,  windows-latest)
@@ -100,11 +101,11 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: dig-companion.exe
+            bin: dig-node.exe
             out_name: windows-x64.exe
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: dig-companion
+            bin: dig-node
             out_name: linux-x64
           # Both macOS arches build on the fast Apple-silicon macos-14 runner.
           # The Intel binary is CROSS-COMPILED there (host arm64 → target
@@ -123,11 +124,11 @@ jobs:
           # thin-shim + apt asset matchers still resolve them.
           - os: macos-14 # Apple silicon (arm64)
             target: aarch64-apple-darwin
-            bin: dig-companion
+            bin: dig-node
             out_name: macos-arm64
           - os: macos-14 # Apple silicon — cross-compiles the Intel binary
             target: x86_64-apple-darwin
-            bin: dig-companion
+            bin: dig-node
             out_name: macos-x64
     runs-on: ${{ matrix.os }}
     steps:
@@ -151,7 +152,7 @@ jobs:
           key: ${{ runner.os }}-companion-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-companion-build-${{ matrix.target }}-
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-companion
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-node
       - name: Stage artifact (dual-named)
         id: stage
         shell: bash

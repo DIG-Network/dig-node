@@ -1,9 +1,11 @@
 # dig-node — user & operator journey
 
-> **Naming.** The shipped binary is `dig-companion` (kept stable so existing installs/clients
-> keep working), but the **service it runs is `dig-node`** — the canonical, user-facing name for
-> the local DIG node (per `SYSTEM.md` → *Canonical terminology & branding*). Everything the user
-> sees and every machine-readable surface identifies itself as `dig-node`.
+> **Naming.** The binary, crate, and service are all `dig-node` — the canonical, user-facing name
+> for the local DIG node (per `SYSTEM.md` → *Canonical terminology & branding*). Everything the user
+> sees and every machine-readable surface identifies itself as `dig-node`. The bind env-var names
+> stay `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` as a stable configuration contract, and the GitHub
+> release also publishes each binary under the legacy `dig-companion-*` filename (identical bytes) for
+> the apt package + the installer's pre-rename fallback.
 
 `dig-node` is the **localhost DIG node** that the [DIG Chrome extension](https://github.com/DIG-Network/dig-chrome-extension)
 (and any DIG client) resolves `chia://` content through, so retrieval happens **on the user's own
@@ -32,13 +34,13 @@ cache contract.
 
 The user installs `dig-node` as part of the DIG experience. The recommended path is the
 **[dig-installer](https://github.com/DIG-Network/dig-installer)**, which downloads the pinned
-`dig-companion` binary for the platform and runs `dig-companion install`. The binary can also be
+`dig-node` binary for the platform and runs `dig-node install`. The binary can also be
 downloaded directly from the repo's GitHub Releases (per-OS, self-contained — no Node runtime).
 
 ```bash
-dig-companion install     # register as an auto-starting OS service on 127.0.0.1:8080
-dig-companion start       # start it now
-dig-companion status      # confirm it's serving (probes /health)
+dig-node install     # register as an auto-starting OS service on 127.0.0.1:8080
+dig-node start       # start it now
+dig-node status      # confirm it's serving (probes /health)
 ```
 
 | OS | Service backend | Privilege | Runs as |
@@ -130,8 +132,8 @@ admin surface* for the full method/param/result table.
 ### 7. Manage / uninstall
 
 ```bash
-dig-companion stop
-dig-companion uninstall
+dig-node stop
+dig-node uninstall
 ```
 
 ---
@@ -163,7 +165,7 @@ every subcommand (machine output to stdout, prose to stderr).
   `INVALID_REQUEST` (-32600), `METHOD_NOT_FOUND` (-32601), `INVALID_PARAMS` (-32602),
   `DISPATCH_FAILED` (-32000, shell), `UPSTREAM_ERROR` (-32010, shell), and the control-plane codes
   `UNAUTHORIZED` (-32020), `NOT_SUPPORTED` (-32021), `CONTROL_ERROR` (-32022). The `data.origin`
-  field distinguishes companion-shell errors from upstream/boundary ones.
+  field distinguishes node-shell errors from upstream/boundary ones.
 - **`rpc.discover`**: returns the OpenRPC document over the wire, so an agent can introspect the
   full method + error surface (including `x-requires-auth` per method and the `info.x-control-auth`
   token scheme) with no out-of-band knowledge.
@@ -174,7 +176,7 @@ every subcommand (machine output to stdout, prose to stderr).
 
 | Hands off to / from | What crosses the boundary |
 |---|---|
-| **dig-installer → dig-node** | Installer downloads the pinned `dig-companion` binary and runs `dig-companion install`; the resolved plan/version is the install contract. |
+| **dig-installer → dig-node** | Installer downloads the pinned `dig-node` binary and runs `dig-node install`; the resolved plan/version is the install contract. |
 | **dig-chrome-extension ↔ dig-node** | The extension's *server host* points at `localhost:8080`; it sends `dig.getContent` and **verifies + decrypts** the returned ciphertext locally (read-crypto is the same `dig_client` WASM the hub uses). |
 | **dig-node → rpc.dig.net (upstream)** | On a cache miss / unhandled method, `dig-node` blind-fetches ciphertext + proof and relays passthrough methods over the same JSON-RPC read contract. |
 | **dig-node ↔ digstore (`dig-node` crate)** | The read path **is** digstore's `dig_node::handle_rpc`, pinned to a digstore release tag — the same node the native DIG Browser runs in-process. One read path, one cache contract across the ecosystem. |
