@@ -5,7 +5,7 @@
 //! (`StartServiceCtrlDispatcher`) and report `Running` within ~30s, or the SCM
 //! kills it with error 1053 ("the service did not respond … in a timely fashion").
 //! This module is that connection: the installed service runs
-//! `dig-companion run-service`, which calls [`run`] here to become a real Windows
+//! `dig-node run-service`, which calls [`run`] here to become a real Windows
 //! service — registering a control handler, reporting `Running`, serving until the
 //! SCM sends `Stop`, then reporting `Stopped`.
 //!

@@ -1447,22 +1447,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
-name = "dig-companion"
-version = "0.3.0"
-dependencies = [
- "axum",
- "clap",
- "dig-node",
- "reqwest",
- "serde",
- "serde_json",
- "service-manager",
- "tokio",
- "tower-http",
- "windows-service",
-]
-
-[[package]]
 name = "dig-node"
 version = "0.1.0"
 source = "git+https://github.com/DIG-Network/digstore.git?rev=b2632c43bdb61673f69cdf38a4bda24a07be12ae#b2632c43bdb61673f69cdf38a4bda24a07be12ae"
@@ -1482,6 +1466,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dig-node"
+version = "0.3.0"
+dependencies = [
+ "axum",
+ "clap",
+ "dig-node 0.1.0",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "service-manager",
+ "tokio",
+ "tower-http",
+ "windows-service",
 ]
 
 [[package]]

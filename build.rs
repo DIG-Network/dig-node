@@ -3,7 +3,7 @@
 //! of `GET /version` and `/.well-known/dig-node.json`).
 //!
 //! Agents correlate a deployed node back to a source revision via this SHA, so it
-//! is emitted as a compile-time env var (`DIG_COMPANION_GIT_SHA`). When the build
+//! is emitted as a compile-time env var (`DIG_NODE_GIT_SHA`). When the build
 //! happens outside a git checkout (e.g. a packaged source tarball), the SHA is
 //! recorded as `"unknown"` rather than failing the build.
 
@@ -11,7 +11,7 @@ use std::process::Command;
 
 fn main() {
     let sha = git_short_sha().unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=DIG_COMPANION_GIT_SHA={sha}");
+    println!("cargo:rustc-env=DIG_NODE_GIT_SHA={sha}");
     // Rerun if the checked-out commit moves, so the embedded SHA stays accurate.
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");

@@ -107,10 +107,10 @@ async fn start_companion(upstream: &str) -> (SocketAddr, EnvHold) {
 /// host controller reads it from `<config_dir>/control-token`; here the test reads
 /// the same on-disk token the server wrote, mirroring exactly that controller flow).
 async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
-    let config = dig_companion::Config {
+    let config = dig_node::Config {
         upstream: upstream.to_string(),
         port: 0, // bind ephemeral
-        ..dig_companion::Config::default()
+        ..dig_node::Config::default()
     };
 
     // Hold the env lock for the WHOLE test (returned as EnvHold), not just the build
@@ -130,25 +130,22 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
         // and on Windows a concurrent reader could hit that file mid-write, error,
         // and fall back to a random in-memory token → intermittent UNAUTHORIZED on a
         // token-gated control.* call (the flaky failure this guards). Give each call
-        // its own PARENT dir (`<temp>/dig-companion-test-<pid>-<seq>/cache`) so the
+        // its own PARENT dir (`<temp>/dig-node-test-<pid>-<seq>/cache`) so the
         // token + config.json are unique per server. (Set before from_env reads it.)
         let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let base = std::env::temp_dir().join(format!(
-            "dig-companion-test-{}-{}",
-            std::process::id(),
-            unique
-        ));
+        let base =
+            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
         let cache = base.join("cache");
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
-        let state = dig_companion::server::build_state(&config);
+        let state = dig_node::server::build_state(&config);
         // The token the server wrote (read from disk, exactly as a real controller
         // would). config_path() resolves under the temp DIG_NODE_CACHE we just set.
-        let token = dig_companion::control::load_or_create_token().unwrap();
+        let token = dig_node::control::load_or_create_token().unwrap();
         (state, token)
     };
-    let app = dig_companion::server::router(state);
+    let app = dig_node::server::router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -178,7 +175,7 @@ async fn health_reports_ok_version_mode_and_cache() {
 
     assert_eq!(resp["status"], json!("ok"));
     assert_eq!(resp["mode"], json!("local-node"));
-    assert_eq!(resp["version"], json!(dig_companion::VERSION));
+    assert_eq!(resp["version"], json!(dig_node::VERSION));
     assert_eq!(resp["upstream"], json!(upstream));
     assert!(resp["cache"]["cap_bytes"].as_u64().is_some());
     assert!(resp["cache"]["used_bytes"].as_u64().is_some());
@@ -238,7 +235,7 @@ async fn version_endpoint_reports_build_fingerprint() {
         .unwrap();
 
     assert_eq!(resp["service"], json!("dig-node"));
-    assert_eq!(resp["version"], json!(dig_companion::VERSION));
+    assert_eq!(resp["version"], json!(dig_node::VERSION));
     assert!(resp["commit"].is_string());
     assert!(resp["dig_node_version"].is_string());
     assert_eq!(resp["protocol"], json!("21"));
@@ -375,11 +372,11 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
     let port = free.local_addr().unwrap().port();
     drop(free); // release it so the server can bind the same port
 
-    let config = dig_companion::Config {
+    let config = dig_node::Config {
         upstream: upstream.to_string(),
         port,
         dig_local: true, // attempt the privileged 127.0.0.2:80 bind (expected to fail in CI)
-        ..dig_companion::Config::default()
+        ..dig_node::Config::default()
     };
 
     // Drive serve under the env lock, held for the whole test (the server reads
@@ -389,11 +386,11 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
     let stop = std::sync::Arc::new(tokio::sync::Notify::new());
     let stop_for_server = stop.clone();
     let server = {
-        let tmp = std::env::temp_dir().join(format!("dig-companion-dual-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("dig-node-dual-{}", std::process::id()));
         std::env::set_var("DIG_NODE_CACHE", &tmp);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
         tokio::spawn(async move {
-            dig_companion::server::serve_with_shutdown(config, async move {
+            dig_node::server::serve_with_shutdown(config, async move {
                 stop_for_server.notified().await;
             })
             .await
@@ -578,7 +575,7 @@ async fn control_status_with_token_returns_rich_status() {
     let r = &resp["result"];
     assert_eq!(r["running"], json!(true));
     assert_eq!(r["service"], json!("dig-node"));
-    assert_eq!(r["version"], json!(dig_companion::VERSION));
+    assert_eq!(r["version"], json!(dig_node::VERSION));
     assert!(r["uptime_secs"].is_u64());
     assert!(r["cache"]["cap_bytes"].is_u64());
     assert!(r["hosted_store_count"].is_u64());

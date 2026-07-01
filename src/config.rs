@@ -1,23 +1,30 @@
-//! Runtime configuration for the companion, resolved from the environment.
+//! Runtime configuration for the dig-node service, resolved from the environment.
 //!
-//! The companion's knobs mirror the Node v0.2 server's env contract so a deploy
+//! The service's knobs mirror the original v0.2 server's env contract so a deploy
 //! that set those vars keeps working: `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST`
 //! pick the bind address; `DIG_RPC_UPSTREAM` picks the upstream the embedded
-//! dig-node proxies blind ciphertext/proof requests to on a cache miss.
+//! dig-node read path proxies blind ciphertext/proof requests to on a cache miss.
 //!
-//! The upstream is wired into dig-node via its own `DIG_NODE_UPSTREAM` env var
-//! (see [`Config::apply_to_env`]) — dig-node reads that name internally, so the
-//! companion translates its public `DIG_RPC_UPSTREAM` knob into it.
+//! **STABLE ENV CONTRACT — the `DIG_COMPANION_*` names are kept ACROSS THE RENAME.**
+//! The binary/crate/service were renamed `dig-companion` → `dig-node`, but the bind
+//! env-var names stay `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` on purpose: the
+//! dig-installer sets them and apt.dig.net documents them, so renaming them would
+//! break those consumers. They are the binary's stable env-var contract, not part
+//! of the user-facing branding rename.
+//!
+//! The upstream is wired into the read path via its own `DIG_NODE_UPSTREAM` env var
+//! (see [`Config::apply_to_env`]) — the dig-node read-path crate reads that name
+//! internally, so this service translates its public `DIG_RPC_UPSTREAM` knob into it.
 //!
 //! ## Shared `.dig` cache (#96)
 //!
-//! `DIG_NODE_CACHE` points dig-node at the on-disk `.dig` cache. The companion
+//! `DIG_NODE_CACHE` points the read path at the on-disk `.dig` cache. This service
 //! reads it **explicitly** ([`Config::cache_dir`]) so an operator/installer can aim
-//! it at one canonical cache, and re-applies it to dig-node's environment in
+//! it at one canonical cache, and re-applies it to the read path's environment in
 //! [`Config::apply_to_env`].
 //!
 //! **Omitting it is the right default for sharing.** When `DIG_NODE_CACHE` is
-//! unset, the companion does NOT invent a path — it leaves dig-node to resolve its
+//! unset, this service does NOT invent a path — it leaves the read path to resolve its
 //! own canonical default (`%LOCALAPPDATA%\DigNode\cache` on Windows,
 //! `$HOME/DigNode/cache` on Unix/macOS), which is **byte-identical** to the dir the
 //! DIG Browser's in-process node uses. So when both the standalone service and the
@@ -32,7 +39,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 /// Default loopback bind port. The DIG Chrome extension defaults its `server.host`
-/// to `localhost:80`, but port 80 needs elevation on most OSes, so the companion
+/// to `localhost:80`, but port 80 needs elevation on most OSes, so dig-node
 /// defaults to 8080 (set the extension's server host to `localhost:8080` to match).
 pub const DEFAULT_PORT: u16 = 8080;
 
@@ -60,10 +67,10 @@ pub const DIG_LOCAL_PORT: u16 = 80;
 /// list (`dig.local` / `localhost` / `127.0.0.1`).
 pub const DIG_LOCAL_HOST: &str = "dig.local";
 
-/// Resolved companion configuration.
+/// Resolved dig-node service configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Bind address (always loopback by default — the companion is a localhost
+    /// Bind address (always loopback by default — dig-node is a localhost
     /// endpoint for a same-machine browser/extension, never a public server).
     pub host: IpAddr,
     /// Bind port.
@@ -103,8 +110,9 @@ impl Default for Config {
 
 impl Config {
     /// Resolve the config from the process environment, falling back to defaults.
-    /// Mirrors the Node server's `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` /
-    /// `DIG_RPC_UPSTREAM` contract.
+    /// Mirrors the stable `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` /
+    /// `DIG_RPC_UPSTREAM` env contract (the `DIG_COMPANION_*` names are kept across
+    /// the rename — see the module-level "STABLE ENV CONTRACT" note).
     pub fn from_env() -> Self {
         let port = std::env::var("DIG_COMPANION_PORT")
             .ok()
@@ -132,10 +140,11 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
 
-        // DIG_NODE_CACHE is read with dig-node's OWN env var name (not a companion
-        // alias) so a value the operator sets reaches the node directly and the
-        // companion just makes honouring it explicit. A blank/whitespace value is
-        // treated as unset → shared default (see resolve_cache_dir).
+        // DIG_NODE_CACHE is read with the read path's OWN env var name (not a
+        // service-specific alias) so a value the operator sets reaches the node
+        // directly and this service just makes honouring it explicit. A
+        // blank/whitespace value is treated as unset → shared default (see
+        // resolve_cache_dir).
         let cache_dir = resolve_cache_dir(std::env::var("DIG_NODE_CACHE").ok());
 
         // The bare-dig.local listener is on by default (auto-attempt + graceful
@@ -153,7 +162,7 @@ impl Config {
 
     /// Apply this config to the environment dig-node reads at `Node::from_env()`:
     ///
-    /// * `DIG_NODE_UPSTREAM` ← the companion's public `DIG_RPC_UPSTREAM` knob.
+    /// * `DIG_NODE_UPSTREAM` ← this service's public `DIG_RPC_UPSTREAM` knob.
     ///   (dig-node deliberately uses a distinct name from the browser's
     ///   `DIG_RPC_ENDPOINT`, which points a client AT the node; reusing that would
     ///   make the node proxy to itself.)
@@ -311,7 +320,7 @@ mod tests {
 
     #[test]
     fn apply_to_env_does_not_set_cache_when_unset() {
-        // When the operator did NOT set DIG_NODE_CACHE, the companion must NOT write
+        // When the operator did NOT set DIG_NODE_CACHE, this service must NOT write
         // it — leaving dig-node free to resolve its shared canonical default. (We
         // assert via the pure helper so the test never mutates process-global env,
         // which would race the concurrent server tests.)
@@ -322,9 +331,9 @@ mod tests {
 
     #[test]
     fn apply_to_env_sets_explicit_cache_dir() {
-        // An explicit DIG_NODE_CACHE is honoured: it is the value the companion
-        // re-applies to dig-node's env (so a service install records it, and the
-        // node + the companion's /health agree on the same shared dir).
+        // An explicit DIG_NODE_CACHE is honoured: it is the value this service
+        // re-applies to the read path's env (so a service install records it, and the
+        // node + this service's /health agree on the same shared dir).
         assert_eq!(
             cache_dir_env_value(Some("D:/dig/shared-cache")),
             Some("D:/dig/shared-cache".to_string())
