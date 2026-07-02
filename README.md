@@ -19,10 +19,9 @@ the **same wire contract as `rpc.dig.net`** — because it routes every request 
 runs in-process. So the extension works against it byte-for-byte, with the bonus that any `.dig`
 store the node has cached locally is served without leaving the machine.
 
-> **v0.3 — now a Rust OS-service binary.** The previous Node implementation (v0.2) is retained as a
-> documented reference under [`node/`](node/), but the **shipped artifact is the Rust `dig-node`
-> binary**. A single binary has no runtime dependency (no Node install required) and installs cleanly
-> as a Windows/Linux/macOS service — which a Node process does not do reliably, especially on Windows.
+> **A Rust OS-service binary.** The shipped artifact is the Rust `dig-node` binary — a single binary
+> with no runtime dependency (no Node install required) that installs cleanly as a Windows/Linux/macOS
+> service, which a Node process does not do reliably, especially on Windows.
 
 ## Install as a service
 
@@ -341,7 +340,6 @@ src/
                   POST / → dig_node::handle_rpc (+ rpc.discover) + the gated control plane, passthrough fallback
   service.rs      OS-service install/uninstall/start/stop/status (service-manager) + /health status probe
   win_service.rs  Windows Service Control Protocol entrypoint (windows-service; Windows only)
-node/             the Node v0.2 reference implementation (documentation only — NOT the shipped artifact)
 USER_JOURNEY.md   the dig-node user/operator/agent journey, surfaces, and ecosystem hand-offs
 ```
 
