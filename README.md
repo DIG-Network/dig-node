@@ -6,8 +6,8 @@ shipped as a **self-contained, cross-platform Rust binary** that installs as an 
 
 > **Naming.** The binary, crate, and service are all `dig-node` — the canonical, user-facing name
 > for the local DIG node. Every machine-readable surface (`/health`, `/version`, `--json`) identifies
-> itself as `dig-node`. The bind env-var names stay `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` as a
-> stable configuration contract (see the Environment section). For the legacy Linux package + the
+> itself as `dig-node`. The bind env-var names are `DIG_NODE_PORT` / `DIG_NODE_HOST` — the stable
+> configuration contract (see the Environment section). For the legacy Linux package + the
 > installer's pre-rename fallback, the GitHub release also publishes each binary under the old
 > `dig-companion-*` filename (identical bytes). See [`USER_JOURNEY.md`](USER_JOURNEY.md).
 
@@ -120,8 +120,8 @@ service's environment so the service serves identically):
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `DIG_COMPANION_PORT` | `8080` | Port the node listens on (`127.0.0.1`). |
-| `DIG_COMPANION_HOST` | `127.0.0.1` | Bind address (loopback — the node is a same-machine endpoint). |
+| `DIG_NODE_PORT` | `8080` | Port the node listens on (`127.0.0.1`). |
+| `DIG_NODE_HOST` | `127.0.0.1` | Bind address (loopback — the node is a same-machine endpoint). |
 | `DIG_RPC_UPSTREAM` | `https://rpc.dig.net` | Upstream DIG RPC the embedded node proxies ciphertext/proof requests to on a local cache miss, and relays unhandled methods to. |
 | `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). **Leave it unset to share one cache with the DIG Browser** — see below. |
 | `DIG_NODE_CACHE_CAP` | `1 GiB` | Cache size cap (floored at 64 MiB), LRU-evicted. Also settable via the `cache.setCapBytes` RPC. |

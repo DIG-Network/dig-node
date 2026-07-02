@@ -3,7 +3,7 @@
 > **Naming.** The binary, crate, and service are all `dig-node` — the canonical, user-facing name
 > for the local DIG node (per `SYSTEM.md` → *Canonical terminology & branding*). Everything the user
 > sees and every machine-readable surface identifies itself as `dig-node`. The bind env-var names
-> stay `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` as a stable configuration contract, and the GitHub
+> are `DIG_NODE_PORT` / `DIG_NODE_HOST` — the stable configuration contract, and the GitHub
 > release also publishes each binary under the legacy `dig-companion-*` filename (identical bytes) for
 > the apt package + the installer's pre-rename fallback.
 
