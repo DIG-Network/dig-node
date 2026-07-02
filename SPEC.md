@@ -96,19 +96,19 @@ shipped artifact and carries no conformance obligations.
 
 Configuration is resolved from the process environment by `Config::from_env()` at startup.
 
-### 3.1. Stable `DIG_COMPANION_*` names (HARD RULE)
+### 3.1. Stable `DIG_NODE_*` names (HARD RULE)
 
-The bind variables keep the pre-rename names **`DIG_COMPANION_PORT`** and
-**`DIG_COMPANION_HOST`**. These are the binary's stable configuration contract: the dig-installer
-sets them and apt.dig.net documents them. They MUST NOT be renamed. The user-facing branding
-rename (`dig-companion` → `dig-node`) explicitly does not extend to these variable names.
+The bind variables are named **`DIG_NODE_PORT`** and **`DIG_NODE_HOST`**. These are the binary's
+stable configuration contract: the dig-installer sets them and apt.dig.net documents them. They
+MUST NOT be renamed again — DIG is pre-release with no legacy aliases (#201); the canonical names
+ARE `DIG_NODE_*`, full stop.
 
 ### 3.2. Variables and defaults
 
 | Variable | Meaning | Default | Rules |
 |---|---|---|---|
-| `DIG_COMPANION_PORT` | localhost-listener bind port | `8080` | Parsed as `u16`; `0`, unparsable, or unset → default. |
-| `DIG_COMPANION_HOST` | localhost-listener bind IP | `127.0.0.1` | Parsed as `IpAddr`; unparsable/unset → default. |
+| `DIG_NODE_PORT` | localhost-listener bind port | `8080` | Parsed as `u16`; `0`, unparsable, or unset → default. |
+| `DIG_NODE_HOST` | localhost-listener bind IP | `127.0.0.1` | Parsed as `IpAddr`; unparsable/unset → default. |
 | `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | `https://rpc.dig.net` | Normalized (§3.3); highest precedence (§3.4). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
 | `DIG_NODE_DIGLOCAL` | toggle for the bare-`http://dig.local` listener | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
@@ -166,7 +166,7 @@ atomic temp-file + rename in the same directory, and MUST preserve all keys the 
 
 The server opens up to two listeners for the SAME router:
 
-1. **`<DIG_COMPANION_HOST>:<DIG_COMPANION_PORT>`** (default `127.0.0.1:8080`) — always on. A bind
+1. **`<DIG_NODE_HOST>:<DIG_NODE_PORT>`** (default `127.0.0.1:8080`) — always on. A bind
    failure here is FATAL (`serve` returns the error; CLI exit `BIND_FAILED`, §8.4).
 2. **`127.0.0.2:80`** — the bare-`http://dig.local` listener (constants `DIG_LOCAL_IP` =
    `127.0.0.2`, `DIG_LOCAL_PORT` = `80`, `DIG_LOCAL_HOST` = `dig.local`). This bind is
@@ -469,7 +469,7 @@ root/sudo; runs as the installing user). Windows SCM has no per-user services, s
 
 9.2. **Recorded environment.** `install` MUST register the absolute path of the currently-running
 executable (never a PATH lookup) and record the resolved config as service environment variables:
-`DIG_COMPANION_PORT`, `DIG_COMPANION_HOST`, `DIG_RPC_UPSTREAM`, and — **only when explicitly
+`DIG_NODE_PORT`, `DIG_NODE_HOST`, `DIG_RPC_UPSTREAM`, and — **only when explicitly
 configured** — `DIG_NODE_CACHE` (omitting it preserves the shared-cache default, §3.5). The
 service is registered with `autostart: true`.
 
@@ -578,7 +578,7 @@ does offset/length arithmetic over untrusted serialized input).
 | # | Contract | Must match | Where enforced / specified |
 |---|---|---|---|
 | 1 | Read-plane wire contract | `rpc.dig.net` byte-for-byte (dispatch IS `digstore_node::handle_rpc`) | §1.3, §5; digstore repo + docs.dig.net Protocol pages |
-| 2 | `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` names | dig-installer + apt.dig.net expectations — never renamed | §3.1 |
+| 2 | `DIG_NODE_PORT` / `DIG_NODE_HOST` names | dig-installer + apt.dig.net expectations — never renamed | §3.1 |
 | 3 | Shared cache default | Byte-identical dir to the DIG Browser's in-process node when `DIG_NODE_CACHE` unset | §3.5 |
 | 4 | `dig.local` addressing | dig-installer hosts entry `127.0.0.2  dig.local`; listener `127.0.0.2:80`, best-effort | §4.1–4.2 |
 | 5 | Host/CORS allowlist | `dig.local` / `localhost` / `127.0.0.1` / `127.0.0.2` (+ `chrome-extension://` origins) | §4.2–4.3 |

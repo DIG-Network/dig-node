@@ -173,7 +173,7 @@ fn hint_for(exit: ExitCode) -> Option<&'static str> {
             Some("Re-run in a terminal opened with \"Run as administrator\" (Windows).")
         }
         ExitCode::BindFailed => {
-            Some("The port is in use or unavailable; set DIG_COMPANION_PORT to a free port.")
+            Some("The port is in use or unavailable; set DIG_NODE_PORT to a free port.")
         }
         _ => None,
     }

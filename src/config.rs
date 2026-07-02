@@ -1,16 +1,13 @@
 //! Runtime configuration for the dig-node service, resolved from the environment.
 //!
-//! The service's knobs mirror the original v0.2 server's env contract so a deploy
-//! that set those vars keeps working: `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST`
-//! pick the bind address; `DIG_RPC_UPSTREAM` picks the upstream the embedded
-//! dig-node read path proxies blind ciphertext/proof requests to on a cache miss.
+//! The service's knobs use the canonical `DIG_NODE_*` env contract: `DIG_NODE_PORT`
+//! / `DIG_NODE_HOST` pick the bind address; `DIG_RPC_UPSTREAM` picks the upstream
+//! the embedded dig-node read path proxies blind ciphertext/proof requests to on a
+//! cache miss.
 //!
-//! **STABLE ENV CONTRACT — the `DIG_COMPANION_*` names are kept ACROSS THE RENAME.**
-//! The binary/crate/service were renamed `dig-companion` → `dig-node`, but the bind
-//! env-var names stay `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` on purpose: the
-//! dig-installer sets them and apt.dig.net documents them, so renaming them would
-//! break those consumers. They are the binary's stable env-var contract, not part
-//! of the user-facing branding rename.
+//! **STABLE ENV CONTRACT — the `DIG_NODE_*` names are the binary's canonical,
+//! stable configuration contract.** The dig-installer sets them and apt.dig.net
+//! documents them, so renaming them again would break those consumers.
 //!
 //! The upstream is wired into the read path via its own `DIG_NODE_UPSTREAM` env var
 //! (see [`Config::apply_to_env`]) — the dig-node read-path crate reads that name
@@ -110,17 +107,16 @@ impl Default for Config {
 
 impl Config {
     /// Resolve the config from the process environment, falling back to defaults.
-    /// Mirrors the stable `DIG_COMPANION_PORT` / `DIG_COMPANION_HOST` /
-    /// `DIG_RPC_UPSTREAM` env contract (the `DIG_COMPANION_*` names are kept across
-    /// the rename — see the module-level "STABLE ENV CONTRACT" note).
+    /// Mirrors the stable `DIG_NODE_PORT` / `DIG_NODE_HOST` / `DIG_RPC_UPSTREAM` env
+    /// contract (see the module-level "STABLE ENV CONTRACT" note).
     pub fn from_env() -> Self {
-        let port = std::env::var("DIG_COMPANION_PORT")
+        let port = std::env::var("DIG_NODE_PORT")
             .ok()
             .and_then(|s| s.parse::<u16>().ok())
             .filter(|p| *p != 0)
             .unwrap_or(DEFAULT_PORT);
 
-        let host = std::env::var("DIG_COMPANION_HOST")
+        let host = std::env::var("DIG_NODE_HOST")
             .ok()
             .and_then(|s| s.parse::<IpAddr>().ok())
             .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));

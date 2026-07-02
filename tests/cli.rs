@@ -18,7 +18,7 @@ fn status_json_reports_not_serving_with_exit_one() {
     let out = bin()
         .args(["status", "--json"])
         // A port nothing is bound to in CI → not serving.
-        .env("DIG_COMPANION_PORT", "1")
+        .env("DIG_NODE_PORT", "1")
         .output()
         .expect("run dig-node status --json");
 
@@ -39,7 +39,7 @@ fn status_json_reports_not_serving_with_exit_one() {
 fn status_human_prose_still_exits_one_when_not_serving() {
     let out = bin()
         .arg("status")
-        .env("DIG_COMPANION_PORT", "1")
+        .env("DIG_NODE_PORT", "1")
         .output()
         .expect("run dig-node status");
 
@@ -51,6 +51,25 @@ fn status_human_prose_still_exits_one_when_not_serving() {
         "prose should mention dig-node: {stdout}"
     );
     assert!(serde_json::from_str::<Value>(stdout.trim()).is_err());
+}
+
+/// `status --json`'s `addr` field reflects `DIG_NODE_HOST`/`DIG_NODE_PORT` — the
+/// canonical env-var names (renamed from the pre-#168 `DIG_COMPANION_*` names).
+/// Regression guard for #168: proves the binary actually reads the new names, not
+/// just that the old names were deleted from source.
+#[test]
+fn status_json_addr_reflects_dig_node_host_and_port_env_vars() {
+    let out = bin()
+        .args(["status", "--json"])
+        .env("DIG_NODE_HOST", "127.0.0.1")
+        .env("DIG_NODE_PORT", "2")
+        .output()
+        .expect("run dig-node status --json");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout must be one JSON object: {e}\n---\n{stdout}"));
+    assert_eq!(v["addr"], Value::String("127.0.0.1:2".into()));
 }
 
 /// A usage error (unknown subcommand) exits non-zero (clap's usage code), proving
