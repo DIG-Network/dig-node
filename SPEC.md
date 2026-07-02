@@ -43,6 +43,19 @@ the same `handle_rpc` the native DIG Browser runs in-process. A client written a
 this node unchanged. Verification and decryption happen in the **client**; the node serves blind
 ciphertext + proofs and MUST NOT return plaintext for content reads.
 
+1.4. **Canonical RPC interface — `dig-rpc-types` + `dig-rpc`.** The RPC surface this node exposes
+(method names + request/response types, the error-code taxonomy, and the tier classification) is
+the canonical DIG-node RPC interface defined ONCE in the **`dig-rpc-types`** crate
+(`modules/crates/dig-rpc-types`) — the single source of truth both node implementations (this
+standalone shell AND digstore's embedded `dig-node`) and the `rpc.dig.net` gateway share, so the
+three can never drift. The JSON-RPC server framework (transport surfaces, tier allowlist
+enforcement, rate limiting, mTLS) is the **`dig-rpc`** crate (`modules/crates/dig-rpc`), which
+depends only on `dig-rpc-types`. This SPEC's method catalogue (§5.5), envelope rules (§5.1), and
+error catalogue (§10) MUST match `dig-rpc-types` exactly; where they differ, `dig-rpc-types` is
+authoritative and this SPEC is the drift to fix. The OpenRPC document (§6.3) is generated from
+`dig-rpc-types`' own method/tier/error tables. (Adopting these crates in this repo's code is the
+tracked adoption unit; this SPEC records the contract they define.)
+
 ---
 
 ## 2. Identity and naming
@@ -197,6 +210,10 @@ Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Typ
 
 ## 5. JSON-RPC surface (read plane)
 
+The method catalogue (§5.5), request/response types, tier classification, and error taxonomy (§10)
+below are the canonical set defined in the **`dig-rpc-types`** crate (§1.4) — the single source of
+truth shared with digstore's `dig-node` and `rpc.dig.net`. This shell MUST NOT diverge from it.
+
 ### 5.1. Envelope rules
 
 - `POST /` accepts a **single JSON-RPC 2.0 request object**. A non-object body (including a batch
@@ -334,7 +351,7 @@ Two layers, both REQUIRED:
 1. **Loopback-only**: the whole server binds loopback (§4.1), so nothing off-machine reaches any
    method.
 2. **Local token**: a `control.*` call MUST present the node's control token; a missing or
-   mismatched token is answered `UNAUTHORIZED` (`-32020`). Token comparison MUST be constant-time
+   mismatched token is answered `UNAUTHORIZED` (`-32030`, §10). Token comparison MUST be constant-time
    (`ct_eq`) so verification cannot be probed via a timing oracle.
 
 Exactly the `control.` method prefix is gated (`is_control_method`); unknown `control.*` methods
@@ -476,9 +493,17 @@ out to both listeners (§4.1).
 ## 10. Error-code catalogue (JSON-RPC wire)
 
 Stable contract: numeric codes, symbolic names, and origins MUST NOT be renumbered or repurposed;
-additions are allowed. `origin` distinguishes who minted the error: `shell` (this service),
+additions are allowed. This catalogue is the canonical set from **`dig-rpc-types`** (§1.4) — it
+MUST match that crate exactly. `origin` distinguishes who minted the error: `shell` (this service),
 `node` (the embedded read path), `upstream` (relayed from the upstream DIG RPC), `boundary` (the
 method-not-found cue).
+
+**Canonical control-code assignment.** The control-plane errors are `-32030`/`-32031`/`-32032`.
+`-32020`/`-32021`/`-32022` are RESERVED for onion-routing errors (`onion_circuit_unavailable` /
+`privacy_requires_local_node` / `onion_hops_out_of_range`) — the published normative contract on
+docs.dig.net — and MUST NOT be used for control. (`dig-rpc-types` is the source of this resolution;
+any client that branched on the old control numbers keys on the symbolic `data.code`, not the
+number.)
 
 | Code | Name | Origin | Meaning |
 |---|---|---|---|
@@ -489,9 +514,12 @@ method-not-found cue).
 | -32000 | `DISPATCH_FAILED` | shell | The shell failed to dispatch the request to the read path. |
 | -32004 | `RESOURCE_NOT_AVAILABLE_AT_ROOT` | upstream | Genuine content miss at the requested root (relayed); distinct from transport failure. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
-| -32020 | `UNAUTHORIZED` | shell | `control.*` called without a valid local control token. |
-| -32021 | `NOT_SUPPORTED` | shell | A control operation this build/pin cannot perform (e.g. §21 sync without an identity). |
-| -32022 | `CONTROL_ERROR` | shell | A control operation failed at runtime (distinct from bad input / absent capability). |
+| -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
+| -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
+| -32022 | *(reserved: onion `onion_hops_out_of_range`)* | — | Reserved for the onion-routing contract. |
+| -32030 | `UNAUTHORIZED` | shell | `control.*` called without a valid local control token. |
+| -32031 | `NOT_SUPPORTED` | shell | A control operation this build/pin cannot perform (e.g. §21 sync without an identity). |
+| -32032 | `CONTROL_ERROR` | shell | A control operation failed at runtime (distinct from bad input / absent capability). |
 
 Read-path and upstream errors outside this table are relayed verbatim; this catalogue governs what
 the **shell** mints plus the cross-boundary codes a client must be able to branch on.
