@@ -108,8 +108,8 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
     // matches what `install` was told (the service process does not inherit the
     // installing shell's environment).
     let mut environment = vec![
-        ("DIG_COMPANION_PORT".to_string(), config.port.to_string()),
-        ("DIG_COMPANION_HOST".to_string(), config.host.to_string()),
+        ("DIG_NODE_PORT".to_string(), config.port.to_string()),
+        ("DIG_NODE_HOST".to_string(), config.host.to_string()),
         ("DIG_RPC_UPSTREAM".to_string(), config.upstream.clone()),
     ];
     // Only record DIG_NODE_CACHE when an explicit dir was set: omitting it lets the
