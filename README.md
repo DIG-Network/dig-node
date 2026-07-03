@@ -129,8 +129,8 @@ service's environment so the service serves identically):
 
 ### Shared `.dig` cache with the DIG Browser (#96)
 
-`dig-node` and the native [DIG Browser](https://github.com/DIG-Network/DIG_Browser) both embed
-digstore's `dig-node`, and **both default to the SAME on-disk cache dir**
+`dig-node` and the native [DIG Browser](https://github.com/DIG-Network/DIG_Browser) both run
+the SAME canonical `dig-node` node library (this repo), and **both default to the SAME on-disk cache dir**
 (`%LOCALAPPDATA%\DigNode\cache` on Windows, `$HOME/DigNode/cache` on Linux/macOS). So when both are
 installed they **share ONE cache** — a capsule fetched by the browser is served from disk by the
 standalone service and vice-versa, with **no double-store**.
@@ -210,7 +210,7 @@ capsule reference `storeId` or `storeId:rootHash` (each part lowercase 64-hex).
 | `control.sync.status` | — | `{ available, method:"section-21-whole-store-sync", pinned_total, pinned_synced, whole_store_trigger_supported }` |
 | `control.sync.trigger` | `{ store }` (= `storeId:rootHash`) or `{ store_id, root }` | `{ store_id, root, status:"synced", size_bytes, served_root }`, or `NOT_SUPPORTED` (`-32021`) if no §21 identity. |
 
-**What's proxied vs. owned.** Cache + sync operations proxy to digstore's `dig-node` crate
+**What's proxied vs. owned.** Cache + sync operations proxy to the node library (`dig_node`)
 (`cache_*`, `clear_cache`, `set_cache_cap_bytes`, `Node::cache_fetch_and_cache` / `cache_remove_cached`
 / `cache_list_cached`) — the node never duplicates the cache/read logic. The shell owns only the
 small state the crate does not model: the **pin registry** (`pinned_stores`) and the **upstream
