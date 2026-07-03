@@ -1,16 +1,16 @@
 //! dig-node-service — the localhost DIG node OS-service shell (binary `dig-node`).
 //!
-//! This crate is the SERVICE HOST around the canonical [`dig_node`] node library (a
+//! This crate is the SERVICE HOST around the canonical [`dig_node_core`] node library (a
 //! first-party sibling crate in this repo): it adds an axum HTTP transport, the
 //! control-plane auth gate, the CLI, and OS-service registration, and delegates every
-//! read request to the node's [`dig_node::handle_rpc`]. The DIG Chrome extension
+//! read request to the node's [`dig_node_core::handle_rpc`]. The DIG Chrome extension
 //! resolves `chia://` (DIG) URLs by calling a DIG RPC for encrypted, merkle-proven
 //! content, then verifying + decrypting it **in the extension**. By default it talks
 //! to `rpc.dig.net`; pointing its `server.host` at this node makes that RPC **local**.
 //!
 //! Because both this OS-service shell AND the DIG Browser's in-process shell
 //! ([`dig_runtime`](https://github.com/DIG-Network/dig-node)) drive the SAME
-//! [`dig_node`] library, the wire contract is byte-identical to rpc.dig.net
+//! [`dig_node_core`] library, the wire contract is byte-identical to rpc.dig.net
 //! (ciphertext + inclusion proof + chunk lengths), with the bonus that any `.dig`
 //! store the node has cached is served without leaving the machine.
 //!

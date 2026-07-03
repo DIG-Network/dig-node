@@ -1,12 +1,12 @@
 [package]
-name = "dig-node"
+name = "dig-node-core"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-only"
-description = "DIG Browser local node sidecar: a loopback JSON-RPC server (dig.getContent, the same contract as rpc.dig.net) that serves dig:// content from LOCAL .dig store modules first (via digstore_host::serve_blind), falling back to rpc.dig.net on a miss, and caching synced stores with an LRU size cap (default 1 GiB). Native Rust so the compiled-module serve path works."
+description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
 
 [lib]
-name = "dig_node"
+name = "dig_node_core"
 path = "src/lib.rs"
 
 [dependencies]

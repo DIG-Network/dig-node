@@ -20,10 +20,10 @@ path = "src/main.rs"
 # (storeId:rootHash) identity rendered by /api/stores.
 digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
-# The node — same workspace now (the DIG Browser's in-process node + wallet are one
-# host cluster). dig-wallet reads the node's cache surface for the wallet UI's
-# "My Node" cache view (cache_cap_bytes / cache_used_bytes / clear_cache / list).
-dig-node = { path = "../dig-node" }
+# The node engine (crate `dig_node_core`) — same workspace (the DIG Browser's in-process
+# node + wallet are one host cluster). dig-wallet reads the node's cache surface for the
+# wallet UI's "My Node" cache view (cache_cap_bytes / cache_used_bytes / clear_cache / list).
+dig-node-core = { path = "../dig-node-core" }
 chia-protocol = "0.26"
 # `chia::puzzles::nft::NftMetadata` — the on-chain NFT metadata struct we serialize
 # into a MintSpec's metadata Program for chia_mintNft / chia_bulkMintNfts.

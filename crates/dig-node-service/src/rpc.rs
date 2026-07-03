@@ -2,7 +2,7 @@
 //! of I/O so it is unit-testable and is the single source of truth for dispatch.
 //!
 //! This service is a thin shell around digstore's `dig-node` read-path crate
-//! (`dig_node::handle_rpc`), which IS the rpc.dig.net-compatible local node the
+//! (`dig_node_core::handle_rpc`), which IS the rpc.dig.net-compatible local node the
 //! native DIG Browser runs in-process: `dig.getContent` returns blind ciphertext +
 //! a merkle inclusion proof + chunk lengths (local-first from cached `.dig` modules,
 //! else proxied to the upstream), `dig.getAnchoredRoot` resolves the chain-anchored
@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use crate::meta::ErrorCode;
 
 /// How the dig-node service handles a given JSON-RPC method. Informational/
-/// structural — dispatch itself is `dig_node::handle_rpc`; this classification
+/// structural — dispatch itself is `dig_node_core::handle_rpc`; this classification
 /// drives request normalisation and keeps the routing intent documented and tested.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Route {

@@ -1738,7 +1738,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "dig-node"
+name = "dig-node-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -1786,7 +1786,7 @@ version = "0.3.0"
 dependencies = [
  "axum",
  "clap",
- "dig-node",
+ "dig-node-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -1838,7 +1838,7 @@ dependencies = [
 name = "dig-runtime"
 version = "0.1.0"
 dependencies = [
- "dig-node",
+ "dig-node-core",
  "dig-wallet",
  "serde_json",
  "tokio",
@@ -1853,7 +1853,7 @@ dependencies = [
  "chia-protocol",
  "chia-sdk-test",
  "chia-wallet-sdk",
- "dig-node",
+ "dig-node-core",
  "digstore-chain",
  "digstore-core",
  "hex",

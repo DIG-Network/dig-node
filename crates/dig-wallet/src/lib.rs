@@ -686,8 +686,8 @@ struct DigConfig {
 
 async fn dig_config_get() -> Json<DigConfig> {
     Json(DigConfig {
-        cache_cap_bytes: dig_node::cache_cap_bytes(),
-        cache_used_bytes: dig_node::cache_used_bytes(),
+        cache_cap_bytes: dig_node_core::cache_cap_bytes(),
+        cache_used_bytes: dig_node_core::cache_used_bytes(),
     })
 }
 
@@ -706,12 +706,12 @@ fn floored_cache_cap(requested: u64) -> u64 {
 
 async fn dig_config_set(Json(req): Json<SetDigConfig>) -> impl IntoResponse {
     let cap = floored_cache_cap(req.cache_cap_bytes);
-    match dig_node::set_cache_cap_bytes(cap) {
+    match dig_node_core::set_cache_cap_bytes(cap) {
         Ok(()) => (
             StatusCode::OK,
             Json(DigConfig {
                 cache_cap_bytes: cap,
-                cache_used_bytes: dig_node::cache_used_bytes(),
+                cache_used_bytes: dig_node_core::cache_used_bytes(),
             }),
         )
             .into_response(),
@@ -722,7 +722,7 @@ async fn dig_config_set(Json(req): Json<SetDigConfig>) -> impl IntoResponse {
 /// Purge the entire local DIG cache. Content stays available — it just falls
 /// back to rpc.dig.net on next visit and re-warms the cache.
 async fn dig_cache_clear() -> impl IntoResponse {
-    dig_node::clear_cache();
+    dig_node_core::clear_cache();
     StatusCode::NO_CONTENT
 }
 
@@ -741,9 +741,9 @@ async fn dig_cache_clear() -> impl IntoResponse {
 
 /// One cached capsule in the settings table: its capsule identity (`storeId:rootHash`),
 /// the store id + root separately (so the UI can show/truncate each), the on-disk size,
-/// and the last-used (LRU recency) timestamp. Mirrors [`dig_node::CachedCapsule`] one to
+/// and the last-used (LRU recency) timestamp. Mirrors [`dig_node_core::CachedCapsule`] one to
 /// one; rendered by [`cached_capsule_json`] so the wire shape is unit-tested.
-fn cached_capsule_json(c: &dig_node::CachedCapsule) -> serde_json::Value {
+fn cached_capsule_json(c: &dig_node_core::CachedCapsule) -> serde_json::Value {
     serde_json::json!({
         // The canonical storeId:rootHash identity (== digstore_core::Capsule::canonical()).
         "capsule": format!("{}:{}", c.store_id, c.root),
@@ -756,13 +756,13 @@ fn cached_capsule_json(c: &dig_node::CachedCapsule) -> serde_json::Value {
 
 /// List every cached capsule (`storeId:rootHash`) with its size + last-used time, for the
 /// DIG settings "Cached stores" table. Self-origin only (the local cache is the user's,
-/// not a dapp surface). Reads via `dig_node::Node::cache_list_cached` on a fresh
+/// not a dapp surface). Reads via `dig_node_core::Node::cache_list_cached` on a fresh
 /// `Node::from_env()` — the same cache dir the loader/CLI use.
 async fn dig_cache_list(headers: HeaderMap) -> Response {
     if !is_self_origin(&origin_of(&headers)) {
         return (StatusCode::FORBIDDEN, "cache manager is wallet-local only").into_response();
     }
-    let node = dig_node::Node::from_env();
+    let node = dig_node_core::Node::from_env();
     let cached = node.cache_list_cached().await;
     let list: Vec<_> = cached.iter().map(cached_capsule_json).collect();
     (StatusCode::OK, Json(serde_json::json!({ "cached": list }))).into_response()
@@ -779,12 +779,12 @@ struct CacheCapsuleReq {
 /// Remove one cached capsule (`storeId:rootHash`) from the local cache. Idempotent: a
 /// capsule that isn't cached returns `removed:false`. Content stays available — it just
 /// re-fetches from rpc.dig.net on next visit. Self-origin only. Delegates to
-/// `dig_node::Node::cache_remove_cached`, which validates the hex + guards path traversal.
+/// `dig_node_core::Node::cache_remove_cached`, which validates the hex + guards path traversal.
 async fn dig_cache_remove(headers: HeaderMap, Json(req): Json<CacheCapsuleReq>) -> Response {
     if !is_self_origin(&origin_of(&headers)) {
         return (StatusCode::FORBIDDEN, "cache manager is wallet-local only").into_response();
     }
-    let node = dig_node::Node::from_env();
+    let node = dig_node_core::Node::from_env();
     match node.cache_remove_cached(&req.store_id, &req.root).await {
         Ok(removed) => (
             StatusCode::OK,
@@ -798,13 +798,13 @@ async fn dig_cache_remove(headers: HeaderMap, Json(req): Json<CacheCapsuleReq>) 
 /// Fetch a capsule (`storeId:rootHash`) into the local cache on demand (the settings
 /// "Cache a capsule" sub-card). May be slow (a network whole-store sync from the §21
 /// remote), so the UI shows a spinner. Self-origin only. Delegates to
-/// `dig_node::Node::cache_fetch_and_cache`; a failed fetch is reported in-band
+/// `dig_node_core::Node::cache_fetch_and_cache`; a failed fetch is reported in-band
 /// (`status:"failed"`) so the manager shows it without treating it as a transport error.
 async fn dig_cache_fetch(headers: HeaderMap, Json(req): Json<CacheCapsuleReq>) -> Response {
     if !is_self_origin(&origin_of(&headers)) {
         return (StatusCode::FORBIDDEN, "cache manager is wallet-local only").into_response();
     }
-    let node = dig_node::Node::from_env();
+    let node = dig_node_core::Node::from_env();
     match node.cache_fetch_and_cache(&req.store_id, &req.root).await {
         Ok((size_bytes, served_root)) => (
             StatusCode::OK,
@@ -848,7 +848,7 @@ struct WcProjectIdResp {
 /// Readable by the wallet UI so the in-page WC responder can boot the relay with
 /// it (or show the "not configured" state).
 async fn wc_project_id_get() -> Json<WcProjectIdResp> {
-    let id = dig_node::wc_project_id();
+    let id = dig_node_core::wc_project_id();
     Json(WcProjectIdResp {
         configured: id.is_some(),
         project_id: id,
@@ -867,9 +867,9 @@ async fn wc_project_id_set(headers: HeaderMap, Json(req): Json<SetWcProjectId>) 
     if !is_self_origin(&origin_of(&headers)) {
         return (StatusCode::FORBIDDEN, "settings are wallet-local only").into_response();
     }
-    match dig_node::set_wc_project_id(&req.project_id) {
+    match dig_node_core::set_wc_project_id(&req.project_id) {
         Ok(()) => {
-            let id = dig_node::wc_project_id();
+            let id = dig_node_core::wc_project_id();
             (
                 StatusCode::OK,
                 Json(WcProjectIdResp {
@@ -4585,7 +4585,7 @@ mod tests {
     fn cached_capsule_json_matches_the_capsule_identity() {
         // The wire shape carries the canonical storeId:rootHash capsule identity plus
         // the head/tail/size/last-used the settings table renders + sorts on.
-        let c = dig_node::CachedCapsule {
+        let c = dig_node_core::CachedCapsule {
             store_id: "aa".repeat(32),
             root: "bb".repeat(32),
             size_bytes: 4096,

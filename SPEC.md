@@ -27,16 +27,17 @@ For usage instructions, see `README.md`. For non-normative narrative, see `USER_
 
 1.1. dig-node is the **canonical node**, organized as a Cargo workspace of four crates:
 
-- **`dig-node`** (library, `dig_node`) — the NODE itself. It owns `handle_rpc` dispatch,
-  local-first content serve/fetch/redirect, chain-anchored-root resolution, chain-watch +
+- **`dig-node-core`** (library, `dig_node_core`) — the NODE engine itself. It owns `handle_rpc`
+  dispatch, local-first content serve/fetch/redirect, chain-anchored-root resolution, chain-watch +
   subscriptions + generation gap-fill, the cache, and the P2P stack (peer serve/dial, DHT
   provider records, PEX, multi-source download). It depends on the P2P crates
   (`dig-nat`/`dig-gossip`/`dig-dht`/`dig-pex`/`dig-download`/`dig-peer-selector`/`dig-protocol`)
   and on digstore's `.dig` store-format LIBRARY crates
   (`digstore-core`/`-crypto`/`-chain`/`-host`/`-remote`/`-stage`) as git dependencies. The
-  dependency direction is dig-node → store-lib; digstore MUST NOT depend on dig-node (digstore is
-  only ever an RPC client of a node).
-- **`dig-node-service`** (binary `dig-node`) — the OS-service host shell around the node library.
+  dependency direction is dig-node-core → store-lib; digstore MUST NOT depend on dig-node-core
+  (digstore is only ever an RPC client of a node). The engine library is named `dig-node-core` so
+  it no longer shares a name with the `dig-node` binary the service shell produces (#216).
+- **`dig-node-service`** (binary `dig-node`) — the OS-service host shell around the engine library.
 - **`dig-runtime`** (cdylib `dig_runtime`) — the DIG Browser's in-process host shell (§FFI).
 - **`dig-wallet`** (library + binary) — the DIG Browser's built-in Chia wallet host.
 
@@ -56,10 +57,10 @@ For usage instructions, see `README.md`. For non-normative narrative, see `USER_
   upstream override (§7.6).
 
 The service shell MUST NOT reimplement, transform, or "improve" the node's responses: what
-`dig_node::handle_rpc` returns is what the client receives.
+`dig_node_core::handle_rpc` returns is what the client receives.
 
 1.3. The wire contract is byte-identical across BOTH host shells because dispatch IS the same
-`dig_node::handle_rpc` in both — the OS-service binary AND the DIG Browser's in-process cdylib run
+`dig_node_core::handle_rpc` in both — the OS-service binary AND the DIG Browser's in-process cdylib run
 ONE node implementation. A client written against `rpc.dig.net` (e.g. the DIG Chrome extension's
 `fetchContentViaRPC` pipeline) MUST work against this node unchanged. Verification and decryption
 happen in the **client**; the node serves blind ciphertext + proofs and MUST NOT return plaintext
@@ -93,14 +94,16 @@ wire is guaranteed identical by the conformance vectors, not by a shared crate.
 
 ## 2. Identity and naming
 
-2.1. **Canonical name.** The binary, Cargo package, library crate, and service are all named
-`dig-node` (lib `dig_node`). Every machine-readable surface (`/health.service`,
+2.1. **Canonical name.** The produced binary, the service-shell Cargo package (`dig-node-service`),
+the OS service, and every machine-readable service-identity surface are named `dig-node`. The node
+ENGINE library crate is `dig-node-core` (lib `dig_node_core`) — a distinct name from the `dig-node`
+binary so the two are never confused (#216). Every machine-readable surface (`/health.service`,
 `/version.service`, the CLI `--json` envelopes' `service` field) MUST report the service identity
 string `"dig-node"` (`meta::SERVICE_NAME`).
 
-2.2. **Node library version.** The node is the first-party `dig-node` library crate in this
-workspace. The constant `meta::DIG_NODE_VERSION` MUST equal the node library's crate version
-(`dig_node::NODE_VERSION`, its `CARGO_PKG_VERSION`) and is surfaced in `/version`,
+2.2. **Node library version.** The node is the first-party `dig-node-core` engine library crate in
+this workspace. The constant `meta::DIG_NODE_VERSION` MUST equal the node library's crate version
+(`dig_node_core::NODE_VERSION`, its `CARGO_PKG_VERSION`) and is surfaced in `/version`,
 `/.well-known/dig-node.json`, and `control.status` as `dig_node_version`. When the node library
 version changes, or when the digstore store-format git dependencies (`digstore-*`) are bumped to a
 new rev, the method catalogue MUST be re-verified against the node's real dispatch (the drift
@@ -183,12 +186,12 @@ The effective upstream is resolved in this order (first non-empty wins):
 - The **authoritative** effective cache dir + `shared` flag are those returned by the
   `cache.getConfig` RPC. The shell's `meta::cache_dir()` mirrors the canonical-path logic for
   discovery surfaces only; `meta::cache_shared()` MUST delegate to the read path's resolver
-  (`dig_node::cache_dir_is_shared`), never reimplement the writability probe.
+  (`dig_node_core::cache_dir_is_shared`), never reimplement the writability probe.
 
 ### 3.6. `config.json` co-tenancy
 
 The shell persists its own keys (`pinned_stores`, `upstream_override`) in the read path's
-`config.json` (path from `dig_node::config_path()`). Writes MUST be read-modify-write with an
+`config.json` (path from `dig_node_core::config_path()`). Writes MUST be read-modify-write with an
 atomic temp-file + rename in the same directory, and MUST preserve all keys the shell does not own
 (e.g. `cache_cap_bytes`, `wc_project_id`).
 
@@ -267,7 +270,7 @@ For each request, in order:
 
 1. `rpc.discover` → answered by the shell with the OpenRPC document (§6.3) as `result`.
 2. `control.*` → the control plane (§7): authorization gate, then `dispatch_control`.
-3. Everything else → normalized (§5.3), then dispatched to `dig_node::handle_rpc` on a
+3. Everything else → normalized (§5.3), then dispatched to `dig_node_core::handle_rpc` on a
    spawned task. A panicked/failed dispatch task yields `DISPATCH_FAILED` (`-32000`); the server
    MUST survive it.
 4. If the read path returns `-32601` (method not found), the shell relays the **original,
@@ -615,7 +618,7 @@ does offset/length arithmetic over untrusted serialized input).
 
 | # | Contract | Must match | Where enforced / specified |
 |---|---|---|---|
-| 1 | Read-plane wire contract | `rpc.dig.net` byte-for-byte (dispatch IS `dig_node::handle_rpc`) | §1.3, §5; `dig-rpc-types` + docs.dig.net Protocol pages |
+| 1 | Read-plane wire contract | `rpc.dig.net` byte-for-byte (dispatch IS `dig_node_core::handle_rpc`) | §1.3, §5; `dig-rpc-types` + docs.dig.net Protocol pages |
 | 2 | `DIG_NODE_PORT` / `DIG_NODE_HOST` names | dig-installer + apt.dig.net expectations — never renamed | §3.1 |
 | 3 | Shared cache default | Byte-identical dir to the DIG Browser's in-process node when `DIG_NODE_CACHE` unset | §3.5 |
 | 4 | `dig.local` addressing | dig-installer hosts entry `127.0.0.2  dig.local`; listener `127.0.0.2:80`, best-effort | §4.1–4.2 |
