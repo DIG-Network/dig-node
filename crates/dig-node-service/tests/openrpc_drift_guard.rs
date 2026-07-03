@@ -1,13 +1,13 @@
 //! DRIFT GUARD (gap #129): the dig-node service's method/error catalogue
 //! (`meta::methods` / `meta::openrpc_document` / `meta::ErrorCode`) must stay in
-//! sync with what the EMBEDDED read path (`dig_node::handle_rpc`) actually
+//! sync with what the EMBEDDED read path (`dig_node_core::handle_rpc`) actually
 //! resolves.
 //!
 //! The catalogue had drifted from the implementation: the `dig.getCapsule` alias was
 //! marked `served: local` though the read path does NOT resolve it (it returns
 //! `-32601` → relayed), and the upstream `-32004` ("resource not available at the
 //! requested root") was uncatalogued. This test pins the catalogue to reality by
-//! DISPATCHING each catalogued read method through the real `dig_node::handle_rpc`
+//! DISPATCHING each catalogued read method through the real `dig_node_core::handle_rpc`
 //! and asserting that:
 //!
 //!   * every `served: "local"` method is RESOLVED by the read path (never returns
@@ -29,7 +29,7 @@
 //! `control.*` methods are the shell's own surface (dispatched by the dig-node
 //! service, not the read path) and are covered by the unit tests in `meta.rs`.
 
-use dig_node::{handle_rpc, Node};
+use dig_node_core::{handle_rpc, Node};
 use dig_node_service::meta::{self, ErrorCode};
 use serde_json::json;
 use std::sync::Arc;
@@ -61,7 +61,7 @@ async fn dispatch_error_code(node: &Node, method: &str) -> Option<i64> {
         .and_then(|c| c.as_i64())
 }
 
-/// The dig-node-shell methods that `dig_node::handle_rpc` never sees (they are
+/// The dig-node-shell methods that `dig_node_core::handle_rpc` never sees (they are
 /// answered by this service's own server/control plane, not dispatched to the read
 /// path). Excluded from the live-dispatch sync check; covered by `meta.rs` units.
 fn is_shell_only(name: &str) -> bool {

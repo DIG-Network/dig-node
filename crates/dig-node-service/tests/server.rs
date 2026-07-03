@@ -204,7 +204,7 @@ async fn cache_get_config_reports_dir_and_shared_from_dig_node() {
 
     // #96 additive fields on the dig-node `cache.getConfig` RPC: the effective
     // resolved cache dir + whether it is the shared canonical one. The companion
-    // routes this straight to dig_node::handle_rpc, so this asserts the new crate
+    // routes this straight to dig_node_core::handle_rpc, so this asserts the new crate
     // contract reaches clients through the companion unchanged.
     let resp: Value = client()
         .post(format!("http://{addr}/"))

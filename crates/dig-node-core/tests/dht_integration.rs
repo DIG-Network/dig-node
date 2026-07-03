@@ -20,14 +20,14 @@ use dig_dht::{
     BootstrapPeer, CandidateAddr, Contact, ContentId, DhtConfig, DhtError, DhtRequest, DhtResponse,
     DhtService, DhtTransport, PeerId, ProviderRecord,
 };
-use dig_node::dht::{
+use dig_node_core::dht::{
     announce_inventory, bootstrap_peers_from_pool, caller_contact, inventory_content_ids,
     NatDhtTransport,
 };
-use dig_node::peer::{
+use dig_node_core::peer::{
     identity_from_seed, install_crypto_provider, serve_peer_rpc_listener, PeerRpcResponder,
 };
-use dig_node::CachedCapsule;
+use dig_node_core::CachedCapsule;
 use serde_json::{json, Value};
 
 // =====================================================================================================

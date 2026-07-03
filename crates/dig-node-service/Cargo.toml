@@ -21,14 +21,15 @@ name = "dig_node_service"
 path = "src/lib.rs"
 
 [dependencies]
-# The canonical NODE library — a first-party sibling crate in this workspace now (no
-# longer a stale git-pinned digstore alias). It IS the rpc.dig.net-compatible node the
-# native DIG Browser runs in-process (`handle_rpc`): local-first serve from cached .dig
-# modules, blind ciphertext+proof proxy to the upstream on a miss, on-chain
-# anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the P2P
-# stack, and the cache.* / control.* surface. This shell adds only the HTTP transport,
-# control-plane auth, CLI, and OS-service registration around it.
-dig-node = { path = "../dig-node" }
+# The canonical NODE engine library (crate `dig_node_core`) — a first-party sibling
+# crate in this workspace (no longer a stale git-pinned digstore alias). It IS the
+# rpc.dig.net-compatible node the native DIG Browser runs in-process (`handle_rpc`):
+# local-first serve from cached .dig modules, blind ciphertext+proof proxy to the
+# upstream on a miss, on-chain anchored-root resolution, chain-watch + subscriptions +
+# generation gap-fill, the P2P stack, and the cache.* / control.* surface. This shell
+# adds only the HTTP transport, control-plane auth, CLI, and OS-service registration
+# around it, and produces the `dig-node` binary (distinct name from the engine lib).
+dig-node-core = { path = "../dig-node-core" }
 
 # HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
 # and one server framework across the node and the service shell.

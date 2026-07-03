@@ -1,21 +1,23 @@
 [workspace]
 resolver = "2"
-# The canonical dig-node repo is a small workspace of the node + its two DIG-Browser
-# host shells:
-#   * dig-node          — the NODE library (RPC dispatch, serve/fetch/redirect,
-#                         chain-watch, subscriptions, gap-fill, cache, P2P). The single
-#                         node implementation shared by BOTH host shells below.
+# The canonical dig-node repo is a small workspace of the node ENGINE + its two
+# DIG-Browser host shells:
+#   * dig-node-core     — the NODE engine library (crate `dig_node_core`): RPC dispatch,
+#                         serve/fetch/redirect, chain-watch, subscriptions, gap-fill,
+#                         cache, P2P. The single node implementation shared by BOTH host
+#                         shells below. (Renamed from `dig-node` so the engine library and
+#                         the produced `dig-node` binary no longer share a name, #216.)
 #   * dig-node-service  — the OS-service binary (`dig-node`): axum transport + control
-#                         plane + CLI + service install. Depends on the node library.
+#                         plane + CLI + service install. Depends on the engine library.
 #   * dig-runtime       — the DIG Browser's in-process node: a cdylib (`dig_runtime.dll`)
 #                         exposing the `dig_rpc`/`dig_wallet_rpc` C-ABI the browser links.
 #   * dig-wallet        — the DIG Browser's built-in Chia wallet host (loopback UI + BLS
 #                         signing), brought up by dig-runtime beside the node.
 # For the `.dig` STORE FORMAT the node depends on digstore's store-format LIBRARY crates
-# (digstore-core/-crypto/-chain/-host/-remote/-stage) as GIT dependencies — dig-node ->
-# store-lib, never the reverse. digstore is only ever an RPC client of a node.
+# (digstore-core/-crypto/-chain/-host/-remote/-stage) as GIT dependencies — dig-node-core
+# -> store-lib, never the reverse. digstore is only ever an RPC client of a node.
 members = [
-    "crates/dig-node",
+    "crates/dig-node-core",
     "crates/dig-node-service",
     "crates/dig-runtime",
     "crates/dig-wallet",
