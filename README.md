@@ -183,7 +183,7 @@ Two layers gate the control surface (the read methods are **not** gated):
    (next to dig-node's `config.json`; `0600` on Unix). A same-host controller reads that file — it can,
    because it runs as the same user on the same machine — and presents the token on every `control.*`
    call, as the **`X-Dig-Control-Token`** request header **or** a **`params._control_token`** field. A
-   call without a valid token is rejected with **`UNAUTHORIZED`** (`-32020`). Token verification is
+   call without a valid token is rejected with **`UNAUTHORIZED`** (`-32030`). Token verification is
    constant-time; the token is generated at runtime and **never committed**.
 
 This is the standard local-capability-file pattern (cf. Chia's daemon / Bitcoin's cookie auth):
@@ -208,7 +208,7 @@ capsule reference `storeId` or `storeId:rootHash` (each part lowercase 64-hex).
 | `control.hostedStores.unpin` | `{ store }` | `{ store_id, unpinned, evicted_capsules }` — removes the pin and evicts the store's cached capsules. |
 | `control.hostedStores.status` | `{ store }` | `{ store_id, pinned, capsule_count, total_bytes, capsules:[…] }` |
 | `control.sync.status` | — | `{ available, method:"section-21-whole-store-sync", pinned_total, pinned_synced, whole_store_trigger_supported }` |
-| `control.sync.trigger` | `{ store }` (= `storeId:rootHash`) or `{ store_id, root }` | `{ store_id, root, status:"synced", size_bytes, served_root }`, or `NOT_SUPPORTED` (`-32021`) if no §21 identity. |
+| `control.sync.trigger` | `{ store }` (= `storeId:rootHash`) or `{ store_id, root }` | `{ store_id, root, status:"synced", size_bytes, served_root }`, or `NOT_SUPPORTED` (`-32031`) if no §21 identity. |
 
 **What's proxied vs. owned.** Cache + sync operations proxy to the node engine library (`dig_node_core`)
 (`cache_*`, `clear_cache`, `set_cache_cap_bytes`, `Node::cache_fetch_and_cache` / `cache_remove_cached`
@@ -286,18 +286,22 @@ distinguishing node-shell errors from upstream/boundary ones), beside the numeri
 | -32602 | `INVALID_PARAMS` | upstream | Invalid or missing method parameters. |
 | -32000 | `DISPATCH_FAILED` | shell | The node failed to dispatch the request. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay to the upstream failed. |
-| -32020 | `UNAUTHORIZED` | shell | A `control.*` method was called without a valid local control token. |
-| -32021 | `NOT_SUPPORTED` | shell | A control op the node build can't perform (e.g. §21 sync with no identity). |
-| -32022 | `CONTROL_ERROR` | shell | A control operation failed at runtime (e.g. could not persist the pin registry). |
+| -32030 | `UNAUTHORIZED` | shell | A `control.*` method was called without a valid local control token. |
+| -32031 | `NOT_SUPPORTED` | shell | A control op the node build can't perform (e.g. §21 sync with no identity). |
+| -32032 | `CONTROL_ERROR` | shell | A control operation failed at runtime (e.g. could not persist the pin registry). |
+
+The control-plane codes are `-32030`/`-32031`/`-32032`. `-32020`/`-32021`/`-32022` are RESERVED
+for the onion-routing (private-retrieval) contract and are never minted by the control plane.
 
 ## How the read path is wired (the important design decision)
 
-The node does **not** reimplement the DIG read path — it depends on digstore's **`dig-node`**
-crate (pinned to the #95/#96 **Pass A** commit, `b2632c4`, which ships the shared-cache work; no
-release tag contains it yet, so the dep is pinned to a `rev`) and routes every request to
-`dig_node_core::handle_rpc`. This is the **same node the native DIG Browser runs in-process**, so the
-node and the browser share one read path, one cache, and one cache contract (see "Shared `.dig`
-cache" above).
+The node engine does **not** reimplement the `.dig` store format — the `dig-node-core` crate depends
+on digstore's store-format **library** crates (`digstore-core`/`-crypto`/`-chain`/`-host`/`-remote`/
+`-stage`, git-pinned to one coherent rev) and owns the read path itself in `dig_node_core::handle_rpc`.
+Every host shell routes each request to that one dispatch. This is the **same node the native DIG
+Browser runs in-process**, so the node and the browser share one read path, one cache, and one cache
+contract (see "Shared `.dig` cache" above). The dependency direction is `dig-node-core` → store-lib,
+never the reverse — digstore is only ever an RPC client of a node.
 
 - `dig-node` is a **clean Cargo dependency**: the guest-wasm build prerequisite that gates
   `digstore-cli` (its `build.rs` embeds the compiled guest) does **not** apply to `dig-node`, which

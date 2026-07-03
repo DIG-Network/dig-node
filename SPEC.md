@@ -38,7 +38,7 @@ For usage instructions, see `README.md`. For non-normative narrative, see `USER_
   (digstore is only ever an RPC client of a node). The engine library is named `dig-node-core` so
   it no longer shares a name with the `dig-node` binary the service shell produces (#216).
 - **`dig-node-service`** (binary `dig-node`) — the OS-service host shell around the engine library.
-- **`dig-runtime`** (cdylib `dig_runtime`) — the DIG Browser's in-process host shell (§FFI).
+- **`dig-runtime`** (cdylib `dig_runtime`) — the DIG Browser's in-process host shell (§15).
 - **`dig-wallet`** (library + binary) — the DIG Browser's built-in Chia wallet host.
 
 1.2. The **service shell** (`dig-node-service`) owns exactly:
@@ -153,6 +153,22 @@ ARE `DIG_NODE_*`, full stop.
 The default port is `8080` (not `80`) because port 80 requires elevation on most OSes; the DIG
 Chrome extension's `server.host` MUST be set to `localhost:8080` to match (its own default is
 `localhost:80`).
+
+The variables above are the shell's public bind/upstream/cache knobs. The node ENGINE library
+(`dig-node-core`) additionally reads the following variables directly from the environment; the shell
+does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see below):
+
+| Variable | Meaning | Default | Rules |
+|---|---|---|---|
+| `DIG_NODE_CACHE_CAP` | LRU cache size cap, in bytes | `1073741824` (1 GiB) | Parsed as `u64`. Consulted ONLY when the persisted `cache_cap_bytes` key in `config.json` is absent or `0` (the persisted value wins). Unparsable/unset ⇒ default. |
+| `DIG_NODE_COINSET` | override the coinset API base used for chain-anchored-root resolution | `https://api.coinset.org` (mainnet) | Blank/unset ⇒ mainnet default. Used for tests / alternate endpoints. |
+| `DIG_NODE_PIN` | read-path anchored-root pin enforcement (§14.4) | `on` (ENFORCED, fail-closed) | ONLY `off`/`0`/`false` disable the node-side pin (a named offline/local-dev escape hatch); any other value or unset ENFORCES. Clients still verify proofs against their own trust root regardless. |
+| `DIG_NODE_WATCH_INTERVAL` | chain-watch poll interval, in seconds (§14.2) | `30` | Parsed as `u64`; `0`/unparsable/unset ⇒ default `30`; floored at `1` s so a mis-set value cannot flood coinset. |
+| `DIG_NODE_UPSTREAM` | **INTERNAL** — the effective upstream the node library reads | `https://rpc.dig.net/` | NOT a user knob. The shell resolves the upstream (§3.4) and writes this via `Config::apply_to_env()` (§3.5); the shell's public knob is `DIG_RPC_UPSTREAM`. |
+| `DIG_WALLET_WC_PROJECT_ID` | initial/default WalletConnect projectId for the wallet host (§16) | *(unset ⇒ none)* | A persisted `wc_project_id` in `config.json` wins over this; a blank persisted value falls through to this env. Blank ⇒ treated as unset. |
+
+The peer-network layer additionally honors `DIG_PEER_NETWORK` (set to a falsy value to disable the L7
+peer network) and `DIG_RELAY_URL` (override or disable the relay), which gate the P2P bring-up.
 
 ### 3.3. Upstream normalization
 
@@ -554,6 +570,7 @@ number.)
 | -32602 | `INVALID_PARAMS` | node | Invalid/missing method parameters (also minted by the control plane for bad control params). |
 | -32000 | `DISPATCH_FAILED` | shell | The shell failed to dispatch the request to the read path. |
 | -32004 | `RESOURCE_NOT_AVAILABLE_AT_ROOT` | upstream | Genuine content miss at the requested root (relayed); distinct from transport failure. |
+| -32005 | `ROOT_NOT_ANCHORED` | node | The node's mandatory read-path anchored-root pin (§14.4) fails closed: the requested root does not match the chain-anchored tip, the store has no confirmed on-chain generation, the chain is unreachable, or a rootless request cannot be resolved under enforcement. Minted by the node library on `dig.getContent`. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
@@ -630,3 +647,182 @@ does offset/length arithmetic over untrusted serialized input).
 | 10 | Release assets | Dual-named `dig-node-*` + legacy `dig-companion-*`, identical bytes, per §11.3 matrix | §11; `.github/workflows/release.yml` |
 | 11 | Control-token scheme | `<config_dir>/control-token`, 64-hex, `X-Dig-Control-Token` / `params._control_token`, constant-time | §7.2–7.3 |
 | 12 | Health/version/well-known shapes | §6 fields; additions additive only | §6; `src/meta.rs`, `src/server.rs` |
+| 13 | Subscription persistence | `<cache>/subscriptions.json` schema-versioned, atomic, cross-process-locked | §14.1; `subscription.rs` |
+| 14 | Autonomous sync fail-closed | chain-watch + gap-fill + read-path pin never serve/pull against an unconfirmable root | §14.2–14.4; `chainwatch.rs`, `lib.rs` |
+| 15 | FFI C-ABI | `dig_runtime_start`/`dig_rpc`/`dig_wallet_rpc`/`dig_free` signatures + ownership/threading | §15; `dig-runtime/src/lib.rs` |
+| 16 | Wallet broadcast gate | dry-run default; mainnet push requires `DIG_WALLET_ALLOW_BROADCAST=1`; a dapp cannot force it | §16; `dig-wallet/src/lib.rs` |
+
+---
+
+## 14. Autonomous sync — subscriptions, chain-watch, generation gap-fill
+
+The node engine keeps its held content current WITHOUT being asked: it watches the chain for the
+stores it subscribes to, proactively pulls the generations it is missing, and pins every serve to the
+chain-anchored root. All of this fails **closed** — an unconfirmable root is never served against or
+pulled.
+
+### 14.1. Subscriptions
+
+A **subscription** is a store the node intends to actively HOLD, WATCH, SYNC, and PUBLISH. It is
+DISTINCT from the durable capsule inventory (the `.dig` modules under the cache dir): the inventory
+answers "what does this node currently hold?", the subscription set answers "what does this node
+intend to keep current?". A store MAY be subscribed before any of its modules are held (the watcher
+pulls them down), and a module MAY be held without a subscription (a one-off cached read).
+
+- **Persistence.** The set is persisted to `<cache>/subscriptions.json` (next to `config.json`, so it
+  shares the cache's writability + lock handling). The on-disk document is
+  `{ "version": <u32, currently 1>, "stores": [<lower-case 64-hex store id>, …] }`. The schema is
+  **additive-only** (a future per-store option is a backwards-compatible field; a bump never removes or
+  repurposes a field).
+- **Normalization.** Store ids are trimmed + lower-cased on insert, de-duplicated, and kept in
+  insertion order. A malformed (non-64-hex) entry MUST be dropped on load, never admitted to the
+  watched set.
+- **Tolerant load.** A missing, empty, or unparseable file is an EMPTY set (never an error). A legacy
+  bare `{ "stores": [...] }` document (no `version`) MUST still load.
+- **Atomicity.** Writes MUST be atomic (temp-file + rename) and serialized by the SAME cross-process
+  advisory lock the `config.json` read-modify-write uses, so two DIG processes sharing the cache (the
+  browser's in-process node + the standalone node) cannot lose each other's subscription updates.
+- **Management.** The set is managed by the node-owned control methods `control.subscribe`,
+  `control.unsubscribe`, and `control.listSubscriptions` (delegated to the node by the shell, §5.5/§7).
+  `subscribe` is idempotent (re-subscribing is a no-op); `unsubscribe` of a store that is not
+  subscribed is a no-op; the RPC echoes the EXACT normalized id it persisted so the echo can never
+  disagree with `listSubscriptions`.
+
+### 14.2. Chain-watch loop
+
+A background loop polls each SUBSCRIBED store's CHIP-0035 singleton to detect a newly-confirmed
+generation.
+
+- **Interval.** The poll interval is `DIG_NODE_WATCH_INTERVAL` seconds, defaulting to `30` and
+  **floored at `1` s** (a `0`/unparsable/unset value ⇒ default; the floor prevents a mis-set value from
+  flooding coinset).
+- **Per-store decision (fail-closed).** After resolving the store's chain-anchored tip root — using the
+  SAME anchored-root resolver the read path uses (§14.4) — the watcher decides:
+  - chain read failed (`Err`) → **Skip** (never gap-fill against an unconfirmable root);
+  - no confirmed generation (`Ok(None)`) → **Skip**;
+  - the confirmed tip is already held locally → **Skip**;
+  - the confirmed tip is NOT held → **GapFill** `(store_id, tip)` (§14.3).
+- A failed pull is simply retried on the next tick.
+
+### 14.3. Generation gap-fill
+
+Gap-fill is the actuator that pulls a missing generation for `(store_id, root)` from another node,
+VERIFIES it against the chain-anchored root, and lands it in the node's cache. A module that arrives at
+a root OTHER than the confirmed root MUST be rejected (never cached or served).
+
+- **Two triggers.** (a) **Proactive** — the chain-watch loop (§14.2) for subscribed stores, so the node
+  *actively seeks other nodes to pull missing generations* rather than only reacting to reads.
+  (b) **Backfill-on-miss** — when a read is satisfied from another node or the upstream rather than
+  from local disk, the node background-backfills the whole capsule so the NEXT read of that resource is
+  served locally (deduplicated: a backfill already in flight for `store:root` is not started twice).
+  Enabled by default; toggle with the `DIG_NODE_BACKFILL_ON_MISS` environment variable.
+- **Fail-closed.** Gap-fill never pulls against an unconfirmable root (the §14.2 decision gates it).
+- **Verification invariant.** Every served module is verified against the chain-anchored root at SERVE,
+  no matter how it arrived — a client read, a §21 whole-store sync, or a proactive/backfill gap-fill.
+
+### 14.4. Read-path anchored-root pin
+
+Every `dig.getContent` serve is PINNED to the store's chain-anchored tip root (#127): the node serves
+against the on-chain current root or fails closed — it NEVER trusts an upstream-/host-reported root.
+
+- For an **explicit-root** request the requested root MUST equal the resolved anchored tip; a mismatch
+  is rejected. For a **rootless** request the node resolves the tip and serves against it.
+- The pin fails closed with `-32005 ROOT_NOT_ANCHORED` (§10) on: a root mismatch, an unreachable chain,
+  a store with no confirmed generation, or a rootless request under enforcement.
+- The pin is ENFORCED by default. The ONLY opt-out is the explicit `DIG_NODE_PIN=off` (also `0`/`false`)
+  environment variable, a named offline/local-development escape hatch — never the default. The pin is
+  a NODE-side gate; clients still verify the returned proof against their own trust root regardless, so
+  the opt-out only relaxes the node's serve gate for local dev.
+
+---
+
+## 15. FFI — dig-runtime C-ABI (in-process host)
+
+`dig-runtime` is a Cargo `cdylib` (`dig_runtime`, e.g. `dig_runtime.dll` shipped beside the browser
+executable) the DIG Browser links to run the node IN-PROCESS — there is no loopback server, no socket,
+and no `dig-node` sidecar. It drives the SAME `dig_node_core::handle_rpc` dispatch the OS-service binary
+runs, on a multi-thread tokio runtime the library owns, and brings up the built-in wallet host (§16)
+beside the node.
+
+The C-ABI exports (all `#[no_mangle] extern "C"`, and panic-safe — a panic is caught and never crosses
+the FFI boundary):
+
+| Export | Signature | Behavior |
+|---|---|---|
+| `dig_runtime_start` | `void dig_runtime_start(void)` | Initialize the runtime: build the node + tokio runtime, load the §21.9 identity, prepare the cache, and start the in-process wallet host. Idempotent and cheap to re-call. Optional (`dig_rpc` initializes lazily), but the browser calls it once at startup so identity + cache are ready before the first navigation. |
+| `dig_rpc` | `char* dig_rpc(const char* request_json)` | Execute ONE DIG JSON-RPC request in-process and return the JSON-RPC response text. Returns NULL only on a null/invalid input pointer or allocation failure. |
+| `dig_wallet_rpc` | `char* dig_wallet_rpc(const char* origin, const char* request_json)` | Execute ONE wallet request (§16) for the calling page's web origin and return a JSON ENVELOPE `{"status": <u16>, "body": <raw JSON>}`, where `status` is the HTTP-equivalent status (200 ok / 202 pending / 403 not-approved / 4xx–5xx error) and `body` is the dispatch's JSON body embedded as RAW JSON (never a double-encoded string). A null pointer or invalid UTF-8 in either argument yields a well-formed error envelope, never undefined behavior. |
+| `dig_free` | `void dig_free(char* ptr)` | Free a string previously returned by `dig_rpc`/`dig_wallet_rpc`. NULL is ignored. |
+
+- **String ownership.** `request_json` and `origin` are NUL-terminated UTF-8 strings OWNED BY THE
+  CALLER for the duration of the call. Each non-NULL return value is a newly-allocated NUL-terminated
+  UTF-8 string OWNED BY THE LIBRARY; the caller MUST return it to `dig_free` EXACTLY ONCE. Passing any
+  other pointer to `dig_free`, or freeing twice, is undefined behavior.
+- **Threading.** `dig_rpc` and `dig_wallet_rpc` BLOCK until the request completes on the shared runtime,
+  so callers MUST invoke them from a thread allowed to block (e.g. a `base::MayBlock` task), NEVER the
+  browser UI/IO thread. Concurrent calls are safe.
+- **Shared state.** `dig_wallet_rpc` runs the SAME `dig_wallet::wallet_dispatch` the loopback
+  `/api/wc/request` handler runs, against the SAME process-global wallet state — so the per-origin
+  approval gate, the unlocked session, and the signer source are shared between the FFI path and the
+  loopback wallet UI. The `origin` argument is supplied first-hand by the browser and is therefore
+  UNSPOOFABLE (unlike a header a page could forge); the approval gate (§16) keys on it.
+
+---
+
+## 16. Built-in wallet host — dig-wallet
+
+`dig-wallet` is the DIG Browser's built-in Chia wallet host: a loopback `axum` server bound
+`127.0.0.1:<DIG_WALLET_PORT>` (default `9777`) serving the wallet UI and a dapp-facing JSON-RPC
+surface, with native BLS signing. In the native browser it ALSO runs in-process via the §15 FFI
+(`dig_wallet_rpc`), sharing one process-global wallet state with the loopback UI.
+
+### 16.1. Method surface + dispatch
+
+The advertised dapp JSON-RPC method catalogue is the crate's `WC_METHOD_CATALOGUE` — the single source
+of truth (a drift test enforces that every advertised method has a real dispatch arm). Dispatch is a
+`match` on the method-name string in `wallet_dispatch` → `wc_dispatch`, reached identically from the
+loopback `/api/wc/request` handler and the §15 FFI. The surface groups as:
+
+- **CHIP-0002 handshake/introspection** — `chip0002_chainId`, `chip0002_connect`, `chip0002_getMethods`
+  (introspection returns the full catalogue).
+- **CHIP-0002 keys + signing** — `chip0002_getPublicKeys`, `chip0002_signMessage`,
+  `chip0002_signCoinSpends`, `chip0002_getAssetBalance`, `chip0002_getAssetCoins`.
+- **`chia_*` wallet surface** — address + sign (`chia_getAddress`, `chia_signMessageByAddress`),
+  payments (`chia_send`), history (`chia_getTransactions`), NFTs (`chia_getNfts`, `chia_transferNft`,
+  `chia_mintNft`, `chia_bulkMintNfts`), DIDs (`chia_getDids`, `chia_createDidWallet`, `chia_transferDid`),
+  and offers (`chia_getOfferSummary`, `chia_createOffer`, `chia_takeOffer`, `chia_cancelOffer`).
+- **CHIP-0035 store lifecycle** — `chia_mintStore`, `chia_advanceStore`, `chia_meltStore`,
+  `chia_setStoreDelegation`, `chia_setStoreOwnership`.
+- **`dig_*` advanced coin types** — clawback (`dig_clawbackSend`/`Claim`/`Recover`), options
+  (`dig_optionCreate`), streams (`dig_streamCreate`/`Claim`/`Clawback`), vaults (`dig_vaultCreate`), and
+  verifiable credentials (`dig_vcVerify`).
+
+A method that is not in the advertised catalogue (including deliberately-unsupported advanced methods)
+MUST return `501 Not Implemented` with an explanatory message — an HONEST "unsupported in this build",
+never a fabricated result.
+
+### 16.2. Authorization — two independent gates
+
+A spend reaches mainnet ONLY when BOTH gates pass:
+
+1. **Per-origin consent gate.** The caller's web origin — the unspoofable HTTP `Origin` header on the
+   loopback path, or the first-hand origin over FFI (§15) — is checked: public methods
+   (`chip0002_chainId`/`getMethods`) need no approval; `chip0002_connect` from an unapproved origin is
+   PARKED as pending (`202`); any key/sign method from an unapproved origin is FORBIDDEN (`403`); an
+   approved origin proceeds. Approvals persist to `connections.json`.
+2. **Broadcast gate (dry-run default).** A signed spend bundle is pushed to mainnet ONLY when
+   broadcasting is explicitly enabled by the process env `DIG_WALLET_ALLOW_BROADCAST=1`. The DEFAULT is
+   a DRY RUN: the bundle is built and BLS-signed but NOT pushed (response status `"signed"`), spending
+   no real funds. A dapp CANNOT force a broadcast — the request-level `broadcast` flag exists only on
+   the local `/api/send` REST path; dapp-originated spends pass broadcast-intent internally and are
+   gated SOLELY by the server-side env. With broadcasting disabled, a broadcast-intent local send is
+   refused (`403` "broadcasting is disabled — set `DIG_WALLET_ALLOW_BROADCAST=1` to spend real mainnet
+   funds") and a dapp spend degrades to a dry run.
+
+### 16.3. Secret custody
+
+Seed-reveal / private-key-export class methods (`export`, `exportMnemonic`, `chip0002_export`,
+`chia_export`, `getMnemonic`, `getSecretKeys`, `getPrivateKey(s)`, `revealSeed`) are HARD-BLOCKED from
+the dapp dispatch surface — they are absent from dispatch (fall to `501`) and are refused before any
+forward to a delegated signer. The mnemonic is revealed ONLY through the local, password-gated,
+self-origin `/api/export` UI route, never over the dapp/WC surface.

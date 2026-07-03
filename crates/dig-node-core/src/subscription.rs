@@ -1,14 +1,14 @@
-//! Subscription management (dig-node SPEC §6) — the node's OWN persisted set of subscribed stores.
+//! Subscription management (dig-node SPEC §14.1) — the node's OWN persisted set of subscribed stores.
 //!
 //! A **subscription** is a store the node has decided to actively HOLD, WATCH, SYNC, and PUBLISH:
-//! subscribing starts chain-watching the store's CHIP-0035 singleton (§4.3), gap-filling the
-//! generations it is missing (§5.1), and publishing provider records so peers find it as a holder
-//! (§6.2); unsubscribing stops watching (and, at the caller's option, evicts the held modules).
+//! subscribing starts chain-watching the store's CHIP-0035 singleton (§14.2), gap-filling the
+//! generations it is missing (§14.3), and publishing provider records so peers find it as a holder
+//! (§14.1); unsubscribing stops watching (and, at the caller's option, evicts the held modules).
 //!
 //! The subscription set is DISTINCT from the durable capsule inventory (the `.dig` modules under the
 //! cache dir). The inventory answers "what does this node currently hold?"; the subscription set
 //! answers "what does this node intend to keep current?" — it drives the proactive chain watcher +
-//! gap-fill loop, which is exactly the piece the SPEC marked **(target)** in §6.1. A store can be
+//! gap-fill loop the SPEC specifies in §14. A store can be
 //! subscribed before any of its modules are held (the watcher pulls them down); a module can be held
 //! without a subscription (a one-off cached read). Keeping the two separate is what lets the node
 //! *actively seek other nodes to pull the missing generations* rather than only reacting to reads.
