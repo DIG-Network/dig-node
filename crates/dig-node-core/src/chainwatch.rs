@@ -1,15 +1,15 @@
-//! Chain-watch + generation gap-fill (dig-node SPEC §4.3 + §5.1) — the node's autonomous sync loop.
+//! Chain-watch + generation gap-fill (dig-node SPEC §14.2 + §14.3) — the node's autonomous sync loop.
 //!
-//! This closes the two SPEC clauses previously marked **(target)**:
+//! This implements the autonomous-sync behaviors the SPEC specifies in §14:
 //!
-//! - **§4.3 chain-watch** — a background loop polls each SUBSCRIBED store's CHIP-0035 singleton (via
+//! - **§14.2 chain-watch** — a background loop polls each SUBSCRIBED store's CHIP-0035 singleton (via
 //!   the node's injectable [`AnchoredRootResolver`](crate::AnchoredRootResolver)) on an interval, so a
 //!   NEW confirmed generation is detected without a client read driving it. The confirmation
 //!   semantics are unchanged from the read-path pin: the unspent-singleton tip's root is the
 //!   authority, and an unreachable chain / no-confirmed-generation is a no-op that FAILS CLOSED (the
 //!   node never gap-fills against a root the chain could not confirm).
 //!
-//! - **§5.1 generation gap-fill** — when the confirmed tip is a root the node does not hold locally
+//! - **§14.3 generation gap-fill** — when the confirmed tip is a root the node does not hold locally
 //!   (`<cache>/modules/<store>/<root>.module` absent), the node is MISSING that generation. It
 //!   actively pulls it down (via the injected [`GapFiller`]), verifying against the chain-anchored
 //!   root exactly as a read would, then refreshes its DHT provider records so peers find it as a new
@@ -70,7 +70,7 @@ pub enum SkipReason {
     AlreadyHeld,
 }
 
-/// The pure per-store watch decision (SPEC §4.3 detect → §5.1 step 1). Given the store id, its
+/// The pure per-store watch decision (SPEC §14.2 detect → §14.3 gap-fill). Given the store id, its
 /// resolved anchored root, and whether the tip's module is already held locally, decide whether to
 /// gap-fill. This is the fail-closed gate the read path uses, applied proactively:
 ///
@@ -102,9 +102,9 @@ pub fn decide_watch(
 /// peers). Production is [`NodeGapFiller`], which delegates to the node's authenticated §21 whole-store
 /// sync (`Node::gap_fill_generation`): the whole `.dig` module for the confirmed generation is pulled
 /// from the node's upstream (the tier-4 gateway `rpc.dig.net` by default, or a configured node),
-/// chain-anchored-root pinned on every serve (§4.2). A failed pull is simply retried on the next tick.
-/// (The DHT-located multi-source range engine (§5.3) is the read-miss fetch path; the proactive
-/// whole-generation gap-fill here uses the whole-store sync, per the SPEC §5.1 ordering note.)
+/// chain-anchored-root pinned on every serve (§14.4). A failed pull is simply retried on the next tick.
+/// (The DHT-located multi-source range engine is the read-miss fetch path; the proactive
+/// whole-generation gap-fill here uses the whole-store sync, per the SPEC §14.3 verification invariant.)
 #[async_trait::async_trait]
 pub trait GapFiller: Send + Sync {
     /// Pull + verify + cache the generation `(store_id, root)`. Idempotent: a call for an
@@ -265,7 +265,7 @@ impl GapFiller for NodeGapFiller {
     }
 }
 
-/// Spawn the chain-watch + gap-fill loop for the standalone node (SPEC §4.3 + §5.1). The loop reads
+/// Spawn the chain-watch + gap-fill loop for the standalone node (SPEC §14.2 + §14.3). The loop reads
 /// the persisted subscription set each tick (so a live subscribe/unsubscribe takes effect), resolves
 /// each subscribed store's anchored root via the node's resolver, and gap-fills any confirmed
 /// generation it does not hold. Best-effort + fail-closed — a chain-unreachable / no-generation store
@@ -301,7 +301,7 @@ mod tests {
 
     // -- decide_watch (pure) -------------------------------------------------------------------------
 
-    /// **Proves:** a chain error never triggers a gap-fill (fail-closed §4.2/§5.1).
+    /// **Proves:** a chain error never triggers a gap-fill (fail-closed §14.2/§14.3).
     #[test]
     fn chain_error_skips() {
         let d = decide_watch(store(1), &Err("coinset 503".into()), false);
@@ -452,7 +452,7 @@ mod tests {
     }
 
     /// **Proves:** a failed gap-fill is counted attempted-but-not-filled, and a SECOND tick retries it
-    /// (interruption-retry, SPEC §5.1) — the store stays missing so the watcher keeps trying.
+    /// (interruption-retry, SPEC §14.3) — the store stays missing so the watcher keeps trying.
     /// **Catches:** a watcher that gives up after one failure, or double-counts a success.
     #[tokio::test]
     async fn failed_gap_fill_retries_next_tick() {

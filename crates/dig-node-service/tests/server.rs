@@ -539,7 +539,9 @@ async fn control_method_without_token_is_rejected_with_unauthorized() {
     )
     .await;
 
-    assert_eq!(resp["error"]["code"], json!(-32020));
+    // Canonical control-plane UNAUTHORIZED is -32030 (dig-rpc-types §10, SPEC §10);
+    // -32020 is reserved for the onion-routing contract and MUST NOT be minted here.
+    assert_eq!(resp["error"]["code"], json!(-32030));
     assert_eq!(resp["error"]["data"]["code"], json!("UNAUTHORIZED"));
     assert_eq!(resp["error"]["data"]["origin"], json!("shell"));
     assert!(resp.get("result").is_none(), "no result on a rejected call");
