@@ -1,0 +1,6 @@
+# Build tooling for the WalletConnect responder bundle. The committed output is
+# ../src/wc-bundle.js (regenerated via `npm install && node build.mjs`); the npm
+# install tree itself is not checked in — the crate builds offline from the
+# committed bundle, never from node_modules.
+node_modules/
+package-lock.json

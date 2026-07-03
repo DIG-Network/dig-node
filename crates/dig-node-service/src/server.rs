@@ -3,7 +3,7 @@
 //!
 //! This is the localhost endpoint the DIG Chrome extension points its `server.host`
 //! setting at. It speaks the SAME wire contract as rpc.dig.net (because it routes
-//! to `digstore_node::handle_rpc`), so the extension's `fetchContentViaRPC` pipeline —
+//! to `dig_node::handle_rpc`), so the extension's `fetchContentViaRPC` pipeline —
 //! `dig.getContent` → verify → decrypt, all done in the extension — works against
 //! it byte-for-byte, with the bonus that resources are served local-first from any
 //! `.dig` modules the node has cached.
@@ -19,7 +19,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use digstore_node::{cache_cap_bytes, cache_used_bytes, handle_rpc, Node};
+use dig_node::{cache_cap_bytes, cache_used_bytes, handle_rpc, Node};
 use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -163,7 +163,7 @@ async fn host_guard(req: Request, next: Next) -> Response {
 pub fn build_state(config: &Config) -> AppState {
     config.apply_to_env();
     let node = Node::from_env();
-    let config_path = digstore_node::config_path();
+    let config_path = dig_node::config_path();
     // Generate (or read) the control token into <config_dir>/control-token. A
     // failure to persist it (e.g. unwritable dir) is non-fatal: fall back to an
     // in-memory token so the control plane is still gated (a controller that can't

@@ -20,12 +20,12 @@
 //! structured object to **stdout** (`{ ok:true, action, ... }`) and routes human
 //! prose to **stderr**; on failure it emits `{ ok:false, error:{ code, exit_code,
 //! message, hint } }` to stdout and still exits with the differentiated code. The
-//! exit-code table is documented in [`dig_node::cli`] and the README.
+//! exit-code table is documented in [`dig_node_service::cli`] and the README.
 
 use clap::{Parser, Subcommand};
-use dig_node::cli::{error_envelope, success_envelope, ExitCode, Outcome};
-use dig_node::config::Config;
-use dig_node::{serve, service, VERSION};
+use dig_node_service::cli::{error_envelope, success_envelope, ExitCode, Outcome};
+use dig_node_service::config::Config;
+use dig_node_service::{serve, service, VERSION};
 
 #[derive(Parser)]
 #[command(
@@ -193,7 +193,7 @@ fn run(config: Config) -> std::io::Result<()> {
 /// non-Windows there is no SCM, so this just runs in the foreground like `run`.
 #[cfg(windows)]
 fn run_service(_config: Config) -> std::io::Result<()> {
-    dig_node::win_service::run()
+    dig_node_service::win_service::run()
 }
 #[cfg(not(windows))]
 fn run_service(config: Config) -> std::io::Result<()> {

@@ -1,20 +1,21 @@
-//! dig-node — the localhost DIG node for the DIG Chrome extension, as a
-//! self-contained cross-platform Rust binary installable as an OS service.
+//! dig-node-service — the localhost DIG node OS-service shell (binary `dig-node`).
 //!
-//! The DIG Chrome extension resolves `chia://` (DIG) URLs by calling a DIG RPC for
-//! encrypted, merkle-proven content, then verifying + decrypting it **in the
-//! extension**. By default it talks to `rpc.dig.net`; pointing its `server.host`
-//! at this dig-node makes that RPC **local**. This service routes every request
-//! to digstore's `dig-node` read-path crate (`digstore_node::handle_rpc`) — the
-//! SAME local-first node the native DIG Browser runs in-process — so the wire
-//! contract is byte-identical to rpc.dig.net (ciphertext + inclusion proof + chunk
-//! lengths), with the bonus that any `.dig` store the node has cached is served
-//! without leaving the machine.
+//! This crate is the SERVICE HOST around the canonical [`dig_node`] node library (a
+//! first-party sibling crate in this repo): it adds an axum HTTP transport, the
+//! control-plane auth gate, the CLI, and OS-service registration, and delegates every
+//! read request to the node's [`dig_node::handle_rpc`]. The DIG Chrome extension
+//! resolves `chia://` (DIG) URLs by calling a DIG RPC for encrypted, merkle-proven
+//! content, then verifying + decrypting it **in the extension**. By default it talks
+//! to `rpc.dig.net`; pointing its `server.host` at this node makes that RPC **local**.
 //!
-//! Why Rust, not the previous Node server: a single self-contained binary has no
-//! runtime dependency and installs cleanly as a Windows/Linux/macOS service. The
-//! original JavaScript v0.2 reference implementation is retained under `node/` for
-//! documentation.
+//! Because both this OS-service shell AND the DIG Browser's in-process shell
+//! ([`dig_runtime`](https://github.com/DIG-Network/dig-node)) drive the SAME
+//! [`dig_node`] library, the wire contract is byte-identical to rpc.dig.net
+//! (ciphertext + inclusion proof + chunk lengths), with the bonus that any `.dig`
+//! store the node has cached is served without leaving the machine.
+//!
+//! Why a single Rust binary: no runtime dependency and it installs cleanly as a
+//! Windows/Linux/macOS service.
 //!
 //! Layout:
 //! - [`config`] — env-driven [`Config`] (port/host/upstream).

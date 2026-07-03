@@ -46,7 +46,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use digstore_node::Node;
+use dig_node::Node;
 use serde_json::{json, Value};
 
 use crate::meta::ErrorCode;
@@ -88,7 +88,7 @@ pub fn control_token_path(config_path: &Path) -> PathBuf {
 /// the dir) read the same value. Written with owner-only permissions on Unix
 /// (`0600`) so another user on the box cannot read it. Never committed.
 pub fn load_or_create_token() -> std::io::Result<String> {
-    let path = control_token_path(&digstore_node::config_path());
+    let path = control_token_path(&dig_node::config_path());
     load_or_create_token_at(&path)
 }
 
@@ -268,7 +268,7 @@ pub const UPSTREAM_OVERRIDE_KEY: &str = "upstream_override";
 /// canonical lowercase 64-hex store id (optionally with a pinned root, kept as a
 /// `{store_id, root?}` object). Missing/blank config → empty list.
 pub fn read_pins() -> Vec<Value> {
-    read_pins_from(&digstore_node::config_path())
+    read_pins_from(&dig_node::config_path())
 }
 
 /// [`read_pins`] for an explicit config path (tests).
@@ -298,7 +298,7 @@ pub fn read_upstream_override_from(config_path: &Path) -> Option<String> {
 
 /// Read the persisted upstream override from the real config path.
 pub fn read_upstream_override() -> Option<String> {
-    read_upstream_override_from(&digstore_node::config_path())
+    read_upstream_override_from(&dig_node::config_path())
 }
 
 /// Read-modify-write the node's config.json, applying `mutate` to the parsed JSON
@@ -442,7 +442,7 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
         "control.cache.get" => control_ok(id, cache_get()),
         "control.cache.setCap" => cache_set_cap(id, params),
         "control.cache.clear" => {
-            digstore_node::clear_cache();
+            dig_node::clear_cache();
             control_ok(id, json!({ "cleared": true }))
         }
         "control.hostedStores.list" => control_ok(id, hosted_list(ctx).await),
@@ -451,11 +451,17 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
         "control.hostedStores.status" => hosted_status(ctx, id, params).await,
         "control.sync.status" => control_ok(id, sync_status(ctx).await),
         "control.sync.trigger" => sync_trigger(ctx, id, params).await,
-        _ => control_error(
-            id,
-            ErrorCode::MethodNotFound,
-            format!("unknown control method: {method}"),
-        ),
+        // Control methods the shell does not own are delegated to the NODE's own
+        // control surface (`control.peerStatus` / `control.subscribe` /
+        // `control.unsubscribe` / `control.listSubscriptions` — the node's persisted
+        // subscription set + peer-status snapshot). These are node-internal control
+        // methods dig_node::handle_rpc resolves; the shell forwards them so the whole
+        // control surface is reachable through one loopback endpoint. A genuinely
+        // unknown control method falls through the node too and returns -32601.
+        _ => {
+            let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+            dig_node::handle_rpc(&ctx.node, req).await
+        }
     }
 }
 
@@ -531,8 +537,8 @@ fn config_set_upstream(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 /// Cache view (cap/used/dir/shared) — reuses the dig-node crate's resolvers.
 fn cache_get() -> Value {
     json!({
-        "cap_bytes": digstore_node::cache_cap_bytes(),
-        "used_bytes": digstore_node::cache_used_bytes(),
+        "cap_bytes": dig_node::cache_cap_bytes(),
+        "used_bytes": dig_node::cache_used_bytes(),
         "dir": crate::meta::cache_dir().display().to_string(),
         "shared": crate::meta::cache_shared(),
     })
@@ -548,7 +554,7 @@ fn cache_set_cap(id: Value, params: &Value) -> Value {
         );
     };
     let floored = cap.max(64 * 1024 * 1024);
-    match digstore_node::set_cache_cap_bytes(floored) {
+    match dig_node::set_cache_cap_bytes(floored) {
         Ok(()) => control_ok(id, json!({ "cap_bytes": floored })),
         Err(e) => control_error(
             id,
@@ -839,7 +845,7 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 }
 
 /// Count distinct store ids among the cached capsules. PURE-ish (reads the slice).
-fn distinct_store_count(cached: &[digstore_node::CachedCapsule]) -> usize {
+fn distinct_store_count(cached: &[dig_node::CachedCapsule]) -> usize {
     cached
         .iter()
         .map(|c| c.store_id.as_str())

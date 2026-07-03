@@ -1,0 +1,19 @@
+{
+  "name": "dig-wallet-wc",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Build tooling for the DIG wallet's WalletConnect responder bundle (wc-bundle.js). Not shipped; the crate is built offline from the checked-in bundle.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "GPL-2.0-only",
+  "devDependencies": {
+    "@walletconnect/sign-client": "^2.23.10",
+    "esbuild": "^0.25.12",
+    "qrcode-generator": "^1.4.4"
+  }
+}
