@@ -33,7 +33,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use base64::Engine;
 use digstore_chain::coinset::Coinset;
 use digstore_chain::singleton::sync_datastore;
@@ -241,18 +240,18 @@ pub struct Node {
     content_cache: std::sync::Mutex<ContentCache>,
     /// Hook the standalone peer-network bring-up installs so the node can refresh its DHT provider
     /// records when its inventory changes (a gap-filled generation, a `cache.fetchAndCache`) — so
-    /// peers find it as a NEW holder without waiting for the maintenance loop (SPEC §6.2). Set ONCE by
+    /// peers find it as a NEW holder without waiting for the maintenance loop (SPEC §14.1). Set ONCE by
     /// [`peer::spawn_peer_network`] via [`Node::set_inventory_refresher`]; NEVER set on the FFI path
     /// (the browser is a consumer with no DHT), where an inventory-change refresh is a no-op. Kept off
     /// the `Node` struct's DHT-handle dependency (the node stays FFI-safe) by taking a boxed async hook.
     inventory_refresher: OnceLock<InventoryRefresher>,
-    /// Capsules whose background backfill (§5.6) is currently in flight, keyed `store_hex:root_hex`,
+    /// Capsules whose background backfill (§14.3) is currently in flight, keyed `store_hex:root_hex`,
     /// so a burst of resource reads for the same not-yet-held store spawns ONE whole-`.dig` pull, not
     /// one per read. An entry is inserted before the pull spawns and removed when it finishes.
     backfilling: std::sync::Mutex<std::collections::HashSet<String>>,
     /// A WEAK self-reference, installed by the standalone peer-network bring-up (which holds the
     /// `Arc<Node>`), so a `&self` read handler can spawn a detached background task that needs an owned
-    /// `Arc<Node>` — the capsule backfill (§5.6). `Weak` (not `Arc`) so the node's refcount is
+    /// `Arc<Node>` — the capsule backfill (§14.3). `Weak` (not `Arc`) so the node's refcount is
     /// unaffected (no self-keep-alive cycle). NEVER set on the FFI path, so a backfill there upgrades
     /// to `None` and is a no-op (the browser consumer has no peer network to pull a capsule from).
     self_ref: OnceLock<std::sync::Weak<Node>>,
@@ -274,7 +273,7 @@ impl Node {
     }
 
     /// Refresh the node's DHT provider records against its current inventory, if a peer network is
-    /// running (SPEC §6.2). A no-op on the FFI path (no hook installed) or before bring-up.
+    /// running (SPEC §14.1). A no-op on the FFI path (no hook installed) or before bring-up.
     pub(crate) async fn refresh_dht_inventory(&self) {
         if let Some(refresh) = self.inventory_refresher.get() {
             refresh().await;
@@ -283,7 +282,7 @@ impl Node {
 
     /// Install the WEAK self-reference (the standalone peer-network bring-up calls this once with the
     /// `Arc<Node>` it holds). Enables `&self` read handlers to spawn owned-`Arc` background tasks — the
-    /// capsule backfill (§5.6). Idempotent; never set on the FFI path.
+    /// capsule backfill (§14.3). Idempotent; never set on the FFI path.
     pub(crate) fn set_self_ref(&self, weak: std::sync::Weak<Node>) {
         let _ = self.self_ref.set(weak);
     }
@@ -712,7 +711,7 @@ fn module_path(dir: &Path, store_hex: &str, root_hex: &str) -> PathBuf {
 }
 
 /// Whether the module for `(store_id, root)` is held locally under `dir` — the "is this generation
-/// missing?" check the chain-watch gap-fill loop keys on (SPEC §5.1 step 1). Thin over
+/// missing?" check the chain-watch gap-fill loop keys on (SPEC §14.2). Thin over
 /// [`module_path`] so the loop's held-check seam ([`chainwatch::HeldCheck`]) has one source of truth.
 pub(crate) fn module_exists(dir: &Path, store_hex: &str, root_hex: &str) -> bool {
     module_path(dir, store_hex, root_hex).exists()
@@ -1680,16 +1679,16 @@ impl Node {
         }
     }
 
-    /// GAP-FILL one missing generation (SPEC §5.1 step 4): pull the whole `.dig` module for
+    /// GAP-FILL one missing generation (SPEC §14.3): pull the whole `.dig` module for
     /// `(store_id, root)` down from other nodes, verify it against the chain-anchored root, land it in
     /// the local cache, and (best-effort) refresh the DHT provider records so peers immediately find
-    /// this node as a NEW holder of the just-synced capsule (§6.2). Idempotent — an already-held
+    /// this node as a NEW holder of the just-synced capsule (§14.1). Idempotent — an already-held
     /// generation is a cheap success with no network.
     ///
     /// The pull reuses the authenticated whole-store sync ([`Self::cache_fetch_and_cache`] →
     /// `sync_module_from`), which lands the module keyed by capsule `(store, root)`. The
-    /// VERIFICATION INVARIANT (SPEC §5.3) is upheld at every SERVE: a gap-filled module is never served
-    /// as current unless its root equals the chain-anchored tip (the read-path pin, §4.2), so a
+    /// VERIFICATION INVARIANT (SPEC §14.3) is upheld at every SERVE: a gap-filled module is never served
+    /// as current unless its root equals the chain-anchored tip (the read-path pin, §14.4), so a
     /// tampered or wrong-generation pull can never be served — the same guarantee whether the module
     /// arrived via a client read, a §21 sync, or this proactive gap-fill.
     ///
@@ -1719,7 +1718,7 @@ impl Node {
         }
 
         // Best-effort: refresh the DHT provider records so peers find this node as a holder of the
-        // newly-synced capsule (§6.2). The peer-network bring-up installs the announce hook; when no
+        // newly-synced capsule (§14.1). The peer-network bring-up installs the announce hook; when no
         // peer network is running (FFI path) this is a no-op.
         self.refresh_dht_inventory().await;
         Ok(())
@@ -2107,13 +2106,6 @@ fn parse_store_id_arg(params: &Value) -> Result<chia_protocol::Bytes32, ()> {
     Ok(chia_protocol::Bytes32::new(arr))
 }
 
-/// Axum route: a thin wrapper over [`handle_rpc`] for the standalone `dig-node`
-/// binary. The DIG browser does NOT use this — it calls `handle_rpc` directly
-/// in-process via the `dig-runtime` FFI, with no loopback server.
-async fn rpc(State(node): State<Arc<Node>>, Json(req): Json<Value>) -> impl IntoResponse {
-    Json(handle_rpc(&node, req).await)
-}
-
 /// String-in / string-out convenience over [`handle_rpc`] for FFI callers
 /// (`dig-runtime`): parse the JSON-RPC request text, dispatch, return the
 /// response as JSON text. Keeps serde out of the FFI crate so the browser side
@@ -2139,9 +2131,9 @@ fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
 
 /// Core JSON-RPC dispatch — the actual DIG node. Takes the request Value and
 /// returns the response Value. This is the single source of truth shared by the
-/// axum route (standalone bin) AND the in-process FFI (`dig-runtime`), so the
-/// browser process can *be* the node: its dig:// handler calls this directly,
-/// no HTTP, no socket, no sidecar.
+/// service shell's HTTP transport (`dig-node-service`) AND the in-process FFI
+/// (`dig-runtime`), so the browser process can *be* the node: its dig:// handler
+/// calls this directly, no HTTP, no socket, no sidecar.
 pub async fn handle_rpc(node: &Node, req: Value) -> Value {
     let id = req.get("id").cloned().unwrap_or(json!(1));
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
@@ -2308,7 +2300,7 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
                             .await
                         {
                             // Served from another node — background-backfill the whole capsule so the
-                            // next read is local (SPEC §5.6). Deduped + detached; no delay here.
+                            // next read is local (SPEC §14.3). Deduped + detached; no delay here.
                             node.maybe_backfill_capsule(store_hex, root_hex);
                             return envelope;
                         }
@@ -2455,7 +2447,7 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
         return match node.cache_fetch_and_cache(store_hex, root_hex).await {
             Ok((size_bytes, served_root)) => {
                 // A freshly-cached capsule entered the served set — refresh the DHT provider records so
-                // peers immediately find this node as a holder (§6.2). No-op on the FFI path / before
+                // peers immediately find this node as a holder (§14.1). No-op on the FFI path / before
                 // peer-network bring-up. (Already-cached is unchanged inventory, so skip the refresh.)
                 if !already {
                     node.refresh_dht_inventory().await;
@@ -2611,7 +2603,7 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
         {
             // This resource is being served FROM ANOTHER NODE (a redirect/fetch-through). In the
             // background, ALSO pull the whole `.dig` capsule for this generation so the NEXT read of
-            // the store is served locally (SPEC §5.6, `DIG_NODE_BACKFILL_ON_MISS`, default on). This
+            // the store is served locally (SPEC §14.3, `DIG_NODE_BACKFILL_ON_MISS`, default on). This
             // does not delay the current response — it spawns a deduped detached pull and returns.
             node.maybe_backfill_capsule(store_hex, &root_hex);
             return envelope;
@@ -2764,55 +2756,6 @@ impl Node {
     pub fn anchored_root_resolver_arc(&self) -> Arc<dyn AnchoredRootResolver> {
         self.anchored_root_resolver.clone()
     }
-}
-
-/// Run the DIG node as a standalone loopback server (the `dig-node` binary only —
-/// the browser does NOT use this; it calls [`handle_rpc`] in-process via the
-/// `dig-runtime` FFI). Binds 127.0.0.1:`DIG_NODE_PORT` (default 9778).
-///
-/// On startup it also brings up the **L7 peer network** (PHASE-2b, #162): dig-gossip's connected peer
-/// pool (introducer-backed auto-discovery via `relay.dig.net`) + the mTLS peer-RPC server, so nodes
-/// across machines discover + connect over the relay, maintain a peer pool, and serve/issue the L7
-/// peer RPC. Disable with `DIG_PEER_NETWORK=off` (or the relay alone with `DIG_RELAY_URL=off`). The
-/// peer network runs in the standalone binary ONLY; the in-process FFI path (a pure consumer) never
-/// opens one, so the byte-exact §21/FFI contract is unchanged.
-pub async fn run() {
-    let node = Node::from_env();
-
-    // Bring up the L7 peer network (pool + discovery + mTLS peer-RPC server) unless opted out. This
-    // replaces the retired bespoke relay client: the relay reservation now lives inside
-    // dig-nat/dig-gossip and is surfaced through the pool status. Best-effort — a failed bring-up
-    // logs + leaves `control.peerStatus` reporting not-running; the HTTP read path below still serves.
-    if peer::peer_network_enabled() {
-        peer::spawn_peer_network(node.clone());
-    } else {
-        println!("dig-node: L7 peer network disabled (DIG_PEER_NETWORK=off)");
-    }
-
-    let app = Router::new()
-        .route("/", post(rpc))
-        .route("/health", axum::routing::get(health))
-        .with_state(node);
-
-    let port: u16 = std::env::var("DIG_NODE_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9778);
-    let addr = format!("127.0.0.1:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .unwrap_or_else(|e| panic!("dig-node: cannot bind {addr}: {e}"));
-    println!("dig-node listening on http://{addr}");
-    axum::serve(listener, app).await.expect("dig-node server");
-}
-
-/// `GET /health` — a tiny liveness + peer-network probe for the standalone node (so an operator or
-/// the installer can confirm the node is up and whether its L7 peer network is running).
-async fn health(State(node): State<Arc<Node>>) -> Json<Value> {
-    Json(json!({
-        "status": "ok",
-        "peer_network_running": node.peer_status.is_running(),
-    }))
 }
 
 /// Crate-internal test helpers shared across module test suites (e.g. the peer-surface
@@ -3053,7 +2996,7 @@ mod tests {
         assert_eq!(cached, module, "served module must be cached locally");
     }
 
-    /// **Proves:** `gap_fill_generation` ACTIVELY PULLS a missing generation end-to-end (SPEC §5.1) —
+    /// **Proves:** `gap_fill_generation` ACTIVELY PULLS a missing generation end-to-end (SPEC §14.3) —
     /// the node holds nothing for `(store, root)`, `gap_fill_generation` fetches the whole module from
     /// a real auth-required §21 remote, verifies + lands it under `(store, root)`, and a second call is
     /// an idempotent no-op. This is the "actively seek other nodes to pull the missing generations"
@@ -3101,7 +3044,7 @@ mod tests {
 
     /// **Proves:** the chain-watch loop's PRODUCTION seams (`NodeGapFiller` + `NodeHeldCheck`) wire the
     /// node's real pull path — one `run_tick` over a subscribed store whose confirmed tip is missing
-    /// pulls it from the §21 remote and marks it held. This exercises the full §4.3→§5.1 loop with the
+    /// pulls it from the §21 remote and marks it held. This exercises the full §14.2→§14.3 loop with the
     /// real node actuator (only the chain resolver is a deterministic mock).
     /// **Catches:** a mis-wired production seam (held-check or gap-filler pointed at the wrong path).
     #[tokio::test]
@@ -3154,7 +3097,7 @@ mod tests {
         );
     }
 
-    /// **Proves:** capsule backfill (§5.6) is a safe NO-OP on the FFI/consumer path — a node with no
+    /// **Proves:** capsule backfill (§14.3) is a safe NO-OP on the FFI/consumer path — a node with no
     /// P2P content engine + no installed self-ref (the browser's in-process node) never spawns a pull
     /// and never records an in-flight entry, so a resource read there is unchanged.
     /// **Catches:** a backfill that panics without a runtime self-ref, or that pulls on the consumer
@@ -3224,6 +3167,7 @@ mod tests {
         use axum::http::{header, HeaderMap};
         use axum::response::Response;
         use axum::routing::get;
+        use axum::Router;
 
         let handler = move |headers: HeaderMap| {
             let captured = captured.clone();
@@ -4937,6 +4881,47 @@ mod tests {
             resp.get("result").is_none(),
             "no proof result is fabricated: {resp}"
         );
+    }
+
+    #[test]
+    fn passthrough_alias_methods_are_method_not_found_on_the_node() {
+        // The node resolves dig.getContent locally but does NOT resolve the passthrough
+        // aliases dig.getCapsule / dig.listCapsules / dig.getManifest — it returns the
+        // catalogued -32601 (method not found), which is the shell's cue to relay the
+        // ORIGINAL request verbatim to the upstream (SPEC §5.4/§5.5). This pins that
+        // classification at the dispatch level so a future read-path change that starts
+        // resolving one of them locally (and would therefore need its catalogue entry
+        // flipped to served=local) is caught here, mirroring the dig.getProof guard.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let (node, _td) = test_node(None);
+        let store_id = Bytes32([1u8; 32]).to_hex();
+        // Representative params per method; the node must still report method-not-found.
+        let cases = [
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getCapsule","params":{
+                "store_id": store_id, "retrieval_key": any_rk_hex(),
+            }}),
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.listCapsules","params":{
+                "store_id": store_id,
+            }}),
+            json!({"jsonrpc":"2.0","id":3,"method":"dig.getManifest","params":{
+                "store_id": store_id,
+            }}),
+        ];
+        for req in cases {
+            let method = req["method"].as_str().unwrap().to_string();
+            let resp = rt.block_on(handle_rpc(&node, req));
+            assert_eq!(
+                resp["error"]["code"],
+                json!(-32601),
+                "{method} must be method-not-found on the node (the passthrough cue): {resp}"
+            );
+            assert!(
+                resp.get("result").is_none(),
+                "{method} must not be resolved locally by the node: {resp}"
+            );
+        }
     }
 
     // -- REDIRECT-ON-MISS (#165) — the content-orchestration miss handler wired into the RPC ----------

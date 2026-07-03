@@ -395,21 +395,24 @@ pub enum ErrorCode {
     /// (unreachable / non-JSON). Dig-node-shell error distinguishing a local
     /// proxy failure from an upstream-returned JSON-RPC error.
     UpstreamError,
-    /// `-32020` — a `control.*` (CONTROL/admin) method was called without a valid
+    /// `-32030` — a `control.*` (CONTROL/admin) method was called without a valid
     /// local control token. The control surface is loopback-only AND locally
     /// authorized: a same-host controller (the DIG Browser "My Node" UI) must read
     /// the node's control token from its config dir and present it. Read methods
     /// are NOT gated; only the mutating/management control namespace is. Shell error.
+    /// (Canonical dig-rpc-types §10 code; `-32020` is RESERVED for onion routing.)
     Unauthorized,
-    /// `-32021` — a control operation the embedded dig-node cannot perform on this
+    /// `-32031` — a control operation the embedded dig-node cannot perform on this
     /// build (e.g. whole-store §21 sync when no §21 identity is loaded, or a feature
     /// the pinned crate revision does not expose). Reported with this STABLE code
     /// rather than a generic failure so a controller can branch on "not supported"
-    /// vs a transient error. Shell error.
+    /// vs a transient error. Shell error. (Canonical dig-rpc-types §10 code; `-32021`
+    /// is RESERVED for onion routing.)
     NotSupported,
-    /// `-32022` — a `control.*` operation failed at runtime (e.g. could not write
+    /// `-32032` — a `control.*` operation failed at runtime (e.g. could not write
     /// the pin registry / config, or the cache op errored). Distinct from
     /// `INVALID_PARAMS` (bad input) and `NOT_SUPPORTED` (capability absent). Shell.
+    /// (Canonical dig-rpc-types §10 code; `-32022` is RESERVED for onion routing.)
     ControlError,
 }
 
@@ -424,9 +427,9 @@ impl ErrorCode {
             ErrorCode::DispatchFailed => -32000,
             ErrorCode::ResourceNotAvailableAtRoot => -32004,
             ErrorCode::UpstreamError => -32010,
-            ErrorCode::Unauthorized => -32020,
-            ErrorCode::NotSupported => -32021,
-            ErrorCode::ControlError => -32022,
+            ErrorCode::Unauthorized => -32030,
+            ErrorCode::NotSupported => -32031,
+            ErrorCode::ControlError => -32032,
         }
     }
 
@@ -872,13 +875,31 @@ mod tests {
 
     #[test]
     fn control_error_codes_are_catalogued() {
-        // The local-auth gate + control surface mint these stable codes.
-        assert_eq!(ErrorCode::Unauthorized.code(), -32020);
+        // The local-auth gate + control surface mint these stable codes. They are the
+        // CANONICAL control-plane numbers -32030/-32031/-32032 (dig-rpc-types §10, SPEC
+        // §10) — CLEAR of -32020/-32021/-32022, which are RESERVED for the onion-routing
+        // contract. This shell mints the SAME numbers the node library's own control
+        // methods use, so the two halves of the node never split the taxonomy.
+        assert_eq!(ErrorCode::Unauthorized.code(), -32030);
         assert_eq!(ErrorCode::Unauthorized.name(), "UNAUTHORIZED");
-        assert_eq!(ErrorCode::NotSupported.code(), -32021);
+        assert_eq!(ErrorCode::NotSupported.code(), -32031);
         assert_eq!(ErrorCode::NotSupported.name(), "NOT_SUPPORTED");
-        assert_eq!(ErrorCode::ControlError.code(), -32022);
+        assert_eq!(ErrorCode::ControlError.code(), -32032);
         assert_eq!(ErrorCode::ControlError.name(), "CONTROL_ERROR");
+        // The reserved onion range MUST NOT be reused by the control plane.
+        for onion in [-32020, -32021, -32022] {
+            for e in [
+                ErrorCode::Unauthorized,
+                ErrorCode::NotSupported,
+                ErrorCode::ControlError,
+            ] {
+                assert_ne!(
+                    e.code(),
+                    onion,
+                    "control code must not collide with the reserved onion range"
+                );
+            }
+        }
         // All are shell-origin (minted by the dig-node control plane).
         for e in [
             ErrorCode::Unauthorized,
