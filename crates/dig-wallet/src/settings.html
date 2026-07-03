@@ -1,0 +1,619 @@
+<!doctype html>
+<html lang="en" data-theme="dig">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIG Settings</title>
+<style>
+:root{
+  --void:#07060F; --space:#0C0B1E; --panel:rgba(22,20,54,.62);
+  --card:rgba(24,18,68,.55); --card-h:rgba(34,26,92,.62);
+  --hair:rgba(255,255,255,.07); --hair2:rgba(255,255,255,.11);
+  --hair-v:rgba(140,112,255,.22); --hair-m:rgba(255,0,222,.42);
+  --violet:#5800D6; --magenta:#FF00DE; --pink:#FF3DF5;
+  --grad:linear-gradient(115deg,#5800D6 0%,#FF00DE 100%);
+  --grad-text:linear-gradient(100deg,#B98CFF 0%,#FF6BEE 100%);
+  --glow-v:0 0 36px rgba(88,0,214,.5); --glow-m:0 0 28px rgba(255,0,222,.4);
+  --gold:#E6CC93; --gold2:#B8924E; --gold-soft:rgba(230,204,147,.14);
+  --grad-gold:linear-gradient(115deg,#F0DCAE,#B8924E);
+  --plat:#ECEAF6;
+  --t1:#F6F4FC; --t2:#C5C1E0; --t3:#928DBA; --t4:#605B8A;
+  --ok:#46E0B0; --warn:#E6B453; --err:#FF6B95;
+  --serif:"Hoefler Text","Iowan Old Style","Palatino Linotype",Georgia,"Times New Roman",serif;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI Variable","Segoe UI",system-ui,Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"Cascadia Code","SF Mono","Segoe UI Mono",Consolas,Menlo,monospace;
+  --ease:cubic-bezier(.22,.61,.36,1);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:var(--sans);color:var(--t1);background:var(--void);-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums;min-height:100vh}
+::selection{background:rgba(255,0,222,.32)}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:rgba(140,112,255,.22);border-radius:6px}
+.mono{font-family:var(--mono)}
+.sky{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(900px 620px at 84% -10%,rgba(88,0,214,.30),transparent 60%),radial-gradient(760px 520px at 6% 2%,rgba(255,0,222,.12),transparent 62%),radial-gradient(130% 1500px at 50% -4%,#1c1248 0%,#130d33 38%,#0c0a22 70%,#07060F 100%)}
+.stars{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.85}
+.stars i{position:absolute;width:2px;height:2px;border-radius:50%;background:#fff;animation:tw 5.5s ease-in-out infinite}
+@keyframes tw{0%,100%{opacity:.18}50%{opacity:.9}}
+.wrap{position:relative;z-index:2;min-height:100vh}
+header{display:flex;align-items:center;gap:12px;padding:20px 34px;border-bottom:1px solid var(--hair);backdrop-filter:blur(16px);background:linear-gradient(180deg,rgba(14,12,38,.5),transparent)}
+.mark{width:36px;height:36px;border-radius:11px;background:var(--grad);display:grid;place-items:center;font-family:var(--serif);font-weight:700;font-size:20px;color:#fff;box-shadow:var(--glow-v)}
+.brand{font-size:15px;font-weight:600;letter-spacing:.2px}
+.brand small{display:block;font-size:9.5px;font-weight:600;letter-spacing:.22em;text-transform:uppercase;margin-top:2px;background:var(--grad-gold);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.spacer{flex:1}
+main{display:flex;justify-content:center;padding:40px 24px 80px}
+.col{width:100%;max-width:620px}
+.eyebrow{font-size:11px;letter-spacing:.2em;text-transform:uppercase;font-weight:600;background:var(--grad-gold);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+h1.title{font-family:var(--serif);font-size:30px;font-weight:600;letter-spacing:-.01em;margin:4px 0 6px}
+.sub{color:var(--t3);font-size:13.5px;line-height:1.55;margin:0 0 30px;max-width:60ch}
+.sechead{display:flex;flex-direction:column;gap:3px;margin:30px 2px 14px}
+.sechead .kick{font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;font-weight:600;background:var(--grad-gold);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.sechead h2{font-family:var(--serif);font-size:21px;font-weight:600;letter-spacing:-.01em}
+.card{border:1px solid var(--hair);border-radius:18px;background:var(--panel);backdrop-filter:blur(16px);padding:24px 26px;margin-bottom:18px;box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+.card h3{font-size:15px;font-weight:600;display:flex;align-items:center;gap:10px}
+.chip{display:inline-flex;align-items:center;gap:6px;background:rgba(70,224,176,.12);color:var(--ok);border:1px solid rgba(70,224,176,.3);border-radius:999px;padding:3px 10px;font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.chip.gold{background:var(--gold-soft);color:var(--gold);border-color:var(--gold-soft)}
+.chip.warn{background:rgba(230,180,83,.12);color:var(--warn);border-color:rgba(230,180,83,.3)}
+.desc{color:var(--t3);font-size:13px;line-height:1.6;margin:8px 0 18px}
+.desc code,code{font-family:var(--mono);font-size:.92em;color:var(--gold)}
+a{color:var(--gold);text-decoration:none}a:hover{color:var(--pink)}
+.lblc{font-size:10.5px;color:var(--t4);text-transform:uppercase;letter-spacing:.16em;font-weight:600;margin:18px 0 8px}
+.field{width:100%;background:rgba(0,0,0,.28);border:1px solid var(--hair);color:var(--t1);border-radius:10px;padding:11px 13px;font-size:13px;font-family:var(--mono);outline:none;transition:border-color .15s var(--ease)}
+.field:focus,textarea.field:focus{border-color:var(--hair-m)}
+textarea.field{resize:vertical;min-height:84px;line-height:1.5}
+.field::placeholder{color:var(--t4)}
+.num{width:96px;background:rgba(0,0,0,.28);border:1px solid var(--hair);color:var(--t1);border-radius:10px;padding:10px 12px;font-size:15px;text-align:right;font-variant-numeric:tabular-nums;outline:none}
+.num:focus{border-color:var(--hair-m)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border:0;cursor:pointer;font-family:inherit;font-weight:600;font-size:13.5px;border-radius:11px;padding:11px 18px;transition:.18s var(--ease)}
+.btn.p{background:var(--grad);color:#fff;box-shadow:0 8px 24px rgba(255,0,222,.26),inset 0 1px 0 rgba(255,255,255,.26)}
+.btn.p:hover{transform:translateY(-2px);box-shadow:0 12px 34px rgba(255,0,222,.4),inset 0 1px 0 rgba(255,255,255,.3)}
+.btn.p:disabled{opacity:.5;transform:none;box-shadow:none;cursor:default}
+.btn.g{background:rgba(255,255,255,.05);color:#fff;border:1px solid var(--hair-v)}
+.btn.g:hover{background:rgba(255,255,255,.1)}
+.btn.danger{background:transparent;color:var(--err);border:1px solid rgba(255,107,149,.35)}
+.btn.danger:hover{background:rgba(255,107,149,.08)}
+.row{display:flex;gap:12px;margin-top:18px;flex-wrap:wrap}
+.row .btn{flex:0 0 auto}
+.row .btn.grow{flex:1}
+.status{font-size:12.5px;margin-top:12px;min-height:15px;color:var(--ok)}
+.status.err{color:var(--err)}
+.warn{color:var(--warn);font-size:12.5px;margin:12px 0;line-height:1.55;display:flex;gap:8px}
+.note{color:var(--t3);font-size:12.5px;margin-top:10px;line-height:1.55}
+.usage{margin:18px 0 6px}
+.usage .nums{display:flex;justify-content:space-between;font-size:13px;color:var(--t3);margin-bottom:8px}
+.usage .nums b{color:var(--t1);font-weight:600}
+.bar{height:10px;background:rgba(0,0,0,.3);border:1px solid var(--hair);border-radius:999px;overflow:hidden}
+.bar > i{display:block;height:100%;width:0;background:var(--grad);border-radius:999px;transition:width .35s var(--ease)}
+.slider-row{display:flex;align-items:center;gap:16px;margin-top:6px}
+input[type=range]{flex:1;accent-color:var(--magenta);height:4px}
+.capbox{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+.unit{color:var(--t3);font-size:14px}
+.kv{display:flex;gap:8px;align-items:center;background:rgba(0,0,0,.24);border:1px solid var(--hair);border-radius:10px;padding:11px 13px;font-family:var(--mono);font-size:12.5px;word-break:break-all;margin-top:8px}
+.kv .copy{margin-left:auto;flex:0 0 auto}
+.seedreveal{background:rgba(0,0,0,.28);border:1px solid var(--gold-soft);border-radius:10px;padding:14px;margin-top:12px;font-family:var(--mono);font-size:13.5px;line-height:1.95;word-spacing:5px;color:var(--t1)}
+.hidden{display:none}
+.cache-controls{display:flex;gap:8px;align-items:center;margin:6px 0 14px;flex-wrap:wrap}
+.cache-controls .field{flex:1;min-width:160px}
+select.sortsel{background:rgba(0,0,0,.28);border:1px solid var(--hair);color:var(--t1);border-radius:10px;padding:10px 12px;font-size:12.5px;cursor:pointer;outline:none}
+select.sortsel:focus{border-color:var(--hair-m)}
+table.ctable{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:4px}
+table.ctable th{text-align:left;color:var(--t4);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;padding:0 8px 8px;border-bottom:1px solid var(--hair)}
+table.ctable th.num,table.ctable td.num{text-align:right;font-variant-numeric:tabular-nums}
+table.ctable td{padding:11px 8px;border-bottom:1px solid var(--hair);font-family:var(--mono);vertical-align:middle;color:var(--t2)}
+table.ctable td.lbl{color:var(--t3);font-family:var(--sans)}
+table.ctable tr:last-child td{border-bottom:0}
+table.ctable .rm{background:transparent;color:var(--err);border:1px solid rgba(255,107,149,.35);border-radius:8px;padding:5px 10px;font-size:11.5px;cursor:pointer;font-family:var(--sans)}
+table.ctable .rm:hover{background:rgba(255,107,149,.08)}
+.subcard{margin-top:22px;border-top:1px solid var(--hair);padding-top:18px}
+.srcopts{display:flex;flex-direction:column;gap:10px;margin:6px 0 4px}
+.srcopt{display:flex;gap:12px;align-items:flex-start;border:1px solid var(--hair);border-radius:12px;padding:14px 16px;cursor:pointer;transition:.15s var(--ease)}
+.srcopt:hover{background:rgba(255,255,255,.04);border-color:var(--hair-v)}
+.srcopt input{margin-top:3px;accent-color:var(--magenta);width:16px;height:16px;flex:0 0 auto}
+.srcopt.on{border-color:var(--hair-m);background:rgba(255,0,222,.06)}
+.srctitle{font-size:14px;font-weight:600;color:var(--t1)}
+.srcsub{font-size:12.5px;color:var(--t3);line-height:1.5;margin-top:3px}
+.foot{color:var(--t3);font-size:12px;text-align:center;margin-top:18px;line-height:1.6}
+@media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
+</style>
+</head>
+<body>
+<div class="sky"></div><div class="stars" id="stars"></div>
+<div class="wrap">
+<header>
+  <div class="mark">&#208;</div>
+  <div class="brand">DIG Settings<small>Self-custodial node</small></div>
+  <div class="spacer"></div>
+  <a class="btn g" href="dig://wallet">Open wallet</a>
+</header>
+<main>
+  <div class="col">
+    <div class="eyebrow">DIG protocol</div>
+    <h1 class="title">Settings</h1>
+    <p class="sub">How this browser participates in the DIG Network as a native node — your local cache, your keys, and the relay that powers connecting apps.</p>
+
+    <!-- ===== KEYS ===== -->
+    <div class="sechead"><div class="kick">Keys</div><h2>Your keys</h2></div>
+
+    <!-- Wallet identity (public key + address) -->
+    <div class="card">
+      <h3>Wallet identity <span class="chip">&#9679; Public</span></h3>
+      <p class="desc">Your wallet's public key and receive address. These are safe to share — they identify your wallet but cannot move funds. (Unlock your wallet at <a href="dig://wallet">dig://wallet</a> to see them.)</p>
+      <div id="idLoaded" class="hidden">
+        <div class="lblc">Public key</div>
+        <div class="kv"><span id="pubKey">—</span><button class="btn g sm copy" id="copyPub" style="padding:6px 12px;font-size:12px;border-radius:8px">Copy</button></div>
+        <div class="lblc">Address</div>
+        <div class="kv"><span id="addr">—</span><button class="btn g sm copy" id="copyAddr" style="padding:6px 12px;font-size:12px;border-radius:8px">Copy</button></div>
+      </div>
+      <div id="idLocked" class="note hidden">Wallet is locked — open <a href="dig://wallet">dig://wallet</a> and unlock to view your public key.</div>
+    </div>
+
+    <!-- Backup & restore (export / import the recovery phrase) -->
+    <div class="card">
+      <h3>Backup &amp; restore <span class="chip warn">&#9679; Sensitive</span></h3>
+      <p class="desc">Your 24-word recovery phrase is the master key to your wallet. Back it up to move your wallet to another device, or restore a wallet from its phrase.</p>
+
+      <div class="lblc">Reveal recovery phrase</div>
+      <p class="warn"><span>&#9888;</span>Anyone with these 24 words controls your funds. Never share them, and only reveal them somewhere private.</p>
+      <div id="exportGate">
+        <input class="field" id="exportPw" type="password" placeholder="Re-enter your wallet password" autocomplete="current-password">
+        <div class="row"><button class="btn p" id="btnReveal">Reveal phrase</button></div>
+      </div>
+      <div id="exportShow" class="hidden">
+        <div class="seedreveal" id="seedWords"></div>
+        <div class="row"><button class="btn g" id="btnHide">Hide</button><button class="btn p" id="btnCopySeed">Copy phrase</button></div>
+      </div>
+      <div class="status" id="exportStatus"></div>
+
+      <div class="lblc" style="margin-top:26px">Restore from recovery phrase</div>
+      <p class="note">Restoring replaces the wallet on this device with the one for the phrase you enter.</p>
+      <textarea class="field" id="importPhrase" placeholder="word1 word2 word3 …" spellcheck="false" autocomplete="off" style="margin-top:8px"></textarea>
+      <input class="field" id="importPw" type="password" placeholder="Set a password (min 8 characters)" autocomplete="new-password" style="margin-top:8px">
+      <div class="row"><button class="btn danger" id="btnImport">Restore wallet</button></div>
+      <div class="status" id="importStatus"></div>
+    </div>
+
+    <!-- ===== WALLET SOURCE ===== -->
+    <div class="sechead"><div class="kick">Wallet</div><h2>Wallet source</h2></div>
+    <div class="card">
+      <h3>Where your wallet lives <span class="chip" id="srcChip">&#9679; Native</span></h3>
+      <p class="desc">Choose how this browser's wallet signs. <b>Native</b> keeps your keys on this device (the built-in wallet). <b>Sage</b> hands every wallet action — balances, sending, signing, offers — to your <a href="https://www.chia.net/downloads/" target="_blank" rel="noopener">Sage</a> wallet over WalletConnect; your keys never leave Sage. Apps you visit don't change — only who signs does.</p>
+
+      <div class="srcopts">
+        <label class="srcopt" id="srcOptNative">
+          <input type="radio" name="walletSource" value="native" id="srcNative">
+          <div><div class="srctitle">Native (local keys)</div><div class="srcsub">Sign with the wallet built into this browser. Your encrypted keys stay on this device.</div></div>
+        </label>
+        <label class="srcopt" id="srcOptSage">
+          <input type="radio" name="walletSource" value="sage" id="srcSage">
+          <div><div class="srctitle">Sage (WalletConnect)</div><div class="srcsub">Delegate to your Sage wallet. This browser holds no keys — Sage signs everything.</div></div>
+        </label>
+      </div>
+      <div class="status" id="srcStatus"></div>
+
+      <!-- Sage connect flow (shown only when Sage is selected) -->
+      <div id="sageConnect" class="subcard hidden">
+        <div id="sageNoPid" class="warn hidden"><span>&#9888;</span>Set a WalletConnect <b>projectId</b> below first — the relay needs it to reach Sage.</div>
+
+        <div id="sageDisconnected">
+          <div class="lblc" style="margin-top:0">Connect Sage</div>
+          <p class="note">Click connect, then scan the QR with Sage (or copy the link and paste it into Sage on this device). Approve the session in Sage to finish.</p>
+          <div class="row"><button class="btn p" id="btnSageConnect">Connect Sage</button></div>
+          <div id="sagePairing" class="hidden">
+            <div id="sageQr" style="margin:14px auto 0;width:220px;height:220px;background:#fff;border-radius:12px;padding:10px;display:grid;place-items:center"></div>
+            <div class="kv"><span id="sageUri" style="font-size:11px">—</span><button class="btn g sm copy" id="btnCopyUri" style="padding:6px 12px;font-size:12px;border-radius:8px">Copy</button></div>
+            <a class="note" id="sageUriLink" href="#" style="display:inline-block;margin-top:6px">Open in Sage on this device</a>
+          </div>
+        </div>
+
+        <div id="sageConnected" class="hidden">
+          <div class="lblc" style="margin-top:0">Connected to Sage <span class="chip" style="margin-left:6px">&#9679; Active</span></div>
+          <div class="kv"><span id="sagePeerName">Sage</span></div>
+          <p class="note">Your wallet is delegating to Sage. Every action in DIG asks Sage to sign.</p>
+          <div class="row"><button class="btn danger" id="btnSageDisconnect">Disconnect Sage</button></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== CONNECTIONS ===== -->
+    <div class="sechead"><div class="kick">Connections</div><h2>WalletConnect</h2></div>
+    <div class="card">
+      <h3>Relay project ID <span class="chip" id="wcChip">&#9679; Not configured</span></h3>
+      <p class="desc">Your built-in wallet can pair with apps over WalletConnect — including apps on other devices. That relay needs a free <b>projectId</b> from <a href="https://cloud.reown.com/" target="_blank" rel="noopener">Reown / WalletConnect Cloud</a>. Paste it here once; the wallet's <b>Connect a dapp</b> panel (and connecting Sage above) use it to pair.</p>
+      <div class="lblc">Project ID</div>
+      <input class="field" id="wcPid" type="text" placeholder="e.g. 1a2b3c… (from cloud.reown.com)" autocomplete="off" spellcheck="false">
+      <div class="row"><button class="btn p" id="btnWcSave">Save project ID</button><button class="btn g" id="btnWcClear">Clear</button></div>
+      <div class="status" id="wcStatus"></div>
+    </div>
+
+    <!-- ===== PERFORMANCE / CACHE ===== -->
+    <div class="sechead"><div class="kick">Performance</div><h2>Local cache</h2></div>
+    <div class="card">
+      <h3>Cache &amp; storage limit <span class="chip">&#9679; Local-first</span></h3>
+      <p class="desc">Your browser is a DIG node. When you open a <b>dig://</b> site, it downloads that store's <code>.dig</code> file to a local cache and serves it from your machine — instantly, and verified against the chain. When the cache is full, the least-recently-visited stores are evicted first (LRU).</p>
+
+      <div class="usage">
+        <div class="nums"><span>Cache used</span><span><b id="usedTxt">—</b> of <b id="capTxt">—</b></span></div>
+        <div class="bar"><i id="usedBar"></i></div>
+      </div>
+
+      <div class="lblc">Storage limit</div>
+      <div class="slider-row">
+        <input type="range" id="capRange" min="1" max="200" step="1" value="1">
+        <div class="capbox"><input class="num" id="capNum" type="number" min="0.06" step="0.5" value="1"><span class="unit">GB</span></div>
+      </div>
+      <div class="row"><button class="btn p" id="btnSave" disabled>Save</button><button class="btn g" id="btnClear">Clear cache</button></div>
+      <div class="status" id="status"></div>
+    </div>
+
+    <!-- Cached stores (#32): per-capsule local-cache manager -->
+    <div class="card">
+      <h3>Cached stores <span class="chip gold">&#9679; Capsules</span></h3>
+      <p class="desc">Every store generation your browser has cached is one <b>capsule</b> — a <code>storeId:rootHash</code> snapshot, stored locally and served instantly (verified against the chain). Remove a capsule to free space, or cache one ahead of time below.</p>
+
+      <div class="cache-controls">
+        <input class="field" id="capFilter" type="text" placeholder="Filter by store id…" autocomplete="off" spellcheck="false">
+        <select id="capSort" class="sortsel">
+          <option value="time">Sort: last used</option>
+          <option value="size">Sort: size</option>
+          <option value="store">Sort: store id</option>
+        </select>
+        <button class="btn g" id="btnCapRefresh">Refresh</button>
+      </div>
+
+      <table class="ctable" id="capTable">
+        <thead><tr><th>Store id</th><th>Root</th><th class="num">Size</th><th>Last used</th><th></th></tr></thead>
+        <tbody id="capBody"></tbody>
+      </table>
+      <div class="note" id="capEmpty">No capsules cached yet.</div>
+      <div class="status" id="capStatus"></div>
+
+      <div class="subcard">
+        <div class="lblc" style="margin-top:0">Cache a capsule</div>
+        <p class="note">Enter a capsule's <code>storeId</code> and <code>rootHash</code> (64-hex each) to fetch and cache it now.</p>
+        <input class="field" id="fetchStore" type="text" placeholder="store id (64-hex)" autocomplete="off" spellcheck="false" style="margin-top:8px">
+        <input class="field" id="fetchRoot" type="text" placeholder="root hash (64-hex)" autocomplete="off" spellcheck="false" style="margin-top:8px">
+        <div class="row"><button class="btn p" id="btnFetchCap">Cache capsule</button></div>
+        <div class="status" id="fetchStatus"></div>
+      </div>
+    </div>
+
+    <p class="foot">Need to publish data to the DIG Network? Use <a href="https://hub.dig.net/" target="_blank" rel="noopener">hub.dig.net</a>.</p>
+  </div>
+</main>
+</div>
+<script src="/wc-bundle.js"></script>
+<script>
+const GiB = 1024 * 1024 * 1024;
+const $ = id => document.getElementById(id);
+let savedCapGb = null;
+
+// decorative starfield (skipped when motion is reduced)
+(function(){ if(window.matchMedia('(prefers-reduced-motion: reduce)').matches) return; var s=$('stars'),h=''; for(var i=0;i<70;i++){h+='<i style="left:'+(Math.random()*100)+'%;top:'+(Math.random()*100)+'%;animation-delay:'+(Math.random()*5).toFixed(2)+'s;opacity:'+(.25+Math.random()*.55).toFixed(2)+'"></i>';} s.innerHTML=h; })();
+
+function fmtBytes(n){
+  if(n >= GiB) return (n / GiB).toFixed(n >= 10*GiB ? 0 : 2) + ' GB';
+  if(n >= 1024*1024) return (n / (1024*1024)).toFixed(0) + ' MB';
+  if(n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+function render(cfg){
+  const capGb = cfg.cache_cap_bytes / GiB;
+  savedCapGb = capGb;
+  $('usedTxt').textContent = fmtBytes(cfg.cache_used_bytes);
+  $('capTxt').textContent = fmtBytes(cfg.cache_cap_bytes);
+  const pct = cfg.cache_cap_bytes ? Math.min(100, 100 * cfg.cache_used_bytes / cfg.cache_cap_bytes) : 0;
+  $('usedBar').style.width = pct + '%';
+  setCap(capGb, false);
+  $('btnSave').disabled = true;
+}
+
+function setCap(gb, dirty){
+  const g = Math.max(0.06, gb);
+  $('capNum').value = Number.isInteger(g) ? g : g.toFixed(2);
+  $('capRange').value = Math.min(200, Math.max(1, Math.round(g)));
+  if(dirty !== false) $('btnSave').disabled = Math.abs(g - savedCapGb) < 1e-6;
+}
+
+async function load(){
+  try{
+    const r = await fetch('/api/dig-config');
+    render(await r.json());
+  }catch(e){ status('Could not reach the DIG node.', true); }
+}
+
+function status(msg, isErr){
+  const el = $('status');
+  el.textContent = msg;
+  el.className = 'status' + (isErr ? ' err' : '');
+}
+
+$('capRange').addEventListener('input', e => setCap(parseFloat(e.target.value), true));
+$('capNum').addEventListener('input', e => setCap(parseFloat(e.target.value || '0'), true));
+
+$('btnSave').addEventListener('click', async () => {
+  const gb = parseFloat($('capNum').value || '0');
+  const bytes = Math.round(gb * GiB);
+  $('btnSave').disabled = true;
+  status('Saving…');
+  try{
+    const r = await fetch('/api/dig-config', {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({cache_cap_bytes: bytes})
+    });
+    if(!r.ok) throw new Error(await r.text());
+    render(await r.json());
+    status('Saved.');
+  }catch(e){ status('Save failed: ' + e.message, true); $('btnSave').disabled = false; }
+});
+
+$('btnClear').addEventListener('click', async () => {
+  status('Clearing…');
+  try{
+    const r = await fetch('/api/dig-cache/clear', {method:'POST'});
+    if(!r.ok && r.status !== 204) throw new Error(await r.text());
+    await load();
+    status('Cache cleared.');
+  }catch(e){ status('Clear failed: ' + e.message, true); }
+});
+
+function setStatus(id, msg, isErr){
+  const el = $(id); el.textContent = msg; el.className = 'status' + (isErr ? ' err' : '');
+}
+function copyBtn(btn, text){
+  navigator.clipboard.writeText(text); const o = btn.textContent;
+  btn.textContent = 'Copied'; setTimeout(()=>btn.textContent=o, 1200);
+}
+
+// --- WalletConnect projectId ---
+async function loadWcPid(){
+  try{
+    const r = await fetch('/api/wc/project-id');
+    const c = await r.json();
+    $('wcPid').value = c.project_id || '';
+    const chip = $('wcChip');
+    chip.textContent = c.configured ? '● Configured' : '● Not configured';
+    chip.className = 'chip' + (c.configured ? '' : ' warn');
+  }catch(e){ /* leave default */ }
+}
+$('btnWcSave').addEventListener('click', async () => {
+  setStatus('wcStatus','Saving…');
+  try{
+    const r = await fetch('/api/wc/project-id', {method:'POST',headers:{'content-type':'application/json'},
+      body: JSON.stringify({project_id: $('wcPid').value.trim()})});
+    if(!r.ok) throw new Error(await r.text());
+    await loadWcPid(); setStatus('wcStatus','Saved.');
+  }catch(e){ setStatus('wcStatus','Save failed: '+e.message, true); }
+});
+$('btnWcClear').addEventListener('click', async () => {
+  setStatus('wcStatus','Clearing…');
+  try{
+    const r = await fetch('/api/wc/project-id', {method:'POST',headers:{'content-type':'application/json'},
+      body: JSON.stringify({project_id: ''})});
+    if(!r.ok) throw new Error(await r.text());
+    await loadWcPid(); setStatus('wcStatus','Cleared (using the built-in default, if any).');
+  }catch(e){ setStatus('wcStatus','Clear failed: '+e.message, true); }
+});
+
+// --- Wallet source: Native (local keys) vs. Sage (WalletConnect delegate), #34 ---
+// Native signs with the on-device keys; Sage delegates the whole wallet surface to the
+// user's Sage wallet over a WalletConnect *requester* session (this wallet is the
+// client, the dual of "Connect a dapp"). The connect flow lives here; the live session
+// it pairs is restorable in the wallet page (same loopback origin) where the delegate
+// pump forwards each request to Sage. window.chia is unchanged either way.
+let _curSource = 'native', _reqReady = false;
+
+function renderSource(source){
+  _curSource = source;
+  $('srcNative').checked = source === 'native';
+  $('srcSage').checked   = source === 'sage';
+  $('srcOptNative').classList.toggle('on', source === 'native');
+  $('srcOptSage').classList.toggle('on', source === 'sage');
+  const chip = $('srcChip');
+  chip.textContent = source === 'sage' ? '● Sage' : '● Native';
+  $('sageConnect').classList.toggle('hidden', source !== 'sage');
+  if(source === 'sage') refreshSageState();
+}
+
+async function loadSource(){
+  try{ const r = await fetch('/api/wallet/source'); renderSource((await r.json()).source || 'native'); }
+  catch(e){ renderSource('native'); }
+}
+
+async function setSource(source){
+  setStatus('srcStatus','Saving…');
+  try{
+    const r = await fetch('/api/wallet/source', {method:'POST',headers:{'content-type':'application/json'},
+      body: JSON.stringify({source})});
+    if(!r.ok) throw new Error(await r.text());
+    renderSource((await r.json()).source || source);
+    setStatus('srcStatus', source === 'sage'
+      ? 'Sage selected — connect your Sage wallet below.'
+      : 'Using this browser’s built-in wallet.');
+  }catch(e){ setStatus('srcStatus','Could not change wallet source: '+e.message, true); }
+}
+$('srcNative').addEventListener('change', () => setSource('native'));
+$('srcSage').addEventListener('change',   () => setSource('sage'));
+
+// Init the WC requester (reuses the bundled SignClient + the configured projectId).
+async function ensureRequester(){
+  if(_reqReady || !window.DigWC || !DigWC.initRequester) return false;
+  let cfg; try{ cfg = await (await fetch('/api/wc/project-id')).json(); }catch(e){ cfg = {configured:false}; }
+  if(!cfg.configured){ $('sageNoPid').classList.remove('hidden'); return false; }
+  $('sageNoPid').classList.add('hidden');
+  try{ await DigWC.initRequester(cfg.project_id); _reqReady = true;
+    DigWC.onSageSessionChanged(refreshSageState); return true; }
+  catch(e){ setStatus('srcStatus','WalletConnect failed to start: '+e.message, true); return false; }
+}
+
+// Reflect whether a Sage session is live (connected vs. needs-connect).
+function refreshSageState(){
+  if(!window.DigWC) return;
+  const s = _reqReady ? DigWC.sageSession() : null;
+  const connected = !!s;
+  $('sageConnected').classList.toggle('hidden', !connected);
+  $('sageDisconnected').classList.toggle('hidden', connected);
+  if(connected){ const p = DigWC.sagePeer(); $('sagePeerName').textContent = (p && (p.name || p.url)) || 'Sage'; }
+}
+
+$('btnSageConnect').addEventListener('click', async () => {
+  if(!(await ensureRequester())) return;
+  setStatus('srcStatus','Opening WalletConnect…');
+  try{
+    const { uri, approval } = await DigWC.connectSage();
+    $('sageUri').textContent = uri;
+    $('sageUriLink').href = uri;
+    $('sageQr').innerHTML = DigWC.qrSvg ? DigWC.qrSvg(uri, 200) : '';
+    $('sagePairing').classList.remove('hidden');
+    setStatus('srcStatus','Scan the QR (or open in Sage) and approve the session.');
+    await approval();                 // resolves when Sage approves
+    $('sagePairing').classList.add('hidden');
+    setStatus('srcStatus','Connected to Sage.');
+    refreshSageState();
+  }catch(e){ setStatus('srcStatus','Connect failed: '+e.message, true); }
+});
+$('btnCopyUri').addEventListener('click', e => copyBtn(e.target, $('sageUri').textContent));
+$('btnSageDisconnect').addEventListener('click', async () => {
+  try{ await DigWC.disconnectSage(); }catch(e){}
+  refreshSageState(); setStatus('srcStatus','Disconnected from Sage.');
+});
+
+// --- Wallet identity: public key + address ---
+async function loadIdentity(){
+  try{
+    const r = await fetch('/api/wallet/pubkey');
+    if(r.status === 401){ $('idLocked').classList.remove('hidden'); $('idLoaded').classList.add('hidden'); return; }
+    if(!r.ok) throw new Error(await r.text());
+    const k = await r.json();
+    $('pubKey').textContent = k.public_key;
+    $('addr').textContent = k.address;
+    $('idLoaded').classList.remove('hidden'); $('idLocked').classList.add('hidden');
+  }catch(e){ $('idLocked').classList.remove('hidden'); }
+}
+$('copyPub').addEventListener('click', e => copyBtn(e.target, $('pubKey').textContent));
+$('copyAddr').addEventListener('click', e => copyBtn(e.target, $('addr').textContent));
+
+// --- Backup: reveal recovery phrase (export) ---
+$('btnReveal').addEventListener('click', async () => {
+  setStatus('exportStatus','');
+  const pw = $('exportPw').value;
+  if(!pw){ setStatus('exportStatus','Enter your wallet password.', true); return; }
+  try{
+    const r = await fetch('/api/export', {method:'POST',headers:{'content-type':'application/json'},
+      body: JSON.stringify({password: pw})});
+    if(!r.ok){ let m='reveal failed'; try{m=await r.text()}catch(e){} throw new Error(m); }
+    const d = await r.json();
+    $('seedWords').textContent = d.mnemonic;
+    $('exportGate').classList.add('hidden'); $('exportShow').classList.remove('hidden');
+    $('exportPw').value = '';
+  }catch(e){ setStatus('exportStatus', e.message, true); }
+});
+$('btnHide').addEventListener('click', () => {
+  $('seedWords').textContent = '';   // drop it from the DOM
+  $('exportShow').classList.add('hidden'); $('exportGate').classList.remove('hidden');
+});
+$('btnCopySeed').addEventListener('click', e => copyBtn(e.target, $('seedWords').textContent));
+
+// --- Restore from recovery phrase (import) ---
+$('btnImport').addEventListener('click', async () => {
+  setStatus('importStatus','');
+  const mnemonic = $('importPhrase').value.trim();
+  const pw = $('importPw').value;
+  if(!mnemonic){ setStatus('importStatus','Enter your recovery phrase.', true); return; }
+  if(pw.length < 8){ setStatus('importStatus','Password must be at least 8 characters.', true); return; }
+  try{
+    const r = await fetch('/api/import', {method:'POST',headers:{'content-type':'application/json'},
+      body: JSON.stringify({mnemonic, password: pw})});
+    if(!r.ok){ let m='restore failed'; try{m=(await r.json()).error||m}catch(e){} throw new Error(m); }
+    $('importPhrase').value=''; $('importPw').value='';
+    setStatus('importStatus','Wallet restored. Open dig://wallet to use it.');
+    loadIdentity();
+  }catch(e){ setStatus('importStatus', e.message, true); }
+});
+
+// --- Cached stores: per-capsule local-cache manager (#32) ---
+const HEX64 = /^[0-9a-fA-F]{64}$/;
+let _capsules = [];
+
+function fmtAgo(ms){
+  if(!ms) return '—';
+  const s = Math.max(0, Math.floor((Date.now() - ms)/1000));
+  if(s < 60) return s+'s ago';
+  if(s < 3600) return Math.floor(s/60)+'m ago';
+  if(s < 86400) return Math.floor(s/3600)+'h ago';
+  return Math.floor(s/86400)+'d ago';
+}
+const shortHex = h => !h ? '' : (h.length>16 ? h.slice(0,8)+'…'+h.slice(-6) : h);
+
+function renderCapsules(){
+  const filter = $('capFilter').value.trim().toLowerCase();
+  const sort = $('capSort').value;
+  let rows = _capsules.filter(c => !filter || c.store_id.toLowerCase().startsWith(filter));
+  rows.sort((a,b) =>
+    sort==='size'  ? b.size_bytes - a.size_bytes :
+    sort==='store' ? a.store_id.localeCompare(b.store_id) :
+                     b.last_used_unix_ms - a.last_used_unix_ms);
+  const body = $('capBody');
+  body.innerHTML = rows.map(c =>
+    `<tr><td title="${c.store_id}">${shortHex(c.store_id)}</td>`+
+    `<td title="${c.root}">${shortHex(c.root)}</td>`+
+    `<td class="num">${fmtBytes(c.size_bytes)}</td>`+
+    `<td class="lbl">${fmtAgo(c.last_used_unix_ms)}</td>`+
+    `<td class="num"><button class="rm" data-rm-store="${c.store_id}" data-rm-root="${c.root}">Remove</button></td></tr>`).join('');
+  const none = rows.length === 0;
+  $('capTable').style.display = none ? 'none' : '';
+  $('capEmpty').style.display = none ? '' : 'none';
+  $('capEmpty').textContent = (_capsules.length && none) ? 'No capsules match the filter.' : 'No capsules cached yet.';
+}
+
+async function loadCapsules(){
+  try{
+    const r = await fetch('/api/dig-cache/list');
+    if(!r.ok) throw new Error(await r.text());
+    _capsules = (await r.json()).cached || [];
+    renderCapsules();
+    setStatus('capStatus', _capsules.length ? _capsules.length+' capsule(s) cached.' : '');
+  }catch(e){ setStatus('capStatus','Could not load cached stores: '+e.message, true); }
+}
+
+$('capFilter').addEventListener('input', renderCapsules);
+$('capSort').addEventListener('change', renderCapsules);
+$('btnCapRefresh').addEventListener('click', loadCapsules);
+
+$('capBody').addEventListener('click', async e => {
+  const store = e.target.dataset.rmStore, root = e.target.dataset.rmRoot;
+  if(!store) return;
+  setStatus('capStatus','Removing…');
+  try{
+    const r = await fetch('/api/dig-cache/remove', {method:'POST',headers:{'content-type':'application/json'},
+      body: JSON.stringify({store_id: store, root})});
+    if(!r.ok){ let m='remove failed'; try{m=(await r.json()).error||m}catch(_){} throw new Error(m); }
+    await loadCapsules();
+  }catch(e){ setStatus('capStatus','Remove failed: '+e.message, true); }
+});
+
+$('btnFetchCap').addEventListener('click', async () => {
+  const store = $('fetchStore').value.trim().replace(/^0x/,'');
+  const root  = $('fetchRoot').value.trim().replace(/^0x/,'');
+  if(!HEX64.test(store)){ setStatus('fetchStatus','Store id must be 64 hex characters.', true); return; }
+  if(!HEX64.test(root)){ setStatus('fetchStatus','Root hash must be 64 hex characters.', true); return; }
+  $('btnFetchCap').disabled = true;
+  setStatus('fetchStatus','Fetching capsule… (this can take a moment)');
+  try{
+    const r = await fetch('/api/dig-cache/fetch', {method:'POST',headers:{'content-type':'application/json'},
+      body: JSON.stringify({store_id: store, root})});
+    if(!r.ok){ let m='fetch failed'; try{m=(await r.json()).error||m}catch(_){} throw new Error(m); }
+    const d = await r.json();
+    if(d.status === 'failed'){ setStatus('fetchStatus', 'Could not cache: '+(d.message||'unknown error'), true); }
+    else { setStatus('fetchStatus', 'Cached ('+fmtBytes(d.size_bytes)+').'); $('fetchStore').value=''; $('fetchRoot').value=''; await loadCapsules(); }
+  }catch(e){ setStatus('fetchStatus','Fetch failed: '+e.message, true); }
+  finally{ $('btnFetchCap').disabled = false; }
+});
+
+load();
+loadWcPid();
+loadSource();
+loadIdentity();
+loadCapsules();
+</script>
+</body>
+</html>

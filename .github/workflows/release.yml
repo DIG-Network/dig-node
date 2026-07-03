@@ -58,6 +58,14 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # ENOSPC guard (digstore CI lesson): the workspace now compiles the full P2P stack
+  # (dig-nat/gossip/dht/pex/download) + wasmtime/cranelift (via digstore-host/-stage) +
+  # the chia wallet SDK, whose debug symbols blow the runner disk. Strip debuginfo from
+  # dev + test builds and keep it out of release binaries, so a full workspace
+  # test/build fits the CI disk.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
   # ---------------------------------------------------------------------------

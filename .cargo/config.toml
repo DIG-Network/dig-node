@@ -1,0 +1,16 @@
+# dig-node workspace cargo config.
+#
+# The node depends (as a GIT dependency of the digstore repo) on `digstore-stage`,
+# whose build script embeds the digstore guest wasm (BINDING contract D6). When
+# digstore-stage is built out-of-workspace like this, its default in-workspace wasm
+# path (`../../target/wasm32-unknown-unknown/release/digstore_guest.wasm`) lives
+# under cargo's read-only git checkout and never holds the artifact. So we point its
+# build at the wasm vendored in THIS repo via the documented `DIGSTORE_GUEST_WASM`
+# override. `relative = true` resolves the path against this config file's parent
+# (the repo root), so it works from any build cwd and in CI.
+#
+# The vendored wasm is pinned to the same digstore rev the store-lib git deps use;
+# rebuild it from `digstore-guest` at that rev if the deps are bumped (see
+# vendor/README.md).
+[env]
+DIGSTORE_GUEST_WASM = { value = "vendor/digstore_guest.wasm", relative = true }

@@ -32,25 +32,28 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// running node back to an exact source revision.
 pub const GIT_SHA: &str = env!("DIG_NODE_GIT_SHA");
 
-/// The embedded dig-node read-path version: the digstore git ref the `dig-node`
-/// crate is pinned to (the same local-first node the native DIG Browser runs
-/// in-process). Currently the #95/#96 Pass A commit (shared `.dig` cache: atomic
-/// content-addressed writes + cross-process lock + the additive
-/// `cache.getConfig` `cache_dir`/`shared` fields) — no release tag contains it yet,
-/// so this is the short `rev`. Kept in sync with the `rev`/`tag` on the `dig-node`
-/// git dependency in `Cargo.toml`.
+/// The node-library version this service is built against. The node
+/// ([`dig_node`]) is now a FIRST-PARTY sibling crate in this repo (not a stale
+/// digstore git pin), so this tracks the node crate's own `CARGO_PKG_VERSION` — the
+/// SAME node the native DIG Browser runs in-process via `dig_runtime`.
 ///
-/// NOTE on what this rev serves LOCALLY vs RELAYS: at this pin `handle_rpc` resolves
-/// `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` locally and returns
-/// `-32601` for everything else (so this service relays it to the upstream). The
-/// in-process local-deploy stage (`dig.stage`) and locally-computed collection reads
-/// (`dig.getCollection`/`dig.listCollectionItems`) land in a LATER dig-node rev that
-/// pulls `digstore-stage` (a guest-wasm build prereq this thin service deliberately
-/// avoids). The catalogue below reflects THIS pin: collection reads are relayed
-/// (`passthrough`). When this service bumps to a stage-capable dig-node, flip those
-/// to `served: local` (the drift-guard test in `tests/openrpc_drift_guard.rs`
-/// enforces the match either way).
-pub const DIG_NODE_VERSION: &str = "b2632c4";
+/// What the node serves LOCALLY: `handle_rpc` resolves `dig.getContent`,
+/// `dig.getAnchoredRoot`, `dig.stage`, the collection reads
+/// (`dig.getCollection`/`dig.listCollectionItems`), the L7 peer surface
+/// (`dig.getNetworkInfo`/`dig.getPeers`/`dig.announce`/`dig.getAvailability`/
+/// `dig.listInventory`/`dig.fetchRange`), all `cache.*`, and the node-owned
+/// `control.*` (peerStatus/subscribe/unsubscribe/listSubscriptions). Everything else
+/// (e.g. `dig.getProof`, `dig.getCapsule`, `dig.listCapsules`, `dig.getManifest`)
+/// returns `-32601` and this service relays it to the upstream. The catalogue below
+/// reflects this, and the drift-guard test in `tests/openrpc_drift_guard.rs` enforces
+/// the match against the real dispatch.
+pub const DIG_NODE_VERSION: &str = dig_node_version();
+
+/// The node library's crate version, resolved at compile time from the `dig-node`
+/// dependency (its `CARGO_PKG_VERSION` re-exported as [`dig_node::NODE_VERSION`]).
+const fn dig_node_version() -> &'static str {
+    dig_node::NODE_VERSION
+}
 
 /// The DIG read protocol the node speaks (the rpc.dig.net §21 JSON-RPC read
 /// contract). Bumped only when the wire contract changes.
@@ -168,12 +171,10 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
-            // #39 public collection reads. At THIS dig-node pin they are RELAYED to
-            // the upstream (handle_rpc returns -32601 → the service passthrough
-            // relays); a later stage-capable dig-node serves them locally from
-            // coinset data (see DIG_NODE_VERSION note). Result shape is the upstream's.
+            // #39 public collection reads — served LOCALLY by the node (resolved from
+            // coinset data), no upstream relay. Result shape is the canonical one.
             name: "dig.getCollection",
-            served: "passthrough",
+            served: "local",
             summary: "Public collection facts for a set of NFT launcher ids. Params \
                       { launcher_ids, did? }; result { did, declared_did, item_count, \
                       resolved_count, royalty_basis_points }.",
@@ -181,11 +182,62 @@ pub fn methods() -> &'static [MethodInfo] {
         },
         MethodInfo {
             name: "dig.listCollectionItems",
-            served: "passthrough",
+            served: "local",
             summary: "A paginated page of a collection's NFT items resolved to their \
                       CURRENT on-chain owner + royalty + CHIP-0007 metadata. Params \
                       { launcher_ids, offset?, limit? }; result { items, offset, limit, \
                       total, next_offset }.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            // #95 Pass C: turn a local folder into a capsule (.dig module) IN PROCESS
+            // via the shared stage→compile engine (digstore-stage). Served locally.
+            name: "dig.stage",
+            served: "local",
+            summary: "Stage + compile a local folder into a capsule (.dig module) in \
+                      process. Params { dir, store_id? }; result the capsule + root.",
+            requires_auth: false,
+        },
+        // -- L7 peer surface (served locally by the node's P2P stack) ----------------
+        MethodInfo {
+            name: "dig.getNetworkInfo",
+            served: "local",
+            summary: "This node's peer-network snapshot: peer_id, listen addresses, \
+                      connected-peer count, relay reservation.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "dig.getPeers",
+            served: "local",
+            summary: "The node's currently known peers (peer_id + addresses).",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "dig.announce",
+            served: "local",
+            summary: "Announce a peer (peer_id 64-hex + addresses) into the node's \
+                      peer pool / DHT.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "dig.getAvailability",
+            served: "local",
+            summary: "Which of the requested capsule/resource items this node holds \
+                      (answered from one inventory snapshot). Params { items }.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "dig.listInventory",
+            served: "local",
+            summary: "The node's held inventory (the capsules/resources it can serve \
+                      to peers).",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "dig.fetchRange",
+            served: "local",
+            summary: "Serve a byte range of a held resource to a peer (multi-source \
+                      download fan-out). Params { store_id, offset?, length }.",
             requires_auth: false,
         },
         // -- CONTROL / admin surface (loopback-only + local-token gated) ----------
@@ -269,6 +321,36 @@ pub fn methods() -> &'static [MethodInfo] {
             served: "control",
             summary: "Trigger a §21 sync for a capsule (storeId + root); reports \
                       NOT_SUPPORTED if no §21 identity / not eligible.",
+            requires_auth: true,
+        },
+        // -- node-owned control methods (delegated to dig_node::handle_rpc) ----------
+        // These live in the node library's own control surface; the shell forwards any
+        // control method it does not own to the node. Loopback-only + token-gated,
+        // like the shell's control methods above.
+        MethodInfo {
+            name: "control.peerStatus",
+            served: "control",
+            summary: "The node's peer-network status snapshot (relay reservation, \
+                      reachability, connected peers).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.subscribe",
+            served: "control",
+            summary: "Subscribe the node to a store (persisted): it actively watches + \
+                      gap-fills that store. Params { store_id }.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.unsubscribe",
+            served: "control",
+            summary: "Unsubscribe the node from a store. Params { store_id }.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.listSubscriptions",
+            served: "control",
+            summary: "List the node's persisted store subscriptions.",
             requires_auth: true,
         },
     ]
@@ -460,11 +542,11 @@ pub fn cache_dir() -> std::path::PathBuf {
 
 /// Whether dig-node's EFFECTIVE cache dir is the shared canonical one (`true`) or a
 /// process-private fallback because the canonical dir was unwritable (`false`).
-/// Delegates to dig-node's resolver ([`digstore_node::cache_dir_is_shared`]) so the
+/// Delegates to dig-node's resolver ([`dig_node::cache_dir_is_shared`]) so the
 /// value is authoritative — this service never re-implements the writability
 /// probe. Surfaced additively in `/health` + the well-known document (#96).
 pub fn cache_shared() -> bool {
-    digstore_node::cache_dir_is_shared()
+    dig_node::cache_dir_is_shared()
 }
 
 /// The `GET /version` body: service identity + build provenance + the embedded
@@ -742,22 +824,17 @@ mod tests {
     }
 
     #[test]
-    fn collection_read_methods_are_catalogued_passthrough_no_auth() {
-        // #39: dig.getCollection / dig.listCollectionItems are public reads. At this
-        // dig-node pin they are RELAYED to the upstream (handle_rpc returns -32601 →
-        // the service passthrough relays), never auth-gated — and they appear in the
-        // generated OpenRPC so rpc.discover / /openrpc.json stay correct. (A later
-        // stage-capable dig-node serves them locally; the drift-guard test enforces
-        // whichever is true.)
+    fn collection_read_methods_are_catalogued_local_no_auth() {
+        // #39: dig.getCollection / dig.listCollectionItems are public reads served
+        // LOCALLY by the node (resolved from coinset data), never auth-gated — and
+        // they appear in the generated OpenRPC so rpc.discover / /openrpc.json stay
+        // correct. The drift-guard test asserts the read path actually resolves them.
         for name in ["dig.getCollection", "dig.listCollectionItems"] {
             let m = methods()
                 .iter()
                 .find(|m| m.name == name)
                 .unwrap_or_else(|| panic!("{name} missing from the method catalogue"));
-            assert_eq!(
-                m.served, "passthrough",
-                "{name} is relayed at this dig-node pin"
-            );
+            assert_eq!(m.served, "local", "{name} is served locally by the node");
             assert!(
                 !m.requires_auth,
                 "{name} is a public read (no control token)"
