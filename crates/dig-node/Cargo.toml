@@ -1,0 +1,150 @@
+[package]
+name = "dig-node"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "DIG Browser local node sidecar: a loopback JSON-RPC server (dig.getContent, the same contract as rpc.dig.net) that serves dig:// content from LOCAL .dig store modules first (via digstore_host::serve_blind), falling back to rpc.dig.net on a miss, and caching synced stores with an LRU size cap (default 1 GiB). Native Rust so the compiled-module serve path works."
+
+[lib]
+name = "dig_node"
+path = "src/lib.rs"
+
+[dependencies]
+# The `.dig` STORE-FORMAT LIBRARY crates. These live in the digstore repo (the store
+# CLI + format/read libraries) and are consumed here as GIT dependencies: the node
+# depends on the store libs, NEVER the reverse (digstore is only ever an RPC client of
+# a node). Pinned to a single digstore rev so the whole store-format surface the node
+# reads/verifies/decrypts against is one coherent version. Bump all six together.
+#
+# digstore-host   — instantiate a compiled module + `serve_blind` (ciphertext + proof).
+# digstore-core   — wire types (ContentResponse), codec, Bytes32/48.
+# digstore-remote — the §21 remote client + persistent identity signer (§21.9).
+# digstore-chain  — CHIP-0035 singleton lineage walk (chain-anchored root).
+# digstore-stage  — the shared stage→compile engine for the `dig.stage` RPC (turn a
+#                   folder into a capsule in-process, #95 Pass C). Its build script
+#                   embeds the guest wasm (BINDING contract D6) via the DIGSTORE_GUEST_WASM
+#                   override this repo sets in .cargo/config.toml (see vendor/).
+# digstore-crypto — read-path crypto primitives.
+digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
+digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
+chia-protocol = "0.26"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
+# Object-safe async trait for the injectable anchored-root resolver (the
+# mandatory read-path chain pin, #127): production walks coinset, tests inject a
+# deterministic resolver.
+async-trait = "0.1"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+filetime = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+fs4 = { version = "1.1.0", features = ["sync"] }
+directories = "6.0.0"
+# OS CSPRNG for the per-stage content-authoring BLS key (#95 Pass C dig.stage).
+getrandom = "0.2"
+# -- L7 DIG Node peer network (PHASE-2b, #162) -------------------------------------------------------
+# The NAT-traversal + connected-peer-pool layer. The bespoke in-node relay client (formerly relay.rs)
+# is RETIRED: the relay connection now lives inside dig-nat (the `connect()` ladder's last-resort tier
+# + the persistent reservation) and dig-gossip (the introducer-backed connected peer pool). dig-node
+# consumes both to auto-discover peers via relay.dig.net, maintain a pool, and serve/issue the L7 peer
+# RPC over mTLS (peer_id = SHA256(TLS SPKI DER)).
+#
+# Sourcing: git-pinned to the exact revs the ecosystem tracks (dig-nat f200cbf, dig-gossip ad20521),
+# mirroring how the superproject + dig-gossip resolve dig-nat from git until it is on crates.io. The
+# release-first rule sequences the crates.io publish/tag swap; here we build against the real revs.
+# NB: dig-nat uses the BARE git form (no `rev`) to match dig-gossip's own `dig-nat = { git = "…dig-nat" }`
+# spec EXACTLY, so cargo unifies to ONE dig-nat copy. A `?rev=` form is a DISTINCT source to cargo even
+# at the same commit, which would fork dig-nat into two incompatible crate instances (the handle's
+# `connect_via_nat`/`query_availability` types would not match ours). Both still resolve to f200cbf via
+# the lockfile. dig-gossip is pinned by rev (its own manifest has no self-reference to worry about).
+dig-nat = { git = "https://github.com/DIG-Network/dig-nat" }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "ad20521335149dfa8687bf893620a87ba04fb30a", default-features = false, features = ["rustls", "relay"] }
+# The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. No
+# `rev` so cargo unifies to the SAME dig-constants source dig-nat/dig-gossip already resolve (one copy).
+dig-constants = { version = "0.2", git = "https://github.com/DIG-Network/dig-constants" }
+# -- L7 content-location DHT (PHASE-B, #163) ---------------------------------------------------------
+# The Kademlia DHT that maps DIG content (store / capsule / root / resource) to the peer_ids holding
+# it. The node LOCATES content it lacks via `find_providers`, and keeps its OWN held-inventory provider
+# records CURRENT in the DHT (`announce_provider` / `withdraw_provider` / `republish`). It rides the
+# SAME dig-nat mTLS transport as the rest of the peer network via a `DhtTransport` adapter (`dht.rs`).
+#
+# Sourcing: bare git form (no `rev`) so cargo unifies dig-dht's `dig-nat` dependency (also bare-git)
+# with dig-node's + dig-gossip's — ONE dig-nat crate instance across the graph, so dig-dht's `PeerId`
+# / `Contact` / `DhtTransport` share the exact types `dig_nat::connect` returns. A `?rev=` form would
+# fork dig-nat into a distinct, incompatible source. Resolved to the tracked rev via the lockfile.
+dig-dht = { git = "https://github.com/DIG-Network/dig-dht" }
+# -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
+# The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
+# logical stream exchanges delta-based first-hand known-peer sets (handshake -> snapshot -> deltas),
+# feeding discovered peers into the pool as dial candidates (hints, verified by dialing) and formalizing
+# what the ad-hoc `dig.getPeers` polling did. dig-pex ships a transport-agnostic sans-IO `PexEngine`
+# this crate embeds; `pex.rs` is the dig-nat mux I/O adapter (SPEC §10.1, Appendix A).
+#
+# Sourcing: bare git form (no `rev`, like dig-nat/dig-dht) so cargo unifies any shared transitive deps
+# to ONE copy across the graph; resolved to the tracked rev via the lockfile. dig-pex keeps a minimal
+# dependency surface (serde/serde_json/tokio/rand — it mirrors the address shape rather than importing
+# the transport crates), so there is no cross-crate type-unification concern here.
+dig-pex = { git = "https://github.com/DIG-Network/dig-pex" }
+# -- Multi-source content fetch (#164) + redirect-on-miss (#165) --------------------------------------
+# The node-side download orchestrator: locate holders via dig-dht `find_providers`, confirm with
+# `dig.getAvailability`, fan byte ranges across MULTIPLE providers simultaneously (`dig.fetchRange`
+# over dig-nat), verify each range + the whole resource against the chain-anchored root, and
+# reassemble — with pause/resume + `.download.tmp` GC. dig-node wires the real seams per the crate's
+# implementers' note (see `download.rs`): DhtProviderLocator over our DhtService, NatRangeTransport
+# over our mTLS identity, MerkleVerifier bound to the digstore proof format, FileSink/FileStateStore
+# under the node's cache dir.
+#
+# Sourcing: bare git form (no `rev`), matching dig-dht/dig-nat above, so cargo unifies dig-download's
+# own dig-dht + dig-nat dependencies with ours — ONE crate instance each across the graph (its
+# re-exported `ContentId`/`ProviderRecord` ARE our dig-dht types). Resolved via the lockfile.
+dig-download = { git = "https://github.com/DIG-Network/dig-download" }
+# -- Self-optimizing peer selection (#178) ------------------------------------------------------------
+# The decision + learning layer between dig-dht discovery and dig-download execution: it ranks the
+# providers `find_providers` returns (learning throughput/rtt/reliability + a per-class saturation
+# point + an adaptive relayed penalty from the REAL measured outcome of every range) and hands
+# dig-download the ranked subset + per-peer concurrency, instead of dig-download picking sources
+# blindly. Every completed/failed range streams back via `record_outcome` in real time, and a dropped
+# source drives a `rebalance`. See `download.rs` (SelectorLocator + the outcome-feedback loop).
+#
+# Sourcing: bare git form (no `rev`), matching dig-dht/dig-nat/dig-download above, so cargo unifies the
+# selector's `dig-nat` + `dig-dht` dependencies with ours — ONE crate instance each (its re-used
+# `PeerId`/`ContentId`/`ProviderRecord`/`CandidateAddr` ARE our dig-nat/dig-dht types). Resolved via
+# the lockfile. The selector mirrors `dig_gossip::PoolEvent` LOCALLY (it does not depend on dig-gossip,
+# which lags as a git dep), so the node maps `dig_gossip::PoolEvent` → the selector's local `PoolEvent`
+# 1:1 (see `download.rs::pool_event_to_selector`).
+dig-peer-selector = { git = "https://github.com/DIG-Network/dig-peer-selector" }
+# Deterministic self-signed node certificate derived from the node's persistent identity seed, so the
+# node's mTLS peer_id is stable across restarts. rustls-only (no OpenSSL), matching dig-nat.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# The PKCS#8 key-DER wrapper rcgen consumes (`KeyPair::from_pkcs8_der_and_sign_algo`) + the mTLS types.
+rustls-pki-types = "1"
+# The mTLS peer-RPC LISTENER (server side): present the node cert + REQUIRE a client cert (peer_id
+# enforced). rustls/tokio-rustls with ring only (no OpenSSL/aws-lc for OUR usage), matching dig-nat.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# Bridge the tokio mTLS byte stream to yamux (dig-nat's PeerStream is a futures-compat stream).
+tokio-util = { version = "0.7", features = ["compat"] }
+# IPv6-first, IPv4-fallback (ecosystem HARD RULE): bind the peer-RPC listener on the IPv6 unspecified
+# address `[::]` as a DUAL-STACK socket (IPV6_V6ONLY cleared) so ONE socket serves both native IPv6
+# and IPv4-mapped peers. Mirrors dig-relay's `net.rs` / dig-gossip's own dual-stack bind.
+socket2 = "0.5"
+# RangeFrame ciphertext payloads over the peer stream.
+serde_bytes = "0.11"
+# The peer transport still frames JSON over the mux + speaks async stream traits.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# In-process loopback mTLS peer drives the peer-network tests with NO real network. (rustls/tokio-rustls/
+# rcgen/rustls-pki-types are already normal deps above; the test uses them for a loopback mTLS client.)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "test-util"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# The peer_network.rs integration test implements PeerRpcResponder (an async trait).
+async-trait = "0.1"

@@ -1,79 +1,49 @@
-[package]
-name = "dig-node"
-version = "0.3.0"
+[workspace]
+resolver = "2"
+# The canonical dig-node repo is a small workspace of the node + its two DIG-Browser
+# host shells:
+#   * dig-node          — the NODE library (RPC dispatch, serve/fetch/redirect,
+#                         chain-watch, subscriptions, gap-fill, cache, P2P). The single
+#                         node implementation shared by BOTH host shells below.
+#   * dig-node-service  — the OS-service binary (`dig-node`): axum transport + control
+#                         plane + CLI + service install. Depends on the node library.
+#   * dig-runtime       — the DIG Browser's in-process node: a cdylib (`dig_runtime.dll`)
+#                         exposing the `dig_rpc`/`dig_wallet_rpc` C-ABI the browser links.
+#   * dig-wallet        — the DIG Browser's built-in Chia wallet host (loopback UI + BLS
+#                         signing), brought up by dig-runtime beside the node.
+# For the `.dig` STORE FORMAT the node depends on digstore's store-format LIBRARY crates
+# (digstore-core/-crypto/-chain/-host/-remote/-stage) as GIT dependencies — dig-node ->
+# store-lib, never the reverse. digstore is only ever an RPC client of a node.
+members = [
+    "crates/dig-node",
+    "crates/dig-node-service",
+    "crates/dig-runtime",
+    "crates/dig-wallet",
+]
+
+[workspace.package]
 edition = "2021"
-license = "MIT"
-description = "The localhost DIG node for the DIG Chrome extension, as a self-contained, cross-platform Rust binary installable as an OS service. Exposes the rpc.dig.net JSON-RPC contract (dig.getContent, dig.getProof, dig.getAnchoredRoot, cache.*) on 127.0.0.1 by routing to digstore's in-process dig-node read path — the same local-first read path the native DIG Browser runs."
-repository = "https://github.com/DIG-Network/dig-node"
-readme = "README.md"
-default-run = "dig-node"
 
-[[bin]]
-name = "dig-node"
-path = "src/main.rs"
-
-[lib]
-name = "dig_node"
-path = "src/lib.rs"
-
-[dependencies]
-# The DIG read path. digstore's `dig-node` crate IS the rpc.dig.net-compatible
-# local node the native DIG Browser runs in-process (handle_rpc): local-first serve
-# from cached .dig modules, blind ciphertext+proof proxy to rpc.dig.net on a miss,
-# on-chain anchored-root resolution, and the cache.* config surface. It builds as a
-# clean dependency: the guest-wasm build prerequisite is digstore-cli's alone (its
-# build.rs), and the dig-node crate does not depend on digstore-cli.
-#
-# NAME ALIAS: this crate is itself named `dig-node` (lib `dig_node`), which would
-# collide with digstore's `dig-node` crate (also lib `dig_node`). So the dependency
-# is imported under the alias `digstore_node` via cargo's `package` rename — every
-# `use digstore_node::…` / `digstore_node::…` in this crate refers to the embedded
-# digstore read-path node, distinct from this crate's own `dig_node` lib.
-#
-# Pinned to the #95/#96 Pass A commit (the shared-.dig-cache work — atomic
-# content-addressed writes + a cross-process advisory lock + a `directories`-based
-# dir resolver with a writability fallback + the additive `cache.getConfig` fields
-# `cache_dir`/`shared`). This is what makes this service's on-disk cache SAFE to
-# share with the DIG Browser's in-process node when both are installed (see the
-# `DIG_NODE_CACHE` note in `config.rs` + the README). Pinned to a `rev`, not a tag,
-# because no release tag yet contains Pass A (it is the tip of digstore `main`);
-# bump to a tag once one ships that includes it.
-digstore_node = { package = "dig-node", git = "https://github.com/DIG-Network/digstore.git", rev = "b2632c43bdb61673f69cdf38a4bda24a07be12ae" }
-
-# HTTP stack: the same axum/tokio the dig-node read path itself uses, so there is one
-# async runtime and one server framework across the read path and the service shell.
-axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
-tower-http = { version = "0.6", features = ["cors"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# CLI + OS-service registration.
-clap = { version = "4", features = ["derive"] }
-# Cross-platform service manager: Windows SCM, Linux systemd, macOS launchd behind
-# one API. User-level install where the platform allows it (per-user service),
-# falling back to system-level with documented elevation.
-service-manager = "0.7"
-
-# HTTP client for the blind-passthrough fallback: digstore_node::handle_rpc resolves
-# only dig.getContent / dig.getAnchoredRoot / cache.*, returning "method not found"
-# for everything else. This service relays those (dig.getProof, dig.listCapsules,
-# dig.getManifest, …) verbatim to the upstream so it stays a correct transparent
-# proxy, matching the Node reference server's documented surface. rustls-tls keeps
-# the binary self-contained (no system OpenSSL), same as the digstore crates.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-
-# Windows Service Control Protocol. service-manager only REGISTERS the service in
-# the SCM; the binary the SCM launches must itself speak the service protocol
-# (StartServiceCtrlDispatcher → report RUNNING/STOPPED) or the SCM kills it with
-# error 1053 ("did not respond in a timely fashion"). The service's hidden
-# `run-service` entrypoint uses this to be a real Windows service. (systemd/launchd
-# exec the foreground process directly, so they need no equivalent.)
-[target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
-
-# Match digstore's release hardening: keep overflow checks on in release. The read
-# path does offset/length arithmetic over untrusted serialized input (it pulls in
-# digstore-core, which is built under this same profile in its own workspace).
+# Release hardening, matching digstore: keep integer-overflow checks ON in release.
+# The node parses untrusted serialized input and does offset/length arithmetic over
+# it, so silent wrapping in release would turn a length bug into a memory/logic hazard.
 [profile.release]
 overflow-checks = true
+
+# -- dig-gossip vendored-fork patches (L7 peer network) -----------------------------------------------
+#
+# The node's P2P stack (dig-nat/dig-gossip/dig-dht/dig-pex/dig-download/dig-peer-selector) builds against
+# ADDITIVE forks of `chia-protocol` + `chia-sdk-client` that dig-gossip vendors: the DIG introducer
+# opcodes `RegisterPeer=218`/`RegisterAck=219` on `ProtocolMessageTypes`, plus `Peer::send_protocol_message`
+# + `RateLimits.dig_wire`. Those forks are the SAME upstream versions (`chia-protocol` 0.26,
+# `chia-sdk-client` 0.28) with additive DIG extensions, so patching the whole workspace to them is safe
+# for the store-format crates too (they simply gain unused enum variants).
+#
+# dig-gossip's own `[patch.crates-io]` does NOT apply transitively when it is a git DEPENDENCY (cargo
+# applies patches only from the ROOT manifest being built), so this workspace re-declares them, resolving
+# the vendored packages from the SAME pinned dig-gossip git rev — CI-safe when the repo is checked out
+# standalone. `native-tls` is NOT patched: dig-gossip is pulled with
+# `default-features = false, features = ["rustls", "relay"]`, so the OpenSSL/native-tls path is off.
+[patch.crates-io]
+chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "ad20521335149dfa8687bf893620a87ba04fb30a" }
+chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "ad20521335149dfa8687bf893620a87ba04fb30a" }

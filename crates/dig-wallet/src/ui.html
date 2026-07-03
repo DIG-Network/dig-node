@@ -1,0 +1,1395 @@
+<!doctype html>
+<html lang="en" data-theme="dig">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIG Wallet</title>
+<style>
+:root{
+  --void:#07060F; --space:#0C0B1E; --panel:rgba(22,20,54,.62); --panel2:rgba(30,24,78,.55);
+  --card:rgba(24,18,68,.55); --card-h:rgba(34,26,92,.62);
+  --hair:rgba(255,255,255,.07); --hair2:rgba(255,255,255,.11);
+  --hair-v:rgba(140,112,255,.22); --hair-m:rgba(255,0,222,.42);
+  --violet:#5800D6; --magenta:#FF00DE; --pink:#FF3DF5;
+  --grad:linear-gradient(115deg,#5800D6 0%,#FF00DE 100%);
+  --grad-text:linear-gradient(100deg,#B98CFF 0%,#FF6BEE 100%);
+  --glow-v:0 0 36px rgba(88,0,214,.5); --glow-m:0 0 28px rgba(255,0,222,.4);
+  --gold:#E6CC93; --gold2:#B8924E; --gold-soft:rgba(230,204,147,.14);
+  --grad-gold:linear-gradient(115deg,#F0DCAE,#B8924E);
+  --plat:#ECEAF6;
+  --t1:#F6F4FC; --t2:#C5C1E0; --t3:#928DBA; --t4:#605B8A;
+  --ok:#46E0B0; --warn:#E6B453; --err:#FF6B95;
+  --serif:"Hoefler Text","Iowan Old Style","Palatino Linotype",Georgia,"Times New Roman",serif;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI Variable","Segoe UI",system-ui,Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,"Cascadia Code","SF Mono","Segoe UI Mono",Consolas,Menlo,monospace;
+  --ease:cubic-bezier(.22,.61,.36,1);
+}
+/* Chia theme: swap the cosmic violet/magenta for Chia mint-greens. */
+html[data-theme="chia"]{
+  --violet:#1f9e87; --magenta:#46E0B0; --pink:#5ece71;
+  --grad:linear-gradient(115deg,#1f9e87 0%,#46E0B0 100%);
+  --grad-text:linear-gradient(100deg,#7ff0cf 0%,#46E0B0 100%);
+  --glow-v:0 0 36px rgba(31,158,135,.5); --glow-m:0 0 28px rgba(70,224,176,.4);
+  --hair-m:rgba(70,224,176,.42);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:var(--sans);color:var(--t1);background:var(--void);-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums;min-height:100vh;overflow-x:hidden}
+::selection{background:rgba(255,0,222,.32)}
+::-webkit-scrollbar{width:10px;height:10px}::-webkit-scrollbar-thumb{background:rgba(140,112,255,.22);border-radius:6px}::-webkit-scrollbar-thumb:hover{background:rgba(140,112,255,.4)}
+.mono{font-family:var(--mono)}
+.sky{position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(900px 620px at 84% -10%,rgba(88,0,214,.30),transparent 60%),radial-gradient(760px 520px at 6% 2%,rgba(255,0,222,.12),transparent 62%),radial-gradient(130% 1500px at 50% -4%,#1c1248 0%,#130d33 38%,#0c0a22 70%,#07060F 100%)}
+html[data-theme="chia"] .sky{background:radial-gradient(900px 620px at 84% -10%,rgba(31,158,135,.30),transparent 60%),radial-gradient(760px 520px at 6% 2%,rgba(70,224,176,.12),transparent 62%),radial-gradient(130% 1500px at 50% -4%,#10342c 0%,#0c2620 38%,#091a16 70%,#07060F 100%)}
+.stars{position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.85}
+.stars i{position:absolute;width:2px;height:2px;border-radius:50%;background:#fff;animation:tw 5.5s ease-in-out infinite}
+@keyframes tw{0%,100%{opacity:.18}50%{opacity:.9}}
+.app{position:relative;z-index:2;display:flex;min-height:100vh}
+.rail{width:248px;flex:0 0 248px;padding:24px 16px 18px;display:flex;flex-direction:column;gap:2px;border-right:1px solid var(--hair);backdrop-filter:blur(16px);background:linear-gradient(180deg,rgba(14,12,38,.55),rgba(7,6,15,.25));position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:12px;padding:6px 8px 20px}
+.mark{width:38px;height:38px;border-radius:12px;background:var(--grad);display:grid;place-items:center;font-family:var(--serif);font-weight:700;font-size:21px;color:#fff;box-shadow:var(--glow-v);flex:none}
+.brand .wm{font-size:16px;font-weight:600;letter-spacing:.2px;line-height:1.15}
+.brand .wm small{display:block;font-size:10px;font-weight:600;letter-spacing:.22em;text-transform:uppercase;margin-top:2px;background:var(--grad-gold);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.navlbl{font-size:10px;font-weight:600;letter-spacing:.2em;text-transform:uppercase;color:var(--t4);padding:16px 12px 7px}
+.nav{display:flex;align-items:center;gap:12px;width:100%;background:none;border:0;border-radius:11px;cursor:pointer;color:var(--t3);font-family:inherit;font-size:14px;font-weight:500;padding:10px 12px;text-align:left;position:relative;transition:background .15s var(--ease),color .15s var(--ease)}
+.nav:hover{color:var(--t1);background:rgba(255,255,255,.04)}
+.nav.on{color:#fff;background:var(--card-h);box-shadow:inset 0 1px 0 rgba(255,255,255,.05)}
+.nav.on::before{content:"";position:absolute;left:-16px;top:50%;transform:translateY(-50%);width:3px;height:22px;border-radius:3px;background:var(--grad);box-shadow:0 0 12px rgba(255,0,222,.7)}
+.nav .ic{width:20px;height:20px;flex:none;opacity:.92}
+.rail .foot{margin-top:auto;display:flex;flex-direction:column;gap:9px;padding-top:14px}
+.addrchip{display:flex;align-items:center;gap:10px;background:rgba(255,255,255,.03);border:1px solid var(--hair);border-radius:11px;padding:9px 11px;cursor:pointer;transition:border-color .15s var(--ease)}
+.addrchip:hover{border-color:var(--hair-v)}
+.addrchip .av{width:24px;height:24px;border-radius:7px;background:var(--grad);flex:none;opacity:.95}
+.addrchip .m{min-width:0}.addrchip .m b{font-size:12px;font-weight:600;display:block}
+.addrchip .m span{font-family:var(--mono);font-size:10.5px;color:var(--t3);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.footrow{display:flex;gap:8px}
+.footrow button{flex:1;background:transparent;border:1px solid var(--hair);color:var(--t2);border-radius:10px;padding:9px;font-size:12px;font-family:inherit;cursor:pointer;transition:.15s var(--ease)}
+.footrow button:hover{border-color:var(--gold);color:var(--gold)}
+.synced{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--t3);padding:2px 4px}
+.live{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(70,224,176,.14);animation:breathe 2.6s var(--ease) infinite}
+.live.off{background:var(--err);box-shadow:0 0 0 3px rgba(255,107,149,.14)}
+@keyframes breathe{0%,100%{opacity:.55}50%{opacity:1}}
+.stage{flex:1;min-width:0;padding:34px 46px 80px;max-width:1180px;margin:0 auto;width:100%}
+.topbar{display:flex;align-items:center;gap:14px;margin-bottom:28px}
+.topbar .eyebrow{font-size:11px;letter-spacing:.2em;text-transform:uppercase;font-weight:600;background:var(--grad-gold);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.topbar h1{font-family:var(--serif);font-size:30px;font-weight:600;letter-spacing:-.01em;margin-top:4px}
+.spacer{flex:1}
+.chip{display:inline-flex;align-items:center;gap:8px;padding:9px 15px;border-radius:999px;border:1px solid var(--hair);background:rgba(255,255,255,.03);color:var(--t2);font-size:12.5px;font-family:inherit;cursor:pointer;transition:.15s var(--ease)}
+.chip:hover{border-color:var(--hair-v);color:#fff}
+.chip.gold{border-color:var(--gold-soft);color:var(--gold)}.chip.gold:hover{border-color:var(--gold)}
+.page{display:none;animation:fade .26s var(--ease)}.page.show{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:none}}
+.hero{position:relative;display:flex;gap:34px;align-items:center;padding:30px 34px;border-radius:26px;overflow:hidden;background:linear-gradient(135deg,rgba(34,26,92,.6),rgba(14,12,38,.5));border:1px solid var(--hair);backdrop-filter:blur(20px);box-shadow:0 30px 80px rgba(6,3,22,.6),inset 0 1px 0 rgba(255,255,255,.05);margin-bottom:14px}
+.hero .bloom{position:absolute;right:-90px;top:-90px;width:340px;height:340px;border-radius:50%;background:radial-gradient(circle,rgba(255,0,222,.16),transparent 65%);pointer-events:none;animation:breathe2 12s var(--ease) infinite}
+@keyframes breathe2{0%,100%{opacity:.6;transform:scale(1)}50%{opacity:1;transform:scale(1.08)}}
+.orb{position:relative;width:200px;height:200px;flex:none;display:grid;place-items:center}
+.orb .ring{position:absolute;inset:0;border-radius:50%;background:conic-gradient(from 0deg,#5800D6,#FF00DE,#FF3DF5,#5800D6);-webkit-mask:radial-gradient(circle,transparent 76px,#000 77px);mask:radial-gradient(circle,transparent 76px,#000 77px);animation:spin 44s linear infinite;opacity:.92}
+html[data-theme="chia"] .orb .ring{background:conic-gradient(from 0deg,#1f9e87,#46E0B0,#7ff0cf,#1f9e87)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.orb .core{position:absolute;inset:18px;border-radius:50%;border:1px solid var(--hair-v);display:grid;place-items:center;background:radial-gradient(circle at 50% 32%,rgba(40,30,98,.92),rgba(10,8,30,.96));box-shadow:inset 0 0 44px rgba(88,0,214,.32);padding:14px;text-align:center}
+.orb .lbl{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--t3)}
+.orb .big{font-family:var(--serif);font-size:34px;font-weight:600;letter-spacing:-.02em;margin-top:4px;line-height:1;background:var(--grad-text);-webkit-background-clip:text;background-clip:text;color:transparent}
+.orb .sub{font-size:12px;color:var(--t3);margin-top:4px}
+.orb .qr{display:none;flex-direction:column;align-items:center;gap:8px}
+.orb.flip .core>.bal{display:none}.orb.flip .qr{display:flex}
+.qrbox{width:96px;height:96px;border-radius:10px;background:conic-gradient(#fff 0 25%,#0c0a22 0 50%,#fff 0 75%,#0c0a22 0) 0 0/16px 16px,linear-gradient(135deg,#1a1340,#0c0a22);box-shadow:0 0 0 6px #fff,0 0 22px rgba(255,0,222,.4)}
+.heromid{flex:1;min-width:0}
+.assetline{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px}
+.acoin{display:flex;align-items:center;gap:10px;padding:10px 14px;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid var(--hair)}
+.medal{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;font-weight:800;font-size:12px;color:#fff;flex:none}
+.acoin .nm{font-size:11px;color:var(--t3)}.acoin .vl{font-size:15px;font-weight:700}.acoin .vl small{font-size:11px;color:var(--t3);font-weight:500}
+.actions{display:flex;gap:12px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:9px;border:0;cursor:pointer;font-family:inherit;font-weight:600;font-size:14px;border-radius:13px;padding:13px 24px;transition:.18s var(--ease)}
+.btn.p{background:var(--grad);color:#fff;box-shadow:0 10px 30px rgba(255,0,222,.3),inset 0 1px 0 rgba(255,255,255,.28)}
+.btn.p:hover{transform:translateY(-2px);box-shadow:0 14px 42px rgba(255,0,222,.48),var(--glow-m),inset 0 1px 0 rgba(255,255,255,.34)}
+.btn.p:active{transform:scale(.98)}
+.btn.g{background:rgba(255,255,255,.05);color:#fff;border:1px solid var(--hair-v);backdrop-filter:blur(8px)}
+.btn.g:hover{background:rgba(255,255,255,.1);border-color:rgba(200,170,255,.4)}
+.btn.gold{background:var(--grad-gold);color:#241a08}.btn.gold:hover{filter:brightness(1.06);transform:translateY(-2px)}
+.btn:disabled{opacity:.5;cursor:default;transform:none!important;box-shadow:none!important}
+.btn svg{width:16px;height:16px}.btn.sm{padding:9px 14px;font-size:13px;border-radius:10px}.btn.full{width:100%}
+.sechead{display:flex;align-items:center;justify-content:space-between;margin:36px 2px 14px;gap:14px}
+.sechead .l{display:flex;flex-direction:column;gap:3px}
+.sechead .kick{font-size:10.5px;letter-spacing:.2em;text-transform:uppercase;font-weight:600;background:var(--grad-gold);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.sechead h2{font-family:var(--serif);font-size:22px;font-weight:600;letter-spacing:-.01em}
+.sechead a{font-size:12.5px;color:var(--t3);cursor:pointer;font-weight:500}.sechead a:hover{color:var(--pink)}
+.dek{color:var(--t3);font-size:13.5px;line-height:1.55;max-width:64ch;margin:-6px 2px 18px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(262px,1fr));gap:16px}
+.jewel{position:relative;padding:19px;border-radius:20px;background:var(--card);border:1px solid var(--hair);backdrop-filter:blur(16px);overflow:hidden;transition:.18s var(--ease);box-shadow:inset 0 1px 0 rgba(255,255,255,.04)}
+.jewel.click{cursor:pointer}
+.jewel.click:hover{transform:translateY(-3px);border-color:var(--hair-m);box-shadow:0 18px 46px rgba(6,3,22,.5),0 0 24px rgba(255,0,222,.13)}
+.jewel .top{position:absolute;top:0;left:0;right:0;height:3px;border-radius:20px 20px 0 0}
+.jrow{display:flex;align-items:center;gap:12px}.jrow .nm{font-size:15px;font-weight:600}.jrow .tk{font-size:11px;color:var(--t3);font-family:var(--mono);margin-top:2px;word-break:break-all}
+.jbal{margin-top:16px;font-family:var(--serif);font-size:26px;font-weight:600;letter-spacing:-.01em}.jbal small{font-family:var(--sans);font-size:13px;color:var(--t3);font-weight:600}
+.jusd{font-size:12px;color:var(--t3);margin-top:3px;line-height:1.5}
+.jfoot{display:flex;gap:8px;margin-top:15px}
+.mini{flex:1;text-align:center;padding:8px;border-radius:10px;background:rgba(255,255,255,.05);border:1px solid var(--hair);font-size:12px;color:var(--t2);cursor:pointer;transition:.15s var(--ease)}
+.mini:hover{background:rgba(255,255,255,.1);color:#fff}
+.addtok{display:grid;place-items:center;border:1px dashed var(--hair-v);background:transparent;color:var(--t3);min-height:158px;text-align:center;cursor:pointer}
+.addtok:hover{color:#fff;border-color:var(--hair-m)}.addtok .plus{font-size:26px;margin-bottom:6px;opacity:.7}
+.museum{display:grid;grid-template-columns:repeat(auto-fill,minmax(184px,1fr));gap:18px}
+.work{background:rgba(230,204,147,.04);border:1px solid var(--hair);border-radius:16px;padding:13px;cursor:pointer;transition:.2s var(--ease)}
+.work:hover{transform:translateY(-6px);border-color:var(--gold);box-shadow:0 22px 50px rgba(6,3,22,.55),0 0 24px rgba(230,204,147,.16)}
+.work .matte{height:160px;border-radius:9px;position:relative;overflow:hidden;box-shadow:inset 0 0 0 5px #0c0a22,inset 0 0 0 6px rgba(230,204,147,.28)}
+.work .fill{position:absolute;inset:6px;border-radius:4px}
+.work .sheen{position:absolute;top:0;left:-40%;width:40%;height:100%;transform:skewX(-18deg);background:linear-gradient(105deg,transparent,rgba(255,255,255,.16),transparent);animation:sheen 7s ease-in-out infinite}
+@keyframes sheen{0%{left:-45%}55%,100%{left:135%}}
+.work .plaque{margin-top:12px;display:flex;justify-content:space-between;align-items:flex-end;gap:8px}
+.work .bt{font-family:var(--serif);font-size:14.5px;color:var(--plat)}.work .bs{font-size:10.5px;color:var(--t4);font-family:var(--mono);margin-top:3px;word-break:break-all}
+.work .ed{font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);border:1px solid var(--gold-soft);border-radius:999px;padding:3px 8px;white-space:nowrap}
+.mintcard{display:grid;place-items:center;border:1px dashed var(--gold-soft);background:transparent;color:var(--gold);min-height:218px;text-align:center;cursor:pointer;border-radius:16px;transition:.18s var(--ease)}
+.mintcard:hover{border-color:var(--gold);background:rgba(230,204,147,.04)}.mintcard .plus{font-size:28px;margin-bottom:8px}
+.cert{position:relative;overflow:hidden;border:1px solid var(--hair);border-radius:18px;padding:22px 24px;margin-bottom:14px;background:linear-gradient(180deg,rgba(230,204,147,.06),rgba(230,204,147,.01)),var(--card);transition:border-color .18s var(--ease)}
+.cert:hover{border-color:var(--gold-soft)}
+.cert::after{content:"";position:absolute;right:-34px;top:-34px;width:140px;height:140px;border-radius:50%;background:radial-gradient(circle,rgba(230,204,147,.16),transparent 70%);pointer-events:none}
+.cert .ch{display:flex;align-items:center;gap:16px;position:relative}
+.gem{display:flex;align-items:center;flex:none}
+.stone{width:44px;height:44px;border-radius:13px;display:grid;place-items:center;font-size:15px;border:1px solid rgba(255,255,255,.16)}
+.stone.s1{background:radial-gradient(circle at 35% 30%,#7a3cff,#5800D6);box-shadow:var(--glow-v)}
+.stone.s2{background:radial-gradient(circle at 35% 30%,#FF3DF5,#FF00DE);box-shadow:var(--glow-m);margin-left:-9px}
+.cert .ti{flex:1;min-width:0}.cert .nm{font-family:var(--serif);font-size:18px;color:var(--plat)}.cert .nmsub{font-size:11px;color:var(--t3);margin-top:2px}
+.gen{padding:5px 11px;border-radius:999px;border:1px solid var(--gold-soft);font-size:11px;color:var(--gold);background:rgba(230,204,147,.06);white-space:nowrap}
+.cert .cap{font-family:var(--mono);font-size:12px;color:var(--t2);margin-top:15px;word-break:break-all;line-height:1.7;background:rgba(0,0,0,.24);border:1px solid var(--hair);border-radius:10px;padding:12px 14px}
+.cert .cap b{color:var(--gold);font-weight:500}
+.own{display:flex;align-items:center;gap:9px;margin-top:14px;font-size:12.5px;color:var(--ok);flex-wrap:wrap}
+.own .mintchip{margin-left:auto;font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--gold);border:1px solid var(--gold-soft);border-radius:999px;padding:4px 11px}
+.constel{display:flex;align-items:center;margin-top:16px;padding-top:14px;border-top:1px solid var(--hair)}
+.constel .tlb{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--t4);margin-right:12px;white-space:nowrap}
+.cstar{width:10px;height:10px;border-radius:50%;background:var(--grad);box-shadow:0 0 9px rgba(255,0,222,.6);flex:none;cursor:pointer;transition:transform .15s var(--ease)}
+.cstar:hover{transform:scale(1.6)}.cstar.dim{background:rgba(255,255,255,.22);box-shadow:none}
+.carc{flex:1;height:2px;background:linear-gradient(90deg,rgba(255,0,222,.45),rgba(88,0,214,.4));margin:0 5px;min-width:14px}.carc.dim{background:rgba(255,255,255,.1)}
+.constel .ct{margin-left:auto;font-size:11px;color:var(--t3);padding-left:12px;white-space:nowrap}
+details.disc{margin-top:12px}
+details.disc summary{list-style:none;cursor:pointer;font-size:12.5px;color:var(--gold);font-weight:500;padding:8px 0;display:flex;align-items:center;gap:8px}
+details.disc summary::-webkit-details-marker{display:none}
+details.disc summary .tw{transition:transform .18s var(--ease)}details.disc[open] summary .tw{transform:rotate(90deg)}
+.disc .body{padding:8px 0 4px}
+.kv{display:flex;justify-content:space-between;gap:16px;padding:8px 0;border-bottom:1px solid var(--hair);font-size:12.5px}.kv:last-child{border:0}
+.kv .k{color:var(--t3)}.kv .v{font-family:var(--mono);font-size:11.5px;color:var(--t2);text-align:right;word-break:break-all}
+.panel{border:1px solid var(--hair);border-radius:18px;background:var(--panel);backdrop-filter:blur(16px);overflow:hidden}
+.row{display:flex;align-items:center;gap:15px;padding:16px 20px;border-bottom:1px solid var(--hair);transition:background .13s var(--ease)}
+.row.click{cursor:pointer}
+.row:last-child{border-bottom:0}.row.click:hover{background:rgba(255,255,255,.025)}
+.badge{width:38px;height:38px;border-radius:11px;flex:none;display:grid;place-items:center;font-weight:700;font-size:14px;color:#fff;background:rgba(255,255,255,.06);border:1px solid var(--hair2)}
+.row .grow{flex:1;min-width:0}.row .t{font-size:14.5px;font-weight:560}.row .s{font-size:12px;color:var(--t3);margin-top:3px;word-break:break-all}
+.row .s.mono{font-family:var(--mono)}
+.row .amt{text-align:right;white-space:nowrap}.row .amt .v{font-size:15px;font-weight:600}.row .amt .v.pos{color:var(--ok)}.row .amt .s{font-size:11.5px;color:var(--t3);margin-top:3px}
+.chev{width:16px;height:16px;color:var(--t4);flex:none}
+.tag{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;font-weight:600;padding:3px 9px;border-radius:999px;letter-spacing:.02em}
+.tag.ok{color:var(--ok);background:rgba(70,224,176,.12)}.tag.pend{color:var(--warn);background:rgba(230,180,83,.12)}.tag.open{color:var(--pink);background:rgba(255,0,222,.12)}
+.pager{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;font-size:12.5px;color:var(--t3)}
+.pager .pg{display:flex;gap:6px}
+.pgbtn{min-width:30px;height:30px;border-radius:8px;border:1px solid var(--hair);background:transparent;color:var(--t2);cursor:pointer;font-family:inherit;font-size:12px;padding:0 9px}
+.pgbtn.on{background:var(--grad);color:#fff;border-color:transparent}.pgbtn:hover:not(.on){border-color:var(--hair-v);color:#fff}
+.pgbtn:disabled{opacity:.4;cursor:default}
+.didcard{display:flex;align-items:center;gap:16px;padding:18px 20px;border:1px solid var(--hair);border-radius:16px;background:var(--card);margin-bottom:12px;transition:.18s var(--ease)}
+.didcard:hover{border-color:var(--hair-v)}
+.avatar{width:52px;height:52px;border-radius:14px;flex:none;display:grid;place-items:center;font-family:var(--serif);font-size:22px;color:#fff;background:var(--grad)}
+.didcard .info{flex:1;min-width:0}.didcard .nm{font-size:15.5px;font-weight:600}.didcard .did{font-family:var(--mono);font-size:11px;color:var(--t3);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.offercard{border:1px solid var(--hair);border-radius:16px;background:var(--card);padding:18px 20px;margin-bottom:12px}
+.offerhead{display:flex;align-items:center;gap:12px;margin-bottom:14px}.offerhead .nm{font-size:15px;font-weight:600}
+.swap{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.leg{flex:1;min-width:150px;border:1px solid var(--hair);border-radius:12px;padding:13px 15px;background:rgba(0,0,0,.18)}
+.leg .lab{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--t4);font-weight:600}.leg .val{font-size:18px;font-weight:700;margin-top:5px;word-break:break-all}.leg .val small{font-size:12px;color:var(--t3);font-weight:500}
+.leg.give{border-color:rgba(255,107,149,.25)}.leg.get{border-color:rgba(70,224,176,.25)}
+.swapic{width:34px;height:34px;border-radius:50%;background:var(--grad);display:grid;place-items:center;flex:none;box-shadow:var(--glow-m)}
+.offerstr{font-family:var(--mono);font-size:11px;color:var(--t3);margin-top:14px;background:rgba(0,0,0,.24);border:1px solid var(--hair);border-radius:10px;padding:11px 13px;word-break:break-all;max-height:120px;overflow:auto;cursor:pointer}
+.offeract{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;align-items:center}
+.field{background:rgba(0,0,0,.28);border:1px solid var(--hair);border-radius:10px;padding:11px 13px;color:var(--t1);font-family:var(--mono);font-size:12.5px;width:100%;outline:none;transition:border-color .15s var(--ease)}
+.field:focus{border-color:var(--hair-m)}
+textarea.field{resize:vertical;min-height:90px;line-height:1.5}
+input.field::placeholder,textarea.field::placeholder{color:var(--t4)}
+.flx{display:flex;gap:10px;flex-wrap:wrap}.flx>*{flex:1;min-width:140px}
+.lblc{font-size:10.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--t4);font-weight:600;margin:14px 2px 7px}
+.status{font-size:12.5px;margin-top:10px;min-height:15px;color:var(--ok)}
+.status.err{color:var(--err)}
+.setgroup{border:1px solid var(--hair);border-radius:16px;background:var(--panel);overflow:hidden;margin-bottom:16px}
+.setrow{display:flex;align-items:center;gap:16px;padding:17px 20px;border-bottom:1px solid var(--hair)}.setrow:last-child{border-bottom:0}
+.setrow .grow{flex:1;min-width:0}.setrow .t{font-size:14px;font-weight:560}.setrow .s{font-size:12px;color:var(--t3);margin-top:3px;line-height:1.5;word-break:break-all}
+.setrow .s.mono{font-family:var(--mono)}
+.toggle{width:46px;height:26px;border-radius:999px;background:rgba(255,255,255,.1);position:relative;cursor:pointer;flex:none;transition:.2s var(--ease)}
+.toggle::after{content:"";position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.2s var(--ease)}
+.toggle.on{background:var(--grad)}.toggle.on::after{left:23px}
+.beacon{display:flex;align-items:center;gap:16px;padding:18px 20px;border:1px solid var(--hair);border-radius:16px;background:var(--card);margin-bottom:12px}
+.node{width:14px;height:14px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(70,224,176,.5);animation:pulse 2.4s ease-out infinite;flex:none}
+.node.warn{background:var(--warn)}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(70,224,176,.5)}70%{box-shadow:0 0 0 12px rgba(70,224,176,0)}100%{box-shadow:0 0 0 0 rgba(70,224,176,0)}}
+.dappicon{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font-weight:700;color:#fff;flex:none;background:var(--grad)}
+.note{margin-top:36px;padding:17px 20px;border-radius:16px;background:rgba(88,0,214,.09);border:1px solid var(--hair-v);font-size:12.5px;color:var(--t2);line-height:1.6;display:flex;gap:13px}.note b{color:#fff}
+.empty{color:var(--t3);font-size:13px;padding:18px 20px;line-height:1.55}
+.skel{padding:16px 20px;border-bottom:1px solid var(--hair);display:flex;align-items:center;gap:15px}
+.skel:last-child{border-bottom:0}
+.skel .sq{width:38px;height:38px;border-radius:11px;flex:none;background:rgba(255,255,255,.05);animation:shim 1.4s ease-in-out infinite}
+.skel .ln{height:11px;border-radius:6px;background:rgba(255,255,255,.05);animation:shim 1.4s ease-in-out infinite}
+@keyframes shim{0%,100%{opacity:.4}50%{opacity:.85}}
+/* lifecycle (auth) views — centred card on the same sky */
+.gate{flex:1;display:flex;align-items:center;justify-content:center;padding:40px 24px;min-height:100vh}
+.gatecard{width:100%;max-width:440px;border:1px solid var(--hair);border-radius:24px;background:linear-gradient(180deg,rgba(30,24,80,.62),rgba(12,10,34,.6));backdrop-filter:blur(20px);box-shadow:0 40px 100px rgba(6,3,22,.6),inset 0 1px 0 rgba(255,255,255,.06);padding:34px 32px}
+.gatecard.hidden{display:none}
+.gatecard .gmark{width:48px;height:48px;border-radius:14px;background:var(--grad);display:grid;place-items:center;font-family:var(--serif);font-weight:700;font-size:26px;color:#fff;box-shadow:var(--glow-v);margin-bottom:20px}
+.gatecard h1{font-family:var(--serif);font-size:26px;font-weight:600;letter-spacing:-.01em}
+.gatecard .gsub{color:var(--t3);font-size:13.5px;line-height:1.6;margin:8px 0 22px}
+.gatecard .lblc{margin-left:0}
+.seed{background:rgba(0,0,0,.28);border:1px solid var(--hair);border-radius:12px;padding:16px;font-family:var(--mono);font-size:13.5px;line-height:1.95;word-spacing:5px;color:var(--t1)}
+.warnline{color:var(--warn);font-size:12.5px;margin:14px 0;line-height:1.5;display:flex;gap:8px}
+.err{color:var(--err);font-size:12.5px;margin-top:10px;min-height:15px}
+.gatecard .btn{margin-top:14px}
+.scrim{position:fixed;inset:0;z-index:50;background:rgba(5,4,14,.66);backdrop-filter:blur(9px);display:none;align-items:center;justify-content:center;padding:24px;animation:fade .2s var(--ease)}
+.scrim.show{display:flex}
+.sheet{width:min(460px,100%);border:1px solid var(--hair-v);border-radius:22px;overflow:hidden;background:linear-gradient(180deg,rgba(30,24,80,.9),rgba(12,10,34,.95));backdrop-filter:blur(24px);box-shadow:0 40px 100px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.06);animation:rise .28s var(--ease);max-height:92vh;overflow-y:auto}
+@keyframes rise{from{opacity:0;transform:translateY(16px) scale(.98)}to{opacity:1;transform:none}}
+.sheethead{padding:22px 24px 14px;border-bottom:1px solid var(--hair);display:flex;align-items:center;gap:12px}
+.sheethead .seal{width:36px;height:36px;border-radius:50%;background:var(--grad-gold);display:grid;place-items:center;color:#241a08;font-weight:800;flex:none;box-shadow:0 0 18px rgba(230,204,147,.4)}
+.sheethead .ht{font-family:var(--serif);font-size:19px}.sheethead .hs{font-size:11.5px;color:var(--t3);margin-top:2px}
+.sheetbody{padding:22px 24px}
+.summary{font-size:16px;line-height:1.55;color:var(--t1)}
+.summary b{background:var(--grad-text);-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:700}
+.costline{display:flex;justify-content:space-between;align-items:center;margin-top:18px;padding:13px 0;border-top:1px solid var(--hair);font-size:13px}
+.costline .k{color:var(--t3)}.costline .v{font-weight:600}
+.owntag{display:flex;align-items:center;gap:10px;margin-top:14px;padding:13px 15px;border-radius:12px;background:rgba(230,204,147,.07);border:1px solid var(--gold-soft);font-size:12.5px;color:var(--gold);line-height:1.5}
+.hold{position:relative;margin-top:20px;width:100%;border-radius:13px;padding:15px;cursor:pointer;font-family:inherit;font-weight:700;font-size:14.5px;color:#fff;background:rgba(255,255,255,.07);overflow:hidden;border:1px solid var(--hair-v);user-select:none}
+.hold .fillbar{position:absolute;inset:0;background:var(--grad);width:0%;transition:width .05s linear;z-index:0}
+.hold .lab{position:relative;z-index:1}
+.cancel{width:100%;margin-top:10px;background:transparent;border:0;color:var(--t3);font-family:inherit;font-size:13px;cursor:pointer;padding:8px}.cancel:hover{color:var(--t1)}
+.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%) translateY(20px);z-index:60;display:none;align-items:center;gap:11px;padding:13px 20px;border-radius:14px;background:linear-gradient(120deg,rgba(70,224,176,.16),rgba(30,24,80,.9));border:1px solid rgba(70,224,176,.4);backdrop-filter:blur(16px);box-shadow:0 16px 44px rgba(0,0,0,.5);font-size:13.5px;color:#fff;max-width:min(92vw,520px)}
+.toast.show{display:flex;animation:toastin .4s var(--ease) forwards}
+.toast.err{background:linear-gradient(120deg,rgba(255,107,149,.18),rgba(30,24,80,.9));border-color:rgba(255,107,149,.45)}
+.toast.err .ti{background:var(--err)}
+@keyframes toastin{to{transform:translateX(-50%) translateY(0)}}
+.toast .ti{width:24px;height:24px;border-radius:50%;background:var(--ok);display:grid;place-items:center;color:#06281d;font-weight:800;flex:none}
+.tabbar{display:none}
+@media(max-width:900px){
+  .rail{display:none}.stage{padding:22px 16px 96px;max-width:100%}.hero{flex-direction:column;text-align:center}.grid{grid-template-columns:1fr}.museum{grid-template-columns:repeat(2,1fr)}
+  .tabbar.show{display:flex;position:fixed;bottom:0;left:0;right:0;z-index:40;padding:8px 6px calc(8px + env(safe-area-inset-bottom));background:rgba(10,8,28,.92);backdrop-filter:blur(20px);border-top:1px solid var(--hair);justify-content:space-around}
+  .tabbar button{flex:1;background:none;border:0;color:var(--t3);font-family:inherit;font-size:10px;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:4px;padding:6px 0}
+  .tabbar button.on{color:#fff}.tabbar button.on svg{stroke:url(#tg)}.tabbar svg{width:21px;height:21px}
+}
+/* Reduce-motion: collapse all ambient + transition motion to instant. */
+@media (prefers-reduced-motion: reduce){ *{animation:none!important;transition:none!important} }
+html[data-motion="off"] *{animation:none!important;transition:none!important}
+</style>
+</head>
+<body>
+<div class="sky"></div><div class="stars" id="stars"></div>
+<svg width="0" height="0" style="position:absolute"><defs><linearGradient id="tg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5800D6"/><stop offset="1" stop-color="#FF00DE"/></linearGradient></defs></svg>
+
+<!-- ============ AUTH GATE (welcome / create / restore / unlock) ============ -->
+<div class="gate" id="gate">
+  <!-- WELCOME -->
+  <div class="gatecard hidden" id="view-welcome">
+    <div class="gmark">&#208;</div>
+    <h1>Your keys, your Chia.</h1>
+    <p class="gsub">A built-in, self-custodial Chia wallet. Create a new wallet or restore one from its 24-word recovery phrase. DIG never sees your keys.</p>
+    <button class="btn p full" id="btnCreate">Create new wallet</button>
+    <button class="btn g full" id="btnRestore">Restore from recovery phrase</button>
+  </div>
+
+  <!-- CREATE: show seed -->
+  <div class="gatecard hidden" id="view-create">
+    <div class="gmark">&#208;</div>
+    <h1>Your recovery phrase</h1>
+    <p class="gsub">Write these 24 words down and keep them safe and offline. Anyone with them controls your funds. DIG never sees them.</p>
+    <div class="seed" id="seedWords"></div>
+    <div class="warnline"><span>&#9888;</span>This phrase is shown once. Store it before continuing.</div>
+    <div class="lblc">Set a password (encrypts your wallet on this device)</div>
+    <input type="password" id="createPw" class="field" placeholder="At least 8 characters" autocomplete="new-password">
+    <div class="err" id="createErr"></div>
+    <button class="btn p full" id="btnSavedSeed">I've saved it — create wallet</button>
+    <button class="btn g full" id="btnBackWelcome1">Back</button>
+  </div>
+
+  <!-- RESTORE -->
+  <div class="gatecard hidden" id="view-restore">
+    <div class="gmark">&#208;</div>
+    <h1>Restore wallet</h1>
+    <p class="gsub">Enter your 12/24-word recovery phrase, separated by spaces.</p>
+    <textarea id="restoreInput" class="field" placeholder="word1 word2 word3 …" spellcheck="false" autocomplete="off"></textarea>
+    <div class="lblc">Set a password (encrypts your wallet on this device)</div>
+    <input type="password" id="restorePw" class="field" placeholder="At least 8 characters" autocomplete="new-password">
+    <div class="err" id="restoreErr"></div>
+    <button class="btn p full" id="btnRestoreGo">Open wallet</button>
+    <button class="btn g full" id="btnBackWelcome2">Back</button>
+  </div>
+
+  <!-- UNLOCK -->
+  <div class="gatecard hidden" id="view-unlock">
+    <div class="gmark">&#208;</div>
+    <h1>Welcome back</h1>
+    <p class="gsub">Enter your password to unlock your DIG Wallet on this device.</p>
+    <input type="password" id="unlockPw" class="field" placeholder="Password" autocomplete="current-password">
+    <div class="err" id="unlockErr"></div>
+    <button class="btn p full" id="btnUnlock">Unlock</button>
+  </div>
+</div>
+
+<!-- ============ WALLET (unlocked) ============ -->
+<div class="app hidden" id="app">
+  <aside class="rail">
+    <div class="brand"><div class="mark">&#208;</div><div class="wm">DIG Wallet<small>Self-custodial</small></div></div>
+    <div class="navlbl">Everyday</div>
+    <button class="nav on" data-go="home"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 11l9-7 9 7M5 10v9h14v-9"/></svg>Home</button>
+    <button class="nav" data-go="tokens"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8"/><path d="M9 12h6"/></svg>Cash &amp; Tokens</button>
+    <button class="nav" data-go="nfts"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="4" y="4" width="7" height="7" rx="1.5"/><rect x="13" y="4" width="7" height="7" rx="1.5"/><rect x="4" y="13" width="7" height="7" rx="1.5"/><rect x="13" y="13" width="7" height="7" rx="1.5"/></svg>Collectibles</button>
+    <button class="nav" data-go="trades"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 10l-3 3 3 3M4 13h12M17 14l3-3-3-3M20 11H8"/></svg>Trades</button>
+    <button class="nav" data-go="activity"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h4l2 6 4-14 2 8h6"/></svg>Activity</button>
+    <div class="navlbl">Identity &amp; Data</div>
+    <button class="nav" data-go="profiles"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>Profiles</button>
+    <button class="nav" data-go="stores"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/></svg>My Stores</button>
+    <div class="navlbl">Tools</div>
+    <button class="nav" data-go="connect"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M9 17v-6l-4 4M15 7v6l4-4"/><rect x="3" y="3" width="18" height="18" rx="4"/></svg>Connect a dapp</button>
+    <button class="nav" data-go="advanced"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 4v4M12 16v4M4 12h4M16 12h4M6 6l3 3M15 15l3 3M18 6l-3 3M9 15l-3 3"/></svg>Advanced</button>
+    <button class="nav" data-go="settings"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/></svg>Settings</button>
+    <div class="foot">
+      <div class="addrchip" title="Copy your receive address" id="railAddr"><div class="av"></div><div class="m"><b>Receive address</b><span id="railAddrText">—</span></div></div>
+      <div class="footrow"><button data-go="settings">Settings</button><button id="btnLock">Lock</button></div>
+      <div class="synced"><span class="live" id="liveDot"></span><span id="syncText">Mainnet · synced via coinset.org</span></div>
+    </div>
+  </aside>
+  <main class="stage">
+
+  <!-- ===== HOME ===== -->
+  <section class="page show" id="page-home">
+    <div class="topbar"><div><div class="eyebrow">Your estate</div><h1>Welcome back</h1></div><div class="spacer"></div><button class="chip" id="btnRefresh">&#8635; Refresh</button><button class="chip gold" id="btnThemeChip">&#10022; DIG theme</button></div>
+    <section class="hero"><div class="bloom"></div>
+      <div class="orb" id="orb"><div class="ring"></div><div class="core">
+        <div class="bal" style="text-align:center"><div class="lbl">Balance</div><div class="big" id="orbTotal">—</div><div class="sub" id="orbSub">syncing…</div></div>
+        <div class="qr"><div class="qrbox"></div><div class="mono" style="font-size:10px;color:var(--t2)" id="orbAddr">—</div></div>
+      </div></div>
+      <div class="heromid">
+        <div class="assetline" id="heroAssets">
+          <div class="acoin"><div class="medal" style="background:linear-gradient(135deg,#46E0B0,#1f9e87)">&#10005;</div><div><div class="nm">Chia</div><div class="vl" id="heroXch">— <small>XCH</small></div></div></div>
+          <div class="acoin"><div class="medal" style="background:var(--grad)">&#208;</div><div><div class="nm">DIG</div><div class="vl" id="heroDig">— <small>DIG</small></div></div></div>
+        </div>
+        <div class="actions"><button class="btn p" id="btnHomeSend"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 19V5M5 12l7-7 7 7"/></svg>Send</button><button class="btn g" id="btnHomeReceive"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 5v14M5 12l7 7 7-7"/></svg>Receive</button><button class="btn g" data-go="trades"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M7 10l-3 3 3 3M4 13h12M17 14l3-3-3-3M20 11H8"/></svg>Trade</button></div>
+      </div>
+    </section>
+    <div class="sechead"><div class="l"><div class="kick">Cash</div><h2>Tokens you hold</h2></div><a data-go="tokens">View all &#8594;</a></div>
+    <div class="grid" id="homeTokens"></div>
+    <div class="sechead"><div class="l"><div class="kick">Collectibles</div><h2>The gallery wall</h2></div><a data-go="nfts">Open gallery &#8594;</a></div>
+    <div class="museum" id="homeNfts"></div>
+    <div class="sechead"><div class="l"><div class="kick">My Stores</div><h2>Capsules you own</h2></div><a data-go="stores">All capsules &#8594;</a></div>
+    <div id="homeStores"></div>
+    <div class="note"><span style="font-size:18px">&#128737;</span><div><b>You're in full control.</b> Your keys live only on this device &#8212; DIG never sees them. Every action is signed by you and shows exactly what it does before it touches the chain. Want the protocol detail? It's always one tap away under <b>Show protocol detail</b>.</div></div>
+  </section>
+
+  <!-- ===== CASH & TOKENS ===== -->
+  <section class="page" id="page-tokens">
+    <div class="topbar"><div><div class="eyebrow">Cash</div><h1>Cash &amp; Tokens</h1></div><div class="spacer"></div><button class="chip" id="btnTokSend">&#8593; Send</button><button class="chip" id="btnTokReceive">&#8595; Receive</button></div>
+    <p class="dek">Everything you can spend. Chia (XCH) is the native coin; everything else is a token (a CAT) identified by its asset id. Add any token by pasting its asset id.</p>
+    <div class="panel" id="tokenList"></div>
+    <details class="disc" style="margin-top:6px"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Show protocol detail</summary>
+      <div class="body panel" style="padding:6px 18px" id="tokenProto"></div>
+    </details>
+    <div class="sechead"><div class="l"><div class="kick">Add</div><h2>Track a token</h2></div></div>
+    <div class="panel" style="padding:18px 20px">
+      <p class="dek" style="margin:0 0 12px">Paste a token's asset id (its 32-byte TAIL) to track its balance here.</p>
+      <div class="flx"><input class="field" id="addCatId" placeholder="asset id (0x… 32-byte TAIL)"><button class="btn p" id="btnAddCat" style="flex:0 0 auto">Add token</button></div>
+    </div>
+  </section>
+
+  <!-- ===== COLLECTIBLES ===== -->
+  <section class="page" id="page-nfts">
+    <div class="topbar"><div><div class="eyebrow">Collectibles</div><h1>The gallery wall</h1></div><div class="spacer"></div><button class="chip gold" id="btnMintOpen">&#10022; Mint</button></div>
+    <p class="dek">Your collectibles, hung and catalogued. Each piece shows its on-chain identity on the plaque. Open one to transfer it. Media is loaded by the app you mint or view in.</p>
+    <div class="museum" id="nftGrid"></div>
+  </section>
+
+  <!-- ===== TRADES ===== -->
+  <section class="page" id="page-trades">
+    <div class="topbar"><div><div class="eyebrow">Trades</div><h1>Offers</h1></div><div class="spacer"></div><button class="chip" id="btnMakeJump">&#65291; Make an offer</button></div>
+    <p class="dek">An offer is a sealed trade you can share with anyone &#8212; no middleman. Make one to propose a swap, or paste an <span class="mono" style="color:var(--gold)">offer1&#8230;</span> string to inspect and take it. Offers are safe: nothing moves until both sides are satisfied.</p>
+
+    <div class="sechead" style="margin-top:8px"><div class="l"><div class="kick">Inspect &amp; take</div><h2>Paste an offer</h2></div></div>
+    <div class="offercard">
+      <textarea class="field" id="takeOfferStr" placeholder="paste an offer1… string"></textarea>
+      <div class="offeract"><button class="btn g sm" id="btnInspectOffer">Inspect</button><button class="btn p sm" id="btnTakeOffer">Take offer</button></div>
+      <div id="offerSummary"></div>
+      <div class="status" id="takeStatus"></div>
+    </div>
+
+    <div class="sechead"><div class="l"><div class="kick">Make</div><h2>Build an offer</h2></div></div>
+    <div class="offercard">
+      <p class="dek" style="margin:0 0 12px">Offer assets and request assets in return. Amounts in base units; leave an asset id blank for XCH.</p>
+      <div class="lblc" style="margin-left:0">You give</div>
+      <div class="flx"><input class="field" id="offerGiveId" placeholder="offer asset id (blank = XCH)"><input class="field" id="offerGiveAmt" placeholder="offer amount"></div>
+      <div class="lblc" style="margin-left:0">You receive</div>
+      <div class="flx"><input class="field" id="offerGetId" placeholder="request asset id (blank = XCH)"><input class="field" id="offerGetAmt" placeholder="request amount"></div>
+      <button class="btn p" id="btnMakeOffer" style="margin-top:14px">Build offer</button>
+      <div id="madeOffer"></div>
+      <div class="status" id="makeStatus"></div>
+    </div>
+
+    <div class="sechead"><div class="l"><div class="kick">Your offers</div><h2>Made by you</h2></div></div>
+    <div class="panel" id="myOffers"><div class="empty">Offers you build this session appear here with a Cancel action.</div></div>
+    <details class="disc" style="margin-top:6px"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Cancel a specific offer</summary>
+      <div class="body">
+        <p class="dek" style="margin:0 0 10px">Paste any <span class="mono" style="color:var(--gold)">offer1…</span> string you made to cancel it on-chain (re-spends the offered coins back to you).</p>
+        <textarea class="field" id="cancelOfferStr" placeholder="paste the offer1… string to cancel"></textarea>
+        <button class="btn g sm" id="btnCancelOfferStr" style="margin-top:10px">Cancel this offer</button>
+        <div class="status" id="cancelStatus"></div>
+      </div>
+    </details>
+  </section>
+
+  <!-- ===== ACTIVITY ===== -->
+  <section class="page" id="page-activity">
+    <div class="topbar"><div><div class="eyebrow">Activity</div><h1>Transaction history</h1></div></div>
+    <p class="dek">Your XCH and DIG activity, newest first.</p>
+    <div class="panel" id="txList"></div>
+    <div class="pager"><span id="txPageLabel">Page 1</span><div class="pg"><button class="pgbtn" id="btnTxPrev">Newer</button><button class="pgbtn" id="btnTxNext">Older</button></div></div>
+  </section>
+
+  <!-- ===== PROFILES (DIDs) ===== -->
+  <section class="page" id="page-profiles">
+    <div class="topbar"><div><div class="eyebrow">Identity</div><h1>Profiles</h1></div><div class="spacer"></div><button class="chip gold" id="btnCreateDid">&#65291; New profile</button></div>
+    <p class="dek">A profile is your portable on-chain identity (a DID). Use it to sign your collectibles, prove authorship, and carry your reputation across apps. You can create several and transfer them.</p>
+    <div id="didList"></div>
+    <div class="status" id="didStatus"></div>
+  </section>
+
+  <!-- ===== MY STORES ===== -->
+  <section class="page" id="page-stores">
+    <div class="topbar"><div><div class="eyebrow">Capsules · DataLayer</div><h1>My Stores</h1></div></div>
+    <p class="dek">Each store you publish is a permanent capsule you <b style="color:var(--t1)">own</b> &#8212; a <span class="mono" style="color:var(--gold)">storeId : rootHash</span> snapshot anchored on Chia, forever. Not a fee &#8212; a keepsake of your estate. Every update adds a new generation to its history.</p>
+    <div id="storeList"></div>
+  </section>
+
+  <!-- ===== CONNECT A DAPP ===== -->
+  <section class="page" id="page-connect">
+    <div class="topbar"><div><div class="eyebrow">WalletConnect</div><h1>Connect a dapp</h1></div></div>
+    <p class="dek">Link this wallet to an app so it can ask you to approve actions. You stay in control &#8212; every request is shown plainly and signed only by you. Paste a <span class="mono" style="color:var(--gold)">wc:&#8230;</span> pairing link to connect.</p>
+    <div id="wcNoPid" class="panel hidden" style="padding:18px 20px">
+      <div class="empty" style="padding:0">WalletConnect isn't configured yet — set a <b style="color:var(--t1)">projectId</b> in <a href="dig://settings" style="color:var(--gold)">DIG settings</a> to pair with apps.</div>
+    </div>
+    <div id="wcPair" class="hidden">
+      <div class="panel" style="padding:20px;margin-bottom:18px"><div style="font-size:13px;color:var(--t3);margin-bottom:9px">Pairing link</div><div style="display:flex;gap:12px;flex-wrap:wrap"><input class="field" id="wcUri" placeholder="wc:a1b2c3…@2?relay-protocol=irn&amp;symKey=…" spellcheck="false" autocomplete="off" style="flex:1;min-width:200px"><button class="btn p" id="btnPair">Connect</button></div><div class="status" id="wcStatus"></div></div>
+    </div>
+    <div id="wcProposal" class="beacon hidden" style="border-color:var(--hair-v)">
+      <span class="node warn"></span>
+      <div class="grow"><div class="t" style="font-weight:600">Wants to connect</div><div class="s" style="font-size:12px;color:var(--t3);margin-top:3px" id="wcProposalName"></div></div>
+      <button class="btn p sm" id="btnWcApprove">Approve</button>
+      <button class="btn g sm" id="btnWcReject">Reject</button>
+    </div>
+    <div class="sechead" style="margin-top:8px"><div class="l"><div class="kick">Connected</div><h2>Active sessions</h2></div></div>
+    <div id="connApproved"></div>
+    <div id="connPending"></div>
+    <div id="wcSessions"></div>
+    <div class="empty" id="connEmpty">No apps connected. Paste a wc: link above to connect one.</div>
+  </section>
+
+  <!-- ===== ADVANCED ===== -->
+  <section class="page" id="page-advanced" data-tab="advanced">
+    <div class="topbar"><div><div class="eyebrow">Power user · the Private Office</div><h1>Advanced</h1></div></div>
+    <p class="dek">Specialist instruments, kept out of the way until you need them. Each is built on the same signed, on-chain flow as everything else &#8212; signed locally and (by default) a safe dry run until broadcasting is enabled.</p>
+    <div class="grid">
+
+      <!-- Reversible payments (clawback) -->
+      <div class="jewel"><div class="top" style="background:var(--grad)"></div>
+        <div class="jrow"><div class="medal" style="background:linear-gradient(135deg,#5800D6,#7a3cff)">&#8617;</div><div><div class="nm">Reversible payments</div><div class="tk">clawback</div></div></div>
+        <div class="jusd" style="margin-top:12px">Send funds the recipient can only claim after a delay &#8212; and that you can take back until they do.</div>
+        <details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Open</summary>
+          <div class="body">
+            <input class="field" id="cbTo" placeholder="recipient address (xch1…)" style="margin-bottom:8px">
+            <div class="flx"><input class="field" id="cbAmt" placeholder="amount (mojos)"><input class="field" id="cbLock" placeholder="claim delay (seconds)"></div>
+            <button class="btn p sm full" id="btnClawSend" style="margin-top:10px">Send reversible payment</button>
+            <div class="status" id="clawStatus"></div>
+            <div id="clawResult"></div>
+            <details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Claim or recover an existing one (protocol detail)</summary>
+              <div class="body">
+                <p class="dek" style="margin:0 0 10px">A clawback coin is a 1-of-2 puzzle: the receiver path (after the delay) and the sender recover path. Supply the coin's terms to claim (you're the receiver) or recover (you're the sender).</p>
+                <input class="field" id="cbParent" placeholder="parent coin id (0x…)" style="margin-bottom:8px">
+                <input class="field" id="cbCoinAmt" placeholder="amount (mojos)" style="margin-bottom:8px">
+                <input class="field" id="cbCoinLock" placeholder="timelock (seconds)" style="margin-bottom:8px">
+                <input class="field" id="cbSender" placeholder="sender address (xch1…)" style="margin-bottom:8px">
+                <input class="field" id="cbReceiver" placeholder="receiver address (xch1…)">
+                <div class="flx" style="margin-top:10px"><button class="btn g sm" id="btnClawClaim">Claim (receiver)</button><button class="btn g sm" id="btnClawRecover">Recover (sender)</button></div>
+                <div class="status" id="clawClaimStatus"></div>
+              </div>
+            </details>
+          </div>
+        </details>
+      </div>
+
+      <!-- Streaming / vesting -->
+      <div class="jewel"><div class="top" style="background:linear-gradient(90deg,#46E0B0,#1f9e87)"></div>
+        <div class="jrow"><div class="medal" style="background:linear-gradient(135deg,#46E0B0,#1f9e87)">&#8767;</div><div><div class="nm">Streaming &amp; vesting</div><div class="tk">streaming</div></div></div>
+        <div class="jusd" style="margin-top:12px">Pay XCH that unlocks gradually between a start and end time &#8212; salaries, grants, vesting.</div>
+        <details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Open</summary>
+          <div class="body">
+            <input class="field" id="strTo" placeholder="recipient address (xch1…)" style="margin-bottom:8px">
+            <input class="field" id="strAmt" placeholder="amount (mojos)" style="margin-bottom:8px">
+            <div class="flx"><input class="field" id="strStart" placeholder="start (unix seconds)"><input class="field" id="strEnd" placeholder="end (unix seconds)"></div>
+            <button class="btn p sm full" id="btnStreamCreate" style="margin-top:10px">Create stream</button>
+            <div class="status" id="streamStatus"></div>
+            <div id="streamResult"></div>
+            <details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Claim vested / claw back (protocol detail)</summary>
+              <div class="body">
+                <p class="dek" style="margin:0 0 10px">Reconstruct the live stream from the coin spend that created/updated it, then claim the vested portion (recipient) or claw back the remainder (payer). Needs a spare 0-mojo coin at your address to carry the authorizing message.</p>
+                <textarea class="field" id="strParentSpend" placeholder='parent coin spend JSON: {"coin":{"parentCoinInfo":"0x…","puzzleHash":"0x…","amount":N},"puzzleReveal":"0x…","solution":"0x…"}'></textarea>
+                <input class="field" id="strPayTime" placeholder="payment time (block timestamp)" style="margin-top:8px">
+                <div class="flx" style="margin-top:10px"><button class="btn g sm" id="btnStreamClaim">Claim vested</button><button class="btn g sm" id="btnStreamClawback">Claw back</button></div>
+                <div class="status" id="streamClaimStatus"></div>
+              </div>
+            </details>
+          </div>
+        </details>
+      </div>
+
+      <!-- Options -->
+      <div class="jewel"><div class="top" style="background:linear-gradient(90deg,#E6B453,#a8761f)"></div>
+        <div class="jrow"><div class="medal" style="background:linear-gradient(135deg,#E6B453,#a8761f)">&#9719;</div><div><div class="nm">Options</div><div class="tk">options</div></div></div>
+        <div class="jusd" style="margin-top:12px">Lock XCH as an option's underlying; the holder can exercise (pay the strike) before expiry, or you reclaim it after.</div>
+        <details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Open</summary>
+          <div class="body">
+            <input class="field" id="optUnderlying" placeholder="underlying XCH to lock (mojos)" style="margin-bottom:8px">
+            <div class="flx"><input class="field" id="optStrike" placeholder="strike amount (XCH mojos)"><input class="field" id="optExpiry" placeholder="expiry (unix seconds)"></div>
+            <button class="btn p sm full" id="btnOptCreate" style="margin-top:10px">Create option</button>
+            <div class="status" id="optStatus"></div>
+            <p class="dek" style="margin-top:8px;font-size:11.5px" id="optNote">Exercise / clawback of options needs a full Chia wallet in this build.</p>
+          </div>
+        </details>
+      </div>
+
+      <!-- Vault -->
+      <div class="jewel"><div class="top" style="background:var(--grad)"></div>
+        <div class="jrow"><div class="medal" style="background:var(--grad)">&#128274;</div><div><div class="nm">Vault</div><div class="tk">vault</div></div></div>
+        <div class="jusd" style="margin-top:12px">Multi-key custody (m-of-n secp256k1 keys) with recovery and spend limits for large holdings.</div>
+        <details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Open</summary>
+          <div class="body">
+            <textarea class="field" id="vaultMembers" placeholder="one K1 public key (33-byte hex) per line"></textarea>
+            <input class="field" id="vaultRequired" placeholder="required signers (blank = all)" style="margin-top:8px">
+            <button class="btn p sm full" id="btnVaultCreate" style="margin-top:10px">Create vault</button>
+            <div class="status" id="vaultStatus"></div>
+            <p class="dek" style="margin-top:8px;font-size:11.5px">Spending a vault needs its K1 custody keys, which this wallet does not hold — create here, spend with the K1 keys elsewhere.</p>
+          </div>
+        </details>
+      </div>
+
+      <!-- Verifiable credentials -->
+      <div class="jewel"><div class="top" style="background:linear-gradient(90deg,#B98CFF,#FF6BEE)"></div>
+        <div class="jrow"><div class="medal" style="background:linear-gradient(135deg,#B98CFF,#FF6BEE)">&#10003;</div><div><div class="nm">Verifiable credentials</div><div class="tk">VCs</div></div></div>
+        <div class="jusd" style="margin-top:12px">Hold and present cryptographic proofs &#8212; KYC, membership, attestations.</div>
+        <details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Open</summary>
+          <div class="body">
+            <p class="dek" style="margin:0 0 10px">Compute the on-chain "asserter" address for a credential — the address a relying party sends a coin to so spending it requires proof the credential was issued.</p>
+            <input class="field" id="vcIssuer" placeholder="issuer DID launcher id (0x…)" style="margin-bottom:8px">
+            <input class="field" id="vcAsset" placeholder="subject asset id (0x…)" style="margin-bottom:8px">
+            <input class="field" id="vcData" placeholder="data hash (0x…)" style="margin-bottom:8px">
+            <input class="field" id="vcVersion" placeholder="version (default 1)">
+            <button class="btn p sm full" id="btnVcVerify" style="margin-top:10px">Compute verifier address</button>
+            <div class="status" id="vcStatus"></div>
+            <div id="vcResult"></div>
+            <p class="dek" style="margin-top:8px;font-size:11.5px">Issuing / revoking a credential needs the issuing DID's tooling (it co-signs the same bundle) — not available standalone in this build.</p>
+          </div>
+        </details>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ===== SETTINGS (in-app shortcuts) ===== -->
+  <section class="page" id="page-settings">
+    <div class="topbar"><div><div class="eyebrow">Settings</div><h1>Settings</h1></div></div>
+    <p class="dek">Quick controls for this device. Keys, WalletConnect, cache and backup live in the full DIG settings page.</p>
+
+    <div class="sechead" style="margin-top:8px"><div class="l"><div class="kick">Appearance</div><h2>Theme &amp; motion</h2></div></div>
+    <div class="setgroup">
+      <div class="setrow"><div class="grow"><div class="t">Cosmic gradient</div><div class="s">DIG violet → magenta. Toggle off for Chia green.</div></div><div class="toggle on" id="tglTheme"></div></div>
+      <div class="setrow"><div class="grow"><div class="t">Reduce motion</div><div class="s">Calm everything down — no drift, breathing or animated fills.</div></div><div class="toggle" id="tglMotion"></div></div>
+    </div>
+
+    <div class="sechead"><div class="l"><div class="kick">Keys &amp; data</div><h2>Full settings</h2></div></div>
+    <div class="setgroup">
+      <div class="setrow"><div class="grow"><div class="t">Public key, export &amp; import</div><div class="s">Copy your public key, reveal your recovery phrase (password-gated), or restore a wallet.</div></div><a class="btn g sm" href="dig://settings">Open</a></div>
+      <div class="setrow"><div class="grow"><div class="t">WalletConnect projectId</div><div class="s">Set the relay projectId that powers Connect a dapp.</div></div><a class="btn g sm" href="dig://settings">Open</a></div>
+      <div class="setrow"><div class="grow"><div class="t">Local cache &amp; cached stores</div><div class="s">Storage limit, clear cache, and the per-capsule cache manager.</div></div><a class="btn g sm" href="dig://settings">Open</a></div>
+    </div>
+
+    <div class="sechead"><div class="l"><div class="kick">Session</div><h2>This wallet</h2></div></div>
+    <div class="setgroup">
+      <div class="setrow"><div class="grow"><div class="t">Receive address</div><div class="s mono" id="setAddr">—</div></div><button class="btn g sm" id="btnSetCopyAddr">Copy</button></div>
+      <div class="setrow"><div class="grow"><div class="t">Lock wallet</div><div class="s">End this session. You'll need your password to unlock again.</div></div><button class="btn g sm" id="btnSetLock">Lock</button></div>
+    </div>
+  </section>
+
+  </main>
+</div>
+
+<!-- bottom tab bar (mobile) -->
+<nav class="tabbar" id="tabbar">
+  <button class="on" data-go="home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 11l9-7 9 7M5 10v9h14v-9"/></svg>Home</button>
+  <button data-go="tokens"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8"/><path d="M9 12h6"/></svg>Cash</button>
+  <button data-go="trades"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 10l-3 3 3 3M4 13h12M17 14l3-3-3-3M20 11H8"/></svg>Trade</button>
+  <button data-go="activity"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12h4l2 6 4-14 2 8h6"/></svg>Activity</button>
+  <button data-go="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>More</button>
+</nav>
+
+<!-- Notary sign sheet (review & confirm) -->
+<div class="scrim" id="signScrim">
+  <div class="sheet">
+    <div class="sheethead"><div class="seal">&#10003;</div><div><div class="ht" id="signTitle">Review &amp; sign</div><div class="hs">This spends real funds on Chia mainnet.</div></div></div>
+    <div class="sheetbody">
+      <div class="summary" id="signSummary"></div>
+      <div id="signFields"></div>
+      <div class="owntag" id="ownTag" style="display:none">&#10022; You'll own this capsule forever — a permanent, on-chain snapshot. The DIG is the one-time price of permanence, not a fee.</div>
+      <details class="disc" id="signDisc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Show what gets signed</summary>
+        <div class="body" id="signProto"></div>
+      </details>
+      <button class="hold" id="holdBtn"><span class="fillbar" id="fillBar"></span><span class="lab" id="holdLab">Hold to sign</span></button>
+      <button class="cancel" id="signCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Mint sheet (collectible) -->
+<div class="scrim" id="mintScrim">
+  <div class="sheet">
+    <div class="sheethead"><div class="seal">&#10022;</div><div><div class="ht">Mint a collectible</div><div class="hs">Choose its art and metadata, then sign.</div></div></div>
+    <div class="sheetbody">
+      <div class="lblc" style="margin-left:0">Image URL (data URI)</div>
+      <input class="field" id="mintDataUri" placeholder="https://… or data:image/…">
+      <div class="lblc" style="margin-left:0">Image hash (optional)</div>
+      <input class="field" id="mintDataHash" placeholder="0x… (optional)">
+      <div class="lblc" style="margin-left:0">Royalty (basis points)</div>
+      <input class="field" id="mintRoyalty" placeholder="e.g. 300 = 3%">
+      <button class="btn gold full" id="btnMintNft" style="margin-top:16px">Mint collectible</button>
+      <button class="cancel" id="mintCancel">Cancel</button>
+      <div class="status" id="mintStatus"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"><span class="ti">&#10003;</span><span id="toastMsg">Done</span></div>
+
+<script src="/wc-bundle.js"></script>
+<script>
+/* ============================================================================
+   DIG Wallet — luxury re-skin over the real signer logic.
+   Every endpoint call below is the SAME contract the prior UI used:
+     - HTTP routes:  /api/status /api/generate /api/import /api/unlock
+                     /api/balance /api/lock /api/stores /api/stores/history
+                     /api/wc/project-id /api/wc/connections|approve|reject|revoke
+                     /api/wc/request  (the native signer dispatch)
+     - WC methods (via /api/wc/request): chip0002_getAssetBalance, chia_send,
+       chia_getNfts/transferNft/mintNft, chia_getOfferSummary/createOffer/
+       takeOffer/cancelOffer, chia_getDids/createDidWallet/transferDid,
+       chia_getTransactions, and the dig_ advanced legs (clawback, option,
+       stream, vault, vcVerify).
+   ========================================================================== */
+const $ = s => document.querySelector(s);
+const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+async function api(path, opts){ const r = await fetch(path, opts); if(!r.ok){ let m='request failed'; try{m=(await r.json()).error||m}catch(e){} throw new Error(m);} return r.status===204?null:r.json(); }
+function esc(s){ return String(s).replace(/[<>&"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c])); }
+
+// Call a WalletConnect/chia method through the native signer (self-origin, so the
+// wallet's own UI is auto-approved). State-changing methods honour the broadcast
+// gate: by default they are SIGNED but not pushed (a safe dry run).
+async function wc(method, params){
+  const r = await api('/api/wc/request', {method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({method, params: params||{}})});
+  return r.data;
+}
+const short = s => !s ? '' : (s.length>20 ? s.slice(0,10)+'…'+s.slice(-6) : s);
+function fmtXch(mojos){ return (Number(mojos)/1e12).toLocaleString(undefined,{maximumFractionDigits:12}); }
+function fmtDig(units){ return (Number(units)/1e3).toLocaleString(undefined,{maximumFractionDigits:3}); }
+function dryNote(status){ return status==='broadcast' ? '(broadcast).' : '(signed — dry run, not broadcast).'; }
+
+// ---- starfield (decorative; skipped when motion is reduced) ----
+(function(){ if(reduce) return; var s=$('#stars'),h=''; for(var i=0;i<90;i++){h+='<i style="left:'+(Math.random()*100)+'%;top:'+(Math.random()*100)+'%;animation-delay:'+(Math.random()*5).toFixed(2)+'s;opacity:'+(.25+Math.random()*.6).toFixed(2)+'"></i>';} s.innerHTML=h; })();
+
+// ---- toast ----
+var toastTimer;
+function toast(msg, isErr){ var t=$('#toast'); $('#toastMsg').textContent=msg; t.classList.toggle('err',!!isErr); t.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(function(){t.classList.remove('show');},2600); }
+function copy(text){ try{ navigator.clipboard.writeText(text); }catch(e){} }
+
+// ---- gate (auth) views ----
+function showGate(id){ $('#app').classList.add('hidden'); $('#tabbar').classList.remove('show'); $('#gate').style.display='flex';
+  document.querySelectorAll('.gatecard').forEach(function(c){c.classList.add('hidden');}); if(id) $('#'+id).classList.remove('hidden'); }
+
+// ---- rail / page navigation ----
+let _address = '';
+function go(id){
+  document.querySelectorAll('.page').forEach(function(p){p.classList.remove('show');});
+  var t=$('#page-'+id); if(t) t.classList.add('show');
+  document.querySelectorAll('.nav').forEach(function(n){n.classList.toggle('on',n.dataset.go===id);});
+  document.querySelectorAll('.tabbar button').forEach(function(b){b.classList.toggle('on',b.dataset.go===id);});
+  window.scrollTo({top:0,behavior: reduce?'auto':'smooth'});
+  if(id==='tokens') loadTokens();
+  else if(id==='nfts') loadNfts();
+  else if(id==='trades') renderMyOffers();
+  else if(id==='activity') loadTxs();
+  else if(id==='profiles') loadDids();
+  else if(id==='stores') loadStores();
+  else if(id==='home') loadHome();
+}
+document.addEventListener('click', function(e){ var el=e.target.closest('[data-go]'); if(el) go(el.dataset.go); });
+
+// ---- balance orb (Home hero) ----
+function countUp(el, target){
+  if(reduce){ el.textContent='$'+Math.round(target).toLocaleString(); return; }
+  var t0=null; function step(ts){ if(!t0)t0=ts; var p=Math.min((ts-t0)/1100,1), e=1-Math.pow(1-p,3); el.textContent='$'+Math.round(target*e).toLocaleString(); if(p<1)requestAnimationFrame(step); } requestAnimationFrame(step);
+}
+function flipOrb(){ $('#orb').classList.toggle('flip'); }
+function showReceive(){ go('home'); if(!$('#orb').classList.contains('flip')) flipOrb(); toast('Receive address shown — tap the orb to copy'); }
+$('#orb').addEventListener('click', function(){ if($('#orb').classList.contains('flip') && _address){ copy(_address); toast('Address copied'); } else { flipOrb(); } });
+
+// ---- balance (the canonical /api/balance route) ----
+async function refreshBalance(){
+  $('#liveDot').classList.remove('off'); $('#syncText').textContent='Mainnet · syncing via coinset.org';
+  $('#orbSub').textContent='syncing…';
+  try{
+    const b = await api('/api/balance');
+    _address = b.address;
+    $('#railAddrText').textContent = short(b.address);
+    $('#orbAddr').textContent = short(b.address);
+    $('#setAddr').textContent = b.address;
+    const xch = fmtXch(b.xch_mojos), dig = fmtDig(b.dig_units);
+    $('#heroXch').innerHTML = esc(xch)+' <small>XCH</small>';
+    $('#heroDig').innerHTML = esc(dig)+' <small>DIG</small>';
+    $('#orbTotal').textContent = xch;
+    $('#orbSub').innerHTML = esc(xch)+' XCH · '+esc(dig)+' DIG';
+    // Orb shows XCH as the headline figure (no fiat oracle in this build).
+    if(reduce){ $('#orbTotal').textContent = xch; } else { countUpText($('#orbTotal'), Number(b.xch_mojos)/1e12); }
+    $('#syncText').textContent='Mainnet · synced via coinset.org';
+  }catch(e){ $('#liveDot').classList.add('off'); $('#syncText').textContent='Could not reach the chain'; $('#orbSub').textContent='offline'; toast(e.message,true); }
+}
+// Count-up for a plain number (no $ prefix — balance is XCH, not fiat).
+function countUpText(el, target){
+  if(reduce){ el.textContent=target.toLocaleString(undefined,{maximumFractionDigits:4}); return; }
+  var t0=null; function step(ts){ if(!t0)t0=ts; var p=Math.min((ts-t0)/1000,1), e=1-Math.pow(1-p,3); el.textContent=(target*e).toLocaleString(undefined,{maximumFractionDigits:4}); if(p<1)requestAnimationFrame(step); } requestAnimationFrame(step);
+}
+
+// ---- HOME (curated slice of each domain) ----
+async function loadHome(){ await loadHomeTokens(); loadHomeNfts(); loadHomeStores(); }
+const _customCats = JSON.parse(localStorage.getItem('digCats')||'[]');
+
+function tokenRows(){ return _tokenCache; }
+let _tokenCache = [];
+async function fetchTokens(){
+  const rows=[];
+  try{ const xch = await wc('chip0002_getAssetBalance', {}); rows.push({name:'Chia', sym:'XCH', id:null, bal:fmtXch(xch.confirmed), mojos:xch.confirmed, native:true, accent:'linear-gradient(90deg,#46E0B0,#1f9e87)', medal:'linear-gradient(135deg,#46E0B0,#1f9e87)', glyph:'✕'}); }catch(e){}
+  try{ const dig = await wc('chip0002_getAssetBalance', {type:'cat'}); rows.push({name:'DIG', sym:'DIG', id:null, bal:fmtDig(dig.confirmed), mojos:dig.confirmed, dig:true, accent:'var(--grad)', medal:'var(--grad)', glyph:'Ð'}); }catch(e){}
+  for(const id of _customCats){
+    try{ const b = await wc('chip0002_getAssetBalance', {type:'cat', assetId:id}); rows.push({name:'Token', sym:'CAT', id, bal:String(b.confirmed), accent:'linear-gradient(90deg,#E6B453,#a8761f)', medal:'linear-gradient(135deg,#E6B453,#a8761f)', glyph:'◈'}); }
+    catch(e){ rows.push({name:'Token', sym:'CAT', id, bal:'—', accent:'linear-gradient(90deg,#3a3470,#221a59)', medal:'linear-gradient(135deg,#3a3470,#221a59)', glyph:'◈'}); }
+  }
+  _tokenCache = rows; return rows;
+}
+async function loadHomeTokens(){
+  const wrap=$('#homeTokens'); wrap.innerHTML=skelGrid(2);
+  const rows = await fetchTokens();
+  wrap.innerHTML = rows.map(jewelCard).join('') +
+    `<div class="jewel addtok click" data-go="tokens"><div><div class="plus">＋</div>Add a token<br><span style="font-size:11px;color:var(--t4)">by asset id</span></div></div>`;
+}
+function jewelCard(r){
+  const sub = r.dig ? 'Powers your stores' : (r.native ? 'Native coin' : 'Custom token');
+  return `<div class="jewel"><div class="top" style="background:${r.accent}"></div>`+
+    `<div class="jrow"><div class="medal" style="background:${r.medal}">${esc(r.glyph)}</div>`+
+    `<div><div class="nm">${esc(r.name)}</div><div class="tk">${r.id?esc(short(r.id)):esc(r.sym)+' · native'}</div></div></div>`+
+    `<div class="jbal">${esc(r.bal)} <small>${esc(r.sym)}</small></div>`+
+    `<div class="jusd">${esc(sub)}</div>`+
+    `<div class="jfoot"><div class="mini" data-send-asset="${r.id?esc(r.id):''}">Send</div><div class="mini" data-receive>Receive</div></div></div>`;
+}
+function skelGrid(n){ let h=''; for(let i=0;i<n;i++) h+='<div class="jewel"><div class="skel" style="border:0;padding:0"><div class="sq"></div><div style="flex:1"><div class="ln" style="width:50%"></div><div class="ln" style="width:70%;margin-top:10px"></div></div></div></div>'; return h; }
+function skelRows(n){ let h=''; for(let i=0;i<n;i++) h+='<div class="skel"><div class="sq"></div><div style="flex:1"><div class="ln" style="width:30%"></div><div class="ln" style="width:55%;margin-top:9px"></div></div></div>'; return h; }
+
+// ---- CASH & TOKENS (full list) ----
+async function loadTokens(){
+  const wrap=$('#tokenList'); wrap.innerHTML=skelRows(3);
+  const rows = await fetchTokens();
+  if(!rows.length){ wrap.innerHTML='<div class="empty">No tokens yet. Add one by asset id below.</div>'; return; }
+  wrap.innerHTML = rows.map(r=>
+    `<div class="row click" data-send-asset="${r.id?esc(r.id):''}">`+
+    `<div class="badge" style="background:${r.medal}">${esc(r.glyph)}</div>`+
+    `<div class="grow"><div class="t">${esc(r.name)}</div>`+
+    `<div class="s${r.id?' mono':''}">${r.id?esc(r.id):esc(r.sym)+' · '+(r.native?'native coin':(r.dig?'powers your stores':'CAT'))}</div></div>`+
+    `<div class="amt"><div class="v">${esc(r.bal)}</div><div class="s">${esc(r.sym)}</div></div>`+
+    `<svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg></div>`).join('');
+  // Protocol detail (raw mojos / TAILs) under a disclosure.
+  let proto = '';
+  rows.forEach(r=>{ if(r.native) proto+=kvRow('XCH balance (mojos)', String(r.mojos||0)); else if(r.dig) proto+=kvRow('DIG balance (base units)', String(r.mojos||0)); else proto+=kvRow('Asset id (TAIL)', r.id||''); });
+  $('#tokenProto').innerHTML = proto;
+}
+$('#btnAddCat').onclick = () => {
+  const id = $('#addCatId').value.trim();
+  if(!/^0x?[0-9a-fA-F]{64}$|^[0-9a-fA-F]{64}$/.test(id.replace(/^0x/,''))){ toast('Enter a 32-byte asset id (hex).',true); return; }
+  if(!_customCats.includes(id)){ _customCats.push(id); localStorage.setItem('digCats', JSON.stringify(_customCats)); }
+  $('#addCatId').value=''; toast('Token added'); loadTokens(); loadHomeTokens();
+};
+function kvRow(k,v){ return `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${esc(v)}</span></div>`; }
+
+// Send/Receive delegation (jewel + row mini buttons)
+document.addEventListener('click', function(e){
+  const sBtn = e.target.closest('[data-send-asset]');
+  if(sBtn){ openSend(sBtn.dataset.sendAsset||''); return; }
+  if(e.target.closest('[data-receive]')){ showReceive(); }
+});
+
+// ---- NFTS ----
+async function loadNfts(){
+  const grid=$('#nftGrid'); grid.innerHTML='<div class="empty">Loading collectibles…</div>';
+  try{
+    const r = await wc('chia_getNfts', {});
+    const nfts = r.nfts||[];
+    grid.innerHTML = nfts.map((n,i)=>{
+      const hue=['radial-gradient(circle at 30% 25%,#FF3DF5,transparent 52%),linear-gradient(135deg,#5800D6,#0c0a22)','radial-gradient(circle at 70% 30%,#46E0B0,transparent 55%),linear-gradient(160deg,#191248,#5800D6)','radial-gradient(circle at 40% 70%,#E6CC93,transparent 52%),linear-gradient(135deg,#221a59,#101132)','radial-gradient(circle at 60% 40%,#B98CFF,transparent 55%),linear-gradient(160deg,#5800D6,#FF00DE)'][i%4];
+      return `<div class="work" data-nft-transfer="${esc(n.coinId)}"><div class="matte"><div class="fill" style="background:${hue}"></div>${i===0?'<div class="sheen"></div>':''}</div>`+
+        `<div class="plaque"><div><div class="bt">Collectible</div><div class="bs">${esc(short(n.launcherId))}</div></div></div></div>`;
+    }).join('') + `<div class="mintcard" id="mintCardTile"><div><div class="plus">＋</div>Mint a collectible<br><span style="font-size:11px;color:var(--t4)">single</span></div></div>`;
+    if(!nfts.length){ grid.insertAdjacentHTML('afterbegin','<div class="empty" style="grid-column:1/-1">No collectibles yet — mint your first below.</div>'); }
+  }catch(e){ grid.innerHTML=`<div class="empty">Could not load: ${esc(e.message)}</div>`; }
+}
+document.addEventListener('click', function(e){
+  if(e.target.id==='mintCardTile' || e.target.closest('#mintCardTile')) openMint();
+});
+function openMint(){ $('#mintScrim').classList.add('show'); $('#mintStatus').textContent=''; $('#mintStatus').className='status'; }
+$('#btnMintOpen').onclick = openMint;
+$('#mintCancel').onclick = () => $('#mintScrim').classList.remove('show');
+$('#mintScrim').addEventListener('click', function(e){ if(e.target===this) this.classList.remove('show'); });
+$('#btnMintNft').onclick = async () => {
+  const st=$('#mintStatus'); st.className='status'; st.textContent='Minting…';
+  try{
+    const md = { dataUris: $('#mintDataUri').value.trim()?[$('#mintDataUri').value.trim()]:[] };
+    const dh = $('#mintDataHash').value.trim(); if(dh) md.dataHash=dh;
+    const params = { metadata: md, royaltyBasisPoints: Number($('#mintRoyalty').value.trim()||0) };
+    const r = await wc('chia_mintNft', params);
+    st.textContent = (r.status==='broadcast'?'Minted: ':'Signed (dry run): ')+short(r.launcherId);
+    toast((r.status==='broadcast'?'Collectible minted ':'Mint signed ')+dryNote(r.status));
+    setTimeout(()=>$('#mintScrim').classList.remove('show'),900); loadNfts();
+  }catch(e){ st.className='status err'; st.textContent=e.message; }
+};
+// NFT transfer (open via the MuseumFrame)
+document.addEventListener('click', async e => {
+  const work = e.target.closest('[data-nft-transfer]'); if(!work) return;
+  const cid = work.dataset.nftTransfer;
+  const to = prompt('Transfer collectible to address (xch1…):'); if(!to) return;
+  try{ const r = await wc('chia_transferNft', {coinId:cid, to:to.trim()});
+    toast(r.status==='broadcast'?'Transferred.':'Signed (dry run — not broadcast).'); loadNfts(); }
+  catch(err){ toast(err.message,true); }
+});
+
+// ---- OFFERS / TRADES ----
+function renderSummaryCard(s){
+  const leg = a => a.type==='xch' ? fmtXch(a.amount)+' XCH' : (a.amount+' '+short(a.assetId));
+  const give = (s.offered||[]).map(leg).join(', ')||'—';
+  const get  = (s.requested||[]).map(leg).join(', ')||'—';
+  return `<div class="swap" style="margin-top:14px"><div class="leg give"><div class="lab">You give</div><div class="val">${esc(give)}</div></div>`+
+    `<div class="swapic"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>`+
+    `<div class="leg get"><div class="lab">You receive</div><div class="val">${esc(get)}</div></div></div>`;
+}
+$('#btnInspectOffer').onclick = async () => {
+  const o = $('#takeOfferStr').value.trim(); const box=$('#offerSummary'); box.innerHTML='';
+  if(!o){ toast('Paste an offer1… string first.',true); return; }
+  try{ const s = await wc('chia_getOfferSummary', {offer:o}); box.innerHTML = renderSummaryCard(s); }
+  catch(e){ box.innerHTML = `<div class="empty" style="padding:14px 0">${esc(e.message)}</div>`; }
+};
+$('#btnTakeOffer').onclick = async () => {
+  const offer = $('#takeOfferStr').value.trim();
+  if(!offer){ toast('Paste an offer1… string first.',true); return; }
+  // Show the summary in the Notary sheet, then hold-to-sign.
+  let summaryHtml = 'Both move together — or not at all.';
+  try{ const s = await wc('chia_getOfferSummary', {offer}); summaryHtml = renderSummaryCard(s) + '<p class="dek" style="margin:12px 0 0">Both move together — or not at all.</p>'; }catch(e){}
+  openSign({
+    title:'Take this offer',
+    summaryHtml: summaryHtml,
+    proto:[['Action','chia_takeOffer'],['Offer (truncated)', short(offer)]],
+    statusId:'takeStatus',
+    run: async (st)=>{ const r = await wc('chia_takeOffer', {offer}); st.textContent = 'Offer taken '+dryNote(r.status); return r; }
+  });
+};
+$('#btnMakeJump').onclick = () => { go('trades'); $('#offerGiveAmt').focus(); };
+let _myOffers = [];
+$('#btnMakeOffer').onclick = async () => {
+  const st=$('#makeStatus'); st.className='status'; st.textContent='Building…'; $('#madeOffer').innerHTML='';
+  const leg = (id, amt) => { const o={amount:amt.trim()}; const i=id.trim(); if(i) o.assetId=i; return o; };
+  try{
+    const give = leg($('#offerGiveId').value, $('#offerGiveAmt').value);
+    const get  = leg($('#offerGetId').value, $('#offerGetAmt').value);
+    const r = await wc('chia_createOffer', { offered:[give], requested:[get] });
+    $('#madeOffer').innerHTML = `<div class="offerstr" id="offerOut" title="Tap to copy">${esc(r.offer)}</div>`+
+      `<div class="offeract"><button class="btn g sm" id="copyOffer">Copy offer</button></div>`;
+    $('#offerOut').onclick = () => { copy(r.offer); toast('Offer copied'); };
+    $('#copyOffer').onclick = () => { copy(r.offer); toast('Offer copied'); };
+    _myOffers.unshift({ offer:r.offer, give:($('#offerGiveAmt').value.trim()||'?')+' '+($('#offerGiveId').value.trim()?short($('#offerGiveId').value.trim()):'XCH'), get:($('#offerGetAmt').value.trim()||'?')+' '+($('#offerGetId').value.trim()?short($('#offerGetId').value.trim()):'XCH'), ts:Date.now() });
+    renderMyOffers();
+    st.textContent='Offer created. Share the string above.'; toast('Offer built');
+  }catch(e){ st.className='status err'; st.textContent=e.message; }
+};
+function renderMyOffers(){
+  const wrap=$('#myOffers');
+  if(!_myOffers.length){ wrap.innerHTML='<div class="empty">Offers you build this session appear here with a Cancel action.</div>'; return; }
+  wrap.innerHTML = _myOffers.map((o,i)=>
+    `<div class="row"><div class="badge" style="background:rgba(255,0,222,.14);color:var(--pink)">⇄</div>`+
+    `<div class="grow"><div class="t">Give ${esc(o.give)} → Get ${esc(o.get)}</div>`+
+    `<div class="s mono">${esc(short(o.offer))}</div></div>`+
+    `<span class="tag open">Open</span>`+
+    `<button class="btn g sm" data-cancel-offer="${i}" style="margin-left:12px">Cancel</button></div>`).join('');
+}
+document.addEventListener('click', function(e){
+  const b=e.target.closest('[data-cancel-offer]'); if(!b) return;
+  const idx=Number(b.dataset.cancelOffer); const o=_myOffers[idx]; if(!o) return;
+  cancelOffer(o.offer, ()=>{ _myOffers.splice(idx,1); renderMyOffers(); });
+});
+$('#btnCancelOfferStr').onclick = () => {
+  const offer=$('#cancelOfferStr').value.trim();
+  if(!offer){ toast('Paste the offer1… string to cancel.',true); return; }
+  cancelOffer(offer, ()=>{ $('#cancelOfferStr').value=''; });
+};
+function cancelOffer(offer, onDone){
+  openSign({
+    title:'Cancel this offer',
+    summaryHtml:'Cancelling re-spends the offered coins back to you, invalidating the outstanding offer.',
+    proto:[['Action','chia_cancelOffer'],['Offer (truncated)', short(offer)]],
+    statusId:'cancelStatus',
+    run: async (st)=>{ const r = await wc('chia_cancelOffer', {offer}); st.textContent='Offer cancelled '+dryNote(r.status); toast('Offer cancelled'); if(onDone) onDone(); return r; }
+  });
+}
+
+// ---- DIDS / PROFILES ----
+async function loadDids(){
+  const wrap=$('#didList'); wrap.innerHTML='<div class="didcard"><div class="skel" style="border:0;padding:0;flex:1"><div class="sq"></div><div style="flex:1"><div class="ln" style="width:30%"></div><div class="ln" style="width:60%;margin-top:9px"></div></div></div></div>';
+  try{
+    const r = await wc('chia_getDids', {});
+    const dids = r.dids||[];
+    if(!dids.length){ wrap.innerHTML='<div class="empty">No profiles yet. Create one with “New profile” above.</div>'; return; }
+    wrap.innerHTML = dids.map((d,i)=>{
+      const letter = 'ABCDEFGH'[i%8];
+      return `<div class="didcard"><div class="avatar">${letter}</div>`+
+        `<div class="info"><div class="nm">Profile</div><div class="did">${esc(d.launcherId)}</div></div>`+
+        `<button class="btn g sm" data-did-transfer="${esc(d.coinId)}">Transfer</button></div>`;
+    }).join('');
+  }catch(e){ wrap.innerHTML=`<div class="empty">Could not load: ${esc(e.message)}</div>`; }
+}
+$('#btnCreateDid').onclick = async () => {
+  const st=$('#didStatus'); st.className='status'; st.textContent='Creating…';
+  try{ const r = await wc('chia_createDidWallet', {});
+    st.textContent=(r.status==='broadcast'?'Created: ':'Signed (dry run): ')+short(r.launcherId); toast('Profile '+(r.status==='broadcast'?'created':'signed')); loadDids(); }
+  catch(e){ st.className='status err'; st.textContent=e.message; }
+};
+document.addEventListener('click', async e => {
+  const b=e.target.closest('[data-did-transfer]'); if(!b) return;
+  const cid=b.dataset.didTransfer;
+  const to = prompt('Transfer profile to address (xch1…):'); if(!to) return;
+  try{ const r = await wc('chia_transferDid', {coinId:cid, to:to.trim()});
+    toast(r.status==='broadcast'?'Transferred.':'Signed (dry run — not broadcast).'); loadDids(); }
+  catch(err){ toast(err.message,true); }
+});
+
+// ---- TRANSACTIONS / ACTIVITY ----
+let _txPage = 0;
+async function loadTxs(){
+  const wrap=$('#txList'); wrap.innerHTML=skelRows(4); $('#txPageLabel').textContent='Page '+(_txPage+1);
+  try{
+    const r = await wc('chia_getTransactions', {page:_txPage});
+    const txs = r.transactions||[];
+    if(!txs.length){ wrap.innerHTML='<div class="empty">'+(_txPage>0?'No older activity.':'No activity yet.')+'</div>'; $('#btnTxNext').disabled = true; return; }
+    $('#btnTxNext').disabled = false;
+    wrap.innerHTML = txs.map(t=>{
+      const isXch = t.asset.type==='xch';
+      const amt = isXch ? fmtXch(t.amount)+' XCH' : (t.amount+' '+(t.asset.type==='cat'?'CAT':t.asset.type));
+      const inbound = t.direction==='in';
+      const sign = inbound?'+':'−';
+      const pending = t.status && /pend/i.test(t.status);
+      const glyph = inbound?'↓':'↑';
+      const badgeStyle = inbound?'background:rgba(70,224,176,.12);color:var(--ok)':(pending?'background:rgba(230,180,83,.12);color:var(--warn)':'');
+      const tag = pending?'<span class="tag pend">pending</span>':'<span class="tag ok">'+esc(t.status||'confirmed')+'</span>';
+      return `<div class="row"><div class="badge" style="${badgeStyle}">${glyph}</div>`+
+        `<div class="grow"><div class="t">${inbound?'Received':'Sent'} ${tag}</div>`+
+        `<div class="s mono">block ${esc(String(t.height||'pending'))} · ${esc(short(t.coinIds[0]||''))}</div></div>`+
+        `<div class="amt"><div class="v ${inbound?'pos':''}">${sign}${esc(amt.split(' ')[0])}</div><div class="s">${esc(amt.split(' ')[1]||'')}</div></div></div>`;
+    }).join('');
+  }catch(e){ wrap.innerHTML=`<div class="empty">Could not load: ${esc(e.message)}</div>`; }
+}
+$('#btnTxPrev').onclick = () => { if(_txPage>0){ _txPage--; loadTxs(); } };
+$('#btnTxNext').onclick = () => { _txPage++; loadTxs(); };
+
+// ---- MY STORES (Certificate of Permanence) ----
+async function loadStores(){
+  const wrap=$('#storeList'); wrap.innerHTML='<div class="cert"><div class="skel" style="border:0;padding:0"><div class="sq"></div><div style="flex:1"><div class="ln" style="width:35%"></div><div class="ln" style="width:65%;margin-top:10px"></div></div></div></div>';
+  try{
+    const r = await api('/api/stores');
+    const stores = r.stores||[];
+    if(!stores.length){ wrap.innerHTML='<div class="empty">No stores found for this wallet. Publish one at <a href="https://hub.dig.net/" style="color:var(--gold)">hub.dig.net</a>.</div>'; return; }
+    wrap.innerHTML = stores.map(s=>{
+      const cap = esc(s.current_capsule);
+      const sid = esc(s.store_id);
+      return `<div class="cert">`+
+        `<div class="ch"><div class="gem"><div class="stone s1">◆</div><div class="stone s2">◇</div></div>`+
+        `<div class="ti"><div class="nm">Store</div><div class="nmsub">addr #${esc(String(s.hd_index))} · published to Chia mainnet</div></div>`+
+        `<div class="gen">Capsule</div></div>`+
+        `<div class="cap">${cap}</div>`+
+        `<div class="own">✓ You own this capsule, permanently.<span class="mintchip">yours forever</span></div>`+
+        `<details class="disc"><summary><svg class="tw" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg>Show history (all generations)</summary>`+
+        `<div class="body" id="hist-${sid}"><button class="btn g sm" data-store-history="${sid}">Load history</button></div></details>`+
+      `</div>`;
+    }).join('');
+  }catch(e){ wrap.innerHTML=`<div class="empty">Could not load: ${esc(e.message)}</div>`; }
+}
+document.addEventListener('click', async e => {
+  const b=e.target.closest('[data-store-history]'); if(!b) return;
+  const sid=b.dataset.storeHistory; const box=$('#hist-'+sid);
+  box.innerHTML='<div class="empty" style="padding:10px 0">Loading history…</div>';
+  try{
+    const r = await api('/api/stores/history?store_id='+encodeURIComponent(sid));
+    const caps = r.capsules||[];
+    // Constellation: one star per generation, current (last) is bright.
+    let constel = '<div class="constel"><span class="tlb">History</span>';
+    caps.forEach((c,i)=>{ const last=i===caps.length-1; if(i>0) constel+='<span class="carc'+(last?'':' dim')+'"></span>'; constel+='<span class="cstar'+(last?'':' dim')+'" title="'+esc(c)+'"></span>'; });
+    constel += '<span class="ct">'+caps.length+' capsule'+(caps.length===1?'':'s')+'</span></div>';
+    box.innerHTML = constel + caps.map((c,i)=>kvRow('Generation '+(i+1), c)).join('');
+  }catch(err){ box.innerHTML=`<div class="empty" style="padding:10px 0">${esc(err.message)}</div>`; }
+});
+// Home: curated stores (first cert) reusing the same renderer shape.
+async function loadHomeStores(){
+  const wrap=$('#homeStores'); wrap.innerHTML='';
+  try{
+    const r = await api('/api/stores'); const stores=r.stores||[];
+    if(!stores.length){ wrap.innerHTML='<div class="empty">No capsules yet. Publish a store at <a href="https://hub.dig.net/" style="color:var(--gold)">hub.dig.net</a>.</div>'; return; }
+    const s = stores[0];
+    wrap.innerHTML = `<div class="cert"><div class="ch"><div class="gem"><div class="stone s1">◆</div><div class="stone s2">◇</div></div>`+
+      `<div class="ti"><div class="nm">Store</div><div class="nmsub">addr #${esc(String(s.hd_index))} · published to Chia mainnet</div></div>`+
+      `<div class="gen">Capsule</div></div><div class="cap">${esc(s.current_capsule)}</div>`+
+      `<div class="own">✓ You own this capsule, permanently.<span class="mintchip">yours forever</span></div></div>`+
+      (stores.length>1?`<div class="sechead" style="margin-top:0"><div class="l"></div><a data-go="stores">+ ${stores.length-1} more →</a></div>`:'');
+  }catch(e){ wrap.innerHTML=''; }
+}
+async function loadHomeNfts(){
+  const wrap=$('#homeNfts'); wrap.innerHTML='';
+  try{
+    const r = await wc('chia_getNfts', {}); const nfts=(r.nfts||[]).slice(0,4);
+    if(!nfts.length){ wrap.innerHTML=`<div class="mintcard" id="homeMintTile" style="grid-column:1/-1;min-height:120px"><div><div class="plus">＋</div>Mint your first collectible</div></div>`; return; }
+    wrap.innerHTML = nfts.map((n,i)=>{
+      const hue=['radial-gradient(circle at 30% 25%,#FF3DF5,transparent 52%),linear-gradient(135deg,#5800D6,#0c0a22)','radial-gradient(circle at 70% 30%,#46E0B0,transparent 55%),linear-gradient(160deg,#191248,#5800D6)','radial-gradient(circle at 40% 70%,#E6CC93,transparent 52%),linear-gradient(135deg,#221a59,#101132)','radial-gradient(circle at 60% 40%,#B98CFF,transparent 55%),linear-gradient(160deg,#5800D6,#FF00DE)'][i%4];
+      return `<div class="work" data-go="nfts"><div class="matte"><div class="fill" style="background:${hue}"></div>${i===0?'<div class="sheen"></div>':''}</div>`+
+        `<div class="plaque"><div><div class="bt">Collectible</div><div class="bs">${esc(short(n.launcherId))}</div></div></div></div>`;
+    }).join('');
+  }catch(e){ wrap.innerHTML=''; }
+}
+document.addEventListener('click', function(e){ if(e.target.closest('#homeMintTile')) openMint(); });
+
+// ---- ADVANCED (power-user coin types) ----
+function advStatus(id, msg, isErr){ const el=$('#'+id); if(!el) return; el.className='status'+(isErr?' err':''); el.textContent=msg; }
+
+$('#btnClawSend').onclick = async () => {
+  advStatus('clawStatus','Building…'); $('#clawResult').innerHTML='';
+  try{
+    const r = await wc('dig_clawbackSend', { receiver:$('#cbTo').value.trim(), amount:$('#cbAmt').value.trim(), timelock:$('#cbLock').value.trim() });
+    advStatus('clawStatus','Reversible payment sent '+dryNote(r.status));
+    const c = r.clawbackCoin||{};
+    $('#clawResult').innerHTML = `<div class="offerstr">coin: ${esc(c.coinId||'')}\nterms: timelock ${esc(String(c.timelock||''))}</div>`;
+  }catch(e){ advStatus('clawStatus', e.message, true); }
+};
+async function clawClaimRecover(method){
+  advStatus('clawClaimStatus','Building…');
+  try{
+    const r = await wc(method, { parentCoinId:$('#cbParent').value.trim(), amount:$('#cbCoinAmt').value.trim(), timelock:$('#cbCoinLock').value.trim(), senderAddress:$('#cbSender').value.trim(), receiverAddress:$('#cbReceiver').value.trim() });
+    advStatus('clawClaimStatus','Done '+dryNote(r.status));
+  }catch(e){ advStatus('clawClaimStatus', e.message, true); }
+}
+$('#btnClawClaim').onclick = () => clawClaimRecover('dig_clawbackClaim');
+$('#btnClawRecover').onclick = () => clawClaimRecover('dig_clawbackRecover');
+
+$('#btnOptCreate').onclick = async () => {
+  advStatus('optStatus','Building…');
+  try{
+    const r = await wc('dig_optionCreate', { underlyingAmount:$('#optUnderlying').value.trim(), expirySeconds:$('#optExpiry').value.trim(), strike:{ type:'xch', amount:$('#optStrike').value.trim() } });
+    advStatus('optStatus','Option created '+dryNote(r.status)+' '+short(r.launcherId||''));
+  }catch(e){ advStatus('optStatus', e.message, true); }
+};
+
+$('#btnStreamCreate').onclick = async () => {
+  advStatus('streamStatus','Building…'); $('#streamResult').innerHTML='';
+  try{
+    const r = await wc('dig_streamCreate', { recipient:$('#strTo').value.trim(), amount:$('#strAmt').value.trim(), startTime:$('#strStart').value.trim(), endTime:$('#strEnd').value.trim() });
+    advStatus('streamStatus','Stream created '+dryNote(r.status));
+    $('#streamResult').innerHTML = `<div class="offerstr">stream coin: ${esc(r.streamCoinId||'')}</div>`;
+  }catch(e){ advStatus('streamStatus', e.message, true); }
+};
+async function streamClaimClawback(method){
+  advStatus('streamClaimStatus','Building…');
+  let parentSpend;
+  try{ parentSpend = JSON.parse($('#strParentSpend').value.trim()); }
+  catch(e){ advStatus('streamClaimStatus','Parent spend must be valid JSON.', true); return; }
+  try{ const r = await wc(method, { parentSpend, paymentTime:$('#strPayTime').value.trim() }); advStatus('streamClaimStatus','Done '+dryNote(r.status)); }
+  catch(e){ advStatus('streamClaimStatus', e.message, true); }
+}
+$('#btnStreamClaim').onclick = () => streamClaimClawback('dig_streamClaim');
+$('#btnStreamClawback').onclick = () => streamClaimClawback('dig_streamClawback');
+
+$('#btnVaultCreate').onclick = async () => {
+  advStatus('vaultStatus','Building…');
+  const members = $('#vaultMembers').value.split(/\s+/).map(s=>s.trim()).filter(Boolean);
+  if(!members.length){ advStatus('vaultStatus','Enter at least one K1 public key.', true); return; }
+  const params = { members };
+  const req = $('#vaultRequired').value.trim(); if(req) params.required = req;
+  try{ const r = await wc('dig_vaultCreate', params); advStatus('vaultStatus','Vault created '+dryNote(r.status)+' '+short(r.launcherId||'')); }
+  catch(e){ advStatus('vaultStatus', e.message, true); }
+};
+
+$('#btnVcVerify').onclick = async () => {
+  advStatus('vcStatus','Computing…'); $('#vcResult').innerHTML='';
+  try{
+    const params = { issuerDid:$('#vcIssuer').value.trim(), assetId:$('#vcAsset').value.trim(), dataHash:$('#vcData').value.trim() };
+    const v = $('#vcVersion').value.trim(); if(v) params.version = Number(v);
+    const r = await wc('dig_vcVerify', params);
+    advStatus('vcStatus','Verifier address computed.');
+    $('#vcResult').innerHTML = `<div class="offerstr">${esc(r.asserterPuzzleHash||'')}</div>`;
+  }catch(e){ advStatus('vcStatus', e.message, true); }
+};
+
+// ---- NOTARY SIGN SHEET (send + reusable for take/cancel) ----
+let _signRun = null, _signStatusId = null;
+function openSign(opts){
+  $('#signTitle').textContent = opts.title || 'Review & sign';
+  $('#signSummary').innerHTML = opts.summaryHtml || '';
+  $('#signFields').innerHTML = opts.fieldsHtml || '';
+  $('#ownTag').style.display = opts.ownership ? 'flex' : 'none';
+  $('#signProto').innerHTML = (opts.proto||[]).map(p=>kvRow(p[0],p[1])).join('');
+  _signRun = opts.run || null; _signStatusId = opts.statusId || null;
+  resetHold();
+  $('#signScrim').classList.add('show');
+}
+function closeSign(){ $('#signScrim').classList.remove('show'); resetHold(); }
+$('#signCancel').onclick = closeSign;
+$('#signScrim').addEventListener('click', function(e){ if(e.target===this) closeSign(); });
+
+// Send: open the sheet, picking the asset (id from a jewel/row, or blank=XCH).
+function openSend(assetId){
+  openSign({
+    title:'Send',
+    summaryHtml:`Send <b id="sendPreview">an amount</b> from this wallet. Enter the recipient and amount below.`,
+    fieldsHtml:
+      (assetId?`<input class="field" id="sendCatId" value="${esc(assetId)}" placeholder="asset id (blank = XCH)" style="margin-top:14px">`:`<input class="field" id="sendCatId" placeholder="asset id (leave blank for XCH)" style="margin-top:14px">`)+
+      `<input class="field" id="sendTo" placeholder="recipient address (xch1…)" style="margin-top:8px">`+
+      `<div class="flx" style="margin-top:8px"><input class="field" id="sendAmt" placeholder="amount (base units)"><input class="field" id="sendFee" placeholder="fee mojos (0)"></div>`,
+    proto:[['Spend type', assetId?'CAT':'standard XCH'],['Goes through','chia_send (native signer)']],
+    statusId:null,
+    run: async ()=>{
+      const id = $('#sendCatId').value.trim();
+      const to = $('#sendTo').value.trim(), amt = $('#sendAmt').value.trim();
+      if(!to || !amt){ throw new Error('Enter a recipient and amount.'); }
+      const params = { address:to, amount:amt, fee:($('#sendFee').value.trim()||'0') };
+      if(id){ params.type='cat'; params.assetId=id; }
+      const r = await wc('chia_send', params);
+      toast(r.status==='broadcast'?'Sent (broadcast).':'Signed (dry run — not broadcast).');
+      refreshBalance();
+      return r;
+    }
+  });
+}
+$('#btnHomeSend').onclick = () => openSend('');
+$('#btnTokSend').onclick = () => openSend('');
+$('#btnHomeReceive').onclick = showReceive;
+$('#btnTokReceive').onclick = showReceive;
+
+// Hold-to-sign mechanics.
+var holding=false,holdStart=0,raf;
+const holdBtn=$('#holdBtn'), bar=$('#fillBar'), lab=$('#holdLab');
+function resetHold(){ holding=false; cancelAnimationFrame(raf); bar.style.width='0%'; lab.textContent='Hold to sign'; }
+async function fireSign(){
+  lab.textContent='Signing…';
+  const st = _signStatusId ? $('#'+_signStatusId) : null;
+  if(st){ st.className='status'; st.textContent='Signing…'; }
+  try{
+    if(_signRun) await _signRun(st||{set textContent(v){},className:''});
+    lab.textContent='Signed ✓';
+    setTimeout(()=>{ closeSign(); toast('Transaction signed'); }, 320);
+  }catch(e){ lab.textContent='Hold to sign'; if(st){ st.className='status err'; st.textContent=e.message; } toast(e.message,true); resetHold(); }
+}
+function tick(ts){ if(!holding) return; var p=Math.min((ts-holdStart)/900,1); bar.style.width=(p*100)+'%'; if(p>=1){ holding=false; fireSign(); return; } raf=requestAnimationFrame(tick); }
+function startHold(){ if(reduce){ fireSign(); bar.style.width='100%'; return; } holding=true; holdStart=performance.now(); lab.textContent='Keep holding…'; raf=requestAnimationFrame(tick); }
+holdBtn.addEventListener('mousedown', startHold);
+holdBtn.addEventListener('touchstart', function(e){ e.preventDefault(); startHold(); }, {passive:false});
+window.addEventListener('mouseup', function(){ if(holding) resetHold(); });
+holdBtn.addEventListener('touchend', function(){ if(holding) resetHold(); });
+
+// ---- theme + motion toggles ----
+function setTheme(dig){ document.documentElement.setAttribute('data-theme', dig?'dig':'chia'); $('#tglTheme').classList.toggle('on',dig); $('#btnThemeChip').innerHTML = dig?'✦ DIG theme':'✦ Chia theme'; localStorage.setItem('digTheme', dig?'dig':'chia'); }
+function setMotion(on){ document.documentElement.setAttribute('data-motion', on?'on':'off'); $('#tglMotion').classList.toggle('on',!on); localStorage.setItem('digMotion', on?'on':'off'); }
+$('#tglTheme').onclick = () => setTheme(document.documentElement.getAttribute('data-theme')!=='dig');
+$('#btnThemeChip').onclick = () => setTheme(document.documentElement.getAttribute('data-theme')!=='dig');
+$('#tglMotion').onclick = () => setMotion(document.documentElement.getAttribute('data-motion')==='off');
+(function(){ const t=localStorage.getItem('digTheme'); setTheme(t!=='chia'); const m=localStorage.getItem('digMotion'); setMotion(m!=='off'); })();
+
+// ---- rail / settings actions ----
+$('#railAddr').onclick = () => { if(_address){ copy(_address); toast('Address copied'); } };
+$('#btnSetCopyAddr').onclick = () => { copy(_address); toast('Address copied'); };
+$('#btnRefresh').onclick = () => { refreshBalance(); refreshConnections(); loadHome(); };
+async function doLock(){ await api('/api/lock',{method:'POST'}); showGate('view-welcome'); }
+$('#btnLock').onclick = doLock;
+$('#btnSetLock').onclick = doLock;
+
+// ---- Connected dapps (CHIP-0002 / window.chia injected approvals) ----
+async function refreshConnections(){
+  let c; try{ c = await api('/api/wc/connections'); }catch(e){ return; }
+  const pend=$('#connPending'), appr=$('#connApproved');
+  pend.innerHTML = (c.pending||[]).map(o =>
+    `<div class="beacon" style="border-color:var(--hair-v)"><span class="node warn"></span>`+
+    `<div class="grow"><div class="t" style="font-weight:600">Wants to connect</div><div class="s" style="font-size:12px;color:var(--t3);margin-top:3px">${esc(o)}</div></div>`+
+    `<button class="btn p sm" data-approve="${esc(o)}">Approve</button>`+
+    `<button class="btn g sm" data-reject="${esc(o)}">Reject</button></div>`).join('');
+  appr.innerHTML = (c.approved||[]).map(o =>
+    `<div class="beacon"><span class="node"></span><div class="dappicon">${esc((o.replace(/^https?:\/\//,'')[0]||'D').toUpperCase())}</div>`+
+    `<div class="grow"><div class="t" style="font-weight:600">${esc(o.replace(/^https?:\/\//,''))}</div>`+
+    `<div class="s" style="font-size:12px;color:var(--t3);margin-top:3px">Can: view balances · request offers · suggest transactions</div></div>`+
+    `<button class="btn g sm" data-revoke="${esc(o)}">Disconnect</button></div>`).join('');
+  updateConnEmpty();
+}
+function updateConnEmpty(){
+  const any = $('#connApproved').children.length || $('#connPending').children.length || $('#wcSessions').children.length || !$('#wcProposal').classList.contains('hidden');
+  $('#connEmpty').style.display = any ? 'none' : '';
+}
+document.addEventListener('click', async (e) => {
+  const t = e.target.closest('[data-approve],[data-reject],[data-revoke]'); if(!t) return;
+  const body = o => ({method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({origin:o})});
+  if(t.dataset.approve){ await api('/api/wc/approve', body(t.dataset.approve)); refreshConnections(); }
+  else if(t.dataset.reject){ await api('/api/wc/reject', body(t.dataset.reject)); refreshConnections(); }
+  else if(t.dataset.revoke){ await api('/api/wc/revoke', body(t.dataset.revoke)); refreshConnections(); }
+});
+setInterval(() => { if(!$('#app').classList.contains('hidden')) refreshConnections(); }, 2000);
+
+// ---- WalletConnect responder: pair with dapps over the relay ----
+let _wcReady=false, _wcAddress=null, _wcProposal=null;
+function wcStatus(msg, isErr){ const el=$('#wcStatus'); if(!el) return; el.textContent=msg||''; el.className='status'+(isErr?' err':''); }
+function renderWcSessions(){
+  const wrap=$('#wcSessions'); if(!wrap || !window.DigWC) return;
+  const list = DigWC.sessions();
+  wrap.innerHTML = list.map(s => {
+    const name = (s.peer && (s.peer.name || s.peer.url)) || s.topic.slice(0,8)+'…';
+    return `<div class="beacon"><span class="node"></span><div class="dappicon">${esc((name[0]||'D').toUpperCase())}</div>`+
+      `<div class="grow"><div class="t" style="font-weight:600">${esc(name)}</div>`+
+      `<div class="s" style="font-size:12px;color:var(--t3);margin-top:3px">Connected over WalletConnect · every request is signed by you</div></div>`+
+      `<button class="btn g sm" data-wc-disconnect="${esc(s.topic)}">Disconnect</button></div>`;
+  }).join('');
+  updateConnEmpty();
+}
+async function initWalletConnect(address){
+  _wcAddress = address;
+  if(!window.DigWC){ $('#wcNoPid').classList.remove('hidden'); return; }
+  let cfg; try{ cfg = await api('/api/wc/project-id'); }catch(e){ cfg = {configured:false}; }
+  if(!cfg.configured){ $('#wcNoPid').classList.remove('hidden'); $('#wcPair').classList.add('hidden'); return; }
+  $('#wcNoPid').classList.add('hidden'); $('#wcPair').classList.remove('hidden');
+  if(_wcReady) return;
+  try{
+    DigWC.onProposal(p => {
+      _wcProposal = p;
+      const md = (p.params && p.params.proposer && p.params.proposer.metadata) || {};
+      $('#wcProposalName').textContent = md.name || md.url || 'A dapp';
+      $('#wcProposal').classList.remove('hidden'); updateConnEmpty();
+    });
+    DigWC.onSessionsChanged(renderWcSessions);
+    await DigWC.init(cfg.project_id);
+    _wcReady = true; renderWcSessions();
+  }catch(e){ wcStatus('WalletConnect failed to start: '+e.message, true); }
+}
+$('#btnPair').onclick = async () => {
+  const uri = $('#wcUri').value.trim();
+  if(!uri.startsWith('wc:')){ wcStatus('Paste a WalletConnect link starting with "wc:".', true); return; }
+  wcStatus('Connecting…');
+  try{ await DigWC.pair(uri); $('#wcUri').value=''; wcStatus('Pairing — approve the request below when it appears.'); }
+  catch(e){ wcStatus('Connect failed: '+e.message, true); }
+};
+$('#btnWcApprove').onclick = async () => {
+  if(!_wcProposal) return;
+  try{ await DigWC.approve(_wcProposal, _wcAddress); $('#wcProposal').classList.add('hidden'); _wcProposal=null; wcStatus('Connected.'); renderWcSessions(); }
+  catch(e){ wcStatus('Approve failed: '+e.message, true); }
+};
+$('#btnWcReject').onclick = async () => {
+  if(!_wcProposal) return;
+  try{ await DigWC.reject(_wcProposal); }catch(e){}
+  $('#wcProposal').classList.add('hidden'); _wcProposal=null; wcStatus('Rejected.'); updateConnEmpty();
+};
+document.addEventListener('click', async (e) => {
+  const b=e.target.closest('[data-wc-disconnect]'); if(!b) return;
+  await DigWC.disconnect(b.dataset.wcDisconnect); renderWcSessions();
+});
+
+// ---- Sage delegate pump (wallet source = Sage, #34) ----
+// When the wallet source is Sage, the native signer is bypassed: wc_dispatch parks
+// each key/sign method on the delegate bridge and this page forwards it to Sage over
+// the WC requester session, then returns Sage's (normalized) result. window.chia is
+// unchanged — it still hits /api/wc/request; only the SIGNER moves to Sage. The
+// connect-to-Sage flow lives in DIG settings; the live session it pairs is restorable
+// here (same loopback origin), so this page just initialises the requester + pumps.
+let _sageReady = false, _pumpRunning = false;
+async function initSageRequester(){
+  if(_sageReady || !window.DigWC || !DigWC.initRequester) return;
+  let cfg; try{ cfg = await api('/api/wc/project-id'); }catch(e){ return; }
+  if(!cfg.configured) return;
+  try{ await DigWC.initRequester(cfg.project_id); _sageReady = true; }
+  catch(e){ /* no relay — delegate calls will surface a clean "not connected" */ }
+}
+// Single long-poll cycle: pull the next parked request, forward to Sage, return the
+// result (or error). Self-origin so the loopback gate auto-approves this page.
+async function pumpOnce(){
+  let job;
+  try{ job = await api('/api/wc/delegate/next'); }catch(e){ return; }
+  if(!job || job.id===undefined) return;            // empty queue
+  let result, error;
+  try{ result = await DigWC.sageRequest(job.method, job.params||{}); }
+  catch(e){ error = (e && e.message) || String(e); }
+  try{
+    await fetch('/api/wc/delegate/result', {method:'POST',headers:{'content-type':'application/json'},
+      body:JSON.stringify(error!==undefined ? {id:job.id, error} : {id:job.id, result})});
+  }catch(e){ /* page is closing; the Rust waiter times out cleanly */ }
+}
+async function startSagePump(){
+  if(_pumpRunning) return; _pumpRunning = true;
+  // Continuous loop: drain parked delegate requests while the page is open. Only does
+  // real work when the source is Sage AND a session exists; otherwise it idles cheaply.
+  while(true){
+    try{
+      const src = await api('/api/wallet/source').catch(()=>({source:'native'}));
+      if(src.source==='sage'){ await initSageRequester(); if(_sageReady) await pumpOnce(); }
+    }catch(e){ /* keep the loop alive */ }
+    await new Promise(r=>setTimeout(r, 700));
+  }
+}
+
+// ---- wallet lifecycle (create / restore / unlock) ----
+$('#btnCreate').onclick = async () => {
+  try{ const g = await api('/api/generate',{method:'POST'}); $('#seedWords').textContent=g.mnemonic; window._seed=g.mnemonic; showGate('view-create'); }
+  catch(e){ toast(e.message,true); }
+};
+$('#btnRestore').onclick = () => showGate('view-restore');
+$('#btnBackWelcome1').onclick = () => showGate('view-welcome');
+$('#btnBackWelcome2').onclick = () => showGate('view-welcome');
+$('#btnSavedSeed').onclick = async () => {
+  $('#createErr').textContent='';
+  const pw = $('#createPw').value;
+  if(pw.length<8){ $('#createErr').textContent='Password must be at least 8 characters'; return; }
+  try{ const r = await api('/api/import',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mnemonic:window._seed,password:pw})}); window._seed=null; enterWallet(r.address); }
+  catch(e){ $('#createErr').textContent=e.message; }
+};
+$('#btnRestoreGo').onclick = async () => {
+  $('#restoreErr').textContent='';
+  const pw = $('#restorePw').value;
+  if(pw.length<8){ $('#restoreErr').textContent='Password must be at least 8 characters'; return; }
+  try{ const r = await api('/api/import',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mnemonic:$('#restoreInput').value,password:pw})}); enterWallet(r.address); }
+  catch(e){ $('#restoreErr').textContent=e.message; }
+};
+$('#btnUnlock').onclick = async () => {
+  $('#unlockErr').textContent='';
+  try{ const r = await api('/api/unlock',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:$('#unlockPw').value})}); enterWallet(r.address); }
+  catch(e){ $('#unlockErr').textContent=e.message; }
+};
+function enterWallet(address){
+  _address = address;
+  $('#gate').style.display='none';
+  $('#app').classList.remove('hidden');
+  $('#tabbar').classList.add('show');
+  refreshBalance(); refreshConnections(); initWalletConnect(address);
+  startSagePump();
+  go('home');
+}
+
+(async function init(){
+  try{ const s = await api('/api/status');
+    if(s.state==='unlocked'){ enterWallet(s.address); }
+    else if(s.state==='locked'){ showGate('view-unlock'); setTimeout(()=>$('#unlockPw').focus(),60); }
+    else { showGate('view-welcome'); }
+  } catch(e){ showGate('view-welcome'); }
+})();
+</script>
+</body>
+</html>

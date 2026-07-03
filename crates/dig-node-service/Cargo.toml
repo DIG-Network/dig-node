@@ -1,0 +1,63 @@
+[package]
+name = "dig-node-service"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "The localhost DIG node OS-service binary (`dig-node`): a self-contained, cross-platform Rust binary installable as a Windows/Linux/macOS service. Wraps the canonical `dig-node` node library (the same node the native DIG Browser runs in-process) with an axum HTTP transport + control plane + CLI + OS-service registration, exposing the rpc.dig.net JSON-RPC contract (dig.getContent, dig.getAnchoredRoot, cache.*, control.*) on 127.0.0.1."
+repository = "https://github.com/DIG-Network/dig-node"
+readme = "../../README.md"
+default-run = "dig-node"
+
+# The produced binary keeps the canonical `dig-node` name (the dig-installer + apt
+# packaging resolve `dig-node`; the release workflow builds `--bin dig-node`).
+[[bin]]
+name = "dig-node"
+path = "src/main.rs"
+
+# The service shell's own library (transport/control/CLI/meta). Named `dig_node_service`
+# so it does not collide with the node library crate, which owns the `dig_node` name.
+[lib]
+name = "dig_node_service"
+path = "src/lib.rs"
+
+[dependencies]
+# The canonical NODE library — a first-party sibling crate in this workspace now (no
+# longer a stale git-pinned digstore alias). It IS the rpc.dig.net-compatible node the
+# native DIG Browser runs in-process (`handle_rpc`): local-first serve from cached .dig
+# modules, blind ciphertext+proof proxy to the upstream on a miss, on-chain
+# anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the P2P
+# stack, and the cache.* / control.* surface. This shell adds only the HTTP transport,
+# control-plane auth, CLI, and OS-service registration around it.
+dig-node = { path = "../dig-node" }
+
+# HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
+# and one server framework across the node and the service shell.
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI + OS-service registration.
+clap = { version = "4", features = ["derive"] }
+# Cross-platform service manager: Windows SCM, Linux systemd, macOS launchd behind
+# one API. User-level install where the platform allows it (per-user service),
+# falling back to system-level with documented elevation.
+service-manager = "0.7"
+
+# HTTP client for the blind-passthrough fallback: dig_node::handle_rpc resolves the
+# node's own method set (dig.getContent / dig.getAnchoredRoot / cache.* / dig.stage /
+# the peer surface), returning "method not found" for everything else. This service
+# relays those (e.g. dig.getProof, dig.listCapsules) verbatim to the upstream so it
+# stays a correct transparent proxy. rustls-tls keeps the binary self-contained (no
+# system OpenSSL), same as the node + store crates.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Windows Service Control Protocol. service-manager only REGISTERS the service in the
+# SCM; the binary the SCM launches must itself speak the service protocol
+# (StartServiceCtrlDispatcher → report RUNNING/STOPPED) or the SCM kills it with error
+# 1053 ("did not respond in a timely fashion"). The service's hidden `run-service`
+# entrypoint uses this to be a real Windows service. (systemd/launchd exec the
+# foreground process directly, so they need no equivalent.)
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
