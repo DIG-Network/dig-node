@@ -1,15 +1,21 @@
 # dig-node — Normative Specification
 
-This document is the authoritative contract for the **dig-node** repository: the localhost DIG
-node shipped as a self-contained, cross-platform Rust binary installable as an OS service
-(Windows SCM, Linux systemd, macOS launchd). It specifies the **service shell**: identity and
-naming, the environment/configuration contract, the HTTP/JSON-RPC surface it exposes, the control
-plane, the CLI contract, the OS-service lifecycle, and the release-asset contract.
+This document is the authoritative contract for the **dig-node** repository: the **canonical DIG
+node**. dig-node OWNS the node implementation directly — the JSON-RPC dispatch, local-first
+content serve/fetch/redirect, chain-anchored-root resolution, chain-watch, subscription
+management, generation gap-fill, the cache, and the peer-to-peer (P2P) stack. It ships two host
+shells around that one node implementation: a self-contained cross-platform binary installable as
+an OS service (Windows SCM, Linux systemd, macOS launchd), and an in-process cdylib the DIG
+Browser links. This document specifies identity and naming, the environment/configuration
+contract, the HTTP/JSON-RPC surface, the control plane, the CLI contract, the OS-service
+lifecycle, and the release-asset contract.
 
-The **DIG read protocol itself** (the `dig.getContent` ciphertext + Merkle-proof wire shapes, the
-URN grammar, anchored-root semantics, the §21 sync protocol) is owned by the digstore `dig-node`
-read-path crate and specified on the docs.dig.net Protocol pages. This document references that
-contract; it does not restate it (§2.2, §5).
+The **DIG read protocol wire shapes** (the `dig.getContent` ciphertext + Merkle-proof shapes, the
+URN grammar, anchored-root semantics, the §21 sync protocol) are the canonical DIG-node RPC
+interface defined in the `dig-rpc-types` crate and specified on the docs.dig.net Protocol pages.
+For the `.dig` STORE FORMAT itself (byte layout, read/verify/decrypt, chain anchoring) dig-node
+depends on digstore's store-format LIBRARY crates. This document references those contracts; it
+does not restate them (§2.2, §5).
 
 The key words MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be interpreted as in RFC 2119.
 
@@ -19,42 +25,69 @@ For usage instructions, see `README.md`. For non-normative narrative, see `USER_
 
 ## 1. Scope and architecture
 
-1.1. dig-node is a **thin service shell** around digstore's `dig-node` read-path crate (imported
-under the Cargo alias `digstore_node`; see `Cargo.toml`). All read/cache RPC dispatch goes through
-`digstore_node::handle_rpc`. The shell MUST NOT reimplement, transform, or "improve" the read
-path's responses: what `handle_rpc` returns is what the client receives.
+1.1. dig-node is the **canonical node**, organized as a Cargo workspace of four crates:
 
-1.2. The shell owns exactly:
+- **`dig-node`** (library, `dig_node`) — the NODE itself. It owns `handle_rpc` dispatch,
+  local-first content serve/fetch/redirect, chain-anchored-root resolution, chain-watch +
+  subscriptions + generation gap-fill, the cache, and the P2P stack (peer serve/dial, DHT
+  provider records, PEX, multi-source download). It depends on the P2P crates
+  (`dig-nat`/`dig-gossip`/`dig-dht`/`dig-pex`/`dig-download`/`dig-peer-selector`/`dig-protocol`)
+  and on digstore's `.dig` store-format LIBRARY crates
+  (`digstore-core`/`-crypto`/`-chain`/`-host`/`-remote`/`-stage`) as git dependencies. The
+  dependency direction is dig-node → store-lib; digstore MUST NOT depend on dig-node (digstore is
+  only ever an RPC client of a node).
+- **`dig-node-service`** (binary `dig-node`) — the OS-service host shell around the node library.
+- **`dig-runtime`** (cdylib `dig_runtime`) — the DIG Browser's in-process host shell (§FFI).
+- **`dig-wallet`** (library + binary) — the DIG Browser's built-in Chia wallet host.
+
+1.2. The **service shell** (`dig-node-service`) owns exactly:
 
 - HTTP transport (axum): listeners, CORS, Host-header allowlist (§4);
 - request **normalization** (param-name aliasing only, §5.3);
-- the **blind-passthrough relay** to the upstream DIG RPC for methods the read path does not
+- the **blind-passthrough relay** to the upstream DIG RPC for methods the node does not
   resolve (§5.4);
 - the **discovery surface** (`/health`, `/version`, `/openrpc.json`,
   `/.well-known/dig-node.json`, `rpc.discover`) (§6);
-- the **control plane** (`control.*`) with its local-token authorization (§7);
+- the **control plane** (`control.*`) with its local-token authorization (§7) — the operator
+  surface (status/hostedStores/sync/config/cache); control methods it does not own are delegated
+  to the node's own control surface (peerStatus/subscribe/unsubscribe/listSubscriptions);
 - the **CLI** and OS-service registration (§8, §9);
 - two small pieces of persisted state in the shared `config.json`: the pin registry and the
   upstream override (§7.6).
 
-1.3. The wire contract of the read plane is byte-identical to `rpc.dig.net` because dispatch IS
-the same `handle_rpc` the native DIG Browser runs in-process. A client written against
-`rpc.dig.net` (e.g. the DIG Chrome extension's `fetchContentViaRPC` pipeline) MUST work against
-this node unchanged. Verification and decryption happen in the **client**; the node serves blind
-ciphertext + proofs and MUST NOT return plaintext for content reads.
+The service shell MUST NOT reimplement, transform, or "improve" the node's responses: what
+`dig_node::handle_rpc` returns is what the client receives.
+
+1.3. The wire contract is byte-identical across BOTH host shells because dispatch IS the same
+`dig_node::handle_rpc` in both — the OS-service binary AND the DIG Browser's in-process cdylib run
+ONE node implementation. A client written against `rpc.dig.net` (e.g. the DIG Chrome extension's
+`fetchContentViaRPC` pipeline) MUST work against this node unchanged. Verification and decryption
+happen in the **client**; the node serves blind ciphertext + proofs and MUST NOT return plaintext
+for content reads.
 
 1.4. **Canonical RPC interface — `dig-rpc-types` + `dig-rpc`.** The RPC surface this node exposes
 (method names + request/response types, the error-code taxonomy, and the tier classification) is
 the canonical DIG-node RPC interface defined ONCE in the **`dig-rpc-types`** crate
-(`modules/crates/dig-rpc-types`) — the single source of truth both node implementations (this
-standalone shell AND digstore's embedded `dig-node`) and the `rpc.dig.net` gateway share, so the
-three can never drift. The JSON-RPC server framework (transport surfaces, tier allowlist
-enforcement, rate limiting, mTLS) is the **`dig-rpc`** crate (`modules/crates/dig-rpc`), which
-depends only on `dig-rpc-types`. This SPEC's method catalogue (§5.5), envelope rules (§5.1), and
-error catalogue (§10) MUST match `dig-rpc-types` exactly; where they differ, `dig-rpc-types` is
-authoritative and this SPEC is the drift to fix. The OpenRPC document (§6.3) is generated from
-`dig-rpc-types`' own method/tier/error tables. (Adopting these crates in this repo's code is the
-tracked adoption unit; this SPEC records the contract they define.)
+(`modules/crates/dig-rpc-types`) — the single source of truth this node (the one implementation
+shared by both host shells) and the `rpc.dig.net` gateway share, so the two can never drift. The
+JSON-RPC server framework (transport surfaces, tier allowlist enforcement, rate limiting, mTLS) is
+the **`dig-rpc`** crate (`modules/crates/dig-rpc`), which depends only on `dig-rpc-types`. This
+SPEC's method catalogue (§5.5), envelope rules (§5.1), and error catalogue (§10) MUST match
+`dig-rpc-types` exactly; where they differ, `dig-rpc-types` is authoritative and this SPEC is the
+drift to fix. The OpenRPC document (§6.3) is generated from `dig-rpc-types`' own
+method/tier/error tables. (Full type-level adoption of `dig-rpc-types`/`dig-rpc` in this repo's
+code is a tracked follow-up — see §1.5; this SPEC records the contract they define, which the
+node's dispatch already conforms to byte-for-byte via the conformance vectors.)
+
+1.5. **dig-rpc / dig-rpc-types adoption status.** `dig-rpc-types` is a PRIVATE sibling repo and
+`dig-rpc` depends on it; this public repo's CI cannot fetch it without authenticated private-repo
+access. The node therefore currently mirrors the canonical contract (the control-plane error
+codes `-32030`/`-32031`/`-32032` and machine strings, the method set, the chunk object) as
+byte-identical constants + types rather than importing the crates, with the shared values asserted
+against the conformance vectors. Swapping to a direct `dig-rpc-types` type dependency + the
+`dig-rpc` server framework is a tracked follow-up gated on the private-repo CI-auth wiring (the
+`dig-rpc` repo itself already authenticates its `dig-rpc-types` sibling checkout). Until then the
+wire is guaranteed identical by the conformance vectors, not by a shared crate.
 
 ---
 
@@ -65,12 +98,13 @@ tracked adoption unit; this SPEC records the contract they define.)
 `/version.service`, the CLI `--json` envelopes' `service` field) MUST report the service identity
 string `"dig-node"` (`meta::SERVICE_NAME`).
 
-2.2. **Embedded read path.** The digstore `dig-node` crate is a git dependency pinned by `rev` in
-`Cargo.toml`. The constant `meta::DIG_NODE_VERSION` MUST equal the short form of that pinned rev
-and is surfaced in `/version`, `/.well-known/dig-node.json`, and `control.status` as
-`dig_node_version`. When the pin is bumped, this constant MUST be updated in the same change, and
-the method catalogue MUST be re-verified against the new rev (the drift guard, §5.6, enforces
-this).
+2.2. **Node library version.** The node is the first-party `dig-node` library crate in this
+workspace. The constant `meta::DIG_NODE_VERSION` MUST equal the node library's crate version
+(`dig_node::NODE_VERSION`, its `CARGO_PKG_VERSION`) and is surfaced in `/version`,
+`/.well-known/dig-node.json`, and `control.status` as `dig_node_version`. When the node library
+version changes, or when the digstore store-format git dependencies (`digstore-*`) are bumped to a
+new rev, the method catalogue MUST be re-verified against the node's real dispatch (the drift
+guard, §5.6, enforces this).
 
 2.3. **Protocol tag.** `meta::PROTOCOL` is the DIG read-protocol identifier (`"21"`, the
 rpc.dig.net §21 JSON-RPC read contract). It MUST be bumped only when the wire contract changes.
@@ -135,7 +169,7 @@ The effective upstream is resolved in this order (first non-empty wins):
 ### 3.5. Shared `.dig` cache
 
 - Before constructing the node, the shell MUST call `Config::apply_to_env()`, which sets
-  `DIG_NODE_UPSTREAM` to the resolved upstream (the read-path crate reads that name internally;
+  `DIG_NODE_UPSTREAM` to the resolved upstream (the node library reads that name internally;
   the shell's public knob is `DIG_RPC_UPSTREAM`), and sets `DIG_NODE_CACHE` **only when an
   explicit non-blank dir was configured**.
 - When `DIG_NODE_CACHE` is unset, the shell MUST NOT invent a path: the read path resolves its
@@ -149,12 +183,12 @@ The effective upstream is resolved in this order (first non-empty wins):
 - The **authoritative** effective cache dir + `shared` flag are those returned by the
   `cache.getConfig` RPC. The shell's `meta::cache_dir()` mirrors the canonical-path logic for
   discovery surfaces only; `meta::cache_shared()` MUST delegate to the read path's resolver
-  (`digstore_node::cache_dir_is_shared`), never reimplement the writability probe.
+  (`dig_node::cache_dir_is_shared`), never reimplement the writability probe.
 
 ### 3.6. `config.json` co-tenancy
 
 The shell persists its own keys (`pinned_stores`, `upstream_override`) in the read path's
-`config.json` (path from `digstore_node::config_path()`). Writes MUST be read-modify-write with an
+`config.json` (path from `dig_node::config_path()`). Writes MUST be read-modify-write with an
 atomic temp-file + rename in the same directory, and MUST preserve all keys the shell does not own
 (e.g. `cache_cap_bytes`, `wc_project_id`).
 
@@ -212,7 +246,7 @@ Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Typ
 
 The method catalogue (§5.5), request/response types, tier classification, and error taxonomy (§10)
 below are the canonical set defined in the **`dig-rpc-types`** crate (§1.4) — the single source of
-truth shared with digstore's `dig-node` and `rpc.dig.net`. This shell MUST NOT diverge from it.
+truth shared with `rpc.dig.net`. This node MUST NOT diverge from it.
 
 ### 5.1. Envelope rules
 
@@ -233,7 +267,7 @@ For each request, in order:
 
 1. `rpc.discover` → answered by the shell with the OpenRPC document (§6.3) as `result`.
 2. `control.*` → the control plane (§7): authorization gate, then `dispatch_control`.
-3. Everything else → normalized (§5.3), then dispatched to `digstore_node::handle_rpc` on a
+3. Everything else → normalized (§5.3), then dispatched to `dig_node::handle_rpc` on a
    spawned task. A panicked/failed dispatch task yields `DISPATCH_FAILED` (`-32000`); the server
    MUST survive it.
 4. If the read path returns `-32601` (method not found), the shell relays the **original,
@@ -268,20 +302,24 @@ MUST NOT re-declare method names. Each entry carries a `served` class and `requi
 
 | `served` | Meaning |
 |---|---|
-| `local` | Resolved by the embedded read path (`handle_rpc`). |
+| `local` | Resolved by the node library (`handle_rpc`). |
 | `passthrough` | Read path returns `-32601`; relayed verbatim to the upstream. |
 | `shell` | Answered by this service itself (`rpc.discover`). |
 | `control` | The gated control plane (§7); always `requires_auth: true`. |
 
-At the current read-path pin (§2.2) the catalogue is:
+For the current node library (§2.2) the catalogue is:
 
-- **local**: `dig.getContent`, `dig.getAnchoredRoot`, `cache.getConfig`, `cache.setCapBytes`,
-  `cache.clear`, `cache.listCached`, `cache.removeCached`, `cache.fetchAndCache`.
-- **passthrough**: `dig.getCapsule` (an alias the read path does NOT resolve — local-first callers
-  use `dig.getContent`), `dig.getProof`, `dig.listCapsules`, `dig.getManifest`,
-  `dig.getCollection`, `dig.listCollectionItems`.
+- **local**: `dig.getContent`, `dig.getAnchoredRoot`, `dig.stage`, `dig.getCollection`,
+  `dig.listCollectionItems`, the L7 peer surface (`dig.getNetworkInfo`, `dig.getPeers`,
+  `dig.announce`, `dig.getAvailability`, `dig.listInventory`, `dig.fetchRange`), and all
+  `cache.*` (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
+  `cache.removeCached`, `cache.fetchAndCache`).
+- **passthrough**: `dig.getCapsule` (an alias the node does NOT resolve — local-first callers use
+  `dig.getContent`), `dig.getProof`, `dig.listCapsules`, `dig.getManifest`.
 - **shell**: `rpc.discover`.
-- **control**: the twelve `control.*` methods of §7.4.
+- **control**: the operator `control.*` methods of §7.4, plus the node-owned control methods the
+  shell delegates to the node (`control.peerStatus`, `control.subscribe`, `control.unsubscribe`,
+  `control.listSubscriptions`).
 
 Param/result schemas for the `dig.*`/`cache.*` methods are owned by the digstore dig RPC and
 published on docs.dig.net (Protocol → the L7 read/RPC pages); this repo's OpenRPC document is a
@@ -296,9 +334,9 @@ Every non-`control.*` method MUST have `requires_auth: false`; every `control.*`
 
 - every `served: "local"` method, dispatched through the real `handle_rpc`, MUST NOT return
   `-32601`;
-- every `served: "passthrough"` method MUST return `-32601` from the read path (the relay cue).
+- every `served: "passthrough"` method MUST return `-32601` from the node (the relay cue).
 
-When a read-path pin bump moves a method between `local` and `passthrough`, the catalogue MUST be
+When a node-library change moves a method between `local` and `passthrough`, the catalogue MUST be
 flipped in the same change or this test fails. The test is hermetic (empty params fail validation
 before any network I/O; `dig.getContent` and `cache.fetchAndCache`, which would reach the network,
 are asserted by classification only).
@@ -398,7 +436,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 
 ### 7.5. Ownership boundary
 
-Cache and sync operations MUST proxy to the read-path crate
+Cache and sync operations MUST proxy to the node library
 (`cache_list_cached`/`cache_remove_cached`/`cache_fetch_and_cache`/`clear_cache`/
 `set_cache_cap_bytes`/`cache_cap_bytes`/`cache_used_bytes`); the shell never duplicates read/cache
 logic. The shell owns only the pin registry and the upstream override.
@@ -495,7 +533,7 @@ out to both listeners (§4.1).
 Stable contract: numeric codes, symbolic names, and origins MUST NOT be renumbered or repurposed;
 additions are allowed. This catalogue is the canonical set from **`dig-rpc-types`** (§1.4) — it
 MUST match that crate exactly. `origin` distinguishes who minted the error: `shell` (this service),
-`node` (the embedded read path), `upstream` (relayed from the upstream DIG RPC), `boundary` (the
+`node` (the node library), `upstream` (relayed from the upstream DIG RPC), `boundary` (the
 method-not-found cue).
 
 **Canonical control-code assignment.** The control-plane errors are `-32030`/`-32031`/`-32032`.
@@ -577,7 +615,7 @@ does offset/length arithmetic over untrusted serialized input).
 
 | # | Contract | Must match | Where enforced / specified |
 |---|---|---|---|
-| 1 | Read-plane wire contract | `rpc.dig.net` byte-for-byte (dispatch IS `digstore_node::handle_rpc`) | §1.3, §5; digstore repo + docs.dig.net Protocol pages |
+| 1 | Read-plane wire contract | `rpc.dig.net` byte-for-byte (dispatch IS `dig_node::handle_rpc`) | §1.3, §5; `dig-rpc-types` + docs.dig.net Protocol pages |
 | 2 | `DIG_NODE_PORT` / `DIG_NODE_HOST` names | dig-installer + apt.dig.net expectations — never renamed | §3.1 |
 | 3 | Shared cache default | Byte-identical dir to the DIG Browser's in-process node when `DIG_NODE_CACHE` unset | §3.5 |
 | 4 | `dig.local` addressing | dig-installer hosts entry `127.0.0.2  dig.local`; listener `127.0.0.2:80`, best-effort | §4.1–4.2 |
