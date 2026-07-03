@@ -14,7 +14,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use dig_node::peer::{identity_from_seed, serve_peer_rpc_listener, write_framed, PeerRpcResponder};
+use dig_node_core::peer::{
+    identity_from_seed, serve_peer_rpc_listener, write_framed, PeerRpcResponder,
+};
 use serde_json::{json, Value};
 
 /// A minimal responder standing in for the node: it answers JSON-RPC + availability + range with
@@ -51,7 +53,7 @@ impl PeerRpcResponder for TestResponder {
 #[tokio::test]
 async fn peer_rpc_is_served_over_mtls_end_to_end() {
     // rustls needs an explicit crypto provider (aws-lc-rs is also in the graph); install ring first.
-    dig_node::peer::install_crypto_provider();
+    dig_node_core::peer::install_crypto_provider();
     // Server identity (stable, deterministic) + a loopback listener on an OS-assigned port.
     let server_identity = identity_from_seed(&[9u8; 32]).expect("server identity");
     let server_peer_id = server_identity.peer_id;
@@ -148,7 +150,7 @@ async fn read_one_frame<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Value {
 
 #[tokio::test]
 async fn dialing_with_the_wrong_expected_peer_id_is_rejected() {
-    dig_node::peer::install_crypto_provider();
+    dig_node_core::peer::install_crypto_provider();
     // mTLS peer identity is ENFORCED: a client that dials the server pinning a DIFFERENT expected
     // peer_id than the one the server presents must have `dig_nat::connect` FAIL (peer_id mismatch),
     // never establishing a session. This is the core "no impersonation / authenticated peer" property

@@ -15,7 +15,7 @@ The extension resolves `chia://` (DIG) URLs by fetching encrypted, Merkle-proven
 RPC and then **verifying + decrypting it in the extension**. By default it talks to `rpc.dig.net`;
 pointing its `server.host` setting at `dig-node` makes that RPC **local**. The node speaks
 the **same wire contract as `rpc.dig.net`** — because it routes every request to digstore's
-`dig_node::handle_rpc`, the exact local-first node the native [DIG Browser](https://github.com/DIG-Network/DIG_Browser)
+`dig_node_core::handle_rpc`, the exact local-first node the native [DIG Browser](https://github.com/DIG-Network/DIG_Browser)
 runs in-process. So the extension works against it byte-for-byte, with the bonus that any `.dig`
 store the node has cached locally is served without leaving the machine.
 
@@ -130,7 +130,7 @@ service's environment so the service serves identically):
 ### Shared `.dig` cache with the DIG Browser (#96)
 
 `dig-node` and the native [DIG Browser](https://github.com/DIG-Network/DIG_Browser) both run
-the SAME canonical `dig-node` node library (this repo), and **both default to the SAME on-disk cache dir**
+the SAME canonical `dig-node-core` node engine library (this repo), and **both default to the SAME on-disk cache dir**
 (`%LOCALAPPDATA%\DigNode\cache` on Windows, `$HOME/DigNode/cache` on Linux/macOS). So when both are
 installed they **share ONE cache** — a capsule fetched by the browser is served from disk by the
 standalone service and vice-versa, with **no double-store**.
@@ -210,7 +210,7 @@ capsule reference `storeId` or `storeId:rootHash` (each part lowercase 64-hex).
 | `control.sync.status` | — | `{ available, method:"section-21-whole-store-sync", pinned_total, pinned_synced, whole_store_trigger_supported }` |
 | `control.sync.trigger` | `{ store }` (= `storeId:rootHash`) or `{ store_id, root }` | `{ store_id, root, status:"synced", size_bytes, served_root }`, or `NOT_SUPPORTED` (`-32021`) if no §21 identity. |
 
-**What's proxied vs. owned.** Cache + sync operations proxy to the node library (`dig_node`)
+**What's proxied vs. owned.** Cache + sync operations proxy to the node engine library (`dig_node_core`)
 (`cache_*`, `clear_cache`, `set_cache_cap_bytes`, `Node::cache_fetch_and_cache` / `cache_remove_cached`
 / `cache_list_cached`) — the node never duplicates the cache/read logic. The shell owns only the
 small state the crate does not model: the **pin registry** (`pinned_stores`) and the **upstream
@@ -295,7 +295,7 @@ distinguishing node-shell errors from upstream/boundary ones), beside the numeri
 The node does **not** reimplement the DIG read path — it depends on digstore's **`dig-node`**
 crate (pinned to the #95/#96 **Pass A** commit, `b2632c4`, which ships the shared-cache work; no
 release tag contains it yet, so the dep is pinned to a `rev`) and routes every request to
-`dig_node::handle_rpc`. This is the **same node the native DIG Browser runs in-process**, so the
+`dig_node_core::handle_rpc`. This is the **same node the native DIG Browser runs in-process**, so the
 node and the browser share one read path, one cache, and one cache contract (see "Shared `.dig`
 cache" above).
 
@@ -337,7 +337,7 @@ src/
   control.rs      CONTROL/admin surface (control.*): hosted-stores/cache/sync/config management +
                   the loopback-only local-token auth gate + pin registry — pure helpers tested
   server.rs       axum HTTP server: /health, /version, /openrpc.json, /.well-known/dig-node.json, CORS,
-                  POST / → dig_node::handle_rpc (+ rpc.discover) + the gated control plane, passthrough fallback
+                  POST / → dig_node_core::handle_rpc (+ rpc.discover) + the gated control plane, passthrough fallback
   service.rs      OS-service install/uninstall/start/stop/status (service-manager) + /health status probe
   win_service.rs  Windows Service Control Protocol entrypoint (windows-service; Windows only)
 USER_JOURNEY.md   the dig-node user/operator/agent journey, surfaces, and ecosystem hand-offs
@@ -346,7 +346,7 @@ USER_JOURNEY.md   the dig-node user/operator/agent journey, surfaces, and ecosys
 ## Relationship to the rest of the ecosystem
 
 - The wire contract is identical to `rpc.dig.net` and to the native browser's in-process node,
-  because all three are (or route to) `dig_node::handle_rpc`. Clients see one consistent local-node
+  because all three are (or route to) `dig_node_core::handle_rpc`. Clients see one consistent local-node
   API across the extension and the native browser.
 - The verify/decrypt read-crypto lives in the **extension** (the same `dig_client` WASM the hub uses);
   the node serves the ciphertext + proof the extension consumes. See the repo `SYSTEM.md`.

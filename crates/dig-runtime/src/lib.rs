@@ -5,7 +5,7 @@
 //! C-ABI entrypoint, [`dig_rpc`] (`request_json -> response_json`), that the
 //! browser's dig:// handler calls IN-PROCESS — there is no loopback server, no
 //! socket, and no `dig-node.exe` sidecar. It runs the exact same
-//! `dig_node::handle_rpc` dispatch the standalone node uses, on a shared
+//! `dig_node_core::handle_rpc` dispatch the standalone node uses, on a shared
 //! multi-thread tokio runtime owned by this library.
 //!
 //! Heavy Rust deps (wasmtime, tokio, reqwest, blst via the node) build freely as
@@ -18,7 +18,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use dig_node::Node;
+use dig_node_core::Node;
 
 /// The process-wide DIG runtime: the tokio runtime + the node it drives. Built
 /// once, lazily, on first use (or eagerly by `dig_runtime_start`).
@@ -84,7 +84,8 @@ pub unsafe extern "C" fn dig_rpc(request_json: *const c_char) -> *mut c_char {
         .into_owned();
     let out = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let rt = runtime();
-        rt.rt.block_on(dig_node::handle_rpc_json(&rt.node, &req))
+        rt.rt
+            .block_on(dig_node_core::handle_rpc_json(&rt.node, &req))
     }));
     match out.ok().and_then(|s| CString::new(s).ok()) {
         Some(c) => c.into_raw(),

@@ -10,7 +10,7 @@ name = "dig_runtime"
 crate-type = ["cdylib"]
 
 [dependencies]
-dig-node = { path = "../dig-node" }
+dig-node-core = { path = "../dig-node-core" }
 dig-wallet = { path = "../dig-wallet" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 # Builds + parses the `dig_wallet_rpc` envelope ({status, body}) so the wallet body

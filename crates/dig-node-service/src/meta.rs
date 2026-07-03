@@ -33,7 +33,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const GIT_SHA: &str = env!("DIG_NODE_GIT_SHA");
 
 /// The node-library version this service is built against. The node
-/// ([`dig_node`]) is now a FIRST-PARTY sibling crate in this repo (not a stale
+/// ([`dig_node_core`]) is now a FIRST-PARTY sibling crate in this repo (not a stale
 /// digstore git pin), so this tracks the node crate's own `CARGO_PKG_VERSION` — the
 /// SAME node the native DIG Browser runs in-process via `dig_runtime`.
 ///
@@ -50,9 +50,9 @@ pub const GIT_SHA: &str = env!("DIG_NODE_GIT_SHA");
 pub const DIG_NODE_VERSION: &str = dig_node_version();
 
 /// The node library's crate version, resolved at compile time from the `dig-node`
-/// dependency (its `CARGO_PKG_VERSION` re-exported as [`dig_node::NODE_VERSION`]).
+/// dependency (its `CARGO_PKG_VERSION` re-exported as [`dig_node_core::NODE_VERSION`]).
 const fn dig_node_version() -> &'static str {
-    dig_node::NODE_VERSION
+    dig_node_core::NODE_VERSION
 }
 
 /// The DIG read protocol the node speaks (the rpc.dig.net §21 JSON-RPC read
@@ -323,7 +323,7 @@ pub fn methods() -> &'static [MethodInfo] {
                       NOT_SUPPORTED if no §21 identity / not eligible.",
             requires_auth: true,
         },
-        // -- node-owned control methods (delegated to dig_node::handle_rpc) ----------
+        // -- node-owned control methods (delegated to dig_node_core::handle_rpc) ----------
         // These live in the node library's own control surface; the shell forwards any
         // control method it does not own to the node. Loopback-only + token-gated,
         // like the shell's control methods above.
@@ -542,11 +542,11 @@ pub fn cache_dir() -> std::path::PathBuf {
 
 /// Whether dig-node's EFFECTIVE cache dir is the shared canonical one (`true`) or a
 /// process-private fallback because the canonical dir was unwritable (`false`).
-/// Delegates to dig-node's resolver ([`dig_node::cache_dir_is_shared`]) so the
+/// Delegates to dig-node's resolver ([`dig_node_core::cache_dir_is_shared`]) so the
 /// value is authoritative — this service never re-implements the writability
 /// probe. Surfaced additively in `/health` + the well-known document (#96).
 pub fn cache_shared() -> bool {
-    dig_node::cache_dir_is_shared()
+    dig_node_core::cache_dir_is_shared()
 }
 
 /// The `GET /version` body: service identity + build provenance + the embedded
