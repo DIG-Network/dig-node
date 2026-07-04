@@ -166,6 +166,7 @@ does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see belo
 | `DIG_NODE_WATCH_INTERVAL` | chain-watch poll interval, in seconds (§14.2) | `30` | Parsed as `u64`; `0`/unparsable/unset ⇒ default `30`; floored at `1` s so a mis-set value cannot flood coinset. |
 | `DIG_NODE_UPSTREAM` | **INTERNAL** — the effective upstream the node library reads | `https://rpc.dig.net/` | NOT a user knob. The shell resolves the upstream (§3.4) and writes this via `Config::apply_to_env()` (§3.5); the shell's public knob is `DIG_RPC_UPSTREAM`. |
 | `DIG_WALLET_WC_PROJECT_ID` | initial/default WalletConnect projectId for the wallet host (§16) | *(unset ⇒ none)* | A persisted `wc_project_id` in `config.json` wins over this; a blank persisted value falls through to this env. Blank ⇒ treated as unset. |
+| `DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC` | outgoing-bandwidth throttle cap, in bytes/second (§17) | `0` (UNLIMITED — opt-in) | Parsed as `u64`; `0`, unparsable, or unset ⇒ unlimited (the throttle is a no-op until an operator configures a cap). Resolved ONCE at node construction. |
 
 The peer-network layer additionally honors `DIG_PEER_NETWORK` (set to a falsy value to disable the L7
 peer network) and `DIG_RELAY_URL` (override or disable the relay), which gate the P2P bring-up.
@@ -592,6 +593,7 @@ number.)
 | -32000 | `DISPATCH_FAILED` | shell | The shell failed to dispatch the request to the read path. |
 | -32004 | `RESOURCE_NOT_AVAILABLE_AT_ROOT` | upstream | Genuine content miss at the requested root (relayed); distinct from transport failure. Also minted directly by the node library for a LOCAL miss at this same root — `dig.fetchRange` ("resource not held") and `dig.getManifest` ("capsule not held locally") — never a fabricated result. |
 | -32005 | `ROOT_NOT_ANCHORED` | node | The node's mandatory read-path anchored-root pin (§14.4) fails closed: the requested root does not match the chain-anchored tip, the store has no confirmed on-chain generation, the chain is unreachable, or a rootless request cannot be resolved under enforcement. Minted by the node library on `dig.getContent`. |
+| -32008 | `CONTENT_REDIRECT` | node | The node does not (or, under §17's throttle, will not right now) serve the requested content itself, but the DHT located peer(s) that hold it — `error.data.redirect` names them (`content`, `providers[].peer_id`/`addresses`, `redirect_depth`, `max_redirects`) so the caller re-requests there. Minted on a content miss (`dig.getContent`/`dig.fetchRange`/the peer range-stream) and on outgoing-bandwidth saturation (§17), bounded by the same redirect-hop cap either way. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
@@ -847,3 +849,52 @@ Seed-reveal / private-key-export class methods (`export`, `exportMnemonic`, `chi
 the dapp dispatch surface — they are absent from dispatch (fall to `501`) and are refused before any
 forward to a delegated signer. The mnemonic is revealed ONLY through the local, password-gated,
 self-origin `/api/export` UI route, never over the dapp/WC surface.
+
+---
+
+## 17. Outgoing-bandwidth throttle and redirect-on-saturation
+
+The standalone node's P2P content engine (`crate::download`, #164/#165) redirects a caller to another
+holder when this node does NOT hold the requested content ("redirect-on-miss," `-32008`
+`CONTENT_REDIRECT`, §10). This section extends that mechanism from "not held" to "held, but serving it
+now would exceed this node's configured outgoing-bandwidth budget."
+
+17.1. **Configuration.** `DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC` (§3.2) sets a bytes/second cap on the
+node's outgoing serve traffic. `0`, unset, or unparsable is UNLIMITED — the throttle is opt-in; an
+unconfigured node's serve path is byte-identical to before this feature. The cap is resolved once at
+node construction (`bandwidth::OutgoingThrottle::from_env`).
+
+17.2. **Accounting.** The throttle tracks bytes served in a fixed 1-second window (`served_bytes`
+against `window_start`), rolling to a fresh window once a full second has elapsed. Before writing a
+chunk the serve path asks whether `served_bytes + this_chunk` would exceed the cap
+(`OutgoingThrottle::would_exceed`) — a peek, not a reservation; on any serve (including the graceful
+fallback, §17.4) it then records the bytes actually sent (`OutgoingThrottle::record_served`).
+
+17.3. **Serve-path integration.** The check runs on every surface that returns resource bytes this
+node already holds locally, immediately before the bytes would be written:
+
+- `dig.getContent`'s LOCAL-FIRST serve (a cold cache hit and the post-§21-sync hit alike);
+- `dig.fetchRange`'s local frame serve;
+- the mTLS peer range-stream (`stream_range`) — the busiest outgoing surface, since multi-source
+  downloaders fan byte-ranges across it.
+
+When the check trips, the node resolves alternate holders via the DHT
+(`download::NodeContent::find_providers`, self excluded) and, if any exist, answers with the SAME
+`CONTENT_REDIRECT` error object shape redirect-on-miss uses
+(`download::redirect_error_object` — `error.data.redirect.{content,providers,redirect_depth,max_redirects}`)
+instead of writing the over-budget bytes. `providers[].addresses` follow the candidate ordering the DHT
+returns, which is IPv6-first (§5.2 — dig-dht orders reflexive/candidate addresses IPv6-first; the
+throttle does not reorder them).
+
+17.4. **Hop budget (shared with redirect-on-miss).** A bandwidth-redirect consumes the SAME
+`redirect_depth`/`REDIRECT_HOP_CAP` budget as a miss-redirect (§10's `-32008` entry): the caller echoes
+the depth a redirect served it, and a request already at the hop cap is served locally rather than
+redirected again, so saturated nodes can never bounce a caller in a loop regardless of which mechanism
+(miss or bandwidth) issued the prior redirects.
+
+17.5. **Graceful fallback — never fail closed.** The node serves the request normally (recording the
+bytes against the throttle) whenever a redirect is not possible: under budget; no P2P content engine is
+attached (the in-process FFI/DIG-Browser path never redirects, having no peer network to redirect to);
+the hop budget is exhausted; or the DHT knows of no alternate holder. The throttle changes WHERE a
+request is served from when it can, never WHETHER it is served — an over-budget request with no known
+alternate still goes out rather than being dropped or erroring.
