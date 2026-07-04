@@ -1,0 +1,106 @@
+# Ensure the project version is incremented in every PR before it can merge to the default branch.
+# Looks for BOTH package.json and Cargo.toml:
+#   - only package.json present  -> its version must increase vs the base branch
+#   - only Cargo.toml present     -> its version must increase vs the base branch
+#   - BOTH present                -> both must increase AND equal each other on this branch
+#   - neither present             -> nothing to enforce (passes)
+# Version files added new on this branch (absent on base) pass. Modeled on Chia-Network/cadt.
+name: Check Version Increment
+
+on:
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  check-version:
+    name: Check version increment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          path: branch-repo
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: base-repo
+
+      - name: Check version increment
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Extract a version from package.json (.version) or Cargo.toml
+          # ([package].version or [workspace.package].version). Empty string if
+          # the file or the field is absent.
+          pkg_version() {
+            local f="$1/package.json"
+            [ -f "$f" ] || { echo ""; return; }
+            jq -r '.version // ""' "$f" 2>/dev/null || echo ""
+          }
+          # [package].version, or [workspace.package].version for workspace roots /
+          # members that inherit ({ version.workspace = true }). Empty if absent.
+          cargo_version() {
+            local f="$1/Cargo.toml"
+            [ -f "$f" ] || { echo ""; return; }
+            python3 -c 'import sys,tomllib; d=tomllib.load(open(sys.argv[1],"rb")); v=d.get("package",{}).get("version") or d.get("workspace",{}).get("package",{}).get("version") or ""; print(v if isinstance(v,str) else "")' "$f" 2>/dev/null || echo ""
+          }
+
+          # strictly-greater semver-ish compare using sort -V; true when $2 > $1
+          greater() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }
+
+          B=base-repo
+          H=branch-repo
+          has_pkg=false; has_cargo=false
+          [ -f "$H/package.json" ] && has_pkg=true
+          [ -f "$H/Cargo.toml" ] && has_cargo=true
+
+          if [ "$has_pkg" = false ] && [ "$has_cargo" = false ]; then
+            echo "No package.json or Cargo.toml at repo root — no version gate to enforce."
+            exit 0
+          fi
+
+          fail=0
+
+          if [ "$has_pkg" = true ]; then
+            bp=$(pkg_version "$B"); hp=$(pkg_version "$H")
+            echo "package.json: base='$bp' head='$hp'"
+            if [ -n "$bp" ]; then
+              if ! greater "$bp" "$hp"; then
+                echo "::error::package.json version must be incremented ($bp -> $hp) before merging."
+                fail=1
+              fi
+            else
+              echo "package.json is new on this branch (no base version) — OK."
+            fi
+          fi
+
+          if [ "$has_cargo" = true ]; then
+            bc=$(cargo_version "$B"); hc=$(cargo_version "$H")
+            echo "Cargo.toml: base='$bc' head='$hc'"
+            if [ -n "$bc" ]; then
+              if ! greater "$bc" "$hc"; then
+                echo "::error::Cargo.toml version must be incremented ($bc -> $hc) before merging."
+                fail=1
+              fi
+            else
+              echo "Cargo.toml is new on this branch (no base version) — OK."
+            fi
+          fi
+
+          if [ "$has_pkg" = true ] && [ "$has_cargo" = true ]; then
+            hp=$(pkg_version "$H"); hc=$(cargo_version "$H")
+            if [ -n "$hp" ] && [ -n "$hc" ] && [ "$hp" != "$hc" ]; then
+              echo "::error::package.json ($hp) and Cargo.toml ($hc) versions must match each other."
+              fail=1
+            fi
+          fi
+
+          exit $fail
