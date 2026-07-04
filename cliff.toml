@@ -1,0 +1,52 @@
+# git-cliff changelog config — builds CHANGELOG.md from Conventional Commits.
+# Uniform across every DIG repo (Rust + JS/TS). Consumed by .github/workflows/release.yml,
+# which regenerates the changelog on merge and commits it BEFORE tagging (so the changelog
+# is included in the vX.Y.Z tag). See CLAUDE.md §3.6.
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project are documented here.
+This project adheres to [Semantic Versioning](https://semver.org) and
+[Conventional Commits](https://www.conventionalcommits.org).\n
+"""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}\
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
+{% endfor %}
+{% endfor %}\n
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "oldest"
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactor" },
+  { message = "^docs", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Testing" },
+  { message = "^build", group = "<!-- 6 -->Build" },
+  { message = "^ci", group = "<!-- 7 -->CI" },
+  { message = "^style", group = "<!-- 8 -->Styling" },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore", group = "<!-- 9 -->Chores" },
+  { body = ".*security", group = "<!-- 10 -->Security" },
+  { message = "^revert", group = "<!-- 11 -->Reverts" },
+]
