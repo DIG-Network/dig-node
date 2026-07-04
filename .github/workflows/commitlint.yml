@@ -38,4 +38,7 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
           set -euo pipefail
-          echo "$PR_TITLE" | npx --yes commitlint --config commitlint.config.mjs
+          # Install both @commitlint/cli AND the extended shareable config so the
+          # `extends: ['@commitlint/config-conventional']` in commitlint.config.mjs resolves.
+          echo "$PR_TITLE" | npx --yes -p @commitlint/cli -p @commitlint/config-conventional \
+            commitlint --config commitlint.config.mjs
