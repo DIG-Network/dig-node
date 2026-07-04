@@ -18,8 +18,8 @@ path = "src/main.rs"
 # node — bump together). digstore-chain: BIP-39 seed + HD wallet scan + DIG-CAT +
 # encrypted seed storage + XCH send. digstore-core: the canonical Capsule
 # (storeId:rootHash) identity rendered by /api/stores.
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
 # The node engine (crate `dig_node_core`) — same workspace (the DIG Browser's in-process
 # node + wallet are one host cluster). dig-wallet reads the node's cache surface for the
 # wallet UI's "My Node" cache view (cache_cap_bytes / cache_used_bytes / clear_cache / list).

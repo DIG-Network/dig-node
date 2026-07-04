@@ -328,13 +328,13 @@ MUST NOT re-declare method names. Each entry carries a `served` class and `requi
 
 For the current node library (§2.2) the catalogue is:
 
-- **local**: `dig.getContent`, `dig.getAnchoredRoot`, `dig.stage`, `dig.getCollection`,
-  `dig.listCollectionItems`, the L7 peer surface (`dig.getNetworkInfo`, `dig.getPeers`,
-  `dig.announce`, `dig.getAvailability`, `dig.listInventory`, `dig.fetchRange`), and all
-  `cache.*` (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
+- **local**: `dig.getContent`, `dig.getAnchoredRoot`, `dig.getManifest`, `dig.stage`,
+  `dig.getCollection`, `dig.listCollectionItems`, the L7 peer surface (`dig.getNetworkInfo`,
+  `dig.getPeers`, `dig.announce`, `dig.getAvailability`, `dig.listInventory`, `dig.fetchRange`),
+  and all `cache.*` (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
   `cache.removeCached`, `cache.fetchAndCache`).
 - **passthrough**: `dig.getCapsule` (an alias the node does NOT resolve — local-first callers use
-  `dig.getContent`), `dig.getProof`, `dig.listCapsules`, `dig.getManifest`.
+  `dig.getContent`), `dig.getProof`, `dig.listCapsules`.
 - **shell**: `rpc.discover`.
 - **control**: the operator `control.*` methods of §7.4, plus the node-owned control methods the
   shell delegates to the node (`control.peerStatus`, `control.subscribe`, `control.unsubscribe`,
@@ -346,6 +346,27 @@ method + error **discovery** catalogue with intentionally permissive schemas.
 
 Every non-`control.*` method MUST have `requires_auth: false`; every `control.*` method MUST have
 `served: "control"` and `requires_auth: true`.
+
+#### 5.5.1. `dig.getManifest` (#176 Phase C)
+
+Resolves the store's normalized **PUBLIC MANIFEST** — the `.dig` format's data-section id 13
+(digstore SPEC.md § the `.dig` format), the store's complete public file surface (the LATEST
+version per path) as of a given capsule's commit. PUBLIC, unencrypted data; no `retrieval_key`.
+
+- **Params**: `{ store_id, root }` — both 64-hex, a capsule identifier (`storeId:rootHash`),
+  matching the shape of the other capsule-scoped read methods (`dig.getAvailability` items,
+  `dig.fetchRange`).
+- **Result on a hit with a manifest**: `{ schema_version, entries: [ { path, latest_root,
+  generation_index, sha256_latest, version_count } ] }`, entries sorted ascending by `path`.
+  Byte-identical to `PublicManifest::to_json` (the same renderer the digstore CLI's `manifest
+  --json` and the `dig-client-wasm` `readPublicManifest` reader use).
+- **Result when the module carries no `PublicManifest` section** (an older `.dig`, or a PRIVATE
+  store whose paths must stay opaque): `result: null` — **NEVER an error**. Store-format §5.1: an
+  optional section's absence is a normal, backwards-compatible outcome.
+- **When this node does not hold the requested capsule at all**: `-32004` (the same
+  `RESOURCE_NOT_AVAILABLE_AT_ROOT`/unavailable code `dig.fetchRange` reports on a miss) — distinct
+  from the "held but no manifest" case above.
+- Malformed `store_id`/`root` (not 64-hex) → `-32602` before any filesystem access.
 
 ### 5.6. OpenRPC drift guard (conformance test)
 
@@ -569,7 +590,7 @@ number.)
 | -32601 | `METHOD_NOT_FOUND` | boundary | Not resolved locally or by the upstream (internally: the passthrough cue). |
 | -32602 | `INVALID_PARAMS` | node | Invalid/missing method parameters (also minted by the control plane for bad control params). |
 | -32000 | `DISPATCH_FAILED` | shell | The shell failed to dispatch the request to the read path. |
-| -32004 | `RESOURCE_NOT_AVAILABLE_AT_ROOT` | upstream | Genuine content miss at the requested root (relayed); distinct from transport failure. |
+| -32004 | `RESOURCE_NOT_AVAILABLE_AT_ROOT` | upstream | Genuine content miss at the requested root (relayed); distinct from transport failure. Also minted directly by the node library for a LOCAL miss at this same root — `dig.fetchRange` ("resource not held") and `dig.getManifest` ("capsule not held locally") — never a fabricated result. |
 | -32005 | `ROOT_NOT_ANCHORED` | node | The node's mandatory read-path anchored-root pin (§14.4) fails closed: the requested root does not match the chain-anchored tip, the store has no confirmed on-chain generation, the chain is unreachable, or a rootless request cannot be resolved under enforcement. Minted by the node library on `dig.getContent`. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |

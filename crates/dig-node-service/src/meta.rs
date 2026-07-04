@@ -38,15 +38,15 @@ pub const GIT_SHA: &str = env!("DIG_NODE_GIT_SHA");
 /// SAME node the native DIG Browser runs in-process via `dig_runtime`.
 ///
 /// What the node serves LOCALLY: `handle_rpc` resolves `dig.getContent`,
-/// `dig.getAnchoredRoot`, `dig.stage`, the collection reads
-/// (`dig.getCollection`/`dig.listCollectionItems`), the L7 peer surface
-/// (`dig.getNetworkInfo`/`dig.getPeers`/`dig.announce`/`dig.getAvailability`/
+/// `dig.getAnchoredRoot`, `dig.getManifest` (#176 Phase C), `dig.stage`, the
+/// collection reads (`dig.getCollection`/`dig.listCollectionItems`), the L7 peer
+/// surface (`dig.getNetworkInfo`/`dig.getPeers`/`dig.announce`/`dig.getAvailability`/
 /// `dig.listInventory`/`dig.fetchRange`), all `cache.*`, and the node-owned
 /// `control.*` (peerStatus/subscribe/unsubscribe/listSubscriptions). Everything else
-/// (e.g. `dig.getProof`, `dig.getCapsule`, `dig.listCapsules`, `dig.getManifest`)
-/// returns `-32601` and this service relays it to the upstream. The catalogue below
-/// reflects this, and the drift-guard test in `tests/openrpc_drift_guard.rs` enforces
-/// the match against the real dispatch.
+/// (e.g. `dig.getProof`, `dig.getCapsule`, `dig.listCapsules`) returns `-32601` and
+/// this service relays it to the upstream. The catalogue below reflects this, and
+/// the drift-guard test in `tests/openrpc_drift_guard.rs` enforces the match
+/// against the real dispatch.
 pub const DIG_NODE_VERSION: &str = dig_node_version();
 
 /// The node library's crate version, resolved at compile time from the `dig-node`
@@ -165,9 +165,18 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
+            // #176 Phase C: served LOCALLY now (was a passthrough alias before this). The
+            // normalized PublicManifest (data-section id 13) embedded in a held capsule's
+            // compiled `.dig` module — the store's complete public file surface as of that
+            // commit. Absence (an older `.dig`, or a private store) is `result: null`, never
+            // an error; a capsule this node does not hold at all is `-32004`.
             name: "dig.getManifest",
-            served: "passthrough",
-            summary: "A capsule's manifest — relayed verbatim to the upstream.",
+            served: "local",
+            summary: "A capsule's (storeId:rootHash) embedded normalized public manifest: \
+                      { schema_version, entries: [{ path, latest_root, generation_index, \
+                      sha256_latest, version_count }] }. Params { store_id, root } (both \
+                      64-hex). `null` when the module carries no manifest section \
+                      (older/private `.dig`); -32004 when the capsule isn't held locally.",
             requires_auth: false,
         },
         MethodInfo {

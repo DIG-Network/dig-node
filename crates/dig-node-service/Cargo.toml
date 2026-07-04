@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-service"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "The localhost DIG node OS-service binary (`dig-node`): a self-contained, cross-platform Rust binary installable as a Windows/Linux/macOS service. Wraps the canonical `dig-node` node library (the same node the native DIG Browser runs in-process) with an axum HTTP transport + control plane + CLI + OS-service registration, exposing the rpc.dig.net JSON-RPC contract (dig.getContent, dig.getAnchoredRoot, cache.*, control.*) on 127.0.0.1."

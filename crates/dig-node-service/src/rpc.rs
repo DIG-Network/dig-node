@@ -146,6 +146,12 @@ mod tests {
     #[test]
     fn routes_unknown_as_passthrough() {
         assert_eq!(route_method("dig.listCapsules"), Route::Passthrough);
+        // `Route` here is a REQUEST-NORMALIZATION classification, not a serve-locally-vs-relay
+        // one (see `route_method`'s doc comment): dig.getManifest needs no storeId/resourceKey
+        // aliasing, so it stays in this "no special normalization" bucket even though the read
+        // path now resolves it LOCALLY (#176 Phase C, `meta::methods()` `served: "local"`) —
+        // the actual local-vs-relay decision in `server::rpc` is driven by whether `handle_rpc`
+        // returns `-32601`, independent of this enum.
         assert_eq!(route_method("dig.getManifest"), Route::Passthrough);
         assert_eq!(route_method(""), Route::Passthrough);
     }
