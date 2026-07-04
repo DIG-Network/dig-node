@@ -838,13 +838,32 @@ impl PeerRpcResponder for NodeResponder {
                 .await
             {
                 Ok(frame) => {
+                    let this_len =
+                        frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    // OUTGOING-BANDWIDTH THROTTLE (#30): this is the node-to-node range-stream wire
+                    // multi-source downloaders hammer — the busiest outgoing-bytes path. Redirect the
+                    // caller to a known holder instead of streaming this frame over-budget (same #165
+                    // redirect shape as a genuine miss); serve it anyway when no alternate is known
+                    // (never drop a request the node could answer).
+                    if this_len > 0 {
+                        if let Some(content) = crate::download::range_content_id(&req) {
+                            let depth = crate::download::redirect_depth(&req);
+                            if let Some(obj) = self
+                                .node
+                                .bandwidth_redirect(&content, this_len as u64, depth)
+                                .await
+                            {
+                                let errf = json!({"error": obj});
+                                return write_framed(out, &errf).await;
+                            }
+                        }
+                    }
+                    self.node.record_outgoing_bytes(this_len as u64);
                     write_framed(out, &frame).await?;
                     let complete = frame
                         .get("complete")
                         .and_then(Value::as_bool)
                         .unwrap_or(true);
-                    let this_len =
-                        frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
                     if complete || this_len == 0 {
                         return Ok(());
                     }
@@ -2037,5 +2056,137 @@ mod tests {
             .handle_json_rpc(json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}))
             .await;
         assert!(peers["result"]["peers"].is_array());
+    }
+
+    // -- OUTGOING-BANDWIDTH THROTTLE on the peer range-stream (dig_ecosystem #30) --------------------
+    //
+    // `stream_range` is the busiest node-to-node egress path (multi-source downloaders fan ranges
+    // across it), so it gets the SAME bandwidth-redirect check as the `dig.getContent`/`dig.fetchRange`
+    // JSON-RPC surface (see `lib.rs`'s `over_cap` test group). This proves the WIRING in `stream_range`
+    // itself: a node that HOLDS the range but is over its configured outgoing-bandwidth cap answers a
+    // redirect error frame (the same `-32008` shape) instead of streaming the frame, when a holder is
+    // known.
+    #[tokio::test]
+    async fn stream_range_over_cap_with_a_provider_redirects_instead_of_streaming() {
+        let (node, td) = crate::test_support::test_node_for_peer_surface();
+        let store = digstore_core::Bytes32([0x31; 32]);
+        let root = digstore_core::Bytes32([0x32; 32]);
+        let rk = [0xcdu8; 32];
+        // The node genuinely HOLDS this resource — 5000 bytes, well past a 10-byte cap. Seeded
+        // directly into the in-memory content cache (no disk/wasmtime — only the throttle+redirect
+        // decision is under test, mirroring lib.rs's `seed_local_resource`).
+        node.content_cache.lock().unwrap().insert(
+            (store.to_hex(), root.to_hex(), rk),
+            Arc::new(digstore_core::wire::ContentResponse {
+                ciphertext: vec![0xABu8; 5000],
+                merkle_proof: digstore_core::merkle::MerkleProof {
+                    leaf: digstore_core::Bytes32([0u8; 32]),
+                    path: vec![],
+                    root: digstore_core::Bytes32([0u8; 32]),
+                },
+                roothash: root,
+                chunk_lens: vec![],
+            }),
+        );
+        let mut node = node;
+        Arc::get_mut(&mut node)
+            .expect("sole owner right after construction")
+            .outgoing_throttle = crate::bandwidth::OutgoingThrottle::new(10);
+        // A holder for this EXACT content is known via the DHT.
+        let cid = dig_dht::ContentId::resource(store.0, root.0, rk);
+        let locator = Arc::new(dig_download::testkit::MockProviderLocator::fixed(vec![
+            dig_download::testkit::mock_provider(6, &cid),
+        ]));
+        let transport = Arc::new(dig_download::testkit::MockRangeTransport::new(
+            dig_download::testkit::MockContent::even(10, 1),
+        ));
+        let pc = crate::download::NodeContent::new(
+            locator,
+            transport,
+            crate::download::MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        node.set_p2p_content(pc);
+
+        let responder: Arc<dyn PeerRpcResponder> = Arc::new(NodeResponder::without_pool(node));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let srv = tokio::spawn(serve_one_stream(server, responder));
+
+        // A bare RangeRequest (no `method`) for the held resource.
+        let req = json!({
+            "store_id": store.to_hex(), "root": root.to_hex(), "retrieval_key": hex::encode(rk),
+            "length": 4096, "offset": 0,
+        });
+        write_framed(&mut client, &req).await.unwrap();
+        let frame = read_framed(&mut client).await.unwrap().expect("a frame");
+        assert_eq!(
+            frame["error"]["code"],
+            json!(crate::download::CONTENT_REDIRECT),
+            "held locally but over the outgoing-bandwidth cap must redirect, not stream: {frame}"
+        );
+        assert_eq!(
+            frame["error"]["data"]["redirect"]["providers"][0]["peer_id"],
+            json!(dig_download::testkit::mock_peer_hex(6))
+        );
+        srv.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_range_over_cap_with_no_provider_still_streams_the_frame() {
+        // The graceful fallback on the peer surface too: no known alternate holder → stream the frame
+        // anyway rather than drop the request.
+        let (node, td) = crate::test_support::test_node_for_peer_surface();
+        let store = digstore_core::Bytes32([0x41; 32]);
+        let root = digstore_core::Bytes32([0x42; 32]);
+        let rk = [0xefu8; 32];
+        node.content_cache.lock().unwrap().insert(
+            (store.to_hex(), root.to_hex(), rk),
+            Arc::new(digstore_core::wire::ContentResponse {
+                ciphertext: vec![0xCDu8; 5000],
+                merkle_proof: digstore_core::merkle::MerkleProof {
+                    leaf: digstore_core::Bytes32([0u8; 32]),
+                    path: vec![],
+                    root: digstore_core::Bytes32([0u8; 32]),
+                },
+                roothash: root,
+                chunk_lens: vec![],
+            }),
+        );
+        let mut node = node;
+        Arc::get_mut(&mut node)
+            .expect("sole owner right after construction")
+            .outgoing_throttle = crate::bandwidth::OutgoingThrottle::new(10);
+        // A P2P engine is attached but the DHT knows of NO holder for this content.
+        let locator = Arc::new(dig_download::testkit::MockProviderLocator::fixed(vec![]));
+        let transport = Arc::new(dig_download::testkit::MockRangeTransport::new(
+            dig_download::testkit::MockContent::even(10, 1),
+        ));
+        let pc = crate::download::NodeContent::new(
+            locator,
+            transport,
+            crate::download::MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        node.set_p2p_content(pc);
+
+        let responder: Arc<dyn PeerRpcResponder> = Arc::new(NodeResponder::without_pool(node));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let srv = tokio::spawn(serve_one_stream(server, responder));
+
+        // Request length comfortably covers the whole 5000-byte resource in one frame.
+        let req = json!({
+            "store_id": store.to_hex(), "root": root.to_hex(), "retrieval_key": hex::encode(rk),
+            "length": 8192, "offset": 0,
+        });
+        write_framed(&mut client, &req).await.unwrap();
+        let frame = read_framed(&mut client).await.unwrap().expect("a frame");
+        assert!(
+            frame.get("error").is_none(),
+            "no known alternate holder must NOT redirect, must stream: {frame}"
+        );
+        assert_eq!(frame["complete"], json!(true));
+        srv.await.unwrap().unwrap();
     }
 }
