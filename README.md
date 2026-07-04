@@ -160,11 +160,12 @@ in-process node expose:
 |---|---|
 | `dig.getContent` / `dig.getCapsule` | **Verified retrieval** — returns blind **ciphertext + a Merkle inclusion proof + chunk lengths** (`{ ciphertext, root, complete, next_offset?, inclusion_proof, chunk_lens, …, source }`). Served **local-first** from a cached `.dig` module, else proxied to the upstream verbatim (so the proxy path carries `total_length` / `offset` too) and the window cached. `source` is `local` or `remote`. **The client (extension/hub/browser) verifies + decrypts** — the node mirrors the ciphertext contract, it does not return plaintext. |
 | `dig.getAnchoredRoot` | The store's **chain-anchored tip root**, resolved on-chain by walking the DataStore singleton lineage on coinset.org (the trusted root for the extension's `chia://` root-pinning). |
+| `dig.getManifest` | A capsule's (`storeId:rootHash`) embedded **normalized public manifest** (data-section id 13): the store's complete public file surface as of that commit — `{ schema_version, entries: [{ path, latest_root, generation_index, sha256_latest, version_count }] }`. Served **local-first** when this node holds the requested capsule. `null` (never an error) when the module carries no manifest section (an older `.dig`, or a private store); `-32004` when the capsule isn't held locally at all. |
 | `cache.getConfig` / `cache.setCapBytes` / `cache.clear` | On-disk cache config: `{ cap_bytes (floored at 64 MiB), used_bytes, cache_dir, shared }` — `cache_dir` is the effective dir and `shared` whether it is the canonical dir shared with the DIG Browser (#96). |
 | `cache.listCached` / `cache.removeCached` / `cache.fetchAndCache` | Cached-capsule manager (`storeId:rootHash`). |
 | `rpc.discover` | **Method discovery** — returns this node's OpenRPC document (the standard OpenRPC discovery method), so a client can introspect every method + error over the wire with no out-of-band knowledge. |
 | `control.*` | **CONTROL / admin surface** (loopback-only + **local-token gated** — see below). Manage the node: hosted/pinned stores, cache, §21 sync, config. Read methods above stay open; only `control.*` requires the token. |
-| `dig.getProof`, `dig.listCapsules`, `dig.getManifest`, *anything else* | **Blind passthrough** — relayed verbatim to the upstream, so the node stays a correct transparent proxy for methods it doesn't resolve locally. |
+| `dig.getProof`, `dig.listCapsules`, *anything else* | **Blind passthrough** — relayed verbatim to the upstream, so the node stays a correct transparent proxy for methods it doesn't resolve locally. |
 
 ## Control / admin surface (`control.*`) — manage the node
 

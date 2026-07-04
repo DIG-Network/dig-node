@@ -269,11 +269,11 @@ async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
 /// sees a JSON-RPC error rather than a transport failure.
 ///
 /// Blind-passthrough fallback: dig-node resolves only `dig.getContent` /
-/// `dig.getAnchoredRoot` / `cache.*` and returns `-32601 method not found` for
-/// everything else. For those (e.g. `dig.getProof`, `dig.listCapsules`,
-/// `dig.getManifest`) this service relays the ORIGINAL request to the upstream so
-/// it stays a correct transparent proxy — matching the Node reference server and
-/// the surface clients expect from an rpc.dig.net endpoint.
+/// `dig.getAnchoredRoot` / `dig.getManifest` / `cache.*` (plus the collection/L7-peer/
+/// `dig.stage` surface) and returns `-32601 method not found` for everything else. For
+/// those (e.g. `dig.getProof`, `dig.listCapsules`) this service relays the ORIGINAL
+/// request to the upstream so it stays a correct transparent proxy — matching the Node
+/// reference server and the surface clients expect from an rpc.dig.net endpoint.
 async fn rpc(
     State(state): State<AppState>,
     headers: HeaderMap,

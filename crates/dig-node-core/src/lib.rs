@@ -950,6 +950,37 @@ fn serve_local_blocking(
     Some(resp)
 }
 
+/// Load + decode the embedded [`PublicManifest`](digstore_core::PublicManifest) (data-section
+/// id 13, #176 Phase C) from a locally cached compiled module. A free function (not a `Node`
+/// method) so it moves into a `spawn_blocking` closure with only the cache dir + request keys,
+/// mirroring [`serve_local_blocking`] (audit #179). Unlike `serve_local_blocking` this does NOT
+/// instantiate the module in wasmtime: the manifest is PUBLIC, unencrypted data embedded
+/// directly in the module's wasm data section, so extracting it is a pure binary-format parse
+/// ([`digstore_compiler::extract_data_section_blob`]) with no `serve_blind` decrypt.
+///
+/// Returns:
+/// - `Ok(Some(Some(manifest)))` — the module is held and carries a `PublicManifest` section.
+/// - `Ok(Some(None))` — the module is held but carries NO `PublicManifest` section (an older
+///   `.dig`, or a private store whose paths must stay opaque — store-format §5.1, additive).
+/// - `Ok(None)` — this node does not hold the requested capsule at all (a cache miss).
+/// - `Err(_)` — the on-disk module's data section is corrupt/malformed.
+fn read_public_manifest_blocking(
+    cache_dir: &Path,
+    store_hex: &str,
+    root_hex: &str,
+) -> Result<Option<Option<digstore_core::PublicManifest>>, String> {
+    let path = module_path(cache_dir, store_hex, root_hex);
+    let module = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let blob = digstore_compiler::extract_data_section_blob(&module)
+        .map_err(|e| format!("malformed module data section: {e}"))?;
+    digstore_core::datasection::read_public_manifest(&blob)
+        .map(Some)
+        .map_err(|e| format!("malformed public manifest section: {e:?}"))
+}
+
 impl Node {
     /// The async, MEMOIZED content-serve path used by every async caller (getContent windows,
     /// fetchRange frames, resource-granularity availability). On a hit in the bounded in-memory
@@ -1179,6 +1210,76 @@ impl Node {
         }
     }
 
+    /// `dig.getManifest` (#176 Phase C): resolve the normalized [`PublicManifest`](digstore_core::PublicManifest)
+    /// (data-section id 13) embedded in a locally held CAPSULE's compiled `.dig` module.
+    ///
+    /// Params `{store_id, root}` (both 64-hex) — a capsule identifier
+    /// (`storeId:rootHash`), matching the shape of the other capsule-scoped read
+    /// methods (`dig.getAvailability`/`dig.fetchRange`). No `retrieval_key`: the
+    /// manifest is PUBLIC, unencrypted data, so no decrypt is needed.
+    ///
+    /// The blocking module read + wasm data-section extraction runs on a
+    /// `spawn_blocking` thread (mirrors [`serve_local_blocking`], audit #179) so it
+    /// never stalls the async runtime.
+    ///
+    /// - Module held, section present → `result` is the manifest JSON
+    ///   (`{schema_version, entries: [...]}`, digstore SPEC.md § the `.dig` format).
+    /// - Module held, section ABSENT (an older `.dig`, or a PRIVATE store whose
+    ///   paths must stay opaque) → `result: null` — **never an error** (store-format
+    ///   §5.1: an optional section's absence is a normal, backwards-compatible
+    ///   outcome).
+    /// - Module NOT held locally at all → `-32004` (the same "not available at this
+    ///   root" code [`dig.fetchRange`](Self::fetch_range_frame) reports on a miss).
+    /// - A corrupt on-disk module → `-32000`.
+    async fn get_manifest(&self, params: &Value, id: Value) -> Value {
+        let store_hex = params.get("store_id").and_then(Value::as_str).unwrap_or("");
+        let root_hex = params.get("root").and_then(Value::as_str).unwrap_or("");
+        fn is_hex64(s: &str) -> bool {
+            s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+        }
+        if !is_hex64(store_hex) || !is_hex64(root_hex) {
+            return rpc_err(
+                &id,
+                -32602,
+                "dig.getManifest requires store_id + root (64-hex each)",
+            );
+        }
+        let cache_dir = self.cache_dir.clone();
+        let store = store_hex.to_string();
+        let root = root_hex.to_string();
+        let outcome = tokio::task::spawn_blocking(move || {
+            read_public_manifest_blocking(&cache_dir, &store, &root)
+        })
+        .await;
+        match outcome {
+            // Module held, PublicManifest section present.
+            Ok(Ok(Some(Some(pm)))) => {
+                // Reuse `PublicManifest::to_json` (the SAME renderer digstore's CLI/wasm
+                // readers use) so the shape is byte-for-byte identical across the ecosystem,
+                // then parse it back into a `Value` for the JSON-RPC `result` field.
+                let value = serde_json::from_str::<Value>(&pm.to_json()).unwrap_or_else(
+                    |_| json!({"schema_version": pm.schema_version, "entries": []}),
+                );
+                json!({"jsonrpc":"2.0","id":id,"result": value})
+            }
+            // Module held, no PublicManifest section — tolerate absence, never an error.
+            Ok(Ok(Some(None))) => json!({"jsonrpc":"2.0","id":id,"result": Value::Null}),
+            // This node does not hold the requested capsule at all.
+            Ok(Ok(None)) => rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "capsule not held locally at the requested root",
+            ),
+            // The on-disk module's data section is corrupt/malformed.
+            Ok(Err(msg)) => rpc_err(&id, -32000, &msg),
+            Err(join_err) => rpc_err(
+                &id,
+                -32000,
+                &format!("manifest read task failed: {join_err}"),
+            ),
+        }
+    }
+
     /// dig.stage (#95 Pass C): turn a local folder into a CAPSULE (`.dig` module)
     /// in process — the staging/compile half of a local deploy.
     ///
@@ -1294,6 +1395,10 @@ impl Node {
             metadata,
             chain_state: None,
             auth: digstore_stage::no_auth(),
+            // Embed the normalized PublicManifest section (id 13, #176 Phase A) only for
+            // PUBLIC stores — a private store's file paths must stay opaque (§5.1 / privacy
+            // model), matching the CLI's own `finalize_commit` rule.
+            include_public_manifest: matches!(visibility, digstore_core::Visibility::Public),
         };
 
         // 8. Stage → compile (generation 0; the browser advances the on-chain root).
@@ -2142,6 +2247,15 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
     if method == "dig.getAnchoredRoot" {
         let params = req.get("params").cloned().unwrap_or(json!({}));
         return node.anchored_root(&params, id).await;
+    }
+    // dig.getManifest (#176 Phase C): the normalized PublicManifest (data-section id 13)
+    // embedded in a specific CAPSULE's (store_id:root) compiled `.dig` module — the store's
+    // complete public file surface (latest version per path) as of that commit. PUBLIC,
+    // unencrypted data, so no retrieval_key is needed. Served LOCALLY now (was a blind
+    // passthrough alias before #176): see `Node::get_manifest`.
+    if method == "dig.getManifest" {
+        let params = req.get("params").cloned().unwrap_or(json!({}));
+        return node.get_manifest(&params, id).await;
     }
     // dig.stage (#95 Pass C): turn a local folder into a capsule (.dig module) IN
     // PROCESS — the staging/compile half of a local deploy. The DIG Browser's
@@ -4886,12 +5000,16 @@ mod tests {
     #[test]
     fn passthrough_alias_methods_are_method_not_found_on_the_node() {
         // The node resolves dig.getContent locally but does NOT resolve the passthrough
-        // aliases dig.getCapsule / dig.listCapsules / dig.getManifest — it returns the
-        // catalogued -32601 (method not found), which is the shell's cue to relay the
-        // ORIGINAL request verbatim to the upstream (SPEC §5.4/§5.5). This pins that
-        // classification at the dispatch level so a future read-path change that starts
-        // resolving one of them locally (and would therefore need its catalogue entry
-        // flipped to served=local) is caught here, mirroring the dig.getProof guard.
+        // aliases dig.getCapsule / dig.listCapsules — it returns the catalogued -32601
+        // (method not found), which is the shell's cue to relay the ORIGINAL request
+        // verbatim to the upstream (SPEC §5.4/§5.5). This pins that classification at
+        // the dispatch level so a future read-path change that starts resolving one of
+        // them locally (and would therefore need its catalogue entry flipped to
+        // served=local) is caught here, mirroring the dig.getProof guard.
+        //
+        // dig.getManifest is EXCLUDED from this list as of #176 Phase C: it moved from
+        // passthrough to served=local (see the dig_get_manifest_* tests below and the
+        // updated catalogue in dig-node-service's meta.rs).
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN");
         let rt = pin_test_rt();
@@ -4903,9 +5021,6 @@ mod tests {
                 "store_id": store_id, "retrieval_key": any_rk_hex(),
             }}),
             json!({"jsonrpc":"2.0","id":2,"method":"dig.listCapsules","params":{
-                "store_id": store_id,
-            }}),
-            json!({"jsonrpc":"2.0","id":3,"method":"dig.getManifest","params":{
                 "store_id": store_id,
             }}),
         ];
@@ -4922,6 +5037,180 @@ mod tests {
                 "{method} must not be resolved locally by the node: {resp}"
             );
         }
+    }
+
+    /// Build a real compiled `.dig` module (via the SAME `digstore_stage::stage_and_compile`
+    /// engine `Node::stage`/the CLI use) so `dig.getManifest` tests exercise the real
+    /// data-section extraction + decode, not a mock. Returns `(root, module_bytes)`.
+    fn compile_fixture_module(
+        store_id: Bytes32,
+        visibility: digstore_core::Visibility,
+        include_public_manifest: bool,
+        files: &[(String, Vec<u8>)],
+    ) -> (Bytes32, Vec<u8>) {
+        let scratch = tempfile::tempdir().unwrap();
+        let secret = digstore_crypto::bls::SecretKey::from_seed(&[42u8; 32]);
+        let pubkey = secret.public_key().to_bytes();
+        let opts = digstore_stage::FinalizeOptions {
+            data_dir: scratch.path().to_path_buf(),
+            trusted_keys: vec![digstore_core::TrustedHostKey {
+                public_key: pubkey.0,
+                label: "test-fixture".to_string(),
+            }],
+            store_pubkey: pubkey,
+            metadata: digstore_stage::empty_manifest(),
+            chain_state: None,
+            auth: digstore_stage::no_auth(),
+            include_public_manifest,
+        };
+        let compiled = digstore_stage::stage_and_compile(
+            files,
+            store_id,
+            &visibility,
+            digstore_core::MAX_STORE_BYTES,
+            false,
+            0,
+            0,
+            &opts,
+        )
+        .expect("stage + compile a fixture module");
+        let bytes = std::fs::read(&compiled.module_path).expect("read compiled module bytes");
+        (compiled.root, bytes)
+    }
+
+    /// Write `module_bytes` into the node's canonical on-disk cache location for
+    /// `(store_hex, root_hex)`, so `dig.getManifest` (and any other local-cache-hit
+    /// method) finds it via [`module_path`].
+    fn seed_cached_module(cache_dir: &Path, store_hex: &str, root_hex: &str, module_bytes: &[u8]) {
+        let path = module_path(cache_dir, store_hex, root_hex);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, module_bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dig_get_manifest_returns_embedded_manifest_json_when_present() {
+        // A PUBLIC store's compiled module embeds the PublicManifest section (#176 Phase A);
+        // dig.getManifest (Phase C) reads it back and returns the exact JSON shape.
+        let (node, _td) = test_node(None);
+        let store_id = Bytes32([9u8; 32]);
+        let files = vec![
+            ("index.html".to_string(), b"<h1>hi</h1>".to_vec()),
+            ("assets/app.js".to_string(), b"console.log(1)".to_vec()),
+        ];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "unexpected error: {resp}");
+        let result = &resp["result"];
+        assert_eq!(result["schema_version"], json!(1));
+        let entries = result["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2);
+        let paths: Vec<&str> = entries
+            .iter()
+            .map(|e| e["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["assets/app.js", "index.html"]);
+        for e in entries {
+            assert_eq!(e["latest_root"], json!(root.to_hex()));
+            assert_eq!(e["generation_index"], json!(0));
+            assert_eq!(e["version_count"], json!(1));
+            assert!(e["sha256_latest"].as_str().unwrap().len() == 64);
+        }
+    }
+
+    #[tokio::test]
+    async fn dig_get_manifest_returns_null_when_section_absent() {
+        // A PRIVATE store's compiled module carries NO PublicManifest section (its paths must
+        // stay opaque). dig.getManifest MUST tolerate the absence: `result: null`, never an
+        // error — store-format §5.1, an optional section's absence is normal + backwards
+        // compatible (an older `.dig` hits this same path).
+        let (node, _td) = test_node(None);
+        let store_id = Bytes32([10u8; 32]);
+        let files = vec![("secret.txt".to_string(), b"top secret".to_vec())];
+        let (root, module_bytes) = compile_fixture_module(
+            store_id,
+            digstore_core::Visibility::Private(digstore_core::SecretSalt([1u8; 32])),
+            false,
+            &files,
+        );
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none(),
+            "absence of a PublicManifest section must NEVER be an error: {resp}"
+        );
+        assert_eq!(
+            resp["result"],
+            Value::Null,
+            "absent manifest -> null result: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dig_get_manifest_reports_unavailable_when_capsule_not_held() {
+        // The node holds nothing for this (store, root) at all — a genuine cache miss, distinct
+        // from "held but no manifest section". Reports the same -32004 dig.fetchRange uses for
+        // an unheld resource, not method-not-found and not a fabricated null.
+        let (node, _td) = test_node(None);
+        let store_hex = Bytes32([11u8; 32]).to_hex();
+        let root_hex = Bytes32([12u8; 32]).to_hex();
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{
+                "store_id": store_hex, "root": root_hex,
+            }}),
+        )
+        .await;
+        assert_eq!(resp["error"]["code"], json!(-32004), "unexpected: {resp}");
+        assert!(resp.get("result").is_none());
+    }
+
+    #[tokio::test]
+    async fn dig_get_manifest_rejects_malformed_params_without_touching_disk() {
+        // Missing/invalid store_id or root is a param-validation error (-32602), returned
+        // before any filesystem access — never -32601 (this method IS served locally) and
+        // never a panic on absent params.
+        let (node, _td) = test_node(None);
+        let empty = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{}}),
+        )
+        .await;
+        assert_eq!(empty["error"]["code"], json!(-32602), "{empty}");
+
+        let bad_root = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getManifest","params":{
+                "store_id": Bytes32([1u8; 32]).to_hex(), "root": "not-hex",
+            }}),
+        )
+        .await;
+        assert_eq!(bad_root["error"]["code"], json!(-32602), "{bad_root}");
     }
 
     // -- REDIRECT-ON-MISS (#165) — the content-orchestration miss handler wired into the RPC ----------

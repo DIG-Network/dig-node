@@ -97,10 +97,12 @@ When a `chia://` resource is requested:
    the "blind host" property is preserved for remote hosts, while the *local* node legitimately
    serves what the user's own machine fetched).
 
-`dig.getAnchoredRoot` resolves a store's chain-anchored tip root; `cache.*` methods configure and
-inspect the on-disk cache; everything else (`dig.getProof`, `dig.listCapsules`, `dig.getManifest`,
-…) is **blind-passthrough** relayed verbatim to the upstream, so the node stays a correct
-transparent proxy.
+`dig.getAnchoredRoot` resolves a store's chain-anchored tip root; `dig.getManifest` reads a held
+capsule's embedded normalized public manifest (the store's complete public file surface — `null`
+when the module carries no manifest section, never an error); `cache.*` methods configure and
+inspect the on-disk cache; everything else (`dig.getProof`, `dig.listCapsules`, …) is
+**blind-passthrough** relayed verbatim to the upstream, so the node stays a correct transparent
+proxy.
 
 ### 5. The local cache
 
