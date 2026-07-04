@@ -1,0 +1,41 @@
+# Enforce Conventional Commits on every PR to the default branch (and the PR title).
+# Reads commitlint.config.mjs at the repo root (extends @commitlint/config-conventional).
+# No local install needed — the action bundles commitlint. See CLAUDE.md §3.2.
+name: Commitlint
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  commitlint:
+    name: Lint commit messages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Lint PR commits
+        uses: wagoid/commitlint-github-action@v6
+        with:
+          configFile: commitlint.config.mjs
+
+      - name: Lint PR title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          echo "$PR_TITLE" | npx --yes commitlint --config commitlint.config.mjs
