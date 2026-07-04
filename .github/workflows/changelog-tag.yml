@@ -1,0 +1,82 @@
+# On merge to the default branch: regenerate CHANGELOG.md from Conventional Commits (git-cliff),
+# commit it to the default branch, THEN tag that commit vX.Y.Z and push the tag. The changelog is
+# therefore INCLUDED in the tag. The pushed tag triggers this repo's deploy/release workflow
+# (wired `on: push: tags: ['v*']`).
+#
+# The tag is pushed with RELEASE_TOKEN (a PAT) — a tag pushed by the default GITHUB_TOKEN does NOT
+# trigger downstream workflows (GitHub anti-recursion), which would break deploy-on-tag. The same
+# PAT pushes the changelog commit (its identity must be allowed past branch protection —
+# enforce_admins is off; the PAT is an org-admin/owner). See CLAUDE.md §3.6.
+#
+# Idempotent + loop-safe: no-op if the version's tag already exists; skips its own changelog commit.
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Changelog + tag
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Resolve version + skip if already tagged
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg() { [ -f package.json ] && jq -r '.version // ""' package.json 2>/dev/null || echo ""; }
+          crg() {
+            [ -f Cargo.toml ] || { echo ""; return; }
+            python3 -c 'import tomllib; d=tomllib.load(open("Cargo.toml","rb")); v=d.get("package",{}).get("version") or d.get("workspace",{}).get("package",{}).get("version") or ""; print(v if isinstance(v,str) else "")' 2>/dev/null || echo ""
+          }
+          PV="$(pkg)"; CV="$(crg)"; VER="${PV:-$CV}"
+          if [ -z "$VER" ]; then echo "skip=true" >>"$GITHUB_OUTPUT"; echo "No version file — nothing to release."; exit 0; fi
+          TAG="v$VER"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+             || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"; echo "Tag $TAG already exists — no-op."; exit 0
+          fi
+          echo "skip=false" >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+          echo "Releasing $TAG"
+
+      - name: Install git-cliff
+        if: steps.ver.outputs.skip == 'false'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Generate changelog
+        if: steps.ver.outputs.skip == 'false'
+        run: git-cliff --config cliff.toml --tag "${{ steps.ver.outputs.tag }}" --output CHANGELOG.md
+
+      - name: Commit changelog, tag, push
+        if: steps.ver.outputs.skip == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "dig-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add CHANGELOG.md
+          # `chore(release):` prefix so this workflow skips its own push (loop guard above).
+          git commit -m "chore(release): ${{ steps.ver.outputs.tag }}" || echo "changelog unchanged"
+          git tag -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
+          git push origin "HEAD:main"
+          git push origin "${{ steps.ver.outputs.tag }}"
+          echo "Pushed changelog commit + ${{ steps.ver.outputs.tag }} — deploy-on-tag will fire."
