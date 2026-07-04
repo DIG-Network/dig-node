@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -14,23 +14,36 @@ path = "src/lib.rs"
 # CLI + format/read libraries) and are consumed here as GIT dependencies: the node
 # depends on the store libs, NEVER the reverse (digstore is only ever an RPC client of
 # a node). Pinned to a single digstore rev so the whole store-format surface the node
-# reads/verifies/decrypts against is one coherent version. Bump all six together.
+# reads/verifies/decrypts against is one coherent version. Bump all seven together.
 #
-# digstore-host   — instantiate a compiled module + `serve_blind` (ciphertext + proof).
-# digstore-core   — wire types (ContentResponse), codec, Bytes32/48.
-# digstore-remote — the §21 remote client + persistent identity signer (§21.9).
-# digstore-chain  — CHIP-0035 singleton lineage walk (chain-anchored root).
-# digstore-stage  — the shared stage→compile engine for the `dig.stage` RPC (turn a
-#                   folder into a capsule in-process, #95 Pass C). Its build script
-#                   embeds the guest wasm (BINDING contract D6) via the DIGSTORE_GUEST_WASM
-#                   override this repo sets in .cargo/config.toml (see vendor/).
-# digstore-crypto — read-path crypto primitives.
-digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
-digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
-digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
-digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "56664ec8c9b45969962b09c95148641c3534826e" }
+# digstore-host     — instantiate a compiled module + `serve_blind` (ciphertext + proof).
+# digstore-core     — wire types (ContentResponse), codec, Bytes32/48, the PublicManifest
+#                     type + `datasection::read_public_manifest` (#176 Phase C).
+# digstore-remote   — the §21 remote client + persistent identity signer (§21.9).
+# digstore-chain    — CHIP-0035 singleton lineage walk (chain-anchored root).
+# digstore-stage    — the shared stage→compile engine for the `dig.stage` RPC (turn a
+#                     folder into a capsule in-process, #95 Pass C). Its build script
+#                     embeds the guest wasm (BINDING contract D6) via the DIGSTORE_GUEST_WASM
+#                     override this repo sets in .cargo/config.toml (see vendor/).
+# digstore-crypto   — read-path crypto primitives.
+# digstore-compiler — `extract_data_section_blob` (#176 Phase C): pulls the embedded DIGS
+#                     data-section blob out of a compiled `.dig` module's wasm binary so
+#                     `dig.getManifest` can read section 13 (the PublicManifest) WITHOUT a
+#                     wasmtime instantiation (the manifest is PUBLIC, unencrypted data — no
+#                     `serve_blind` decrypt needed). Already a transitive dependency via
+#                     digstore-stage; pinned directly at the SAME rev so its public API is
+#                     usable here too.
+#
+# Bumped to a rev past digstore's "Add normalized public manifest to the .dig format"
+# commit (08f5d39) so `PublicManifest`/`read_public_manifest`/`extract_data_section_blob`
+# exist. Bump all seven together.
+digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
+digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
+digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
 chia-protocol = "0.26"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 # Object-safe async trait for the injectable anchored-root resolver (the

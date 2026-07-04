@@ -1739,7 +1739,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1753,6 +1753,7 @@ dependencies = [
  "dig-peer-selector",
  "dig-pex",
  "digstore-chain",
+ "digstore-compiler",
  "digstore-core",
  "digstore-crypto",
  "digstore-host",
@@ -1782,7 +1783,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "clap",
@@ -1888,7 +1889,7 @@ dependencies = [
 [[package]]
 name = "digstore-chain"
 version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1918,7 +1919,7 @@ dependencies = [
 [[package]]
 name = "digstore-chunker"
 version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "digstore-core",
  "sha2 0.10.9",
@@ -1927,7 +1928,7 @@ dependencies = [
 [[package]]
 name = "digstore-compiler"
 version = "1.0.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "chacha20 0.9.1",
  "digstore-core",
@@ -1943,7 +1944,7 @@ dependencies = [
 [[package]]
 name = "digstore-core"
 version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "aes-gcm-siv",
  "hex",
@@ -1956,7 +1957,7 @@ dependencies = [
 [[package]]
 name = "digstore-crypto"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "chia-bls 0.45.0",
  "digstore-core",
@@ -1970,7 +1971,7 @@ dependencies = [
 [[package]]
 name = "digstore-host"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "anyhow",
  "clap",
@@ -1992,7 +1993,7 @@ dependencies = [
 [[package]]
 name = "digstore-prover"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "digstore-core",
  "digstore-crypto",
@@ -2005,7 +2006,7 @@ dependencies = [
 [[package]]
 name = "digstore-remote"
 version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "async-trait",
  "axum",
@@ -2032,7 +2033,7 @@ dependencies = [
 [[package]]
 name = "digstore-stage"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "digstore-chunker",
  "digstore-compiler",
@@ -2048,7 +2049,7 @@ dependencies = [
 [[package]]
 name = "digstore-store"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=56664ec8c9b45969962b09c95148641c3534826e#56664ec8c9b45969962b09c95148641c3534826e"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
 dependencies = [
  "digstore-chunker",
  "digstore-core",
