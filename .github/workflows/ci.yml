@@ -1,0 +1,102 @@
+# PR quality gates for the dig-node Rust workspace: formatting, linting, tests, and
+# a (measure-only) coverage report. Runs on every PR to main (and on pushes to main
+# so the default branch history stays green). Job `name:`s are stable — they are the
+# required-check contexts wired on the protected branch.
+#
+# Build note: this workspace depends on digstore's store-format crates, whose build
+# script embeds the digstore guest wasm (BINDING contract D6). The wasm is VENDORED in
+# this repo (vendor/digstore_guest.wasm) and pointed at by .cargo/config.toml via the
+# DIGSTORE_GUEST_WASM override, so no wasm build step is needed here — the checkout
+# already carries the artifact. See CLAUDE.md §3.5.
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test + coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # Runs the whole workspace test suite AND measures line coverage in a single
+      # instrumented build. Coverage is measure-only for now (reported in the log +
+      # summary, NOT gated) — the ≥80% floor is tracked separately (#157). Raising the
+      # gate here is a one-line change: add `--fail-under-lines 80`.
+      - name: cargo llvm-cov (test + coverage)
+        run: |
+          cargo llvm-cov --workspace --summary-only | tee coverage-summary.txt
+
+      - name: Coverage summary to job summary
+        if: always()
+        run: |
+          {
+            echo '### dig-node coverage (measure-only)'
+            echo '```'
+            cat coverage-summary.txt 2>/dev/null || echo 'no coverage output'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
