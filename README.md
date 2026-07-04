@@ -126,6 +126,7 @@ service's environment so the service serves identically):
 | `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). **Leave it unset to share one cache with the DIG Browser** — see below. |
 | `DIG_NODE_CACHE_CAP` | `1 GiB` | Cache size cap (floored at 64 MiB), LRU-evicted. Also settable via the `cache.setCapBytes` RPC. |
 | `DIG_NODE_DIGLOCAL` | `1` (on) | Whether to ALSO open the bare-`http://dig.local` listener (`127.0.0.2:80`) beside `localhost:<port>`. Auto-attempt with graceful fallback (see [Addressing](#addressing--httpdiglocal-no-port--httplocalhostport-91)). Set to `0`/`false` to skip the attempt. |
+| `DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC` | `0` (unlimited) | Outgoing-bandwidth cap in bytes/second. Past the cap, a request for content this node holds is redirected to another peer known to hold it (SPEC §17) instead of served over-budget; served locally as a graceful fallback when no alternate holder is known. |
 
 ### Shared `.dig` cache with the DIG Browser (#96)
 

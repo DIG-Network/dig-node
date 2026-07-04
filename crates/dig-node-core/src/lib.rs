@@ -45,6 +45,7 @@ use fs4::FileExt;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+pub mod bandwidth;
 pub mod chainwatch;
 pub mod dht;
 pub mod download;
@@ -255,6 +256,12 @@ pub struct Node {
     /// unaffected (no self-keep-alive cycle). NEVER set on the FFI path, so a backfill there upgrades
     /// to `None` and is a no-op (the browser consumer has no peer network to pull a capsule from).
     self_ref: OnceLock<std::sync::Weak<Node>>,
+    /// The outgoing-bandwidth throttle (dig_ecosystem issue #30): tracks bytes served this second
+    /// against a configurable cap (`DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC`, unlimited by default) so
+    /// the serve path can redirect an over-budget request to a known alternate holder instead of
+    /// serving over-cap or dropping it. See [`bandwidth::OutgoingThrottle`] and
+    /// [`Node::bandwidth_redirect`].
+    outgoing_throttle: bandwidth::OutgoingThrottle,
 }
 
 /// A boxed async hook that reconciles the node's DHT provider records with its current cache
@@ -900,6 +907,16 @@ fn plan_eviction(entries: &[(PathBuf, std::time::SystemTime, u64)], cap: u64) ->
         running = running.saturating_sub(*sz);
     }
     victims
+}
+
+/// The number of raw ciphertext bytes the WINDOW-based `dig.getContent` window at `offset` serves
+/// for a resource of `total` bytes — the same slicing [`build_result`] performs, exposed standalone
+/// so the outgoing-bandwidth throttle (#30) can decide BEFORE building the result whether serving it
+/// would exceed the cap.
+fn content_window_len(total: usize, offset: usize) -> usize {
+    let start = offset.min(total);
+    let end = (start + WINDOW).min(total);
+    end - start
 }
 
 /// Build the JSON-RPC `result` object for one window of a decoded ContentResponse.
@@ -2400,7 +2417,21 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
             .fetch_range_frame(store_hex, root_hex, rk_hex, offset, length)
             .await
         {
-            Ok(frame) => json!({"jsonrpc":"2.0","id":id,"result": frame}),
+            Ok(frame) => {
+                // OUTGOING-BANDWIDTH THROTTLE (#30): this node HOLDS the range, but serving it now
+                // may push it over its configured cap — redirect to a known holder instead (same
+                // #165 redirect shape) with a graceful serve-anyway fallback when none is known.
+                let bytes = frame.get("length").and_then(Value::as_u64).unwrap_or(0);
+                let depth = download::redirect_depth(&params);
+                if let Some(obj) = node
+                    .bandwidth_redirect_for(store_hex, root_hex, rk_hex, bytes, depth)
+                    .await
+                {
+                    return json!({"jsonrpc":"2.0","id":id,"error":obj});
+                }
+                node.record_outgoing_bytes(bytes);
+                json!({"jsonrpc":"2.0","id":id,"result": frame})
+            }
             // A LOCAL MISS (-32004): try the #165 P2P miss path — redirect to a holder (default) or
             // fetch-through via dig-download — before returning the bare not-found. An empty engine
             // (FFI path) or no provider yields `None` and the original error stands (no silent 404
@@ -2658,6 +2689,12 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
     //    served module's own root MUST equal the pinned chain-anchored root — a
     //    cached module whose generation is not the anchored tip is rejected (it is
     //    not served as if current).
+    // OUTGOING-BANDWIDTH THROTTLE (dig_ecosystem #30): before serving a LOCAL-FIRST hit, check
+    // whether the window's bytes would push this node's outgoing traffic over its configured cap;
+    // if so and a holder is known, redirect there instead (extends #165 redirect-on-miss from "not
+    // held" to "held but saturated") — else the graceful fallback: serve anyway.
+    let depth = download::redirect_depth(&params);
+
     if let (Ok(rk), false) = (decode_rk(rk_hex), root_hex.is_empty()) {
         if let Some(resp) = node.serve_local_cached(store_hex, &root_hex, &rk).await {
             if let Some(pin) = pinned_root {
@@ -2673,6 +2710,14 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
                     );
                 }
             }
+            let bytes = content_window_len(resp.ciphertext.len(), offset) as u64;
+            if let Some(obj) = node
+                .bandwidth_redirect_for(store_hex, &root_hex, rk_hex, bytes, depth)
+                .await
+            {
+                return json!({"jsonrpc":"2.0","id":id,"error":obj});
+            }
+            node.record_outgoing_bytes(bytes);
             return local(&id, build_result(&resp, offset));
         }
         // 1b. AUTHENTICATED WHOLE-STORE SYNC (§21.9): on a module-cache miss, pull
@@ -2687,6 +2732,14 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
             node.invalidate_content_cache(store_hex, &root_hex);
             if let Some(resp) = node.serve_local_cached(store_hex, &root_hex, &rk).await {
                 if pinned_root.map(|p| resp.roothash == p).unwrap_or(true) {
+                    let bytes = content_window_len(resp.ciphertext.len(), offset) as u64;
+                    if let Some(obj) = node
+                        .bandwidth_redirect_for(store_hex, &root_hex, rk_hex, bytes, depth)
+                        .await
+                    {
+                        return json!({"jsonrpc":"2.0","id":id,"error":obj});
+                    }
+                    node.record_outgoing_bytes(bytes);
                     return local(&id, build_result(&resp, offset));
                 }
             }
@@ -2836,6 +2889,7 @@ impl Node {
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             self_ref: OnceLock::new(),
+            outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
         })
     }
 
@@ -2897,6 +2951,7 @@ pub(crate) mod test_support {
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             self_ref: OnceLock::new(),
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
         (Arc::new(node), td)
     }
@@ -3067,6 +3122,7 @@ mod tests {
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             self_ref: OnceLock::new(),
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
         (node, td)
     }
@@ -3138,6 +3194,7 @@ mod tests {
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             self_ref: OnceLock::new(),
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
 
         // Missing before the pull.
@@ -3180,6 +3237,7 @@ mod tests {
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             self_ref: OnceLock::new(),
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -5470,6 +5528,265 @@ mod tests {
             "fetch-through serves the holder's bytes"
         );
         assert_eq!(frame["root"], json!(content.root));
+    }
+
+    // -- OUTGOING-BANDWIDTH THROTTLE + REDIRECT-ON-SATURATION (dig_ecosystem #30) --------------------
+    //
+    // These extend the #165 redirect-on-miss drives above to "the node DOES hold the content, but
+    // serving it now would blow its configured outgoing-bandwidth cap": with a tiny cap and a known
+    // holder, the node redirects (the SAME -32008 shape) instead of serving over-budget; with no known
+    // holder (no provider, or no P2P engine at all — the FFI/browser path) it serves anyway (the
+    // graceful fallback — never drop a request the node could have answered). Content is seeded
+    // directly into the in-memory `content_cache` (mirrors
+    // `serve_local_cached_serves_a_memoized_decode_without_touching_disk` above) so these tests never
+    // touch disk/wasmtime — only the throttle + redirect decision is under test.
+
+    /// Seed `node`'s in-memory content cache with a resource genuinely HELD at `(store, root, rk)`,
+    /// `len` ciphertext bytes, roothash == `root` (so it passes the #127 anchored-root pin).
+    fn seed_local_resource(node: &Node, store: Bytes32, root: Bytes32, rk: [u8; 32], len: usize) {
+        let resp = ContentResponse {
+            ciphertext: vec![0xABu8; len],
+            merkle_proof: digstore_core::merkle::MerkleProof {
+                leaf: Bytes32([0u8; 32]),
+                path: vec![],
+                root: Bytes32([0u8; 32]),
+            },
+            roothash: root,
+            chunk_lens: vec![],
+        };
+        node.content_cache
+            .lock()
+            .unwrap()
+            .insert((store.to_hex(), root.to_hex(), rk), Arc::new(resp));
+    }
+
+    #[test]
+    fn get_content_over_cap_with_a_provider_redirects_instead_of_local_serve() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk_hex) = miss_setup();
+        let rk = decode_rk(&rk_hex).expect("valid rk");
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        // This node genuinely HOLDS the resource — 5000 bytes, well past a 10-byte cap.
+        seed_local_resource(&node, store, tip, rk, 5000);
+        let node = Node {
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            ..node
+        };
+        // A holder for this EXACT content is known via the DHT.
+        let cid = ContentId::resource(store.0, tip.0, rk);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(9, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
+            }}),
+        ));
+        assert_eq!(
+            resp["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "held locally but over the outgoing-bandwidth cap must redirect, not serve: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["data"]["redirect"]["providers"][0]["peer_id"],
+            json!(dig_download::testkit::mock_peer_hex(9))
+        );
+        assert_eq!(
+            resp["error"]["data"]["redirect"]["redirect_depth"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn get_content_over_cap_with_no_provider_still_serves_locally() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk_hex) = miss_setup();
+        let rk = decode_rk(&rk_hex).expect("valid rk");
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        seed_local_resource(&node, store, tip, rk, 5000);
+        let node = Node {
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            ..node
+        };
+        // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
+        // fallback: serve anyway rather than drop the request.
+        attach_p2p(
+            &node,
+            vec![],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
+            }}),
+        ));
+        assert_ne!(
+            resp["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "no known alternate holder must NOT redirect: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["source"],
+            json!("local"),
+            "served from local cache despite being over the soft cap: {resp}"
+        );
+    }
+
+    #[test]
+    fn get_content_over_cap_with_no_p2p_engine_still_serves_locally() {
+        // The in-process FFI/browser path never attaches a P2P content engine at all — the throttle
+        // must not fail closed there either (nothing to redirect to, so it serves).
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk_hex) = miss_setup();
+        let rk = decode_rk(&rk_hex).expect("valid rk");
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        seed_local_resource(&node, store, tip, rk, 5000);
+        let node = Node {
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            ..node
+        };
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
+            }}),
+        ));
+        assert_eq!(resp["result"]["source"], json!("local"), "{resp}");
+    }
+
+    #[test]
+    fn get_content_under_cap_serves_locally_not_redirect() {
+        // A generous cap the 5000-byte resource fits comfortably under, even though a holder IS known
+        // — proves the throttle does not over-fire when the request is well within budget.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk_hex) = miss_setup();
+        let rk = decode_rk(&rk_hex).expect("valid rk");
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        seed_local_resource(&node, store, tip, rk, 5000);
+        let node = Node {
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(1_000_000),
+            ..node
+        };
+        let cid = ContentId::resource(store.0, tip.0, rk);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(9, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
+            }}),
+        ));
+        assert_eq!(resp["result"]["source"], json!("local"), "{resp}");
+    }
+
+    #[test]
+    fn get_content_over_cap_honors_the_redirect_hop_cap() {
+        // A bandwidth-redirect reuses the SAME hop budget as miss-redirect (#165) — a request already
+        // redirected up to the cap must not be redirected again, even though it is over budget and a
+        // holder is known (loop prevention across saturated nodes).
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk_hex) = miss_setup();
+        let rk = decode_rk(&rk_hex).expect("valid rk");
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        seed_local_resource(&node, store, tip, rk, 5000);
+        let node = Node {
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            ..node
+        };
+        let cid = ContentId::resource(store.0, tip.0, rk);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(9, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
+                "redirect_depth": REDIRECT_HOP_CAP,
+            }}),
+        ));
+        assert_ne!(
+            resp["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "at the hop cap the node must not redirect again: {resp}"
+        );
+    }
+
+    #[test]
+    fn fetch_range_over_cap_with_a_provider_redirects() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk_hex) = miss_setup();
+        let rk = decode_rk(&rk_hex).expect("valid rk");
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        seed_local_resource(&node, store, tip, rk, 5000);
+        let node = Node {
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            ..node
+        };
+        let cid = ContentId::resource(store.0, tip.0, rk);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(4, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":7,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
+                "length": 4096, "offset": 0,
+            }}),
+        ));
+        assert_eq!(
+            resp["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "held locally but over the outgoing-bandwidth cap must redirect: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["data"]["redirect"]["providers"][0]["peer_id"],
+            json!(dig_download::testkit::mock_peer_hex(4))
+        );
     }
 
     /// `dig.getNetworkInfo` must never report the wildcard bind address as a dialable endpoint, and
