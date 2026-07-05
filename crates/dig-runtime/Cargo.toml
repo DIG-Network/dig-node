@@ -1,9 +1,9 @@
 [package]
 name = "dig-runtime"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-2.0-only"
-description = "DIG browser native in-process runtime: a cdylib (dig_runtime.dll) the browser loads at startup to run the DIG node (and, later, wallet) on background threads INSIDE the browser process — no sidecar."
+description = "DIG browser native in-process runtime: a cdylib (dig_runtime.dll) the browser loads at startup. Exposes the built-in Chia wallet FFI (dig_wallet_rpc) and the digstore Rust read-crypto FFI (dig_read_verify_decrypt) — the SAME Rust the webpage wasm wraps — plus, for other consumers, the full node RPC (dig_rpc). The browser starts it WALLET-ONLY (no node engine); the read-crypto FFI needs no runtime at all."
 
 [lib]
 name = "dig_runtime"
@@ -16,3 +16,10 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # Builds + parses the `dig_wallet_rpc` envelope ({status, body}) so the wallet body
 # is embedded as raw JSON rather than a double-encoded string.
 serde_json = "1"
+# The digstore `.dig` read-crypto — the ONE Rust impl the webpage `dig-client-wasm`
+# wraps. The native browser calls the SAME crypto directly via FFI (no wasm in the
+# browser). Pinned to the SAME rev dig-node-core uses so cargo unifies to one version.
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7" }
+# The `X-Dig-Inclusion-Proof` header wire form is base64; store id / root / salt are hex.
+base64 = "0.22"
+hex = "0.4"
