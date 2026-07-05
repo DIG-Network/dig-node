@@ -60,11 +60,14 @@ The service shell MUST NOT reimplement, transform, or "improve" the node's respo
 `dig_node_core::handle_rpc` returns is what the client receives.
 
 1.3. The wire contract is byte-identical across BOTH host shells because dispatch IS the same
-`dig_node_core::handle_rpc` in both — the OS-service binary AND the DIG Browser's in-process cdylib run
-ONE node implementation. A client written against `rpc.dig.net` (e.g. the DIG Chrome extension's
-`fetchContentViaRPC` pipeline) MUST work against this node unchanged. Verification and decryption
-happen in the **client**; the node serves blind ciphertext + proofs and MUST NOT return plaintext
-for content reads.
+`dig_node_core::handle_rpc` in both — the OS-service binary AND the `dig-runtime` cdylib's `dig_rpc`
+export run ONE node implementation. (The DIG Browser itself starts the cdylib WALLET-ONLY (§15) and does
+NOT run this in-process node — it is a pure RPC consumer of an EXTERNAL node over the §5.3 ladder; the
+`dig_rpc` full-node path is for other consumers.) A client written against `rpc.dig.net` (e.g. the DIG
+Chrome extension's `fetchContentViaRPC` pipeline) MUST work against this node unchanged. Verification and
+decryption happen in the **client** — for the DIG Browser via the native read-crypto FFI (§15.1), for
+webpages via the equivalent `dig-client-wasm`; the node serves blind ciphertext + proofs and MUST NOT
+return plaintext for content reads.
 
 1.4. **Canonical RPC interface — `dig-rpc-types` + `dig-rpc`.** The RPC surface this node exposes
 (method names + request/response types, the error-code taxonomy, and the tier classification) is
@@ -672,7 +675,7 @@ does offset/length arithmetic over untrusted serialized input).
 | 12 | Health/version/well-known shapes | §6 fields; additions additive only | §6; `src/meta.rs`, `src/server.rs` |
 | 13 | Subscription persistence | `<cache>/subscriptions.json` schema-versioned, atomic, cross-process-locked | §14.1; `subscription.rs` |
 | 14 | Autonomous sync fail-closed | chain-watch + gap-fill + read-path pin never serve/pull against an unconfirmable root | §14.2–14.4; `chainwatch.rs`, `lib.rs` |
-| 15 | FFI C-ABI | `dig_runtime_start`/`dig_rpc`/`dig_wallet_rpc`/`dig_free` signatures + ownership/threading | §15; `dig-runtime/src/lib.rs` |
+| 15 | FFI C-ABI | `dig_runtime_start`/`dig_runtime_start_wallet` (wallet-only vs full) + `dig_rpc`/`dig_wallet_rpc`/`dig_free` + read-crypto `dig_read_verify_decrypt`/`dig_bytes_free` (`DIG_READ_*` codes) signatures + ownership/threading | §15, §15.1; `dig-runtime/src/lib.rs` |
 | 16 | Wallet broadcast gate | dry-run default; mainnet push requires `DIG_WALLET_ALLOW_BROADCAST=1`; a dapp cannot force it | §16; `dig-wallet/src/lib.rs` |
 
 ---
@@ -762,19 +765,35 @@ against the on-chain current root or fails closed — it NEVER trusts an upstrea
 ## 15. FFI — dig-runtime C-ABI (in-process host)
 
 `dig-runtime` is a Cargo `cdylib` (`dig_runtime`, e.g. `dig_runtime.dll` shipped beside the browser
-executable) the DIG Browser links to run the node IN-PROCESS — there is no loopback server, no socket,
-and no `dig-node` sidecar. It drives the SAME `dig_node_core::handle_rpc` dispatch the OS-service binary
-runs, on a multi-thread tokio runtime the library owns, and brings up the built-in wallet host (§16)
-beside the node.
+executable) exposing three C-ABI surfaces the DIG Browser links directly IN-PROCESS — no loopback
+server, no socket, no `dig-node` sidecar:
+
+- the **built-in wallet** (`dig_wallet_rpc`, §16) — the browser's reason to load the DLL;
+- the **read-crypto** (`dig_read_verify_decrypt`, §15.1) — the digstore `.dig` verify+decrypt, the SAME
+  `digstore-core` Rust the webpage `dig-client-wasm` wraps (ONE impl, two bindings: native FFI for the
+  native browser, wasm for webpages — the browser NEVER uses wasm);
+- the **full node RPC** (`dig_rpc`) — the SAME `dig_node_core::handle_rpc` dispatch the OS-service
+  binary runs, retained for consumers that want an in-process node.
+
+The runtime has TWO start modes, fixed by whichever `dig_runtime_start*` runs FIRST (idempotent
+`OnceLock`):
+
+- **wallet-only** (`dig_runtime_start_wallet`) — brings up the wallet host (§16) + tokio runtime with
+  NO node engine (no P2P, no cache, no `dig_rpc` dispatch). This is the DIG Browser's mode: it links the
+  wallet + read-crypto FFI and resolves `chia://`/`dig://` content from an EXTERNAL dig-node over RPC
+  (the §5.3 ladder), running no in-process node.
+- **full** (`dig_runtime_start`, or lazily on the first `dig_rpc`/`dig_wallet_rpc`) — builds the node
+  engine + wallet host, for non-browser consumers that want an in-process node.
 
 The C-ABI exports (all `#[no_mangle] extern "C"`, and panic-safe — a panic is caught and never crosses
 the FFI boundary):
 
 | Export | Signature | Behavior |
 |---|---|---|
-| `dig_runtime_start` | `void dig_runtime_start(void)` | Initialize the runtime: build the node + tokio runtime, load the §21.9 identity, prepare the cache, and start the in-process wallet host. Idempotent and cheap to re-call. Optional (`dig_rpc` initializes lazily), but the browser calls it once at startup so identity + cache are ready before the first navigation. |
-| `dig_rpc` | `char* dig_rpc(const char* request_json)` | Execute ONE DIG JSON-RPC request in-process and return the JSON-RPC response text. Returns NULL only on a null/invalid input pointer or allocation failure. |
-| `dig_wallet_rpc` | `char* dig_wallet_rpc(const char* origin, const char* request_json)` | Execute ONE wallet request (§16) for the calling page's web origin and return a JSON ENVELOPE `{"status": <u16>, "body": <raw JSON>}`, where `status` is the HTTP-equivalent status (200 ok / 202 pending / 403 not-approved / 4xx–5xx error) and `body` is the dispatch's JSON body embedded as RAW JSON (never a double-encoded string). A null pointer or invalid UTF-8 in either argument yields a well-formed error envelope, never undefined behavior. |
+| `dig_runtime_start` | `void dig_runtime_start(void)` | Initialize the runtime FULLY: build the node engine + tokio runtime, load the §21.9 identity, prepare the cache, and start the wallet host. Idempotent; the FIRST `dig_runtime_start*` call fixes the mode. |
+| `dig_runtime_start_wallet` | `void dig_runtime_start_wallet(void)` | Initialize the runtime WALLET-ONLY: bring up the wallet host + tokio runtime with NO node engine (no P2P/cache/`dig_rpc`). What the DIG Browser calls at startup. Idempotent; the FIRST `dig_runtime_start*` call fixes the mode. |
+| `dig_rpc` | `char* dig_rpc(const char* request_json)` | Execute ONE DIG JSON-RPC request in-process and return the JSON-RPC response text. In WALLET-ONLY mode there is no node engine, so it returns a well-formed JSON-RPC error (`code -32000`, "node engine not available: dig-runtime started wallet-only") rather than spinning one up. Returns NULL only on a null/invalid input pointer or allocation failure. |
+| `dig_wallet_rpc` | `char* dig_wallet_rpc(const char* origin, const char* request_json)` | Execute ONE wallet request (§16) for the calling page's web origin and return a JSON ENVELOPE `{"status": <u16>, "body": <raw JSON>}`, where `status` is the HTTP-equivalent status (200 ok / 202 pending / 403 not-approved / 4xx–5xx error) and `body` is the dispatch's JSON body embedded as RAW JSON (never a double-encoded string). Present in BOTH start modes. A null pointer or invalid UTF-8 in either argument yields a well-formed error envelope, never undefined behavior. |
 | `dig_free` | `void dig_free(char* ptr)` | Free a string previously returned by `dig_rpc`/`dig_wallet_rpc`. NULL is ignored. |
 
 - **String ownership.** `request_json` and `origin` are NUL-terminated UTF-8 strings OWNED BY THE
@@ -789,6 +808,38 @@ the FFI boundary):
   approval gate, the unlocked session, and the signer source are shared between the FFI path and the
   loopback wallet UI. The `origin` argument is supplied first-hand by the browser and is therefore
   UNSPOOFABLE (unlike a header a page could forge); the approval gate (§16) keys on it.
+
+### 15.1. Read-crypto FFI — dig_read_verify_decrypt
+
+The browser is NATIVE, so it verifies + decrypts served `.dig` content by calling the `digstore-core`
+read-crypto Rust DIRECTLY over this C-ABI — NOT wasm (wasm is ONLY for webpages: hub / extension / SDK).
+It is the SAME `digstore-core` crypto the webpage `dig-client-wasm` wraps as `decryptResource`, so a
+native browser read and a webpage read derive the IDENTICAL key and enforce the IDENTICAL proof — ONE
+Rust impl, two bindings. This call needs NO runtime and NO node engine: it is pure crypto over bytes the
+caller already fetched from an external node (§5.3), so it works whether or not a `dig_runtime_start*`
+has run.
+
+| Export | Signature | Behavior |
+|---|---|---|
+| `dig_read_verify_decrypt` | `int32_t dig_read_verify_decrypt(const char* store_id_hex, const char* resource_key, const uint8_t* ciphertext, size_t ciphertext_len, const char* proof_b64, const char* trusted_root_hex, const char* salt_hex, const uint32_t* chunk_lens, size_t chunk_lens_len, uint8_t** out_ptr, size_t* out_len)` | Verify the served `ciphertext`'s Merkle inclusion against the chain-anchored `trusted_root_hex`, THEN AES-256-GCM-SIV-decrypt it — fail-closed (verify gates decrypt). On success returns `DIG_READ_OK` and writes a heap plaintext buffer to `*out_ptr`/`*out_len`; on ANY failure returns a `DIG_READ_*` code and leaves `*out_ptr`/`*out_len` null/0 (nothing to free). |
+| `dig_bytes_free` | `void dig_bytes_free(uint8_t* ptr, size_t len)` | Free a plaintext buffer returned by `dig_read_verify_decrypt`. The `(ptr, len)` pair MUST be exactly one success's output. NULL is ignored. |
+
+- **Inputs.** `store_id_hex` and `trusted_root_hex` are 64-hex (required). `resource_key` is the
+  resource path (required; EMPTY resolves to the §8.5 default view `index.html`). `ciphertext` is the
+  plain concatenation of the per-chunk ciphertexts (`ciphertext_len == 0` allowed with a null pointer).
+  `proof_b64` is the base64 `X-Dig-Inclusion-Proof` header wire form (the Chia streamable `MerkleProof`
+  codec). `salt_hex` is the 64-hex private-store secret salt, or NULL/empty for a PUBLIC store.
+  `chunk_lens` are the per-chunk CIPHERTEXT byte lengths in order (NULL/0 ⇒ a single chunk) and MUST sum
+  to `ciphertext_len`.
+- **Status codes.** `DIG_READ_OK = 0`; `DIG_READ_BAD_INPUT = 1` (malformed argument — bad hex/base64,
+  or `chunk_lens` not summing to `ciphertext_len`); `DIG_READ_VERIFY_FAILED = 2` (the served bytes'
+  proof does NOT chain to the chain-anchored root — a tampered chunk or a decoy/wrong-store response);
+  `DIG_READ_DECRYPT_FAILED = 3` (AES-256-GCM-SIV tag failure — a wrong key/salt or tampered ciphertext);
+  `DIG_READ_INTERNAL = 4` (a caught panic or allocation failure). Every failure is fail-closed.
+- **Buffer ownership.** The `out_ptr` buffer is OWNED BY THE LIBRARY; the caller MUST return it to
+  `dig_bytes_free` EXACTLY ONCE with the matching `out_len`. This is a DISTINCT allocator discipline from
+  the `dig_free` C-string path — never cross the two (a `dig_read_verify_decrypt` buffer to `dig_free`,
+  or a `dig_rpc` string to `dig_bytes_free`, is undefined behavior).
 
 ---
 
