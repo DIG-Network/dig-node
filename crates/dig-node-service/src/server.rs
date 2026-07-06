@@ -407,7 +407,7 @@ pub async fn serve(config: Config) -> std::io::Result<()> {
 ///
 /// The node opens TWO loopback listeners for the SAME app:
 ///
-/// 1. **`127.0.0.1:<port>`** (default 8080) — `http://localhost:<port>`. **Always
+/// 1. **`127.0.0.1:<port>`** (default 9778, #132) — `http://localhost:<port>`. **Always
 ///    on** (unprivileged, conflict-free). A failure to bind this is FATAL — the
 ///    node has no endpoint, so `serve` returns the error (mapped to `BIND_FAILED`).
 /// 2. **`127.0.0.2:80`** — bare `http://dig.local` (no port), matching the
@@ -549,10 +549,10 @@ mod tests {
         for ok in [
             "chrome-extension://abcdefghijklmnop",
             "http://localhost",
-            "http://localhost:8080",
+            "http://localhost:9778",
             "http://dig.local",
             "http://dig.local:80",
-            "http://127.0.0.1:8080",
+            "http://127.0.0.1:9778",
             "http://127.0.0.2",
         ] {
             assert!(

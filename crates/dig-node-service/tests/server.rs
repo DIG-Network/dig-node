@@ -323,7 +323,7 @@ async fn host_allowlist_accepts_dig_local_and_localhost() {
     for host in [
         "dig.local",
         "dig.local:80",
-        "localhost:8080",
+        "localhost:9778",
         "127.0.0.1",
         "127.0.0.2:80",
     ] {
@@ -801,4 +801,105 @@ async fn control_cors_preflight_allows_the_control_token_header() {
         allow_headers.contains("x-dig-control-token"),
         "preflight must allow the control-token header, got: {allow_headers}"
     );
+}
+
+// ===========================================================================
+// #130 cross-repo node-control CONTRACT conformance.
+//
+// The dig-chrome-extension node-control UI is written against THIS interface
+// (SYSTEM.md → "dig-node control interface" is the source of truth). These tests
+// pin the exact field names the extension consumes so a one-sided dig-node change
+// can never silently break the extension's node-status panel. If any assertion
+// here fails, the extension's `src/lib/dig-control.ts` reader breaks in lockstep —
+// change BOTH sides in one coordinated unit (cross-repo-contracts skill).
+// ===========================================================================
+
+/// The `control.status` result MUST carry the exact snake_case fields the
+/// extension's `ControlStatusPayload` + `controlPanelViewModel` read
+/// (`dig-chrome-extension/src/lib/dig-control.ts`): `hosted_store_count`,
+/// `pinned_store_count`, `cached_capsule_count`, `cache.used_bytes`,
+/// `sync.available`, `upstream`. A rename here shows the extension `'—'` for every
+/// stat, so this is the contract pin.
+#[tokio::test]
+async fn control_status_emits_the_extension_consumed_field_names() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.status" }),
+        Some(&token),
+    )
+    .await;
+    let r = &resp["result"];
+    // Store/capsule counters the ControlTab renders.
+    assert!(
+        r["hosted_store_count"].is_u64(),
+        "extension reads status.hosted_store_count"
+    );
+    assert!(
+        r["pinned_store_count"].is_u64(),
+        "extension reads status.pinned_store_count (hosted-stores fallback)"
+    );
+    assert!(
+        r["cached_capsule_count"].is_u64(),
+        "extension reads status.cached_capsule_count"
+    );
+    // Nested cache.used_bytes (the panel's cache-usage line).
+    assert!(
+        r["cache"]["used_bytes"].is_u64(),
+        "extension reads status.cache.used_bytes"
+    );
+    // Nested sync.available (the panel's sync toggle state).
+    assert!(
+        r["sync"]["available"].is_boolean(),
+        "extension reads status.sync.available"
+    );
+    // Upstream line.
+    assert!(r["upstream"].is_string(), "extension reads status.upstream");
+}
+
+/// A `control.*` call the extension makes WITHOUT the local token (a sandboxed MV3
+/// extension cannot read `<config_dir>/control-token`) MUST be answered with the
+/// canonical `UNAUTHORIZED` code `-32030` and machine `data.code` `"UNAUTHORIZED"` —
+/// the exact value the extension's `isUnauthorizedControlResult` / `CONTROL_ERR`
+/// branch on to fall back to the "manage in the DIG Browser" affordance.
+#[tokio::test]
+async fn control_unauthorized_matches_the_extension_error_contract() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+
+    let resp = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.status" }),
+        None,
+    )
+    .await;
+    assert_eq!(resp["error"]["code"], json!(-32030));
+    assert_eq!(resp["error"]["data"]["code"], json!("UNAUTHORIZED"));
+}
+
+/// `GET /health` is the OPEN status probe the extension's node-detection + status
+/// UI relies on (no control token). It MUST carry the stable probe contract fields
+/// (`status`, `version`, `mode`, `upstream`, `cache`) so a consumer can display node
+/// liveness + identity without the token-gated control plane.
+#[tokio::test]
+async fn health_carries_the_open_status_probe_contract() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    let resp: Value = client()
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["status"], json!("ok"));
+    assert_eq!(resp["mode"], json!("local-node"));
+    assert!(resp["version"].is_string());
+    assert_eq!(resp["upstream"], json!(upstream));
+    assert!(resp["cache"]["used_bytes"].is_u64());
+    assert!(resp["cache"]["cap_bytes"].is_u64());
 }

@@ -210,12 +210,12 @@ mod tests {
     fn success_envelope_folds_result_fields_and_marks_ok() {
         let env = success_envelope(
             "status",
-            json!({ "serving": true, "addr": "127.0.0.1:8080" }),
+            json!({ "serving": true, "addr": "127.0.0.1:9778" }),
         );
         assert_eq!(env["ok"], json!(true));
         assert_eq!(env["action"], json!("status"));
         assert_eq!(env["serving"], json!(true));
-        assert_eq!(env["addr"], json!("127.0.0.1:8080"));
+        assert_eq!(env["addr"], json!("127.0.0.1:9778"));
         assert_eq!(env["service"], json!("dig-node"));
     }
 
