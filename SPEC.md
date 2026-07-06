@@ -147,15 +147,21 @@ ARE `DIG_NODE_*`, full stop.
 
 | Variable | Meaning | Default | Rules |
 |---|---|---|---|
-| `DIG_NODE_PORT` | localhost-listener bind port | `8080` | Parsed as `u16`; `0`, unparsable, or unset → default. |
+| `DIG_NODE_PORT` | localhost-listener bind port | `9778` | Parsed as `u16`; `0`, unparsable, or unset → default. |
 | `DIG_NODE_HOST` | localhost-listener bind IP | `127.0.0.1` | Parsed as `IpAddr`; unparsable/unset → default. |
 | `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | `https://rpc.dig.net` | Normalized (§3.3); highest precedence (§3.4). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
 | `DIG_NODE_DIGLOCAL` | toggle for the bare-`http://dig.local` listener | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
 
-The default port is `8080` (not `80`) because port 80 requires elevation on most OSes; the DIG
-Chrome extension's `server.host` MUST be set to `localhost:8080` to match (its own default is
-`localhost:80`).
+The default port is the UNCOMMON high port **`9778`** (not `80`/`8080`). Port 80 requires elevation
+on most OSes, and both `80` and `8080` are the collision-prone common-dev ports most likely already
+bound on a developer machine; `9778` is deliberately clear of the common-dev set
+(80/443/3000/5000/8000/8080/8888/9000) and well-known service ports. It is the sibling of the
+dig-wallet HTTP API's `9777` (wallet `9777`, node `9778`) and matches the local-node port the
+digstore §5.3 resolver already expects (`DEFAULT_LOCAL_NODE_PORT`). Every consumer of the §5.3
+`localhost` tier — the DIG Chrome extension's `server.host` default, the dig-installer, and the DIG
+Browser — MUST target `localhost:9778` to match. `DIG_NODE_PORT` overrides it; the `http://dig.local`
+listener (`127.0.0.2:80`) is unaffected — only this localhost port changed (#132).
 
 The variables above are the shell's public bind/upstream/cache knobs. The node ENGINE library
 (`dig-node-core`) additionally reads the following variables directly from the environment; the shell
@@ -223,7 +229,7 @@ atomic temp-file + rename in the same directory, and MUST preserve all keys the 
 
 The server opens up to two listeners for the SAME router:
 
-1. **`<DIG_NODE_HOST>:<DIG_NODE_PORT>`** (default `127.0.0.1:8080`) — always on. A bind
+1. **`<DIG_NODE_HOST>:<DIG_NODE_PORT>`** (default `127.0.0.1:9778`, §3.2) — always on. A bind
    failure here is FATAL (`serve` returns the error; CLI exit `BIND_FAILED`, §8.4).
 2. **`127.0.0.2:80`** — the bare-`http://dig.local` listener (constants `DIG_LOCAL_IP` =
    `127.0.0.2`, `DIG_LOCAL_PORT` = `80`, `DIG_LOCAL_HOST` = `dig.local`). This bind is
@@ -419,7 +425,20 @@ The canonical first-fetch discovery document: service identity + versions + prot
 
 ## 7. Control plane (`control.*`)
 
+This section is the **canonical node-control interface** — the ONE contract every node
+controller speaks (the DIG Chrome extension's node UI, the DIG Browser "My Node" surface, the CLI,
+any local tool). It is the cross-repo source of truth mirrored in the superproject `SYSTEM.md`
+("dig-node control interface"); a consumer's node-control UI conforms to the method names, params,
+result shapes, health/status schema, error codes, token model, and served port defined here — never
+a parallel interface. A change to any of them is a coordinated cross-repo change (§4.1 in the
+ecosystem contract) updating this SPEC, `SYSTEM.md`, and every consumer in one unit.
+
 ### 7.1. Role split
+
+The read methods (`dig.*`, `cache.*`, `rpc.discover`) are open to any local consumer. The
+`control.*` namespace MANAGES the node (pins, cache, sync, config, status) and is gated so a web
+page a user merely visits — which can reach loopback but cannot read local files — cannot drive
+the node.
 
 The read methods (`dig.*`, `cache.*`, `rpc.discover`) are open to any local consumer. The
 `control.*` namespace MANAGES the node (pins, cache, sync, config, status) and is gated so a web
@@ -492,6 +511,49 @@ Persisted under the shell-namespaced `pinned_stores` key in `config.json` (§3.6
 entry, never duplicates); `unpin` of an absent store is a no-op reporting `unpinned: false`. Pins
 survive cache eviction: a pinned-but-uncached store MUST still appear in
 `control.hostedStores.list`.
+
+### 7.7. Consumer conformance (the cross-repo parity contract)
+
+A node controller is any local surface that queries or manages a running dig-node. All consume the
+one interface above; what differs is only how far each reaches, gated by whether it can read the
+same-host control token.
+
+- **Open status/discovery surface (no token — every consumer, including a sandboxed web extension).**
+  A consumer that cannot read a local file (a Manifest V3 browser extension, a visited web page) is
+  limited to the UNGATED surface: `GET /health`, `GET /version`, `GET /.well-known/dig-node.json`,
+  `rpc.discover`/`GET /openrpc.json`, and the read methods (`dig.*`/`cache.*`). This is sufficient to
+  render node liveness, identity (service/version/commit), the bound addr, upstream, and cache
+  cap/used. Node detection uses the §5.3 ladder (explicit `server.host` override > `dig.local` >
+  `localhost:9778` > `rpc.dig.net`); the localhost tier MUST target the §3.2 default port `9778`.
+- **Token-gated management (a same-host process controller).** The mutating + privacy-sensitive
+  `control.*` methods require the control token from `<config_dir>/control-token` (§7.3). Only a
+  process that can read that file — the DIG Browser "My Node" UI (a native process), the CLI, a local
+  tool — can drive them. A sandboxed extension MUST NOT attempt to read the token; it MAY still CALL
+  `control.status` and, on the canonical `-32030 UNAUTHORIZED` (§10), fall back to deep-linking a
+  same-host controller for management. It MUST branch on the machine `data.code` (`"UNAUTHORIZED"`),
+  never the numeric value alone.
+- **`control.status` is the canonical status shape (a stable consumer contract).** A status consumer
+  MUST be able to read these fields from `control.status` `result` (snake_case, additive-only): the
+  store/capsule counters `hosted_store_count`, `pinned_store_count`, `cached_capsule_count`; the
+  nested `cache.used_bytes` (and `cache.cap_bytes`); the nested `sync.available`; and `upstream`.
+  Renaming or removing any of them is a breaking cross-repo change. The `control.status` field-name
+  conformance is pinned by an integration test (`tests/server.rs`).
+- **Lifecycle (start/stop/restart) is the CLI/OS-service contract, NOT an RPC.** A controller starts,
+  stops, or restarts a node through the §8 CLI subcommands (`install`/`uninstall`/`start`/`stop`/
+  `status`) and the §9 OS-service manager — never a `control.*` RPC (a node cannot RPC-restart itself,
+  and lifecycle is an OS-service-manager concern). Liveness is observed via `GET /health` (`status:
+  "ok"`) and `control.status` (`running: true`); `dig-node status` probes `/health` (§8.3). There is
+  no `control.start`/`control.stop`/`control.restart`.
+
+### 7.8. Integration-test launch surface
+
+To let a consumer's end-to-end test exercise parity against a REAL node, `dig-node run` MUST bring up
+a clean foreground node with zero out-of-band setup: it binds `127.0.0.1:$DIG_NODE_PORT` (default
+`9778`), prints its readiness line to stderr, serves `GET /health` immediately, and exits gracefully
+on Ctrl-C/SIGTERM (§9.5) so a test harness can `spawn → poll GET /health → drive control.* / read →
+signal-stop`. `DIG_NODE_PORT` MUST be honored so a test picks a free port; `DIG_NODE_DIGLOCAL=0`
+SHOULD be set in tests to skip the privileged `:80` dig.local bind. The control token for a
+token-gated test is read from `<config_dir>/control-token` after startup.
 
 ---
 

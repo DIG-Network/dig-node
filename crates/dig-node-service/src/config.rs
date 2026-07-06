@@ -35,10 +35,16 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-/// Default loopback bind port. The DIG Chrome extension defaults its `server.host`
-/// to `localhost:80`, but port 80 needs elevation on most OSes, so dig-node
-/// defaults to 8080 (set the extension's server host to `localhost:8080` to match).
-pub const DEFAULT_PORT: u16 = 8080;
+/// Default loopback bind port — an UNCOMMON high port, deliberately clear of the
+/// collision-prone common-dev ports (80/443/3000/5000/8000/8080/8888/9000) that a
+/// dev machine is most likely to already have in use (#132). `9778` is the sibling
+/// of the dig-wallet HTTP API's `9777` (wallet on `9777`, node on `9778`) and is the
+/// port the digstore-remote §5.3 resolver already expects a local node on
+/// (`DEFAULT_LOCAL_NODE_PORT`), so aligning here removes that cross-repo drift. Every
+/// consumer of the §5.3 `localhost` tier (the extension's `server.host` default, the
+/// installer, the DIG Browser) MUST target `9778` to match. `DIG_NODE_PORT` overrides
+/// it. (`dig.local` on `127.0.0.2:80` is unaffected — only this localhost port moves.)
+pub const DEFAULT_PORT: u16 = 9778;
 
 /// Default upstream DIG RPC the embedded node proxies to on a local cache miss.
 pub const DEFAULT_UPSTREAM: &str = "https://rpc.dig.net";
@@ -224,7 +230,7 @@ pub fn host_is_allowed(host_header: Option<&str>) -> bool {
         return true;
     }
     // Strip a trailing `:port` (IPv4 / hostname forms only — the node binds IPv4
-    // loopback, never `[::1]`). `dig.local:80`, `localhost:8080`, `127.0.0.1` all
+    // loopback, never `[::1]`). `dig.local:80`, `localhost:9778`, `127.0.0.1` all
     // reduce to their hostname for the allowlist check.
     let name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
     matches!(
@@ -299,10 +305,13 @@ mod tests {
     }
 
     #[test]
-    fn default_config_is_loopback_8080() {
+    fn default_config_is_loopback_9778() {
         let c = Config::default();
         assert_eq!(c.port, DEFAULT_PORT);
-        assert_eq!(c.bind_addr(), "127.0.0.1:8080");
+        // #132: the default localhost port is the uncommon high port 9778 (the
+        // dig-wallet 9777 sibling), NOT the collision-prone 8080.
+        assert_eq!(DEFAULT_PORT, 9778);
+        assert_eq!(c.bind_addr(), "127.0.0.1:9778");
         assert_eq!(c.upstream, DEFAULT_UPSTREAM);
     }
 
@@ -398,9 +407,9 @@ mod tests {
             "dig.local",
             "dig.local:80",
             "localhost",
-            "localhost:8080",
+            "localhost:9778",
             "127.0.0.1",
-            "127.0.0.1:8080",
+            "127.0.0.1:9778",
             "127.0.0.2",
             "127.0.0.2:80",
             "  dig.local  ",

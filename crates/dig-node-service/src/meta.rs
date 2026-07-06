@@ -714,7 +714,7 @@ pub fn openrpc_document() -> Value {
             },
         },
         "servers": [
-            { "name": "loopback", "url": "http://127.0.0.1:8080/" }
+            { "name": "loopback", "url": "http://127.0.0.1:9778/" }
         ],
         "methods": method_objs,
         "components": {
@@ -960,9 +960,9 @@ mod tests {
 
     #[test]
     fn well_known_document_exposes_addr_cache_methods_and_errors() {
-        let doc = well_known_document("127.0.0.1:8080", "https://rpc.dig.net", 1024, 0);
+        let doc = well_known_document("127.0.0.1:9778", "https://rpc.dig.net", 1024, 0);
         assert_eq!(doc["service"], json!("dig-node"));
-        assert_eq!(doc["addr"], json!("127.0.0.1:8080"));
+        assert_eq!(doc["addr"], json!("127.0.0.1:9778"));
         assert!(doc["cache"]["dir"].is_string());
         assert_eq!(doc["cache"]["cap_bytes"], json!(1024));
         // #96: the discovery doc reports whether the cache is the shared canonical
