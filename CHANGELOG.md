@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.5.1] - 2026-07-06
+
+### Documentation
+- **dig-node:** Reconcile the two cache-method families in the control contract (#6)
+
 ## [0.5.0] - 2026-07-06
 
 ### Features
