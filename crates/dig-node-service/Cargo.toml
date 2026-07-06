@@ -1,6 +1,10 @@
 [package]
 name = "dig-node-service"
-version = "0.4.1"
+# Inherits the workspace release version (root [workspace.package].version) so the
+# produced `dig-node` binary, the tag-on-merge tag, and the version-increment gate
+# all read ONE version from the root manifest (§2.4/§3.6). Bump it in Cargo.toml
+# (root) per SemVer.
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "The localhost DIG node OS-service binary (`dig-node`): a self-contained, cross-platform Rust binary installable as a Windows/Linux/macOS service. Wraps the canonical `dig-node` node library (the same node the native DIG Browser runs in-process) with an axum HTTP transport + control plane + CLI + OS-service registration, exposing the rpc.dig.net JSON-RPC contract (dig.getContent, dig.getAnchoredRoot, cache.*, control.*) on 127.0.0.1."

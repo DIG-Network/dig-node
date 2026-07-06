@@ -28,7 +28,7 @@ store the node has cached locally is served without leaving the machine.
 Download (or build — see below) the `dig-node` binary for your OS, then:
 
 ```bash
-dig-node install     # register as an auto-starting OS service on 127.0.0.1:8080
+dig-node install     # register as an auto-starting OS service on 127.0.0.1:9778
 dig-node start       # start it now
 dig-node status      # confirm it's serving (probes /health)
 ```
@@ -62,11 +62,12 @@ dig-node uninstall
 In the DIG Chrome extension's options, set **server host** to:
 
 ```
-localhost:8080
+localhost:9778
 ```
 
-(The extension defaults to `localhost:80`; port 80 needs elevated privileges on most OSes, so the
-node defaults to `8080`. Set the extension to match, or run the node on `80` if you can.)
+(dig-node defaults to the uncommon high port `9778` — deliberately clear of the collision-prone
+common-dev ports like `80`/`8080`, and the sibling of the dig-wallet API's `9777`. The extension's
+`server.host` default targets `9778` to match. Override with `DIG_NODE_PORT` if you need another port.)
 
 ## Addressing — `http://dig.local` (no port) + `http://localhost:<port>` (#91)
 
@@ -74,7 +75,7 @@ The node opens **two loopback listeners for the same app** so it is reachable tw
 
 | Address | Listener | Always on? |
 |---|---|---|
-| **`http://localhost:<port>`** (default `localhost:8080`) | `127.0.0.1:<port>` | **Yes** — unprivileged, conflict-free. The guaranteed fallback. |
+| **`http://localhost:<port>`** (default `localhost:9778`) | `127.0.0.1:<port>` | **Yes** — unprivileged, conflict-free. The guaranteed fallback. |
 | **`http://dig.local`** (no port) | `127.0.0.2:80` | **Best-effort** — needs the privileged `:80` bind (+ on macOS a loopback alias). Falls back gracefully if it can't bind. |
 
 - The bare `http://dig.local` URL (no `:port`) works because [`dig-installer`](https://github.com/DIG-Network/dig-installer)
@@ -108,7 +109,7 @@ The node opens **two loopback listeners for the same app** so it is reachable tw
 ## Run in the foreground (no service)
 
 ```bash
-dig-node run         # serve on 127.0.0.1:8080 until Ctrl-C
+dig-node run         # serve on 127.0.0.1:9778 until Ctrl-C
 # or simply:
 dig-node             # bare invocation == run
 ```
@@ -120,7 +121,7 @@ service's environment so the service serves identically):
 
 | Env var | Default | Meaning |
 |---|---|---|
-| `DIG_NODE_PORT` | `8080` | Port the node listens on (`127.0.0.1`). |
+| `DIG_NODE_PORT` | `9778` | Port the node listens on (`127.0.0.1`). Uncommon high port (dig-wallet `9777` sibling) to avoid `80`/`8080` collisions. |
 | `DIG_NODE_HOST` | `127.0.0.1` | Bind address (loopback — the node is a same-machine endpoint). |
 | `DIG_RPC_UPSTREAM` | `https://rpc.dig.net` | Upstream DIG RPC the embedded node proxies ciphertext/proof requests to on a local cache miss, and relays unhandled methods to. |
 | `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). **Leave it unset to share one cache with the DIG Browser** — see below. |
@@ -250,10 +251,10 @@ to **stderr**.
 
 ```bash
 dig-node status --json
-# {"ok":true,"action":"status","service":"dig-node","version":"0.3.0","serving":false,"addr":"127.0.0.1:8080",…}
+# {"ok":true,"action":"status","service":"dig-node","version":"0.5.0","serving":false,"addr":"127.0.0.1:9778",…}
 
 dig-node install --json
-# {"ok":true,"action":"install","installed":true,"registered":true,"started":false,"label":"…","scope":"system","addr":"127.0.0.1:8080",…}
+# {"ok":true,"action":"install","installed":true,"registered":true,"started":false,"label":"…","scope":"system","addr":"127.0.0.1:9778",…}
 ```
 
 On failure: `{ "ok":false, "action":…, "error":{ "code", "exit_code", "message", "hint" } }`.

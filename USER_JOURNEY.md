@@ -38,7 +38,7 @@ The user installs `dig-node` as part of the DIG experience. The recommended path
 downloaded directly from the repo's GitHub Releases (per-OS, self-contained — no Node runtime).
 
 ```bash
-dig-node install     # register as an auto-starting OS service on 127.0.0.1:8080
+dig-node install     # register as an auto-starting OS service on 127.0.0.1:9778
 dig-node start       # start it now
 dig-node status      # confirm it's serving (probes /health)
 ```
@@ -56,13 +56,13 @@ speaks the Windows Service Control Protocol so the SCM does not kill it with err
 
 ### 2. The service runs
 
-Once installed, `dig-node` runs on `127.0.0.1:8080` (configurable — see the env table in the
+Once installed, `dig-node` runs on `127.0.0.1:9778` (configurable — see the env table in the
 README) and auto-starts on boot/login. It is **loopback-only**: it is a same-machine endpoint for
 the browser/extension, never a public server.
 
 It opens **two loopback listeners for the same app** (#91), so it is reachable two ways at once:
 
-- **`http://localhost:<port>`** (default `localhost:8080`, on `127.0.0.1`) — **always on**
+- **`http://localhost:<port>`** (default `localhost:9778`, on `127.0.0.1`) — **always on**
   (unprivileged, conflict-free); the guaranteed fallback.
 - **`http://dig.local`** (no port, on `127.0.0.2:80`) — **best-effort**: the dig-installer writes a
   hosts entry `127.0.0.2  dig.local` and the node binds `127.0.0.2:80`, so the bare port-free URL
@@ -78,7 +78,7 @@ per-platform `:80` privilege / macOS-alias caveats.
 ### 3. The extension (or browser) points at it
 
 In the DIG Chrome extension's options, the **server host** is set to `dig.local` (port-free, when
-the `:80` listener is up) or `localhost:8080` (the always-on fallback). From then on the extension
+the `:80` listener is up) or `localhost:9778` (the always-on fallback). From then on the extension
 resolves `chia://` URLs through the local node instead of `rpc.dig.net`. (The extension's resolver
 already tries `dig.local` first, then `localhost:<port>`.)
 
@@ -179,7 +179,7 @@ every subcommand (machine output to stdout, prose to stderr).
 | Hands off to / from | What crosses the boundary |
 |---|---|
 | **dig-installer → dig-node** | Installer downloads the pinned `dig-node` binary and runs `dig-node install`; the resolved plan/version is the install contract. |
-| **dig-chrome-extension ↔ dig-node** | The extension's *server host* points at `localhost:8080`; it sends `dig.getContent` and **verifies + decrypts** the returned ciphertext locally (read-crypto is the same `dig_client` WASM the hub uses). |
+| **dig-chrome-extension ↔ dig-node** | The extension's *server host* points at `localhost:9778`; it sends `dig.getContent` and **verifies + decrypts** the returned ciphertext locally (read-crypto is the same `dig_client` WASM the hub uses). |
 | **dig-node → rpc.dig.net (upstream)** | On a cache miss / unhandled method, `dig-node` blind-fetches ciphertext + proof and relays passthrough methods over the same JSON-RPC read contract. |
 | **dig-node ↔ digstore (`dig-node` crate)** | The read path **is** digstore's `dig_node::handle_rpc`, pinned to a digstore release tag — the same node the native DIG Browser runs in-process. One read path, one cache contract across the ecosystem. |
 | **dig-node ↔ DIG Browser (native)** | Same wire contract and cache semantics; `dig-node` is the standalone-service form for users who run the extension in a normal browser rather than the native fork. |
