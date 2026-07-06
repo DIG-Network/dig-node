@@ -555,6 +555,36 @@ signal-stop`. `DIG_NODE_PORT` MUST be honored so a test picks a free port; `DIG_
 SHOULD be set in tests to skip the privileged `:80` dig.local bind. The control token for a
 token-gated test is read from `<config_dir>/control-token` after startup.
 
+### 7.9. Cache-method families (open `cache.*` vs gated `control.cache.*`)
+
+The node exposes cache operations under TWO method families, BY DESIGN — a consumer picks the one
+its transport/authorization permits. This is a deliberate dual surface, not a duplication to
+collapse:
+
+- **`cache.*` — open, node-engine-native (no token).** `cache.getConfig`, `cache.setCapBytes`,
+  `cache.clear`, `cache.listCached`, `cache.removeCached`, `cache.fetchAndCache` — the node ENGINE's
+  own cache RPC (dispatched by `dig_node_core::handle_rpc`, `served: "local"`, §5.5), reachable by
+  any local consumer over `POST /` AND over the in-process FFI (`dig_rpc`) the DIG Browser's
+  `chrome://settings` `DigCacheHandler` calls. Loopback-only is the only boundary; these are NOT
+  token-gated.
+- **`control.cache.*` — token-gated operator aliases.** `control.cache.get`, `control.cache.setCap`,
+  `control.cache.clear` (§7.4) — the control plane's cache view/cap/clear, requiring the control
+  token (§7.2). They wrap the SAME node-library cache operations behind the control-plane gate so a
+  same-host process controller manages the cache through the one authorized `control.*` surface.
+
+The name differences are intentional and STABLE: `getConfig`/`setCapBytes` are the engine's
+long-standing FFI/RPC names; `get`/`setCap` are the control plane's terse aliases. Neither family is
+renamed (backwards-compat). Guidance: a controller holding the token SHOULD use `control.cache.*`
+(uniform control surface); a consumer without the token — a sandboxed extension, or the in-process
+FFI — uses `cache.*`. `control.cache.get` mirrors `cache.getConfig`, `control.cache.setCap` mirrors
+`cache.setCapBytes`, `control.cache.clear` mirrors `cache.clear`.
+
+The full authoritative method + error set (both families, the `control.*` operator methods, and the
+read/peer methods) is the one defined by this SPEC and mirrored in `SYSTEM.md`; consumers implement
+SUBSETS of it (the extension drives `control.status` + `dig.getContent`; the browser a wider subset)
+but MUST NOT diverge names or shapes. The eventual single shared home for this catalogue is the
+`dig-rpc-types` crate (§1.4/§1.5) — until it is wired in, this SPEC is authoritative.
+
 ---
 
 ## 8. CLI contract
