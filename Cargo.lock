@@ -1742,6 +1742,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
+name = "dig-clvm"
+version = "0.1.1"
+source = "git+https://github.com/DIG-Network/dig-clvm.git?rev=3808440dd89863f806d47fabd548edcb76650fda#3808440dd89863f806d47fabd548edcb76650fda"
+dependencies = [
+ "chia-bls 0.26.0",
+ "chia-consensus",
+ "chia-protocol",
+ "chia-puzzles",
+ "chia-sdk-coinset",
+ "chia-sdk-driver",
+ "chia-sdk-types 0.30.0",
+ "chia-traits 0.26.0",
+ "clvm-traits",
+ "clvm-utils",
+ "clvmr",
+ "dig-constants 0.1.0",
+ "hex",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "dig-constants"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85a16228a534843f72d269f6e6cb3b6202495195c128f1bad4c7b04b8bf70690"
+dependencies = [
+ "chia-bls 0.26.0",
+ "chia-consensus",
+ "chia-protocol",
+ "hex-literal",
+]
+
+[[package]]
 name = "dig-constants"
 version = "0.2.0"
 source = "git+https://github.com/DIG-Network/dig-constants#c27e9445e8f8d9d29595884c4f9303208ea1da56"
@@ -1795,7 +1828,7 @@ dependencies = [
  "chia-sha2 0.26.0",
  "chia-traits 0.26.0",
  "chia_streamable_macro 0.26.0",
- "dig-constants",
+ "dig-constants 0.2.0",
  "dig-nat",
  "dig-protocol",
  "futures-util",
@@ -1821,7 +1854,7 @@ version = "0.1.0"
 source = "git+https://github.com/DIG-Network/dig-nat#e54e8f0a1a0a64007a03e7cf7e774aef47fe4c38"
 dependencies = [
  "async-trait",
- "dig-constants",
+ "dig-constants 0.2.0",
  "futures",
  "futures-util",
  "igd-next",
@@ -1851,7 +1884,7 @@ dependencies = [
  "axum",
  "base64",
  "chia-protocol",
- "dig-constants",
+ "dig-constants 0.2.0",
  "dig-dht",
  "dig-download",
  "dig-gossip",
@@ -1966,6 +1999,8 @@ dependencies = [
  "chia-query",
  "chia-sdk-test",
  "chia-wallet-sdk",
+ "clvmr",
+ "dig-clvm",
  "dig-node-core",
  "digstore-chain",
  "digstore-core",
