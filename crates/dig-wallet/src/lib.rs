@@ -42,6 +42,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, Mutex};
 use zeroize::Zeroizing;
 
+// #205 phase-2: the Sage-parity wallet RPC — direct-peer chain sync, a local SQLite
+// wallet DB, the chia-query/coinset fallback tier, and the dual-transport server that
+// re-serves Sage's `endpoints.json` method surface byte-compatibly. This is an ADDITIVE
+// surface (distinct from the CHIP-0002 `window.chia` dapp responder above and the
+// wallet-UI host); see `SPEC.md §18` and `docs/design/dig-node-sage-parity-rpc.md`.
+pub mod sage;
+
 /// In-memory unlocked wallet for the session.
 struct Session {
     mnemonic: Zeroizing<String>,
