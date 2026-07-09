@@ -95,6 +95,63 @@ pub struct DerivationRow {
     pub address: String,
 }
 
+/// A reconstructed NFT row: filter columns + the full serialized `NftRecord` wire JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NftDbRow {
+    /// The launcher (singleton) id (hex).
+    pub launcher_id: String,
+    /// The current coin id (hex).
+    pub coin_id: String,
+    /// The collection id, if resolved.
+    pub collection_id: Option<String>,
+    /// The minter DID, if known.
+    pub minter_did: Option<String>,
+    /// The current owner DID, if assigned.
+    pub owner_did: Option<String>,
+    /// Human-readable name, if known.
+    pub name: Option<String>,
+    /// Whether visible in the wallet UI.
+    pub visible: bool,
+    /// The block height the current coin was created at.
+    pub created_height: Option<i64>,
+    /// The serialized `NftRecord` (the Sage wire record) for byte-parity reads.
+    pub record_json: String,
+}
+
+/// A reconstructed DID row: the launcher/coin + the full serialized `DidRecord` wire JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DidDbRow {
+    /// The launcher (singleton) id (hex).
+    pub launcher_id: String,
+    /// The current coin id (hex).
+    pub coin_id: String,
+    /// Human-readable name, if assigned.
+    pub name: Option<String>,
+    /// Whether visible in the wallet UI.
+    pub visible: bool,
+    /// The block height the current coin was created at.
+    pub created_height: Option<i64>,
+    /// The serialized `DidRecord` (the Sage wire record) for byte-parity reads.
+    pub record_json: String,
+}
+
+/// An NFT-collection row: the id/DID + the full serialized `NftCollectionRecord` wire JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NftCollectionDbRow {
+    /// The collection id.
+    pub collection_id: String,
+    /// The DID that minted the collection.
+    pub did_id: String,
+    /// The metadata collection id.
+    pub metadata_collection_id: String,
+    /// Human-readable name.
+    pub name: Option<String>,
+    /// Whether visible in the wallet UI.
+    pub visible: bool,
+    /// The serialized `NftCollectionRecord` (the Sage wire record) for byte-parity reads.
+    pub record_json: String,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_state (
     id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -151,7 +208,8 @@ CREATE TABLE IF NOT EXISTS nfts (
     name TEXT,
     metadata_json TEXT,
     visible INTEGER NOT NULL DEFAULT 1,
-    created_height INTEGER
+    created_height INTEGER,
+    record_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_nfts_collection ON nfts (collection_id);
 
@@ -160,7 +218,8 @@ CREATE TABLE IF NOT EXISTS dids (
     coin_id TEXT NOT NULL,
     name TEXT,
     visible INTEGER NOT NULL DEFAULT 1,
-    created_height INTEGER
+    created_height INTEGER,
+    record_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS nft_collections (
@@ -169,9 +228,21 @@ CREATE TABLE IF NOT EXISTS nft_collections (
     metadata_collection_id TEXT NOT NULL,
     name TEXT,
     icon TEXT,
-    visible INTEGER NOT NULL DEFAULT 1
+    visible INTEGER NOT NULL DEFAULT 1,
+    record_json TEXT
 );
 "#;
+
+/// Additive column migrations for wallet DBs created before #216 (§5.1 additive-only): the
+/// singleton-record tables gained a `record_json` column holding the full serialized Sage
+/// wire record. `CREATE TABLE IF NOT EXISTS` does not add columns to a pre-existing table,
+/// so these `ALTER TABLE … ADD COLUMN` statements run idempotently (a duplicate-column error
+/// on an already-migrated DB is ignored).
+const ADD_COLUMN_MIGRATIONS: &[&str] = &[
+    "ALTER TABLE nfts ADD COLUMN record_json TEXT",
+    "ALTER TABLE dids ADD COLUMN record_json TEXT",
+    "ALTER TABLE nft_collections ADD COLUMN record_json TEXT",
+];
 
 impl WalletDb {
     /// Open (creating if needed) a wallet DB at `path`, with WAL enabled, and apply the
@@ -212,6 +283,11 @@ impl WalletDb {
             if !stmt.is_empty() {
                 sqlx::query(stmt).execute(&mut *conn).await?;
             }
+        }
+        // Additive column migrations for pre-#216 DBs; ignore "duplicate column" on DBs the
+        // updated CREATE TABLE already covers (a fresh DB, or one already migrated).
+        for stmt in ADD_COLUMN_MIGRATIONS {
+            let _ = sqlx::query(stmt).execute(&mut *conn).await;
         }
         Ok(())
     }
@@ -606,6 +682,209 @@ impl WalletDb {
             .await?;
         Ok(did.is_some())
     }
+
+    // ---- CAT attribution (sync-time, #216) --------------------------------
+
+    /// Attribute a synced coin to a CAT asset id (and record its hint) once the sync loop
+    /// has uncurried the coin's CAT layer. Only updates an existing coin row.
+    pub async fn attribute_cat_coin(
+        &self,
+        coin_id: &str,
+        asset_id: &str,
+        hint: Option<&str>,
+    ) -> sqlx::Result<()> {
+        sqlx::query("UPDATE coins SET asset_id = ?, hint = COALESCE(?, hint) WHERE coin_id = ?")
+            .bind(asset_id)
+            .bind(hint)
+            .bind(coin_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ---- NFTs -------------------------------------------------------------
+
+    /// Insert or update a reconstructed NFT (keyed by launcher id; a later coin overwrites
+    /// the mutable fields — the current coin, owner, and wire record).
+    pub async fn upsert_nft(&self, n: &NftDbRow) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO nfts
+                (launcher_id, coin_id, collection_id, minter_did, owner_did, name,
+                 visible, created_height, record_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(launcher_id) DO UPDATE SET
+                coin_id = excluded.coin_id,
+                collection_id = excluded.collection_id,
+                minter_did = excluded.minter_did,
+                owner_did = excluded.owner_did,
+                name = excluded.name,
+                created_height = excluded.created_height,
+                record_json = excluded.record_json",
+        )
+        .bind(&n.launcher_id)
+        .bind(&n.coin_id)
+        .bind(&n.collection_id)
+        .bind(&n.minter_did)
+        .bind(&n.owner_did)
+        .bind(&n.name)
+        .bind(n.visible)
+        .bind(n.created_height)
+        .bind(&n.record_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn nft_from_row(r: &sqlx::sqlite::SqliteRow) -> NftDbRow {
+        NftDbRow {
+            launcher_id: r.get("launcher_id"),
+            coin_id: r.get("coin_id"),
+            collection_id: r.get("collection_id"),
+            minter_did: r.get("minter_did"),
+            owner_did: r.get("owner_did"),
+            name: r.get("name"),
+            visible: r.get::<i64, _>("visible") != 0,
+            created_height: r.get("created_height"),
+            record_json: r.get::<Option<String>, _>("record_json").unwrap_or_default(),
+        }
+    }
+
+    /// All reconstructed NFTs (higher layers filter/paginate in Rust — one small wallet).
+    pub async fn all_nfts(&self) -> sqlx::Result<Vec<NftDbRow>> {
+        let rows = sqlx::query("SELECT * FROM nfts ORDER BY launcher_id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(Self::nft_from_row).collect())
+    }
+
+    /// One reconstructed NFT by launcher id.
+    pub async fn nft(&self, launcher_id: &str) -> sqlx::Result<Option<NftDbRow>> {
+        Ok(sqlx::query("SELECT * FROM nfts WHERE launcher_id = ?")
+            .bind(launcher_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(Self::nft_from_row))
+    }
+
+    /// Store/refresh an NFT's off-chain metadata JSON (CHIP-0015) once fetched.
+    pub async fn set_nft_metadata_json(&self, launcher_id: &str, json: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE nfts SET metadata_json = ? WHERE launcher_id = ?")
+            .bind(json)
+            .bind(launcher_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// An NFT's stored off-chain metadata JSON, if fetched.
+    pub async fn nft_metadata_json(&self, launcher_id: &str) -> sqlx::Result<Option<String>> {
+        let row = sqlx::query("SELECT metadata_json FROM nfts WHERE launcher_id = ?")
+            .bind(launcher_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("metadata_json")))
+    }
+
+    // ---- DIDs -------------------------------------------------------------
+
+    /// Insert or update a reconstructed DID (keyed by launcher id).
+    pub async fn upsert_did(&self, d: &DidDbRow) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO dids (launcher_id, coin_id, name, visible, created_height, record_json)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(launcher_id) DO UPDATE SET
+                coin_id = excluded.coin_id,
+                name = COALESCE(excluded.name, dids.name),
+                created_height = excluded.created_height,
+                record_json = excluded.record_json",
+        )
+        .bind(&d.launcher_id)
+        .bind(&d.coin_id)
+        .bind(&d.name)
+        .bind(d.visible)
+        .bind(d.created_height)
+        .bind(&d.record_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn did_from_row(r: &sqlx::sqlite::SqliteRow) -> DidDbRow {
+        DidDbRow {
+            launcher_id: r.get("launcher_id"),
+            coin_id: r.get("coin_id"),
+            name: r.get("name"),
+            visible: r.get::<i64, _>("visible") != 0,
+            created_height: r.get("created_height"),
+            record_json: r.get::<Option<String>, _>("record_json").unwrap_or_default(),
+        }
+    }
+
+    /// All reconstructed DIDs.
+    pub async fn all_dids(&self) -> sqlx::Result<Vec<DidDbRow>> {
+        let rows = sqlx::query("SELECT * FROM dids ORDER BY launcher_id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(Self::did_from_row).collect())
+    }
+
+    // ---- NFT collections --------------------------------------------------
+
+    /// Insert or update an NFT collection (keyed by collection id).
+    pub async fn upsert_nft_collection(&self, c: &NftCollectionDbRow) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO nft_collections
+                (collection_id, did_id, metadata_collection_id, name, visible, record_json)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(collection_id) DO UPDATE SET
+                did_id = excluded.did_id,
+                metadata_collection_id = excluded.metadata_collection_id,
+                name = excluded.name,
+                record_json = excluded.record_json",
+        )
+        .bind(&c.collection_id)
+        .bind(&c.did_id)
+        .bind(&c.metadata_collection_id)
+        .bind(&c.name)
+        .bind(c.visible)
+        .bind(&c.record_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn collection_from_row(r: &sqlx::sqlite::SqliteRow) -> NftCollectionDbRow {
+        NftCollectionDbRow {
+            collection_id: r.get("collection_id"),
+            did_id: r.get("did_id"),
+            metadata_collection_id: r.get("metadata_collection_id"),
+            name: r.get("name"),
+            visible: r.get::<i64, _>("visible") != 0,
+            record_json: r.get::<Option<String>, _>("record_json").unwrap_or_default(),
+        }
+    }
+
+    /// All NFT collections.
+    pub async fn all_nft_collections(&self) -> sqlx::Result<Vec<NftCollectionDbRow>> {
+        let rows = sqlx::query("SELECT * FROM nft_collections ORDER BY collection_id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(Self::collection_from_row).collect())
+    }
+
+    /// One NFT collection by id.
+    pub async fn nft_collection(
+        &self,
+        collection_id: &str,
+    ) -> sqlx::Result<Option<NftCollectionDbRow>> {
+        Ok(sqlx::query("SELECT * FROM nft_collections WHERE collection_id = ?")
+            .bind(collection_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(Self::collection_from_row))
+    }
 }
 
 #[cfg(test)]
@@ -764,5 +1043,102 @@ mod tests {
             .unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].coin_id, "a");
+    }
+
+    #[tokio::test]
+    async fn attribute_cat_coin_sets_asset_and_makes_it_owned() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        // A coin arrives from sync with no asset attribution yet.
+        db.upsert_coin(&coin("catcoin", 300, Some(10), None))
+            .await
+            .unwrap();
+        assert!(!db.is_asset_owned("abc").await.unwrap());
+        // The sync loop uncurries its CAT layer and attributes it.
+        db.attribute_cat_coin("catcoin", "abc", Some("hint1"))
+            .await
+            .unwrap();
+        assert_eq!(db.balance(Some("abc")).await.unwrap(), 300);
+        assert_eq!(db.balance(None).await.unwrap(), 0);
+        assert_eq!(db.owned_cat_asset_ids().await.unwrap(), vec!["abc".to_string()]);
+        assert!(db.is_asset_owned("abc").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn nft_upsert_read_and_overwrite_on_new_coin() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_nft(&NftDbRow {
+            launcher_id: "l1".into(),
+            coin_id: "c1".into(),
+            collection_id: Some("col1".into()),
+            minter_did: Some("did1".into()),
+            owner_did: None,
+            name: Some("Cool NFT".into()),
+            visible: true,
+            created_height: Some(100),
+            record_json: r#"{"launcher_id":"l1"}"#.into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.all_nfts().await.unwrap().len(), 1);
+        assert_eq!(db.nft("l1").await.unwrap().unwrap().coin_id, "c1");
+        // A later coin for the same launcher overwrites the current coin id.
+        db.upsert_nft(&NftDbRow {
+            launcher_id: "l1".into(),
+            coin_id: "c2".into(),
+            collection_id: Some("col1".into()),
+            minter_did: Some("did1".into()),
+            owner_did: Some("did9".into()),
+            name: Some("Cool NFT".into()),
+            visible: true,
+            created_height: Some(200),
+            record_json: r#"{"launcher_id":"l1","v":2}"#.into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.all_nfts().await.unwrap().len(), 1);
+        let n = db.nft("l1").await.unwrap().unwrap();
+        assert_eq!(n.coin_id, "c2");
+        assert_eq!(n.owner_did.as_deref(), Some("did9"));
+
+        db.set_nft_metadata_json("l1", r#"{"name":"Cool NFT"}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.nft_metadata_json("l1").await.unwrap().as_deref(),
+            Some(r#"{"name":"Cool NFT"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn did_and_collection_upsert_read() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_did(&DidDbRow {
+            launcher_id: "did1".into(),
+            coin_id: "dc1".into(),
+            name: None,
+            visible: true,
+            created_height: Some(50),
+            record_json: r#"{"launcher_id":"did1"}"#.into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.all_dids().await.unwrap().len(), 1);
+        assert!(db.is_asset_owned("did1").await.unwrap());
+
+        db.upsert_nft_collection(&NftCollectionDbRow {
+            collection_id: "col1".into(),
+            did_id: "did1".into(),
+            metadata_collection_id: "meta-col".into(),
+            name: Some("My Collection".into()),
+            visible: true,
+            record_json: r#"{"collection_id":"col1"}"#.into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.all_nft_collections().await.unwrap().len(), 1);
+        assert_eq!(
+            db.nft_collection("col1").await.unwrap().unwrap().name.as_deref(),
+            Some("My Collection")
+        );
     }
 }

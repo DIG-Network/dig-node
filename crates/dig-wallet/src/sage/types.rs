@@ -845,6 +845,281 @@ pub struct GetKeysResponse {
     pub keys: Vec<KeyInfo>,
 }
 
+// =============================================================================
+// Spend / transaction wire types (sage-api `records/transaction_summary.rs`)
+// =============================================================================
+
+/// The serde default for `auto_submit` / `include_hint` (Sage's `#[serde(default = "yes")]`).
+fn default_true() -> bool {
+    true
+}
+
+/// A coin as it appears inside a `CoinSpend` (design A.7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoinJson {
+    /// The parent coin id (hex).
+    pub parent_coin_info: String,
+    /// The puzzle hash (hex).
+    pub puzzle_hash: String,
+    /// The coin amount.
+    pub amount: Amount,
+}
+
+/// A single coin spend: the coin plus its hex-encoded serialized CLVM puzzle + solution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoinSpendJson {
+    /// The coin being spent.
+    pub coin: CoinJson,
+    /// The hex-encoded serialized CLVM puzzle reveal.
+    pub puzzle_reveal: String,
+    /// The hex-encoded serialized CLVM solution.
+    pub solution: String,
+}
+
+/// A full spend bundle: coin spends + the aggregated BLS signature (hex).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpendBundleJson {
+    /// The coin spends.
+    pub coin_spends: Vec<CoinSpendJson>,
+    /// The aggregated BLS signature (hex).
+    pub aggregated_signature: String,
+}
+
+/// One output produced by a transaction input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionOutput {
+    /// The created coin id (hex).
+    pub coin_id: String,
+    /// The output amount.
+    pub amount: Amount,
+    /// The receiving address.
+    pub address: String,
+    /// Whether this output is received by the wallet.
+    pub receiving: bool,
+    /// Whether this output is a burn.
+    pub burning: bool,
+}
+
+/// One input coin of a transaction and the outputs it produces.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionInput {
+    /// The spent coin id (hex).
+    pub coin_id: String,
+    /// The input amount.
+    pub amount: Amount,
+    /// The address the input coin encodes.
+    pub address: String,
+    /// The asset the input holds (XCH when `None`).
+    pub asset: Option<Asset>,
+    /// The outputs this input produces.
+    pub outputs: Vec<TransactionOutput>,
+}
+
+/// A human-readable summary of a spend (design A.7).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionSummary {
+    /// The network fee reserved by the spend.
+    pub fee: Amount,
+    /// The transaction inputs + their outputs.
+    pub inputs: Vec<TransactionInput>,
+}
+
+/// The shared response of every spend-builder endpoint (the `pub type …Response =
+/// TransactionResponse` aliases): a summary + the built (unsigned) coin spends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionResponse {
+    /// The spend summary.
+    pub summary: TransactionSummary,
+    /// The built coin spends (unsigned).
+    pub coin_spends: Vec<CoinSpendJson>,
+}
+
+// =============================================================================
+// Spend-builder request/response structs (design A.5 — this PR's send/spend group)
+// =============================================================================
+
+/// `send_xch` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendXch {
+    /// The destination address.
+    pub address: String,
+    /// The amount to send.
+    pub amount: Amount,
+    /// The network fee.
+    pub fee: Amount,
+    /// Coin memos.
+    #[serde(default)]
+    pub memos: Vec<String>,
+    /// An optional clawback timeout (seconds).
+    #[serde(default)]
+    pub clawback: Option<u64>,
+    /// Whether to broadcast immediately.
+    #[serde(default = "default_true")]
+    pub auto_submit: bool,
+}
+
+/// `bulk_send_xch` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkSendXch {
+    /// The destination addresses (each receives `amount`).
+    pub addresses: Vec<String>,
+    /// The amount to send to each address.
+    pub amount: Amount,
+    /// The network fee.
+    pub fee: Amount,
+    /// Coin memos.
+    #[serde(default)]
+    pub memos: Vec<String>,
+    /// Whether to broadcast immediately.
+    #[serde(default = "default_true")]
+    pub auto_submit: bool,
+}
+
+/// `combine` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Combine {
+    /// The coin ids to combine.
+    pub coin_ids: Vec<String>,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately.
+    #[serde(default = "default_true")]
+    pub auto_submit: bool,
+}
+
+/// `split` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Split {
+    /// The coin ids to split.
+    pub coin_ids: Vec<String>,
+    /// The number of output coins to produce.
+    pub output_count: u32,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately.
+    #[serde(default = "default_true")]
+    pub auto_submit: bool,
+}
+
+/// `send_cat` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendCat {
+    /// The CAT asset id (hex).
+    pub asset_id: String,
+    /// The destination address.
+    pub address: String,
+    /// The amount to send (in CAT base units).
+    pub amount: Amount,
+    /// The network fee (paid from XCH).
+    pub fee: Amount,
+    /// Whether to include the destination puzzle-hash hint.
+    #[serde(default = "default_true")]
+    pub include_hint: bool,
+    /// Coin memos.
+    #[serde(default)]
+    pub memos: Vec<String>,
+    /// An optional clawback timeout (seconds).
+    #[serde(default)]
+    pub clawback: Option<u64>,
+    /// Whether to broadcast immediately.
+    #[serde(default = "default_true")]
+    pub auto_submit: bool,
+}
+
+/// `bulk_send_cat` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkSendCat {
+    /// The CAT asset id (hex).
+    pub asset_id: String,
+    /// The destination addresses (each receives `amount`).
+    pub addresses: Vec<String>,
+    /// The amount to send to each address.
+    pub amount: Amount,
+    /// The network fee (paid from XCH).
+    pub fee: Amount,
+    /// Whether to include the destination puzzle-hash hint.
+    #[serde(default = "default_true")]
+    pub include_hint: bool,
+    /// Coin memos.
+    #[serde(default)]
+    pub memos: Vec<String>,
+    /// Whether to broadcast immediately.
+    #[serde(default = "default_true")]
+    pub auto_submit: bool,
+}
+
+/// A single payment in a `multi_send` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Payment {
+    /// The asset id (`None` = XCH).
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    /// The destination address.
+    pub address: String,
+    /// The amount to send.
+    pub amount: Amount,
+    /// Coin memos.
+    #[serde(default)]
+    pub memos: Vec<String>,
+}
+
+/// `multi_send` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiSend {
+    /// The payments to make.
+    pub payments: Vec<Payment>,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately.
+    #[serde(default = "default_true")]
+    pub auto_submit: bool,
+}
+
+/// `sign_coin_spends` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignCoinSpends {
+    /// The coin spends to sign.
+    pub coin_spends: Vec<CoinSpendJson>,
+    /// Whether to broadcast the signed bundle immediately.
+    #[serde(default = "default_true")]
+    pub auto_submit: bool,
+    /// Whether a partial signature (not all required sigs present) is acceptable.
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// `sign_coin_spends` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignCoinSpendsResponse {
+    /// The signed spend bundle.
+    pub spend_bundle: SpendBundleJson,
+}
+
+/// `view_coin_spends` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewCoinSpends {
+    /// The coin spends to summarize.
+    pub coin_spends: Vec<CoinSpendJson>,
+}
+
+/// `view_coin_spends` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewCoinSpendsResponse {
+    /// The spend summary.
+    pub summary: TransactionSummary,
+}
+
+/// `submit_transaction` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitTransaction {
+    /// The signed spend bundle to broadcast.
+    pub spend_bundle: SpendBundleJson,
+}
+
+/// `submit_transaction` response (empty).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SubmitTransactionResponse {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,5 +1219,76 @@ mod tests {
         assert_eq!(req.filter_mode, CoinFilterMode::Selectable);
         assert!(!req.ascending);
         assert!(req.asset_id.is_none());
+    }
+
+    #[test]
+    fn coin_spend_json_round_trips_byte_identically() {
+        let cs = CoinSpendJson {
+            coin: CoinJson {
+                parent_coin_info: "aa".into(),
+                puzzle_hash: "bb".into(),
+                amount: Amount::u64(7),
+            },
+            puzzle_reveal: "ff01".into(),
+            solution: "80".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&cs).unwrap(),
+            r#"{"coin":{"parent_coin_info":"aa","puzzle_hash":"bb","amount":7},"puzzle_reveal":"ff01","solution":"80"}"#
+        );
+    }
+
+    #[test]
+    fn transaction_response_matches_sage_shape() {
+        let resp = TransactionResponse {
+            summary: TransactionSummary {
+                fee: Amount::u64(10),
+                inputs: vec![TransactionInput {
+                    coin_id: "c0".into(),
+                    amount: Amount::u64(100),
+                    address: "xch1a".into(),
+                    asset: None,
+                    outputs: vec![TransactionOutput {
+                        coin_id: "c1".into(),
+                        amount: Amount::u64(90),
+                        address: "xch1b".into(),
+                        receiving: false,
+                        burning: false,
+                    }],
+                }],
+            },
+            coin_spends: vec![],
+        };
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
+            r#"{"summary":{"fee":10,"inputs":[{"coin_id":"c0","amount":100,"address":"xch1a","asset":null,"outputs":[{"coin_id":"c1","amount":90,"address":"xch1b","receiving":false,"burning":false}]}]},"coin_spends":[]}"#
+        );
+    }
+
+    #[test]
+    fn send_xch_request_defaults_auto_submit_true_and_empty_memos() {
+        let r: SendXch =
+            serde_json::from_str(r#"{"address":"xch1x","amount":5,"fee":0}"#).unwrap();
+        assert!(r.auto_submit, "auto_submit defaults to true (Sage parity)");
+        assert!(r.memos.is_empty());
+        assert!(r.clawback.is_none());
+    }
+
+    #[test]
+    fn send_cat_request_defaults_include_hint_true() {
+        let r: SendCat = serde_json::from_str(
+            r#"{"asset_id":"dead","address":"xch1x","amount":5,"fee":0,"auto_submit":false}"#,
+        )
+        .unwrap();
+        assert!(r.include_hint, "include_hint defaults to true");
+        assert!(!r.auto_submit);
+    }
+
+    #[test]
+    fn empty_submit_transaction_response_is_empty_object() {
+        assert_eq!(
+            serde_json::to_string(&SubmitTransactionResponse {}).unwrap(),
+            "{}"
+        );
     }
 }
