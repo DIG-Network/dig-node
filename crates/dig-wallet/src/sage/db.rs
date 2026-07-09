@@ -152,6 +152,22 @@ pub struct NftCollectionDbRow {
     pub record_json: String,
 }
 
+/// A stored offer row: the `offer1…` string + its status + the full serialized
+/// `OfferSummary` wire JSON (so `get_offers`/`get_offer` reads are byte-parity).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferDbRow {
+    /// The offer id (hex).
+    pub offer_id: String,
+    /// The bech32m `offer1…` string.
+    pub offer: String,
+    /// The offer's lifecycle status (snake_case wire token).
+    pub status: String,
+    /// The creation timestamp (unix seconds).
+    pub creation_timestamp: i64,
+    /// The serialized `OfferSummary` (the Sage wire summary) for byte-parity reads.
+    pub summary_json: String,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_state (
     id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -231,6 +247,15 @@ CREATE TABLE IF NOT EXISTS nft_collections (
     visible INTEGER NOT NULL DEFAULT 1,
     record_json TEXT
 );
+
+CREATE TABLE IF NOT EXISTS offers (
+    offer_id TEXT PRIMARY KEY,
+    offer TEXT NOT NULL,
+    status TEXT NOT NULL,
+    creation_timestamp INTEGER NOT NULL DEFAULT 0,
+    summary_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_offers_created ON offers (creation_timestamp);
 "#;
 
 /// Additive column migrations for wallet DBs created before #216 (§5.1 additive-only): the
@@ -892,6 +917,69 @@ impl WalletDb {
                 .as_ref()
                 .map(Self::collection_from_row),
         )
+    }
+
+    // ---- offers (#218) ----------------------------------------------------
+
+    /// Insert or update a stored offer (keyed by offer id). A later write (e.g. a
+    /// status change) overwrites the mutable fields.
+    pub async fn upsert_offer(&self, o: &OfferDbRow) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO offers (offer_id, offer, status, creation_timestamp, summary_json)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(offer_id) DO UPDATE SET
+                offer = excluded.offer,
+                status = excluded.status,
+                creation_timestamp = excluded.creation_timestamp,
+                summary_json = excluded.summary_json",
+        )
+        .bind(&o.offer_id)
+        .bind(&o.offer)
+        .bind(&o.status)
+        .bind(o.creation_timestamp)
+        .bind(&o.summary_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn offer_from_row(r: &sqlx::sqlite::SqliteRow) -> OfferDbRow {
+        OfferDbRow {
+            offer_id: r.get("offer_id"),
+            offer: r.get("offer"),
+            status: r.get("status"),
+            creation_timestamp: r.get("creation_timestamp"),
+            summary_json: r.get("summary_json"),
+        }
+    }
+
+    /// All stored offers, newest first.
+    pub async fn all_offers(&self) -> sqlx::Result<Vec<OfferDbRow>> {
+        let rows = sqlx::query("SELECT * FROM offers ORDER BY creation_timestamp DESC, offer_id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(Self::offer_from_row).collect())
+    }
+
+    /// One stored offer by id.
+    pub async fn offer(&self, offer_id: &str) -> sqlx::Result<Option<OfferDbRow>> {
+        Ok(sqlx::query("SELECT * FROM offers WHERE offer_id = ?")
+            .bind(offer_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(Self::offer_from_row))
+    }
+
+    /// Update a stored offer's lifecycle status (e.g. to `cancelled`). No-op if the
+    /// offer is not stored.
+    pub async fn set_offer_status(&self, offer_id: &str, status: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE offers SET status = ? WHERE offer_id = ?")
+            .bind(status)
+            .bind(offer_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

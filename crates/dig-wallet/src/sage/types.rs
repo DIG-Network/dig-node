@@ -1120,6 +1120,315 @@ pub struct SubmitTransaction {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SubmitTransactionResponse {}
 
+// =============================================================================
+// Offer suite + DID/NFT mint & transfer (design A.5/A.6 — #218 PR3)
+// =============================================================================
+
+/// The lifecycle status of a stored offer (Sage `OfferRecordStatus`). Wire values are
+/// snake_case (`pending`/`active`/`completed`/`cancelled`/`expired`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfferRecordStatus {
+    /// Created but not yet observed on-chain / imported.
+    Pending,
+    /// Live and takeable.
+    Active,
+    /// Settled (taken).
+    Completed,
+    /// Cancelled by the maker.
+    Cancelled,
+    /// Past its expiry.
+    Expired,
+}
+
+/// The royalty leg carried by an NFT asset in an offer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NftRoyalty {
+    /// The royalty payout address.
+    pub royalty_address: String,
+    /// The royalty share in ten-thousandths (300 = 3%).
+    pub royalty_basis_points: u16,
+}
+
+/// One side's asset leg in an [`OfferSummary`]: the asset, its amount, and any royalty.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferAsset {
+    /// The asset descriptor.
+    pub asset: Asset,
+    /// The amount in the asset's smallest unit.
+    pub amount: Amount,
+    /// The royalty amount owed on this leg (0 when none).
+    pub royalty: Amount,
+    /// The NFT royalty config, if this leg is an NFT.
+    pub nft_royalty: Option<NftRoyalty>,
+    /// Option-contract assets, if this leg is an option (out of scope this PR — always
+    /// `null`; kept for wire-shape parity).
+    pub option_assets: Option<serde_json::Value>,
+}
+
+/// A two-sided summary of an offer: what the maker gives (`maker`) and what the taker
+/// must pay (`taker`), plus the fee and expiry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferSummary {
+    /// The network fee reserved by the offer.
+    pub fee: Amount,
+    /// The assets the maker offers (the taker receives).
+    pub maker: Vec<OfferAsset>,
+    /// The assets the maker requests (the taker pays).
+    pub taker: Vec<OfferAsset>,
+    /// The block height the offer expires at, if bounded.
+    pub expiration_height: Option<u32>,
+    /// The timestamp the offer expires at, if bounded.
+    pub expiration_timestamp: Option<u64>,
+}
+
+/// A stored offer record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferRecord {
+    /// The offer id (hex).
+    pub offer_id: String,
+    /// The bech32m `offer1…` string.
+    pub offer: String,
+    /// The offer's lifecycle status.
+    pub status: OfferRecordStatus,
+    /// The creation timestamp (unix seconds).
+    pub creation_timestamp: u64,
+    /// The two-sided summary.
+    pub summary: OfferSummary,
+}
+
+/// A single asset amount in a `make_offer` requested/offered list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferAmount {
+    /// The asset id (hex), or `None` for XCH.
+    pub asset_id: Option<String>,
+    /// The amount in the asset's smallest unit.
+    pub amount: Amount,
+}
+
+/// `make_offer` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MakeOffer {
+    /// The assets the maker requests (the taker will pay these).
+    pub requested_assets: Vec<OfferAmount>,
+    /// The assets the maker offers (the taker will receive these).
+    pub offered_assets: Vec<OfferAmount>,
+    /// The network fee.
+    pub fee: Amount,
+    /// The address requested payments are sent to (defaults to the wallet's receive
+    /// address).
+    #[serde(default)]
+    pub receive_address: Option<String>,
+    /// An optional expiry (unix seconds).
+    #[serde(default)]
+    pub expires_at_second: Option<u64>,
+    /// Whether to store the built offer in the wallet's offer list (default true).
+    #[serde(default = "default_true")]
+    pub auto_import: bool,
+}
+/// `make_offer` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MakeOfferResponse {
+    /// The bech32m `offer1…` string.
+    pub offer: String,
+    /// The offer id (hex).
+    pub offer_id: String,
+}
+
+/// `take_offer` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TakeOffer {
+    /// The bech32m `offer1…` string to take.
+    pub offer: String,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+/// `take_offer` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TakeOfferResponse {
+    /// The spend summary of the combined take.
+    pub summary: TransactionSummary,
+    /// The combined (maker + taker), signed spend bundle.
+    pub spend_bundle: SpendBundleJson,
+    /// The transaction id (the bundle's name, hex).
+    pub transaction_id: String,
+}
+
+/// `combine_offers` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CombineOffers {
+    /// The bech32m `offer1…` strings to combine.
+    pub offers: Vec<String>,
+}
+/// `combine_offers` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CombineOffersResponse {
+    /// The combined bech32m `offer1…` string.
+    pub offer: String,
+}
+
+/// `view_offer` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewOffer {
+    /// The bech32m `offer1…` string to inspect.
+    pub offer: String,
+}
+/// `view_offer` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewOfferResponse {
+    /// The two-sided summary.
+    pub offer: OfferSummary,
+    /// The offer's lifecycle status.
+    pub status: OfferRecordStatus,
+}
+
+/// `get_offers` request (empty).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GetOffers {}
+/// `get_offers` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOffersResponse {
+    /// The wallet's stored offers.
+    pub offers: Vec<OfferRecord>,
+}
+
+/// `get_offer` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOffer {
+    /// The offer id (hex).
+    pub offer_id: String,
+}
+/// `get_offer` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOfferResponse {
+    /// The stored offer.
+    pub offer: OfferRecord,
+}
+
+/// `cancel_offer` request (returns [`TransactionResponse`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelOffer {
+    /// The offer id (hex) to cancel.
+    pub offer_id: String,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
+/// `create_did` request (returns [`TransactionResponse`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDid {
+    /// The DID's display name.
+    pub name: String,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
+/// A single NFT to mint in `bulk_mint_nfts` (Sage `NftMint`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NftMint {
+    /// The address the minted NFT is created for (defaults to the wallet's receive
+    /// address).
+    #[serde(default)]
+    pub address: Option<String>,
+    /// The edition number within the collection.
+    #[serde(default)]
+    pub edition_number: Option<u32>,
+    /// The total edition count.
+    #[serde(default)]
+    pub edition_total: Option<u32>,
+    /// The data file content hash (hex).
+    #[serde(default)]
+    pub data_hash: Option<String>,
+    /// The data file URIs.
+    #[serde(default)]
+    pub data_uris: Vec<String>,
+    /// The metadata file content hash (hex).
+    #[serde(default)]
+    pub metadata_hash: Option<String>,
+    /// The metadata file URIs.
+    #[serde(default)]
+    pub metadata_uris: Vec<String>,
+    /// The license file content hash (hex).
+    #[serde(default)]
+    pub license_hash: Option<String>,
+    /// The license file URIs.
+    #[serde(default)]
+    pub license_uris: Vec<String>,
+    /// The royalty payout address (defaults to the mint address).
+    #[serde(default)]
+    pub royalty_address: Option<String>,
+    /// The royalty share in ten-thousandths (300 = 3%).
+    #[serde(default)]
+    pub royalty_ten_thousandths: u16,
+}
+
+/// `bulk_mint_nfts` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkMintNfts {
+    /// The NFTs to mint.
+    pub mints: Vec<NftMint>,
+    /// The minting DID's launcher id (hex or bech32m).
+    pub did_id: String,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+/// `bulk_mint_nfts` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkMintNftsResponse {
+    /// The launcher ids of the minted NFTs (hex).
+    pub nft_ids: Vec<String>,
+    /// The spend summary.
+    pub summary: TransactionSummary,
+    /// The built coin spends (unsigned).
+    pub coin_spends: Vec<CoinSpendJson>,
+}
+
+/// `transfer_nfts` request (returns [`TransactionResponse`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferNfts {
+    /// The NFT ids to transfer (hex or bech32m).
+    pub nft_ids: Vec<String>,
+    /// The destination address.
+    pub address: String,
+    /// The network fee.
+    pub fee: Amount,
+    /// An optional clawback timeout (seconds).
+    #[serde(default)]
+    pub clawback: Option<u64>,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
+/// `transfer_dids` request (returns [`TransactionResponse`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferDids {
+    /// The DID ids to transfer (hex or bech32m).
+    pub did_ids: Vec<String>,
+    /// The destination address.
+    pub address: String,
+    /// The network fee.
+    pub fee: Amount,
+    /// An optional clawback timeout (seconds).
+    #[serde(default)]
+    pub clawback: Option<u64>,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

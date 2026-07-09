@@ -21,17 +21,26 @@
 //!   syncing or for out-of-DB/non-wallet reads — never the primary path.
 //! - [`routing`] — the sync-state-gated source selection (design B.6 routing table).
 //! - [`rpc`] — the `POST /{method}` handler set + Sage's text-body error model (A.3),
-//!   dispatching the core READ methods.
+//!   dispatching every served method.
+//! - [`spend`] — the send/spend group builders (#216): XCH/CAT sends, combine/split,
+//!   sign/view/submit — build via `chia-wallet-sdk`, validate via `dig-clvm`, broadcast
+//!   via the [`spend::Broadcaster`] gate (never in CI).
+//! - [`mint`] — DID/NFT mint + transfer builders (#218): `create_did`, `bulk_mint_nfts`,
+//!   `transfer_nfts`, `transfer_dids`.
+//! - [`offers`] — the offer suite builders (#218): `make_offer`, `take_offer`,
+//!   `view_offer`, `combine_offers`, `cancel_offer` (`get_offers`/`get_offer` are DB reads).
 //! - [`transport`] — the dual transport (design C.3): mTLS `9257` (Sage byte-parity)
 //!   + the plain-HTTP+CORS browser mirror, both dispatching the SAME handler set.
 //!
-//! ## Scope (this PR — reads + sync only)
+//! ## Scope
 //!
-//! Signing/spends/offers/mutations and the `SyncEvent` stream are deliberate
-//! follow-on PRs; this unit is the read + sync foundation.
+//! The `SyncEvent` stream, options/actions/themes/network-settings endpoints, OpenAPI
+//! generation, and dig-keystore seed migration are deliberate follow-on units (SPEC §18.12).
 
 pub mod db;
 pub mod fallback;
+pub mod mint;
+pub mod offers;
 pub mod routing;
 pub mod rpc;
 pub mod singleton;

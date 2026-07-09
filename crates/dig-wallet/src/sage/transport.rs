@@ -273,7 +273,7 @@ mod tests {
     #[tokio::test]
     async fn error_body_is_plain_text_with_mapped_status() {
         let backend = test_backend().await;
-        let (status, body) = oneshot_body(build_router(backend), "make_offer").await;
+        let (status, body) = oneshot_body(build_router(backend), "get_secret_key").await;
         assert_eq!(status, 404);
         assert!(body.contains("unsupported"));
     }

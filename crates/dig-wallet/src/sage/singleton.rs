@@ -205,6 +205,49 @@ pub fn resolve_cat(parent: &ParentSpend, child: Coin) -> Result<Option<Cat>> {
     Ok(None)
 }
 
+/// Parse the spendable [`Nft`] for `child` from its `parent` spend INTO `ctx`, so its
+/// allocator-relative metadata pointer is valid for a transfer spend built in the same
+/// `ctx`. `None` if the parent is not an NFT or no child matches (used by `transfer_nfts`).
+pub fn parse_nft_in(
+    ctx: &mut SpendContext,
+    parent: &ParentSpend,
+    child: Coin,
+) -> Result<Option<Nft>> {
+    let puzzle_ptr = ctx
+        .alloc(&Program::from(parent.puzzle_reveal.clone()))
+        .map_err(|e| Error::internal(format!("alloc parent puzzle: {e}")))?;
+    let parent_puzzle = Puzzle::parse(ctx, puzzle_ptr);
+    let solution_ptr = ctx
+        .alloc(&Program::from(parent.solution.clone()))
+        .map_err(|e| Error::internal(format!("alloc parent solution: {e}")))?;
+    let child_id = child.coin_id();
+    match Nft::parse_child(ctx, parent.coin, parent_puzzle, solution_ptr) {
+        Ok(Some(nft)) if nft.coin.coin_id() == child_id => Ok(Some(nft)),
+        _ => Ok(None),
+    }
+}
+
+/// Parse the spendable [`Did`] for `child` from its `parent` spend INTO `ctx` (the DID twin
+/// of [`parse_nft_in`]). `None` if the parent is not a DID or the child does not match
+/// (used by `transfer_dids` and DID-attributed mints).
+pub fn parse_did_in(
+    ctx: &mut SpendContext,
+    parent: &ParentSpend,
+    child: Coin,
+) -> Result<Option<Did>> {
+    let puzzle_ptr = ctx
+        .alloc(&Program::from(parent.puzzle_reveal.clone()))
+        .map_err(|e| Error::internal(format!("alloc parent puzzle: {e}")))?;
+    let parent_puzzle = Puzzle::parse(ctx, puzzle_ptr);
+    let solution_ptr = ctx
+        .alloc(&Program::from(parent.solution.clone()))
+        .map_err(|e| Error::internal(format!("alloc parent solution: {e}")))?;
+    match Did::parse_child(ctx, parent.coin, parent_puzzle, solution_ptr, child) {
+        Ok(did) => Ok(did),
+        Err(_) => Ok(None),
+    }
+}
+
 fn nft_row(
     ctx: &mut SpendContext,
     prefix: &str,
