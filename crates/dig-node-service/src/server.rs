@@ -424,6 +424,23 @@ where
 {
     let addr = config.bind_addr();
     let state = build_state(&config);
+
+    // §14 autonomous sync (#213): bring up the L7 peer network — the connected peer
+    // pool, the content-location DHT + P2P content engine, PEX, and the chain-watch +
+    // generation gap-fill loop — so a running node tracks the chain and PROACTIVELY
+    // pulls the generations of its subscribed stores, not merely reacts to reads. The
+    // MACHINERY lives in dig-node-core (`peer::spawn_peer_network` → `run_peer_network`,
+    // which installs the P2P content engine + the inventory refresher and spawns the
+    // chain-watch loop); this shell only makes the call that was missing. Best-effort +
+    // detached: a bring-up failure is recorded on `control.peerStatus` and never blocks
+    // the HTTP read path. Gated by the existing `DIG_PEER_NETWORK` switch (default ON;
+    // `off`/`0`/`false` opts out for a standalone read-only node). The in-process FFI
+    // path (`dig-runtime`) never routes through `serve_with_shutdown`, so the browser's
+    // node keeps installing no P2P content — its in-process trust boundary is unchanged.
+    if dig_node_core::peer::peer_network_enabled() {
+        dig_node_core::peer::spawn_peer_network(state.node.clone());
+    }
+
     let app = router(state);
 
     // (1) The ALWAYS-ON localhost listener. A failure here is fatal: no endpoint.

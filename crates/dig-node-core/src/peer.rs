@@ -1029,7 +1029,8 @@ impl PeerRpcClient {
 
 // -- Peer-network bring-up: the connected pool + discovery + the mTLS peer-RPC server -----------------
 
-/// Spawn the node's L7 peer network in the background (standalone `run()` only): bring up
+/// Spawn the node's L7 peer network in the background (the OS-service bring-up calls this — #213;
+/// the in-process FFI host never does): bring up
 /// [`dig_gossip`]'s connected peer pool (introducer-backed auto-discovery via `relay.dig.net` + the
 /// relay reservation) AND the mTLS peer-RPC server (answers the L7 peer RPC from other nodes). Both
 /// use ONE TLS identity so the node presents a consistent `peer_id`. Best-effort: a failed bring-up

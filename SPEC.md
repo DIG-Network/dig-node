@@ -779,6 +779,15 @@ stores it subscribes to, proactively pulls the generations it is missing, and pi
 chain-anchored root. All of this fails **closed** — an unconfirmable root is never served against or
 pulled.
 
+**Bring-up.** The chain-watch + gap-fill loop is started by the OS-service bring-up as part of the
+peer network: `dig-node run` (and the Windows SCM entrypoint) call `peer::spawn_peer_network`, which
+installs the P2P content engine + the DHT inventory refresher and spawns the chain-watch loop
+(`crate::chainwatch`). It is gated by `DIG_PEER_NETWORK` — ON by default; `off`/`0`/`false` opts a
+standalone read-only node out of the whole peer network (pool + DHT + watcher), leaving the HTTP read
+path serving. Bring-up is best-effort and detached: a failure is recorded on `control.peerStatus` and
+never blocks reads. The in-process FFI host (`dig-runtime`, §15) does NOT run this — the browser is a
+consumer, so its node installs no P2P content and runs no watcher (its in-process trust boundary).
+
 ### 14.1. Subscriptions
 
 A **subscription** is a store the node intends to actively HOLD, WATCH, SYNC, and PUBLISH. It is

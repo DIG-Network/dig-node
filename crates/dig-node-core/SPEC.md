@@ -577,7 +577,9 @@ The standalone node runs the full L7 peer network by composing the peer crates. 
 
 ### 7.2 Peer-network bring-up + status
 
-Standalone startup (`spawn_peer_network` → `run_peer_network`) proceeds in order:
+The OS-service bring-up (`dig-node run` / the Windows SCM entrypoint) calls `spawn_peer_network`
+unless `DIG_PEER_NETWORK` is `off`/`0`/`false`; the in-process FFI host never does (§1.2). Startup
+(`spawn_peer_network` → `run_peer_network`) proceeds in order:
 1. derive the deterministic mTLS identity from the seed;
 2. bring up the dig-gossip connected pool + relay introducer registration (relay via `DIG_RELAY_URL`,
    default `wss://relay.dig.net:9450`), and a background task that refreshes pool status (~10 s);

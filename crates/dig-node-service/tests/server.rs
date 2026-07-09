@@ -389,6 +389,10 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
         let tmp = std::env::temp_dir().join(format!("dig-node-dual-{}", std::process::id()));
         std::env::set_var("DIG_NODE_CACHE", &tmp);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        // This test exercises the LISTENER bind fallback, not the peer network. Opt out of the
+        // §14 peer-network bring-up (#213) so `serve_with_shutdown` stays hermetic here (no gossip
+        // pool / DHT / relay reach). A dedicated test covers the peer-network wiring.
+        std::env::set_var("DIG_PEER_NETWORK", "off");
         tokio::spawn(async move {
             dig_node_service::server::serve_with_shutdown(config, async move {
                 stop_for_server.notified().await;
@@ -902,4 +906,172 @@ async fn health_carries_the_open_status_probe_contract() {
     assert_eq!(resp["upstream"], json!(upstream));
     assert!(resp["cache"]["used_bytes"].is_u64());
     assert!(resp["cache"]["cap_bytes"].is_u64());
+}
+
+// -- §14 autonomous-sync bring-up (#213) -------------------------------------------
+//
+// The OS-service bring-up (`serve_with_shutdown`) must start the L7 peer network — the
+// connected pool + DHT + the chain-watch/gap-fill loop — unless the operator opts out
+// with `DIG_PEER_NETWORK=off`. Before #213 it never did (the §14 loop was dead code:
+// `spawn_peer_network` had zero call sites), so these drive the real serve path and
+// observe the peer network via `control.peerStatus`. Hermetic: relay OFF (no live
+// network), an ephemeral peer port, no privileged `:80` bind, an isolated cache dir.
+
+/// Drive `serve_with_shutdown` on a free loopback port with the `DIG_PEER_NETWORK` gate
+/// set to `peer_network` (`"on"`/`"off"`) and a hermetic peer-network env. Returns the
+/// bound port, a shutdown `Notify`, the server task handle, the control token, and the
+/// held env guard (kept alive for the whole test). Polls until `/health` serves.
+async fn start_serving_node(
+    peer_network: &str,
+) -> (
+    u16,
+    std::sync::Arc<tokio::sync::Notify>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    String,
+    EnvHold,
+) {
+    let (upstream, _calls) = start_mock_upstream().await;
+
+    // Grab then release a free loopback port so serve binds a known address.
+    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = free.local_addr().unwrap().port();
+    drop(free);
+
+    let config = dig_node_service::Config {
+        upstream,
+        port,
+        dig_local: false, // skip the privileged 127.0.0.2:80 bind in tests
+        ..dig_node_service::Config::default()
+    };
+
+    let hold = EnvHold(env_guard().lock_owned().await);
+    let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base =
+        std::env::temp_dir().join(format!("dig-node-peernet-{}-{}", std::process::id(), unique));
+    let cache = base.join("cache");
+    std::fs::create_dir_all(&cache).expect("create test cache dir");
+    std::env::set_var("DIG_NODE_CACHE", &cache);
+    std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+    // Hermetic peer network: no relay/introducer reach, ephemeral mTLS port.
+    std::env::set_var("DIG_RELAY_URL", "off");
+    std::env::set_var("DIG_PEER_PORT", "0");
+    std::env::set_var("DIG_PEER_NETWORK", peer_network);
+
+    // The token the bring-up writes (read from disk exactly as a same-host controller would).
+    let token = dig_node_service::control::load_or_create_token().unwrap();
+
+    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let stop_for_server = stop.clone();
+    let server = tokio::spawn(async move {
+        dig_node_service::server::serve_with_shutdown(config, async move {
+            stop_for_server.notified().await;
+        })
+        .await
+    });
+
+    let url = format!("http://127.0.0.1:{port}/health");
+    let mut served = false;
+    for _ in 0..100 {
+        if let Ok(r) = client().get(&url).send().await {
+            if r.status().is_success() {
+                served = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    assert!(served, "the node must serve /health after bring-up");
+
+    (port, stop, server, token, hold)
+}
+
+/// Call `control.peerStatus` with the control token and return the JSON-RPC response.
+async fn peer_status(port: u16, token: &str) -> Value {
+    client()
+        .post(format!("http://127.0.0.1:{port}/"))
+        .header("X-Dig-Control-Token", token)
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "control.peerStatus" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Clear the peer-network env this test set (held under the env lock).
+fn clear_peernet_env() {
+    std::env::remove_var("DIG_PEER_NETWORK");
+    std::env::remove_var("DIG_RELAY_URL");
+    std::env::remove_var("DIG_PEER_PORT");
+}
+
+#[tokio::test]
+async fn serve_with_gate_on_starts_the_peer_network_and_still_serves_reads() {
+    // #213 (RED before the wiring): `serve_with_shutdown` built the node + control token
+    // ONLY and never called `spawn_peer_network`, so `control.peerStatus.running` stayed
+    // false forever — the §14 autonomous-sync loop was dead code. With the gate ON
+    // (default) the service bring-up MUST start the peer network (running:true) while the
+    // HTTP read path keeps serving.
+    let (port, stop, server, token, _hold) = start_serving_node("on").await;
+
+    // Poll control.peerStatus until the peer network reports running (set as soon as the
+    // bring-up derives the node identity, before the pool/DHT come up).
+    let mut running = false;
+    for _ in 0..100 {
+        if peer_status(port, &token).await["result"]["running"] == json!(true) {
+            running = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    }
+    assert!(
+        running,
+        "gate ON → the service bring-up must start the peer network (running:true)"
+    );
+
+    // Reads still serve while the peer network runs.
+    let health: Value = client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["status"], json!("ok"));
+
+    stop.notify_waiters();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    clear_peernet_env();
+}
+
+#[tokio::test]
+async fn serve_with_gate_off_disables_the_peer_network_but_still_serves_reads() {
+    // AC3: DIG_PEER_NETWORK=off cleanly disables the §14 peer network — the node comes up
+    // serving reads and control.peerStatus reports NOT running (no pool/DHT/chain-watch).
+    let (port, stop, server, token, _hold) = start_serving_node("off").await;
+
+    let health: Value = client()
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["status"], json!("ok"));
+
+    // Give any (erroneously-spawned) bring-up a moment, then assert it is NOT running.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let resp = peer_status(port, &token).await;
+    assert_eq!(
+        resp["result"]["running"],
+        json!(false),
+        "gate OFF → the peer network must not run"
+    );
+
+    stop.notify_waiters();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    clear_peernet_env();
 }
