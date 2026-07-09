@@ -1050,3 +1050,96 @@ attached (the in-process FFI/DIG-Browser path never redirects, having no peer ne
 the hop budget is exhausted; or the DHT knows of no alternate holder. The throttle changes WHERE a
 request is served from when it can, never WHETHER it is served — an over-budget request with no known
 alternate still goes out rather than being dropped or erroring.
+
+## 18. Sage-parity wallet RPC — direct-peer sync, local wallet DB, fallback tier
+
+This section specifies the dig-node's **Sage-parity wallet RPC**: a byte-compatible replica of the
+[Sage](https://github.com/xch-dev/sage) wallet RPC surface (`endpoints.json`, **pinned v0.12.11**,
+commit `a84d7dfc`) backed by a direct-peer chain sync into a local wallet database, with a
+`chia-query`/coinset fallback tier. A Sage RPC client can point at the dig-node interchangeably with
+Sage. It is a new surface, additive to and DISTINCT from the built-in wallet host (§16), the read/control
+JSON-RPC (§5/§7), and the CHIP-0002 `window.chia` dapp responder. It lives in the `dig-wallet` crate
+(`crate::sage`). This PR (#215) implements the READ + sync foundation; spend/mutation/offer methods and
+the event stream are follow-on units (§18.9).
+
+18.1. **Transport — one method surface, two transports.** Byte-compatibility with Sage is required at
+the application layer (method names + JSON request/response shapes); the transport is adapted per client
+class. Both listeners dispatch the SAME handler set (`WalletBackend::dispatch`), so their bodies are
+byte-identical by construction:
+
+- **mTLS `9257`** (default; configurable). `POST /{method}` over TLS with Sage's shared-self-signed-cert
+  MUTUAL-TLS model: the server accepts a client cert iff its DER is byte-identical to the server's own
+  cert (a local-possession auth model — whoever can read the cert+key is authorized). Loopback only.
+- **Plain-HTTP + CORS** (browser mirror). A browser/MV3 extension cannot present a client cert, so the
+  identical surface is served over the loopback plain-HTTP transport with permissive CORS. Loopback only.
+
+18.2. **Request/response model.** Every endpoint is `POST /{endpoint}` where `{endpoint}` is the exact
+snake_case method name. There is NO JSON-RPC envelope, NO batching — the path IS the method. Request body
+= the method's request struct as a single JSON object (an empty body is treated as `{}`). Success →
+`200 OK` with the response struct as JSON (`content-type: application/json`). Error → a non-200 status
+with the error message as a **plain-text** body (NOT a JSON error object), reproducing Sage's model.
+
+18.3. **Wire types (byte-parity invariants).** The request/response/record types match `sage-api`
+byte-for-byte:
+
+- **`Amount`** — an untagged enum serializing as a JSON **number** when `<= 9_007_199_254_740_991`
+  (`MAX_JS_SAFE_INTEGER`), else a JSON **string**; deserializes from either. This exact threshold MUST be
+  reproduced (JS clients depend on it). Amounts are in the asset's smallest unit (mojos for XCH).
+- **Casing** — struct fields are snake_case (Rust idents already are; no `rename_all` on structs); enums
+  carry `#[serde(rename_all = "snake_case")]`.
+- **Optional fields** — `Option<T>` serializes as `null` when `None` (Sage does NOT omit them); field
+  order equals declaration order.
+
+18.4. **Error model.** `ErrorKind` → HTTP status: `api` → `400`, `not_found` → `404`, `unauthorized` →
+`401`, `wallet`/`internal` → `500`. An unknown/unsupported method is `404`; a malformed request body is
+`400`.
+
+18.5. **Local wallet database (SQLite).** The sync loop persists the wallet's chain state to a local
+SQLite database (via `sqlx`), mirroring `sage-wallet`'s relational store: coins/CATs/derivations (and
+NFT/DID/collection tables) keyed by the wallet's hardened AND unhardened HD puzzle hashes + CAT hints,
+plus the synced peak height. SQLite (NOT RocksDB): the workload is relational, multi-index, query-rich
+and small (one wallet). Indexes on `puzzle_hash`, `asset_id`, a PARTIAL index on unspent
+(`spent_height IS NULL`), and `created_height`; WAL enabled. Amounts are stored as decimal TEXT (full
+`u64`/`u128` range, no `i64` overflow). This DB is the source of truth for a SYNCED wallet's data.
+
+18.6. **Direct-peer sync (primary path).** Wallet chain data is obtained by connecting directly to Chia
+full-node peers over the light-wallet protocol on `chia-wallet-sdk 0.30` `Peer` (`NodeType::Wallet`,
+protocol `0.0.37`, the four DNS introducers, multi-peer, IPv6-first per §5.2), exactly as Sage does — NOT
+via coinset for the wallet-data path. The node subscribes the wallet's puzzle hashes (BOTH hardened and
+unhardened + CAT hints) with `request_puzzle_state(subscribe = true)`, applies the returned coin states,
+then consumes `coin_state_update` pushes into the DB. A reorg (a `coin_state_update` whose `fork_height`
+is below the current peak) rolls the DB back above the fork — coins created above it are deleted, coins
+spent above it become unspent again — then applies the update's coin states and advances the peak.
+
+18.7. **Fallback tier + sync-state-gated routing.** `chia-query` (coinset.org + non-subscribing peer
+point-reads) is reused AS-IS as a fallback tier — never the primary. The B.3 subscription loop is NOT
+added to `chia-query`. Every wallet-data read selects its source:
+
+| Condition                                            | Source           |
+|------------------------------------------------------|------------------|
+| Wallet's own data, DB synced to peak                 | Local wallet DB  |
+| Wallet's own data, DB still syncing                  | Fallback tier    |
+| Chain data not scoped to this wallet, not in the DB  | Fallback tier    |
+
+So a caller never blocks on an unsynced replica. `get_sync_status` reports the gating sync state.
+
+18.8. **Method surface (this PR — MUST-tier reads).** `login`, `logout`, `get_version`,
+`get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,
+`get_spendable_coin_count`, `get_coins`, `get_coins_by_ids`, `get_cats`, `get_all_cats`, `get_token`,
+`get_dids`, `get_nfts`, `get_nft`, `get_nft_data`, `get_nft_collections`, `get_nft_collection`,
+`get_transactions`, `get_transaction`, `get_pending_transactions`, `is_asset_owned`, `get_key`,
+`get_keys`. Coins and CAT balances/records are fully synced and served; transactions are derived from the
+coin table grouped by created/spent height; NFT/DID/collection reads return from their tables (singleton
+reconstruction that POPULATES them from coin state is a follow-on, §18.9), so an empty list rather than an
+error. `get_pending_transactions` is empty (no spend/submit path in this PR).
+
+18.9. **Deferred to follow-on PRs.** All spend/mutation methods (`send_xch`/`send_cat`/`combine`/`split`/
+`multi_send`/`sign_coin_spends`/`submit_transaction`/…), the full offer suite, DID/NFT mint/transfer,
+options/actions/themes/network-settings; NFT/DID singleton reconstruction + metadata fetch; CAT
+attribution while syncing (needs puzzle uncurrying); dig-keystore seed migration; and the `SyncEvent`
+stream (clients poll `get_sync_status` for MVP parity). Secret-touching endpoints
+(`get_secret_key`/`generate_mnemonic`/`import_key`) stay loopback-only and gated regardless.
+
+18.10. **Security.** Both listeners bind loopback only. The mTLS listener enforces the shared-cert mutual
+TLS. Multi-peer sync is a correctness/censorship property (never collapse to one peer). Reads tolerate
+unknown/forward-incompatible fields (additive, §5.1 spirit).

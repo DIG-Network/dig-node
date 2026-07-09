@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -31,14 +31,35 @@ chia = "0.26"
 # Needed to NAME the SDK spendable `Cat` type when assembling a make-offer's
 # MakerFunds, and `SpendContext` to serialize NFT metadata into a Program.
 chia-wallet-sdk = { version = "0.30", features = ["offer-compression"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 zeroize = "1"
 
+# -- #205 Sage-parity wallet RPC (§18) --------------------------------------------------
+# Local wallet database (B.6): SQLite via sqlx, mirroring sage-wallet's relational store.
+# `sqlite` bundles libsqlite3-sys (no system SQLite needed); runtime-tokio, no TLS (local
+# file). We use the runtime `query()` API (NOT the compile-time `query!` macro) so the
+# build needs no live DATABASE_URL; `macros` is only for `#[derive(FromRow)]`.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
+# Fallback tier (B.5): coinset.org + non-subscribing peer point-reads, reused AS-IS. Git
+# dep (not path) so a standalone dig-node checkout builds it in CI.
+chia-query = { git = "https://github.com/DIG-Network/chia-query.git", rev = "b4e7cfb1933327bb48c41f3dcca762f226ad0ab9" }
+# Dual transport (C.3): mTLS 9257 (Sage byte-parity) + plain-HTTP+CORS browser mirror.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
+tower-http = { version = "0.6", features = ["cors"] }
+async-trait = "0.1"
+
 [dev-dependencies]
 tempfile = "3"
 # K1Pair — real secp256k1 test key pairs for the vault config / K1 pubkey parse tests.
-chia-sdk-test = "0.30"
+chia-sdk-test = { version = "0.30", features = ["peer-simulator"] }
+# Drive the axum Router transport-independently (oneshot) and read response bodies in
+# the conformance + transport-parity tests.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

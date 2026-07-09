@@ -31,7 +31,7 @@ edition = "2021"
 # (`[workspace.package].version`), so it MUST be set here for a release to fire
 # (§3.6). The library crates (dig-node-core/dig-runtime/dig-wallet) keep their own
 # independent versions — only the released binary tracks the workspace version.
-version = "0.6.0"
+version = "0.7.0"
 
 # Release hardening, matching digstore: keep integer-overflow checks ON in release.
 # The node parses untrusted serialized input and does offset/length arithmetic over
