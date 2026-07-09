@@ -31,6 +31,9 @@ chia = "0.26"
 # Needed to NAME the SDK spendable `Cat` type when assembling a make-offer's
 # MakerFunds, and `SpendContext` to serialize NFT metadata into a Program.
 chia-wallet-sdk = { version = "0.30", features = ["offer-compression"] }
+# CLVM runtime types (NodePtr/Allocator) used by the #216 singleton reconstruction + spend
+# builders. Pinned to the same 0.14 the SDK resolves so the NodePtr types unify.
+clvmr = "0.14"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }

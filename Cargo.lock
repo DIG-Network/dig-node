@@ -1999,6 +1999,7 @@ dependencies = [
  "chia-query",
  "chia-sdk-test",
  "chia-wallet-sdk",
+ "clvmr",
  "dig-clvm",
  "dig-node-core",
  "digstore-chain",
