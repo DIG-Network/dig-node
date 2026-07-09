@@ -54,6 +54,18 @@ rustls-pemfile = "2"
 rcgen = "0.13"
 tower-http = { version = "0.6", features = ["cors"] }
 async-trait = "0.1"
+# -- #216 send/spend + singleton reconstruction (§18.9 → §18.8) -------------------------
+# Pre-broadcast spend-bundle validation (C.6 fail-closed): validate_spend_bundle runs the
+# bundle through chia-consensus before any peer broadcast. Same chia-* 0.26 / SDK 0.30 line
+# as dig-wallet, so Coin/CoinSpend/SpendBundle unify across the crate boundary.
+dig-clvm = { git = "https://github.com/DIG-Network/dig-clvm.git", rev = "3808440dd89863f806d47fabd548edcb76650fda" }
+# Spend building (XCH/CAT), coin selection, signing, and NFT/DID/CAT singleton
+# reconstruction all reuse the canonical `chia-wallet-sdk` driver constructors
+# (SpendContext + StandardLayer + Cat::spend_all + the Nft/Did parsers) already depended on
+# above — never hand-rolled CLVM (SYSTEM.md §4.1). NB: `dig-l1-wallet` (the C.2 reuse target
+# for spend building) is not yet git-consumable — its `dig-keystore` path dependency does not
+# resolve from a git checkout — so its thin SDK-wrapper builder pattern is followed directly
+# on chia-wallet-sdk here; making dig-l1-wallet git-consumable is a tracked follow-up (#216).
 
 [dev-dependencies]
 tempfile = "3"
