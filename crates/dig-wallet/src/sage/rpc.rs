@@ -12,14 +12,18 @@
 //! byte-identical by construction. Success → `200` + JSON; error → Sage's status (A.3) +
 //! the plain-text message.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use serde::Serialize;
 use serde_json::Value;
 
 use super::db::{CoinRow, WalletDb};
 use super::fallback::{ChainFallback, FallbackCoin};
 use super::routing::{self, Source};
+use super::singleton::{self, LineageSource};
+use super::spend::{self, Broadcaster, WalletSigner};
 use super::types::*;
 use super::{Error, Result};
 
@@ -51,22 +55,52 @@ impl Default for WalletConfig {
     }
 }
 
-/// The Sage-parity wallet-read backend.
+/// The Sage-parity wallet backend.
 #[derive(Clone)]
 pub struct WalletBackend {
     db: WalletDb,
     fallback: Arc<dyn ChainFallback>,
     config: WalletConfig,
+    /// The wallet's signing keys (node-custodied). `None` when no wallet is loaded — spend
+    /// building/signing then returns an error (C.6: the extension self-custodies and never
+    /// uses this path).
+    signer: Option<Arc<WalletSigner>>,
+    /// The network broadcaster. `None` in tests/CI so a built spend is NEVER auto-broadcast.
+    broadcaster: Option<Arc<dyn Broadcaster>>,
+    /// The lineage source for CAT-send input resolution (parent-spend reads).
+    lineage: Option<Arc<dyn LineageSource>>,
 }
 
 impl WalletBackend {
-    /// Build a backend over a DB, a fallback tier, and the wallet config.
+    /// Build a read-only backend over a DB, a fallback tier, and the wallet config. Spend
+    /// methods are disabled until a signer/broadcaster are attached (see [`Self::with_signer`]).
     pub fn new(db: WalletDb, fallback: Arc<dyn ChainFallback>, config: WalletConfig) -> Self {
         Self {
             db,
             fallback,
             config,
+            signer: None,
+            broadcaster: None,
+            lineage: None,
         }
+    }
+
+    /// Attach the node-custodied signing keys (enables spend building + signing).
+    pub fn with_signer(mut self, signer: Arc<WalletSigner>) -> Self {
+        self.signer = Some(signer);
+        self
+    }
+
+    /// Attach the network broadcaster (enables `auto_submit` + `submit_transaction`).
+    pub fn with_broadcaster(mut self, broadcaster: Arc<dyn Broadcaster>) -> Self {
+        self.broadcaster = Some(broadcaster);
+        self
+    }
+
+    /// Attach the lineage source used to resolve input CAT coins for `send_cat`.
+    pub fn with_lineage(mut self, lineage: Arc<dyn LineageSource>) -> Self {
+        self.lineage = Some(lineage);
+        self
     }
 
     /// The exact method set this PR serves (the core READ surface). Used by the
@@ -98,6 +132,17 @@ impl WalletBackend {
         "is_asset_owned",
         "get_key",
         "get_keys",
+        // #216 send/spend group.
+        "send_xch",
+        "bulk_send_xch",
+        "send_cat",
+        "bulk_send_cat",
+        "combine",
+        "split",
+        "multi_send",
+        "sign_coin_spends",
+        "view_coin_spends",
+        "submit_transaction",
     ];
 
     /// Whether `method` is served by this backend.
@@ -370,33 +415,120 @@ impl WalletBackend {
         })
     }
 
-    // NFT/DID reads: the schema + read path are wired; singleton reconstruction that
-    // POPULATES these tables from coin state (puzzle uncurrying + metadata fetch) is a
-    // named follow-on PR, so a synced wallet with no reconstructed singletons returns
-    // empty lists (never an error).
-    async fn get_dids(&self) -> GetDidsResponse {
-        GetDidsResponse { dids: Vec::new() }
+    // NFT/DID reads: served from the tables the sync reconstruction populates
+    // ([`crate::sage::singleton`]). A wallet with no such assets returns an empty list.
+    async fn get_dids(&self) -> Result<GetDidsResponse> {
+        let rows = self.db.all_dids().await?;
+        let dids = rows
+            .iter()
+            .filter_map(|r| serde_json::from_str::<DidRecord>(&r.record_json).ok())
+            .collect();
+        Ok(GetDidsResponse { dids })
     }
-    async fn get_nfts(&self, _req: &GetNfts) -> GetNftsResponse {
-        GetNftsResponse {
-            nfts: Vec::new(),
-            total: 0,
+
+    async fn get_nfts(&self, req: &GetNfts) -> Result<GetNftsResponse> {
+        let rows = self.db.all_nfts().await?;
+        let matches = |r: &super::db::NftDbRow| -> bool {
+            let coll_ok = match &req.collection_id {
+                Some(c) => r.collection_id.as_deref() == Some(c.as_str()),
+                None => true,
+            };
+            let minter_ok = match &req.minter_did_id {
+                Some(m) => r.minter_did.as_deref() == Some(m.as_str()),
+                None => true,
+            };
+            let owner_ok = match &req.owner_did_id {
+                Some(o) => r.owner_did.as_deref() == Some(o.as_str()),
+                None => true,
+            };
+            let name_ok = match &req.name {
+                Some(n) => r
+                    .name
+                    .as_deref()
+                    .map(|rn| rn.contains(n.as_str()))
+                    .unwrap_or(false),
+                None => true,
+            };
+            coll_ok && minter_ok && owner_ok && name_ok
+        };
+        let mut nfts: Vec<NftRecord> = rows
+            .iter()
+            .filter(|r| req.include_hidden || r.visible)
+            .filter(|r| matches(r))
+            .filter_map(|r| serde_json::from_str::<NftRecord>(&r.record_json).ok())
+            .collect();
+        match req.sort_mode {
+            NftSortMode::Name => nfts.sort_by(|a, b| a.name.cmp(&b.name)),
+            NftSortMode::Recent => nfts.sort_by_key(|n| std::cmp::Reverse(n.created_height)),
         }
+        let total = nfts.len() as u32;
+        let page = nfts
+            .into_iter()
+            .skip(req.offset as usize)
+            .take(req.limit as usize)
+            .collect();
+        Ok(GetNftsResponse { nfts: page, total })
     }
-    async fn get_nft(&self, _req: &GetNft) -> GetNftResponse {
-        GetNftResponse { nft: None }
+
+    async fn get_nft(&self, req: &GetNft) -> Result<GetNftResponse> {
+        let launcher = normalize_singleton_id(&req.nft_id);
+        let nft = self
+            .db
+            .nft(&launcher)
+            .await?
+            .and_then(|r| serde_json::from_str::<NftRecord>(&r.record_json).ok());
+        Ok(GetNftResponse { nft })
     }
-    async fn get_nft_data(&self, _req: &GetNftData) -> GetNftDataResponse {
-        GetNftDataResponse { data: None }
+
+    async fn get_nft_data(&self, req: &GetNftData) -> Result<GetNftDataResponse> {
+        let launcher = normalize_singleton_id(&req.nft_id);
+        let Some(_row) = self.db.nft(&launcher).await? else {
+            return Ok(GetNftDataResponse { data: None });
+        };
+        // The off-chain data blob + CHIP-0015 metadata JSON are fetched opportunistically; a
+        // synced wallet always knows the on-chain URIs/hashes (in the NftRecord). When the
+        // metadata JSON has been fetched, surface it; the raw blob fetch is a follow-on.
+        let metadata_json = self.db.nft_metadata_json(&launcher).await?;
+        Ok(GetNftDataResponse {
+            data: Some(NftData {
+                blob: None,
+                mime_type: None,
+                hash_matches: false,
+                metadata_hash_matches: metadata_json.is_some(),
+                metadata_json,
+            }),
+        })
     }
-    async fn get_nft_collections(&self, _req: &GetNftCollections) -> GetNftCollectionsResponse {
-        GetNftCollectionsResponse {
-            collections: Vec::new(),
-            total: 0,
-        }
+
+    async fn get_nft_collections(
+        &self,
+        req: &GetNftCollections,
+    ) -> Result<GetNftCollectionsResponse> {
+        let rows = self.db.all_nft_collections().await?;
+        let all: Vec<NftCollectionRecord> = rows
+            .iter()
+            .filter(|r| req.include_hidden || r.visible)
+            .filter_map(|r| serde_json::from_str::<NftCollectionRecord>(&r.record_json).ok())
+            .collect();
+        let total = all.len() as u32;
+        let collections = all
+            .into_iter()
+            .skip(req.offset as usize)
+            .take(req.limit as usize)
+            .collect();
+        Ok(GetNftCollectionsResponse { collections, total })
     }
-    async fn get_nft_collection(&self, _req: &GetNftCollection) -> GetNftCollectionResponse {
-        GetNftCollectionResponse { collection: None }
+
+    async fn get_nft_collection(&self, req: &GetNftCollection) -> Result<GetNftCollectionResponse> {
+        let collection = match &req.collection_id {
+            Some(id) => self
+                .db
+                .nft_collection(id)
+                .await?
+                .and_then(|r| serde_json::from_str::<NftCollectionRecord>(&r.record_json).ok()),
+            None => None,
+        };
+        Ok(GetNftCollectionResponse { collection })
     }
 
     // Transactions are derived from the coin table grouped by created/spent height.
@@ -516,6 +648,293 @@ impl WalletBackend {
         }
     }
 
+    // ---- send/spend method group (#216) ----------------------------------
+
+    /// The wallet's tracked p2 puzzle hashes (for summary "receiving" flags).
+    fn wallet_puzzle_hashes(&self) -> HashSet<Bytes32> {
+        if let Some(s) = &self.signer {
+            return s.puzzle_hashes();
+        }
+        self.config
+            .puzzle_hashes
+            .iter()
+            .filter_map(|h| singleton::bytes32_from_hex(h).ok())
+            .collect()
+    }
+
+    /// The signer, or a locked-wallet error (C.6: spends need node-custodied keys).
+    fn require_signer(&self) -> Result<&WalletSigner> {
+        self.signer
+            .as_deref()
+            .ok_or_else(|| Error::internal("wallet is locked: no signing key available"))
+    }
+
+    /// The change puzzle hash (the wallet's first receive address).
+    fn change_ph(&self) -> Result<Bytes32> {
+        if let Some(ph) = self.signer.as_ref().and_then(|s| s.change_puzzle_hash()) {
+            return Ok(ph);
+        }
+        match self.config.puzzle_hashes.first() {
+            Some(h) => singleton::bytes32_from_hex(h),
+            None => Err(Error::internal("no change address available")),
+        }
+    }
+
+    /// Decode a destination address to its puzzle hash.
+    fn decode_ph(&self, address: &str) -> Result<Bytes32> {
+        let hex = decode_address(address)
+            .ok_or_else(|| Error::api(format!("invalid address: {address}")))?;
+        singleton::bytes32_from_hex(&hex)
+    }
+
+    /// The spendable coins for an asset (`None` = XCH), as `chia_protocol::Coin`s.
+    async fn spendable_coins(&self, asset_id: Option<&str>) -> Result<Vec<Coin>> {
+        let rows = self.db.unspent_coins(asset_id).await?;
+        rows.iter().map(singleton::coin_from_row).collect()
+    }
+
+    /// Fetch specific coins by id (all must exist), as `chia_protocol::Coin`s.
+    async fn coins_from_ids(&self, ids: &[String]) -> Result<Vec<Coin>> {
+        let rows = self.db.coins_by_ids(ids).await?;
+        if rows.len() != ids.len() {
+            return Err(Error::not_found(
+                "one or more coins not found in the wallet",
+            ));
+        }
+        rows.iter().map(singleton::coin_from_row).collect()
+    }
+
+    /// Validate (dig-clvm), summarize, optionally sign+broadcast (only when a broadcaster is
+    /// attached — NEVER in CI), and return the Sage `TransactionResponse`.
+    async fn finalize_spend(
+        &self,
+        coin_spends: Vec<CoinSpend>,
+        auto_submit: bool,
+    ) -> Result<TransactionResponse> {
+        spend::run_and_validate(&coin_spends)?;
+        let summary = spend::summarize(
+            &coin_spends,
+            &self.config.address_prefix,
+            &self.wallet_puzzle_hashes(),
+        )?;
+        if auto_submit {
+            if let (Some(signer), Some(bc)) = (self.signer.as_ref(), self.broadcaster.as_ref()) {
+                let sig = signer.sign(&coin_spends)?;
+                bc.broadcast(&SpendBundle::new(coin_spends.clone(), sig))
+                    .await?;
+            }
+        }
+        let coin_spends_json = coin_spends
+            .iter()
+            .map(spend::coin_spend_to_json)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(TransactionResponse {
+            summary,
+            coin_spends: coin_spends_json,
+        })
+    }
+
+    async fn send_xch(&self, req: &SendXch) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let amount = amount_u64(&req.amount)?;
+        let fee = amount_u64(&req.fee)?;
+        let dest = self.decode_ph(&req.address)?;
+        let inputs = spend::select_coins(
+            self.spendable_coins(None).await?,
+            amount.saturating_add(fee),
+        )?;
+        let coin_spends =
+            spend::build_xch_send(signer, &inputs, dest, amount, fee, self.change_ph()?)?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    async fn bulk_send_xch(&self, req: &BulkSendXch) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let amount = amount_u64(&req.amount)?;
+        let fee = amount_u64(&req.fee)?;
+        let dests = req
+            .addresses
+            .iter()
+            .map(|a| self.decode_ph(a))
+            .collect::<Result<Vec<_>>>()?;
+        let target = amount
+            .saturating_mul(dests.len() as u64)
+            .saturating_add(fee);
+        let inputs = spend::select_coins(self.spendable_coins(None).await?, target)?;
+        let coin_spends =
+            spend::build_bulk_xch_send(signer, &inputs, &dests, amount, fee, self.change_ph()?)?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    async fn combine(&self, req: &Combine) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let inputs = self.coins_from_ids(&req.coin_ids).await?;
+        let coin_spends = spend::build_combine(signer, &inputs, self.change_ph()?, fee)?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    async fn split(&self, req: &Split) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let inputs = self.coins_from_ids(&req.coin_ids).await?;
+        let coin_spends =
+            spend::build_split(signer, &inputs, req.output_count, self.change_ph()?, fee)?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    async fn multi_send(&self, req: &MultiSend) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let mut payments = Vec::with_capacity(req.payments.len());
+        for p in &req.payments {
+            if p.asset_id.is_some() {
+                return Err(Error::api(
+                    "CAT payments in multi_send are not yet supported (use send_cat)",
+                ));
+            }
+            payments.push(spend::MultiPayment {
+                dest: self.decode_ph(&p.address)?,
+                amount: amount_u64(&p.amount)?,
+            });
+        }
+        let target = payments
+            .iter()
+            .map(|p| p.amount)
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(fee);
+        let inputs = spend::select_coins(self.spendable_coins(None).await?, target)?;
+        let coin_spends =
+            spend::build_multi_send(signer, &inputs, &payments, fee, self.change_ph()?)?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    /// Resolve the spendable input `Cat`s covering `amount` of `asset_id`, and the XCH fee
+    /// coins covering `fee`, via the attached lineage source.
+    async fn select_cats(
+        &self,
+        asset_id: &str,
+        amount: u64,
+        fee: u64,
+    ) -> Result<(Vec<chia_wallet_sdk::driver::Cat>, Vec<Coin>)> {
+        let lineage = self
+            .lineage
+            .as_deref()
+            .ok_or_else(|| Error::internal("CAT send requires a lineage source"))?;
+        let rows = select_cat_rows(self.db.unspent_coins(Some(asset_id)).await?, amount)?;
+        let mut cats = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let created = row
+                .created_height
+                .ok_or_else(|| Error::internal("CAT coin missing created height"))?
+                as u32;
+            let parent = lineage
+                .parent_spend(&row.parent_coin_info, created)
+                .await?
+                .ok_or_else(|| Error::internal("CAT parent spend unavailable"))?;
+            let child = singleton::coin_from_row(row)?;
+            let cat = singleton::resolve_cat(&parent, child)?
+                .ok_or_else(|| Error::internal("could not resolve CAT lineage"))?;
+            cats.push(cat);
+        }
+        let xch_fee_coins = if fee > 0 {
+            spend::select_coins(self.spendable_coins(None).await?, fee)?
+        } else {
+            Vec::new()
+        };
+        Ok((cats, xch_fee_coins))
+    }
+
+    async fn send_cat(&self, req: &SendCat) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let amount = amount_u64(&req.amount)?;
+        let fee = amount_u64(&req.fee)?;
+        let dest = self.decode_ph(&req.address)?;
+        let (cats, xch_fee_coins) = self.select_cats(&req.asset_id, amount, fee).await?;
+        let coin_spends = spend::build_cat_send(
+            signer,
+            &cats,
+            dest,
+            amount,
+            self.change_ph()?,
+            req.include_hint,
+            fee,
+            &xch_fee_coins,
+        )?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    async fn bulk_send_cat(&self, req: &BulkSendCat) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let amount = amount_u64(&req.amount)?;
+        let fee = amount_u64(&req.fee)?;
+        let outputs = req
+            .addresses
+            .iter()
+            .map(|a| self.decode_ph(a).map(|ph| (ph, amount)))
+            .collect::<Result<Vec<_>>>()?;
+        let total = amount.saturating_mul(req.addresses.len() as u64);
+        let (cats, xch_fee_coins) = self.select_cats(&req.asset_id, total, fee).await?;
+        let coin_spends = spend::build_cat_send_multi(
+            signer,
+            &cats,
+            &outputs,
+            self.change_ph()?,
+            req.include_hint,
+            fee,
+            &xch_fee_coins,
+        )?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    async fn sign_coin_spends(&self, req: &SignCoinSpends) -> Result<SignCoinSpendsResponse> {
+        let signer = self.require_signer()?;
+        let coin_spends = req
+            .coin_spends
+            .iter()
+            .map(spend::coin_spend_from_json)
+            .collect::<Result<Vec<_>>>()?;
+        let signature = signer.sign(&coin_spends)?;
+        let bundle = SpendBundle::new(coin_spends, signature);
+        if req.auto_submit {
+            if let Some(bc) = self.broadcaster.as_ref() {
+                bc.broadcast(&bundle).await?;
+            }
+        }
+        Ok(SignCoinSpendsResponse {
+            spend_bundle: spend::spend_bundle_to_json(&bundle)?,
+        })
+    }
+
+    async fn view_coin_spends(&self, req: &ViewCoinSpends) -> Result<ViewCoinSpendsResponse> {
+        let coin_spends = req
+            .coin_spends
+            .iter()
+            .map(spend::coin_spend_from_json)
+            .collect::<Result<Vec<_>>>()?;
+        let summary = spend::summarize(
+            &coin_spends,
+            &self.config.address_prefix,
+            &self.wallet_puzzle_hashes(),
+        )?;
+        Ok(ViewCoinSpendsResponse { summary })
+    }
+
+    async fn submit_transaction(
+        &self,
+        req: &SubmitTransaction,
+    ) -> Result<SubmitTransactionResponse> {
+        let bundle = spend::spend_bundle_from_json(&req.spend_bundle)?;
+        // Fail-closed: structural + CLVM validation before broadcast.
+        spend::run_and_validate(&bundle.coin_spends)?;
+        let bc = self
+            .broadcaster
+            .as_ref()
+            .ok_or_else(|| Error::internal("no broadcaster configured"))?;
+        bc.broadcast(&bundle).await?;
+        Ok(SubmitTransactionResponse {})
+    }
+
     // ---- the single dispatch both transports call ------------------------
 
     /// Parse + route a single Sage-parity RPC call. Returns `(http_status, body)`:
@@ -594,27 +1013,27 @@ impl WalletBackend {
             }
             "get_dids" => {
                 let _r = req!(GetDids);
-                json(self.get_dids().await)?
+                json(self.get_dids().await?)?
             }
             "get_nfts" => {
                 let r = req!(GetNfts);
-                json(self.get_nfts(&r).await)?
+                json(self.get_nfts(&r).await?)?
             }
             "get_nft" => {
                 let r = req!(GetNft);
-                json(self.get_nft(&r).await)?
+                json(self.get_nft(&r).await?)?
             }
             "get_nft_data" => {
                 let r = req!(GetNftData);
-                json(self.get_nft_data(&r).await)?
+                json(self.get_nft_data(&r).await?)?
             }
             "get_nft_collections" => {
                 let r = req!(GetNftCollections);
-                json(self.get_nft_collections(&r).await)?
+                json(self.get_nft_collections(&r).await?)?
             }
             "get_nft_collection" => {
                 let r = req!(GetNftCollection);
-                json(self.get_nft_collection(&r).await)?
+                json(self.get_nft_collection(&r).await?)?
             }
             "get_transactions" => {
                 let r = req!(GetTransactions);
@@ -640,6 +1059,46 @@ impl WalletBackend {
                 let _r = req!(GetKeys);
                 json(self.get_keys())?
             }
+            "send_xch" => {
+                let r = req!(SendXch);
+                json(self.send_xch(&r).await?)?
+            }
+            "bulk_send_xch" => {
+                let r = req!(BulkSendXch);
+                json(self.bulk_send_xch(&r).await?)?
+            }
+            "send_cat" => {
+                let r = req!(SendCat);
+                json(self.send_cat(&r).await?)?
+            }
+            "bulk_send_cat" => {
+                let r = req!(BulkSendCat);
+                json(self.bulk_send_cat(&r).await?)?
+            }
+            "combine" => {
+                let r = req!(Combine);
+                json(self.combine(&r).await?)?
+            }
+            "split" => {
+                let r = req!(Split);
+                json(self.split(&r).await?)?
+            }
+            "multi_send" => {
+                let r = req!(MultiSend);
+                json(self.multi_send(&r).await?)?
+            }
+            "sign_coin_spends" => {
+                let r = req!(SignCoinSpends);
+                json(self.sign_coin_spends(&r).await?)?
+            }
+            "view_coin_spends" => {
+                let r = req!(ViewCoinSpends);
+                json(self.view_coin_spends(&r).await?)?
+            }
+            "submit_transaction" => {
+                let r = req!(SubmitTransaction);
+                json(self.submit_transaction(&r).await?)?
+            }
             other => {
                 return Err(Error::not_found(format!(
                     "unknown or unsupported method: {other}"
@@ -654,6 +1113,47 @@ impl WalletBackend {
 
 fn json<T: Serialize>(v: T) -> Result<Value> {
     serde_json::to_value(v).map_err(|e| Error::internal(format!("serialize: {e}")))
+}
+
+/// Parse a wire [`Amount`] to `u64` (rejecting values beyond `u64`).
+fn amount_u64(a: &Amount) -> Result<u64> {
+    a.to_u64()
+        .ok_or_else(|| Error::api("amount exceeds u64 range".to_string()))
+}
+
+/// Normalize a Sage `nft_id`/`did_id` to the stored hex launcher id: a bech32m singleton
+/// address decodes to its 32-byte launcher id; a hex id is used as-is (lowercased).
+fn normalize_singleton_id(id: &str) -> String {
+    if let Some(ph) = decode_address(id) {
+        return ph;
+    }
+    id.strip_prefix("0x").unwrap_or(id).to_ascii_lowercase()
+}
+
+/// Greedily select CAT coin rows (largest first) covering `target`. Errors if they cannot.
+fn select_cat_rows(mut rows: Vec<CoinRow>, target: u64) -> Result<Vec<CoinRow>> {
+    rows.sort_by(|a, b| {
+        b.amount
+            .parse::<u64>()
+            .unwrap_or(0)
+            .cmp(&a.amount.parse::<u64>().unwrap_or(0))
+            .then(a.coin_id.cmp(&b.coin_id))
+    });
+    let mut selected = Vec::new();
+    let mut total: u64 = 0;
+    for r in rows {
+        if total >= target {
+            break;
+        }
+        total += r.amount.parse::<u64>().unwrap_or(0);
+        selected.push(r);
+    }
+    if total < target {
+        return Err(Error::api(format!(
+            "insufficient CAT balance: have {total}, need {target}"
+        )));
+    }
+    Ok(selected)
 }
 
 /// Encode a puzzle-hash hex as a bech32m address with `prefix`.
@@ -854,7 +1354,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_is_404() {
         let be = backend_with(vec![], true).await;
-        let (status, body) = be.dispatch("send_xch", "{}").await;
+        // `make_offer` is a real Sage endpoint but deferred to PR3 — unsupported here → 404.
+        let (status, body) = be.dispatch("make_offer", "{}").await;
         assert_eq!(status, 404);
         assert!(body.contains("unsupported"));
     }
@@ -886,5 +1387,188 @@ mod tests {
             .await;
         let resp: IsAssetOwnedResponse = serde_json::from_str(&body).unwrap();
         assert!(resp.owned);
+    }
+
+    // ---- send/spend dispatch (#216) --------------------------------------
+
+    use super::super::db::NftDbRow;
+    use super::super::spend::{MockBroadcaster, WalletSigner};
+    use chia_sdk_test::BlsPair;
+
+    /// A backend with a signer over a single test key, a coin funded at that key's puzzle
+    /// hash, and a mock broadcaster — enough to drive the send/spend surface off-chain.
+    async fn spend_backend(fund: u64) -> (WalletBackend, std::sync::Arc<MockBroadcaster>, Bytes32) {
+        let pair = BlsPair::new(1);
+        let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
+        let ph = *signer.puzzle_hashes().iter().next().unwrap();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&CoinRow {
+            coin_id: "coin1".into(),
+            parent_coin_info: "11".repeat(32),
+            puzzle_hash: hex::encode(ph),
+            amount: fund.to_string(),
+            created_height: Some(1),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        })
+        .await
+        .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let bc = Arc::new(MockBroadcaster::default());
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![hex::encode(ph)],
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), cfg)
+            .with_signer(signer)
+            .with_broadcaster(bc.clone());
+        (be, bc, ph)
+    }
+
+    #[tokio::test]
+    async fn send_xch_dispatch_builds_validates_and_broadcasts() {
+        let (be, bc, _ph) = spend_backend(1_000).await;
+        let dest = encode_address(&"22".repeat(32), "txch").unwrap();
+        let body = format!(r#"{{"address":"{dest}","amount":600,"fee":10,"auto_submit":true}}"#);
+        let (status, resp) = be.dispatch("send_xch", &body).await;
+        assert_eq!(status, 200, "{resp}");
+        let tr: TransactionResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(tr.summary.fee.to_u64(), Some(10));
+        assert!(!tr.coin_spends.is_empty());
+        assert_eq!(
+            bc.sent.lock().unwrap().len(),
+            1,
+            "auto_submit broadcasts once"
+        );
+    }
+
+    #[tokio::test]
+    async fn spend_without_signer_is_locked_error() {
+        // No signer attached → spend building must fail (C.6), not panic.
+        let be = backend_with(vec![], true).await;
+        let dest = encode_address(&"22".repeat(32), "xch").unwrap();
+        let body = format!(r#"{{"address":"{dest}","amount":1,"fee":0}}"#);
+        let (status, body) = be.dispatch("send_xch", &body).await;
+        assert_eq!(status, 500);
+        assert!(body.contains("locked") || body.contains("signing key"));
+    }
+
+    #[tokio::test]
+    async fn view_and_sign_and_submit_round_trip() {
+        let (be, bc, _ph) = spend_backend(1_000).await;
+        // Build (no broadcast) to get coin_spends.
+        let dest = encode_address(&"33".repeat(32), "txch").unwrap();
+        let build_body =
+            format!(r#"{{"address":"{dest}","amount":500,"fee":0,"auto_submit":false}}"#);
+        let (s, resp) = be.dispatch("send_xch", &build_body).await;
+        assert_eq!(s, 200, "{resp}");
+        let built: TransactionResponse = serde_json::from_str(&resp).unwrap();
+        let cs_json = serde_json::to_string(&built.coin_spends).unwrap();
+
+        // view_coin_spends summarizes the same spends.
+        let (s, resp) = be
+            .dispatch(
+                "view_coin_spends",
+                &format!(r#"{{"coin_spends":{cs_json}}}"#),
+            )
+            .await;
+        assert_eq!(s, 200, "{resp}");
+        let view: ViewCoinSpendsResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(view.summary.inputs.len(), 1);
+
+        // sign_coin_spends returns a bundle; submit_transaction broadcasts it.
+        let (s, resp) = be
+            .dispatch(
+                "sign_coin_spends",
+                &format!(r#"{{"coin_spends":{cs_json},"auto_submit":false}}"#),
+            )
+            .await;
+        assert_eq!(s, 200, "{resp}");
+        let signed: SignCoinSpendsResponse = serde_json::from_str(&resp).unwrap();
+        let bundle_json = serde_json::to_string(&signed.spend_bundle).unwrap();
+        let (s, _resp) = be
+            .dispatch(
+                "submit_transaction",
+                &format!(r#"{{"spend_bundle":{bundle_json}}}"#),
+            )
+            .await;
+        assert_eq!(s, 200);
+        assert_eq!(
+            bc.sent.lock().unwrap().len(),
+            1,
+            "submit broadcasts the bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_nfts_and_get_dids_return_reconstructed_rows() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let nft = NftRecord {
+            launcher_id: "aa".repeat(32),
+            collection_id: None,
+            collection_name: None,
+            minter_did: None,
+            owner_did: None,
+            visible: true,
+            sensitive_content: false,
+            name: Some("Test".into()),
+            created_height: Some(5),
+            coin_id: "bb".repeat(32),
+            address: "xch1".into(),
+            royalty_address: "xch1".into(),
+            royalty_ten_thousandths: 300,
+            data_uris: vec!["u".into()],
+            data_hash: None,
+            metadata_uris: vec![],
+            metadata_hash: None,
+            license_uris: vec![],
+            license_hash: None,
+            edition_number: Some(1),
+            edition_total: Some(1),
+            icon_url: None,
+            created_timestamp: None,
+            special_use_type: None,
+        };
+        db.upsert_nft(&NftDbRow {
+            launcher_id: nft.launcher_id.clone(),
+            coin_id: nft.coin_id.clone(),
+            collection_id: None,
+            minter_did: None,
+            owner_did: None,
+            name: nft.name.clone(),
+            visible: true,
+            created_height: Some(5),
+            record_json: serde_json::to_string(&nft).unwrap(),
+        })
+        .await
+        .unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+
+        let (s, resp) = be
+            .dispatch(
+                "get_nfts",
+                r#"{"offset":0,"limit":10,"sort_mode":"name","include_hidden":false}"#,
+            )
+            .await;
+        assert_eq!(s, 200, "{resp}");
+        let got: GetNftsResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(got.total, 1);
+        assert_eq!(got.nfts[0].launcher_id, nft.launcher_id);
+
+        // get_nft by hex launcher id.
+        let (_s, resp) = be
+            .dispatch("get_nft", &format!(r#"{{"nft_id":"{}"}}"#, nft.launcher_id))
+            .await;
+        let one: GetNftResponse = serde_json::from_str(&resp).unwrap();
+        assert!(one.nft.is_some());
     }
 }

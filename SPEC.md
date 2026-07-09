@@ -1059,8 +1059,9 @@ commit `a84d7dfc`) backed by a direct-peer chain sync into a local wallet databa
 `chia-query`/coinset fallback tier. A Sage RPC client can point at the dig-node interchangeably with
 Sage. It is a new surface, additive to and DISTINCT from the built-in wallet host (§16), the read/control
 JSON-RPC (§5/§7), and the CHIP-0002 `window.chia` dapp responder. It lives in the `dig-wallet` crate
-(`crate::sage`). This PR (#215) implements the READ + sync foundation; spend/mutation/offer methods and
-the event stream are follow-on units (§18.9).
+(`crate::sage`). #215 shipped the READ + sync foundation; #216 added NFT/DID/CAT reconstruction (§18.11)
+and the send/spend method group (§18.9). The offer suite, DID/NFT mint+transfer, and the event stream
+remain follow-on units (§18.12).
 
 18.1. **Transport — one method surface, two transports.** Byte-compatibility with Sage is required at
 the application layer (method names + JSON request/response shapes); the transport is adapted per client
@@ -1123,23 +1124,49 @@ added to `chia-query`. Every wallet-data read selects its source:
 
 So a caller never blocks on an unsynced replica. `get_sync_status` reports the gating sync state.
 
-18.8. **Method surface (this PR — MUST-tier reads).** `login`, `logout`, `get_version`,
+18.8. **Method surface — reads (served).** `login`, `logout`, `get_version`,
 `get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,
 `get_spendable_coin_count`, `get_coins`, `get_coins_by_ids`, `get_cats`, `get_all_cats`, `get_token`,
 `get_dids`, `get_nfts`, `get_nft`, `get_nft_data`, `get_nft_collections`, `get_nft_collection`,
 `get_transactions`, `get_transaction`, `get_pending_transactions`, `is_asset_owned`, `get_key`,
 `get_keys`. Coins and CAT balances/records are fully synced and served; transactions are derived from the
-coin table grouped by created/spent height; NFT/DID/collection reads return from their tables (singleton
-reconstruction that POPULATES them from coin state is a follow-on, §18.9), so an empty list rather than an
-error. `get_pending_transactions` is empty (no spend/submit path in this PR).
+coin table grouped by created/spent height; NFT/DID/collection reads return the rows the sync
+reconstruction populates (§18.11). `get_pending_transactions` is empty (no pending-tracking store yet).
 
-18.9. **Deferred to follow-on PRs.** All spend/mutation methods (`send_xch`/`send_cat`/`combine`/`split`/
-`multi_send`/`sign_coin_spends`/`submit_transaction`/…), the full offer suite, DID/NFT mint/transfer,
-options/actions/themes/network-settings; NFT/DID singleton reconstruction + metadata fetch; CAT
-attribution while syncing (needs puzzle uncurrying); dig-keystore seed migration; and the `SyncEvent`
-stream (clients poll `get_sync_status` for MVP parity). Secret-touching endpoints
-(`get_secret_key`/`generate_mnemonic`/`import_key`) stay loopback-only and gated regardless.
+18.9. **Method surface — send/spend group (served, #216).** `send_xch`, `bulk_send_xch`, `send_cat`,
+`bulk_send_cat`, `combine`, `split`, `multi_send`, `sign_coin_spends`, `view_coin_spends`,
+`submit_transaction`. Spends are built with the canonical `chia-wallet-sdk` driver constructors
+(`StandardLayer`/`SpendContext`/`Cat::spend_all`) — never hand-rolled CLVM — over coins selected from the
+wallet DB; the built bundle is validated by `dig-clvm` (`validate_spend_bundle`) BEFORE any broadcast
+(fail-closed). Because `dig-clvm` is the DIG **L2** consensus engine, its aggregate-signature check uses
+the DIG-L2 domain (not the Chia **L1** domain a wallet spend is signed for), so pre-broadcast validation
+runs with `DONT_VALIDATE_SIGNATURE` (CLVM execution + conservation + structure) and the **L1 broadcast
+target** (the Chia peer's `send_transaction`) verifies the signature against L1 constants. `auto_submit`
+broadcasts only when a broadcaster is attached; there is NEVER an auto-broadcast in tests/CI (a real
+mainnet broadcast is a separate, explicitly-gated live pass). Spend methods require the node-custodied
+signer; a locked wallet returns an error. `multi_send` covers XCH payments (CAT payments via `send_cat`).
 
-18.10. **Security.** Both listeners bind loopback only. The mTLS listener enforces the shared-cert mutual
+18.10. **Signing + custody (C.6).** The node signs with its custodied seed only for node-class /
+DIG-Browser callers (a `WalletSigner` over the wallet's synthetic p2 keys). Secret-touching endpoints
+(`get_secret_key`/`generate_mnemonic`/`import_key`/exportMnemonic/revealSeed) stay 501'd + loopback+token
+gated, NEVER reachable from a dapp/non-loopback origin. The MV3 extension self-custodies and does NOT use
+the node's sign/spend path.
+
+18.11. **NFT/DID/CAT reconstruction.** A raw `CoinState` does not reveal a coin's asset kind — that lives
+in the coin's puzzle, revealed only when its parent is spent. Reconstruction uncurries the parent spend
+(via the `Nft`/`Did`/`Cat` driver parsers) to populate the `nfts`/`dids`/`nft_collections` tables and to
+attribute CAT coins to their asset id (TAIL hash) in the `coins` table (so `get_cats`/`get_token` become
+complete). Parent spends are fetched through a `LineageSource` (out-of-DB lineage reads, B.5). Reads only.
+
+18.12. **Deferred to follow-on PRs.** The full offer suite (`make_offer`/`take_offer`/`view_offer`/
+`combine_offers`/`get_offers`/`cancel_offer`), DID/NFT mint+transfer (`create_did`/`bulk_mint_nfts`/
+`transfer_nfts`/`transfer_dids`), options/actions/themes/network-settings, the `SyncEvent` stream
+(clients poll `get_sync_status` for MVP parity), OpenAPI generation, dig-keystore seed migration, and the
+off-chain NFT data-blob/CHIP-0015 metadata fetch (`get_nft_data` returns on-chain fields; the metadata
+JSON surfaces when fetched). The service bring-up that starts the dual-transport server and invokes
+reconstruction after sync (via a peer/coinset `LineageSource`) is the remaining integration.
+
+18.13. **Security.** Both listeners bind loopback only. The mTLS listener enforces the shared-cert mutual
 TLS. Multi-peer sync is a correctness/censorship property (never collapse to one peer). Reads tolerate
-unknown/forward-incompatible fields (additive, §5.1 spirit).
+unknown/forward-incompatible fields (additive, §5.1 spirit). Spend submission is validated via `dig-clvm`
+before broadcast (fail-closed) and never auto-broadcasts without an attached broadcaster.

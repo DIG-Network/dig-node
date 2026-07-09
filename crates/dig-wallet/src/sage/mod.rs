@@ -34,6 +34,8 @@ pub mod db;
 pub mod fallback;
 pub mod routing;
 pub mod rpc;
+pub mod singleton;
+pub mod spend;
 pub mod sync;
 pub mod transport;
 pub mod types;

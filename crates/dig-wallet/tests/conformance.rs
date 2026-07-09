@@ -28,8 +28,77 @@ fn every_supported_method_is_a_real_sage_endpoint() {
              replica must not invent endpoints"
         );
     }
-    // The core READ subset this PR serves is 25 methods.
-    assert_eq!(WalletBackend::SUPPORTED_METHODS.len(), 25);
+    // 25 core reads (#215) + 10 send/spend methods (#216) = 35.
+    assert_eq!(WalletBackend::SUPPORTED_METHODS.len(), 35);
+}
+
+#[test]
+fn send_spend_group_methods_are_real_sage_endpoints() {
+    let catalogue: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(SAGE_ENDPOINTS).expect("endpoints.json parses");
+    for method in [
+        "send_xch",
+        "bulk_send_xch",
+        "send_cat",
+        "bulk_send_cat",
+        "combine",
+        "split",
+        "multi_send",
+        "sign_coin_spends",
+        "view_coin_spends",
+        "submit_transaction",
+    ] {
+        assert!(
+            catalogue.contains_key(method),
+            "send/spend method `{method}` is not in the pinned Sage v0.12.11 endpoints.json"
+        );
+        assert!(WalletBackend::supports(method), "`{method}` must be served");
+    }
+}
+
+#[test]
+fn coin_spend_json_is_byte_identical() {
+    let cs = CoinSpendJson {
+        coin: CoinJson {
+            parent_coin_info: "aa".into(),
+            puzzle_hash: "bb".into(),
+            amount: Amount::u64(1),
+        },
+        puzzle_reveal: "ff01".into(),
+        solution: "80".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&cs).unwrap(),
+        r#"{"coin":{"parent_coin_info":"aa","puzzle_hash":"bb","amount":1},"puzzle_reveal":"ff01","solution":"80"}"#
+    );
+}
+
+#[test]
+fn transaction_response_is_byte_identical() {
+    // The `pub type …Response = TransactionResponse` shape shared by every spend builder.
+    let resp = TransactionResponse {
+        summary: TransactionSummary {
+            fee: Amount::u64(0),
+            inputs: vec![],
+        },
+        coin_spends: vec![],
+    };
+    assert_eq!(
+        serde_json::to_string(&resp).unwrap(),
+        r#"{"summary":{"fee":0,"inputs":[]},"coin_spends":[]}"#
+    );
+}
+
+#[test]
+fn spend_bundle_json_is_byte_identical() {
+    let b = SpendBundleJson {
+        coin_spends: vec![],
+        aggregated_signature: "c0".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&b).unwrap(),
+        r#"{"coin_spends":[],"aggregated_signature":"c0"}"#
+    );
 }
 
 #[test]
