@@ -1029,7 +1029,8 @@ impl PeerRpcClient {
 
 // -- Peer-network bring-up: the connected pool + discovery + the mTLS peer-RPC server -----------------
 
-/// Spawn the node's L7 peer network in the background (standalone `run()` only): bring up
+/// Spawn the node's L7 peer network in the background (the OS-service bring-up calls this — #213;
+/// the in-process FFI host never does): bring up
 /// [`dig_gossip`]'s connected peer pool (introducer-backed auto-discovery via `relay.dig.net` + the
 /// relay reservation) AND the mTLS peer-RPC server (answers the L7 peer RPC from other nodes). Both
 /// use ONE TLS identity so the node presents a consistent `peer_id`. Best-effort: a failed bring-up
@@ -1147,6 +1148,22 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     status.set_running(peer_id_hex.clone());
     println!("dig-node peer network: peer_id {peer_id_hex} (network {network_id_str})");
 
+    // §14 autonomous sync — spawn the CHAIN-WATCH + GAP-FILL loop (SPEC §14.2 + §14.3) FIRST,
+    // INDEPENDENTLY of the P2P layer below. The proactive pull path (`Node::gap_fill_generation` →
+    // the authenticated §21 whole-store sync) needs NEITHER the connected pool NOR the DHT, so §14
+    // MUST NOT be gated behind them: a failed pool/DHT bring-up (a network hiccup, or the pre-launch
+    // placeholder network genesis the gossip config currently rejects) must never silently disable
+    // autonomous sync — the exact "declared complete but not running" gap (#213). The loop polls each
+    // subscribed store's anchored root on its interval and pulls any confirmed generation it lacks,
+    // verifying against the chain-anchored root; once the DHT is up (below) a successful pull also
+    // refreshes the provider records via the inventory hook. The in-process FFI path never reaches
+    // this bring-up, so it runs no watcher.
+    crate::chainwatch::spawn_chain_watch(node.clone());
+    println!(
+        "dig-node peer network: chain-watch + gap-fill loop up (interval {:?})",
+        crate::chainwatch::watch_interval_from_env()
+    );
+
     // 2. Bring up the connected peer pool (dig-gossip) with discovery via the relay introducer + the
     //    relay reservation for NAT reachability. The GossipService owns its own chia-ssl TLS cert
     //    under the cache dir; the pool auto-discovers + maintains connected peers.
@@ -1263,18 +1280,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         }));
     }
 
-    // 4d. Spawn the CHAIN-WATCH + GAP-FILL loop (SPEC §4.3 + §5.1) over the subscribed store set. This
-    //     runs INDEPENDENTLY of the DHT: the pull path (`Node::gap_fill_generation` → the authenticated
-    //     §21 whole-store sync) does not need the DHT, so a DHT bring-up failure must NOT silently
-    //     disable proactive gap-fill. The loop polls each subscribed store's anchored root on an
-    //     interval and pulls down any confirmed generation it lacks, verifying against the
-    //     chain-anchored root; when the DHT is up, a successful pull also refreshes the provider records
-    //     via the hook above. The in-process FFI path never reaches this bring-up, so it runs no watcher.
-    crate::chainwatch::spawn_chain_watch(node.clone());
-    println!(
-        "dig-node peer network: chain-watch + gap-fill loop up (interval {:?})",
-        crate::chainwatch::watch_interval_from_env()
-    );
+    // (The chain-watch + gap-fill loop was spawned FIRST, above, independent of the pool/DHT — §14.)
 
     // Graceful shutdown: on ctrl-c, best-effort withdraw this node's provider records so peers stop
     // being told to dial a node that is going away (TTL expiry is the backstop if this does not reach
