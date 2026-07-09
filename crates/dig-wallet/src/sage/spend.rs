@@ -403,9 +403,7 @@ pub fn build_multi_send(
 
 // ---- CAT spend builder ----------------------------------------------------
 
-/// Build a CAT send: `amount` of the CAT to `dest`, change back to `change`; `fee` (XCH) is
-/// paid from `xch_fee_coins` linked via `assert_concurrent_spend`. `cats` are the spendable
-/// input CAT coins (resolved with lineage via [`super::singleton::resolve_cat`]).
+/// Build a CAT send of `amount` to a single `dest` (see [`build_cat_send_multi`]).
 pub fn build_cat_send(
     signer: &WalletSigner,
     cats: &[Cat],
@@ -416,17 +414,36 @@ pub fn build_cat_send(
     fee: u64,
     xch_fee_coins: &[Coin],
 ) -> Result<Vec<CoinSpend>> {
+    build_cat_send_multi(signer, cats, &[(dest, amount)], change, include_hint, fee, xch_fee_coins)
+}
+
+/// Build a CAT send with one or more `outputs` (`(dest, amount)`), change back to `change`;
+/// `fee` (XCH) is paid from `xch_fee_coins` linked via `assert_concurrent_spend`. `cats` are
+/// the spendable input CAT coins (resolved with lineage via [`super::singleton::resolve_cat`]).
+pub fn build_cat_send_multi(
+    signer: &WalletSigner,
+    cats: &[Cat],
+    outputs: &[(Bytes32, u64)],
+    change: Bytes32,
+    include_hint: bool,
+    fee: u64,
+    xch_fee_coins: &[Coin],
+) -> Result<Vec<CoinSpend>> {
     if cats.is_empty() {
         return Err(Error::api("no CAT coins"));
     }
+    if outputs.is_empty() {
+        return Err(Error::api("no CAT outputs"));
+    }
     let total: u64 = cats.iter().map(|c| c.coin.amount).sum();
-    if total < amount {
+    let out_total: u64 = outputs.iter().map(|(_, a)| *a).sum();
+    if total < out_total {
         return Err(Error::api(format!(
-            "insufficient CAT balance: have {total}, need {amount}"
+            "insufficient CAT balance: have {total}, need {out_total}"
         )));
     }
     let mut ctx = SpendContext::new();
-    let cat_change = total - amount;
+    let cat_change = total - out_total;
     let mut cat_spends = Vec::with_capacity(cats.len());
     for (i, cat) in cats.iter().enumerate() {
         let syn_pk = signer
@@ -434,12 +451,15 @@ pub fn build_cat_send(
             .ok_or_else(|| Error::internal("no signing key for CAT inner puzzle"))?;
         let p2 = StandardLayer::new(syn_pk);
         let inner_conditions = if i == 0 {
-            let dest_memos = if include_hint {
-                ctx.hint(dest).map_err(|e| Error::internal(format!("hint: {e:?}")))?
-            } else {
-                Memos::None
-            };
-            let mut conds = Conditions::new().create_coin(dest, amount, dest_memos);
+            let mut conds = Conditions::new();
+            for (dest, amount) in outputs {
+                let dest_memos = if include_hint {
+                    ctx.hint(*dest).map_err(|e| Error::internal(format!("hint: {e:?}")))?
+                } else {
+                    Memos::None
+                };
+                conds = conds.create_coin(*dest, *amount, dest_memos);
+            }
             if cat_change > 0 {
                 conds = conds.create_coin(change, cat_change, Memos::None);
             }
