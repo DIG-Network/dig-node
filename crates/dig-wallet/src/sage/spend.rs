@@ -98,6 +98,12 @@ impl WalletSigner {
         self.keys.iter().map(|k| k.puzzle_hash).collect()
     }
 
+    /// The ordered `owner puzzle hash -> standard-layer public key` map the chia-wallet-sdk
+    /// action system's `Spends::finish_with_keys` needs (offer building, [`super::offers`]).
+    pub fn key_map(&self) -> indexmap::IndexMap<Bytes32, PublicKey> {
+        self.keys.iter().map(|k| (k.puzzle_hash, k.p2_pk)).collect()
+    }
+
     /// The wallet's first receive puzzle hash (used as the change address).
     pub fn change_puzzle_hash(&self) -> Option<Bytes32> {
         self.keys.first().map(|k| k.puzzle_hash)
@@ -178,7 +184,8 @@ pub fn select_coins(mut coins: Vec<Coin>, target: u64) -> Result<Vec<Coin>> {
 // ---- XCH spend builders (per-coin synthetic key) --------------------------
 
 /// Spend one coin at `coin.puzzle_hash` with `conditions`, using the key that owns it.
-fn spend_std(
+/// `pub(crate)` so the mint/offer builders reuse the exact per-coin standard-layer spend.
+pub(crate) fn spend_std(
     ctx: &mut SpendContext,
     signer: &WalletSigner,
     coin: Coin,
@@ -194,7 +201,11 @@ fn spend_std(
 }
 
 /// Link the remaining input coins to the first via `assert_concurrent_spend`.
-fn link_rest(ctx: &mut SpendContext, signer: &WalletSigner, inputs: &[Coin]) -> Result<()> {
+pub(crate) fn link_rest(
+    ctx: &mut SpendContext,
+    signer: &WalletSigner,
+    inputs: &[Coin],
+) -> Result<()> {
     if let Some(first) = inputs.first() {
         let first_id = first.coin_id();
         for coin in &inputs[1..] {

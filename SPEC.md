@@ -1060,8 +1060,9 @@ commit `a84d7dfc`) backed by a direct-peer chain sync into a local wallet databa
 Sage. It is a new surface, additive to and DISTINCT from the built-in wallet host (§16), the read/control
 JSON-RPC (§5/§7), and the CHIP-0002 `window.chia` dapp responder. It lives in the `dig-wallet` crate
 (`crate::sage`). #215 shipped the READ + sync foundation; #216 added NFT/DID/CAT reconstruction (§18.11)
-and the send/spend method group (§18.9). The offer suite, DID/NFT mint+transfer, and the event stream
-remain follow-on units (§18.12).
+and the send/spend method group (§18.9); #218 added the offer suite + DID/NFT mint & transfer (§18.9a).
+The `SyncEvent` stream, options/actions/themes/network-settings endpoints, OpenAPI generation, and the
+dig-keystore seed migration remain follow-on units (§18.12).
 
 18.1. **Transport — one method surface, two transports.** Byte-compatibility with Sage is required at
 the application layer (method names + JSON request/response shapes); the transport is adapted per client
@@ -1097,8 +1098,8 @@ byte-for-byte:
 
 18.5. **Local wallet database (SQLite).** The sync loop persists the wallet's chain state to a local
 SQLite database (via `sqlx`), mirroring `sage-wallet`'s relational store: coins/CATs/derivations (and
-NFT/DID/collection tables) keyed by the wallet's hardened AND unhardened HD puzzle hashes + CAT hints,
-plus the synced peak height. SQLite (NOT RocksDB): the workload is relational, multi-index, query-rich
+NFT/DID/collection tables, plus an `offers` table for imported/built offers, #218) keyed by the wallet's
+hardened AND unhardened HD puzzle hashes + CAT hints, plus the synced peak height. SQLite (NOT RocksDB): the workload is relational, multi-index, query-rich
 and small (one wallet). Indexes on `puzzle_hash`, `asset_id`, a PARTIAL index on unspent
 (`spent_height IS NULL`), and `created_height`; WAL enabled. Amounts are stored as decimal TEXT (full
 `u64`/`u128` range, no `i64` overflow). This DB is the source of truth for a SYNCED wallet's data.
@@ -1146,6 +1147,26 @@ broadcasts only when a broadcaster is attached; there is NEVER an auto-broadcast
 mainnet broadcast is a separate, explicitly-gated live pass). Spend methods require the node-custodied
 signer; a locked wallet returns an error. `multi_send` covers XCH payments (CAT payments via `send_cat`).
 
+18.9a. **Method surface — offer suite + DID/NFT mint & transfer (served, #218).** `make_offer`,
+`take_offer`, `view_offer`, `combine_offers`, `get_offers`, `get_offer`, `cancel_offer`, `create_did`,
+`bulk_mint_nfts`, `transfer_nfts`, `transfer_dids`. Offers are built with the canonical `chia-wallet-sdk`
+action system (`Spends`/`Action`/`RequestedPayments`/`Offer`): `make_offer` spends the offered coins into
+the settlement puzzle and asserts the requested notarized payments (nonce = tree-hash of the sorted
+offered coin ids), signs the maker side, and encodes the `offer1…` string; `take_offer` decodes the
+offer, funds the requested payments from the wallet, signs the taker side, and returns the COMBINED
+(maker + taker) signed bundle; `view_offer` decodes to the two-sided `OfferSummary` without settling;
+`combine_offers` aggregates several offers' spend bundles into one; `cancel_offer` reclaims the offer's
+still-cancellable offered coins back to the wallet. DID/NFT mint & transfer use the driver primitives
+(`Launcher::create_simple_did`, one `IntermediateLauncher` per NFT + `Nft`/`Did` `TransferNft`
+attribution, `Nft::transfer`/`Did::transfer`) — never hand-rolled CLVM. `bulk_mint_nfts` launches every
+NFT off the minting DID coin and spends the DID once to acknowledge all attributions atomically, funding
+the per-NFT launcher mojos + the fee from an XCH funding coin (Chia enforces conservation over the whole
+bundle). Every built bundle is validated by `dig-clvm` (`DONT_VALIDATE_SIGNATURE`, as §18.9) before any
+broadcast; `auto_submit` broadcasts only when a broadcaster is attached (never in CI). `make_offer`
+persists the built offer to a local `offers` table when `auto_import` is set; `get_offers`/`get_offer`
+read it back, `cancel_offer` marks it cancelled. Sage's per-endpoint `auto_submit` defaults are matched
+(offers/mint/transfer default `false`; `make_offer.auto_import` defaults `true`).
+
 18.10. **Signing + custody (C.6).** The node signs with its custodied seed only for node-class /
 DIG-Browser callers (a `WalletSigner` over the wallet's synthetic p2 keys). Secret-touching endpoints
 (`get_secret_key`/`generate_mnemonic`/`import_key`/exportMnemonic/revealSeed) stay 501'd + loopback+token
@@ -1158,13 +1179,12 @@ in the coin's puzzle, revealed only when its parent is spent. Reconstruction unc
 attribute CAT coins to their asset id (TAIL hash) in the `coins` table (so `get_cats`/`get_token` become
 complete). Parent spends are fetched through a `LineageSource` (out-of-DB lineage reads, B.5). Reads only.
 
-18.12. **Deferred to follow-on PRs.** The full offer suite (`make_offer`/`take_offer`/`view_offer`/
-`combine_offers`/`get_offers`/`cancel_offer`), DID/NFT mint+transfer (`create_did`/`bulk_mint_nfts`/
-`transfer_nfts`/`transfer_dids`), options/actions/themes/network-settings, the `SyncEvent` stream
-(clients poll `get_sync_status` for MVP parity), OpenAPI generation, dig-keystore seed migration, and the
-off-chain NFT data-blob/CHIP-0015 metadata fetch (`get_nft_data` returns on-chain fields; the metadata
-JSON surfaces when fetched). The service bring-up that starts the dual-transport server and invokes
-reconstruction after sync (via a peer/coinset `LineageSource`) is the remaining integration.
+18.12. **Deferred to follow-on PRs.** The options/actions/themes/network-settings endpoints, the
+`SyncEvent` stream (clients poll `get_sync_status` for MVP parity), OpenAPI generation, dig-keystore seed
+migration, and the off-chain NFT data-blob/CHIP-0015 metadata fetch (`get_nft_data` returns on-chain
+fields; the metadata JSON surfaces when fetched). The service bring-up that starts the dual-transport
+server and invokes reconstruction after sync (via a peer/coinset `LineageSource`) is the remaining
+integration.
 
 18.13. **Security.** Both listeners bind loopback only. The mTLS listener enforces the shared-cert mutual
 TLS. Multi-peer sync is a correctness/censorship property (never collapse to one peer). Reads tolerate

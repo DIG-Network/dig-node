@@ -34,6 +34,10 @@ chia-wallet-sdk = { version = "0.30", features = ["offer-compression"] }
 # CLVM runtime types (NodePtr/Allocator) used by the #216 singleton reconstruction + spend
 # builders. Pinned to the same 0.14 the SDK resolves so the NodePtr types unify.
 clvmr = "0.14"
+# Offer building (design A.5): the chia-wallet-sdk action system's `Spends::finish_with_keys`
+# takes an ordered `IndexMap<Bytes32, PublicKey>` (owner ph -> signing key), as digstore-chain's
+# offer builder does. Same crate the SDK resolves.
+indexmap = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }

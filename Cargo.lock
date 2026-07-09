@@ -2006,6 +2006,7 @@ dependencies = [
  "digstore-core",
  "hex",
  "http-body-util",
+ "indexmap",
  "rcgen",
  "rustls",
  "rustls-pemfile",
