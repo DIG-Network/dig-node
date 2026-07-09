@@ -94,7 +94,7 @@ fn encode_addr(puzzle_hash: Bytes32, prefix: &str) -> String {
         .unwrap_or_else(|_| hexb(puzzle_hash))
 }
 
-fn bytes32_from_hex(s: &str) -> Result<Bytes32> {
+pub(crate) fn bytes32_from_hex(s: &str) -> Result<Bytes32> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     let v = hex::decode(s).map_err(|e| Error::internal(format!("bad hex: {e}")))?;
     let arr: [u8; 32] = v
@@ -104,7 +104,7 @@ fn bytes32_from_hex(s: &str) -> Result<Bytes32> {
 }
 
 /// Build a `chia_protocol::Coin` from a stored wallet [`CoinRow`].
-fn coin_from_row(c: &CoinRow) -> Result<Coin> {
+pub(crate) fn coin_from_row(c: &CoinRow) -> Result<Coin> {
     Ok(Coin {
         parent_coin_info: bytes32_from_hex(&c.parent_coin_info)?,
         puzzle_hash: bytes32_from_hex(&c.puzzle_hash)?,
@@ -184,6 +184,26 @@ pub fn reconstruct(
         solution_ptr,
         child,
     ))
+}
+
+/// Resolve a spendable [`Cat`] (with its lineage proof) for `child` from its parent spend —
+/// the input a CAT spend builder needs. `None` if the parent is not a CAT or no child matches.
+pub fn resolve_cat(parent: &ParentSpend, child: Coin) -> Result<Option<Cat>> {
+    let mut ctx = SpendContext::new();
+    let puzzle_ptr = ctx
+        .alloc(&Program::from(parent.puzzle_reveal.clone()))
+        .map_err(|e| Error::internal(format!("alloc parent puzzle: {e}")))?;
+    let parent_puzzle = Puzzle::parse(&ctx, puzzle_ptr);
+    let solution_ptr = ctx
+        .alloc(&Program::from(parent.solution.clone()))
+        .map_err(|e| Error::internal(format!("alloc parent solution: {e}")))?;
+    let child_id = child.coin_id();
+    if let Ok(Some(children)) =
+        Cat::parse_children(&mut ctx, parent.coin, parent_puzzle, solution_ptr)
+    {
+        return Ok(children.into_iter().find(|c| c.coin.coin_id() == child_id));
+    }
+    Ok(None)
 }
 
 fn nft_row(
