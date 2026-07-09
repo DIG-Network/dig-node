@@ -19,12 +19,15 @@ use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::db::{CoinRow, WalletDb};
+use chia_wallet_sdk::driver::Cat;
+
+use super::db::{CoinRow, OfferDbRow, WalletDb};
 use super::fallback::{ChainFallback, FallbackCoin};
 use super::routing::{self, Source};
-use super::singleton::{self, LineageSource};
+use super::singleton::{self, LineageSource, ParentSpend};
 use super::spend::{self, Broadcaster, WalletSigner};
 use super::types::*;
+use super::{mint, offers};
 use super::{Error, Result};
 
 /// Static wallet identity + config the read surface needs (derived once at bring-up).
@@ -143,6 +146,19 @@ impl WalletBackend {
         "sign_coin_spends",
         "view_coin_spends",
         "submit_transaction",
+        // #218 offer suite.
+        "make_offer",
+        "take_offer",
+        "view_offer",
+        "combine_offers",
+        "get_offers",
+        "get_offer",
+        "cancel_offer",
+        // #218 DID/NFT mint + transfer.
+        "create_did",
+        "bulk_mint_nfts",
+        "transfer_nfts",
+        "transfer_dids",
     ];
 
     /// Whether `method` is served by this backend.
@@ -935,6 +951,349 @@ impl WalletBackend {
         Ok(SubmitTransactionResponse {})
     }
 
+    // ---- offer suite + DID/NFT mint & transfer (#218) --------------------
+
+    /// The lineage source, or an error when none is attached — CAT/singleton spends need
+    /// parent-spend reads to reconstruct their spendable driver objects.
+    fn require_lineage(&self) -> Result<&dyn LineageSource> {
+        self.lineage
+            .as_deref()
+            .ok_or_else(|| Error::internal("this operation requires a lineage source"))
+    }
+
+    /// Resolve a coin's parent spend + the current coin, from the wallet DB + lineage — the
+    /// input a singleton (NFT/DID) spend reconstruction needs.
+    async fn singleton_parent_child(&self, coin_id: &str) -> Result<(ParentSpend, Coin)> {
+        let lineage = self.require_lineage()?;
+        let row = self
+            .db
+            .coins_by_ids(&[coin_id.to_string()])
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::not_found("coin not tracked in the wallet"))?;
+        let created =
+            row.created_height
+                .ok_or_else(|| Error::internal("coin missing created height"))? as u32;
+        let parent = lineage
+            .parent_spend(&row.parent_coin_info, created)
+            .await?
+            .ok_or_else(|| Error::internal("parent spend unavailable"))?;
+        let child = singleton::coin_from_row(&row)?;
+        Ok((parent, child))
+    }
+
+    /// Resolve `nft_id` (hex/bech32m) to its current coin's (parent spend, coin).
+    async fn nft_parent_child(&self, nft_id: &str) -> Result<(ParentSpend, Coin)> {
+        let launcher = normalize_singleton_id(nft_id);
+        let row = self
+            .db
+            .nft(&launcher)
+            .await?
+            .ok_or_else(|| Error::not_found("NFT not tracked in the wallet"))?;
+        self.singleton_parent_child(&row.coin_id).await
+    }
+
+    /// Resolve `did_id` (hex/bech32m) to its current coin's (parent spend, coin).
+    async fn did_parent_child(&self, did_id: &str) -> Result<(ParentSpend, Coin)> {
+        let launcher = normalize_singleton_id(did_id);
+        let row = self
+            .db
+            .all_dids()
+            .await?
+            .into_iter()
+            .find(|d| d.launcher_id == launcher)
+            .ok_or_else(|| Error::not_found("DID not tracked in the wallet"))?;
+        self.singleton_parent_child(&row.coin_id).await
+    }
+
+    /// Reconstruct the spendable [`chia_wallet_sdk::driver::Did`] for `did_id` (a simple DID's
+    /// metadata is `NIL`, so it is safe to hand to the mint builder's own context).
+    async fn resolve_did(&self, did_id: &str) -> Result<chia_wallet_sdk::driver::Did> {
+        let (parent, child) = self.did_parent_child(did_id).await?;
+        let mut ctx = chia_wallet_sdk::driver::SpendContext::new();
+        singleton::parse_did_in(&mut ctx, &parent, child)?
+            .ok_or_else(|| Error::internal("could not reconstruct the minting DID"))
+    }
+
+    /// The spendable CAT coins of `asset_id` covering `amount` (with lineage proofs).
+    async fn resolve_offer_cats(&self, asset_id: &str, amount: u64) -> Result<Vec<Cat>> {
+        let (cats, _fee) = self.select_cats(asset_id, amount, 0).await?;
+        Ok(cats)
+    }
+
+    async fn make_offer(&self, req: &MakeOffer) -> Result<MakeOfferResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let receive_ph = match &req.receive_address {
+            Some(a) => self.decode_ph(a)?,
+            None => self.change_ph()?,
+        };
+        let change = self.change_ph()?;
+
+        let mut inputs = offers::OfferInputs::default();
+        let mut offered_legs = Vec::with_capacity(req.offered_assets.len());
+        let mut any_xch_offered = false;
+        for a in &req.offered_assets {
+            let amount = amount_u64(&a.amount)?;
+            match &a.asset_id {
+                None => any_xch_offered = true,
+                Some(id) => inputs
+                    .cats
+                    .extend(self.resolve_offer_cats(id, amount).await?),
+            }
+            offered_legs.push(offers::OfferLeg {
+                asset_id: opt_asset_id(&a.asset_id)?,
+                amount,
+            });
+        }
+        if any_xch_offered {
+            inputs.xch = self.spendable_coins(None).await?;
+        }
+        let requested_legs = req
+            .requested_assets
+            .iter()
+            .map(|a| {
+                Ok(offers::OfferLeg {
+                    asset_id: opt_asset_id(&a.asset_id)?,
+                    amount: amount_u64(&a.amount)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let (offer_str, offer_id) = offers::build_make_offer(
+            signer,
+            &inputs,
+            &offered_legs,
+            &requested_legs,
+            receive_ph,
+            change,
+            fee,
+        )?;
+
+        if req.auto_import {
+            let summary = offers::summarize_offer(&offer_str)?;
+            self.db
+                .upsert_offer(&OfferDbRow {
+                    offer_id: offer_id.clone(),
+                    offer: offer_str.clone(),
+                    status: "active".into(),
+                    creation_timestamp: now_secs() as i64,
+                    summary_json: serde_json::to_string(&summary).unwrap_or_default(),
+                })
+                .await?;
+        }
+        Ok(MakeOfferResponse {
+            offer: offer_str,
+            offer_id,
+        })
+    }
+
+    async fn take_offer(&self, req: &TakeOffer) -> Result<TakeOfferResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let change = self.change_ph()?;
+
+        // The taker pays the maker's requested assets — fund exactly those.
+        let summary = offers::summarize_offer(&req.offer)?;
+        let mut inputs = offers::OfferInputs::default();
+        let mut need_xch = fee > 0;
+        for a in &summary.taker {
+            let amount = a.amount.to_u64().unwrap_or(0);
+            match &a.asset.asset_id {
+                None => need_xch = true,
+                Some(id) => inputs
+                    .cats
+                    .extend(self.resolve_offer_cats(id, amount).await?),
+            }
+        }
+        if need_xch {
+            inputs.xch = self.spendable_coins(None).await?;
+        }
+
+        let bundle = offers::build_take_offer(signer, &req.offer, &inputs, change, fee)?;
+        spend::run_and_validate(&bundle.coin_spends)?;
+        let tx_summary = spend::summarize(
+            &bundle.coin_spends,
+            &self.config.address_prefix,
+            &self.wallet_puzzle_hashes(),
+        )?;
+        if req.auto_submit {
+            if let Some(bc) = self.broadcaster.as_ref() {
+                bc.broadcast(&bundle).await?;
+            }
+        }
+        Ok(TakeOfferResponse {
+            summary: tx_summary,
+            spend_bundle: spend::spend_bundle_to_json(&bundle)?,
+            transaction_id: offers::offer_id_of_str(&req.offer)?,
+        })
+    }
+
+    fn view_offer_summary(&self, req: &ViewOffer) -> Result<OfferSummary> {
+        offers::summarize_offer(&req.offer)
+    }
+
+    async fn view_offer(&self, req: &ViewOffer) -> Result<ViewOfferResponse> {
+        let summary = self.view_offer_summary(req)?;
+        let offer_id = offers::offer_id_of_str(&req.offer)?;
+        let status = match self.db.offer(&offer_id).await? {
+            Some(r) => parse_offer_status(&r.status),
+            None => OfferRecordStatus::Active,
+        };
+        Ok(ViewOfferResponse {
+            offer: summary,
+            status,
+        })
+    }
+
+    fn combine_offers(&self, req: &CombineOffers) -> Result<CombineOffersResponse> {
+        Ok(CombineOffersResponse {
+            offer: offers::combine_offers(&req.offers)?,
+        })
+    }
+
+    async fn get_offers(&self) -> Result<GetOffersResponse> {
+        let rows = self.db.all_offers().await?;
+        Ok(GetOffersResponse {
+            offers: rows.iter().filter_map(offer_row_to_record).collect(),
+        })
+    }
+
+    async fn get_offer(&self, req: &GetOffer) -> Result<GetOfferResponse> {
+        let row = self
+            .db
+            .offer(&req.offer_id)
+            .await?
+            .ok_or_else(|| Error::not_found("offer not found"))?;
+        Ok(GetOfferResponse {
+            offer: offer_row_to_record(&row)
+                .ok_or_else(|| Error::internal("corrupt stored offer record"))?,
+        })
+    }
+
+    async fn cancel_offer(&self, req: &CancelOffer) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let change = self.change_ph()?;
+        let row = self
+            .db
+            .offer(&req.offer_id)
+            .await?
+            .ok_or_else(|| Error::not_found("offer not found"))?;
+        let coin_spends = offers::build_cancel_offer(signer, &row.offer, change, fee)?;
+        let resp = self.finalize_spend(coin_spends, req.auto_submit).await?;
+        self.db.set_offer_status(&req.offer_id, "cancelled").await?;
+        Ok(resp)
+    }
+
+    async fn create_did(&self, req: &CreateDid) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let inputs =
+            spend::select_coins(self.spendable_coins(None).await?, 1u64.saturating_add(fee))?;
+        let (coin_spends, _launcher) =
+            mint::build_create_did(signer, &inputs, self.change_ph()?, fee)?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    async fn bulk_mint_nfts(&self, req: &BulkMintNfts) -> Result<BulkMintNftsResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let did = self.resolve_did(&req.did_id).await?;
+        let default_owner = self.change_ph()?;
+        let mut plans = Vec::with_capacity(req.mints.len());
+        for m in &req.mints {
+            let owner_ph = match &m.address {
+                Some(a) => self.decode_ph(a)?,
+                None => default_owner,
+            };
+            let royalty_ph = match &m.royalty_address {
+                Some(a) => self.decode_ph(a)?,
+                None => owner_ph,
+            };
+            let metadata = mint::nft_metadata(
+                m.data_uris.clone(),
+                m.data_hash.as_deref(),
+                m.metadata_uris.clone(),
+                m.metadata_hash.as_deref(),
+                m.license_uris.clone(),
+                m.license_hash.as_deref(),
+                m.edition_number,
+                m.edition_total,
+            )?;
+            plans.push(mint::NftMintPlan {
+                metadata,
+                owner_ph,
+                royalty_ph,
+                royalty_basis_points: m.royalty_ten_thousandths,
+            });
+        }
+        let n = plans.len() as u64;
+        let funding =
+            spend::select_coins(self.spendable_coins(None).await?, n.saturating_add(fee))?;
+        let (coin_spends, launcher_ids) =
+            mint::build_bulk_mint(signer, did, &plans, &funding, self.change_ph()?, fee)?;
+        spend::run_and_validate(&coin_spends)?;
+        let summary = spend::summarize(
+            &coin_spends,
+            &self.config.address_prefix,
+            &self.wallet_puzzle_hashes(),
+        )?;
+        if req.auto_submit {
+            if let (Some(s), Some(bc)) = (self.signer.as_ref(), self.broadcaster.as_ref()) {
+                let sig = s.sign(&coin_spends)?;
+                bc.broadcast(&SpendBundle::new(coin_spends.clone(), sig))
+                    .await?;
+            }
+        }
+        let coin_spends_json = coin_spends
+            .iter()
+            .map(spend::coin_spend_to_json)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(BulkMintNftsResponse {
+            nft_ids: launcher_ids.iter().map(hex::encode).collect(),
+            summary,
+            coin_spends: coin_spends_json,
+        })
+    }
+
+    async fn transfer_nfts(&self, req: &TransferNfts) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let dest = self.decode_ph(&req.address)?;
+        let mut nfts = Vec::with_capacity(req.nft_ids.len());
+        for id in &req.nft_ids {
+            nfts.push(self.nft_parent_child(id).await?);
+        }
+        let fee_coins = if fee > 0 {
+            spend::select_coins(self.spendable_coins(None).await?, fee)?
+        } else {
+            Vec::new()
+        };
+        let coin_spends =
+            mint::build_nft_transfer(signer, &nfts, dest, &fee_coins, self.change_ph()?, fee)?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    async fn transfer_dids(&self, req: &TransferDids) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let dest = self.decode_ph(&req.address)?;
+        let mut dids = Vec::with_capacity(req.did_ids.len());
+        for id in &req.did_ids {
+            dids.push(self.did_parent_child(id).await?);
+        }
+        let fee_coins = if fee > 0 {
+            spend::select_coins(self.spendable_coins(None).await?, fee)?
+        } else {
+            Vec::new()
+        };
+        let coin_spends =
+            mint::build_did_transfer(signer, &dids, dest, &fee_coins, self.change_ph()?, fee)?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
     // ---- the single dispatch both transports call ------------------------
 
     /// Parse + route a single Sage-parity RPC call. Returns `(http_status, body)`:
@@ -1099,6 +1458,50 @@ impl WalletBackend {
                 let r = req!(SubmitTransaction);
                 json(self.submit_transaction(&r).await?)?
             }
+            "make_offer" => {
+                let r = req!(MakeOffer);
+                json(self.make_offer(&r).await?)?
+            }
+            "take_offer" => {
+                let r = req!(TakeOffer);
+                json(self.take_offer(&r).await?)?
+            }
+            "view_offer" => {
+                let r = req!(ViewOffer);
+                json(self.view_offer(&r).await?)?
+            }
+            "combine_offers" => {
+                let r = req!(CombineOffers);
+                json(self.combine_offers(&r)?)?
+            }
+            "get_offers" => {
+                let _r = req!(GetOffers);
+                json(self.get_offers().await?)?
+            }
+            "get_offer" => {
+                let r = req!(GetOffer);
+                json(self.get_offer(&r).await?)?
+            }
+            "cancel_offer" => {
+                let r = req!(CancelOffer);
+                json(self.cancel_offer(&r).await?)?
+            }
+            "create_did" => {
+                let r = req!(CreateDid);
+                json(self.create_did(&r).await?)?
+            }
+            "bulk_mint_nfts" => {
+                let r = req!(BulkMintNfts);
+                json(self.bulk_mint_nfts(&r).await?)?
+            }
+            "transfer_nfts" => {
+                let r = req!(TransferNfts);
+                json(self.transfer_nfts(&r).await?)?
+            }
+            "transfer_dids" => {
+                let r = req!(TransferDids);
+                json(self.transfer_dids(&r).await?)?
+            }
             other => {
                 return Err(Error::not_found(format!(
                     "unknown or unsupported method: {other}"
@@ -1119,6 +1522,46 @@ fn json<T: Serialize>(v: T) -> Result<Value> {
 fn amount_u64(a: &Amount) -> Result<u64> {
     a.to_u64()
         .ok_or_else(|| Error::api("amount exceeds u64 range".to_string()))
+}
+
+/// Parse a wire asset id (`None` = XCH) to a 32-byte hash.
+fn opt_asset_id(id: &Option<String>) -> Result<Option<Bytes32>> {
+    match id {
+        None => Ok(None),
+        Some(s) => Ok(Some(singleton::bytes32_from_hex(s)?)),
+    }
+}
+
+/// The current unix time in seconds (0 if the clock is before the epoch).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse a stored status token into an [`OfferRecordStatus`] (unknown → `Active`).
+fn parse_offer_status(s: &str) -> OfferRecordStatus {
+    match s {
+        "pending" => OfferRecordStatus::Pending,
+        "completed" => OfferRecordStatus::Completed,
+        "cancelled" => OfferRecordStatus::Cancelled,
+        "expired" => OfferRecordStatus::Expired,
+        _ => OfferRecordStatus::Active,
+    }
+}
+
+/// Render a stored [`OfferDbRow`] as the Sage [`OfferRecord`] wire shape (`None` if the
+/// stored summary JSON is corrupt).
+fn offer_row_to_record(row: &OfferDbRow) -> Option<OfferRecord> {
+    let summary: OfferSummary = serde_json::from_str(&row.summary_json).ok()?;
+    Some(OfferRecord {
+        offer_id: row.offer_id.clone(),
+        offer: row.offer.clone(),
+        status: parse_offer_status(&row.status),
+        creation_timestamp: row.creation_timestamp as u64,
+        summary,
+    })
 }
 
 /// Normalize a Sage `nft_id`/`did_id` to the stored hex launcher id: a bech32m singleton
@@ -1354,8 +1797,9 @@ mod tests {
     #[tokio::test]
     async fn unknown_method_is_404() {
         let be = backend_with(vec![], true).await;
-        // `make_offer` is a real Sage endpoint but deferred to PR3 — unsupported here → 404.
-        let (status, body) = be.dispatch("make_offer", "{}").await;
+        // `get_secret_key` is a real Sage endpoint but not served here (secret-touching,
+        // never exposed) — an unsupported method → 404.
+        let (status, body) = be.dispatch("get_secret_key", "{}").await;
         assert_eq!(status, 404);
         assert!(body.contains("unsupported"));
     }
@@ -1502,6 +1946,85 @@ mod tests {
             1,
             "submit broadcasts the bundle"
         );
+    }
+
+    #[tokio::test]
+    async fn offer_and_did_dispatch_end_to_end() {
+        // A single wallet backend with a signer + a large funding coin drives the offer +
+        // DID dispatch surface: make_offer stores an offer, get_offers/get_offer/view_offer
+        // read it, cancel_offer flips its status, create_did builds a valid DID spend. No
+        // broadcast reaches the network (MockBroadcaster).
+        let (be, _bc, ph) = spend_backend(1_000_000).await;
+        let addr = encode_address(&hex::encode(ph), "txch").unwrap();
+
+        // make_offer: OFFER 300 XCH, REQUEST 500 XCH to our own address (auto_import).
+        let body = format!(
+            r#"{{"offered_assets":[{{"asset_id":null,"amount":300}}],"requested_assets":[{{"asset_id":null,"amount":500}}],"fee":0,"receive_address":"{addr}"}}"#
+        );
+        let (s, resp) = be.dispatch("make_offer", &body).await;
+        assert_eq!(s, 200, "{resp}");
+        let mo: MakeOfferResponse = serde_json::from_str(&resp).unwrap();
+        assert!(mo.offer.starts_with("offer1"), "got {}", mo.offer);
+        assert_eq!(mo.offer_id.len(), 64);
+
+        // get_offers returns the stored offer (auto_import defaulted true).
+        let (s, resp) = be.dispatch("get_offers", "{}").await;
+        assert_eq!(s, 200);
+        let go: GetOffersResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(go.offers.len(), 1);
+        assert_eq!(go.offers[0].offer_id, mo.offer_id);
+        assert!(matches!(go.offers[0].status, OfferRecordStatus::Active));
+
+        // view_offer summarizes it: maker gives 300, taker pays 500.
+        let vo_body = format!(
+            r#"{{"offer":{}}}"#,
+            serde_json::to_string(&mo.offer).unwrap()
+        );
+        let (s, resp) = be.dispatch("view_offer", &vo_body).await;
+        assert_eq!(s, 200, "{resp}");
+        let vo: ViewOfferResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(vo.offer.maker[0].amount.to_u64(), Some(300));
+        assert_eq!(vo.offer.taker[0].amount.to_u64(), Some(500));
+
+        // create_did builds + validates a DID creation (no broadcast: auto_submit default false).
+        let (s, resp) = be.dispatch("create_did", r#"{"name":"me","fee":0}"#).await;
+        assert_eq!(s, 200, "{resp}");
+        let tr: TransactionResponse = serde_json::from_str(&resp).unwrap();
+        assert!(!tr.coin_spends.is_empty());
+
+        // cancel_offer flips the stored offer to cancelled.
+        let (s, resp) = be
+            .dispatch(
+                "cancel_offer",
+                &format!(r#"{{"offer_id":"{}","fee":0}}"#, mo.offer_id),
+            )
+            .await;
+        assert_eq!(s, 200, "{resp}");
+        let (_s, resp) = be
+            .dispatch("get_offer", &format!(r#"{{"offer_id":"{}"}}"#, mo.offer_id))
+            .await;
+        let one: GetOfferResponse = serde_json::from_str(&resp).unwrap();
+        assert!(matches!(one.offer.status, OfferRecordStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn transfer_without_signer_is_locked_and_combine_needs_two() {
+        // Secret-custody gate (C.6): a spend method with no signer attached fails locked.
+        let be = backend_with(vec![], true).await;
+        let (status, body) = be
+            .dispatch(
+                "transfer_nfts",
+                r#"{"nft_ids":["aa"],"address":"xch1x","fee":0}"#,
+            )
+            .await;
+        assert_eq!(status, 500);
+        assert!(body.contains("locked") || body.contains("signing key"));
+
+        // combine_offers needs at least two offers → 400.
+        let (status, _b) = be
+            .dispatch("combine_offers", r#"{"offers":["offer1abc"]}"#)
+            .await;
+        assert_eq!(status, 400);
     }
 
     #[tokio::test]
