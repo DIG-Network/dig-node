@@ -745,7 +745,9 @@ impl WalletDb {
             name: r.get("name"),
             visible: r.get::<i64, _>("visible") != 0,
             created_height: r.get("created_height"),
-            record_json: r.get::<Option<String>, _>("record_json").unwrap_or_default(),
+            record_json: r
+                .get::<Option<String>, _>("record_json")
+                .unwrap_or_default(),
         }
     }
 
@@ -817,7 +819,9 @@ impl WalletDb {
             name: r.get("name"),
             visible: r.get::<i64, _>("visible") != 0,
             created_height: r.get("created_height"),
-            record_json: r.get::<Option<String>, _>("record_json").unwrap_or_default(),
+            record_json: r
+                .get::<Option<String>, _>("record_json")
+                .unwrap_or_default(),
         }
     }
 
@@ -861,7 +865,9 @@ impl WalletDb {
             metadata_collection_id: r.get("metadata_collection_id"),
             name: r.get("name"),
             visible: r.get::<i64, _>("visible") != 0,
-            record_json: r.get::<Option<String>, _>("record_json").unwrap_or_default(),
+            record_json: r
+                .get::<Option<String>, _>("record_json")
+                .unwrap_or_default(),
         }
     }
 
@@ -878,12 +884,14 @@ impl WalletDb {
         &self,
         collection_id: &str,
     ) -> sqlx::Result<Option<NftCollectionDbRow>> {
-        Ok(sqlx::query("SELECT * FROM nft_collections WHERE collection_id = ?")
-            .bind(collection_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .as_ref()
-            .map(Self::collection_from_row))
+        Ok(
+            sqlx::query("SELECT * FROM nft_collections WHERE collection_id = ?")
+                .bind(collection_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .as_ref()
+                .map(Self::collection_from_row),
+        )
     }
 }
 
@@ -1059,7 +1067,10 @@ mod tests {
             .unwrap();
         assert_eq!(db.balance(Some("abc")).await.unwrap(), 300);
         assert_eq!(db.balance(None).await.unwrap(), 0);
-        assert_eq!(db.owned_cat_asset_ids().await.unwrap(), vec!["abc".to_string()]);
+        assert_eq!(
+            db.owned_cat_asset_ids().await.unwrap(),
+            vec!["abc".to_string()]
+        );
         assert!(db.is_asset_owned("abc").await.unwrap());
     }
 
@@ -1137,7 +1148,12 @@ mod tests {
         .unwrap();
         assert_eq!(db.all_nft_collections().await.unwrap().len(), 1);
         assert_eq!(
-            db.nft_collection("col1").await.unwrap().unwrap().name.as_deref(),
+            db.nft_collection("col1")
+                .await
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
             Some("My Collection")
         );
     }

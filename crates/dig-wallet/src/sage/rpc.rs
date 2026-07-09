@@ -442,7 +442,11 @@ impl WalletBackend {
                 None => true,
             };
             let name_ok = match &req.name {
-                Some(n) => r.name.as_deref().map(|rn| rn.contains(n.as_str())).unwrap_or(false),
+                Some(n) => r
+                    .name
+                    .as_deref()
+                    .map(|rn| rn.contains(n.as_str()))
+                    .unwrap_or(false),
                 None => true,
             };
             coll_ok && minter_ok && owner_ok && name_ok
@@ -455,7 +459,7 @@ impl WalletBackend {
             .collect();
         match req.sort_mode {
             NftSortMode::Name => nfts.sort_by(|a, b| a.name.cmp(&b.name)),
-            NftSortMode::Recent => nfts.sort_by(|a, b| b.created_height.cmp(&a.created_height)),
+            NftSortMode::Recent => nfts.sort_by_key(|n| std::cmp::Reverse(n.created_height)),
         }
         let total = nfts.len() as u32;
         let page = nfts
@@ -512,16 +516,10 @@ impl WalletBackend {
             .skip(req.offset as usize)
             .take(req.limit as usize)
             .collect();
-        Ok(GetNftCollectionsResponse {
-            collections,
-            total,
-        })
+        Ok(GetNftCollectionsResponse { collections, total })
     }
 
-    async fn get_nft_collection(
-        &self,
-        req: &GetNftCollection,
-    ) -> Result<GetNftCollectionResponse> {
+    async fn get_nft_collection(&self, req: &GetNftCollection) -> Result<GetNftCollectionResponse> {
         let collection = match &req.collection_id {
             Some(id) => self
                 .db
@@ -699,7 +697,9 @@ impl WalletBackend {
     async fn coins_from_ids(&self, ids: &[String]) -> Result<Vec<Coin>> {
         let rows = self.db.coins_by_ids(ids).await?;
         if rows.len() != ids.len() {
-            return Err(Error::not_found("one or more coins not found in the wallet"));
+            return Err(Error::not_found(
+                "one or more coins not found in the wallet",
+            ));
         }
         rows.iter().map(singleton::coin_from_row).collect()
     }
@@ -720,7 +720,8 @@ impl WalletBackend {
         if auto_submit {
             if let (Some(signer), Some(bc)) = (self.signer.as_ref(), self.broadcaster.as_ref()) {
                 let sig = signer.sign(&coin_spends)?;
-                bc.broadcast(&SpendBundle::new(coin_spends.clone(), sig)).await?;
+                bc.broadcast(&SpendBundle::new(coin_spends.clone(), sig))
+                    .await?;
             }
         }
         let coin_spends_json = coin_spends
@@ -738,8 +739,10 @@ impl WalletBackend {
         let amount = amount_u64(&req.amount)?;
         let fee = amount_u64(&req.fee)?;
         let dest = self.decode_ph(&req.address)?;
-        let inputs =
-            spend::select_coins(self.spendable_coins(None).await?, amount.saturating_add(fee))?;
+        let inputs = spend::select_coins(
+            self.spendable_coins(None).await?,
+            amount.saturating_add(fee),
+        )?;
         let coin_spends =
             spend::build_xch_send(signer, &inputs, dest, amount, fee, self.change_ph()?)?;
         self.finalize_spend(coin_spends, req.auto_submit).await
@@ -1394,9 +1397,7 @@ mod tests {
 
     /// A backend with a signer over a single test key, a coin funded at that key's puzzle
     /// hash, and a mock broadcaster — enough to drive the send/spend surface off-chain.
-    async fn spend_backend(
-        fund: u64,
-    ) -> (WalletBackend, std::sync::Arc<MockBroadcaster>, Bytes32) {
+    async fn spend_backend(fund: u64) -> (WalletBackend, std::sync::Arc<MockBroadcaster>, Bytes32) {
         let pair = BlsPair::new(1);
         let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
         let ph = *signer.puzzle_hashes().iter().next().unwrap();
@@ -1438,7 +1439,11 @@ mod tests {
         let tr: TransactionResponse = serde_json::from_str(&resp).unwrap();
         assert_eq!(tr.summary.fee.to_u64(), Some(10));
         assert!(!tr.coin_spends.is_empty());
-        assert_eq!(bc.sent.lock().unwrap().len(), 1, "auto_submit broadcasts once");
+        assert_eq!(
+            bc.sent.lock().unwrap().len(),
+            1,
+            "auto_submit broadcasts once"
+        );
     }
 
     #[tokio::test]
@@ -1466,7 +1471,10 @@ mod tests {
 
         // view_coin_spends summarizes the same spends.
         let (s, resp) = be
-            .dispatch("view_coin_spends", &format!(r#"{{"coin_spends":{cs_json}}}"#))
+            .dispatch(
+                "view_coin_spends",
+                &format!(r#"{{"coin_spends":{cs_json}}}"#),
+            )
             .await;
         assert_eq!(s, 200, "{resp}");
         let view: ViewCoinSpendsResponse = serde_json::from_str(&resp).unwrap();
@@ -1489,7 +1497,11 @@ mod tests {
             )
             .await;
         assert_eq!(s, 200);
-        assert_eq!(bc.sent.lock().unwrap().len(), 1, "submit broadcasts the bundle");
+        assert_eq!(
+            bc.sent.lock().unwrap().len(),
+            1,
+            "submit broadcasts the bundle"
+        );
     }
 
     #[tokio::test]
@@ -1535,10 +1547,17 @@ mod tests {
         })
         .await
         .unwrap();
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
 
         let (s, resp) = be
-            .dispatch("get_nfts", r#"{"offset":0,"limit":10,"sort_mode":"name","include_hidden":false}"#)
+            .dispatch(
+                "get_nfts",
+                r#"{"offset":0,"limit":10,"sort_mode":"name","include_hidden":false}"#,
+            )
             .await;
         assert_eq!(s, 200, "{resp}");
         let got: GetNftsResponse = serde_json::from_str(&resp).unwrap();

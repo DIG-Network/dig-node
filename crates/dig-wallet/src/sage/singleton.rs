@@ -137,8 +137,7 @@ pub fn reconstruct_parsed(
     }
 
     // DID: parse_child validates the given child coin.
-    if let Ok(Some(did)) =
-        Did::parse_child(ctx, parent_coin, parent_puzzle, parent_solution, child)
+    if let Ok(Some(did)) = Did::parse_child(ctx, parent_coin, parent_puzzle, parent_solution, child)
     {
         return Reconstructed::Did(Box::new(did_row(prefix, created_height, &did)));
     }
@@ -344,7 +343,10 @@ pub async fn reconstruct_coins(
         if !is_candidate(c, plain_puzzle_hashes) {
             continue;
         }
-        let Some(parent) = lineage.parent_spend(&c.parent_coin_info, created as u32).await? else {
+        let Some(parent) = lineage
+            .parent_spend(&c.parent_coin_info, created as u32)
+            .await?
+        else {
             continue;
         };
         let child = coin_from_row(c)?;
@@ -362,7 +364,8 @@ pub async fn reconstruct_coins(
                 asset_id,
                 hint,
             } => {
-                db.attribute_cat_coin(&coin_id, &asset_id, Some(&hint)).await?;
+                db.attribute_cat_coin(&coin_id, &asset_id, Some(&hint))
+                    .await?;
                 stats.cats += 1;
             }
             Reconstructed::Unknown => {}
@@ -386,13 +389,13 @@ pub async fn reconstruct_all(
 mod tests {
     use super::*;
     use chia::traits::Streamable;
+    use chia_sdk_test::Simulator;
     use chia_wallet_sdk::driver::{
         Cat as SdkCat, CatSpend, IntermediateLauncher, Launcher, NftMint, SingletonInfo,
         SpendWithConditions, StandardLayer,
     };
     use chia_wallet_sdk::types::conditions::TransferNft;
     use chia_wallet_sdk::types::Conditions;
-    use chia_sdk_test::Simulator;
     use std::collections::HashMap;
 
     /// A [`LineageSource`] backed by an in-memory map of `parent_coin_id -> ParentSpend`,
@@ -447,8 +450,15 @@ mod tests {
     /// Mint a DID + an NFT on the simulator, transfer both to self, and return the parent
     /// spends + the child coins a syncing wallet would observe.
     #[allow(clippy::type_complexity)]
-    fn mint_did_and_nft() -> (Simulator, ParentSpend, Coin, ParentSpend, Coin, Bytes32, Bytes32)
-    {
+    fn mint_did_and_nft() -> (
+        Simulator,
+        ParentSpend,
+        Coin,
+        ParentSpend,
+        Coin,
+        Bytes32,
+        Bytes32,
+    ) {
         let mut sim = Simulator::new();
         let ctx = &mut SpendContext::new();
         let alice = sim.bls(2);
@@ -462,7 +472,9 @@ mod tests {
 
         // Mint an NFT owned by the DID.
         let mut metadata = NftMetadata::default();
-        metadata.data_uris.push("https://example.com/a.png".to_string());
+        metadata
+            .data_uris
+            .push("https://example.com/a.png".to_string());
         metadata.data_hash = Some(Bytes32::new([7; 32]));
         let metadata = ctx.alloc_hashed(&metadata).unwrap();
         let (mint_nft, nft) = IntermediateLauncher::new(did.coin.coin_id(), 0, 1)
@@ -483,10 +495,13 @@ mod tests {
             )
             .unwrap();
         let did = did.update(ctx, &alice_p2, mint_nft).unwrap();
-        sim.spend_coins(ctx.take(), &[alice.sk.clone()]).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
 
         // Transfer both singletons to self, producing the children a wallet syncs.
-        let child_did = did.transfer(ctx, &alice_p2, alice.puzzle_hash, Conditions::new()).unwrap();
+        let child_did = did
+            .transfer(ctx, &alice_p2, alice.puzzle_hash, Conditions::new())
+            .unwrap();
         let child_nft = nft
             .transfer(ctx, &alice_p2, alice.puzzle_hash, Conditions::new())
             .unwrap();
@@ -551,7 +566,8 @@ mod tests {
         )
         .unwrap();
         alice_p2.spend(ctx, alice.coin, issue_cat).unwrap();
-        sim.spend_coins(ctx.take(), &[alice.sk.clone()]).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
         let cat0 = cats[0];
 
         let inner = alice_p2
@@ -591,10 +607,15 @@ mod tests {
             .by_parent
             .insert(hex::encode(did_child.parent_coin_info), did_parent);
 
-        let stats =
-            reconstruct_coins(&db, &lineage, "xch", &HashSet::new(), &db.all_coins().await.unwrap())
-                .await
-                .unwrap();
+        let stats = reconstruct_coins(
+            &db,
+            &lineage,
+            "xch",
+            &HashSet::new(),
+            &db.all_coins().await.unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.nfts, 1, "one NFT reconstructed");
         assert_eq!(stats.dids, 1, "one DID reconstructed");
         assert_eq!(db.all_nfts().await.unwrap().len(), 1);

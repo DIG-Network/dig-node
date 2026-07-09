@@ -35,7 +35,9 @@ use chia_wallet_sdk::signer::{AggSigConstants, RequiredSignature};
 use chia_wallet_sdk::types::Conditions;
 use clvmr::Allocator;
 use dig_clvm::chia_consensus::flags::DONT_VALIDATE_SIGNATURE;
-use dig_clvm::{validate_spend_bundle, SpendResult, ValidationConfig, ValidationContext, DIG_MAINNET};
+use dig_clvm::{
+    validate_spend_bundle, SpendResult, ValidationConfig, ValidationContext, DIG_MAINNET,
+};
 
 use super::types::{
     Amount, CoinJson, CoinSpendJson, SpendBundleJson, TransactionInput, TransactionOutput,
@@ -220,7 +222,9 @@ pub fn build_xch_send(
         return Err(Error::api("no input coins"));
     }
     let total: u64 = inputs.iter().map(|c| c.amount).sum();
-    let need = amount.checked_add(fee).ok_or_else(|| Error::api("amount overflow"))?;
+    let need = amount
+        .checked_add(fee)
+        .ok_or_else(|| Error::api("amount overflow"))?;
     if total < need {
         return Err(Error::api(format!(
             "insufficient funds: have {total}, need {need}"
@@ -375,7 +379,9 @@ pub fn build_multi_send(
     }
     let total: u64 = inputs.iter().map(|c| c.amount).sum();
     let out: u64 = payments.iter().map(|p| p.amount).sum();
-    let need = out.checked_add(fee).ok_or_else(|| Error::api("amount overflow"))?;
+    let need = out
+        .checked_add(fee)
+        .ok_or_else(|| Error::api("amount overflow"))?;
     if total < need {
         return Err(Error::api(format!(
             "insufficient funds: have {total}, need {need}"
@@ -404,6 +410,7 @@ pub fn build_multi_send(
 // ---- CAT spend builder ----------------------------------------------------
 
 /// Build a CAT send of `amount` to a single `dest` (see [`build_cat_send_multi`]).
+#[allow(clippy::too_many_arguments)]
 pub fn build_cat_send(
     signer: &WalletSigner,
     cats: &[Cat],
@@ -414,7 +421,15 @@ pub fn build_cat_send(
     fee: u64,
     xch_fee_coins: &[Coin],
 ) -> Result<Vec<CoinSpend>> {
-    build_cat_send_multi(signer, cats, &[(dest, amount)], change, include_hint, fee, xch_fee_coins)
+    build_cat_send_multi(
+        signer,
+        cats,
+        &[(dest, amount)],
+        change,
+        include_hint,
+        fee,
+        xch_fee_coins,
+    )
 }
 
 /// Build a CAT send with one or more `outputs` (`(dest, amount)`), change back to `change`;
@@ -454,7 +469,8 @@ pub fn build_cat_send_multi(
             let mut conds = Conditions::new();
             for (dest, amount) in outputs {
                 let dest_memos = if include_hint {
-                    ctx.hint(*dest).map_err(|e| Error::internal(format!("hint: {e:?}")))?
+                    ctx.hint(*dest)
+                        .map_err(|e| Error::internal(format!("hint: {e:?}")))?
                 } else {
                     Memos::None
                 };
@@ -472,7 +488,8 @@ pub fn build_cat_send_multi(
             .map_err(|e| Error::internal(format!("cat inner spend: {e:?}")))?;
         cat_spends.push(CatSpend::new(*cat, inner_spend));
     }
-    Cat::spend_all(&mut ctx, &cat_spends).map_err(|e| Error::internal(format!("cat spend_all: {e:?}")))?;
+    Cat::spend_all(&mut ctx, &cat_spends)
+        .map_err(|e| Error::internal(format!("cat spend_all: {e:?}")))?;
 
     if fee > 0 {
         if xch_fee_coins.is_empty() {
@@ -509,7 +526,11 @@ pub fn run_and_validate(coin_spends: &[CoinSpend]) -> Result<SpendResult> {
         coin_records: HashMap::new(),
         // Treat every spent coin as available so the structural check passes without a UTXO
         // set (the node has already confirmed these coins exist in its wallet DB).
-        ephemeral_coins: bundle.coin_spends.iter().map(|cs| cs.coin.coin_id()).collect(),
+        ephemeral_coins: bundle
+            .coin_spends
+            .iter()
+            .map(|cs| cs.coin.coin_id())
+            .collect(),
     };
     let mut config = ValidationConfig::default();
     config.flags |= DONT_VALIDATE_SIGNATURE;
@@ -681,13 +702,16 @@ mod tests {
         );
 
         let dest = Bytes32::new([9; 32]);
-        let coin_spends = build_xch_send(&signer, &[alice.coin], dest, 600, 10, alice.puzzle_hash, )
-            .unwrap();
+        let coin_spends =
+            build_xch_send(&signer, &[alice.coin], dest, 600, 10, alice.puzzle_hash).unwrap();
 
         // dig-clvm validates CLVM execution + conservation (fee = 10).
         let result = run_and_validate(&coin_spends).unwrap();
         assert_eq!(result.fee, 10);
-        assert!(result.additions.iter().any(|a| a.puzzle_hash == dest && a.amount == 600));
+        assert!(result
+            .additions
+            .iter()
+            .any(|a| a.puzzle_hash == dest && a.amount == 600));
 
         // Sign, then broadcast the SIGNED bundle to the simulator (real consensus, incl. BLS).
         let signature = signer.sign(&coin_spends).unwrap();
@@ -712,8 +736,12 @@ mod tests {
         assert_eq!(summary.inputs.len(), 1);
         let outputs = &summary.inputs[0].outputs;
         // dest (600, not ours) + change (390, ours).
-        assert!(outputs.iter().any(|o| o.amount.to_u64() == Some(600) && !o.receiving));
-        assert!(outputs.iter().any(|o| o.amount.to_u64() == Some(390) && o.receiving));
+        assert!(outputs
+            .iter()
+            .any(|o| o.amount.to_u64() == Some(600) && !o.receiving));
+        assert!(outputs
+            .iter()
+            .any(|o| o.amount.to_u64() == Some(390) && o.receiving));
     }
 
     #[test]
@@ -726,8 +754,14 @@ mod tests {
             build_xch_send(&signer, &[alice.coin], dest, 400, 0, alice.puzzle_hash).unwrap();
 
         // Round-trip through the wire JSON (what sign_coin_spends receives), sign, broadcast.
-        let json: Vec<_> = coin_spends.iter().map(|cs| coin_spend_to_json(cs).unwrap()).collect();
-        let parsed: Vec<_> = json.iter().map(|j| coin_spend_from_json(j).unwrap()).collect();
+        let json: Vec<_> = coin_spends
+            .iter()
+            .map(|cs| coin_spend_to_json(cs).unwrap())
+            .collect();
+        let parsed: Vec<_> = json
+            .iter()
+            .map(|j| coin_spend_from_json(j).unwrap())
+            .collect();
         let signature = signer.sign(&parsed).unwrap();
         let bundle = SpendBundle::new(parsed, signature);
         assert!(sim.new_transaction(bundle).is_ok());
@@ -753,7 +787,8 @@ mod tests {
         )
         .unwrap();
         alice_p2.spend(ctx, alice.coin, issue).unwrap();
-        sim.spend_coins(ctx.take(), &[alice.sk.clone()]).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
         let cat0 = cats[0];
 
         // Build a CAT send of 400 to a destination, 600 change, no fee.
@@ -763,7 +798,8 @@ mod tests {
         run_and_validate(&coin_spends).unwrap();
         let signature = signer.sign(&coin_spends).unwrap();
         assert!(
-            sim.new_transaction(SpendBundle::new(coin_spends, signature)).is_ok(),
+            sim.new_transaction(SpendBundle::new(coin_spends, signature))
+                .is_ok(),
             "simulator must accept the signed CAT send"
         );
     }

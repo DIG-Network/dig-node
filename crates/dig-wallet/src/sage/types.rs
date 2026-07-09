@@ -1267,8 +1267,7 @@ mod tests {
 
     #[test]
     fn send_xch_request_defaults_auto_submit_true_and_empty_memos() {
-        let r: SendXch =
-            serde_json::from_str(r#"{"address":"xch1x","amount":5,"fee":0}"#).unwrap();
+        let r: SendXch = serde_json::from_str(r#"{"address":"xch1x","amount":5,"fee":0}"#).unwrap();
         assert!(r.auto_submit, "auto_submit defaults to true (Sage parity)");
         assert!(r.memos.is_empty());
         assert!(r.clawback.is_none());
