@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.0] - 2026-07-09
+
+### Features
+- **sync:** Wire §14 autonomous chain-watch + proactive gap-fill into service bring-up (#7)
+
 ## [0.5.1] - 2026-07-06
 
 ### Documentation
