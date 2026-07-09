@@ -581,17 +581,26 @@ The OS-service bring-up (`dig-node run` / the Windows SCM entrypoint) calls `spa
 unless `DIG_PEER_NETWORK` is `off`/`0`/`false`; the in-process FFI host never does (§1.2). Startup
 (`spawn_peer_network` → `run_peer_network`) proceeds in order:
 1. derive the deterministic mTLS identity from the seed;
-2. bring up the dig-gossip connected pool + relay introducer registration (relay via `DIG_RELAY_URL`,
+2. spawn the chain-watch + generation gap-fill loop over the subscribed store set (§4.3, §5.1)
+   **FIRST**, INDEPENDENTLY of the pool/DHT — the proactive pull path is the authenticated §21
+   whole-store sync, which needs neither, so a failed (or unavailable) P2P bring-up MUST NOT disable
+   autonomous sync;
+3. bring up the dig-gossip connected pool + relay introducer registration (relay via `DIG_RELAY_URL`,
    default `wss://relay.dig.net:9450`), and a background task that refreshes pool status (~10 s);
-3. bring up the dig-dht content-location DHT (bootstrap from the gossip pool), and announce the held
+4. bring up the dig-dht content-location DHT (bootstrap from the gossip pool), and announce the held
    inventory (§6.2);
-4. wire the multi-source content engine (`NodeContent`) to the DHT + the selector (fed by pool churn);
-4b. install the DHT inventory-refresh hook (so a gap-filled generation is announced immediately, §6.2)
-   and spawn the chain-watch + gap-fill loop over the subscribed store set (§4.3, §5.1);
-5. install the Ctrl-C graceful-shutdown hook (DHT `withdraw_all` sweep);
-6. bind the mTLS peer-RPC listener dual-stack on `[::]:{DIG_PEER_PORT}` (§7.3) and enter the accept
+5. wire the multi-source content engine (`NodeContent`) to the DHT + the selector (fed by pool churn),
+   and install the DHT inventory-refresh hook (so a gap-filled generation is announced immediately,
+   §6.2);
+6. install the Ctrl-C graceful-shutdown hook (DHT `withdraw_all` sweep);
+7. bind the mTLS peer-RPC listener dual-stack on `[::]:{DIG_PEER_PORT}` (§7.3) and enter the accept
    loop, one mTLS session → yamux mux per peer;
-7. bring up dig-pex (peer-exchange engine + pool feeder + tick loop).
+8. bring up dig-pex (peer-exchange engine + pool feeder + tick loop).
+
+Steps 3–8 are best-effort and gated on the P2P layer coming up; step 2 (autonomous sync) is not. In
+the pre-launch state, the DIG network genesis is a placeholder, so the gossip config is rejected and
+steps 3–8 do not start — the node still watches the chain and proactively gap-fills (step 2) and
+serves the HTTP read path.
 
 `control.peerStatus` reports a snapshot: `{ running: bool, peer_id: 64hex|null, network_id: string,
 relay: { url, reserved: bool }, connected_peers: u64, last_error: string|null }`. Bring-up is

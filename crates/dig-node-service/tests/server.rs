@@ -946,8 +946,11 @@ async fn start_serving_node(
 
     let hold = EnvHold(env_guard().lock_owned().await);
     let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let base =
-        std::env::temp_dir().join(format!("dig-node-peernet-{}-{}", std::process::id(), unique));
+    let base = std::env::temp_dir().join(format!(
+        "dig-node-peernet-{}-{}",
+        std::process::id(),
+        unique
+    ));
     let cache = base.join("cache");
     std::fs::create_dir_all(&cache).expect("create test cache dir");
     std::env::set_var("DIG_NODE_CACHE", &cache);

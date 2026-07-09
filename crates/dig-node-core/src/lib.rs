@@ -279,13 +279,6 @@ impl Node {
         let _ = self.inventory_refresher.set(refresher);
     }
 
-    /// Whether the DHT inventory-refresh hook is installed (the standalone peer-network bring-up ran
-    /// [`set_inventory_refresher`](Self::set_inventory_refresher)). Lets a test assert the bring-up
-    /// wired the refresher; on the FFI path this stays `false`.
-    pub(crate) fn has_inventory_refresher(&self) -> bool {
-        self.inventory_refresher.get().is_some()
-    }
-
     /// Refresh the node's DHT provider records against its current inventory, if a peer network is
     /// running (SPEC §14.1). A no-op on the FFI path (no hook installed) or before bring-up.
     pub(crate) async fn refresh_dht_inventory(&self) {
@@ -3276,83 +3269,87 @@ mod tests {
         );
     }
 
-    /// **Proves (#213):** the standalone peer-network bring-up the OS service now invokes
-    /// ([`peer::spawn_peer_network`]) installs the P2P content engine + the DHT inventory refresher
-    /// AND spawns the §14 chain-watch loop, which PROACTIVELY pulls a subscribed store's missing
-    /// generation from a local "peer" (a real auth-required §21 remote) with NO client read
-    /// triggering the miss. Hermetic + mainnet-safe: relay OFF (no live network), ephemeral peer
-    /// port, a deterministic mock anchored-root resolver, a 1 s watch tick.
-    /// **Catches:** the exact #213 dead-code gap — a node that comes up "serving" but never starts
-    /// autonomous sync — and a bring-up that installs the engines but not the proactive watcher.
-    #[tokio::test]
-    async fn spawn_peer_network_installs_engines_and_proactively_gap_fills() {
+    /// **Proves (#213):** driving the REAL peer-network bring-up the OS service now invokes
+    /// ([`peer::spawn_peer_network`]) starts the §14 chain-watch loop, which PROACTIVELY pulls a
+    /// subscribed store's missing generation from a local "peer" (a real auth-required §21 remote)
+    /// with NO client read triggering the miss — EVEN THOUGH the P2P pool/DHT bring-up cannot come up
+    /// in this env (the pre-launch placeholder network genesis makes the gossip config invalid). That
+    /// is the whole point of the §14 decoupling: autonomous sync must run regardless of the P2P
+    /// layer's health. Hermetic + mainnet-safe: relay OFF, ephemeral peer port, a deterministic mock
+    /// anchored-root resolver, a 1 s watch tick, the upstream a real §21 remote holding the generation.
+    /// **Catches:** the exact #213 gap — chain-watch gated behind a pool/DHT bring-up that fails, so
+    /// autonomous sync never actually runs even after the service wires the call.
+    //
+    // NB: like the other env-touching tests, these mutate the PROCESS-GLOBAL `DIG_NODE_CACHE` (the
+    // subscription set + `cache_dir()`), so they hold `ENV_GUARD` for the whole body and are plain
+    // `#[test]` fns driving a current-thread runtime via `block_on` (not `#[tokio::test]`) — the std
+    // guard is then never held across an `.await` (clippy `await_holding_lock`).
+    #[test]
+    fn spawn_peer_network_proactively_gap_fills_even_when_the_p2p_layer_cannot_come_up() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        let module = b"proactively-pulled-generation".to_vec();
-        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
-        let root = Bytes32([0x10; 32]);
-        let td = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let module = b"proactively-pulled-generation".to_vec();
+            let (base, store_hex) = spawn_authed_remote(module.clone()).await;
+            let root = Bytes32([0x10; 32]);
+            let td = tempfile::tempdir().unwrap();
 
-        // The chain-watch loop reads the PROCESS-GLOBAL subscription set + cache dir (via
-        // `cache_dir()`), so pin DIG_NODE_CACHE at the node's cache dir, then persist a subscription
-        // for the store. Relay OFF + an ephemeral peer port keep the bring-up hermetic (no
-        // relay/introducer reach); a 1 s tick makes the first poll prompt.
-        std::env::set_var("DIG_NODE_CACHE", td.path());
-        std::env::set_var("DIG_RELAY_URL", "off");
-        std::env::set_var("DIG_PEER_PORT", "0");
-        std::env::set_var("DIG_NODE_WATCH_INTERVAL", "1");
-        std::env::remove_var("DIG_PEER_NETWORK"); // unset → default ON
-        subscribe_store(&store_hex).unwrap();
+            // The chain-watch loop reads the PROCESS-GLOBAL subscription set + cache dir (via
+            // `cache_dir()`), so pin DIG_NODE_CACHE at the node's cache dir, then persist a
+            // subscription for the store. Relay OFF + an ephemeral peer port keep the bring-up
+            // hermetic (no relay/introducer reach); a 1 s tick makes the first poll prompt.
+            std::env::set_var("DIG_NODE_CACHE", td.path());
+            std::env::set_var("DIG_RELAY_URL", "off");
+            std::env::set_var("DIG_PEER_PORT", "0");
+            std::env::set_var("DIG_NODE_WATCH_INTERVAL", "1");
+            std::env::remove_var("DIG_PEER_NETWORK"); // unset → default ON
+            subscribe_store(&store_hex).unwrap();
 
-        let node = Arc::new(Node {
-            cache_dir: td.path().to_path_buf(),
-            http: reqwest::Client::new(),
-            upstream: base,
-            cache_lock: Mutex::new(()),
-            identity_seed: Some([5u8; 32]),
-            anchored_root_resolver: MockResolver::one(&store_hex, root),
-            peer_status: peer::PeerStatus::new(),
-            p2p_content: OnceLock::new(),
-            content_cache: std::sync::Mutex::new(ContentCache::default()),
-            inventory_refresher: OnceLock::new(),
-            backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
-            self_ref: OnceLock::new(),
-            outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
-        });
+            let node = Arc::new(Node {
+                cache_dir: td.path().to_path_buf(),
+                http: reqwest::Client::new(),
+                upstream: base,
+                cache_lock: Mutex::new(()),
+                identity_seed: Some([5u8; 32]),
+                anchored_root_resolver: MockResolver::one(&store_hex, root),
+                peer_status: peer::PeerStatus::new(),
+                p2p_content: OnceLock::new(),
+                content_cache: std::sync::Mutex::new(ContentCache::default()),
+                inventory_refresher: OnceLock::new(),
+                backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+                self_ref: OnceLock::new(),
+                outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+            });
 
-        assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
+            assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
 
-        peer::install_crypto_provider();
-        peer::spawn_peer_network(node.clone());
+            peer::install_crypto_provider();
+            peer::spawn_peer_network(node.clone());
 
-        // Poll until the watcher PROACTIVELY pulls + lands the missing generation. No client read is
-        // ever issued here, so a landed module can ONLY be the background chain-watch loop's work.
-        let mut landed = false;
-        for _ in 0..200 {
-            if module_exists(&node.cache_dir, &store_hex, &root.to_hex()) {
-                landed = true;
-                break;
+            // Poll until the watcher PROACTIVELY pulls + lands the missing generation. No client read
+            // is ever issued here, so a landed module can ONLY be the background chain-watch loop.
+            let mut landed = false;
+            for _ in 0..200 {
+                if module_exists(&node.cache_dir, &store_hex, &root.to_hex()) {
+                    landed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(
-            landed,
-            "chain-watch must proactively pull the subscribed store's missing generation"
-        );
+            assert!(
+                landed,
+                "chain-watch must proactively pull the subscribed store's missing generation, \
+                 independent of the (unavailable) P2P pool/DHT"
+            );
 
-        // The bring-up also installed the P2P content engine + the DHT inventory refresher.
-        assert!(
-            node.p2p_content().is_some(),
-            "bring-up must install the P2P content engine"
-        );
-        assert!(
-            node.has_inventory_refresher(),
-            "bring-up must install the DHT inventory refresher"
-        );
-
-        std::env::remove_var("DIG_NODE_CACHE");
-        std::env::remove_var("DIG_RELAY_URL");
-        std::env::remove_var("DIG_PEER_PORT");
-        std::env::remove_var("DIG_NODE_WATCH_INTERVAL");
+            std::env::remove_var("DIG_NODE_CACHE");
+            std::env::remove_var("DIG_RELAY_URL");
+            std::env::remove_var("DIG_PEER_PORT");
+            std::env::remove_var("DIG_NODE_WATCH_INTERVAL");
+        });
     }
 
     /// **Proves (#213, robust/hermetic):** the §14 chain-watch loop the bring-up spawns
@@ -3360,52 +3357,58 @@ mod tests {
     /// a subscribed store's missing generation from a local §21 "peer" with NO client read — the
     /// autonomous-sync behavior, isolated from the gossip/DHT bring-up so it never depends on the
     /// network. **Catches:** a chain-watch spawn that never actually drives the pull.
-    #[tokio::test]
-    async fn chain_watch_loop_proactively_gap_fills_without_a_read() {
+    #[test]
+    fn chain_watch_loop_proactively_gap_fills_without_a_read() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        let module = b"chain-watch-pulled".to_vec();
-        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
-        let root = Bytes32([0x10; 32]);
-        let td = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let module = b"chain-watch-pulled".to_vec();
+            let (base, store_hex) = spawn_authed_remote(module.clone()).await;
+            let root = Bytes32([0x10; 32]);
+            let td = tempfile::tempdir().unwrap();
 
-        std::env::set_var("DIG_NODE_CACHE", td.path());
-        std::env::set_var("DIG_NODE_WATCH_INTERVAL", "1");
-        subscribe_store(&store_hex).unwrap();
+            std::env::set_var("DIG_NODE_CACHE", td.path());
+            std::env::set_var("DIG_NODE_WATCH_INTERVAL", "1");
+            subscribe_store(&store_hex).unwrap();
 
-        let node = Arc::new(Node {
-            cache_dir: td.path().to_path_buf(),
-            http: reqwest::Client::new(),
-            upstream: base,
-            cache_lock: Mutex::new(()),
-            identity_seed: Some([5u8; 32]),
-            anchored_root_resolver: MockResolver::one(&store_hex, root),
-            peer_status: peer::PeerStatus::new(),
-            p2p_content: OnceLock::new(),
-            content_cache: std::sync::Mutex::new(ContentCache::default()),
-            inventory_refresher: OnceLock::new(),
-            backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
-            self_ref: OnceLock::new(),
-            outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
-        });
+            let node = Arc::new(Node {
+                cache_dir: td.path().to_path_buf(),
+                http: reqwest::Client::new(),
+                upstream: base,
+                cache_lock: Mutex::new(()),
+                identity_seed: Some([5u8; 32]),
+                anchored_root_resolver: MockResolver::one(&store_hex, root),
+                peer_status: peer::PeerStatus::new(),
+                p2p_content: OnceLock::new(),
+                content_cache: std::sync::Mutex::new(ContentCache::default()),
+                inventory_refresher: OnceLock::new(),
+                backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+                self_ref: OnceLock::new(),
+                outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+            });
 
-        assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
-        chainwatch::spawn_chain_watch(node.clone());
+            assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
+            chainwatch::spawn_chain_watch(node.clone());
 
-        let mut landed = false;
-        for _ in 0..100 {
-            if module_exists(&node.cache_dir, &store_hex, &root.to_hex()) {
-                landed = true;
-                break;
+            let mut landed = false;
+            for _ in 0..100 {
+                if module_exists(&node.cache_dir, &store_hex, &root.to_hex()) {
+                    landed = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        assert!(
-            landed,
-            "the spawned chain-watch loop must proactively pull the missing generation"
-        );
+            assert!(
+                landed,
+                "the spawned chain-watch loop must proactively pull the missing generation"
+            );
 
-        std::env::remove_var("DIG_NODE_CACHE");
-        std::env::remove_var("DIG_NODE_WATCH_INTERVAL");
+            std::env::remove_var("DIG_NODE_CACHE");
+            std::env::remove_var("DIG_NODE_WATCH_INTERVAL");
+        });
     }
 
     /// **Proves:** capsule backfill (§14.3) is a safe NO-OP on the FFI/consumer path — a node with no
