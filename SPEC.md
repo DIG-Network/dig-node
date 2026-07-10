@@ -1060,9 +1060,12 @@ commit `a84d7dfc`) backed by a direct-peer chain sync into a local wallet databa
 Sage. It is a new surface, additive to and DISTINCT from the built-in wallet host (§16), the read/control
 JSON-RPC (§5/§7), and the CHIP-0002 `window.chia` dapp responder. It lives in the `dig-wallet` crate
 (`crate::sage`). #215 shipped the READ + sync foundation; #216 added NFT/DID/CAT reconstruction (§18.11)
-and the send/spend method group (§18.9); #218 added the offer suite + DID/NFT mint & transfer (§18.9a).
-The `SyncEvent` stream, options/actions/themes/network-settings endpoints, OpenAPI generation, and the
-dig-keystore seed migration remain follow-on units (§18.12).
+and the send/spend method group (§18.9); #218 added the offer suite + DID/NFT mint & transfer (§18.9a);
+#205 PR4 added the `SyncEvent` stream (§18.14), the option-contract suite (§18.15), record-update
+actions + the theme store (§18.16), network/peer settings (§18.17), the dig-keystore seed migration
+(§18.18), and the generated-OpenAPI conformance vector (§18.19) — completing the served method surface
+to 75 of the 100 Sage `endpoints.json` methods (the remaining 25 are secret-touching, gated per §18.10,
+or Sage-desktop-only per design Part F MAY/N-A, e.g. `delete_database`/`perform_database_maintenance`).
 
 18.1. **Transport — one method surface, two transports.** Byte-compatibility with Sage is required at
 the application layer (method names + JSON request/response shapes); the transport is adapted per client
@@ -1179,14 +1182,93 @@ in the coin's puzzle, revealed only when its parent is spent. Reconstruction unc
 attribute CAT coins to their asset id (TAIL hash) in the `coins` table (so `get_cats`/`get_token` become
 complete). Parent spends are fetched through a `LineageSource` (out-of-DB lineage reads, B.5). Reads only.
 
-18.12. **Deferred to follow-on PRs.** The options/actions/themes/network-settings endpoints, the
-`SyncEvent` stream (clients poll `get_sync_status` for MVP parity), OpenAPI generation, dig-keystore seed
-migration, and the off-chain NFT data-blob/CHIP-0015 metadata fetch (`get_nft_data` returns on-chain
-fields; the metadata JSON surfaces when fetched). The service bring-up that starts the dual-transport
-server and invokes reconstruction after sync (via a peer/coinset `LineageSource`) is the remaining
-integration.
+18.12. **Deferred to follow-on units.** The off-chain NFT data-blob/CHIP-0015 metadata fetch
+(`get_nft_data` returns on-chain fields; the metadata JSON surfaces when fetched), `exercise_options`
+(§18.15 — a documented, non-silent follow-on), and real image-derived theme content (§18.16 — this
+backend stores a placeholder). The service bring-up that starts the dual-transport server and invokes
+reconstruction after sync (via a peer/coinset `LineageSource`) is the remaining integration.
 
 18.13. **Security.** Both listeners bind loopback only. The mTLS listener enforces the shared-cert mutual
 TLS. Multi-peer sync is a correctness/censorship property (never collapse to one peer). Reads tolerate
 unknown/forward-incompatible fields (additive, §5.1 spirit). Spend submission is validated via `dig-clvm`
 before broadcast (fail-closed) and never auto-broadcasts without an attached broadcaster.
+
+18.14. **`SyncEvent` stream (design A.9, #205 PR4).** An in-process [`crate::sage::events::EventBus`]
+(a `tokio::sync::broadcast` channel) the direct-peer sync loop (§18.6) publishes lifecycle events to:
+`start{ip}` (sync begins on a peer), `subscribed` (puzzle-hash subscription acknowledged),
+`puzzle_batch_synced` (once per initial-catch-up batch applied), `coin_state` (a `coin_state_update`
+applied), `stop` (the peer connection ended). Streamed over `GET /events` (Server-Sent Events) on BOTH
+transports (the shared router, §18.1) — the `event:` field is the Sage `type` tag, `data:` is the
+event's JSON. A best-effort push channel: publishing with zero subscribers is a no-op, and a lagging
+subscriber (broadcast-channel overflow) simply misses the gap rather than erroring the stream —
+`get_sync_status` polling remains the authoritative source of truth regardless of whether anything is
+subscribed. `derivation`/`transaction_failed`/`cat_info`/`did_info`/`nft_data` are defined on the wire
+(byte-parity with Sage's tagged union) but not yet published by any producer — reserved for the
+respective follow-on work.
+
+18.15. **Option-contract suite (design A.5, #205 PR4).** `get_options`/`get_option` (DB reads, paginated/
+sorted/filtered like `get_nfts`), `mint_option`/`transfer_options` (real `chia-wallet-sdk`
+`OptionLauncher`/`OptionContract` driver builders — never hand-rolled CLVM, §4.1) are served.
+`mint_option` in this backend mints an **XCH-underlying** option only (the underlying lock coin holds
+plain XCH); the strike may be XCH or a CAT (a pure enum tag with no extra coin-construction cost at mint
+time — the exerciser funds it later). A CAT/NFT-underlying mint returns a clear `400` naming the
+limitation, never a mis-built spend. `exercise_options` is accepted on the wire but returns a clear,
+named `500` (`crate::sage::options::exercise_options_unimplemented`) — exercising requires tracking the
+underlying-lock coin's OWN lineage (a derived, non-HD puzzle hash outside the wallet's ordinary
+subscription set) plus the `MipsSpend`/merkle-proof machinery `OptionUnderlying::exercise_spend` needs; a
+tracked follow-on, not a silent gap. The `OptionRecord` wire shape (`launcher_id`/`amount`/
+`underlying_asset`/`strike_asset`/`name`/`created_timestamp` alongside the coin/visibility/expiration
+fields) is verified field-name-identical against the pinned v0.12.11 generated OpenAPI (§18.19) — an
+initial guess used `option_id` instead of the real `launcher_id`, caught and fixed by that vector.
+
+18.16. **Record-update actions + the theme store (design A.5, #205 PR4).** `resync_cat` (clears a CAT's
+cached display metadata, forcing a re-fetch — balance/coins untouched), `update_cat` (persists a
+caller-supplied `TokenRecord`'s display metadata; requires `asset_id`), `update_did`/`update_option`/
+`update_nft`/`update_nft_collection` (name/visibility, patching both the indexed DB column and the
+stored wire-record JSON so subsequent reads reflect it immediately), `redownload_nft` (clears cached
+off-chain metadata JSON, forcing a re-fetch), `increase_derivation_index` (raises a per-tree derivation-
+index FLOOR so `get_sync_status`/`get_derivations` report at least the requested coverage — never
+lowers an existing floor; requires `hardened` and/or `unhardened` be requested). The theme store
+(`get_user_themes`/`get_user_theme`/`save_user_theme`/`delete_user_theme`, Sage-desktop-UI origin,
+design Part F MAY/N-A) is DB-backed, keyed by NFT id. **Verified against the generated OpenAPI
+(§18.19):** the real `save_user_theme` request carries ONLY `nft_id` — Sage derives the theme from the
+NFT's own artwork (color extraction) rather than accepting caller-supplied content (an initial guess
+added a `theme: String` field, caught and fixed). This backend has no image/color-extraction pipeline,
+so `save_user_theme` persists a fixed placeholder (`crate::sage::themes::DERIVED_THEME_PLACEHOLDER`)
+rather than a real derived theme — `get_user_theme(s)` still correctly reports "is this NFT themed",
+just not a real color scheme; real derivation is a tracked follow-on.
+
+18.17. **Network / peer / sync settings (design A.5, #205 PR4).** `get_peers`/`add_peer`/`remove_peer`
+are DB-backed: `add_peer` persists a user-managed entry at the standard Chia full-node port (design
+B.1, `8444`) surviving restarts (mirroring Sage); `remove_peer{ban:true}` keeps the row but excludes it
+from `get_peers`; `peak_height` reports `0` until live per-peer telemetry is wired to the sync loop —
+never fabricated. `set_discover_peers`/`set_target_peers`/`set_delta_sync`/`set_delta_sync_override`/
+`set_change_address` persist to a `network_settings` row. `set_network`/`set_network_override` both set
+the same stored network override (this backend tracks one active wallet key; a genuine per-fingerprint
+override is a follow-on for multi-key support). `get_networks`/`get_network` report the two networks
+this backend can sync against (design Part B): mainnet and testnet11. `NetworkKind` is a 3-variant enum
+(`mainnet`/`testnet`/`unknown`) — verified against the generated OpenAPI (§18.19); an initial guess had
+only 2 variants, caught and fixed. The real Sage `Network`/`NetworkList`/`get_network`/`get_networks`
+response schemas are opaque (untyped `object`) in the generated OpenAPI, so this backend's `Network`
+shape (`name`/`ticker`/`address_prefix`/`precision`/`default_port`) is a best-effort, not byte-verified,
+representation — documented as such.
+
+18.18. **dig-keystore seed migration (design C.2, #205 PR4).** The wallet's on-disk seed file
+(`seed_path()`, §16) is now encrypted at rest via the `dig-keystore` crate's `opaque` container
+(Argon2id + AES-256-GCM, versioned/magic-tagged/CRC-guarded — the SAME primitives the bespoke
+`digstore_chain::seed` format used, now consolidated onto the ecosystem's canonical keystore crate,
+Appendix B) for every NEW write (`crate::seed_store::encrypt_seed`). Reads accept EITHER format: the
+on-disk magic (`DIGVK1`/`DIGLW1`/`DIGOP1` = a `dig-keystore` container; anything else = the legacy
+layout) selects the decoder, so a seed file written before this migration keeps opening
+(`crate::seed_store::decrypt_seed`) — proven by a golden-fixture test that encrypts a mnemonic with the
+ACTUAL legacy `digstore_chain::seed::encrypt_seed` and asserts the new unified reader still recovers it.
+
+18.19. **Generated-OpenAPI conformance vector (design A.10, #205 PR4).** `sage-cli` (a pure CLI/RPC
+crate, no Tauri/desktop dependency) was built from the pinned `xch-dev/sage` `v0.12.11` tag and
+`cargo run --bin sage rpc generate_openapi` run to produce the golden vector, committed as
+`crates/dig-wallet/tests/vectors/sage-openapi-v0.12.11.json` (100 paths, matching the design's method
+count) — no build step is needed to re-derive it; re-pinning to a newer Sage tag regenerates it the same
+way. `crates/dig-wallet/tests/conformance.rs` asserts every served method has a real path in it, and
+cross-checks representative request/response schemas field-name-identical against it — this caught the
+three real drifts documented in §18.15/§18.16/§18.17. The hand-authored `sage-endpoints-v0.12.11.json`
+(method-name-only) vector from #215 remains as a lighter first check.

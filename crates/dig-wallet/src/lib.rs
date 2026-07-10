@@ -33,9 +33,7 @@ use axum::{
 };
 use digstore_chain::coinset::{ChainReads, Coinset};
 use digstore_chain::keys::{derive_wallet_keys, owner_address};
-use digstore_chain::seed::{
-    decrypt_seed, encrypt_seed, generate_mnemonic, validate_mnemonic, EncryptedSeed,
-};
+use digstore_chain::seed::{generate_mnemonic, validate_mnemonic};
 use digstore_chain::send::{build_xch_send, decode_xch_address};
 use digstore_chain::wallet::scan_wallet;
 use serde::{Deserialize, Serialize};
@@ -48,6 +46,11 @@ use zeroize::Zeroizing;
 // surface (distinct from the CHIP-0002 `window.chia` dapp responder above and the
 // wallet-UI host); see `SPEC.md §18` and `docs/design/dig-node-sage-parity-rpc.md`.
 pub mod sage;
+
+// #205 PR4: unified at-rest seed custody via `dig-keystore` (new writes), with
+// backwards-compatible reads of the legacy `digstore_chain::seed` on-disk format (an old seed
+// file keeps opening — see the module docs).
+mod seed_store;
 
 /// In-memory unlocked wallet for the session.
 struct Session {
@@ -359,9 +362,9 @@ async fn import(
             format!("invalid recovery phrase: {e}"),
         )
     })?;
-    // Encrypt at rest (Argon2 + AES-GCM) and persist.
-    let enc = encrypt_seed(&m, &req.password)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Encrypt at rest (Argon2 + AES-GCM via `dig-keystore`) and persist.
+    let enc_bytes = seed_store::encrypt_seed(&m, &req.password)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let path = seed_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| {
@@ -371,7 +374,7 @@ async fn import(
             )
         })?;
     }
-    std::fs::write(&path, enc.to_bytes()).map_err(|e| {
+    std::fs::write(&path, &enc_bytes).map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("write seed: {e}"),
@@ -390,13 +393,7 @@ async fn unlock(
 ) -> Result<Json<AddressResp>, (StatusCode, Json<ErrResp>)> {
     let bytes = std::fs::read(seed_path())
         .map_err(|_| err(StatusCode::NOT_FOUND, "no wallet on this device"))?;
-    let enc = EncryptedSeed::from_bytes(&bytes).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("corrupt seed file: {e}"),
-        )
-    })?;
-    let m = decrypt_seed(&enc, &req.password)
+    let m = seed_store::decrypt_seed(&bytes, &req.password)
         .map_err(|_| err(StatusCode::UNAUTHORIZED, "wrong password"))?;
     let address = open_session(&st, m)
         .await
@@ -1017,17 +1014,7 @@ async fn export(headers: HeaderMap, Json(req): Json<ExportReq>) -> Response {
         Ok(b) => b,
         Err(_) => return (StatusCode::NOT_FOUND, "no wallet on this device").into_response(),
     };
-    let enc = match EncryptedSeed::from_bytes(&bytes) {
-        Ok(e) => e,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("corrupt seed file: {e}"),
-            )
-                .into_response()
-        }
-    };
-    match decrypt_seed(&enc, &req.password) {
+    match seed_store::decrypt_seed(&bytes, &req.password) {
         Ok(m) => (
             StatusCode::OK,
             Json(ExportResp {
@@ -5054,10 +5041,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         std::env::set_var("LOCALAPPDATA", td.path());
         // Encrypt + persist the seed exactly as `import` does.
-        let enc = encrypt_seed(ABANDON, PW).unwrap();
+        let enc_bytes = seed_store::encrypt_seed(ABANDON, PW).unwrap();
         let path = seed_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, enc.to_bytes()).unwrap();
+        std::fs::write(&path, &enc_bytes).unwrap();
 
         let dapp = "https://evil.example.com";
         let self_origin = format!("http://127.0.0.1:{}", wallet_port());

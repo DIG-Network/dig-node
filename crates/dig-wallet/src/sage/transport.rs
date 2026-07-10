@@ -15,24 +15,31 @@
 //! Both bind loopback only. `build_router` produces the shared `Router`; the HTTP mirror
 //! layers CORS on top of the same routes.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 
 use axum::{
     body::Bytes,
     extract::{Path, State},
     http::{header, HeaderValue, Method, StatusCode},
-    response::Response,
-    routing::post,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Response,
+    },
+    routing::{get, post},
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
+use futures_core::Stream;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::WebPkiSupportedAlgorithms;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as RustlsError, SignatureScheme};
+use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tower_http::cors::{Any, CorsLayer};
 
+use super::events::SyncEvent;
 use super::rpc::WalletBackend;
 
 /// The Sage-parity RPC default mTLS port (design C.4). Loopback only.
@@ -163,10 +170,50 @@ async fn handle(
     resp
 }
 
-/// Build the shared `Router` (`POST /{method}`) both transports dispatch.
+/// The `SyncEvent` type tag (design A.9) an event maps to, used as the SSE `event:` name.
+fn event_type_tag(event: &SyncEvent) -> &'static str {
+    match event {
+        SyncEvent::Start { .. } => "start",
+        SyncEvent::Stop => "stop",
+        SyncEvent::Subscribed => "subscribed",
+        SyncEvent::Derivation => "derivation",
+        SyncEvent::CoinState => "coin_state",
+        SyncEvent::TransactionFailed { .. } => "transaction_failed",
+        SyncEvent::PuzzleBatchSynced => "puzzle_batch_synced",
+        SyncEvent::CatInfo => "cat_info",
+        SyncEvent::DidInfo => "did_info",
+        SyncEvent::NftData => "nft_data",
+    }
+}
+
+/// The `GET /events` SSE handler (design A.9, #205 PR4): subscribes to the backend's
+/// [`super::events::EventBus`] and streams every published [`SyncEvent`] as a
+/// Server-Sent Event (the `event:` field is the Sage `type` tag; `data:` is the event's full
+/// JSON, byte-parity with the wire shape `dispatch` would use if this were a poll). A lagging
+/// subscriber (missed events dropped from the broadcast channel) simply skips the gap rather
+/// than erroring the stream — `get_sync_status` polling remains the authoritative source of
+/// truth regardless.
+async fn handle_events(
+    State(backend): State<Arc<WalletBackend>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = backend.events().subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(|item| {
+        let event = item.ok()?;
+        let tag = event_type_tag(&event);
+        let sse_event = Event::default()
+            .event(tag)
+            .json_data(&event)
+            .unwrap_or_else(|_| Event::default().event(tag));
+        Some(Ok(sse_event))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// Build the shared `Router` (`POST /{method}` + `GET /events`) both transports dispatch.
 pub fn build_router(backend: Arc<WalletBackend>) -> Router {
     Router::new()
         .route("/:method", post(handle))
+        .route("/events", get(handle_events))
         .with_state(backend)
 }
 
@@ -345,5 +392,63 @@ mod tests {
         );
         assert_eq!(body, expected, "wire body must equal dispatch output");
         assert!(body.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    /// **Proves:** `GET /events` (design A.9) subscribes to the backend's event bus and
+    /// streams a published [`SyncEvent`] as a Server-Sent Event — the `event:` field is the
+    /// Sage `type` tag and `data:` carries the event's JSON.
+    #[tokio::test]
+    async fn events_sse_streams_a_published_sync_event() {
+        let backend = test_backend().await;
+        let router = build_cors_router(backend.clone());
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/events")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The handler has already subscribed by the time the response is ready (subscribing
+        // happens synchronously while building the stream, before any bytes are polled).
+        backend.events().publish(SyncEvent::Stop);
+
+        let mut body = resp.into_body();
+        let mut collected = Vec::new();
+        let found = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match body.frame().await {
+                    Some(Ok(frame)) => {
+                        if let Some(data) = frame.data_ref() {
+                            collected.extend_from_slice(data);
+                            if String::from_utf8_lossy(&collected).contains("event: stop") {
+                                return true;
+                            }
+                        }
+                    }
+                    Some(Err(_)) | None => return false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        let text = String::from_utf8_lossy(&collected);
+        assert!(found, "expected an SSE 'stop' event, got: {text}");
+        assert!(text.contains("\"type\":\"stop\""), "got: {text}");
+    }
+
+    /// **Proves:** the `/events` route coexists with the `/:method` POST dispatch route on
+    /// the SAME router without a construction-time panic or routing conflict — the static
+    /// `/events` route takes precedence over the dynamic `/:method` parameter route at the
+    /// same path (matching axum's documented static-over-dynamic routing priority), so a
+    /// `POST /events` (the SSE route is GET-only) is a `405 Method Not Allowed`, never
+    /// silently misrouted into the method dispatcher.
+    #[tokio::test]
+    async fn events_route_coexists_with_method_dispatch_route() {
+        let backend = test_backend().await;
+        let (status, _) = oneshot_body(build_router(backend), "events").await;
+        assert_eq!(status, 405);
     }
 }

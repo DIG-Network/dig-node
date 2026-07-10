@@ -1849,6 +1849,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-keystore"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b6d423d51540e0d5dbbc9276e574ecd5cfbc1a544e3b304218cf03c90ec53e1"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "chia-bls 0.26.0",
+ "crc32fast",
+ "hex",
+ "parking_lot",
+ "rand_chacha 0.3.1",
+ "rand_core 0.6.4",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
 name = "dig-nat"
 version = "0.1.0"
 source = "git+https://github.com/DIG-Network/dig-nat#e54e8f0a1a0a64007a03e7cf7e774aef47fe4c38"
@@ -1922,7 +1940,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "axum",
  "clap",
@@ -1989,7 +2007,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2001,9 +2019,11 @@ dependencies = [
  "chia-wallet-sdk",
  "clvmr",
  "dig-clvm",
+ "dig-keystore",
  "dig-node-core",
  "digstore-chain",
  "digstore-core",
+ "futures-core",
  "hex",
  "http-body-util",
  "indexmap",
@@ -2015,6 +2035,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tower 0.5.3",
  "tower-http",
  "zeroize",
@@ -5218,6 +5239,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

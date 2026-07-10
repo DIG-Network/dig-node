@@ -32,20 +32,46 @@
 //! - [`transport`] — the dual transport (design C.3): mTLS `9257` (Sage byte-parity)
 //!   + the plain-HTTP+CORS browser mirror, both dispatching the SAME handler set.
 //!
+//! - [`events`] — the [`events::SyncEvent`] stream (design A.9, #205 PR4): an in-process
+//!   [`events::EventBus`] the sync loop publishes to, streamed over `GET /events` (SSE) on
+//!   the shared transport. `get_sync_status` polling remains fully supported.
+//! - [`actions`] — the record-update actions (#205 PR4): `resync_cat`, `update_cat`,
+//!   `update_did`, `update_option`, `update_nft`, `update_nft_collection`, `redownload_nft`,
+//!   `increase_derivation_index`.
+//! - [`themes`] — the Sage-desktop-UI theme store (#205 PR4): `get_user_themes`,
+//!   `get_user_theme`, `save_user_theme`, `delete_user_theme` (DB-backed, additive).
+//! - [`network`] — peers + network/sync settings (#205 PR4): `get_peers`/`add_peer`/
+//!   `remove_peer`, `set_discover_peers`/`set_target_peers`, `set_network`/
+//!   `set_network_override`/`get_networks`/`get_network`, `set_delta_sync`/
+//!   `set_delta_sync_override`, `set_change_address`.
+//! - [`options`] — the option-contract suite (#205 PR4): `get_options`/`get_option` (DB
+//!   reads), `mint_option`/`transfer_options` (real `chia-wallet-sdk` `OptionLauncher`/
+//!   `OptionContract` builders, XCH/CAT scope). `exercise_options` is a documented follow-on
+//!   (see the module docs) pending underlying-lock-coin lineage tracking.
+//!
 //! ## Scope
 //!
-//! The `SyncEvent` stream, options/actions/themes/network-settings endpoints, OpenAPI
-//! generation, and dig-keystore seed migration are deliberate follow-on units (SPEC §18.12).
+//! The generated-OpenAPI conformance vector (SPEC §18.19) IS committed (`sage-cli` — a pure
+//! CLI/RPC crate with no Tauri/desktop dependency — was built from the pinned `v0.12.11` tag
+//! and `sage rpc generate_openapi` run once; no build step is needed to re-derive it).
+//! `exercise_options` (above) remains the one option-suite method pending underlying-lock-coin
+//! lineage tracking (SPEC §18.15); real image-derived theme content remains pending an
+//! image/color-extraction pipeline (SPEC §18.16).
 
+pub mod actions;
 pub mod db;
+pub mod events;
 pub mod fallback;
 pub mod mint;
+pub mod network;
 pub mod offers;
+pub mod options;
 pub mod routing;
 pub mod rpc;
 pub mod singleton;
 pub mod spend;
 pub mod sync;
+pub mod themes;
 pub mod transport;
 pub mod types;
 

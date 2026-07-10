@@ -1,21 +1,37 @@
 //! Conformance harness (design **Part E**): assert the dig-node Sage-parity surface
 //! matches the pinned Sage **v0.12.11** contract.
 //!
-//! Two checks:
+//! Three checks:
 //! 1. **Method-name parity** — every method the backend serves is a real Sage endpoint
 //!    (a subset of the committed `endpoints.json` vector), so nothing is invented.
 //! 2. **Byte-parity of the wire shapes** — representative responses serialize to the exact
 //!    JSON `sage-api` emits (the `Amount` number/string threshold, snake_case, `null` for
 //!    `None` in declaration order), and Sage-shaped requests deserialize losslessly.
-//!
-//! The generated OpenAPI (design A.10) requires building Sage and is a follow-on; the
-//! committed `endpoints.json` + these golden vectors pin the surface meanwhile.
+//! 3. **Schema parity against the REAL generated OpenAPI** (design A.10) — `sage-cli` was
+//!    built from the pinned `xch-dev/sage` `v0.12.11` tag and `sage rpc generate_openapi`
+//!    run to produce `vectors/sage-openapi-v0.12.11.json` (committed here — no build step
+//!    needed to re-derive it): every served method has a real `POST /{method}` path, and a
+//!    set of representative response/request schemas are asserted field-name-identical to
+//!    the real spec. This caught and fixed real drift during #205 PR4 (`OptionRecord` used
+//!    `option_id` instead of the real `launcher_id`; `NetworkKind` was missing the real
+//!    `unknown` variant; `save_user_theme`'s request wrongly carried a caller-supplied
+//!    `theme` field the real Sage request does not have).
 
 use dig_wallet::sage::rpc::WalletBackend;
 use dig_wallet::sage::types::*;
 
-/// The pinned Sage v0.12.11 endpoint catalogue, committed as the conformance vector.
+/// The pinned Sage v0.12.11 endpoint catalogue (hand-authored from the design-doc research),
+/// committed as the first conformance vector.
 const SAGE_ENDPOINTS: &str = include_str!("vectors/sage-endpoints-v0.12.11.json");
+
+/// The REAL OpenAPI spec generated from the pinned `xch-dev/sage` `v0.12.11` tag via
+/// `cargo run --bin sage rpc generate_openapi` (design A.10) — the machine-checkable golden
+/// vector `endpoints.json` approximates.
+const SAGE_OPENAPI: &str = include_str!("vectors/sage-openapi-v0.12.11.json");
+
+fn sage_openapi() -> serde_json::Value {
+    serde_json::from_str(SAGE_OPENAPI).expect("the generated OpenAPI parses")
+}
 
 #[test]
 fn every_supported_method_is_a_real_sage_endpoint() {
@@ -28,8 +44,180 @@ fn every_supported_method_is_a_real_sage_endpoint() {
              replica must not invent endpoints"
         );
     }
-    // 25 core reads (#215) + 10 send/spend (#216) + 11 offer/mint/transfer (#218) = 46.
-    assert_eq!(WalletBackend::SUPPORTED_METHODS.len(), 46);
+    // 25 core reads (#215) + 10 send/spend (#216) + 11 offer/mint/transfer (#218)
+    // + 29 options/actions/themes/network (#205 PR4) = 75.
+    assert_eq!(WalletBackend::SUPPORTED_METHODS.len(), 75);
+}
+
+#[test]
+fn every_supported_method_has_a_real_path_in_the_generated_openapi() {
+    let spec = sage_openapi();
+    let paths = spec["paths"].as_object().expect("paths object");
+    for method in WalletBackend::SUPPORTED_METHODS {
+        let path = format!("/{method}");
+        assert!(
+            paths.contains_key(&path),
+            "`{method}` has no `POST {path}` path in the generated Sage v0.12.11 OpenAPI"
+        );
+    }
+    // The generated spec itself carries the full 100-endpoint surface (design A.5).
+    assert_eq!(paths.len(), 100);
+}
+
+/// Assert `schema_name`'s real property set (from the generated OpenAPI) equals `fields`
+/// exactly — the strongest available proof this replica's Rust type matches Sage byte-for-
+/// byte at the field-name level.
+fn assert_schema_fields(schema_name: &str, fields: &[&str]) {
+    let spec = sage_openapi();
+    let schema = &spec["components"]["schemas"][schema_name];
+    let props = schema["properties"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{schema_name} has no properties in the generated OpenAPI"));
+    let mut real: Vec<&str> = props.keys().map(String::as_str).collect();
+    real.sort_unstable();
+    let mut expected: Vec<&str> = fields.to_vec();
+    expected.sort_unstable();
+    assert_eq!(real, expected, "{schema_name} field set drifted from Sage");
+}
+
+#[test]
+fn options_types_match_the_generated_openapi_field_sets() {
+    assert_schema_fields(
+        "OptionRecord",
+        &[
+            "launcher_id",
+            "visible",
+            "coin_id",
+            "address",
+            "amount",
+            "underlying_asset",
+            "underlying_amount",
+            "underlying_coin_id",
+            "strike_asset",
+            "strike_amount",
+            "expiration_seconds",
+            "name",
+            "created_height",
+            "created_timestamp",
+        ],
+    );
+    assert_schema_fields(
+        "MintOption",
+        &[
+            "expiration_seconds",
+            "underlying",
+            "strike",
+            "fee",
+            "auto_submit",
+        ],
+    );
+    assert_schema_fields(
+        "MintOptionResponse",
+        &["option_id", "summary", "coin_spends"],
+    );
+    assert_schema_fields(
+        "GetOptions",
+        &[
+            "offset",
+            "limit",
+            "sort_mode",
+            "ascending",
+            "find_value",
+            "include_hidden",
+        ],
+    );
+    assert_schema_fields("GetOptionsResponse", &["options", "total"]);
+    assert_schema_fields("OptionAsset", &["asset_id", "amount"]);
+    assert_schema_fields(
+        "TransferOptions",
+        &["option_ids", "address", "fee", "clawback", "auto_submit"],
+    );
+    assert_schema_fields("ExerciseOptions", &["option_ids", "fee", "auto_submit"]);
+
+    // The real `NetworkKind` enum has a third `unknown` variant this replica now includes.
+    let spec = sage_openapi();
+    let kind_enum = spec["components"]["schemas"]["NetworkKind"]["enum"]
+        .as_array()
+        .expect("NetworkKind enum array");
+    let real: Vec<&str> = kind_enum.iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(real, vec!["mainnet", "testnet", "unknown"]);
+}
+
+#[test]
+fn actions_themes_and_network_types_match_the_generated_openapi_field_sets() {
+    assert_schema_fields("ResyncCat", &["asset_id"]);
+    assert_schema_fields("UpdateCat", &["record"]);
+    assert_schema_fields("UpdateDid", &["did_id", "name", "visible"]);
+    assert_schema_fields("UpdateOption", &["option_id", "visible"]);
+    assert_schema_fields("UpdateNft", &["nft_id", "visible"]);
+    assert_schema_fields("UpdateNftCollection", &["collection_id", "visible"]);
+    assert_schema_fields("RedownloadNft", &["nft_id"]);
+    assert_schema_fields(
+        "IncreaseDerivationIndex",
+        &["hardened", "index", "unhardened"],
+    );
+    assert_schema_fields("GetUserThemesResponse", &["themes"]);
+    assert_schema_fields("GetUserThemeResponse", &["theme"]);
+    // Verified/fixed by this vector: the real request has NO caller-supplied theme content.
+    assert_schema_fields("SaveUserTheme", &["nft_id"]);
+    assert_schema_fields("DeleteUserTheme", &["nft_id"]);
+    assert_schema_fields("GetPeersResponse", &["peers"]);
+    assert_schema_fields(
+        "PeerRecord",
+        &["ip_addr", "port", "peak_height", "user_managed"],
+    );
+    assert_schema_fields("AddPeer", &["ip"]);
+    assert_schema_fields("RemovePeer", &["ip", "ban"]);
+    assert_schema_fields("SetDiscoverPeers", &["discover_peers"]);
+    assert_schema_fields("SetTargetPeers", &["target_peers"]);
+    assert_schema_fields("SetNetwork", &["name"]);
+    assert_schema_fields("SetNetworkOverride", &["fingerprint", "name"]);
+    assert_schema_fields("SetDeltaSync", &["delta_sync"]);
+    assert_schema_fields("SetDeltaSyncOverride", &["fingerprint", "delta_sync"]);
+    assert_schema_fields("SetChangeAddress", &["fingerprint", "change_address"]);
+}
+
+#[test]
+fn options_actions_themes_network_methods_are_real_sage_endpoints() {
+    let spec = sage_openapi();
+    let paths = spec["paths"].as_object().expect("paths object");
+    for method in [
+        "get_options",
+        "get_option",
+        "mint_option",
+        "transfer_options",
+        "exercise_options",
+        "resync_cat",
+        "update_cat",
+        "update_did",
+        "update_option",
+        "update_nft",
+        "update_nft_collection",
+        "redownload_nft",
+        "increase_derivation_index",
+        "get_user_themes",
+        "get_user_theme",
+        "save_user_theme",
+        "delete_user_theme",
+        "get_peers",
+        "add_peer",
+        "remove_peer",
+        "set_discover_peers",
+        "set_target_peers",
+        "set_network",
+        "set_network_override",
+        "get_networks",
+        "get_network",
+        "set_delta_sync",
+        "set_delta_sync_override",
+        "set_change_address",
+    ] {
+        assert!(
+            paths.contains_key(&format!("/{method}")),
+            "`{method}` is not a real Sage v0.12.11 endpoint"
+        );
+        assert!(WalletBackend::supports(method), "`{method}` must be served");
+    }
 }
 
 #[test]
