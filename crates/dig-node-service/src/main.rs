@@ -25,6 +25,7 @@
 use clap::{Parser, Subcommand};
 use dig_node_service::cli::{error_envelope, success_envelope, ExitCode, Outcome};
 use dig_node_service::config::Config;
+use dig_node_service::pair::{self, PairAction};
 use dig_node_service::{serve, service, VERSION};
 
 #[derive(Parser)]
@@ -63,6 +64,29 @@ enum Command {
     Stop,
     /// Report whether the node is serving (probes /health).
     Status,
+    /// Pair a browser controller (the DIG Chrome extension) with this node (#280):
+    /// grant it a scoped, revocable control token after local confirmation.
+    Pair {
+        #[command(subcommand)]
+        action: Option<PairCommand>,
+    },
+}
+
+/// `dig-node pair` sub-actions. With none, lists pending requests + issued tokens.
+#[derive(Subcommand)]
+enum PairCommand {
+    /// List pending pairing requests (with codes) + issued controller tokens.
+    List,
+    /// Approve a pending pairing by id (mints a scoped controller token).
+    Approve {
+        /// The pairing_id from `dig-node pair` / the extension.
+        pairing_id: String,
+    },
+    /// Revoke an issued controller token by id.
+    Revoke {
+        /// The token id from `dig-node pair`.
+        token_id: String,
+    },
 }
 
 impl Command {
@@ -75,6 +99,7 @@ impl Command {
             Command::Start => "start",
             Command::Stop => "stop",
             Command::Status => "status",
+            Command::Pair { .. } => "pair",
         }
     }
 }
@@ -96,6 +121,14 @@ fn main() -> std::process::ExitCode {
         Command::Start => render(service::start(), action, json),
         Command::Stop => render(service::stop(), action, json),
         Command::Status => render_status(service::status(&config), action, json),
+        Command::Pair { action: pair_cmd } => {
+            let pair_action = match pair_cmd {
+                None | Some(PairCommand::List) => PairAction::List,
+                Some(PairCommand::Approve { pairing_id }) => PairAction::Approve { pairing_id },
+                Some(PairCommand::Revoke { token_id }) => PairAction::Revoke { token_id },
+            };
+            render(pair::run(&config, pair_action), action, json)
+        }
     };
     std::process::ExitCode::from(exit.code())
 }

@@ -71,6 +71,21 @@ pub fn is_control_method(method: &str) -> bool {
     method.starts_with("control.")
 }
 
+/// Is this a PAIRING-ADMINISTRATION control method (#280)? PURE.
+///
+/// These manage the pairing lifecycle — list pending requests, approve one (minting
+/// a scoped controller token), revoke an issued token — and so MUST require the
+/// MASTER control token (a local file read), NEVER a paired token: a paired
+/// controller can drive `control.*` mutations but can neither mint more tokens nor
+/// hide/revoke itself. The auth gate consults this to decide whether the paired-token
+/// path is even eligible.
+pub fn is_pairing_admin_method(method: &str) -> bool {
+    matches!(
+        method,
+        "control.pairing.list" | "control.pairing.approve" | "control.pairing.revoke"
+    )
+}
+
 /// The path to the control-token file, given the node's config dir. The config dir
 /// is `config.json`'s parent (dig-node's `config_path()`), so the token lives beside
 /// the shared config. PURE (path math only).
@@ -116,18 +131,35 @@ pub fn load_or_create_token_at(path: &Path) -> std::io::Result<String> {
 /// to the user, and loopback-only binding is the primary control; this is
 /// best-effort defense-in-depth, so a failure is ignored.
 #[cfg(unix)]
-fn restrict_permissions(path: &Path) {
+pub(crate) fn restrict_permissions(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
 }
 #[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) {}
+pub(crate) fn restrict_permissions(_path: &Path) {}
 
 /// Generate a fresh 64-hex control token from 32 bytes of OS randomness.
 fn generate_token() -> String {
-    let mut buf = [0u8; 32];
+    random_hex(32)
+}
+
+/// `n_bytes` of OS randomness rendered as lowercase hex. Used for the control token
+/// (32 bytes → 64-hex) and the pairing ids/tokens (#280). Same randomness source as
+/// [`generate_token`].
+pub(crate) fn random_hex(n_bytes: usize) -> String {
+    let mut buf = vec![0u8; n_bytes];
     fill_random(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A short numeric pairing code (6 digits, zero-padded) for the compare-codes
+/// consent step (#280) — the human confirms the extension's code matches the CLI's
+/// before approving. Uniformly random over `000000..=999999` from OS randomness.
+pub(crate) fn random_pairing_code() -> String {
+    let mut buf = [0u8; 4];
+    fill_random(&mut buf);
+    let n = u32::from_le_bytes(buf) % 1_000_000;
+    format!("{n:06}")
 }
 
 /// Fill `buf` with cryptographically-random bytes from the OS, without adding a
@@ -319,8 +351,9 @@ fn update_config(config_path: &Path, mutate: impl FnOnce(&mut Value)) -> std::io
     write_atomic(config_path, &bytes)
 }
 
-/// Atomic write (temp in same dir + rename) — see [`update_config`].
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Atomic write (temp in same dir + rename) — see [`update_config`]. Also used by
+/// the pairing module (#280) to persist the paired-token store without a torn read.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     let nanos = std::time::SystemTime::now()
@@ -429,6 +462,10 @@ pub struct ControlCtx {
     /// Whether authenticated §21 whole-store sync is available (a §21 identity is
     /// loaded). Drives `control.sync.*` and NOT_SUPPORTED.
     pub sync_available: bool,
+    /// The in-memory pending-pairing set (#280), shared with the OPEN
+    /// `pairing.request`/`pairing.poll` handlers so an operator-approved pairing
+    /// becomes pollable by the requesting extension.
+    pub pairings: Arc<std::sync::Mutex<crate::pairing::PendingPairings>>,
 }
 
 /// Dispatch a single authorized CONTROL method. The caller has ALREADY enforced the
@@ -451,6 +488,13 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
         "control.hostedStores.status" => hosted_status(ctx, id, params).await,
         "control.sync.status" => control_ok(id, sync_status(ctx).await),
         "control.sync.trigger" => sync_trigger(ctx, id, params).await,
+        // Pairing administration (#280) — reached only with the MASTER token (the
+        // gate blocks a paired token from these, see `is_pairing_admin_method`).
+        "control.pairing.list" => crate::pairing::list(&ctx.pairings, &ctx.config_path, id),
+        "control.pairing.approve" => {
+            crate::pairing::approve(&ctx.pairings, &ctx.config_path, id, params)
+        }
+        "control.pairing.revoke" => crate::pairing::revoke(&ctx.config_path, id, params),
         // Control methods the shell does not own are delegated to the NODE's own
         // control surface (`control.peerStatus` / `control.subscribe` /
         // `control.unsubscribe` / `control.listSubscriptions` — the node's persisted

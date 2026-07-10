@@ -147,9 +147,33 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
+            name: "cache.stats",
+            served: "local",
+            summary: "Cache telemetry: { cap_bytes, used_bytes, entry_count, total_bytes, \
+                      evicted_count, evicted_bytes, content_cache{hits,misses} }.",
+            requires_auth: false,
+        },
+        MethodInfo {
             name: "rpc.discover",
             served: "shell",
             summary: "Return this node's OpenRPC document (method/error discovery).",
+            requires_auth: false,
+        },
+        // -- pairing bootstrap (#280) — OPEN (no token; an MV3 extension can't read the
+        // control-token file). The scoped token is minted only after LOCAL operator
+        // approval via the gated control.pairing.approve. --------------------------------
+        MethodInfo {
+            name: "pairing.request",
+            served: "shell",
+            summary: "Request a control-token pairing. Params { client_name }; result \
+                      { pairing_id, pairing_code, expires_ms }. OPEN.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "pairing.poll",
+            served: "shell",
+            summary: "Poll a pairing by id; once the operator approves, returns \
+                      { status:\"approved\", token } once. Params { pairing_id }. OPEN.",
             requires_auth: false,
         },
         MethodInfo {
@@ -330,6 +354,27 @@ pub fn methods() -> &'static [MethodInfo] {
             served: "control",
             summary: "Trigger a §21 sync for a capsule (storeId + root); reports \
                       NOT_SUPPORTED if no §21 identity / not eligible.",
+            requires_auth: true,
+        },
+        // -- pairing administration (#280) — MASTER-token only ----------------------------
+        MethodInfo {
+            name: "control.pairing.list",
+            served: "control",
+            summary: "List pending pairing requests (with codes) + issued controller \
+                      tokens (id/client_name/created; never the token value).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.pairing.approve",
+            served: "control",
+            summary: "Approve a pending pairing by id; mints + persists a scoped, \
+                      revocable controller token. Params { pairing_id }.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.pairing.revoke",
+            served: "control",
+            summary: "Revoke an issued controller token by id. Params { token_id }.",
             requires_auth: true,
         },
         // -- node-owned control methods (delegated to dig_node_core::handle_rpc) ----------
@@ -640,6 +685,9 @@ pub fn well_known_document(addr: &str, upstream: &str, cap_bytes: u64, used_byte
             "version": "/version",
             "well_known": "/.well-known/dig-node.json",
             "openrpc": "/openrpc.json",
+            // WebSocket status/liveness channel (#239): a snapshot on connect, then a
+            // periodic heartbeat + WS ping — the open socket itself is the liveness signal.
+            "ws_status": "/ws/status",
         },
         "methods": methods_json(),
         "errors": error_catalogue(),
@@ -971,5 +1019,13 @@ mod tests {
         assert!(doc["methods"].is_array());
         assert!(doc["errors"].is_array());
         assert_eq!(doc["rpc"]["openrpc"], json!("/openrpc.json"));
+    }
+
+    /// **Proves:** the discovery doc surfaces the WS status/liveness endpoint (#239)
+    /// so an agent/client learns about it with zero out-of-band knowledge.
+    #[test]
+    fn well_known_document_exposes_the_ws_status_endpoint() {
+        let doc = well_known_document("127.0.0.1:9778", "https://rpc.dig.net", 1024, 0);
+        assert_eq!(doc["endpoints"]["ws_status"], json!("/ws/status"));
     }
 }
