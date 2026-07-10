@@ -724,7 +724,7 @@ dependencies = [
 [[package]]
 name = "chia-protocol"
 version = "0.26.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=ad20521335149dfa8687bf893620a87ba04fb30a#ad20521335149dfa8687bf893620a87ba04fb30a"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=5457857dc9194d4589dc33f7943f4b6fadd95b9a#5457857dc9194d4589dc33f7943f4b6fadd95b9a"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-serde",
@@ -768,7 +768,7 @@ dependencies = [
 [[package]]
 name = "chia-query"
 version = "0.2.0"
-source = "git+https://github.com/DIG-Network/chia-query.git?rev=b4e7cfb1933327bb48c41f3dcca762f226ad0ab9#b4e7cfb1933327bb48c41f3dcca762f226ad0ab9"
+source = "git+https://github.com/DIG-Network/chia-query.git?rev=d40edc4cf4b28f625ca0301b0327a77461e33975#d40edc4cf4b28f625ca0301b0327a77461e33975"
 dependencies = [
  "chia",
  "chia-wallet-sdk",
@@ -791,7 +791,7 @@ dependencies = [
 [[package]]
 name = "chia-sdk-client"
 version = "0.28.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=ad20521335149dfa8687bf893620a87ba04fb30a#ad20521335149dfa8687bf893620a87ba04fb30a"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=5457857dc9194d4589dc33f7943f4b6fadd95b9a#5457857dc9194d4589dc33f7943f4b6fadd95b9a"
 dependencies = [
  "aws-lc-rs",
  "chia-protocol",
@@ -1744,7 +1744,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 [[package]]
 name = "dig-clvm"
 version = "0.1.1"
-source = "git+https://github.com/DIG-Network/dig-clvm.git?rev=3808440dd89863f806d47fabd548edcb76650fda#3808440dd89863f806d47fabd548edcb76650fda"
+source = "git+https://github.com/DIG-Network/dig-clvm.git?rev=b1de169f7c0fa74cc5965b7ec69f40e576d2deb8#b1de169f7c0fa74cc5965b7ec69f40e576d2deb8"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-consensus",
@@ -1821,7 +1821,7 @@ dependencies = [
 [[package]]
 name = "dig-gossip"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=ad20521335149dfa8687bf893620a87ba04fb30a#ad20521335149dfa8687bf893620a87ba04fb30a"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=5457857dc9194d4589dc33f7943f4b6fadd95b9a#5457857dc9194d4589dc33f7943f4b6fadd95b9a"
 dependencies = [
  "bincode",
  "chia-protocol",
@@ -2065,7 +2065,7 @@ dependencies = [
 [[package]]
 name = "digstore-chain"
 version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2095,7 +2095,7 @@ dependencies = [
 [[package]]
 name = "digstore-chunker"
 version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "digstore-core",
  "sha2 0.10.9",
@@ -2104,7 +2104,7 @@ dependencies = [
 [[package]]
 name = "digstore-compiler"
 version = "1.0.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "chacha20 0.9.1",
  "digstore-core",
@@ -2120,7 +2120,7 @@ dependencies = [
 [[package]]
 name = "digstore-core"
 version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "aes-gcm-siv",
  "hex",
@@ -2133,7 +2133,7 @@ dependencies = [
 [[package]]
 name = "digstore-crypto"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "chia-bls 0.45.0",
  "digstore-core",
@@ -2147,7 +2147,7 @@ dependencies = [
 [[package]]
 name = "digstore-host"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "anyhow",
  "clap",
@@ -2169,7 +2169,7 @@ dependencies = [
 [[package]]
 name = "digstore-prover"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "digstore-core",
  "digstore-crypto",
@@ -2182,7 +2182,7 @@ dependencies = [
 [[package]]
 name = "digstore-remote"
 version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "async-trait",
  "axum",
@@ -2209,7 +2209,7 @@ dependencies = [
 [[package]]
 name = "digstore-stage"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "digstore-chunker",
  "digstore-compiler",
@@ -2225,7 +2225,7 @@ dependencies = [
 [[package]]
 name = "digstore-store"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7#bcb84a6afbbd6e7c71f8bd10775f37f10bf1b0b7"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
 dependencies = [
  "digstore-chunker",
  "digstore-core",
