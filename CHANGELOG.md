@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.0] - 2026-07-10
+
+### Features
+- **control:** Dig-node control-panel surface — WS status, cache-LRU, token pairing (#16)
+
+### Bug Fixes
+- **deps:** Re-pin DIG git deps to rewritten (co-author history) revs- **deps:** Re-resolve DIG git deps to rewritten (co-author/signed) revs
+
 ## [0.11.1] - 2026-07-10
 
 ### Bug Fixes
@@ -51,11 +59,6 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ## [0.5.0] - 2026-07-06
 
-### Features
-- **dig-node:** Canonical node-control contract + uncommon default port 9778 (#5)
-
-## [0.4.1] - 2026-07-05
-
 ### #168
 - Rename DIG_COMPANION_* env vars to DIG_NODE_*
 
@@ -63,7 +66,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 - Dig-node is now the CANONICAL node — first-party node + browser-host cluster
 
 ### Features
-- Serve dig.getManifest locally from the embedded public manifest (#1)- Throttle outgoing bandwidth and redirect saturated serves to peers (#3)- **dig-runtime:** Wallet-only start + native read-crypto FFI (#4)
+- Serve dig.getManifest locally from the embedded public manifest (#1)- Throttle outgoing bandwidth and redirect saturated serves to peers (#3)- **dig-runtime:** Wallet-only start + native read-crypto FFI (#4)- **dig-node:** Canonical node-control contract + uncommon default port 9778 (#5)
 
 ### Documentation
 - Chia:// content scheme + canonical Discord/docs links
