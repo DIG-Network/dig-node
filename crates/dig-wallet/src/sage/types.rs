@@ -1429,6 +1429,437 @@ pub struct TransferDids {
     pub auto_submit: bool,
 }
 
+// =============================================================================
+// Options (design A.5 "Transactions" option-suite methods, #205 PR4).
+// `get_options`/`get_option`/`mint_option`/`transfer_options` are served (`sage::options`);
+// `exercise_options` is a documented follow-on (see `sage::options` module docs).
+// =============================================================================
+
+/// One side's asset spec in `mint_option` (Sage `OptionAsset`): the underlying or the
+/// strike, by asset id (`None` = XCH) + amount.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionAsset {
+    /// The asset id (hex), or `None` for XCH.
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    /// The amount in the asset's smallest unit.
+    pub amount: Amount,
+}
+
+/// `mint_option` request. This backend mints an XCH-underlying option (the underlying lock
+/// coin holds plain XCH); the strike may be XCH or a CAT. See `sage::options` module docs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintOption {
+    /// Seconds until the option expires (from the current time).
+    pub expiration_seconds: u64,
+    /// The underlying asset locked by the option (this backend: XCH only).
+    pub underlying: OptionAsset,
+    /// The asset the exerciser must pay to claim the underlying (XCH or CAT).
+    pub strike: OptionAsset,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+/// `mint_option` response (a distinct shape, like `bulk_mint_nfts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MintOptionResponse {
+    /// The minted option's id (hex launcher id).
+    pub option_id: String,
+    /// The spend summary.
+    pub summary: TransactionSummary,
+    /// The built coin spends (unsigned).
+    pub coin_spends: Vec<CoinSpendJson>,
+}
+
+/// `transfer_options` request (returns [`TransactionResponse`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferOptions {
+    /// The option ids to transfer (hex or bech32m).
+    pub option_ids: Vec<String>,
+    /// The destination address.
+    pub address: String,
+    /// The network fee.
+    pub fee: Amount,
+    /// An optional clawback timeout (seconds).
+    #[serde(default)]
+    pub clawback: Option<u64>,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
+/// `exercise_options` request — accepted on the wire; the backend returns a clear
+/// "not yet implemented" error (see `sage::options` module docs) rather than silently
+/// mis-building a spend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExerciseOptions {
+    /// The option ids to exercise (hex or bech32m).
+    pub option_ids: Vec<String>,
+    /// The network fee.
+    pub fee: Amount,
+    /// Whether to broadcast immediately (Sage default: false).
+    #[serde(default)]
+    pub auto_submit: bool,
+}
+
+/// How to sort a `get_options` result.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionSortMode {
+    /// By name.
+    Name,
+    /// Most recent first (default).
+    #[default]
+    Recent,
+}
+
+/// A tracked option-contract record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptionRecord {
+    /// The option id (hex launcher id). Verified against the pinned v0.12.11 generated
+    /// OpenAPI (design A.10): the real field is `launcher_id`, not `option_id` (this replica
+    /// initially guessed `option_id` before the real schema was available — corrected).
+    pub launcher_id: String,
+    /// Whether visible in the wallet UI.
+    pub visible: bool,
+    /// The current coin id (hex).
+    pub coin_id: String,
+    /// The current owner (p2) address.
+    pub address: String,
+    /// The option singleton coin's own amount (1 mojo for a simple option).
+    pub amount: Amount,
+    /// The locked underlying asset descriptor.
+    pub underlying_asset: Asset,
+    /// The locked underlying amount.
+    pub underlying_amount: Amount,
+    /// The underlying-lock coin's id (hex).
+    pub underlying_coin_id: String,
+    /// The strike asset descriptor the exerciser must pay.
+    pub strike_asset: Asset,
+    /// The strike amount the exerciser must pay.
+    pub strike_amount: Amount,
+    /// Seconds until expiration (from mint time).
+    pub expiration_seconds: u64,
+    /// A display name, if set.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The block height the current coin was created at.
+    pub created_height: Option<u32>,
+    /// The creation timestamp (unix seconds), if known.
+    #[serde(default)]
+    pub created_timestamp: Option<u64>,
+}
+
+/// `get_options` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOptions {
+    /// Pagination offset.
+    pub offset: u32,
+    /// Pagination limit.
+    pub limit: u32,
+    /// Sort mode.
+    #[serde(default)]
+    pub sort_mode: OptionSortMode,
+    /// Ascending order.
+    #[serde(default)]
+    pub ascending: bool,
+    /// An optional free-text filter (matched against nothing yet — reserved for parity).
+    #[serde(default)]
+    pub find_value: Option<String>,
+    /// Whether to include hidden options.
+    #[serde(default)]
+    pub include_hidden: bool,
+}
+/// `get_options` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOptionsResponse {
+    /// The page of options.
+    pub options: Vec<OptionRecord>,
+    /// The total (unpaginated) count.
+    pub total: u32,
+}
+
+/// `get_option` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOption {
+    /// The option id (hex or bech32m).
+    pub option_id: String,
+}
+/// `get_option` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetOptionResponse {
+    /// The option, if tracked.
+    pub option: Option<OptionRecord>,
+}
+
+// =============================================================================
+// Actions — record-update methods (design A.5 "Actions", #205 PR4).
+// =============================================================================
+
+/// `resync_cat` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResyncCat {
+    /// The CAT asset id (hex).
+    pub asset_id: String,
+}
+
+/// `update_cat` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateCat {
+    /// The CAT record to persist (`asset_id` must be set).
+    pub record: TokenRecord,
+}
+
+/// `update_did` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDid {
+    /// The DID id (hex or bech32m).
+    pub did_id: String,
+    /// The new display name, if changing it.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The new visibility.
+    pub visible: bool,
+}
+
+/// `update_option` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateOption {
+    /// The option id (hex or bech32m).
+    pub option_id: String,
+    /// The new visibility.
+    pub visible: bool,
+}
+
+/// `update_nft` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateNft {
+    /// The NFT id (hex or bech32m).
+    pub nft_id: String,
+    /// The new visibility.
+    pub visible: bool,
+}
+
+/// `update_nft_collection` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateNftCollection {
+    /// The collection id.
+    pub collection_id: String,
+    /// The new visibility.
+    pub visible: bool,
+}
+
+/// `redownload_nft` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedownloadNft {
+    /// The NFT id (hex or bech32m).
+    pub nft_id: String,
+}
+
+/// `increase_derivation_index` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncreaseDerivationIndex {
+    /// Raise the hardened-tree floor.
+    #[serde(default)]
+    pub hardened: Option<bool>,
+    /// Raise the unhardened-tree floor.
+    #[serde(default)]
+    pub unhardened: Option<bool>,
+    /// The index to guarantee coverage up to.
+    pub index: u32,
+}
+
+/// An empty response shared by every action method above (`{}`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ActionResponse {}
+
+// =============================================================================
+// Themes — the Sage-desktop-UI theme store (design A.5 "Themes", #205 PR4).
+// =============================================================================
+
+/// `get_user_themes` request (empty).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GetUserThemes {}
+/// `get_user_themes` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetUserThemesResponse {
+    /// Every NFT id with a saved theme.
+    pub themes: Vec<String>,
+}
+
+/// `get_user_theme` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetUserTheme {
+    /// The NFT id the theme is themed after.
+    pub nft_id: String,
+}
+/// `get_user_theme` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetUserThemeResponse {
+    /// The saved theme, if any.
+    pub theme: Option<String>,
+}
+
+/// `save_user_theme` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SaveUserTheme {
+    /// The NFT id the theme is themed after. Verified against the pinned v0.12.11 generated
+    /// OpenAPI (design A.10): the real request carries ONLY `nft_id` — Sage derives the
+    /// theme from the NFT's own artwork rather than accepting caller-supplied content (this
+    /// replica initially guessed a `theme: String` field before the real schema was
+    /// available — corrected; see `crate::sage::themes` module docs for what this backend
+    /// stores in lieu of real color-extraction).
+    pub nft_id: String,
+}
+
+/// `delete_user_theme` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteUserTheme {
+    /// The NFT id whose theme to delete.
+    pub nft_id: String,
+}
+
+// =============================================================================
+// Network / peers / settings (design A.5, #205 PR4).
+// =============================================================================
+
+/// `get_peers` request (empty).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GetPeers {}
+/// `get_peers` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetPeersResponse {
+    /// The tracked (non-banned) peers.
+    pub peers: Vec<PeerRecord>,
+}
+
+/// `add_peer` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddPeer {
+    /// The peer's IP address.
+    pub ip: String,
+}
+
+/// `remove_peer` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemovePeer {
+    /// The peer's IP address.
+    pub ip: String,
+    /// Whether to ban the peer (kept, but excluded from `get_peers`) instead of forgetting it.
+    #[serde(default)]
+    pub ban: bool,
+}
+
+/// `set_discover_peers` request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetDiscoverPeers {
+    /// Whether peer discovery (DNS introducers) is enabled.
+    pub discover_peers: bool,
+}
+
+/// `set_target_peers` request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetTargetPeers {
+    /// The target number of connected peers.
+    pub target_peers: u32,
+}
+
+/// `set_network` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetNetwork {
+    /// The network id to switch to (e.g. `mainnet`/`testnet11`).
+    pub name: String,
+}
+
+/// `set_network_override` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetNetworkOverride {
+    /// The wallet fingerprint the override applies to (one active wallet in this backend).
+    pub fingerprint: u32,
+    /// The network id override, or `None` to clear it.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// A known Chia network's connection parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Network {
+    /// The network id (`mainnet`/`testnet11`).
+    pub name: String,
+    /// The native asset ticker.
+    pub ticker: String,
+    /// The bech32m address prefix.
+    pub address_prefix: String,
+    /// Decimal precision.
+    pub precision: u8,
+    /// The default full-node peer port.
+    pub default_port: u16,
+}
+
+/// Whether a network is the production mainnet or a test network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkKind {
+    /// The production Chia network.
+    Mainnet,
+    /// A test network.
+    Testnet,
+    /// An unrecognized/unconfigured network id. Verified against the pinned v0.12.11
+    /// generated OpenAPI (design A.10): the real enum has three variants, not two.
+    Unknown,
+}
+
+/// `get_networks` request (empty).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GetNetworks {}
+/// `get_networks` response (Sage's `NetworkList`): every known network by id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkList {
+    /// Known networks, keyed by network id.
+    pub networks: std::collections::BTreeMap<String, Network>,
+}
+
+/// `get_network` request (empty).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct GetNetwork {}
+/// `get_network` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetNetworkResponse {
+    /// The currently-active network.
+    pub network: Network,
+    /// Its kind.
+    pub kind: NetworkKind,
+}
+
+/// `set_delta_sync` request.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SetDeltaSync {
+    /// Whether delta-sync is enabled.
+    pub delta_sync: bool,
+}
+
+/// `set_delta_sync_override` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetDeltaSyncOverride {
+    /// The wallet fingerprint the override applies to.
+    pub fingerprint: u32,
+    /// The delta-sync override, or `None` to clear it.
+    #[serde(default)]
+    pub delta_sync: Option<bool>,
+}
+
+/// `set_change_address` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetChangeAddress {
+    /// The wallet fingerprint the override applies to.
+    pub fingerprint: u32,
+    /// The change-address override, or `None` to clear it (use the wallet's own).
+    #[serde(default)]
+    pub change_address: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1598,5 +2029,111 @@ mod tests {
             serde_json::to_string(&SubmitTransactionResponse {}).unwrap(),
             "{}"
         );
+    }
+
+    // ---- #205 PR4: options/actions/themes/network wire shapes ----------------
+
+    #[test]
+    fn option_sort_mode_is_snake_case_and_defaults_to_recent() {
+        assert_eq!(
+            serde_json::to_string(&OptionSortMode::Name).unwrap(),
+            "\"name\""
+        );
+        assert_eq!(OptionSortMode::default(), OptionSortMode::Recent);
+    }
+
+    #[test]
+    fn mint_option_request_defaults_auto_submit_false() {
+        let r: MintOption = serde_json::from_str(
+            r#"{"expiration_seconds":3600,"underlying":{"amount":1000},"strike":{"amount":500},"fee":0}"#,
+        )
+        .unwrap();
+        assert!(r.underlying.asset_id.is_none());
+        assert!(r.strike.asset_id.is_none());
+        assert!(
+            !r.auto_submit,
+            "auto_submit defaults to false (Sage parity)"
+        );
+    }
+
+    #[test]
+    fn mint_option_response_matches_distinct_shape() {
+        let resp = MintOptionResponse {
+            option_id: "abc".into(),
+            summary: TransactionSummary {
+                fee: Amount::u64(0),
+                inputs: vec![],
+            },
+            coin_spends: vec![],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.starts_with(r#"{"option_id":"abc","summary""#));
+    }
+
+    #[test]
+    fn action_response_is_empty_object() {
+        assert_eq!(serde_json::to_string(&ActionResponse {}).unwrap(), "{}");
+    }
+
+    #[test]
+    fn increase_derivation_index_request_omits_defaultable_fields() {
+        let r: IncreaseDerivationIndex = serde_json::from_str(r#"{"index":5}"#).unwrap();
+        assert!(r.hardened.is_none());
+        assert!(r.unhardened.is_none());
+        assert_eq!(r.index, 5);
+    }
+
+    #[test]
+    fn theme_requests_round_trip() {
+        // Verified against the pinned v0.12.11 generated OpenAPI: `save_user_theme`'s
+        // request carries ONLY `nft_id` (no caller-supplied theme content).
+        let save: SaveUserTheme = serde_json::from_str(r#"{"nft_id":"n1"}"#).unwrap();
+        assert_eq!(save.nft_id, "n1");
+        let resp = GetUserThemesResponse {
+            themes: vec!["n1".into()],
+        };
+        assert_eq!(
+            serde_json::to_string(&resp).unwrap(),
+            r#"{"themes":["n1"]}"#
+        );
+    }
+
+    #[test]
+    fn network_kind_is_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&NetworkKind::Mainnet).unwrap(),
+            "\"mainnet\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NetworkKind::Testnet).unwrap(),
+            "\"testnet\""
+        );
+        // Verified against the pinned v0.12.11 generated OpenAPI: the real enum has a third
+        // `unknown` variant.
+        assert_eq!(
+            serde_json::to_string(&NetworkKind::Unknown).unwrap(),
+            "\"unknown\""
+        );
+    }
+
+    #[test]
+    fn remove_peer_request_defaults_ban_false() {
+        let r: RemovePeer = serde_json::from_str(r#"{"ip":"1.2.3.4"}"#).unwrap();
+        assert!(!r.ban);
+    }
+
+    #[test]
+    fn get_peers_response_shape() {
+        let resp = GetPeersResponse {
+            peers: vec![PeerRecord {
+                ip_addr: "1.2.3.4".into(),
+                port: 8444,
+                peak_height: 0,
+                user_managed: true,
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ip_addr\":\"1.2.3.4\""));
+        assert!(json.contains("\"user_managed\":true"));
     }
 }

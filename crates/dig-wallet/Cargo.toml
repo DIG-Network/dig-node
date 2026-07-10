@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -73,6 +73,20 @@ dig-clvm = { git = "https://github.com/DIG-Network/dig-clvm.git", rev = "3808440
 # for spend building) is not yet git-consumable — its `dig-keystore` path dependency does not
 # resolve from a git checkout — so its thin SDK-wrapper builder pattern is followed directly
 # on chia-wallet-sdk here; making dig-l1-wallet git-consumable is a tracked follow-up (#216).
+
+# -- #205 PR4 (options/actions/themes/network-settings, SyncEvent stream, dig-keystore
+# seed migration) -----------------------------------------------------------------------
+# At-rest seed custody (design C.2, `seed_store` module): the `opaque` container (Argon2id +
+# AES-256-GCM, versioned/magic-tagged/CRC-guarded) replaces the bespoke `digstore_chain::seed`
+# on-disk layout for NEW writes; `seed_store::decrypt_seed` still reads old-format files.
+# Published on crates.io (not a git dep) — the crate ships its library surface there.
+dig-keystore = "0.3"
+# The `SyncEvent` stream (design A.9): wraps the `tokio::sync::broadcast` receiver as a
+# `Stream` for the SSE `GET /events` handler (`sage::transport`). `tokio-stream` supplies the
+# `BroadcastStream` wrapper + `StreamExt` combinators; `futures-core` supplies the `Stream`
+# trait itself (axum's `Sse<S>` is generic over it) — both tiny, no extra runtime.
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-core = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

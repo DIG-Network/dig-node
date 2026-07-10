@@ -168,6 +168,54 @@ pub struct OfferDbRow {
     pub summary_json: String,
 }
 
+/// A saved Sage-desktop-UI theme, keyed by the NFT id it is themed after (#205 PR4 §18.15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThemeRow {
+    /// The NFT id (hex launcher id) the theme is themed after.
+    pub nft_id: String,
+    /// The theme content (an opaque string; the desktop UI's own encoding).
+    pub theme: String,
+}
+
+/// A stored option-contract row: the singleton/coin identity + the full serialized
+/// `OptionRecord`-equivalent wire JSON (#205 PR4 §18.15/options).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionDbRow {
+    /// The option launcher (singleton) id (hex).
+    pub option_id: String,
+    /// The current coin id (hex).
+    pub coin_id: String,
+    /// The underlying-lock coin's id (hex) — what the option, once exercised, releases.
+    pub underlying_coin_id: String,
+    /// The underlying delegated-puzzle tree hash (hex) — part of the option's on-chain info.
+    pub underlying_delegated_puzzle_hash: String,
+    /// The current p2 (owner) puzzle hash (hex).
+    pub p2_puzzle_hash: String,
+    /// Whether visible in the wallet UI.
+    pub visible: bool,
+    /// The block height the current coin was created at.
+    pub created_height: Option<i64>,
+    /// The serialized wire record (`OptionRecord`-shaped JSON) for byte-parity reads.
+    pub record_json: String,
+}
+
+/// A tracked peer (#205 PR4 §18.16). Manually added (`add_peer`) peers persist here across
+/// restarts, mirroring Sage's `user_managed` peers; `peak_height` is 0 until this node's
+/// bring-up wires live per-peer telemetry (SPEC §18.16) — never fabricated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRow {
+    /// The peer's IP address.
+    pub ip_addr: String,
+    /// The peer's port.
+    pub port: i64,
+    /// The peer's last-known peak height (0 if unknown).
+    pub peak_height: i64,
+    /// Whether the peer was added manually by the user (`add_peer`).
+    pub user_managed: bool,
+    /// Whether the peer is banned (`remove_peer { ban: true }`) — excluded from `get_peers`.
+    pub banned: bool,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_state (
     id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -256,6 +304,43 @@ CREATE TABLE IF NOT EXISTS offers (
     summary_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_offers_created ON offers (creation_timestamp);
+
+CREATE TABLE IF NOT EXISTS user_themes (
+    nft_id TEXT PRIMARY KEY,
+    theme TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS options (
+    option_id TEXT PRIMARY KEY,
+    coin_id TEXT NOT NULL,
+    underlying_coin_id TEXT NOT NULL,
+    underlying_delegated_puzzle_hash TEXT NOT NULL,
+    p2_puzzle_hash TEXT NOT NULL,
+    visible INTEGER NOT NULL DEFAULT 1,
+    created_height INTEGER,
+    record_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS peers (
+    ip_addr TEXT PRIMARY KEY,
+    port INTEGER NOT NULL,
+    peak_height INTEGER NOT NULL DEFAULT 0,
+    user_managed INTEGER NOT NULL DEFAULT 0,
+    banned INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS network_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    discover_peers INTEGER NOT NULL DEFAULT 1,
+    target_peers INTEGER NOT NULL DEFAULT 3,
+    network_override TEXT,
+    delta_sync INTEGER NOT NULL DEFAULT 1,
+    delta_sync_override INTEGER,
+    change_address TEXT,
+    derivation_floor_hardened INTEGER NOT NULL DEFAULT 0,
+    derivation_floor_unhardened INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO network_settings (id) VALUES (0);
 "#;
 
 /// Additive column migrations for wallet DBs created before #216 (§5.1 additive-only): the
@@ -413,7 +498,9 @@ impl WalletDb {
         Ok((out, total as u32))
     }
 
-    /// The highest derivation index seen for one HD tree (for `get_sync_status`).
+    /// The highest derivation index seen for one HD tree (for `get_sync_status`), floored by
+    /// any `increase_derivation_index` request (§18.16 `actions`) so the reported index never
+    /// regresses below what the caller asked the wallet to guarantee coverage up to.
     pub async fn max_derivation_index(&self, hardened: bool) -> sqlx::Result<u32> {
         let n: Option<i64> =
             sqlx::query("SELECT MAX(idx) AS m FROM derivations WHERE hardened = ?")
@@ -421,7 +508,42 @@ impl WalletDb {
                 .fetch_one(&self.pool)
                 .await?
                 .get("m");
-        Ok(n.map(|v| v as u32 + 1).unwrap_or(0))
+        let from_rows = n.map(|v| v as u32 + 1).unwrap_or(0);
+        let floor = self.derivation_floor(hardened).await?;
+        Ok(from_rows.max(floor))
+    }
+
+    /// Raise the derivation-index floor for one HD tree (`increase_derivation_index`,
+    /// §18.16) — [`Self::max_derivation_index`] never reports less than this afterward, even
+    /// if no derivation rows exist yet at that index. Never lowers an existing floor.
+    pub async fn raise_derivation_floor(&self, hardened: bool, index: u32) -> sqlx::Result<()> {
+        let col = if hardened {
+            "derivation_floor_hardened"
+        } else {
+            "derivation_floor_unhardened"
+        };
+        sqlx::query(&format!(
+            "UPDATE network_settings SET {col} = MAX({col}, ?) WHERE id = 0"
+        ))
+        .bind(i64::from(index))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn derivation_floor(&self, hardened: bool) -> sqlx::Result<u32> {
+        let col = if hardened {
+            "derivation_floor_hardened"
+        } else {
+            "derivation_floor_unhardened"
+        };
+        let v: i64 = sqlx::query(&format!(
+            "SELECT {col} AS v FROM network_settings WHERE id = 0"
+        ))
+        .fetch_one(&self.pool)
+        .await?
+        .get("v");
+        Ok(v as u32)
     }
 
     // ---- coins ------------------------------------------------------------
@@ -981,6 +1103,423 @@ impl WalletDb {
             .await?;
         Ok(())
     }
+
+    // ---- user themes (#205 PR4, `sage::themes`) ---------------------------
+
+    /// Every NFT id with a saved theme (`get_user_themes`).
+    pub async fn all_theme_nft_ids(&self) -> sqlx::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT nft_id FROM user_themes ORDER BY nft_id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| r.get("nft_id")).collect())
+    }
+
+    /// One NFT's saved theme, if any (`get_user_theme`).
+    pub async fn user_theme(&self, nft_id: &str) -> sqlx::Result<Option<String>> {
+        Ok(
+            sqlx::query("SELECT theme FROM user_themes WHERE nft_id = ?")
+                .bind(nft_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .map(|r| r.get("theme")),
+        )
+    }
+
+    /// Save (insert or overwrite) an NFT's theme (`save_user_theme`).
+    pub async fn save_user_theme(&self, nft_id: &str, theme: &str) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO user_themes (nft_id, theme) VALUES (?, ?)
+             ON CONFLICT(nft_id) DO UPDATE SET theme = excluded.theme",
+        )
+        .bind(nft_id)
+        .bind(theme)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete an NFT's saved theme (`delete_user_theme`; a no-op if absent).
+    pub async fn delete_user_theme(&self, nft_id: &str) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM user_themes WHERE nft_id = ?")
+            .bind(nft_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ---- record-update actions (#205 PR4, `sage::actions`) ----------------
+
+    /// Reset a CAT's cached metadata (name/ticker/description/icon_url) to unknown, forcing a
+    /// future re-fetch (`resync_cat`). Balance/coins are untouched — this only clears the
+    /// display metadata cache.
+    pub async fn clear_cat_metadata(&self, asset_id: &str) -> sqlx::Result<()> {
+        sqlx::query(
+            "UPDATE cats SET name = NULL, ticker = NULL, description = NULL, icon_url = NULL
+             WHERE asset_id = ?",
+        )
+        .bind(asset_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update a CAT's stored metadata (`update_cat`; upserts if the CAT has no row yet).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_cat_metadata(
+        &self,
+        asset_id: &str,
+        name: Option<&str>,
+        ticker: Option<&str>,
+        description: Option<&str>,
+        icon_url: Option<&str>,
+        visible: bool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO cats (asset_id, name, ticker, description, icon_url, visible)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(asset_id) DO UPDATE SET
+                name = excluded.name, ticker = excluded.ticker,
+                description = excluded.description, icon_url = excluded.icon_url,
+                visible = excluded.visible",
+        )
+        .bind(asset_id)
+        .bind(name)
+        .bind(ticker)
+        .bind(description)
+        .bind(icon_url)
+        .bind(visible)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update a DID's display name and/or visibility (`update_did`), patching both the
+    /// indexed columns and the stored wire-record JSON's matching fields so `get_dids`
+    /// reflects the change immediately.
+    pub async fn update_did_fields(
+        &self,
+        did_id: &str,
+        name: Option<&str>,
+        visible: bool,
+    ) -> sqlx::Result<()> {
+        sqlx::query("UPDATE dids SET name = COALESCE(?, name), visible = ? WHERE launcher_id = ?")
+            .bind(name)
+            .bind(visible)
+            .bind(did_id)
+            .execute(&self.pool)
+            .await?;
+        self.patch_record_json("dids", "launcher_id", did_id, |v| {
+            if let Some(n) = name {
+                v["name"] = serde_json::Value::String(n.to_string());
+            }
+            v["visible"] = serde_json::Value::Bool(visible);
+        })
+        .await
+    }
+
+    /// Update an NFT's visibility (`update_nft`).
+    pub async fn update_nft_visible(&self, nft_id: &str, visible: bool) -> sqlx::Result<()> {
+        sqlx::query("UPDATE nfts SET visible = ? WHERE launcher_id = ?")
+            .bind(visible)
+            .bind(nft_id)
+            .execute(&self.pool)
+            .await?;
+        self.patch_record_json("nfts", "launcher_id", nft_id, |v| {
+            v["visible"] = serde_json::Value::Bool(visible);
+        })
+        .await
+    }
+
+    /// Update an NFT collection's visibility (`update_nft_collection`).
+    pub async fn update_nft_collection_visible(
+        &self,
+        collection_id: &str,
+        visible: bool,
+    ) -> sqlx::Result<()> {
+        sqlx::query("UPDATE nft_collections SET visible = ? WHERE collection_id = ?")
+            .bind(visible)
+            .bind(collection_id)
+            .execute(&self.pool)
+            .await?;
+        self.patch_record_json("nft_collections", "collection_id", collection_id, |v| {
+            v["visible"] = serde_json::Value::Bool(visible);
+        })
+        .await
+    }
+
+    /// Update an option's visibility (`update_option`).
+    pub async fn update_option_visible(&self, option_id: &str, visible: bool) -> sqlx::Result<()> {
+        sqlx::query("UPDATE options SET visible = ? WHERE option_id = ?")
+            .bind(visible)
+            .bind(option_id)
+            .execute(&self.pool)
+            .await?;
+        self.patch_record_json("options", "option_id", option_id, |v| {
+            v["visible"] = serde_json::Value::Bool(visible);
+        })
+        .await
+    }
+
+    /// Clear an NFT's cached off-chain metadata JSON, forcing a future re-fetch
+    /// (`redownload_nft`).
+    pub async fn clear_nft_metadata_json(&self, nft_id: &str) -> sqlx::Result<()> {
+        sqlx::query("UPDATE nfts SET metadata_json = NULL WHERE launcher_id = ?")
+            .bind(nft_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Patch the `record_json` column of `table` (keyed by `id_col = id`) via `patch`;
+    /// silently does nothing for a missing row or corrupt/absent JSON (nothing sane to
+    /// patch) — `table`/`id_col` are always internal constants, never caller-supplied.
+    async fn patch_record_json(
+        &self,
+        table: &str,
+        id_col: &str,
+        id: &str,
+        patch: impl FnOnce(&mut serde_json::Value),
+    ) -> sqlx::Result<()> {
+        let row = sqlx::query(&format!(
+            "SELECT record_json FROM {table} WHERE {id_col} = ?"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else { return Ok(()) };
+        let Some(json_str) = row.get::<Option<String>, _>("record_json") else {
+            return Ok(());
+        };
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&json_str) else {
+            return Ok(());
+        };
+        patch(&mut value);
+        let Ok(new_json) = serde_json::to_string(&value) else {
+            return Ok(());
+        };
+        sqlx::query(&format!(
+            "UPDATE {table} SET record_json = ? WHERE {id_col} = ?"
+        ))
+        .bind(new_json)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ---- options (#205 PR4, `sage::options`) -------------------------------
+
+    /// Insert or update a tracked option contract (keyed by option id).
+    pub async fn upsert_option(&self, o: &OptionDbRow) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO options
+                (option_id, coin_id, underlying_coin_id, underlying_delegated_puzzle_hash,
+                 p2_puzzle_hash, visible, created_height, record_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(option_id) DO UPDATE SET
+                coin_id = excluded.coin_id,
+                underlying_coin_id = excluded.underlying_coin_id,
+                underlying_delegated_puzzle_hash = excluded.underlying_delegated_puzzle_hash,
+                p2_puzzle_hash = excluded.p2_puzzle_hash,
+                created_height = excluded.created_height,
+                record_json = excluded.record_json",
+        )
+        .bind(&o.option_id)
+        .bind(&o.coin_id)
+        .bind(&o.underlying_coin_id)
+        .bind(&o.underlying_delegated_puzzle_hash)
+        .bind(&o.p2_puzzle_hash)
+        .bind(o.visible)
+        .bind(o.created_height)
+        .bind(&o.record_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    fn option_from_row(r: &sqlx::sqlite::SqliteRow) -> OptionDbRow {
+        OptionDbRow {
+            option_id: r.get("option_id"),
+            coin_id: r.get("coin_id"),
+            underlying_coin_id: r.get("underlying_coin_id"),
+            underlying_delegated_puzzle_hash: r.get("underlying_delegated_puzzle_hash"),
+            p2_puzzle_hash: r.get("p2_puzzle_hash"),
+            visible: r.get::<i64, _>("visible") != 0,
+            created_height: r.get("created_height"),
+            record_json: r.get("record_json"),
+        }
+    }
+
+    /// All tracked options (`get_options`; higher layers filter/paginate/sort in Rust).
+    pub async fn all_options(&self) -> sqlx::Result<Vec<OptionDbRow>> {
+        let rows = sqlx::query("SELECT * FROM options ORDER BY option_id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(Self::option_from_row).collect())
+    }
+
+    /// One tracked option by id (`get_option`).
+    pub async fn option(&self, option_id: &str) -> sqlx::Result<Option<OptionDbRow>> {
+        Ok(sqlx::query("SELECT * FROM options WHERE option_id = ?")
+            .bind(option_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(Self::option_from_row))
+    }
+
+    // ---- peers (#205 PR4, `sage::network`) ---------------------------------
+
+    /// Every non-banned tracked peer (`get_peers`). `peak_height` is 0 until live per-peer
+    /// telemetry is wired (SPEC §18.16) — never fabricated.
+    pub async fn all_peers(&self) -> sqlx::Result<Vec<PeerRow>> {
+        let rows = sqlx::query(
+            "SELECT ip_addr, port, peak_height, user_managed, banned FROM peers
+             WHERE banned = 0 ORDER BY ip_addr",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::peer_from_row).collect())
+    }
+
+    fn peer_from_row(r: &sqlx::sqlite::SqliteRow) -> PeerRow {
+        PeerRow {
+            ip_addr: r.get("ip_addr"),
+            port: r.get("port"),
+            peak_height: r.get("peak_height"),
+            user_managed: r.get::<i64, _>("user_managed") != 0,
+            banned: r.get::<i64, _>("banned") != 0,
+        }
+    }
+
+    /// Add (or un-ban + refresh the port of) a user-managed peer (`add_peer`).
+    pub async fn add_peer(&self, ip_addr: &str, port: i64) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT INTO peers (ip_addr, port, peak_height, user_managed, banned)
+             VALUES (?, ?, 0, 1, 0)
+             ON CONFLICT(ip_addr) DO UPDATE SET port = excluded.port, banned = 0",
+        )
+        .bind(ip_addr)
+        .bind(port)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a peer (`remove_peer { ban: false }`, deletes the row) or ban it
+    /// (`remove_peer { ban: true }`, kept but excluded from [`Self::all_peers`]).
+    pub async fn remove_peer(&self, ip_addr: &str, ban: bool) -> sqlx::Result<()> {
+        if ban {
+            sqlx::query(
+                "INSERT INTO peers (ip_addr, port, peak_height, user_managed, banned)
+                 VALUES (?, 0, 0, 0, 1)
+                 ON CONFLICT(ip_addr) DO UPDATE SET banned = 1",
+            )
+            .bind(ip_addr)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM peers WHERE ip_addr = ?")
+                .bind(ip_addr)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    // ---- network / sync settings (#205 PR4, `sage::network`) ---------------
+
+    /// Read the current network/sync settings row.
+    pub async fn network_settings(&self) -> sqlx::Result<NetworkSettingsRow> {
+        let row = sqlx::query(
+            "SELECT discover_peers, target_peers, network_override, delta_sync,
+                    delta_sync_override, change_address FROM network_settings WHERE id = 0",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(NetworkSettingsRow {
+            discover_peers: row.get::<i64, _>("discover_peers") != 0,
+            target_peers: row.get::<i64, _>("target_peers") as u32,
+            network_override: row.get("network_override"),
+            delta_sync: row.get::<i64, _>("delta_sync") != 0,
+            delta_sync_override: row
+                .get::<Option<i64>, _>("delta_sync_override")
+                .map(|v| v != 0),
+            change_address: row.get("change_address"),
+        })
+    }
+
+    /// `set_discover_peers`.
+    pub async fn set_discover_peers(&self, on: bool) -> sqlx::Result<()> {
+        sqlx::query("UPDATE network_settings SET discover_peers = ? WHERE id = 0")
+            .bind(on)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// `set_target_peers`.
+    pub async fn set_target_peers(&self, n: u32) -> sqlx::Result<()> {
+        sqlx::query("UPDATE network_settings SET target_peers = ? WHERE id = 0")
+            .bind(i64::from(n))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// `set_network` / `set_network_override` (one active wallet, so both map to the same
+    /// stored override — a per-fingerprint override is a follow-on for multi-key support).
+    pub async fn set_network_override(&self, name: Option<&str>) -> sqlx::Result<()> {
+        sqlx::query("UPDATE network_settings SET network_override = ? WHERE id = 0")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// `set_delta_sync`.
+    pub async fn set_delta_sync(&self, on: bool) -> sqlx::Result<()> {
+        sqlx::query("UPDATE network_settings SET delta_sync = ? WHERE id = 0")
+            .bind(on)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// `set_delta_sync_override`.
+    pub async fn set_delta_sync_override(&self, on: Option<bool>) -> sqlx::Result<()> {
+        sqlx::query("UPDATE network_settings SET delta_sync_override = ? WHERE id = 0")
+            .bind(on.map(i64::from))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// `set_change_address`.
+    pub async fn set_change_address(&self, address: Option<&str>) -> sqlx::Result<()> {
+        sqlx::query("UPDATE network_settings SET change_address = ? WHERE id = 0")
+            .bind(address)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+/// The current network/sync settings (design A.5 network/peers/settings group).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkSettingsRow {
+    /// Whether peer discovery (DNS introducers) is enabled.
+    pub discover_peers: bool,
+    /// The target number of connected peers.
+    pub target_peers: u32,
+    /// An explicit active-network override (`None` = the node's configured default).
+    pub network_override: Option<String>,
+    /// Whether delta-sync is enabled.
+    pub delta_sync: bool,
+    /// A per-wallet delta-sync override (`None` = use `delta_sync`).
+    pub delta_sync_override: Option<bool>,
+    /// An explicit change-address override (`None` = the wallet's own change address).
+    pub change_address: Option<String>,
 }
 
 #[cfg(test)]
@@ -1244,5 +1783,288 @@ mod tests {
                 .as_deref(),
             Some("My Collection")
         );
+    }
+
+    // ---- user themes (#205 PR4) --------------------------------------------
+
+    #[tokio::test]
+    async fn user_themes_save_get_delete_round_trip() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        assert!(db.user_theme("nft1").await.unwrap().is_none());
+        assert!(db.all_theme_nft_ids().await.unwrap().is_empty());
+
+        db.save_user_theme("nft1", "dark-purple").await.unwrap();
+        assert_eq!(
+            db.user_theme("nft1").await.unwrap().as_deref(),
+            Some("dark-purple")
+        );
+        assert_eq!(db.all_theme_nft_ids().await.unwrap(), vec!["nft1"]);
+
+        // Overwrite.
+        db.save_user_theme("nft1", "light-blue").await.unwrap();
+        assert_eq!(
+            db.user_theme("nft1").await.unwrap().as_deref(),
+            Some("light-blue")
+        );
+
+        db.delete_user_theme("nft1").await.unwrap();
+        assert!(db.user_theme("nft1").await.unwrap().is_none());
+    }
+
+    // ---- record-update actions (#205 PR4) ------------------------------------
+
+    #[tokio::test]
+    async fn resync_cat_clears_cached_metadata_only() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_cat(&CatRow {
+            asset_id: "a1".into(),
+            name: Some("Old Name".into()),
+            ticker: Some("OLD".into()),
+            precision: 3,
+            description: Some("stale".into()),
+            icon_url: Some("http://x".into()),
+            visible: true,
+        })
+        .await
+        .unwrap();
+        db.clear_cat_metadata("a1").await.unwrap();
+        let cat = db.cat("a1").await.unwrap().unwrap();
+        assert!(cat.name.is_none());
+        assert!(cat.ticker.is_none());
+        assert!(cat.description.is_none());
+        assert!(cat.icon_url.is_none());
+        assert!(cat.visible, "visible flag is untouched by resync");
+    }
+
+    #[tokio::test]
+    async fn update_cat_metadata_upserts() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.update_cat_metadata(
+            "a2",
+            Some("New Name"),
+            Some("NEW"),
+            Some("desc"),
+            Some("http://icon"),
+            false,
+        )
+        .await
+        .unwrap();
+        let cat = db.cat("a2").await.unwrap().unwrap();
+        assert_eq!(cat.name.as_deref(), Some("New Name"));
+        assert!(!cat.visible);
+    }
+
+    #[tokio::test]
+    async fn update_did_fields_patches_column_and_json() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_did(&DidDbRow {
+            launcher_id: "didX".into(),
+            coin_id: "c1".into(),
+            name: Some("Old".into()),
+            visible: true,
+            created_height: Some(1),
+            record_json: r#"{"launcher_id":"didX","name":"Old","visible":true}"#.into(),
+        })
+        .await
+        .unwrap();
+
+        db.update_did_fields("didX", Some("New"), false)
+            .await
+            .unwrap();
+
+        let row = db.all_dids().await.unwrap().into_iter().next().unwrap();
+        assert_eq!(row.name.as_deref(), Some("New"));
+        assert!(!row.visible);
+        let json: serde_json::Value = serde_json::from_str(&row.record_json).unwrap();
+        assert_eq!(json["name"], "New");
+        assert_eq!(json["visible"], false);
+    }
+
+    #[tokio::test]
+    async fn update_nft_visible_patches_column_and_json() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_nft(&NftDbRow {
+            launcher_id: "nftX".into(),
+            coin_id: "c1".into(),
+            collection_id: None,
+            minter_did: None,
+            owner_did: None,
+            name: Some("N".into()),
+            visible: true,
+            created_height: Some(1),
+            record_json: r#"{"launcher_id":"nftX","visible":true}"#.into(),
+        })
+        .await
+        .unwrap();
+
+        db.update_nft_visible("nftX", false).await.unwrap();
+
+        let row = db.nft("nftX").await.unwrap().unwrap();
+        assert!(!row.visible);
+        let json: serde_json::Value = serde_json::from_str(&row.record_json).unwrap();
+        assert_eq!(json["visible"], false);
+    }
+
+    #[tokio::test]
+    async fn update_nft_collection_visible_patches_column_and_json() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_nft_collection(&NftCollectionDbRow {
+            collection_id: "colX".into(),
+            did_id: "didX".into(),
+            metadata_collection_id: "mc".into(),
+            name: Some("Coll".into()),
+            visible: true,
+            record_json: r#"{"collection_id":"colX","visible":true}"#.into(),
+        })
+        .await
+        .unwrap();
+
+        db.update_nft_collection_visible("colX", false)
+            .await
+            .unwrap();
+
+        let row = db.nft_collection("colX").await.unwrap().unwrap();
+        assert!(!row.visible);
+        let json: serde_json::Value = serde_json::from_str(&row.record_json).unwrap();
+        assert_eq!(json["visible"], false);
+    }
+
+    #[tokio::test]
+    async fn redownload_nft_clears_metadata_json_only() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_nft(&NftDbRow {
+            launcher_id: "nftY".into(),
+            coin_id: "c1".into(),
+            collection_id: None,
+            minter_did: None,
+            owner_did: None,
+            name: Some("N".into()),
+            visible: true,
+            created_height: Some(1),
+            record_json: r#"{"launcher_id":"nftY"}"#.into(),
+        })
+        .await
+        .unwrap();
+        db.set_nft_metadata_json("nftY", r#"{"cached":true}"#)
+            .await
+            .unwrap();
+        assert!(db.nft_metadata_json("nftY").await.unwrap().is_some());
+
+        db.clear_nft_metadata_json("nftY").await.unwrap();
+        assert!(db.nft_metadata_json("nftY").await.unwrap().is_none());
+        // The record itself is untouched.
+        assert!(db.nft("nftY").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn increase_derivation_index_raises_floor_never_lowers() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        assert_eq!(db.max_derivation_index(false).await.unwrap(), 0);
+
+        db.raise_derivation_floor(false, 50).await.unwrap();
+        assert_eq!(db.max_derivation_index(false).await.unwrap(), 50);
+
+        // A lower floor request never regresses the reported index.
+        db.raise_derivation_floor(false, 10).await.unwrap();
+        assert_eq!(db.max_derivation_index(false).await.unwrap(), 50);
+
+        // A real derivation row above the floor still wins.
+        db.upsert_derivation(&DerivationRow {
+            hardened: false,
+            index: 99,
+            public_key: "pk".into(),
+            puzzle_hash: "ph".into(),
+            address: "xch1x".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.max_derivation_index(false).await.unwrap(), 100);
+
+        // Hardened and unhardened floors are independent.
+        assert_eq!(db.max_derivation_index(true).await.unwrap(), 0);
+    }
+
+    // ---- options (#205 PR4) ---------------------------------------------------
+
+    #[tokio::test]
+    async fn options_upsert_list_get_update_visible() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_option(&OptionDbRow {
+            option_id: "opt1".into(),
+            coin_id: "c1".into(),
+            underlying_coin_id: "u1".into(),
+            underlying_delegated_puzzle_hash: "dph".into(),
+            p2_puzzle_hash: "p2".into(),
+            visible: true,
+            created_height: Some(5),
+            record_json: r#"{"option_id":"opt1","visible":true}"#.into(),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(db.all_options().await.unwrap().len(), 1);
+        assert!(db.option("opt1").await.unwrap().is_some());
+        assert!(db.option("missing").await.unwrap().is_none());
+
+        db.update_option_visible("opt1", false).await.unwrap();
+        let row = db.option("opt1").await.unwrap().unwrap();
+        assert!(!row.visible);
+        let json: serde_json::Value = serde_json::from_str(&row.record_json).unwrap();
+        assert_eq!(json["visible"], false);
+    }
+
+    // ---- peers (#205 PR4) ------------------------------------------------------
+
+    #[tokio::test]
+    async fn add_remove_and_ban_peer() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        assert!(db.all_peers().await.unwrap().is_empty());
+
+        db.add_peer("1.2.3.4", 8444).await.unwrap();
+        let peers = db.all_peers().await.unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].ip_addr, "1.2.3.4");
+        assert_eq!(peers[0].port, 8444);
+        assert!(peers[0].user_managed);
+
+        // Removing without ban deletes it outright.
+        db.remove_peer("1.2.3.4", false).await.unwrap();
+        assert!(db.all_peers().await.unwrap().is_empty());
+
+        // Adding then banning excludes it from the list (but a subsequent add un-bans it).
+        db.add_peer("5.6.7.8", 8444).await.unwrap();
+        db.remove_peer("5.6.7.8", true).await.unwrap();
+        assert!(db.all_peers().await.unwrap().is_empty());
+        db.add_peer("5.6.7.8", 8444).await.unwrap();
+        assert_eq!(db.all_peers().await.unwrap().len(), 1);
+    }
+
+    // ---- network / sync settings (#205 PR4) ------------------------------------
+
+    #[tokio::test]
+    async fn network_settings_defaults_and_setters() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let s = db.network_settings().await.unwrap();
+        assert!(s.discover_peers);
+        assert_eq!(s.target_peers, 3);
+        assert!(s.network_override.is_none());
+        assert!(s.delta_sync);
+        assert!(s.delta_sync_override.is_none());
+        assert!(s.change_address.is_none());
+
+        db.set_discover_peers(false).await.unwrap();
+        db.set_target_peers(7).await.unwrap();
+        db.set_network_override(Some("testnet11")).await.unwrap();
+        db.set_delta_sync(false).await.unwrap();
+        db.set_delta_sync_override(Some(true)).await.unwrap();
+        db.set_change_address(Some("xch1change")).await.unwrap();
+
+        let s2 = db.network_settings().await.unwrap();
+        assert!(!s2.discover_peers);
+        assert_eq!(s2.target_peers, 7);
+        assert_eq!(s2.network_override.as_deref(), Some("testnet11"));
+        assert!(!s2.delta_sync);
+        assert_eq!(s2.delta_sync_override, Some(true));
+        assert_eq!(s2.change_address.as_deref(), Some("xch1change"));
     }
 }
