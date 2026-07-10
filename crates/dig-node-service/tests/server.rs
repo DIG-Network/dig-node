@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::routing::post;
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 /// Serializes every test that builds a companion server. dig-node reads
@@ -565,6 +566,106 @@ async fn control_method_with_wrong_token_is_rejected() {
     assert_eq!(resp["error"]["data"]["code"], json!("UNAUTHORIZED"));
 }
 
+// --- #280: control-token PAIRING — the extension bootstraps a scoped credential ----
+//
+// End-to-end over the real HTTP server: an unpaired caller is rejected (-32030); it
+// pairs (OPEN request/poll + operator approve with the MASTER token); the scoped
+// token then authorizes a control MUTATION but NOT pairing administration; and a
+// revoke immediately un-authorizes it.
+
+/// A control MUTATION probe (`control.config.setUpstream`) for the pairing test —
+/// reusable across the un-paired / paired / revoked assertions.
+async fn setupstream_mutation(addr: &SocketAddr, token: Option<&str>) -> Value {
+    post_rpc(
+        addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.config.setUpstream",
+                "params": { "upstream": "https://paired.example" } }),
+        token,
+    )
+    .await
+}
+
+/// OPEN `pairing.poll` for the given id.
+async fn poll_pairing(addr: &SocketAddr, pairing_id: &str) -> Value {
+    post_rpc(
+        addr,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "pairing.poll",
+                "params": { "pairing_id": pairing_id } }),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, master, _hold) = start_companion_full(&upstream).await;
+
+    // A control MUTATION with no token is rejected (the extension can't read the file).
+    let denied = setupstream_mutation(&addr, None).await;
+    assert_eq!(denied["error"]["data"]["code"], json!("UNAUTHORIZED"));
+
+    // 1. OPEN pairing.request → a pairing_id + a compare-codes value.
+    let req = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "pairing.request",
+                "params": { "client_name": "DIG Chrome Extension" } }),
+        None,
+    )
+    .await;
+    let pairing_id = req["result"]["pairing_id"].as_str().unwrap().to_string();
+    assert_eq!(req["result"]["pairing_code"].as_str().unwrap().len(), 6);
+
+    // 2. OPEN pairing.poll → pending (not yet approved).
+    assert_eq!(
+        poll_pairing(&addr, &pairing_id).await["result"]["status"],
+        json!("pending")
+    );
+
+    // 3. The operator approves with the MASTER token (the `dig-node pair` step).
+    let approve = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "control.pairing.approve",
+                "params": { "pairing_id": pairing_id } }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(approve["result"]["approved"], json!(true));
+    let token_id = approve["result"]["token_id"].as_str().unwrap().to_string();
+
+    // 4. The extension polls again → approved + its scoped token (delivered once).
+    let approved = poll_pairing(&addr, &pairing_id).await;
+    assert_eq!(approved["result"]["status"], json!("approved"));
+    let scoped = approved["result"]["token"].as_str().unwrap().to_string();
+    assert_eq!(scoped.len(), 64);
+
+    // 5. The scoped token AUTHORIZES a control mutation.
+    let ok = setupstream_mutation(&addr, Some(&scoped)).await;
+    assert_eq!(ok["result"]["upstream"], json!("https://paired.example"));
+
+    // 6. But the scoped token CANNOT administer pairings (master-only).
+    let admin = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 6, "method": "control.pairing.list" }),
+        Some(&scoped),
+    )
+    .await;
+    assert_eq!(admin["error"]["data"]["code"], json!("UNAUTHORIZED"));
+
+    // 7. The operator revokes it (master token) → the scoped token stops working.
+    let revoke = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 7, "method": "control.pairing.revoke",
+                "params": { "token_id": token_id } }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(revoke["result"]["revoked"], json!(true));
+
+    let after_revoke = setupstream_mutation(&addr, Some(&scoped)).await;
+    assert_eq!(after_revoke["error"]["data"]["code"], json!("UNAUTHORIZED"));
+}
+
 #[tokio::test]
 async fn control_status_with_token_returns_rich_status() {
     let (upstream, _calls) = start_mock_upstream().await;
@@ -1077,4 +1178,165 @@ async fn serve_with_gate_off_disables_the_peer_network_but_still_serves_reads() 
     stop.notify_waiters();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     clear_peernet_env();
+}
+
+// --- #239: `GET /ws/status` — the WS liveness/status endpoint ----------------------
+//
+// The extension's SW holds this socket open as its liveness signal for the local
+// dig-node; these tests exercise it end-to-end (real TCP, real WS frames) exactly
+// like the HTTP tests above do for `/health` — the pattern is the SSE `GET /events`
+// on dig-wallet's transport (design A.9), adapted to a real WebSocket here because
+// the extension needs a socket whose OPEN/CLOSE state itself is the liveness
+// signal it holds in its service worker (rather than polling an SSE reconnect).
+
+/// **Proves:** on connect, `/ws/status` immediately sends a `status` snapshot with
+/// the same unauthenticated fields `/health` exposes (service/version/mode/addr/
+/// upstream/cache/sync) — issue #239's "send the current status snapshot".
+#[tokio::test]
+async fn ws_status_sends_snapshot_on_connect() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/status"))
+        .await
+        .expect("connect to /ws/status");
+
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("timed out waiting for the snapshot")
+        .expect("stream ended before a snapshot arrived")
+        .expect("ws error");
+    let text = msg.into_text().expect("snapshot is a text frame");
+    let v: Value = serde_json::from_str(&text).expect("snapshot is valid JSON");
+
+    assert_eq!(v["type"], json!("status"));
+    assert_eq!(v["service"], json!("dig-node"));
+    assert!(v["version"].is_string());
+    assert_eq!(v["mode"], json!("local-node"));
+    // `addr` is the CONFIGURED bind address string (here `127.0.0.1:0`, since the test
+    // config binds an ephemeral port — the same shape `/health` already reports), not
+    // necessarily the actual bound ephemeral port `addr` (the SocketAddr) resolved to.
+    assert!(v["addr"].is_string());
+    assert!(v["cache"]["cap_bytes"].is_number());
+    assert_eq!(v["sync"]["available"], json!(true));
+}
+
+/// **Proves:** after the initial snapshot, the server pushes a periodic `heartbeat`
+/// (carrying `ts` + a refreshed status) — the liveness pulse a client uses to
+/// notice a stalled/half-open connection (issue #239 acceptance #2).
+#[tokio::test]
+async fn ws_status_sends_heartbeat_after_snapshot() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/status"))
+        .await
+        .expect("connect to /ws/status");
+
+    // Drain the snapshot first.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("timeout waiting for snapshot")
+        .expect("stream ended before snapshot")
+        .expect("ws error");
+
+    // Then a heartbeat within one interval + margin.
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+        .await
+        .expect("timed out waiting for the heartbeat")
+        .expect("stream ended before a heartbeat arrived")
+        .expect("ws error");
+    let text = msg.into_text().expect("heartbeat is a text frame");
+    let v: Value = serde_json::from_str(&text).expect("heartbeat is valid JSON");
+    assert_eq!(v["type"], json!("heartbeat"));
+    assert!(v["ts"].as_u64().is_some());
+    assert_eq!(v["service"], json!("dig-node"));
+}
+
+/// **Proves:** a client-initiated close is handled cleanly — the server's close
+/// handshake (echoing `Message::Close`, see `ws_status_session`) completes
+/// without the client hanging or erroring on the close itself, and a FOLLOW-UP
+/// connection to the same endpoint still works — i.e. the server didn't wedge
+/// its listener/router state from the prior connection's teardown.
+#[tokio::test]
+async fn ws_status_closes_cleanly_on_client_close() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/status"))
+        .await
+        .expect("connect to /ws/status");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await;
+    ws.close(None)
+        .await
+        .expect("client close must not hang/error");
+
+    // A second, independent connection right after proves the server is still healthy
+    // (didn't panic/wedge while tearing down the first).
+    let (mut ws2, _resp2) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/status"))
+        .await
+        .expect("connect to /ws/status after a prior client close");
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws2.next())
+        .await
+        .expect("timeout waiting for the second connection's snapshot")
+        .expect("stream ended before a snapshot arrived")
+        .expect("ws error");
+    assert!(msg.into_text().unwrap().contains("\"type\":\"status\""));
+}
+
+/// **Proves:** the `Origin` header is validated with the SAME allowlist CORS
+/// reflects (#91's local-origin policy) — a disallowed Origin never reaches the
+/// upgrade. Unlike `fetch`, a WS handshake is not blocked by the browser based on
+/// CORS response headers, so the server itself must reject it (CSWSH defense).
+#[tokio::test]
+async fn ws_status_rejects_a_disallowed_origin() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    let mut request = format!("ws://{addr}/ws/status")
+        .into_client_request()
+        .expect("build client request");
+    request
+        .headers_mut()
+        .insert("origin", "https://evil.example.com".parse().unwrap());
+
+    let result = tokio_tungstenite::connect_async(request).await;
+    match result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), 403);
+        }
+        other => panic!("expected an HTTP 403 rejection, got {other:?}"),
+    }
+}
+
+/// **Proves:** the real caller's origin — `chrome-extension://…` — is accepted,
+/// the same allowlist that already permits it for CORS (#91).
+#[tokio::test]
+async fn ws_status_accepts_a_chrome_extension_origin() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    let mut request = format!("ws://{addr}/ws/status")
+        .into_client_request()
+        .expect("build client request");
+    request.headers_mut().insert(
+        "origin",
+        "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+            .parse()
+            .unwrap(),
+    );
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("chrome-extension origin must be accepted");
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("timeout")
+        .expect("stream ended")
+        .expect("ws error");
+    assert!(msg.into_text().unwrap().contains("\"type\":\"status\""));
 }

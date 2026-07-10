@@ -268,6 +268,58 @@ Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Typ
 | `/version` | GET | Build fingerprint (§6.2). |
 | `/openrpc.json` | GET | The OpenRPC document (§6.3). |
 | `/.well-known/dig-node.json` | GET | The discovery document (§6.4). |
+| `/ws/status` | GET (WS upgrade) | WebSocket status/liveness channel (§4.5). |
+
+### 4.5. `GET /ws/status` — WebSocket status/liveness channel (#239)
+
+A browser client (the DIG Chrome extension's service worker) that needs to react to the node
+going offline/online AT ANY MOMENT — not just at the moment of its own next request — upgrades
+this route to a WebSocket instead of polling `/health`. The **open socket is itself the liveness
+signal**: a clean close, an abrupt reset, or a failed upgrade all mean "the node is not reachable
+right now" to the client; there is no separate "are you alive" request/response on this channel.
+
+**Origin validation (CSWSH defense).** Unlike `fetch`, a WebSocket handshake is not blocked by the
+browser based on `Access-Control-*` response headers — a page from ANY origin can attempt
+`new WebSocket(...)` against a listener the user's browser can reach. The server therefore
+validates the `Origin` header itself, with the SAME allowlist §4.3's CORS layer reflects
+(`chrome-extension://*` and an allowed local `http://` origin). A disallowed `Origin` MUST be
+rejected `403 Forbidden` before the upgrade completes. A request with NO `Origin` header (a
+non-browser client — a CLI, an integration test) MUST be allowed; the loopback-only bind is that
+caller's defense.
+
+**Message contract.** Every pushed frame is a JSON text frame carrying a discriminated `type`:
+
+- **`status`** — sent EXACTLY ONCE, immediately on a successful upgrade. Fields: `type:"status"`,
+  `service`, `version`, `commit`, `mode` (`"local-node"`), `addr`, `upstream`, `cache` (`dir` /
+  `cap_bytes` / `used_bytes` / `shared`, identical shape to `/health`'s `cache` field), and `sync`
+  (`{ "available": bool }`, whether a §21.9 identity is loaded — see §7.2). This is the SAME
+  unauthenticated field set `/health` returns (`status_fields`, shared by both handlers so they can
+  never drift) minus `/health`'s own `status:"ok"` and `methods` fields.
+- **`heartbeat`** — pushed every ~5 seconds (`WS_HEARTBEAT_INTERVAL`) for the life of the
+  connection: `type:"heartbeat"`, `ts` (unix milliseconds), plus a FRESH copy of the same
+  service/version/commit/mode/addr/upstream/cache/sync fields as `status`. A heartbeat doubles as
+  the "status changed" push — because it always carries a freshly-recomputed snapshot, any change
+  (cache usage, sync availability) is visible to the client within one heartbeat interval; there is
+  no separate change-detection mechanism in this version (the simplest thing that works).
+
+Alongside each `heartbeat` text frame the server also sends a transport-level WS **Ping**. A
+compliant WebSocket implementation (every browser; `tokio-tungstenite` on the Rust side) answers a
+Ping with a Pong automatically at the protocol layer — this is invisible to page/service-worker
+JavaScript (the browser `WebSocket` API never surfaces raw ping/pong frames to script), so it is a
+belt-and-suspenders mechanism for the SERVER's own half-open detection, not something a browser
+client can observe directly. If the server does not observe ANY frame from the client (a Pong or
+otherwise) within `WS_PONG_TIMEOUT` (~20 seconds, 4x the heartbeat interval), it treats the
+connection as half-open and closes it server-side (a clean WS Close), so the client's own
+reconnect logic takes over. On receiving a client-initiated Close, the server MUST echo a Close
+frame back (completing the WS closing handshake) before dropping the connection.
+
+**Client responsibility (not specified here — see the consuming client's own SPEC.md).** Because a
+browser's WebSocket API does not expose ping/pong to script, a client MUST judge liveness from the
+`status`/`heartbeat` frames it actually receives: track the time since the last frame, and treat a
+connection that has gone quiet for materially longer than the heartbeat interval as stale (close +
+reconnect) even if the socket's `readyState` still reports open. A client SHOULD reconnect with
+exponential backoff + jitter on any close/error and reset that backoff the moment a connection
+succeeds again.
 
 ---
 
@@ -419,7 +471,13 @@ and error enum. Each method object carries the machine-readable `x-requires-auth
 The canonical first-fetch discovery document: service identity + versions + protocol, the bound
 `addr`, `upstream`, the live cache block (dir, cap/used bytes, shared), the full method catalogue
 (name/served/summary/requires_auth), the full error catalogue, and pointers to `/health`,
-`/version`, `/openrpc.json`, and the `rpc.discover` method.
+`/version`, `/openrpc.json`, and the `rpc.discover` method. Its `endpoints` map also carries
+`ws_status: "/ws/status"` (§4.5).
+
+### 6.5. `GET /ws/status`
+
+The WebSocket status/liveness channel — see §4.5 for the full message contract (this is the
+discovery-surface cross-reference; §4.5 is normative).
 
 ---
 
@@ -451,12 +509,15 @@ Two layers, both REQUIRED:
 
 1. **Loopback-only**: the whole server binds loopback (§4.1), so nothing off-machine reaches any
    method.
-2. **Local token**: a `control.*` call MUST present the node's control token; a missing or
-   mismatched token is answered `UNAUTHORIZED` (`-32030`, §10). Token comparison MUST be constant-time
-   (`ct_eq`) so verification cannot be probed via a timing oracle.
+2. **Local token**: a `control.*` call MUST present a valid control credential — the master control
+   token (§7.3) OR, for a non-administrative method, a paired controller token (§7.11); a missing or
+   mismatched credential is answered `UNAUTHORIZED` (`-32030`, §10). Token comparison MUST be
+   constant-time (`ct_eq`) so verification cannot be probed via a timing oracle.
 
 Exactly the `control.` method prefix is gated (`is_control_method`); unknown `control.*` methods
-still pass the auth gate first, then yield `METHOD_NOT_FOUND`.
+still pass the auth gate first, then yield `METHOD_NOT_FOUND`. The pairing-administration methods
+(`control.pairing.list`/`approve`/`revoke`, §7.11) require the MASTER token specifically — a paired
+token is NOT accepted for them.
 
 ### 7.3. The control token
 
@@ -584,6 +645,81 @@ read/peer methods) is the one defined by this SPEC and mirrored in `SYSTEM.md`; 
 SUBSETS of it (the extension drives `control.status` + `dig.getContent`; the browser a wider subset)
 but MUST NOT diverge names or shapes. The eventual single shared home for this catalogue is the
 `dig-rpc-types` crate (§1.4/§1.5) — until it is wired in, this SPEC is authoritative.
+
+### 7.10. Cache LRU order + telemetry (#279)
+
+The OPEN `cache.*` family is the surface a browser controller (the DIG Chrome extension's control
+panel) uses to MANAGE how much disk space is reserved for cached `.dig` content under the node's LRU
+eviction. These additive fields/methods complete that surface; all are `served: "local"`,
+`requires_auth: false`, and additive-only (§5.1 — an older reader ignores the new fields).
+
+- **`cache.listCached` — per-entry `lru_rank`.** Each entry in the `cached` array carries, beside
+  `capsule` / `store_id` / `root` / `size_bytes` / `last_used_unix_ms`, an integer **`lru_rank`**:
+  `0` is the LEAST-recently-used capsule (the NEXT one the size cap would evict), increasing with
+  recency, forming a strict `0..n` permutation over the listed entries. The order is exactly the
+  oldest-`last_used_unix_ms`-first order `plan_eviction` applies (ties broken by list position), so a
+  controller renders the eviction queue directly without re-deriving it. `last_used_unix_ms` is the
+  file mtime, bumped to now on every local serve.
+
+- **`cache.setCapBytes { cap_bytes }` — the RESERVED cap.** Sets the reserved disk space for cached
+  content, **floored at 64 MiB** (a `cap_bytes` below the floor is raised to it), and returns the
+  applied `{ cap_bytes }`. `cache.getConfig` returns the live `{ cap_bytes, used_bytes, cache_dir,
+  shared }`.
+
+- **`cache.stats` — session cache telemetry (new).** Result:
+  `{ cap_bytes, used_bytes, entry_count, total_bytes, evicted_count, evicted_bytes,
+  content_cache: { hits, misses } }`. `entry_count`/`total_bytes` are the count and summed on-disk
+  size of cached capsules; `evicted_count`/`evicted_bytes` are the disk-cache LRU evictions since the
+  node started; `content_cache.hits`/`misses` are the decoded-content (RAM) cache lookups since
+  start. All counters are process-lifetime (reset each start), never persisted.
+
+### 7.11. Control-token pairing for browser controllers (#280)
+
+An MV3 browser extension cannot read the `<config_dir>/control-token` file, so it cannot drive
+token-gated `control.*` mutations. PAIRING lets it obtain its OWN scoped, revocable controller token
+after LOCAL operator approval, WITHOUT ever exposing the master token. Two OPEN bootstrap methods +
+three MASTER-gated administration methods, all loopback-only.
+
+**OPEN methods (no token):**
+
+- **`pairing.request { client_name }`** → `{ pairing_id, pairing_code, expires_ms }`. Creates a
+  PENDING pairing. `pairing_id` is a 32-hex secret returned only to the requester; `pairing_code` is
+  a 6-digit compare-codes value the requester DISPLAYS. Pending requests expire after 5 minutes; the
+  node caps concurrent pendings (oldest evicted past the cap).
+- **`pairing.poll { pairing_id }`** → `{ status, token? }` where `status` ∈
+  `"pending" | "approved" | "expired" | "unknown"`. On `"approved"` the minted `token` is returned
+  and the pending entry is CONSUMED (the token is delivered exactly once). The extension stores the
+  token and presents it as `X-Dig-Control-Token` on subsequent `control.*` calls.
+
+**MASTER-token-gated administration** (a paired token is NEVER accepted here — §7.2):
+
+- **`control.pairing.list`** → `{ pending: [{ pairing_id, pairing_code, client_name, created_ms,
+  expires_ms }], tokens: [{ id, client_name, created_ms }] }`. The token VALUE is never listed.
+- **`control.pairing.approve { pairing_id }`** → `{ approved: true, client_name, token_id }`. Mints a
+  fresh 64-hex scoped token, PERSISTS it to `<config_dir>/paired-tokens.json` (owner-only, atomic),
+  and marks the pending entry approved so the requester's next `pairing.poll` returns it. Approval is
+  the CONSENT step: it requires the master token (a local file read), so only the machine's operator
+  can grant a pairing.
+- **`control.pairing.revoke { token_id }`** → `{ revoked: bool, token_id }`. Removes the token; the
+  gate rejects it on the very next request (the store is consulted per request).
+
+**Flow (compare-codes consent).** (1) The extension calls `pairing.request` and shows
+`pairing_code`. (2) The operator runs `dig-node pair` (which reads the master token), sees the
+pending request + its code + `client_name`, CONFIRMS the code matches the extension, and runs
+`dig-node pair approve <pairing_id>`. (3) The extension's `pairing.poll` returns its scoped token.
+(4) The extension drives `control.*` mutations with it. `dig-node pair revoke <token_id>` undoes it.
+
+**Security properties (MUST hold).** Loopback-only, same as `control.*`. Approval requires the master
+token, so consent is gated on local-machine control; the compare-codes step defeats a concurrent
+rogue request (a visited page's) being approved by mistake. The `pairing.poll` response carrying the
+token is readable only by an allowed CORS origin (`chrome-extension://…`, §4.3) — a foreign web
+origin is CORS-blocked from reading it (and blocked at preflight from sending a `control.*` token
+header). A paired token is SCOPED (it authorizes `control.*` mutations but not pairing administration)
+and REVOCABLE. All token comparisons are constant-time.
+
+**Paired-token store.** `<config_dir>/paired-tokens.json` = `{ "tokens": [{ id, token, client_name,
+created_ms }] }`, owner-only, atomic writes. The auth gate accepts the master token OR any token in
+this store (except for the pairing-administration methods).
 
 ---
 

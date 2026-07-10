@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Request, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Request, State,
+    },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -27,6 +30,7 @@ use crate::config::{host_is_allowed, Config};
 use crate::control::{self, ControlCtx};
 use crate::meta;
 use crate::meta::ErrorCode;
+use crate::pairing;
 use crate::rpc::{normalize_request, request_id, rpc_error};
 
 /// The dig-node binary version, surfaced by `/health`.
@@ -58,6 +62,10 @@ pub struct AppState {
     sync_available: bool,
     /// Process start instant, for `control.status` uptime.
     started: Instant,
+    /// In-memory pending-pairing set (#280) — shared across every request so the
+    /// OPEN `pairing.request`/`pairing.poll` and the gated `control.pairing.*`
+    /// handlers see one consistent set of in-flight pairings.
+    pairings: Arc<std::sync::Mutex<crate::pairing::PendingPairings>>,
 }
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
@@ -72,6 +80,7 @@ const METHOD_NOT_FOUND: i64 = ErrorCode::MethodNotFound.code();
 ///   * `GET /version`                    — build/commit/version fingerprint
 ///   * `GET /openrpc.json`               — the OpenRPC method+error spec
 ///   * `GET /.well-known/dig-node.json`  — addr + cache + methods + errors + spec links
+///   * `GET /ws/status`                  — WebSocket status/liveness channel (#239)
 ///
 /// Split out from [`serve`] so it can be exercised by an in-process test without
 /// binding a port.
@@ -99,6 +108,10 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .route("/openrpc.json", get(openrpc))
         .route("/.well-known/dig-node.json", get(well_known))
+        // `GET /ws/status` (#239): a WebSocket liveness/status channel for a browser
+        // client's SW — the OPEN SOCKET is itself the liveness signal, with a
+        // heartbeat detecting a half-open connection. See [`ws_status`].
+        .route("/ws/status", get(ws_status))
         // Host-header allowlist (#91): both loopback listeners share this router,
         // so a single guard accepts the canonical local names (dig.local /
         // localhost / 127.0.0.1 / 127.0.0.2 [+ :port]) and rejects a foreign Host
@@ -195,6 +208,9 @@ pub fn build_state(config: &Config) -> AppState {
         // surface a real NOT_SUPPORTED/failure in-band if a given store isn't served.
         sync_available: true,
         started: Instant::now(),
+        pairings: Arc::new(std::sync::Mutex::new(
+            crate::pairing::PendingPairings::default(),
+        )),
     }
 }
 
@@ -208,7 +224,37 @@ fn control_ctx(state: &AppState) -> ControlCtx {
         upstream: state.upstream.clone(),
         started: state.started,
         sync_available: state.sync_available,
+        pairings: state.pairings.clone(),
     }
+}
+
+/// The status fields shared by `GET /health` and `GET /ws/status` (#239): service
+/// identity, mode, the bound `addr`, `upstream`, cache stats, and §21 sync
+/// availability. Pulled out so the two unauthenticated liveness surfaces can never
+/// silently drift from each other.
+fn status_fields(state: &AppState) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("service".into(), json!(meta::SERVICE_NAME));
+    m.insert("version".into(), json!(VERSION));
+    m.insert("commit".into(), json!(meta::GIT_SHA));
+    m.insert("mode".into(), json!("local-node"));
+    m.insert("addr".into(), json!(state.addr));
+    m.insert("upstream".into(), json!(state.upstream));
+    m.insert(
+        "cache".into(),
+        json!({
+            "dir": meta::cache_dir().display().to_string(),
+            "cap_bytes": cache_cap_bytes(),
+            "used_bytes": cache_used_bytes(),
+            // #96: whether the cache is the shared canonical dir (the dir the DIG
+            // Browser's in-process node also uses) or a process-private fallback.
+            "shared": meta::cache_shared(),
+        }),
+    );
+    // §21 whole-store sync availability (whether a §21.9 identity is loaded) — the
+    // "sync state" a live client wants alongside version/addr (#239).
+    m.insert("sync".into(), json!({ "available": state.sync_available }));
+    m
 }
 
 /// `GET /health` (and `GET /`) — liveness + mode + cache stats + discovery hooks.
@@ -219,24 +265,117 @@ fn control_ctx(state: &AppState) -> ControlCtx {
 /// private fallback), and the `methods` catalogue — so a single `/health` fetch
 /// reveals what the node is and what it serves.
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    Json(json!({
-        "status": "ok",
-        "service": meta::SERVICE_NAME,
-        "version": VERSION,
-        "commit": meta::GIT_SHA,
-        "mode": "local-node",
-        "addr": state.addr,
-        "upstream": state.upstream,
-        "cache": {
-            "dir": meta::cache_dir().display().to_string(),
-            "cap_bytes": cache_cap_bytes(),
-            "used_bytes": cache_used_bytes(),
-            // #96: whether the cache is the shared canonical dir (the dir the DIG
-            // Browser's in-process node also uses) or a process-private fallback.
-            "shared": meta::cache_shared(),
-        },
-        "methods": meta::method_names(),
-    }))
+    let mut body = status_fields(&state);
+    body.insert("status".into(), json!("ok"));
+    body.insert("methods".into(), json!(meta::method_names()));
+    Json(Value::Object(body))
+}
+
+/// Heartbeat cadence for `GET /ws/status` (#239): short enough that a half-open
+/// connection (dead TCP with no FIN — e.g. sleep/network-change) is noticed
+/// within one interval, on both sides of the socket.
+const WS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// If no pong (nor any other client frame) has been observed within this long,
+/// the connection is treated as half-open and closed server-side — 4x the
+/// heartbeat interval, a generous margin for scheduling jitter while still
+/// "detected promptly" (#239 acceptance #2).
+const WS_PONG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// `GET /ws/status` (#239) — upgrade to a WebSocket status/liveness channel. The
+/// `Origin` header is checked against the SAME [`is_local_origin`] allowlist the
+/// CORS layer reflects: unlike `fetch`, a WebSocket handshake is not blocked by
+/// the browser based on CORS response headers, so the server itself must reject
+/// a disallowed Origin (Cross-Site WebSocket Hijacking defense). A request with
+/// NO Origin header (a non-browser client, e.g. this repo's own tests, or a CLI)
+/// is allowed — loopback-only binding is that caller's defense.
+async fn ws_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if !is_local_origin(origin) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(rpc_error(
+                    Value::Null,
+                    ErrorCode::InvalidRequest,
+                    "dig-node: Origin not allowed for /ws/status",
+                )),
+            )
+                .into_response();
+        }
+    }
+    ws.on_upgrade(move |socket| ws_status_session(socket, state))
+}
+
+/// Drive one `/ws/status` connection (#239): send the initial `status` snapshot,
+/// then loop pushing a `heartbeat` (a refreshed snapshot + `ts`) every
+/// [`WS_HEARTBEAT_INTERVAL`] alongside a transport-level WS ping, while watching
+/// for the client's pong/close/disconnect. Any status change (cache usage, sync
+/// availability) is visible within one heartbeat — there is no separate
+/// change-detection push in this version (the simplest thing that works). If no
+/// frame from the client is observed for [`WS_PONG_TIMEOUT`], the connection is
+/// treated as half-open and closed from this side so the client reconnects.
+async fn ws_status_session(mut socket: WebSocket, state: AppState) {
+    let mut snapshot = status_fields(&state);
+    snapshot.insert("type".into(), json!("status"));
+    if socket
+        .send(Message::Text(Value::Object(snapshot).to_string()))
+        .await
+        .is_err()
+    {
+        return; // client gone before the first send
+    }
+
+    let mut ticker = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
+    ticker.tick().await; // consume the immediate first tick (the snapshot above already went out)
+    let mut last_seen = tokio::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if last_seen.elapsed() > WS_PONG_TIMEOUT {
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+                let mut hb = status_fields(&state);
+                hb.insert("type".into(), json!("heartbeat"));
+                hb.insert(
+                    "ts".into(),
+                    json!(std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64),
+                );
+                if socket.send(Message::Text(Value::Object(hb).to_string())).await.is_err() {
+                    return;
+                }
+                // A transport-level ping the client's WS implementation auto-pongs
+                // (browsers do this at the protocol layer, invisible to page JS —
+                // only the socket's eventual open/close state is observable there).
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    return;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    // Echo the Close frame back (the WS closing handshake) before
+                    // dropping the socket — otherwise the peer sees an abrupt reset
+                    // rather than a clean close.
+                    Some(Ok(Message::Close(_))) => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        return;
+                    }
+                    // ANY other frame from the client (pong, or otherwise) is evidence
+                    // the round trip is alive.
+                    Some(Ok(_)) => { last_seen = tokio::time::Instant::now(); }
+                    Some(Err(_)) | None => return,
+                }
+            }
+        }
+    }
 }
 
 /// `GET /version` — the build/commit/version fingerprint, so an agent can correlate
@@ -311,6 +450,22 @@ async fn rpc(
         );
     }
 
+    // PAIRING plane (#280): `pairing.request` / `pairing.poll` are OPEN (no token) —
+    // an MV3 extension can't read the control-token file, so it bootstraps a scoped
+    // credential here. They are NOT under `control.` (so the gate below leaves them
+    // open) and are answered by the shell (not the read path). The scoped token they
+    // yield is minted only after LOCAL operator approval via the gated
+    // `control.pairing.approve` (see [`crate::pairing`]).
+    if method == "pairing.request" || method == "pairing.poll" {
+        let params = req.get("params").cloned().unwrap_or(json!({}));
+        let resp = if method == "pairing.request" {
+            pairing::request(&state.pairings, id, &params)
+        } else {
+            pairing::poll(&state.pairings, id, &params)
+        };
+        return (StatusCode::OK, Json(resp));
+    }
+
     // CONTROL plane: the `control.*` (admin/management) methods are loopback-only
     // (the whole server binds 127.0.0.1) AND locally authorized — a same-host
     // controller must present the local control token (the X-Dig-Control-Token
@@ -320,14 +475,24 @@ async fn rpc(
             .get(control::CONTROL_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok());
         let presented = control::presented_token(header_tok, &req);
-        if !control::is_authorized(&method, presented.as_deref(), &state.control_token) {
+        // Authorization is granted by EITHER the master control token OR — for a
+        // NON-administrative control method — a valid PAIRED token (#280). Pairing
+        // administration (list/approve/revoke) requires the MASTER token only, so a
+        // paired controller can neither mint more tokens nor revoke itself.
+        let master_ok = control::is_authorized(&method, presented.as_deref(), &state.control_token);
+        let paired_ok = !control::is_pairing_admin_method(&method)
+            && presented.as_deref().is_some_and(|tok| {
+                pairing::is_paired_token(&pairing::paired_tokens_path(&state.config_path), tok)
+            });
+        if !(master_ok || paired_ok) {
             return (
                 StatusCode::OK,
                 Json(control::control_error(
                     id,
                     ErrorCode::Unauthorized,
                     "control.* requires the local control token (X-Dig-Control-Token \
-                     header or params._control_token, from <config_dir>/control-token)",
+                     header or params._control_token, from <config_dir>/control-token), \
+                     or a paired controller token (see `dig-node pair`)",
                 )),
             );
         }

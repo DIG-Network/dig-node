@@ -140,6 +140,25 @@ const MAX_AVAILABILITY_ITEMS: usize = 512;
 /// comfortably holds a few large resources' decoded ciphertext while capping node memory.
 const CONTENT_CACHE_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
+// -- Session cache telemetry (#279) ------------------------------------------
+//
+// Process-global counters surfaced by the OPEN `cache.stats` RPC so a controller
+// (the dig-chrome-extension control panel) can show how the LRU cap is behaving:
+// how much the disk cache has evicted this run, and the decoded-content cache's
+// hit/miss ratio. They are cheap `Relaxed` atomics (no ordering coupling to any
+// other state) reset to zero each process start — "since the node started"
+// telemetry, never persisted. Additive-only (§5.1): a new read surface, no
+// change to any existing field.
+
+/// Count of disk-cache files the LRU cap has evicted since process start.
+static CACHE_EVICTED_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes reclaimed by disk-cache LRU eviction since process start.
+static CACHE_EVICTED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decoded-content-cache lookups that HIT (served a resource window from RAM).
+static CONTENT_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Decoded-content-cache lookups that MISSED (had to re-decode the module).
+static CONTENT_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The [`ContentCache`] key: `(store_hex, root_hex, retrieval_key)` identifying one served resource.
 type ContentCacheKey = (String, String, [u8; 32]);
 
@@ -163,9 +182,18 @@ impl ContentCache {
     fn get(&mut self, key: &ContentCacheKey) -> Option<Arc<ContentResponse>> {
         self.tick += 1;
         let tick = self.tick;
-        let entry = self.entries.get_mut(key)?;
-        entry.1 = tick;
-        Some(entry.0.clone())
+        match self.entries.get_mut(key) {
+            Some(entry) => {
+                entry.1 = tick;
+                // #279 telemetry: a RAM hit (no re-decode of the module).
+                CONTENT_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Some(entry.0.clone())
+            }
+            None => {
+                CONTENT_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     /// Insert a decoded response, then evict least-recently-used entries until the total cached
@@ -1109,7 +1137,18 @@ impl Node {
         // without restarting the browser. `self.cache_cap` is the startup default.
         let cap = cache_cap_bytes();
         for victim in plan_eviction(&entries, cap) {
-            let _ = std::fs::remove_file(victim);
+            // Size of the victim, looked up from the scan, so the reclaimed-bytes
+            // counter is accurate even though the file is about to be unlinked.
+            let size = entries
+                .iter()
+                .find(|(p, _, _)| *p == victim)
+                .map(|(_, _, s)| *s)
+                .unwrap_or(0);
+            if std::fs::remove_file(&victim).is_ok() {
+                // #279 telemetry: record the LRU eviction (count + reclaimed bytes).
+                CACHE_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                CACHE_EVICTED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -2548,11 +2587,22 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
     // (task #32). Each cached module is a CAPSULE (storeId:rootHash), so these are
     // keyed by capsule identity (`digstore_core::Capsule`).
     if method == "cache.listCached" {
-        let cached: Vec<Value> = node
-            .cache_list_cached()
-            .await
-            .into_iter()
-            .map(|c| {
+        let list = node.cache_list_cached().await;
+        // #279: attach `lru_rank` to each entry so a controller can render the
+        // eviction order without re-deriving it. Rank 0 = the LEAST-recently-used
+        // capsule (the NEXT one the size cap would evict), increasing with recency
+        // — the same oldest-mtime-first order `plan_eviction` uses. Computed here
+        // (a view concept) rather than on `CachedCapsule` (kept a plain fact).
+        let mut order: Vec<usize> = (0..list.len()).collect();
+        order.sort_by_key(|&i| (list[i].last_used_unix_ms, i));
+        let mut rank_of = vec![0u64; list.len()];
+        for (rank, &i) in order.iter().enumerate() {
+            rank_of[i] = rank as u64;
+        }
+        let cached: Vec<Value> = list
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
                 json!({
                     // The canonical capsule string identity (storeId:rootHash),
                     // identical to digstore_core::Capsule::canonical().
@@ -2561,10 +2611,32 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
                     "root": c.root,
                     "size_bytes": c.size_bytes,
                     "last_used_unix_ms": c.last_used_unix_ms,
+                    // #279: LRU/eviction order — 0 = next to be evicted.
+                    "lru_rank": rank_of[i],
                 })
             })
             .collect();
         return json!({"jsonrpc":"2.0","id":id,"result":{"cached": cached}});
+    }
+    if method == "cache.stats" {
+        // #279: OPEN cache telemetry beside `cache.getConfig` — the reserved cap +
+        // live usage, the cached-capsule count and their total on-disk bytes, and
+        // the session eviction + decoded-content hit/miss counters. All additive.
+        let list = node.cache_list_cached().await;
+        let entry_count = list.len() as u64;
+        let total_bytes: u64 = list.iter().map(|c| c.size_bytes).sum();
+        use std::sync::atomic::Ordering::Relaxed;
+        return json!({"jsonrpc":"2.0","id":id,"result":{
+        "cap_bytes": cache_cap_bytes(),
+        "used_bytes": cache_used_bytes(),
+        "entry_count": entry_count,
+        "total_bytes": total_bytes,
+        "evicted_count": CACHE_EVICTED_COUNT.load(Relaxed),
+        "evicted_bytes": CACHE_EVICTED_BYTES.load(Relaxed),
+        "content_cache": {
+            "hits": CONTENT_CACHE_HITS.load(Relaxed),
+            "misses": CONTENT_CACHE_MISSES.load(Relaxed),
+        }}});
     }
     if method == "cache.removeCached" {
         let params = req.get("params").cloned().unwrap_or(json!({}));
@@ -3974,6 +4046,85 @@ mod tests {
         let (node, _td) = test_node(None);
         let cached = node.cache_list_cached().await;
         assert!(cached.is_empty(), "no modules → empty capsule list");
+    }
+
+    #[tokio::test]
+    async fn list_cached_reports_lru_rank_ordered_by_recency() {
+        // #279: each cache.listCached entry carries an `lru_rank` — 0 = the
+        // least-recently-used capsule (the NEXT one the LRU cap would evict),
+        // increasing with recency. The rank is a strict 0..n permutation and its
+        // ordering agrees with `last_used_unix_ms`, so a controller can render the
+        // eviction order without re-deriving it.
+        let (node, _td) = test_node(None);
+        for i in 0u8..3 {
+            let store = format!("{:02x}", i).repeat(32);
+            let root = format!("{:02x}", i + 0x40).repeat(32);
+            seed_module(&node, &store, &root, b"x");
+        }
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.listCached"}),
+        )
+        .await;
+        let items = resp["result"]["cached"].as_array().unwrap().clone();
+        assert_eq!(items.len(), 3);
+
+        // Every entry has an lru_rank; the set of ranks is exactly {0,1,2}.
+        let mut ranks: Vec<u64> = items
+            .iter()
+            .map(|c| c["lru_rank"].as_u64().expect("lru_rank present"))
+            .collect();
+        ranks.sort_unstable();
+        assert_eq!(ranks, vec![0, 1, 2], "ranks are a 0..n permutation");
+
+        // Ordering by lru_rank agrees with ordering by last_used_unix_ms.
+        let mut by_rank = items.clone();
+        by_rank.sort_by_key(|c| c["lru_rank"].as_u64().unwrap());
+        let last_used: Vec<u64> = by_rank
+            .iter()
+            .map(|c| c["last_used_unix_ms"].as_u64().unwrap())
+            .collect();
+        assert!(
+            last_used.windows(2).all(|w| w[0] <= w[1]),
+            "rank order must be non-decreasing in last_used (rank 0 = oldest = next evicted)"
+        );
+
+        // The rank-0 entry is (one of) the least-recently-used.
+        let min_used = last_used.iter().copied().min().unwrap();
+        let rank0 = items
+            .iter()
+            .find(|c| c["lru_rank"].as_u64() == Some(0))
+            .unwrap();
+        assert_eq!(rank0["last_used_unix_ms"].as_u64(), Some(min_used));
+    }
+
+    #[tokio::test]
+    async fn cache_stats_reports_totals_and_counters() {
+        // #279: cache.stats is an OPEN telemetry method — reserved cap, live used
+        // bytes, the cached-capsule count + their total bytes, plus session eviction
+        // + content-cache hit/miss counters. Additive-only (§5.1).
+        let (node, _td) = test_node(None);
+        let store = "ab".repeat(32);
+        let root = "cd".repeat(32);
+        seed_module(&node, &store, &root, b"twelve-bytes"); // 12 bytes
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+        )
+        .await;
+        let r = &resp["result"];
+        assert!(r["cap_bytes"].as_u64().is_some(), "cap_bytes");
+        assert!(r["used_bytes"].as_u64().is_some(), "used_bytes");
+        assert_eq!(r["entry_count"].as_u64(), Some(1), "one cached capsule");
+        assert_eq!(r["total_bytes"].as_u64(), Some(12), "sum of capsule sizes");
+        // Session counters are present (exact values are process-global, so only
+        // their presence/type is asserted — never a cross-test-contaminated count).
+        assert!(r["evicted_count"].as_u64().is_some(), "evicted_count");
+        assert!(r["evicted_bytes"].as_u64().is_some(), "evicted_bytes");
+        assert!(r["content_cache"]["hits"].as_u64().is_some(), "cc hits");
+        assert!(r["content_cache"]["misses"].as_u64().is_some(), "cc misses");
     }
 
     // -- dig.stage (#95 Pass C): in-process capsule staging/compile -------------

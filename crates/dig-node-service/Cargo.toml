@@ -36,9 +36,10 @@ path = "src/lib.rs"
 dig-node-core = { path = "../dig-node-core" }
 
 # HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
-# and one server framework across the node and the service shell.
-axum = "0.7"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# and one server framework across the node and the service shell. `ws` enables
+# `axum::extract::ws` for the `GET /ws/status` liveness endpoint (#239).
+axum = { version = "0.7", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -66,3 +67,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # foreground process directly, so they need no equivalent.)
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+
+# Test-only WS client for the `GET /ws/status` integration tests (#239): connects
+# over the wire and reads real frames, mirroring how `tests/server.rs` already
+# exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

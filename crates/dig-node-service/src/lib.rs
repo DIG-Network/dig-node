@@ -34,6 +34,8 @@ pub mod cli;
 pub mod config;
 pub mod control;
 pub mod meta;
+pub mod pair;
+pub mod pairing;
 pub mod rpc;
 pub mod server;
 pub mod service;
