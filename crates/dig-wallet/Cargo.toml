@@ -18,8 +18,8 @@ path = "src/main.rs"
 # node — bump together). digstore-chain: BIP-39 seed + HD wallet scan + DIG-CAT +
 # encrypted seed storage + XCH send. digstore-core: the canonical Capsule
 # (storeId:rootHash) identity rendered by /api/stores.
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
 # The node engine (crate `dig_node_core`) — same workspace (the DIG Browser's in-process
 # node + wallet are one host cluster). dig-wallet reads the node's cache surface for the
 # wallet UI's "My Node" cache view (cache_cap_bytes / cache_used_bytes / clear_cache / list).
@@ -53,7 +53,7 @@ zeroize = "1"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
 # Fallback tier (B.5): coinset.org + non-subscribing peer point-reads, reused AS-IS. Git
 # dep (not path) so a standalone dig-node checkout builds it in CI.
-chia-query = { git = "https://github.com/DIG-Network/chia-query.git", rev = "d40edc4cf4b28f625ca0301b0327a77461e33975" }
+chia-query = { git = "https://github.com/DIG-Network/chia-query.git", rev = "48f7f6521fcc109f6c935e56f96cb5a86da1ae22" }
 # Dual transport (C.3): mTLS 9257 (Sage byte-parity) + plain-HTTP+CORS browser mirror.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -65,7 +65,7 @@ async-trait = "0.1"
 # Pre-broadcast spend-bundle validation (C.6 fail-closed): validate_spend_bundle runs the
 # bundle through chia-consensus before any peer broadcast. Same chia-* 0.26 / SDK 0.30 line
 # as dig-wallet, so Coin/CoinSpend/SpendBundle unify across the crate boundary.
-dig-clvm = { git = "https://github.com/DIG-Network/dig-clvm.git", rev = "b1de169f7c0fa74cc5965b7ec69f40e576d2deb8" }
+dig-clvm = { git = "https://github.com/DIG-Network/dig-clvm.git", rev = "356771034afd54a61d6199bc5960786139e39988" }
 # Spend building (XCH/CAT), coin selection, signing, and NFT/DID/CAT singleton
 # reconstruction all reuse the canonical `chia-wallet-sdk` driver constructors
 # (SpendContext + StandardLayer + Cat::spend_all + the Nft/Did parsers) already depended on

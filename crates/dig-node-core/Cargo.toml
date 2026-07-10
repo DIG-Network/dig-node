@@ -37,13 +37,13 @@ path = "src/lib.rs"
 # Bumped to a rev past digstore's "Add normalized public manifest to the .dig format"
 # commit (08f5d39) so `PublicManifest`/`read_public_manifest`/`extract_data_section_blob`
 # exist. Bump all seven together.
-digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
-digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
-digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
-digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
-digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
+digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
 chia-protocol = "0.26"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 # Object-safe async trait for the injectable anchored-root resolver (the
@@ -76,7 +76,7 @@ getrandom = "0.2"
 # `connect_via_nat`/`query_availability` types would not match ours). Both still resolve to f200cbf via
 # the lockfile. dig-gossip is pinned by rev (its own manifest has no self-reference to worry about).
 dig-nat = { git = "https://github.com/DIG-Network/dig-nat" }
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5457857dc9194d4589dc33f7943f4b6fadd95b9a", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "9177a9b3af1db53e294d3407844f0dd986206ced", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. No
 # `rev` so cargo unifies to the SAME dig-constants source dig-nat/dig-gossip already resolve (one copy).
 dig-constants = { version = "0.2", git = "https://github.com/DIG-Network/dig-constants" }

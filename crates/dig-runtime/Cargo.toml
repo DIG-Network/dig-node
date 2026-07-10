@@ -19,7 +19,7 @@ serde_json = "1"
 # The digstore `.dig` read-crypto — the ONE Rust impl the webpage `dig-client-wasm`
 # wraps. The native browser calls the SAME crypto directly via FFI (no wasm in the
 # browser). Pinned to the SAME rev dig-node-core uses so cargo unifies to one version.
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "dfb0d137143495669d7d98a1aaf03d0d0f31995a" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
 # The `X-Dig-Inclusion-Proof` header wire form is base64; store id / root / salt are hex.
 base64 = "0.22"
 hex = "0.4"

@@ -555,15 +555,15 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
-version = "1.12.0"
+version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
+checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.2.65"
+version = "1.2.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e228eec9be7c17ccb640b59b36a5cd805ea2a564a4c5e162c2f659fea30d3b96"
+checksum = "f5d6cac793997bd970000024b2934968efe83b382de4fdcf4fcb46b6ee4ad996"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -724,7 +724,7 @@ dependencies = [
 [[package]]
 name = "chia-protocol"
 version = "0.26.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=5457857dc9194d4589dc33f7943f4b6fadd95b9a#5457857dc9194d4589dc33f7943f4b6fadd95b9a"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=9177a9b3af1db53e294d3407844f0dd986206ced#9177a9b3af1db53e294d3407844f0dd986206ced"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-serde",
@@ -767,8 +767,8 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.2.0"
-source = "git+https://github.com/DIG-Network/chia-query.git?rev=d40edc4cf4b28f625ca0301b0327a77461e33975#d40edc4cf4b28f625ca0301b0327a77461e33975"
+version = "0.2.1"
+source = "git+https://github.com/DIG-Network/chia-query.git?rev=48f7f6521fcc109f6c935e56f96cb5a86da1ae22#48f7f6521fcc109f6c935e56f96cb5a86da1ae22"
 dependencies = [
  "chia",
  "chia-wallet-sdk",
@@ -791,7 +791,7 @@ dependencies = [
 [[package]]
 name = "chia-sdk-client"
 version = "0.28.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=5457857dc9194d4589dc33f7943f4b6fadd95b9a#5457857dc9194d4589dc33f7943f4b6fadd95b9a"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=9177a9b3af1db53e294d3407844f0dd986206ced#9177a9b3af1db53e294d3407844f0dd986206ced"
 dependencies = [
  "aws-lc-rs",
  "chia-protocol",
@@ -1596,9 +1596,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-deque"
-version = "0.8.6"
+version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dd111b7b7f7d55b72c0a6ae361660ee5853c9af73f70c3c2ef6858b950e2e51"
+checksum = "5181e0de7b61eb03a81e347d6dd8797bae9da5146707b51077e2d71a54ec0ceb"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -1606,9 +1606,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1624,9 +1624,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-utils"
-version = "0.8.21"
+version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 
 [[package]]
 name = "crypto-bigint"
@@ -1744,7 +1744,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 [[package]]
 name = "dig-clvm"
 version = "0.1.1"
-source = "git+https://github.com/DIG-Network/dig-clvm.git?rev=b1de169f7c0fa74cc5965b7ec69f40e576d2deb8#b1de169f7c0fa74cc5965b7ec69f40e576d2deb8"
+source = "git+https://github.com/DIG-Network/dig-clvm.git?rev=356771034afd54a61d6199bc5960786139e39988#356771034afd54a61d6199bc5960786139e39988"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-consensus",
@@ -1776,8 +1776,8 @@ dependencies = [
 
 [[package]]
 name = "dig-constants"
-version = "0.2.0"
-source = "git+https://github.com/DIG-Network/dig-constants#c27e9445e8f8d9d29595884c4f9303208ea1da56"
+version = "0.2.1"
+source = "git+https://github.com/DIG-Network/dig-constants#8a4c1670a7005b991611a796e17eccf8aff00e21"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-consensus",
@@ -1788,7 +1788,7 @@ dependencies = [
 [[package]]
 name = "dig-dht"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-dht#68cf40db138134ed3d771e26ee7c737b4c8c54c2"
+source = "git+https://github.com/DIG-Network/dig-dht#d5b4a7d9f5d9632a036b8c06cf7ae0da16d83ad1"
 dependencies = [
  "async-trait",
  "dig-nat",
@@ -1804,7 +1804,7 @@ dependencies = [
 [[package]]
 name = "dig-download"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-download#0e1e7fa5c4e1875ae204dcc9741f542304c81417"
+source = "git+https://github.com/DIG-Network/dig-download#706bce6d1d7a9a38e70010bf94320160b725d2f3"
 dependencies = [
  "async-trait",
  "dig-dht",
@@ -1821,14 +1821,14 @@ dependencies = [
 [[package]]
 name = "dig-gossip"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=5457857dc9194d4589dc33f7943f4b6fadd95b9a#5457857dc9194d4589dc33f7943f4b6fadd95b9a"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=9177a9b3af1db53e294d3407844f0dd986206ced#9177a9b3af1db53e294d3407844f0dd986206ced"
 dependencies = [
  "bincode",
  "chia-protocol",
  "chia-sha2 0.26.0",
  "chia-traits 0.26.0",
  "chia_streamable_macro 0.26.0",
- "dig-constants 0.2.0",
+ "dig-constants 0.2.1",
  "dig-nat",
  "dig-protocol",
  "futures-util",
@@ -1838,6 +1838,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tokio-native-tls",
@@ -1869,10 +1870,10 @@ dependencies = [
 [[package]]
 name = "dig-nat"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-nat#e54e8f0a1a0a64007a03e7cf7e774aef47fe4c38"
+source = "git+https://github.com/DIG-Network/dig-nat#00f438b5f0f18d37395448520c41b8b446afa700"
 dependencies = [
  "async-trait",
- "dig-constants 0.2.0",
+ "dig-constants 0.2.1",
  "futures",
  "futures-util",
  "igd-next",
@@ -1902,7 +1903,7 @@ dependencies = [
  "axum",
  "base64",
  "chia-protocol",
- "dig-constants 0.2.0",
+ "dig-constants 0.2.1",
  "dig-dht",
  "dig-download",
  "dig-gossip",
@@ -1957,19 +1958,19 @@ dependencies = [
 [[package]]
 name = "dig-peer-selector"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-peer-selector#8798ce6301c941b6cb1fc8c32d1c3bd3d1fa4bc4"
+source = "git+https://github.com/DIG-Network/dig-peer-selector#b7aed526fb6c3f3bc7fedc3a874860db29ee2847"
 dependencies = [
  "dig-dht",
  "dig-nat",
  "rand 0.8.6",
- "rand_pcg",
+ "rand_pcg 0.3.1",
  "serde",
 ]
 
 [[package]]
 name = "dig-pex"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-pex#fe3fd6896a816a536949b306e25f31d393f47dda"
+source = "git+https://github.com/DIG-Network/dig-pex#bf8e10f0022cd72f7f37cecf5954bf54401c1a39"
 dependencies = [
  "rand 0.8.6",
  "serde",
@@ -2064,8 +2065,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-chain"
-version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+version = "0.10.1"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2094,8 +2095,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-chunker"
-version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+version = "0.10.1"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "digstore-core",
  "sha2 0.10.9",
@@ -2104,7 +2105,7 @@ dependencies = [
 [[package]]
 name = "digstore-compiler"
 version = "1.0.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "chacha20 0.9.1",
  "digstore-core",
@@ -2119,8 +2120,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-core"
-version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+version = "0.10.1"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "aes-gcm-siv",
  "hex",
@@ -2133,7 +2134,7 @@ dependencies = [
 [[package]]
 name = "digstore-crypto"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "chia-bls 0.45.0",
  "digstore-core",
@@ -2147,7 +2148,7 @@ dependencies = [
 [[package]]
 name = "digstore-host"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "anyhow",
  "clap",
@@ -2169,7 +2170,7 @@ dependencies = [
 [[package]]
 name = "digstore-prover"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "digstore-core",
  "digstore-crypto",
@@ -2181,8 +2182,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-remote"
-version = "0.6.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+version = "0.10.1"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "async-trait",
  "axum",
@@ -2209,7 +2210,7 @@ dependencies = [
 [[package]]
 name = "digstore-stage"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "digstore-chunker",
  "digstore-compiler",
@@ -2225,7 +2226,7 @@ dependencies = [
 [[package]]
 name = "digstore-store"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=dfb0d137143495669d7d98a1aaf03d0d0f31995a#dfb0d137143495669d7d98a1aaf03d0d0f31995a"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "digstore-chunker",
  "digstore-core",
@@ -2704,11 +2705,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
- "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
- "wasm-bindgen",
 ]
 
 [[package]]
@@ -2718,9 +2717,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3236,11 +3237,11 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jobserver"
-version = "0.1.34"
+version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9afb3de4395d6b3e67a780b6de64b51c978ecf11cb9a462c66be7d4ca9039d33"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "libc",
 ]
 
@@ -3435,9 +3436,9 @@ dependencies = [
 
 [[package]]
 name = "memchr"
-version = "2.8.2"
+version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memfd"
@@ -3530,9 +3531,9 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.7"
+version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c863e9ab5e7bf9c99ba75e1050f1e4d624ae87ed3532d6238ffbdc7b585dbbe6"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -3581,11 +3582,10 @@ dependencies = [
 
 [[package]]
 name = "num-iter"
-version = "0.1.45"
+version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1429034a0490724d0075ebb2bc9e875d6503c3cf69e235a8941aa757d83ef5bf"
+checksum = "c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"
 dependencies = [
- "autocfg",
  "num-integer",
  "num-traits",
 ]
@@ -3881,13 +3881,13 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plist"
-version = "1.9.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "092791278e026273c1b65bbdcfbba3a300f2994c896bd01ab01da613c29c46f1"
+checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
  "base64",
  "indexmap",
- "quick-xml 0.39.4",
+ "quick-xml 0.41.0",
  "serde",
  "time",
 ]
@@ -4037,9 +4037,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.39.4"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
 ]
@@ -4066,14 +4066,15 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.15"
+version = "0.11.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
+checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
 dependencies = [
  "bytes",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "lru-slab",
- "rand 0.9.4",
+ "rand 0.10.2",
+ "rand_pcg 0.10.2",
  "ring",
  "rustc-hash",
  "rustls",
@@ -4087,16 +4088,16 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.14"
+version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "addec6a0dcad8a8d96a771f815f0eaf55f9d1805756410b39f5fa81332574cbd"
+checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
 dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4212,6 +4213,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rayon"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4292,9 +4302,9 @@ dependencies = [
 
 [[package]]
 name = "regex"
-version = "1.12.4"
+version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1292b7759ae1cb9ec195452d1390a074f0cd8541ab7a5a8c31cd6db45d4a6ba"
+checksum = "2a0e75113e14dc5acb068cd0786884f214f1312650a3d36d269f5c4f3cdee8a2"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -4304,9 +4314,9 @@ dependencies = [
 
 [[package]]
 name = "regex-automata"
-version = "0.4.14"
+version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e1dd4122fc1595e8162618945476892eefca7b88c52820e74af6262213cae8f"
+checksum = "1f388202e4b80542a0921078cc23b6333bcf1409c1e3f86404cae4766a6131db"
 dependencies = [
  "aho-corasick",
  "memchr",
@@ -4414,9 +4424,9 @@ dependencies = [
 
 [[package]]
 name = "rustc-demangle"
-version = "0.1.27"
+version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
+checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
 
 [[package]]
 name = "rustc-hash"
@@ -4520,9 +4530,9 @@ dependencies = [
 
 [[package]]
 name = "rustversion"
-version = "1.0.22"
+version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "ryu"
@@ -4697,9 +4707,9 @@ dependencies = [
 
 [[package]]
 name = "sha1"
-version = "0.10.6"
+version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
@@ -5669,12 +5679,12 @@ dependencies = [
 
 [[package]]
 name = "wasm-encoder"
-version = "0.252.0"
+version = "0.253.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8185ae345fa5687c054626ff9a50e7089797a343d9904d1dc9820eb4c4d3196f"
+checksum = "59972d6cd272259de647b7c1f1912e45e289c75ffd4be04e10695507cd7e1b59"
 dependencies = [
  "leb128fmt",
- "wasmparser 0.252.0",
+ "wasmparser 0.253.0",
 ]
 
 [[package]]
@@ -5718,9 +5728,9 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.252.0"
+version = "0.253.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3eb099dcadcde5be9eef55e3a337128efd4e44b4c93122487e4d2e4e1c6627c"
+checksum = "19db11f87d2486580e1e8b6f494c54df7e0566b87d0b599db843c24019667339"
 dependencies = [
  "bitflags",
  "indexmap",
@@ -5924,22 +5934,22 @@ dependencies = [
 
 [[package]]
 name = "wast"
-version = "252.0.0"
+version = "253.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "942a3449d6a593fccc111a6241c8df52bda168af30e40bf9580d4394d7374c65"
+checksum = "d3264542f8965c5d84fb1085d924bfba9a6314bb228eff13a2de14d7627664d0"
 dependencies = [
  "bumpalo",
  "leb128fmt",
  "memchr",
  "unicode-width 0.2.2",
- "wasm-encoder 0.252.0",
+ "wasm-encoder 0.253.0",
 ]
 
 [[package]]
 name = "wat"
-version = "1.252.0"
+version = "1.253.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c72a4ba7088f7bac94cf516e49882bdf97068904a563768cf249efc839ec42cb"
+checksum = "4bfc5ce906144200c972ec617470aa35bd847472e170b26dde3e80541c674055"
 dependencies = [
  "wast",
 ]
@@ -6160,15 +6170,6 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
-version = "0.60.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2f500e4d28234f72040990ec9d39e3a6b950f9f22d3dba18416c35882612bcb"
-dependencies = [
- "windows-targets 0.53.5",
-]
-
-[[package]]
-name = "windows-sys"
 version = "0.61.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
@@ -6200,28 +6201,11 @@ dependencies = [
  "windows_aarch64_gnullvm 0.52.6",
  "windows_aarch64_msvc 0.52.6",
  "windows_i686_gnu 0.52.6",
- "windows_i686_gnullvm 0.52.6",
+ "windows_i686_gnullvm",
  "windows_i686_msvc 0.52.6",
  "windows_x86_64_gnu 0.52.6",
  "windows_x86_64_gnullvm 0.52.6",
  "windows_x86_64_msvc 0.52.6",
-]
-
-[[package]]
-name = "windows-targets"
-version = "0.53.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4945f9f551b88e0d65f3db0bc25c33b8acea4d9e41163edf90dcd0b19f9069f3"
-dependencies = [
- "windows-link",
- "windows_aarch64_gnullvm 0.53.1",
- "windows_aarch64_msvc 0.53.1",
- "windows_i686_gnu 0.53.1",
- "windows_i686_gnullvm 0.53.1",
- "windows_i686_msvc 0.53.1",
- "windows_x86_64_gnu 0.53.1",
- "windows_x86_64_gnullvm 0.53.1",
- "windows_x86_64_msvc 0.53.1",
 ]
 
 [[package]]
@@ -6237,12 +6221,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a4622180e7a0ec044bb555404c800bc9fd9ec262ec147edd5989ccd0c02cd3"
 
 [[package]]
-name = "windows_aarch64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9d8416fa8b42f5c947f8482c43e7d89e73a173cead56d044f6a56104a6d1b53"
-
-[[package]]
 name = "windows_aarch64_msvc"
 version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6253,12 +6231,6 @@ name = "windows_aarch64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ec2a7bb152e2252b53fa7803150007879548bc709c039df7627cabbd05d469"
-
-[[package]]
-name = "windows_aarch64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9d782e804c2f632e395708e99a94275910eb9100b2114651e04744e9b125006"
 
 [[package]]
 name = "windows_i686_gnu"
@@ -6273,22 +6245,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e9b5ad5ab802e97eb8e295ac6720e509ee4c243f69d781394014ebfe8bbfa0b"
 
 [[package]]
-name = "windows_i686_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960e6da069d81e09becb0ca57a65220ddff016ff2d6af6a223cf372a506593a3"
-
-[[package]]
 name = "windows_i686_gnullvm"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0eee52d38c090b3caa76c563b86c3a4bd71ef1a819287c19d586d7334ae8ed66"
-
-[[package]]
-name = "windows_i686_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa7359d10048f68ab8b09fa71c3daccfb0e9b559aed648a8f95469c27057180c"
 
 [[package]]
 name = "windows_i686_msvc"
@@ -6303,12 +6263,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "240948bc05c5e7c6dabba28bf89d89ffce3e303022809e73deaefe4f6ec56c66"
 
 [[package]]
-name = "windows_i686_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e7ac75179f18232fe9c285163565a57ef8d3c89254a30685b57d83a38d326c2"
-
-[[package]]
 name = "windows_x86_64_gnu"
 version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6319,12 +6273,6 @@ name = "windows_x86_64_gnu"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "147a5c80aabfbf0c7d901cb5895d1de30ef2907eb21fbbab29ca94c5b08b1a78"
-
-[[package]]
-name = "windows_x86_64_gnu"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c3842cdd74a865a8066ab39c8a7a473c0778a3f29370b5fd6b4b9aa7df4a499"
 
 [[package]]
 name = "windows_x86_64_gnullvm"
@@ -6339,12 +6287,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "24d5b23dc417412679681396f2b49f3de8c1473deb516bd34410872eff51ed0d"
 
 [[package]]
-name = "windows_x86_64_gnullvm"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ffa179e2d07eee8ad8f57493436566c7cc30ac536a3379fdf008f47f6bb7ae1"
-
-[[package]]
 name = "windows_x86_64_msvc"
 version = "0.48.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6355,12 +6297,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "windows_x86_64_msvc"
-version = "0.53.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "winnow"
@@ -6495,18 +6431,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.52"
+version = "0.8.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce1022995ff5ff5d841ad7d994facc23098cd40152f2c1d11cd607c6f530653f"
+checksum = "b7cbbc0a705a0fd05cc3676525980d2bf5a9bc4adac6d6475209a7887cf59d19"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.52"
+version = "0.8.54"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ae7f38b72ec2a254e2b87ef277cf2cd4fb97cbebf944faa6f33354da0867930"
+checksum = "e2e817b7b52d0c7358d3246da9d69935ebb18116b2b102b4230dac079b4862f5"
 dependencies = [
  "proc-macro2",
  "quote",

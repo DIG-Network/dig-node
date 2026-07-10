@@ -54,5 +54,5 @@ overflow-checks = true
 # standalone. `native-tls` is NOT patched: dig-gossip is pulled with
 # `default-features = false, features = ["rustls", "relay"]`, so the OpenSSL/native-tls path is off.
 [patch.crates-io]
-chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5457857dc9194d4589dc33f7943f4b6fadd95b9a" }
-chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5457857dc9194d4589dc33f7943f4b6fadd95b9a" }
+chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "9177a9b3af1db53e294d3407844f0dd986206ced" }
+chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "9177a9b3af1db53e294d3407844f0dd986206ced" }
