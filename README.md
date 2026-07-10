@@ -52,10 +52,14 @@ dig-node uninstall
   (Run as administrator)** terminal. `dig-node` detects a non-elevated console and tells you,
   rather than failing deep inside `sc.exe`. The installed service runs the binary's internal
   `run-service` entrypoint, which speaks the Windows Service Control Protocol (so the SCM does not
-  kill it with error 1053). After install it auto-starts on boot.
+  kill it with error 1053). After install it auto-starts on boot, and `install` also configures SCM
+  **recovery actions** (`sc.exe failure` — restart 5s/10s/30s after the 1st/2nd/subsequent crash, resetting after a day with no further crashes) so a crashed service comes back up on its own,
+  same as the systemd/launchd behavior below; check with `sc qfailure net.dignetwork.dig-node`.
 - **Linux / macOS:** the service installs at **user level** (systemd `--user` / a launchd GUI agent),
   so no `sudo` is needed and it runs as you. (systemd user services start at login; enable
   linger — `loginctl enable-linger $USER` — if you want it running without an active session.)
+  Both back ends restart the service on crash out of the box — systemd's generated unit sets
+  `Restart=on-failure`, launchd's generated plist sets `KeepAlive: true`.
 
 ## Point the extension at it
 

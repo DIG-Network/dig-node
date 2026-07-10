@@ -28,9 +28,12 @@ use service_manager::{
 use crate::cli::Outcome;
 use crate::config::Config;
 
-/// The reverse-DNS service label. On Windows this becomes the SCM service name
-/// `net-dignetwork-dig_node`; on launchd the plist label; on systemd the unit
-/// name. Kept stable so install/uninstall/start/stop all address the same service.
+/// The reverse-DNS service label. `ServiceLabel::to_qualified_name` rejoins its
+/// 3 dot-separated segments unchanged, so on Windows this is used AS-IS as the SCM
+/// service name (`sc.exe create`/`failure`/`start`/`stop` all address
+/// `net.dignetwork.dig-node` literally); on launchd it's the plist label; on
+/// systemd the unit name. Kept stable so install/uninstall/start/stop (and the
+/// recovery-action config below) all address the same service.
 pub const SERVICE_LABEL: &str = "net.dignetwork.dig-node";
 
 /// Whether user-level (no-elevation) install is supported on this OS. Windows SCM
@@ -87,10 +90,65 @@ fn is_elevated() -> bool {
     true
 }
 
+/// `sc.exe failure` recovery-action config: reset the failure counter after one
+/// day of no further crashes, and restart the service 5s/10s/30s after the
+/// 1st/2nd/subsequent failure in that window. Mirrors the spirit of systemd's
+/// `Restart=on-failure` default (which `service-manager` already applies on
+/// Linux) and launchd's `KeepAlive` (already applied on macOS) — see
+/// [`configure_windows_recovery`].
+const RECOVERY_RESET_SECONDS: &str = "86400";
+const RECOVERY_ACTIONS: &str = "restart/5000/restart/10000/restart/30000";
+
+/// Build the `sc.exe failure` argument list that configures restart-on-crash
+/// recovery actions for `service_name`. PURE (no process spawn) so the argument
+/// construction is unit-testable without invoking `sc.exe` for real.
+fn recovery_action_args(service_name: &str) -> Vec<String> {
+    vec![
+        "failure".to_string(),
+        service_name.to_string(),
+        "reset=".to_string(),
+        RECOVERY_RESET_SECONDS.to_string(),
+        "actions=".to_string(),
+        RECOVERY_ACTIONS.to_string(),
+    ]
+}
+
+/// Register Windows SCM recovery actions (restart-on-crash) for the installed
+/// service. `service-manager`'s `sc.rs` backend only shells out to `sc create`
+/// (§`install`) — it never configures `SERVICE_CONFIG_FAILURE_ACTIONS`, and the
+/// pinned `windows-service` 0.7 crate exposes no `ChangeServiceConfig2` binding
+/// either, so Windows services do NOT restart on crash unless this is set
+/// explicitly (unlike systemd/launchd, which `service-manager` already covers by
+/// default). Call ONLY after a successful `mgr.install`; the caller treats a
+/// failure here as non-fatal (see [`install`]).
+#[cfg(windows)]
+fn configure_windows_recovery(service_name: &str) -> std::io::Result<()> {
+    let args = recovery_action_args(service_name);
+    let output = std::process::Command::new("sc.exe")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let msg = if msg.is_empty() {
+            format!("sc.exe failure exited with {}", output.status)
+        } else {
+            msg
+        };
+        Err(std::io::Error::other(msg))
+    }
+}
+
 /// Install dig-node as an auto-starting OS service that runs
 /// `dig-node run` on the configured loopback port. The service's environment
 /// carries the resolved port/host/upstream so it serves identically to a manual
-/// `run`.
+/// `run`. On Windows, also configures SCM recovery actions (restart-on-crash) —
+/// see [`configure_windows_recovery`] — so a crashed service comes back up the
+/// same way systemd (`Restart=on-failure`) and launchd (`KeepAlive`) already do
+/// for Linux/macOS via `service-manager`'s own defaults.
 pub fn install(config: &Config) -> std::io::Result<Outcome> {
     if cfg!(windows) && !is_elevated() {
         return Err(std::io::Error::new(
@@ -103,6 +161,7 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
 
     let (mgr, user_level) = manager()?;
     let program = current_exe()?;
+    let svc_label = label()?;
 
     // Pass the effective config to the service as env vars so the running service
     // matches what `install` was told (the service process does not inherit the
@@ -128,7 +187,7 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
     let entry_arg = if cfg!(windows) { "run-service" } else { "run" };
 
     mgr.install(ServiceInstallCtx {
-        label: label()?,
+        label: svc_label.clone(),
         program: program.clone(),
         args: vec![OsString::from(entry_arg)],
         contents: None,
@@ -138,14 +197,40 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
         autostart: true,
     })?;
 
+    // Windows: best-effort SCM recovery-action config. A failure here (e.g.
+    // `sc.exe` missing/blocked) must not fail the whole install — the service is
+    // already registered and usable, just without auto-restart-on-crash; surface
+    // it as a note instead. Linux/macOS need no equivalent step: service-manager's
+    // own defaults (`Restart=on-failure` / `KeepAlive`) already cover them.
+    #[cfg(windows)]
+    let (recovery_configured, recovery_note) =
+        match configure_windows_recovery(&svc_label.to_qualified_name()) {
+            Ok(()) => (true, None),
+            Err(e) => (
+                false,
+                Some(format!(
+                    "note: could not configure Windows SCM restart-on-crash recovery \
+                     actions ({e}); the service is installed but will NOT auto-restart \
+                     if it crashes. Configure manually with: sc.exe failure {SERVICE_LABEL} \
+                     reset= {RECOVERY_RESET_SECONDS} actions= {RECOVERY_ACTIONS}"
+                )),
+            ),
+        };
+    #[cfg(not(windows))]
+    let (recovery_configured, recovery_note): (bool, Option<String>) = (true, None);
+
     let scope = if user_level { "user" } else { "system" };
     let addr = config.bind_addr();
-    let summary = format!(
+    let mut summary = format!(
         "dig-node: installed as a {scope}-level service \"{SERVICE_LABEL}\"\n  \
          program: {}\n  serves:  http://{addr}\n  Set the DIG Chrome extension's \"server host\" to {addr}.\n  \
          Start it now with: dig-node start",
         program.display(),
     );
+    if let Some(note) = &recovery_note {
+        summary.push_str("\n  ");
+        summary.push_str(note);
+    }
     Ok(Outcome::new(
         summary,
         json!({
@@ -157,6 +242,7 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
             "program": program.display().to_string(),
             "addr": addr,
             "upstream": config.upstream,
+            "recovery_configured": recovery_configured,
         }),
     ))
 }
@@ -286,6 +372,41 @@ mod tests {
     fn service_label_parses() {
         let l = label().expect("constant label must parse");
         assert_eq!(l.application, "dig-node");
+    }
+
+    #[test]
+    fn service_label_qualified_name_matches_the_constant() {
+        // `configure_windows_recovery` targets `sc.exe failure` at
+        // `svc_label.to_qualified_name()` — this MUST be the exact name
+        // `mgr.install` registered the service under (SERVICE_LABEL itself, for
+        // this 3-segment reverse-DNS label), or the recovery-action call would
+        // silently target a nonexistent service.
+        let l = label().expect("constant label must parse");
+        assert_eq!(l.to_qualified_name(), SERVICE_LABEL);
+    }
+
+    #[test]
+    fn recovery_action_args_build_the_expected_sc_failure_command() {
+        let args = recovery_action_args(SERVICE_LABEL);
+        assert_eq!(
+            args,
+            vec![
+                "failure".to_string(),
+                SERVICE_LABEL.to_string(),
+                "reset=".to_string(),
+                "86400".to_string(),
+                "actions=".to_string(),
+                "restart/5000/restart/10000/restart/30000".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_action_args_targets_the_given_service_name() {
+        // Pure builder — must plumb an arbitrary service name through unchanged,
+        // not hardcode SERVICE_LABEL internally.
+        let args = recovery_action_args("some.other.service");
+        assert_eq!(args[1], "some.other.service");
     }
 
     #[test]
