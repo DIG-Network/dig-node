@@ -647,6 +647,23 @@ executable (never a PATH lookup) and record the resolved config as service envir
 configured** — `DIG_NODE_CACHE` (omitting it preserves the shared-cache default, §3.5). The
 service is registered with `autostart: true`.
 
+9.2a. **Restart-on-crash recovery (all 3 platforms).** A crashed `dig-node` service MUST come back
+up on its own, not sit stopped until a human restarts it:
+  - **Linux (systemd)** and **macOS (launchd)** get this from `service-manager`'s own install
+    defaults with no extra step — systemd's generated unit sets `Restart=on-failure`; launchd's
+    generated plist sets `KeepAlive: true` (alongside `RunAtLoad: true` from `autostart`).
+  - **Windows (SCM)** has no such default: `sc create` alone leaves recovery actions at "Take No
+    Action". `install` MUST additionally configure them after a successful `mgr.install`, by
+    invoking `sc.exe failure <SERVICE_LABEL> reset= 86400 actions=
+    restart/5000/restart/10000/restart/30000` (reset the failure counter after 1 day with no
+    further crashes; restart after 5s/10s/30s on the 1st/2nd/subsequent failure in that window) —
+    `<SERVICE_LABEL>` here is `net.dignetwork.dig-node` used literally (§2.4's `to_qualified_name`
+    rejoins its 3 segments unchanged, so it is the exact registered SCM service name). This step is
+    **best-effort**: a failure to configure recovery actions MUST NOT fail the whole `install` (the
+    service is still registered and usable) — it surfaces as a `note` in the human summary and
+    `result.recovery_configured: false` in `--json` output (`true` otherwise, and always `true` on
+    Linux/macOS since their defaults already apply).
+
 9.3. **Entrypoint per platform.** The installed service runs `dig-node run-service` on Windows and
 `dig-node run` on systemd/launchd (which exec the foreground process directly).
 
