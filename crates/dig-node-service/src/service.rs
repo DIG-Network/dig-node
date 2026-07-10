@@ -90,18 +90,28 @@ fn is_elevated() -> bool {
     true
 }
 
+// These three items back the Windows-only recovery path ([`configure_windows_recovery`]
+// + the note in [`install`]), but are deliberately kept platform-INDEPENDENT so the
+// pure argument-building is unit-tested on EVERY CI runner (the coverage/test job runs
+// on Linux). Their only non-test consumer is `#[cfg(windows)]`, so off Windows a
+// non-test build sees them as unused — silence that one targeted case rather than
+// gate them (which would drop the Linux CI coverage of the builder).
+
 /// `sc.exe failure` recovery-action config: reset the failure counter after one
 /// day of no further crashes, and restart the service 5s/10s/30s after the
 /// 1st/2nd/subsequent failure in that window. Mirrors the spirit of systemd's
 /// `Restart=on-failure` default (which `service-manager` already applies on
 /// Linux) and launchd's `KeepAlive` (already applied on macOS) — see
 /// [`configure_windows_recovery`].
+#[cfg_attr(not(windows), allow(dead_code))]
 const RECOVERY_RESET_SECONDS: &str = "86400";
+#[cfg_attr(not(windows), allow(dead_code))]
 const RECOVERY_ACTIONS: &str = "restart/5000/restart/10000/restart/30000";
 
 /// Build the `sc.exe failure` argument list that configures restart-on-crash
 /// recovery actions for `service_name`. PURE (no process spawn) so the argument
 /// construction is unit-testable without invoking `sc.exe` for real.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn recovery_action_args(service_name: &str) -> Vec<String> {
     vec![
         "failure".to_string(),
