@@ -21,6 +21,7 @@ use chia_protocol::Bytes32;
 use chia_wallet_sdk::client::Peer;
 
 use super::db::{CoinRow, WalletDb};
+use super::events::{EventBus, SyncEvent};
 
 /// A sync error (peer/protocol/db).
 #[derive(Debug)]
@@ -77,10 +78,13 @@ pub async fn apply_coin_states(db: &WalletDb, states: &[CoinState]) -> Result<()
 
 /// Handle a `coin_state_update` push: on a reorg (`fork_height` below the current peak)
 /// roll the DB back above the fork first (design B.3), then apply the update's coin states
-/// and advance the synced peak.
+/// and advance the synced peak. Publishes [`SyncEvent::CoinState`] on `events` once applied
+/// (design A.9) — a best-effort push notification; `get_sync_status` polling stays the
+/// authoritative source of truth regardless of whether anything is subscribed to `events`.
 pub async fn handle_coin_state_update(
     db: &WalletDb,
     update: &CoinStateUpdate,
+    events: &EventBus,
 ) -> Result<(), SyncError> {
     let current_peak = db.sync_state().await?.peak_height;
     if let Some(peak) = current_peak {
@@ -91,6 +95,7 @@ pub async fn handle_coin_state_update(
     apply_coin_states(db, &update.items).await?;
     db.set_peak(update.height, &hex::encode(update.peak_hash))
         .await?;
+    events.publish(SyncEvent::CoinState);
     Ok(())
 }
 
@@ -98,15 +103,26 @@ pub async fn handle_coin_state_update(
 /// apply the returned coin states, batching through `RespondPuzzleState.next` until the
 /// peer reports it is caught up. Marks the DB initial-sync-complete so
 /// [`crate::sage::routing`] flips reads from the fallback to the DB.
+///
+/// Publishes the sync lifecycle on `events` (design A.9): [`SyncEvent::Start`] once (the
+/// caller supplies `peer_ip` — whatever address it dialed to obtain `peer`),
+/// [`SyncEvent::Subscribed`] after the first successful puzzle-state response, and
+/// [`SyncEvent::PuzzleBatchSynced`] once per batch applied.
 pub async fn initial_sync(
     peer: &Peer,
     db: &WalletDb,
     puzzle_hashes: Vec<Bytes32>,
     genesis_challenge: Bytes32,
+    peer_ip: &str,
+    events: &EventBus,
 ) -> Result<(), SyncError> {
     let mut previous_height: Option<u32> = None;
     let mut header_hash = genesis_challenge;
+    events.publish(SyncEvent::Start {
+        ip: peer_ip.to_string(),
+    });
 
+    let mut first_batch = true;
     loop {
         let response = peer
             .request_puzzle_state(
@@ -123,8 +139,13 @@ pub async fn initial_sync(
             Ok(r) => r,
             Err(reject) => return Err(SyncError::Rejected(format!("{reject:?}"))),
         };
+        if first_batch {
+            events.publish(SyncEvent::Subscribed);
+            first_batch = false;
+        }
 
         apply_coin_states(db, &respond.coin_states).await?;
+        events.publish(SyncEvent::PuzzleBatchSynced);
 
         if respond.is_finished {
             db.set_peak(respond.height, &hex::encode(respond.header_hash))
@@ -142,16 +163,18 @@ pub async fn initial_sync(
 
 /// Consume peer pushes on the receiver until it closes: `coin_state_update` →
 /// [`handle_coin_state_update`]; `new_peak_wallet` → advance the peak. This is the
-/// production loop run after [`initial_sync`]; it returns when the peer disconnects.
+/// production loop run after [`initial_sync`]; it returns when the peer disconnects, at
+/// which point it publishes [`SyncEvent::Stop`] on `events`.
 pub async fn run_update_loop(
     db: &WalletDb,
     mut receiver: tokio::sync::mpsc::Receiver<Message>,
+    events: &EventBus,
 ) -> Result<(), SyncError> {
     while let Some(message) = receiver.recv().await {
         match message.msg_type {
             ProtocolMessageTypes::CoinStateUpdate => {
                 if let Ok(update) = decode::<CoinStateUpdate>(&message) {
-                    handle_coin_state_update(db, &update).await?;
+                    handle_coin_state_update(db, &update, events).await?;
                 }
             }
             ProtocolMessageTypes::NewPeakWallet => {
@@ -165,6 +188,7 @@ pub async fn run_update_loop(
             _ => {}
         }
     }
+    events.publish(SyncEvent::Stop);
     Ok(())
 }
 
@@ -236,7 +260,12 @@ mod tests {
             peak_hash: Bytes32::new([7; 32]),
             items: vec![state(coin(2, 9, 8), Some(26), None)],
         };
-        handle_coin_state_update(&db, &update).await.unwrap();
+        let events = EventBus::with_capacity(8);
+        let mut rx = events.subscribe();
+        handle_coin_state_update(&db, &update, &events)
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().await.unwrap(), SyncEvent::CoinState);
 
         // The rolled-back coin is unspent again (5) + the new coin (8) = 13.
         assert_eq!(db.balance(None).await.unwrap(), 13);
@@ -256,8 +285,57 @@ mod tests {
             peak_hash: Bytes32::new([1; 32]),
             items: vec![state(coin(2, 9, 3), Some(50), None)],
         };
-        handle_coin_state_update(&db, &update).await.unwrap();
+        let events = EventBus::default();
+        handle_coin_state_update(&db, &update, &events)
+            .await
+            .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 8);
         assert_eq!(db.sync_state().await.unwrap().peak_height, Some(50));
+    }
+
+    /// **Proves:** [`run_update_loop`] publishes [`SyncEvent::Stop`] when its receiver
+    /// channel closes (the peer disconnected / shutdown), even with zero messages processed.
+    #[tokio::test]
+    async fn run_update_loop_publishes_stop_on_channel_close() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let events = EventBus::with_capacity(8);
+        let mut rx = events.subscribe();
+        let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(1);
+        drop(tx); // closes the channel immediately
+
+        run_update_loop(&db, receiver, &events).await.unwrap();
+
+        assert_eq!(rx.recv().await.unwrap(), SyncEvent::Stop);
+    }
+
+    /// **Proves:** [`handle_coin_state_update`] publishes exactly one [`SyncEvent::CoinState`]
+    /// per applied update via [`run_update_loop`]'s dispatch path.
+    #[tokio::test]
+    async fn run_update_loop_publishes_coin_state_per_update() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(10, "aa").await.unwrap();
+        let events = EventBus::with_capacity(8);
+        let mut rx = events.subscribe();
+        let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(4);
+
+        let update = CoinStateUpdate {
+            height: 11,
+            fork_height: 10,
+            peak_hash: Bytes32::new([2; 32]),
+            items: vec![state(coin(3, 9, 42), Some(11), None)],
+        };
+        let msg = Message {
+            msg_type: ProtocolMessageTypes::CoinStateUpdate,
+            id: None,
+            data: chia::traits::Streamable::to_bytes(&update).unwrap().into(),
+        };
+        tx.send(msg).await.unwrap();
+        drop(tx);
+
+        run_update_loop(&db, receiver, &events).await.unwrap();
+
+        assert_eq!(rx.recv().await.unwrap(), SyncEvent::CoinState);
+        assert_eq!(rx.recv().await.unwrap(), SyncEvent::Stop);
+        assert_eq!(db.balance(None).await.unwrap(), 42);
     }
 }

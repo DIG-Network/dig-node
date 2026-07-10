@@ -21,13 +21,14 @@ use serde_json::Value;
 
 use chia_wallet_sdk::driver::Cat;
 
-use super::db::{CoinRow, OfferDbRow, WalletDb};
+use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
+use super::events::EventBus;
 use super::fallback::{ChainFallback, FallbackCoin};
 use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
 use super::spend::{self, Broadcaster, WalletSigner};
 use super::types::*;
-use super::{mint, offers};
+use super::{actions, mint, network, offers, options, themes};
 use super::{Error, Result};
 
 /// Static wallet identity + config the read surface needs (derived once at bring-up).
@@ -72,6 +73,11 @@ pub struct WalletBackend {
     broadcaster: Option<Arc<dyn Broadcaster>>,
     /// The lineage source for CAT-send input resolution (parent-spend reads).
     lineage: Option<Arc<dyn LineageSource>>,
+    /// The `SyncEvent` publish bus (design A.9, #205 PR4). Always present (a fresh bus with
+    /// no subscribers is a harmless no-op) so `GET /events` always has somewhere to
+    /// subscribe; [`Self::with_events`] lets bring-up share the SAME bus the sync loop
+    /// publishes to.
+    events: Arc<EventBus>,
 }
 
 impl WalletBackend {
@@ -85,6 +91,7 @@ impl WalletBackend {
             signer: None,
             broadcaster: None,
             lineage: None,
+            events: Arc::new(EventBus::default()),
         }
     }
 
@@ -104,6 +111,18 @@ impl WalletBackend {
     pub fn with_lineage(mut self, lineage: Arc<dyn LineageSource>) -> Self {
         self.lineage = Some(lineage);
         self
+    }
+
+    /// Share an existing [`EventBus`] (e.g. the SAME bus the sync loop publishes
+    /// [`super::events::SyncEvent`]s to) instead of this backend's own default bus.
+    pub fn with_events(mut self, events: Arc<EventBus>) -> Self {
+        self.events = events;
+        self
+    }
+
+    /// The event bus `GET /events` (SSE, [`super::transport`]) subscribes to.
+    pub fn events(&self) -> &Arc<EventBus> {
+        &self.events
     }
 
     /// The exact method set this PR serves (the core READ surface). Used by the
@@ -159,6 +178,40 @@ impl WalletBackend {
         "bulk_mint_nfts",
         "transfer_nfts",
         "transfer_dids",
+        // #205 PR4: options (exercise_options is served but returns a documented error —
+        // see `sage::options` module docs).
+        "get_options",
+        "get_option",
+        "mint_option",
+        "transfer_options",
+        "exercise_options",
+        // #205 PR4: actions.
+        "resync_cat",
+        "update_cat",
+        "update_did",
+        "update_option",
+        "update_nft",
+        "update_nft_collection",
+        "redownload_nft",
+        "increase_derivation_index",
+        // #205 PR4: themes.
+        "get_user_themes",
+        "get_user_theme",
+        "save_user_theme",
+        "delete_user_theme",
+        // #205 PR4: network / peers / settings.
+        "get_peers",
+        "add_peer",
+        "remove_peer",
+        "set_discover_peers",
+        "set_target_peers",
+        "set_network",
+        "set_network_override",
+        "get_networks",
+        "get_network",
+        "set_delta_sync",
+        "set_delta_sync_override",
+        "set_change_address",
     ];
 
     /// Whether `method` is served by this backend.
@@ -1294,6 +1347,320 @@ impl WalletBackend {
         self.finalize_spend(coin_spends, req.auto_submit).await
     }
 
+    // ---- options (#205 PR4) -----------------------------------------------
+
+    /// Resolve `option_id` (hex/bech32m) to its current coin's (parent spend, coin).
+    async fn option_parent_child(&self, option_id: &str) -> Result<(ParentSpend, Coin)> {
+        let launcher = normalize_singleton_id(option_id);
+        let row = self
+            .db
+            .option(&launcher)
+            .await?
+            .ok_or_else(|| Error::not_found("option not tracked in the wallet"))?;
+        self.singleton_parent_child(&row.coin_id).await
+    }
+
+    async fn get_options(&self, req: &GetOptions) -> Result<GetOptionsResponse> {
+        let rows = self.db.all_options().await?;
+        let mut all: Vec<OptionRecord> = rows
+            .iter()
+            .filter(|r| req.include_hidden || r.visible)
+            .filter_map(|r| options::record_from_row(r, &self.address_of(&r.p2_puzzle_hash)))
+            .collect();
+        all.sort_by(|a, b| {
+            let ord = match req.sort_mode {
+                // Fall back to a stable id ordering when neither side has a name set.
+                OptionSortMode::Name => a
+                    .name
+                    .cmp(&b.name)
+                    .then_with(|| a.launcher_id.cmp(&b.launcher_id)),
+                OptionSortMode::Recent => b.created_height.cmp(&a.created_height),
+            };
+            if req.ascending {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+        let total = all.len() as u32;
+        let page = all
+            .into_iter()
+            .skip(req.offset as usize)
+            .take(req.limit as usize)
+            .collect();
+        Ok(GetOptionsResponse {
+            options: page,
+            total,
+        })
+    }
+
+    async fn get_option(&self, req: &GetOption) -> Result<GetOptionResponse> {
+        let id = normalize_singleton_id(&req.option_id);
+        let option = match self.db.option(&id).await? {
+            Some(row) => options::record_from_row(&row, &self.address_of(&row.p2_puzzle_hash)),
+            None => None,
+        };
+        Ok(GetOptionResponse { option })
+    }
+
+    async fn mint_option(&self, req: &MintOption) -> Result<MintOptionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        if req.underlying.asset_id.is_some() {
+            return Err(Error::api(
+                "mint_option: only an XCH underlying is supported in this backend (see \
+                 crate::sage::options module docs)",
+            ));
+        }
+        let underlying_amount = amount_u64(&req.underlying.amount)?;
+        let strike = options::strike_type_from_asset(&req.strike)?;
+        let owner_ph = self.change_ph()?;
+
+        let all_spendable = self.spendable_coins(None).await?;
+        let underlying_inputs = spend::select_coins(all_spendable.clone(), underlying_amount)?;
+        let underlying_ids: HashSet<Bytes32> =
+            underlying_inputs.iter().map(|c| c.coin_id()).collect();
+        let remaining: Vec<Coin> = all_spendable
+            .into_iter()
+            .filter(|c| !underlying_ids.contains(&c.coin_id()))
+            .collect();
+        let launcher_inputs = spend::select_coins(remaining, 1u64.saturating_add(fee))?;
+
+        let (coin_spends, info) = options::build_mint_option(
+            signer,
+            &underlying_inputs,
+            underlying_amount,
+            &launcher_inputs,
+            strike,
+            req.expiration_seconds,
+            owner_ph,
+            owner_ph,
+            fee,
+        )?;
+        spend::run_and_validate(&coin_spends)?;
+        let summary = spend::summarize(
+            &coin_spends,
+            &self.config.address_prefix,
+            &self.wallet_puzzle_hashes(),
+        )?;
+
+        let option_id = hex::encode(info.launcher_id);
+        let strike_amount = amount_u64(&req.strike.amount)?;
+        let underlying_coin_hex = hex::encode(info.underlying_coin_id);
+        let p2_hex = hex::encode(info.p2_puzzle_hash);
+        let record = options::new_record(
+            &option_id,
+            &option_id,
+            &self.address_of(&p2_hex),
+            1,
+            options::asset_for(None), // this backend mints XCH-underlying options only
+            underlying_amount,
+            &underlying_coin_hex,
+            options::asset_for(req.strike.asset_id.as_deref()),
+            strike_amount,
+            req.expiration_seconds,
+        );
+        self.db
+            .upsert_option(&OptionDbRow {
+                option_id: option_id.clone(),
+                coin_id: option_id.clone(),
+                underlying_coin_id: underlying_coin_hex,
+                underlying_delegated_puzzle_hash: hex::encode(
+                    info.underlying_delegated_puzzle_hash,
+                ),
+                p2_puzzle_hash: p2_hex,
+                visible: true,
+                created_height: None,
+                record_json: serde_json::to_string(&record).unwrap_or_default(),
+            })
+            .await?;
+
+        if req.auto_submit {
+            if let (Some(s), Some(bc)) = (self.signer.as_ref(), self.broadcaster.as_ref()) {
+                let sig = s.sign(&coin_spends)?;
+                bc.broadcast(&SpendBundle::new(coin_spends.clone(), sig))
+                    .await?;
+            }
+        }
+        let coin_spends_json = coin_spends
+            .iter()
+            .map(spend::coin_spend_to_json)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(MintOptionResponse {
+            option_id,
+            summary,
+            coin_spends: coin_spends_json,
+        })
+    }
+
+    async fn transfer_options(&self, req: &TransferOptions) -> Result<TransactionResponse> {
+        let signer = self.require_signer()?;
+        let fee = amount_u64(&req.fee)?;
+        let dest = self.decode_ph(&req.address)?;
+        let mut opts = Vec::with_capacity(req.option_ids.len());
+        for id in &req.option_ids {
+            opts.push(self.option_parent_child(id).await?);
+        }
+        let fee_coins = if fee > 0 {
+            spend::select_coins(self.spendable_coins(None).await?, fee)?
+        } else {
+            Vec::new()
+        };
+        let coin_spends = options::build_option_transfer(
+            signer,
+            &opts,
+            dest,
+            &fee_coins,
+            self.change_ph()?,
+            fee,
+        )?;
+        self.finalize_spend(coin_spends, req.auto_submit).await
+    }
+
+    /// `exercise_options` — a documented follow-on; see `crate::sage::options` module docs.
+    async fn exercise_options(&self, _req: &ExerciseOptions) -> Result<TransactionResponse> {
+        Err(options::exercise_options_unimplemented())
+    }
+
+    // ---- record-update actions (#205 PR4) ----------------------------------
+
+    async fn resync_cat(&self, req: &ResyncCat) -> Result<ActionResponse> {
+        actions::resync_cat(&self.db, &req.asset_id).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn update_cat(&self, req: &UpdateCat) -> Result<ActionResponse> {
+        actions::update_cat(&self.db, &req.record).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn update_did_action(&self, req: &UpdateDid) -> Result<ActionResponse> {
+        let id = normalize_singleton_id(&req.did_id);
+        actions::update_did(&self.db, &id, req.name.as_deref(), req.visible).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn update_option_action(&self, req: &UpdateOption) -> Result<ActionResponse> {
+        let id = normalize_singleton_id(&req.option_id);
+        actions::update_option(&self.db, &id, req.visible).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn update_nft_action(&self, req: &UpdateNft) -> Result<ActionResponse> {
+        let id = normalize_singleton_id(&req.nft_id);
+        actions::update_nft(&self.db, &id, req.visible).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn update_nft_collection_action(
+        &self,
+        req: &UpdateNftCollection,
+    ) -> Result<ActionResponse> {
+        actions::update_nft_collection(&self.db, &req.collection_id, req.visible).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn redownload_nft_action(&self, req: &RedownloadNft) -> Result<ActionResponse> {
+        let id = normalize_singleton_id(&req.nft_id);
+        actions::redownload_nft(&self.db, &id).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn increase_derivation_index(
+        &self,
+        req: &IncreaseDerivationIndex,
+    ) -> Result<ActionResponse> {
+        actions::increase_derivation_index(&self.db, req.hardened, req.unhardened, req.index)
+            .await?;
+        Ok(ActionResponse {})
+    }
+
+    // ---- themes (#205 PR4) --------------------------------------------------
+
+    async fn get_user_themes(&self) -> Result<GetUserThemesResponse> {
+        Ok(GetUserThemesResponse {
+            themes: themes::get_user_themes(&self.db).await?,
+        })
+    }
+
+    async fn get_user_theme(&self, req: &GetUserTheme) -> Result<GetUserThemeResponse> {
+        Ok(GetUserThemeResponse {
+            theme: themes::get_user_theme(&self.db, &req.nft_id).await?,
+        })
+    }
+
+    async fn save_user_theme(&self, req: &SaveUserTheme) -> Result<ActionResponse> {
+        themes::save_user_theme(&self.db, &req.nft_id).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn delete_user_theme(&self, req: &DeleteUserTheme) -> Result<ActionResponse> {
+        themes::delete_user_theme(&self.db, &req.nft_id).await?;
+        Ok(ActionResponse {})
+    }
+
+    // ---- network / peers / settings (#205 PR4) -------------------------------
+
+    async fn get_peers(&self) -> Result<GetPeersResponse> {
+        Ok(GetPeersResponse {
+            peers: network::get_peers(&self.db).await?,
+        })
+    }
+
+    async fn add_peer(&self, req: &AddPeer) -> Result<ActionResponse> {
+        network::add_peer(&self.db, &req.ip).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn remove_peer(&self, req: &RemovePeer) -> Result<ActionResponse> {
+        network::remove_peer(&self.db, &req.ip, req.ban).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn set_discover_peers(&self, req: &SetDiscoverPeers) -> Result<ActionResponse> {
+        network::set_discover_peers(&self.db, req.discover_peers).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn set_target_peers(&self, req: &SetTargetPeers) -> Result<ActionResponse> {
+        network::set_target_peers(&self.db, req.target_peers).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn set_network(&self, req: &SetNetwork) -> Result<ActionResponse> {
+        network::set_network(&self.db, Some(&req.name)).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn set_network_override(&self, req: &SetNetworkOverride) -> Result<ActionResponse> {
+        network::set_network(&self.db, req.name.as_deref()).await?;
+        Ok(ActionResponse {})
+    }
+
+    fn get_networks(&self) -> NetworkList {
+        network::get_networks()
+    }
+
+    async fn get_network(&self) -> Result<GetNetworkResponse> {
+        let (net, kind) = network::get_network(&self.db, &self.config.network_id).await?;
+        Ok(GetNetworkResponse { network: net, kind })
+    }
+
+    async fn set_delta_sync(&self, req: &SetDeltaSync) -> Result<ActionResponse> {
+        network::set_delta_sync(&self.db, req.delta_sync).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn set_delta_sync_override(&self, req: &SetDeltaSyncOverride) -> Result<ActionResponse> {
+        network::set_delta_sync_override(&self.db, req.delta_sync).await?;
+        Ok(ActionResponse {})
+    }
+
+    async fn set_change_address(&self, req: &SetChangeAddress) -> Result<ActionResponse> {
+        network::set_change_address(&self.db, req.change_address.as_deref()).await?;
+        Ok(ActionResponse {})
+    }
+
     // ---- the single dispatch both transports call ------------------------
 
     /// Parse + route a single Sage-parity RPC call. Returns `(http_status, body)`:
@@ -1501,6 +1868,122 @@ impl WalletBackend {
             "transfer_dids" => {
                 let r = req!(TransferDids);
                 json(self.transfer_dids(&r).await?)?
+            }
+            "get_options" => {
+                let r = req!(GetOptions);
+                json(self.get_options(&r).await?)?
+            }
+            "get_option" => {
+                let r = req!(GetOption);
+                json(self.get_option(&r).await?)?
+            }
+            "mint_option" => {
+                let r = req!(MintOption);
+                json(self.mint_option(&r).await?)?
+            }
+            "transfer_options" => {
+                let r = req!(TransferOptions);
+                json(self.transfer_options(&r).await?)?
+            }
+            "exercise_options" => {
+                let r = req!(ExerciseOptions);
+                json(self.exercise_options(&r).await?)?
+            }
+            "resync_cat" => {
+                let r = req!(ResyncCat);
+                json(self.resync_cat(&r).await?)?
+            }
+            "update_cat" => {
+                let r = req!(UpdateCat);
+                json(self.update_cat(&r).await?)?
+            }
+            "update_did" => {
+                let r = req!(UpdateDid);
+                json(self.update_did_action(&r).await?)?
+            }
+            "update_option" => {
+                let r = req!(UpdateOption);
+                json(self.update_option_action(&r).await?)?
+            }
+            "update_nft" => {
+                let r = req!(UpdateNft);
+                json(self.update_nft_action(&r).await?)?
+            }
+            "update_nft_collection" => {
+                let r = req!(UpdateNftCollection);
+                json(self.update_nft_collection_action(&r).await?)?
+            }
+            "redownload_nft" => {
+                let r = req!(RedownloadNft);
+                json(self.redownload_nft_action(&r).await?)?
+            }
+            "increase_derivation_index" => {
+                let r = req!(IncreaseDerivationIndex);
+                json(self.increase_derivation_index(&r).await?)?
+            }
+            "get_user_themes" => {
+                let _r = req!(GetUserThemes);
+                json(self.get_user_themes().await?)?
+            }
+            "get_user_theme" => {
+                let r = req!(GetUserTheme);
+                json(self.get_user_theme(&r).await?)?
+            }
+            "save_user_theme" => {
+                let r = req!(SaveUserTheme);
+                json(self.save_user_theme(&r).await?)?
+            }
+            "delete_user_theme" => {
+                let r = req!(DeleteUserTheme);
+                json(self.delete_user_theme(&r).await?)?
+            }
+            "get_peers" => {
+                let _r = req!(GetPeers);
+                json(self.get_peers().await?)?
+            }
+            "add_peer" => {
+                let r = req!(AddPeer);
+                json(self.add_peer(&r).await?)?
+            }
+            "remove_peer" => {
+                let r = req!(RemovePeer);
+                json(self.remove_peer(&r).await?)?
+            }
+            "set_discover_peers" => {
+                let r = req!(SetDiscoverPeers);
+                json(self.set_discover_peers(&r).await?)?
+            }
+            "set_target_peers" => {
+                let r = req!(SetTargetPeers);
+                json(self.set_target_peers(&r).await?)?
+            }
+            "set_network" => {
+                let r = req!(SetNetwork);
+                json(self.set_network(&r).await?)?
+            }
+            "set_network_override" => {
+                let r = req!(SetNetworkOverride);
+                json(self.set_network_override(&r).await?)?
+            }
+            "get_networks" => {
+                let _r = req!(GetNetworks);
+                json(self.get_networks())?
+            }
+            "get_network" => {
+                let _r = req!(GetNetwork);
+                json(self.get_network().await?)?
+            }
+            "set_delta_sync" => {
+                let r = req!(SetDeltaSync);
+                json(self.set_delta_sync(&r).await?)?
+            }
+            "set_delta_sync_override" => {
+                let r = req!(SetDeltaSyncOverride);
+                json(self.set_delta_sync_override(&r).await?)?
+            }
+            "set_change_address" => {
+                let r = req!(SetChangeAddress);
+                json(self.set_change_address(&r).await?)?
             }
             other => {
                 return Err(Error::not_found(format!(
@@ -2093,5 +2576,189 @@ mod tests {
             .await;
         let one: GetNftResponse = serde_json::from_str(&resp).unwrap();
         assert!(one.nft.is_some());
+    }
+
+    // ---- #205 PR4 dispatch coverage: options/actions/themes/network -----------
+
+    /// A backend funded with TWO separate spendable coins (mint_option needs one to lock the
+    /// underlying and a distinct one to fund the launcher — realistic for any multi-UTXO
+    /// wallet).
+    async fn two_coin_spend_backend(a: u64, b: u64) -> WalletBackend {
+        let pair = BlsPair::new(2);
+        let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
+        let ph = *signer.puzzle_hashes().iter().next().unwrap();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        for (i, amount) in [a, b].into_iter().enumerate() {
+            db.upsert_coin(&CoinRow {
+                coin_id: format!("coin{i}"),
+                parent_coin_info: "33".repeat(32),
+                puzzle_hash: hex::encode(ph),
+                amount: amount.to_string(),
+                created_height: Some(1),
+                spent_height: None,
+                asset_id: None,
+                hint: None,
+                created_timestamp: None,
+                spent_timestamp: None,
+            })
+            .await
+            .unwrap();
+        }
+        db.set_initial_sync_complete(true).await.unwrap();
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![hex::encode(ph)],
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        WalletBackend::new(db, Arc::new(MockFallback::default()), cfg).with_signer(signer)
+    }
+
+    #[tokio::test]
+    async fn mint_option_dispatch_builds_transfers_and_lists() {
+        let be = two_coin_spend_backend(2_000, 100).await;
+
+        // Mint an XCH-underlying, XCH-strike option (no broadcast: auto_submit false).
+        let body = r#"{"expiration_seconds":3600,"underlying":{"amount":1000},"strike":{"amount":500},"fee":0}"#;
+        let (s, resp) = be.dispatch("mint_option", body).await;
+        assert_eq!(s, 200, "{resp}");
+        let minted: MintOptionResponse = serde_json::from_str(&resp).unwrap();
+        assert!(!minted.coin_spends.is_empty());
+
+        // A CAT-underlying mint is explicitly out of scope → a clear 400, not a panic.
+        let cat_body = format!(
+            r#"{{"expiration_seconds":10,"underlying":{{"asset_id":"{}","amount":1}},"strike":{{"amount":1}},"fee":0}}"#,
+            "aa".repeat(32)
+        );
+        let (s, resp) = be.dispatch("mint_option", &cat_body).await;
+        assert_eq!(s, 400, "{resp}");
+        assert!(resp.contains("XCH underlying"));
+
+        // exercise_options is a documented follow-on: a clear 500, never a panic.
+        let (s, resp) = be
+            .dispatch("exercise_options", r#"{"option_ids":["aa"],"fee":0}"#)
+            .await;
+        assert_eq!(s, 500, "{resp}");
+        assert!(resp.contains("not yet implemented"));
+    }
+
+    #[tokio::test]
+    async fn actions_themes_and_network_dispatch_round_trip() {
+        let be = backend_with(vec![], true).await;
+
+        // resync_cat / update_cat.
+        let (s, _) = be.dispatch("resync_cat", r#"{"asset_id":"a1"}"#).await;
+        assert_eq!(s, 200);
+        let update_cat_body = r#"{"record":{"asset_id":"a1","name":"N","ticker":"T","precision":3,"description":null,"icon_url":null,"visible":true,"balance":0,"selectable_balance":0,"revocation_address":null}}"#;
+        let (s, resp) = be.dispatch("update_cat", update_cat_body).await;
+        assert_eq!(s, 200, "{resp}");
+
+        // increase_derivation_index then get_sync_status reflects the floor.
+        let (s, _) = be
+            .dispatch(
+                "increase_derivation_index",
+                r#"{"unhardened":true,"index":25}"#,
+            )
+            .await;
+        assert_eq!(s, 200);
+        let (_s, resp) = be.dispatch("get_sync_status", "{}").await;
+        let status: GetSyncStatusResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(status.unhardened_derivation_index, 25);
+
+        // increase_derivation_index with neither tree selected is a clear 400.
+        let (s, _) = be
+            .dispatch("increase_derivation_index", r#"{"index":5}"#)
+            .await;
+        assert_eq!(s, 400);
+
+        // themes round trip (Sage's real request is `{nft_id}` only — see `sage::themes`).
+        let (s, _) = be.dispatch("save_user_theme", r#"{"nft_id":"n1"}"#).await;
+        assert_eq!(s, 200);
+        let (s, resp) = be.dispatch("get_user_theme", r#"{"nft_id":"n1"}"#).await;
+        assert_eq!(s, 200);
+        let theme: GetUserThemeResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            theme.theme.as_deref(),
+            Some(crate::sage::themes::DERIVED_THEME_PLACEHOLDER)
+        );
+        let (s, resp) = be.dispatch("get_user_themes", "{}").await;
+        assert_eq!(s, 200);
+        let themes: GetUserThemesResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(themes.themes, vec!["n1"]);
+        let (s, _) = be.dispatch("delete_user_theme", r#"{"nft_id":"n1"}"#).await;
+        assert_eq!(s, 200);
+
+        // peers round trip.
+        let (s, _) = be.dispatch("add_peer", r#"{"ip":"1.2.3.4"}"#).await;
+        assert_eq!(s, 200);
+        let (s, resp) = be.dispatch("get_peers", "{}").await;
+        assert_eq!(s, 200);
+        let peers: GetPeersResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(peers.peers.len(), 1);
+        assert_eq!(peers.peers[0].ip_addr, "1.2.3.4");
+        let (s, _) = be.dispatch("remove_peer", r#"{"ip":"1.2.3.4"}"#).await;
+        assert_eq!(s, 200);
+
+        // network settings + get_networks/get_network.
+        let (s, resp) = be.dispatch("get_networks", "{}").await;
+        assert_eq!(s, 200, "{resp}");
+        let list: NetworkList = serde_json::from_str(&resp).unwrap();
+        assert!(list.networks.contains_key("mainnet"));
+
+        let (s, resp) = be.dispatch("get_network", "{}").await;
+        assert_eq!(s, 200);
+        let net: GetNetworkResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(net.network.name, "mainnet");
+
+        let (s, _) = be.dispatch("set_network", r#"{"name":"testnet11"}"#).await;
+        assert_eq!(s, 200);
+        let (_s, resp) = be.dispatch("get_network", "{}").await;
+        let net: GetNetworkResponse = serde_json::from_str(&resp).unwrap();
+        assert_eq!(net.network.name, "testnet11");
+
+        let (s, _) = be
+            .dispatch("set_discover_peers", r#"{"discover_peers":false}"#)
+            .await;
+        assert_eq!(s, 200);
+        let (s, _) = be
+            .dispatch("set_target_peers", r#"{"target_peers":5}"#)
+            .await;
+        assert_eq!(s, 200);
+        let (s, _) = be
+            .dispatch("set_delta_sync", r#"{"delta_sync":false}"#)
+            .await;
+        assert_eq!(s, 200);
+        let (s, _) = be
+            .dispatch(
+                "set_change_address",
+                r#"{"fingerprint":1,"change_address":"xch1abc"}"#,
+            )
+            .await;
+        assert_eq!(s, 200);
+    }
+
+    /// **Proves:** [`WalletBackend::events`] is always populated, and
+    /// [`WalletBackend::with_events`] lets a shared bus be attached — the `GET /events`
+    /// SSE handler (`sage::transport`) always has somewhere to subscribe, and a
+    /// caller-attached bus (e.g. shared with the sync loop) is honored.
+    #[tokio::test]
+    async fn event_bus_is_always_present_and_can_be_shared() {
+        let be = backend_with(vec![], true).await;
+        assert_eq!(be.events().subscriber_count(), 0);
+
+        let shared = std::sync::Arc::new(super::super::events::EventBus::with_capacity(4));
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be2 = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_events(shared.clone());
+        let mut rx = be2.events().subscribe();
+        shared.publish(super::super::events::SyncEvent::Stop);
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            super::super::events::SyncEvent::Stop
+        );
     }
 }
