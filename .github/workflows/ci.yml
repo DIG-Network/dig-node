@@ -60,8 +60,11 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
+      # `--locked` so a manifest version bump (or any dependency change) that
+      # forgets to regenerate Cargo.lock FAILS here on the PR, not later in the
+      # release preflight (which is `--locked`) after the tag is already cut.
       - name: cargo clippy -D warnings
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test + coverage
@@ -89,7 +92,7 @@ jobs:
       # gate here is a one-line change: add `--fail-under-lines 80`.
       - name: cargo llvm-cov (test + coverage)
         run: |
-          cargo llvm-cov --workspace --summary-only | tee coverage-summary.txt
+          cargo llvm-cov --workspace --locked --summary-only | tee coverage-summary.txt
 
       - name: Coverage summary to job summary
         if: always()
