@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.10.0] - 2026-07-10
+
+### Features
+- **sage:** Options/actions/themes/network-settings, SyncEvent stream, dig-keystore seed migration (#12)
+
 ## [0.9.0] - 2026-07-09
 
 ### Features
