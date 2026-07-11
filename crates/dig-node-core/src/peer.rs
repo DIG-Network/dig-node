@@ -1351,8 +1351,12 @@ async fn bring_up_dht(
     // our network id, bounding each RPC by the config's per-RPC timeout, over the FULL NAT ladder with
     // the relay's STUN server feeding its hole-punch tier (#385).
     let transport = Arc::new(
-        crate::dht::NatDhtTransport::new(identity.clone(), network_id.to_string(), config.rpc_timeout)
-            .with_stun_server(stun_server),
+        crate::dht::NatDhtTransport::new(
+            identity.clone(),
+            network_id.to_string(),
+            config.rpc_timeout,
+        )
+        .with_stun_server(stun_server),
     );
     // Our own advertised addresses: the node's REAL routable address(es) at the P2P listen port,
     // ordered IPv6-first (ecosystem HARD RULE) — a global-unicast IPv6 address (when the host has one)
@@ -1361,7 +1365,8 @@ async fn bring_up_dht(
     // with no routable address advertises nothing here and stays reachable via the relay tiers dig-nat
     // composes; loopback/in-process setups opt into a loopback candidate via DIG_NODE_ADVERTISE_LOOPBACK.
     let port = peer_port_from_env();
-    let local = crate::net::advertised_socket_addrs(port, crate::net::advertise_loopback_from_env());
+    let local =
+        crate::net::advertised_socket_addrs(port, crate::net::advertise_loopback_from_env());
     // Add this node's STUN-discovered server-reflexive (public) address to the advertised set (#385)
     // so a remote peer behind a different NAT can dial / hole-punch to it, not just to a LAN-local
     // address. Best-effort + bounded: a failure (no STUN server, timeout) advertises the local
@@ -1371,7 +1376,9 @@ async fn bring_up_dht(
         None => None,
     };
     if let Some(r) = reflexive {
-        println!("dig-node peer network: STUN reflexive address {r} added to advertised candidates");
+        println!(
+            "dig-node peer network: STUN reflexive address {r} added to advertised candidates"
+        );
     }
     let local_addresses: Vec<CandidateAddr> = crate::net::merge_reflexive(local, reflexive)
         .into_iter()

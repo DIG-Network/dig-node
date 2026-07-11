@@ -544,7 +544,10 @@ const NEUTRAL_DIAL_SCORE: f64 = 0.5;
 /// Order dialable candidates best-first by the ranker's score (HIGHER first), STABLY — so the book's
 /// IPv6-first order (§5.2) is preserved among equally-scored peers. A `None` ranker leaves the order
 /// untouched (the book is already IPv6-first). Pure so the ordering is unit-tested without a handle.
-fn order_by_ranker(cands: &mut [crate::address_book::CandidateAddr], ranker: Option<&dyn DialRanker>) {
+fn order_by_ranker(
+    cands: &mut [crate::address_book::CandidateAddr],
+    ranker: Option<&dyn DialRanker>,
+) {
     let Some(r) = ranker else {
         return;
     };
@@ -601,9 +604,10 @@ impl PexPool for GossipPexPool {
             .enabled_methods
             .clone();
         for cand in dialable.into_iter().take(MAX_CANDIDATE_DIALS) {
-            let (Some(peer_id), Some(addr)) =
-                (parse_gossip_peer_id(&cand.peer_id), cand.addrs.first().copied())
-            else {
+            let (Some(peer_id), Some(addr)) = (
+                parse_gossip_peer_id(&cand.peer_id),
+                cand.addrs.first().copied(),
+            ) else {
                 continue;
             };
             // Skip a peer already in the connected pool — the book is a superset of the live pool.

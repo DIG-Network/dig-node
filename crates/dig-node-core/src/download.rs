@@ -725,7 +725,8 @@ impl NodeContent {
         stun_server: Option<std::net::SocketAddr>,
     ) -> Arc<Self> {
         let locator = Arc::new(DhtProviderLocator::new(dht));
-        let nat_config = crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server);
+        let nat_config =
+            crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server);
         let transport = Arc::new(NatRangeTransport::new(identity, nat_config, network_id));
         Self::new(locator, transport, miss_mode, self_peer_id, cache_dir)
     }

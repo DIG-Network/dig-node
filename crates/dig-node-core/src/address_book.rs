@@ -199,7 +199,10 @@ impl AddressBook {
     /// Number of entries currently held (incl. stale-but-not-yet-evicted).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.lock().expect("address_book mutex poisoned").len()
+        self.entries
+            .lock()
+            .expect("address_book mutex poisoned")
+            .len()
     }
 
     /// Whether the book holds no entries.
@@ -272,7 +275,12 @@ mod tests {
 
     #[test]
     fn new_orders_addresses_ipv6_first_and_dedups() {
-        let c = CandidateAddr::new(hexid(1), vec![v4(9), v6(9), v4(9)], AddrProvenance::Pex, 100);
+        let c = CandidateAddr::new(
+            hexid(1),
+            vec![v4(9), v6(9), v4(9)],
+            AddrProvenance::Pex,
+            100,
+        );
         assert_eq!(c.addrs, vec![v6(9), v4(9)], "IPv6 leads, duplicate dropped");
         assert!(c.has_ipv6());
         assert!(!c.is_relay_only());
@@ -289,7 +297,12 @@ mod tests {
     #[test]
     fn relay_only_hint_persists_in_the_book() {
         let book = AddressBook::new(DEFAULT_TTL_SECS, DEFAULT_CAPACITY);
-        book.offer(CandidateAddr::new(hexid(3), vec![], AddrProvenance::Pex, 100));
+        book.offer(CandidateAddr::new(
+            hexid(3),
+            vec![],
+            AddrProvenance::Pex,
+            100,
+        ));
         assert!(book.contains(&hexid(3)), "relay-only hint must persist");
         // It appears in the full candidate list (seeding future selection) but NOT the dialable set.
         assert_eq!(book.candidates(100).len(), 1);
@@ -299,11 +312,25 @@ mod tests {
     #[test]
     fn offer_upserts_unions_addresses_and_freshens() {
         let book = AddressBook::new(DEFAULT_TTL_SECS, DEFAULT_CAPACITY);
-        book.offer(CandidateAddr::new(hexid(4), vec![v4(9)], AddrProvenance::Pex, 100));
-        book.offer(CandidateAddr::new(hexid(4), vec![v6(9)], AddrProvenance::GetPeers, 200));
+        book.offer(CandidateAddr::new(
+            hexid(4),
+            vec![v4(9)],
+            AddrProvenance::Pex,
+            100,
+        ));
+        book.offer(CandidateAddr::new(
+            hexid(4),
+            vec![v6(9)],
+            AddrProvenance::GetPeers,
+            200,
+        ));
         assert_eq!(book.len(), 1, "same peer upserts, not duplicates");
         let c = &book.candidates(200)[0];
-        assert_eq!(c.addrs, vec![v6(9), v4(9)], "addresses unioned + IPv6-first");
+        assert_eq!(
+            c.addrs,
+            vec![v6(9), v4(9)],
+            "addresses unioned + IPv6-first"
+        );
         assert_eq!(c.learned_at, 200, "freshened to newer sighting");
         assert_eq!(
             c.provenance,
@@ -315,18 +342,50 @@ mod tests {
     #[test]
     fn later_pex_hint_does_not_downgrade_first_hand_provenance() {
         let book = AddressBook::new(DEFAULT_TTL_SECS, DEFAULT_CAPACITY);
-        book.offer(CandidateAddr::new(hexid(5), vec![v6(9)], AddrProvenance::PoolDirect, 100));
-        book.offer(CandidateAddr::new(hexid(5), vec![v6(9)], AddrProvenance::Pex, 150));
-        assert_eq!(book.candidates(150)[0].provenance, AddrProvenance::PoolDirect);
+        book.offer(CandidateAddr::new(
+            hexid(5),
+            vec![v6(9)],
+            AddrProvenance::PoolDirect,
+            100,
+        ));
+        book.offer(CandidateAddr::new(
+            hexid(5),
+            vec![v6(9)],
+            AddrProvenance::Pex,
+            150,
+        ));
+        assert_eq!(
+            book.candidates(150)[0].provenance,
+            AddrProvenance::PoolDirect
+        );
     }
 
     #[test]
     fn candidates_are_ipv6_first_then_dialable_then_relay_only() {
         let book = AddressBook::new(DEFAULT_TTL_SECS, DEFAULT_CAPACITY);
-        book.offer(CandidateAddr::new(hexid(0x10), vec![], AddrProvenance::Pex, 100)); // relay-only
-        book.offer(CandidateAddr::new(hexid(0x11), vec![v4(9)], AddrProvenance::Pex, 100)); // v4
-        book.offer(CandidateAddr::new(hexid(0x12), vec![v6(9)], AddrProvenance::Pex, 100)); // v6
-        let ordered: Vec<String> = book.candidates(100).into_iter().map(|c| c.peer_id).collect();
+        book.offer(CandidateAddr::new(
+            hexid(0x10),
+            vec![],
+            AddrProvenance::Pex,
+            100,
+        )); // relay-only
+        book.offer(CandidateAddr::new(
+            hexid(0x11),
+            vec![v4(9)],
+            AddrProvenance::Pex,
+            100,
+        )); // v4
+        book.offer(CandidateAddr::new(
+            hexid(0x12),
+            vec![v6(9)],
+            AddrProvenance::Pex,
+            100,
+        )); // v6
+        let ordered: Vec<String> = book
+            .candidates(100)
+            .into_iter()
+            .map(|c| c.peer_id)
+            .collect();
         assert_eq!(ordered, vec![hexid(0x12), hexid(0x11), hexid(0x10)]);
         // dialable_candidates drops the relay-only tail, keeps IPv6-first.
         let dialable: Vec<String> = book
@@ -340,18 +399,44 @@ mod tests {
     #[test]
     fn stale_candidates_are_dropped_from_readback() {
         let book = AddressBook::new(10, DEFAULT_CAPACITY);
-        book.offer(CandidateAddr::new(hexid(6), vec![v6(9)], AddrProvenance::Pex, 100));
+        book.offer(CandidateAddr::new(
+            hexid(6),
+            vec![v6(9)],
+            AddrProvenance::Pex,
+            100,
+        ));
         assert_eq!(book.candidates(105).len(), 1, "within TTL: present");
-        assert!(book.candidates(200).is_empty(), "past TTL: dropped from readback");
-        assert!(book.contains(&hexid(6)), "still held until evicted/refreshed");
+        assert!(
+            book.candidates(200).is_empty(),
+            "past TTL: dropped from readback"
+        );
+        assert!(
+            book.contains(&hexid(6)),
+            "still held until evicted/refreshed"
+        );
     }
 
     #[test]
     fn capacity_evicts_the_stalest_on_new_insert() {
         let book = AddressBook::new(DEFAULT_TTL_SECS, 2);
-        book.offer(CandidateAddr::new(hexid(7), vec![v6(9)], AddrProvenance::Pex, 100)); // stalest
-        book.offer(CandidateAddr::new(hexid(8), vec![v6(9)], AddrProvenance::Pex, 200));
-        book.offer(CandidateAddr::new(hexid(9), vec![v6(9)], AddrProvenance::Pex, 300)); // evicts 7
+        book.offer(CandidateAddr::new(
+            hexid(7),
+            vec![v6(9)],
+            AddrProvenance::Pex,
+            100,
+        )); // stalest
+        book.offer(CandidateAddr::new(
+            hexid(8),
+            vec![v6(9)],
+            AddrProvenance::Pex,
+            200,
+        ));
+        book.offer(CandidateAddr::new(
+            hexid(9),
+            vec![v6(9)],
+            AddrProvenance::Pex,
+            300,
+        )); // evicts 7
         assert_eq!(book.len(), 2);
         assert!(!book.contains(&hexid(7)), "stalest evicted");
         assert!(book.contains(&hexid(8)) && book.contains(&hexid(9)));

@@ -397,7 +397,10 @@ mod tests {
         }
         // The port-mapping + hole-punch tiers that the old `[Direct, Relayed]` config skipped:
         assert!(
-            cfg.is_enabled(Upnp) && cfg.is_enabled(NatPmp) && cfg.is_enabled(Pcp) && cfg.is_enabled(HolePunch),
+            cfg.is_enabled(Upnp)
+                && cfg.is_enabled(NatPmp)
+                && cfg.is_enabled(Pcp)
+                && cfg.is_enabled(HolePunch),
             "UPnP/NAT-PMP/PCP/hole-punch must be tried before falling back to the relay"
         );
     }
@@ -468,6 +471,9 @@ mod tests {
             vec![reflexive_v4, v4]
         );
         // With no local addresses at all, the reflexive is the sole candidate.
-        assert_eq!(merge_reflexive(vec![], Some(reflexive_v4)), vec![reflexive_v4]);
+        assert_eq!(
+            merge_reflexive(vec![], Some(reflexive_v4)),
+            vec![reflexive_v4]
+        );
     }
 }
