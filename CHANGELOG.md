@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.16.0] - 2026-07-11
+
+### Features
+- **verify:** Server-side verification ledger + GET /verify endpoint (#307) (#20)
+
 ## [0.15.0] - 2026-07-11
 
 ### Features
