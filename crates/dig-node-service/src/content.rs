@@ -167,10 +167,7 @@ pub fn reroot_via_referer(referer: Option<&str>, req_path: &str) -> Option<Store
     let referer = referer?;
     // Take the PATH component of the Referer URL (strip scheme + host).
     let after_scheme = referer.split_once("://").map_or(referer, |x| x.1);
-    let ref_path = match after_scheme.find('/') {
-        Some(i) => &after_scheme[i..],
-        None => return None,
-    };
+    let ref_path = &after_scheme[after_scheme.find('/')?..];
     let base = parse_store_path(ref_path)?;
     Some(StorePath {
         store_id: base.store_id,
