@@ -32,6 +32,10 @@
 
 pub mod cli;
 pub mod config;
+/// Pure HTTP helpers for the local plaintext content-serve surface (#289): `/s/...` route parsing,
+/// `<base>`/Referer store-root rerooting, the content-type map, the SPA-vs-asset classifier, and the
+/// served-store CSP. The wiring lives in [`server`].
+pub mod content;
 pub mod control;
 pub mod meta;
 pub mod pair;

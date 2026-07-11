@@ -12,21 +12,27 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Request, State,
+        Path, Request, State,
     },
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use dig_node_core::content_serve::{PlaintextOutcome, ServeSource};
 use dig_node_core::{cache_cap_bytes, cache_used_bytes, handle_rpc, Node};
 use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::config::{host_is_allowed, Config};
+use crate::content::{
+    content_type_for, inject_html_head, is_html, is_static_asset_path, parse_store_path,
+    reroot_via_referer, store_base_href, StorePath, STORE_CSP,
+};
 use crate::control::{self, ControlCtx};
 use crate::meta;
 use crate::meta::ErrorCode;
@@ -122,6 +128,13 @@ pub fn router(state: AppState) -> Router {
         // client's SW — the OPEN SOCKET is itself the liveness signal, with a
         // heartbeat detecting a half-open connection. See [`ws_status`].
         .route("/ws/status", get(ws_status))
+        // `GET /s/<storeId>[:<root>]/<path>` (#289): the LOCAL plaintext content-serve
+        // surface — the node decrypts server-side and returns the real website over
+        // loopback, DISTINCT from the blind-ciphertext JSON-RPC `POST /` above. See
+        // [`store_serve`]. A root-absolute subresource (`GET /foo.js`) misses this
+        // route and lands in the fallback, which reroots it via `Referer`.
+        .route("/s/*path", get(store_serve))
+        .fallback(fallback_serve)
         // Host-header allowlist (#91): both loopback listeners share this router,
         // so a single guard accepts the canonical local names (dig.local /
         // localhost / 127.0.0.1 / 127.0.0.2 [+ :port]) and rejects a foreign Host
@@ -564,6 +577,147 @@ async fn proxy(http: &reqwest::Client, upstream: &str, req: &Value) -> Result<Va
     resp.json::<Value>()
         .await
         .map_err(|e| format!("upstream returned non-JSON: {e}"))
+}
+
+// -- Local plaintext content-serve (#289/#290) ---------------------------------------------------
+//
+// `GET /s/<storeId>[:<root>]/<path>` decrypts server-side and returns the real website over
+// LOOPBACK — DISTINCT from the blind-ciphertext JSON-RPC `POST /`. The resolve→verify→decrypt core
+// (local-first → peer → public-RPC, chain-anchored-root pinned, #127/#290) is
+// `dig_node_core::Node::serve_content_plaintext`; the pure HTTP helpers (route parse, base/Referer
+// rerooting, content-type, CSP, SPA classifier) are in [`crate::content`]. Plaintext only ever
+// crosses loopback (the Host allowlist + CORS answer only loopback names), never the public gateway.
+
+/// `GET /s/<storeId>[:<root>]/<path>` — serve a store resource as decrypted plaintext.
+async fn store_serve(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    match parse_store_path(&path) {
+        Some(sp) => serve_resource(&state, sp).await,
+        None => not_found(),
+    }
+}
+
+/// Router fallback: a ROOT-ABSOLUTE subresource request (`GET /foo.js`) whose store the browser
+/// dropped from the path. Reroot it into its store via the same-origin `Referer` a store page
+/// carries (`<meta name="referrer" content="same-origin">` guarantees it is sent); an unattributable
+/// request is a plain `404` (an asset) or is SPA-handled inside [`serve_resource`] (a route). Any
+/// non-store / non-GET request lands here too and 404s.
+async fn fallback_serve(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+    let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
+    match reroot_via_referer(referer, uri.path()) {
+        Some(sp) => serve_resource(&state, sp).await,
+        None => not_found(),
+    }
+}
+
+/// Resolve → verify → decrypt one store resource and shape the HTTP response, applying the
+/// SPA-fallback-vs-404 decision on a miss.
+async fn serve_resource(state: &AppState, sp: StorePath) -> Response {
+    let root = sp.root.as_deref().unwrap_or("");
+    // Public stores only for now (salt = None): a private store's secret salt is not yet provisioned
+    // to the local serve surface, so such a store fails closed at decrypt (a documented follow-up).
+    match state
+        .node
+        .serve_content_plaintext(&sp.store_id, root, &sp.resource, None)
+        .await
+    {
+        PlaintextOutcome::Served {
+            bytes,
+            root_hex,
+            verified,
+            source,
+        } => served_response(&sp, &sp.resource, bytes, &root_hex, verified, source),
+        PlaintextOutcome::NotFound { root_hex } => serve_miss(state, &sp, &root_hex).await,
+        PlaintextOutcome::InvalidParams { message } => {
+            error_response(StatusCode::BAD_REQUEST, &message)
+        }
+        // The chain-anchored-root pin failed closed, or the fetched bytes could not be verified/
+        // decrypted — a gateway-class error, never a silently-served failure (#127 fail-closed).
+        PlaintextOutcome::RootError { message, .. }
+        | PlaintextOutcome::Unreadable { message, .. } => {
+            error_response(StatusCode::BAD_GATEWAY, &message)
+        }
+    }
+}
+
+/// The SPA-fallback-vs-404 decision on a content miss (#144 MIME rule):
+/// - a known static ASSET that misses → honest `404` (never `text/html`);
+/// - a KNOWN file (in the store's public manifest) missing at this root → honest `404`;
+/// - otherwise a ROUTE (or a store with no manifest) → serve the store's `index.html` (`200`,
+///   `text/html`) so an SPA client-side deep link boots.
+async fn serve_miss(state: &AppState, sp: &StorePath, root_hex: &str) -> Response {
+    if is_static_asset_path(&sp.resource) {
+        return not_found();
+    }
+    if let Some(paths) = state.node.manifest_paths(&sp.store_id, root_hex).await {
+        if paths.iter().any(|p| p == &sp.resource) {
+            return not_found();
+        }
+    }
+    // SPA fallback: the store's default view, served against the SAME resolved root.
+    match state
+        .node
+        .serve_content_plaintext(&sp.store_id, root_hex, "index.html", None)
+        .await
+    {
+        PlaintextOutcome::Served {
+            bytes,
+            root_hex,
+            verified,
+            source,
+        } => served_response(sp, "index.html", bytes, &root_hex, verified, source),
+        _ => not_found(),
+    }
+}
+
+/// Build the `200` response for a served resource: the ecosystem content-type + `nosniff`, the
+/// `X-Dig-Verified`/`X-Dig-Root`/`X-Dig-Source` provenance headers (#292), and — for HTML — the
+/// injected store-root `<base>`/`<meta referrer>` plus the hardened store CSP.
+fn served_response(
+    sp: &StorePath,
+    resource: &str,
+    bytes: Vec<u8>,
+    root_hex: &str,
+    verified: bool,
+    source: ServeSource,
+) -> Response {
+    let content_type = content_type_for(resource);
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header("X-Content-Type-Options", "nosniff")
+        .header("X-Dig-Verified", if verified { "true" } else { "false" })
+        .header("X-Dig-Root", root_hex)
+        .header("X-Dig-Source", source.as_str());
+
+    let body = if is_html(content_type) {
+        builder = builder.header(header::CONTENT_SECURITY_POLICY, STORE_CSP);
+        let html = String::from_utf8_lossy(&bytes);
+        inject_html_head(&html, &store_base_href(sp)).into_bytes()
+    } else {
+        bytes
+    };
+    builder
+        .body(Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// A plain-text error response (never `text/html`, so a browser never renders a store error as a
+/// page) carrying `nosniff`.
+fn error_response(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        [
+            ("content-type", "text/plain; charset=utf-8"),
+            ("x-content-type-options", "nosniff"),
+        ],
+        format!("{}: {message}", status.as_u16()),
+    )
+        .into_response()
+}
+
+/// A plain-text `404` for an asset miss / unattributable request.
+fn not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "not found")
 }
 
 /// Run the dig-node HTTP server until the process is asked to stop. Binds the

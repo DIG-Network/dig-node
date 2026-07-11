@@ -67,7 +67,10 @@ NOT run this in-process node — it is a pure RPC consumer of an EXTERNAL node o
 Chrome extension's `fetchContentViaRPC` pipeline) MUST work against this node unchanged. Verification and
 decryption happen in the **client** — for the DIG Browser via the native read-crypto FFI (§15.1), for
 webpages via the equivalent `dig-client-wasm`; the node serves blind ciphertext + proofs and MUST NOT
-return plaintext for content reads.
+return plaintext for content reads. The ONE exception is the loopback-only local plaintext
+content-serve surface (§4.6) — a DISTINCT HTTP surface from this JSON-RPC read plane — which decrypts
+SERVER-SIDE for a same-machine browser over loopback; the JSON-RPC `POST /` read plane, `rpc.dig.net`,
+and every peer surface stay blind ciphertext + proof.
 
 1.4. **Canonical RPC interface — `dig-rpc-types` + `dig-rpc`.** The RPC surface this node exposes
 (method names + request/response types, the error-code taxonomy, and the tier classification) is
@@ -294,6 +297,8 @@ method/header-allow behavior above.
 | `/openrpc.json` | GET | The OpenRPC document (§6.3). |
 | `/.well-known/dig-node.json` | GET | The discovery document (§6.4). |
 | `/ws/status` | GET (WS upgrade) | WebSocket status/liveness channel (§4.5). |
+| `/s/<storeId>[:<root>]/<path>` | GET | Local plaintext content-serve — server-side decrypt (§4.6). |
+| *(fallback)* | GET | Root-absolute subresource rerooted via `Referer` into its store (§4.6). |
 
 ### 4.5. `GET /ws/status` — WebSocket status/liveness channel (#239)
 
@@ -345,6 +350,71 @@ connection that has gone quiet for materially longer than the heartbeat interval
 reconnect) even if the socket's `readyState` still reports open. A client SHOULD reconnect with
 exponential backoff + jitter on any close/error and reset that backoff the moment a connection
 succeeds again.
+
+### 4.6. Local plaintext content-serve — `GET /s/<storeId>[:<root>]/<path>` (#289/#290)
+
+A same-machine browser cannot present a client cert to obtain plaintext from the public gateway
+(§5.3), so the LOCAL node — the trusted, key-holding, loopback-only endpoint — exposes a DISTINCT
+HTTP surface that decrypts SERVER-SIDE and returns the real website. This is separate from the blind
+JSON-RPC `POST /` read plane (§1.3, §5): plaintext crosses ONLY loopback; `rpc.dig.net` and peers
+stay ciphertext-only.
+
+**Route.** `GET /s/<storeId>[:<root>]/<path>` on every loopback listener (§4.1: `localhost:<port>`,
+`[::1]:<port>`, and bare `http://dig.local`). `<storeId>` and the optional `<root>` are 64-hex; a
+bare `/s/<storeId>[:<root>]/` (empty `<path>`) serves the store's default view `index.html`
+(`DEFAULT_RESOURCE_KEY`). The Host allowlist (§4.2) + CORS (§4.3) answer only loopback names, so this
+surface is never reachable off-machine.
+
+**Resolution + verify + decrypt (fail-closed).** For `(storeId, path)` the node:
+1. resolves `path` → `retrieval_key = SHA-256(canonical rootless URN)` (`urn:dig:chia:<storeId>[/<path>]`,
+   empty → `index.html`) — byte-identical to `dig-client-wasm`/`dig-runtime`;
+2. resolves the store's chain-anchored tip root and PINS the serve to it (§14.4, #127) — a requested
+   root that is not the tip, an unconfirmable store, or an unreachable chain fails closed;
+3. fetches the resource's ciphertext + inclusion proof + chunk lengths LOCAL-FIRST, then peer, then the
+   public RPC (§4.6 cache order below);
+4. verifies `resource_leaf(ciphertext) == proof.leaf`, `proof.verify()`, and `proof.root ==
+   chain_anchored_root`, THEN AES-256-GCM-SIV-decrypts each chunk under the per-URN key — the SAME
+   `digstore-core` read-crypto every DIG client uses. A tampered chunk, decoy, or non-anchored root
+   never decrypts.
+
+**Store-root scoping (shared-origin best-effort).** Served HTML is rewritten with an injected
+`<base href="/s/<storeId>[:<root>]/">` (RELATIVE links resolve within the store) and
+`<meta name="referrer" content="same-origin">`. A ROOT-ABSOLUTE `/foo` request (the browser drops the
+`/s/...` prefix) lands in the router fallback and is REROOTED via the same-origin `Referer` back into
+its store; an unattributable root-absolute request is a `404` (asset) or the SPA fallback (route).
+Absolute `https://…` URLs bypass the node entirely.
+
+**SPA history-fallback + MIME rule (#144).** A route-like miss (`path` whose final segment has NO known
+static-asset extension) serves the store's `index.html` (`200 text/html`) so a client-side deep link
+boots. The node uses the store's `PublicManifest` (§5.5.1) to distinguish a KNOWN file genuinely missing
+at this root (an honest `404`) from a route (the SPA fallback); a null manifest (old/private store)
+degrades to the extension-less-path heuristic. An ASSET miss (a known non-HTML extension —
+`js`/`mjs`/`css`/`json`/`wasm`/`svg`/images/fonts/media/…) is ALWAYS an honest `404`, never `text/html`
+(a `text/html` body for a service-worker/module fetch is rejected by the browser for a wrong MIME type).
+
+**Content-type + CSP.** The `Content-Type` is the ecosystem extension→MIME map (byte-identical to the
+DIG loader's `contentType()`), with `X-Content-Type-Options: nosniff`. Served HTML additionally carries
+a synthesized hardened store CSP (`object-src 'none'`, same-origin `base-uri`, un-framed, with the
+sanctioned content network legs) attached as a response header, never trusted from the store body.
+
+**Provenance headers (every serve, #292).** `X-Dig-Verified: true|false` (inclusion + chain-anchored-root
+verified server-side — `false` only when the node-side pin is disabled via `DIG_NODE_PIN=off`),
+`X-Dig-Root: <root>` (the resolved root served against), and `X-Dig-Source: local|peer|rpc` (the tier
+that served the MAIN resource). A consumer's DIG Shields / toolbar reads these.
+
+**Local-first store cache (#290).** Resolution order per `(store, root)`:
+1. a synced+verified `.dig` module on disk → serve LOCAL, no network (the DEFAULT once cached);
+2. not held → serve the immediate resource from a peer / the public RPC AND trigger a single-flight
+   background whole-`.dig` sync-down (the deduped `maybe_backfill_capsule` → chain-anchored-root-pinned
+   whole-store pull) into the reserved LRU cache dir, so the NEXT read is local. LRU eviction (§7.10)
+   applies; an evicted-then-re-requested capsule re-syncs. Freshness is inherent to the anchored-root
+   pin (§14.4): a stale locally-cached generation whose root is not the on-chain tip is NEVER served as
+   current — the read resolves the tip and fetches/backfills that generation, so local-default is never
+   local-FROZEN. A synced `.dig` is trusted only after it verifies against the on-chain root at serve.
+
+**Salt.** A private store's secret salt is not yet provisioned to this surface; a private store therefore
+fails closed at decrypt. Public stores (salt = none) serve fully. (Private-store salt provisioning is a
+tracked follow-up.)
 
 ---
 
