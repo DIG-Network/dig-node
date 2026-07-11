@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.19.0] - 2026-07-11
+
+### Features
+- **p2p:** Wire dig-node to its P2P crates (full ladder, DHT locator, address book, dials) (#23)
+
 ## [0.18.0] - 2026-07-11
 
 ### Features
