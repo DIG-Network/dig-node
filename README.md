@@ -73,29 +73,42 @@ localhost:9778
 common-dev ports like `80`/`8080`, and the sibling of the dig-wallet API's `9777`. The extension's
 `server.host` default targets `9778` to match. Override with `DIG_NODE_PORT` if you need another port.)
 
-## Addressing — `http://dig.local` (no port) + `http://localhost:<port>` (#91)
+## Addressing — `http://dig.local` (no port) + `http://localhost:<port>` (#91, #288)
 
-The node opens **two loopback listeners for the same app** so it is reachable two ways at once:
+The node opens **up to three loopback listeners for the same app** so it is reachable multiple
+ways at once:
 
 | Address | Listener | Always on? |
 |---|---|---|
-| **`http://localhost:<port>`** (default `localhost:9778`) | `127.0.0.1:<port>` | **Yes** — unprivileged, conflict-free. The guaranteed fallback. |
+| **`http://localhost:<port>`** (IPv4, default `localhost:9778`) | `127.0.0.1:<port>` | **Yes** — unprivileged, conflict-free. The guaranteed fallback. |
+| **`http://localhost:<port>`** (IPv6) | `[::1]:<port>` | **Best-effort**, on by default. Present unless an explicit `DIG_NODE_HOST` override is set. |
 | **`http://dig.local`** (no port) | `127.0.0.2:80` | **Best-effort** — needs the privileged `:80` bind (+ on macOS a loopback alias). Falls back gracefully if it can't bind. |
 
+- **Dual-stack `localhost` (#288).** Some systems resolve `localhost` to the IPv6 loopback `::1`
+  FIRST (Windows by default). Without the `[::1]:<port>` listener such a client cannot reach the
+  node and reports it offline even though `127.0.0.1:<port>` answers fine. The node binds BOTH
+  loopback families by default so `localhost:<port>` works regardless of which family a client's
+  resolver returns first. Setting `DIG_NODE_HOST` to an explicit address REPLACES this default dual
+  bind with exactly that one address (a service install only forwards `DIG_NODE_HOST` into the
+  installed service's environment when you gave an explicit override, so a plain `dig-node install`
+  still dual-binds).
 - The bare `http://dig.local` URL (no `:port`) works because [`dig-installer`](https://github.com/DIG-Network/dig-installer)
   writes a hosts entry **`127.0.0.2  dig.local`** and the node binds **`127.0.0.2:80`**. A distinct
   loopback IP (`.2`, not `.1`) is used so the port-80 bind can never collide with an unrelated
   `localhost:80` service.
-- **Neither listener binds `0.0.0.0`** — both are loopback IPs, so the node is **never LAN-exposed**.
-- **Graceful fallback (never aborts):** binding `127.0.0.2:80` is privileged and may fail (no
-  privilege, port in use, or — on macOS — a missing loopback alias). If it fails, the node logs a
-  **structured warning** and serves **localhost-only**; it never aborts. `localhost:<port>` is the
-  guaranteed fallback. Set **`DIG_NODE_DIGLOCAL=0`** to skip the `dig.local` attempt entirely.
-- **Host-header allowlist.** Both listeners answer only to the canonical local names — **`dig.local`**,
-  **`localhost`**, **`127.0.0.1`**, **`127.0.0.2`** (with or without a `:port`). A request with any
-  other `Host` (the classic DNS-rebinding vector — a public name pointed at the loopback bind) is
-  rejected **`421 Misdirected Request`** with a catalogued `INVALID_REQUEST` error body, even though
-  the bind is already loopback-only. A missing `Host` (HTTP/1.0 / health probes) is allowed.
+- **No listener binds `0.0.0.0` or `[::]`** — every one is a loopback address, so the node is
+  **never LAN-exposed**.
+- **Graceful fallback (never aborts):** binding `[::1]:<port>` (IPv6 loopback unavailable/disabled)
+  or `127.0.0.2:80` (privileged; no privilege, port in use, or — on macOS — a missing loopback
+  alias) may fail. If either fails, the node logs a **structured warning** and keeps serving on
+  whatever it did bind; it never aborts for either. `127.0.0.1:<port>` is the one guaranteed
+  fallback. Set **`DIG_NODE_DIGLOCAL=0`** to skip the `dig.local` attempt entirely.
+- **Host-header allowlist.** Every listener answers only to the canonical local names — **`dig.local`**,
+  **`localhost`**, **`127.0.0.1`**, **`127.0.0.2`**, **`::1`** (with or without a `:port`, and
+  bracketed — `[::1]`/`[::1]:<port>` — for the IPv6 literal). A request with any other `Host` (the
+  classic DNS-rebinding vector — a public name pointed at the loopback bind) is rejected
+  **`421 Misdirected Request`** with a catalogued `INVALID_REQUEST` error body, even though the bind
+  is already loopback-only. A missing `Host` (HTTP/1.0 / health probes) is allowed.
 
 ### Platform caveats for the `dig.local` (`:80`) listener
 
@@ -126,11 +139,11 @@ service's environment so the service serves identically):
 | Env var | Default | Meaning |
 |---|---|---|
 | `DIG_NODE_PORT` | `9778` | Port the node listens on (`127.0.0.1`). Uncommon high port (dig-wallet `9777` sibling) to avoid `80`/`8080` collisions. |
-| `DIG_NODE_HOST` | `127.0.0.1` | Bind address (loopback — the node is a same-machine endpoint). |
+| `DIG_NODE_HOST` | *(unset)* | EXPLICIT bind-address override. Unset (the default) binds BOTH loopback families — `127.0.0.1` and `[::1]` (#288, see [Addressing](#addressing--httpdiglocal-no-port--httplocalhostport-91-288)); setting it REPLACES that dual bind with exactly the one address given. |
 | `DIG_RPC_UPSTREAM` | `https://rpc.dig.net` | Upstream DIG RPC the embedded node proxies ciphertext/proof requests to on a local cache miss, and relays unhandled methods to. |
 | `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). **Leave it unset to share one cache with the DIG Browser** — see below. |
 | `DIG_NODE_CACHE_CAP` | `1 GiB` | Cache size cap (floored at 64 MiB), LRU-evicted. Also settable via the `cache.setCapBytes` RPC. |
-| `DIG_NODE_DIGLOCAL` | `1` (on) | Whether to ALSO open the bare-`http://dig.local` listener (`127.0.0.2:80`) beside `localhost:<port>`. Auto-attempt with graceful fallback (see [Addressing](#addressing--httpdiglocal-no-port--httplocalhostport-91)). Set to `0`/`false` to skip the attempt. |
+| `DIG_NODE_DIGLOCAL` | `1` (on) | Whether to ALSO open the bare-`http://dig.local` listener (`127.0.0.2:80`) beside `localhost:<port>`. Auto-attempt with graceful fallback (see [Addressing](#addressing--httpdiglocal-no-port--httplocalhostport-91-288)). Set to `0`/`false` to skip the attempt. |
 | `DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC` | `0` (unlimited) | Outgoing-bandwidth cap in bytes/second. Past the cap, a request for content this node holds is redirected to another peer known to hold it (SPEC §17) instead of served over-budget; served locally as a graceful fallback when no alternate holder is known. |
 
 ### Shared `.dig` cache with the DIG Browser (#96)
@@ -184,7 +197,9 @@ server side of SYSTEM.md → *"the browser is also the dig-node's CONTROLLER UI"
 
 Two layers gate the control surface (the read methods are **not** gated):
 
-1. **Loopback-only** — the whole server binds `127.0.0.1`, so nothing off-machine can reach any method.
+1. **Loopback-only** — the whole server binds only loopback addresses (`127.0.0.1` and, by
+   default, `[::1]` — see [Addressing](#addressing--httpdiglocal-no-port--httplocalhostport-91-288)),
+   so nothing off-machine can reach any method.
 2. **Local authorization** for the mutating `control.*` namespace. A random **control token** (32 bytes,
    64-hex) is generated at first run into the node's config dir at **`<config_dir>/control-token`**
    (next to dig-node's `config.json`; `0600` on Unix). A same-host controller reads that file — it can,
@@ -243,8 +258,8 @@ A single fetch tells an agent what the node is, where it serves, and what it spe
 | `GET /.well-known/dig-node.json` | The canonical discovery doc: identity, bound `addr`, cache (`dir`/`cap_bytes`/`used_bytes`/`shared`), the method catalogue, the error catalogue, and pointers to the OpenRPC/health/version endpoints. |
 
 CORS reflects `chrome-extension://` and the local page origins `http://localhost` / `http://dig.local`
-/ `http://127.0.0.1` / `http://127.0.0.2` (with or without a `:port`), so the extension and any page
-served from a canonical local name can call it.
+/ `http://127.0.0.1` / `http://127.0.0.2` / `http://[::1]` (with or without a `:port`), so the
+extension and any page served from a canonical local name can call it.
 
 ## Machine-readable contracts (agent-friendly)
 

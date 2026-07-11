@@ -73,9 +73,17 @@ pub const DIG_LOCAL_HOST: &str = "dig.local";
 /// Resolved dig-node service configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Bind address (always loopback by default — dig-node is a localhost
-    /// endpoint for a same-machine browser/extension, never a public server).
-    pub host: IpAddr,
+    /// Explicit `DIG_NODE_HOST` override, or `None` for the default (#288, §5.2).
+    /// `None` — the default — means "bind BOTH loopback families": `127.0.0.1`
+    /// (always-on, fatal on failure) AND `[::1]` (best-effort), so `localhost`
+    /// reaches the node whether the resolver returns the IPv4 or the IPv6 loopback
+    /// first (Windows resolves `localhost` to `::1` first by default, which made the
+    /// node appear offline to an IPv6-first client before this). `Some(ip)` — an
+    /// explicit override — REPLACES the default dual bind with exactly that one
+    /// address; it does not add to it. See [`Config::bind_addr`] (the primary/
+    /// always-on address) and [`Config::bind_addr_v6`] (the additional IPv6
+    /// loopback address, when applicable).
+    pub host: Option<IpAddr>,
     /// Bind port.
     pub port: u16,
     /// Upstream DIG RPC base URL the embedded dig-node proxies to on a miss.
@@ -100,7 +108,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            host: None,
             port: DEFAULT_PORT,
             upstream: DEFAULT_UPSTREAM.to_string(),
             cache_dir: None,
@@ -122,10 +130,7 @@ impl Config {
             .filter(|p| *p != 0)
             .unwrap_or(DEFAULT_PORT);
 
-        let host = std::env::var("DIG_NODE_HOST")
-            .ok()
-            .and_then(|s| s.parse::<IpAddr>().ok())
-            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let host = parse_host_override(std::env::var("DIG_NODE_HOST").ok());
 
         // Upstream precedence: explicit DIG_RPC_UPSTREAM env > the persisted
         // override (set via the control plane's `control.config.setUpstream`,
@@ -183,9 +188,30 @@ impl Config {
     }
 
     /// The `host:port` socket string for the always-on localhost listener
-    /// (binding / logging).
+    /// (binding / logging): the explicit `DIG_NODE_HOST` override, or the default
+    /// `127.0.0.1` when unset. A bind failure on THIS address is fatal (see
+    /// `server::serve_with_shutdown`) — every consumer (CLI `status`/`pair`, the
+    /// installed-service summary, `/health`'s `addr` field) treats it as THE
+    /// address, so its shape never changes based on the dual-stack default below.
     pub fn bind_addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        format!(
+            "{}:{}",
+            self.host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            self.port
+        )
+    }
+
+    /// The IPv6 loopback bind address (`[::1]:<port>`) to open BESIDE
+    /// [`Config::bind_addr`] (#288, §5.2 dual-stack loopback): `Some` when no
+    /// explicit `DIG_NODE_HOST` override is set (the default — bind BOTH loopback
+    /// families, since some resolvers — Windows' `localhost` by default — return
+    /// `::1` before `127.0.0.1`); `None` when an explicit host override is set (it
+    /// REPLACES the default dual bind with exactly that one address, rather than
+    /// adding to it). This listener is BEST-EFFORT at bind time (see `serve`): an
+    /// IPv6-loopback-unavailable system falls back to IPv4-only, mirroring the
+    /// existing [`Config::dig_local_addr`] best-effort pattern.
+    pub fn bind_addr_v6(&self) -> Option<String> {
+        self.host.is_none().then(|| format!("[::1]:{}", self.port))
     }
 
     /// The `host:port` socket string for the BEST-EFFORT bare-`http://dig.local`
@@ -211,13 +237,26 @@ pub fn parse_dig_local_flag(raw: Option<String>) -> bool {
     }
 }
 
-/// Whether a request `Host` header is allowed (#91). The node is loopback-only and
-/// answers to the canonical local names — bare `dig.local`, `localhost`, the two
-/// loopback IPs `127.0.0.1`/`127.0.0.2` — with or without a `:port` suffix; a
-/// missing Host is allowed (HTTP/1.0 / health probes). Any OTHER host (e.g. a
-/// public domain pointed at the machine, the classic DNS-rebinding vector) is
-/// rejected, so even though the listeners are loopback-only the node never serves a
-/// foreign-named request. PURE: takes the raw header value, returns the decision.
+/// Parse the `DIG_NODE_HOST` override (#288): `Some(ip)` when the raw value is a
+/// valid IP literal, `None` when unset/blank/unparsable. `None` is the DEFAULT and
+/// carries meaning — it is not merely "no value" — see [`Config::host`] and
+/// [`Config::bind_addr_v6`]: it means "bind BOTH loopback families", not merely
+/// "fall back to 127.0.0.1". PURE so the override-vs-default policy is
+/// unit-testable without touching process env.
+pub fn parse_host_override(raw: Option<String>) -> Option<IpAddr> {
+    raw.as_deref().and_then(|s| s.trim().parse::<IpAddr>().ok())
+}
+
+/// Whether a request `Host` header is allowed (#91, #288). The node is
+/// loopback-only and answers to the canonical local names — bare `dig.local`,
+/// `localhost`, the loopback IPs `127.0.0.1`/`127.0.0.2`, and the IPv6 loopback
+/// `::1` (bracketed `[::1]`/`[::1]:<port>` per RFC 7230's mandatory bracketing for
+/// an IPv6-literal Host, or bare `::1` for a non-browser client that omits them) —
+/// with or without a `:port` suffix; a missing Host is allowed (HTTP/1.0 / health
+/// probes). Any OTHER host (e.g. a public domain pointed at the machine, the
+/// classic DNS-rebinding vector) is rejected, so even though the listeners are
+/// loopback-only the node never serves a foreign-named request. PURE: takes the
+/// raw header value, returns the decision.
 pub fn host_is_allowed(host_header: Option<&str>) -> bool {
     // No Host header at all (HTTP/1.0, some probes) → allow: it cannot be a
     // rebinding attack (there is no attacker-chosen name) and the loopback bind
@@ -229,9 +268,29 @@ pub fn host_is_allowed(host_header: Option<&str>) -> bool {
     if host.is_empty() {
         return true;
     }
-    // Strip a trailing `:port` (IPv4 / hostname forms only — the node binds IPv4
-    // loopback, never `[::1]`). `dig.local:80`, `localhost:9778`, `127.0.0.1` all
-    // reduce to their hostname for the allowlist check.
+
+    // IPv6-literal forms (#288): `[::1]` / `[::1]:<port>` (bracketed, the ONLY
+    // legal way to carry an IPv6 literal in a Host header per RFC 7230 — the
+    // brackets disambiguate the address's own colons from the port separator), or
+    // bare `::1` for a non-browser client that skips the brackets. Checked BEFORE
+    // the generic `:port`-strip below, because naively splitting an IPv6 literal
+    // on its LAST `:` would still work for these two specific shapes, but bracket
+    // handling makes the intent explicit and rejects malformed bracket forms.
+    if let Some(inner) = host.strip_prefix('[') {
+        return match inner.strip_suffix(']') {
+            Some(addr) => addr == "::1",
+            None => inner
+                .rsplit_once("]:")
+                .is_some_and(|(addr, _port)| addr == "::1"),
+        };
+    }
+    if host == "::1" {
+        return true;
+    }
+
+    // Strip a trailing `:port` (IPv4 / hostname forms only). `dig.local:80`,
+    // `localhost:9778`, `127.0.0.1` all reduce to their hostname for the
+    // allowlist check.
     let name = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
     matches!(
         name,
@@ -313,6 +372,50 @@ mod tests {
         assert_eq!(DEFAULT_PORT, 9778);
         assert_eq!(c.bind_addr(), "127.0.0.1:9778");
         assert_eq!(c.upstream, DEFAULT_UPSTREAM);
+    }
+
+    // ----- #288: dual-stack loopback bind (127.0.0.1 AND [::1]) ----------------
+
+    #[test]
+    fn default_config_binds_both_loopback_families() {
+        // No DIG_NODE_HOST override → the default is dual-stack: the always-on
+        // IPv4 loopback AND the additional (best-effort) IPv6 loopback, same port.
+        let c = Config::default();
+        assert_eq!(c.host, None);
+        assert_eq!(c.bind_addr(), "127.0.0.1:9778");
+        assert_eq!(c.bind_addr_v6().as_deref(), Some("[::1]:9778"));
+    }
+
+    #[test]
+    fn explicit_host_override_replaces_rather_than_extends_the_default_bind() {
+        // An explicit DIG_NODE_HOST fully replaces the dual-stack default with
+        // exactly that one address — it does not ALSO open [::1].
+        let c = Config {
+            host: Some(std::net::Ipv4Addr::new(10, 0, 0, 5).into()),
+            ..Config::default()
+        };
+        assert_eq!(c.bind_addr(), "10.0.0.5:9778");
+        assert_eq!(c.bind_addr_v6(), None);
+    }
+
+    #[test]
+    fn parse_host_override_parses_a_valid_ip_literal() {
+        assert_eq!(
+            parse_host_override(Some("127.0.0.1".to_string())),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            parse_host_override(Some(" ::1 ".to_string())),
+            Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+    }
+
+    #[test]
+    fn parse_host_override_is_none_when_unset_blank_or_unparsable() {
+        assert_eq!(parse_host_override(None), None);
+        assert_eq!(parse_host_override(Some(String::new())), None);
+        assert_eq!(parse_host_override(Some("   ".to_string())), None);
+        assert_eq!(parse_host_override(Some("not-an-ip".to_string())), None);
     }
 
     #[test]
@@ -421,6 +524,16 @@ mod tests {
     }
 
     #[test]
+    fn host_allowlist_accepts_ipv6_loopback_forms() {
+        // #288: a `localhost` client whose resolver returns `::1` first (Windows
+        // default) sends a bracketed IPv6-literal Host; a non-browser client may
+        // send it bare. All must be allowed the same as the IPv4 loopback forms.
+        for ok in ["::1", "[::1]", "[::1]:9778", "[::1]:80"] {
+            assert!(host_is_allowed(Some(ok)), "{ok:?} must be allowed");
+        }
+    }
+
+    #[test]
     fn host_allowlist_rejects_foreign_hosts() {
         // Anything not on the loopback allowlist (the DNS-rebinding vector) is
         // rejected even though the listeners are loopback-only.
@@ -432,6 +545,15 @@ mod tests {
             "0.0.0.0",
             "attacker",
         ] {
+            assert!(!host_is_allowed(Some(bad)), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn host_allowlist_rejects_non_loopback_ipv6_and_malformed_brackets() {
+        // A non-loopback IPv6 literal (the rebinding vector, ipv6 flavor) and
+        // malformed bracket forms must NOT be allowed.
+        for bad in ["[::2]", "[fe80::1]", "[::1", "[]", "[::1]evil"] {
             assert!(!host_is_allowed(Some(bad)), "{bad:?} must be rejected");
         }
     }
