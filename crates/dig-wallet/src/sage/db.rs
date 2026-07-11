@@ -735,6 +735,134 @@ impl WalletDb {
             .sum())
     }
 
+    // ---- identity-scoped reads (#407) -------------------------------------
+    //
+    // The node answers balance/token/coin reads for the CLIENT's connected wallet, scoped
+    // by that wallet's PUBLIC puzzle hashes (never the node's own coins, never a private
+    // key — #217). XCH coins sit AT the owner's p2 puzzle hash, so they are scoped by
+    // `puzzle_hash`; CAT coins sit at the outer CAT puzzle hash and are HINTED to the
+    // owner p2, so they are scoped by `hint`. An empty identity matches nothing (the node
+    // is not tracking that wallet) — the caller reports the explicit not-tracking state.
+
+    /// Build `n` comma-separated `?` placeholders for an `IN (...)` clause.
+    fn placeholders(n: usize) -> String {
+        vec!["?"; n].join(",")
+    }
+
+    /// Unspent coins for `asset_id` scoped to `puzzle_hashes` (XCH by `puzzle_hash`, CAT by
+    /// `hint`). Returns empty when the identity is empty (nothing tracked).
+    pub async fn unspent_coins_scoped(
+        &self,
+        asset_id: Option<&str>,
+        puzzle_hashes: &[String],
+    ) -> sqlx::Result<Vec<CoinRow>> {
+        if puzzle_hashes.is_empty() {
+            return Ok(vec![]);
+        }
+        let ph = Self::placeholders(puzzle_hashes.len());
+        let (scope_col, asset_clause) = match asset_id {
+            Some(_) => ("hint", "AND asset_id = ?"),
+            None => ("puzzle_hash", "AND asset_id IS NULL"),
+        };
+        let sql = format!(
+            "SELECT * FROM coins WHERE spent_height IS NULL AND created_height IS NOT NULL \
+             AND {scope_col} IN ({ph}) {asset_clause}"
+        );
+        let mut q = sqlx::query(&sql);
+        for p in puzzle_hashes {
+            q = q.bind(p.to_ascii_lowercase());
+        }
+        if let Some(a) = asset_id {
+            q = q.bind(a.to_ascii_lowercase());
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(Self::coin_from_row).collect())
+    }
+
+    /// The unspent balance for `asset_id` scoped to `puzzle_hashes` (the connected wallet).
+    pub async fn balance_scoped(
+        &self,
+        asset_id: Option<&str>,
+        puzzle_hashes: &[String],
+    ) -> sqlx::Result<u128> {
+        let coins = self.unspent_coins_scoped(asset_id, puzzle_hashes).await?;
+        Ok(coins
+            .iter()
+            .filter_map(|c| c.amount.parse::<u128>().ok())
+            .sum())
+    }
+
+    /// All coins (any spent state) for `asset_id` scoped to `puzzle_hashes`. Used by
+    /// `get_coins`, which applies its own spent/filter modes over the returned set.
+    pub async fn coins_scoped(
+        &self,
+        asset_id: Option<&str>,
+        puzzle_hashes: &[String],
+    ) -> sqlx::Result<Vec<CoinRow>> {
+        if puzzle_hashes.is_empty() {
+            return Ok(vec![]);
+        }
+        let ph = Self::placeholders(puzzle_hashes.len());
+        let (scope_col, asset_clause) = match asset_id {
+            Some(_) => ("hint", "AND asset_id = ?"),
+            None => ("puzzle_hash", "AND asset_id IS NULL"),
+        };
+        let sql = format!("SELECT * FROM coins WHERE {scope_col} IN ({ph}) {asset_clause}");
+        let mut q = sqlx::query(&sql);
+        for p in puzzle_hashes {
+            q = q.bind(p.to_ascii_lowercase());
+        }
+        if let Some(a) = asset_id {
+            q = q.bind(a.to_ascii_lowercase());
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(Self::coin_from_row).collect())
+    }
+
+    /// Count of confirmed, unspent coins (XCH + CAT) tracked for `puzzle_hashes` — the
+    /// number of coins the wallet holds for the connected identity. Zero when the identity
+    /// is empty (not tracking). Used to report the honest sync count.
+    pub async fn coin_count_scoped(&self, puzzle_hashes: &[String]) -> sqlx::Result<u32> {
+        if puzzle_hashes.is_empty() {
+            return Ok(0);
+        }
+        let ph = Self::placeholders(puzzle_hashes.len());
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM coins WHERE spent_height IS NULL \
+             AND created_height IS NOT NULL AND (puzzle_hash IN ({ph}) OR hint IN ({ph}))"
+        );
+        let mut q = sqlx::query(&sql);
+        // bound twice — once for the puzzle_hash IN, once for the hint IN
+        for p in puzzle_hashes.iter().chain(puzzle_hashes.iter()) {
+            q = q.bind(p.to_ascii_lowercase());
+        }
+        let row = q.fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("n") as u32)
+    }
+
+    /// Distinct CAT asset ids with at least one unspent coin HINTED to `puzzle_hashes` —
+    /// the CATs the connected wallet owns. Empty when the identity is empty.
+    pub async fn owned_cat_asset_ids_scoped(
+        &self,
+        puzzle_hashes: &[String],
+    ) -> sqlx::Result<Vec<String>> {
+        if puzzle_hashes.is_empty() {
+            return Ok(vec![]);
+        }
+        let ph = Self::placeholders(puzzle_hashes.len());
+        let sql = format!(
+            "SELECT DISTINCT asset_id FROM coins \
+             WHERE asset_id IS NOT NULL AND spent_height IS NULL AND created_height IS NOT NULL \
+             AND hint IN ({ph}) ORDER BY asset_id"
+        );
+        let mut q = sqlx::query(&sql);
+        for p in puzzle_hashes {
+            q = q.bind(p.to_ascii_lowercase());
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("asset_id")).collect())
+    }
+
     // ---- CATs -------------------------------------------------------------
 
     /// Insert or update CAT metadata.

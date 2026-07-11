@@ -13,7 +13,7 @@
 //! the plain-text message.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use serde::Serialize;
@@ -78,6 +78,24 @@ pub struct WalletBackend {
     /// subscribe; [`Self::with_events`] lets bring-up share the SAME bus the sync loop
     /// publishes to.
     events: Arc<EventBus>,
+    /// The connected client's per-session PUBLIC identity (#407), seeded by `login` and
+    /// cleared by `logout`. Interior-mutable + shared across `Clone`s so a `login` on one
+    /// dispatch is visible to subsequent reads on the same backend. `None` until a client
+    /// logs in with its public puzzle hashes — reads then fall back to the node's own
+    /// configured puzzle hashes (legacy), and report "not tracking" when BOTH are empty.
+    /// The node NEVER holds the client's private key (#217): scoping is by public data.
+    identity: Arc<RwLock<Option<SessionIdentity>>>,
+}
+
+/// The connected client's PUBLIC identity for a session (#407). Scoping data only — no key.
+#[derive(Debug, Clone, Default)]
+struct SessionIdentity {
+    /// The logged-in wallet fingerprint (informational; scoping is by puzzle hash).
+    #[allow(dead_code)]
+    fingerprint: u32,
+    /// The client's PUBLIC puzzle hashes (normalized lowercase hex, no `0x`). Reads are
+    /// scoped to these; NEVER the node's own coins.
+    puzzle_hashes: Vec<String>,
 }
 
 impl WalletBackend {
@@ -92,6 +110,7 @@ impl WalletBackend {
             broadcaster: None,
             lineage: None,
             events: Arc::new(EventBus::default()),
+            identity: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -267,13 +286,71 @@ impl WalletBackend {
         Ok(self.db.is_synced().await?)
     }
 
+    // ---- session identity scoping (#407) ---------------------------------
+
+    /// Record the CLIENT's PUBLIC identity for this session (#407): the puzzle hashes /
+    /// addresses it declared on `login`. Reads (`get_sync_status`, `get_cats`, coins) are
+    /// then scoped to these public puzzle hashes — NEVER the node's own coins, NEVER a
+    /// private key (#217). A bare fingerprint login (no puzzle hashes/addresses) leaves any
+    /// prior identity untouched and does NOT seed one.
+    fn login(&self, req: &Login) -> LoginResponse {
+        let mut phs: Vec<String> = Vec::new();
+        if let Some(hashes) = &req.puzzle_hashes {
+            phs.extend(hashes.iter().map(|h| normalize_ph(h)));
+        }
+        if let Some(addrs) = &req.addresses {
+            for a in addrs {
+                if let Some(ph) = decode_address(a) {
+                    phs.push(normalize_ph(&ph));
+                }
+            }
+        }
+        phs.retain(|p| !p.is_empty());
+        phs.sort();
+        phs.dedup();
+        if !phs.is_empty() {
+            *self.identity.write().unwrap() = Some(SessionIdentity {
+                fingerprint: req.fingerprint,
+                puzzle_hashes: phs,
+            });
+        }
+        LoginResponse {}
+    }
+
+    /// Clear the session identity (`logout`): the node stops tracking the client's wallet.
+    fn logout(&self) -> LogoutResponse {
+        *self.identity.write().unwrap() = None;
+        LogoutResponse {}
+    }
+
+    /// The PUBLIC puzzle hashes a wallet-data read is scoped to: the logged-in session
+    /// identity if a `login` seeded one, else the node's own configured puzzle hashes
+    /// (legacy). Normalized lowercase hex. Empty ⇒ the node is not tracking any wallet, so
+    /// scoped reads return nothing and `get_sync_status` reports the honest not-tracking
+    /// state (never a silent synced-zero).
+    fn scoped_identity(&self) -> Vec<String> {
+        if let Some(id) = self.identity.read().unwrap().as_ref() {
+            if !id.puzzle_hashes.is_empty() {
+                return id.puzzle_hashes.clone();
+            }
+        }
+        self.config
+            .puzzle_hashes
+            .iter()
+            .map(|p| normalize_ph(p))
+            .collect()
+    }
+
     /// The candidate coin set for a wallet-data read of `asset_id`, sourced per the B.6
     /// routing table: the local DB once synced, else the coinset fallback (so the caller
     /// never blocks on an unsynced replica).
     async fn wallet_coins(&self, asset_id: Option<&str>) -> Result<Vec<CoinRecord>> {
+        // Scope EVERY wallet-data read to the connected client's PUBLIC identity (#407) —
+        // never the node's own coins. An empty identity ⇒ not tracking ⇒ no coins.
+        let identity = self.scoped_identity();
         match routing::route(self.synced().await?, true) {
             Source::Db => {
-                let rows = self.db.all_coins().await?;
+                let rows = self.db.coins_scoped(asset_id, &identity).await?;
                 Ok(rows
                     .iter()
                     .filter(|c| c.asset_id.as_deref() == asset_id)
@@ -289,7 +366,7 @@ impl WalletBackend {
                 }
                 let coins = self
                     .fallback
-                    .coin_records_by_puzzle_hashes(&self.config.puzzle_hashes)
+                    .coin_records_by_puzzle_hashes(&identity)
                     .await?;
                 Ok(coins
                     .iter()
@@ -307,14 +384,45 @@ impl WalletBackend {
         }
     }
 
+    /// The connected wallet's sync state (#407), scoped to the client's PUBLIC identity and
+    /// reported TRUTHFULLY:
+    ///
+    /// - `selectable_balance` sums ONLY the identity's unspent XCH coins (never the node's
+    ///   own coins). An identity the node isn't tracking sums to 0.
+    /// - The sync flag the client derives as `synced_coins >= total_coins` (with
+    ///   `total_coins == 0` treated as synced) is made HONEST: the node reports synced ONLY
+    ///   when it is tracking the identity AND the DB has completed its initial catch-up.
+    ///   Otherwise it reports `synced_coins < total_coins` (`0` of at-least-`1`), so the
+    ///   client sees "syncing"/"not tracking" and NEVER adopts a silent synced-zero (the
+    ///   #399 root cause: an empty/unsynced DB previously forced `synced_coins==total_coins`
+    ///   and read as synced with balance 0).
     async fn get_sync_status(&self) -> Result<GetSyncStatusResponse> {
-        let balance = self.db.balance(None).await?;
-        let total = self.db.all_coins().await?.len() as u32;
+        let identity = self.scoped_identity();
+        let tracking = !identity.is_empty();
+        let db_synced = self.db.is_synced().await?;
+        let balance = if tracking {
+            self.db.balance_scoped(None, &identity).await?
+        } else {
+            0
+        };
+        let known = if tracking {
+            self.db.coin_count_scoped(&identity).await?
+        } else {
+            0
+        };
+        let (synced_coins, total_coins) = if tracking && db_synced {
+            // Tracking + caught up ⇒ synced (an empty-but-synced wallet is `0 == 0` = synced).
+            (known, known)
+        } else {
+            // Not tracking, or still catching up ⇒ honestly NOT synced: force
+            // `synced_coins < total_coins` so the client shows syncing, never a silent 0.
+            (0, known.max(1))
+        };
         Ok(GetSyncStatusResponse {
             selectable_balance: Amount::u128(balance),
             unit: Unit::xch(),
-            synced_coins: total,
-            total_coins: total,
+            synced_coins,
+            total_coins,
             receive_address: self.config.receive_address.clone(),
             burn_address: self.burn_address(),
             unhardened_derivation_index: self.db.max_derivation_index(false).await?,
@@ -419,9 +527,11 @@ impl WalletBackend {
     }
 
     async fn token_record(&self, asset_id: Option<&str>) -> Result<TokenRecord> {
+        // Balances are scoped to the connected client's PUBLIC identity (#407).
+        let identity = self.scoped_identity();
         match asset_id {
             None => {
-                let bal = self.db.balance(None).await?;
+                let bal = self.db.balance_scoped(None, &identity).await?;
                 Ok(TokenRecord {
                     asset_id: None,
                     name: Some("Chia".into()),
@@ -436,7 +546,7 @@ impl WalletBackend {
                 })
             }
             Some(a) => {
-                let bal = self.db.balance(Some(a)).await?;
+                let bal = self.db.balance_scoped(Some(a), &identity).await?;
                 let meta = self.db.cat(a).await?;
                 Ok(TokenRecord {
                     asset_id: Some(a.to_string()),
@@ -455,7 +565,12 @@ impl WalletBackend {
     }
 
     async fn get_cats(&self) -> Result<GetCatsResponse> {
-        let ids = self.db.owned_cat_asset_ids().await?;
+        // Scope to the connected client's PUBLIC identity (#407): the CATs whose coins are
+        // hinted to the client's puzzle hashes, not every CAT in the node's DB.
+        let ids = self
+            .db
+            .owned_cat_asset_ids_scoped(&self.scoped_identity())
+            .await?;
         let mut cats = Vec::with_capacity(ids.len());
         for id in ids {
             cats.push(self.token_record(Some(&id)).await?);
@@ -1686,12 +1801,12 @@ impl WalletBackend {
 
         let value: Value = match method {
             "login" => {
-                let _r = req!(Login);
-                json(LoginResponse {})?
+                let r = req!(Login);
+                json(self.login(&r))?
             }
             "logout" => {
                 let _r = req!(Logout);
-                json(LogoutResponse {})?
+                json(self.logout())?
             }
             "get_version" => {
                 let _r = req!(GetVersion);
@@ -2093,6 +2208,12 @@ fn encode_address(puzzle_hash_hex: &str, prefix: &str) -> Option<String> {
         .ok()
 }
 
+/// Normalize a puzzle-hash hex for identity scoping (#407): strip an optional `0x` prefix
+/// and lowercase, so client-supplied hashes match the DB's `hex::encode` form.
+fn normalize_ph(ph: &str) -> String {
+    ph.strip_prefix("0x").unwrap_or(ph).to_ascii_lowercase()
+}
+
 /// Decode a bech32m address into its puzzle-hash hex (any valid prefix).
 fn decode_address(address: &str) -> Option<String> {
     chia_wallet_sdk::utils::Address::decode(address)
@@ -2152,12 +2273,23 @@ mod tests {
     use super::super::fallback::FallbackCoin;
     use super::*;
 
+    /// The puzzle hash every `xch_coin` test coin sits at — the identity reads scope to.
+    fn test_ph() -> String {
+        "00".repeat(32)
+    }
+
     async fn backend_with(coins: Vec<CoinRow>, synced: bool) -> WalletBackend {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coins(&coins).await.unwrap();
         db.set_initial_sync_complete(synced).await.unwrap();
         let fb = Arc::new(MockFallback::default());
-        WalletBackend::new(db, fb, WalletConfig::default())
+        // Scope reads (#407) to the test coins' puzzle hash so identity-scoped reads see
+        // them — mirrors a client `login` declaring its public puzzle hash.
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![test_ph()],
+            ..Default::default()
+        };
+        WalletBackend::new(db, fb, cfg)
     }
 
     fn xch_coin(id: &str, amount: u64, created: Option<i64>, spent: Option<i64>) -> CoinRow {
@@ -2194,7 +2326,12 @@ mod tests {
         .await
         .unwrap();
         db.set_initial_sync_complete(true).await.unwrap();
-        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+        // Reads scope to the wallet's identity (#407); the test coins sit at `test_ph()`.
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![test_ph()],
+            ..Default::default()
+        };
+        let be = WalletBackend::new(db, fb.clone(), cfg);
 
         let (status, body) = be.dispatch("get_coins", r#"{"offset":0,"limit":10}"#).await;
         assert_eq!(status, 200);
@@ -2760,5 +2897,237 @@ mod tests {
             rx.recv().await.unwrap(),
             super::super::events::SyncEvent::Stop
         );
+    }
+
+    // ---- #407: identity-scoped reads + honest sync + CAT attribution -----
+
+    /// A `CoinRow` at `puzzle_hash` (XCH unless `asset_id`/`hint` given).
+    fn coin_at(id: &str, ph: &str, amount: u64) -> CoinRow {
+        CoinRow {
+            coin_id: id.into(),
+            parent_coin_info: "pp".into(),
+            puzzle_hash: ph.into(),
+            amount: amount.to_string(),
+            created_height: Some(10),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    /// **Regression (#407 / #399): honest sync state.** An empty or not-yet-caught-up DB
+    /// MUST read as NOT synced (the client derives `synced` as `synced_coins >= total_coins`
+    /// with `total_coins == 0` treated as synced) so it never adopts a silent synced-zero.
+    #[tokio::test]
+    async fn get_sync_status_reports_not_synced_on_empty_or_unsynced_db() {
+        // Fresh DB: initial catch-up NOT complete, no wallet tracked.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        let (status, body) = be.dispatch("get_sync_status", "{}").await;
+        assert_eq!(status, 200);
+        let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
+        assert!(
+            r.total_coins > r.synced_coins,
+            "empty/unsynced DB must read NOT synced (got synced={} total={})",
+            r.synced_coins,
+            r.total_coins
+        );
+        assert_eq!(r.selectable_balance.to_u64(), Some(0));
+
+        // Even with the DB marked caught up, a wallet the node is NOT tracking (no login,
+        // no config) still reads NOT synced — never a silent synced-0.
+        let db2 = WalletDb::open_in_memory().await.unwrap();
+        db2.set_initial_sync_complete(true).await.unwrap();
+        let be2 =
+            WalletBackend::new(db2, Arc::new(MockFallback::default()), WalletConfig::default());
+        let (_s, body) = be2.dispatch("get_sync_status", "{}").await;
+        let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
+        assert!(
+            r.total_coins > r.synced_coins,
+            "untracked wallet must read NOT synced"
+        );
+        assert_eq!(r.selectable_balance.to_u64(), Some(0));
+    }
+
+    /// **Regression (#407): identity-scoped reads.** `login` with the client's PUBLIC
+    /// puzzle hashes scopes reads to the CLIENT's coins; an identity the node isn't tracking
+    /// reads as the explicit not-tracking state (NEVER a silent 0), and a coin belonging to
+    /// a different wallet in the same DB is never counted for the client.
+    #[tokio::test]
+    async fn identity_scoped_reads_return_client_balance_never_other_wallets() {
+        let client_ph = "aa".repeat(32);
+        let other_ph = "bb".repeat(32);
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[
+            coin_at("client1", &client_ph, 7_000),
+            coin_at("other1", &other_ph, 9_999),
+        ])
+        .await
+        .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        // Identity comes ONLY from the client's login — the node has no own wallet config.
+        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+
+        // No login → not tracking → NOT synced + balance 0 (never the other wallet's coin).
+        let (_s, body) = be.dispatch("get_sync_status", "{}").await;
+        let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(r.selectable_balance.to_u64(), Some(0));
+        assert!(r.total_coins > r.synced_coins, "untracked reads NOT synced");
+
+        // Login with the client's public puzzle hash → scope to the client's coin only.
+        let (s, _) = be
+            .dispatch(
+                "login",
+                &format!(r#"{{"fingerprint":42,"puzzle_hashes":["{client_ph}"]}}"#),
+            )
+            .await;
+        assert_eq!(s, 200);
+        let (_s, body) = be.dispatch("get_sync_status", "{}").await;
+        let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            r.selectable_balance.to_u64(),
+            Some(7_000),
+            "must report the CLIENT's balance, not the other wallet's 9999"
+        );
+        assert_eq!(r.synced_coins, r.total_coins, "tracked + caught up = synced");
+        assert!(r.total_coins >= 1);
+
+        // logout → not tracking again.
+        be.dispatch("logout", "{}").await;
+        let (_s, body) = be.dispatch("get_sync_status", "{}").await;
+        let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
+        assert!(r.total_coins > r.synced_coins, "after logout reads NOT synced");
+        assert_eq!(r.selectable_balance.to_u64(), Some(0));
+    }
+
+    /// `login` accepts bech32m ADDRESSES too, decoding them to puzzle hashes for scoping.
+    #[tokio::test]
+    async fn login_accepts_addresses_for_scoping() {
+        let ph = "aa".repeat(32);
+        let addr = encode_address(&ph, "xch").unwrap();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[coin_at("c1", &ph, 4_200)]).await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        be.dispatch("login", &format!(r#"{{"fingerprint":1,"addresses":["{addr}"]}}"#))
+            .await;
+        let (_s, body) = be.dispatch("get_sync_status", "{}").await;
+        let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(r.selectable_balance.to_u64(), Some(4_200));
+    }
+
+    /// **Regression (#407): CAT `asset_id` attribution.** After a CAT coin is synced (stored
+    /// with `asset_id: None`) and attributed by uncurrying its parent spend, `get_cats`
+    /// returns the real TAIL/asset id for the connected identity — so `$DIG` resolves.
+    #[tokio::test]
+    async fn get_cats_returns_cat_tail_after_synced_cat_coin() {
+        use super::super::singleton::{reconstruct_coins, LineageSource, ParentSpend};
+        use chia::traits::Streamable;
+        use chia_sdk_test::Simulator;
+        use chia_wallet_sdk::driver::{
+            Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
+        };
+        use chia_wallet_sdk::types::Conditions;
+
+        // A LineageSource returning one prebuilt parent spend (the CAT parent).
+        struct OneParent {
+            parent_id: String,
+            spend: ParentSpend,
+        }
+        #[async_trait::async_trait]
+        impl LineageSource for OneParent {
+            async fn parent_spend(
+                &self,
+                parent_coin_id: &str,
+                _spent_height: u32,
+            ) -> Result<Option<ParentSpend>> {
+                Ok((parent_coin_id == self.parent_id).then(|| self.spend.clone()))
+            }
+        }
+
+        // Issue a real CAT on the simulator, then spend it to produce a child CAT coin
+        // (its parent is a CAT coin — what `Cat::parse_children` uncurries the tail from).
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let memos = ctx.hint(alice.puzzle_hash).unwrap();
+        let (issue_cat, cats) = SdkCat::issue_with_coin(
+            ctx,
+            alice.coin.coin_id(),
+            1_000,
+            Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
+        )
+        .unwrap();
+        alice_p2.spend(ctx, alice.coin, issue_cat).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
+        let cat0 = cats[0];
+        let inner = alice_p2
+            .spend_with_conditions(
+                ctx,
+                Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
+            )
+            .unwrap();
+        SdkCat::spend_all(ctx, &[CatSpend::new(cat0, inner)]).unwrap();
+        sim.spend_coins(ctx.take(), &[alice.sk]).unwrap();
+        let child_cat = cat0.child(alice.puzzle_hash, 1_000);
+
+        // The wallet synced the child CAT coin — persisted with asset_id None.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut row = coin_at(
+            &hex::encode(child_cat.coin.coin_id()),
+            &hex::encode(child_cat.coin.puzzle_hash),
+            child_cat.coin.amount,
+        );
+        row.parent_coin_info = hex::encode(child_cat.coin.parent_coin_info);
+        db.upsert_coin(&row).await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+
+        // Attribute CATs by uncurrying the parent spend (the sync attribution step).
+        let parent = ParentSpend {
+            coin: cat0.coin,
+            puzzle_reveal: sim
+                .puzzle_reveal(cat0.coin.coin_id())
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            solution: sim.solution(cat0.coin.coin_id()).unwrap().to_bytes().unwrap(),
+        };
+        let lineage = OneParent {
+            parent_id: hex::encode(child_cat.coin.parent_coin_info),
+            spend: parent,
+        };
+        let stats = reconstruct_coins(
+            &db,
+            &lineage,
+            "xch",
+            &HashSet::new(),
+            &db.all_coins().await.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.cats, 1, "the synced CAT coin was attributed");
+
+        // Login as the CAT owner → get_cats returns the real tail + scoped balance.
+        let owner_ph = hex::encode(alice.puzzle_hash);
+        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        be.dispatch(
+            "login",
+            &format!(r#"{{"fingerprint":1,"puzzle_hashes":["{owner_ph}"]}}"#),
+        )
+        .await;
+        let (status, body) = be.dispatch("get_cats", "{}").await;
+        assert_eq!(status, 200);
+        let resp: GetCatsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(resp.cats.len(), 1, "the owned CAT is listed");
+        assert_eq!(
+            resp.cats[0].asset_id.as_deref(),
+            Some(hex::encode(cat0.info.asset_id).as_str()),
+            "get_cats returns the uncurried TAIL"
+        );
+        assert_eq!(resp.cats[0].balance.to_u64(), Some(1_000));
     }
 }
