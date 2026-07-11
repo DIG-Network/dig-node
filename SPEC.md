@@ -1707,3 +1707,91 @@ the authorized-extension path (distinct from the `DIG_WALLET_ALLOW_BROADCAST` da
 an unconsented op builds + signs + validates but does NOT broadcast (nothing is spent). CI NEVER broadcasts
 to mainnet — tests drive the `chia-sdk-test` simulator (real consensus incl. BLS) or the recording
 `MockBroadcaster`; a real mainnet broadcast is a separate, explicitly-gated live pass.
+
+## 19. Peer network — NAT traversal, discovery, address book, and content location
+
+The standalone `dig-node` binary runs an L7 peer network (the in-process FFI/browser host does not —
+§1, §15): a dig-gossip connected peer pool + relay reservation + introducer, a dig-dht content-location
+index, node↔node PEX, and multi-source download — all over ONE mTLS identity
+(`peer_id = SHA-256(TLS SPKI DER)`) on the dual-stack `[::]` listener (§4.1). This section is the
+normative contract for how the node USES its P2P crates. All peer communication is IPv6-first with IPv4
+as the fallback (§5.2 ecosystem HARD RULE).
+
+### 19.1. NAT traversal — the full ladder (dig-nat)
+
+Every outbound peer dial (DHT RPCs, multi-source range fetches, PEX candidate verification) MUST use the
+FULL dig-nat traversal ladder, tried in canonical rank order:
+
+> Direct → UPnP → NAT-PMP → PCP → hole-punch → Relayed
+
+The relay tier (`Relayed`, via `relay.dig.net`) is the LAST resort — reached only after every direct +
+port-mapping + hole-punch tier has failed. A node MUST NOT cap dials to `[Direct, Relayed]` (which skips
+port-mapping + hole-punch and over-loads the relay). One shared config constructor
+(`net::full_nat_config(per_method_timeout, stun_server)`, built from `dig_nat::NatConfig::default`) is
+used at every dial site, so a new dig-nat tier is picked up everywhere at once. Each tier is bounded by a
+per-method timeout so a dial never hangs.
+
+### 19.2. STUN reflexive-address discovery
+
+The node discovers its server-reflexive (public) transport address via STUN (RFC 5389) against the STUN
+server co-located with the relay (`<relay-host>:3478`, derived from `DIG_RELAY_URL`). The reflexive
+address is (a) configured on the NAT config so dig-nat's hole-punch tier can use it, and (b) merged into
+the node's advertised DHT candidate set **IPv6-first** — a reflexive IPv6 address leads the whole set; a
+reflexive IPv4 address leads the IPv4 fallback group — so a peer behind a different NAT can dial or
+hole-punch to it. Discovery is best-effort + bounded; on failure the node advertises its local addresses
+only. The wildcard bind address (`[::]`/`0.0.0.0`) is never advertised as a candidate.
+
+### 19.3. Content location — dig-dht is the sole locator
+
+Content location ("which peers hold capsule X?") is the dig-dht provider index, and ONLY that: the live
+locator is `DhtProviderLocator → find_providers` inside the content engine (`NodeContent`), used by both
+the redirect-on-miss and the multi-source fetch paths. There is NO separate pool-availability provider
+seam. The node keeps its own held-inventory provider records current (announce / republish / refresh /
+gc) and withdraws them on shutdown.
+
+### 19.4. Address book — durable, IPv6-first, provenance + TTL
+
+The node maintains a durable peer address book: every learned peer candidate — from PEX, `dig.getPeers`,
+the relay introducer, or an observed pool peer — is INGESTED into the book (keyed by `peer_id`) rather
+than dialed-and-dropped. The book:
+
+- unions each peer's directly-dialable addresses, ordered **IPv6-first**;
+- records provenance (a first-hand pool / `getPeers` sighting is not downgraded by a later PEX hint) and
+  a freshen timestamp;
+- persists relay-only / not-currently-dialable hints (they survive to seed a later dial);
+- reads back a ranked, non-stale candidate list (IPv6-dialable peers first, then other dialable, then
+  relay-only; ties by recency), evicting the stalest entry at a capacity bound and dropping entries past
+  a staleness TTL.
+
+### 19.5. PEX candidate handling
+
+PEX-discovered candidates are HINTS (proven only by a successful mTLS dial). On receiving a PEX candidate
+batch the node offers EVERY candidate (including relay-only) to the address book (§19.4), then dials a
+bounded number selected from the book — verifying each over the full ladder (§19.1) and adopting the
+verified connection into the pool. A failed dial keeps the hint in the book for a later retry; a peer
+already in the pool is skipped.
+
+### 19.6. Selector-driven dial ordering
+
+The shared self-optimizing peer selector (dig-peer-selector) that ranks download SOURCES also orders
+which address-book candidates the node DIALS first: dials are ranked by the selector's content-agnostic
+per-peer quality (reliability blended with throughput; a banned peer sinks to the bottom; a cold peer is
+explored at a neutral rank). The node reuses the ONE selector instance; IPv6-first order is preserved
+among equally-ranked peers. In PRIVACY mode the selector does not apply (the onion path uses its own).
+
+### 19.7. Crate-API integration status (release-first follow-ups)
+
+Two intended crate-side integrations are pending a release-first dig-gossip change and are realized
+node-side in the interim:
+
+- dig-gossip exposes no PUBLIC production API to ingest external addresses into its `AddressManager`
+  (only a hidden test hook), so the durable address book (§19.4) lives in the node; when dig-gossip ships
+  a public `offer_addresses` ingest API the book flushes into the crate `AddressManager` (one source of
+  truth).
+- dig-gossip's `PeerPoolConfig` exposes no dial-priority hook, so selector-driven ordering (§19.6)
+  applies to the node's PEX candidate dials; when dig-gossip ships a pool dial-priority hook the same
+  ranking drives the pool's own maintenance dial loop.
+
+Exercising the connected pool end-to-end is gated on the network-genesis bring-up (the pre-launch
+placeholder genesis is rejected by `GossipService::start`); these behaviors are unit-tested
+independently of a live pool.

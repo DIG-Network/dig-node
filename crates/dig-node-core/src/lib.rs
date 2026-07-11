@@ -45,6 +45,7 @@ use fs4::FileExt;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+pub mod address_book;
 pub mod bandwidth;
 pub mod chainwatch;
 /// Local plaintext content-serve (#289/#290): server-side verify+decrypt for the loopback

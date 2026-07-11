@@ -454,6 +454,52 @@ impl ProviderLocator for SelectorLocator {
     }
 }
 
+// -- Selector-driven DIAL ordering (#384) ------------------------------------------------------------
+
+/// A [`DialRanker`](crate::pex::DialRanker) over the shared [`PeerSelector`] — so the SAME learned
+/// peer-quality model that ranks download SOURCES also drives which PEX candidates the node DIALS
+/// first (#384). Reuses the one `PeerSelector` instance in [`NodeContent`]; a second is never spun up.
+///
+/// The dial score is CONTENT-AGNOSTIC (dialing is not per-content), read from the selector's per-peer
+/// [`peer_snapshot`](PeerSelector::peer_snapshot): a banned peer sinks to the bottom; a measured peer
+/// scores by reliability (primary) blended with normalized throughput (secondary); a cold peer (no
+/// measured outcomes yet) returns `None` so the dialer explores it at a neutral rank (SPEC §5.2 — in
+/// PRIVACY mode the selector does not apply; the onion path uses its own selector, so this ranker is
+/// simply not wired there).
+pub struct SelectorDialRanker {
+    selector: Arc<PeerSelector>,
+}
+
+impl SelectorDialRanker {
+    /// Wrap the shared selector as a dial ranker.
+    #[must_use]
+    pub fn new(selector: Arc<PeerSelector>) -> Self {
+        SelectorDialRanker { selector }
+    }
+}
+
+impl crate::pex::DialRanker for SelectorDialRanker {
+    fn score(&self, peer_id_hex: &str) -> Option<f64> {
+        // 64-hex → the selector's 32-byte PeerId (SHA-256(SPKI DER), same identity as dig-nat/gossip).
+        let bytes = hex::decode(peer_id_hex).ok()?;
+        let arr: [u8; 32] = bytes.try_into().ok()?;
+        let snapshot = self.selector.peer_snapshot(&PeerId::from_bytes(arr))?;
+        if snapshot.banned {
+            // Proven-bad: dial only after every neutral/good peer.
+            return Some(f64::MIN);
+        }
+        if snapshot.samples == 0 {
+            // Cold peer — no measured model yet; let the dialer explore it at the neutral rank.
+            return None;
+        }
+        let reliability = snapshot.reliability.unwrap_or(0.0);
+        // Normalize throughput to [0,1] with a ~1 MB/s midpoint (bps / (bps + 1e6)); missing → 0.
+        let throughput = snapshot.throughput_bps.unwrap_or(0.0);
+        let throughput_norm = (throughput / (throughput + 1_000_000.0)).clamp(0.0, 1.0);
+        Some(reliability * 0.8 + throughput_norm * 0.2)
+    }
+}
+
 /// Current unix seconds (the `at` timestamp on a [`TransferOutcome`]).
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -665,7 +711,10 @@ impl NodeContent {
     /// The PRODUCTION constructor — wire the engine from the live DHT + the node's mTLS identity,
     /// exactly as dig-download's implementers' note prescribes: [`DhtProviderLocator`] over the
     /// bootstrapped [`DhtService`](dig_dht::DhtService), [`NatRangeTransport`] dialing providers
-    /// over the same Direct→Relayed NAT tiers the rest of the peer network uses.
+    /// over the FULL NAT traversal ladder (Direct → UPnP → NAT-PMP → PCP → hole-punch → Relayed) the
+    /// rest of the peer network now uses, so a range fetch reaches a NAT'd provider directly whenever
+    /// possible and relays only as the last resort (#385). `stun_server` (when `Some`) feeds the
+    /// hole-punch tier's reflexive-address discovery.
     pub fn for_dht(
         dht: Arc<dig_dht::DhtService>,
         identity: dig_nat::LocalIdentity,
@@ -673,15 +722,11 @@ impl NodeContent {
         miss_mode: MissMode,
         self_peer_id: Option<String>,
         cache_dir: &Path,
+        stun_server: Option<std::net::SocketAddr>,
     ) -> Arc<Self> {
         let locator = Arc::new(DhtProviderLocator::new(dht));
-        let nat_config = dig_nat::NatConfig::builder()
-            .enabled_methods(vec![
-                dig_nat::TraversalKind::Direct,
-                dig_nat::TraversalKind::Relayed,
-            ])
-            .per_method_timeout(crate::dht::default_rpc_timeout())
-            .build();
+        let nat_config =
+            crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server);
         let transport = Arc::new(NatRangeTransport::new(identity, nat_config, network_id));
         Self::new(locator, transport, miss_mode, self_peer_id, cache_dir)
     }

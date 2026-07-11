@@ -83,6 +83,10 @@ pub struct NatDhtTransport {
     network_id: String,
     /// Per-RPC timeout (dial + exchange).
     rpc_timeout: Duration,
+    /// The STUN server (co-located with the relay) dig-nat's hole-punch tier queries for this node's
+    /// server-reflexive address (#385). `None` leaves STUN unconfigured; set at bring-up via
+    /// [`Self::with_stun_server`].
+    stun_server: Option<std::net::SocketAddr>,
 }
 
 impl NatDhtTransport {
@@ -97,7 +101,16 @@ impl NatDhtTransport {
             identity,
             network_id: network_id.into(),
             rpc_timeout,
+            stun_server: None,
         }
+    }
+
+    /// Set the STUN server used by the full-ladder [`Self::nat_config`]'s hole-punch tier (#385). The
+    /// node resolves it once at bring-up from the relay endpoint (`<relay-host>:3478`).
+    #[must_use]
+    pub fn with_stun_server(mut self, stun_server: Option<std::net::SocketAddr>) -> Self {
+        self.stun_server = stun_server;
+        self
     }
 
     /// Build the dig-nat [`PeerTarget`](dig_nat::PeerTarget) for `peer`: its verified `peer_id` plus
@@ -126,17 +139,12 @@ impl NatDhtTransport {
         }
     }
 
-    /// The dig-nat config for a DHT dial: bound each traversal method by the RPC timeout, and offer
-    /// Direct + Relayed (a direct candidate is tried first, falling back to the relay for a NAT'd
-    /// peer). Kept minimal + honest — the same tiers the peer-RPC client dials with.
+    /// The dig-nat config for a DHT dial: the FULL traversal ladder (Direct → UPnP → NAT-PMP → PCP →
+    /// hole-punch → Relayed), bounded per-tier by the RPC timeout, with the relay reached only after
+    /// every direct + port-mapping + hole-punch tier fails (#385). Shared with every other node dial
+    /// via [`crate::net::full_nat_config`].
     fn nat_config(&self) -> dig_nat::NatConfig {
-        dig_nat::NatConfig::builder()
-            .enabled_methods(vec![
-                dig_nat::TraversalKind::Direct,
-                dig_nat::TraversalKind::Relayed,
-            ])
-            .per_method_timeout(self.rpc_timeout)
-            .build()
+        crate::net::full_nat_config(self.rpc_timeout, self.stun_server)
     }
 }
 

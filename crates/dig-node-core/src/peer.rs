@@ -30,12 +30,13 @@
 //! so the byte-exact §21/FFI contract is untouched. `control.peerStatus` is always safe to call (it
 //! reports "not running" when no network is up).
 //!
-//! ## The clean seam for #163 (dig-dht)
+//! ## Content location — the dig-dht provider index (#163)
 //!
-//! Peer DISCOVERY here is pool + `dig.getPeers` (the introducer/gossip sources). The provider-lookup
-//! seam — "who holds capsule X?" beyond the local pool — is [`PeerRpcClient::find_holders`], which
-//! today queries the connected pool via availability; #163 (dig-dht) slots in as an additional
-//! provider source behind the SAME interface without touching the serve path.
+//! Peer DISCOVERY here is the connected pool + `dig.getPeers` (the introducer/gossip sources). Content
+//! LOCATION — "who holds capsule X?" beyond the local pool — is the **dig-dht provider index**, wired as
+//! the live locator inside [`crate::download::NodeContent`] (`DhtProviderLocator` → `find_providers`);
+//! the redirect-on-miss and multi-source fetch paths both resolve holders through it. There is exactly
+//! ONE provider path — no separate pool-availability seam.
 //!
 //! ## Address-family policy — IPv6-first, IPv4-fallback (ecosystem HARD RULE)
 //!
@@ -984,83 +985,6 @@ async fn stream_fetched_range(
     }
 }
 
-// -- Outgoing L7 peer RPC (the multi-source download seam, #163 dig-dht clean seam) ------------------
-
-/// Outcome of an availability check against one pool peer, for the multi-source download planner.
-#[derive(Debug, Clone)]
-pub struct PeerAvailability {
-    /// The peer's `peer_id` (64-hex).
-    pub peer_id: String,
-    /// The raw availability answers (one per queried item), from the peer.
-    pub answers: Vec<dig_nat::AvailabilityAnswer>,
-}
-
-/// ISSUE the L7 peer RPC to pool peers — the outgoing client path (multi-source download seam). Given
-/// a running [`dig_gossip::GossipHandle`], this lets the node ASK pool peers for availability and
-/// FETCH byte ranges of a resource it lacks, verifying each range against the chain-anchored root
-/// before use. Today the provider set is the connected pool ([`dig_gossip::GossipHandle`]'s
-/// `connected_pool_peers`) + `dig.getPeers`; #163 (dig-dht) plugs in as an additional provider source
-/// behind [`Self::find_holders`] WITHOUT touching this fetch/verify path.
-pub struct PeerRpcClient {
-    handle: dig_gossip::GossipHandle,
-    per_method_timeout: std::time::Duration,
-}
-
-impl PeerRpcClient {
-    /// Build a client over a running gossip handle. `per_method_timeout` bounds each NAT-traversal
-    /// tier so a dial never hangs (a dig-nat guarantee).
-    pub fn new(handle: dig_gossip::GossipHandle, per_method_timeout: std::time::Duration) -> Self {
-        PeerRpcClient {
-            handle,
-            per_method_timeout,
-        }
-    }
-
-    /// Find pool peers that HOLD a capsule/resource by asking each connected peer for availability.
-    /// This is the discovery step of the multi-source download flow; #163 (dig-dht) extends the
-    /// candidate set behind this same signature. Returns per-peer availability answers.
-    ///
-    /// `items` is the availability batch (store/root/resource granularity items). Only currently
-    /// connected pool peers are queried (already-authenticated mTLS links); a peer that errors is
-    /// skipped (best-effort). Dial-and-query of not-yet-connected candidates is a follow-up seam.
-    pub async fn find_holders(
-        &self,
-        items: Vec<dig_nat::AvailabilityItem>,
-    ) -> Vec<PeerAvailability> {
-        let mut out = Vec::new();
-        for (peer_id, addr, _outbound) in self.handle.connected_pool_peers() {
-            // Dial the peer over the NAT ladder (direct-first) and query availability. The pool peer
-            // is already known + authenticated; this opens a control stream to it.
-            match self
-                .handle
-                .connect_via_nat(
-                    peer_id,
-                    Some(addr),
-                    &[
-                        dig_nat::TraversalKind::Direct,
-                        dig_nat::TraversalKind::Relayed,
-                    ],
-                    self.per_method_timeout,
-                )
-                .await
-            {
-                Ok(mut conn) => match conn.query_availability(items.clone()).await {
-                    Ok(resp) => out.push(PeerAvailability {
-                        // gossip PeerId is a chia Bytes32 (no to_hex) — render as 64-hex.
-                        peer_id: hex::encode(peer_id),
-                        answers: resp.items,
-                    }),
-                    Err(e) => {
-                        tracing::debug!(peer = %peer_id, error = %e, "availability query failed")
-                    }
-                },
-                Err(e) => tracing::debug!(peer = %peer_id, error = %e, "connect_via_nat failed"),
-            }
-        }
-        out
-    }
-}
-
 // -- Peer-network bring-up: the connected pool + discovery + the mTLS peer-RPC server -----------------
 
 /// Spawn the node's L7 peer network in the background (the OS-service bring-up calls this — #213;
@@ -1252,7 +1176,31 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     //    hold content this node wants, and keeps this node's OWN held-inventory provider records
     //    CURRENT so other nodes can find it. Best-effort — a DHT bring-up failure logs + leaves the
     //    node serving without the DHT (the pool + §21 read path still work).
-    let dht = match bring_up_dht(&node, &identity, &network_id_str, &handle).await {
+    // Resolve the STUN server co-located with the relay (`<relay-host>:3478`) ONCE — it feeds both the
+    // node's own reflexive-address discovery (advertised-candidate set) and the hole-punch tier of the
+    // FULL NAT ladder every node dial now uses (#385). Blocking DNS resolution is moved off the async
+    // runtime; a failure leaves STUN unconfigured (the ladder still falls through to the relay).
+    let stun_server = if relay_enabled() {
+        let ep = relay_endpoint.clone();
+        tokio::task::spawn_blocking(move || crate::net::stun_server_from_relay(&ep))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(stun) = stun_server {
+        println!("dig-node peer network: STUN server for reflexive discovery: {stun}");
+    }
+
+    // The durable, IPv6-first peer address book (#381): every PEX-learned + otherwise-learned candidate
+    // accumulates here (incl. relay-only hints) instead of being dial-and-dropped, seeding future dials.
+    // The selector-driven dial ranker (#384) is wired below once the content engine (the shared
+    // selector) is up; until then dials keep the book's IPv6-first order.
+    let address_book = Arc::new(crate::address_book::AddressBook::default());
+    let mut dial_ranker: Option<Arc<dyn crate::pex::DialRanker>> = None;
+
+    let dht = match bring_up_dht(&node, &identity, &network_id_str, &handle, stun_server).await {
         Ok(dht) => Some(dht),
         Err(e) => {
             tracing::warn!(error = %e, "dig-node DHT bring-up failed; continuing without the DHT");
@@ -1275,6 +1223,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             crate::download::miss_mode_from_env(),
             Some(peer_id_hex.clone()),
             node.cache_dir_path(),
+            stun_server,
         );
         content.spawn_gc();
         // Feed the selector's registry from the connected pool (#178, SPEC §2.3): seed from the current
@@ -1282,6 +1231,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         // live peer set. The selector already drives dig-download's source choice + learns from every
         // range outcome inside `NodeContent`; this keeps its candidate registry current.
         spawn_selector_registry_feed(content.clone(), handle.clone());
+        // #384: the SAME self-optimizing selector that ranks download SOURCES also drives PEX dial
+        // ORDERING — reuse the ONE selector instance (never a second) so a high-quality peer is dialed
+        // before a low-quality one.
+        dial_ranker = Some(Arc::new(crate::download::SelectorDialRanker::new(
+            content.selector().clone(),
+        )));
         node.set_p2p_content(content);
         println!(
             "dig-node peer network: P2P content engine up (selector-driven, miss mode: {:?})",
@@ -1358,7 +1313,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     crate::pex::spawn_tick_loop(pex_engine.clone());
     let pex = crate::pex::PexServing::new(
         pex_engine,
-        Arc::new(crate::pex::GossipPexPool::new(handle.clone())),
+        Arc::new(crate::pex::GossipPexPool::new(
+            handle.clone(),
+            stun_server,
+            address_book,
+            dial_ranker,
+        )),
     );
 
     // The served responder carries the LIVE pool handle so `dig.getPeers` reflects connected peers,
@@ -1382,17 +1342,22 @@ async fn bring_up_dht(
     identity: &dig_nat::LocalIdentity,
     network_id: &str,
     pool: &dig_gossip::GossipHandle,
+    stun_server: Option<std::net::SocketAddr>,
 ) -> Result<Arc<crate::dht::DhtHandle>, String> {
     use dig_dht::{CandidateAddr, DhtConfig, DhtService};
 
     let config = DhtConfig::default();
     // The transport dials peers as THIS node (client cert = our identity), scoping relay lookups to
-    // our network id, bounding each RPC by the config's per-RPC timeout.
-    let transport = Arc::new(crate::dht::NatDhtTransport::new(
-        identity.clone(),
-        network_id.to_string(),
-        config.rpc_timeout,
-    ));
+    // our network id, bounding each RPC by the config's per-RPC timeout, over the FULL NAT ladder with
+    // the relay's STUN server feeding its hole-punch tier (#385).
+    let transport = Arc::new(
+        crate::dht::NatDhtTransport::new(
+            identity.clone(),
+            network_id.to_string(),
+            config.rpc_timeout,
+        )
+        .with_stun_server(stun_server),
+    );
     // Our own advertised addresses: the node's REAL routable address(es) at the P2P listen port,
     // ordered IPv6-first (ecosystem HARD RULE) — a global-unicast IPv6 address (when the host has one)
     // precedes the IPv4 fallback, so a peer's happy-eyeballs dialer prefers IPv6. The wildcard bind
@@ -1400,11 +1365,25 @@ async fn bring_up_dht(
     // with no routable address advertises nothing here and stays reachable via the relay tiers dig-nat
     // composes; loopback/in-process setups opt into a loopback candidate via DIG_NODE_ADVERTISE_LOOPBACK.
     let port = peer_port_from_env();
-    let local_addresses: Vec<CandidateAddr> =
-        crate::net::advertised_socket_addrs(port, crate::net::advertise_loopback_from_env())
-            .into_iter()
-            .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
-            .collect();
+    let local =
+        crate::net::advertised_socket_addrs(port, crate::net::advertise_loopback_from_env());
+    // Add this node's STUN-discovered server-reflexive (public) address to the advertised set (#385)
+    // so a remote peer behind a different NAT can dial / hole-punch to it, not just to a LAN-local
+    // address. Best-effort + bounded: a failure (no STUN server, timeout) advertises the local
+    // addresses only. The reflexive candidate is merged IPv6-first (§5.2) by `merge_reflexive`.
+    let reflexive = match stun_server {
+        Some(stun) => crate::net::reflexive_via_stun(stun, config.rpc_timeout).await,
+        None => None,
+    };
+    if let Some(r) = reflexive {
+        println!(
+            "dig-node peer network: STUN reflexive address {r} added to advertised candidates"
+        );
+    }
+    let local_addresses: Vec<CandidateAddr> = crate::net::merge_reflexive(local, reflexive)
+        .into_iter()
+        .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
+        .collect();
     let service = Arc::new(DhtService::new(
         identity.peer_id,
         local_addresses,
