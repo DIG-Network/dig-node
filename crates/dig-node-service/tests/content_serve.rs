@@ -303,3 +303,169 @@ async fn root_absolute_subresource_reroots_via_referer() {
     );
     assert_eq!(resp.text().await.unwrap(), "console.log(1)");
 }
+
+// -- Verification ledger (#307) -----------------------------------------------------------------
+//
+// The `/s/` serve path records each served (or fail-closed) resource's verdict + Merkle proof into
+// the in-memory verification ledger; `GET /verify/<store>[:<root>]` exposes it. These prove the
+// end-to-end HTTP contract the extension's "Verified by Chia" badge + proof-inspection modal consume.
+
+/// A mock upstream that answers every `dig.getContent` with a self-consistent Merkle proof whose root
+/// is the served leaf — which is NOT the requested (anchored) root — so the node's RPC tier verifies,
+/// FAILS CLOSED (a decoy/tampered response), and never serves the bytes. Returns the crafted result.
+async fn mock_upstream_bad_bytes() -> String {
+    use base64::Engine;
+    use digstore_core::codec::{Encode, Encoder};
+    use digstore_core::{resource_leaf, MerkleProof};
+
+    // Bytes that are NOT the requested resource; a self-consistent single-leaf proof rooted at the
+    // leaf. `proof.root == leaf` (folds) but `leaf != requested_root`, so the anchored-root gate
+    // rejects it (the decoy-for-a-missing-key shape).
+    let ciphertext = b"decoy-bytes-not-the-resource".to_vec();
+    let leaf = resource_leaf(&ciphertext);
+    let proof = MerkleProof {
+        leaf,
+        path: Vec::new(),
+        root: leaf,
+    };
+    let mut enc = Encoder::new();
+    proof.encode(&mut enc);
+    let proof_b64 = base64::engine::general_purpose::STANDARD.encode(enc.finish());
+    let ct_b64 = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+
+    let app = Router::new().route(
+        "/",
+        post(move |Json(req): Json<Value>| {
+            let ct_b64 = ct_b64.clone();
+            let proof_b64 = proof_b64.clone();
+            async move {
+                let id = req.get("id").cloned().unwrap_or(json!(1));
+                Json(json!({"jsonrpc":"2.0","id":id,"result":{
+                    "ciphertext": ct_b64,
+                    "inclusion_proof": proof_b64,
+                    "chunk_lens": [],
+                    "complete": true,
+                }}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// Fetch + parse the `/verify/<store>[:<root>]` JSON snapshot.
+async fn get_verify(addr: &SocketAddr, store_hex: &str, root_hex: &str) -> Value {
+    let url = format!("http://{addr}/verify/{store_hex}:{root_hex}");
+    let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "/verify always returns a valid snapshot"
+    );
+    resp.json::<Value>().await.unwrap()
+}
+
+#[tokio::test]
+async fn served_page_records_the_verification_ledger_with_proof_data() {
+    let (store, files) = store_and_files();
+    let (root, module) = compile_public_module(store, &files);
+    let upstream = mock_upstream_all_miss().await;
+    let (addr, cache, _hold) = start_server(&upstream).await;
+    seed_module(&cache, &store.to_hex(), &root.to_hex(), &module);
+
+    // Serve two distinct resources of the page from the local module.
+    for path in ["index.html", "assets/app.js"] {
+        let url = format!(
+            "http://{addr}/s/{}:{}/{}",
+            store.to_hex(),
+            root.to_hex(),
+            path
+        );
+        let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{path} served");
+    }
+
+    let v = get_verify(&addr, &store.to_hex(), &root.to_hex()).await;
+    assert_eq!(v["storeId"], store.to_hex());
+    assert_eq!(v["root"], root.to_hex());
+    // Both resources recorded, each from the local tier, with proof data.
+    let resources = v["resources"].as_array().unwrap();
+    assert_eq!(resources.len(), 2, "index.html + assets/app.js recorded");
+    for entry in resources {
+        assert_eq!(entry["source"], "local", "served from the local .dig");
+        assert!(
+            entry["proof"]["leafHash"].as_str().unwrap().len() == 64,
+            "leaf hash is 32-byte hex"
+        );
+        assert!(entry["proof"].get("siblings").is_some());
+        assert!(entry["proof"].get("leafIndex").is_some());
+        assert_eq!(entry["proof"]["proofRoot"], root.to_hex());
+        assert_eq!(entry["root"], root.to_hex());
+    }
+    let counts = &v["aggregate"]["counts"];
+    assert_eq!(counts["total"], 2);
+    assert_eq!(counts["bySource"]["local"], 2);
+    // The pin is OFF in this hermetic harness, so the serve is not chain-anchored → verified=false
+    // per resource; the aggregate is therefore not "verified", and — being all local — no RPC failed.
+    assert_eq!(v["aggregate"]["verified"], false);
+    assert_eq!(v["aggregate"]["anyRpcFailed"], false);
+}
+
+#[tokio::test]
+async fn rpc_verification_failure_is_recorded_and_fails_closed() {
+    let (store, _files) = store_and_files();
+    // A requested root that the decoy proof will NOT fold to — the fail-closed trigger.
+    let root = digstore_core::Bytes32([0x5au8; 32]);
+    let upstream = mock_upstream_bad_bytes().await;
+    // Do NOT seed any local module: the serve falls through local → peer → RPC (the mock).
+    let (addr, _cache, _hold) = start_server(&upstream).await;
+
+    // The resource is NEVER served (fail-closed): a route-like miss SPA-falls-back to index.html,
+    // which also fails to verify, so the response is an honest error, not decoy plaintext.
+    let url = format!(
+        "http://{addr}/s/{}:{}/index.html",
+        store.to_hex(),
+        root.to_hex()
+    );
+    let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+    assert_ne!(
+        resp.status(),
+        200,
+        "a decoy that fails verification is never served"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains("decoy-bytes"),
+        "fail-closed: no decoy plaintext crosses the wire: {body}"
+    );
+
+    // But the failed verification IS recorded, flipping the page aggregate to Unverified.
+    let v = get_verify(&addr, &store.to_hex(), &root.to_hex()).await;
+    assert_eq!(
+        v["aggregate"]["verified"], false,
+        "a failed RPC resource → not verified"
+    );
+    assert_eq!(
+        v["aggregate"]["anyRpcFailed"], true,
+        "source=rpc && !verified"
+    );
+    let resources = v["resources"].as_array().unwrap();
+    assert!(
+        !resources.is_empty(),
+        "the failed resource is recorded, not silently dropped"
+    );
+    let failed = &resources[0];
+    assert_eq!(failed["source"], "rpc");
+    assert_eq!(failed["verified"], false);
+    assert!(
+        failed["failReason"].as_str().is_some_and(|s| !s.is_empty()),
+        "the fail-closed reason is recorded: {failed}"
+    );
+    // Proof data for the (failed) resource is exposed for the modal.
+    assert_eq!(failed["proof"]["leafHash"].as_str().unwrap().len(), 64);
+    assert!(failed["proof"].get("proofRoot").is_some());
+}

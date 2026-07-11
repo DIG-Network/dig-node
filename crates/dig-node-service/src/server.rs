@@ -31,7 +31,7 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use crate::config::{host_is_allowed, Config};
 use crate::content::{
     content_type_for, inject_html_head, is_html, is_static_asset_path, parse_store_path,
-    reroot_via_referer, store_base_href, StorePath, STORE_CSP,
+    parse_verify_path, reroot_via_referer, store_base_href, StorePath, STORE_CSP,
 };
 use crate::control::{self, ControlCtx};
 use crate::meta;
@@ -134,6 +134,11 @@ pub fn router(state: AppState) -> Router {
         // [`store_serve`]. A root-absolute subresource (`GET /foo.js`) misses this
         // route and lands in the fallback, which reroots it via `Referer`.
         .route("/s/*path", get(store_serve))
+        // `GET /verify/<storeId>[:<root>]` (#307): the read-only verification-ledger surface on the
+        // SAME loopback browser surface as `/s/` (host-guard + CORS). Returns the per-resource verify
+        // verdicts + Merkle proof data the serve path recorded, plus the page-level aggregate the
+        // extension's "Verified by Chia" badge consumes. Loopback-only, no secrets. See [`verify_ledger`].
+        .route("/verify/*path", get(verify_ledger))
         .fallback(fallback_serve)
         // Host-header allowlist (#91): both loopback listeners share this router,
         // so a single guard accepts the canonical local names (dig.local /
@@ -592,6 +597,24 @@ async fn proxy(http: &reqwest::Client, upstream: &str, req: &Value) -> Result<Va
 async fn store_serve(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     match parse_store_path(&path) {
         Some(sp) => serve_resource(&state, sp).await,
+        None => not_found(),
+    }
+}
+
+/// `GET /verify/<storeId>[:<root>]` (#307) — the read-only verification-ledger snapshot for a
+/// `(store, root)` page session: the per-resource verify verdicts + Merkle inclusion-proof data the
+/// `/s/` serve path recorded, plus the page-level `aggregate` the extension's "Verified by Chia"
+/// badge consumes. `root` omitted → the store's most-recently-served session. Always `200` with a
+/// valid (possibly empty) JSON body; a malformed path is `404`. Loopback-only (shared host-guard +
+/// CORS with `/s/`), no secrets.
+async fn verify_ledger(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    match parse_verify_path(&path) {
+        Some((store_id, root)) => {
+            let snapshot = state
+                .node
+                .verification_ledger_snapshot(&store_id, root.as_deref());
+            (StatusCode::OK, Json(snapshot)).into_response()
+        }
         None => not_found(),
     }
 }
