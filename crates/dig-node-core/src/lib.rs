@@ -47,6 +47,9 @@ use tokio::sync::Mutex;
 
 pub mod bandwidth;
 pub mod chainwatch;
+/// Local plaintext content-serve (#289/#290): server-side verify+decrypt for the loopback
+/// `GET /s/...` surface the service shell exposes to a same-machine browser (SPEC §4.6).
+pub mod content_serve;
 pub mod dht;
 pub mod download;
 pub mod net;
@@ -5562,6 +5565,132 @@ mod tests {
         )
         .await;
         assert_eq!(bad_root["error"]["code"], json!(-32602), "{bad_root}");
+    }
+
+    // -- LOCAL PLAINTEXT CONTENT-SERVE (#289/#290) — serve_content_plaintext + manifest_paths --------
+    //
+    // These drive the NEW server-side verify+decrypt path against a REAL compiled `.dig` module
+    // (via `compile_fixture_module`), the injected anchored-root resolver as the trusted root, and the
+    // test node's unroutable upstream — so a LOCAL hit proves no-network local-first serve. They pin
+    // the fail-closed root check (#127) and the ecosystem key derivation (byte-identical plaintext).
+
+    /// **Proves:** a synced+verified public `.dig` module is served LOCAL-FIRST as decrypted plaintext
+    /// (no network), the empty resource defaults to `index.html`, and the tier/root/verified provenance
+    /// is reported. **Catches:** a serve that returns ciphertext, mis-derives the key, or hits the
+    /// network on a local hit.
+    #[test]
+    fn serve_content_plaintext_serves_local_first_decrypted() {
+        use crate::content_serve::{PlaintextOutcome, ServeSource};
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([21u8; 32]);
+        let files = vec![
+            ("index.html".to_string(), b"<h1>hi</h1>".to_vec()),
+            ("assets/app.js".to_string(), b"console.log(1)".to_vec()),
+        ];
+        let (root, module) =
+            compile_fixture_module(store, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root.to_hex(), &module);
+
+        // index.html, decrypted, from the local module — the test node's upstream is unroutable, so a
+        // Served result PROVES it came from disk.
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "index.html",
+            None,
+        ));
+        match out {
+            PlaintextOutcome::Served {
+                bytes,
+                root_hex,
+                verified,
+                source,
+            } => {
+                assert_eq!(bytes, b"<h1>hi</h1>");
+                assert_eq!(root_hex, root.to_hex());
+                assert!(
+                    verified,
+                    "the chain-anchored pin is enforced → verified=true"
+                );
+                assert_eq!(source, ServeSource::Local);
+            }
+            other => panic!("expected a local Served, got {other:?}"),
+        }
+
+        // A nested asset decrypts to its exact bytes.
+        let js = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "assets/app.js",
+            None,
+        ));
+        assert!(
+            matches!(js, PlaintextOutcome::Served { ref bytes, .. } if bytes == b"console.log(1)"),
+            "expected the js asset, got {js:?}"
+        );
+
+        // The EMPTY resource resolves to the default view index.html (same bytes).
+        let bare =
+            rt.block_on(node.serve_content_plaintext(&store.to_hex(), &root.to_hex(), "", None));
+        assert!(
+            matches!(bare, PlaintextOutcome::Served { ref bytes, .. } if bytes == b"<h1>hi</h1>"),
+            "empty resource must default to index.html, got {bare:?}"
+        );
+    }
+
+    /// **Proves:** the serve path fails CLOSED when the requested root is not the chain-anchored tip
+    /// (#127) — never decrypting/serving a generation the chain did not confirm. **Catches:** a serve
+    /// that trusts the caller's root over the chain.
+    #[test]
+    fn serve_content_plaintext_rejects_a_non_anchored_root() {
+        use crate::content_serve::PlaintextOutcome;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([22u8; 32]);
+        let anchored = Bytes32([0x33; 32]);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store.to_hex(), anchored));
+        let wrong = Bytes32([0x44; 32]).to_hex();
+        let out =
+            rt.block_on(node.serve_content_plaintext(&store.to_hex(), &wrong, "index.html", None));
+        assert!(
+            matches!(out, PlaintextOutcome::RootError { .. }),
+            "a non-anchored requested root must fail closed, got {out:?}"
+        );
+    }
+
+    /// **Proves:** `manifest_paths` lists the store's public file paths when the capsule is held with a
+    /// manifest, and is `None` when the capsule is not held (drives the shell's SPA-vs-404 decision).
+    #[tokio::test]
+    async fn manifest_paths_lists_public_paths_when_held_and_none_when_not() {
+        let (node, _td) = test_node(None);
+        let store = Bytes32([23u8; 32]);
+        let files = vec![
+            ("index.html".to_string(), b"x".to_vec()),
+            ("assets/app.js".to_string(), b"y".to_vec()),
+        ];
+        let (root, module) =
+            compile_fixture_module(store, digstore_core::Visibility::Public, true, &files);
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root.to_hex(), &module);
+        let paths = node
+            .manifest_paths(&store.to_hex(), &root.to_hex())
+            .await
+            .expect("held capsule with a manifest → Some(paths)");
+        assert!(paths.contains(&"index.html".to_string()));
+        assert!(paths.contains(&"assets/app.js".to_string()));
+
+        // A capsule this node does not hold → None (the shell then uses the extension-less heuristic).
+        let absent = node
+            .manifest_paths(&Bytes32([24u8; 32]).to_hex(), &Bytes32([25u8; 32]).to_hex())
+            .await;
+        assert!(
+            absent.is_none(),
+            "an unheld capsule yields no manifest paths"
+        );
     }
 
     // -- REDIRECT-ON-MISS (#165) — the content-orchestration miss handler wired into the RPC ----------
