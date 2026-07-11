@@ -38,6 +38,7 @@ use crate::meta;
 use crate::meta::ErrorCode;
 use crate::pairing;
 use crate::rpc::{normalize_request, request_id, rpc_error};
+use crate::wallet_authz;
 
 /// The dig-node binary version, surfaced by `/health`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -528,6 +529,46 @@ async fn rpc(
         let ctx = control_ctx(&state);
         let resp = control::dispatch_control(&ctx, id, &method, &params).await;
         return (StatusCode::OK, Json(resp));
+    }
+
+    // WALLET plane (#370, §7.12): custody-lifecycle (`wallet.*`) + wallet MUTATION methods
+    // (sign/spend/offer/mint/transfer + state-changing actions) are paired-token gated over this
+    // authorized surface AND are NEVER relayed upstream — a signing/custody request must not leave
+    // the loopback node. Authorization is the master control token OR a valid paired token (#280);
+    // an unauthorized caller (no/wrong/revoked token) is -32030. An authorized call is served
+    // locally by the node-custodied wallet once that surface is wired on this transport
+    // (#368/#369); until then it returns a catalogued method-not-served error rather than leaking a
+    // spend/custody op to the public gateway.
+    if wallet_authz::requires_authorization(&method) {
+        let header_tok = headers
+            .get(control::CONTROL_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let presented = control::presented_token(header_tok, &req);
+        let paired_path = pairing::paired_tokens_path(&state.config_path);
+        let authorized =
+            wallet_authz::authorize(&method, presented.as_deref(), &state.control_token, |tok| {
+                pairing::is_paired_token(&paired_path, tok)
+            });
+        if !authorized {
+            return (
+                StatusCode::OK,
+                Json(rpc_error(
+                    id,
+                    ErrorCode::Unauthorized,
+                    "this wallet method requires the local control token (X-Dig-Control-Token \
+                     header or params._control_token) or a paired controller token (see \
+                     `dig-node pair`); it is never relayed upstream",
+                )),
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(rpc_error(
+                id,
+                ErrorCode::MethodNotFound,
+                "the node-custodied wallet surface is not served on this transport yet",
+            )),
+        );
     }
 
     // Keep the original request for a possible passthrough relay (the upstream must

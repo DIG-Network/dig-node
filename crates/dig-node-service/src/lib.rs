@@ -43,6 +43,7 @@ pub mod pairing;
 pub mod rpc;
 pub mod server;
 pub mod service;
+pub mod wallet_authz;
 
 /// Windows Service Control Protocol entrypoint — only meaningful on Windows, where
 /// the SCM-launched binary must speak the service protocol (see the module docs).
