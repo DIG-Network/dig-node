@@ -472,11 +472,30 @@ pub enum NftSortMode {
 // Endpoint request/response structs (the core READ surface — this PR's scope)
 // =============================================================================
 
-/// `login` request: authenticate a wallet by fingerprint.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// `login` request: authenticate/select a wallet by fingerprint, and — for the DIG
+/// extension (#407) — OPTIONALLY declare the CLIENT's PUBLIC identity so the node scopes
+/// wallet-data reads to it.
+///
+/// `puzzle_hashes` (hex) and/or `addresses` (bech32m) are the client's own PUBLIC puzzle
+/// hashes; the node NEVER receives a private key (#217). When either is present the node
+/// records a per-session identity and scopes `get_sync_status`/`get_cats`/coin reads to
+/// those puzzle hashes. Absent both, this is a bare Sage-style fingerprint login and the
+/// node tracks no wallet for the session (reads report the honest "not tracking" state).
+///
+/// Both fields are additive: a Sage client sending only `fingerprint` deserializes
+/// unchanged, and the fields serialize away (`skip_serializing_if`) so the wire stays
+/// Sage-shaped when unused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Login {
     /// The wallet fingerprint to log in.
     pub fingerprint: u32,
+    /// The client's PUBLIC puzzle hashes (hex, optional `0x`) to scope reads to (#407).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub puzzle_hashes: Option<Vec<String>>,
+    /// The client's PUBLIC addresses (bech32m) — decoded to puzzle hashes and merged with
+    /// `puzzle_hashes` for read scoping (#407).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addresses: Option<Vec<String>>,
 }
 /// `login` response (empty).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

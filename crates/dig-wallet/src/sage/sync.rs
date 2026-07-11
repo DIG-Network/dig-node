@@ -13,6 +13,8 @@
 //! mainnet-safely against synthetic `CoinState`s AND the Chia peer simulator — no real
 //! spends (this PR has none).
 
+use std::collections::HashSet;
+
 use chia::protocol::{
     Coin, CoinState, CoinStateFilters, CoinStateUpdate, Message, NewPeakWallet,
     ProtocolMessageTypes,
@@ -22,6 +24,7 @@ use chia_wallet_sdk::client::Peer;
 
 use super::db::{CoinRow, WalletDb};
 use super::events::{EventBus, SyncEvent};
+use super::singleton::{self, LineageSource};
 
 /// A sync error (peer/protocol/db).
 #[derive(Debug)]
@@ -32,6 +35,8 @@ pub enum SyncError {
     Rejected(String),
     /// A database error.
     Db(sqlx::Error),
+    /// A CAT/singleton attribution error (parent-spend read / uncurry).
+    Attribution(String),
 }
 
 impl std::fmt::Display for SyncError {
@@ -40,6 +45,7 @@ impl std::fmt::Display for SyncError {
             SyncError::Peer(e) => write!(f, "peer: {e}"),
             SyncError::Rejected(e) => write!(f, "subscription rejected: {e}"),
             SyncError::Db(e) => write!(f, "db: {e}"),
+            SyncError::Attribution(e) => write!(f, "attribution: {e}"),
         }
     }
 }
@@ -50,8 +56,11 @@ impl From<sqlx::Error> for SyncError {
     }
 }
 
-/// Map a Chia `CoinState` to a wallet DB [`CoinRow`]. `asset_id`/`hint` are attributed by
-/// the caller (XCH coins are `None`; CAT attribution via puzzle uncurrying is a follow-on).
+/// Map a Chia `CoinState` to a wallet DB [`CoinRow`]. A raw `CoinState` does not reveal
+/// whether a coin is a CAT (that lives in its parent's spend), so this stores `asset_id`
+/// as `None`; a [`CatAttributor`] pass (design B.6, #407) then uncurries the parent spend
+/// via [`singleton::reconstruct_coins`] and fills in the CAT `asset_id`/`hint`, so
+/// `get_cats`/`$DIG` resolve. XCH coins legitimately keep `asset_id: None`.
 pub fn coin_state_to_row(state: &CoinState) -> CoinRow {
     let coin: &Coin = &state.coin;
     CoinRow {
@@ -74,6 +83,34 @@ pub async fn apply_coin_states(db: &WalletDb, states: &[CoinState]) -> Result<()
     let rows: Vec<CoinRow> = states.iter().map(coin_state_to_row).collect();
     db.upsert_coins(&rows).await?;
     Ok(())
+}
+
+/// The CAT/singleton attribution step of the sync loop (design B.6, #407). Coins arrive
+/// from `coin_state_update` with `asset_id: None` (a raw `CoinState` does not reveal the
+/// asset); this uncurries each candidate coin's parent spend through `lineage` and fills in
+/// the CAT `asset_id`/`hint` (and NFT/DID rows), so `get_cats`/`get_token` are complete.
+///
+/// `plain_puzzle_hashes` are the wallet's own p2 hashes — a coin sitting at one of them
+/// with an even amount is an ordinary XCH coin and is skipped (never fetches a parent
+/// spend). Attribution reads only; it never signs or broadcasts.
+pub struct CatAttributor<'a> {
+    /// The parent-spend source (coinset/peer point-read) uncurrying reads through.
+    pub lineage: &'a dyn LineageSource,
+    /// The address bech32m prefix for any reconstructed NFT/DID addresses.
+    pub prefix: &'a str,
+    /// The wallet's own plain p2 puzzle hashes (hex) — ordinary XCH coins at these are skipped.
+    pub plain_puzzle_hashes: &'a HashSet<String>,
+}
+
+impl CatAttributor<'_> {
+    /// Attribute every not-yet-attributed coin currently in `db` (idempotent: already-spent
+    /// or already-attributed coins are skipped by [`singleton::reconstruct_coins`]).
+    pub async fn attribute(&self, db: &WalletDb) -> Result<(), SyncError> {
+        singleton::reconstruct_all(db, self.lineage, self.prefix, self.plain_puzzle_hashes)
+            .await
+            .map(|_| ())
+            .map_err(|e| SyncError::Attribution(e.to_string()))
+    }
 }
 
 /// Handle a `coin_state_update` push: on a reorg (`fork_height` below the current peak)
@@ -165,16 +202,24 @@ pub async fn initial_sync(
 /// [`handle_coin_state_update`]; `new_peak_wallet` → advance the peak. This is the
 /// production loop run after [`initial_sync`]; it returns when the peer disconnects, at
 /// which point it publishes [`SyncEvent::Stop`] on `events`.
+///
+/// When `attributor` is `Some`, each applied `coin_state_update` is followed by a CAT/
+/// singleton attribution pass (#407) so newly-synced CAT coins gain their `asset_id`. When
+/// `None`, coins are stored as-is (attribution runs elsewhere / not at all).
 pub async fn run_update_loop(
     db: &WalletDb,
     mut receiver: tokio::sync::mpsc::Receiver<Message>,
     events: &EventBus,
+    attributor: Option<&CatAttributor<'_>>,
 ) -> Result<(), SyncError> {
     while let Some(message) = receiver.recv().await {
         match message.msg_type {
             ProtocolMessageTypes::CoinStateUpdate => {
                 if let Ok(update) = decode::<CoinStateUpdate>(&message) {
                     handle_coin_state_update(db, &update, events).await?;
+                    if let Some(a) = attributor {
+                        a.attribute(db).await?;
+                    }
                 }
             }
             ProtocolMessageTypes::NewPeakWallet => {
@@ -303,7 +348,7 @@ mod tests {
         let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(1);
         drop(tx); // closes the channel immediately
 
-        run_update_loop(&db, receiver, &events).await.unwrap();
+        run_update_loop(&db, receiver, &events, None).await.unwrap();
 
         assert_eq!(rx.recv().await.unwrap(), SyncEvent::Stop);
     }
@@ -332,10 +377,73 @@ mod tests {
         tx.send(msg).await.unwrap();
         drop(tx);
 
-        run_update_loop(&db, receiver, &events).await.unwrap();
+        run_update_loop(&db, receiver, &events, None).await.unwrap();
 
         assert_eq!(rx.recv().await.unwrap(), SyncEvent::CoinState);
         assert_eq!(rx.recv().await.unwrap(), SyncEvent::Stop);
         assert_eq!(db.balance(None).await.unwrap(), 42);
+    }
+
+    /// **Proves (#407):** with a [`CatAttributor`], the update loop runs the attribution pass
+    /// after applying a coin state — fetching the candidate coin's parent spend so a synced
+    /// CAT can be attributed. (The full uncurry→`get_cats` path is proven in `sage::rpc`.)
+    #[tokio::test]
+    async fn run_update_loop_runs_attribution_when_attributor_present() {
+        use crate::sage::singleton::{LineageSource, ParentSpend};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct CountingLineage {
+            hits: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl LineageSource for CountingLineage {
+            async fn parent_spend(
+                &self,
+                _parent_coin_id: &str,
+                _spent_height: u32,
+            ) -> crate::sage::Result<Option<ParentSpend>> {
+                self.hits.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+        }
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(10, "aa").await.unwrap();
+        let events = EventBus::with_capacity(8);
+        let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(4);
+        // A candidate coin (its puzzle hash is not a wallet plain p2 hash) → attribution
+        // fetches its parent spend.
+        let update = CoinStateUpdate {
+            height: 11,
+            fork_height: 10,
+            peak_hash: Bytes32::new([2; 32]),
+            items: vec![state(coin(3, 9, 42), Some(11), None)],
+        };
+        let msg = Message {
+            msg_type: ProtocolMessageTypes::CoinStateUpdate,
+            id: None,
+            data: chia::traits::Streamable::to_bytes(&update).unwrap().into(),
+        };
+        tx.send(msg).await.unwrap();
+        drop(tx);
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let lineage = CountingLineage { hits: hits.clone() };
+        let plain = HashSet::new();
+        let attributor = CatAttributor {
+            lineage: &lineage,
+            prefix: "xch",
+            plain_puzzle_hashes: &plain,
+        };
+        run_update_loop(&db, receiver, &events, Some(&attributor))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "attributor fetched the candidate coin's parent spend"
+        );
     }
 }

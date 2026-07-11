@@ -1454,6 +1454,31 @@ added to `chia-query`. Every wallet-data read selects its source:
 
 So a caller never blocks on an unsynced replica. `get_sync_status` reports the gating sync state.
 
+18.7a. **Identity-scoped reads + honest sync state (#407).** The dig-node answers wallet-data reads for
+the CLIENT's connected self-custody wallet, scoped by that wallet's PUBLIC identity — NEVER the node's
+own coins, and NEVER holding the client's private key (the node receives only public puzzle
+hashes/addresses).
+
+- **Session identity via `login`.** `login` accepts, in addition to `fingerprint`, an OPTIONAL
+  `puzzle_hashes` (hex) and/or `addresses` (bech32m, decoded to puzzle hashes). When either is present
+  the node records a per-session identity (the set of PUBLIC puzzle hashes) and scopes subsequent reads
+  to it; `logout` clears it. These fields are additive — a Sage client sending only `fingerprint`
+  deserializes unchanged and seeds no identity. The node MUST subscribe the declared puzzle hashes for
+  chain-watch so the local DB converges to the client's coins.
+- **Read scoping.** `get_sync_status` (XCH balance), `get_cats`/`get_token`/`get_all_cats` (CAT
+  balances), and `get_coins`/`get_spendable_coin_count` filter to the session identity's coins: XCH
+  coins by `puzzle_hash ∈ identity`, CAT coins by `hint ∈ identity` (a CAT sits at the outer CAT puzzle
+  hash and is hinted to the owner p2). Absent a session identity, reads fall back to the node's own
+  configured puzzle hashes (legacy); when BOTH are empty the node is tracking no wallet and scoped reads
+  return nothing.
+- **Honest sync state (never a silent synced-zero).** `get_sync_status` reports `synced_coins`/
+  `total_coins` TRUTHFULLY. A client derives "synced" as `synced_coins >= total_coins` (treating
+  `total_coins == 0` as synced). The node reports synced ONLY when it is tracking the identity AND the
+  DB has completed initial catch-up (`is_synced()`); otherwise it reports `synced_coins < total_coins`
+  (`0` of at-least-`1`), so an empty or not-yet-caught-up DB, and a wallet the node is not tracking,
+  read as NOT synced and never as a synced-zero. `selectable_balance` is the identity-scoped unspent XCH
+  balance (0 when not tracking).
+
 18.8. **Method surface — reads (served).** `login`, `logout`, `get_version`,
 `get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,
 `get_spendable_coin_count`, `get_coins`, `get_coins_by_ids`, `get_cats`, `get_all_cats`, `get_token`,
@@ -1507,6 +1532,10 @@ in the coin's puzzle, revealed only when its parent is spent. Reconstruction unc
 (via the `Nft`/`Did`/`Cat` driver parsers) to populate the `nfts`/`dids`/`nft_collections` tables and to
 attribute CAT coins to their asset id (TAIL hash) in the `coins` table (so `get_cats`/`get_token` become
 complete). Parent spends are fetched through a `LineageSource` (out-of-DB lineage reads, B.5). Reads only.
+The sync loop runs this attribution as a post-apply step (`sync::CatAttributor`, threaded into
+`run_update_loop`): every `coin_state_update` is followed by an attribution pass that uncurries the
+newly-synced candidate coins, so a synced CAT coin — stored initially with `asset_id: None` — gains its
+TAIL and surfaces in `get_cats` (this is how `$DIG` resolves from the node).
 
 18.12. **Deferred to follow-on units.** The off-chain NFT data-blob/CHIP-0015 metadata fetch
 (`get_nft_data` returns on-chain fields; the metadata JSON surfaces when fetched), `exercise_options`
