@@ -178,9 +178,17 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
     // installing shell's environment).
     let mut environment = vec![
         ("DIG_NODE_PORT".to_string(), config.port.to_string()),
-        ("DIG_NODE_HOST".to_string(), config.host.to_string()),
         ("DIG_RPC_UPSTREAM".to_string(), config.upstream.clone()),
     ];
+    // Only record DIG_NODE_HOST when the operator gave an EXPLICIT override
+    // (#288): omitting it lets the installed service resolve the same default the
+    // CLI would — bind BOTH loopback families (127.0.0.1 AND [::1], §5.2) —
+    // instead of freezing today's IPv4-only default into the service's
+    // environment forever. An operator who set DIG_NODE_HOST before `dig-node
+    // install` still gets that exact override carried into the service.
+    if let Some(host) = config.host {
+        environment.push(("DIG_NODE_HOST".to_string(), host.to_string()));
+    }
     // Only record DIG_NODE_CACHE when an explicit dir was set: omitting it lets the
     // service resolve dig-node's shared canonical default — the SAME dir the DIG
     // Browser's in-process node uses — so the two share ONE cache (#96). Recording

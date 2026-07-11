@@ -174,7 +174,7 @@ async fn host_guard(req: Request, next: Next) -> Response {
             Value::Null,
             ErrorCode::InvalidRequest,
             "dig-node: Host not allowed — this loopback node answers only to \
-             dig.local / localhost / 127.0.0.1 / 127.0.0.2",
+             dig.local / localhost / 127.0.0.1 / 127.0.0.2 / ::1",
         )),
     )
         .into_response()
@@ -578,21 +578,32 @@ pub async fn serve(config: Config) -> std::io::Result<()> {
 /// service entrypoint uses this to drive graceful shutdown from the SCM `Stop`
 /// control event (which is not a unix signal), instead of the OS-signal future.
 ///
-/// ## Dual loopback listeners (#91)
+/// ## Loopback listeners (#91, #288)
 ///
-/// The node opens TWO loopback listeners for the SAME app:
+/// The node opens UP TO THREE loopback listeners for the SAME app:
 ///
-/// 1. **`127.0.0.1:<port>`** (default 9778, #132) — `http://localhost:<port>`. **Always
-///    on** (unprivileged, conflict-free). A failure to bind this is FATAL — the
-///    node has no endpoint, so `serve` returns the error (mapped to `BIND_FAILED`).
-/// 2. **`127.0.0.2:80`** — bare `http://dig.local` (no port), matching the
+/// 1. **`127.0.0.1:<port>`** (default 9778, #132) — `http://localhost:<port>` on
+///    IPv4. **Always on** (unprivileged, conflict-free). A failure to bind this is
+///    FATAL — the node has no endpoint, so `serve` returns the error (mapped to
+///    `BIND_FAILED`).
+/// 2. **`[::1]:<port>`** — the SAME `localhost:<port>` on IPv6 (§5.2 dual-stack
+///    loopback). **Best-effort**: some systems resolve `localhost` to `::1` FIRST
+///    (Windows by default), so without this listener such a client cannot reach
+///    the node and reports it offline even though `127.0.0.1` answers fine. A bind
+///    failure here (IPv6 loopback unavailable/disabled) logs a structured warning
+///    and the node continues IPv4-only — it NEVER aborts for this. Skipped
+///    entirely when an explicit `DIG_NODE_HOST` override is set
+///    ([`Config::bind_addr_v6`]) — the override REPLACES the default dual bind
+///    with exactly that one address.
+/// 3. **`127.0.0.2:80`** — bare `http://dig.local` (no port), matching the
 ///    dig-installer hosts entry. **Best-effort**: binding the privileged port 80
 ///    (and, on macOS, the `127.0.0.2` loopback alias) may fail; if so the node logs
 ///    a structured warning and serves localhost-only — it NEVER aborts for this.
 ///    Skipped entirely when `DIG_NODE_DIGLOCAL=0` ([`Config::dig_local`]).
 ///
-/// Neither listener binds `0.0.0.0` — both are loopback IPs, so the node is never
-/// LAN-exposed. The shared shutdown future drives BOTH to a graceful stop.
+/// No listener ever binds `0.0.0.0` or the IPv6 wildcard `[::]` — every one is a
+/// loopback address, so the node is never LAN-exposed. The shared shutdown future
+/// drives every bound listener to a graceful stop.
 pub async fn serve_with_shutdown<F>(config: Config, shutdown: F) -> std::io::Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -618,18 +629,36 @@ where
 
     let app = router(state);
 
-    // (1) The ALWAYS-ON localhost listener. A failure here is fatal: no endpoint.
+    // (1) The ALWAYS-ON localhost listener (IPv4). A failure here is fatal: no endpoint.
     let localhost = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| std::io::Error::new(e.kind(), format!("dig-node: cannot bind {addr}: {e}")))?;
 
-    // (2) The BEST-EFFORT bare-dig.local listener (127.0.0.2:80). Try to bind; on
+    // (2) The BEST-EFFORT IPv6 loopback listener (`[::1]:<port>`, #288, §5.2): the
+    // SAME localhost:<port> on the other loopback family, so a client whose
+    // resolver returns `::1` before `127.0.0.1` for `localhost` (Windows' default)
+    // still reaches the node. `bind_addr_v6` is `None` when an explicit
+    // `DIG_NODE_HOST` override replaced the default dual bind — nothing to try in
+    // that case. A bind failure (IPv6 loopback unavailable/disabled) is
+    // non-fatal: warn and continue IPv4-only, mirroring the `dig_local` pattern.
+    let ipv6 = match config.bind_addr_v6() {
+        Some(v6_addr) => match tokio::net::TcpListener::bind(&v6_addr).await {
+            Ok(l) => Some((v6_addr, l)),
+            Err(e) => {
+                warn_ipv6_bind_failed(&v6_addr, &e);
+                None
+            }
+        },
+        None => None,
+    };
+
+    // (3) The BEST-EFFORT bare-dig.local listener (127.0.0.2:80). Try to bind; on
     // failure, log a structured warning and continue with localhost-only.
     let dig_local = match config.dig_local_addr() {
         Some(dl_addr) => match tokio::net::TcpListener::bind(&dl_addr).await {
             Ok(l) => {
                 eprintln!("dig-node: bare http://dig.local enabled (listening on {dl_addr})");
-                Some(l)
+                Some((dl_addr, l))
             }
             Err(e) => {
                 warn_dig_local_bind_failed(&dl_addr, &e);
@@ -643,22 +672,27 @@ where
     };
 
     // Operational log line → stderr, so `run --json` leaves stdout for the single
-    // structured object (prose-to-stderr convention).
-    let dig_local_note = if dig_local.is_some() {
-        "  Also reachable at http://dig.local (no port).\n"
-    } else {
-        ""
-    };
+    // structured object (prose-to-stderr convention). Lists every address actually
+    // bound (#288: an agent/operator can see at a glance which loopback families
+    // are live, not just assume the IPv4 default).
+    let mut bound_addrs = vec![format!("http://{addr}")];
+    if let Some((v6_addr, _)) = &ipv6 {
+        bound_addrs.push(format!("http://{v6_addr}"));
+    }
+    if dig_local.is_some() {
+        bound_addrs.push("http://dig.local (no port)".to_string());
+    }
     eprintln!(
-        "dig-node v{VERSION} (local-node) listening on http://{addr}\n  \
-         upstream: {}\n{dig_local_note}  \
+        "dig-node v{VERSION} (local-node) listening on: {}\n  \
+         upstream: {}\n  \
          Point the DIG Chrome extension's \"server host\" at {addr}.",
+        bound_addrs.join(", "),
         config.upstream
     );
 
-    // A single shutdown signal fanned out to both listeners: when it fires, both
+    // A single shutdown signal fanned out to every listener: when it fires, all
     // axum::serve loops stop gracefully. (The caller's future resolves once; we
-    // notify both servers from it.)
+    // notify every server from it.)
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     {
         let n = shutdown_notify.clone();
@@ -674,18 +708,41 @@ where
         axum::serve(localhost, app).with_graceful_shutdown(async move { n.notified().await })
     };
 
-    // Drive both servers concurrently; return the first error (there normally is
-    // none — they run until the shared shutdown). When dig.local is absent we just
-    // await the localhost server.
-    match dig_local {
-        Some(dl_listener) => {
-            let n = shutdown_notify.clone();
-            let dig_local_srv = axum::serve(dl_listener, app)
-                .with_graceful_shutdown(async move { n.notified().await });
-            tokio::try_join!(localhost_srv, dig_local_srv).map(|_| ())
-        }
-        None => localhost_srv.await,
+    let ipv6_srv = ipv6.map(|(_, l)| {
+        let app = app.clone();
+        let n = shutdown_notify.clone();
+        axum::serve(l, app).with_graceful_shutdown(async move { n.notified().await })
+    });
+
+    let dig_local_srv = dig_local.map(|(_, l)| {
+        let n = shutdown_notify.clone();
+        axum::serve(l, app).with_graceful_shutdown(async move { n.notified().await })
+    });
+
+    // Drive every bound listener concurrently; return the first error (there
+    // normally is none — they run until the shared shutdown). Best-effort
+    // listeners that failed to bind are simply absent from the join.
+    match (ipv6_srv, dig_local_srv) {
+        (Some(v6), Some(dl)) => tokio::try_join!(localhost_srv, v6, dl).map(|_| ()),
+        (Some(v6), None) => tokio::try_join!(localhost_srv, v6).map(|_| ()),
+        (None, Some(dl)) => tokio::try_join!(localhost_srv, dl).map(|_| ()),
+        (None, None) => localhost_srv.await,
     }
+}
+
+/// Log the structured warning when the best-effort `[::1]:<port>` (IPv6 loopback)
+/// bind fails (#288). Split out so the message is one place and the policy — warn
+/// and continue IPv4-only, never abort — is obvious at the call site. An IPv6
+/// loopback bind failure is uncommon (most OSes always provide `::1`) but not
+/// impossible: IPv6 disabled at the kernel/network-stack level, or a sandboxed/
+/// restricted environment without it.
+fn warn_ipv6_bind_failed(v6_addr: &str, e: &std::io::Error) {
+    eprintln!(
+        "dig-node: WARN could not bind {v6_addr} for the IPv6 loopback listener ({e}); \
+         continuing IPv4-only on {v6_addr}'s sibling 127.0.0.1 address. This is non-fatal. \
+         A client whose `localhost` resolves to `::1` first (e.g. Windows) may need to use \
+         127.0.0.1 explicitly until IPv6 loopback is available on this system."
+    );
 }
 
 /// Log the structured warning when the best-effort `127.0.0.2:80` (dig.local) bind
@@ -746,6 +803,10 @@ mod tests {
             "http://dig.local:80",
             "http://127.0.0.1:9778",
             "http://127.0.0.2",
+            // #288: a page served from the IPv6 loopback (a client whose
+            // `localhost` resolves to `::1` first) is reflected too.
+            "http://[::1]:9778",
+            "http://[::1]",
         ] {
             assert!(
                 is_local_origin(ok),
@@ -762,6 +823,7 @@ mod tests {
             "http://",           // empty host
             "http://dig.local.evil.com",
             "ws://localhost",
+            "http://[::2]", // non-loopback IPv6 literal
             "",
         ] {
             assert!(!is_local_origin(bad), "{bad:?} must NOT be reflected");

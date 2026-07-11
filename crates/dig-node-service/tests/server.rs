@@ -424,6 +424,73 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
 }
 
+/// #288: with the DEFAULT config (no `DIG_NODE_HOST` override), `serve_with_shutdown`
+/// must bind BOTH loopback families on the SAME port — `127.0.0.1` AND `[::1]` —
+/// so `localhost` reaches the node regardless of which address family the
+/// resolver returns first (Windows resolves `localhost` to `::1` first by
+/// default, which made the node appear offline to such a client before this).
+#[tokio::test]
+async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
+    let (upstream, _calls) = start_mock_upstream().await;
+
+    // Grab a free loopback port, then hand it to serve_with_shutdown explicitly so
+    // we know where to probe (serve_with_shutdown binds config.bind_addr directly).
+    let free = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = free.local_addr().unwrap().port();
+    drop(free); // release it so the server can bind the same port
+
+    let config = dig_node_service::Config {
+        upstream: upstream.to_string(),
+        port,
+        dig_local: false, // skip the privileged 127.0.0.2:80 bind in tests
+        ..dig_node_service::Config::default()  // host: None → dual-stack default
+    };
+
+    let _hold = EnvHold(env_guard().lock_owned().await);
+    let stop = std::sync::Arc::new(tokio::sync::Notify::new());
+    let stop_for_server = stop.clone();
+    let server = {
+        let tmp = std::env::temp_dir().join(format!("dig-node-dualstack-{}", std::process::id()));
+        std::env::set_var("DIG_NODE_CACHE", &tmp);
+        std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        std::env::set_var("DIG_PEER_NETWORK", "off");
+        tokio::spawn(async move {
+            dig_node_service::server::serve_with_shutdown(config, async move {
+                stop_for_server.notified().await;
+            })
+            .await
+        })
+    };
+
+    // Poll both addresses until each answers /health (the server starts async).
+    async fn poll_health(url: &str) -> bool {
+        for _ in 0..50 {
+            if let Ok(r) = client().get(url).send().await {
+                if r.status().is_success() {
+                    return true;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        false
+    }
+
+    let v4_url = format!("http://127.0.0.1:{port}/health");
+    let v6_url = format!("http://[::1]:{port}/health");
+    let v4_served = poll_health(&v4_url).await;
+    let v6_served = poll_health(&v6_url).await;
+
+    assert!(v4_served, "127.0.0.1 must serve /health");
+    assert!(
+        v6_served,
+        "[::1] must ALSO serve /health on the same port (#288 dual-stack default)"
+    );
+
+    // Clean shutdown.
+    stop.notify_waiters();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+}
+
 #[tokio::test]
 async fn cors_reflects_chrome_extension_origin() {
     let (upstream, _calls) = start_mock_upstream().await;

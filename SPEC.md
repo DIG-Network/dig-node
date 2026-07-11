@@ -148,7 +148,7 @@ ARE `DIG_NODE_*`, full stop.
 | Variable | Meaning | Default | Rules |
 |---|---|---|---|
 | `DIG_NODE_PORT` | localhost-listener bind port | `9778` | Parsed as `u16`; `0`, unparsable, or unset → default. |
-| `DIG_NODE_HOST` | localhost-listener bind IP | `127.0.0.1` | Parsed as `IpAddr`; unparsable/unset → default. |
+| `DIG_NODE_HOST` | EXPLICIT localhost-listener bind IP override | *(unset)* | Parsed as `IpAddr`; unparsable/blank/unset ⇒ unset (§4.1's dual-stack default — see below), NOT a hardcoded `127.0.0.1` default. Setting it REPLACES the dual-stack default with exactly that one address (#288). |
 | `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | `https://rpc.dig.net` | Normalized (§3.3); highest precedence (§3.4). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
 | `DIG_NODE_DIGLOCAL` | toggle for the bare-`http://dig.local` listener | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
@@ -225,13 +225,21 @@ atomic temp-file + rename in the same directory, and MUST preserve all keys the 
 
 ## 4. HTTP transport
 
-### 4.1. Dual loopback listeners
+### 4.1. Loopback listeners (dual-stack default, #91, #288)
 
-The server opens up to two listeners for the SAME router:
+The server opens UP TO THREE listeners for the SAME router:
 
 1. **`<DIG_NODE_HOST>:<DIG_NODE_PORT>`** (default `127.0.0.1:9778`, §3.2) — always on. A bind
    failure here is FATAL (`serve` returns the error; CLI exit `BIND_FAILED`, §8.4).
-2. **`127.0.0.2:80`** — the bare-`http://dig.local` listener (constants `DIG_LOCAL_IP` =
+2. **`[::1]:<DIG_NODE_PORT>`** (§5.2 dual-stack loopback) — the SAME `localhost:<port>` on the
+   IPv6 loopback. Present ONLY when `DIG_NODE_HOST` is unset (the default): some resolvers return
+   `::1` before `127.0.0.1` for `localhost` (Windows by default), so without this listener such a
+   client cannot reach the node and observes it as offline even though the IPv4 listener answers.
+   An explicit `DIG_NODE_HOST` override REPLACES the default dual bind with exactly that one
+   address — this listener is then skipped, not added to. This bind is **best-effort**: on
+   failure (IPv6 loopback unavailable/disabled) the node MUST log a structured warning to stderr
+   and continue IPv4-only — it MUST NOT abort.
+3. **`127.0.0.2:80`** — the bare-`http://dig.local` listener (constants `DIG_LOCAL_IP` =
    `127.0.0.2`, `DIG_LOCAL_PORT` = `80`, `DIG_LOCAL_HOST` = `dig.local`). This bind is
    **best-effort**: on failure (no privilege, port in use, missing macOS `127.0.0.2` loopback
    alias) the node MUST log a structured warning to stderr and continue serving localhost-only —
@@ -239,17 +247,23 @@ The server opens up to two listeners for the SAME router:
 
 The distinct loopback IP `.2` exists so the port-80 bind can never collide with an unrelated
 `localhost:80` service. The dig-installer writes the hosts entry `127.0.0.2  dig.local`; this
-listener is what makes the portless `http://dig.local` URL reach the node. Neither listener may
-bind `0.0.0.0` or `[::]` — the node is a localhost endpoint and MUST never be LAN-exposed.
+listener is what makes the portless `http://dig.local` URL reach the node. No listener may
+bind `0.0.0.0` or the IPv6 wildcard `[::]` — the node is a localhost endpoint and MUST never be
+LAN-exposed. A service install (§9) forwards `DIG_NODE_HOST` into the installed service's
+environment ONLY when the operator gave an explicit override, so a plain `dig-node install` with
+no override yields a service that also dual-binds by default, rather than freezing an IPv4-only
+default into every future install.
 
 ### 4.2. Host-header allowlist (anti-rebinding)
 
 Every non-`OPTIONS` request MUST pass the Host allowlist before any handler runs. Allowed host
-names (with or without a `:port` suffix): `dig.local`, `localhost`, `127.0.0.1`, `127.0.0.2`. A
-missing or empty `Host` header MUST be allowed (HTTP/1.0, health probes). Any other Host — the
-DNS-rebinding vector — MUST be rejected with HTTP **`421 Misdirected Request`** and a JSON-RPC
-error body carrying the catalogued `INVALID_REQUEST` code (§10). `OPTIONS` (CORS preflight) is
-exempt so preflights to allowed origins always succeed.
+names (with or without a `:port` suffix): `dig.local`, `localhost`, `127.0.0.1`, `127.0.0.2`, and
+the IPv6 loopback `::1` (bracketed `[::1]`/`[::1]:<port>` per RFC 7230's mandatory bracketing for
+an IPv6-literal Host, or bare `::1` for a non-browser client that omits them, #288). A missing or
+empty `Host` header MUST be allowed (HTTP/1.0, health probes). Any other Host — the DNS-rebinding
+vector — MUST be rejected with HTTP **`421 Misdirected Request`** and a JSON-RPC error body
+carrying the catalogued `INVALID_REQUEST` code (§10). `OPTIONS` (CORS preflight) is exempt so
+preflights to allowed origins always succeed.
 
 ### 4.3. CORS
 
@@ -900,7 +914,7 @@ does offset/length arithmetic over untrusted serialized input).
 
 ## 12. Security properties (summary)
 
-- **Never LAN-exposed:** loopback-only binds (§4.1); no `0.0.0.0`.
+- **Never LAN-exposed:** loopback-only binds (§4.1); no `0.0.0.0` or `[::]`.
 - **Anti-DNS-rebinding:** Host allowlist with 421 rejection (§4.2); CORS reflects only local
   origins (§4.3).
 - **Read/control split:** read methods open to local consumers; `control.*` requires possession of
@@ -921,7 +935,7 @@ does offset/length arithmetic over untrusted serialized input).
 | 2 | `DIG_NODE_PORT` / `DIG_NODE_HOST` names | dig-installer + apt.dig.net expectations — never renamed | §3.1 |
 | 3 | Shared cache default | Byte-identical dir to the DIG Browser's in-process node when `DIG_NODE_CACHE` unset | §3.5 |
 | 4 | `dig.local` addressing | dig-installer hosts entry `127.0.0.2  dig.local`; listener `127.0.0.2:80`, best-effort | §4.1–4.2 |
-| 5 | Host/CORS allowlist | `dig.local` / `localhost` / `127.0.0.1` / `127.0.0.2` (+ `chrome-extension://` origins) | §4.2–4.3 |
+| 5 | Host/CORS allowlist | `dig.local` / `localhost` / `127.0.0.1` / `127.0.0.2` / `::1` (+ `chrome-extension://` origins) | §4.2–4.3 |
 | 6 | Method catalogue ↔ read path | drift guard: `local` resolves, `passthrough` returns `-32601` at the pinned rev | §5.5–5.6; `tests/openrpc_drift_guard.rs` |
 | 7 | Error codes | Table §10 — stable numbers + UPPER_SNAKE names + origins | §10; `src/meta.rs` |
 | 8 | CLI exit codes + `--json` envelopes | Table §8.4; one JSON object on stdout | §8; `src/cli.rs`, `tests/cli.rs` |
