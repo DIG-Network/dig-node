@@ -30,12 +30,13 @@
 //! so the byte-exact §21/FFI contract is untouched. `control.peerStatus` is always safe to call (it
 //! reports "not running" when no network is up).
 //!
-//! ## The clean seam for #163 (dig-dht)
+//! ## Content location — the dig-dht provider index (#163)
 //!
-//! Peer DISCOVERY here is pool + `dig.getPeers` (the introducer/gossip sources). The provider-lookup
-//! seam — "who holds capsule X?" beyond the local pool — is [`PeerRpcClient::find_holders`], which
-//! today queries the connected pool via availability; #163 (dig-dht) slots in as an additional
-//! provider source behind the SAME interface without touching the serve path.
+//! Peer DISCOVERY here is the connected pool + `dig.getPeers` (the introducer/gossip sources). Content
+//! LOCATION — "who holds capsule X?" beyond the local pool — is the **dig-dht provider index**, wired as
+//! the live locator inside [`crate::download::NodeContent`] (`DhtProviderLocator` → `find_providers`);
+//! the redirect-on-miss and multi-source fetch paths both resolve holders through it. There is exactly
+//! ONE provider path — no separate pool-availability seam.
 //!
 //! ## Address-family policy — IPv6-first, IPv4-fallback (ecosystem HARD RULE)
 //!
@@ -981,83 +982,6 @@ async fn stream_fetched_range(
                 return write_framed(out, &errf).await;
             }
         }
-    }
-}
-
-// -- Outgoing L7 peer RPC (the multi-source download seam, #163 dig-dht clean seam) ------------------
-
-/// Outcome of an availability check against one pool peer, for the multi-source download planner.
-#[derive(Debug, Clone)]
-pub struct PeerAvailability {
-    /// The peer's `peer_id` (64-hex).
-    pub peer_id: String,
-    /// The raw availability answers (one per queried item), from the peer.
-    pub answers: Vec<dig_nat::AvailabilityAnswer>,
-}
-
-/// ISSUE the L7 peer RPC to pool peers — the outgoing client path (multi-source download seam). Given
-/// a running [`dig_gossip::GossipHandle`], this lets the node ASK pool peers for availability and
-/// FETCH byte ranges of a resource it lacks, verifying each range against the chain-anchored root
-/// before use. Today the provider set is the connected pool ([`dig_gossip::GossipHandle`]'s
-/// `connected_pool_peers`) + `dig.getPeers`; #163 (dig-dht) plugs in as an additional provider source
-/// behind [`Self::find_holders`] WITHOUT touching this fetch/verify path.
-pub struct PeerRpcClient {
-    handle: dig_gossip::GossipHandle,
-    per_method_timeout: std::time::Duration,
-}
-
-impl PeerRpcClient {
-    /// Build a client over a running gossip handle. `per_method_timeout` bounds each NAT-traversal
-    /// tier so a dial never hangs (a dig-nat guarantee).
-    pub fn new(handle: dig_gossip::GossipHandle, per_method_timeout: std::time::Duration) -> Self {
-        PeerRpcClient {
-            handle,
-            per_method_timeout,
-        }
-    }
-
-    /// Find pool peers that HOLD a capsule/resource by asking each connected peer for availability.
-    /// This is the discovery step of the multi-source download flow; #163 (dig-dht) extends the
-    /// candidate set behind this same signature. Returns per-peer availability answers.
-    ///
-    /// `items` is the availability batch (store/root/resource granularity items). Only currently
-    /// connected pool peers are queried (already-authenticated mTLS links); a peer that errors is
-    /// skipped (best-effort). Dial-and-query of not-yet-connected candidates is a follow-up seam.
-    pub async fn find_holders(
-        &self,
-        items: Vec<dig_nat::AvailabilityItem>,
-    ) -> Vec<PeerAvailability> {
-        let mut out = Vec::new();
-        for (peer_id, addr, _outbound) in self.handle.connected_pool_peers() {
-            // Dial the peer over the NAT ladder (direct-first) and query availability. The pool peer
-            // is already known + authenticated; this opens a control stream to it.
-            match self
-                .handle
-                .connect_via_nat(
-                    peer_id,
-                    Some(addr),
-                    &[
-                        dig_nat::TraversalKind::Direct,
-                        dig_nat::TraversalKind::Relayed,
-                    ],
-                    self.per_method_timeout,
-                )
-                .await
-            {
-                Ok(mut conn) => match conn.query_availability(items.clone()).await {
-                    Ok(resp) => out.push(PeerAvailability {
-                        // gossip PeerId is a chia Bytes32 (no to_hex) — render as 64-hex.
-                        peer_id: hex::encode(peer_id),
-                        answers: resp.items,
-                    }),
-                    Err(e) => {
-                        tracing::debug!(peer = %peer_id, error = %e, "availability query failed")
-                    }
-                },
-                Err(e) => tracing::debug!(peer = %peer_id, error = %e, "connect_via_nat failed"),
-            }
-        }
-        out
     }
 }
 
