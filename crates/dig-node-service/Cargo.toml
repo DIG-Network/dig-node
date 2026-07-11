@@ -82,3 +82,8 @@ digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "0
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
 digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
 tempfile = "3"
+# The verification-ledger fail-closed integration test (#307, `tests/content_serve.rs`) crafts a
+# self-consistent Merkle proof whose root is NOT the requested (anchored) root and base64-encodes it
+# into a mock `dig.getContent` window, so the node's RPC tier verifies-then-fails-closed and records
+# the failed entry. `base64` matches dig-node-core's version.
+base64 = "0.22"

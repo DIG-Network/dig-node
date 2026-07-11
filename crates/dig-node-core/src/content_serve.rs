@@ -337,19 +337,45 @@ impl Node {
                         salt.as_ref(),
                         &chunk_lens,
                     ) {
-                        Ok(bytes) => PlaintextOutcome::Served {
-                            bytes,
-                            root_hex: root_hex.clone(),
-                            verified,
-                            source: ServeSource::Rpc,
-                        },
+                        Ok(bytes) => {
+                            // Ledger (#307): record the verified RPC serve + its proof.
+                            self.record_verification(
+                                store_hex,
+                                &root_hex,
+                                effective_key,
+                                ServeSource::Rpc.as_str(),
+                                verified,
+                                &proof,
+                                None,
+                            );
+                            PlaintextOutcome::Served {
+                                bytes,
+                                root_hex: root_hex.clone(),
+                                verified,
+                                source: ServeSource::Rpc,
+                            }
+                        }
                         // The gateway returned bytes that do not verify against the anchored root — a
                         // decoy for a missing key (or tampered). Either way the resource is NOT
                         // genuinely available at this root → a clean miss (drives the SPA/404 decision),
                         // never a served-garbage result (fail-closed: no plaintext is returned).
-                        Err(_) => PlaintextOutcome::NotFound {
-                            root_hex: root_hex.clone(),
-                        },
+                        // Ledger (#307): the bytes were fetched via RPC and FAILED verification, so
+                        // record a fail-closed entry (verified=false + the reason) — never served, but
+                        // retained so the badge reads "Unverified" + the modal shows the failed proof.
+                        Err(reason) => {
+                            self.record_verification(
+                                store_hex,
+                                &root_hex,
+                                effective_key,
+                                ServeSource::Rpc.as_str(),
+                                false,
+                                &proof,
+                                Some(reason),
+                            );
+                            PlaintextOutcome::NotFound {
+                                root_hex: root_hex.clone(),
+                            }
+                        }
                     };
                 }
                 Err(ProxyMiss::NotFound) => {
@@ -407,11 +433,25 @@ impl Node {
             &resp.chunk_lens,
         )
         .ok()
-        .map(|bytes| PlaintextOutcome::Served {
-            bytes,
-            root_hex: root_hex.to_string(),
-            verified,
-            source: ServeSource::Local,
+        .map(|bytes| {
+            // Ledger (#307): record the verified local serve + its proof. A decoy/verify failure here
+            // returns `None` (fall through to peer/RPC) and is NOT recorded — only this definitive
+            // local-served outcome is.
+            self.record_verification(
+                &store_id.to_hex(),
+                root_hex,
+                effective_key,
+                ServeSource::Local.as_str(),
+                verified,
+                &resp.merkle_proof,
+                None,
+            );
+            PlaintextOutcome::Served {
+                bytes,
+                root_hex: root_hex.to_string(),
+                verified,
+                source: ServeSource::Local,
+            }
         })
     }
 
@@ -445,12 +485,24 @@ impl Node {
             salt,
             &chunk_lens,
         ) {
-            Ok(bytes) => Some(PlaintextOutcome::Served {
-                bytes,
-                root_hex: root_hex.to_string(),
-                verified,
-                source: ServeSource::Peer,
-            }),
+            Ok(bytes) => {
+                // Ledger (#307): record the verified peer serve + its proof.
+                self.record_verification(
+                    store_hex,
+                    root_hex,
+                    effective_key,
+                    ServeSource::Peer.as_str(),
+                    verified,
+                    &proof,
+                    None,
+                );
+                Some(PlaintextOutcome::Served {
+                    bytes,
+                    root_hex: root_hex.to_string(),
+                    verified,
+                    source: ServeSource::Peer,
+                })
+            }
             // A verify/decrypt failure on the peer bytes is NOT fatal to the serve — fall through to
             // the public RPC (a different holder / the gateway may serve the correct bytes).
             Err(_) => None,

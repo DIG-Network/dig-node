@@ -298,6 +298,7 @@ method/header-allow behavior above.
 | `/.well-known/dig-node.json` | GET | The discovery document (§6.4). |
 | `/ws/status` | GET (WS upgrade) | WebSocket status/liveness channel (§4.5). |
 | `/s/<storeId>[:<root>]/<path>` | GET | Local plaintext content-serve — server-side decrypt (§4.6). |
+| `/verify/<storeId>[:<root>]` | GET | Verification-ledger snapshot for a page session (§4.7). |
 | *(fallback)* | GET | Root-absolute subresource rerooted via `Referer` into its store (§4.6). |
 
 ### 4.5. `GET /ws/status` — WebSocket status/liveness channel (#239)
@@ -415,6 +416,83 @@ that served the MAIN resource). A consumer's DIG Shields / toolbar reads these.
 **Salt.** A private store's secret salt is not yet provisioned to this surface; a private store therefore
 fails closed at decrypt. Public stores (salt = none) serve fully. (Private-store salt provisioning is a
 tracked follow-up.)
+
+### 4.7. Verification ledger — `GET /verify/<storeId>[:<root>]` (#307)
+
+The `/s/` serve path (§4.6) verifies every resource server-side against the store's chain-anchored root
+and fails closed. The node RETAINS each per-resource verdict + the Merkle inclusion-proof data that verify
+step computed, in a bounded, short-TTL, in-memory **verification ledger** keyed by `storeId:root`, and
+exposes it read-only on the SAME loopback browser surface (same host-guard §4.2 + CORS §4.3 as `/s/`;
+loopback-only, no secrets). A consumer (the DIG Chrome extension) reads it to render a page-level
+"Verified by Chia" badge and a proof-inspection modal.
+
+**Recording.** An entry is written on the EXISTING verify step (the ledger does NOT re-verify — it reuses
+the proof the serve already computed), at each DEFINITIVE per-resource outcome:
+- a resource served (`local`/`peer`/`rpc`) that verified → recorded with `verified` = the `X-Dig-Verified`
+  result for that serve (`true` under the default chain-anchored pin; `false` only when `DIG_NODE_PIN=off`);
+- an `rpc` response whose bytes were fetched but FAILED verification (a decoy / tamper / a root that is not
+  the anchored tip) → recorded `verified: false` with a `failReason`, and — per fail-closed — NEVER served.
+
+A tier fall-through (a `local` decoy that falls through to `peer`/`rpc`) and a genuine upstream content miss
+(the `-32004` "resource not available") are NOT verification failures and are NOT recorded. Entries are
+deduped by resource key (a re-served resource updates its entry in place, preserving load order).
+
+**Bounds.** In-memory only, never persisted. Retained per `(store, root)` page session for a short TTL
+(15 minutes since last update), capped at 64 sessions (least-recently-updated evicted) and 1024 resources
+per session.
+
+**Request.** `GET /verify/<storeId>[:<root>]`. `<storeId>` and the optional `<root>` are 64-hex (lowercased).
+With `<root>` present the exact session is returned; with `<root>` omitted the store's most-recently-updated
+session is returned (a page has one active root). A malformed path is `404`; any well-formed request is
+`200` with a valid (possibly empty) JSON body.
+
+**Response.** `application/json`, camelCase, stable field names:
+
+```json
+{
+  "storeId": "<64-hex>",
+  "root": "<64-hex>",
+  "aggregate": {
+    "verified": true,
+    "anyRpcFailed": false,
+    "counts": { "total": 3, "verified": 3, "failed": 0,
+                "bySource": { "local": 2, "peer": 0, "rpc": 1 } }
+  },
+  "resources": [
+    {
+      "resourceKey": "index.html",
+      "source": "local",
+      "verified": true,
+      "root": "<64-hex anchored root this entry served against>",
+      "proof": {
+        "leafHash": "<64-hex — SHA-256(resource ciphertext), the D5 leaf>",
+        "siblings": [ { "hash": "<64-hex>", "dir": "left" }, { "hash": "<64-hex>", "dir": "right" } ],
+        "leafIndex": 0,
+        "proofRoot": "<64-hex — the root the proof folds to>"
+      },
+      "failReason": null
+    }
+  ]
+}
+```
+
+**Aggregate rules (normative).**
+- `aggregate.verified` = `resources` is non-empty AND every entry has `verified: true`. The badge is green
+  "Verified by Chia" only when this is `true`; otherwise "Unverified".
+- `aggregate.anyRpcFailed` = any entry with `source == "rpc" && verified == false`.
+- `counts.total`/`verified`/`failed` count the entries; `counts.bySource` counts entries per tier.
+
+**Proof-data semantics (for display + optional client re-verification).**
+- `leafHash` = `SHA-256(resource_ciphertext)` — the per-resource Merkle leaf.
+- `siblings` = the bottom-up inclusion path in fold order. `dir == "left"` means the sibling is the LEFT
+  node (fold `hash(sibling, acc)`); `dir == "right"` means the sibling is the RIGHT node (fold
+  `hash(acc, sibling)`). Internal-node hashing is domain-separated (`SHA-256("digstore:node:v1" || left || right)`).
+- `proofRoot` = the root the proof folds to. A client re-verifies by folding `leafHash` up through `siblings`
+  and checking it equals `proofRoot`, then checking `proofRoot == root` (the chain-anchored root). For a
+  verified entry `proofRoot == root`; for a fail-closed entry they differ (and `failReason` explains why).
+- `leafIndex` = the leaf's index reconstructed from the sibling directions (a left-sibling step sets the bit
+  at that level). It is a DISPLAY value only — re-verification never consults it — and is exact for a leaf
+  whose path has no odd-carry level.
 
 ---
 

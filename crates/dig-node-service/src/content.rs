@@ -149,6 +149,36 @@ pub fn parse_store_path(path: &str) -> Option<StorePath> {
     })
 }
 
+/// Parse a `GET /verify/<storeId>[:<root>]` verification-ledger request path into `(store_id, root)`,
+/// or `None` when it is not well-formed (missing `/verify/` prefix, or a store id / root that is not
+/// 64-hex). Accepts the full request path (`/verify/...`) OR the bare wildcard tail
+/// (`<store>[:<root>]`) the router hands over, with an optional trailing slash. There is NO resource
+/// tail — a query names only the `(store, root)` page session; `root` omitted selects the most-recent
+/// session for the store (#307).
+pub fn parse_verify_path(path: &str) -> Option<(String, Option<String>)> {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    let rest = rest.strip_prefix("verify/").unwrap_or(rest);
+    let rest = rest.trim_end_matches('/');
+    // Only `<store>[:<root>]` is meaningful; ignore any accidental extra path segment.
+    let head = rest.split('/').next().unwrap_or(rest);
+    let (store_id, root) = match head.split_once(':') {
+        Some((s, r)) => (s, Some(r.to_string())),
+        None => (head, None),
+    };
+    if !is_hex64(store_id) {
+        return None;
+    }
+    if let Some(r) = &root {
+        if !is_hex64(r) {
+            return None;
+        }
+    }
+    Some((
+        store_id.to_ascii_lowercase(),
+        root.map(|r| r.to_ascii_lowercase()),
+    ))
+}
+
 /// The store-root base href for a `<base>` tag: `/s/<store>[:<root>]/`. A store's RELATIVE links
 /// resolve within its own path against this.
 pub fn store_base_href(sp: &StorePath) -> String {
@@ -278,6 +308,35 @@ mod tests {
         assert!(parse_store_path("/s/not-hex/index.html").is_none());
         assert!(parse_store_path(&format!("/s/{STORE}:zz/index.html")).is_none());
         // bad root
+    }
+
+    #[test]
+    fn parse_verify_path_extracts_store_and_optional_root() {
+        // Full path with root.
+        let (store, root) = parse_verify_path(&format!("/verify/{STORE}:{ROOT}")).unwrap();
+        assert_eq!(store, STORE);
+        assert_eq!(root.as_deref(), Some(ROOT));
+
+        // Store only (no root) → None root (⇒ most-recent session downstream).
+        let (store, root) = parse_verify_path(&format!("/verify/{STORE}")).unwrap();
+        assert_eq!(store, STORE);
+        assert_eq!(root, None);
+
+        // Trailing slash tolerated.
+        let (store, root) = parse_verify_path(&format!("/verify/{STORE}:{ROOT}/")).unwrap();
+        assert_eq!(store, STORE);
+        assert_eq!(root.as_deref(), Some(ROOT));
+
+        // Bare wildcard tail (router already stripped "/verify/").
+        let (store, _root) = parse_verify_path(&format!("{STORE}:{ROOT}")).unwrap();
+        assert_eq!(store, STORE);
+    }
+
+    #[test]
+    fn parse_verify_path_rejects_non_hex() {
+        assert!(parse_verify_path("/verify/not-hex").is_none());
+        assert!(parse_verify_path(&format!("/verify/{STORE}:zz")).is_none());
+        assert!(parse_verify_path("/verify/").is_none());
     }
 
     #[test]

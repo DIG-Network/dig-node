@@ -56,6 +56,10 @@ pub mod net;
 pub mod peer;
 pub mod pex;
 pub mod subscription;
+/// Server-side verification ledger (#307): the bounded, short-TTL record of the per-resource
+/// verify verdict + Merkle inclusion-proof data the `/s/` serve path (#289) computes, exposed
+/// read-only on the loopback browser surface (`GET /verify/...`).
+pub mod verification_ledger;
 
 /// The node library's crate version (its `Cargo.toml` `version`). Host shells (the
 /// OS-service `dig-node-service`, the DIG Browser's `dig_runtime`) surface this as the
@@ -293,6 +297,13 @@ pub struct Node {
     /// serving over-cap or dropping it. See [`bandwidth::OutgoingThrottle`] and
     /// [`Node::bandwidth_redirect`].
     outgoing_throttle: bandwidth::OutgoingThrottle,
+    /// The server-side VERIFICATION LEDGER (#307): a bounded, short-TTL, in-memory record of the
+    /// per-resource verify verdict + Merkle inclusion-proof data the `/s/` serve path already
+    /// computes, keyed by `store:root`. The loopback service shell exposes it read-only at
+    /// `GET /verify/<store>[:<root>]` so the extension can render the page-level "Verified by Chia"
+    /// badge + proof-inspection modal. Populated on the existing verify step (never re-verified),
+    /// fail-closed unchanged. See [`verification_ledger::VerificationLedger`].
+    verification_ledger: verification_ledger::VerificationLedger,
 }
 
 /// A boxed async hook that reconciles the node's DHT provider records with its current cache
@@ -2963,6 +2974,7 @@ impl Node {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
         })
@@ -3025,6 +3037,7 @@ pub(crate) mod test_support {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
@@ -3196,6 +3209,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
@@ -3268,6 +3282,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
@@ -3311,6 +3326,7 @@ mod tests {
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         });
@@ -3395,6 +3411,7 @@ mod tests {
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
                 backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+                verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             });
@@ -3461,6 +3478,7 @@ mod tests {
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
                 backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+                verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             });
@@ -5639,6 +5657,44 @@ mod tests {
             matches!(bare, PlaintextOutcome::Served { ref bytes, .. } if bytes == b"<h1>hi</h1>"),
             "empty resource must default to index.html, got {bare:?}"
         );
+
+        // Verification ledger (#307): every served resource was recorded local + verified against the
+        // chain-anchored root, so the page-level aggregate is "Verified by Chia". `index.html` (served
+        // twice — explicitly and via the empty default) is deduped to ONE entry, so the two distinct
+        // resources (`index.html`, `assets/app.js`) yield two ledger entries, both local + verified.
+        let snap = node.verification_ledger_snapshot(&store.to_hex(), Some(&root.to_hex()));
+        assert_eq!(snap.store_id, store.to_hex());
+        assert_eq!(snap.root, root.to_hex());
+        assert_eq!(
+            snap.resources.len(),
+            2,
+            "index.html deduped; index + app.js"
+        );
+        assert!(
+            snap.aggregate.verified,
+            "all local + chain-anchored → verified"
+        );
+        assert!(!snap.aggregate.any_rpc_failed);
+        assert_eq!(snap.aggregate.counts.total, 2);
+        assert_eq!(snap.aggregate.counts.verified, 2);
+        assert_eq!(snap.aggregate.counts.by_source.local, 2);
+        let idx = snap
+            .resources
+            .iter()
+            .find(|e| e.resource_key == "index.html")
+            .expect("index.html recorded");
+        assert!(idx.verified);
+        assert_eq!(idx.source, "local");
+        assert_eq!(idx.root, root.to_hex());
+        // Proof data is present + ties to the anchored root (leaf hash + fold root serialized).
+        assert_eq!(idx.proof.proof_root, root.to_hex());
+        assert!(!idx.proof.leaf_hash.is_empty());
+        assert!(idx.fail_reason.is_none());
+
+        // A no-root query returns the same (most-recent) page session.
+        let latest = node.verification_ledger_snapshot(&store.to_hex(), None);
+        assert_eq!(latest.root, root.to_hex());
+        assert_eq!(latest.resources.len(), 2);
     }
 
     /// **Proves:** the serve path fails CLOSED when the requested root is not the chain-anchored tip
