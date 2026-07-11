@@ -2456,7 +2456,9 @@ mod tests {
     // ---- send/spend dispatch (#216) --------------------------------------
 
     use super::super::db::NftDbRow;
-    use super::super::spend::{MockBroadcaster, WalletSigner};
+    use super::super::spend::{
+        BroadcastConsent, ConsentBroadcaster, MockBroadcaster, WalletSigner,
+    };
     use chia_sdk_test::BlsPair;
 
     /// A backend with a signer over a single test key, a coin funded at that key's puzzle
@@ -2491,6 +2493,57 @@ mod tests {
             .with_signer(signer)
             .with_broadcaster(bc.clone());
         (be, bc, ph)
+    }
+
+    /// Like [`spend_backend`] but the broadcaster is a [`ConsentBroadcaster`] wrapping the mock —
+    /// so a broadcast reaches the (mock) network ONLY after per-op consent is armed (#371).
+    async fn consent_spend_backend(
+        fund: u64,
+    ) -> (
+        WalletBackend,
+        std::sync::Arc<MockBroadcaster>,
+        BroadcastConsent,
+    ) {
+        let (base, mock, ph) = spend_backend(fund).await;
+        let consent = BroadcastConsent::new();
+        let gated = Arc::new(ConsentBroadcaster::new(mock.clone(), consent.clone()));
+        // Rebuild the backend attaching the consent-gated broadcaster in place of the plain mock.
+        let be = base.with_broadcaster(gated);
+        let _ = ph;
+        (be, mock, consent)
+    }
+
+    /// #371 (§18.21): `send_xch` builds + signs + validates, but the node broadcasts on the
+    /// paired caller's behalf ONLY with explicit per-op consent. Unconsented → fails closed,
+    /// nothing spent; consented → broadcasts exactly once.
+    #[tokio::test]
+    async fn send_xch_broadcasts_only_with_per_op_consent() {
+        let (be, mock, consent) = consent_spend_backend(1_000).await;
+        let dest = encode_address(&"22".repeat(32), "txch").unwrap();
+        let body = format!(r#"{{"address":"{dest}","amount":600,"fee":10,"auto_submit":true}}"#);
+
+        // Unconsented: the spend builds + signs + validates, but the broadcast is refused —
+        // nothing reaches the (mock) network and dispatch returns a non-200 fail-closed status.
+        let (status, resp) = be.dispatch("send_xch", &body).await;
+        assert_ne!(
+            status, 200,
+            "unconsented broadcast must fail closed: {resp}"
+        );
+        assert_eq!(
+            mock.sent.lock().unwrap().len(),
+            0,
+            "nothing is broadcast without per-op consent"
+        );
+
+        // Consent armed: the same op now signs + broadcasts exactly once.
+        consent.arm();
+        let (status, resp) = be.dispatch("send_xch", &body).await;
+        assert_eq!(status, 200, "{resp}");
+        assert_eq!(
+            mock.sent.lock().unwrap().len(),
+            1,
+            "a consented op broadcasts exactly once"
+        );
     }
 
     #[tokio::test]

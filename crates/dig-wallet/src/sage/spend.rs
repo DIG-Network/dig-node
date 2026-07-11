@@ -158,6 +158,132 @@ impl Broadcaster for MockBroadcaster {
     }
 }
 
+/// The PRODUCTION broadcaster (§18.21): pushes a signed bundle to mainnet via
+/// `chia_query::push_tx` — decentralized Chia peers with a coinset.org fallback (IPv6-first per
+/// §5.2), mirroring Sage's peer `send_transaction`. This is the REAL [`Broadcaster`] the node
+/// attaches on the authorized sign+broadcast path; tests use [`MockBroadcaster`] or the simulator,
+/// NEVER this (there is no auto-broadcast in CI).
+pub struct ChiaQueryBroadcaster {
+    query: std::sync::Arc<chia_query::ChiaQuery>,
+}
+
+impl ChiaQueryBroadcaster {
+    /// Wrap a shared [`chia_query::ChiaQuery`] — the SAME substrate the fallback tier uses
+    /// ([`super::fallback::CoinsetFallback`]), so the serving layer shares one client.
+    pub fn new(query: std::sync::Arc<chia_query::ChiaQuery>) -> Self {
+        Self { query }
+    }
+}
+
+/// Convert a `chia_protocol::SpendBundle` into the `chia_query` wire bundle `push_tx` accepts
+/// (hex-encoded coin spends + aggregate signature; `chia_query` parses these 0x-tolerantly). PURE
+/// — unit-tested against a known bundle so the field encoding can't silently drift.
+fn to_query_bundle(bundle: &SpendBundle) -> Result<chia_query::SpendBundle> {
+    let coin_spends = bundle
+        .coin_spends
+        .iter()
+        .map(|cs| {
+            Ok(chia_query::CoinSpend {
+                coin: chia_query::Coin {
+                    parent_coin_info: hex::encode(cs.coin.parent_coin_info),
+                    puzzle_hash: hex::encode(cs.coin.puzzle_hash),
+                    amount: cs.coin.amount,
+                },
+                puzzle_reveal: hex::encode(
+                    cs.puzzle_reveal
+                        .to_bytes()
+                        .map_err(|e| Error::internal(format!("serialize puzzle: {e}")))?,
+                ),
+                solution: hex::encode(
+                    cs.solution
+                        .to_bytes()
+                        .map_err(|e| Error::internal(format!("serialize solution: {e}")))?,
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(chia_query::SpendBundle {
+        coin_spends,
+        aggregated_signature: hex::encode(bundle.aggregated_signature.to_bytes()),
+    })
+}
+
+#[async_trait]
+impl Broadcaster for ChiaQueryBroadcaster {
+    async fn broadcast(&self, bundle: &SpendBundle) -> Result<()> {
+        let wire = to_query_bundle(bundle)?;
+        let status = self
+            .query
+            .push_tx(&wire)
+            .await
+            .map_err(|e| Error::internal(format!("broadcast (push_tx) failed: {e}")))?;
+        // Fail closed: a non-success mempool status is an error, not a silent no-op.
+        if !status.success {
+            return Err(Error::api(format!(
+                "the network rejected the transaction: {}",
+                status.status
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A one-shot broadcast-consent handle (§18.21). The served layer ARMS it when the paired caller
+/// confirms a SPECIFIC spend; [`ConsentBroadcaster`] then forwards exactly ONE broadcast and
+/// disarms. Cheap to `clone` (shared flag) so the arming site and the broadcaster observe the same
+/// state. The default is DISARMED — nothing broadcasts until explicit per-op consent.
+#[derive(Clone, Default)]
+pub struct BroadcastConsent {
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl BroadcastConsent {
+    /// A fresh, DISARMED consent handle.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Arm consent for the NEXT single broadcast (the caller confirmed the op).
+    pub fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Whether consent is currently armed (does not consume it).
+    pub fn is_armed(&self) -> bool {
+        self.armed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// Consume the armed consent (one-shot): returns whether it WAS armed, disarming it.
+    fn take(&self) -> bool {
+        self.armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A [`Broadcaster`] decorator enforcing per-op consent (§18.21). It forwards to `inner` ONLY when
+/// a one-shot [`BroadcastConsent`] is armed, then disarms; an unarmed (unconsented) broadcast FAILS
+/// CLOSED and the inner broadcaster is never called — nothing is spent. This adapts the §16.2
+/// broadcast gate to the authorized-extension path (each spend needs a fresh, explicit confirm).
+pub struct ConsentBroadcaster {
+    inner: std::sync::Arc<dyn Broadcaster>,
+    consent: BroadcastConsent,
+}
+
+impl ConsentBroadcaster {
+    /// Wrap `inner`, gating each broadcast on `consent`.
+    pub fn new(inner: std::sync::Arc<dyn Broadcaster>, consent: BroadcastConsent) -> Self {
+        Self { inner, consent }
+    }
+}
+
+#[async_trait]
+impl Broadcaster for ConsentBroadcaster {
+    async fn broadcast(&self, bundle: &SpendBundle) -> Result<()> {
+        if !self.consent.take() {
+            return Err(Error::unauthorized(
+                "broadcast requires explicit per-op consent; nothing was spent",
+            ));
+        }
+        self.inner.broadcast(bundle).await
+    }
+}
+
 // ---- coin selection -------------------------------------------------------
 
 /// Greedily select coins (largest first) covering `target`. Errors if the coins cannot cover
@@ -776,6 +902,76 @@ mod tests {
         let signature = signer.sign(&parsed).unwrap();
         let bundle = SpendBundle::new(parsed, signature);
         assert!(sim.new_transaction(bundle).is_ok());
+    }
+
+    /// Per-op consent gate (#371, §18.21): an unconsented broadcast fails closed and the inner
+    /// broadcaster is never called; an armed consent forwards EXACTLY one broadcast, then disarms.
+    #[tokio::test]
+    async fn consent_broadcaster_refuses_without_consent_and_forwards_once_when_armed() {
+        let inner = std::sync::Arc::new(MockBroadcaster::default());
+        let consent = BroadcastConsent::new();
+        let bc = ConsentBroadcaster::new(inner.clone(), consent.clone());
+        let bundle = SpendBundle::new(vec![], Signature::default());
+
+        // Unconsented: fails closed, inner never called (nothing spent).
+        assert!(bc.broadcast(&bundle).await.is_err());
+        assert_eq!(inner.sent.lock().unwrap().len(), 0);
+        assert!(!consent.is_armed());
+
+        // Armed: forwards exactly once, then disarms.
+        consent.arm();
+        assert!(consent.is_armed());
+        assert!(bc.broadcast(&bundle).await.is_ok());
+        assert_eq!(inner.sent.lock().unwrap().len(), 1);
+
+        // One-shot: a second broadcast without re-arming fails closed again.
+        assert!(bc.broadcast(&bundle).await.is_err());
+        assert_eq!(inner.sent.lock().unwrap().len(), 1);
+    }
+
+    /// `to_query_bundle` hex-encodes each field into the `chia_query` wire shape (the production
+    /// broadcaster's conversion — proven deterministically so it can't silently drift).
+    #[test]
+    fn to_query_bundle_hex_encodes_every_field() {
+        let cs = CoinSpend {
+            coin: Coin::new(Bytes32::new([1; 32]), Bytes32::new([2; 32]), 42),
+            puzzle_reveal: Program::from(vec![0x80]),
+            solution: Program::from(vec![0x81]),
+        };
+        let bundle = SpendBundle::new(vec![cs], Signature::default());
+        let wire = to_query_bundle(&bundle).unwrap();
+        assert_eq!(wire.coin_spends.len(), 1);
+        assert_eq!(wire.coin_spends[0].coin.parent_coin_info, "01".repeat(32));
+        assert_eq!(wire.coin_spends[0].coin.puzzle_hash, "02".repeat(32));
+        assert_eq!(wire.coin_spends[0].coin.amount, 42);
+        assert_eq!(wire.coin_spends[0].puzzle_reveal, "80");
+        assert_eq!(wire.coin_spends[0].solution, "81");
+        assert_eq!(
+            wire.aggregated_signature,
+            hex::encode(Signature::default().to_bytes())
+        );
+    }
+
+    /// Fail-closed pre-broadcast validation (#371): a tampered bundle (an over-spend — inputs less
+    /// than outputs) is rejected by `dig-clvm` before any broadcast.
+    #[test]
+    fn tampered_bundle_fails_dig_clvm_validation() {
+        let mut sim = Simulator::new();
+        let alice = sim.bls(1_000);
+        let signer = signer_for(alice.sk.clone());
+        let dest = Bytes32::new([9; 32]);
+        let mut coin_spends =
+            build_xch_send(&signer, &[alice.coin], dest, 600, 10, alice.puzzle_hash).unwrap();
+
+        // The honest bundle validates.
+        assert!(run_and_validate(&coin_spends).is_ok());
+
+        // Tamper: claim the spent coin holds far less than its outputs create (over-spend).
+        coin_spends[0].coin.amount = 1;
+        assert!(
+            run_and_validate(&coin_spends).is_err(),
+            "a tampered/over-spending bundle must fail dig-clvm validation (fail-closed)"
+        );
     }
 
     #[test]
