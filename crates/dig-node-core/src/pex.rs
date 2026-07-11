@@ -495,13 +495,23 @@ pub fn spawn_pool_feeder(
 /// SPEC §11.1); a muted misbehaving peer is disconnected. All best-effort.
 pub struct GossipPexPool {
     handle: dig_gossip::GossipHandle,
+    /// The STUN server (co-located with the relay) dig-nat's hole-punch tier queries for this node's
+    /// server-reflexive address when verifying a PEX candidate over the FULL traversal ladder (#385).
+    stun_server: Option<std::net::SocketAddr>,
 }
 
 impl GossipPexPool {
-    /// A sink over the live gossip handle.
+    /// A sink over the live gossip handle. `stun_server` (when `Some`) is passed to the full-ladder
+    /// NAT config used to dial+verify each PEX candidate (#385).
     #[must_use]
-    pub fn new(handle: dig_gossip::GossipHandle) -> Self {
-        GossipPexPool { handle }
+    pub fn new(
+        handle: dig_gossip::GossipHandle,
+        stun_server: Option<std::net::SocketAddr>,
+    ) -> Self {
+        GossipPexPool {
+            handle,
+            stun_server,
+        }
     }
 }
 
@@ -519,20 +529,17 @@ impl PexPool for GossipPexPool {
                 continue;
             };
             let handle = self.handle.clone();
-            // Verify by DIALING (mTLS proves the peer_id) and adopt the verified connection into the
-            // pool — exactly how the pool's own maintenance turns a candidate into a member. Spawned so
-            // one slow dial never stalls the inbound PEX read loop.
+            // Verify by DIALING over the FULL NAT ladder (Direct → UPnP → NAT-PMP → PCP → hole-punch →
+            // Relayed, #385) — mTLS proves the peer_id — and adopt the verified connection into the
+            // pool, exactly how the pool's own maintenance turns a candidate into a member. The relay
+            // tier is reached only after every direct + hole-punch tier fails. Spawned so one slow dial
+            // never stalls the inbound PEX read loop.
+            let methods = crate::net::full_nat_config(CANDIDATE_DIAL_TIMEOUT, self.stun_server)
+                .enabled_methods
+                .clone();
             tokio::spawn(async move {
                 match handle
-                    .connect_via_nat(
-                        peer_id,
-                        Some(addr),
-                        &[
-                            dig_nat::TraversalKind::Direct,
-                            dig_nat::TraversalKind::Relayed,
-                        ],
-                        CANDIDATE_DIAL_TIMEOUT,
-                    )
+                    .connect_via_nat(peer_id, Some(addr), &methods, CANDIDATE_DIAL_TIMEOUT)
                     .await
                 {
                     Ok(conn) => {

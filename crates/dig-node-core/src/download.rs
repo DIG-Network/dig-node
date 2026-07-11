@@ -665,7 +665,10 @@ impl NodeContent {
     /// The PRODUCTION constructor — wire the engine from the live DHT + the node's mTLS identity,
     /// exactly as dig-download's implementers' note prescribes: [`DhtProviderLocator`] over the
     /// bootstrapped [`DhtService`](dig_dht::DhtService), [`NatRangeTransport`] dialing providers
-    /// over the same Direct→Relayed NAT tiers the rest of the peer network uses.
+    /// over the FULL NAT traversal ladder (Direct → UPnP → NAT-PMP → PCP → hole-punch → Relayed) the
+    /// rest of the peer network now uses, so a range fetch reaches a NAT'd provider directly whenever
+    /// possible and relays only as the last resort (#385). `stun_server` (when `Some`) feeds the
+    /// hole-punch tier's reflexive-address discovery.
     pub fn for_dht(
         dht: Arc<dig_dht::DhtService>,
         identity: dig_nat::LocalIdentity,
@@ -673,15 +676,10 @@ impl NodeContent {
         miss_mode: MissMode,
         self_peer_id: Option<String>,
         cache_dir: &Path,
+        stun_server: Option<std::net::SocketAddr>,
     ) -> Arc<Self> {
         let locator = Arc::new(DhtProviderLocator::new(dht));
-        let nat_config = dig_nat::NatConfig::builder()
-            .enabled_methods(vec![
-                dig_nat::TraversalKind::Direct,
-                dig_nat::TraversalKind::Relayed,
-            ])
-            .per_method_timeout(crate::dht::default_rpc_timeout())
-            .build();
+        let nat_config = crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server);
         let transport = Arc::new(NatRangeTransport::new(identity, nat_config, network_id));
         Self::new(locator, transport, miss_mode, self_peer_id, cache_dir)
     }

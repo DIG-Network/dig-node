@@ -1252,7 +1252,24 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     //    hold content this node wants, and keeps this node's OWN held-inventory provider records
     //    CURRENT so other nodes can find it. Best-effort — a DHT bring-up failure logs + leaves the
     //    node serving without the DHT (the pool + §21 read path still work).
-    let dht = match bring_up_dht(&node, &identity, &network_id_str, &handle).await {
+    // Resolve the STUN server co-located with the relay (`<relay-host>:3478`) ONCE — it feeds both the
+    // node's own reflexive-address discovery (advertised-candidate set) and the hole-punch tier of the
+    // FULL NAT ladder every node dial now uses (#385). Blocking DNS resolution is moved off the async
+    // runtime; a failure leaves STUN unconfigured (the ladder still falls through to the relay).
+    let stun_server = if relay_enabled() {
+        let ep = relay_endpoint.clone();
+        tokio::task::spawn_blocking(move || crate::net::stun_server_from_relay(&ep))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(stun) = stun_server {
+        println!("dig-node peer network: STUN server for reflexive discovery: {stun}");
+    }
+
+    let dht = match bring_up_dht(&node, &identity, &network_id_str, &handle, stun_server).await {
         Ok(dht) => Some(dht),
         Err(e) => {
             tracing::warn!(error = %e, "dig-node DHT bring-up failed; continuing without the DHT");
@@ -1275,6 +1292,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             crate::download::miss_mode_from_env(),
             Some(peer_id_hex.clone()),
             node.cache_dir_path(),
+            stun_server,
         );
         content.spawn_gc();
         // Feed the selector's registry from the connected pool (#178, SPEC §2.3): seed from the current
@@ -1358,7 +1376,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     crate::pex::spawn_tick_loop(pex_engine.clone());
     let pex = crate::pex::PexServing::new(
         pex_engine,
-        Arc::new(crate::pex::GossipPexPool::new(handle.clone())),
+        Arc::new(crate::pex::GossipPexPool::new(handle.clone(), stun_server)),
     );
 
     // The served responder carries the LIVE pool handle so `dig.getPeers` reflects connected peers,
@@ -1382,17 +1400,18 @@ async fn bring_up_dht(
     identity: &dig_nat::LocalIdentity,
     network_id: &str,
     pool: &dig_gossip::GossipHandle,
+    stun_server: Option<std::net::SocketAddr>,
 ) -> Result<Arc<crate::dht::DhtHandle>, String> {
     use dig_dht::{CandidateAddr, DhtConfig, DhtService};
 
     let config = DhtConfig::default();
     // The transport dials peers as THIS node (client cert = our identity), scoping relay lookups to
-    // our network id, bounding each RPC by the config's per-RPC timeout.
-    let transport = Arc::new(crate::dht::NatDhtTransport::new(
-        identity.clone(),
-        network_id.to_string(),
-        config.rpc_timeout,
-    ));
+    // our network id, bounding each RPC by the config's per-RPC timeout, over the FULL NAT ladder with
+    // the relay's STUN server feeding its hole-punch tier (#385).
+    let transport = Arc::new(
+        crate::dht::NatDhtTransport::new(identity.clone(), network_id.to_string(), config.rpc_timeout)
+            .with_stun_server(stun_server),
+    );
     // Our own advertised addresses: the node's REAL routable address(es) at the P2P listen port,
     // ordered IPv6-first (ecosystem HARD RULE) — a global-unicast IPv6 address (when the host has one)
     // precedes the IPv4 fallback, so a peer's happy-eyeballs dialer prefers IPv6. The wildcard bind
@@ -1400,11 +1419,22 @@ async fn bring_up_dht(
     // with no routable address advertises nothing here and stays reachable via the relay tiers dig-nat
     // composes; loopback/in-process setups opt into a loopback candidate via DIG_NODE_ADVERTISE_LOOPBACK.
     let port = peer_port_from_env();
-    let local_addresses: Vec<CandidateAddr> =
-        crate::net::advertised_socket_addrs(port, crate::net::advertise_loopback_from_env())
-            .into_iter()
-            .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
-            .collect();
+    let local = crate::net::advertised_socket_addrs(port, crate::net::advertise_loopback_from_env());
+    // Add this node's STUN-discovered server-reflexive (public) address to the advertised set (#385)
+    // so a remote peer behind a different NAT can dial / hole-punch to it, not just to a LAN-local
+    // address. Best-effort + bounded: a failure (no STUN server, timeout) advertises the local
+    // addresses only. The reflexive candidate is merged IPv6-first (§5.2) by `merge_reflexive`.
+    let reflexive = match stun_server {
+        Some(stun) => crate::net::reflexive_via_stun(stun, config.rpc_timeout).await,
+        None => None,
+    };
+    if let Some(r) = reflexive {
+        println!("dig-node peer network: STUN reflexive address {r} added to advertised candidates");
+    }
+    let local_addresses: Vec<CandidateAddr> = crate::net::merge_reflexive(local, reflexive)
+        .into_iter()
+        .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
+        .collect();
     let service = Arc::new(DhtService::new(
         identity.peer_id,
         local_addresses,

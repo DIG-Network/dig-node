@@ -21,6 +21,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
@@ -163,6 +164,121 @@ pub fn advertise_loopback_from_env() -> bool {
     )
 }
 
+// -- Shared NAT-traversal config (#385) --------------------------------------------------------------
+
+/// The RFC-5389 STUN port the DIG relay co-locates with its relay host (`relay.dig.net:3478`). A node
+/// derives its STUN server from the relay endpoint (`<relay-host>:STUN_PORT`) — dig-nat L7 spec §3.
+pub const STUN_PORT: u16 = 3478;
+
+/// The shared [`dig_nat::NatConfig`] for EVERY node peer dial (DHT lookups, multi-source range
+/// fetches, PEX candidate verification): the **FULL** traversal ladder — Direct → UPnP → NAT-PMP →
+/// PCP → hole-punch → Relayed — with `Relayed` (the relay/TURN-last tier) reached ONLY after every
+/// direct + port-mapping + hole-punch tier has failed (dig-nat tries the enabled methods in canonical
+/// rank order, relay last).
+///
+/// This replaces the former `[Direct, Relayed]`-only config every node call site used, which skipped
+/// UPnP/NAT-PMP/PCP + hole-punch and jumped straight to the relay — over-loading `relay.dig.net` and
+/// defeating the "attempt direct traversal before relaying" intent of the ecosystem IPv6-first rule
+/// (§5.2). The method set comes from [`dig_nat::NatConfig::default`] (the full ladder) rather than an
+/// explicit list, so a future dig-nat tier is picked up automatically here + at every call site.
+///
+/// `per_method_timeout` bounds each tier so a dial never hangs (a dig-nat guarantee). `stun_server`,
+/// when `Some`, is the STUN server dig-nat's hole-punch tier queries for this node's server-reflexive
+/// (public) address; `None` leaves STUN unconfigured (the ladder still falls through to the relay).
+pub fn full_nat_config(
+    per_method_timeout: Duration,
+    stun_server: Option<SocketAddr>,
+) -> dig_nat::NatConfig {
+    let mut builder = dig_nat::NatConfig::builder().per_method_timeout(per_method_timeout);
+    if let Some(stun) = stun_server {
+        builder = builder.stun_server(stun);
+    }
+    builder.build()
+}
+
+/// Extract the host from a relay endpoint URL so the node can derive the co-located STUN server
+/// (`<host>:STUN_PORT`). Pure: strips the scheme (`wss://`), any `:port`, and any trailing path/query.
+/// A bracketed IPv6 literal (`wss://[2001:db8::1]:9450`) yields the literal without brackets. Returns
+/// `None` for an empty/unparseable host.
+pub fn parse_relay_host(endpoint: &str) -> Option<String> {
+    let s = endpoint.trim();
+    let s = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
+    // Drop any path / query.
+    let s = s.split(['/', '?']).next().unwrap_or(s);
+    if s.is_empty() {
+        return None;
+    }
+    // Bracketed IPv6 literal: [addr]:port
+    if let Some(rest) = s.strip_prefix('[') {
+        let host = rest.split(']').next().unwrap_or("");
+        return (!host.is_empty()).then(|| host.to_string());
+    }
+    let host = s.split(':').next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Resolve the DIG STUN server (`<relay-host>:STUN_PORT`) from the relay endpoint URL, IPv6-first when
+/// the host resolves to both families (ecosystem rule). Best-effort blocking DNS resolution; `None`
+/// when the host can't be parsed/resolved. Call off the async runtime (e.g. via `spawn_blocking`).
+pub fn stun_server_from_relay(relay_endpoint: &str) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let host = parse_relay_host(relay_endpoint)?;
+    let mut addrs: Vec<SocketAddr> = (host.as_str(), STUN_PORT).to_socket_addrs().ok()?.collect();
+    // IPv6-first: `false` (IPv6) sorts before `true` (IPv4).
+    addrs.sort_by_key(SocketAddr::is_ipv4);
+    addrs.into_iter().next()
+}
+
+/// Merge a STUN-discovered server-reflexive candidate into the advertised set, preserving IPv6-first
+/// ordering + dedup. The reflexive (public) address is the most-dialable candidate for a NAT'd node, so
+/// it leads its family group: an IPv6 reflexive leads the whole list; an IPv4 reflexive leads the IPv4
+/// fallback group (after any IPv6). A reflexive already present is not duplicated. Pure so the ordering
+/// is unit-tested without a socket.
+pub fn merge_reflexive(local: Vec<SocketAddr>, reflexive: Option<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(r) = reflexive else {
+        return local;
+    };
+    if local.contains(&r) {
+        return local;
+    }
+    let mut out = Vec::with_capacity(local.len() + 1);
+    if r.is_ipv6() {
+        out.push(r);
+        out.extend(local);
+        return out;
+    }
+    // IPv4 reflexive: insert before the first IPv4 (after all IPv6), else append.
+    let mut inserted = false;
+    for a in local {
+        if a.is_ipv4() && !inserted {
+            out.push(r);
+            inserted = true;
+        }
+        out.push(a);
+    }
+    if !inserted {
+        out.push(r);
+    }
+    out
+}
+
+/// Best-effort discover this node's server-reflexive (public) address via STUN against `stun_server`,
+/// so the node advertises a candidate a remote peer can dial / hole-punch to (not just its LAN-local
+/// address). Binds an ephemeral UDP socket in the STUN server's address family and runs ONE bounded
+/// Binding transaction ([`dig_nat::stun::query_reflexive_address`]); any failure (timeout, unreachable,
+/// no route) returns `None` and the node advertises its local addresses only.
+pub async fn reflexive_via_stun(stun_server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
+    let bind = if stun_server.is_ipv6() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    };
+    let socket = tokio::net::UdpSocket::bind(bind).await.ok()?;
+    dig_nat::stun::query_reflexive_address(&socket, stun_server, timeout)
+        .await
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,5 +381,93 @@ mod tests {
         let v4: Ipv4Addr = "203.0.113.7".parse().unwrap();
         let addrs = order_advertised(None, Some(v4), 9444, false);
         assert_eq!(addrs, vec![SocketAddr::new(IpAddr::V4(v4), 9444)]);
+    }
+
+    // -- #385: full NAT traversal ladder + STUN reflexive discovery ----------------------------------
+
+    /// The shared config enables the WHOLE ladder — not just `Direct` + `Relayed`. This is the
+    /// regression guard for the bug the ticket fixes: every node dial now attempts UPnP/NAT-PMP/PCP +
+    /// hole-punch BEFORE the relay, so `relay.dig.net` is a genuine last resort.
+    #[test]
+    fn full_nat_config_enables_the_whole_ladder_not_just_direct_relayed() {
+        use dig_nat::TraversalKind::*;
+        let cfg = full_nat_config(Duration::from_secs(3), None);
+        for k in [Direct, Upnp, NatPmp, Pcp, HolePunch, Relayed] {
+            assert!(cfg.is_enabled(k), "{k:?} must be enabled (full ladder)");
+        }
+        // The port-mapping + hole-punch tiers that the old `[Direct, Relayed]` config skipped:
+        assert!(
+            cfg.is_enabled(Upnp) && cfg.is_enabled(NatPmp) && cfg.is_enabled(Pcp) && cfg.is_enabled(HolePunch),
+            "UPnP/NAT-PMP/PCP/hole-punch must be tried before falling back to the relay"
+        );
+    }
+
+    #[test]
+    fn full_nat_config_sets_stun_server_only_when_provided() {
+        let stun: SocketAddr = "203.0.113.5:3478".parse().unwrap();
+        assert_eq!(
+            full_nat_config(Duration::from_secs(3), Some(stun)).stun_server,
+            Some(stun)
+        );
+        assert_eq!(
+            full_nat_config(Duration::from_secs(3), None).stun_server,
+            None
+        );
+    }
+
+    #[test]
+    fn parse_relay_host_strips_scheme_port_and_path() {
+        assert_eq!(
+            parse_relay_host("wss://relay.dig.net:9450").as_deref(),
+            Some("relay.dig.net")
+        );
+        assert_eq!(
+            parse_relay_host("relay.dig.net").as_deref(),
+            Some("relay.dig.net")
+        );
+        assert_eq!(
+            parse_relay_host("wss://relay.dig.net/introducer?x=1").as_deref(),
+            Some("relay.dig.net")
+        );
+        // Bracketed IPv6 literal.
+        assert_eq!(
+            parse_relay_host("wss://[2001:db8::1]:9450").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(parse_relay_host(""), None);
+        assert_eq!(parse_relay_host("wss://"), None);
+    }
+
+    #[test]
+    fn merge_reflexive_ipv6_leads_and_dedups() {
+        let v6: SocketAddr = "[2001:db8::1]:9444".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.7:9444".parse().unwrap();
+        let reflexive_v6: SocketAddr = "[2606:4700::1]:9444".parse().unwrap();
+        // IPv6 reflexive leads the whole list.
+        let merged = merge_reflexive(vec![v6, v4], Some(reflexive_v6));
+        assert_eq!(merged, vec![reflexive_v6, v6, v4]);
+        // Already-present reflexive is not duplicated.
+        assert_eq!(merge_reflexive(vec![v6, v4], Some(v6)), vec![v6, v4]);
+        // No reflexive → unchanged.
+        assert_eq!(merge_reflexive(vec![v6, v4], None), vec![v6, v4]);
+    }
+
+    #[test]
+    fn merge_reflexive_ipv4_leads_ipv4_group_after_ipv6() {
+        let v6: SocketAddr = "[2001:db8::1]:9444".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.7:9444".parse().unwrap();
+        let reflexive_v4: SocketAddr = "198.51.100.9:9444".parse().unwrap();
+        // IPv4 reflexive sits after IPv6, before the local IPv4 fallback.
+        assert_eq!(
+            merge_reflexive(vec![v6, v4], Some(reflexive_v4)),
+            vec![v6, reflexive_v4, v4]
+        );
+        // With no local IPv6, the IPv4 reflexive leads.
+        assert_eq!(
+            merge_reflexive(vec![v4], Some(reflexive_v4)),
+            vec![reflexive_v4, v4]
+        );
+        // With no local addresses at all, the reflexive is the sole candidate.
+        assert_eq!(merge_reflexive(vec![], Some(reflexive_v4)), vec![reflexive_v4]);
     }
 }
