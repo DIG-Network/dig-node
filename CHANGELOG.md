@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.17.0] - 2026-07-11
+
+### Features
+- **wallet:** Identity-scoped Sage-parity reads + CAT asset_id attribution + honest sync (#407) (#21)
+
 ## [0.16.0] - 2026-07-11
 
 ### Features
