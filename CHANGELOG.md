@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.18.0] - 2026-07-11
+
+### Features
+- **wallet:** Node-custodied wallet + paired-token authz + sign/broadcast on behalf (#370, #371) (#22)
+
 ## [0.17.0] - 2026-07-11
 
 ### Features
