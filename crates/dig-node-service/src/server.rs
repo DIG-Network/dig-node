@@ -100,7 +100,17 @@ pub fn router(state: AppState) -> Router {
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderName::from_static("x-dig-control-token"),
-        ]);
+        ])
+        // #285: Chrome's Private Network Access blocks a page/extension-context request to a
+        // private IP (127.0.0.1) unless the preflight response carries
+        // `Access-Control-Allow-Private-Network: true` (sent only when the preflight itself
+        // carries `Access-Control-Request-Private-Network: true` — tower_http gates this
+        // itself, see `is_local_origin`'s callers). Without it Chrome silently blocks every
+        // extension→node request and the extension (correctly) reports the node offline, even
+        // though `/health` answers fine to a direct curl/fetch from a non-PNA-checked context.
+        // The node is loopback-only, so allowing this to every reflected local origin is not a
+        // public-exposure risk (mirrors the existing origin-reflection trust boundary above).
+        .allow_private_network(true);
 
     Router::new()
         .route("/", get(health).post(rpc))

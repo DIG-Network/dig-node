@@ -602,6 +602,15 @@ the pre-launch state, the DIG network genesis is a placeholder, so the gossip co
 steps 3–8 do not start — the node still watches the chain and proactively gap-fills (step 2) and
 serves the HTTP read path.
 
+**`DIG_NETWORK_GENESIS` override (#285).** Step 3's `GossipConfig.network_id` is resolved by
+`peer::genesis_challenge_from_env`: when the env var `DIG_NETWORK_GENESIS` is set to a valid
+non-zero 64-hex (32-byte) value, THAT value is used as the gossip network id; otherwise (unset,
+blank, non-hex, wrong length, or all-zero) the pre-launch placeholder
+`dig_constants::DIG_MAINNET.genesis_challenge()` is used, preserving today's graceful-skip
+behavior. This lets a dev/local deployment (or, at launch, the real mainnet genesis) bring steps
+3–8 up without dig-node baking in an unreleased value — the real mainnet genesis remains a launch
+decision (#214) and MUST NOT be hardcoded here.
+
 `control.peerStatus` reports a snapshot: `{ running: bool, peer_id: 64hex|null, network_id: string,
 relay: { url, reserved: bool }, connected_peers: u64, last_error: string|null }`. Bring-up is
 best-effort — a failure logs, leaves `control.peerStatus` "not running", and the HTTP read path still
@@ -894,6 +903,7 @@ cache cap is `config.json` > env > default).
 | `DIG_NODE_WATCH_INTERVAL` | chain-watch poll interval (seconds) over the subscribed store set (§4.3) | `30` (floor `1`) |
 | `DIG_PEER_NETWORK` | `off`/`0`/`false` disables the peer network (read path only) | on |
 | `DIG_NETWORK_ID` | network id for peer discovery / handshake scope | `DIG_MAINNET` |
+| `DIG_NETWORK_GENESIS` | gossip `network_id` genesis-challenge override (64-hex, 32 bytes); invalid/unset/zero ⇒ placeholder (§7.2) | `dig_constants::DIG_MAINNET.genesis_challenge()` (all-zero placeholder) |
 | `DIG_RELAY_URL` | relay endpoint (`off`/`disabled` disables the reservation) | `wss://relay.dig.net:9450` |
 | `DIG_NODE_ADVERTISE_LOOPBACK` | advertise loopback candidates when no routable address (§7.3) | off |
 | `DIG_WALLET_WC_PROJECT_ID` | WalletConnect project id (persisted in `config.json`) | unset |

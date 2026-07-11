@@ -450,6 +450,72 @@ async fn cors_reflects_chrome_extension_origin() {
     );
 }
 
+/// #285: Chrome's Private Network Access blocks an extension/page request to a private IP
+/// (127.0.0.1) unless the preflight response carries `Access-Control-Allow-Private-Network:
+/// true` — this was the sole reason a running node was reported OFFLINE by the extension.
+/// A preflight that itself carries `Access-Control-Request-Private-Network: true` (Chrome sends
+/// this whenever the calling context is public/private and the target is more-private/local)
+/// MUST get the allow header back.
+#[tokio::test]
+async fn cors_preflight_emits_pna_header_for_a_private_network_request() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    let resp = client()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
+        .header("Origin", "chrome-extension://abcdefghijklmnop")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "content-type")
+        .header("Access-Control-Request-Private-Network", "true")
+        .send()
+        .await
+        .unwrap();
+
+    let pna = resp
+        .headers()
+        .get("access-control-allow-private-network")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(
+        pna, "true",
+        "a PNA preflight must get Access-Control-Allow-Private-Network: true, or Chrome \
+         blocks the extension's request and reports the node offline (#285)"
+    );
+}
+
+/// The PNA header is a narrowly-scoped ADDITION: a preflight that does NOT carry
+/// `Access-Control-Request-Private-Network` (ordinary same-origin-family CORS, unaffected by
+/// PNA) must NOT get the allow-private-network response header — proving the fix does not
+/// change CORS behavior for non-PNA requests.
+#[tokio::test]
+async fn cors_preflight_omits_pna_header_without_a_private_network_request() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    let resp = client()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/"))
+        .header("Origin", "chrome-extension://abcdefghijklmnop")
+        .header("Access-Control-Request-Method", "POST")
+        .header("Access-Control-Request-Headers", "content-type")
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        resp.headers()
+            .get("access-control-allow-private-network")
+            .is_none(),
+        "no PNA request header in the preflight → no PNA response header"
+    );
+    // The existing origin-reflection behavior is unchanged alongside the new header.
+    let allow = resp
+        .headers()
+        .get("access-control-allow-origin")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(allow, "chrome-extension://abcdefghijklmnop");
+}
+
 #[tokio::test]
 async fn cache_get_config_reports_cap_and_used() {
     let (upstream, _calls) = start_mock_upstream().await;
