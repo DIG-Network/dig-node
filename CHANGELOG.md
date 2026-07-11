@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.13.0] - 2026-07-11
+
+### Features
+- **server:** PNA preflight header + DIG_NETWORK_GENESIS override (#17)
+
 ## [0.12.0] - 2026-07-10
 
 ### Features
