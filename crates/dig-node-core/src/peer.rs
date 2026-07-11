@@ -238,6 +238,40 @@ pub fn network_id_from_env() -> String {
         .unwrap_or_else(|| DEFAULT_NETWORK_ID.to_string())
 }
 
+/// The gossip `GossipConfig.network_id` genesis-challenge: `DIG_NETWORK_GENESIS` (64-hex, 32
+/// bytes) when set to a valid non-zero value, else `dig_constants::DIG_MAINNET.genesis_challenge()`
+/// — the pre-launch all-zero placeholder gossip currently rejects with "network_id must be
+/// non-zero" (the real mainnet value is a launch decision, #214, and MUST NOT be hardcoded here).
+/// Setting this lets a dev/local node — or, at launch, the real genesis — bring the gossip peer
+/// pool up without dig-node baking in an unreleased value. Pure core [`genesis_challenge_from`].
+pub fn genesis_challenge_from_env() -> chia_protocol::Bytes32 {
+    genesis_challenge_from(std::env::var("DIG_NETWORK_GENESIS").ok().as_deref())
+}
+
+/// Pure: resolve an optional `DIG_NETWORK_GENESIS` value into the gossip `network_id` `Bytes32`,
+/// falling back to the placeholder constant for anything that isn't a valid non-zero 64-hex
+/// 32-byte value (unset, blank, non-hex, wrong length, or all-zero) — the same graceful-skip
+/// sentinel the pre-launch placeholder already is.
+fn genesis_challenge_from(env: Option<&str>) -> chia_protocol::Bytes32 {
+    let placeholder = dig_constants::DIG_MAINNET.genesis_challenge();
+    let Some(s) = env.map(str::trim).filter(|s| !s.is_empty()) else {
+        return placeholder;
+    };
+    if s.len() != 64 {
+        return placeholder;
+    }
+    let Ok(bytes) = hex::decode(s) else {
+        return placeholder;
+    };
+    let Ok(arr) = <[u8; 32]>::try_from(bytes) else {
+        return placeholder;
+    };
+    if arr == [0u8; 32] {
+        return placeholder;
+    }
+    chia_protocol::Bytes32::new(arr)
+}
+
 /// The P2P listen port: `DIG_PEER_PORT` if a valid u16, else [`DEFAULT_P2P_PORT`].
 pub fn peer_port_from_env() -> u16 {
     std::env::var("DIG_PEER_PORT")
@@ -1170,7 +1204,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     let gossip_dir = node.peer_cert_dir();
     let _ = std::fs::create_dir_all(&gossip_dir);
     let mut cfg = dig_gossip::GossipConfig {
-        network_id: dig_constants::DIG_MAINNET.genesis_challenge(),
+        network_id: genesis_challenge_from_env(),
         cert_path: gossip_dir.join("node.cert").display().to_string(),
         key_path: gossip_dir.join("node.key").display().to_string(),
         peers_file_path: gossip_dir.join("peers.json"),
@@ -1666,6 +1700,41 @@ mod tests {
             "case-insensitive opt-out"
         );
         assert!(is_relay_enabled(Some("wss://my-relay:9450")));
+    }
+
+    // #285: DIG_NETWORK_GENESIS env override — unset/invalid/zero fall back to the pre-launch
+    // placeholder (the current graceful-skip behavior, #214 gates the real value); a valid
+    // non-zero 64-hex value is used verbatim as the gossip `network_id`.
+    #[test]
+    fn genesis_challenge_env_override() {
+        let placeholder = dig_constants::DIG_MAINNET.genesis_challenge();
+
+        // Unset → placeholder (today's graceful-skip default is preserved).
+        assert_eq!(genesis_challenge_from(None), placeholder);
+        // Blank → placeholder.
+        assert_eq!(genesis_challenge_from(Some("   ")), placeholder);
+
+        // Valid 64-hex, non-zero → used verbatim.
+        let hex64 = "11".repeat(32);
+        assert_eq!(
+            genesis_challenge_from(Some(&hex64)),
+            chia_protocol::Bytes32::new([0x11u8; 32]),
+            "a valid 64-hex genesis must be used as the gossip network_id"
+        );
+        // Leading/trailing whitespace is trimmed.
+        assert_eq!(
+            genesis_challenge_from(Some(&format!("  {hex64}  "))),
+            chia_protocol::Bytes32::new([0x11u8; 32])
+        );
+
+        // All-zero 64-hex → placeholder (the graceful-skip sentinel, not a "real" genesis).
+        assert_eq!(genesis_challenge_from(Some(&"00".repeat(32))), placeholder);
+        // Too short → placeholder.
+        assert_eq!(genesis_challenge_from(Some("abcd")), placeholder);
+        // Too long → placeholder.
+        assert_eq!(genesis_challenge_from(Some(&"11".repeat(33))), placeholder);
+        // Non-hex → placeholder.
+        assert_eq!(genesis_challenge_from(Some(&"zz".repeat(32))), placeholder);
     }
 
     #[test]

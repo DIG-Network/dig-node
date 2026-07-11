@@ -258,6 +258,17 @@ where `<host>` passes the §4.2 allowlist. `https://` and other schemes MUST NOT
 Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Type` and
 `X-Dig-Control-Token`.
 
+**Private Network Access (PNA, #285).** The server MUST advertise `allow_private_network` on the
+CORS layer, so a preflight that carries `Access-Control-Request-Private-Network: true` gets
+`Access-Control-Allow-Private-Network: true` back. Modern Chrome enforces PNA: any request from a
+page or extension context to a private-network address (loopback included) is blocked unless the
+preflight response carries this header — WITHOUT it, Chrome silently blocks every
+extension→dig-node request and the extension (correctly, from its perspective) reports the node
+OFFLINE even though the node is up and `/health` answers a direct, non-PNA-checked request. The
+header is emitted ONLY on a preflight that itself requests it (tower_http's `CorsLayer` gates this
+automatically); it never appears on an ordinary response and never changes the origin-reflection or
+method/header-allow behavior above.
+
 ### 4.4. Routes
 
 | Route | Method | Behavior |
