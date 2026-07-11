@@ -860,7 +860,10 @@ impl WalletDb {
             q = q.bind(p.to_ascii_lowercase());
         }
         let rows = q.fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(|r| r.get::<String, _>("asset_id")).collect())
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<String, _>("asset_id"))
+            .collect())
     }
 
     // ---- CATs -------------------------------------------------------------

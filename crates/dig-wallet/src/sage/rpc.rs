@@ -2924,7 +2924,11 @@ mod tests {
     async fn get_sync_status_reports_not_synced_on_empty_or_unsynced_db() {
         // Fresh DB: initial catch-up NOT complete, no wallet tracked.
         let db = WalletDb::open_in_memory().await.unwrap();
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
         let (status, body) = be.dispatch("get_sync_status", "{}").await;
         assert_eq!(status, 200);
         let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
@@ -2940,8 +2944,11 @@ mod tests {
         // no config) still reads NOT synced — never a silent synced-0.
         let db2 = WalletDb::open_in_memory().await.unwrap();
         db2.set_initial_sync_complete(true).await.unwrap();
-        let be2 =
-            WalletBackend::new(db2, Arc::new(MockFallback::default()), WalletConfig::default());
+        let be2 = WalletBackend::new(
+            db2,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
         let (_s, body) = be2.dispatch("get_sync_status", "{}").await;
         let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
         assert!(
@@ -2968,7 +2975,11 @@ mod tests {
         .unwrap();
         db.set_initial_sync_complete(true).await.unwrap();
         // Identity comes ONLY from the client's login — the node has no own wallet config.
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
 
         // No login → not tracking → NOT synced + balance 0 (never the other wallet's coin).
         let (_s, body) = be.dispatch("get_sync_status", "{}").await;
@@ -2991,14 +3002,20 @@ mod tests {
             Some(7_000),
             "must report the CLIENT's balance, not the other wallet's 9999"
         );
-        assert_eq!(r.synced_coins, r.total_coins, "tracked + caught up = synced");
+        assert_eq!(
+            r.synced_coins, r.total_coins,
+            "tracked + caught up = synced"
+        );
         assert!(r.total_coins >= 1);
 
         // logout → not tracking again.
         be.dispatch("logout", "{}").await;
         let (_s, body) = be.dispatch("get_sync_status", "{}").await;
         let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
-        assert!(r.total_coins > r.synced_coins, "after logout reads NOT synced");
+        assert!(
+            r.total_coins > r.synced_coins,
+            "after logout reads NOT synced"
+        );
         assert_eq!(r.selectable_balance.to_u64(), Some(0));
     }
 
@@ -3010,9 +3027,16 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coins(&[coin_at("c1", &ph, 4_200)]).await.unwrap();
         db.set_initial_sync_complete(true).await.unwrap();
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
-        be.dispatch("login", &format!(r#"{{"fingerprint":1,"addresses":["{addr}"]}}"#))
-            .await;
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+        be.dispatch(
+            "login",
+            &format!(r#"{{"fingerprint":1,"addresses":["{addr}"]}}"#),
+        )
+        .await;
         let (_s, body) = be.dispatch("get_sync_status", "{}").await;
         let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
         assert_eq!(r.selectable_balance.to_u64(), Some(4_200));
@@ -3094,7 +3118,11 @@ mod tests {
                 .unwrap()
                 .to_bytes()
                 .unwrap(),
-            solution: sim.solution(cat0.coin.coin_id()).unwrap().to_bytes().unwrap(),
+            solution: sim
+                .solution(cat0.coin.coin_id())
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
         };
         let lineage = OneParent {
             parent_id: hex::encode(child_cat.coin.parent_coin_info),
@@ -3113,7 +3141,11 @@ mod tests {
 
         // Login as the CAT owner → get_cats returns the real tail + scoped balance.
         let owner_ph = hex::encode(alice.puzzle_hash);
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
         be.dispatch(
             "login",
             &format!(r#"{{"fingerprint":1,"puzzle_hashes":["{owner_ph}"]}}"#),
