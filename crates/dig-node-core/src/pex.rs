@@ -498,45 +498,124 @@ pub struct GossipPexPool {
     /// The STUN server (co-located with the relay) dig-nat's hole-punch tier queries for this node's
     /// server-reflexive address when verifying a PEX candidate over the FULL traversal ladder (#385).
     stun_server: Option<std::net::SocketAddr>,
+    /// The durable, IPv6-first address book EVERY learned PEX candidate is offered into (#387), and the
+    /// SOURCE the dialer selects from (#381) — so relay-only + not-currently-dialable hints persist and
+    /// seed future dials instead of being dial-and-dropped.
+    book: Arc<crate::address_book::AddressBook>,
+    /// The shared peer-quality ranker (dig-peer-selector) that orders which book candidates to dial
+    /// first (#384). `None` (e.g. no content engine up) → dials keep the book's IPv6-first order.
+    ranker: Option<Arc<dyn DialRanker>>,
 }
 
 impl GossipPexPool {
-    /// A sink over the live gossip handle. `stun_server` (when `Some`) is passed to the full-ladder
-    /// NAT config used to dial+verify each PEX candidate (#385).
+    /// A sink over the live gossip handle. `stun_server` (when `Some`) feeds the full-ladder NAT config
+    /// used to dial+verify each candidate (#385); `book` is the durable address book (#381/#387);
+    /// `ranker` (when `Some`) drives selector-ranked dial ordering (#384).
     #[must_use]
     pub fn new(
         handle: dig_gossip::GossipHandle,
         stun_server: Option<std::net::SocketAddr>,
+        book: Arc<crate::address_book::AddressBook>,
+        ranker: Option<Arc<dyn DialRanker>>,
     ) -> Self {
         GossipPexPool {
             handle,
             stun_server,
+            book,
+            ranker,
         }
     }
+}
+
+/// Content-agnostic peer-quality ranker for DIAL choice (#384). Implemented over the shared
+/// dig-peer-selector `PeerSelector` (see [`crate::download::SelectorDialRanker`]); a `None` ranker on
+/// the pool leaves dials in the book's IPv6-first order (no quality ranking).
+pub trait DialRanker: Send + Sync {
+    /// A dial-preference score for `peer_id_hex` — HIGHER dials first. `None` for a peer the selector
+    /// has no measured model of yet (a cold peer), which is dialed at a neutral rank so it is still
+    /// explored (after proven-good peers, before proven-bad ones).
+    fn score(&self, peer_id_hex: &str) -> Option<f64>;
+}
+
+/// The neutral dial score assigned to a cold/unknown peer when ranking (#384): between a proven-good
+/// (→1.0) and a banned/proven-bad peer (→ very negative), so unmeasured peers are still explored.
+const NEUTRAL_DIAL_SCORE: f64 = 0.5;
+
+/// Order dialable candidates best-first by the ranker's score (HIGHER first), STABLY — so the book's
+/// IPv6-first order (§5.2) is preserved among equally-scored peers. A `None` ranker leaves the order
+/// untouched (the book is already IPv6-first). Pure so the ordering is unit-tested without a handle.
+fn order_by_ranker(cands: &mut [crate::address_book::CandidateAddr], ranker: Option<&dyn DialRanker>) {
+    let Some(r) = ranker else {
+        return;
+    };
+    cands.sort_by(|a, b| {
+        let sa = r.score(&a.peer_id).unwrap_or(NEUTRAL_DIAL_SCORE);
+        let sb = r.score(&b.peer_id).unwrap_or(NEUTRAL_DIAL_SCORE);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Convert a PEX [`PeerEntry`] into an address-book [`CandidateAddr`](crate::address_book::CandidateAddr):
+/// collect its directly-dialable IP-literal addresses (IPv6-first ordering handled by the book), or
+/// none for a relay-only / hostname-only hint (still persisted). Provenance is always PEX (a HINT). Pure.
+fn book_candidate_from_entry(
+    entry: &PeerEntry,
+    now_secs: u64,
+) -> crate::address_book::CandidateAddr {
+    let addrs: Vec<std::net::SocketAddr> = entry
+        .addresses
+        .iter()
+        .filter(|a| a.port != 0)
+        .filter_map(|a| {
+            a.host
+                .parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| std::net::SocketAddr::new(ip, a.port))
+        })
+        .collect();
+    crate::address_book::CandidateAddr::new(
+        entry.peer_id.clone(),
+        addrs,
+        crate::address_book::AddrProvenance::Pex,
+        now_secs,
+    )
 }
 
 #[async_trait]
 impl PexPool for GossipPexPool {
     async fn offer_candidates(&self, _source_peer_id: &str, candidates: Vec<PeerEntry>) {
-        for entry in candidates.into_iter().take(MAX_CANDIDATE_DIALS) {
-            let (Some(peer_id), Some(addr)) = (
-                parse_gossip_peer_id(&entry.peer_id),
-                best_socket_addr(&entry),
-            ) else {
-                // Relay-only or unparseable candidate: nothing to dial directly here. (A relay-only
-                // peer is reached via the relay tiers when the pool later selects it; the address book
-                // already knows it through the introducer.)
+        let now = now_ms() / 1000;
+        // #387: PERSIST every learned candidate — including relay-only + not-currently-dialable hints —
+        // into the durable address book (IPv6-first, provenance PEX). Nothing is dial-and-dropped; a
+        // hint that can't be reached now survives to seed a later dial.
+        for entry in &candidates {
+            self.book.offer(book_candidate_from_entry(entry, now));
+        }
+        // #381/#384: DIAL from the ranked, IPv6-first, non-stale BOOK (the accumulated learned set, not
+        // just this batch), preferring high-quality peers per the shared selector — so previously-
+        // learned + relay-only-turned-dialable hints are retried and proven-good peers are dialed
+        // first. Each dial verifies over the FULL NAT ladder (#385).
+        let mut dialable = self.book.dialable_candidates(now);
+        order_by_ranker(&mut dialable, self.ranker.as_deref());
+        let methods = crate::net::full_nat_config(CANDIDATE_DIAL_TIMEOUT, self.stun_server)
+            .enabled_methods
+            .clone();
+        for cand in dialable.into_iter().take(MAX_CANDIDATE_DIALS) {
+            let (Some(peer_id), Some(addr)) =
+                (parse_gossip_peer_id(&cand.peer_id), cand.addrs.first().copied())
+            else {
                 continue;
             };
+            // Skip a peer already in the connected pool — the book is a superset of the live pool.
+            if self.handle.is_pool_peer(&peer_id) {
+                continue;
+            }
             let handle = self.handle.clone();
-            // Verify by DIALING over the FULL NAT ladder (Direct → UPnP → NAT-PMP → PCP → hole-punch →
-            // Relayed, #385) — mTLS proves the peer_id — and adopt the verified connection into the
-            // pool, exactly how the pool's own maintenance turns a candidate into a member. The relay
-            // tier is reached only after every direct + hole-punch tier fails. Spawned so one slow dial
-            // never stalls the inbound PEX read loop.
-            let methods = crate::net::full_nat_config(CANDIDATE_DIAL_TIMEOUT, self.stun_server)
-                .enabled_methods
-                .clone();
+            let methods = methods.clone();
+            // Verify by DIALING over the FULL NAT ladder (mTLS proves the peer_id) and adopt the
+            // verified connection into the pool — exactly how the pool's own maintenance turns a
+            // candidate into a member; the relay tier is reached only after every direct + hole-punch
+            // tier fails. Spawned so one slow dial never stalls the inbound PEX read loop.
             tokio::spawn(async move {
                 match handle
                     .connect_via_nat(peer_id, Some(addr), &methods, CANDIDATE_DIAL_TIMEOUT)
@@ -547,7 +626,8 @@ impl PexPool for GossipPexPool {
                         let _ = handle.adopt_nat_connection(conn).await;
                     }
                     Err(e) => {
-                        tracing::debug!(peer = %peer_id, error = %e, "pex candidate dial failed (hint discarded)");
+                        // The hint PERSISTS in the book (retried later); only this dial attempt failed.
+                        tracing::debug!(peer = %peer_id, error = %e, "pex candidate dial attempt failed (kept in address book)");
                     }
                 }
             });
@@ -577,20 +657,6 @@ fn parse_gossip_peer_id(peer_id_hex: &str) -> Option<dig_gossip::PeerId> {
     let bytes = hex::decode(peer_id_hex).ok()?;
     let arr: [u8; 32] = bytes.try_into().ok()?;
     Some(dig_gossip::PeerId::from(arr))
-}
-
-/// The first dialable [`std::net::SocketAddr`] in a candidate's addresses (an IP literal + non-zero
-/// port), or `None` for a relay-only / hostname-only entry. Pure so it is unit-tested without a socket.
-fn best_socket_addr(entry: &PeerEntry) -> Option<std::net::SocketAddr> {
-    for a in &entry.addresses {
-        if a.port == 0 {
-            continue;
-        }
-        if let Ok(ip) = a.host.parse::<std::net::IpAddr>() {
-            return Some(std::net::SocketAddr::new(ip, a.port));
-        }
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1022,23 +1088,58 @@ mod tests {
         assert!(parse_gossip_peer_id(&"zz".repeat(32)).is_none());
     }
 
+    /// #387: a PEX entry converts to a book candidate that keeps only IP-literal, non-zero-port
+    /// addresses (IPv6-first, via the book), skipping hostnames + zero ports; provenance is PEX.
     #[test]
-    fn best_socket_addr_picks_first_dialable_ip() {
+    fn book_candidate_from_entry_collects_dialable_ips() {
         let e = PeerEntry::new(hexid(0x01), "mainnet", 1, Provenance::Direct)
             .with_address(Address::new("not-an-ip", 9444, AddressKind::Direct))
-            .with_address(Address::direct("198.51.100.7", 9444));
+            .with_address(Address::new("198.51.100.7", 0, AddressKind::Direct)) // zero port skipped
+            .with_address(Address::direct("198.51.100.7", 9444))
+            .with_address(Address::direct("2001:db8::9", 9444));
+        let c = book_candidate_from_entry(&e, 1000);
         assert_eq!(
-            best_socket_addr(&e),
-            Some("198.51.100.7:9444".parse().unwrap()),
-            "skips the hostname, takes the IP literal"
+            c.addrs,
+            vec![
+                "[2001:db8::9]:9444".parse().unwrap(), // IPv6 leads
+                "198.51.100.7:9444".parse().unwrap(),
+            ]
         );
-        // A relay-only / addressless entry has nothing to dial directly.
-        let relay_only = PeerEntry::new(hexid(0x01), "mainnet", 1, Provenance::Direct);
-        assert_eq!(best_socket_addr(&relay_only), None);
-        // A zero port is not dialable.
-        let zero = PeerEntry::new(hexid(0x01), "mainnet", 1, Provenance::Direct)
-            .with_address(Address::new("198.51.100.7", 0, AddressKind::Direct));
-        assert_eq!(best_socket_addr(&zero), None);
+        assert_eq!(c.provenance, crate::address_book::AddrProvenance::Pex);
+        assert!(!c.is_relay_only());
+        // A relay-only / addressless entry becomes a persisted relay-only candidate.
+        let relay_only = PeerEntry::new(hexid(0x02), "mainnet", 1, Provenance::Direct);
+        assert!(book_candidate_from_entry(&relay_only, 1000).is_relay_only());
+    }
+
+    /// #384: `order_by_ranker` puts the higher-scored peer first (stable; a `None` ranker is a no-op).
+    #[test]
+    fn order_by_ranker_prefers_higher_scored_peers() {
+        use crate::address_book::{AddrProvenance, CandidateAddr};
+        struct FixedRanker;
+        impl DialRanker for FixedRanker {
+            fn score(&self, peer_id_hex: &str) -> Option<f64> {
+                // Peer 0xaa is proven-good; 0xbb is proven-bad; anything else is unknown (neutral).
+                if peer_id_hex == hexid(0xaa) {
+                    Some(0.9)
+                } else if peer_id_hex == hexid(0xbb) {
+                    Some(0.1)
+                } else {
+                    None
+                }
+            }
+        }
+        let addr: std::net::SocketAddr = "198.51.100.7:9444".parse().unwrap();
+        let mk = |b: u8| CandidateAddr::new(hexid(b), vec![addr], AddrProvenance::Pex, 100);
+        let mut cands = vec![mk(0xbb), mk(0xcc), mk(0xaa)]; // bad, unknown, good
+        order_by_ranker(&mut cands, Some(&FixedRanker));
+        let order: Vec<String> = cands.iter().map(|c| c.peer_id.clone()).collect();
+        // good (0.9) → unknown (neutral 0.5) → bad (0.1)
+        assert_eq!(order, vec![hexid(0xaa), hexid(0xcc), hexid(0xbb)]);
+        // A None ranker leaves the (book) order untouched.
+        let mut cands2 = vec![mk(0xbb), mk(0xaa)];
+        order_by_ranker(&mut cands2, None);
+        assert_eq!(cands2[0].peer_id, hexid(0xbb));
     }
 
     #[test]

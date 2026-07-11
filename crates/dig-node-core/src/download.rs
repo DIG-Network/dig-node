@@ -454,6 +454,52 @@ impl ProviderLocator for SelectorLocator {
     }
 }
 
+// -- Selector-driven DIAL ordering (#384) ------------------------------------------------------------
+
+/// A [`DialRanker`](crate::pex::DialRanker) over the shared [`PeerSelector`] — so the SAME learned
+/// peer-quality model that ranks download SOURCES also drives which PEX candidates the node DIALS
+/// first (#384). Reuses the one `PeerSelector` instance in [`NodeContent`]; a second is never spun up.
+///
+/// The dial score is CONTENT-AGNOSTIC (dialing is not per-content), read from the selector's per-peer
+/// [`peer_snapshot`](PeerSelector::peer_snapshot): a banned peer sinks to the bottom; a measured peer
+/// scores by reliability (primary) blended with normalized throughput (secondary); a cold peer (no
+/// measured outcomes yet) returns `None` so the dialer explores it at a neutral rank (SPEC §5.2 — in
+/// PRIVACY mode the selector does not apply; the onion path uses its own selector, so this ranker is
+/// simply not wired there).
+pub struct SelectorDialRanker {
+    selector: Arc<PeerSelector>,
+}
+
+impl SelectorDialRanker {
+    /// Wrap the shared selector as a dial ranker.
+    #[must_use]
+    pub fn new(selector: Arc<PeerSelector>) -> Self {
+        SelectorDialRanker { selector }
+    }
+}
+
+impl crate::pex::DialRanker for SelectorDialRanker {
+    fn score(&self, peer_id_hex: &str) -> Option<f64> {
+        // 64-hex → the selector's 32-byte PeerId (SHA-256(SPKI DER), same identity as dig-nat/gossip).
+        let bytes = hex::decode(peer_id_hex).ok()?;
+        let arr: [u8; 32] = bytes.try_into().ok()?;
+        let snapshot = self.selector.peer_snapshot(&PeerId::from_bytes(arr))?;
+        if snapshot.banned {
+            // Proven-bad: dial only after every neutral/good peer.
+            return Some(f64::MIN);
+        }
+        if snapshot.samples == 0 {
+            // Cold peer — no measured model yet; let the dialer explore it at the neutral rank.
+            return None;
+        }
+        let reliability = snapshot.reliability.unwrap_or(0.0);
+        // Normalize throughput to [0,1] with a ~1 MB/s midpoint (bps / (bps + 1e6)); missing → 0.
+        let throughput = snapshot.throughput_bps.unwrap_or(0.0);
+        let throughput_norm = (throughput / (throughput + 1_000_000.0)).clamp(0.0, 1.0);
+        Some(reliability * 0.8 + throughput_norm * 0.2)
+    }
+}
+
 /// Current unix seconds (the `at` timestamp on a [`TransferOutcome`]).
 fn now_unix() -> u64 {
     std::time::SystemTime::now()

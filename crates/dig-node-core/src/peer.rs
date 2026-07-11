@@ -1193,6 +1193,13 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         println!("dig-node peer network: STUN server for reflexive discovery: {stun}");
     }
 
+    // The durable, IPv6-first peer address book (#381): every PEX-learned + otherwise-learned candidate
+    // accumulates here (incl. relay-only hints) instead of being dial-and-dropped, seeding future dials.
+    // The selector-driven dial ranker (#384) is wired below once the content engine (the shared
+    // selector) is up; until then dials keep the book's IPv6-first order.
+    let address_book = Arc::new(crate::address_book::AddressBook::default());
+    let mut dial_ranker: Option<Arc<dyn crate::pex::DialRanker>> = None;
+
     let dht = match bring_up_dht(&node, &identity, &network_id_str, &handle, stun_server).await {
         Ok(dht) => Some(dht),
         Err(e) => {
@@ -1224,6 +1231,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         // live peer set. The selector already drives dig-download's source choice + learns from every
         // range outcome inside `NodeContent`; this keeps its candidate registry current.
         spawn_selector_registry_feed(content.clone(), handle.clone());
+        // #384: the SAME self-optimizing selector that ranks download SOURCES also drives PEX dial
+        // ORDERING — reuse the ONE selector instance (never a second) so a high-quality peer is dialed
+        // before a low-quality one.
+        dial_ranker = Some(Arc::new(crate::download::SelectorDialRanker::new(
+            content.selector().clone(),
+        )));
         node.set_p2p_content(content);
         println!(
             "dig-node peer network: P2P content engine up (selector-driven, miss mode: {:?})",
@@ -1300,7 +1313,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     crate::pex::spawn_tick_loop(pex_engine.clone());
     let pex = crate::pex::PexServing::new(
         pex_engine,
-        Arc::new(crate::pex::GossipPexPool::new(handle.clone(), stun_server)),
+        Arc::new(crate::pex::GossipPexPool::new(
+            handle.clone(),
+            stun_server,
+            address_book,
+            dial_ranker,
+        )),
     );
 
     // The served responder carries the LIVE pool handle so `dig.getPeers` reflects connected peers,
