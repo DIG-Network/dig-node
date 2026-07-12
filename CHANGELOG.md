@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.21.0] - 2026-07-12
+
+### Features
+- **node:** Tipping subsystem — owner lookup + auto-tip engine + $DIG spend + tip ledger (#378) (#25)
+
 ## [0.20.0] - 2026-07-12
 
 ### Features
