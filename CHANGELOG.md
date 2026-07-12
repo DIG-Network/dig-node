@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.20.0] - 2026-07-12
+
+### Features
+- **node:** Serve Sage-parity wallet RPC + bidirectional WS wallet/control transport (#368, #369) (#24)
+
 ## [0.19.0] - 2026-07-11
 
 ### Features
