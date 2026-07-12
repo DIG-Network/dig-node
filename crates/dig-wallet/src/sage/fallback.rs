@@ -52,14 +52,16 @@ pub trait ChainFallback: Send + Sync {
 }
 
 /// The production fallback: `chia_query::ChiaQuery` (coinset.org + peer point-reads),
-/// reused as-is. Constructed lazily by the backend when a fallback read is first needed.
+/// reused as-is. Holds a shared [`std::sync::Arc`] so ONE `ChiaQuery` client backs the fallback
+/// reads, the live broadcaster, the confirmer, and the lineage source together (§18.12).
 pub struct CoinsetFallback {
-    query: chia_query::ChiaQuery,
+    query: std::sync::Arc<chia_query::ChiaQuery>,
 }
 
 impl CoinsetFallback {
-    /// Wrap an already-constructed [`chia_query::ChiaQuery`].
-    pub fn new(query: chia_query::ChiaQuery) -> Self {
+    /// Wrap a shared [`chia_query::ChiaQuery`] — the SAME client the broadcaster/confirmer/lineage
+    /// share, so the live wallet uses one connection pool.
+    pub fn new(query: std::sync::Arc<chia_query::ChiaQuery>) -> Self {
         Self { query }
     }
 
@@ -132,6 +134,56 @@ impl ChainFallback for CoinsetFallback {
             // A missing coin surfaces as an error from coinset; treat as "not found".
             Err(_) => Ok(None),
         }
+    }
+}
+
+/// The production lineage source (§18.12): resolves a parent coin's spend (puzzle reveal +
+/// solution) via `chia_query::get_puzzle_and_solution`, so CAT/singleton reconstruction (the
+/// `$DIG` attribution + `send_cat` input resolution) works over live chain reads. Shares the SAME
+/// [`std::sync::Arc`]`<`[`chia_query::ChiaQuery`]`>` the fallback/broadcaster use.
+pub struct ChiaQueryLineage {
+    query: std::sync::Arc<chia_query::ChiaQuery>,
+}
+
+impl ChiaQueryLineage {
+    /// Wrap the shared `ChiaQuery` client.
+    pub fn new(query: std::sync::Arc<chia_query::ChiaQuery>) -> Self {
+        Self { query }
+    }
+}
+
+#[async_trait]
+impl super::singleton::LineageSource for ChiaQueryLineage {
+    async fn parent_spend(
+        &self,
+        parent_coin_id: &str,
+        spent_height: u32,
+    ) -> Result<Option<super::singleton::ParentSpend>> {
+        let coin_id = format!("0x{}", CoinsetFallback::norm_hex(parent_coin_id));
+        let cs = match self
+            .query
+            .get_puzzle_and_solution(&coin_id, Some(spent_height))
+            .await
+        {
+            Ok(cs) => cs,
+            // The parent spend is not available (unspent / not found) — a clean "no lineage".
+            Err(_) => return Ok(None),
+        };
+        let decode = |field: &str, s: &str| -> Result<Vec<u8>> {
+            hex::decode(s.strip_prefix("0x").unwrap_or(s))
+                .map_err(|e| Error::internal(format!("lineage {field} hex: {e}")))
+        };
+        let parent = super::singleton::bytes32_from_hex(&cs.coin.parent_coin_info)?;
+        let puzzle_hash = super::singleton::bytes32_from_hex(&cs.coin.puzzle_hash)?;
+        Ok(Some(super::singleton::ParentSpend {
+            coin: chia_protocol::Coin {
+                parent_coin_info: parent,
+                puzzle_hash,
+                amount: cs.coin.amount,
+            },
+            puzzle_reveal: decode("puzzle_reveal", &cs.puzzle_reveal)?,
+            solution: decode("solution", &cs.solution)?,
+        }))
     }
 }
 

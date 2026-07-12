@@ -1003,6 +1003,7 @@ impl WalletBackend {
         amount: u64,
         fee: u64,
         broadcaster: &dyn Broadcaster,
+        confirmer: Option<&dyn super::spend::Confirmer>,
     ) -> Result<super::tipping::TipSpendOutcome> {
         use super::tipping::TipSpendOutcome;
         // Signer (node custody). A locked wallet is retryable, not a spend failure.
@@ -1052,11 +1053,14 @@ impl WalletBackend {
                 })
             }
         };
-        if let Err(e) = spend::run_and_validate(&coin_spends) {
-            return Ok(TipSpendOutcome::NotExecutable {
-                reason: format!("tip validation failed: {e}"),
-            });
-        }
+        let validated = match spend::run_and_validate(&coin_spends) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(TipSpendOutcome::NotExecutable {
+                    reason: format!("tip validation failed: {e}"),
+                })
+            }
+        };
         let sig = match signer.sign(&coin_spends) {
             Ok(s) => s,
             Err(e) => {
@@ -1070,7 +1074,57 @@ impl WalletBackend {
         // The ONLY money-moving step. An error here is AMBIGUOUS → propagate (the engine keeps the
         // reservation, never retries that day).
         broadcaster.broadcast(&bundle).await?;
-        Ok(TipSpendOutcome::Broadcast { txid })
+        // Best-effort on-chain confirmation (§18.12): poll for a created output coin. A confirmed
+        // spend records the tip `Confirmed`; a miss/timeout (or no confirmer) records it `Pending`
+        // with the txid — the money moved either way (broadcast succeeded), so confirmation is NEVER
+        // treated as a spend failure. The confirm read is post-broadcast and its outcome only labels
+        // the ledger status; it does not gate the money movement.
+        let confirmed = match confirmer {
+            Some(c) => {
+                let created: Vec<Bytes32> =
+                    validated.additions.iter().map(|a| a.coin_id()).collect();
+                c.confirm(&created).await.unwrap_or(false)
+            }
+            None => false,
+        };
+        Ok(TipSpendOutcome::Broadcast { txid, confirmed })
+    }
+
+    /// Point-read live sync (§18.12): refresh the wallet DB from the fallback tier for the wallet's
+    /// OWN tracked puzzle hashes — read XCH coins by puzzle hash AND CAT coins by hint (a CAT is
+    /// hinted to the owner p2 hash), upsert them, then attribute CATs to their TAIL via the attached
+    /// lineage source (so `$DIG` coins gain an `asset_id` and become selectable). Best-effort +
+    /// idempotent: it never DELETES rows and re-runs safely, so the spend path selects over CURRENT
+    /// chain state without a subscription loop. A no-op with the graceful `EmptyFallback` (empty
+    /// reads); a locked wallet (no signer ⇒ no tracked puzzle hashes) is a clean `Ok(0)`. Returns
+    /// the number of coin rows upserted.
+    pub async fn refresh_tracked_coins(&self) -> Result<usize> {
+        let Some(signer) = self.current_signer() else {
+            return Ok(0); // locked: no key ⇒ no tracked puzzle hashes to sync
+        };
+        let phs: Vec<String> = signer.puzzle_hashes().iter().map(hex::encode).collect();
+        if phs.is_empty() {
+            return Ok(0);
+        }
+        // XCH coins sitting at our puzzle hashes + CAT coins hinted to them (unspent + recent).
+        let mut fetched = self.fallback.coin_records_by_puzzle_hashes(&phs).await?;
+        fetched.extend(self.fallback.coin_records_by_hints(&phs).await?);
+        let rows: Vec<CoinRow> = fetched.iter().map(fallback_coin_to_row).collect();
+        let n = rows.len();
+        if n > 0 {
+            self.db.upsert_coins(&rows).await?;
+        }
+        // Attribute CATs (fills `asset_id`/`hint`) when a lineage source is attached — best-effort:
+        // an attribution read failure must never make a fresh XCH sync look like a hard error.
+        if let Some(lineage) = self.lineage.as_deref() {
+            let plain: HashSet<String> = phs.iter().cloned().collect();
+            let _ =
+                singleton::reconstruct_all(&self.db, lineage, &self.config.address_prefix, &plain)
+                    .await;
+        }
+        // Mark the DB synced so wallet-data reads flip from the fallback to the local DB (routing).
+        self.db.set_initial_sync_complete(true).await?;
+        Ok(n)
     }
 
     async fn send_xch(&self, req: &SendXch) -> Result<TransactionResponse> {
@@ -2533,6 +2587,24 @@ fn decode_address(address: &str) -> Option<String> {
         .map(|a| hex::encode(a.puzzle_hash))
 }
 
+/// Map a [`FallbackCoin`] (a chain read) into a [`CoinRow`] for the wallet DB. `asset_id`/`hint`
+/// start `None` (a raw coin read does not reveal a CAT's TAIL — the lineage attribution pass fills
+/// them in, mirroring the direct-peer sync's `coin_state_to_row`).
+fn fallback_coin_to_row(c: &FallbackCoin) -> CoinRow {
+    CoinRow {
+        coin_id: c.coin_id.clone(),
+        parent_coin_info: c.parent_coin_info.clone(),
+        puzzle_hash: c.puzzle_hash.clone(),
+        amount: c.amount.to_string(),
+        created_height: c.created_height.map(i64::from),
+        spent_height: c.spent_height.map(i64::from),
+        asset_id: None,
+        hint: None,
+        created_timestamp: c.created_timestamp.map(|t| t as i64),
+        spent_timestamp: c.spent_timestamp.map(|t| t as i64),
+    }
+}
+
 /// A coin is spendable iff it is confirmed (`created_height` set) and unspent.
 fn is_spendable(c: &CoinRecord) -> bool {
     c.created_height.is_some() && c.spent_height.is_none()
@@ -2805,6 +2877,62 @@ mod tests {
             .with_signer(signer)
             .with_broadcaster(bc.clone());
         (be, bc, ph)
+    }
+
+    /// Point-read live sync (§18.12): `refresh_tracked_coins` reads the wallet's coins from the
+    /// fallback tier, upserts them into the DB, and marks the DB synced — so coin selection then
+    /// runs over live-synced state. Proven with a [`MockFallback`] holding one XCH coin at the
+    /// signer's puzzle hash (no chain touched).
+    #[tokio::test]
+    async fn refresh_tracked_coins_populates_the_db_for_selection() {
+        let pair = BlsPair::new(2);
+        let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
+        let ph = *signer.puzzle_hashes().iter().next().unwrap();
+        let ph_hex = hex::encode(ph);
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let fallback = MockFallback::with_coins(vec![FallbackCoin {
+            coin_id: "aa".repeat(32),
+            parent_coin_info: "11".repeat(32),
+            puzzle_hash: ph_hex.clone(),
+            amount: 7_000,
+            created_height: Some(5),
+            spent_height: None,
+            created_timestamp: Some(1),
+            spent_timestamp: None,
+        }]);
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![ph_hex.clone()],
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        let be = WalletBackend::new(db, Arc::new(fallback), cfg).with_signer(signer);
+
+        // Before the sync the DB has no spendable coins.
+        assert!(be.spendable_coins(None).await.unwrap().is_empty());
+        // Sync from the fallback → the coin lands in the DB.
+        let n = be.refresh_tracked_coins().await.unwrap();
+        assert_eq!(n, 1, "one XCH coin synced from the fallback");
+        // After the sync the coin is selectable over the (now live-synced) DB.
+        let coins = be.spendable_coins(None).await.unwrap();
+        assert_eq!(coins.len(), 1);
+        assert_eq!(coins[0].amount, 7_000, "the synced coin is selectable");
+        assert!(
+            be.db.sync_state().await.unwrap().initial_sync_complete,
+            "DB marked synced"
+        );
+    }
+
+    /// A locked wallet (no signer ⇒ no tracked puzzle hashes) is a clean no-op refresh — never an
+    /// error, never a spurious sync.
+    #[tokio::test]
+    async fn refresh_tracked_coins_is_a_noop_when_locked() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+        assert_eq!(be.refresh_tracked_coins().await.unwrap(), 0);
     }
 
     /// Like [`spend_backend`] but the broadcaster is a [`ConsentBroadcaster`] wrapping the mock —

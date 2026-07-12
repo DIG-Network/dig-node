@@ -1625,14 +1625,64 @@ The sync loop runs this attribution as a post-apply step (`sync::CatAttributor`,
 newly-synced candidate coins, so a synced CAT coin — stored initially with `asset_id: None` — gains its
 TAIL and surfaces in `get_cats` (this is how `$DIG` resolves from the node).
 
-18.12. **Deferred to follow-on units.** The off-chain NFT data-blob/CHIP-0015 metadata fetch
+18.12. **Live broadcaster bring-up — real mainnet $DIG spends behind a config gate (#428).** The
+node-custodied wallet BUILDS + SIGNS + VALIDATES spends (§18.9/§18.21) and the tip engine (§18.23)
+reserves + caps them, but on the shipped node NO broadcaster is attached, so no `$DIG` moves. This
+unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only by explicit opt-in.
+
+- **Config gate (`enable_live_broadcast`, default OFF).** Sourced from
+  `DIG_WALLET_ENABLE_LIVE_BROADCAST` (`1`/`true`/`yes`/`on` ⇒ enabled; **anything else, including
+  unset, ⇒ OFF** — the OPPOSITE default to the dig.local toggle: money movement is never on by
+  accident). OFF reproduces today's behaviour exactly (no broadcaster attached; a tip / sign-on-
+  behalf / send cleanly reports unavailable and nothing is spent). ON assembles the live wiring.
+- **Live wiring (`WalletService::build_with`).** When enabled, the bring-up builds ONE shared
+  `chia_query::ChiaQuery` client (mainnet; decentralized peers + coinset.org fallback, §5.2) and
+  attaches, all over that one client: a real `spend::ChiaQueryBroadcaster` (`chia_query::push_tx`),
+  a `spend::ChiaQueryConfirmer` (on-chain confirmation poll), a `fallback::ChiaQueryLineage`
+  (CAT/singleton parent-spend reads via `get_puzzle_and_solution`), and a `fallback::CoinsetFallback`
+  read tier. A client-construction failure (offline / no peer reachable) is NON-FATAL and DISABLES
+  live broadcast (logged) — a half-built client can never send.
+- **Broadcaster split (no double-confirm).** The GENERAL wallet surface (send/offer/mint,
+  `finalize_spend`/`submit_transaction`/`sign_coin_spends`) gets a `spend::ConfirmingBroadcaster`
+  wrapping the raw broadcaster: it pushes to the mempool (the money boundary — a push error
+  propagates) then BEST-EFFORT confirms on-chain (a miss/timeout is logged, NOT an error — the money
+  already moved; the Sage responses carry no confirmation field). The TIP path gets the RAW
+  broadcaster PLUS the confirmer directly, because it surfaces confirmation ITSELF in its ledger
+  (below) and must not double-confirm.
+- **Confirmation semantics (poll for a created coin).** `Confirmer::confirm(created_coin_ids)` polls
+  `chia_query::wait_for_confirmation` for a created OUTPUT coin (a created coin with a non-zero
+  confirmed height proves the spend was included in a block). `Ok(true)` = confirmed on-chain;
+  `Ok(false)` = accepted into the mempool but not confirmed within the window (money moved —
+  confirmation is asynchronous, NOT a failure). A confirmation READ error folds into `Ok(false)`:
+  a failed read after a successful broadcast is never reported as a spend failure.
+- **Tip ledger surfacing (confirm-before-marking-confirmed).** `WalletBackend::build_and_broadcast_dig_tip`
+  returns `TipSpendOutcome::Broadcast { txid, confirmed }`. The engine reconcile (§18.23) maps
+  `confirmed:true` ⇒ ledger status `Confirmed`, `confirmed:false` ⇒ `Pending` (txid recorded —
+  broadcast, awaiting on-chain inclusion). Either way the persisted reservation blocks a same-day
+  retry and its amount counts toward the caps, so a pending (unconfirmed) tip can NEVER enable a
+  double-spend. An AMBIGUOUS broadcast error is still `Failed` (never retried that day, §18.23).
+- **Coin selection over live-synced state.** `WalletBackend::refresh_tracked_coins` is a best-effort
+  point-read sync: it reads the wallet's OWN coins from the fallback tier (XCH by puzzle hash, CAT by
+  hint), upserts them into the local DB, attributes CATs to their TAIL via the lineage source (so
+  `$DIG` coins become selectable), and marks the DB synced. The live tip spender runs it BEFORE
+  selecting, so the spend builds over current chain state; a sync failure is not a spend failure
+  (selection then reports `NotExecutable`, retryable). A no-op under the graceful `EmptyFallback`.
+- **Live-funds e2e (env-gated, SKIPPED by default).** A documented, runnable end-to-end test
+  (`crates/dig-node-service/tests/live_funds_tip_e2e.rs` + `runbooks/live-funds-tip-e2e.md`) drives a
+  real mainnet `$DIG` tip to the DIG treasury (`digstore_chain::dig::treasury_inner_puzzle_hash()`).
+  It is SKIPPED unless `DIG_LIVE_FUNDS_TEST=1` AND the funded test wallet is provided (via
+  `/.test-credentials`, referenced by path — NEVER inlined). **CI never broadcasts to mainnet**: all
+  automated tests use the `chia-sdk-test` simulator (real consensus incl. BLS) or the recording
+  `MockBroadcaster`/`MockConfirmer`; the live path is exercised only by this explicit, capped,
+  operator-run pass.
+
+18.12a. **Deferred to follow-on units.** The off-chain NFT data-blob/CHIP-0015 metadata fetch
 (`get_nft_data` returns on-chain fields; the metadata JSON surfaces when fetched), `exercise_options`
 (§18.15 — a documented, non-silent follow-on), and real image-derived theme content (§18.16 — this
-backend stores a placeholder). The service bring-up that STARTS the served surface is DONE (§18.1/#368);
-the remaining integration is spawning the live direct-peer sync loop (§18.6) into that bring-up so the
-shared `EventBus` is fed from real chain events (until then the DB stays honestly `syncing` and the
-graceful `EmptyFallback` returns empty reads) and reconstruction-after-sync via a peer/coinset
-`LineageSource`.
+backend stores a placeholder). The point-read live sync above populates the DB for the spend path;
+the richer live direct-peer SUBSCRIPTION sync loop (§18.6) — feeding the shared `EventBus` from real
+chain `coin_state_update` pushes for continuous wallet-data reads — remains the follow-on integration
+(until it is spawned, wallet-data reads outside a live spend use the fallback tier / point-read sync).
 
 18.13. **Security.** Both listeners bind loopback only. The mTLS listener enforces the shared-cert mutual
 TLS. Multi-peer sync is a correctness/censorship property (never collapse to one peer). Reads tolerate

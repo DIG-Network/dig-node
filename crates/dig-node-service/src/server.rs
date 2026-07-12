@@ -233,7 +233,15 @@ pub async fn build_state(config: &Config) -> AppState {
     // Assemble the SERVED wallet under the node config dir (#368): the live wallet DB + custody +
     // shared event bus + mTLS cert. Never blocks on network (graceful fallback tier).
     let config_dir = config_path.parent().unwrap_or(&config_path).to_path_buf();
-    let wallet_service = WalletService::build(&config_dir).await;
+    // Pass the live-broadcast flag (§18.12, #428): OFF ⇒ offline-safe (no $DIG moves); ON ⇒ real
+    // mainnet broadcast + confirm for node-custodied spends.
+    let wallet_service = WalletService::build_with(
+        &config_dir,
+        dig_wallet::sage::service::WalletServiceConfig {
+            enable_live_broadcast: config.enable_live_broadcast,
+        },
+    )
+    .await;
     // Generate (or read) the control token into <config_dir>/control-token. A
     // failure to persist it (e.g. unwritable dir) is non-fatal: fall back to an
     // in-memory token so the control plane is still gated (a controller that can't
