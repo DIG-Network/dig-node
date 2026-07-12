@@ -103,6 +103,13 @@ pub struct Config {
     /// node logs a structured warning and serves localhost-only, never aborting.
     /// Set `DIG_NODE_DIGLOCAL=0` to skip the attempt entirely.
     pub dig_local: bool,
+    /// Whether the node-custodied wallet broadcasts spends for REAL on mainnet (§18.12, #428).
+    /// From `DIG_WALLET_ENABLE_LIVE_BROADCAST` (`1`/`true`/`yes`/`on` ⇒ enabled); **default
+    /// `false`** — the money-safe default: no broadcaster is attached and NO $DIG moves (a tip /
+    /// sign-on-behalf / send cleanly reports unavailable). When enabled, the served wallet attaches
+    /// a real `chia_query` broadcaster + confirmer + lineage so node-custodied spends execute +
+    /// confirm on mainnet. Enabling it means REAL $DIG movement — opt-in only.
+    pub enable_live_broadcast: bool,
 }
 
 impl Default for Config {
@@ -115,6 +122,8 @@ impl Default for Config {
             // Auto-attempt the bare-dig.local listener by default (graceful
             // fallback if the privileged bind fails) — see the field doc + #91.
             dig_local: true,
+            // Money-safe default: live broadcast is OFF unless explicitly enabled.
+            enable_live_broadcast: false,
         }
     }
 }
@@ -158,12 +167,17 @@ impl Config {
         // fallback); DIG_NODE_DIGLOCAL=0/false/no/off turns it off entirely.
         let dig_local = parse_dig_local_flag(std::env::var("DIG_NODE_DIGLOCAL").ok());
 
+        // Live mainnet broadcast is OFF unless explicitly enabled (money-safe default).
+        let enable_live_broadcast =
+            parse_live_broadcast_flag(std::env::var("DIG_WALLET_ENABLE_LIVE_BROADCAST").ok());
+
         Config {
             host,
             port,
             upstream,
             cache_dir,
             dig_local,
+            enable_live_broadcast,
         }
     }
 
@@ -235,6 +249,21 @@ pub fn parse_dig_local_flag(raw: Option<String>) -> bool {
         // Unset, blank, or anything unrecognised → the default-on behaviour.
         _ => true,
     }
+}
+
+/// Parse the `DIG_WALLET_ENABLE_LIVE_BROADCAST` toggle (§18.12, #428). Truthy
+/// (`1`/`true`/`yes`/`on`) ⇒ enable REAL mainnet broadcast; **anything else — including unset,
+/// blank, or unrecognised — ⇒ the money-safe default `false`** (no $DIG moves). This is the
+/// OPPOSITE default to `parse_dig_local_flag`: money movement is opt-in, never on by accident.
+/// Case/whitespace-insensitive. PURE so the toggle policy is unit-testable without process env.
+pub fn parse_live_broadcast_flag(raw: Option<String>) -> bool {
+    matches!(
+        raw.as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 /// Parse the `DIG_NODE_HOST` override (#288): `Some(ip)` when the raw value is a
@@ -500,6 +529,26 @@ mod tests {
         assert!(parse_dig_local_flag(None));
         assert!(parse_dig_local_flag(Some(String::new())));
         assert!(parse_dig_local_flag(Some("maybe".to_string())));
+    }
+
+    #[test]
+    fn parse_live_broadcast_flag_is_off_by_default_and_only_truthy_enables() {
+        // Truthy enables real mainnet broadcast.
+        for on in ["1", "true", "YES", "on", " On "] {
+            assert!(
+                parse_live_broadcast_flag(Some(on.to_string())),
+                "{on:?} should enable live broadcast"
+            );
+        }
+        // Everything else — unset, blank, falsy, or unrecognised — is the money-safe default OFF.
+        assert!(!parse_live_broadcast_flag(None), "unset ⇒ OFF (money-safe)");
+        assert!(!parse_live_broadcast_flag(Some(String::new())));
+        assert!(!parse_live_broadcast_flag(Some("maybe".to_string())));
+        for off in ["0", "false", "no", "off"] {
+            assert!(!parse_live_broadcast_flag(Some(off.to_string())));
+        }
+        // And the resolved Config default matches (opt-in only).
+        assert!(!Config::default().enable_live_broadcast);
     }
 
     #[test]

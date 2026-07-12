@@ -228,6 +228,138 @@ impl Broadcaster for ChiaQueryBroadcaster {
     }
 }
 
+/// Confirms that a broadcast spend reached the chain by polling for one of its CREATED output
+/// coins to appear on-chain (§18.12): a created coin with a non-zero confirmed height proves the
+/// spend was included in a block. Injected as a seam so the confirm logic is testable without a
+/// live chain (tests use a mock; production uses [`ChiaQueryConfirmer`]).
+#[async_trait]
+pub trait Confirmer: Send + Sync {
+    /// Poll until any of `created_coin_ids` is confirmed on-chain, or the confirmer's timeout
+    /// elapses.
+    ///
+    /// - `Ok(true)` — confirmed on-chain (a block included the spend).
+    /// - `Ok(false)` — NOT confirmed within the window. The spend was already accepted into the
+    ///   mempool (money moved — that boundary is [`Broadcaster::broadcast`]); on-chain inclusion
+    ///   is asynchronous, so a miss is NOT a spend failure — it is "pending confirmation".
+    ///
+    /// A confirmation READ error (network/parse) is folded into `Ok(false)` by the production
+    /// implementation: a failed READ must never be reported as a spend failure (the money already
+    /// moved). The `Result` is kept for a future confirmer that needs to distinguish read faults.
+    async fn confirm(&self, created_coin_ids: &[Bytes32]) -> Result<bool>;
+}
+
+/// The PRODUCTION confirmer (§18.12): polls `chia_query::wait_for_confirmation` for a created
+/// output coin. Shares the SAME [`chia_query::ChiaQuery`] the broadcaster + fallback use.
+pub struct ChiaQueryConfirmer {
+    query: std::sync::Arc<chia_query::ChiaQuery>,
+    poll_interval: std::time::Duration,
+    timeout: std::time::Duration,
+}
+
+impl ChiaQueryConfirmer {
+    /// A confirmer with the default cadence (poll every 5s, give up after 3 minutes) — long enough
+    /// to span a mainnet block, short enough not to wedge the unattended tip engine.
+    pub fn new(query: std::sync::Arc<chia_query::ChiaQuery>) -> Self {
+        Self::with_timings(
+            query,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(180),
+        )
+    }
+
+    /// A confirmer with explicit poll/timeout durations (tests pin tiny values).
+    pub fn with_timings(
+        query: std::sync::Arc<chia_query::ChiaQuery>,
+        poll_interval: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            query,
+            poll_interval,
+            timeout,
+        }
+    }
+}
+
+#[async_trait]
+impl Confirmer for ChiaQueryConfirmer {
+    async fn confirm(&self, created_coin_ids: &[Bytes32]) -> Result<bool> {
+        let Some(first) = created_coin_ids.first() else {
+            // Nothing to confirm against (should not happen for a real spend) — treat as pending.
+            return Ok(false);
+        };
+        // Confirm on the first created coin: every addition of one spend is included in the SAME
+        // block, so the first is representative. `wait_for_confirmation` polls until the coin has a
+        // non-zero confirmed height or the timeout elapses (a timeout ⇒ pending, not a failure).
+        let coin_id = format!("0x{}", hex::encode(first));
+        match self
+            .query
+            .wait_for_confirmation(&coin_id, self.poll_interval, self.timeout)
+            .await
+        {
+            Ok(_record) => Ok(true),
+            // Timed out (or the read repeatedly failed) — the broadcast still succeeded; report
+            // pending, never a failure.
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+/// A [`Broadcaster`] decorator (§18.12) that broadcasts via `inner` (mempool accept = the
+/// money-moving boundary) and then BEST-EFFORT confirms on-chain via `confirmer`. A confirmation
+/// miss/timeout is LOGGED but NOT an error: the spend was accepted; on-chain inclusion is
+/// asynchronous. ONLY a mempool-push (`inner`) error propagates. This is the broadcaster attached
+/// to the GENERAL wallet surface (send/offer/mint) whose Sage responses carry no confirmation
+/// field; the tip path surfaces confirmation EXPLICITLY in its ledger via its own
+/// [`Confirmer`] (see `WalletBackend::build_and_broadcast_dig_tip`).
+pub struct ConfirmingBroadcaster {
+    inner: std::sync::Arc<dyn Broadcaster>,
+    confirmer: std::sync::Arc<dyn Confirmer>,
+}
+
+impl ConfirmingBroadcaster {
+    /// Wrap `inner`, confirming each broadcast via `confirmer`.
+    pub fn new(
+        inner: std::sync::Arc<dyn Broadcaster>,
+        confirmer: std::sync::Arc<dyn Confirmer>,
+    ) -> Self {
+        Self { inner, confirmer }
+    }
+}
+
+#[async_trait]
+impl Broadcaster for ConfirmingBroadcaster {
+    async fn broadcast(&self, bundle: &SpendBundle) -> Result<()> {
+        // The money boundary: propagate a mempool-push failure (ambiguous), never swallow it.
+        self.inner.broadcast(bundle).await?;
+        // Best-effort on-chain confirmation (observability only — the send already happened).
+        let created = bundle_addition_coin_ids(bundle).unwrap_or_default();
+        match self.confirmer.confirm(&created).await {
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "dig-node: WARN broadcast accepted into the mempool but not confirmed on-chain \
+                 within the window (txid {}); confirmation is asynchronous",
+                hex::encode(bundle.name())
+            ),
+            Err(e) => eprintln!(
+                "dig-node: WARN confirmation read failed after a successful broadcast (txid {}): \
+                 {e}",
+                hex::encode(bundle.name())
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// The coin ids of the output coins a signed `bundle` CREATES — the confirmation targets (a created
+/// coin appearing on-chain proves the spend was included). Computed by running the bundle through
+/// `dig-clvm` (pure — no network) and taking the additions. PURE + fail-closed: a bundle that does
+/// not validate yields no ids (the caller then confirms nothing rather than confirming a phantom).
+pub fn bundle_addition_coin_ids(bundle: &SpendBundle) -> Result<Vec<Bytes32>> {
+    let result = run_and_validate(&bundle.coin_spends)?;
+    Ok(result.additions.iter().map(|a| a.coin_id()).collect())
+}
+
 /// A one-shot broadcast-consent handle (§18.21). The served layer ARMS it when the paired caller
 /// confirms a SPECIFIC spend; [`ConsentBroadcaster`] then forwards exactly ONE broadcast and
 /// disarms. Cheap to `clone` (shared flag) so the arming site and the broadcaster observe the same
@@ -1081,6 +1213,140 @@ mod tests {
         assert!(
             sim.new_transaction(bundle).is_ok(),
             "the tip spend must be a valid, broadcastable bundle"
+        );
+    }
+
+    /// A [`Confirmer`] test double: returns a fixed verdict and records how many times it was asked
+    /// (so tests assert confirmation was — or was not — attempted). Never touches a chain.
+    struct MockConfirmer {
+        verdict: bool,
+        calls: std::sync::Mutex<usize>,
+    }
+    impl MockConfirmer {
+        fn confirming() -> Self {
+            Self {
+                verdict: true,
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+        fn pending() -> Self {
+            Self {
+                verdict: false,
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+    #[async_trait]
+    impl Confirmer for MockConfirmer {
+        async fn confirm(&self, _created_coin_ids: &[Bytes32]) -> Result<bool> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(self.verdict)
+        }
+    }
+
+    /// A broadcaster that always fails at the mempool boundary (money never moves).
+    struct FailingBroadcaster;
+    #[async_trait]
+    impl Broadcaster for FailingBroadcaster {
+        async fn broadcast(&self, _bundle: &SpendBundle) -> Result<()> {
+            Err(Error::api("mempool rejected"))
+        }
+    }
+
+    /// `bundle_addition_coin_ids` returns the CREATED output coin ids of a valid bundle (the
+    /// confirmation targets) — proven against a real built XCH send (dest coin + change coin).
+    #[test]
+    fn bundle_addition_coin_ids_lists_the_created_output_coins() {
+        let mut sim = Simulator::new();
+        let alice = sim.bls(1_000);
+        let signer = signer_for(alice.sk.clone());
+        let dest = Bytes32::new([9; 32]);
+        let coin_spends =
+            build_xch_send(&signer, &[alice.coin], dest, 600, 10, alice.puzzle_hash).unwrap();
+        let bundle = SpendBundle::new(coin_spends, Signature::default());
+
+        let ids = bundle_addition_coin_ids(&bundle).unwrap();
+        // Two additions: the 600 to `dest` and the 390 change back to alice.
+        assert_eq!(ids.len(), 2, "the send creates two output coins");
+        // Each id is the canonical coin id of an addition (matches run_and_validate).
+        let expected: HashSet<Bytes32> = run_and_validate(&bundle.coin_spends)
+            .unwrap()
+            .additions
+            .iter()
+            .map(|a| a.coin_id())
+            .collect();
+        assert_eq!(ids.into_iter().collect::<HashSet<_>>(), expected);
+    }
+
+    /// `ConfirmingBroadcaster` (§18.12): broadcasts via the inner broadcaster (money boundary),
+    /// THEN confirms on-chain. Inner is called exactly once; the confirmer is consulted once.
+    #[tokio::test]
+    async fn confirming_broadcaster_broadcasts_then_confirms() {
+        let inner = std::sync::Arc::new(MockBroadcaster::default());
+        let confirmer = std::sync::Arc::new(MockConfirmer::confirming());
+        let bc = ConfirmingBroadcaster::new(inner.clone(), confirmer.clone());
+
+        // A real, validatable bundle so `bundle_addition_coin_ids` yields confirmation targets.
+        let mut sim = Simulator::new();
+        let alice = sim.bls(1_000);
+        let signer = signer_for(alice.sk.clone());
+        let coin_spends = build_xch_send(
+            &signer,
+            &[alice.coin],
+            Bytes32::new([9; 32]),
+            600,
+            10,
+            alice.puzzle_hash,
+        )
+        .unwrap();
+        let sig = signer.sign(&coin_spends).unwrap();
+        let bundle = SpendBundle::new(coin_spends, sig);
+
+        bc.broadcast(&bundle).await.unwrap();
+        assert_eq!(inner.sent.lock().unwrap().len(), 1, "inner broadcast once");
+        assert_eq!(confirmer.calls(), 1, "confirmation attempted once");
+    }
+
+    /// A pending (unconfirmed) result is NOT an error: the money moved at the mempool boundary, so
+    /// `ConfirmingBroadcaster::broadcast` still returns `Ok` (confirmation is asynchronous).
+    #[tokio::test]
+    async fn confirming_broadcaster_pending_confirmation_is_not_an_error() {
+        let inner = std::sync::Arc::new(MockBroadcaster::default());
+        let confirmer = std::sync::Arc::new(MockConfirmer::pending());
+        let bc = ConfirmingBroadcaster::new(inner.clone(), confirmer.clone());
+        let bundle = SpendBundle::new(vec![], Signature::default());
+
+        assert!(
+            bc.broadcast(&bundle).await.is_ok(),
+            "pending is not a failure"
+        );
+        assert_eq!(
+            inner.sent.lock().unwrap().len(),
+            1,
+            "the send still happened"
+        );
+    }
+
+    /// A mempool-push failure PROPAGATES and the confirmer is never consulted (nothing to confirm —
+    /// no money moved). Fail-closed at the money boundary.
+    #[tokio::test]
+    async fn confirming_broadcaster_propagates_mempool_failure_and_skips_confirm() {
+        let inner = std::sync::Arc::new(FailingBroadcaster);
+        let confirmer = std::sync::Arc::new(MockConfirmer::confirming());
+        let bc = ConfirmingBroadcaster::new(inner, confirmer.clone());
+        let bundle = SpendBundle::new(vec![], Signature::default());
+
+        assert!(
+            bc.broadcast(&bundle).await.is_err(),
+            "mempool failure propagates"
+        );
+        assert_eq!(
+            confirmer.calls(),
+            0,
+            "no confirmation when nothing was broadcast"
         );
     }
 }

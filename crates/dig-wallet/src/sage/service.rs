@@ -20,10 +20,42 @@ use std::sync::Arc;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
-use super::fallback::EmptyFallback;
+use super::fallback::{ChainFallback, ChiaQueryLineage, CoinsetFallback, EmptyFallback};
 use super::rpc::{WalletBackend, WalletConfig};
+use super::singleton::LineageSource;
+use super::spend::{
+    Broadcaster, ChiaQueryBroadcaster, ChiaQueryConfirmer, Confirmer, ConfirmingBroadcaster,
+};
 use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
+
+/// Bring-up configuration for the served wallet (§18.12).
+#[derive(Debug, Clone, Default)]
+pub struct WalletServiceConfig {
+    /// Enable REAL mainnet broadcast of node-custodied spends (the tip spend #378, the
+    /// sign+broadcast-on-behalf path #371, and any wallet send/offer/mint). **Default `false`** —
+    /// the offline-safe behaviour where no broadcaster is attached and NO $DIG moves. When `true`,
+    /// the node builds ONE shared `chia_query` client and attaches a real
+    /// [`ChiaQueryBroadcaster`] + [`ChiaQueryConfirmer`] + [`ChiaQueryLineage`] + [`CoinsetFallback`]
+    /// so spends execute + confirm on mainnet. Sourced from `DIG_WALLET_ENABLE_LIVE_BROADCAST`.
+    pub enable_live_broadcast: bool,
+}
+
+/// The live-broadcast wiring: one shared `chia_query` client backs a real broadcaster (for the
+/// tip path — which surfaces confirmation itself), a confirming broadcaster (for the general
+/// send/offer/mint surface), a confirmer, a lineage source, and a coinset fallback read tier.
+struct LiveWallet {
+    /// The RAW broadcaster the tip path uses (it runs its own confirmer, so must NOT double-confirm).
+    tip_broadcaster: Arc<dyn Broadcaster>,
+    /// The confirming broadcaster the general wallet surface uses (broadcast + best-effort confirm).
+    general_broadcaster: Arc<dyn Broadcaster>,
+    /// The on-chain confirmer (shared).
+    confirmer: Arc<dyn Confirmer>,
+    /// The live lineage source (CAT/singleton parent-spend reads).
+    lineage: Arc<dyn LineageSource>,
+    /// The coinset/peer fallback read tier.
+    fallback: Arc<dyn ChainFallback>,
+}
 
 /// A fully-assembled, ready-to-serve wallet: the dispatch backend, the shared event bus the WS
 /// transport (#369) subscribes to, and the shared self-signed cert the mTLS listener presents.
@@ -46,25 +78,63 @@ impl WalletService {
     /// (mainnet custody). Never blocks on network: the fallback tier defaults to
     /// [`EmptyFallback`]. A DB-open failure falls back to an in-memory DB so the node still serves
     /// the version/custody/sync-status surface (reported, not fatal).
+    /// Assemble the served wallet, offline-safe (no live broadcast). Equivalent to
+    /// [`WalletService::build_with`] with the default [`WalletServiceConfig`].
     pub async fn build(config_dir: &Path) -> WalletService {
+        Self::build_with(config_dir, WalletServiceConfig::default()).await
+    }
+
+    /// Assemble the served wallet under `config_dir` with an explicit [`WalletServiceConfig`]. When
+    /// `cfg.enable_live_broadcast` is set, attaches the real broadcaster/confirmer/lineage/fallback
+    /// so node-custodied spends execute on mainnet (§18.12); otherwise behaves exactly as the
+    /// offline-safe shipped bring-up (no broadcaster ⇒ no $DIG moves).
+    pub async fn build_with(config_dir: &Path, cfg: WalletServiceConfig) -> WalletService {
         let events = Arc::new(EventBus::default());
         let db = open_db(config_dir).await;
         let custody = WalletCustody::mainnet(seed_path(config_dir));
         let tip_events = Arc::new(TipEventBus::default());
+
+        // Live-broadcast wiring (§18.12), gated on the config flag. A construction failure (no peer
+        // reachable / offline) is NON-FATAL and DISABLES live broadcast — a half-built client must
+        // never send. Default OFF: `None` here reproduces the offline-safe shipped behaviour.
+        let live = if cfg.enable_live_broadcast {
+            build_live_wallet().await
+        } else {
+            None
+        };
+
+        let fallback: Arc<dyn ChainFallback> = match &live {
+            Some(l) => l.fallback.clone(),
+            None => Arc::new(EmptyFallback),
+        };
         // The base backend WITHOUT the tipping engine attached — cloned into the tip spender so the
         // spender's backend handle has `tipping == None` (no reference cycle engine↔backend). Both
         // share the SAME inner Arcs (db/custody/events/tip_events), so a runtime `wallet.unlock` is
         // visible to the spender.
-        let base = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+        let mut base = WalletBackend::new(db, fallback, WalletConfig::default())
             .with_events(events.clone())
             .with_custody(custody)
             .with_tip_events(tip_events.clone());
-        // The tip subsystem (#378). Offline-safe: the owner resolver is a lazy coinset.org client
-        // (no network at construction), and the spender carries NO broadcaster yet — so on the
-        // shipped node a tip cleanly reports NotExecutable (nothing is spent) until the wallet
-        // spend path's live sync/lineage/broadcaster lands (SPEC §18.12). The config/ledger/RPC/WS
-        // surface is fully live now for the extension (#379/#380) to build against.
-        let spender = NodeTipSpender::new(Arc::new(base.clone()), None);
+        if let Some(l) = &live {
+            // The GENERAL wallet surface (send/offer/mint) gets the confirming broadcaster + the
+            // live lineage source so CAT/singleton spends resolve inputs.
+            base = base
+                .with_broadcaster(l.general_broadcaster.clone())
+                .with_lineage(l.lineage.clone());
+        }
+        // The tip subsystem (#378). When live is OFF the spender carries NO broadcaster, so a tip
+        // cleanly reports NotExecutable (nothing is spent). When live is ON the spender gets the RAW
+        // broadcaster + the confirmer (the tip path surfaces confirmation ITSELF via the confirmer —
+        // pending/confirmed in its ledger — so it must not be handed the double-confirming wrapper).
+        let spender_backend = Arc::new(base.clone());
+        let spender = match &live {
+            Some(l) => NodeTipSpender::new(
+                spender_backend,
+                Some(l.tip_broadcaster.clone()),
+                Some(l.confirmer.clone()),
+            ),
+            None => NodeTipSpender::new(spender_backend, None, None),
+        };
         let tipping = TippingEngine::load(
             config_dir,
             Box::new(ChainOwnerResolver::mainnet()),
@@ -81,6 +151,44 @@ impl WalletService {
             backend,
             events,
             cert,
+        }
+    }
+}
+
+/// Build the live-broadcast wiring (§18.12): ONE shared `chia_query` client backing a real
+/// broadcaster, a confirming broadcaster, a confirmer, a lineage source, and a coinset fallback.
+/// Returns `None` (non-fatally, with a logged warning) when the client cannot start — so
+/// `enable_live_broadcast` on an offline/peerless host degrades to no-broadcast (never a
+/// half-built live sender). Mainnet only (the node's wallet is mainnet custody).
+async fn build_live_wallet() -> Option<LiveWallet> {
+    match chia_query::ChiaQuery::new(chia_query::ChiaQueryConfig::default()).await {
+        Ok(q) => {
+            let query = Arc::new(q);
+            let raw: Arc<dyn Broadcaster> = Arc::new(ChiaQueryBroadcaster::new(query.clone()));
+            let confirmer: Arc<dyn Confirmer> = Arc::new(ChiaQueryConfirmer::new(query.clone()));
+            let general: Arc<dyn Broadcaster> =
+                Arc::new(ConfirmingBroadcaster::new(raw.clone(), confirmer.clone()));
+            let lineage: Arc<dyn LineageSource> = Arc::new(ChiaQueryLineage::new(query.clone()));
+            let fallback: Arc<dyn ChainFallback> = Arc::new(CoinsetFallback::new(query.clone()));
+            eprintln!(
+                "dig-node: wallet LIVE broadcast ENABLED — node-custodied spends will execute on \
+                 mainnet (real $DIG). Disable by unsetting DIG_WALLET_ENABLE_LIVE_BROADCAST."
+            );
+            Some(LiveWallet {
+                tip_broadcaster: raw,
+                general_broadcaster: general,
+                confirmer,
+                lineage,
+                fallback,
+            })
+        }
+        Err(e) => {
+            eprintln!(
+                "dig-node: WARN DIG_WALLET_ENABLE_LIVE_BROADCAST is set but the chia_query client \
+                 failed to start ({e}); LIVE broadcast DISABLED (no $DIG will move) — the wallet \
+                 stays offline-safe until a node/network is reachable"
+            );
+            None
         }
     }
 }

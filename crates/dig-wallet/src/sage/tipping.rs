@@ -276,6 +276,11 @@ pub enum TipSpendOutcome {
     Broadcast {
         /// The broadcast transaction id (spend-bundle name hex).
         txid: String,
+        /// Whether the spend was CONFIRMED on-chain within the confirmer's window (§18.12). `true`
+        /// ⇒ a block included it (ledger status `Confirmed`); `false` ⇒ accepted into the mempool
+        /// but not yet confirmed (ledger status `Pending`, txid set — money moved, confirmation is
+        /// asynchronous, and the reservation blocks a same-day retry either way).
+        confirmed: bool,
     },
     /// The wallet cannot currently build/broadcast the tip (locked / not-yet-synced / no lineage /
     /// insufficient $DIG). Definitively PRE-broadcast — no money moved; the caller may retry later.
@@ -830,9 +835,18 @@ impl TippingEngine {
         let outcome = self.spender.send_dig_tip(&recipient, amount, fee).await;
         let mut st = self.state.lock().await;
         match outcome {
-            Ok(TipSpendOutcome::Broadcast { txid }) => {
+            Ok(TipSpendOutcome::Broadcast { txid, confirmed }) => {
                 if let Some(e) = st.entry_mut(id) {
-                    e.status = TipStatus::Confirmed;
+                    // Confirm-before-marking-confirmed (§18.12): a broadcast that was included in a
+                    // block is `Confirmed`; one accepted into the mempool but not yet confirmed
+                    // stays `Pending` with its txid (money moved — the reservation still blocks a
+                    // same-day retry, and Pending amounts count toward the caps, so this never
+                    // enables a double-spend).
+                    e.status = if confirmed {
+                        TipStatus::Confirmed
+                    } else {
+                        TipStatus::Pending
+                    };
                     e.txid = Some(txid.clone());
                 }
                 self.persist_ledger(&st)?;
@@ -1027,18 +1041,26 @@ impl OwnerResolver for ChainOwnerResolver {
 pub struct NodeTipSpender {
     backend: std::sync::Arc<super::rpc::WalletBackend>,
     broadcaster: Option<std::sync::Arc<dyn super::spend::Broadcaster>>,
+    /// The on-chain confirmer (§18.12). `None` ⇒ a broadcast tip is recorded `Pending` (accepted,
+    /// not confirmed); `Some` ⇒ the tip waits for on-chain inclusion and is recorded `Confirmed`
+    /// once a block includes it. Shares the SAME `chia_query` client as the broadcaster.
+    confirmer: Option<std::sync::Arc<dyn super::spend::Confirmer>>,
 }
 
 impl NodeTipSpender {
     /// Build a spender over `backend`. The `backend` MUST NOT itself hold this engine (pass a clone
-    /// taken before `with_tipping`) to avoid a reference cycle.
+    /// taken before `with_tipping`) to avoid a reference cycle. `broadcaster`/`confirmer` are
+    /// `None` on the offline-safe shipped bring-up (a tip then reports `NotExecutable` and money
+    /// never moves) and `Some` when live broadcast is enabled (§18.12).
     pub fn new(
         backend: std::sync::Arc<super::rpc::WalletBackend>,
         broadcaster: Option<std::sync::Arc<dyn super::spend::Broadcaster>>,
+        confirmer: Option<std::sync::Arc<dyn super::spend::Confirmer>>,
     ) -> Self {
         Self {
             backend,
             broadcaster,
+            confirmer,
         }
     }
 }
@@ -1056,9 +1078,24 @@ impl TipSpender for NodeTipSpender {
                 reason: "no broadcaster configured (wallet spend path not yet wired)".into(),
             });
         };
+        // Point-read live sync before selecting (§18.12): refresh the wallet DB from the fallback so
+        // coin selection runs over current chain state. Best-effort — a sync failure is not a spend
+        // failure: `build_and_broadcast_dig_tip` then reports NotExecutable if no $DIG is selectable
+        // (retryable), never a false spend.
+        if let Err(e) = self.backend.refresh_tracked_coins().await {
+            eprintln!(
+                "dig-node: WARN tip pre-spend coin sync failed (continuing best-effort): {e}"
+            );
+        }
         let recipient = super::singleton::bytes32_from_hex(recipient_ph_hex)?;
         self.backend
-            .build_and_broadcast_dig_tip(recipient, amount, fee, bc.as_ref())
+            .build_and_broadcast_dig_tip(
+                recipient,
+                amount,
+                fee,
+                bc.as_ref(),
+                self.confirmer.as_deref(),
+            )
             .await
     }
 }
@@ -1074,8 +1111,11 @@ mod tests {
     /// Behaviour of a mock spend attempt.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum SpendBehaviour {
-        /// Accept + return a fresh txid.
+        /// Accept + confirm on-chain: a fresh txid, `confirmed: true` (ledger `Confirmed`).
         Broadcast,
+        /// Accept into the mempool but NOT confirmed within the window: a fresh txid,
+        /// `confirmed: false` (ledger `Pending`, txid set — §18.12).
+        BroadcastUnconfirmed,
         /// Definitively pre-broadcast (locked/no-coins) — retryable.
         NotExecutable,
         /// Ambiguous broadcast error — fail-closed, no retry.
@@ -1127,6 +1167,14 @@ mod tests {
                     let n = self.seq.fetch_add(1, Ordering::SeqCst);
                     Ok(TipSpendOutcome::Broadcast {
                         txid: format!("tx{n}"),
+                        confirmed: true,
+                    })
+                }
+                SpendBehaviour::BroadcastUnconfirmed => {
+                    let n = self.seq.fetch_add(1, Ordering::SeqCst);
+                    Ok(TipSpendOutcome::Broadcast {
+                        txid: format!("tx{n}"),
+                        confirmed: false,
                     })
                 }
             }
@@ -1663,6 +1711,41 @@ mod tests {
         let retry = eng.auto_tip_for_store(STORE).await.unwrap();
         assert_eq!(retry, TipOutcome::skipped("already-tipped-today"));
         assert_eq!(sp.call_count(), 1, "an ambiguous day is never retried");
+    }
+
+    /// A broadcast that was accepted into the mempool but NOT confirmed on-chain within the window
+    /// (§18.12) records the tip as `Pending` (money moved — outcome is `Tipped`, txid set), and the
+    /// reservation still blocks a same-day retry (Pending counts toward the caps + idempotency).
+    #[tokio::test]
+    async fn unconfirmed_broadcast_is_pending_with_txid_and_blocks_retry() {
+        let dir = scratch();
+        let sp = MockSpender::new();
+        sp.set(SpendBehaviour::BroadcastUnconfirmed);
+        let eng = make(
+            &dir,
+            MockOwner::some(&owner_hex()),
+            sp.clone(),
+            FixedClock::at(DAY0),
+            test_config(),
+        )
+        .await;
+        // Money moved (broadcast accepted) → the outcome is Tipped with a txid.
+        let out = eng.auto_tip_for_store(STORE).await.unwrap();
+        assert!(matches!(out, TipOutcome::Tipped { .. }));
+        // But the ledger status is Pending (not yet confirmed on-chain) with the txid recorded.
+        let ledger = eng.get_ledger(None).await;
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].status, TipStatus::Pending);
+        assert!(ledger[0].txid.is_some(), "the broadcast txid is recorded");
+        // A same-day retry is refused: the Pending reservation blocks re-tipping (no double-spend).
+        sp.set(SpendBehaviour::Broadcast);
+        let retry = eng.auto_tip_for_store(STORE).await.unwrap();
+        assert_eq!(retry, TipOutcome::skipped("already-tipped-today"));
+        assert_eq!(
+            sp.call_count(),
+            1,
+            "a pending (unconfirmed) tip is never re-broadcast"
+        );
     }
 
     // ── manual tip: bypasses idempotency + caps, always executes ─────────
