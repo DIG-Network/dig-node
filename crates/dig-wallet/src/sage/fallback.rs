@@ -70,6 +70,23 @@ impl CoinsetFallback {
         s.strip_prefix("0x").unwrap_or(s).to_ascii_lowercase()
     }
 
+    /// Normalize a hash/hint to the canonical Chia-RPC QUERY form: a lowercased, **`0x`-prefixed**
+    /// hex string. `chia_query`'s coinset tier forwards these verbatim to coinset.org, whose
+    /// full-node RPC matches ONLY `0x`-prefixed hex — so a bare-hex query silently returns zero
+    /// coins. That was the live "have 0 $DIG" bug (#430): the wallet coin-DB sync
+    /// ([`super::rpc::WalletBackend::refresh_tracked_coins`]) builds its tracked puzzle hashes with
+    /// bare `hex::encode`, which the tolerant peer tier accepted (it strips an optional `0x`) but
+    /// the coinset fallback tier dropped — so a bring-up that fell through to coinset saw an empty
+    /// balance and could not select $DIG. Prefixing satisfies BOTH tiers.
+    fn query_hash(s: &str) -> String {
+        format!("0x{}", Self::norm_hex(s))
+    }
+
+    /// [`Self::query_hash`] over a slice (the puzzle-hash / hint list a query takes).
+    fn query_hashes(items: &[String]) -> Vec<String> {
+        items.iter().map(|s| Self::query_hash(s)).collect()
+    }
+
     /// Compute a coin id from a coinset [`chia_query::Coin`].
     fn coin_id_of(coin: &chia_query::Coin) -> Result<String> {
         let parent = Self::norm_hex(&coin.parent_coin_info);
@@ -107,18 +124,20 @@ impl CoinsetFallback {
 #[async_trait]
 impl ChainFallback for CoinsetFallback {
     async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {
+        let phs = Self::query_hashes(phs);
         let records = self
             .query
-            .get_coin_records_by_puzzle_hashes(phs, None, None, true)
+            .get_coin_records_by_puzzle_hashes(&phs, None, None, true)
             .await
             .map_err(|e| Error::internal(format!("fallback puzzle-hash read: {e}")))?;
         records.iter().map(Self::map_record).collect()
     }
 
     async fn coin_records_by_hints(&self, hints: &[String]) -> Result<Vec<FallbackCoin>> {
+        let hints = Self::query_hashes(hints);
         let records = self
             .query
-            .get_coin_records_by_hints(hints, None, None, true)
+            .get_coin_records_by_hints(&hints, None, None, true)
             .await
             .map_err(|e| Error::internal(format!("fallback hint read: {e}")))?;
         records.iter().map(Self::map_record).collect()
@@ -127,7 +146,7 @@ impl ChainFallback for CoinsetFallback {
     async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
         match self
             .query
-            .get_coin_record_by_name(&Self::norm_hex(coin_id))
+            .get_coin_record_by_name(&Self::query_hash(coin_id))
             .await
         {
             Ok(r) => Ok(Some(Self::map_record(&r)?)),
@@ -212,6 +231,25 @@ impl ChainFallback for EmptyFallback {
 #[cfg(test)]
 mod empty_fallback_tests {
     use super::*;
+
+    /// Regression (#430): the coinset tier of `chia_query` forwards puzzle hashes / hints to
+    /// coinset.org verbatim, and that RPC matches only `0x`-prefixed hex. [`CoinsetFallback`]
+    /// MUST therefore normalize its bare-hex inputs (the form `refresh_tracked_coins` produces
+    /// via `hex::encode`) to lowercased `0x`-prefixed hex before the query — otherwise a
+    /// bring-up that falls through to coinset reads back zero coins ("have 0 $DIG").
+    #[test]
+    fn query_hash_prefixes_0x_and_lowercases() {
+        assert_eq!(CoinsetFallback::query_hash("ABcd"), "0xabcd");
+        assert_eq!(
+            CoinsetFallback::query_hash("0xABcd"),
+            "0xabcd",
+            "existing 0x is not doubled"
+        );
+        assert_eq!(
+            CoinsetFallback::query_hashes(&["aa".into(), "0xBB".into()]),
+            vec!["0xaa".to_string(), "0xbb".to_string()],
+        );
+    }
 
     #[tokio::test]
     async fn empty_fallback_returns_empty_never_errors() {

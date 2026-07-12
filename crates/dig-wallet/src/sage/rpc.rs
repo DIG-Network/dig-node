@@ -3656,6 +3656,197 @@ mod tests {
         assert_eq!(resp.cats[0].balance.to_u64(), Some(1_000));
     }
 
+    /// **#430 — the wallet coin-DB sync feeds $DIG coin selection end-to-end.** The live tip /
+    /// send path selects $DIG from the local DB (`select_cats` → `unspent_coins`); nothing
+    /// selects until [`WalletBackend::refresh_tracked_coins`] populates the DB from chain. This
+    /// drives the FULL path on the `chia-sdk-test` simulator with NO live broadcast: issue a real
+    /// CAT hinted to the wallet, expose it through a chain-fallback (`coin_records_by_hints`) + a
+    /// lineage source, then prove that BEFORE the sync `select_cats` reports the exact live-funds
+    /// failure ("insufficient CAT balance: have 0"), and AFTER `refresh_tracked_coins` the coin
+    /// lands in the DB attributed to its TAIL, `select_cats` resolves it, and a CAT send builds +
+    /// validates (dig-clvm) + signs + is handed to a recording [`MockBroadcaster`]. This is the
+    /// identical mechanism `build_and_broadcast_dig_tip` uses (it just fixes the asset id to
+    /// `DIG_ASSET_ID`, which the simulator cannot mint — an arbitrary sim CAT stands in for $DIG).
+    #[tokio::test]
+    async fn refresh_tracked_coins_feeds_cat_selection_and_build_sign() {
+        use super::super::fallback::ChainFallback;
+        use super::super::singleton::{LineageSource, ParentSpend};
+        use super::super::spend::{self, MockBroadcaster, WalletSigner};
+        use chia::traits::Streamable;
+        use chia_sdk_test::Simulator;
+        use chia_wallet_sdk::driver::{
+            Cat as SdkCat, CatSpend, SpendContext, SpendWithConditions, StandardLayer,
+        };
+        use chia_wallet_sdk::types::Conditions;
+
+        // A chain fallback that returns one CAT coin when queried by the owner's p2 hint —
+        // exactly what the live coinset/peer tier does for a $DIG coin hinted to the wallet.
+        struct HintFallback {
+            owner_ph: String,
+            coin: FallbackCoin,
+        }
+        #[async_trait::async_trait]
+        impl ChainFallback for HintFallback {
+            async fn coin_records_by_puzzle_hashes(
+                &self,
+                _phs: &[String],
+            ) -> Result<Vec<FallbackCoin>> {
+                Ok(vec![]) // the CAT is HINTED to us, not sitting AT our p2 hash
+            }
+            async fn coin_records_by_hints(&self, hints: &[String]) -> Result<Vec<FallbackCoin>> {
+                Ok(if hints.iter().any(|h| h == &self.owner_ph) {
+                    vec![self.coin.clone()]
+                } else {
+                    vec![]
+                })
+            }
+            async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
+                Ok(None)
+            }
+        }
+
+        // A lineage source returning the CAT's parent spend (so attribution + input resolution work).
+        struct OneParent {
+            parent_id: String,
+            spend: ParentSpend,
+        }
+        #[async_trait::async_trait]
+        impl LineageSource for OneParent {
+            async fn parent_spend(
+                &self,
+                parent_coin_id: &str,
+                _spent_height: u32,
+            ) -> Result<Option<ParentSpend>> {
+                Ok((parent_coin_id == self.parent_id).then(|| self.spend.clone()))
+            }
+        }
+
+        // Issue a CAT on the simulator, then spend it to a child CAT hinted to alice — the coin a
+        // syncing wallet observes on chain.
+        let mut sim = Simulator::new();
+        let ctx = &mut SpendContext::new();
+        let alice = sim.bls(1_000);
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let memos = ctx.hint(alice.puzzle_hash).unwrap();
+        let (issue_cat, cats) = SdkCat::issue_with_coin(
+            ctx,
+            alice.coin.coin_id(),
+            1_000,
+            Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
+        )
+        .unwrap();
+        alice_p2.spend(ctx, alice.coin, issue_cat).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
+        let cat0 = cats[0];
+        let inner = alice_p2
+            .spend_with_conditions(
+                ctx,
+                Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
+            )
+            .unwrap();
+        SdkCat::spend_all(ctx, &[CatSpend::new(cat0, inner)]).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
+        let child_cat = cat0.child(alice.puzzle_hash, 1_000);
+        let asset_hex = hex::encode(cat0.info.asset_id);
+
+        // The chain-facing doubles: the child CAT surfaced by hint, and its parent spend.
+        let fallback = HintFallback {
+            owner_ph: hex::encode(alice.puzzle_hash),
+            coin: FallbackCoin {
+                coin_id: hex::encode(child_cat.coin.coin_id()),
+                parent_coin_info: hex::encode(child_cat.coin.parent_coin_info),
+                puzzle_hash: hex::encode(child_cat.coin.puzzle_hash),
+                amount: 1_000,
+                created_height: Some(5),
+                spent_height: None,
+                created_timestamp: Some(1),
+                spent_timestamp: None,
+            },
+        };
+        let lineage = OneParent {
+            parent_id: hex::encode(child_cat.coin.parent_coin_info),
+            spend: ParentSpend {
+                coin: cat0.coin,
+                puzzle_reveal: sim
+                    .puzzle_reveal(cat0.coin.coin_id())
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+                solution: sim
+                    .solution(cat0.coin.coin_id())
+                    .unwrap()
+                    .to_bytes()
+                    .unwrap(),
+            },
+        };
+
+        let signer = Arc::new(WalletSigner::new(vec![alice.sk], Bytes32::new([0u8; 32])));
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mock = Arc::new(MockBroadcaster::default());
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![hex::encode(alice.puzzle_hash)],
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        let be = WalletBackend::new(db, Arc::new(fallback), cfg)
+            .with_signer(signer.clone())
+            .with_lineage(Arc::new(lineage))
+            .with_broadcaster(mock.clone());
+
+        // BEFORE the sync: the DB is empty → selection reports the exact live-funds failure.
+        let err = be.select_cats(&asset_hex, 1_000, 0).await.unwrap_err();
+        assert!(
+            err.to_string().contains("insufficient CAT balance: have 0"),
+            "pre-sync selection reproduces the live 'have 0' skip, got: {err}"
+        );
+
+        // The wallet coin-DB sync: read the wallet's own coins from chain + attribute the CAT.
+        let n = be.refresh_tracked_coins().await.unwrap();
+        assert_eq!(n, 1, "the hinted CAT coin was synced into the DB");
+
+        // AFTER the sync: the coin is in the DB, attributed to its TAIL, and selectable.
+        let unspent = be.db.unspent_coins(Some(&asset_hex)).await.unwrap();
+        assert_eq!(
+            unspent.len(),
+            1,
+            "the $DIG-standin CAT is now in the coin DB"
+        );
+        assert_eq!(unspent[0].asset_id.as_deref(), Some(asset_hex.as_str()));
+
+        let (selected, xch_fee) = be
+            .select_cats(&asset_hex, 1_000, 0)
+            .await
+            .expect("select_cats resolves the synced CAT");
+        assert_eq!(selected.len(), 1, "one CAT input covers the amount");
+        assert!(xch_fee.is_empty(), "no XCH fee coins needed at fee=0");
+
+        // Build + validate (dig-clvm) + sign the CAT send, then hand it to the recording
+        // broadcaster — the identical build/sign/broadcast steps the tip runs, NO live send.
+        let recipient = Bytes32::new([9u8; 32]);
+        let coin_spends = spend::build_cat_send(
+            signer.as_ref(),
+            &selected,
+            recipient,
+            1_000,
+            alice.puzzle_hash,
+            true,
+            0,
+            &xch_fee,
+        )
+        .expect("CAT send builds over the synced coin");
+        spend::run_and_validate(&coin_spends).expect("dig-clvm validation passes");
+        let sig = signer.sign(&coin_spends).unwrap();
+        let bundle = SpendBundle::new(coin_spends, sig);
+        mock.broadcast(&bundle).await.unwrap();
+        assert_eq!(
+            mock.sent.lock().unwrap().len(),
+            1,
+            "the signed tip/send bundle reached the (mock) broadcaster"
+        );
+    }
+
     // ---- #368: runtime signer load via node custody + wallet.* dispatch + sync-status --------
 
     use super::super::custody::{Network, WalletCustody};
