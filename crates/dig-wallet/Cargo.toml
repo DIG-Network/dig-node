@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -25,6 +25,11 @@ digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "09
 # wallet UI's "My Node" cache view (cache_cap_bytes / cache_used_bytes / clear_cache / list).
 dig-node-core = { path = "../dig-node-core" }
 chia-protocol = "0.26"
+# BIP-39 mnemonic → seed for deriving each custodied wallet's stable id (the Chia BLS
+# master public-key FINGERPRINT, #427). Already resolved transitively via digstore-chain;
+# declared directly here so `custody` can compute the fingerprint without re-exposing it
+# through digstore-chain's `WalletKeys` (a separate, release-first repo).
+bip39 = "2"
 # `chia::puzzles::nft::NftMetadata` — the on-chain NFT metadata struct we serialize
 # into a MintSpec's metadata Program for chia_mintNft / chia_bulkMintNfts.
 chia = "0.26"

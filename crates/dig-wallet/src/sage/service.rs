@@ -74,8 +74,9 @@ pub struct WalletService {
 
 impl WalletService {
     /// Assemble the served wallet under `config_dir` (the node's config directory). The wallet DB
-    /// is `<config_dir>/wallet.sqlite`; the encrypted seed is `<config_dir>/wallet-seed.bin`
-    /// (mainnet custody). Never blocks on network: the fallback tier defaults to
+    /// is `<config_dir>/wallet.sqlite`; the encrypted seeds are `<config_dir>/wallets/<id>.seed`
+    /// (mainnet MULTI-wallet custody, #427; a legacy `<config_dir>/wallet-seed.bin` is adopted).
+    /// Never blocks on network: the fallback tier defaults to
     /// [`EmptyFallback`]. A DB-open failure falls back to an in-memory DB so the node still serves
     /// the version/custody/sync-status surface (reported, not fatal).
     /// Assemble the served wallet, offline-safe (no live broadcast). Equivalent to
@@ -91,7 +92,9 @@ impl WalletService {
     pub async fn build_with(config_dir: &Path, cfg: WalletServiceConfig) -> WalletService {
         let events = Arc::new(EventBus::default());
         let db = open_db(config_dir).await;
-        let custody = WalletCustody::mainnet(seed_path(config_dir));
+        // MULTI-wallet custody (#427) rooted at the node config dir: seeds live under
+        // `<config_dir>/wallets/`, and a legacy single `<config_dir>/wallet-seed.bin` is adopted.
+        let custody = WalletCustody::mainnet(config_dir.to_path_buf());
         let tip_events = Arc::new(TipEventBus::default());
 
         // Live-broadcast wiring (§18.12), gated on the config flag. A construction failure (no peer
@@ -196,11 +199,6 @@ async fn build_live_wallet() -> Option<LiveWallet> {
 /// The wallet DB path under the node config dir.
 fn db_path(config_dir: &Path) -> PathBuf {
     config_dir.join("wallet.sqlite")
-}
-
-/// The encrypted-seed path under the node config dir.
-fn seed_path(config_dir: &Path) -> PathBuf {
-    config_dir.join("wallet-seed.bin")
 }
 
 /// Open the on-disk wallet DB, falling back to an in-memory DB (reported) if the on-disk open
