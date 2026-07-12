@@ -1661,12 +1661,27 @@ unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only
   broadcast, awaiting on-chain inclusion). Either way the persisted reservation blocks a same-day
   retry and its amount counts toward the caps, so a pending (unconfirmed) tip can NEVER enable a
   double-spend. An AMBIGUOUS broadcast error is still `Failed` (never retried that day, §18.23).
-- **Coin selection over live-synced state.** `WalletBackend::refresh_tracked_coins` is a best-effort
-  point-read sync: it reads the wallet's OWN coins from the fallback tier (XCH by puzzle hash, CAT by
-  hint), upserts them into the local DB, attributes CATs to their TAIL via the lineage source (so
-  `$DIG` coins become selectable), and marks the DB synced. The live tip spender runs it BEFORE
-  selecting, so the spend builds over current chain state; a sync failure is not a spend failure
-  (selection then reports `NotExecutable`, retryable). A no-op under the graceful `EmptyFallback`.
+- **Coin selection over live-synced state (the wallet coin-DB sync contract).**
+  `WalletBackend::refresh_tracked_coins` is a best-effort point-read sync that FEEDS coin selection:
+  it reads the wallet's OWN coins from the fallback tier for every tracked p2 puzzle hash — XCH coins
+  sitting AT the puzzle hash (`coin_records_by_puzzle_hashes`) AND CAT coins HINTED to it
+  (`coin_records_by_hints`, since a CAT is hinted to the owner p2) — upserts them into the local coin
+  DB (`unspent_coins`/`select_cats` read this), attributes each CAT to its TAIL by uncurrying the
+  parent spend via the lineage source (so a `$DIG` coin, stored initially with `asset_id: None`, gains
+  its asset id and becomes selectable), and marks the DB synced. It runs on the SPEND path: the live
+  tip spender (and any node-custodied send) invokes it BEFORE selecting, so the spend builds over
+  current chain state. Idempotent + non-destructive (upsert-only; a re-sync marks a now-spent coin
+  spent so it drops out of selection). A sync failure is NOT a spend failure — selection then reports
+  `NotExecutable`/insufficient-balance (retryable, never a false spend). A no-op under the graceful
+  `EmptyFallback`.
+- **Canonical query hex.** All coin-record queries into `chia_query` (the fallback tier: peers +
+  coinset.org) MUST pass hashes/hints as lowercased **`0x`-prefixed** hex. The coinset RPC matches
+  ONLY `0x`-prefixed hex (the peer tier tolerantly strips an optional `0x`); a bare-hex query silently
+  reads back zero coins. `refresh_tracked_coins` builds tracked puzzle hashes with bare `hex::encode`,
+  so the `CoinsetFallback` adapter normalizes them to the `0x` form at the query boundary (the DB and
+  internal comparisons stay bare-hex). Omitting this normalization is the live "have 0 $DIG" failure
+  (#430): the mock/peer paths accept bare hex, so it surfaces only when a bring-up falls through to
+  coinset.
 - **Live-funds e2e (env-gated, SKIPPED by default).** A documented, runnable end-to-end test
   (`crates/dig-node-service/tests/live_funds_tip_e2e.rs` + `runbooks/live-funds-tip-e2e.md`) drives a
   real mainnet `$DIG` tip to the DIG treasury (`digstore_chain::dig::treasury_inner_puzzle_hash()`).
