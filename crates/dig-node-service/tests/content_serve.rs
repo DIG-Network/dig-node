@@ -118,7 +118,7 @@ async fn start_server(upstream: &str) -> (SocketAddr, PathBuf, EnvHold) {
         dig_local: false,
         ..dig_node_service::Config::default()
     };
-    let state = dig_node_service::server::build_state(&config);
+    let state = dig_node_service::server::build_state(&config).await;
     let app = dig_node_service::server::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

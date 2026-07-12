@@ -297,6 +297,9 @@ method/header-allow behavior above.
 | `/openrpc.json` | GET | The OpenRPC document (§6.3). |
 | `/.well-known/dig-node.json` | GET | The discovery document (§6.4). |
 | `/ws/status` | GET (WS upgrade) | WebSocket status/liveness channel (§4.5). |
+| `/ws` | GET (WS upgrade) | Bidirectional wallet+control transport — correlated request/response + proactive push (§4.8). |
+| `/{method}` | POST | Served Sage-parity wallet RPC (`POST {base}/{method}`, §18.1/§18.19). |
+| `/{seg}` | GET | Root-absolute subresource rerooted via `Referer` into its store (§4.6). |
 | `/s/<storeId>[:<root>]/<path>` | GET | Local plaintext content-serve — server-side decrypt (§4.6). |
 | `/verify/<storeId>[:<root>]` | GET | Verification-ledger snapshot for a page session (§4.7). |
 | *(fallback)* | GET | Root-absolute subresource rerooted via `Referer` into its store (§4.6). |
@@ -493,6 +496,49 @@ session is returned (a page has one active root). A malformed path is `404`; any
 - `leafIndex` = the leaf's index reconstructed from the sibling directions (a left-sibling step sets the bit
   at that level). It is a DISPLAY value only — re-verification never consults it — and is exact for a leaf
   whose path has no odd-carry level.
+
+### 4.8. `GET /ws` — bidirectional wallet+control transport (#369)
+
+A thin client (the DIG Chrome extension) drives ALL wallet reads + `control.*`/wallet mutations over
+ONE upgraded WebSocket instead of per-call HTTP, and the node PROACTIVELY PUSHES sync-status
+transitions + sync events on the same socket — subsuming the SSE `SyncEvent` stream (§18.14) and
+`get_sync_status` polling. This is the wallet+control channel ONLY; the resolver/content transport
+(§4.6, JSON-RPC §5) is UNCHANGED.
+
+**Origin validation (CSWSH).** Identical to §4.5: the `Origin` header is checked against the local-origin
+allowlist (`chrome-extension://*` + allowed local `http://`); a disallowed browser `Origin` is rejected
+`403` before the upgrade. No `Origin` (a non-browser client) is allowed (loopback bind is the defense).
+
+**Frames are JSON text frames.** Client→node frames carry a discriminated `type`:
+
+- **`request`** — `{ "type":"request", "id": <string|number>, "method": <string>, "params": <object>,
+  "token": <string?> }`. `id` correlates the response. `method` is any served wallet method (Sage
+  snake_case + the `wallet.*` custody lifecycle, §18.20) or a `control.*`/`pairing.*` method. `params` is
+  the method's request object (the Sage body for a wallet method). `token` is the paired/control token
+  (§7.11/§7.12), required for gated ops (below).
+
+Node→client frames:
+
+- **`response`** — `{ "type":"response", "id": <echoed>, "ok": <bool>, "result": <json>?, "error": {
+  "code": <int>, "message": <string> }? }`. `ok:true` carries `result`; `ok:false` carries `error`.
+- **`sync_status`** (PUSH) — `{ "type":"sync_status", "state": "syncing"|"synced"|"disconnected",
+  "peak_height": <u32>?, "target_height": <u32>? }`. Pushed ONCE immediately on connect (the initial
+  snapshot) and again on every TRANSITION. `state` is derived from the wallet DB's synced peak +
+  initial-catch-up flag; a `stop` sync event pushes `disconnected`. The client renders "Syncing…
+  (peak/target)" and gates trust in balances/spends on `synced`.
+- **`event`** (PUSH) — `{ "type":"event", "event": <SyncEvent> }`, where `<SyncEvent>` is the tagged-union
+  wire shape of §18.14 (`{"type":"coin_state"}`, `{"type":"stop"}`, …). Every published sync event is
+  forwarded to each connected socket (best-effort; a lagging subscriber skips the gap).
+
+**Subscription model.** A connected socket is IMPLICITLY subscribed to `sync_status` + `event` pushes for
+its lifetime — the client gets one socket, no explicit subscribe call. A transport ping every ~5s with a
+pong-timeout closes a half-open socket (as §4.5).
+
+**Authorization (§7.12).** Over `/ws`, wallet READS are open to the local client; every wallet MUTATION,
+every `wallet.*` custody method, and every `control.*` method REQUIRES the frame's `token` to be the
+master control token OR a valid paired token (pairing-admin `control.*` needs the master token). An
+unauthorized request gets an `ok:false` response with an `unauthorized` error — the op never runs and is
+never relayed upstream. `pairing.request`/`pairing.poll` are open (the bootstrap, §7.11).
 
 ---
 
@@ -1434,6 +1480,14 @@ byte-identical by construction:
 - **Plain-HTTP + CORS** (browser mirror). A browser/MV3 extension cannot present a client cert, so the
   identical surface is served over the loopback plain-HTTP transport with permissive CORS. Loopback only.
 
+On the shipped `dig-node` binary this surface IS served (#368): the service bring-up assembles ONE live
+`WalletBackend` (`sage::service::WalletService` — the wallet DB + a graceful fallback tier + a shared
+`EventBus` + the node custody) and (a) integrates the browser mirror onto the SAME loopback service router
+as `POST /{method}` on the default port `9778` — the exact base the extension's `node-wallet` client
+targets — with the wallet authz gate (§7.12) applied, and (b) brings up the mTLS `9257` sibling listener
+(best-effort, non-fatal) for node-class/Sage-drop-in parity. The bidirectional `/ws` transport (§4.8) also
+dispatches to this same backend. Wallet methods are NEVER relayed to the upstream gateway.
+
 18.2. **Request/response model.** Every endpoint is `POST /{endpoint}` where `{endpoint}` is the exact
 snake_case method name. There is NO JSON-RPC envelope, NO batching — the path IS the method. Request body
 = the method's request struct as a single JSON object (an empty body is treated as `{}`). Success →
@@ -1571,8 +1625,11 @@ TAIL and surfaces in `get_cats` (this is how `$DIG` resolves from the node).
 18.12. **Deferred to follow-on units.** The off-chain NFT data-blob/CHIP-0015 metadata fetch
 (`get_nft_data` returns on-chain fields; the metadata JSON surfaces when fetched), `exercise_options`
 (§18.15 — a documented, non-silent follow-on), and real image-derived theme content (§18.16 — this
-backend stores a placeholder). The service bring-up that starts the dual-transport server and invokes
-reconstruction after sync (via a peer/coinset `LineageSource`) is the remaining integration.
+backend stores a placeholder). The service bring-up that STARTS the served surface is DONE (§18.1/#368);
+the remaining integration is spawning the live direct-peer sync loop (§18.6) into that bring-up so the
+shared `EventBus` is fed from real chain events (until then the DB stays honestly `syncing` and the
+graceful `EmptyFallback` returns empty reads) and reconstruction-after-sync via a peer/coinset
+`LineageSource`.
 
 18.13. **Security.** Both listeners bind loopback only. The mTLS listener enforces the shared-cert mutual
 TLS. Multi-peer sync is a correctness/censorship property (never collapse to one peer). Reads tolerate
@@ -1707,6 +1764,25 @@ the authorized-extension path (distinct from the `DIG_WALLET_ALLOW_BROADCAST` da
 an unconsented op builds + signs + validates but does NOT broadcast (nothing is spent). CI NEVER broadcasts
 to mainnet — tests drive the `chia-sdk-test` simulator (real consensus incl. BLS) or the recording
 `MockBroadcaster`; a real mainnet broadcast is a separate, explicitly-gated live pass.
+
+18.22. **Served on the shipped node + runtime signer load + custody dispatch (#368/#369).** The
+`WalletBackend` is BUILT and SERVED by the shipped `dig-node` (§18.1): the `POST /{method}` HTTP mirror on
+`9778`, the mTLS `9257` sibling listener, and the bidirectional `/ws` transport (§4.8) all dispatch to the
+one live backend.
+
+- **Runtime signer load.** The served backend resolves its signer from the node custody (§18.20) at
+  RUNTIME: `require_signer` returns the bring-up-injected signer if present, else the signer of the
+  currently-UNLOCKED custody session. A paired `wallet.unlock` therefore enables signing/spend immediately,
+  WITHOUT reconstructing the backend; `wallet.lock`/`delete` disable it again. (The test/simulator path
+  still injects a fixed signer via `with_signer`, which wins when present.)
+- **Custody lifecycle dispatch.** The `wallet.*` methods (`wallet.status`/`create`/`import`/`restore`/
+  `unlock`/`lock`/`delete`, §18.20) are dispatched by `WalletBackend::dispatch` to the attached
+  `WalletCustody`. `wallet.create`/`import`/`restore`/`unlock` return `{ "address": "xch1…" }`;
+  `wallet.status` returns the custody status (`{ "state": "none"|"locked"|"unlocked", "address"? }`);
+  `wallet.lock`/`delete` return the resulting state. All are gated (§7.12).
+- **Sync-status snapshot.** `WalletBackend::sync_status()` derives the `{ state, peak_height, target_height }`
+  tri-state (`SyncStatus`, `crate::sage::events`) from the wallet DB — `synced` iff the initial catch-up
+  completed, else `syncing`; it is the body the `/ws` transport pushes (§4.8) and re-pushes on transition.
 
 ## 19. Peer network — NAT traversal, discovery, address book, and content location
 

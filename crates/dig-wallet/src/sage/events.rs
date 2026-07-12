@@ -49,6 +49,35 @@ pub enum SyncEvent {
     NftData,
 }
 
+/// The wallet sync lifecycle a thin client renders + gates trust on (epic #365 §1, #369). The
+/// node PUSHES a [`SyncStatus`] whenever this transitions, so the extension shows
+/// "Syncing… (h/target)" and never adopts a silent synced-zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncLifecycle {
+    /// A peer connection is up and the initial puzzle-state catch-up has NOT completed.
+    Syncing,
+    /// The initial catch-up completed; balances/spends can be trusted.
+    Synced,
+    /// No live sync (the sync loop stopped / no peer) — the client shows a disconnected wallet.
+    Disconnected,
+}
+
+/// The first-class sync-status push (#369): the tri-state plus the synced peak + best-known target
+/// height. Pushed proactively to subscribed WS clients on every transition; also the body of a
+/// `get_sync_status`-adjacent poll. Field omission mirrors the Sage wire convention.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncStatus {
+    /// The tri-state the client renders + gates trust on.
+    pub state: SyncLifecycle,
+    /// The highest block height the wallet DB has processed (`None` before any progress).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_height: Option<u32>,
+    /// The height the wallet is syncing TOWARD (best-known; equals `peak_height` once synced).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_height: Option<u32>,
+}
+
 /// The default channel capacity: generous enough that a slow SSE consumer does not miss a
 /// burst of sync events under normal operation; a consumer that falls further behind than
 /// this sees `RecvError::Lagged` (handled by the SSE bridge, see `sage::transport`) rather

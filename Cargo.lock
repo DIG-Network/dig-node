@@ -1944,12 +1944,13 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.19.0"
+version = "0.20.0"
 dependencies = [
  "axum",
  "base64",
  "clap",
  "dig-node-core",
+ "dig-wallet",
  "digstore-core",
  "digstore-crypto",
  "digstore-stage",

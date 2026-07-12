@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::routing::post;
 use axum::{Json, Router};
-use futures_util::StreamExt;
+use dig_wallet::sage::events::SyncEvent;
+use dig_wallet::sage::rpc::WalletBackend;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 
 /// Serializes every test that builds a companion server. dig-node reads
@@ -140,7 +142,7 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
-        let state = dig_node_service::server::build_state(&config);
+        let state = dig_node_service::server::build_state(&config).await;
         // The token the server wrote (read from disk, exactly as a real controller
         // would). config_path() resolves under the temp DIG_NODE_CACHE we just set.
         let token = dig_node_service::control::load_or_create_token().unwrap();
@@ -154,6 +156,40 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
         axum::serve(listener, app).await.unwrap();
     });
     (addr, token, EnvHold(hold))
+}
+
+/// Like [`start_companion_full`] but ALSO returns the served wallet backend (#368/#369) so a WS
+/// push test can drive the backend's event bus directly. Same per-call on-disk isolation + env
+/// lock (the wallet DB + seed live under the same per-test config dir).
+async fn start_companion_wallet(
+    upstream: &str,
+) -> (SocketAddr, String, Arc<WalletBackend>, EnvHold) {
+    let config = dig_node_service::Config {
+        upstream: upstream.to_string(),
+        port: 0,
+        ..dig_node_service::Config::default()
+    };
+    let hold = env_guard().lock_owned().await;
+    let (state, token, backend) = {
+        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).expect("create test cache dir");
+        std::env::set_var("DIG_NODE_CACHE", &cache);
+        std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        let state = dig_node_service::server::build_state(&config).await;
+        let token = dig_node_service::control::load_or_create_token().unwrap();
+        let backend = state.wallet_backend();
+        (state, token, backend)
+    };
+    let app = dig_node_service::server::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, token, backend, EnvHold(hold))
 }
 
 fn client() -> reqwest::Client {
@@ -1472,4 +1508,209 @@ async fn ws_status_accepts_a_chrome_extension_origin() {
         .expect("stream ended")
         .expect("ws error");
     assert!(msg.into_text().unwrap().contains("\"type\":\"status\""));
+}
+
+// --- #368: the served Sage-parity wallet RPC surface (POST /{method}) ----------------
+//
+// The shipped node now BUILDS + SERVES the node-custodied wallet backend on the
+// extension-reachable loopback. These prove the extension's `node-wallet` target
+// (`POST {base}/{method}`) is answered by the installed binary (not relayed upstream),
+// and that custody/mutation methods are paired-token gated.
+
+/// **Proves (#368):** the running node answers the core Sage reads (`get_version`,
+/// `get_sync_status`, `get_coins`) over `POST /{method}` on the loopback — not a `404`
+/// and not relayed to the upstream.
+#[tokio::test]
+async fn wallet_rpc_answers_core_reads_on_loopback() {
+    let (upstream, calls) = start_mock_upstream().await;
+    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    for (method, body) in [
+        ("get_version", "{}"),
+        ("get_sync_status", "{}"),
+        ("get_coins", r#"{"offset":0,"limit":10}"#),
+    ] {
+        let resp = client()
+            .post(format!("http://{addr}/{method}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{method} must be answered by the node");
+        let v: Value = resp.json().await.unwrap();
+        if method == "get_version" {
+            assert!(v["version"].is_string(), "get_version returns a version");
+        }
+    }
+    // None of the wallet reads were relayed to the upstream DIG RPC.
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "wallet reads must not relay upstream"
+    );
+}
+
+/// **Proves (#368 security):** an unauthenticated wallet MUTATION (`send_xch`) over the
+/// served surface is rejected `401` — a spend is never served without the paired/control
+/// token, and never relayed upstream.
+#[tokio::test]
+async fn wallet_rpc_rejects_unauthorized_mutation() {
+    let (upstream, calls) = start_mock_upstream().await;
+    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let resp = client()
+        .post(format!("http://{addr}/send_xch"))
+        .header("content-type", "application/json")
+        .body(r#"{"address":"xch1xxxx","amount":1,"fee":0}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "an unauthorized spend must be 401");
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a spend must never relay upstream"
+    );
+}
+
+// --- #369: the bidirectional WS wallet+control transport (GET /ws) -------------------
+
+/// Read the next TEXT frame as JSON within a timeout, skipping transport ping/pong/close.
+async fn next_ws_json<S>(ws: &mut S) -> Value
+where
+    S: futures_util::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + Unpin,
+{
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for a WS frame")
+            .expect("stream ended")
+            .expect("ws error");
+        if let tokio_tungstenite::tungstenite::Message::Text(t) = msg {
+            return serde_json::from_str(&t).expect("frame is valid JSON");
+        }
+        // Skip ping/pong/binary/close keepalives.
+    }
+}
+
+/// **Proves (#369):** on connect `/ws` pushes the initial `sync_status`, and a correlated
+/// `request` (a wallet read) gets a `response` frame echoing its `id`.
+#[tokio::test]
+async fn ws_wallet_pushes_status_and_correlates_a_request() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+
+    // Initial push: a sync_status frame (fresh DB => syncing).
+    let snap = next_ws_json(&mut ws).await;
+    assert_eq!(snap["type"], json!("sync_status"));
+    assert_eq!(snap["state"], json!("syncing"));
+
+    // A correlated wallet read.
+    ws.send(Message::Text(
+        r#"{"id":"req-1","type":"request","method":"get_version","params":{}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let resp = next_ws_json(&mut ws).await;
+    assert_eq!(resp["id"], json!("req-1"));
+    assert_eq!(resp["type"], json!("response"));
+    assert_eq!(resp["ok"], json!(true));
+    assert!(resp["result"]["version"].is_string());
+}
+
+/// **Proves (#369 push):** the node forwards sync EVENTS to the subscribed socket and pushes
+/// a `sync_status` transition to `disconnected` when the sync loop stops.
+#[tokio::test]
+async fn ws_wallet_pushes_events_and_disconnected_on_stop() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+
+    // Drain the initial sync_status snapshot (subscription is now active).
+    let snap = next_ws_json(&mut ws).await;
+    assert_eq!(snap["type"], json!("sync_status"));
+
+    // A coin-state change is forwarded as an event frame.
+    backend.events().publish(SyncEvent::CoinState);
+    let ev = next_ws_json(&mut ws).await;
+    assert_eq!(ev["type"], json!("event"));
+    assert_eq!(ev["event"]["type"], json!("coin_state"));
+
+    // Stop => the event is forwarded AND a disconnected sync_status transition is pushed.
+    backend.events().publish(SyncEvent::Stop);
+    let ev = next_ws_json(&mut ws).await;
+    assert_eq!(ev["type"], json!("event"));
+    assert_eq!(ev["event"]["type"], json!("stop"));
+    let status = next_ws_json(&mut ws).await;
+    assert_eq!(status["type"], json!("sync_status"));
+    assert_eq!(status["state"], json!("disconnected"));
+}
+
+/// **Proves (#369 authz):** an unauthorized wallet MUTATION and an unauthorized `control.*`
+/// call over the WS are both rejected (`ok:false`), while a wallet READ is served.
+#[tokio::test]
+async fn ws_wallet_rejects_unauthorized_mutation_and_control() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await; // drain initial sync_status
+
+    // Unauthorized mutation (no token).
+    ws.send(Message::Text(
+        r#"{"id":"m1","type":"request","method":"send_xch","params":{"address":"xch1x","amount":1,"fee":0}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let resp = next_ws_json(&mut ws).await;
+    assert_eq!(resp["id"], json!("m1"));
+    assert_eq!(resp["ok"], json!(false), "unauthorized mutation rejected");
+
+    // Unauthorized control.* (no token).
+    ws.send(Message::Text(
+        r#"{"id":"c1","type":"request","method":"control.status","params":{}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let resp = next_ws_json(&mut ws).await;
+    assert_eq!(resp["id"], json!("c1"));
+    assert_eq!(resp["ok"], json!(false), "unauthorized control.* rejected");
+}
+
+/// **Proves (#369 CSWSH):** `/ws` validates the `Origin` with the same local-origin allowlist —
+/// a disallowed browser Origin is rejected at the handshake (`403`), never upgraded.
+#[tokio::test]
+async fn ws_wallet_rejects_a_disallowed_origin() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let mut request = format!("ws://{addr}/ws")
+        .into_client_request()
+        .expect("build client request");
+    request
+        .headers_mut()
+        .insert("origin", "https://evil.example.com".parse().unwrap());
+
+    match tokio_tungstenite::connect_async(request).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), 403);
+        }
+        other => panic!("expected an HTTP 403 rejection, got {other:?}"),
+    }
 }

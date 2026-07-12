@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use chia_wallet_sdk::driver::Cat;
 
+use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
 use super::fallback::{ChainFallback, FallbackCoin};
@@ -85,6 +86,11 @@ pub struct WalletBackend {
     /// configured puzzle hashes (legacy), and report "not tracking" when BOTH are empty.
     /// The node NEVER holds the client's private key (#217): scoping is by public data.
     identity: Arc<RwLock<Option<SessionIdentity>>>,
+    /// The node-custodied seed lifecycle (#370), attached at bring-up ([`Self::with_custody`]) so
+    /// the served backend can resolve its signer from the CURRENTLY-UNLOCKED custody session at
+    /// runtime (#368 runtime signer load) — not only from a signer injected once at construction.
+    /// `None` on the test/simulator path (which injects a fixed signer via [`Self::with_signer`]).
+    custody: Option<WalletCustody>,
 }
 
 /// The connected client's PUBLIC identity for a session (#407). Scoping data only — no key.
@@ -111,6 +117,7 @@ impl WalletBackend {
             lineage: None,
             events: Arc::new(EventBus::default()),
             identity: Arc::new(RwLock::new(None)),
+            custody: None,
         }
     }
 
@@ -118,6 +125,21 @@ impl WalletBackend {
     pub fn with_signer(mut self, signer: Arc<WalletSigner>) -> Self {
         self.signer = Some(signer);
         self
+    }
+
+    /// Attach the node-custodied seed lifecycle (#370/#368). The served backend then resolves its
+    /// signer from the currently-unlocked custody session at runtime, so a paired caller's
+    /// `wallet.unlock` immediately enables signing/spend WITHOUT reconstructing the backend. A
+    /// bring-up-injected [`Self::with_signer`] still wins when present (the simulator path).
+    pub fn with_custody(mut self, custody: WalletCustody) -> Self {
+        self.custody = Some(custody);
+        self
+    }
+
+    /// The node-custodied seed lifecycle, if attached (#368) — used by the transport layer to
+    /// dispatch the `wallet.*` custody methods to one shared custody state machine.
+    pub fn custody(&self) -> Option<&WalletCustody> {
+        self.custody.as_ref()
     }
 
     /// Attach the network broadcaster (enables `auto_submit` + `submit_transaction`).
@@ -836,7 +858,7 @@ impl WalletBackend {
 
     /// The wallet's tracked p2 puzzle hashes (for summary "receiving" flags).
     fn wallet_puzzle_hashes(&self) -> HashSet<Bytes32> {
-        if let Some(s) = &self.signer {
+        if let Some(s) = self.current_signer() {
             return s.puzzle_hashes();
         }
         self.config
@@ -846,16 +868,25 @@ impl WalletBackend {
             .collect()
     }
 
-    /// The signer, or a locked-wallet error (C.6: spends need node-custodied keys).
-    fn require_signer(&self) -> Result<&WalletSigner> {
+    /// The EFFECTIVE signing key (#368): the bring-up-injected signer if present, else the signer
+    /// loaded by the currently-unlocked node custody. `None` ⇒ the wallet is locked / no key is
+    /// available. Returns an owned `Arc` because the custody signer lives behind custody's own lock,
+    /// so it cannot be borrowed out of `&self`.
+    fn current_signer(&self) -> Option<Arc<WalletSigner>> {
         self.signer
-            .as_deref()
+            .clone()
+            .or_else(|| self.custody.as_ref().and_then(|c| c.signer()))
+    }
+
+    /// The signer, or a locked-wallet error (C.6: spends need node-custodied keys).
+    fn require_signer(&self) -> Result<Arc<WalletSigner>> {
+        self.current_signer()
             .ok_or_else(|| Error::internal("wallet is locked: no signing key available"))
     }
 
     /// The change puzzle hash (the wallet's first receive address).
     fn change_ph(&self) -> Result<Bytes32> {
-        if let Some(ph) = self.signer.as_ref().and_then(|s| s.change_puzzle_hash()) {
+        if let Some(ph) = self.current_signer().and_then(|s| s.change_puzzle_hash()) {
             return Ok(ph);
         }
         match self.config.puzzle_hashes.first() {
@@ -902,7 +933,7 @@ impl WalletBackend {
             &self.wallet_puzzle_hashes(),
         )?;
         if auto_submit {
-            if let (Some(signer), Some(bc)) = (self.signer.as_ref(), self.broadcaster.as_ref()) {
+            if let (Some(signer), Some(bc)) = (self.current_signer(), self.broadcaster.as_ref()) {
                 let sig = signer.sign(&coin_spends)?;
                 bc.broadcast(&SpendBundle::new(coin_spends.clone(), sig))
                     .await?;
@@ -920,6 +951,7 @@ impl WalletBackend {
 
     async fn send_xch(&self, req: &SendXch) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let amount = amount_u64(&req.amount)?;
         let fee = amount_u64(&req.fee)?;
         let dest = self.decode_ph(&req.address)?;
@@ -934,6 +966,7 @@ impl WalletBackend {
 
     async fn bulk_send_xch(&self, req: &BulkSendXch) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let amount = amount_u64(&req.amount)?;
         let fee = amount_u64(&req.fee)?;
         let dests = req
@@ -952,6 +985,7 @@ impl WalletBackend {
 
     async fn combine(&self, req: &Combine) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let inputs = self.coins_from_ids(&req.coin_ids).await?;
         let coin_spends = spend::build_combine(signer, &inputs, self.change_ph()?, fee)?;
@@ -960,6 +994,7 @@ impl WalletBackend {
 
     async fn split(&self, req: &Split) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let inputs = self.coins_from_ids(&req.coin_ids).await?;
         let coin_spends =
@@ -969,6 +1004,7 @@ impl WalletBackend {
 
     async fn multi_send(&self, req: &MultiSend) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let mut payments = Vec::with_capacity(req.payments.len());
         for p in &req.payments {
@@ -1031,6 +1067,7 @@ impl WalletBackend {
 
     async fn send_cat(&self, req: &SendCat) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let amount = amount_u64(&req.amount)?;
         let fee = amount_u64(&req.fee)?;
         let dest = self.decode_ph(&req.address)?;
@@ -1050,6 +1087,7 @@ impl WalletBackend {
 
     async fn bulk_send_cat(&self, req: &BulkSendCat) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let amount = amount_u64(&req.amount)?;
         let fee = amount_u64(&req.fee)?;
         let outputs = req
@@ -1073,6 +1111,7 @@ impl WalletBackend {
 
     async fn sign_coin_spends(&self, req: &SignCoinSpends) -> Result<SignCoinSpendsResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let coin_spends = req
             .coin_spends
             .iter()
@@ -1192,6 +1231,7 @@ impl WalletBackend {
 
     async fn make_offer(&self, req: &MakeOffer) -> Result<MakeOfferResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let receive_ph = match &req.receive_address {
             Some(a) => self.decode_ph(a)?,
@@ -1259,6 +1299,7 @@ impl WalletBackend {
 
     async fn take_offer(&self, req: &TakeOffer) -> Result<TakeOfferResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let change = self.change_ph()?;
 
@@ -1342,6 +1383,7 @@ impl WalletBackend {
 
     async fn cancel_offer(&self, req: &CancelOffer) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let change = self.change_ph()?;
         let row = self
@@ -1357,6 +1399,7 @@ impl WalletBackend {
 
     async fn create_did(&self, req: &CreateDid) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let inputs =
             spend::select_coins(self.spendable_coins(None).await?, 1u64.saturating_add(fee))?;
@@ -1367,6 +1410,7 @@ impl WalletBackend {
 
     async fn bulk_mint_nfts(&self, req: &BulkMintNfts) -> Result<BulkMintNftsResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let did = self.resolve_did(&req.did_id).await?;
         let default_owner = self.change_ph()?;
@@ -1409,7 +1453,7 @@ impl WalletBackend {
             &self.wallet_puzzle_hashes(),
         )?;
         if req.auto_submit {
-            if let (Some(s), Some(bc)) = (self.signer.as_ref(), self.broadcaster.as_ref()) {
+            if let (Some(s), Some(bc)) = (self.current_signer(), self.broadcaster.as_ref()) {
                 let sig = s.sign(&coin_spends)?;
                 bc.broadcast(&SpendBundle::new(coin_spends.clone(), sig))
                     .await?;
@@ -1428,6 +1472,7 @@ impl WalletBackend {
 
     async fn transfer_nfts(&self, req: &TransferNfts) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let dest = self.decode_ph(&req.address)?;
         let mut nfts = Vec::with_capacity(req.nft_ids.len());
@@ -1446,6 +1491,7 @@ impl WalletBackend {
 
     async fn transfer_dids(&self, req: &TransferDids) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let dest = self.decode_ph(&req.address)?;
         let mut dids = Vec::with_capacity(req.did_ids.len());
@@ -1520,6 +1566,7 @@ impl WalletBackend {
 
     async fn mint_option(&self, req: &MintOption) -> Result<MintOptionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         if req.underlying.asset_id.is_some() {
             return Err(Error::api(
@@ -1591,7 +1638,7 @@ impl WalletBackend {
             .await?;
 
         if req.auto_submit {
-            if let (Some(s), Some(bc)) = (self.signer.as_ref(), self.broadcaster.as_ref()) {
+            if let (Some(s), Some(bc)) = (self.current_signer(), self.broadcaster.as_ref()) {
                 let sig = s.sign(&coin_spends)?;
                 bc.broadcast(&SpendBundle::new(coin_spends.clone(), sig))
                     .await?;
@@ -1610,6 +1657,7 @@ impl WalletBackend {
 
     async fn transfer_options(&self, req: &TransferOptions) -> Result<TransactionResponse> {
         let signer = self.require_signer()?;
+        let signer = signer.as_ref();
         let fee = amount_u64(&req.fee)?;
         let dest = self.decode_ph(&req.address)?;
         let mut opts = Vec::with_capacity(req.option_ids.len());
@@ -2100,6 +2148,10 @@ impl WalletBackend {
                 let r = req!(SetChangeAddress);
                 json(self.set_change_address(&r).await?)?
             }
+            // The node-custodied seed lifecycle (#370/#368): create/import/restore/unlock/lock/
+            // status/delete. Reachable only when custody is attached ([`Self::with_custody`]);
+            // authorization is the transport's concern (the paired-token gate, SPEC §7.12).
+            m if m.starts_with("wallet.") => self.dispatch_custody(m, body)?,
             other => {
                 return Err(Error::not_found(format!(
                     "unknown or unsupported method: {other}"
@@ -2107,6 +2159,80 @@ impl WalletBackend {
             }
         };
         serde_json::to_string(&value).map_err(|e| Error::internal(format!("serialize: {e}")))
+    }
+
+    /// The first-class sync-status snapshot (#369): the tri-state ([`SyncLifecycle`]) derived from
+    /// the wallet DB's synced peak + initial-catch-up flag, plus the synced peak height. The WS
+    /// transport pushes this whenever it changes; the resolver/content transport is untouched.
+    pub async fn sync_status(&self) -> Result<super::events::SyncStatus> {
+        use super::events::{SyncLifecycle, SyncStatus};
+        let st = self.db.sync_state().await?;
+        Ok(SyncStatus {
+            state: if st.initial_sync_complete {
+                SyncLifecycle::Synced
+            } else {
+                SyncLifecycle::Syncing
+            },
+            peak_height: st.peak_height,
+            // Until a chain tip is separately tracked, the best-known target is the synced peak.
+            target_height: st.peak_height,
+        })
+    }
+
+    /// Dispatch a `wallet.*` custody-lifecycle method to the attached [`WalletCustody`] (#368).
+    /// Returns the Sage-shaped result value; a node without custody attached reports the method
+    /// as unavailable. Password/mnemonic params are read from the JSON body.
+    fn dispatch_custody(&self, method: &str, body: &str) -> Result<Value> {
+        #[derive(serde::Deserialize, Default)]
+        struct PwReq {
+            #[serde(default)]
+            password: String,
+        }
+        #[derive(serde::Deserialize, Default)]
+        struct MnemonicReq {
+            #[serde(default)]
+            mnemonic: String,
+            #[serde(default)]
+            password: String,
+        }
+        let custody = self
+            .custody
+            .as_ref()
+            .ok_or_else(|| Error::internal("wallet custody is not enabled on this node"))?;
+        let body_s = if body.trim().is_empty() { "{}" } else { body };
+        let parse_pw = || -> Result<PwReq> {
+            serde_json::from_str(body_s)
+                .map_err(|e| Error::api(format!("invalid request for {method}: {e}")))
+        };
+        let parse_mn = || -> Result<MnemonicReq> {
+            serde_json::from_str(body_s)
+                .map_err(|e| Error::api(format!("invalid request for {method}: {e}")))
+        };
+        let addr = |address: String| json(serde_json::json!({ "address": address }));
+        match method {
+            "wallet.status" => json(custody.status()),
+            "wallet.create" => addr(custody.create(&parse_pw()?.password)?),
+            "wallet.import" => {
+                let r = parse_mn()?;
+                addr(custody.import(&r.mnemonic, &r.password)?)
+            }
+            "wallet.restore" => {
+                let r = parse_mn()?;
+                addr(custody.restore(&r.mnemonic, &r.password)?)
+            }
+            "wallet.unlock" => addr(custody.unlock(&parse_pw()?.password)?),
+            "wallet.lock" => {
+                custody.lock();
+                json(serde_json::json!({ "state": "locked" }))
+            }
+            "wallet.delete" => {
+                custody.delete(&parse_pw()?.password)?;
+                json(serde_json::json!({ "state": "none" }))
+            }
+            other => Err(Error::not_found(format!(
+                "unknown or unsupported method: {other}"
+            ))),
+        }
     }
 }
 
@@ -3214,5 +3340,146 @@ mod tests {
             "get_cats returns the uncurried TAIL"
         );
         assert_eq!(resp.cats[0].balance.to_u64(), Some(1_000));
+    }
+
+    // ---- #368: runtime signer load via node custody + wallet.* dispatch + sync-status --------
+
+    use super::super::custody::{Network, WalletCustody};
+    use super::super::events::SyncLifecycle;
+
+    /// A fresh custody manager over a unique temp seed path (no file yet), covering a small HD
+    /// range so the key-build stays fast.
+    fn fresh_custody() -> WalletCustody {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "dig-wallet-rpc-custody-{}-{}",
+            std::process::id(),
+            n
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        WalletCustody::new(dir.join("seed.bin"), Network::Testnet11, 2)
+    }
+
+    async fn custody_backend() -> WalletBackend {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_custody(fresh_custody())
+    }
+
+    /// **Proves (#368 runtime signer load):** a served backend resolves its signer from the
+    /// node-custodied session at RUNTIME. With no wallet, a spend method fails "locked"; after a
+    /// `wallet.create` over the same dispatch surface, the same method no longer reports locked
+    /// (it fails later, at coin selection) — i.e. `require_signer` succeeded without a bring-up
+    /// `with_signer`.
+    #[tokio::test]
+    async fn custody_unlock_enables_the_signer_at_runtime() {
+        let be = custody_backend().await;
+        let send = r#"{"address":"txch1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqp7z9wc","amount":1,"fee":0,"auto_submit":false}"#;
+
+        // Locked: no signer available yet.
+        let (status, body) = be.dispatch("send_xch", send).await;
+        assert_ne!(status, 200);
+        assert!(
+            body.contains("locked") || body.contains("signing key"),
+            "expected a locked-wallet error, got: {body}"
+        );
+
+        // Create a wallet over the custody dispatch surface — leaves it unlocked with a signer.
+        let (status, body) = be
+            .dispatch("wallet.create", r#"{"password":"hunter2pw"}"#)
+            .await;
+        assert_eq!(status, 200, "wallet.create failed: {body}");
+        assert!(body.contains("address"), "wallet.create returns an address");
+
+        // Now the signer resolves: send_xch no longer reports locked (fails at coin selection).
+        let (_status, body2) = be.dispatch("send_xch", send).await;
+        assert!(
+            !body2.contains("no signing key") && !body2.contains("wallet is locked"),
+            "signer must be resolved after unlock, got: {body2}"
+        );
+    }
+
+    /// **Proves:** the `wallet.*` custody lifecycle is dispatchable on the served surface —
+    /// status transitions none → unlocked → locked → unlocked → none across the lifecycle calls.
+    #[tokio::test]
+    async fn wallet_custody_lifecycle_over_dispatch() {
+        let be = custody_backend().await;
+
+        let state = |body: &str| -> String {
+            serde_json::from_str::<Value>(body).unwrap()["state"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let (_s, body) = be.dispatch("wallet.status", "{}").await;
+        assert_eq!(state(&body), "none");
+
+        let (s, _b) = be
+            .dispatch("wallet.create", r#"{"password":"hunter2pw"}"#)
+            .await;
+        assert_eq!(s, 200);
+        let (_s, body) = be.dispatch("wallet.status", "{}").await;
+        assert_eq!(state(&body), "unlocked");
+
+        let (s, _b) = be.dispatch("wallet.lock", "{}").await;
+        assert_eq!(s, 200);
+        let (_s, body) = be.dispatch("wallet.status", "{}").await;
+        assert_eq!(state(&body), "locked");
+
+        let (s, _b) = be
+            .dispatch("wallet.unlock", r#"{"password":"hunter2pw"}"#)
+            .await;
+        assert_eq!(s, 200);
+        let (_s, body) = be.dispatch("wallet.status", "{}").await;
+        assert_eq!(state(&body), "unlocked");
+
+        let (s, _b) = be
+            .dispatch("wallet.delete", r#"{"password":"hunter2pw"}"#)
+            .await;
+        assert_eq!(s, 200);
+        let (_s, body) = be.dispatch("wallet.status", "{}").await;
+        assert_eq!(state(&body), "none");
+    }
+
+    /// **Proves:** a wrong password on `wallet.unlock` fails closed (`401`) — the paired caller
+    /// cannot brute the seed for free over the dispatch surface.
+    #[tokio::test]
+    async fn wallet_unlock_wrong_password_fails_closed() {
+        let be = custody_backend().await;
+        be.dispatch("wallet.create", r#"{"password":"correcthorse"}"#)
+            .await;
+        be.dispatch("wallet.lock", "{}").await;
+        let (status, _body) = be
+            .dispatch("wallet.unlock", r#"{"password":"wrong"}"#)
+            .await;
+        assert_eq!(status, 401, "wrong password must be 401");
+    }
+
+    /// **Proves (#369 sync-status):** the sync-status snapshot derives the tri-state from the DB —
+    /// `syncing` before the initial catch-up completes, `synced` (with the peak height) after.
+    #[tokio::test]
+    async fn sync_status_reports_tristate_from_db() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(false).await.unwrap();
+        let be = WalletBackend::new(
+            db.clone(),
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+        let s = be.sync_status().await.unwrap();
+        assert_eq!(s.state, SyncLifecycle::Syncing);
+
+        db.set_peak(123, "aa").await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let s = be.sync_status().await.unwrap();
+        assert_eq!(s.state, SyncLifecycle::Synced);
+        assert_eq!(s.peak_height, Some(123));
     }
 }
