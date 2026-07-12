@@ -2148,6 +2148,38 @@ pub trait AnchoredRootResolver: Send + Sync {
     /// Resolve `store_id`'s current on-chain root, or `None` if the store has no
     /// confirmed generation yet, or `Err` if the chain is unreachable.
     async fn anchored_root(&self, store_id: &[u8; 32]) -> Result<Option<Bytes32>, String>;
+
+    /// The richer form of [`anchored_root`](Self::anchored_root): the SAME resolution, ALSO
+    /// carrying the store's current on-chain OWNER puzzle hash — the future tip recipient
+    /// surfaced by the local content-serve path as `X-Dig-Owner-Puzzle-Hash` (#486). Default
+    /// impl wraps `anchored_root` with `owner_puzzle_hash: None` (used by resolvers — e.g. test
+    /// mocks — that only know the root). [`CoinsetResolver`] overrides this to capture BOTH
+    /// fields from the single `sync_datastore` walk it already performs, so content-serve never
+    /// needs a second coinset round trip to learn the owner.
+    async fn anchored_state(
+        &self,
+        store_id: &[u8; 32],
+    ) -> Result<Option<AnchoredStoreState>, String> {
+        Ok(self
+            .anchored_root(store_id)
+            .await?
+            .map(|root| AnchoredStoreState {
+                root,
+                owner_puzzle_hash: None,
+            }))
+    }
+}
+
+/// The store's on-chain DataStore singleton state, as resolved by walking its lineage to the
+/// unspent tip (`sync_datastore`): its CURRENT content root (the read-path anchor, #127) and its
+/// CURRENT owner puzzle hash (the tip recipient, #486). Bundled because both come from the SAME
+/// chain read — no second coinset call is needed to serve owner metadata alongside the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnchoredStoreState {
+    pub root: Bytes32,
+    /// `None` when the resolver cannot supply it (see [`AnchoredRootResolver::anchored_state`]'s
+    /// default impl) — content-serve OMITS `X-Dig-Owner-Puzzle-Hash` rather than guess.
+    pub owner_puzzle_hash: Option<Bytes32>,
 }
 
 /// Production resolver: walks the store's DataStore singleton lineage on
@@ -2160,6 +2192,13 @@ struct CoinsetResolver;
 #[async_trait::async_trait]
 impl AnchoredRootResolver for CoinsetResolver {
     async fn anchored_root(&self, store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
+        Ok(self.anchored_state(store_id).await?.map(|s| s.root))
+    }
+
+    async fn anchored_state(
+        &self,
+        store_id: &[u8; 32],
+    ) -> Result<Option<AnchoredStoreState>, String> {
         let launcher = chia_protocol::Bytes32::new(*store_id);
         match sync_datastore(&resolution_coinset(), launcher).await {
             Ok(store) => {
@@ -2167,7 +2206,12 @@ impl AnchoredRootResolver for CoinsetResolver {
                 // node's content-root type), mirroring the CLI clone/pull pin.
                 let mut a = [0u8; 32];
                 a.copy_from_slice(store.info.metadata.root_hash.as_ref());
-                Ok(Some(Bytes32(a)))
+                let mut o = [0u8; 32];
+                o.copy_from_slice(store.info.owner_puzzle_hash.as_ref());
+                Ok(Some(AnchoredStoreState {
+                    root: Bytes32(a),
+                    owner_puzzle_hash: Some(Bytes32(o)),
+                }))
             }
             Err(e) => {
                 // A "not minted yet" / "launcher unspent" lineage error is a
@@ -3144,6 +3188,9 @@ mod tests {
     /// `Ok(None)` = no confirmed generation; `Err(msg)` = chain unreachable.
     struct MockResolver {
         outcomes: std::collections::HashMap<String, Result<Option<Bytes32>, String>>,
+        /// Optional owner puzzle hash `anchored_state` reports alongside the root (#486 test
+        /// support). `None` ⇒ the trait's default owner-less wrapping (most tests don't need it).
+        owner: Option<Bytes32>,
     }
 
     impl MockResolver {
@@ -3151,7 +3198,25 @@ mod tests {
         fn one(store_hex: &str, root: Bytes32) -> Arc<dyn AnchoredRootResolver> {
             let mut outcomes = std::collections::HashMap::new();
             outcomes.insert(store_hex.to_string(), Ok(Some(root)));
-            Arc::new(MockResolver { outcomes })
+            Arc::new(MockResolver {
+                outcomes,
+                owner: None,
+            })
+        }
+        /// Like [`one`](Self::one) but ALSO reports `owner` from `anchored_state` (#486): the
+        /// content-serve `X-Dig-Owner-Puzzle-Hash` tests need a resolver that supplies both the
+        /// root and the owner, mirroring `CoinsetResolver`'s single-chain-read shape.
+        fn one_with_owner(
+            store_hex: &str,
+            root: Bytes32,
+            owner: Bytes32,
+        ) -> Arc<dyn AnchoredRootResolver> {
+            let mut outcomes = std::collections::HashMap::new();
+            outcomes.insert(store_hex.to_string(), Ok(Some(root)));
+            Arc::new(MockResolver {
+                outcomes,
+                owner: Some(owner),
+            })
         }
         /// A resolver whose every lookup is `outcome` (e.g. chain-unreachable).
         fn always(outcome: Result<Option<Bytes32>, String>) -> Arc<dyn AnchoredRootResolver> {
@@ -3161,6 +3226,7 @@ mod tests {
                     m.insert("*".to_string(), outcome);
                     m
                 },
+                owner: None,
             })
         }
     }
@@ -3174,6 +3240,19 @@ mod tests {
                 .or_else(|| self.outcomes.get("*"))
                 .cloned()
                 .unwrap_or(Ok(None))
+        }
+
+        async fn anchored_state(
+            &self,
+            store_id: &[u8; 32],
+        ) -> Result<Option<AnchoredStoreState>, String> {
+            Ok(self
+                .anchored_root(store_id)
+                .await?
+                .map(|root| AnchoredStoreState {
+                    root,
+                    owner_puzzle_hash: self.owner,
+                }))
         }
     }
 
@@ -5627,6 +5706,8 @@ mod tests {
                 root_hex,
                 verified,
                 source,
+                owner_puzzle_hash,
+                generation,
             } => {
                 assert_eq!(bytes, b"<h1>hi</h1>");
                 assert_eq!(root_hex, root.to_hex());
@@ -5635,6 +5716,11 @@ mod tests {
                     "the chain-anchored pin is enforced → verified=true"
                 );
                 assert_eq!(source, ServeSource::Local);
+                // The injected resolver (`MockResolver::one`) reports no owner (#486) — the header
+                // must be OMITTED, never guessed.
+                assert_eq!(owner_puzzle_hash, None);
+                // The fixture module embeds a PublicManifest (single commit) → generation 0.
+                assert_eq!(generation, Some(0));
             }
             other => panic!("expected a local Served, got {other:?}"),
         }
@@ -5696,6 +5782,135 @@ mod tests {
         let latest = node.verification_ledger_snapshot(&store.to_hex(), None);
         assert_eq!(latest.root, root.to_hex());
         assert_eq!(latest.resources.len(), 2);
+    }
+
+    /// **Proves:** the serve-metadata `X-Dig-Owner-Puzzle-Hash` source (#486) — when the chain-anchored
+    /// pin is ENFORCED and the resolver reports the store's on-chain owner, `serve_content_plaintext`
+    /// surfaces it on the `Served` outcome, resolved from the SAME chain read as the root pin (no second
+    /// coinset call). **Catches:** the owner silently staying `None` when the resolver DOES supply it,
+    /// or the field being guessed/fabricated rather than sourced from the resolver.
+    #[test]
+    fn serve_content_plaintext_reports_the_resolver_owner_puzzle_hash_when_pin_enforced() {
+        use crate::content_serve::PlaintextOutcome;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([23u8; 32]);
+        let owner = Bytes32([0xaa; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>owned</h1>".to_vec())];
+        let (root, module) =
+            compile_fixture_module(store, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) = test_node_with_resolver(
+            None,
+            MockResolver::one_with_owner(&store.to_hex(), root, owner),
+        );
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root.to_hex(), &module);
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "index.html",
+            None,
+        ));
+        match out {
+            PlaintextOutcome::Served {
+                owner_puzzle_hash,
+                generation,
+                ..
+            } => {
+                assert_eq!(
+                    owner_puzzle_hash,
+                    Some(owner.to_hex()),
+                    "the resolver's owner puzzle hash must be surfaced verbatim"
+                );
+                assert_eq!(generation, Some(0));
+            }
+            other => panic!("expected a local Served, got {other:?}"),
+        }
+    }
+
+    /// **Proves:** `X-Dig-Owner-Puzzle-Hash` is OMITTED (never a placeholder) when the chain-anchored
+    /// pin did not run (`DIG_NODE_PIN=off`) — the owner is genuinely unknowable without a chain read, so
+    /// the serve-metadata source (#486) must not guess. The LOCAL-only generation lookup is unaffected
+    /// (it never calls the chain) and still resolves.
+    #[test]
+    fn serve_content_plaintext_omits_owner_puzzle_hash_when_pin_is_off() {
+        use crate::content_serve::PlaintextOutcome;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("DIG_NODE_PIN", "off");
+        let rt = pin_test_rt();
+        let store = Bytes32([24u8; 32]);
+        let owner = Bytes32([0xbb; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>unpinned</h1>".to_vec())];
+        let (root, module) =
+            compile_fixture_module(store, digstore_core::Visibility::Public, true, &files);
+        // Even though the resolver COULD supply an owner, the pin being off means it is never consulted.
+        let (node, _td) = test_node_with_resolver(
+            None,
+            MockResolver::one_with_owner(&store.to_hex(), root, owner),
+        );
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root.to_hex(), &module);
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "index.html",
+            None,
+        ));
+        match out {
+            PlaintextOutcome::Served {
+                owner_puzzle_hash,
+                generation,
+                ..
+            } => {
+                assert_eq!(
+                    owner_puzzle_hash, None,
+                    "pin off ⇒ owner is unknowable, never guessed"
+                );
+                assert_eq!(
+                    generation,
+                    Some(0),
+                    "the local manifest lookup is independent of the chain pin"
+                );
+            }
+            other => panic!("expected a local Served, got {other:?}"),
+        }
+        std::env::remove_var("DIG_NODE_PIN");
+    }
+
+    /// **Proves:** `X-Dig-Generation` is OMITTED when the served module carries NO `PublicManifest`
+    /// section (a private store, or an older `.dig` compiled before #176) — the generation is genuinely
+    /// unknowable from the module alone, never fabricated.
+    #[test]
+    fn serve_content_plaintext_omits_generation_when_manifest_absent() {
+        use crate::content_serve::PlaintextOutcome;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([25u8; 32]);
+        let files = vec![("secret.txt".to_string(), b"top secret".to_vec())];
+        // include_public_manifest = false: no PublicManifest section embedded (a public store here,
+        // so the resource still decrypts with no salt — only the manifest presence is under test).
+        let (root, module) =
+            compile_fixture_module(store, digstore_core::Visibility::Public, false, &files);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root.to_hex(), &module);
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "secret.txt",
+            None,
+        ));
+        match out {
+            PlaintextOutcome::Served { generation, .. } => {
+                assert_eq!(
+                    generation, None,
+                    "no manifest section ⇒ generation is unknowable, never fabricated"
+                );
+            }
+            other => panic!("expected a local Served, got {other:?}"),
+        }
     }
 
     /// **Proves:** the serve path fails CLOSED when the requested root is not the chain-anchored tip

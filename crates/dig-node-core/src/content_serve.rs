@@ -74,6 +74,17 @@ pub enum PlaintextOutcome {
         root_hex: String,
         verified: bool,
         source: ServeSource,
+        /// The store's on-chain OWNER puzzle hash (64-hex) — the future tip recipient, surfaced
+        /// as `X-Dig-Owner-Puzzle-Hash` (#486). `None` when the chain-anchored pin did not run
+        /// (`DIG_NODE_PIN=off`) or the resolver could not supply it — the header is OMITTED
+        /// rather than guessed. Resolved ONCE per request and applied uniformly across whichever
+        /// tier served the bytes (see [`with_serve_metadata`]).
+        owner_puzzle_hash: Option<String>,
+        /// The 0-based commit ordinal that last wrote this resource, per the store's embedded
+        /// `PublicManifest` (data-section id 13) — surfaced as `X-Dig-Generation` (#486). `None`
+        /// when the module carries no manifest (an older `.dig`) or lists no entry for this
+        /// exact key — the header is OMITTED rather than guessed. Local-only (no chain call).
+        generation: Option<u64>,
     },
     /// The resource is genuinely not available at the resolved root (a real content miss). Carries the
     /// resolved root so the HTTP layer can look up the store's manifest for the SPA-fallback decision.
@@ -251,8 +262,21 @@ impl Node {
         // A concrete, valid requested root; "latest"/malformed ⇒ rootless (resolve the tip).
         let requested_root = Bytes32::from_hex(requested_root_hex).ok();
         let enforced = pin_enforced();
+        // The store's current on-chain OWNER puzzle hash (#486), resolved from the SAME chain
+        // read as the anchored-root pin below — no second coinset call. Stays `None` when the
+        // pin is disabled (`DIG_NODE_PIN=off`) or the resolver can't supply it.
+        let mut owner_puzzle_hash: Option<String> = None;
         let pinned_root: Option<Bytes32> = if enforced {
-            let anchored = self.anchored_root_resolver.anchored_root(&store_id.0).await;
+            let anchored_state = self
+                .anchored_root_resolver
+                .anchored_state(&store_id.0)
+                .await;
+            owner_puzzle_hash = match &anchored_state {
+                Ok(Some(state)) => state.owner_puzzle_hash.map(|ph| ph.to_hex()),
+                _ => None,
+            };
+            let anchored: Result<Option<Bytes32>, String> =
+                anchored_state.map(|opt| opt.map(|state| state.root));
             match decide_pin(true, requested_root, anchored) {
                 PinDecision::ServeAt(root) => Some(root),
                 PinDecision::Reject(code, message) => {
@@ -270,6 +294,14 @@ impl Node {
             .map(|r| r.to_hex())
             .unwrap_or_else(|| requested_root_hex.to_string());
         let verified = enforced;
+        // The store generation this resource came from (#486) — a local-only manifest lookup, no
+        // chain call. `None` on a rootless/pin-off request or when the generation is unknowable.
+        let generation = if root_hex.is_empty() {
+            None
+        } else {
+            self.resource_generation(store_hex, &root_hex, effective_key)
+                .await
+        };
 
         let retrieval_key = derive_retrieval_key(&store_id, effective_key).0;
         let rk_hex = hex::encode(retrieval_key);
@@ -292,7 +324,7 @@ impl Node {
                     &root_hex,
                     verified,
                 ) {
-                    return served;
+                    return with_serve_metadata(served, owner_puzzle_hash, generation);
                 }
                 // else: a decoy / verify or decrypt failure → fall through to peer/RPC.
             }
@@ -317,7 +349,7 @@ impl Node {
             {
                 // A peer served the resource; warm the whole capsule locally for next time (#290).
                 self.maybe_backfill_capsule(store_hex, &root_hex);
-                return peer;
+                return with_serve_metadata(peer, owner_puzzle_hash, generation);
             }
         }
 
@@ -348,12 +380,18 @@ impl Node {
                                 &proof,
                                 None,
                             );
-                            PlaintextOutcome::Served {
-                                bytes,
-                                root_hex: root_hex.clone(),
-                                verified,
-                                source: ServeSource::Rpc,
-                            }
+                            with_serve_metadata(
+                                PlaintextOutcome::Served {
+                                    bytes,
+                                    root_hex: root_hex.clone(),
+                                    verified,
+                                    source: ServeSource::Rpc,
+                                    owner_puzzle_hash: None,
+                                    generation: None,
+                                },
+                                owner_puzzle_hash,
+                                generation,
+                            )
                         }
                         // The gateway returned bytes that do not verify against the anchored root — a
                         // decoy for a missing key (or tampered). Either way the resource is NOT
@@ -451,6 +489,10 @@ impl Node {
                 root_hex: root_hex.to_string(),
                 verified,
                 source: ServeSource::Local,
+                // Stamped by the caller (`serve_content_plaintext`) via `with_serve_metadata` —
+                // both fields are resolved ONCE per request, not per tier.
+                owner_puzzle_hash: None,
+                generation: None,
             }
         })
     }
@@ -501,6 +543,9 @@ impl Node {
                     root_hex: root_hex.to_string(),
                     verified,
                     source: ServeSource::Peer,
+                    // Stamped by the caller via `with_serve_metadata` (see `decrypt_local`).
+                    owner_puzzle_hash: None,
+                    generation: None,
                 })
             }
             // A verify/decrypt failure on the peer bytes is NOT fatal to the serve — fall through to
@@ -599,6 +644,59 @@ impl Node {
             _ => None,
         }
     }
+
+    /// The store generation (0-based commit ordinal) that most recently wrote `resource_key`, per
+    /// the store's embedded `PublicManifest` (id 13) at `(store, root)` — surfaced as
+    /// `X-Dig-Generation` (#486). `None` when this node does not hold the capsule, the module
+    /// carries no manifest (an older `.dig` or a private store whose paths stay opaque), or the
+    /// manifest lists no entry for this exact key (a resource outside the normalized public-path
+    /// surface). Local-only (mirrors [`manifest_paths`](Self::manifest_paths)) — never a chain call.
+    pub async fn resource_generation(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        resource_key: &str,
+    ) -> Option<u64> {
+        let cache_dir = self.cache_dir.clone();
+        let (store, root, key) = (
+            store_hex.to_string(),
+            root_hex.to_string(),
+            resource_key.to_string(),
+        );
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::read_public_manifest_blocking(&cache_dir, &store, &root)
+        })
+        .await
+        .ok()?;
+        match outcome {
+            Ok(Some(Some(pm))) => pm
+                .entries
+                .into_iter()
+                .find(|e| e.path == key)
+                .map(|e| e.generation_index),
+            _ => None,
+        }
+    }
+}
+
+/// Stamp the request-scoped serve-metadata (#486) onto a `Served` outcome — the owner puzzle hash
+/// and generation resolved ONCE in [`Node::serve_content_plaintext`], applied uniformly across
+/// whichever tier (local/peer/rpc) actually served the bytes. A no-op on any other variant.
+fn with_serve_metadata(
+    mut outcome: PlaintextOutcome,
+    owner_puzzle_hash: Option<String>,
+    generation: Option<u64>,
+) -> PlaintextOutcome {
+    if let PlaintextOutcome::Served {
+        owner_puzzle_hash: o,
+        generation: g,
+        ..
+    } = &mut outcome
+    {
+        *o = owner_puzzle_hash;
+        *g = generation;
+    }
+    outcome
 }
 
 #[cfg(test)]
