@@ -953,7 +953,7 @@ rejected with `-32030 UNAUTHORIZED` before the method runs.
 
 **Gated wallet methods (MUST present a token).** The custody-lifecycle group (§18.20 —
 `wallet.create` / `wallet.import` / `wallet.restore` / `wallet.unlock` / `wallet.lock` /
-`wallet.status` / `wallet.delete`) and the mutation group (the send/spend group §18.9, the offer suite
+`wallet.status` / `wallet.list` / `wallet.select` / `wallet.delete`) and the mutation group (the send/spend group §18.9, the offer suite
 + DID/NFT mint & transfer §18.9a, and the state-changing record-update actions §18.16) are all gated.
 These methods are NEVER relayed upstream — a signing/custody request must never leave the loopback node;
 an authorized call is served locally by the node-custodied wallet (or, until the wallet surface is served
@@ -1784,39 +1784,97 @@ cross-checks representative request/response schemas field-name-identical agains
 three real drifts documented in §18.15/§18.16/§18.17. The hand-authored `sage-endpoints-v0.12.11.json`
 (method-name-only) vector from #215 remains as a lighter first check.
 
-18.20. **Node-custodied wallet provisioning + custody lifecycle (#370).** For the thin-client model
-(epic #365) the node HOLDS the wallet key: it generates or imports the seed, encrypts it at rest via
-`dig-keystore` (§18.18 `seed_store`), and loads an in-memory `WalletSigner` on unlock. This is a distinct
-custody locus from the read-only path of #217/#407 (where the node holds only the client's PUBLIC puzzle
-hashes and NEVER a key) and supersedes, for the PAIRED-extension path, §18.10's "the extension
-self-custodies and never uses the node's sign path". `crate::sage::custody::WalletCustody` owns the
-lifecycle, each op authorized per §7.12:
+18.20. **Node-custodied MULTI-wallet provisioning + custody lifecycle (#370/#427).** For the thin-client
+model (epic #365) the node HOLDS the wallet keys: it generates or imports one or MORE independent seeds,
+encrypts each at rest via `dig-keystore` (§18.18 `seed_store`), and loads an in-memory `WalletSigner` on
+unlock. This is a distinct custody locus from the read-only path of #217/#407 (where the node holds only
+the client's PUBLIC puzzle hashes and NEVER a key) and supersedes, for the PAIRED-extension path, §18.10's
+"the extension self-custodies and never uses the node's sign path". The node custodies MULTIPLE wallets so
+the extension's multi-wallet registry (`WalletEntry[]`, each its own seed) can be migrated IN one wallet at
+a time (#374). `crate::sage::custody::WalletCustody` owns the lifecycle, each op authorized per §7.12.
 
-- **create(password)** — generate a fresh 24-word BIP-39 mnemonic, encrypt it under `password`
-  (`seed_store::encrypt_seed`), persist it to the custodied seed file, and load the signer. Returns the
-  wallet's receive address ONLY — NEVER the mnemonic (backup is node-local, below).
-- **import(mnemonic, password)** / **restore(mnemonic, password)** — validate the mnemonic, encrypt +
-  persist it under `password`, and load the signer. This is the one-time migration path that accepts the
-  extension's existing seed IN (epic §migration); it is the only inbound key path, loopback-only + gated.
-- **unlock(password)** — decrypt the on-disk seed and load the in-memory signer (derived over the wallet's
-  synthetic p2 keys for HD indices `0..N`); enables signing (§18.21). Wrong password fails closed. This is
-  the runtime signer load that replaces the bring-up-only `with_signer`.
-- **lock()** — drop the in-memory signer (the encrypted seed stays on disk); signing is disabled until the
-  next unlock.
-- **status()** — `none` (no seed on this device), `locked` (encrypted seed present, no signer loaded), or
-  `unlocked` (a signer is loaded), plus the address when unlocked.
-- **delete(password)** — verify the password against the on-disk seed, then remove the seed file + lock.
+**Wallet identity — the master-key fingerprint (§18.20a).** Each custodied wallet has a stable id: the
+decimal string of its BIP-39 seed's Chia BLS **master public-key fingerprint** (a `u32`, the canonical Chia
+wallet identifier Sage/`get_keys`/CHIP-0002 use). The id is deterministic (same seed ⇒ same id on any
+device), non-secret (public-key-derived), and lets a paired caller correlate a node wallet to its
+extension `WalletEntry` by fingerprint. Importing a seed whose fingerprint already exists is REFUSED (no
+double-custody of one key). One wallet is the ACTIVE wallet; id-taking methods default to it when the `id`
+is omitted, so single-wallet callers are unchanged.
 
-**Key at rest + never exported.** The seed is Argon2id + AES-256-GCM encrypted at rest (§18.18) and is
-never logged, never returned by any lifecycle op, and never crosses the paired boundary. The ONLY seed
-egress is the node-local, password-gated backup (`WalletCustody::reveal_mnemonic`, surfaced on the
-self-origin `/api/export` UI §16.3 or a `dig-node wallet backup` CLI) — never a wallet/`control.*` method
-(§7.12).
+Lifecycle methods (a `?`-suffixed `id` argument defaults to the active wallet):
+
+- **create(password, label?)** — generate a fresh 24-word BIP-39 mnemonic, derive its fingerprint id,
+  encrypt the mnemonic under `password` (`seed_store::encrypt_seed`), persist it to `<id>.seed`, record a
+  non-secret manifest entry, make it the active wallet if none is, and load the signer. Returns `{ id,
+  address }` — NEVER the mnemonic (backup is node-local, below).
+- **import(mnemonic, password, label?)** / **restore(mnemonic, password, label?)** — validate the mnemonic,
+  derive its fingerprint id (refused if that wallet already exists), encrypt + persist it under `password`,
+  record the manifest entry, and load the signer. This is the per-wallet migration path that accepts an
+  extension seed IN (epic §migration); it is the only inbound key path, loopback-only + gated.
+- **unlock(id?, password)** — decrypt the addressed wallet's on-disk seed and load its in-memory signer
+  (derived over the wallet's synthetic p2 keys for HD indices `0..N`); enables signing (§18.21). MULTIPLE
+  wallets may be unlocked at once. Wrong password fails closed. This is the runtime signer load that
+  replaces the bring-up-only `with_signer`.
+- **lock(id?)** — drop the addressed wallet's in-memory signer (its encrypted seed stays on disk); signing
+  with it is disabled until the next unlock. Other wallets are unaffected.
+- **list()** — enumerate every custodied wallet: `[{ id, address?, label?, state, active }]` where `state`
+  is `locked`|`unlocked` per wallet. Non-secret only (no seed, no key). The address is present once known
+  (recorded at create/import, or cached on the wallet's first unlock).
+- **select(id)** — make `id` the active wallet (must exist). The active wallet is the one the Sage-parity
+  sign/spend surface (§18.21) signs with, so `select` is how a paired caller scopes signing to a specific
+  wallet WITHOUT adding a wallet-id argument to the Sage request schemas (Sage byte-parity, §18.19).
+- **status(id?)** — the addressed (default active) wallet's state: `none` (no wallets on this device),
+  `locked` (encrypted seed present, no signer loaded), or `unlocked` (a signer is loaded), plus its address
+  when known and (additively) its `id` + whether it is `active`.
+- **delete(id?, password)** — verify `password` against the addressed wallet's on-disk seed, then remove
+  ONLY that wallet's seed file + manifest entry + in-memory signer. Other wallets are untouched; if the
+  removed wallet was active, the active pointer moves to another remaining wallet (or clears when none
+  remain).
+
+**Key at rest + never exported.** Each seed is Argon2id + AES-256-GCM encrypted at rest under its OWN
+password (§18.18), never logged, never returned by any lifecycle op, and never crosses the paired boundary.
+The manifest holds NON-SECRET data only (id, receive address, optional label, creation timestamp, the
+active id). The ONLY seed egress is the node-local, password-gated backup
+(`WalletCustody::reveal_mnemonic(id?)`, surfaced on the self-origin `/api/export` UI §16.3 or a `dig-node
+wallet backup` CLI) — never a wallet/`control.*` method (§7.12).
+
+18.20a. **Multi-wallet on-disk layout + back-compat (#427).** Custodied wallets live under
+`<config_dir>/wallets/`: one `dig-keystore` container per wallet at `<config_dir>/wallets/<id>.seed`
+(owner-only, `0600` on Unix), plus a non-secret JSON manifest `<config_dir>/wallets/index.json` =
+`{ "active": "<id>"|null, "wallets": [{ "id", "address"?, "label"?, "created_ms" }] }` (atomic,
+owner-only writes). A seed file is encrypted INDEPENDENTLY of every other, so unlocking, signing with, or
+removing one wallet cannot decrypt or affect another; every custody error fails closed (a missing wallet
+→ not-found, a wrong password → unauthorized, and neither mutates other wallets).
+
+**Legacy single-wallet back-compat + canonicalization (HARD).** A pre-existing single seed at the legacy
+path `<config_dir>/wallet-seed.bin` (the #370 single-wallet layout) is adopted as the active wallet under
+the reserved TRANSIENT id `default` when the manifest names no other — its real fingerprint id is
+unknowable while the seed is encrypted (no password at construction). An existing single-wallet setup
+keeps unlocking, signing, and backing up exactly as before: a caller that omits `id` on every method
+observes the identical single-wallet behaviour. New wallets always receive a fingerprint id under
+`wallets/`.
+
+The legacy wallet is **canonicalized to its real fingerprint id** the first time its mnemonic becomes
+knowable — on its first `unlock` (or `restore`/`import` of the same key): the encrypted seed is moved
+`wallet-seed.bin` → `wallets/<fp>.seed` (its at-rest password preserved — the file is moved, not
+re-encrypted), the manifest entry is renamed `default` → `<fp>` (preserving the active pointer, label,
+timestamp, address), and any in-memory session is re-keyed. After canonicalization there is no
+`default`-vs-`<fp>` split: exactly ONE id per key. **A key is never custodied twice** — a re-import of the
+legacy key under the same password (the #374 migration re-push) canonicalizes the legacy entry FIRST and
+is then refused as a duplicate; a re-import under a different password (the legacy password being unknown,
+the only case a transient second entry can form) is collapsed to the single canonical entry on the next
+unlock of the legacy wallet.
+
+The manifest is self-healing: a missing or corrupt `index.json` is rebuilt from the seed files present at
+construction (adopting a legacy `wallet-seed.bin` as `default`), so a seed file is never orphaned and the
+reconciled active pointer never dangles.
 
 18.21. **Sign + broadcast on behalf of the paired caller + per-op consent (#371).** With a wallet unlocked
 (§18.20), the node is the SIGNER + BROADCASTER for a paired caller (§7.12): a spend request (or a
 wasm-built unsigned bundle) is built with the canonical `chia-wallet-sdk` driver constructors (§18.9),
-signed with the node-custodied `WalletSigner` (native BLS), validated by `dig-clvm`
+signed with the node-custodied `WalletSigner` of the ACTIVE wallet (native BLS; a paired caller scopes
+signing to a specific custodied wallet via `wallet.select`, §18.20 — the Sage request schemas gain no
+wallet-id argument), validated by `dig-clvm`
 (`validate_spend_bundle`, `DONT_VALIDATE_SIGNATURE` — §18.9) BEFORE broadcast (fail-closed on a tampered or
 over-spending bundle), and broadcast to mainnet via `crate::sage::spend::ChiaQueryBroadcaster` (the real
 `Broadcaster`, wrapping `chia_query::push_tx` = decentralized peers + coinset fallback, mirroring Sage's
@@ -1843,11 +1901,16 @@ one live backend.
   currently-UNLOCKED custody session. A paired `wallet.unlock` therefore enables signing/spend immediately,
   WITHOUT reconstructing the backend; `wallet.lock`/`delete` disable it again. (The test/simulator path
   still injects a fixed signer via `with_signer`, which wins when present.)
-- **Custody lifecycle dispatch.** The `wallet.*` methods (`wallet.status`/`create`/`import`/`restore`/
-  `unlock`/`lock`/`delete`, §18.20) are dispatched by `WalletBackend::dispatch` to the attached
-  `WalletCustody`. `wallet.create`/`import`/`restore`/`unlock` return `{ "address": "xch1…" }`;
-  `wallet.status` returns the custody status (`{ "state": "none"|"locked"|"unlocked", "address"? }`);
-  `wallet.lock`/`delete` return the resulting state. All are gated (§7.12).
+- **Custody lifecycle dispatch.** The `wallet.*` methods (`wallet.status`/`list`/`create`/`import`/
+  `restore`/`unlock`/`lock`/`select`/`delete`, §18.20) are dispatched by `WalletBackend::dispatch` to the
+  attached `WalletCustody`. `wallet.create`/`import`/`restore`/`unlock`/`select` return `{ "address":
+  "xch1…", "id": "<fingerprint>" }`; `wallet.status` returns the custody status (`{ "state":
+  "none"|"locked"|"unlocked", "address"?, "id"?, "active"? }`); `wallet.list` returns `{ "active":
+  "<id>"|null, "wallets": [{ "id", "address"?, "label"?, "state", "active" }] }`; `wallet.lock`/`delete`
+  return the resulting state. A `wallet.unlock`/`lock`/`status`/`delete` with no `id` addresses the ACTIVE
+  wallet (single-wallet back-compat). The effective signer (`current_signer`) resolves to the ACTIVE
+  wallet's unlocked signer, so `wallet.select` scopes the sign/spend surface to a chosen wallet. All are
+  gated (§7.12).
 - **Sync-status snapshot.** `WalletBackend::sync_status()` derives the `{ state, peak_height, target_height }`
   tri-state (`SyncStatus`, `crate::sage::events`) from the wallet DB — `synced` iff the initial catch-up
   completed, else `syncing`; it is the body the `/ws` transport pushes (§4.8) and re-pushes on transition.

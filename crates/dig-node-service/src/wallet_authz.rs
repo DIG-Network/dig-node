@@ -17,9 +17,11 @@
 
 use crate::control::ct_eq;
 
-/// The custody-lifecycle namespace prefix (§18.20): `wallet.create`, `wallet.import`,
-/// `wallet.restore`, `wallet.unlock`, `wallet.lock`, `wallet.status`, `wallet.delete`. EVERY
-/// `wallet.*` method is gated (even `wallet.status`, which reveals wallet presence + the address).
+/// The custody-lifecycle namespace prefix (§18.20/§18.20a): `wallet.create`, `wallet.import`,
+/// `wallet.restore`, `wallet.unlock`, `wallet.lock`, `wallet.status`, `wallet.list`,
+/// `wallet.select`, `wallet.delete`. EVERY `wallet.*` method is gated by this prefix (even the reads
+/// `wallet.status`/`wallet.list`, which reveal which wallets are custodied + their addresses), so a
+/// new custody method is gated the moment it lands under `wallet.*` — no per-method allowlist.
 pub const CUSTODY_PREFIX: &str = "wallet.";
 
 /// Wallet MUTATION methods that MUST be authorized (§7.12): they sign, spend, broadcast, or change
@@ -156,6 +158,8 @@ mod tests {
             "wallet.unlock",
             "wallet.lock",
             "wallet.status",
+            "wallet.list",
+            "wallet.select",
             "wallet.delete",
         ] {
             assert_eq!(classify(m), WalletMethodClass::Custody, "{m}");

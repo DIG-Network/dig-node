@@ -912,7 +912,7 @@ impl WalletBackend {
     fn current_signer(&self) -> Option<Arc<WalletSigner>> {
         self.signer
             .clone()
-            .or_else(|| self.custody.as_ref().and_then(|c| c.signer()))
+            .or_else(|| self.custody.as_ref().and_then(|c| c.signer(None)))
     }
 
     /// The signer, or a locked-wallet error (C.6: spends need node-custodied keys).
@@ -2361,19 +2361,25 @@ impl WalletBackend {
         })
     }
 
-    /// Dispatch a `wallet.*` custody-lifecycle method to the attached [`WalletCustody`] (#368).
-    /// Returns the Sage-shaped result value; a node without custody attached reports the method
-    /// as unavailable. Password/mnemonic params are read from the JSON body.
+    /// Dispatch a `wallet.*` MULTI-wallet custody-lifecycle method to the attached [`WalletCustody`]
+    /// (#368/#427). Returns the Sage-shaped result value; a node without custody attached reports
+    /// the method as unavailable. The optional `id` addresses a specific custodied wallet (default:
+    /// the active wallet, so single-wallet callers are unchanged); `label` names a new wallet;
+    /// `mnemonic`/`password` are the create/import/unlock inputs — all read from the JSON body.
     fn dispatch_custody(&self, method: &str, body: &str) -> Result<Value> {
+        /// The union of every custody-method parameter; each method reads only the fields it needs.
         #[derive(serde::Deserialize, Default)]
-        struct PwReq {
+        struct CustodyReq {
+            /// Addresses a specific wallet; absent ⇒ the active wallet.
             #[serde(default)]
-            password: String,
-        }
-        #[derive(serde::Deserialize, Default)]
-        struct MnemonicReq {
+            id: Option<String>,
+            /// A human label for a newly created/imported wallet.
+            #[serde(default)]
+            label: Option<String>,
+            /// The mnemonic for import/restore.
             #[serde(default)]
             mnemonic: String,
+            /// The at-rest password for create/import/unlock/delete.
             #[serde(default)]
             password: String,
         }
@@ -2382,34 +2388,41 @@ impl WalletBackend {
             .as_ref()
             .ok_or_else(|| Error::internal("wallet custody is not enabled on this node"))?;
         let body_s = if body.trim().is_empty() { "{}" } else { body };
-        let parse_pw = || -> Result<PwReq> {
-            serde_json::from_str(body_s)
-                .map_err(|e| Error::api(format!("invalid request for {method}: {e}")))
-        };
-        let parse_mn = || -> Result<MnemonicReq> {
-            serde_json::from_str(body_s)
-                .map_err(|e| Error::api(format!("invalid request for {method}: {e}")))
-        };
-        let addr = |address: String| json(serde_json::json!({ "address": address }));
+        let r: CustodyReq = serde_json::from_str(body_s)
+            .map_err(|e| Error::api(format!("invalid request for {method}: {e}")))?;
+        let id = r.id.as_deref();
+        // create/import/restore/unlock return the wallet ref `{ id, address }`.
         match method {
-            "wallet.status" => json(custody.status()),
-            "wallet.create" => addr(custody.create(&parse_pw()?.password)?),
-            "wallet.import" => {
-                let r = parse_mn()?;
-                addr(custody.import(&r.mnemonic, &r.password)?)
+            "wallet.status" => json(custody.status(id)),
+            "wallet.list" => {
+                #[derive(serde::Serialize)]
+                struct ListResp {
+                    active: Option<String>,
+                    wallets: Vec<super::custody::WalletInfo>,
+                }
+                let wallets = custody.list();
+                let active = wallets.iter().find(|w| w.active).map(|w| w.id.clone());
+                json(ListResp { active, wallets })
             }
-            "wallet.restore" => {
-                let r = parse_mn()?;
-                addr(custody.restore(&r.mnemonic, &r.password)?)
+            "wallet.create" => json(custody.create(&r.password, r.label)?),
+            "wallet.import" => json(custody.import(&r.mnemonic, &r.password, r.label)?),
+            "wallet.restore" => json(custody.restore(&r.mnemonic, &r.password, r.label)?),
+            "wallet.unlock" => json(custody.unlock(id, &r.password)?),
+            "wallet.select" => {
+                let sel =
+                    r.id.as_deref()
+                        .ok_or_else(|| Error::api("wallet.select requires an `id`"))?;
+                json(custody.select(sel)?)
             }
-            "wallet.unlock" => addr(custody.unlock(&parse_pw()?.password)?),
             "wallet.lock" => {
-                custody.lock();
-                json(serde_json::json!({ "state": "locked" }))
+                custody.lock(id);
+                // The resulting state of the addressed wallet (`locked` when it exists).
+                json(custody.status(id))
             }
             "wallet.delete" => {
-                custody.delete(&parse_pw()?.password)?;
-                json(serde_json::json!({ "state": "none" }))
+                custody.delete(id, &r.password)?;
+                // The node-level status after removal (a remaining wallet becomes active, else none).
+                json(custody.status(None))
             }
             other => Err(Error::not_found(format!(
                 "unknown or unsupported method: {other}"
@@ -3852,8 +3865,8 @@ mod tests {
     use super::super::custody::{Network, WalletCustody};
     use super::super::events::SyncLifecycle;
 
-    /// A fresh custody manager over a unique temp seed path (no file yet), covering a small HD
-    /// range so the key-build stays fast.
+    /// A fresh multi-wallet custody manager over a unique temp CONFIG DIR (no wallets yet), covering
+    /// a small HD range so the key-build stays fast.
     fn fresh_custody() -> WalletCustody {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3863,7 +3876,7 @@ mod tests {
             n
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        WalletCustody::new(dir.join("seed.bin"), Network::Testnet11, 2)
+        WalletCustody::new(dir, Network::Testnet11, 2)
     }
 
     async fn custody_backend() -> WalletBackend {

@@ -83,10 +83,13 @@ async fn live_funds_dev_tip_broadcasts_and_confirms() {
         .backend
         .custody()
         .expect("live wallet must carry node custody");
-    let address = custody
-        .import(&mnemonic, password)
+    let wallet = custody
+        .import(&mnemonic, password, None)
         .expect("import + unlock the funded test wallet");
-    eprintln!("live e2e: funded test wallet unlocked at {address}");
+    eprintln!(
+        "live e2e: funded test wallet unlocked at {}",
+        wallet.address
+    );
 
     // Pin a TINY, single-tip budget: dev tip = TIP_BASE_UNITS, creator off, daily cap = one tip,
     // zero fee. A bug cannot over-spend beyond one base unit.
