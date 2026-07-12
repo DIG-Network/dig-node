@@ -185,7 +185,7 @@ every subcommand (machine output to stdout, prose to stderr).
 | **dig-node ↔ DIG Browser (native)** | Same wire contract and cache semantics; `dig-node` is the standalone-service form for users who run the extension in a normal browser rather than the native fork. |
 | **DIG Browser "My Node" controller → dig-node** | The browser drives the `control.*` admin surface over loopback, reading the control token from `<config_dir>/control-token` and sending it as `X-Dig-Control-Token`. The contract (methods/params/results, `x-requires-auth`, error codes) is discoverable via `/openrpc.json` / `rpc.discover`. |
 | **docs.dig.net** | The canonical dig-RPC param/result schemas are published by docs.dig.net; this node's `/openrpc.json` is the local method+error **discovery** surface that aligns with it. Run-a-node docs: [https://docs.dig.net/docs/run-a-node](https://docs.dig.net/docs/run-a-node). |
-| **Discord** | Questions, help, and the DIG Network community: [https://discord.gg/dignetwork](https://discord.gg/dignetwork). |
+| **Discord** | Questions, help, and the DIG Network community: [https://discord.gg/v78aygUZt](https://discord.gg/v78aygUZt). |
 
 See the repo `README.md` for the full configuration table and `SYSTEM.md` (ecosystem root) for the
 shared contracts and interaction map.
