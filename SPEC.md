@@ -953,7 +953,10 @@ rejected with `-32030 UNAUTHORIZED` before the method runs.
 
 **Gated wallet methods (MUST present a token).** The custody-lifecycle group (§18.20 —
 `wallet.create` / `wallet.import` / `wallet.restore` / `wallet.unlock` / `wallet.lock` /
-`wallet.status` / `wallet.list` / `wallet.select` / `wallet.delete`) and the mutation group (the send/spend group §18.9, the offer suite
+`wallet.status` / `wallet.list` / `wallet.select` / `wallet.delete`), the node-managed unlock-auth group
+(§18.24 — EVERY `auth.*` method: `auth.status` / `auth.get_method` / `auth.set_method` / `auth.set_mode` /
+`auth.enroll_totp` / `auth.enroll_passkey_begin` / `auth.enroll_passkey_finish` / `auth.unlock` /
+`auth.sign_unlock` / `auth.lock`), and the mutation group (the send/spend group §18.9, the offer suite
 + DID/NFT mint & transfer §18.9a, and the state-changing record-update actions §18.16) are all gated.
 These methods are NEVER relayed upstream — a signing/custody request must never leave the loopback node;
 an authorized call is served locally by the node-custodied wallet (or, until the wallet surface is served
@@ -2001,6 +2004,110 @@ Each returns a `TipOutcome` — `{ result: "tipped", txid, dig_amount, recipient
 `TipEventBus` (kept OUT of the Sage-parity `SyncEvent` union so tip events never leak into the `GET /events`
 Sage stream). Each `/ws` session forwards it as a `{ "type": "tip", "tip": <ledger-entry> }` push frame,
 alongside the `sync_status` + `event` frames.
+
+## 18.24. Node-managed unlock authentication + per-transaction sign-unlock (#431/#432)
+
+The node is the LOCAL authority that gates the node-custodied signer (§18.21). There is **NO central
+server**: enrollment + verification are entirely local, credential material is encrypted at rest via
+`dig-keystore`, and no auth secret is ever logged or returned over any transport. This makes signing
+SAFE BY DEFAULT: the decrypted private key MUST NOT persist in memory beyond a single signature.
+
+`crate::sage::auth::UnlockAuth` owns the auth+unlock state machine; it holds a handle to the
+`WalletCustody` (§18.20) and mediates the effective signer. When an `UnlockAuth` is attached to the
+served `WalletBackend` (`with_auth`), it GOVERNS `current_signer()` — the §18.21 sign/broadcast-on-behalf
+path obtains a signer ONLY through the auth gate. When no `UnlockAuth` is attached (the simulator /
+bring-up-injected-signer path), behaviour is unchanged (back-compat).
+
+**Unlock mode (the ONLY policy knob).**
+
+- **`per_transaction` (DEFAULT, secure).** A successful `unlock` grants a READ-ONLY session
+  (balances/history/reads). It loads NO signer — `current_signer()` is `None`. **Each signing operation
+  requires a fresh `sign_unlock`**: the node decrypts the seed, builds a one-shot signer, signs exactly
+  ONE operation, and the signer is DROPPED (not resident) immediately after. The key never persists
+  beyond that single operation.
+- **`session_unlock_all` (OPT-OUT, convenience, OFF by default).** One `unlock` at session start builds
+  and HOLDS the signer for the session lifetime; `current_signer()` returns it until `lock`. Set via
+  `auth.set_mode`.
+
+**Auth model — per-wallet password + NODE-LEVEL second factor.** One method is active at a time; the user
+may add TOTP or a passkey on top of the password.
+
+- The **password is PER-WALLET**: it is the at-rest KDF root that decrypts THAT wallet's seed
+  (`dig-keystore` Argon2id, §18.18/§18.20). Every `unlock`/`sign_unlock` requires the TARGET wallet's
+  password (`WalletCustody::verify_password`).
+- The **second factor (TOTP / passkey) is NODE-LEVEL** — a single node authentication that authorizes the
+  unlock across EVERY custodied wallet (#431). Its secret is sealed at rest under a node-level device key
+  (`auth/node.key`, owner-only), NOT under any wallet password, so 2FA works uniformly for every wallet.
+  When a second factor is enrolled, `unlock`/`sign_unlock` require BOTH the target wallet's password AND
+  the node-level factor. A `Credential` carries the password plus, per the active method, a TOTP code or a
+  WebAuthn assertion; verification requires every factor the active method mandates. (This is an honest,
+  strong-at-rest design for a keyless local node; true passwordless replacement via WebAuthn PRF or a
+  TPM-sealed key is a scoped follow-up.)
+
+- **`password` (default).** Verified by decrypting the addressed wallet's seed.
+- **`totp` (RFC-6238, `totp-rs`).** `auth.enroll_totp` generates a fresh node-level secret, seals it under
+  `auth/node.key`, sets the method to `totp`, and returns the base32 secret + `otpauth://` URI EXACTLY
+  ONCE. Thereafter `unlock`/`sign_unlock` require the target wallet's password AND a current 6-digit code
+  (±1 step skew). **A code is ONE-TIME-USE** (RFC-6238 §5.2): the last-accepted time-step is persisted and
+  a code at a step `<=` it is rejected as a REPLAY (`401`). The check-and-advance is ATOMIC — the
+  find-step → compare-to-last → advance runs under a single exclusive lock — so two CONCURRENT verifies of
+  the same code cannot both pass (the replay window holds under concurrency, not just sequentially).
+- **`passkey` (WebAuthn).** `auth.enroll_passkey_begin`/`finish` register a node-level credential.
+  Thereafter `unlock`/`sign_unlock` require the password AND a valid assertion. The real `webauthn-rs`
+  ceremony is finalized with the paired-extension origin (#433 follow-up) — it fails closed until then, so
+  the active method never becomes `passkey` on this node.
+
+**Enrolling or replacing a factor re-verifies the CURRENT factor.** `auth.enroll_totp` /
+`auth.enroll_passkey_begin` / `auth.set_method` and switching mode to `session_unlock_all` all run the
+FULL current-factor verification (`verify(id, cred)` — password AND, when a second factor is already
+active, the live code/assertion) BEFORE rotating/weakening. So an attacker holding the paired token + a
+stolen password — the exact threat 2FA backstops — cannot rotate the factor to their own authenticator or
+silently downgrade the posture. Password-only enrollment is permitted ONLY while the active method is
+`password`.
+
+**State machine + the §18.21 gate.**
+
+- `unlock(id?, cred)` → verify per the active method → set the session READ-ONLY (`per_transaction`), or
+  build + hold the session signer BOUND to that wallet (`session_unlock_all`). Never returns a signer or
+  key. A wrong/expired/replayed credential is denied (`401`), leaves the state unchanged, loads nothing.
+- `sign_unlock(id?, cred)` → verify (FRESH) → decrypt the target wallet's seed, build a one-shot signer
+  BOUND to that wallet, and ARM it for exactly ONE signing operation.
+- **Grants/session signers are BOUND to their wallet id (§18.20a multi-wallet).** `current_signer()` for a
+  signing op returns the armed grant (or the held session signer) ONLY when its bound wallet id equals the
+  node's currently-ACTIVE wallet; otherwise it fails closed — a grant armed for wallet A can never sign
+  when B is active. `current_signer()` resolves: bring-up-injected signer (tests) → the wallet-matched auth
+  gate signer → (only when NO auth is attached) the legacy held custody signer.
+- **Signing dispatch is SERIALIZED + the one-shot grant is consumed panic-safely.** Every key-touching
+  signing method (`send_xch`/`send_cat`/`combine`/`split`/`sign_coin_spends`/`submit_transaction`/
+  `make_offer`/`take_offer`/mint/transfer/… AND `tip.manual`/`tip.dev_tick`/`tip.notify_consumed`, which
+  sign a $DIG tip) is dispatched under a signing mutex held from before the handler THROUGH grant
+  consumption, so two concurrent signing calls can never both observe one armed grant (a gate TOCTOU) —
+  ONE `sign_unlock` authorizes EXACTLY ONE signature. Consumption is via an RAII guard that runs on normal
+  return AND on a panic unwind, so a panicking handler can never leave the key armed + reusable.
+- `lock()` → clear the read-only session, drop the session signer AND any armed grant.
+
+**No sibling resident key over the paired boundary.** When the auth gate is attached it is the ONLY
+signer-loading path: `wallet.create`/`import`/`restore` verify-and-persist but leave NO resident custody
+signer (the custody session is locked immediately after provisioning), and `wallet.unlock` is redirected
+to `auth.unlock`/`auth.sign_unlock` rather than loading a session-long resident key.
+
+**Zeroize / residency invariant (adversarial-verified).** In `per_transaction` mode no signer is resident
+between signatures: after a `sign_unlock` + one signing operation the one-shot signer is dropped and
+`current_signer()` returns `None` — a fresh `sign_unlock` is required for the next signature. Decrypted
+mnemonic material is held only in `zeroize::Zeroizing` for the duration of a build and dropped
+immediately. (`chia-bls` 0.26 `SecretKey` does not itself zeroize-on-drop; the delivered guarantee is
+non-retention — the signer allocation is dropped promptly — plus zeroization of the mnemonic buffer.
+Byte-level scrub of the derived scalar via a key wrapper is a scoped follow-up.)
+
+**WS/RPC surface (paired-token gated, §7.12).** Every `auth.*` method requires the master control token
+OR a valid paired token, on every transport (`POST /{method}`, `/ws`, mTLS `9257`). Methods:
+`auth.status` (mode, method, session state, whether a sign-grant is armed) · `auth.get_method` /
+`auth.set_method` (switch active method — `password` resets to password-only) · `auth.set_mode`
+(`per_transaction` | `session_unlock_all`) · `auth.enroll_totp` · `auth.enroll_passkey_begin` /
+`auth.enroll_passkey_finish` · `auth.unlock` (read-only session) · `auth.sign_unlock` (per-transaction,
+authorizes exactly one signature) · `auth.lock`. Auth secrets are NEVER returned except the one-time TOTP
+enrollment secret/URI at `enroll_totp` (needed to provision the authenticator). No auth material crosses
+as a wallet/`control.*` result.
 
 ## 19. Peer network — NAT traversal, discovery, address book, and content location
 

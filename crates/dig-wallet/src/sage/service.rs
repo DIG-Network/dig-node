@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::auth::UnlockAuth;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
@@ -95,6 +96,11 @@ impl WalletService {
         // MULTI-wallet custody (#427) rooted at the node config dir: seeds live under
         // `<config_dir>/wallets/`, and a legacy single `<config_dir>/wallet-seed.bin` is adopted.
         let custody = WalletCustody::mainnet(config_dir.to_path_buf());
+        // The node-managed unlock authority (#431/#432, §18.24): it GATES the sign/broadcast path so
+        // signing is SAFE BY DEFAULT (per-transaction re-auth; the key is not resident between
+        // signatures). It shares the SAME custody state (a `WalletCustody` clone shares its inner
+        // Arcs), so decrypting a seed for a one-shot sign always uses the on-disk seed + password.
+        let auth = Arc::new(UnlockAuth::new(custody.clone(), config_dir.to_path_buf()));
         let tip_events = Arc::new(TipEventBus::default());
 
         // Live-broadcast wiring (§18.12), gated on the config flag. A construction failure (no peer
@@ -117,6 +123,7 @@ impl WalletService {
         let mut base = WalletBackend::new(db, fallback, WalletConfig::default())
             .with_events(events.clone())
             .with_custody(custody)
+            .with_auth(auth)
             .with_tip_events(tip_events.clone());
         if let Some(l) = &live {
             // The GENERAL wallet surface (send/offer/mint) gets the confirming broadcaster + the

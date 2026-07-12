@@ -419,6 +419,30 @@ impl WalletCustody {
             .map(|u| u.signer.clone())
     }
 
+    /// Verify `password` against the addressed wallet's on-disk seed WITHOUT loading a signer or
+    /// changing any state (§18.24): decrypt the seed (the decrypted mnemonic is dropped immediately)
+    /// and return `Ok` iff it decrypts. This is the read-only-session password check the unlock-auth
+    /// state machine uses — a successful verify grants reads but never makes signing possible. Wrong
+    /// password fails closed (`401`); a missing wallet is `404`. NEVER mutates custody.
+    pub fn verify_password(&self, id: Option<&str>, password: &str) -> Result<()> {
+        let id = self.resolve_id(id)?;
+        // `read_seed` returns a `Zeroizing<String>`, dropped (and scrubbed) at the end of this scope.
+        let _ = self.read_seed(&id, password)?;
+        Ok(())
+    }
+
+    /// Build a ONE-SHOT signer for the addressed wallet (default: the ACTIVE wallet) by decrypting its
+    /// on-disk seed with `password` — WITHOUT inserting it into the persistent `unlocked` session
+    /// (§18.24 per-transaction sign). The returned `Arc<WalletSigner>` is the ONLY strong reference;
+    /// when the caller drops it (after one signing operation) the decrypted-key allocation is released
+    /// — the key is not retained. Wrong password fails closed (`401`); a missing wallet is `404`.
+    pub fn sign_once(&self, id: Option<&str>, password: &str) -> Result<Arc<WalletSigner>> {
+        let id = self.resolve_id(id)?;
+        let mnemonic = self.read_seed(&id, password)?;
+        let (signer, _address) = self.build_signer(&mnemonic)?;
+        Ok(Arc::new(signer))
+    }
+
     // ---- internals --------------------------------------------------------
 
     /// Reject a password below the minimum length.
@@ -1058,6 +1082,62 @@ mod tests {
         // A's password cannot reveal it under the wrong password, nor with B's password.
         assert!(c.reveal_mnemonic(Some(&a.id), "passphrase-b").is_err());
         assert!(c.reveal_mnemonic(Some(&a.id), "wrong").is_err());
+    }
+
+    #[test]
+    fn verify_password_checks_without_loading_a_signer() {
+        let (c, _p) = fresh();
+        c.import(ABANDON, "correcthorse", None).unwrap();
+        c.lock(None);
+        assert_eq!(c.status(None).state, CustodyState::Locked);
+        // A correct password verifies; a wrong password fails closed. Neither loads a signer.
+        assert!(c.verify_password(None, "correcthorse").is_ok());
+        assert!(c.verify_password(None, "wrong").is_err());
+        assert_eq!(
+            c.status(None).state,
+            CustodyState::Locked,
+            "verify_password must not load a signer"
+        );
+        assert!(c.signer(None).is_none());
+    }
+
+    #[test]
+    fn sign_once_builds_a_signer_without_persisting_a_session() {
+        let (c, _p) = fresh();
+        let held = c.import(ABANDON, "correcthorse", None).unwrap();
+        c.lock(None);
+        assert!(c.signer(None).is_none(), "locked");
+
+        // sign_once builds a usable signer (same wallet's puzzle hashes) but does NOT persist it.
+        let one = c.sign_once(None, "correcthorse").unwrap();
+        assert!(!one.puzzle_hashes().is_empty());
+        assert!(
+            c.signer(None).is_none(),
+            "sign_once must not load a persistent session"
+        );
+        assert_eq!(c.status(None).state, CustodyState::Locked);
+
+        // The one-shot signer is the sole owner: dropping it releases the decrypted-key allocation.
+        let weak = Arc::downgrade(&one);
+        drop(one);
+        assert!(
+            weak.upgrade().is_none(),
+            "the decrypted signer must not be retained after drop"
+        );
+        let _ = held;
+    }
+
+    #[test]
+    fn sign_once_wrong_password_fails_closed() {
+        let (c, _p) = fresh();
+        c.import(ABANDON, "correcthorse", None).unwrap();
+        c.lock(None);
+        // NB: `WalletSigner` deliberately has no `Debug` (it holds secret keys), so we cannot
+        // `unwrap_err()` the `Result<Arc<WalletSigner>, _>` — inspect the error via `err()`.
+        let res = c.sign_once(None, "wrong");
+        assert!(res.is_err());
+        assert_eq!(res.err().unwrap().kind, ErrorKind::Unauthorized);
+        assert!(c.signer(None).is_none());
     }
 
     #[test]

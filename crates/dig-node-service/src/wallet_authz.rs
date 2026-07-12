@@ -24,6 +24,13 @@ use crate::control::ct_eq;
 /// new custody method is gated the moment it lands under `wallet.*` — no per-method allowlist.
 pub const CUSTODY_PREFIX: &str = "wallet.";
 
+/// The node-managed unlock-auth namespace prefix (§18.24, #431/#432): `auth.status`, `auth.unlock`,
+/// `auth.sign_unlock`, `auth.set_mode`, `auth.set_method`, `auth.enroll_totp`, `auth.enroll_passkey_*`,
+/// `auth.lock`, `auth.get_method`. EVERY `auth.*` method is paired-token gated (§7.12) — even the
+/// reads reveal the auth posture (mode/method/session state), and `unlock`/`sign_unlock` gate the
+/// node-custodied signer — so a new auth method is gated the moment it lands under `auth.*`.
+pub const AUTH_PREFIX: &str = "auth.";
+
 /// Wallet MUTATION methods that MUST be authorized (§7.12): they sign, spend, broadcast, or change
 /// persisted wallet state. Sourced from the dig-wallet Sage surface (§18.9/§18.9a/§18.16/§18.17).
 const GATED_WALLET_MUTATIONS: &[&str] = &[
@@ -83,7 +90,8 @@ const GATED_WALLET_MUTATIONS: &[&str] = &[
 /// The authorization class of a JSON-RPC method w.r.t. the wallet surface (§7.12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalletMethodClass {
-    /// A custody-lifecycle method (`wallet.*`, §18.20) — GATED.
+    /// A custody-lifecycle method (`wallet.*`, §18.20) or a node-managed unlock-auth method
+    /// (`auth.*`, §18.24) — GATED.
     Custody,
     /// A wallet MUTATION (sign/spend/offer/mint/transfer + state-changing actions) — GATED.
     Mutation,
@@ -95,7 +103,7 @@ pub enum WalletMethodClass {
 
 /// Classify a method against the wallet-authorization policy. PURE.
 pub fn classify(method: &str) -> WalletMethodClass {
-    if method.starts_with(CUSTODY_PREFIX) {
+    if method.starts_with(CUSTODY_PREFIX) || method.starts_with(AUTH_PREFIX) {
         WalletMethodClass::Custody
     } else if GATED_WALLET_MUTATIONS.contains(&method) {
         WalletMethodClass::Mutation
@@ -164,6 +172,42 @@ mod tests {
         ] {
             assert_eq!(classify(m), WalletMethodClass::Custody, "{m}");
             assert!(requires_authorization(m), "{m} must be gated");
+        }
+    }
+
+    #[test]
+    fn auth_methods_are_gated_and_no_token_is_denied() {
+        for m in [
+            "auth.status",
+            "auth.get_method",
+            "auth.set_method",
+            "auth.set_mode",
+            "auth.enroll_totp",
+            "auth.enroll_passkey_begin",
+            "auth.enroll_passkey_finish",
+            "auth.unlock",
+            "auth.sign_unlock",
+            "auth.lock",
+        ] {
+            assert_eq!(classify(m), WalletMethodClass::Custody, "{m}");
+            assert!(requires_authorization(m), "{m} must be gated");
+            // No token / wrong token → denied; master or paired → allowed.
+            assert!(
+                !authorize(m, None, MASTER, is_paired),
+                "{m}: no token denied"
+            );
+            assert!(
+                !authorize(m, Some("nope"), MASTER, is_paired),
+                "{m}: wrong token denied"
+            );
+            assert!(
+                authorize(m, Some(MASTER), MASTER, is_paired),
+                "{m}: master ok"
+            );
+            assert!(
+                authorize(m, Some(PAIRED), MASTER, is_paired),
+                "{m}: paired ok"
+            );
         }
     }
 

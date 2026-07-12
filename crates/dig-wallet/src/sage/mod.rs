@@ -59,6 +59,7 @@
 //! image/color-extraction pipeline (SPEC §18.16).
 
 pub mod actions;
+pub mod auth;
 pub mod custody;
 pub mod db;
 pub mod events;
