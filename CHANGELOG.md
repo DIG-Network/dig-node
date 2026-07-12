@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.22.0] - 2026-07-12
+
+### Features
+- **node:** Live wallet broadcaster + confirm — real push_tx behind a config gate (#428) (#26)
+
 ## [0.21.0] - 2026-07-12
 
 ### Features
