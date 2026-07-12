@@ -35,6 +35,13 @@ path = "src/lib.rs"
 # around it, and produces the `dig-node` binary (distinct name from the engine lib).
 dig-node-core = { path = "../dig-node-core" }
 
+# The Sage-parity wallet engine (crate `dig_wallet`) — the node-custodied wallet DB + dual-transport
+# dispatch + seed custody. This shell WIRES it into bring-up (#368): it builds one live
+# `WalletBackend` (`sage::service::WalletService`) and serves the Sage method surface on the
+# extension-reachable loopback (`POST /{method}`, 9778) + the mTLS 9257 listener, and bridges the
+# bidirectional WS wallet+control transport (#369) onto it.
+dig-wallet = { path = "../dig-wallet" }
+
 # HTTP stack: the same axum/tokio the node itself uses, so there is one async runtime
 # and one server framework across the node and the service shell. `ws` enables
 # `axum::extract::ws` for the `GET /ws/status` liveness endpoint (#239).

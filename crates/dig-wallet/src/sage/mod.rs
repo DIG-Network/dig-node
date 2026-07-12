@@ -69,6 +69,7 @@ pub mod offers;
 pub mod options;
 pub mod routing;
 pub mod rpc;
+pub mod service;
 pub mod singleton;
 pub mod spend;
 pub mod sync;

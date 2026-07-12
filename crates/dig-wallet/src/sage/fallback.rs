@@ -135,6 +135,49 @@ impl ChainFallback for CoinsetFallback {
     }
 }
 
+/// A graceful no-network fallback (#368): every read returns empty / not-found rather than
+/// erroring. It is the default fallback for the shipped node's served backend BEFORE the
+/// direct-peer sync loop is wired (SPEC §18.12): a wallet-scoped read of an unsynced DB then
+/// reports an honest empty result (matching the pushed `syncing` state) instead of a `500`, and
+/// the node never blocks bring-up on network/TLS setup. Replaced by [`CoinsetFallback`] once the
+/// live sync loop is attached.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EmptyFallback;
+
+#[async_trait]
+impl ChainFallback for EmptyFallback {
+    async fn coin_records_by_puzzle_hashes(&self, _phs: &[String]) -> Result<Vec<FallbackCoin>> {
+        Ok(Vec::new())
+    }
+    async fn coin_records_by_hints(&self, _hints: &[String]) -> Result<Vec<FallbackCoin>> {
+        Ok(Vec::new())
+    }
+    async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod empty_fallback_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_fallback_returns_empty_never_errors() {
+        let fb = EmptyFallback;
+        assert!(fb
+            .coin_records_by_puzzle_hashes(&["00".repeat(32)])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fb
+            .coin_records_by_hints(&["ab".into()])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(fb.coin_record_by_id("cc").await.unwrap().is_none());
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod mock {
     //! A deterministic in-memory [`ChainFallback`] for routing/RPC unit tests.

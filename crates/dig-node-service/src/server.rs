@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Request, State,
@@ -20,11 +20,15 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use dig_node_core::content_serve::{PlaintextOutcome, ServeSource};
 use dig_node_core::{cache_cap_bytes, cache_used_bytes, handle_rpc, Node};
+use dig_wallet::sage::events::{SyncEvent, SyncLifecycle, SyncStatus};
+use dig_wallet::sage::rpc::WalletBackend;
+use dig_wallet::sage::service::WalletService;
+use dig_wallet::sage::transport::{serve_mtls, SharedCert, DEFAULT_MTLS_PORT};
 use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -73,6 +77,14 @@ pub struct AppState {
     /// OPEN `pairing.request`/`pairing.poll` and the gated `control.pairing.*`
     /// handlers see one consistent set of in-flight pairings.
     pairings: Arc<std::sync::Mutex<crate::pairing::PendingPairings>>,
+    /// The SERVED Sage-parity wallet backend (#368): one live [`WalletBackend`] (wallet DB +
+    /// fallback tier + shared [`EventBus`] + node custody) dispatched by BOTH the loopback
+    /// `POST /{method}` HTTP mirror the extension targets AND the bidirectional `/ws` wallet+control
+    /// transport (#369). Custody-backed, so a paired `wallet.unlock` enables signing at runtime.
+    wallet: Arc<WalletBackend>,
+    /// The shared self-signed cert the mTLS `9257` listener presents (Sage byte-parity, node-class
+    /// clients). Held so [`serve_with_shutdown`] can bring up that sibling listener.
+    wallet_cert: SharedCert,
 }
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
@@ -129,6 +141,18 @@ pub fn router(state: AppState) -> Router {
         // client's SW — the OPEN SOCKET is itself the liveness signal, with a
         // heartbeat detecting a half-open connection. See [`ws_status`].
         .route("/ws/status", get(ws_status))
+        // `GET /ws` (#369): the BIDIRECTIONAL wallet+control transport. A thin client drives every
+        // wallet read + `control.*`/wallet mutation over this ONE socket (correlated request →
+        // response), and the node PUSHES sync-status transitions + sync events proactively —
+        // subsuming the SSE stream + per-call HTTP polling. Paired-token gated for mutations +
+        // `control.*` (§7.12); reads open. See [`ws_wallet`]. Resolver/content transport untouched.
+        .route("/ws", get(ws_wallet))
+        // `POST /{method}` (#368): the Sage-parity wallet RPC surface the extension's `node-wallet`
+        // client targets (`POST {base}/{method}`, snake_case Sage body). Served by the live
+        // node-custodied [`WalletBackend`]; mutations + `wallet.*` are paired-token gated and NEVER
+        // relayed upstream. A one-segment GET (a root-absolute store subresource) still reaches the
+        // content-serve path via the method-router `.get` arm, so this never shadows content serving.
+        .route("/:method", post(wallet_rpc).get(fallback_serve))
         // `GET /s/<storeId>[:<root>]/<path>` (#289): the LOCAL plaintext content-serve
         // surface — the node decrypts server-side and returns the real website over
         // loopback, DISTINCT from the blind-ciphertext JSON-RPC `POST /` above. See
@@ -202,10 +226,14 @@ async fn host_guard(req: Request, next: Next) -> Response {
 /// Construct the shared state from config: apply the upstream to dig-node's env,
 /// then build the node from the environment (cache dir/cap, §21 identity), and
 /// generate/load the local control token into the node's config dir.
-pub fn build_state(config: &Config) -> AppState {
+pub async fn build_state(config: &Config) -> AppState {
     config.apply_to_env();
     let node = Node::from_env();
     let config_path = dig_node_core::config_path();
+    // Assemble the SERVED wallet under the node config dir (#368): the live wallet DB + custody +
+    // shared event bus + mTLS cert. Never blocks on network (graceful fallback tier).
+    let config_dir = config_path.parent().unwrap_or(&config_path).to_path_buf();
+    let wallet_service = WalletService::build(&config_dir).await;
     // Generate (or read) the control token into <config_dir>/control-token. A
     // failure to persist it (e.g. unwritable dir) is non-fatal: fall back to an
     // in-memory token so the control plane is still gated (a controller that can't
@@ -240,6 +268,17 @@ pub fn build_state(config: &Config) -> AppState {
         pairings: Arc::new(std::sync::Mutex::new(
             crate::pairing::PendingPairings::default(),
         )),
+        wallet: wallet_service.backend,
+        wallet_cert: wallet_service.cert,
+    }
+}
+
+impl AppState {
+    /// The served node-custodied wallet backend (#368). Exposed so a caller that built the state
+    /// (e.g. an integration test, or the bring-up that spawns the mTLS listener) can share the SAME
+    /// backend + its event bus the router dispatches to.
+    pub fn wallet_backend(&self) -> Arc<WalletBackend> {
+        self.wallet.clone()
     }
 }
 
@@ -561,13 +600,14 @@ async fn rpc(
                 )),
             );
         }
+        // Authorized: serve via the node-custodied wallet backend (#368) — the JSON-RPC `params`
+        // object IS the Sage request body. A signing/custody request is NEVER relayed upstream.
+        let params = req.get("params").cloned().unwrap_or(json!({}));
+        let body = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+        let (status, out) = state.wallet.dispatch(&method, &body).await;
         return (
             StatusCode::OK,
-            Json(rpc_error(
-                id,
-                ErrorCode::MethodNotFound,
-                "the node-custodied wallet surface is not served on this transport yet",
-            )),
+            Json(wallet_result_to_jsonrpc(id, status, out)),
         );
     }
 
@@ -623,6 +663,307 @@ async fn proxy(http: &reqwest::Client, upstream: &str, req: &Value) -> Result<Va
     resp.json::<Value>()
         .await
         .map_err(|e| format!("upstream returned non-JSON: {e}"))
+}
+
+// -- Served wallet surface (#368) + bidirectional WS wallet+control transport (#369) -------------
+
+/// Wrap a Sage `dispatch` `(http_status, body)` into a JSON-RPC envelope: a `200` body becomes the
+/// `result` (parsed JSON); a non-`200` plain-text body becomes `error.message` with the Sage HTTP
+/// status mapped to a catalogued JSON-RPC error code.
+fn wallet_result_to_jsonrpc(id: Value, status: u16, body: String) -> Value {
+    if status == 200 {
+        let result: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    } else {
+        let code = match status {
+            400 => ErrorCode::InvalidParams,
+            401 => ErrorCode::Unauthorized,
+            404 => ErrorCode::MethodNotFound,
+            _ => ErrorCode::DispatchFailed,
+        };
+        rpc_error(id, code, body)
+    }
+}
+
+/// The token a wallet/control caller presented on the loopback surface: the `X-Dig-Control-Token`
+/// header, else a `_control_token` field in the (Sage/JSON) body.
+fn presented_wallet_token(headers: &HeaderMap, body: &str) -> Option<String> {
+    if let Some(t) = headers
+        .get(control::CONTROL_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        v.get("_control_token")
+            .and_then(|t| t.as_str())
+            .map(String::from)
+    })
+}
+
+/// Whether a wallet-surface caller presenting `token` is authorized for `method` (§7.12): reads are
+/// open; every custody-lifecycle + mutation method needs the master control token OR a paired token.
+fn wallet_call_authorized(state: &AppState, method: &str, token: Option<&str>) -> bool {
+    let paired_path = pairing::paired_tokens_path(&state.config_path);
+    wallet_authz::authorize(method, token, &state.control_token, |t| {
+        pairing::is_paired_token(&paired_path, t)
+    })
+}
+
+/// `POST /{method}` (#368) — the Sage-parity wallet RPC surface. Dispatches to the node-custodied
+/// [`WalletBackend`], reproducing Sage's response model: `200` + JSON on success, or the mapped
+/// status with a plain-text message on error. Custody + mutation methods are paired-token gated
+/// (§7.12) and are never relayed upstream; wallet reads are open to local consumers.
+async fn wallet_rpc(
+    State(state): State<AppState>,
+    Path(method): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let body_str = String::from_utf8_lossy(&body).into_owned();
+    if wallet_authz::requires_authorization(&method) {
+        let token = presented_wallet_token(&headers, &body_str);
+        if !wallet_call_authorized(&state, &method, token.as_deref()) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                format!(
+                    "401: {method} requires the local control token (X-Dig-Control-Token header) \
+                     or a paired controller token (see `dig-node pair`)"
+                ),
+            )
+                .into_response();
+        }
+    }
+    let (status, out) = state.wallet.dispatch(&method, &body_str).await;
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let content_type = if status == 200 {
+        "application/json"
+    } else {
+        "text/plain; charset=utf-8"
+    };
+    (code, [(header::CONTENT_TYPE, content_type)], out).into_response()
+}
+
+/// `GET /ws` (#369) — upgrade to the bidirectional wallet+control WebSocket. Same CSWSH `Origin`
+/// allowlist as `/ws/status`: a disallowed browser Origin is rejected server-side (a WS handshake
+/// is not gated by CORS); a request with NO Origin (a non-browser client) is allowed.
+async fn ws_wallet(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if !is_local_origin(origin) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(rpc_error(
+                    Value::Null,
+                    ErrorCode::InvalidRequest,
+                    "dig-node: Origin not allowed for /ws",
+                )),
+            )
+                .into_response();
+        }
+    }
+    ws.on_upgrade(move |socket| ws_wallet_session(socket, state))
+}
+
+/// Build the `sync_status` PUSH frame from a [`SyncStatus`] (adds the `type` tag).
+fn status_push_frame(status: &SyncStatus) -> Value {
+    let mut v = serde_json::to_value(status).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("type".into(), json!("sync_status"));
+    }
+    v
+}
+
+/// A WS error response frame (correlated by `id`).
+fn ws_err(id: Value, code: ErrorCode, msg: &str) -> Value {
+    json!({ "id": id, "type": "response", "ok": false, "error": { "code": code.code(), "message": msg } })
+}
+
+/// Normalize a `control.*`/`pairing.*` JSON-RPC envelope into the uniform WS response frame.
+fn ws_from_jsonrpc(id: Value, env: Value) -> Value {
+    if let Some(err) = env.get("error") {
+        json!({ "id": id, "type": "response", "ok": false, "error": err.clone() })
+    } else {
+        json!({ "id": id, "type": "response", "ok": true, "result": env.get("result").cloned().unwrap_or(Value::Null) })
+    }
+}
+
+/// Dispatch ONE correlated WS request → the uniform response frame. Routes `control.*` (token-gated,
+/// pairing-admin needs the master token), the OPEN `pairing.request`/`pairing.poll`, and the wallet
+/// surface (reads open; custody + mutations paired-token gated, §7.12). Wallet/custody ops are
+/// served by the node-custodied backend and never relayed upstream.
+async fn ws_dispatch(
+    state: &AppState,
+    id: Value,
+    method: &str,
+    params: Value,
+    token: Option<&str>,
+) -> Value {
+    if control::is_control_method(method) {
+        let master_ok = control::is_authorized(method, token, &state.control_token);
+        let paired_ok = !control::is_pairing_admin_method(method)
+            && token.is_some_and(|t| {
+                pairing::is_paired_token(&pairing::paired_tokens_path(&state.config_path), t)
+            });
+        if !(master_ok || paired_ok) {
+            return ws_err(
+                id,
+                ErrorCode::Unauthorized,
+                "control.* requires the local control token or a paired controller token",
+            );
+        }
+        let ctx = control_ctx(state);
+        let env = control::dispatch_control(&ctx, id.clone(), method, &params).await;
+        return ws_from_jsonrpc(id, env);
+    }
+    if method == "pairing.request" || method == "pairing.poll" {
+        let env = if method == "pairing.request" {
+            pairing::request(&state.pairings, id.clone(), &params)
+        } else {
+            pairing::poll(&state.pairings, id.clone(), &params)
+        };
+        return ws_from_jsonrpc(id, env);
+    }
+    if wallet_authz::requires_authorization(method) && !wallet_call_authorized(state, method, token)
+    {
+        return ws_err(
+            id,
+            ErrorCode::Unauthorized,
+            "this wallet method requires a paired controller token (see `dig-node pair`)",
+        );
+    }
+    let body = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+    let (status, out) = state.wallet.dispatch(method, &body).await;
+    if status == 200 {
+        let result: Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+        json!({ "id": id, "type": "response", "ok": true, "result": result })
+    } else {
+        json!({ "id": id, "type": "response", "ok": false, "error": { "code": status, "message": out } })
+    }
+}
+
+/// Parse one client text frame and, if it is a `request`, dispatch it to a response frame. Non-request
+/// frames (client-side keepalives, unknown types) are ignored (`None`).
+async fn ws_handle_text(state: &AppState, txt: &str) -> Option<Value> {
+    let v: Value = serde_json::from_str(txt).ok()?;
+    let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("request");
+    if ty != "request" {
+        return None;
+    }
+    let id = v.get("id").cloned().unwrap_or(Value::Null);
+    let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    if method.is_empty() {
+        return Some(ws_err(id, ErrorCode::InvalidRequest, "missing method"));
+    }
+    let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
+    let token = v.get("token").and_then(|t| t.as_str());
+    Some(ws_dispatch(state, id, method, params, token).await)
+}
+
+/// Drive one `/ws` connection (#369). On connect the client is subscribed to the node's push
+/// stream: the current `sync_status` snapshot is pushed immediately, then every sync event is
+/// forwarded (`{type:"event",...}`) and any resulting sync-status transition is pushed
+/// (`{type:"sync_status",...}`) — a `SyncEvent::Stop` pushes `disconnected`. Client `request`
+/// frames are dispatched to correlated `response` frames. A transport heartbeat + pong-timeout
+/// closes a half-open socket.
+async fn ws_wallet_session(mut socket: WebSocket, state: AppState) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut rx = state.wallet.events().subscribe();
+    let mut bus_open = true;
+
+    // Initial sync-status snapshot so the client can render syncing/synced immediately.
+    let mut last: Option<SyncStatus> = state.wallet.sync_status().await.ok();
+    if let Some(s) = &last {
+        if socket
+            .send(Message::Text(status_push_frame(s).to_string()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let mut ticker = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
+    ticker.tick().await;
+    let mut last_seen = tokio::time::Instant::now();
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if last_seen.elapsed() > WS_PONG_TIMEOUT {
+                    let _ = socket.send(Message::Close(None)).await;
+                    return;
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    return;
+                }
+            }
+            ev = rx.recv(), if bus_open => {
+                match ev {
+                    Ok(event) => {
+                        // Forward the raw sync event (subsumes the SSE stream).
+                        let frame = json!({ "type": "event", "event": event });
+                        if socket.send(Message::Text(frame.to_string())).await.is_err() {
+                            return;
+                        }
+                        // Recompute the tri-state and push on transition; Stop ⇒ disconnected.
+                        let cur = if matches!(event, SyncEvent::Stop) {
+                            SyncStatus {
+                                state: SyncLifecycle::Disconnected,
+                                peak_height: last.as_ref().and_then(|s| s.peak_height),
+                                target_height: last.as_ref().and_then(|s| s.target_height),
+                            }
+                        } else {
+                            state.wallet.sync_status().await.unwrap_or(SyncStatus {
+                                state: SyncLifecycle::Syncing,
+                                peak_height: None,
+                                target_height: None,
+                            })
+                        };
+                        if last.as_ref() != Some(&cur) {
+                            if socket
+                                .send(Message::Text(status_push_frame(&cur).to_string()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            last = Some(cur);
+                        }
+                    }
+                    // A lagging subscriber skips the gap; a closed bus stops the push arm but the
+                    // request/response side keeps serving.
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => { bus_open = false; }
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Text(txt))) => {
+                        last_seen = tokio::time::Instant::now();
+                        if let Some(frame) = ws_handle_text(&state, &txt).await {
+                            if socket.send(Message::Text(frame.to_string())).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        return;
+                    }
+                    Some(Ok(_)) => { last_seen = tokio::time::Instant::now(); }
+                    Some(Err(_)) | None => return,
+                }
+            }
+        }
+    }
 }
 
 // -- Local plaintext content-serve (#289/#290) ---------------------------------------------------
@@ -827,7 +1168,13 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let addr = config.bind_addr();
-    let state = build_state(&config);
+    let state = build_state(&config).await;
+
+    // Grab the wallet backend + mTLS cert before the router consumes `state` (#368): the served
+    // wallet rides the loopback HTTP surface (`POST /{method}`) AND a sibling mTLS 9257 listener
+    // for node-class/Sage-drop-in parity (§5.3 transport).
+    let wallet_backend = state.wallet.clone();
+    let wallet_cert = state.wallet_cert.clone();
 
     // §14 autonomous sync (#213): bring up the L7 peer network — the connected peer
     // pool, the content-location DHT + P2P content engine, PEX, and the chain-watch +
@@ -843,6 +1190,31 @@ where
     // node keeps installing no P2P content — its in-process trust boundary is unchanged.
     if dig_node_core::peer::peer_network_enabled() {
         dig_node_core::peer::spawn_peer_network(state.node.clone());
+    }
+
+    // Best-effort mTLS `9257` listener (#368, Sage byte-parity, node-class clients, §5.3). Binds
+    // loopback only; a bind failure (port in use) is NON-FATAL — the wallet stays reachable over
+    // the plain-HTTP `POST /{method}` surface + the `/ws` transport, which is what the extension
+    // uses. The listener stops when the process exits with the rest of the node.
+    match std::net::TcpListener::bind(("127.0.0.1", DEFAULT_MTLS_PORT)) {
+        Ok(l) => {
+            let _ = l.set_nonblocking(true);
+            let backend = wallet_backend.clone();
+            let cert = wallet_cert.clone();
+            tokio::spawn(async move {
+                if let Err(e) = serve_mtls(backend, l, &cert).await {
+                    eprintln!("dig-node: WARN wallet mTLS listener exited: {e}");
+                }
+            });
+            eprintln!(
+                "dig-node: wallet mTLS (Sage-parity) listening on 127.0.0.1:{DEFAULT_MTLS_PORT}"
+            );
+        }
+        Err(e) => eprintln!(
+            "dig-node: WARN could not bind 127.0.0.1:{DEFAULT_MTLS_PORT} for the wallet mTLS \
+             listener ({e}); node-class Sage-parity clients unavailable (non-fatal). The wallet \
+             is still served on the loopback HTTP surface + /ws."
+        ),
     }
 
     let app = router(state);
