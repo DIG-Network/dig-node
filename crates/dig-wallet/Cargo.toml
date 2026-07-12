@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -92,6 +92,16 @@ dig-keystore = "0.3"
 # trait itself (axum's `Sse<S>` is generic over it) — both tiny, no extra runtime.
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-core = "0.3"
+
+# -- #431/#432 node-managed unlock auth (§18.24) ----------------------------------------
+# TOTP 2FA (RFC-6238) as an optional required second factor on the password unlock. Pure
+# Rust (no OpenSSL): `otpauth` gives the `otpauth://` provisioning URI, `gen_secret` the
+# random secret generator. The secret is sealed at rest under the wallet password via the
+# `dig-keystore` `opaque` container (§18.18) — never stored in plaintext, never logged.
+# (WebAuthn/passkey — SPEC §18.24 — is enrolled behind the same interface; its real
+# `webauthn-rs` ceremony is finalized with the extension origin in the follow-up, since
+# webauthn-rs pulls OpenSSL and the RP/origin is defined by the paired extension #433.)
+totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
 
 [dev-dependencies]
 tempfile = "3"
