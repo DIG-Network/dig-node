@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.25.0] - 2026-07-12
+
+### Features
+- **dig-wallet:** Node-managed unlock auth + per-transaction sign-unlock (#432) (#29)
+
 ## [0.24.0] - 2026-07-12
 
 ### Features
