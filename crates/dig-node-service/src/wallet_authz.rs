@@ -69,6 +69,13 @@ const GATED_WALLET_MUTATIONS: &[&str] = &[
     "set_change_address",
     "save_user_theme",
     "delete_user_theme",
+    // tipping subsystem mutations (#378, SPEC §18.23): they change persisted config or SPEND real
+    // mainnet $DIG, so they require the master/paired token. The tip READS (`tip.get_config`,
+    // `tip.get_ledger`) are open (the read plane, §7.2).
+    "tip.set_config",
+    "tip.manual",
+    "tip.notify_consumed",
+    "tip.dev_tick",
 ];
 
 /// The authorization class of a JSON-RPC method w.r.t. the wallet surface (§7.12).
@@ -211,6 +218,33 @@ mod tests {
                 !authorize(m, Some("revoked-token-not-in-store"), MASTER, is_paired),
                 "{m}: revoked token"
             );
+        }
+    }
+
+    #[test]
+    fn tip_mutations_are_gated_and_tip_reads_are_open() {
+        // Money-spending / state-changing tip methods are gated (#378).
+        for m in [
+            "tip.set_config",
+            "tip.manual",
+            "tip.notify_consumed",
+            "tip.dev_tick",
+        ] {
+            assert_eq!(classify(m), WalletMethodClass::Mutation, "{m}");
+            assert!(requires_authorization(m), "{m} must be gated");
+            assert!(
+                !authorize(m, None, MASTER, is_paired),
+                "{m}: no token denied"
+            );
+            assert!(
+                authorize(m, Some(PAIRED), MASTER, is_paired),
+                "{m}: paired ok"
+            );
+        }
+        // Tip reads follow the read plane — open.
+        for m in ["tip.get_config", "tip.get_ledger"] {
+            assert_eq!(classify(m), WalletMethodClass::Other, "{m}");
+            assert!(!requires_authorization(m), "{m} is a read");
         }
     }
 

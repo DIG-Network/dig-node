@@ -22,6 +22,7 @@ use super::db::WalletDb;
 use super::events::EventBus;
 use super::fallback::EmptyFallback;
 use super::rpc::{WalletBackend, WalletConfig};
+use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
 
 /// A fully-assembled, ready-to-serve wallet: the dispatch backend, the shared event bus the WS
@@ -49,11 +50,29 @@ impl WalletService {
         let events = Arc::new(EventBus::default());
         let db = open_db(config_dir).await;
         let custody = WalletCustody::mainnet(seed_path(config_dir));
-        let backend = Arc::new(
-            WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
-                .with_events(events.clone())
-                .with_custody(custody),
+        let tip_events = Arc::new(TipEventBus::default());
+        // The base backend WITHOUT the tipping engine attached — cloned into the tip spender so the
+        // spender's backend handle has `tipping == None` (no reference cycle engine↔backend). Both
+        // share the SAME inner Arcs (db/custody/events/tip_events), so a runtime `wallet.unlock` is
+        // visible to the spender.
+        let base = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_events(events.clone())
+            .with_custody(custody)
+            .with_tip_events(tip_events.clone());
+        // The tip subsystem (#378). Offline-safe: the owner resolver is a lazy coinset.org client
+        // (no network at construction), and the spender carries NO broadcaster yet — so on the
+        // shipped node a tip cleanly reports NotExecutable (nothing is spent) until the wallet
+        // spend path's live sync/lineage/broadcaster lands (SPEC §18.12). The config/ledger/RPC/WS
+        // surface is fully live now for the extension (#379/#380) to build against.
+        let spender = NodeTipSpender::new(Arc::new(base.clone()), None);
+        let tipping = TippingEngine::load(
+            config_dir,
+            Box::new(ChainOwnerResolver::mainnet()),
+            Box::new(spender),
+            Box::new(SystemClock),
+            tip_events,
         );
+        let backend = Arc::new(base.with_tipping(Arc::new(tipping)));
         // A generated shared cert is fine for a loopback listener: whoever can reach the loopback
         // mTLS port and present the matching cert is a local node-class client. A persisted cert
         // (so a separate node-class process can read it) is the follow-up when that client lands.
@@ -141,6 +160,41 @@ mod tests {
             Arc::as_ptr(svc.backend.events()),
             Arc::as_ptr(&svc.events)
         ));
+    }
+
+    /// **Proves (#378):** the served backend carries the tipping subsystem — `tip.get_config`
+    /// answers with creator + dev BOTH DEFAULT-ON, and `tip.dev_tick` on the offline-safe shipped
+    /// bring-up (no broadcaster wired yet) cleanly SKIPS as wallet-unavailable — never spends, never
+    /// errors. No network is touched.
+    #[tokio::test]
+    async fn build_serves_the_tipping_subsystem() {
+        let dir = scratch();
+        let svc = WalletService::build(&dir).await;
+
+        let (status, body) = svc.backend.dispatch("tip.get_config", "{}").await;
+        assert_eq!(status, 200, "{body}");
+        let cfg: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            cfg["creator"]["enabled"], true,
+            "creator auto-tip DEFAULT-ON"
+        );
+        assert_eq!(
+            cfg["dev"]["enabled"], true,
+            "dev tip DEFAULT-ON (real treasury recipient)"
+        );
+
+        // The dev tip cleanly skips (no broadcaster on the offline-safe bring-up) — never a spend.
+        let (status, body) = svc.backend.dispatch("tip.dev_tick", "{}").await;
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("skipped") && body.contains("wallet-unavailable"),
+            "dev tip must skip cleanly when no broadcaster is wired: {body}"
+        );
+
+        // The tip ledger starts empty (a rolled-back NotExecutable leaves no reservation).
+        let (status, body) = svc.backend.dispatch("tip.get_ledger", "{}").await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body.trim(), "[]");
     }
 
     /// **Proves:** the DB persists across two builds over the same dir (a created wallet is still

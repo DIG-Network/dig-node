@@ -74,6 +74,7 @@ pub mod singleton;
 pub mod spend;
 pub mod sync;
 pub mod themes;
+pub mod tipping;
 pub mod transport;
 pub mod types;
 

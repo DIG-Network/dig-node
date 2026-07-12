@@ -877,6 +877,10 @@ async fn ws_wallet_session(mut socket: WebSocket, state: AppState) {
 
     let mut rx = state.wallet.events().subscribe();
     let mut bus_open = true;
+    // The tip-event stream (#378): a DISTINCT bus from the Sage `SyncEvent` bus, forwarded as
+    // `{type:"tip", tip:<entry>}` frames (SPEC §4.8) so tip pushes never pollute the Sage stream.
+    let mut tip_rx = state.wallet.tip_events().subscribe();
+    let mut tip_open = true;
 
     // Initial sync-status snapshot so the client can render syncing/synced immediately.
     let mut last: Option<SyncStatus> = state.wallet.sync_status().await.ok();
@@ -942,6 +946,18 @@ async fn ws_wallet_session(mut socket: WebSocket, state: AppState) {
                     // request/response side keeps serving.
                     Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => { bus_open = false; }
+                }
+            }
+            tev = tip_rx.recv(), if tip_open => {
+                match tev {
+                    Ok(tip) => {
+                        let frame = json!({ "type": "tip", "tip": tip.entry });
+                        if socket.send(Message::Text(frame.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => { tip_open = false; }
                 }
             }
             msg = socket.recv() => {

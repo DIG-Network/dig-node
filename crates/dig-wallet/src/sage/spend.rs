@@ -1010,4 +1010,77 @@ mod tests {
             "simulator must accept the signed CAT send"
         );
     }
+
+    /// The TIP spend path (#378), mainnet-safe: build a $DIG-style CAT tip to a store OWNER puzzle
+    /// hash, validate (dig-clvm), sign, and route through the [`Broadcaster`] seam using a
+    /// [`MockBroadcaster`] — which RECORDS the bundle and NEVER sends it. Also asserts the real
+    /// simulator accepts the SAME signed bundle (so the recorded tip is a valid on-chain spend),
+    /// and that it pays the owner the tip amount. This is the "spend build + mocked broadcaster"
+    /// proof: no live mainnet broadcast is ever reached from a test.
+    #[tokio::test]
+    async fn dig_tip_cat_send_records_via_mock_broadcaster_never_sends() {
+        use chia_wallet_sdk::driver::Cat as SdkCat;
+
+        let mut sim = Simulator::new();
+        let alice = sim.bls(1_000);
+        let signer = signer_for(alice.sk.clone());
+        let alice_p2 = StandardLayer::new(alice.pk);
+        let ctx = &mut SpendContext::new();
+
+        let memos = ctx.hint(alice.puzzle_hash).unwrap();
+        let (issue, cats) = SdkCat::issue_with_coin(
+            ctx,
+            alice.coin.coin_id(),
+            1_000,
+            Conditions::new().create_coin(alice.puzzle_hash, 1_000, memos),
+        )
+        .unwrap();
+        alice_p2.spend(ctx, alice.coin, issue).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&alice.sk))
+            .unwrap();
+        let cat0 = cats[0];
+
+        // A tip of 100 base units to the store OWNER puzzle hash (hinted so the owner's wallet sees it).
+        let owner_ph = Bytes32::new([7; 32]);
+        let tip: u64 = 100;
+        let coin_spends = build_cat_send(
+            &signer,
+            &[cat0],
+            owner_ph,
+            tip,
+            alice.puzzle_hash,
+            true,
+            0,
+            &[],
+        )
+        .unwrap();
+
+        // dig-clvm validates the tip (fail-closed). The created CAT coin's puzzle hash is the
+        // CAT-layer-wrapped hash of the owner p2 (not the bare owner ph), so assert the tip-AMOUNT
+        // output coin exists (the recipient is `owner_ph` by construction — `dest` above — and it
+        // is hinted so the owner's wallet attributes it).
+        let result = run_and_validate(&coin_spends).unwrap();
+        assert!(
+            result.additions.iter().any(|a| a.amount == tip),
+            "the tip must create an output coin of the tip amount"
+        );
+
+        let signature = signer.sign(&coin_spends).unwrap();
+        let bundle = SpendBundle::new(coin_spends, signature);
+
+        // Route through the Broadcaster seam with a MockBroadcaster: it RECORDS, never sends.
+        let mock = MockBroadcaster::default();
+        mock.broadcast(&bundle).await.unwrap();
+        assert_eq!(
+            mock.sent.lock().unwrap().len(),
+            1,
+            "the tip bundle is recorded by the mock, not sent to any network"
+        );
+
+        // The recorded bundle is a valid on-chain spend (real simulator consensus, incl. BLS).
+        assert!(
+            sim.new_transaction(bundle).is_ok(),
+            "the tip spend must be a valid, broadcastable bundle"
+        );
+    }
 }
