@@ -174,6 +174,23 @@ async fn serves_index_html_decrypted_with_headers_and_injected_base() {
         "served HTML carries the store CSP"
     );
 
+    // Serve-metadata headers (#486).
+    assert_eq!(h.get("x-dig-store-id").unwrap(), &store.to_hex());
+    assert_eq!(
+        h.get("x-dig-capsule").unwrap(),
+        &format!("{}:{}", store.to_hex(), root.to_hex())
+    );
+    assert_eq!(h.get("x-dig-resource-key").unwrap(), "index.html");
+    // The fixture module embeds a PublicManifest (single commit) → generation 0, a LOCAL-only lookup
+    // unaffected by the pin being off.
+    assert_eq!(h.get("x-dig-generation").unwrap(), "0");
+    // The pin is OFF ⇒ no chain read ran ⇒ the owner is genuinely unknowable → OMITTED, never a
+    // placeholder.
+    assert!(
+        h.get("x-dig-owner-puzzle-hash").is_none(),
+        "owner is unknowable with the pin off — must be omitted, not guessed"
+    );
+
     let body = resp.text().await.unwrap();
     assert!(body.contains("hello dig"), "the HTML was decrypted: {body}");
     assert!(
@@ -209,6 +226,15 @@ async fn serves_js_asset_verbatim_without_html_injection() {
         .to_str()
         .unwrap()
         .starts_with("text/javascript"));
+    // Serve-metadata (#486): the resource key reports the ACTUAL asset served, not a default.
+    assert_eq!(
+        resp.headers().get("x-dig-resource-key").unwrap(),
+        "assets/app.js"
+    );
+    assert_eq!(
+        resp.headers().get("x-dig-store-id").unwrap(),
+        &store.to_hex()
+    );
     let body = resp.text().await.unwrap();
     assert_eq!(body, "console.log(1)");
     assert!(!body.contains("<base"), "no HTML injection on a JS asset");
@@ -242,6 +268,12 @@ async fn spa_route_falls_back_to_index_html() {
         .to_str()
         .unwrap()
         .starts_with("text/html"));
+    // Serve-metadata (#486): the resource key reports what was ACTUALLY served (the SPA fallback
+    // index.html), never the miss path (`dashboard/settings`) that triggered it.
+    assert_eq!(
+        resp.headers().get("x-dig-resource-key").unwrap(),
+        "index.html"
+    );
     let body = resp.text().await.unwrap();
     assert!(
         body.contains("hello dig"),
@@ -273,6 +305,60 @@ async fn missing_static_asset_is_an_honest_404() {
         .to_str()
         .unwrap()
         .starts_with("text/html"));
+    // Serve-metadata (#486): NONE of the 5 headers appear on an unresolved/non-served response — no
+    // empty placeholder, the headers simply do not exist.
+    for name in [
+        "x-dig-store-id",
+        "x-dig-owner-puzzle-hash",
+        "x-dig-generation",
+        "x-dig-capsule",
+        "x-dig-resource-key",
+    ] {
+        assert!(
+            resp.headers().get(name).is_none(),
+            "a 404 must carry no serve-metadata header, found {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn head_request_returns_the_same_serve_metadata_headers_with_no_body() {
+    // #486: a HEAD request must carry the identical serve-metadata + provenance headers as the
+    // equivalent GET, but with an empty body (axum dispatches HEAD to the registered GET route and
+    // strips the body — no separate HEAD handler is needed).
+    let (store, files) = store_and_files();
+    let (root, module) = compile_public_module(store, &files);
+    let upstream = mock_upstream_all_miss().await;
+    let (addr, cache, _hold) = start_server(&upstream).await;
+    seed_module(&cache, &store.to_hex(), &root.to_hex(), &module);
+
+    let url = format!(
+        "http://{addr}/s/{}:{}/index.html",
+        store.to_hex(),
+        root.to_hex()
+    );
+    let resp = reqwest::Client::new().head(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let h = resp.headers();
+    assert!(h
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert_eq!(h.get("x-dig-source").unwrap(), "local");
+    assert_eq!(h.get("x-dig-root").unwrap(), &root.to_hex());
+    assert_eq!(h.get("x-dig-store-id").unwrap(), &store.to_hex());
+    assert_eq!(
+        h.get("x-dig-capsule").unwrap(),
+        &format!("{}:{}", store.to_hex(), root.to_hex())
+    );
+    assert_eq!(h.get("x-dig-resource-key").unwrap(), "index.html");
+    assert_eq!(h.get("x-dig-generation").unwrap(), "0");
+
+    let body = resp.bytes().await.unwrap();
+    assert!(body.is_empty(), "a HEAD response must carry no body");
 }
 
 #[tokio::test]

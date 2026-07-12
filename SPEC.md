@@ -406,6 +406,24 @@ verified server-side — `false` only when the node-side pin is disabled via `DI
 `X-Dig-Root: <root>` (the resolved root served against), and `X-Dig-Source: local|peer|rpc` (the tier
 that served the MAIN resource). A consumer's DIG Shields / toolbar reads these.
 
+**Serve-metadata headers (every serve, #486).** Alongside the provenance set, every served resource
+carries: `X-Dig-Store-Id: <64-hex>` (the storeId serving this resource); `X-Dig-Owner-Puzzle-Hash:
+<64-hex>` — the store's on-chain OWNER puzzle hash, resolved from the SAME chain read as the
+anchored-root pin (§14.4) with no extra coinset call; **THE gate for tippability** — a consumer treats
+a response carrying this header as tippable, one carrying no header as not; `X-Dig-Generation: <n>` —
+the 0-based commit ordinal that last wrote the resource, per the store's embedded `PublicManifest`
+(§5.5.1), a local-only lookup (never a chain call); `X-Dig-Capsule: <storeId:root>` — the capsule id
+(the canonical `storeId:rootHash` pairing); `X-Dig-Resource-Key: <key>` — the resource/retrieval key of
+the served resource (a bare/empty request normalizes to `index.html`, the resolved default view, never
+an empty header value). All five describe the MAIN resource served; a value that is unknowable —
+`X-Dig-Owner-Puzzle-Hash` when the chain-anchored pin did not run (`DIG_NODE_PIN=off`) or the resolver
+could not supply it, `X-Dig-Generation` when the module carries no `PublicManifest` (an older `.dig` or
+a private store) or lists no entry for the exact key — is OMITTED, never an empty placeholder. These
+headers are attached ONLY on a genuine served resource (never on an error/`404`/non-DIG response), and
+are present identically on a `HEAD` request to the same route (axum dispatches `HEAD` to the
+registered `GET` handler and strips the body, so the full header set arrives with no body — no
+separate HEAD code path).
+
 **Local-first store cache (#290).** Resolution order per `(store, root)`:
 1. a synced+verified `.dig` module on disk → serve LOCAL, no network (the DEFAULT once cached);
 2. not held → serve the immediate resource from a peer / the public RPC AND trigger a single-flight

@@ -83,13 +83,24 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      # Runs the whole workspace test suite AND measures line coverage in a single
-      # instrumented build. Coverage is measure-only for now (reported in the log +
-      # summary, NOT gated) — the ≥80% floor is tracked separately (#157). Raising the
-      # gate here is a one-line change: add `--fail-under-lines 80`.
-      - name: cargo llvm-cov (test + coverage)
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # cargo-nextest drives the whole workspace test suite, WITH `--retries 2` so a flaky
+      # test gets a second chance before failing the job (#489) instead of blocking a
+      # release on a false negative; nextest surfaces a retried-but-passed test distinctly
+      # (flaky, not a silent pass) in its run summary. `cargo llvm-cov nextest` runs nextest
+      # itself through the SAME instrumented build so coverage is still collected —
+      # running nextest and llvm-cov as two separate steps collects NO coverage at all, so
+      # this must stay one combined invocation. Coverage is measure-only for now (reported,
+      # NOT gated) — the ≥80% floor across the whole workspace (CLI/service-shell files in
+      # particular) is tracked separately; raising the gate here is a one-line addition of
+      # `--fail-under-lines 80`.
+      - name: cargo llvm-cov nextest (test + coverage, flaky-retried)
         run: |
-          cargo llvm-cov --workspace --locked --summary-only | tee coverage-summary.txt
+          cargo llvm-cov nextest --workspace --locked --retries 2 --summary-only | tee coverage-summary.txt
 
       - name: Coverage summary to job summary
         if: always()

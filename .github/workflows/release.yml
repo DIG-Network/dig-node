@@ -40,6 +40,13 @@ name: Release dig-node
 # if/when an arm64-Linux consumer appears (would need vendored/cross OpenSSL).
 #
 # A push to main also builds (no publish) so a broken build is caught before tagging.
+#
+# The `check` gate below runs fmt + clippy ONLY (#489) — it deliberately does NOT re-run the
+# test suite. The PR's own required CI (`ci.yml`) already ran fmt/clippy/tests/coverage against
+# this exact merged tree before merge (§2.4a); re-running `cargo test` here on the tag/main-push
+# path added nothing but a second chance for a flaky test to block a release that had already
+# passed its gate once (the #488 v1.96.0 incident). fmt/clippy stay: they are deterministic
+# (never flaky) and are a cheap fail-fast before spending 4 platforms' worth of build minutes.
 
 on:
   push:
@@ -69,11 +76,11 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Gate: fmt + clippy + tests on Linux, once. A tag that doesn't pass the gate
-  # never produces release binaries.
+  # Gate: fmt + clippy on Linux, once. A tag that doesn't pass the gate never
+  # produces release binaries. No test re-run here — see the header comment (#489).
   # ---------------------------------------------------------------------------
   check:
-    name: fmt + clippy + test
+    name: fmt + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

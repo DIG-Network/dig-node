@@ -1054,7 +1054,18 @@ async fn serve_resource(state: &AppState, sp: StorePath) -> Response {
             root_hex,
             verified,
             source,
-        } => served_response(&sp, &sp.resource, bytes, &root_hex, verified, source),
+            owner_puzzle_hash,
+            generation,
+        } => served_response(
+            &sp,
+            &sp.resource,
+            bytes,
+            &root_hex,
+            verified,
+            source,
+            owner_puzzle_hash.as_deref(),
+            generation,
+        ),
         PlaintextOutcome::NotFound { root_hex } => serve_miss(state, &sp, &root_hex).await,
         PlaintextOutcome::InvalidParams { message } => {
             error_response(StatusCode::BAD_REQUEST, &message)
@@ -1093,14 +1104,35 @@ async fn serve_miss(state: &AppState, sp: &StorePath, root_hex: &str) -> Respons
             root_hex,
             verified,
             source,
-        } => served_response(sp, "index.html", bytes, &root_hex, verified, source),
+            owner_puzzle_hash,
+            generation,
+        } => served_response(
+            sp,
+            "index.html",
+            bytes,
+            &root_hex,
+            verified,
+            source,
+            owner_puzzle_hash.as_deref(),
+            generation,
+        ),
         _ => not_found(),
     }
 }
 
 /// Build the `200` response for a served resource: the ecosystem content-type + `nosniff`, the
-/// `X-Dig-Verified`/`X-Dig-Root`/`X-Dig-Source` provenance headers (#292), and — for HTML — the
-/// injected store-root `<base>`/`<meta referrer>` plus the hardened store CSP.
+/// `X-Dig-Verified`/`X-Dig-Root`/`X-Dig-Source` provenance headers (#292), the serve-metadata HEAD
+/// (#486: `X-Dig-Store-Id`/`X-Dig-Capsule`/`X-Dig-Resource-Key` always, `X-Dig-Owner-Puzzle-Hash`/
+/// `X-Dig-Generation` when resolvable), and — for HTML — the injected store-root
+/// `<base>`/`<meta referrer>` plus the hardened store CSP.
+///
+/// The serve-metadata headers describe THIS response's MAIN resource; a HEAD request lands on the
+/// SAME handler (axum dispatches `HEAD` to the registered `GET` route and strips the body), so the
+/// full header set is present with an empty body — no separate HEAD code path is needed.
+///
+/// `owner_puzzle_hash`/`generation` are OMITTED (not an empty placeholder) when unknowable — see
+/// [`PlaintextOutcome::Served`]'s field docs.
+#[allow(clippy::too_many_arguments)]
 fn served_response(
     sp: &StorePath,
     resource: &str,
@@ -1108,15 +1140,33 @@ fn served_response(
     root_hex: &str,
     verified: bool,
     source: ServeSource,
+    owner_puzzle_hash: Option<&str>,
+    generation: Option<u64>,
 ) -> Response {
     let content_type = content_type_for(resource);
+    // The MAIN resource actually served: an empty key (a bare store-root request) resolved to the
+    // default view `index.html` internally, so the header reports that, never a blank string.
+    let resource_key = if resource.is_empty() {
+        "index.html"
+    } else {
+        resource
+    };
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header("X-Content-Type-Options", "nosniff")
         .header("X-Dig-Verified", if verified { "true" } else { "false" })
         .header("X-Dig-Root", root_hex)
-        .header("X-Dig-Source", source.as_str());
+        .header("X-Dig-Source", source.as_str())
+        .header("X-Dig-Store-Id", sp.store_id.as_str())
+        .header("X-Dig-Capsule", format!("{}:{}", sp.store_id, root_hex))
+        .header("X-Dig-Resource-Key", resource_key);
+    if let Some(owner) = owner_puzzle_hash {
+        builder = builder.header("X-Dig-Owner-Puzzle-Hash", owner);
+    }
+    if let Some(gen) = generation {
+        builder = builder.header("X-Dig-Generation", gen.to_string());
+    }
 
     let body = if is_html(content_type) {
         builder = builder.header(header::CONTENT_SECURITY_POLICY, STORE_CSP);
