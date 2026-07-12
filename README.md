@@ -381,7 +381,7 @@ USER_JOURNEY.md   the dig-node user/operator/agent journey, surfaces, and ecosys
 
 - **Docs:** [https://docs.dig.net/docs/run-a-node](https://docs.dig.net/docs/run-a-node) — running a
   local `dig-node` (install, configure, point a client at it).
-- **Discord:** [https://discord.gg/dignetwork](https://discord.gg/dignetwork) — questions, help, and
+- **Discord:** [https://discord.gg/v78aygUZt](https://discord.gg/v78aygUZt) — questions, help, and
   the rest of the DIG Network community.
 
 ## License
