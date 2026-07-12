@@ -91,6 +91,16 @@ pub struct WalletBackend {
     /// runtime (#368 runtime signer load) — not only from a signer injected once at construction.
     /// `None` on the test/simulator path (which injects a fixed signer via [`Self::with_signer`]).
     custody: Option<WalletCustody>,
+    /// The tipping subsystem (#378), attached at bring-up ([`Self::with_tipping`]). `None` disables
+    /// the `tip.*` methods (the transport reports them unavailable). The engine holds the persisted
+    /// config + ledger, the owner resolver, and the tip spender.
+    tipping: Option<Arc<super::tipping::TippingEngine>>,
+    /// The tip-event bus WS sessions subscribe to for `{type:"tip"}` pushes (SPEC §4.8). ALWAYS
+    /// present (a default empty bus is a harmless no-op) so `/ws` always has somewhere to subscribe;
+    /// [`Self::with_tip_events`] shares the SAME bus the attached [`super::tipping::TippingEngine`]
+    /// publishes to. DISTINCT from [`Self::events`] so tip events never leak into the Sage-parity
+    /// `SyncEvent` stream.
+    tip_events: Arc<super::tipping::TipEventBus>,
 }
 
 /// The connected client's PUBLIC identity for a session (#407). Scoping data only — no key.
@@ -118,7 +128,34 @@ impl WalletBackend {
             events: Arc::new(EventBus::default()),
             identity: Arc::new(RwLock::new(None)),
             custody: None,
+            tipping: None,
+            tip_events: Arc::new(super::tipping::TipEventBus::default()),
         }
+    }
+
+    /// Attach the tipping subsystem (#378) — enables the `tip.*` methods. The engine should be
+    /// constructed with the SAME [`super::tipping::TipEventBus`] passed to [`Self::with_tip_events`]
+    /// so its tip pushes reach `/ws` subscribers.
+    pub fn with_tipping(mut self, tipping: Arc<super::tipping::TippingEngine>) -> Self {
+        self.tipping = Some(tipping);
+        self
+    }
+
+    /// Share the tip-event bus the WS transport subscribes to (must be the same bus the attached
+    /// [`super::tipping::TippingEngine`] publishes to).
+    pub fn with_tip_events(mut self, bus: Arc<super::tipping::TipEventBus>) -> Self {
+        self.tip_events = bus;
+        self
+    }
+
+    /// The tipping subsystem, if attached (#378).
+    pub fn tipping(&self) -> Option<&Arc<super::tipping::TippingEngine>> {
+        self.tipping.as_ref()
+    }
+
+    /// The tip-event bus `/ws` subscribes to for `{type:"tip"}` pushes (SPEC §4.8).
+    pub fn tip_events(&self) -> &Arc<super::tipping::TipEventBus> {
+        &self.tip_events
     }
 
     /// Attach the node-custodied signing keys (enables spend building + signing).
@@ -947,6 +984,93 @@ impl WalletBackend {
             summary,
             coin_spends: coin_spends_json,
         })
+    }
+
+    /// Build+sign+validate+broadcast a $DIG tip of `amount` base units to `recipient`, reusing the
+    /// canonical `send_cat` path (coin selection + [`spend::build_cat_send`] = `Cat::spend_all`,
+    /// never hand-rolled CLVM). The tipping engine (#378) drives this — it passes its OWN broadcaster
+    /// so the backend's `broadcaster` field (unset on the shipped node) is bypassed and enabling
+    /// tips never enables live broadcast for the whole wallet surface.
+    ///
+    /// Fail-closed contract (see [`super::tipping::TipSpender`]): definitively PRE-broadcast
+    /// conditions (locked wallet / no lineage / insufficient $DIG / build or validation failure)
+    /// return [`TipSpendOutcome::NotExecutable`] (retryable — no money moved); the ONLY money-moving
+    /// step is `broadcaster.broadcast`, whose error propagates as `Err` (ambiguous — the engine keeps
+    /// the reservation and does not retry that day).
+    pub async fn build_and_broadcast_dig_tip(
+        &self,
+        recipient: Bytes32,
+        amount: u64,
+        fee: u64,
+        broadcaster: &dyn Broadcaster,
+    ) -> Result<super::tipping::TipSpendOutcome> {
+        use super::tipping::TipSpendOutcome;
+        // Signer (node custody). A locked wallet is retryable, not a spend failure.
+        let Some(signer) = self.current_signer() else {
+            return Ok(TipSpendOutcome::NotExecutable {
+                reason: "wallet is locked".into(),
+            });
+        };
+        // CAT-send needs a lineage source to resolve input coins; absent ⇒ not-yet-synced.
+        if self.lineage.is_none() {
+            return Ok(TipSpendOutcome::NotExecutable {
+                reason: "no lineage source (wallet not synced)".into(),
+            });
+        }
+        let asset_hex = hex::encode(digstore_chain::dig::DIG_ASSET_ID);
+        let (cats, xch_fee_coins) = match self.select_cats(&asset_hex, amount, fee).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(TipSpendOutcome::NotExecutable {
+                    reason: format!("cannot select $DIG coins: {e}"),
+                })
+            }
+        };
+        let change = match self.change_ph() {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(TipSpendOutcome::NotExecutable {
+                    reason: format!("no change address: {e}"),
+                })
+            }
+        };
+        // Build + validate (dig-clvm, fail-closed) — all PRE-broadcast, so a failure is retryable.
+        let coin_spends = match spend::build_cat_send(
+            signer.as_ref(),
+            &cats,
+            recipient,
+            amount,
+            change,
+            true, // hint the recipient so their wallet sees the tip
+            fee,
+            &xch_fee_coins,
+        ) {
+            Ok(cs) => cs,
+            Err(e) => {
+                return Ok(TipSpendOutcome::NotExecutable {
+                    reason: format!("tip build failed: {e}"),
+                })
+            }
+        };
+        if let Err(e) = spend::run_and_validate(&coin_spends) {
+            return Ok(TipSpendOutcome::NotExecutable {
+                reason: format!("tip validation failed: {e}"),
+            });
+        }
+        let sig = match signer.sign(&coin_spends) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(TipSpendOutcome::NotExecutable {
+                    reason: format!("tip signing failed: {e}"),
+                })
+            }
+        };
+        let bundle = SpendBundle::new(coin_spends, sig);
+        let txid = hex::encode(bundle.name());
+        // The ONLY money-moving step. An error here is AMBIGUOUS → propagate (the engine keeps the
+        // reservation, never retries that day).
+        broadcaster.broadcast(&bundle).await?;
+        Ok(TipSpendOutcome::Broadcast { txid })
     }
 
     async fn send_xch(&self, req: &SendXch) -> Result<TransactionResponse> {
@@ -2148,6 +2272,10 @@ impl WalletBackend {
                 let r = req!(SetChangeAddress);
                 json(self.set_change_address(&r).await?)?
             }
+            // The tipping subsystem (#378): tip.get_config / set_config / get_ledger / manual /
+            // notify_consumed / dev_tick. Reachable only when the engine is attached
+            // ([`Self::with_tipping`]); mutations are paired-token gated by the transport (§7.12).
+            m if m.starts_with("tip.") => self.dispatch_tip(m, body).await?,
             // The node-custodied seed lifecycle (#370/#368): create/import/restore/unlock/lock/
             // status/delete. Reachable only when custody is attached ([`Self::with_custody`]);
             // authorization is the transport's concern (the paired-token gate, SPEC §7.12).
@@ -2229,6 +2357,64 @@ impl WalletBackend {
                 custody.delete(&parse_pw()?.password)?;
                 json(serde_json::json!({ "state": "none" }))
             }
+            other => Err(Error::not_found(format!(
+                "unknown or unsupported method: {other}"
+            ))),
+        }
+    }
+
+    /// Dispatch a `tip.*` method to the attached tipping engine (#378). A node without the engine
+    /// attached reports the method unavailable. Reads (`get_config`/`get_ledger`) are open; the
+    /// mutations (`set_config`/`manual`/`notify_consumed`/`dev_tick`) are paired-token gated by the
+    /// transport (SPEC §7.12).
+    async fn dispatch_tip(&self, method: &str, body: &str) -> Result<Value> {
+        let engine = self
+            .tipping
+            .as_ref()
+            .ok_or_else(|| Error::not_found("tipping is not enabled on this node"))?;
+        let body_s = if body.trim().is_empty() { "{}" } else { body };
+        #[derive(serde::Deserialize, Default)]
+        struct StoreReq {
+            #[serde(default)]
+            store_id: String,
+        }
+        #[derive(serde::Deserialize, Default)]
+        struct LedgerReq {
+            #[serde(default)]
+            since_ts: Option<u64>,
+        }
+        let parse = |label: &str| -> Result<StoreReq> {
+            serde_json::from_str::<StoreReq>(body_s)
+                .map_err(|e| Error::api(format!("invalid request for {label}: {e}")))
+        };
+        match method {
+            "tip.get_config" => json(engine.get_config().await),
+            "tip.set_config" => {
+                let cfg: super::tipping::TippingConfig = serde_json::from_str(body_s)
+                    .map_err(|e| Error::api(format!("invalid tip.set_config: {e}")))?;
+                engine.set_config(cfg).await?;
+                json(engine.get_config().await)
+            }
+            "tip.get_ledger" => {
+                let r: LedgerReq = serde_json::from_str(body_s)
+                    .map_err(|e| Error::api(format!("invalid tip.get_ledger: {e}")))?;
+                json(engine.get_ledger(r.since_ts).await)
+            }
+            "tip.manual" => {
+                let r = parse("tip.manual")?;
+                if r.store_id.trim().is_empty() {
+                    return Err(Error::api("tip.manual requires store_id"));
+                }
+                json(engine.manual_tip(&r.store_id).await?)
+            }
+            "tip.notify_consumed" => {
+                let r = parse("tip.notify_consumed")?;
+                if r.store_id.trim().is_empty() {
+                    return Err(Error::api("tip.notify_consumed requires store_id"));
+                }
+                json(engine.auto_tip_for_store(&r.store_id).await?)
+            }
+            "tip.dev_tick" => json(engine.dev_daily_tip().await?),
             other => Err(Error::not_found(format!(
                 "unknown or unsupported method: {other}"
             ))),

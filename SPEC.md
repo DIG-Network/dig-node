@@ -529,6 +529,9 @@ Node→client frames:
 - **`event`** (PUSH) — `{ "type":"event", "event": <SyncEvent> }`, where `<SyncEvent>` is the tagged-union
   wire shape of §18.14 (`{"type":"coin_state"}`, `{"type":"stop"}`, …). Every published sync event is
   forwarded to each connected socket (best-effort; a lagging subscriber skips the gap).
+- **`tip`** (PUSH) — `{ "type":"tip", "tip": <tip-ledger-entry> }` (§18.23). Pushed when the tipping
+  subsystem records a tip. Carried on a DEDICATED bus (NOT the Sage `SyncEvent` union), so it never
+  appears on the `GET /events` Sage-parity SSE stream — only on `/ws`.
 
 **Subscription model.** A connected socket is IMPLICITLY subscribed to `sync_status` + `event` pushes for
 its lifetime — the client gets one socket, no explicit subscribe call. A transport ping every ~5s with a
@@ -1783,6 +1786,93 @@ one live backend.
 - **Sync-status snapshot.** `WalletBackend::sync_status()` derives the `{ state, peak_height, target_height }`
   tri-state (`SyncStatus`, `crate::sage::events`) from the wallet DB — `synced` iff the initial catch-up
   completed, else `syncing`; it is the body the `/ws` transport pushes (§4.8) and re-pushes on transition.
+
+## 18.23. Tipping subsystem — owner lookup, auto-tip policy engine, $DIG spend, tip ledger (#377/#378)
+
+The node OWNS tipping: it holds the wallet/keys and builds+signs+broadcasts the $DIG tip spend; a thin
+client (the extension, #379/#380) only CONFIGURES + DISPLAYS it over the WS wallet/control transport
+(§4.8). The client NEVER hand-rolls a tip spend. Implemented in `crate::sage::tipping`
+(`TippingEngine`), attached to the served `WalletBackend` (`with_tipping`).
+
+**Owner-PH lookup.** A store's on-chain OWNER puzzle hash is resolved from its CHIP-0035 singleton
+(the launcher id) via `digstore_chain::singleton::sync_datastore(...).info.owner_puzzle_hash` — the SAME
+DataStore parser the node uses for store sync (never re-parses a singleton by hand). The result is
+cached per store. The chain client is a `digstore_chain::coinset::ChainReads` (coinset.org) behind the
+`OwnerResolver` seam; a `chia-query`-backed `ChainReads` (decentralized peers + coinset fallback — the
+substrate that already backs the coin-read fallback tier, §18.5) is a drop-in.
+
+**Config (`tipping-config.json`, persisted, durable atomic write).** `{ creator: AutoTipPolicy, dev:
+AutoTipPolicy, daily_total_cap, fee }` where `AutoTipPolicy = { enabled, dig_amount, mode, per_site_cap,
+per_site_overrides }` and `mode ∈ { per-site-per-day, daily-budget }`. Amounts are $DIG base units (1
+$DIG = 1000 base units, `DIG_DECIMALS = 3`). **Both creator and dev auto-tip are DEFAULT-ON** (#377) —
+each has a real recipient (the on-chain-resolved store owner / the DIG treasury), so default-on is safe
+paired with the honest-default disclosure + one-click-off (§6.0, #207).
+
+**DIG dev-account daily tip.** The SAME engine, a SEPARATE toggle. Recipient = the **canonical DIG
+treasury inner puzzle hash** — the EXISTING byte-identical shared contract that receives every
+per-capsule $DIG payment (`digstore_chain::dig::treasury_inner_puzzle_hash()`, decoded from
+`TREASURY_ADDRESS` `xch1a37rq3cgcl2ecpudttsf35x75qzdan68lgw2l6ajvmqs44jxdn5qv6pk3y` =
+`ec7c304708c7d59c078d5ae098d0dea004decf47fa1cafebb266c10ad6466ce8`; mirrored byte-identical in chip35 +
+dighub-core). It is sourced from the shared contract (NEVER re-hardcoded, so a payment-critical value can
+never drift into a divergent copy) and is a REAL recipient — so the dev tip is DEFAULT-ON with a small
+default daily amount + the same hard caps. Its CAT spend targets this inner PH exactly as the per-capsule
+payment does (`Cat::spend_all` CAT-wraps it).
+
+**Money-safety invariants (real mainnet $DIG) — FAIL CLOSED.**
+- **Hard caps.** A per-site/day cap (in `per-site-per-day` mode) AND a daily total cap spanning creator +
+  dev. Reserved (`Pending`), `Confirmed`, AND ambiguous-`Failed` amounts all count toward the caps, so an
+  in-flight or unknown-outcome tip can never be double-counted into an over-spend. A tip that would exceed
+  a cap is SKIPPED (`over-per-site-cap` / `over-daily-cap`), never trimmed-and-sent.
+- **Crash-safe idempotency.** At most ONE auto tip per `(kind, owner/site, UTC-day)`. The ledger
+  reservation (a `Pending` entry) is persisted to `tip-ledger.json` IMMEDIATELY BEFORE the broadcast
+  (the only money-moving step). A crash at any point leaves ≤1 reserved entry for that key; on restart the
+  engine (re-loaded from the ledger file) treats the key as already tipped and SKIPS — erring toward
+  under-tipping, never a double-spend. A definitively PRE-broadcast failure (`TipSpendOutcome::NotExecutable`
+  — locked wallet / not-yet-synced / insufficient $DIG) rolls the reservation back (retryable); an
+  AMBIGUOUS broadcast error keeps it as `Failed` (never retried that day).
+- **Fail-closed on unreadable persisted state.** Load distinguishes an ABSENT file (a genuine first run:
+  config → DEFAULT-ON, ledger → empty) from a file that is PRESENT but unreadable/unparseable
+  (locked / corrupt / truncated / forward-incompatible). A present-but-unreadable **ledger** POISONS the
+  engine — EVERY tip (auto + manual) and config mutation is REFUSED (skip `state-unreadable: …`) until the
+  operator resolves the file and restarts — so a corrupt ledger can NEVER reset the cap + idempotency
+  accounting to "empty → tip freely" (an N×cap over-spend / same-day double-spend). A present-but-unreadable
+  **config** never silently falls back to the DEFAULT-ON default: it fails closed to DISABLED (never
+  re-enables an auto-tip the user turned off) and also poisons. `unwrap_or_default()` on the persisted read
+  is forbidden.
+- **Durable writes.** `tip-ledger.json` / `tipping-config.json` are written to a temp file that is
+  `fsync`ed, atomically `rename`d into place, then the parent directory is `fsync`ed (best-effort) — so a
+  crash/power-loss can never leave a truncated/zero-length ledger that would then trip the fail-closed
+  read path.
+
+**The $DIG spend.** `WalletBackend::build_and_broadcast_dig_tip` selects input $DIG CAT coins
+(`asset_id = digstore_chain::dig::DIG_ASSET_ID`) + XCH fee coins, builds via the canonical
+`chia-wallet-sdk` `Cat::spend_all` (`spend::build_cat_send` — never hand-rolled CLVM), validates with
+`dig-clvm` (`DONT_VALIDATE_SIGNATURE`, §18.9, fail-closed), signs with the node-custodied `WalletSigner`,
+and broadcasts through an injected `Broadcaster` (the engine passes its own — so enabling tips does NOT
+enable live broadcast for the whole wallet surface). Unattended auto tips need NO per-op user interaction:
+the standing config consent (enabled + caps) IS the authorization (the honest-default model, §6.0/#207).
+CI NEVER broadcasts to mainnet — tests drive the `chia-sdk-test` simulator + a recording `MockBroadcaster`.
+
+**Method surface (`tip.*`, dispatched by `WalletBackend::dispatch`).** Reads are OPEN; mutations are
+paired-token gated (§7.12, `wallet_authz::GATED_WALLET_MUTATIONS`):
+- `tip.get_config` (read) → the `TippingConfig`.
+- `tip.set_config` (gated) → replace + persist config; returns the stored config.
+- `tip.get_ledger { since_ts? }` (read) → the ledger, newest first (each entry `{ id, recipient_ph,
+  store_id?, dig_amount, ts, day, txid?, trigger: auto|manual, kind: creator|dev, status:
+  pending|confirmed|failed }`).
+- `tip.notify_consumed { store_id }` (gated) → run the creator auto-tip for a consumed store.
+- `tip.dev_tick` (gated) → run the dev-account daily tip (pays the DIG treasury shared contract).
+- `tip.manual { store_id }` (gated) → one-tap manual tip to the store's owner (explicit consent: NOT
+  bounded by the auto caps, NOT subject to the once-per-day idempotency).
+Each returns a `TipOutcome` — `{ result: "tipped", txid, dig_amount, recipient_ph }` or `{ result:
+"skipped", reason }` (stable reason tokens: `disabled`, `owner-unresolved`, `already-tipped-today`,
+`over-per-site-cap`, `over-daily-cap`, `state-unreadable: …`, `wallet-unavailable: …`,
+`spend-failed-not-retried: …`).
+
+**WS push (§4.8 extension).** When a tip is recorded the engine publishes a `TipEvent` on a DEDICATED
+`TipEventBus` (kept OUT of the Sage-parity `SyncEvent` union so tip events never leak into the `GET /events`
+Sage stream). Each `/ws` session forwards it as a `{ "type": "tip", "tip": <ledger-entry> }` push frame,
+alongside the `sync_status` + `event` frames.
 
 ## 19. Peer network — NAT traversal, discovery, address book, and content location
 
