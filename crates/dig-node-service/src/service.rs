@@ -179,7 +179,35 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
     let mut environment = vec![
         ("DIG_NODE_PORT".to_string(), config.port.to_string()),
         ("DIG_RPC_UPSTREAM".to_string(), config.upstream.clone()),
+        // Mark the installed service as a SERVICE run (#501): the running daemon may bootstrap
+        // the machine-wide state dir when absent, whereas a bare CLI never does. On Windows this
+        // is belt-and-suspenders (the SCM `run-service` entrypoint also sets it); on
+        // systemd/launchd this env carries the signal into the unit.
+        (
+            crate::state::RUN_CONTEXT_ENV.to_string(),
+            crate::state::RUN_CONTEXT_SERVICE.to_string(),
+        ),
     ];
+    // HARDEN the machine-wide state dir NOW, as the INSTALLING (interactive) user, per the
+    // #501 contract: owner→SYSTEM, purge foreign ACEs, protected DACL granting SYSTEM +
+    // Administrators full AND this interactive user READ, then readback-verify. Setting the
+    // owner to SYSTEM here means the LocalSystem service's own startup harden later sees a
+    // TRUSTED dir and PRESERVES this interactive read grant (rather than purging it), so the
+    // operator's `dig-node pair` can read the token the service writes. Best-effort + cross-
+    // platform: on a user-level Linux/macOS install the daemon runs as the SAME user, so the
+    // legacy per-user fallback already keeps daemon + CLI in agreement, and a failure to
+    // create/secure `/var/lib/dig-node` (needs root) is expected — the service re-secures it
+    // at startup regardless.
+    if let Some(machine_dir) = crate::state::machine_state_dirs().into_iter().next() {
+        let grant = crate::state::interactive_read_grant();
+        if let Err(e) = crate::state::harden_state_dir(&machine_dir, grant.as_deref()) {
+            eprintln!(
+                "dig-node: WARN could not harden {} during install ({e}); the service will \
+                 re-secure it at startup",
+                machine_dir.display()
+            );
+        }
+    }
     // Only record DIG_NODE_HOST when the operator gave an EXPLICIT override
     // (#288): omitting it lets the installed service resolve the same default the
     // CLI would — bind BOTH loopback families (127.0.0.1 AND [::1], §5.2) —

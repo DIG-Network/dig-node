@@ -25,6 +25,7 @@
 use clap::{Parser, Subcommand};
 use dig_node_service::cli::{error_envelope, success_envelope, ExitCode, Outcome};
 use dig_node_service::config::Config;
+use dig_node_service::open;
 use dig_node_service::pair::{self, PairAction};
 use dig_node_service::{serve, service, VERSION};
 
@@ -70,6 +71,13 @@ enum Command {
         #[command(subcommand)]
         action: Option<PairCommand>,
     },
+    /// Open a DIG link in the default browser (#389). The OS scheme-handler target the
+    /// installer registers for `chia://` + `urn:dig:chia:`. Accepts ONLY those two schemes,
+    /// resolves via the local node's serve URL, and never invokes a shell.
+    Open {
+        /// The DIG link (`chia://<storeId>[:<root>]/<path>` or `urn:dig:chia:<…>`).
+        link: String,
+    },
 }
 
 /// `dig-node pair` sub-actions. With none, lists pending requests + issued tokens.
@@ -100,6 +108,7 @@ impl Command {
             Command::Stop => "stop",
             Command::Status => "status",
             Command::Pair { .. } => "pair",
+            Command::Open { .. } => "open",
         }
     }
 }
@@ -129,6 +138,7 @@ fn main() -> std::process::ExitCode {
             };
             render(pair::run(&config, pair_action), action, json)
         }
+        Command::Open { link } => render(open::run(&config, &link), action, json),
     };
     std::process::ExitCode::from(exit.code())
 }

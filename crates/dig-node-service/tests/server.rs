@@ -142,6 +142,12 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        // Isolate the control-token/paired-token STATE dir per test (#501): without this, on a
+        // host that already has a real machine state dir (`/var/lib/dig-node`, `%PROGRAMDATA%\
+        // DigNode`, …) the server + this test would resolve THAT shared dir instead of the temp
+        // one, losing isolation and clobbering across concurrent tests. DIG_NODE_STATE_DIR (the
+        // designed test/deploy override) pins it to this test's base dir, identity-independently.
+        std::env::set_var("DIG_NODE_STATE_DIR", &base);
         let state = dig_node_service::server::build_state(&config).await;
         // The token the server wrote (read from disk, exactly as a real controller
         // would). config_path() resolves under the temp DIG_NODE_CACHE we just set.
@@ -178,6 +184,12 @@ async fn start_companion_wallet(
         std::fs::create_dir_all(&cache).expect("create test cache dir");
         std::env::set_var("DIG_NODE_CACHE", &cache);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        // Isolate the control-token/paired-token STATE dir per test (#501): without this, on a
+        // host that already has a real machine state dir (`/var/lib/dig-node`, `%PROGRAMDATA%\
+        // DigNode`, …) the server + this test would resolve THAT shared dir instead of the temp
+        // one, losing isolation and clobbering across concurrent tests. DIG_NODE_STATE_DIR (the
+        // designed test/deploy override) pins it to this test's base dir, identity-independently.
+        std::env::set_var("DIG_NODE_STATE_DIR", &base);
         let state = dig_node_service::server::build_state(&config).await;
         let token = dig_node_service::control::load_or_create_token().unwrap();
         let backend = state.wallet_backend();
@@ -426,6 +438,8 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
         let tmp = std::env::temp_dir().join(format!("dig-node-dual-{}", std::process::id()));
         std::env::set_var("DIG_NODE_CACHE", &tmp);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        // Isolate the #501 control-token/paired-token state dir per test (see the note above).
+        std::env::set_var("DIG_NODE_STATE_DIR", &tmp);
         // This test exercises the LISTENER bind fallback, not the peer network. Opt out of the
         // §14 peer-network bring-up (#213) so `serve_with_shutdown` stays hermetic here (no gossip
         // pool / DHT / relay reach). A dedicated test covers the peer-network wiring.
@@ -489,6 +503,8 @@ async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
         let tmp = std::env::temp_dir().join(format!("dig-node-dualstack-{}", std::process::id()));
         std::env::set_var("DIG_NODE_CACHE", &tmp);
         std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        // Isolate the #501 control-token/paired-token state dir per test (see the note above).
+        std::env::set_var("DIG_NODE_STATE_DIR", &tmp);
         std::env::set_var("DIG_PEER_NETWORK", "off");
         tokio::spawn(async move {
             dig_node_service::server::serve_with_shutdown(config, async move {

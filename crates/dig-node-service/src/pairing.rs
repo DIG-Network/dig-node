@@ -58,8 +58,9 @@ use serde_json::{json, Value};
 use crate::control::{control_error, control_ok, ct_eq};
 use crate::meta::ErrorCode;
 
-/// The paired-token store file, beside `config.json` / `control-token` in the
-/// node's config dir.
+/// The paired-token store file, beside `control-token` in the machine-wide state dir
+/// (#501, [`crate::state::state_dir`]) — NOT the per-user config dir — so the daemon
+/// and the operator CLI resolve the SAME store regardless of OS user.
 pub const PAIRED_TOKENS_FILE: &str = "paired-tokens.json";
 
 /// How long a pending pairing request stays valid before it must be re-requested.
@@ -200,7 +201,7 @@ pub fn poll(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> Valu
 /// GATED `control.pairing.list` — the operator's approve view: pending requests
 /// (each with its `pairing_code` + `client_name`) AND the issued controller tokens
 /// (id + client_name + created, NEVER the token value).
-pub fn list(pending: &Mutex<PendingPairings>, config_path: &Path, id: Value) -> Value {
+pub fn list(pending: &Mutex<PendingPairings>, state_dir: &Path, id: Value) -> Value {
     let now = now_ms();
     let mut g = pending.lock().unwrap_or_else(|e| e.into_inner());
     g.prune(now);
@@ -220,7 +221,7 @@ pub fn list(pending: &Mutex<PendingPairings>, config_path: &Path, id: Value) -> 
         .collect();
     pending_list.sort_by(|a, b| a["created_ms"].as_u64().cmp(&b["created_ms"].as_u64()));
 
-    let tokens: Vec<Value> = load_paired_tokens(&paired_tokens_path(config_path))
+    let tokens: Vec<Value> = load_paired_tokens(&paired_tokens_path(state_dir))
         .iter()
         .map(|t| json!({ "id": t.id, "client_name": t.client_name, "created_ms": t.created_ms }))
         .collect();
@@ -232,7 +233,7 @@ pub fn list(pending: &Mutex<PendingPairings>, config_path: &Path, id: Value) -> 
 /// mark the pending entry approved (so the requester's `pairing.poll` returns it).
 pub fn approve(
     pending: &Mutex<PendingPairings>,
-    config_path: &Path,
+    state_dir: &Path,
     id: Value,
     params: &Value,
 ) -> Value {
@@ -265,7 +266,7 @@ pub fn approve(
         client_name: client_name.clone(),
         created_ms: now,
     };
-    if let Err(e) = append_paired_token(&paired_tokens_path(config_path), &record) {
+    if let Err(e) = append_paired_token(&paired_tokens_path(state_dir), &record) {
         return control_error(
             id,
             ErrorCode::ControlError,
@@ -285,7 +286,7 @@ pub fn approve(
 
 /// GATED `control.pairing.revoke { token_id }` — remove an issued token; the gate
 /// rejects it immediately (the file is consulted per request).
-pub fn revoke(config_path: &Path, id: Value, params: &Value) -> Value {
+pub fn revoke(state_dir: &Path, id: Value, params: &Value) -> Value {
     let token_id = params
         .get("token_id")
         .or_else(|| params.get("id"))
@@ -298,7 +299,7 @@ pub fn revoke(config_path: &Path, id: Value, params: &Value) -> Value {
             "control.pairing.revoke requires params.token_id",
         );
     }
-    match revoke_paired_token(&paired_tokens_path(config_path), token_id) {
+    match revoke_paired_token(&paired_tokens_path(state_dir), token_id) {
         Ok(removed) => control_ok(id, json!({ "revoked": removed, "token_id": token_id })),
         Err(e) => control_error(
             id,
@@ -322,12 +323,10 @@ pub struct PairedToken {
     pub created_ms: u64,
 }
 
-/// Path to the paired-token store, given the node's config.json path.
-pub fn paired_tokens_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .map(|p| p.join(PAIRED_TOKENS_FILE))
-        .unwrap_or_else(|| PathBuf::from(PAIRED_TOKENS_FILE))
+/// Path to the paired-token store within the machine-wide state dir (#501). `state_dir`
+/// is [`crate::state::state_dir`] (the same dir the control token lives in).
+pub fn paired_tokens_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(PAIRED_TOKENS_FILE)
 }
 
 /// Load the issued paired tokens (missing/blank/malformed file → empty).
@@ -348,10 +347,11 @@ pub fn load_paired_tokens(path: &Path) -> Vec<PairedToken> {
         .unwrap_or_default()
 }
 
-/// Persist the token list atomically + owner-only.
+/// Persist the token list atomically + owner-only. The state dir is created with a
+/// restrictive ACL (#501) — the paired tokens are as sensitive as the master token.
 fn save_paired_tokens(path: &Path, tokens: &[PairedToken]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        crate::state::ensure_dir_restricted(dir)?;
     }
     let bytes = serde_json::to_vec_pretty(&json!({ "tokens": tokens })).unwrap_or_default();
     crate::control::write_atomic(path, &bytes)?;
@@ -393,6 +393,9 @@ pub fn is_paired_token(path: &Path, presented: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// A unique temp STATE dir (#501: the paired-token store now lives in the state
+    /// dir, not beside a `config.json`). Returns `(state_dir, state_dir)` so both
+    /// tuple bindings point at the dir a test seeds + cleans.
     fn tmp_config() -> (PathBuf, PathBuf) {
         // A process-wide counter makes the dir unique even when two tests build it in
         // the same millisecond (parallel test threads) — otherwise one test's
@@ -407,7 +410,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        (dir.join("config.json"), dir)
+        (dir.clone(), dir)
     }
 
     fn pending() -> Mutex<PendingPairings> {

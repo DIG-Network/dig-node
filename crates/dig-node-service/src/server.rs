@@ -62,8 +62,13 @@ pub struct AppState {
     /// The node's config.json path — where the service's pin registry + upstream
     /// override live (the CONTROL plane reads/writes here).
     config_path: std::path::PathBuf,
+    /// The machine-wide daemon STATE dir (#501) — where the control token +
+    /// `paired-tokens.json` live, resolved IDENTICALLY by the daemon and the operator
+    /// CLI regardless of OS user (see [`crate::state`]). Distinct from `config_path`:
+    /// the bulk per-user cache + `config.json` stay per-user; only the auth state moves here.
+    state_dir: std::path::PathBuf,
     /// The local control token: a same-host controller must present it on every
-    /// `control.*` call. Generated at startup into `<config_dir>/control-token`
+    /// `control.*` call. Generated at startup into `<state_dir>/control-token`
     /// (loopback-only + locally-authorized gate — see [`crate::control`]).
     control_token: String,
     /// Whether authenticated §21 whole-store sync is available (a §21 identity is
@@ -225,7 +230,66 @@ async fn host_guard(req: Request, next: Next) -> Response {
 
 /// Construct the shared state from config: apply the upstream to dig-node's env,
 /// then build the node from the environment (cache dir/cap, §21 identity), and
-/// generate/load the local control token into the node's config dir.
+/// generate/load the local control token into the machine-wide state dir (#501).
+/// Resolve the machine-wide state dir + the control token, applying the #501 hardening on a
+/// SERVICE run and FAILING CLOSED when the machine dir cannot be secured.
+///
+/// - **Service run:** [`crate::state::ensure_service_state_dir`] hardens + readback-verifies
+///   the machine dir (owner→SYSTEM, purge foreign ACEs, protected DACL, no Users/Everyone
+///   ACE) BEFORE the token is written. If it cannot be secured, the node does NOT write the
+///   token there — it falls back to an ephemeral, unshared dir + a random in-memory token so
+///   the control plane is unauthorizable (never served from an attacker-controlled dir).
+/// - **CLI / dev run:** unchanged — resolve (read an existing machine dir, else the legacy
+///   per-user dir), never harden. A persist failure also fails closed to the in-memory token.
+fn resolve_state_dir_and_token() -> (std::path::PathBuf, String) {
+    // The ephemeral fail-closed fallback: an unshared temp dir + a random in-memory token
+    // that nothing can present → the control plane is unauthorizable.
+    let ephemeral = || {
+        let dir =
+            std::env::temp_dir().join(format!("dig-node-control-token-{}", std::process::id()));
+        let token = control::load_or_create_token_at(&dir.join(control::CONTROL_TOKEN_FILE))
+            .unwrap_or_default();
+        (dir, token)
+    };
+
+    if crate::state::running_as_service() {
+        match crate::state::ensure_service_state_dir() {
+            Ok(dir) => {
+                match control::load_or_create_token_at(&dir.join(control::CONTROL_TOKEN_FILE)) {
+                    Ok(token) => (dir, token),
+                    Err(e) => {
+                        eprintln!(
+                            "dig-node: WARN could not persist the control token in the secured \
+                         state dir ({e}); using an in-memory token (control.* unauthorizable)"
+                        );
+                        ephemeral()
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "dig-node: WARN could not secure the machine state dir ({e}); refusing to \
+                     serve the control plane from it — {}",
+                    control::control_token_remedy()
+                );
+                ephemeral()
+            }
+        }
+    } else {
+        let dir = crate::state::state_dir();
+        match control::load_or_create_token() {
+            Ok(token) => (dir, token),
+            Err(e) => {
+                eprintln!(
+                    "dig-node: WARN could not persist control token ({e}); using an in-memory \
+                     token (control.* will be unauthorizable until the state dir is writable)"
+                );
+                ephemeral()
+            }
+        }
+    }
+}
+
 pub async fn build_state(config: &Config) -> AppState {
     config.apply_to_env();
     let node = Node::from_env();
@@ -242,22 +306,16 @@ pub async fn build_state(config: &Config) -> AppState {
         },
     )
     .await;
-    // Generate (or read) the control token into <config_dir>/control-token. A
-    // failure to persist it (e.g. unwritable dir) is non-fatal: fall back to an
-    // in-memory token so the control plane is still gated (a controller that can't
-    // read the file simply can't authorize — fail-closed). The read plane is
-    // unaffected either way.
-    let control_token = control::load_or_create_token().unwrap_or_else(|e| {
-        eprintln!(
-            "dig-node: WARN could not persist control token ({e}); using an in-memory \
-             token (control.* will be unauthorizable until the config dir is writable)"
-        );
-        // A random in-memory token nothing can present → control plane fails closed.
-        control::load_or_create_token_at(
-            &std::env::temp_dir().join(format!("dig-node-control-token-{}", std::process::id())),
-        )
-        .unwrap_or_default()
-    });
+    // Resolve the machine-wide state dir the control token + paired-token store live in
+    // (#501). On a SERVICE run this HARDENS + readback-verifies the machine dir per the
+    // security contract BEFORE the token is written into it (owner→SYSTEM, purge foreign
+    // ACEs, protected DACL, no Users/Everyone ACE) — closing the ProgramData squatting hole
+    // where a low-priv user pre-creates C:\ProgramData\DigNode and keeps CREATOR OWNER /
+    // WRITE_DAC. If the dir cannot be secured, the node MUST NOT write the token there:
+    // it fails closed onto an ephemeral, unshared dir + an in-memory token so the control
+    // plane is unauthorizable rather than served from an attacker-controlled dir. The read
+    // plane is unaffected either way. The CLI (non-service) never hardens — it only reads.
+    let (state_dir, control_token) = resolve_state_dir_and_token();
     AppState {
         node,
         upstream: config.upstream.clone(),
@@ -267,6 +325,7 @@ pub async fn build_state(config: &Config) -> AppState {
             .expect("dig-node: build http client"),
         addr: config.bind_addr(),
         config_path,
+        state_dir,
         control_token,
         // Node::from_env loads/creates the §21.9 identity, enabling authenticated
         // whole-store sync; we report it available and let the per-capsule fetch
@@ -296,6 +355,7 @@ fn control_ctx(state: &AppState) -> ControlCtx {
     ControlCtx {
         node: state.node.clone(),
         config_path: state.config_path.clone(),
+        state_dir: state.state_dir.clone(),
         addr: state.addr.clone(),
         upstream: state.upstream.clone(),
         started: state.started,
@@ -558,7 +618,7 @@ async fn rpc(
         let master_ok = control::is_authorized(&method, presented.as_deref(), &state.control_token);
         let paired_ok = !control::is_pairing_admin_method(&method)
             && presented.as_deref().is_some_and(|tok| {
-                pairing::is_paired_token(&pairing::paired_tokens_path(&state.config_path), tok)
+                pairing::is_paired_token(&pairing::paired_tokens_path(&state.state_dir), tok)
             });
         if !(master_ok || paired_ok) {
             return (
@@ -566,9 +626,13 @@ async fn rpc(
                 Json(control::control_error(
                     id,
                     ErrorCode::Unauthorized,
-                    "control.* requires the local control token (X-Dig-Control-Token \
-                     header or params._control_token, from <config_dir>/control-token), \
-                     or a paired controller token (see `dig-node pair`)",
+                    format!(
+                        "control.* requires the local control token (X-Dig-Control-Token \
+                         header or params._control_token, from {}), or a paired controller \
+                         token (see `dig-node pair`). {}",
+                        control::control_token_path().display(),
+                        control::control_token_remedy()
+                    ),
                 )),
             );
         }
@@ -591,7 +655,7 @@ async fn rpc(
             .get(control::CONTROL_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok());
         let presented = control::presented_token(header_tok, &req);
-        let paired_path = pairing::paired_tokens_path(&state.config_path);
+        let paired_path = pairing::paired_tokens_path(&state.state_dir);
         let authorized =
             wallet_authz::authorize(&method, presented.as_deref(), &state.control_token, |tok| {
                 pairing::is_paired_token(&paired_path, tok)
@@ -714,7 +778,7 @@ fn presented_wallet_token(headers: &HeaderMap, body: &str) -> Option<String> {
 /// Whether a wallet-surface caller presenting `token` is authorized for `method` (§7.12): reads are
 /// open; every custody-lifecycle + mutation method needs the master control token OR a paired token.
 fn wallet_call_authorized(state: &AppState, method: &str, token: Option<&str>) -> bool {
-    let paired_path = pairing::paired_tokens_path(&state.config_path);
+    let paired_path = pairing::paired_tokens_path(&state.state_dir);
     wallet_authz::authorize(method, token, &state.control_token, |t| {
         pairing::is_paired_token(&paired_path, t)
     })
@@ -817,7 +881,7 @@ async fn ws_dispatch(
         let master_ok = control::is_authorized(method, token, &state.control_token);
         let paired_ok = !control::is_pairing_admin_method(method)
             && token.is_some_and(|t| {
-                pairing::is_paired_token(&pairing::paired_tokens_path(&state.config_path), t)
+                pairing::is_paired_token(&pairing::paired_tokens_path(&state.state_dir), t)
             });
         if !(master_ok || paired_ok) {
             return ws_err(

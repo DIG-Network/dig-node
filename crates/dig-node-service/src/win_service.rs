@@ -55,6 +55,15 @@ fn service_main(_args: Vec<OsString>) {
 /// The actual service body: register the control handler, report `Running`, run the
 /// HTTP server until `Stop`, then report `Stopped`.
 fn run_service() -> std::io::Result<()> {
+    // Self-identify as a SERVICE run (#501): this entrypoint is reached ONLY when the Windows
+    // SCM launches the installed service, so it is the authoritative place to mark the process
+    // as a service — the daemon may then bootstrap the machine-wide state dir
+    // (`%PROGRAMDATA%\DigNode`) if the installer did not pre-create it. Belt-and-suspenders with
+    // the same env `install` writes into the service environment.
+    std::env::set_var(
+        crate::state::RUN_CONTEXT_ENV,
+        crate::state::RUN_CONTEXT_SERVICE,
+    );
     let config = Config::from_env();
 
     // Channel the control handler signals on `Stop`; the server's graceful-shutdown

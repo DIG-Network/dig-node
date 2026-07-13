@@ -37,7 +37,11 @@ pub enum PairAction {
 /// `main.rs` maps them to the differentiated exit code.
 pub fn run(config: &Config, action: PairAction) -> std::io::Result<Outcome> {
     let addr = config.bind_addr();
-    let token = control::load_or_create_token()?;
+    // Read the master token WITHOUT minting one (#501): if the running node (a service under a
+    // different OS account) wrote a token this user cannot read, minting a fresh one here would
+    // recreate the exact bug — a token the node never trusts. `load_token_readonly` instead
+    // surfaces the precise service-vs-user remedy (elevate / grant read ACL / start the node).
+    let token = control::load_token_readonly()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

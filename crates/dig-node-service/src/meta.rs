@@ -452,8 +452,8 @@ pub enum ErrorCode {
     /// `-32030` — a `control.*` (CONTROL/admin) method was called without a valid
     /// local control token. The control surface is loopback-only AND locally
     /// authorized: a same-host controller (the DIG Browser "My Node" UI) must read
-    /// the node's control token from its config dir and present it. Read methods
-    /// are NOT gated; only the mutating/management control namespace is. Shell error.
+    /// the node's control token from the machine-wide state dir and present it. Read
+    /// methods are NOT gated; only the mutating/management control namespace is. Shell error.
     /// (Canonical dig-rpc-types §10 code; `-32020` is RESERVED for onion routing.)
     Unauthorized,
     /// `-32031` — a control operation the embedded dig-node cannot perform on this
@@ -710,7 +710,8 @@ pub fn openrpc_document() -> Value {
             let auth_note = if m.requires_auth {
                 " CONTROL method: requires the local control token (loopback-only + \
                   locally authorized — present it as the X-Dig-Control-Token header or \
-                  params._control_token; read it from <config_dir>/control-token)."
+                  params._control_token; read it from the machine-wide state dir's \
+                  control-token file, e.g. via `dig-node pair`)."
             } else {
                 ""
             };

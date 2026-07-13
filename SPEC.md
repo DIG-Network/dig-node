@@ -761,20 +761,120 @@ token is NOT accepted for them.
 
 ### 7.3. The control token
 
-- File: `<config_dir>/control-token`, where `<config_dir>` is the parent of the read path's
-  `config.json`.
+- **File: `<state_dir>/control-token`** (§7.3a), where `<state_dir>` is the machine-wide, identity-
+  INDEPENDENT daemon state dir — NOT the per-user config dir. This is REQUIRED (#501): on a real
+  install the daemon runs as a service under a different OS account (Windows LocalSystem, a root
+  daemon) than the operator's interactive CLI. A per-user path resolves DIFFERENTLY for the two
+  identities, so the CLI would never see the token the service wrote (and would mint a phantom the
+  daemon never trusts). Resolving a machine-wide dir independently of the running user makes the
+  daemon and the CLI read the SAME token.
 - Value: 32 bytes of OS randomness rendered as 64 lowercase hex characters. Generated at first
-  run; subsequent runs (and other same-host processes) read the same value. On Unix the file MUST
-  be written with owner-only permissions (`0600`, best-effort). The token MUST never be committed
-  or logged.
+  run; subsequent runs (and other same-host processes/users) read the same value. The token MUST
+  never be committed or logged.
 - Presentation, either of (header preferred): the `X-Dig-Control-Token` request header, or the
   `params._control_token` field. Blank presentations are treated as absent.
-- If the token cannot be persisted (unwritable config dir), the node MUST fall back to an
+- **The daemon MAY create the token (write); an operator CLI MUST NOT mint one.** The CLI
+  (`dig-node pair` / any control tool) reads the token READ-ONLY; if it is missing or unreadable it
+  MUST fail with a precise remedy (§7.3a) rather than write a fresh token the daemon does not trust.
+- **Trust a pre-existing token file ONLY when it is owned by a TRUSTED principal (owner
+  verification).** Before the daemon loads and trusts the bytes of an EXISTING `control-token`, it
+  MUST verify the file's OWNER; a foreign-owned token is DELETED and REGENERATED, never returned.
+  This closes the residual where an unprivileged local user plants a KNOWN token in the machine-wide
+  state dir (a `%PROGRAMDATA%` squat, or the narrow window during a service harden) so the daemon
+  (LocalSystem) reads + trusts it and the attacker learns the control token → full local control
+  (local privilege escalation). Trusted owners: **Windows** — `S-1-5-18` (SYSTEM) or `S-1-5-32-544`
+  (Administrators) always; a NON-service (dev/operator) run ALSO trusts the CURRENT process user's
+  own SID (so a dev token in the legacy per-user dir keeps working), and a SERVICE run requires
+  SYSTEM/Administrators. **Unix** — owner uid `0` (root) always, else the CURRENT effective uid AND
+  mode `0600` (owner-only); a group/other-readable or foreign-uid token is untrusted. This is layered
+  BENEATH the §7.3a state-dir hardening (which already purges a squatter-owned dir on a service run)
+  as defense-in-depth: it also guards the non-hardened dev path and any harden gap.
+- If the token cannot be persisted (unwritable state dir), the daemon MUST fall back to an
   in-memory token that no controller can read — the control plane fails **closed**; the read plane
   is unaffected.
 - Randomness source: the kernel CSPRNG (`/dev/urandom`) on Unix; elsewhere a non-deterministic
   mixed fallback. The security model is *possession of a same-host-readable file*, layered on the
   loopback bind — not secrecy from a network attacker.
+
+### 7.3a. The daemon state dir — location, ACL, threat model (#501)
+
+The state dir holds ONLY the control/auth state — the control token (§7.3) and the paired-token
+store (`paired-tokens.json`, §7.11). The bulk per-user `.dig` cache and `config.json` (§3.5–3.6) do
+NOT move; they stay per-user (shared with the browser/digstore, #96).
+
+**Resolution order** (the daemon and every operator CLI MUST resolve this identically, so it MUST
+NOT depend on `$HOME`/`%LOCALAPPDATA%`/the running user):
+
+1. `DIG_NODE_STATE_DIR` (env override) — wins outright (tests + custom deploys).
+2. The first machine-wide candidate that already EXISTS — Windows `%PROGRAMDATA%\DigNode`
+   (`C:\ProgramData\DigNode`); Linux `/var/lib/dig-node` then `/etc/dig-node`; macOS
+   `/Library/Application Support/DigNode`.
+3. Only for a SERVICE run (self-identified via `DIG_NODE_RUN_CONTEXT=service`): the first
+   machine-wide candidate it can create. A bare CLI MUST NOT create a machine-wide dir.
+4. Else the LEGACY per-user dir (the parent of `config.json`) — the back-compat fallback that keeps
+   a non-service `dig-node run` as a normal user working exactly as before (additive).
+
+**Creation + ACL — the HARDENING CONTRACT.** The state dir holds the control token that grants FULL
+local control, so its ACL MUST NOT be world/all-users-readable. On Windows this is the HARD case:
+`%PROGRAMDATA%` grants `BUILTIN\Users` "create subfolder", so ANY low-priv user can pre-create
+`C:\ProgramData\DigNode`, become its CREATOR OWNER, and keep `WRITE_DAC` forever — a naive
+`icacls /inheritance:r /grant:r` (which never resets OWNER nor purges foreign explicit ACEs) leaves
+that squatter able to rewrite the DACL and read the token → local privilege escalation. A
+pre-existing machine dir MUST therefore NOT be trusted blindly.
+
+On a SERVICE run (self-identified via `DIG_NODE_RUN_CONTEXT=service`), BEFORE the daemon writes or
+reads the control token, the resolved MACHINE state dir MUST be HARDENED and READBACK-VERIFIED:
+
+1. Resolve the interactive read-grant principal as a real SID from the CURRENT PROCESS TOKEN
+   (`whoami /user`), NEVER the spoofable `%USERNAME%`/`%USERDOMAIN%` env. REJECT it if it is a
+   well-known group/broad SID (`S-1-1-0` Everyone, `S-1-5-11` Authenticated Users, `S-1-5-7`
+   Anonymous, `S-1-5-32-545` Users) or SYSTEM (`S-1-5-18`). A LocalSystem service thus resolves NO
+   interactive grant; it instead PRESERVES an installer-set interactive read grant if one is
+   discoverable on a TRUSTED (SYSTEM/Administrators-owned) pre-existing dir.
+2. Create the dir if absent — but NEVER early-return when it already exists (a squatter may have
+   pre-created it); always run steps 3-6.
+3. Take ownership so the squatter loses `WRITE_DAC`: `icacls D /setowner *S-1-5-18 /T` (owner ⇒
+   SYSTEM). A pre-existing dir with an UNTRUSTED owner is PURGED (`remove_dir_all`) and recreated.
+4. Purge ALL foreign explicit ACEs: `icacls D /reset /T`.
+5. Lock the DACL: `icacls D /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F` and,
+   only when a valid interactive read grant survived step 1, append `<user_sid>:(OI)(CI)R` (READ only
+   for the interactive user, never full). Principals are always addressed by SID literal, never the
+   localized name.
+6. READBACK-VERIFY (`Get-Acl`, SID-based) as the acceptance gate: NO Everyone/Users/Authenticated-
+   Users/Anonymous ACE; owner is SYSTEM (or Administrators); SYSTEM + Administrators present with
+   full; the interactive read grant present iff one was applied; NO principal beyond those; and
+   inheritance disabled. Any violation FAILS.
+7. FAIL CLOSED: if any of steps 3-6 fails, hardening returns an error, the dir is best-effort
+   DELETED, and the daemon MUST NOT write the token there — it falls back to an ephemeral, unshared
+   dir + a random in-memory token so the control plane is UNAUTHORIZABLE (never served from an
+   attacker-controlled dir). The read plane is unaffected.
+
+`dig-node install` (run elevated by the interactive user) applies the SAME hardening as the
+installing user, setting owner = SYSTEM and granting THAT user READ, so the LocalSystem service's
+startup harden later sees a TRUSTED dir and PRESERVES the grant. Idempotency: running the harden
+twice on a legit dir yields the same final ACL. On Unix the dir is `0700` and the token file `0600`,
+owned by the daemon identity (root on a real install under root-owned `/var/lib`, which is not
+squattable); the installer additionally best-effort `setfacl`s READ for the `SUDO_USER`.
+
+The CLI (non-service) NEVER hardens (it is not elevated) — it only READS an existing machine dir,
+else falls back to the LEGACY per-user dir. A non-service dev run on the legacy per-user dir does NOT
+invoke the machine-dir hardening (that dir is already user-scoped).
+
+**Threat model.** The control token grants full local control of the node (mint controller tokens,
+change pins, drive wallet-adjacent control). A machine-wide file readable by every local user, or one
+sitting in a squatter-controlled dir, would be a local privilege-escalation vector — any user could
+seize control of a node running as another identity. The invariant that MUST hold either way is: NO
+Users/Everyone/Authenticated-Users ACE and owner = SYSTEM. The ACL is defense-in-depth layered on the
+loopback bind + token-possession model, BUT because a loose ACL is itself a priv-esc, the SERVICE-run
+harden is FAIL-CLOSED (unlike the best-effort dev/self-create path, where an `icacls`-unavailable
+tighten failure does not hard-fail startup).
+
+**Degraded case + remedy.** When the daemon bootstraps the dir itself as SYSTEM/root (the installer
+did not pre-create it), the interactive user is not a trustee and cannot read the token. The
+`UNAUTHORIZED` (`-32030`) error and the operator CLI MUST then print the PRECISE remedy — the exact
+token path, and that it needs elevation (Administrator / `sudo`) or the install-user read ACL —
+rather than a generic hint. The CLI distinguishes token-present-but-unreadable (the service-vs-user
+split → "elevate / grant read") from token-absent ("start the node so it mints one").
 
 ### 7.4. Control methods
 
@@ -827,7 +927,7 @@ same-host control token.
   cap/used. Node detection uses the §5.3 ladder (explicit `server.host` override > `dig.local` >
   `localhost:9778` > `rpc.dig.net`); the localhost tier MUST target the §3.2 default port `9778`.
 - **Token-gated management (a same-host process controller).** The mutating + privacy-sensitive
-  `control.*` methods require the control token from `<config_dir>/control-token` (§7.3). Only a
+  `control.*` methods require the control token from `<state_dir>/control-token` (§7.3/§7.3a). Only a
   process that can read that file — the DIG Browser "My Node" UI (a native process), the CLI, a local
   tool — can drive them. A sandboxed extension MUST NOT attempt to read the token; it MAY still CALL
   `control.status` and, on the canonical `-32030 UNAUTHORIZED` (§10), fall back to deep-linking a
@@ -854,7 +954,9 @@ a clean foreground node with zero out-of-band setup: it binds `127.0.0.1:$DIG_NO
 on Ctrl-C/SIGTERM (§9.5) so a test harness can `spawn → poll GET /health → drive control.* / read →
 signal-stop`. `DIG_NODE_PORT` MUST be honored so a test picks a free port; `DIG_NODE_DIGLOCAL=0`
 SHOULD be set in tests to skip the privileged `:80` dig.local bind. The control token for a
-token-gated test is read from `<config_dir>/control-token` after startup.
+token-gated test is read from `<state_dir>/control-token` after startup; a test SHOULD set
+`DIG_NODE_STATE_DIR` to an isolated temp dir (§7.3a) so its token/paired-token state is hermetic
+regardless of any real machine-wide state dir on the host.
 
 ### 7.9. Cache-method families (open `cache.*` vs gated `control.cache.*`)
 
@@ -915,7 +1017,7 @@ eviction. These additive fields/methods complete that surface; all are `served: 
 
 ### 7.11. Control-token pairing for browser controllers (#280)
 
-An MV3 browser extension cannot read the `<config_dir>/control-token` file, so it cannot drive
+An MV3 browser extension cannot read the `<state_dir>/control-token` file, so it cannot drive
 token-gated `control.*` mutations. PAIRING lets it obtain its OWN scoped, revocable controller token
 after LOCAL operator approval, WITHOUT ever exposing the master token. Two OPEN bootstrap methods +
 three MASTER-gated administration methods, all loopback-only.
@@ -936,8 +1038,8 @@ three MASTER-gated administration methods, all loopback-only.
 - **`control.pairing.list`** → `{ pending: [{ pairing_id, pairing_code, client_name, created_ms,
   expires_ms }], tokens: [{ id, client_name, created_ms }] }`. The token VALUE is never listed.
 - **`control.pairing.approve { pairing_id }`** → `{ approved: true, client_name, token_id }`. Mints a
-  fresh 64-hex scoped token, PERSISTS it to `<config_dir>/paired-tokens.json` (owner-only, atomic),
-  and marks the pending entry approved so the requester's next `pairing.poll` returns it. Approval is
+  fresh 64-hex scoped token, PERSISTS it to `<state_dir>/paired-tokens.json` (§7.3a, restricted,
+  atomic), and marks the pending entry approved so the requester's next `pairing.poll` returns it. Approval is
   the CONSENT step: it requires the master token (a local file read), so only the machine's operator
   can grant a pairing.
 - **`control.pairing.revoke { token_id }`** → `{ revoked: bool, token_id }`. Removes the token; the
@@ -957,8 +1059,8 @@ origin is CORS-blocked from reading it (and blocked at preflight from sending a 
 header). A paired token is SCOPED (it authorizes `control.*` mutations but not pairing administration)
 and REVOCABLE. All token comparisons are constant-time.
 
-**Paired-token store.** `<config_dir>/paired-tokens.json` = `{ "tokens": [{ id, token, client_name,
-created_ms }] }`, owner-only, atomic writes. The auth gate accepts the master token OR any token in
+**Paired-token store.** `<state_dir>/paired-tokens.json` (§7.3a) = `{ "tokens": [{ id, token,
+client_name, created_ms }] }`, restricted (dir ACL), atomic writes. The auth gate accepts the master token OR any token in
 this store (except for the pairing-administration methods).
 
 ### 7.12. Paired-token authorization for wallet methods (#370)
@@ -1002,7 +1104,30 @@ authorizes a mutation but NOT pairing administration; a revoked token is denied 
 
 `run` (default when no subcommand; serves in the foreground and is the unix-service entrypoint) ·
 `run-service` (hidden; the Windows SCM entrypoint, §9.4; behaves as `run` off Windows) ·
-`install` · `uninstall` · `start` · `stop` · `status`.
+`install` · `uninstall` · `start` · `stop` · `status` · `pair` (§7.11) · `open` (§8.5).
+
+### 8.5. `open` — the OS scheme handler (#389)
+
+`dig-node open <link>` is the target the installer registers for the OS `chia://` and
+`urn:dig:chia:` protocol handlers (`dig-node open "%1"`). It is the OS-level fallback resolver for a
+DIG link that no in-browser DIG extension intercepted.
+
+- **Input.** Accepts ONLY `chia://<storeId>[:<root>][/<path>]` and
+  `urn:dig:chia:<storeId>[:<root>][/<path>]` (scheme match is case-insensitive). The store reference
+  MUST be canonical 64-hex (`storeId` or `storeId:root`).
+- **Untrusted-input validation (MUST).** The argument arrives from an OS handler and may be
+  attacker-influenced (a hostile page can invoke a registered scheme). The command MUST reject every
+  other scheme (`file:`, `javascript:`, `data:`, `http(s):`, …), shell metacharacters, control
+  characters, whitespace, and `..` path traversal, and MUST NOT pass the argument to a shell — the
+  resolved URL is launched via the OS "open a URL" facility with the URL as a SINGLE, non-shell argv
+  entry (Windows `rundll32 url.dll,FileProtocolHandler`, Linux `xdg-open`, macOS `open`). A rejected
+  link exits `USAGE` (2) and launches nothing.
+- **Behavior.** Opens the user's DEFAULT browser at the node's LOCAL serve URL
+  `http://<host>:<port>/s/<storeId>[:<root>]/<path>` (the §4.6 plaintext content route; host/port
+  from the node's own config, default `localhost:9778`), so the node — the resolver of record —
+  serves the content and any installed DIG extension can still verify it. It NEVER opens `chia://`
+  at the OS level (dig-node is itself the OS `chia://` handler, so that would recurse) and NEVER
+  opens a dig-node GUI (it has none). Under `--json`: `{ opened: true, url, store_id, root, path }`.
 
 ### 8.2. `--json` (global flag)
 
@@ -1168,10 +1293,17 @@ does offset/length arithmetic over untrusted serialized input).
 - **Read/control split:** read methods open to local consumers; `control.*` requires possession of
   the same-host capability file, compared in constant time, failing closed when unpersistable
   (§7.2–7.3).
+- **Machine-wide auth state, not world-readable:** the control token + paired-token store live in a
+  machine-wide state dir resolved identically by the daemon and the operator CLI, restricted by ACL
+  to SYSTEM + Administrators + the creating user (Unix `0700`/`0600`) — never all-users-readable, so
+  it is not a local privilege-escalation vector (§7.3a). The operator CLI reads the token read-only
+  and never mints a rival token.
+- **Untrusted scheme-handler input:** `dig-node open` (the OS `chia://`/`urn:dig:chia:` handler,
+  §8.5) strictly validates its argument and launches the resolved URL without a shell.
 - **Blind serving:** content reads return ciphertext + proofs; verification/decryption is the
   client's job (§1.3). The node never returns plaintext for content reads.
-- **No secrets in artifacts:** the control token is generated at runtime, owner-restricted on
-  Unix, and never committed or logged.
+- **No secrets in artifacts:** the control token is generated at runtime, ACL-restricted (§7.3a),
+  and never committed or logged.
 
 ---
 
@@ -1189,7 +1321,7 @@ does offset/length arithmetic over untrusted serialized input).
 | 8 | CLI exit codes + `--json` envelopes | Table §8.4; one JSON object on stdout | §8; `src/cli.rs`, `tests/cli.rs` |
 | 9 | Service label | `net.dignetwork.dig-node` across install/uninstall/start/stop/SCM dispatcher | §2.4, §9.4 |
 | 10 | Release assets | Dual-named `dig-node-*` + legacy `dig-companion-*`, identical bytes, per §11.3 matrix | §11; `.github/workflows/release.yml` |
-| 11 | Control-token scheme | `<config_dir>/control-token`, 64-hex, `X-Dig-Control-Token` / `params._control_token`, constant-time | §7.2–7.3 |
+| 11 | Control-token scheme | `<state_dir>/control-token` (machine-wide, ACL-restricted, §7.3a), 64-hex, `X-Dig-Control-Token` / `params._control_token`, constant-time | §7.2–7.3a |
 | 12 | Health/version/well-known shapes | §6 fields; additions additive only | §6; `src/meta.rs`, `src/server.rs` |
 | 13 | Subscription persistence | `<cache>/subscriptions.json` schema-versioned, atomic, cross-process-locked | §14.1; `subscription.rs` |
 | 14 | Autonomous sync fail-closed | chain-watch + gap-fill + read-path pin never serve/pull against an unconfirmable root | §14.2–14.4; `chainwatch.rs`, `lib.rs` |

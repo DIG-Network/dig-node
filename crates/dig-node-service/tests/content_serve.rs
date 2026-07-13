@@ -109,6 +109,9 @@ async fn start_server(upstream: &str) -> (SocketAddr, PathBuf, EnvHold) {
     let cache = base.join("cache");
     std::fs::create_dir_all(&cache).unwrap();
     std::env::set_var("DIG_NODE_CACHE", &cache);
+    // Isolate the #501 control-token/paired-token state dir per test (identity-independent), so a
+    // host with a real machine state dir can't defeat the temp isolation.
+    std::env::set_var("DIG_NODE_STATE_DIR", &base);
     // Hermetic: disable the chain-anchored pin so the serve resolves against the requested root with
     // NO coinset call (the node-side gate only; a real deploy leaves the pin ON).
     std::env::set_var("DIG_NODE_PIN", "off");
