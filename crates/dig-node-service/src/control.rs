@@ -17,13 +17,14 @@
 //! 1. **Loopback-only.** The whole server binds `127.0.0.1` (see [`crate::config`]),
 //!    so nothing off-machine can reach any method.
 //! 2. **Local authorization** for the mutating control namespace. A random
-//!    **control token** is generated at first run into the node's config dir
-//!    (`<config_dir>/control-token`, next to dig-node's `config.json`) with
-//!    owner-only permissions where the OS supports it. A same-host controller reads
-//!    that file (it can, because it runs as the same user on the same machine) and
-//!    presents the token on every `control.*` call — as the `X-Dig-Control-Token`
-//!    request header or a `params._control_token` field. The READ methods are NOT
-//!    gated; only `control.*` requires the token.
+//!    **control token** is generated at first run into the machine-wide, identity-
+//!    INDEPENDENT state dir (`<state_dir>/control-token` — [`crate::state`], #501) with
+//!    a restrictive ACL. A same-host controller reads that file and presents the token
+//!    on every `control.*` call — as the `X-Dig-Control-Token` request header or a
+//!    `params._control_token` field. The READ methods are NOT gated; only `control.*`
+//!    requires the token. The token lives in [`crate::state::state_dir`] (NOT the
+//!    per-user config dir) so the daemon (which may run as a service under a different
+//!    OS account) and the operator CLI resolve the SAME file.
 //!
 //! This is the standard "local capability file" pattern (cf. Chia's `daemon` /
 //! Bitcoin's cookie auth): possession of the on-disk token = authorization, so a
@@ -86,25 +87,94 @@ pub fn is_pairing_admin_method(method: &str) -> bool {
     )
 }
 
-/// The path to the control-token file, given the node's config dir. The config dir
-/// is `config.json`'s parent (dig-node's `config_path()`), so the token lives beside
-/// the shared config. PURE (path math only).
-pub fn control_token_path(config_path: &Path) -> PathBuf {
-    config_path
-        .parent()
-        .map(|p| p.join(CONTROL_TOKEN_FILE))
-        .unwrap_or_else(|| PathBuf::from(CONTROL_TOKEN_FILE))
+/// The path to the control-token file: `<state_dir>/control-token`, where the state
+/// dir is the machine-wide, identity-INDEPENDENT daemon state dir (#501,
+/// [`crate::state::state_dir`]) — NOT the per-user config dir. Decoupling the token
+/// from `config_path()` is the fix for the service-vs-user path split: the running
+/// daemon and the operator CLI resolve this ONE path regardless of which OS user each
+/// runs as, so the CLI reads the SAME token the service wrote.
+pub fn control_token_path() -> PathBuf {
+    crate::state::state_dir().join(CONTROL_TOKEN_FILE)
 }
 
 /// Load the control token, generating + persisting a fresh one if absent.
 ///
 /// The token is 32 random bytes rendered as 64-hex. Generated at RUNTIME into the
-/// node's config dir on first call; subsequent calls (and other processes sharing
-/// the dir) read the same value. Written with owner-only permissions on Unix
-/// (`0600`) so another user on the box cannot read it. Never committed.
+/// machine-wide state dir ([`control_token_path`]) on first call; subsequent calls (and
+/// other processes / users on the box) read the same value. The dir + file are created
+/// with a RESTRICTIVE ACL (owner/SYSTEM + Administrators, the creating user; never
+/// world/all-users-readable — see [`crate::state`]). Never committed.
 pub fn load_or_create_token() -> std::io::Result<String> {
-    let path = control_token_path(&dig_node_core::config_path());
-    load_or_create_token_at(&path)
+    load_or_create_token_at(&control_token_path())
+}
+
+/// A precise, service-aware remedy for a control-token authorization failure (#501).
+///
+/// The classic failure is the service-vs-user PATH/PERMISSION split: the node runs as a
+/// service (Windows LocalSystem / a root daemon) and minted `control-token` in the
+/// machine-wide state dir with restrictive perms, but the interactive user running
+/// `dig-node pair` / a `control.*` call cannot READ it. This inspects the resolved token
+/// path from the CALLER's perspective and returns the exact fix (which dir + that it
+/// needs elevation or the install-user's read ACL), instead of the generic hint.
+pub fn control_token_remedy() -> String {
+    let path = control_token_path();
+    let dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    // Read once: an Ok read = readable (whatever the contents); an Err with the file present
+    // = the service-vs-user ACL split; absent = the node has not minted one yet.
+    let read = std::fs::read_to_string(&path);
+    let readable = read.is_ok();
+    let present = readable || path.exists();
+    if present && !readable {
+        format!(
+            "the node's control token at {} exists but is NOT readable by your account — \
+             the node runs as a service under a different account (Windows LocalSystem / a \
+             root daemon). Re-run this command elevated (Administrator on Windows, sudo on \
+             Unix), or have the installer grant your account read access to {}.",
+            path.display(),
+            dir
+        )
+    } else if !present {
+        format!(
+            "no control token found at {}. Start the node so it mints one \
+             (`dig-node run`, or `dig-node start` for the installed service), then retry.",
+            path.display()
+        )
+    } else {
+        format!(
+            "the presented control token was not accepted. Ensure the node and this command \
+             resolve the SAME state dir ({dir}) — if you set DIG_NODE_STATE_DIR it must match \
+             on both the node and this command."
+        )
+    }
+}
+
+/// Read the master control token WITHOUT creating one — the OPERATOR-side load (`dig-node
+/// pair` / any local control CLI, #501). It must NEVER mint a token: minting a fresh token
+/// the running node does not trust is the exact original bug (the CLI wrote its own token to
+/// a per-user path the service never read). On a missing/unreadable/blank token it returns a
+/// rich [`std::io::Error`] carrying [`control_token_remedy`] — the precise service-vs-user
+/// remedy — with the error KIND chosen so the CLI maps it to the right exit code
+/// ([`crate::cli::ExitCode::from_io_error`]): `PermissionDenied` (the ACL split → "elevate")
+/// when the file is present but unreadable, else `NotFound` ("start the node").
+pub fn load_token_readonly() -> std::io::Result<String> {
+    let path = control_token_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+        // Present but blank/unreadable, or absent → never mint; surface the exact remedy.
+        other => {
+            let kind = if path.exists() {
+                std::io::ErrorKind::PermissionDenied
+            } else {
+                std::io::ErrorKind::NotFound
+            };
+            // Drop the raw read value; the remedy is the actionable message.
+            drop(other);
+            Err(std::io::Error::new(kind, control_token_remedy()))
+        }
+    }
 }
 
 /// [`load_or_create_token`] for an explicit path (so tests use a temp dir and never
@@ -119,24 +189,24 @@ pub fn load_or_create_token_at(path: &Path) -> std::io::Result<String> {
     }
     let token = generate_token();
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        // Create the state dir with a RESTRICTIVE ACL (not the world-readable default of
+        // a machine-wide `%PROGRAMDATA%`) — see [`crate::state::ensure_dir_restricted`].
+        crate::state::ensure_dir_restricted(dir)?;
     }
     std::fs::write(path, &token)?;
     restrict_permissions(path);
     Ok(token)
 }
 
-/// Restrict the token file to owner read/write where the OS supports it (Unix
-/// `0600`). On Windows the default ACL on a per-user profile dir already scopes it
-/// to the user, and loopback-only binding is the primary control; this is
-/// best-effort defense-in-depth, so a failure is ignored.
-#[cfg(unix)]
+/// Restrict a control/auth file so it is not readable by every local user. Delegates to
+/// [`crate::state::restrict_file`]: Unix `0600`; on Windows the file inherits the tight,
+/// inheritable ACL of the machine-wide state dir ([`crate::state::ensure_dir_restricted`]) —
+/// critical now that the file lives under `%PROGRAMDATA%`, whose default would otherwise let
+/// every local user read it (a local privilege-escalation vector, #501). Best-effort (a
+/// failure is ignored — loopback bind + token possession are the primary gate).
 pub(crate) fn restrict_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    crate::state::restrict_file(path);
 }
-#[cfg(not(unix))]
-pub(crate) fn restrict_permissions(_path: &Path) {}
 
 /// Generate a fresh 64-hex control token from 32 bytes of OS randomness.
 fn generate_token() -> String {
@@ -453,6 +523,10 @@ pub struct ControlCtx {
     pub node: Arc<Node>,
     /// The node's config.json path (pins + upstream override live here).
     pub config_path: PathBuf,
+    /// The machine-wide daemon STATE dir (#501) — where the control token +
+    /// `paired-tokens.json` live (NOT the per-user config dir). The pairing-admin
+    /// methods read/write the paired-token store from here.
+    pub state_dir: PathBuf,
     /// The loopback `host:port` the node is bound to (status/config).
     pub addr: String,
     /// The upstream DIG RPC the node proxies/syncs to.
@@ -490,11 +564,11 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
         "control.sync.trigger" => sync_trigger(ctx, id, params).await,
         // Pairing administration (#280) — reached only with the MASTER token (the
         // gate blocks a paired token from these, see `is_pairing_admin_method`).
-        "control.pairing.list" => crate::pairing::list(&ctx.pairings, &ctx.config_path, id),
+        "control.pairing.list" => crate::pairing::list(&ctx.pairings, &ctx.state_dir, id),
         "control.pairing.approve" => {
-            crate::pairing::approve(&ctx.pairings, &ctx.config_path, id, params)
+            crate::pairing::approve(&ctx.pairings, &ctx.state_dir, id, params)
         }
-        "control.pairing.revoke" => crate::pairing::revoke(&ctx.config_path, id, params),
+        "control.pairing.revoke" => crate::pairing::revoke(&ctx.state_dir, id, params),
         // Control methods the shell does not own are delegated to the NODE's own
         // control surface (`control.peerStatus` / `control.subscribe` /
         // `control.unsubscribe` / `control.listSubscriptions` — the node's persisted
@@ -982,6 +1056,48 @@ mod tests {
         assert_eq!(first, second, "token must be stable across reads");
         assert_eq!(first.len(), 64);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SECURITY (#501): the control token grants full local control, so the created
+    /// file MUST NOT be readable by other local users. On Unix that is a hard `0600`
+    /// assertion (no group/other bits) — the CI-gated path (CI runs on Linux). On
+    /// Windows the restriction is applied via `icacls` (asserted separately in a
+    /// Windows-gated test / by the orchestrator's adversarial ACL check).
+    #[cfg(unix)]
+    #[test]
+    fn created_token_file_is_not_world_or_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "dig-node-token-perms-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = dir.join(CONTROL_TOKEN_FILE);
+        let _ = std::fs::remove_dir_all(&dir);
+        load_or_create_token_at(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "token must have NO group/other permission bits (got {mode:o})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The remedy hint names the concrete token path and, when the token is absent from
+    /// the caller's perspective, tells them to start the node — never the old generic
+    /// "<config_dir>" wording.
+    #[test]
+    fn control_token_remedy_names_a_concrete_path() {
+        let remedy = control_token_remedy();
+        assert!(
+            remedy.contains("control token") || remedy.contains("control-token"),
+            "remedy should mention the control token: {remedy}"
+        );
+        assert!(
+            remedy.contains("dig-node") || remedy.contains("state dir") || remedy.contains('/') || remedy.contains('\\'),
+            "remedy should name a path or command: {remedy}"
+        );
     }
 
     #[test]

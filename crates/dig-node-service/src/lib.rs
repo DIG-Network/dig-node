@@ -38,11 +38,19 @@ pub mod config;
 pub mod content;
 pub mod control;
 pub mod meta;
+/// `dig-node open <chia://… | urn:dig:chia:…>` (#389): the OS scheme-handler target the
+/// installer registers for `chia://` + `urn:dig:chia:`. Strictly validates the untrusted
+/// handler argument, then opens the user's default browser at the resolving URL. See [`open`].
+pub mod open;
 pub mod pair;
 pub mod pairing;
 pub mod rpc;
 pub mod server;
 pub mod service;
+/// The machine-wide, identity-independent daemon STATE dir (#501): where the control token +
+/// paired-token store live so the daemon (which may run as a service under a different OS
+/// account) and the operator CLI resolve the SAME files. See [`state`].
+pub mod state;
 pub mod wallet_authz;
 
 /// Windows Service Control Protocol entrypoint — only meaningful on Windows, where

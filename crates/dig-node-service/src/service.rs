@@ -179,7 +179,25 @@ pub fn install(config: &Config) -> std::io::Result<Outcome> {
     let mut environment = vec![
         ("DIG_NODE_PORT".to_string(), config.port.to_string()),
         ("DIG_RPC_UPSTREAM".to_string(), config.upstream.clone()),
+        // Mark the installed service as a SERVICE run (#501): the running daemon may bootstrap
+        // the machine-wide state dir when absent, whereas a bare CLI never does. On Windows this
+        // is belt-and-suspenders (the SCM `run-service` entrypoint also sets it); on
+        // systemd/launchd this env carries the signal into the unit.
+        (
+            crate::state::RUN_CONTEXT_ENV.to_string(),
+            crate::state::RUN_CONTEXT_SERVICE.to_string(),
+        ),
     ];
+    // Create the machine-wide state dir NOW, as the INSTALLING (interactive) user, so its
+    // restrictive ACL grants THAT user read access to the control token the service will write
+    // (#501). This is the key to the fix on Windows, where the service runs as LocalSystem and
+    // could not otherwise grant the operator's account read. Best-effort + cross-platform: on a
+    // user-level Linux/macOS install the daemon runs as the SAME user, so the legacy per-user
+    // fallback already keeps daemon + CLI in agreement and a failure to create `/var/lib/dig-node`
+    // (needs root) is expected and harmless.
+    if let Some(machine_dir) = crate::state::machine_state_dirs().into_iter().next() {
+        let _ = crate::state::ensure_dir_restricted(&machine_dir);
+    }
     // Only record DIG_NODE_HOST when the operator gave an EXPLICIT override
     // (#288): omitting it lets the installed service resolve the same default the
     // CLI would — bind BOTH loopback families (127.0.0.1 AND [::1], §5.2) —

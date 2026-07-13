@@ -96,6 +96,9 @@ impl ExitCode {
         match e.kind() {
             PermissionDenied => ExitCode::PermissionDenied,
             AddrInUse | AddrNotAvailable => ExitCode::BindFailed,
+            // A bad argument surfaced as `InvalidInput` (e.g. `dig-node open` rejecting a
+            // non-DIG/malformed link) is a USAGE error, not a generic I/O failure.
+            InvalidInput => ExitCode::Usage,
             _ => ExitCode::IoError,
         }
     }
@@ -204,6 +207,8 @@ mod tests {
         assert_eq!(ExitCode::from_io_error(&bind), ExitCode::BindFailed);
         let other = std::io::Error::other("x");
         assert_eq!(ExitCode::from_io_error(&other), ExitCode::IoError);
+        let usage = std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad link");
+        assert_eq!(ExitCode::from_io_error(&usage), ExitCode::Usage);
     }
 
     #[test]
