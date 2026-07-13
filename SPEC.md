@@ -801,24 +801,60 @@ NOT depend on `$HOME`/`%LOCALAPPDATA%`/the running user):
 4. Else the LEGACY per-user dir (the parent of `config.json`) — the back-compat fallback that keeps
    a non-service `dig-node run` as a normal user working exactly as before (additive).
 
-**Creation + ACL.** Whoever creates the state dir FIRST fixes its ACL, applied ONLY on fresh
-creation (a pre-existing dir is left untouched so a later SYSTEM/root service run cannot clobber the
-installer's grant):
+**Creation + ACL — the HARDENING CONTRACT.** The state dir holds the control token that grants FULL
+local control, so its ACL MUST NOT be world/all-users-readable. On Windows this is the HARD case:
+`%PROGRAMDATA%` grants `BUILTIN\Users` "create subfolder", so ANY low-priv user can pre-create
+`C:\ProgramData\DigNode`, become its CREATOR OWNER, and keep `WRITE_DAC` forever — a naive
+`icacls /inheritance:r /grant:r` (which never resets OWNER nor purges foreign explicit ACEs) leaves
+that squatter able to rewrite the DACL and read the token → local privilege escalation. A
+pre-existing machine dir MUST therefore NOT be trusted blindly.
 
-- **Unix:** dir `0700`, token file `0600`. NEVER group/world-readable (`0644` is forbidden).
-- **Windows:** inheritance removed (`icacls /inheritance:r`) and inheritable full granted to EXACTLY
-  three trustees — SYSTEM, Administrators, and the creating user — and NO ONE ELSE (never the
-  default `%PROGRAMDATA%` grant that lets all Users read). `dig-node install` (run elevated by the
-  interactive user) pre-creates the dir so THAT user is among the trustees and can read the token the
-  LocalSystem service later writes; the token file inherits the dir ACL.
+On a SERVICE run (self-identified via `DIG_NODE_RUN_CONTEXT=service`), BEFORE the daemon writes or
+reads the control token, the resolved MACHINE state dir MUST be HARDENED and READBACK-VERIFIED:
+
+1. Resolve the interactive read-grant principal as a real SID from the CURRENT PROCESS TOKEN
+   (`whoami /user`), NEVER the spoofable `%USERNAME%`/`%USERDOMAIN%` env. REJECT it if it is a
+   well-known group/broad SID (`S-1-1-0` Everyone, `S-1-5-11` Authenticated Users, `S-1-5-7`
+   Anonymous, `S-1-5-32-545` Users) or SYSTEM (`S-1-5-18`). A LocalSystem service thus resolves NO
+   interactive grant; it instead PRESERVES an installer-set interactive read grant if one is
+   discoverable on a TRUSTED (SYSTEM/Administrators-owned) pre-existing dir.
+2. Create the dir if absent — but NEVER early-return when it already exists (a squatter may have
+   pre-created it); always run steps 3-6.
+3. Take ownership so the squatter loses `WRITE_DAC`: `icacls D /setowner *S-1-5-18 /T` (owner ⇒
+   SYSTEM). A pre-existing dir with an UNTRUSTED owner is PURGED (`remove_dir_all`) and recreated.
+4. Purge ALL foreign explicit ACEs: `icacls D /reset /T`.
+5. Lock the DACL: `icacls D /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F` and,
+   only when a valid interactive read grant survived step 1, append `<user_sid>:(OI)(CI)R` (READ only
+   for the interactive user, never full). Principals are always addressed by SID literal, never the
+   localized name.
+6. READBACK-VERIFY (`Get-Acl`, SID-based) as the acceptance gate: NO Everyone/Users/Authenticated-
+   Users/Anonymous ACE; owner is SYSTEM (or Administrators); SYSTEM + Administrators present with
+   full; the interactive read grant present iff one was applied; NO principal beyond those; and
+   inheritance disabled. Any violation FAILS.
+7. FAIL CLOSED: if any of steps 3-6 fails, hardening returns an error, the dir is best-effort
+   DELETED, and the daemon MUST NOT write the token there — it falls back to an ephemeral, unshared
+   dir + a random in-memory token so the control plane is UNAUTHORIZABLE (never served from an
+   attacker-controlled dir). The read plane is unaffected.
+
+`dig-node install` (run elevated by the interactive user) applies the SAME hardening as the
+installing user, setting owner = SYSTEM and granting THAT user READ, so the LocalSystem service's
+startup harden later sees a TRUSTED dir and PRESERVES the grant. Idempotency: running the harden
+twice on a legit dir yields the same final ACL. On Unix the dir is `0700` and the token file `0600`,
+owned by the daemon identity (root on a real install under root-owned `/var/lib`, which is not
+squattable); the installer additionally best-effort `setfacl`s READ for the `SUDO_USER`.
+
+The CLI (non-service) NEVER hardens (it is not elevated) — it only READS an existing machine dir,
+else falls back to the LEGACY per-user dir. A non-service dev run on the legacy per-user dir does NOT
+invoke the machine-dir hardening (that dir is already user-scoped).
 
 **Threat model.** The control token grants full local control of the node (mint controller tokens,
-change pins, drive wallet-adjacent control). A machine-wide file readable by every local user would
-be a local privilege-escalation vector — any user could seize control of a node running as another
-identity. The ACL above ensures every OTHER local user is denied; the creating user is granted full
-because it must write the token it mints (dev/self-create) and an elevated installer must retain
-read. The ACL is defense-in-depth layered on the loopback bind + token-possession model; a failure
-to tighten it (e.g. `icacls` unavailable) MUST NOT hard-fail node startup.
+change pins, drive wallet-adjacent control). A machine-wide file readable by every local user, or one
+sitting in a squatter-controlled dir, would be a local privilege-escalation vector — any user could
+seize control of a node running as another identity. The invariant that MUST hold either way is: NO
+Users/Everyone/Authenticated-Users ACE and owner = SYSTEM. The ACL is defense-in-depth layered on the
+loopback bind + token-possession model, BUT because a loose ACL is itself a priv-esc, the SERVICE-run
+harden is FAIL-CLOSED (unlike the best-effort dev/self-create path, where an `icacls`-unavailable
+tighten failure does not hard-fail startup).
 
 **Degraded case + remedy.** When the daemon bootstraps the dir itself as SYSTEM/root (the installer
 did not pre-create it), the interactive user is not a trustee and cannot read the token. The

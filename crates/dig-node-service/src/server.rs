@@ -231,6 +231,65 @@ async fn host_guard(req: Request, next: Next) -> Response {
 /// Construct the shared state from config: apply the upstream to dig-node's env,
 /// then build the node from the environment (cache dir/cap, §21 identity), and
 /// generate/load the local control token into the machine-wide state dir (#501).
+/// Resolve the machine-wide state dir + the control token, applying the #501 hardening on a
+/// SERVICE run and FAILING CLOSED when the machine dir cannot be secured.
+///
+/// - **Service run:** [`crate::state::ensure_service_state_dir`] hardens + readback-verifies
+///   the machine dir (owner→SYSTEM, purge foreign ACEs, protected DACL, no Users/Everyone
+///   ACE) BEFORE the token is written. If it cannot be secured, the node does NOT write the
+///   token there — it falls back to an ephemeral, unshared dir + a random in-memory token so
+///   the control plane is unauthorizable (never served from an attacker-controlled dir).
+/// - **CLI / dev run:** unchanged — resolve (read an existing machine dir, else the legacy
+///   per-user dir), never harden. A persist failure also fails closed to the in-memory token.
+fn resolve_state_dir_and_token() -> (std::path::PathBuf, String) {
+    // The ephemeral fail-closed fallback: an unshared temp dir + a random in-memory token
+    // that nothing can present → the control plane is unauthorizable.
+    let ephemeral = || {
+        let dir =
+            std::env::temp_dir().join(format!("dig-node-control-token-{}", std::process::id()));
+        let token = control::load_or_create_token_at(&dir.join(control::CONTROL_TOKEN_FILE))
+            .unwrap_or_default();
+        (dir, token)
+    };
+
+    if crate::state::running_as_service() {
+        match crate::state::ensure_service_state_dir() {
+            Ok(dir) => {
+                match control::load_or_create_token_at(&dir.join(control::CONTROL_TOKEN_FILE)) {
+                    Ok(token) => (dir, token),
+                    Err(e) => {
+                        eprintln!(
+                            "dig-node: WARN could not persist the control token in the secured \
+                         state dir ({e}); using an in-memory token (control.* unauthorizable)"
+                        );
+                        ephemeral()
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "dig-node: WARN could not secure the machine state dir ({e}); refusing to \
+                     serve the control plane from it — {}",
+                    control::control_token_remedy()
+                );
+                ephemeral()
+            }
+        }
+    } else {
+        let dir = crate::state::state_dir();
+        match control::load_or_create_token() {
+            Ok(token) => (dir, token),
+            Err(e) => {
+                eprintln!(
+                    "dig-node: WARN could not persist control token ({e}); using an in-memory \
+                     token (control.* will be unauthorizable until the state dir is writable)"
+                );
+                ephemeral()
+            }
+        }
+    }
+}
+
 pub async fn build_state(config: &Config) -> AppState {
     config.apply_to_env();
     let node = Node::from_env();
@@ -247,25 +306,16 @@ pub async fn build_state(config: &Config) -> AppState {
         },
     )
     .await;
-    // Generate (or read) the control token into <state_dir>/control-token (#501). A
-    // failure to persist it (e.g. unwritable dir) is non-fatal: fall back to an
-    // in-memory token so the control plane is still gated (a controller that can't
-    // read the file simply can't authorize — fail-closed). The read plane is
-    // unaffected either way.
-    let control_token = control::load_or_create_token().unwrap_or_else(|e| {
-        eprintln!(
-            "dig-node: WARN could not persist control token ({e}); using an in-memory \
-             token (control.* will be unauthorizable until the state dir is writable)"
-        );
-        // A random in-memory token nothing can present → control plane fails closed.
-        control::load_or_create_token_at(
-            &std::env::temp_dir().join(format!("dig-node-control-token-{}", std::process::id())),
-        )
-        .unwrap_or_default()
-    });
-    // The machine-wide state dir the control token + paired-token store live in (#501). The
-    // daemon and the operator CLI resolve this SAME dir regardless of OS user — the whole fix.
-    let state_dir = crate::state::state_dir();
+    // Resolve the machine-wide state dir the control token + paired-token store live in
+    // (#501). On a SERVICE run this HARDENS + readback-verifies the machine dir per the
+    // security contract BEFORE the token is written into it (owner→SYSTEM, purge foreign
+    // ACEs, protected DACL, no Users/Everyone ACE) — closing the ProgramData squatting hole
+    // where a low-priv user pre-creates C:\ProgramData\DigNode and keeps CREATOR OWNER /
+    // WRITE_DAC. If the dir cannot be secured, the node MUST NOT write the token there:
+    // it fails closed onto an ephemeral, unshared dir + an in-memory token so the control
+    // plane is unauthorizable rather than served from an attacker-controlled dir. The read
+    // plane is unaffected either way. The CLI (non-service) never hardens — it only reads.
+    let (state_dir, control_token) = resolve_state_dir_and_token();
     AppState {
         node,
         upstream: config.upstream.clone(),
