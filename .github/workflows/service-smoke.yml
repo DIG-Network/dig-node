@@ -1,0 +1,163 @@
+# A REAL, 3-OS end-to-end smoke test of `dig-node install`/`start`/`uninstall` against the
+# actual OS service manager (Windows SCM / systemd / launchd) — the thing ci.yml's mocked
+# `ServiceBackend` unit tests (crates/dig-node-service/src/service.rs) cannot prove: that
+# `install` registers a service the OS actually starts and serves from, that a SECOND `install`
+# cleanly recreates it instead of hitting Windows `CreateService` error 1073 (#494), and that
+# `uninstall` actually removes the registration.
+#
+# Kept as its OWN workflow (not folded into ci.yml) because it performs REAL, mutating
+# OS-service registration on every runner — a materially different (and slower/less hermetic)
+# kind of check than the rest of the PR gate set.
+name: Service smoke test
+
+on:
+  pull_request:
+    paths:
+      - "crates/dig-node-service/src/service.rs"
+      - "crates/dig-node-service/src/config.rs"
+      - "crates/dig-node-service/src/hosts.rs"
+      - "packaging/**"
+      - ".github/workflows/service-smoke.yml"
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: install/start/reinstall/uninstall (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-14, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: service-smoke
+
+      - name: Build dig-node (release)
+        run: cargo build --release --locked --bin dig-node
+
+      # `dig-node install` registers a USER-level systemd unit on Linux (no root needed), which
+      # needs a real user D-Bus session — the GH-hosted runner's non-interactive job shell does
+      # not start one implicitly. `enable-linger` + pointing at the per-uid runtime dir brings one
+      # up so `systemctl --user ...` (what service-manager shells out to) has a bus to talk to.
+      - name: (Linux) bring up a user systemd/D-Bus session
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$(whoami)"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+
+      - name: Resolve the built binary path
+        id: bin
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "path=target/release/dig-node.exe" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=target/release/dig-node" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install (1st) — fresh registration
+        shell: bash
+        run: |
+          "${{ steps.bin.outputs.path }}" install --json | tee install-1.json
+          grep -q '"installed":true' install-1.json
+          grep -q '"reinstalled":false' install-1.json
+
+      - name: Windows — assert the SCM display name
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          sc.exe qc net.dignetwork.dig-node | tee sc-qc-1.txt
+          grep -Eq 'DISPLAY_NAME[[:space:]]*: DIG NETWORK: NODE' sc-qc-1.txt
+
+      - name: Start + poll for RUNNING
+        shell: bash
+        run: |
+          "${{ steps.bin.outputs.path }}" start --json || true
+          ok=0
+          for _ in $(seq 1 20); do
+            if "${{ steps.bin.outputs.path }}" status --json | tee status-1.json | grep -q '"serving":true'; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ok" -eq 1
+
+      - name: Install (2nd) — proves clean-reinstall avoids CreateService 1073
+        shell: bash
+        run: |
+          "${{ steps.bin.outputs.path }}" install --json | tee install-2.json
+          grep -q '"installed":true' install-2.json
+          grep -q '"reinstalled":true' install-2.json
+
+      - name: Windows — re-assert the SCM display name after reinstall
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          sc.exe qc net.dignetwork.dig-node | tee sc-qc-2.txt
+          grep -Eq 'DISPLAY_NAME[[:space:]]*: DIG NETWORK: NODE' sc-qc-2.txt
+
+      - name: Start again + poll for RUNNING
+        shell: bash
+        run: |
+          "${{ steps.bin.outputs.path }}" start --json || true
+          ok=0
+          for _ in $(seq 1 20); do
+            if "${{ steps.bin.outputs.path }}" status --json | tee status-2.json | grep -q '"serving":true'; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ok" -eq 1
+
+      - name: Stop
+        shell: bash
+        run: |
+          "${{ steps.bin.outputs.path }}" stop --json
+
+      - name: Uninstall + assert the service is gone
+        shell: bash
+        run: |
+          "${{ steps.bin.outputs.path }}" uninstall --json | tee uninstall.json
+          grep -q '"installed":false' uninstall.json
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ! sc.exe query net.dignetwork.dig-node
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            ! launchctl print "gui/$(id -u)/net.dignetwork.dig-node"
+          else
+            ! systemctl --user cat net.dignetwork.dig-node.service
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-smoke-${{ matrix.os }}
+          path: |
+            install-1.json
+            install-2.json
+            status-1.json
+            status-2.json
+            uninstall.json
+            sc-qc-1.txt
+            sc-qc-2.txt
+          if-no-files-found: ignore

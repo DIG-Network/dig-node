@@ -44,7 +44,11 @@ use std::net::{IpAddr, Ipv4Addr};
 /// consumer of the §5.3 `localhost` tier (the extension's `server.host` default, the
 /// installer, the DIG Browser) MUST target `9778` to match. `DIG_NODE_PORT` overrides
 /// it. (`dig.local` on `127.0.0.2:80` is unaffected — only this localhost port moves.)
-pub const DEFAULT_PORT: u16 = 9778;
+///
+/// Single-sourced from the shared `dig-constants` crate (`DIG_NODE_PORT`) rather than
+/// re-declared here, so every §5.3 client→node consumer that also imports the constant agrees
+/// with this service byte-for-byte with no copy to drift.
+pub const DEFAULT_PORT: u16 = dig_constants::DIG_NODE_PORT;
 
 /// Default upstream DIG RPC the embedded node proxies to on a local cache miss.
 pub const DEFAULT_UPSTREAM: &str = "https://rpc.dig.net";

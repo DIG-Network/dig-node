@@ -1801,6 +1801,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-constants"
+version = "0.3.0"
+source = "git+https://github.com/DIG-Network/dig-constants?rev=438ac8caf9ffb80cadd10362deacd63763a7f141#438ac8caf9ffb80cadd10362deacd63763a7f141"
+dependencies = [
+ "chia-consensus",
+ "chia-protocol",
+ "hex-literal",
+]
+
+[[package]]
 name = "dig-dht"
 version = "0.1.0"
 source = "git+https://github.com/DIG-Network/dig-dht#d5b4a7d9f5d9632a036b8c06cf7ae0da16d83ad1"
@@ -1956,11 +1966,12 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "axum",
  "base64",
  "clap",
+ "dig-constants 0.3.0",
  "dig-node-core",
  "dig-wallet",
  "digstore-core",
