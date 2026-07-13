@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchDaemon for the DIG node (#503). A system-level daemon (installed to
+  /Library/LaunchDaemons, loaded by launchd as root): RunAtLoad + KeepAlive give
+  auto-start + restart-on-crash, matching the systemd unit + Windows SCM recovery.
+  DIG_NODE_RUN_CONTEXT=service lets the daemon bootstrap the machine-wide state dir
+  (/Library/Application Support/DigNode) with a restrictive owner-only ACL (#501).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>net.dignetwork.dig-node</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/dig-node</string>
+        <string>run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DIG_NODE_RUN_CONTEXT</key>
+        <string>service</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/var/log/dig-node.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/dig-node.log</string>
+</dict>
+</plist>

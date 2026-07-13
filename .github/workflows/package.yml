@@ -1,0 +1,199 @@
+name: Native install packages
+
+# Build the native OS install packages (#503) — the Windows .msi, macOS .pkg, and Ubuntu .deb —
+# that ARE the install architecture (the dig-installer just fetches + runs them). Each package
+# installs the binary, registers the OS service `net.dignetwork.dig-node`, the chia:// scheme
+# handler (→ `dig-node open`), and the restrictive machine-wide state dir (#501).
+#
+#   * pull_request → BUILD all three (validation only; no publish), so a broken package definition
+#     is caught on the PR (release.yml is tag/main-only and does not build packages).
+#   * push tag v* → build all three AND attach them to the GitHub Release. The Ubuntu .deb is a
+#     release ASSET (apt.dig.net's deploy ingests upstream GitHub release .debs to build the signed
+#     apt repo — no push needed; the .deb name + control metadata are apt-correct + stable).
+on:
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/package.yml"
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_RELEASE_DEBUG: "0"
+
+jobs:
+  # ---- Ubuntu .deb ----------------------------------------------------------
+  deb:
+    name: build .deb (linux-x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-pkg-deb-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-pkg-deb-
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+      - name: Build release binary
+        run: cargo build --release --locked --bin dig-node
+      - name: Build .deb
+        run: bash packaging/linux/build-deb.sh target/release/dig-node "${{ steps.ver.outputs.v }}" amd64 dist
+      - name: Validate .deb metadata
+        run: |
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dig-node-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  # ---- macOS .pkg (universal) ----------------------------------------------
+  pkg:
+    name: build .pkg (macos-universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust + targets
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-pkg-mac-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-pkg-mac-
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+      - name: Build both arches + lipo a universal binary
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin --bin dig-node
+          cargo build --release --locked --target x86_64-apple-darwin --bin dig-node
+          mkdir -p dist
+          lipo -create -output dist/dig-node \
+            target/aarch64-apple-darwin/release/dig-node \
+            target/x86_64-apple-darwin/release/dig-node
+          lipo -info dist/dig-node
+      - name: Build .pkg
+        run: bash packaging/macos/build-pkg.sh dist/dig-node "${{ steps.ver.outputs.v }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dig-node-pkg
+          path: dist/*.pkg
+          if-no-files-found: error
+
+  # ---- Windows .msi ---------------------------------------------------------
+  msi:
+    name: build .msi (windows-x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-pkg-msi-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-pkg-msi-
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
+          echo "v=$V" >> "$GITHUB_OUTPUT"
+      - name: Build release binary
+        run: cargo build --release --locked --bin dig-node
+      - name: Install WiX
+        shell: bash
+        run: |
+          # Pin WiX v5.0.2 — the last release BEFORE the v6+ Open Source Maintenance Fee (OSMF)
+          # EULA gate (WIX7015), which cannot be accepted non-interactively in CI. The .wxs uses the
+          # v4 schema namespace, which v5 supports. Pin the extension to the SAME version so the
+          # WixToolset.Util.wixext major matches the toolset (a mismatched ext major fails to load).
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+      - name: Build .msi
+        shell: bash
+        run: |
+          mkdir -p dist
+          wix build packaging/windows/dig-node.wxs \
+            -ext WixToolset.Util.wixext \
+            -arch x64 \
+            -d Version="${{ steps.ver.outputs.v }}" \
+            -d BinDir="target/release" \
+            -o "dist/dig-node-${{ steps.ver.outputs.v }}-windows-x64.msi"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dig-node-msi
+          path: dist/*.msi
+          if-no-files-found: error
+
+  # ---- Attach to the GitHub Release (tags only) -----------------------------
+  publish:
+    name: Attach packages to the release
+    needs: [deb, pkg, msi]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.deb' -o -name '*.pkg' -o -name '*.msi' \) -exec cp {} release/ \;
+          ls -la release
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          # Do NOT regenerate notes — release.yml (the binary release) owns the notes; this job
+          # only appends the native-package assets to the same tag's release.
+          generate_release_notes: false
+          fail_on_unmatched_files: true

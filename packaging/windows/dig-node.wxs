@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX v4/v5 source for the dig-node Windows .msi (#503). This IS the Windows install
+  architecture: the dig-installer just fetches + runs this .msi.
+
+  It (declaratively):
+    * installs dig-node.exe to "%ProgramFiles%\DIG Network\dig-node\";
+    * registers the OS service `net.dignetwork.dig-node` (display "DIG NETWORK: NODE")
+      running `dig-node.exe run-service` as LocalSystem, auto-start, STARTED on install,
+      STOPPED + REMOVED on uninstall (ServiceInstall + ServiceControl);
+    * creates C:\ProgramData\DigNode with a RESTRICTIVE ACL — inheritance broken, only
+      SYSTEM + Administrators (no Users) — so the control token written there by the
+      LocalSystem service is NOT readable by other local users (#501). dig-node's own
+      ensure_dir_restricted() leaves this pre-created dir untouched (it only tightens a
+      dir it creates fresh), so this ACL is authoritative.
+    * registers the `chia://` scheme handler (HKLM\Software\Classes\chia →
+      `"…\dig-node.exe" open "%1"`, #389);
+    * appends the install dir to the system PATH;
+    * ensures the dig.local → 127.0.0.2 hosts entry via a deferred (SYSTEM) custom action
+      calling `dig-node ensure-hosts` (no shell).
+  A stable UpgradeCode + MajorUpgrade gives clean in-place upgrades.
+
+  Build (CI, windows runner):
+    wix build packaging/windows/dig-node.wxs -ext WixToolset.Util.wixext \
+      -d Version=<x.y.z> -d BinDir=<dir-with-dig-node.exe> -arch x64 -o dig-node-<ver>-windows-x64.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package
+      Name="DIG NETWORK: NODE"
+      Manufacturer="DIG Network"
+      Version="$(var.Version)"
+      UpgradeCode="7E9B1C2D-3A4F-4B5C-8D6E-1F2A3B4C5D6E"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <!-- Clean in-place upgrades; block downgrades with a clear message. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of DIG NETWORK: NODE is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- The single install feature. -->
+    <Feature Id="Main" Title="DIG Network Node" Level="1">
+      <ComponentGroupRef Id="NodeComponents" />
+    </Feature>
+
+    <!-- INSTALLFOLDER = %ProgramFiles%\DIG Network\dig-node\ -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="MANUFACTURERFOLDER" Name="DIG Network">
+        <Directory Id="INSTALLFOLDER" Name="dig-node" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- C:\ProgramData\DigNode — the machine-wide state dir (#501). -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="STATEDIR" Name="DigNode" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="NodeComponents">
+      <!-- The binary + the OS service (install/start/stop/remove). -->
+      <Component Id="DigNodeExe" Directory="INSTALLFOLDER" Guid="*">
+        <File Id="dig_node_exe" Source="$(var.BinDir)\dig-node.exe" KeyPath="yes" />
+        <ServiceInstall
+            Id="DigNodeService"
+            Type="ownProcess"
+            Name="net.dignetwork.dig-node"
+            DisplayName="DIG NETWORK: NODE"
+            Description="The local DIG node: serves chia:// (DIG) content over loopback and resolves DIG links."
+            Start="auto"
+            Account="LocalSystem"
+            ErrorControl="normal"
+            Arguments="run-service"
+            Vital="yes" />
+        <!-- Start on install; stop + delete on install AND uninstall. -->
+        <ServiceControl
+            Id="DigNodeServiceControl"
+            Name="net.dignetwork.dig-node"
+            Start="install"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+      </Component>
+
+      <!-- Append the install dir to the SYSTEM PATH. -->
+      <Component Id="PathEntry" Directory="INSTALLFOLDER" Guid="*">
+        <Environment Id="PathAppend" Name="PATH" Value="[INSTALLFOLDER]" Part="last"
+                     Action="set" Permanent="no" System="yes" />
+        <RegistryValue Root="HKLM" Key="Software\DIG Network\dig-node" Name="PathAdded"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- chia:// OS scheme handler (#389). -->
+      <Component Id="ChiaScheme" Directory="INSTALLFOLDER" Guid="*">
+        <RegistryKey Root="HKLM" Key="Software\Classes\chia">
+          <RegistryValue Type="string" Value="URL:chia Protocol" />
+          <RegistryValue Name="URL Protocol" Type="string" Value="" />
+          <RegistryKey Key="shell\open\command">
+            <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]dig-node.exe&quot; open &quot;%1&quot;" />
+          </RegistryKey>
+        </RegistryKey>
+      </Component>
+
+      <!-- The restrictive machine-wide state dir (#501). util:PermissionEx REPLACES the DACL
+           (breaking the inherited %ProgramData% ACL that grants Users read): only SYSTEM +
+           Administrators, so the control token is not readable by other local users. A non-
+           elevated operator uses an elevated `dig-node pair` (the exact remedy the CLI prints). -->
+      <Component Id="StateDir" Directory="STATEDIR" Guid="*">
+        <CreateFolder>
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" />
+        </CreateFolder>
+        <RegistryValue Root="HKLM" Key="Software\DIG Network\dig-node" Name="StateDirCreated"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- dig.local → 127.0.0.2 hosts entry, via a deferred (SYSTEM, no-shell) custom action that
+         calls the binary's own idempotent `ensure-hosts`. Non-vital: a failure never blocks install. -->
+    <CustomAction Id="EnsureHosts" FileRef="dig_node_exe" ExeCommand="ensure-hosts"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <InstallExecuteSequence>
+      <Custom Action="EnsureHosts" After="InstallServices" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

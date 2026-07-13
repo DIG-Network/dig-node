@@ -1,0 +1,23 @@
+#!/bin/sh
+# Post-install (runs as root): create the restrictive machine-wide state dir (#501),
+# register + start the LaunchDaemon, and register the chia:// URL handler with LaunchServices.
+set -e
+
+# #501: machine-wide auth-state dir, owner (root) only — the daemon inherits it and the
+# control token is not readable by other local users. A non-root operator uses `sudo dig-node pair`.
+mkdir -p "/Library/Application Support/DigNode"
+chmod 700 "/Library/Application Support/DigNode"
+
+# Load + start the daemon (RunAtLoad brings it up; kickstart forces an immediate start).
+launchctl bootout system/net.dignetwork.dig-node 2>/dev/null || true
+launchctl bootstrap system /Library/LaunchDaemons/net.dignetwork.dig-node.plist || true
+launchctl enable system/net.dignetwork.dig-node || true
+launchctl kickstart -k system/net.dignetwork.dig-node || true
+
+# Register the chia:// handler app with LaunchServices so the scheme resolves to `dig-node open`.
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [ -x "$LSREGISTER" ]; then
+  "$LSREGISTER" -f "/Applications/DIG Network.app" >/dev/null 2>&1 || true
+fi
+
+exit 0
