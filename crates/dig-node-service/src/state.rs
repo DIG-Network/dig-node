@@ -64,7 +64,9 @@ pub const RUN_CONTEXT_ENV: &str = "DIG_NODE_RUN_CONTEXT";
 pub const RUN_CONTEXT_SERVICE: &str = "service";
 
 /// The machine-wide base folder name (Windows/macOS) — `DigNode` under `%PROGRAMDATA%` /
-/// `/Library/Application Support`. Linux uses the kebab `dig-node` path directly.
+/// `/Library/Application Support`. Linux uses the kebab `dig-node` path directly, so this is
+/// only referenced on Windows + macOS (gated to avoid a dead-code lint on Linux).
+#[cfg(any(windows, target_os = "macos"))]
 const MACHINE_FOLDER: &str = "DigNode";
 
 /// The ordered machine-wide candidate directories for THIS OS (identity-independent).
