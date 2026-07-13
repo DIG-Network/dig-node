@@ -78,6 +78,11 @@ enum Command {
         /// The DIG link (`chia://<storeId>[:<root>]/<path>` or `urn:dig:chia:<…>`).
         link: String,
     },
+    /// Internal: idempotently register the `dig.local` → `127.0.0.2` OS hosts entry (#91/#503),
+    /// so `http://dig.local` resolves to the node. Invoked by the native install packages;
+    /// requires write access to the hosts file (run elevated). Not meant to be run by hand.
+    #[command(hide = true)]
+    EnsureHosts,
 }
 
 /// `dig-node pair` sub-actions. With none, lists pending requests + issued tokens.
@@ -109,6 +114,7 @@ impl Command {
             Command::Status => "status",
             Command::Pair { .. } => "pair",
             Command::Open { .. } => "open",
+            Command::EnsureHosts => "ensure-hosts",
         }
     }
 }
@@ -139,6 +145,7 @@ fn main() -> std::process::ExitCode {
             render(pair::run(&config, pair_action), action, json)
         }
         Command::Open { link } => render(open::run(&config, &link), action, json),
+        Command::EnsureHosts => render(dig_node_service::hosts::run(), action, json),
     };
     std::process::ExitCode::from(exit.code())
 }

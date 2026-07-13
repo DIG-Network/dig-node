@@ -1213,6 +1213,47 @@ out to both listeners (§4.1).
 
 9.6. **Uninstall.** `uninstall` performs a best-effort `stop` first, then removes the registration.
 
+### 9.7. Native install packages (#503)
+
+The canonical end-user install path is a NATIVE OS PACKAGE built by this repo's CI (`package.yml`),
+published as GitHub Release assets on each `vX.Y.Z` tag. The `dig-installer` simply fetches + runs
+the right package; it does not re-implement service registration. Each package installs the binary,
+registers the OS service, registers the `chia://` scheme handler (→ `dig-node open`, §8.5), creates
+the machine-wide state dir (§7.3a), and sets the `dig.local` → `127.0.0.2` hosts entry (via the
+idempotent, no-shell `dig-node ensure-hosts`, §8.1). The `dig-node install`/`uninstall` CLI (§9.1)
+remains for manual/dev use.
+
+- **Windows `.msi`** (WiX; `dig-node-<ver>-windows-x64.msi`). Installs `dig-node.exe` under
+  `%ProgramFiles%\DIG Network\dig-node\`; `ServiceInstall`+`ServiceControl` register
+  `net.dignetwork.dig-node` (DisplayName **"DIG NETWORK: NODE"**) running `dig-node.exe run-service`
+  as LocalSystem, auto-start, STARTED on install, STOPPED+REMOVED on uninstall; creates
+  `C:\ProgramData\DigNode` with a **restrictive DACL — inheritance broken, only SYSTEM +
+  Administrators (never Users)** so the token is not world-readable (§7.3a; dig-node leaves a
+  pre-existing dir's ACL intact); registers `chia://` under `HKLM\Software\Classes\chia`
+  (`shell\open\command` = `"…\dig-node.exe" open "%1"`); appends the install dir to the system PATH;
+  runs `dig-node ensure-hosts` as a deferred (SYSTEM) custom action. A stable `UpgradeCode` +
+  `MajorUpgrade` give clean in-place upgrades.
+- **macOS `.pkg`** (`dig-node-<ver>-macos.pkg`, universal arm64+x86_64). Installs `dig-node` to
+  `/usr/local/bin`; a LaunchDaemon `/Library/LaunchDaemons/net.dignetwork.dig-node.plist`
+  (`RunAtLoad`+`KeepAlive`, `run` with `DIG_NODE_RUN_CONTEXT=service`); a tiny AppleScript app
+  (`/Applications/DIG Network.app`, `CFBundleURLTypes` for the `chia` scheme) forwards URL opens to
+  `dig-node open`; `postinstall` creates the restrictive state dir, `launchctl bootstrap`s the
+  daemon, and registers the handler with LaunchServices.
+- **Ubuntu `.deb`** (`dig-node_<ver>_amd64.deb`; `Package: dig-node`, `Depends: libc6`). Installs
+  `/usr/bin/dig-node`; a systemd system unit `net.dignetwork.dig-node.service` (auto-start,
+  `Restart=on-failure`, `DIG_NODE_RUN_CONTEXT=service`); a `.desktop` with
+  `MimeType=x-scheme-handler/chia` registered as the system default handler; `postinst` creates
+  `/var/lib/dig-node` (root-owned `0700`), the hosts entry, and enables+starts the unit; `prerm`
+  stops+disables it. The filename + control metadata are **apt-correct + stable** so apt.dig.net
+  ingests the Release asset to build its signed apt repo (the repo is GPG-signed by apt.dig.net; the
+  `.deb` itself needs no code-signing cert).
+- **Scheme registration scope.** All three register the DIG-specific **`chia://`** scheme. The
+  `urn:dig:chia:` textual form is accepted by `dig-node open` (§8.5) but is NOT registered as a
+  global OS handler — doing so would hijack the entire `urn:` scheme (every URN on the machine).
+- **Unix service identity.** The systemd/launchd services run as **root**, so `/var/lib/dig-node`
+  and `/Library/Application Support/DigNode` are root-owned `0700` and a non-root operator drives
+  control with `sudo dig-node pair` (the remedy the CLI prints, §7.3a).
+
 ---
 
 ## 10. Error-code catalogue (JSON-RPC wire)

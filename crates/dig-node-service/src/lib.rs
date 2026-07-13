@@ -37,6 +37,9 @@ pub mod config;
 /// served-store CSP. The wiring lives in [`server`].
 pub mod content;
 pub mod control;
+/// `dig-node ensure-hosts` (#91/#503): idempotently register the `dig.local` → `127.0.0.2` OS
+/// hosts entry so `http://dig.local` resolves to the node. Invoked by the native install packages.
+pub mod hosts;
 pub mod meta;
 /// `dig-node open <chia://… | urn:dig:chia:…>` (#389): the OS scheme-handler target the
 /// installer registers for `chia://` + `urn:dig:chia:`. Strictly validates the untrusted

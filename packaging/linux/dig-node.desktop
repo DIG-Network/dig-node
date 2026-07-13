@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=DIG Network
+Comment=Open DIG Network chia:// links
+# The OS scheme-handler target (#389): xdg passes the clicked URL as %u; `dig-node open`
+# strictly validates it (chia:// / urn:dig:chia: only) and opens the local node serve URL.
+Exec=/usr/bin/dig-node open %u
+Terminal=false
+NoDisplay=true
+# Register ONLY the DIG-specific `chia` scheme. The `urn:dig:chia:` textual form is also
+# accepted by `dig-node open`, but registering the whole `urn` scheme at OS level would
+# hijack every urn: link on the machine — so it is intentionally NOT a global handler here.
+MimeType=x-scheme-handler/chia;

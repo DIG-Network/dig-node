@@ -1,0 +1,29 @@
+[Unit]
+Description=DIG NETWORK: NODE
+Documentation=https://dig.net
+# The node serves content + a P2P layer; come up after the network is online so the
+# first bind + peer dial succeed. Never hard-depends on it (offline serve still works).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The .deb installs the binary here (see build-deb.sh). `run` is the unix-service
+# entrypoint (SPEC §8.1) — it serves in the foreground until SIGTERM.
+ExecStart=/usr/bin/dig-node run
+# Self-identify as a SERVICE run (#501): the daemon may bootstrap the machine-wide
+# state dir (/var/lib/dig-node) with a restrictive owner-only ACL. A bare CLI never does.
+Environment=DIG_NODE_RUN_CONTEXT=service
+# Restart-on-crash, matching the Windows SCM recovery actions + launchd KeepAlive.
+Restart=on-failure
+RestartSec=5
+# Runs as root (a system service): the state dir under /var/lib/dig-node is therefore
+# root-owned 0700, so the control token is not readable by other local users (#501). A
+# non-root operator drives control with `sudo dig-node pair` (the exact remedy the CLI prints).
+# Hardening: the node needs no elevated capabilities beyond binding its loopback port.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

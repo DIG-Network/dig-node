@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stop any running instance of the daemon before the payload is replaced, so the new binary
+# is not overwritten while in use (idempotent — ignore "not loaded").
+set -e
+launchctl bootout system/net.dignetwork.dig-node 2>/dev/null || true
+exit 0
