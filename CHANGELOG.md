@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.29.0] - 2026-07-13
+
+### Features
+- Windows display name, clean-reinstall, macOS ensure-hosts, 3-OS service smoke CI (#34)
+
 ## [0.28.0] - 2026-07-13
 
 ### Features
