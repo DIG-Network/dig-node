@@ -181,7 +181,12 @@ does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see belo
 | `DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC` | outgoing-bandwidth throttle cap, in bytes/second (§17) | `0` (UNLIMITED — opt-in) | Parsed as `u64`; `0`, unparsable, or unset ⇒ unlimited (the throttle is a no-op until an operator configures a cap). Resolved ONCE at node construction. |
 
 The peer-network layer additionally honors `DIG_PEER_NETWORK` (set to a falsy value to disable the L7
-peer network) and `DIG_RELAY_URL` (override or disable the relay), which gate the P2P bring-up.
+peer network) and `DIG_RELAY_URL` (override or disable the relay), which gate the P2P bring-up, and
+**`DIG_PEER_PORT`** — the P2P listen port for the mTLS peer-RPC server (dig-node-to-dig-node
+traffic, §5.2/§14 — distinct from the client-facing `DIG_NODE_PORT` JSON-RPC listener above).
+Parsed as `u16`; unparsable/unset ⇒ the default **`9444`** (`peer::DEFAULT_P2P_PORT`, matching
+dig-gossip's own `DEFAULT_P2P_PORT` so a node and its gossip peers agree on the conventional port
+with no configuration). Bound dual-stack IPv6-first with an IPv4 fallback, per §5.2.
 
 ### 3.3. Upstream normalization
 
@@ -1197,6 +1202,33 @@ up on its own, not sit stopped until a human restarts it:
     service is still registered and usable) — it surfaces as a `note` in the human summary and
     `result.recovery_configured: false` in `--json` output (`true` otherwise, and always `true` on
     Linux/macOS since their defaults already apply).
+
+9.2b. **Display name + clean-reinstall (`install`, #494).** `install` is a stop→delete→wait→create
+CLEAN-REINSTALL, never a reconfigure-in-place, so re-running it against an already-registered
+service does not hit Windows `CreateService` error 1073 ("the specified service already exists"):
+
+- If the service is not yet registered, `install` simply creates it.
+- If it IS already registered, `install` best-effort stops it, deletes (deregisters) it, polls for
+  the deregistration to actually take effect (bounded, `TimedOut` if it never does — a lingering
+  Windows deletion can hold on until open handles close), and only THEN recreates it.
+- **`install` never starts the service** (fresh or reinstalled) — it only registers
+  `autostart: true` for the next boot/login. A caller starts it explicitly with `dig-node start`.
+  This is deliberate: the dig-installer calls `install` then, when configured to start it, a
+  SEPARATE `start` and treats a `start` failure as fatal for that step; if `install` also started
+  the service, that second `start` would hit "already running" and could flip the installer's
+  reported outcome to failed even though the service is up.
+- **Windows display name.** `sc create` (via `service-manager`) always sets the SCM display name to
+  the service id; `install` follows it with `sc config <id> displayname= "DIG NETWORK: NODE"`, then
+  reads the config back with `sc qc <id>` to CONFIRM the override took (rather than trusting the
+  `sc config` exit code alone). Both steps are best-effort — a failure leaves the service
+  registered and usable, just possibly showing its id instead of the friendly name in the Services
+  console; `result.display_name_verified` (`--json`) reports whether the read-back confirmed it.
+- **macOS/Linux friendly name.** launchd has no display-name-equivalent plist key, so the daemon is
+  identified by its `Label` (`net.dignetwork.dig-node`) only. systemd's `Description=` DOES carry a
+  friendly name; the native `.deb`'s STATIC unit file (§9.7) already sets
+  `Description=DIG NETWORK: NODE`. A bare `dig-node install` (not via the `.deb`) registers a
+  service-manager-generated unit whose `Description` is the service id, matching `dig-dns`'s own
+  established precedent for the CLI-only path.
 
 9.3. **Entrypoint per platform.** The installed service runs `dig-node run-service` on Windows and
 `dig-node run` on systemd/launchd (which exec the foreground process directly).

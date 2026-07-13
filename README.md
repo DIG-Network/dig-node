@@ -55,6 +55,10 @@ dig-node uninstall
   kill it with error 1053). After install it auto-starts on boot, and `install` also configures SCM
   **recovery actions** (`sc.exe failure` — restart 5s/10s/30s after the 1st/2nd/subsequent crash, resetting after a day with no further crashes) so a crashed service comes back up on its own,
   same as the systemd/launchd behavior below; check with `sc qfailure net.dignetwork.dig-node`.
+  It shows up in the Services console as **"DIG NETWORK: NODE"** (set via a post-create
+  `sc config` + a `sc qc` read-back to confirm it took). Re-running `install` against an
+  already-registered service cleanly stops + deregisters + recreates it instead of hitting
+  `CreateService` error 1073 ("the specified service already exists").
 - **Linux / macOS:** the service installs at **user level** (systemd `--user` / a launchd GUI agent),
   so no `sudo` is needed and it runs as you. (systemd user services start at login; enable
   linger — `loginctl enable-linger $USER` — if you want it running without an active session.)
@@ -273,7 +277,7 @@ dig-node status --json
 # {"ok":true,"action":"status","service":"dig-node","version":"0.5.0","serving":false,"addr":"127.0.0.1:9778",…}
 
 dig-node install --json
-# {"ok":true,"action":"install","installed":true,"registered":true,"started":false,"label":"…","scope":"system","addr":"127.0.0.1:9778",…}
+# {"ok":true,"action":"install","installed":true,"reinstalled":false,"registered":true,"started":false,"label":"…","display_name":"DIG NETWORK: NODE","scope":"system","addr":"127.0.0.1:9778",…}
 ```
 
 On failure: `{ "ok":false, "action":…, "error":{ "code", "exit_code", "message", "hint" } }`.

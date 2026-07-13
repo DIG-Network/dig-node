@@ -1,12 +1,18 @@
 #!/bin/sh
-# Post-install (runs as root): create the restrictive machine-wide state dir (#501),
-# register + start the LaunchDaemon, and register the chia:// URL handler with LaunchServices.
+# Post-install (runs as root): create the restrictive machine-wide state dir (#501), register
+# the dig.local hosts entry (#494), register + start the LaunchDaemon, and register the
+# chia:// URL handler with LaunchServices.
 set -e
 
 # #501: machine-wide auth-state dir, owner (root) only — the daemon inherits it and the
 # control token is not readable by other local users. A non-root operator uses `sudo dig-node pair`.
 mkdir -p "/Library/Application Support/DigNode"
 chmod 700 "/Library/Application Support/DigNode"
+
+# dig.local → 127.0.0.2 (#91/#494), via the binary's own idempotent `ensure-hosts` (no shell
+# hand-editing of /etc/hosts here — mirrors the Windows MSI's EnsureHosts custom action and the
+# Ubuntu .deb postinst). Non-vital: a failure never blocks install.
+"/usr/local/bin/dig-node" ensure-hosts || true
 
 # Load + start the daemon (RunAtLoad brings it up; kickstart forces an immediate start).
 launchctl bootout system/net.dignetwork.dig-node 2>/dev/null || true
