@@ -121,6 +121,7 @@ impl ExitCode {
 /// stderr in the default mode) and a machine `result` object (folded into the
 /// `--json` success envelope). Service functions return this instead of printing
 /// directly, so main.rs renders ONE consistent surface for both audiences.
+#[derive(Debug)]
 pub struct Outcome {
     /// Human-readable, possibly multi-line, summary lines.
     pub summary: String,

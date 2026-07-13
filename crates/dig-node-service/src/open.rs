@@ -157,7 +157,10 @@ pub fn normalize(input: &str) -> Result<DigLink, String> {
         return Err("empty link".to_string());
     }
     if let Some(bad) = s.chars().find(|c| c.is_control()) {
-        return Err(format!("control character not allowed (U+{:04X})", bad as u32));
+        return Err(format!(
+            "control character not allowed (U+{:04X})",
+            bad as u32
+        ));
     }
     if let Some(bad) = s.chars().find(|c| DISALLOWED.contains(c)) {
         return Err(format!("disallowed character in link: {bad:?}"));
@@ -336,11 +339,7 @@ mod tests {
         let url = serve_url(&cfg, &link);
         assert_eq!(
             url,
-            format!(
-                "http://localhost:9778/s/{}:{}/index.html",
-                store(),
-                root()
-            )
+            format!("http://localhost:9778/s/{}:{}/index.html", store(), root())
         );
     }
 

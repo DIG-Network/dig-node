@@ -1095,7 +1095,10 @@ mod tests {
             "remedy should mention the control token: {remedy}"
         );
         assert!(
-            remedy.contains("dig-node") || remedy.contains("state dir") || remedy.contains('/') || remedy.contains('\\'),
+            remedy.contains("dig-node")
+                || remedy.contains("state dir")
+                || remedy.contains('/')
+                || remedy.contains('\\'),
             "remedy should name a path or command: {remedy}"
         );
     }

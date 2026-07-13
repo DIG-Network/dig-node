@@ -41,11 +41,13 @@
 //! The control token grants FULL local control of the node (mint controller tokens,
 //! change pins, drive wallet-adjacent control). A machine-wide file must therefore NOT be
 //! world/all-users-readable, or ANY local user could seize control (a local privilege
-//! escalation). The token dir + files are created with a restrictive ACL: owner/SYSTEM +
-//! Administrators full, the creating user read; nobody else. On Unix the files are `0600`
-//! and the dir `0700`; on Windows inherited ACEs are stripped (`icacls /inheritance:r`)
-//! and only SYSTEM + Administrators (+ the creating user) are granted — never the default
-//! `ProgramData` grant that lets all Users read.
+//! escalation). The token dir + files are created with a restrictive ACL granting EXACTLY
+//! SYSTEM + Administrators + the creating user, and NO ONE ELSE. On Unix the dir is `0700`
+//! and the token file `0600`; on Windows inherited ACEs are stripped (`icacls
+//! /inheritance:r`) and only those three trustees are granted (inheritable) — never the
+//! default `ProgramData` grant that lets all Users read. The creating user is granted full
+//! (it must write the token it mints, and an elevated installer must retain read); the
+//! security-critical property is that every OTHER local user is denied.
 
 use std::path::{Path, PathBuf};
 
@@ -221,7 +223,7 @@ pub fn ensure_dir_restricted(dir: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        windows_restrict(dir, true);
+        windows_restrict_dir(dir);
     }
     Ok(())
 }
@@ -264,30 +266,42 @@ fn current_user_account() -> Option<String> {
     if user.is_empty() {
         return None;
     }
-    match std::env::var("USERDOMAIN").ok().map(|d| d.trim().to_string()) {
+    match std::env::var("USERDOMAIN")
+        .ok()
+        .map(|d| d.trim().to_string())
+    {
         Some(domain) if !domain.is_empty() => Some(format!("{domain}\\{user}")),
         _ => Some(user.to_string()),
     }
 }
 
-/// Apply a restrictive Windows ACL to `path` via `icacls` (no shell — args are passed
-/// directly). Removes inherited ACEs (`/inheritance:r`) and grants ONLY SYSTEM
-/// (`*S-1-5-18`) + Administrators (`*S-1-5-32-544`) full, plus the creating user. For a
-/// directory the grants are made inheritable (`(OI)(CI)`) so files created inside inherit
-/// the same tight ACL. Best-effort: a failure (icacls missing/blocked) is ignored — the
-/// loopback bind + possession model still hold, and Unix is the CI-gated assertion path.
+/// Apply a restrictive Windows ACL to the state DIR `path` via `icacls` (no shell — args are
+/// passed directly). Removes inherited ACEs (`/inheritance:r`) so the world-readable
+/// `%PROGRAMDATA%` default does NOT apply, then grants inheritable full (`(OI)(CI)(F)`) to
+/// EXACTLY three trustees and NO ONE ELSE: SYSTEM (`*S-1-5-18`), Administrators
+/// (`*S-1-5-32-544`), and the creating user.
+///
+/// The creating user gets FULL (not merely read): the SAME process that creates the dir must be
+/// able to WRITE the token file into it (the dev/self-create path), and when an elevated
+/// `dig-node install` creates the dir the interactive user must retain read afterwards — FULL is
+/// a superset of read and, critically, still denies every OTHER local user, which is the
+/// security property that matters (no local privilege escalation). When the daemon bootstraps the
+/// dir as SYSTEM/root, the interactive user is simply not among the three trustees, so a
+/// non-elevated operator CLI cannot read the token and gets the precise remedy. Inheritable, so
+/// the token file created inside inherits exactly this tight ACL. Best-effort: a failure (icacls
+/// missing/blocked) is ignored — the loopback bind + token possession remain the primary gate,
+/// and Unix `0700`/`0600` is the CI-gated assertion path.
 #[cfg(windows)]
-fn windows_restrict(path: &Path, is_dir: bool) {
-    let full = if is_dir { "(OI)(CI)(F)" } else { "(F)" };
-    let user_perm = if is_dir { "(OI)(CI)(R)" } else { "(R)" };
+fn windows_restrict_dir(path: &Path) {
+    const GRANT: &str = "(OI)(CI)(F)";
     let mut cmd = std::process::Command::new("icacls");
     cmd.arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
-        .arg(format!("*S-1-5-18:{full}"))
-        .arg(format!("*S-1-5-32-544:{full}"));
+        .arg(format!("*S-1-5-18:{GRANT}"))
+        .arg(format!("*S-1-5-32-544:{GRANT}"));
     if let Some(user) = current_user_account() {
-        cmd.arg(format!("{user}:{user_perm}"));
+        cmd.arg(format!("{user}:{GRANT}"));
     }
     let _ = cmd
         .stdout(std::process::Stdio::null())
@@ -335,9 +349,9 @@ mod tests {
         let chosen = choose_state_dir(
             None,
             &[primary.clone(), fallback.clone()],
-            &|_p| false,          // none exist yet
-            &|p| p == fallback,   // only /etc is creatable here
-            true,                 // a service run
+            &|_p| false,        // none exist yet
+            &|p| p == fallback, // only /etc is creatable here
+            true,               // a service run
             PathBuf::from("/home/u/.local/DigNode"),
         );
         assert_eq!(chosen, fallback, "picks the first creatable candidate");
@@ -367,7 +381,10 @@ mod tests {
         let legacy = PathBuf::from("/home/u/.local/DigNode");
         let chosen = choose_state_dir(
             None,
-            &[PathBuf::from("/var/lib/dig-node"), PathBuf::from("/etc/dig-node")],
+            &[
+                PathBuf::from("/var/lib/dig-node"),
+                PathBuf::from("/etc/dig-node"),
+            ],
             &|_p| false, // absent
             &|_p| false, // uncreatable (no privilege)
             true,        // a service run
@@ -412,7 +429,8 @@ mod tests {
     #[test]
     fn ensure_dir_restricted_is_0700_and_not_group_or_world_accessible() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("dig-state-dir-{}-{}", std::process::id(), line!()));
+        let dir =
+            std::env::temp_dir().join(format!("dig-state-dir-{}-{}", std::process::id(), line!()));
         let _ = std::fs::remove_dir_all(&dir);
         ensure_dir_restricted(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
