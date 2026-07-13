@@ -333,7 +333,7 @@ mod tests {
         let machine = PathBuf::from("/var/lib/dig-node");
         let chosen = choose_state_dir(
             None,
-            &[machine.clone()],
+            std::slice::from_ref(&machine),
             &|p| p == machine, // it already exists
             &|_p| false,
             false, // NOT a service (the operator CLI)
