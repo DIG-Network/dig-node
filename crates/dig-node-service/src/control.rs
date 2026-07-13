@@ -178,13 +178,24 @@ pub fn load_token_readonly() -> std::io::Result<String> {
 }
 
 /// [`load_or_create_token`] for an explicit path (so tests use a temp dir and never
-/// touch the real config). Reads an existing non-blank token; otherwise generates,
-/// persists (owner-only on Unix), and returns a fresh one.
+/// touch the real config). Reads an existing non-blank token ONLY when its file is owned by a
+/// trusted principal ([`crate::state::token_file_is_trusted`], #501 residual); otherwise (or
+/// when absent) generates, persists (owner-only on Unix), and returns a fresh one.
 pub fn load_or_create_token_at(path: &Path) -> std::io::Result<String> {
     if let Ok(existing) = std::fs::read_to_string(path) {
         let t = existing.trim().to_string();
         if !t.is_empty() {
-            return Ok(t);
+            // #501 residual: TRUST a pre-existing token ONLY when its file is owned by a
+            // trusted principal. An attacker who can plant a KNOWN token in the machine-wide
+            // state dir — a `%PROGRAMDATA%` squat, or the narrow window during a service
+            // harden — would otherwise have the daemon (LocalSystem) read + trust it, learning
+            // the control token → full local node control (a local privilege escalation). A
+            // foreign-owned token is deleted + regenerated, so the daemon only ever trusts a
+            // token it (or a trusted principal: SYSTEM/Administrators/root) owns.
+            if crate::state::token_file_is_trusted(path, crate::state::running_as_service()) {
+                return Ok(t);
+            }
+            let _ = std::fs::remove_file(path);
         }
     }
     let token = generate_token();
@@ -1055,6 +1066,77 @@ mod tests {
         let second = load_or_create_token_at(&path).unwrap();
         assert_eq!(first, second, "token must be stable across reads");
         assert_eq!(first.len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SECURITY (#501 residual): a pre-existing control-token file that is NOT owned by a
+    /// trusted principal (here forced group/other-readable, so not owner-only) MUST be DELETED
+    /// and REGENERATED — never returned — so a planted/squatted token can never become the
+    /// trusted one (which would hand an attacker full local node control). Unix-gated: it
+    /// relies on mode bits (CI runs on Linux). Skipped when running as root, where a
+    /// root-owned file is legitimately trusted regardless of mode.
+    #[cfg(unix)]
+    #[test]
+    fn foreign_owned_token_file_is_regenerated_not_trusted() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "dig-node-token-untrusted-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = dir.join(CONTROL_TOKEN_FILE);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let planted = "planted0".repeat(8); // a KNOWN 64-char attacker value (non-empty)
+        std::fs::write(&path, &planted).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let running_as_root = std::fs::metadata(&path)
+            .map(|m| m.uid() == 0)
+            .unwrap_or(false);
+        let got = load_or_create_token_at(&path).unwrap();
+        if !running_as_root {
+            assert_ne!(
+                got, planted,
+                "an untrusted (group-readable) token must be regenerated, not returned"
+            );
+            assert_eq!(
+                got.len(),
+                64,
+                "the regenerated token is a fresh 64-hex value"
+            );
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "the regenerated token must be owner-only 0600 (got {mode:o})"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A trusted (owner-only `0600`, current-user-owned) pre-existing token is loaded AS-IS —
+    /// never regenerated — so a legit token stays stable across runs (#501 residual).
+    #[cfg(unix)]
+    #[test]
+    fn trusted_owner_only_token_file_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "dig-node-token-trusted-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = dir.join(CONTROL_TOKEN_FILE);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = "a".repeat(64);
+        std::fs::write(&path, &existing).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let got = load_or_create_token_at(&path).unwrap();
+        assert_eq!(
+            got, existing,
+            "a trusted owner-only token must be loaded as-is, not regenerated"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

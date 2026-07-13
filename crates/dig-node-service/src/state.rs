@@ -558,6 +558,109 @@ pub fn parse_first_user_read_sid(output: &str) -> Option<String> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// Control-token FILE owner verification (#501 residual). A pre-existing token file must be
+// OWNED by a trusted principal before the daemon trusts its BYTES: otherwise a local user who
+// planted a known token in the (machine-wide) state dir — a `%PROGRAMDATA%` squat, or the
+// narrow window during a service harden — could learn the control token and gain full local
+// node control (a local privilege escalation). The trust DECISION is a pure, unit-tested
+// helper (per platform); the owner READ is the thin I/O in [`token_file_is_trusted`].
+// ---------------------------------------------------------------------------
+
+/// PURE: may a control-token FILE whose Windows OWNER is `owner_sid` be trusted (loaded
+/// as-is)? SYSTEM (`S-1-5-18`) and Administrators (`S-1-5-32-544`) are ALWAYS trusted (the
+/// daemon identity / an elevated installer). A SERVICE run requires one of those — it MUST
+/// NEVER trust a token owned by a normal user (that is the priv-esc). A NON-service (dev /
+/// operator) run ALSO trusts the CURRENT process user's own SID, so a dev token in the legacy
+/// per-user dir keeps working; when the current user SID is indeterminate it stays LENIENT
+/// (preserving the pre-#501 dev behaviour) rather than needlessly regenerate. Any OTHER owner
+/// (a squatter's SID) is NOT trusted → the file is deleted + regenerated.
+#[cfg(windows)]
+pub fn windows_token_owner_is_trusted(
+    owner_sid: &str,
+    is_service: bool,
+    current_user_sid: Option<&str>,
+) -> bool {
+    if owner_sid == SID_SYSTEM || owner_sid == SID_ADMINISTRATORS {
+        return true;
+    }
+    if is_service {
+        // A service (LocalSystem) must only trust a SYSTEM/Administrators-owned token.
+        return false;
+    }
+    // Non-service (dev / operator): trust the current user's OWN token; stay lenient when the
+    // current user SID is indeterminate (no needless regeneration on a legacy per-user dir).
+    match current_user_sid {
+        Some(cur) => !cur.is_empty() && owner_sid == cur,
+        None => true,
+    }
+}
+
+/// PURE: may a control-token FILE owned by `owner_uid` with unix `mode` be trusted? `root`
+/// (uid 0) is ALWAYS trusted (a root/elevated installer wrote it). Otherwise it is trusted
+/// only when owned by the CURRENT effective uid AND `0600` (owner-only) — a token owned by
+/// another user, or one any group/other can read, is NOT trusted → deleted + regenerated.
+#[cfg(unix)]
+pub fn unix_token_owner_is_trusted(owner_uid: u32, mode: u32, current_euid: u32) -> bool {
+    if owner_uid == 0 {
+        return true;
+    }
+    owner_uid == current_euid && (mode & 0o777) == 0o600
+}
+
+/// Verify a PRE-EXISTING control-token FILE at `path` is owned by a TRUSTED principal before
+/// the daemon trusts its contents (#501 residual). `is_service` is the caller's run context
+/// ([`running_as_service`]). Returns `true` when the file may be loaded as-is; `false` when it
+/// is foreign-owned (a planted/squatted token) and MUST be deleted + regenerated. Reads the
+/// real owner (Windows `Get-Acl` via [`path_owner_sid`]; unix `stat`) and defers the decision
+/// to the pure [`windows_token_owner_is_trusted`] / [`unix_token_owner_is_trusted`].
+pub fn token_file_is_trusted(path: &Path, is_service: bool) -> bool {
+    #[cfg(windows)]
+    {
+        let owner = match path_owner_sid(path) {
+            Some(o) => o,
+            // Owner indeterminate: fail CLOSED on a service run (security wins over
+            // convenience — regenerate); stay LENIENT on a dev run (pre-#501 behaviour).
+            None => return !is_service,
+        };
+        windows_token_owner_is_trusted(&owner, is_service, current_user_sid().as_deref())
+    }
+    #[cfg(unix)]
+    {
+        // The unix trust rule is is_service-independent (see the helper): a service runs as
+        // root ⇒ its own tokens are uid-0-owned (trusted), and any foreign-uid token is not.
+        let _ = is_service;
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        match current_euid_near(path) {
+            Some(euid) => unix_token_owner_is_trusted(meta.uid(), meta.mode(), euid),
+            // Can't determine our euid → trust only a root-owned file.
+            None => meta.uid() == 0,
+        }
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = (path, is_service);
+        true
+    }
+}
+
+/// The current process's effective uid, via a probe file created in `path`'s parent dir (a
+/// freshly-created file is owned by the creating euid). Dependency-free (no `libc`); `None`
+/// when the probe cannot be created/statted. Used to compare a token file's owner to "us".
+#[cfg(unix)]
+fn current_euid_near(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = path.parent()?;
+    let probe = dir.join(format!(".dig-euid-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"").ok()?;
+    let uid = std::fs::metadata(&probe).ok().map(|m| m.uid());
+    let _ = std::fs::remove_file(&probe);
+    uid
+}
+
 /// Harden `dir` per the #501 contract, granting an optional interactive `read_grant`.
 /// FAILS CLOSED: any failure to establish + verify the tight ACL returns `Err`, and the
 /// caller must delete the dir + refuse to serve control from it. Idempotent on a legit dir
@@ -626,9 +729,11 @@ fn current_user_sid() -> Option<String> {
     Some(sid)
 }
 
-/// The dir's current owner SID via `Get-Acl`, or `None` if it can't be read.
+/// The current owner SID of `path` (a dir OR a file) via `Get-Acl`, or `None` if it can't be
+/// read. Used both for the dir-trust checks (harden / discover) and the control-token FILE
+/// owner verification ([`token_file_is_trusted`]).
 #[cfg(windows)]
-fn dir_owner_sid(path: &Path) -> Option<String> {
+fn path_owner_sid(path: &Path) -> Option<String> {
     let dir = path.to_string_lossy().replace('\'', "''");
     let ps = format!(
         "(Get-Acl -LiteralPath '{dir}').GetOwner([System.Security.Principal.SecurityIdentifier]).Value"
@@ -659,7 +764,7 @@ fn discover_existing_read_grant(dir: &Path) -> Option<String> {
         return None;
     }
     let trusted = matches!(
-        dir_owner_sid(dir).as_deref(),
+        path_owner_sid(dir).as_deref(),
         Some(SID_SYSTEM) | Some(SID_ADMINISTRATORS)
     );
     if !trusted {
@@ -726,7 +831,7 @@ fn windows_harden_dir(dir: &Path, read_grant: Option<&str>) -> std::io::Result<(
     //    rather than adopt an attacker-controlled directory.
     if dir.exists() {
         let trusted = matches!(
-            dir_owner_sid(dir).as_deref(),
+            path_owner_sid(dir).as_deref(),
             Some(SID_SYSTEM) | Some(SID_ADMINISTRATORS)
         );
         if !trusted {
@@ -1121,6 +1226,110 @@ mod tests {
         ensure_dir_restricted(&dir).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "state dir must be owner-only (got {mode:o})");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- control-token FILE owner verification (#501 residual) ------------------
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_token_owner_trust_rules() {
+        // SYSTEM + Administrators are trusted on BOTH a service and a non-service run.
+        assert!(windows_token_owner_is_trusted(SID_SYSTEM, true, None));
+        assert!(windows_token_owner_is_trusted(SID_SYSTEM, false, None));
+        assert!(windows_token_owner_is_trusted(
+            SID_ADMINISTRATORS,
+            true,
+            None
+        ));
+        let user = "S-1-5-21-1-2-3-1001";
+        // A SERVICE run must NOT trust a token owned by a normal user (the priv-esc)…
+        assert!(!windows_token_owner_is_trusted(user, true, Some(user)));
+        // …but a NON-service run trusts the CURRENT user's own token.
+        assert!(windows_token_owner_is_trusted(user, false, Some(user)));
+        // A DIFFERENT user's token (a squatter) is never trusted on a non-service run.
+        assert!(!windows_token_owner_is_trusted(
+            user,
+            false,
+            Some("S-1-5-21-9-9-9-2002")
+        ));
+        // Indeterminate current user on a non-service run → lenient (no needless churn).
+        assert!(windows_token_owner_is_trusted(user, false, None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_token_owner_trust_rules() {
+        let me = 1000u32;
+        // root-owned is trusted regardless of mode (a root/elevated installer wrote it).
+        assert!(unix_token_owner_is_trusted(0, 0o644, me));
+        assert!(unix_token_owner_is_trusted(0, 0o600, me));
+        // My own owner-only (0600) token is trusted.
+        assert!(unix_token_owner_is_trusted(me, 0o600, me));
+        // My own but group/other-readable token is NOT trusted.
+        assert!(!unix_token_owner_is_trusted(me, 0o644, me));
+        assert!(!unix_token_owner_is_trusted(me, 0o660, me));
+        // Another user's token (a squatter) is NOT trusted even at 0600.
+        assert!(!unix_token_owner_is_trusted(1001, 0o600, me));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn token_file_is_trusted_rejects_a_service_run_on_a_user_owned_file() {
+        // A file THIS (interactive-user) process creates is owned by the current user. A
+        // NON-service run trusts it; a SERVICE run does NOT (it requires SYSTEM/Administrators).
+        let dir = std::env::temp_dir().join(format!(
+            "dig-token-owner-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-token");
+        std::fs::write(&path, b"deadbeef").unwrap();
+        assert!(
+            token_file_is_trusted(&path, false),
+            "a non-service run trusts the current user's own token"
+        );
+        assert!(
+            !token_file_is_trusted(&path, true),
+            "a service run must NOT trust a user-owned token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_trusted_accepts_0600_rejects_group_readable() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "dig-token-owner-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-token");
+        std::fs::write(&path, b"deadbeef").unwrap();
+        // A 0600 file owned by the test user (== current euid) is trusted.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            token_file_is_trusted(&path, false),
+            "own 0600 token is trusted"
+        );
+        // A group/other-readable (0644) file is NOT trusted — UNLESS we are root (uid 0), where
+        // a root-owned file is legitimately trusted regardless of mode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let running_as_root = std::fs::metadata(&path)
+            .map(|m| m.uid() == 0)
+            .unwrap_or(false);
+        if !running_as_root {
+            assert!(
+                !token_file_is_trusted(&path, false),
+                "a group/other-readable token is not trusted"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -776,6 +776,19 @@ token is NOT accepted for them.
 - **The daemon MAY create the token (write); an operator CLI MUST NOT mint one.** The CLI
   (`dig-node pair` / any control tool) reads the token READ-ONLY; if it is missing or unreadable it
   MUST fail with a precise remedy (§7.3a) rather than write a fresh token the daemon does not trust.
+- **Trust a pre-existing token file ONLY when it is owned by a TRUSTED principal (owner
+  verification).** Before the daemon loads and trusts the bytes of an EXISTING `control-token`, it
+  MUST verify the file's OWNER; a foreign-owned token is DELETED and REGENERATED, never returned.
+  This closes the residual where an unprivileged local user plants a KNOWN token in the machine-wide
+  state dir (a `%PROGRAMDATA%` squat, or the narrow window during a service harden) so the daemon
+  (LocalSystem) reads + trusts it and the attacker learns the control token → full local control
+  (local privilege escalation). Trusted owners: **Windows** — `S-1-5-18` (SYSTEM) or `S-1-5-32-544`
+  (Administrators) always; a NON-service (dev/operator) run ALSO trusts the CURRENT process user's
+  own SID (so a dev token in the legacy per-user dir keeps working), and a SERVICE run requires
+  SYSTEM/Administrators. **Unix** — owner uid `0` (root) always, else the CURRENT effective uid AND
+  mode `0600` (owner-only); a group/other-readable or foreign-uid token is untrusted. This is layered
+  BENEATH the §7.3a state-dir hardening (which already purges a squatter-owned dir on a service run)
+  as defense-in-depth: it also guards the non-hardened dev path and any harden gap.
 - If the token cannot be persisted (unwritable state dir), the daemon MUST fall back to an
   in-memory token that no controller can read — the control plane fails **closed**; the read plane
   is unaffected.
