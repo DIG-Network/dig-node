@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.27.0] - 2026-07-13
+
+### Features
+- Machine-wide control-token state dir + `dig-node open` handler (#501, #389) (#32)
+
 ## [0.26.0] - 2026-07-12
 
 ### Features
