@@ -105,7 +105,18 @@ the OS service, and every machine-readable service-identity surface are named `d
 ENGINE library crate is `dig-node-core` (lib `dig_node_core`) — a distinct name from the `dig-node`
 binary so the two are never confused (#216). Every machine-readable surface (`/health.service`,
 `/version.service`, the CLI `--json` envelopes' `service` field) MUST report the service identity
-string `"dig-node"` (`meta::SERVICE_NAME`).
+string `"dig-node"` (`meta::SERVICE_NAME`) — the alias below renames only the invoked binary, never
+the service identity.
+
+2.1a. **`dign` first-class alias (issue #548).** The service shell also produces a second binary,
+`dign`, a FIRST-CLASS alias for `dig-node` (mirroring how `digs` aliases `digstore`, #434). It is a
+real installed binary — not a shell alias — defined as a second `[[bin]]` target
+(`crates/dig-node-service/src/bin/dign.rs`) that shares the SINGLE entrypoint
+`dig_node_service::run()` with `dig-node`, so there is NO duplicated logic. `dign <args>` MUST behave
+IDENTICALLY to `dig-node <args>`: the same subcommands, flags, `--json` envelopes, and exit codes.
+The displayed program name is derived from arg0, so `dign --help`/`--version` report `dign` while
+`dig-node --help`/`--version` report `dig-node`. A release publishes `dign` alongside the primary
+under the stem `dign-<ver>-<os>-<arch>[.exe]` (byte-identical shape to `dig-node-<ver>-<os>-<arch>`).
 
 2.2. **Node library version.** The node is the first-party `dig-node-core` engine library crate in
 this workspace. The constant `meta::DIG_NODE_VERSION` MUST equal the node library's crate version
@@ -1151,6 +1162,10 @@ passes through unchanged, with no shape to keep in sync on this side.
 `run` (default when no subcommand; serves in the foreground and is the unix-service entrypoint) ·
 `run-service` (hidden; the Windows SCM entrypoint, §9.4; behaves as `run` off Windows) ·
 `install` · `uninstall` · `start` · `stop` · `status` · `pair` (§7.11) · `open` (§8.5).
+
+The `dign` alias binary (§2.1a) exposes this SAME subcommand set with the SAME semantics — `dign
+<subcommand>` is equivalent to `dig-node <subcommand>` in every respect except the reported program
+name.
 
 ### 8.5. `open` — the OS scheme handler (#389)
 

@@ -37,6 +37,10 @@ pub mod config;
 /// served-store CSP. The wiring lives in [`server`].
 pub mod content;
 pub mod control;
+/// The shared CLI entrypoint ([`run`]) for BOTH the `dig-node` binary and its first-class
+/// `dign` alias (issue #548). Both `src/main.rs` and `src/bin/dign.rs` are thin shims over
+/// it, so the two binaries share ONE codepath and each reports its own invoked name.
+pub mod entrypoint;
 /// `dig-node ensure-hosts` (#91/#503): idempotently register the `dig.local` → `127.0.0.2` OS
 /// hosts entry so `http://dig.local` resolves to the node. Invoked by the native install packages.
 pub mod hosts;
@@ -67,5 +71,6 @@ pub mod win_service;
 
 pub use cli::{ExitCode, Outcome};
 pub use config::Config;
+pub use entrypoint::run;
 pub use meta::ErrorCode;
 pub use server::{serve, VERSION};

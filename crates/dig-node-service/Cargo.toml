@@ -18,6 +18,15 @@ default-run = "dig-node"
 name = "dig-node"
 path = "src/main.rs"
 
+# `dign` — a FIRST-CLASS alias binary for `dig-node` (issue #548), mirroring how `digs`
+# aliases `digstore` (#434). It shares the SINGLE entrypoint `dig_node_service::run()`
+# (see src/bin/dign.rs) so there is no duplicated logic; a build produces BOTH `dig-node`
+# and `dign`, and each reflects its own invoked name in --help/--version. The release
+# workflow publishes it alongside the primary as `dign-<ver>-<os_arch>[.exe]`.
+[[bin]]
+name = "dign"
+path = "src/bin/dign.rs"
+
 # A tiny stand-in for the REAL `dig-updater` beacon CLI (a separate repo/release, not
 # vendored here), so the `updater.*` control-plane tests (#515) exercise a genuine child-
 # process spawn — argv, stdout/exit-code parsing — without depending on that binary being
