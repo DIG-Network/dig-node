@@ -1,0 +1,359 @@
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+# The nightly + manual-dispatch RELEASE ORCHESTRATOR (dig_ecosystem #590/#592). Copied from the
+# ecosystem's REFERENCE nightlies implementation (DIG-Network/dig-updater) and adapted to
+# dig-node's build. The normative contract is SPEC.md §11; the ops runbook is runbooks/release.md.
+#
+# It replaces the old "tag-and-release-on-every-merge-to-main" model. Releases are no longer cut
+# per merge; they are batched to a nightly cron (+ manual dispatch), across two channels:
+#
+#   • STABLE channel  (job `stable`): the unchanged changelog+tag logic, now driven by the cron
+#     instead of push-to-main. It reads the version from Cargo.toml and cuts `vX.Y.Z` ONLY when
+#     that tag does not already exist — i.e. only when the version file was bumped since the last
+#     release (an unchanged version = the tag exists = a no-op). Cutting the tag = git-cliff
+#     regenerates CHANGELOG.md, commits it to main, tags that commit `vX.Y.Z`, and pushes both
+#     with RELEASE_TOKEN. The pushed `v*` tag then fires the STABLE binary build+publish
+#     (release.yml). This is the SAME stable path as before — only its trigger changed.
+#
+#   • NIGHTLY channel (jobs `nightly-meta` → `nightly-build` → `nightly-publish`): every night it
+#     builds `main` HEAD and publishes a GitHub PRE-release (never `latest`) under a dated tag
+#     `nightly-YYYYMMDD` plus a force-moved rolling `nightly` tag, so there is ALWAYS a fresh
+#     nightly regardless of whether the version was bumped. It synthesizes a semver-prerelease
+#     version `X.Y.Z-nightly.YYYYMMDD.<shortsha>` at BUILD time (nothing is committed) and prunes
+#     dated nightlies down to a retention window.
+#
+# Manual invocation (`workflow_dispatch`) drives EITHER channel on demand — choose `stable`,
+# `nightly`, or `both`; `force` re-cuts a stable release even when the version is unchanged.
+#
+# RELEASE_TOKEN posture (both channels): a tag pushed by the default GITHUB_TOKEN does NOT trigger
+# downstream workflows (GitHub anti-recursion) and GITHUB_TOKEN cannot push past branch protection,
+# so releases use the RELEASE_TOKEN org PAT. If RELEASE_TOKEN is absent, every channel NO-OPS with
+# a clear warning instead of half-releasing — add the org secret to enable releases.
+#
+# 60-day auto-disable (GitHub platform behavior, not this workflow's): GitHub disables a
+# `schedule:` trigger after 60 days with NO repo activity on a public repo, with no auto-re-enable
+# — and since #590 removed the push-to-main trigger, this cron is the ONLY automatic release
+# path. If nightlies silently stop, check `gh api repos/<owner>/<repo>/actions/workflows/
+# nightly-release.yml --jq .state` and re-enable with `gh workflow enable nightly-release.yml`
+# (see runbooks/release.md + SPEC.md §11.1).
+# ─────────────────────────────────────────────────────────────────────────────────────────────
+name: Nightly + stable release
+
+on:
+  # Midnight UTC — GitHub Actions cron is ALWAYS UTC. GitHub may delay a top-of-hour cron under
+  # load; that is acceptable here (a nightly a little late is fine, and the stable channel is
+  # idempotent — a delayed or skipped run just re-checks next time).
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Which channel(s) to release."
+        type: choice
+        options: [both, stable, nightly]
+        default: both
+      force:
+        description: "Force a STABLE release even if the version is unchanged (re-cut the tag)."
+        type: boolean
+        default: false
+
+concurrency:
+  # Serialize release runs so an overlapping cron + manual dispatch can never race on tags/releases.
+  group: nightly-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  # ───────────────────────────────── STABLE channel ─────────────────────────────────
+  # The converted on-merge tagger: version-detect → skip-if-already-tagged → git-cliff changelog
+  # → commit + tag + push (RELEASE_TOKEN). The pushed `v*` tag fires release.yml (the binary build).
+  stable:
+    name: Stable — changelog + tag
+    # Run on the schedule (both channels) or when dispatch selects stable/both. The
+    # `!startsWith(...chore(release):...)` guard is preserved from the on-merge era: it is INERT on
+    # schedule/dispatch (there is no `head_commit`), but it keeps the release changelog commit
+    # self-labelled so the loop stays safe even if a push trigger is ever re-introduced.
+    if: >-
+      ${{
+        !startsWith(github.event.head_commit.message, 'chore(release):') &&
+        (github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both')
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require RELEASE_TOKEN (else no-op)
+        id: token
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::warning::RELEASE_TOKEN is not set on this repo. The stable changelog+tag release is a NO-OP until the org-level PAT secret is added (see runbooks/release.md + SPEC.md §11). Nothing will be released."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          # Pin to `main` explicitly (opus review of #592): a schedule/dispatch run already
+          # defaults to the branch it ran on, but pinning makes the `HEAD:main` push below
+          # unambiguous — the changelog commit + tag can only ever land on `main` HEAD.
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Resolve version + skip if already tagged
+        if: steps.token.outputs.present == 'true'
+        id: ver
+        shell: bash
+        env:
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          crg() {
+            [ -f Cargo.toml ] || { echo ""; return; }
+            python3 -c 'import tomllib; d=tomllib.load(open("Cargo.toml","rb")); v=d.get("package",{}).get("version") or d.get("workspace",{}).get("package",{}).get("version") or ""; print(v if isinstance(v,str) else "")' 2>/dev/null || echo ""
+          }
+          VER="$(crg)"
+          if [ -z "$VER" ]; then echo "skip=true" >>"$GITHUB_OUTPUT"; echo "No version file — nothing to release."; exit 0; fi
+          TAG="v$VER"
+          # The idempotency keystone: an unchanged version means `vX.Y.Z` already exists, so the
+          # run is a no-op — UNLESS `force` was requested (a manual re-cut of the same version).
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null \
+             || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            if [ "$FORCE" = "true" ]; then
+              # Supply-chain guard: a PUBLISHED release is a shipped artifact — force-moving its
+              # tag onto a different commit would silently overwrite that version's binaries with
+              # code nobody reviewed under it. Only allow the re-cut when it is SAFE: the tag
+              # already points at the commit we're about to build (a legitimate "the build
+              # failed, re-fire release.yml" retry), or the tag has no published release yet (a
+              # repair of a bare/failed tag). Resolve the tag's commit locally first, falling back
+              # to the remote (mirrors the existence check above, which is dual local/remote too).
+              TAG_COMMIT="$(git rev-parse -q --verify "refs/tags/$TAG^{commit}" 2>/dev/null || true)"
+              if [ -z "$TAG_COMMIT" ]; then
+                TAG_COMMIT="$(git ls-remote origin "refs/tags/$TAG^{}" 2>/dev/null | cut -f1)"
+              fi
+              if [ -z "$TAG_COMMIT" ]; then
+                TAG_COMMIT="$(git ls-remote origin "refs/tags/$TAG" 2>/dev/null | cut -f1)"
+              fi
+              HEAD_COMMIT="$(git rev-parse HEAD)"
+              IS_PUBLISHED_RELEASE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft == false' 2>/dev/null || echo "false")"
+              if [ "$IS_PUBLISHED_RELEASE" = "true" ] && [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+                echo "::error::refusing to force-move $TAG — a PUBLISHED release already exists for it and the tag points at a different commit ($TAG_COMMIT) than this run's target ($HEAD_COMMIT). force is only for re-cutting the SAME commit (a failed-build retry) or repairing a tag with no published release. Bump the version instead of overwriting a shipped release."
+                exit 1
+              fi
+              echo "Tag $TAG already exists but force=true — re-cutting (the tag will be moved)."
+              echo "force=true" >>"$GITHUB_OUTPUT"
+            else
+              echo "skip=true" >>"$GITHUB_OUTPUT"; echo "Tag $TAG already exists — no-op."; exit 0
+            fi
+          fi
+          echo "skip=false" >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG" >>"$GITHUB_OUTPUT"
+          echo "Releasing $TAG"
+
+      - name: Install git-cliff
+        if: steps.token.outputs.present == 'true' && steps.ver.outputs.skip == 'false'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - name: Generate changelog
+        if: steps.token.outputs.present == 'true' && steps.ver.outputs.skip == 'false'
+        run: git-cliff --config cliff.toml --tag "${{ steps.ver.outputs.tag }}" --output CHANGELOG.md
+
+      - name: Commit changelog, tag, push
+        if: steps.token.outputs.present == 'true' && steps.ver.outputs.skip == 'false'
+        shell: bash
+        env:
+          FORCE_TAG: ${{ steps.ver.outputs.force }}
+        run: |
+          set -euo pipefail
+          git config user.name "dig-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          git add CHANGELOG.md
+          # `chore(release):` prefix labels the release commit so a re-introduced push trigger would
+          # skip it (the loop guard on the job `if:`).
+          git commit -m "chore(release): ${{ steps.ver.outputs.tag }}" || echo "changelog unchanged"
+          # A `force` re-cut moves an existing tag onto the fresh changelog commit; a normal cut
+          # creates a new tag. Main is NEVER force-pushed. NOTE (opus review of #592): a force-moved
+          # tag breaks git tag-immutability for that version — acceptable ONLY for the guarded
+          # retry/repair cases above. dig-node updates are gated by the dig-updater signed feed
+          # (the beacon verifies an Ed25519 signature over the update descriptor before applying),
+          # so that SIGNATURE — not the mutable git tag — is the integrity layer consumers rely on.
+          if [ "$FORCE_TAG" = "true" ]; then
+            git tag -f -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
+            git push origin "HEAD:main"
+            git push -f origin "${{ steps.ver.outputs.tag }}"
+          else
+            git tag -a "${{ steps.ver.outputs.tag }}" -m "Release ${{ steps.ver.outputs.tag }}"
+            git push origin "HEAD:main"
+            git push origin "${{ steps.ver.outputs.tag }}"
+          fi
+          echo "Pushed changelog commit + ${{ steps.ver.outputs.tag }} — release.yml (stable build) will fire."
+
+  # ───────────────────────────────── NIGHTLY channel ─────────────────────────────────
+  # 1) meta: gate on the token + synthesize the nightly version and tags (nothing is committed).
+  nightly-meta:
+    name: Nightly — resolve version
+    if: >-
+      ${{ github.event_name == 'schedule' || inputs.channel == 'nightly' || inputs.channel == 'both' }}
+    runs-on: ubuntu-latest
+    outputs:
+      token_present: ${{ steps.token.outputs.present }}
+      version: ${{ steps.v.outputs.version }}
+      dated_tag: ${{ steps.v.outputs.dated_tag }}
+      title: ${{ steps.v.outputs.title }}
+    steps:
+      - name: Require RELEASE_TOKEN (else no-op)
+        id: token
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_TOKEN" ]; then
+            echo "::warning::RELEASE_TOKEN is not set on this repo. The nightly pre-release is a NO-OP until the org-level PAT secret is added (see runbooks/release.md + SPEC.md §11)."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.token.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Synthesize the nightly version + tags
+        if: steps.token.outputs.present == 'true'
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          crg() {
+            python3 -c 'import tomllib; d=tomllib.load(open("Cargo.toml","rb")); v=d.get("package",{}).get("version") or d.get("workspace",{}).get("package",{}).get("version") or ""; print(v if isinstance(v,str) else "")'
+          }
+          BASE="$(crg)"                      # e.g. 0.31.2 (the current Cargo.toml version)
+          DATE="$(date -u +%Y%m%d)"          # e.g. 20260714 (UTC)
+          DATE_DASH="$(date -u +%Y-%m-%d)"   # e.g. 2026-07-14 (UTC, for the human title)
+          SHA="$(git rev-parse --short HEAD)"
+          # Semver PRERELEASE version — sorts BELOW the plain `X.Y.Z`, so a nightly never outranks
+          # the stable release of the same version. Built at CI time; never committed.
+          echo "version=${BASE}-nightly.${DATE}.${SHA}" >> "$GITHUB_OUTPUT"
+          echo "dated_tag=nightly-${DATE}" >> "$GITHUB_OUTPUT"
+          echo "title=Nightly ${DATE_DASH} (${SHA})" >> "$GITHUB_OUTPUT"
+
+  # 2) build: the SAME reusable cross-OS build the stable release uses, stamped with the nightly
+  #    version. Skipped (with the whole channel) when the token is absent.
+  nightly-build:
+    name: Nightly — build
+    needs: nightly-meta
+    if: needs.nightly-meta.outputs.token_present == 'true'
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version: ${{ needs.nightly-meta.outputs.version }}
+      ref: "" # build this run's commit (main HEAD)
+
+  # 3) publish: attach the built binaries to a dated + rolling PRE-release, then prune old
+  #    nightlies. Uses RELEASE_TOKEN for git tag + gh release operations (same identity as stable).
+  nightly-publish:
+    name: Nightly — publish + prune
+    needs: [nightly-meta, nightly-build]
+    if: needs.nightly-meta.outputs.token_present == 'true'
+    runs-on: ubuntu-latest
+    env:
+      # How many dated `nightly-YYYYMMDD` pre-releases to retain; older ones (and their tags) are
+      # pruned each run. The rolling `nightly` and all `v*` stable releases are NEVER pruned.
+      KEEP_NIGHTLIES: 14
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      REPO: ${{ github.repository }}
+      DATED_TAG: ${{ needs.nightly-meta.outputs.dated_tag }}
+      TITLE: ${{ needs.nightly-meta.outputs.title }}
+    steps:
+      - name: Checkout (with push credentials)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release
+
+      - name: Move nightly tags (dated + rolling) to this build
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "dig-release-bot"
+          git config user.email "release-bot@users.noreply.github.com"
+          # Force so a same-day re-run (or the moving rolling pointer) is idempotent. Neither
+          # `nightly-*` nor `nightly` matches release.yml's `v*` trigger, so no stable build fires.
+          git push -f origin "HEAD:refs/tags/${DATED_TAG}"
+          git push -f origin "HEAD:refs/tags/nightly"
+
+      - name: Publish the dated + rolling pre-releases
+        shell: bash
+        run: |
+          set -euo pipefail
+          NOTES="Automated nightly pre-release built from \`main\` HEAD (${TITLE}). Version \`${{ needs.nightly-meta.outputs.version }}\`. Pre-release — NOT a stable release; for alpha testers tracking the nightly channel."
+
+          # Ensure a prerelease exists at the tag, keep its metadata current, and replace ALL of
+          # its assets with THIS run's binaries (filenames carry the date+sha, so a stale asset
+          # would otherwise linger — clear then upload). Applied to both the immutable dated tag
+          # and the rolling `nightly` pointer.
+          #
+          # Delete-then-upload (not `gh release upload --clobber`) is intentional, not an
+          # oversight: each night's filenames embed that day's date+shortsha, so `--clobber`
+          # (which only overwrites SAME-named assets) would never remove the PREVIOUS night's
+          # differently-named leftovers from the rolling `nightly` release — a stale-then-fresh
+          # asset pair would accumulate forever. This does leave a brief assetless window on the
+          # release mid-step; acceptable for this nightly PRE-release channel (stable releases
+          # never take this path).
+          refresh_release() {
+            local tag="$1"
+            gh release view "$tag" --repo "$REPO" >/dev/null 2>&1 \
+              || gh release create "$tag" --repo "$REPO" --verify-tag \
+                   --prerelease --latest=false --title "$TITLE" --notes "$NOTES"
+            gh release edit "$tag" --repo "$REPO" --prerelease --latest=false --title "$TITLE" >/dev/null
+            gh release view "$tag" --repo "$REPO" --json assets --jq '.assets[].name' \
+              | while read -r asset; do
+                  [ -n "$asset" ] && gh release delete-asset "$tag" "$asset" --repo "$REPO" --yes
+                done
+            gh release upload "$tag" release/* --repo "$REPO"
+          }
+
+          refresh_release "${DATED_TAG}"
+          refresh_release "nightly"
+          echo "Published ${DATED_TAG} + moved rolling nightly."
+
+      - name: Prune old nightlies (keep newest KEEP_NIGHTLIES + the rolling tag)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `gh release list` runs as its own un-swallowed statement — a real listing failure
+          # (auth/API/network) reds this step per `set -e`, rather than being masked into a silent
+          # empty-prune. Only the DOWNSTREAM grep's exit 1 (its normal "no dated nightlies matched"
+          # on a quiet/new repo) is tolerated — a listing failure surfaces, a genuine empty match
+          # does not.
+          ALL_TAGS="$(gh release list --repo "$REPO" --limit 1000 --json tagName --jq '.[].tagName')"
+          # Dated nightly tags ONLY: `nightly-YYYYMMDD` sorts chronologically as text, so `sort -r`
+          # is newest-first. The rolling `nightly` and every `v*` stable tag are excluded by the
+          # pattern and are never touched.
+          mapfile -t dated < <(
+            printf '%s\n' "$ALL_TAGS" | grep -E '^nightly-[0-9]{8}$' | sort -r || [ $? -eq 1 ]
+          )
+          # Everything past the newest KEEP_NIGHTLIES is pruned — release AND git tag together.
+          for tag in "${dated[@]:$KEEP_NIGHTLIES}"; do
+            echo "Pruning old nightly: $tag"
+            gh release delete "$tag" --repo "$REPO" --yes --cleanup-tag
+          done
+          echo "Retention: kept newest $KEEP_NIGHTLIES dated nightlies + the rolling nightly."
