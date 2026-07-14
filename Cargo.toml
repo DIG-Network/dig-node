@@ -27,11 +27,11 @@ members = [
 edition = "2021"
 # The RELEASE version of the repo's shipped artifact — the `dig-node` binary
 # (`dig-node-service`, which inherits this via `version.workspace = true`). This is
-# the version the tag-on-merge + version-increment CI reads from the ROOT manifest
-# (`[workspace.package].version`), so it MUST be set here for a release to fire
-# (§3.6). The library crates (dig-node-core/dig-runtime/dig-wallet) keep their own
-# independent versions — only the released binary tracks the workspace version.
-version = "0.31.2"
+# the version the nightly-release.yml stable channel + version-increment CI reads from
+# the ROOT manifest (`[workspace.package].version`), so it MUST be set here for a
+# release to fire (§3.6). The library crates (dig-node-core/dig-runtime/dig-wallet)
+# keep their own independent versions — only the released binary tracks the workspace version.
+version = "0.31.3"
 
 # Release hardening, matching digstore: keep integer-overflow checks ON in release.
 # The node parses untrusted serialized input and does offset/length arithmetic over

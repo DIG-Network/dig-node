@@ -207,6 +207,7 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       dated_tag: ${{ steps.v.outputs.dated_tag }}
       title: ${{ steps.v.outputs.title }}
+      sha: ${{ steps.v.outputs.sha }}
     steps:
       - name: Require RELEASE_TOKEN (else no-op)
         id: token
@@ -238,12 +239,14 @@ jobs:
           BASE="$(crg)"                      # e.g. 0.31.2 (the current Cargo.toml version)
           DATE="$(date -u +%Y%m%d)"          # e.g. 20260714 (UTC)
           DATE_DASH="$(date -u +%Y-%m-%d)"   # e.g. 2026-07-14 (UTC, for the human title)
-          SHA="$(git rev-parse --short HEAD)"
+          SHORTSHA="$(git rev-parse --short HEAD)"
+          FULLSHA="$(git rev-parse HEAD)"
           # Semver PRERELEASE version — sorts BELOW the plain `X.Y.Z`, so a nightly never outranks
           # the stable release of the same version. Built at CI time; never committed.
-          echo "version=${BASE}-nightly.${DATE}.${SHA}" >> "$GITHUB_OUTPUT"
+          echo "version=${BASE}-nightly.${DATE}.${SHORTSHA}" >> "$GITHUB_OUTPUT"
           echo "dated_tag=nightly-${DATE}" >> "$GITHUB_OUTPUT"
-          echo "title=Nightly ${DATE_DASH} (${SHA})" >> "$GITHUB_OUTPUT"
+          echo "title=Nightly ${DATE_DASH} (${SHORTSHA})" >> "$GITHUB_OUTPUT"
+          echo "sha=${FULLSHA}" >> "$GITHUB_OUTPUT"
 
   # 2) build: the SAME reusable cross-OS build the stable release uses, stamped with the nightly
   #    version. Skipped (with the whole channel) when the token is absent.
@@ -254,7 +257,7 @@ jobs:
     uses: ./.github/workflows/build-binaries.yml
     with:
       version: ${{ needs.nightly-meta.outputs.version }}
-      ref: "" # build this run's commit (main HEAD)
+      ref: ${{ needs.nightly-meta.outputs.sha }}
 
   # 3) publish: attach the built binaries to a dated + rolling PRE-release, then prune old
   #    nightlies. Uses RELEASE_TOKEN for git tag + gh release operations (same identity as stable).
