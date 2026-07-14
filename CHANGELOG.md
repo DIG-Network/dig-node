@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.31.0] - 2026-07-14
+
+### Features
+- **cli:** Dign first-class alias binary for dig-node (mirror digs #434) (#36)
+
 ## [0.30.0] - 2026-07-14
 
 ### Features
