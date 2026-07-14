@@ -1026,6 +1026,111 @@ async fn control_sync_status_reports_availability() {
     assert!(resp["result"]["pinned_total"].is_u64());
 }
 
+// --- #515: DIG auto-update beacon proxy (`control.updater.*`) ----------------------
+//
+// A THIN passthrough to `dig-updater`'s own status file + CLI (`crate::updater`'s own
+// unit tests cover the arg-building/output-parsing logic in isolation); these prove the
+// FULL wire path — HTTP -> the control-token gate -> dispatch -> the proxy -> a real
+// child-process spawn (the `fake_beacon_cli` fixture, `tests/fixtures/fake_beacon_cli.rs`)
+// -> the response back over HTTP.
+
+/// `control.updater.*` requires the SAME control token as every other `control.*` method —
+/// a read (`status`) and a mutation (`checkNow`) are both rejected without one.
+#[tokio::test]
+async fn control_updater_methods_without_token_are_rejected() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+
+    for method in ["control.updater.status", "control.updater.checkNow"] {
+        let resp = post_rpc(
+            &addr,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": method }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            resp["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} must require the control token"
+        );
+    }
+}
+
+/// The full status round trip (absent -> present, read directly off disk) PLUS a real
+/// mutation (`setChannel`, spawned against the `fake_beacon_cli` fixture) — end to end
+/// over the real HTTP server, with the control token.
+#[tokio::test]
+async fn control_updater_status_and_mutation_wired_over_http() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
+
+    // -- status: absent (no beacon installed on this runner) is a normal, non-error result.
+    let status_dir = std::env::temp_dir().join(format!(
+        "dig-node-updater-e2e-status-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&status_dir);
+    std::env::set_var("DIG_UPDATER_STATUS_DIR", &status_dir);
+
+    let absent = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "control.updater.status" }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(absent["result"]["installed"], json!(false));
+
+    // -- status: present is forwarded verbatim.
+    std::fs::create_dir_all(&status_dir).unwrap();
+    let body = json!({ "schema": 1, "version": "0.6.0", "channel": "alpha", "paused": false });
+    std::fs::write(
+        status_dir.join("status.json"),
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+
+    let present = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "control.updater.status" }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(present["result"]["installed"], json!(true));
+    assert_eq!(present["result"]["status"], body);
+
+    // -- a real mutation, spawned against the fake CLI fixture — proves setChannel walks
+    // the whole path (auth -> dispatch -> a real child process -> its JSON stdout) rather
+    // than being tested only in isolation (`crate::updater`'s own unit tests).
+    std::env::set_var("DIG_UPDATER_BIN", env!("CARGO_BIN_EXE_fake_beacon_cli"));
+    std::env::set_var(
+        "FAKE_UPDATER_STDOUT",
+        r#"{"command":"channel","channel":"alpha"}"#,
+    );
+    std::env::set_var("FAKE_UPDATER_EXIT_CODE", "0");
+
+    let set_channel = post_rpc(
+        &addr,
+        json!({
+            "jsonrpc": "2.0", "id": 3, "method": "control.updater.setChannel",
+            "params": { "channel": "alpha" }
+        }),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(set_channel["result"]["channel"], json!("alpha"));
+
+    let _ = std::fs::remove_dir_all(&status_dir);
+    for var in [
+        "DIG_UPDATER_STATUS_DIR",
+        "DIG_UPDATER_BIN",
+        "FAKE_UPDATER_STDOUT",
+        "FAKE_UPDATER_EXIT_CODE",
+    ] {
+        std::env::remove_var(var);
+    }
+}
+
 #[tokio::test]
 async fn control_unknown_method_is_method_not_found() {
     let (upstream, _calls) = start_mock_upstream().await;

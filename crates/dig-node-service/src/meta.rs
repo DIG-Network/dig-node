@@ -356,6 +356,39 @@ pub fn methods() -> &'static [MethodInfo] {
                       NOT_SUPPORTED if no §21 identity / not eligible.",
             requires_auth: true,
         },
+        // -- DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater` --
+        MethodInfo {
+            name: "control.updater.status",
+            served: "control",
+            summary: "The DIG auto-update beacon's status (channel, paused, last check, \
+                      per-component decisions); { installed: false } if not installed.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.updater.setChannel",
+            served: "control",
+            summary: "Set the beacon's update channel. Params { channel }.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.updater.pause",
+            served: "control",
+            summary: "Suspend the beacon's auto-updates. Params { until? } (unix seconds).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.updater.resume",
+            served: "control",
+            summary: "Resume the beacon's auto-updates (clears any pause).",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.updater.checkNow",
+            served: "control",
+            summary: "Trigger an on-demand full beacon update pass; blocks until it \
+                      completes.",
+            requires_auth: true,
+        },
         // -- pairing administration (#280) — MASTER-token only ----------------------------
         MethodInfo {
             name: "control.pairing.list",
@@ -876,6 +909,12 @@ mod tests {
             "control.hostedStores.status",
             "control.sync.status",
             "control.sync.trigger",
+            // DIG auto-update beacon proxy (#515).
+            "control.updater.status",
+            "control.updater.setChannel",
+            "control.updater.pause",
+            "control.updater.resume",
+            "control.updater.checkNow",
         ] {
             assert!(
                 names.contains(&required),
