@@ -10,6 +10,11 @@ shipped as a **self-contained, cross-platform Rust binary** that installs as an 
 > configuration contract (see the Environment section). For the legacy Linux package + the
 > installer's pre-rename fallback, the GitHub release also publishes each binary under the old
 > `dig-companion-*` filename (identical bytes). See [`USER_JOURNEY.md`](USER_JOURNEY.md).
+>
+> **`dign` alias.** A shorter first-class alias binary, `dign`, ships alongside `dig-node` (mirroring
+> `digs`↔`digstore`): `dign <args>` behaves identically to `dig-node <args>` — same subcommands,
+> flags, `--json`, and exit codes — and each binary reports its own name in `--help`/`--version`. The
+> release publishes it as `dign-<ver>-<os>-<arch>[.exe]` beside the `dig-node-*` asset.
 
 The extension resolves `chia://` (DIG) URLs by fetching encrypted, Merkle-proven content over a DIG
 RPC and then **verifying + decrypting it in the extension**. By default it talks to `rpc.dig.net`;
@@ -133,6 +138,8 @@ ways at once:
 dig-node run         # serve on 127.0.0.1:9778 until Ctrl-C
 # or simply:
 dig-node             # bare invocation == run
+# the `dign` alias is interchangeable everywhere:
+dign run             # identical to `dig-node run`
 ```
 
 ## Configuration

@@ -24,6 +24,12 @@ name: Release dig-node
 # still published (a copy of the same bytes) so apt.dig.net + the installer fallback
 # keep resolving byte-exact across the rename without editing the consumer repos.
 #
+# `dign` is a FIRST-CLASS alias binary for `dig-node` (issue #548, mirroring how `digs`
+# aliases `digstore` #434): a SEPARATE `[[bin]]` target sharing the SAME entrypoint, so
+# `dign <args>` behaves byte-for-byte like `dig-node <args>`. It is built + published
+# ALONGSIDE `dig-node` under its own stem `dign-<ver>-<os>-<arch>[.exe]` (identical shape
+# to `dig-node-*`), which the dig-installer resolves via `Repo::dign()` (a follow-up).
+#
 # Per OS/arch (each emitted under both stems above):
 #   * windows-x64   (x86_64-pc-windows-msvc,  windows-latest)
 #   * linux-x64     (x86_64-unknown-linux-gnu, ubuntu-latest)
@@ -166,8 +172,10 @@ jobs:
             target
           key: ${{ runner.os }}-companion-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-companion-build-${{ matrix.target }}-
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-node
+      - name: Build release binaries (dig-node + dign alias)
+        # Build BOTH bins — `dign` is the first-class alias (issue #548, mirroring digs
+        # #434), published alongside `dig-node` under its own asset stem below.
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-node --bin dign
       - name: Stage artifact (dual-named)
         id: stage
         shell: bash
@@ -183,6 +191,15 @@ jobs:
           # template + the installer's pre-rename fallback). See the header comment.
           cp "$SRC" "dist/dig-node-${VER}-${{ matrix.out_name }}"
           cp "$SRC" "dist/dig-companion-${VER}-${{ matrix.out_name }}"
+          # The `dign` first-class alias (issue #548): a SEPARATE binary that behaves
+          # byte-for-byte like `dig-node`, published under its own `dign-*` stem (same
+          # shape as `dig-node-*`) so the dig-installer resolves it via Repo::dign(). Its
+          # filename differs from `dig-node` only by the `dig-node`->`dign` substring
+          # (incl. the `.exe` suffix on Windows).
+          DIGN_BIN="${{ matrix.bin }}"; DIGN_BIN="${DIGN_BIN/dig-node/dign}"
+          DIGN_SRC="target/${{ matrix.target }}/release/${DIGN_BIN}"
+          test -f "$DIGN_SRC" || { echo "dign binary not produced: $DIGN_SRC"; exit 1; }
+          cp "$DIGN_SRC" "dist/dign-${VER}-${{ matrix.out_name }}"
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
           ls -la dist
       - name: Upload build artifact
