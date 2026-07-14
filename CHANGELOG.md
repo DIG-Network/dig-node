@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.31.1] - 2026-07-14
+
+### Testing
+- **updater:** Make not-installed test hermetic (force empty resolution dir) (#571) (#37)
+
 ## [0.31.0] - 2026-07-14
 
 ### Features
