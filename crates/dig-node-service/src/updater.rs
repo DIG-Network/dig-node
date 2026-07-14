@@ -46,6 +46,10 @@ pub const STATUS_DIR_ENV: &str = "DIG_UPDATER_STATUS_DIR";
 /// fixture) or an operator whose beacon install lives at a nonstandard path.
 pub const CLI_BIN_ENV: &str = "DIG_UPDATER_BIN";
 
+/// Overrides the list of conventional bin directories [`conventional_bin_dirs`] — set by a test
+/// to make binary resolution deterministic (a semicolon-separated list, or empty for no fallback).
+pub const CLI_BIN_RESOLUTION_DIRS_ENV: &str = "DIG_UPDATER_BIN_RESOLUTION_DIRS";
+
 /// The beacon's world-readable status directory (dig-updater SPEC §13.2): a sibling of its
 /// Admin/SYSTEM-only state directory, named `<state-dir-name>-status`.
 ///
@@ -121,8 +125,17 @@ fn resolve_cli_binary() -> Option<PathBuf> {
 }
 
 /// The per-OS conventional shared bin dir dig-installer places `digstore`/`dig-node`/`dig-dns`
-/// (and, once #514 ships, `dig-updater`) into.
+/// (and, once #514 ships, `dig-updater`) into. [`CLI_BIN_RESOLUTION_DIRS_ENV`] overrides this
+/// for tests (a semicolon-separated list of dirs; empty list disables the fallback).
 fn conventional_bin_dirs() -> Vec<PathBuf> {
+    if let Some(override_str) = std::env::var_os(CLI_BIN_RESOLUTION_DIRS_ENV) {
+        return override_str
+            .to_string_lossy()
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .collect();
+    }
     #[cfg(windows)]
     {
         let program_files =
@@ -428,10 +441,17 @@ mod tests {
     #[tokio::test]
     async fn every_mutation_reports_not_installed_when_no_binary_resolves() {
         let _guard = env_guard().lock().await;
-        // No override, and a real `dig-updater` is never present beside this test binary or
-        // under the conventional install dirs on a CI runner (or a normal dev checkout) — so
-        // NOT_SUPPORTED is the correct, real outcome for every mutation.
-        std::env::remove_var(CLI_BIN_ENV);
+        // Force an empty resolution dir so the test is hermetic: no real dig-updater will ever
+        // be found, even if one is installed on the machine. This ensures the test reliably
+        // passes by failing binary resolution, not by assuming it doesn't exist locally.
+        let empty_dir = unique_path("empty-resolution");
+        let _ = std::fs::create_dir_all(&empty_dir);
+        std::env::set_var(CLI_BIN_ENV, empty_dir.join("dig-updater")); // Override to a path that
+                                                                       // won't exist
+        std::env::set_var(
+            CLI_BIN_RESOLUTION_DIRS_ENV,
+            empty_dir.to_string_lossy().as_ref(),
+        );
 
         let checks = [
             (
@@ -449,6 +469,10 @@ mod tests {
                 "{label} should report NOT_SUPPORTED with no dig-updater binary resolvable"
             );
         }
+
+        let _ = std::fs::remove_dir_all(&empty_dir);
+        std::env::remove_var(CLI_BIN_ENV);
+        std::env::remove_var(CLI_BIN_RESOLUTION_DIRS_ENV);
     }
 
     // CLI-spawn behavior (arg building, `--json` output parsing, declined/malformed
