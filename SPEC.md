@@ -1384,12 +1384,33 @@ the **shell** mints plus the cross-boundary codes a client must be able to branc
 
 ## 11. Release and CI contract
 
-11.1. **Tag-driven releases.** Pushing a `v*` tag runs `.github/workflows/release.yml`: a gate job
-(`cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked`)
-that MUST pass before any binary is built, then a per-OS/arch build matrix, then a single publish
-job attaching all binaries to the GitHub Release. A push to `main` touching
-`src/**`/`tests/**`/`build.rs`/`Cargo.toml`/`Cargo.lock`/the workflow runs gate + build (no
-publish). Doc-only commits do not trigger the workflow.
+11.1. **Nightly cron + manual dispatch (NOT per-merge).** Releases are batched to a nightly cron
+plus manual dispatch — NOT cut on every merge to `main` (dig_ecosystem #590/#592; the shape is
+copied from the reference `dig-updater`). One orchestrator, `.github/workflows/nightly-release.yml`,
+triggers ONLY on `schedule: cron '0 0 * * *'` (midnight UTC — GitHub cron is always UTC, and a
+top-of-hour cron MAY be delayed under load, which is acceptable since both channels are idempotent)
+and `workflow_dispatch` (inputs `channel` = `both`|`stable`|`nightly`, default `both`; `force`
+boolean, default `false`). It MUST NOT trigger on `push` to `main`.
+
+- **Stable channel:** cuts a `vX.Y.Z` release when — and only when — the `[workspace.package].version`
+  in the root `Cargo.toml` has advanced beyond the newest `vX.Y.Z` tag (the skip-if-already-tagged
+  check IS the version-changed check). Cutting = `git-cliff` regenerates `CHANGELOG.md`, commits it
+  to `main` as `chore(release): vX.Y.Z`, tags THAT commit, and pushes commit + tag with
+  `RELEASE_TOKEN`. The pushed `v*` tag fires `release.yml` (§11.2/§11.3), which publishes a GitHub
+  Release with `prerelease: false` + `make_latest: true` — the ONLY release that moves `latest`.
+- **Force re-cut (guarded).** `force: true` bypasses skip-if-tagged and re-cuts the current version
+  (moving the tag onto a fresh changelog commit; `main` is never force-pushed). It MUST be refused
+  — non-zero exit, clear error — when BOTH: (a) a PUBLISHED (non-draft) Release exists at the tag,
+  AND (b) the tag points at a commit DIFFERENT from the one this run would build (that would
+  overwrite shipped binaries with unreviewed code under the same version). Force MAY proceed for a
+  same-commit re-cut (failed-build retry) or a tag with no published release (a tag repair). A
+  force-moved tag breaks git tag-immutability; because dig-node updates are gated by the dig-updater
+  signed feed (an Ed25519 signature over the update descriptor, verified before apply), that
+  signature — not the mutable tag — is the integrity anchor. Ship new code by bumping the version.
+
+11.1a. **Doc-only commits never release** (the version is unchanged → the tag exists → the stable
+job is a no-op). The manual-dispatch `workflow_dispatch` on `release.yml` is a build-only "does main
+still build?" canary — it never publishes (publish is gated on a tag ref).
 
 11.2. **Dual asset naming (HARD RULE).** Every per-OS/arch binary MUST be published under TWO
 filenames containing identical bytes:
@@ -1411,6 +1432,32 @@ rejects arm64 tokens).
 
 11.4. **Release hardening.** The release profile keeps `overflow-checks = true` (the read path
 does offset/length arithmetic over untrusted serialized input).
+
+11.5. **Nightly channel.** Every night (and on demand) the orchestrator builds `main` HEAD for
+every OS/arch and publishes a GitHub **pre-release** — so a fresh nightly always exists regardless
+of a version bump. It synthesizes a build-time version `X.Y.Z-nightly.YYYYMMDD.<shortsha>` (nothing
+is committed; as a semver prerelease it sorts BELOW the plain `X.Y.Z`), publishes under a dated tag
+`nightly-YYYYMMDD` AND force-moves a rolling `nightly` tag, with `prerelease: true` and **never**
+`latest`. Retention keeps the newest **14** dated nightlies plus the rolling `nightly`, pruning
+older dated pre-releases AND their tags together (`gh release delete --cleanup-tag`); `v*` stable
+tags/releases and the rolling `nightly` are NEVER pruned. Neither `nightly-*` nor `nightly` matches
+`release.yml`'s `v*` trigger, so the nightly channel never fires the stable build.
+
+11.6. **Reusable build.** The cross-OS build lives once in `.github/workflows/build-binaries.yml`
+(`on: workflow_call`, inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel
+call it, so the two paths can never diverge on HOW a binary is produced — including the dual
+`dig-node-*`/`dig-companion-*` naming (§11.2) and the `dign` alias.
+
+11.7. **RELEASE_TOKEN posture + 60-day cron caveat.** Releasing uses the `RELEASE_TOKEN` org PAT,
+not `GITHUB_TOKEN` (a tag pushed by `GITHUB_TOKEN` does not trigger downstream workflows, and it
+cannot push a changelog commit past branch protection). If `RELEASE_TOKEN` is absent, EVERY channel
+NO-OPS with a clear `::warning::` — never a half-release. A `concurrency: nightly-release` group
+(cancel-in-progress `false`) serializes runs. GitHub auto-disables a `schedule:` trigger after 60
+days with no repo activity on a public repo, with no auto-re-enable — and since this cron is now the
+ONLY automatic release trigger, a quiet repo can silently stop releasing. Detect with
+`gh api repos/DIG-Network/dig-node/actions/workflows/nightly-release.yml --jq .state`
+(`disabled_inactivity` = auto-disabled) and recover with `gh workflow enable nightly-release.yml`
+(see `runbooks/release.md`).
 
 ---
 

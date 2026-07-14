@@ -1,218 +1,64 @@
-name: Release dig-node
-
-# On a version tag (v*), build the self-contained `dig-node` service binary for
-# every supported OS/arch and attach them to a GitHub Release. Mirrors the
-# tag-driven, per-OS matrix pattern of digstore's release workflow, but the artifact
-# here is the plain installable binary (no Tauri installer): users download it and
-# run `dig-node install`.
+# STABLE binary release. On a `vX.Y.Z` tag (cut by the nightly-release orchestrator's stable job
+# — nightly-release.yml — either from the midnight cron detecting a version bump or from a manual
+# `workflow_dispatch`), this workflow builds the `dig-node` service binary + its `dign` alias for
+# every OS/arch (via the reusable build workflow) and publishes them to a STABLE GitHub Release:
+# `prerelease: false`, marked `latest`. Every per-OS/arch binary is published under BOTH the
+# canonical `dig-node-*` and legacy `dig-companion-*` names (SPEC §11.2). The changelog is already
+# inside the tag (the orchestrator committed it before tagging), so the notes carry the changelog.
 #
-# DUAL ASSET NAMING — every per-OS/arch binary is published under TWO names so both
-# downstream consumers resolve it with NO change on their side:
-#
-#   * `dig-node-<ver>-<os>-<arch>[.exe]`      ← the CANONICAL name the dig-installer
-#       thin-shim PREFERS (its dig-node Repo stem is `dig-node`; see
-#       dig-installer/src/asset.rs::select_asset + release.rs::Repo::dig_node).
-#   * `dig-companion-<ver>-<os>-<arch>[.exe]` ← the legacy name. apt.dig.net's
-#       packaging resolves the Linux binary by this exact template
-#       (`dig-companion-{ver}-linux-{x64,arm64}`, ARCHIVE_BIN_PATH="" = bare binary;
-#       see apt.dig.net/packaging/config.sh::PKG_dig_node_ASSET_TEMPLATE) and the
-#       installer keeps it as its pre-rename fallback (Repo::dig_node_legacy).
-#
-# The binary itself is identical; only the filename differs. The repo + Cargo binary
-# were renamed dig-companion → dig-node, so the build now emits `dig-node` and the
-# CANONICAL asset matches the produced binary; the legacy `dig-companion-*` asset is
-# still published (a copy of the same bytes) so apt.dig.net + the installer fallback
-# keep resolving byte-exact across the rename without editing the consumer repos.
-#
-# `dign` is a FIRST-CLASS alias binary for `dig-node` (issue #548, mirroring how `digs`
-# aliases `digstore` #434): a SEPARATE `[[bin]]` target sharing the SAME entrypoint, so
-# `dign <args>` behaves byte-for-byte like `dig-node <args>`. It is built + published
-# ALONGSIDE `dig-node` under its own stem `dign-<ver>-<os>-<arch>[.exe]` (identical shape
-# to `dig-node-*`), which the dig-installer resolves via `Repo::dign()` (a follow-up).
-#
-# Per OS/arch (each emitted under both stems above):
-#   * windows-x64   (x86_64-pc-windows-msvc,  windows-latest)
-#   * linux-x64     (x86_64-unknown-linux-gnu, ubuntu-latest)
-#   * macos-arm64   (aarch64-apple-darwin,     macos-14)
-#   * macos-x64     (x86_64-apple-darwin,      macos-14, cross-compiled — see below)
-#
-# NO linux-arm64 asset is published: the active Linux build graph pulls in
-# `openssl-sys` (via the Chia wallet SDK `datalayer-driver` + `native-tls`, NOT via
-# reqwest, which uses rustls here), so an aarch64-Linux cross-compile would also have
-# to cross-compile OpenSSL — fragile and slow. No consumer requests it today: the
-# dig-installer's Linux os_arch_tokens are x64-only and it REJECTS an `arm64`/
-# `aarch64` token as a competing arch, and apt.dig.net treats arm64 as best-effort
-# (build-deb.sh resolves the asset, finds none, and SKIPS arm64 non-fatally). Revisit
-# if/when an arm64-Linux consumer appears (would need vendored/cross OpenSSL).
-#
-# A push to main also builds (no publish) so a broken build is caught before tagging.
-#
-# The `check` gate below runs fmt + clippy ONLY (#489) — it deliberately does NOT re-run the
-# test suite. The PR's own required CI (`ci.yml`) already ran fmt/clippy/tests/coverage against
-# this exact merged tree before merge (§2.4a); re-running `cargo test` here on the tag/main-push
-# path added nothing but a second chance for a flaky test to block a release that had already
-# passed its gate once (the #488 v1.96.0 incident). fmt/clippy stay: they are deterministic
-# (never flaky) and are a cheap fail-fast before spending 4 platforms' worth of build minutes.
+# This is intentionally tag-ONLY: merges to main no longer build or release here (dig_ecosystem
+# #590 batches releases to the nightly cron + manual dispatch). Pre-merge coverage comes from
+# ci.yml (fmt/clippy/test/coverage on every PR); daily main-HEAD build coverage comes from the
+# nightly channel. A `workflow_dispatch` is kept as a manual "does main still build?" canary — it
+# builds but does not publish (publish is gated on a tag ref).
+name: Release (stable)
 
 on:
   push:
     tags:
       - "v*"
-    branches: [main]
-    paths:
-      - "src/**"
-      - "tests/**"
-      - "build.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/release.yml"
   workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "0"
-  # ENOSPC guard (digstore CI lesson): the workspace now compiles the full P2P stack
-  # (dig-nat/gossip/dht/pex/download) + wasmtime/cranelift (via digstore-host/-stage) +
-  # the chia wallet SDK, whose debug symbols blow the runner disk. Strip debuginfo from
-  # dev + test builds and keep it out of release binaries, so a full workspace
-  # test/build fits the CI disk.
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
-  CARGO_PROFILE_RELEASE_DEBUG: "0"
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Gate: fmt + clippy on Linux, once. A tag that doesn't pass the gate never
-  # produces release binaries. No test re-run here — see the header comment (#489).
-  # ---------------------------------------------------------------------------
-  check:
-    name: fmt + clippy
+  # Resolve the version string the artifacts are stamped with: `X.Y.Z` from a `vX.Y.Z` tag, or a
+  # `g<shortsha>` build id for the manual canary (which never publishes).
+  meta:
+    name: Resolve version
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install Rust (stable + components)
+      - id: v
+        shell: bash
         run: |
-          rustup toolchain install stable --component rustfmt --component clippy
-          rustup default stable
-          rustc --version
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-companion-check-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-companion-check-
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=g$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
 
-  # ---------------------------------------------------------------------------
-  # Build the binary per OS/arch.
-  # ---------------------------------------------------------------------------
+  # Build every OS/arch through the shared reusable workflow — the same build the nightly channel
+  # uses, so the two release paths can never diverge on how a binary is produced.
   build:
-    name: build (${{ matrix.out_name }})
-    needs: check
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bin: dig-node.exe
-            out_name: windows-x64.exe
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: dig-node
-            out_name: linux-x64
-          # Both macOS arches build on the fast Apple-silicon macos-14 runner.
-          # The Intel binary is CROSS-COMPILED there (host arm64 → target
-          # x86_64-apple-darwin) rather than on a native macos-13 (Intel)
-          # runner: that Intel runner pool is chronically backlogged, so the
-          # macos-x64 job used to hang for hours (pending, never failing) and
-          # the release never completed. Cross-compiling needs no extra
-          # toolchain here — Apple's clang (Xcode on macos-14) targets both
-          # arches, the build steps are already `--target`-parameterized, and
-          # the only C/asm dependency in the macOS build graph is `ring` (via
-          # rustls), which the Apple toolchain assembles for x86_64 natively.
-          # `openssl-sys` is cfg-gated to non-Apple targets, so it is NOT in
-          # the macOS graph at all (TLS on macOS resolves to native-tls →
-          # Security.framework); there is no vendored-openssl cross-compile to
-          # worry about. Artifact names are unchanged so the dig-installer
-          # thin-shim + apt asset matchers still resolve them.
-          - os: macos-14 # Apple silicon (arm64)
-            target: aarch64-apple-darwin
-            bin: dig-node
-            out_name: macos-arm64
-          - os: macos-14 # Apple silicon — cross-compiles the Intel binary
-            target: x86_64-apple-darwin
-            bin: dig-node
-            out_name: macos-x64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install Rust + target
-        shell: bash
-        run: |
-          rustup toolchain install stable
-          rustup default stable
-          rustup target add ${{ matrix.target }}
-          rustc --version
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: ${{ runner.os }}-companion-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-companion-build-${{ matrix.target }}-
-      - name: Build release binaries (dig-node + dign alias)
-        # Build BOTH bins — `dign` is the first-class alias (issue #548, mirroring digs
-        # #434), published alongside `dig-node` under its own asset stem below.
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-node --bin dign
-      - name: Stage artifact (dual-named)
-        id: stage
-        shell: bash
-        run: |
-          VER="${GITHUB_REF_NAME#v}"
-          [ "$GITHUB_REF_TYPE" = "tag" ] || VER="g$(git rev-parse --short HEAD)"
-          mkdir -p dist
-          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
-          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
-          # On Windows out_name already ends in .exe; on unix there is no extension.
-          # Publish the SAME binary under both the canonical dig-node-* name (dig-
-          # installer's preferred stem) and the legacy dig-companion-* name (apt's
-          # template + the installer's pre-rename fallback). See the header comment.
-          cp "$SRC" "dist/dig-node-${VER}-${{ matrix.out_name }}"
-          cp "$SRC" "dist/dig-companion-${VER}-${{ matrix.out_name }}"
-          # The `dign` first-class alias (issue #548): a SEPARATE binary that behaves
-          # byte-for-byte like `dig-node`, published under its own `dign-*` stem (same
-          # shape as `dig-node-*`) so the dig-installer resolves it via Repo::dign(). Its
-          # filename differs from `dig-node` only by the `dig-node`->`dign` substring
-          # (incl. the `.exe` suffix on Windows).
-          DIGN_BIN="${{ matrix.bin }}"; DIGN_BIN="${DIGN_BIN/dig-node/dign}"
-          DIGN_SRC="target/${{ matrix.target }}/release/${DIGN_BIN}"
-          test -f "$DIGN_SRC" || { echo "dign binary not produced: $DIGN_SRC"; exit 1; }
-          cp "$DIGN_SRC" "dist/dign-${VER}-${{ matrix.out_name }}"
-          echo "ver=$VER" >> "$GITHUB_OUTPUT"
-          ls -la dist
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: dig-node-${{ matrix.out_name }}
-          path: dist/*
-          if-no-files-found: error
+    name: Build
+    needs: meta
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version: ${{ needs.meta.outputs.version }}
+      # Empty ref => build the tag/commit this run is on.
+      ref: ""
 
-  # ---------------------------------------------------------------------------
-  # One publish job after all builds, so there is no race to create the Release.
-  # Only on a tag push.
-  # ---------------------------------------------------------------------------
+  # Publish ONLY for a real tag — the manual-dispatch canary builds but stops here.
   publish:
     name: Publish GitHub Release
     needs: build
@@ -230,9 +76,14 @@ jobs:
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
           ls -la release
-      - name: Create / update the release and attach binaries
+      - name: Create / update the STABLE release and attach binaries
         uses: softprops/action-gh-release@v2
         with:
+          # `prerelease: false` + `make_latest: true`: a stable release is the one that moves
+          # `latest`. Nightlies (nightly-release.yml) are always prerelease + never latest, so a
+          # nightly can never masquerade as this stable download.
+          prerelease: false
+          make_latest: "true"
           files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true
