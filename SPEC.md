@@ -1101,6 +1101,47 @@ boundary, so key material never crosses to a paired caller even with a valid tok
 unit-tested exhaustively: an unpaired caller is denied on every mutation/custody method; a paired token
 authorizes a mutation but NOT pairing administration; a revoked token is denied on the next request.
 
+### 7.13. DIG auto-update beacon proxy (`control.updater.*`, #515)
+
+The DIG auto-update beacon (`dig-updater`, a separate installable service — DIG-Network/dig-updater
+SPEC §§1–13) checks daily for new releases of the DIG binaries and installs them behind a signed
+trust chain. dig-node exposes a THIN proxy to it over the SAME `control.*` gate (§7.2) — it never
+re-verifies the beacon's signed manifest and never decides what to install; it only reads the
+beacon's world-readable status mirror and shells its own elevation-gated CLI.
+
+| Method | Params | Result (essentials) |
+|---|---|---|
+| `control.updater.status` | — | `installed: false` when the beacon has no status.json yet (never an error); else `installed: true`, `status` = the beacon's `status.json` verbatim (dig-updater SPEC §13.2: `schema`, `version`, `channel`, `paused`, `paused_until`, `last_check`, `last_check_kind`, `last_outcome`, `last_reason`, `last_detail`, `components[]`, `next_wake`, `trust_state`) |
+| `control.updater.setChannel` | `channel` (string, e.g. `"alpha"`) | The beacon CLI's `channel set <channel> --json` output verbatim (dig-updater SPEC §13.3) |
+| `control.updater.pause` | `until?` (unix seconds) | The beacon CLI's `pause [--until <ts>] --json` output verbatim |
+| `control.updater.resume` | — | The beacon CLI's `resume --json` output verbatim |
+| `control.updater.checkNow` | — | The beacon CLI's `check --now --json` output verbatim — a full pass; the call blocks until it completes |
+
+**Status is read directly off disk, never through the CLI** — `control.updater.status` is the
+method a controller polls, and a file read is far cheaper than a process spawn on every poll. The
+status directory is a WORLD-READABLE sibling of the beacon's own Admin/SYSTEM-only state directory
+(dig-updater SPEC §13.2: `%ProgramData%\DIG\updater-status` on Windows, `/var/lib/dig-updater-status`
+on Unix), so dig-node needs no elevation to read it. A present-but-corrupt `status.json` is reported
+as `CONTROL_ERROR` (a genuine anomaly); an ABSENT one is `{ "installed": false }` (the beacon may
+simply never have been installed on this machine) — never an error either way.
+
+**Mutations shell the `dig-updater` CLI** — `setChannel`/`pause`/`resume`/`checkNow` invoke the
+already elevation-gated operator CLI (dig-updater SPEC §13.3: `channel set`/`pause`/`resume` require
+Administrator/root) rather than writing the beacon's Admin-only `config.json` directly. This service
+runs privileged (Windows LocalSystem / a root daemon), so it satisfies that elevation check the same
+way a human operator running an elevated terminal would. The CLI is resolved by an ABSOLUTE path —
+an explicit override, else beside this running `dig-node` binary (the shared bin dir dig-installer
+places `digstore`/`dig-node`/`dig-dns` into, and where the beacon installer, #514, is expected to
+place `dig-updater`), else a per-OS conventional install root — NEVER a bare name resolved through
+`PATH`. No binary resolves → `NOT_SUPPORTED` ("the DIG auto-update beacon is not installed on this
+machine"); the CLI runs but declines (a bad channel, a missing elevation) → `CONTROL_ERROR` carrying
+the CLI's own `detail` message; the CLI produces unparsable output (a crash) → `CONTROL_ERROR`.
+
+**Opaque passthrough by design.** Both the status file and every CLI `--json` result are forwarded
+as opaque JSON, never re-typed into a dig-node-owned shape — the beacon's schema-versioned wire
+contract exists precisely so an independent reader can do this safely: a field the beacon adds later
+passes through unchanged, with no shape to keep in sync on this side.
+
 ---
 
 ## 8. CLI contract

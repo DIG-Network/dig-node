@@ -43,6 +43,8 @@
 //! not model: the **pin registry** (which stores the operator chose to host, so they
 //! survive being listed even before/after caching) and the **upstream override**,
 //! both persisted in this service's own keys inside the shared `config.json`.
+//! `control.updater.*` (#515) proxies the DIG auto-update beacon the same way — see
+//! [`crate::updater`] for what it reads directly vs. shells out to.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -573,6 +575,14 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
         "control.hostedStores.status" => hosted_status(ctx, id, params).await,
         "control.sync.status" => control_ok(id, sync_status(ctx).await),
         "control.sync.trigger" => sync_trigger(ctx, id, params).await,
+        // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
+        // own status file + CLI (see `crate::updater`'s module doc for why nothing here
+        // re-implements the beacon's trust/install logic).
+        "control.updater.status" => crate::updater::status(id),
+        "control.updater.setChannel" => crate::updater::set_channel(id, params).await,
+        "control.updater.pause" => crate::updater::pause(id, params).await,
+        "control.updater.resume" => crate::updater::resume(id).await,
+        "control.updater.checkNow" => crate::updater::check_now(id).await,
         // Pairing administration (#280) — reached only with the MASTER token (the
         // gate blocks a paired token from these, see `is_pairing_admin_method`).
         "control.pairing.list" => crate::pairing::list(&ctx.pairings, &ctx.state_dir, id),

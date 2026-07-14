@@ -18,6 +18,22 @@ default-run = "dig-node"
 name = "dig-node"
 path = "src/main.rs"
 
+# A tiny stand-in for the REAL `dig-updater` beacon CLI (a separate repo/release, not
+# vendored here), so the `updater.*` control-plane tests (#515) exercise a genuine child-
+# process spawn — argv, stdout/exit-code parsing — without depending on that binary being
+# installed on the test runner. Controlled entirely by env vars (see the fixture's own doc
+# comment); never shipped (the release workflows build only `--bin dig-node`, §2.4a).
+#
+# Deliberately named WITHOUT "update"/"install"/"setup"/"patch": Windows' installer-detection
+# heuristic can require elevation to launch (or even just spawn via CreateProcess) an
+# unmanifested `.exe` whose name matches those substrings (`ERROR_ELEVATION_REQUIRED`, 740) —
+# hit empirically while developing #515 with a `fake_dig_updater` name. The REAL `dig-updater`
+# binary name is the beacon repo's own choice and out of scope here; this fixture just avoids
+# the trap for OUR test infra.
+[[bin]]
+name = "fake_beacon_cli"
+path = "tests/fixtures/fake_beacon_cli.rs"
+
 # The service shell's own library (transport/control/CLI/meta). Named `dig_node_service`
 # so it does not collide with the node library crate, which owns the `dig_node` name.
 [lib]
@@ -46,7 +62,9 @@ dig-wallet = { path = "../dig-wallet" }
 # and one server framework across the node and the service shell. `ws` enables
 # `axum::extract::ws` for the `GET /ws/status` liveness endpoint (#239).
 axum = { version = "0.7", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+# `process` backs the async `tokio::process::Command` the `updater` module (#515) spawns the
+# `dig-updater` beacon CLI through — a non-blocking child-process wait alongside the axum runtime.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "process"] }
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
