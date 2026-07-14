@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.30.0] - 2026-07-14
+
+### Features
+- **control:** DIG auto-update beacon RPC proxy (control.updater.*) (#35)
+
 ## [0.29.0] - 2026-07-13
 
 ### Features
