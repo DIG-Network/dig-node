@@ -1966,7 +1966,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.31.3"
+version = "0.32.0"
 dependencies = [
  "axum",
  "base64",

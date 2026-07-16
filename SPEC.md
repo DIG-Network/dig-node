@@ -1123,7 +1123,7 @@ beacon's world-readable status mirror and shells its own elevation-gated CLI.
 | Method | Params | Result (essentials) |
 |---|---|---|
 | `control.updater.status` | — | `installed: false` when the beacon has no status.json yet (never an error); else `installed: true`, `status` = the beacon's `status.json` verbatim (dig-updater SPEC §13.2: `schema`, `version`, `channel`, `paused`, `paused_until`, `last_check`, `last_check_kind`, `last_outcome`, `last_reason`, `last_detail`, `components[]`, `next_wake`, `trust_state`) |
-| `control.updater.setChannel` | `channel` (string, e.g. `"alpha"`) | The beacon CLI's `channel set <channel> --json` output verbatim (dig-updater SPEC §13.3) |
+| `control.updater.setChannel` | `channel` (string: `"nightly"` or `"stable"`; `"alpha"` is a deprecated alias for `nightly`) | The beacon CLI's `channel set <channel> --json` output verbatim (dig-updater SPEC §13.3). Thin passthrough — the token is forwarded VERBATIM and the beacon CLI is the sole validator; an unknown token is forwarded and its decline surfaces as `CONTROL_ERROR` |
 | `control.updater.pause` | `until?` (unix seconds) | The beacon CLI's `pause [--until <ts>] --json` output verbatim |
 | `control.updater.resume` | — | The beacon CLI's `resume --json` output verbatim |
 | `control.updater.checkNow` | — | The beacon CLI's `check --now --json` output verbatim — a full pass; the call blocks until it completes |

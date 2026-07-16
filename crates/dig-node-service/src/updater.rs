@@ -262,13 +262,18 @@ pub fn status(id: Value) -> Value {
     }
 }
 
-/// `control.updater.setChannel` — set the beacon's update channel. Params: `{ "channel": "alpha" }`.
+/// `control.updater.setChannel` — set the beacon's update channel. Params:
+/// `{ "channel": "nightly" | "stable" }` (`stable` is the beacon's default; the legacy `"alpha"`
+/// is still accepted as a deprecated alias for `nightly`). A THIN passthrough: the token is
+/// forwarded VERBATIM to the beacon's `channel set` CLI, which is the SOLE validator — the proxy
+/// keeps no channel enum of its own to drift from the beacon's, so any garbage token is forwarded
+/// and the CLI's decline surfaces as a `CONTROL_ERROR`.
 pub async fn set_channel(id: Value, params: &Value) -> Value {
     let Some(channel) = params.get("channel").and_then(|v| v.as_str()) else {
         return control_error(
             id,
             ErrorCode::InvalidParams,
-            "control.updater.setChannel requires params.channel (a string, e.g. \"alpha\")",
+            "control.updater.setChannel requires params.channel (a string: \"nightly\" or \"stable\")",
         );
     };
     match run_cli(&["channel", "set", channel]).await {
