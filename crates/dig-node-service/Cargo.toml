@@ -132,6 +132,16 @@ dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-con
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 
+# The install-root owner-SID probe (#565 LPE) reads the directory owner through the Win32 security
+# API (`GetNamedSecurityInfoW` → owner SID → `ConvertSidToStringSidW`) instead of spawning a
+# PowerShell owner query — a bare-name spawn from the (attacker-writable) install root is itself the
+# LPE this gate refuses (self_heal.rs). No process is launched.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+
 # Test-only WS client for the `GET /ws/status` integration tests (#239): connects
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.

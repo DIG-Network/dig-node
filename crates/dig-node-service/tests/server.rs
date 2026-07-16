@@ -246,6 +246,57 @@ async fn health_reports_ok_version_mode_and_cache() {
     assert!(methods.iter().any(|m| m == &json!("rpc.discover")));
 }
 
+/// #669: a desktop-app (Tauri) cross-origin request to the loopback serve surface must be
+/// reflected by CORS, and the `X-Dig-*` verification headers must be EXPOSED so the browser
+/// dig-urn-resolver can read the "Verified by Chia" attestation instead of failing closed.
+#[tokio::test]
+async fn cors_reflects_tauri_origin_and_exposes_verification_headers() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    // A preflight from a Tauri origin is answered + reflected (not blocked as foreign).
+    let preflight = client()
+        .request(reqwest::Method::OPTIONS, format!("http://{addr}/health"))
+        .header("Origin", "tauri://localhost")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("tauri://localhost"),
+        "the Tauri desktop-app origin must be reflected by CORS"
+    );
+
+    // A real GET from that origin exposes the verification headers to the cross-origin reader.
+    let resp = client()
+        .get(format!("http://{addr}/health"))
+        .header("Origin", "tauri://localhost")
+        .send()
+        .await
+        .unwrap();
+    let exposed = resp
+        .headers()
+        .get("access-control-expose-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for required in [
+        "x-dig-verified",
+        "x-dig-root",
+        "x-dig-inclusion-proof",
+        "x-dig-chunk-lens",
+    ] {
+        assert!(
+            exposed.contains(required),
+            "{required} must be listed in Access-Control-Expose-Headers (got {exposed:?})"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cache_get_config_reports_dir_and_shared_from_dig_node() {
     let (upstream, _calls) = start_mock_upstream().await;

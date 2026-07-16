@@ -1983,7 +1983,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.33.0"
+version = "0.34.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2008,6 +2008,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower-http",
  "windows-service",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
