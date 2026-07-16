@@ -32,3 +32,23 @@ fn release_workflow_stages_the_dign_asset() {
         "build-binaries.yml must stage a `dign-<ver>-<os_arch>` release asset"
     );
 }
+
+/// Guard (#585): the release NO LONGER ships the duplicate legacy `dig-companion-*`
+/// asset. dig-node was formerly dig-companion (#209); the old dual-naming published a
+/// byte-identical copy of every binary under a `dig-companion-<ver>-<os_arch>` name. No
+/// downstream consumer resolves that legacy name from a dig-node RELEASE:
+///   * apt.dig.net's packaging uses the canonical `dig-node-{ver}-linux-{arch}` template,
+///   * the dig-installer's legacy fallback targets the SEPARATE `DIG-Network/dig-companion`
+///     repo's own frozen historical releases (its own asset stem), not this asset name.
+///
+/// So the duplicate is pure release-noise — the build must ship ONLY `dig-node-*` + `dign-*`.
+#[test]
+fn release_workflow_no_longer_ships_the_legacy_dig_companion_asset() {
+    // Scope to the STAGED asset path (`dist/dig-companion-…`), not any mention of the word —
+    // the header comment legitimately explains WHY the legacy copy was dropped.
+    assert!(
+        !BUILD_YML.contains("dist/dig-companion"),
+        "build-binaries.yml must NOT stage a duplicate legacy `dig-companion-*` asset \
+         (#585) — ship only the canonical `dig-node-*` name + the `dign-*` alias"
+    );
+}

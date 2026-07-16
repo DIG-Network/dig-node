@@ -1,7 +1,6 @@
 # Runbook — releasing dig-node (nightly cron + manual dispatch)
 
-How this repo's `dig-node` binary (+ the `dig-companion` legacy-named copy + the `dign` alias) is
-built and released. The shape is copied from the ecosystem's **reference nightlies system**
+How this repo's `dig-node` binary (+ the `dign` alias) is built and released. The shape is copied from the ecosystem's **reference nightlies system**
 (`dig-updater`, dig_ecosystem #590/#592); the normative contract is `SPEC.md` §11.
 
 ## TL;DR
@@ -10,8 +9,8 @@ built and released. The shape is copied from the ecosystem's **reference nightli
   plus **manual dispatch**.
 - **Stable** (`vX.Y.Z`): cut automatically when the `[workspace.package].version` in the root
   `Cargo.toml` was bumped (detected as "the `vX.Y.Z` tag doesn't exist yet"), or on demand.
-  `prerelease: false`, marked `latest`. Every per-OS/arch binary ships under BOTH `dig-node-*` and
-  legacy `dig-companion-*` names, plus the `dign-*` alias.
+  `prerelease: false`, marked `latest`. Every per-OS/arch binary ships under the canonical
+  `dig-node-*` name, plus the `dign-*` alias.
 - **Nightly**: built every night from `main` HEAD as a **pre-release** under a dated tag
   `nightly-YYYYMMDD` + a rolling `nightly` tag. `prerelease: true`, never `latest`. Keeps 14.
 
@@ -61,7 +60,7 @@ Actions → **Nightly + stable release** → **Run workflow** → `channel: nigh
 ## Verify a release went live
 
 - **Stable:** `gh release view vX.Y.Z --repo DIG-Network/dig-node` — 4 OS/arch × (`dig-node-*` +
-  `dig-companion-*` + `dign-*`), `prerelease: false`, marked latest. Watch: `gh run watch <id>`.
+  `dign-*`), `prerelease: false`, marked latest. Watch: `gh run watch <id>`.
 - **Nightly:** `gh release view nightly --repo DIG-Network/dig-node` (rolling) or
   `gh release view nightly-YYYYMMDD` — `prerelease: true`.
 
