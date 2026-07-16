@@ -367,7 +367,8 @@ pub fn methods() -> &'static [MethodInfo] {
         MethodInfo {
             name: "control.updater.setChannel",
             served: "control",
-            summary: "Set the beacon's update channel. Params { channel }.",
+            summary: "Set the beacon's update channel (\"nightly\" or \"stable\"; \
+                      \"alpha\" is a deprecated alias for nightly). Params { channel }.",
             requires_auth: true,
         },
         MethodInfo {

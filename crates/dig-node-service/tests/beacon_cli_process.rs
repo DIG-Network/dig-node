@@ -82,6 +82,38 @@ async fn set_channel_runs_the_cli_and_returns_its_json_verbatim() {
     clear_fixture_env();
 }
 
+/// The proxy is a THIN passthrough (#605): whatever channel token the controller sends is
+/// forwarded VERBATIM to `dig-updater channel set <token> --json`. The beacon CLI — never this
+/// proxy — is the single validation surface, so the proxy carries `nightly`, `stable`, and the
+/// deprecated `alpha` alias identically, with no enum of its own to drift from the beacon's
+/// (dig-updater's `Channel`: `nightly | stable`, `alpha` ≡ `nightly`, default `stable`).
+#[tokio::test]
+async fn set_channel_forwards_every_channel_token_verbatim() {
+    let _guard = env_guard().lock().await;
+    for channel in ["nightly", "stable", "alpha"] {
+        clear_fixture_env();
+        std::env::set_var(CLI_BIN_ENV, fake_cli_path());
+        std::env::set_var(
+            "FAKE_UPDATER_STDOUT",
+            format!(r#"{{"command":"channel","channel":"{channel}"}}"#),
+        );
+        let args_file = unique_path(&format!("args-setchannel-{channel}"));
+        std::env::set_var("FAKE_UPDATER_ARGS_FILE", &args_file);
+
+        let resp = set_channel(json!(1), &json!({ "channel": channel })).await;
+
+        assert_eq!(resp["result"]["channel"], json!(channel));
+        assert_eq!(
+            std::fs::read_to_string(&args_file).unwrap(),
+            format!("channel set {channel} --json"),
+            "the {channel} token must reach dig-updater verbatim"
+        );
+
+        let _ = std::fs::remove_file(&args_file);
+    }
+    clear_fixture_env();
+}
+
 #[tokio::test]
 async fn pause_with_until_passes_the_flag_through() {
     let _guard = env_guard().lock().await;
@@ -156,6 +188,10 @@ async fn check_now_forwards_the_pass_report_on_success() {
     clear_fixture_env();
 }
 
+/// A garbage channel token is still forwarded verbatim (the proxy does not pre-validate — #605);
+/// the beacon CLI is the sole validator, and its decline surfaces through the existing
+/// exit-code + `detail` classification as a `CONTROL_ERROR`. (`nightly`/`stable`/`alpha` are the
+/// only tokens the beacon accepts; anything else — like this `banana` — is declined there.)
 #[tokio::test]
 async fn a_declined_cli_run_surfaces_its_detail_as_a_control_error() {
     let _guard = env_guard().lock().await;
@@ -163,17 +199,17 @@ async fn a_declined_cli_run_surfaces_its_detail_as_a_control_error() {
     std::env::set_var(CLI_BIN_ENV, fake_cli_path());
     std::env::set_var(
         "FAKE_UPDATER_STDOUT",
-        r#"{"status":"error","detail":"channel 'stable' is reserved"}"#,
+        r#"{"status":"error","detail":"unknown channel 'banana'"}"#,
     );
     std::env::set_var("FAKE_UPDATER_EXIT_CODE", "2");
 
-    let resp = set_channel(json!(1), &json!({ "channel": "stable" })).await;
+    let resp = set_channel(json!(1), &json!({ "channel": "banana" })).await;
 
     assert_eq!(resp["error"]["data"]["code"], json!("CONTROL_ERROR"));
     assert!(resp["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("reserved"));
+        .contains("banana"));
 
     clear_fixture_env();
 }
