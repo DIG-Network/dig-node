@@ -161,7 +161,8 @@ where
 
 /// Bound a child spawn to [`CHILD_TIMEOUT`] (#693): a child that never completes surfaces as a
 /// `TimedOut` I/O error rather than an infinite await, so the caller classifies it as a failed kick
-/// and the self-heal pass keeps going. The dropped `fut` cancels the underlying spawn.
+/// and the self-heal pass keeps going. When the future is dropped on timeout, the underlying child
+/// process is killed via [`tokio::process::Command::kill_on_drop`].
 async fn with_child_timeout<Fut>(fut: Fut) -> std::io::Result<Output>
 where
     Fut: Future<Output = std::io::Result<Output>>,
@@ -171,7 +172,7 @@ where
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             format!(
-                "self-heal child exceeded the {}s bound and was cancelled",
+                "self-heal child exceeded the {}s bound and was killed",
                 CHILD_TIMEOUT.as_secs()
             ),
         )),
@@ -180,9 +181,12 @@ where
 
 /// Spawn `bin` with `args` as a child process and collect its output. The production [`kick_with`]
 /// spawner. Callers bound it with [`with_child_timeout`] so a hung child never stalls a pass.
+/// Sets [`kill_on_drop(true)`](tokio::process::Command::kill_on_drop) so that when the timeout
+/// future is dropped on [`CHILD_TIMEOUT`] elapse, the child process is immediately killed.
 async fn spawn_process(bin: PathBuf, args: Vec<String>) -> std::io::Result<Output> {
     tokio::process::Command::new(&bin)
         .args(&args)
+        .kill_on_drop(true)
         .output()
         .await
 }
