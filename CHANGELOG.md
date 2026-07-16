@@ -7,17 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.35.0] - 2026-07-16
 
 ### Features
-- **tls:** Verify the TLS root is SYSTEM/Administrators-owned before reading `ca.key`, fail closed to plaintext otherwise (#661)
-
-### Bug Fixes
-- **tls:** Use a `Delay` missed-tick policy on the daily leaf-rotation interval so a host sleep never bursts redundant passes (#660)
-- **self-heal:** Bound each self-heal child spawn to a 120s timeout so a hung child cannot stall future passes (#693)
-
-### Testing
-- **tls:** Unit-test the leaf-rotation cadence, missed-tick behaviour, and the rotation action (#659)
-
-### Refactor
-- **security:** Extract the spawn-free Win32/unix owner check into a shared `security` module reused by self-heal (#565) and the TLS-root gate (#661)
+- **tls:** TLS-root owner gate + leaf-rotation hardening + self-heal timeout (#43)
 
 ## [0.34.0] - 2026-07-16
 
