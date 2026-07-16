@@ -67,3 +67,32 @@ no override field; for launchd there is no such key at all. The NATIVE `.deb`/`.
 packages (`packaging/`) sidestep this entirely by shipping their own static unit
 file/plist/WiX-`ServiceInstall` with the friendly name baked in — only the bare `dig-node install`
 CLI path (not via a native package) needs the `sc config`/`sc qc` dance.
+
+## HTTPS serve on dig.local (#624) — the dig-cert consumer
+
+- The node serves the SAME axum router over TLS on `127.0.0.2:443` (`https://dig.local`) + a
+  best-effort `[::1]:443` sibling, beside the kept plaintext `:80` listener. TLS material comes
+   from the `dig-cert` crate (pinned git-dep `tag = "v0.1.0"`, NOT `main` — release-first §4.1);
+  the config is built via `dig_cert::load_server_config` (a reloadable `ReloadableCertResolver`).
+- **Fail-soft is mandatory:** the CA + leaf are provisioned by the installer (#623), which may not
+  have run. `crate::tls::load_https_material` returns `None` (⇒ plaintext only) when `leaf.{crt,key}`
+  are absent/unloadable — HTTPS is never a hard requirement, mirroring the best-effort `:80` bind.
+- **Rotation:** the node is the runtime OWNER but delegates the HOW to dig-cert's `RenewalManager`.
+  A daily `maintain` pass re-issues the leaf from `ca.key` at <30d remaining, atomically swaps the
+  pair, and fires `resolver.reload()` → the live listener serves the new leaf with no restart. The
+  CA anchor is NEVER auto-rotated here (only `ca_renewal_due` is reported; `rotate_ca` is
+  installer-coordinated). Only install + renewal read `ca.key`.
+- **Gotcha — TLS-serving stack:** reuse `axum-server` (`RustlsConfig::from_config(Arc::new(config))`
+  + `from_tcp_rustls(...).handle(handle).serve(...)`), the SAME crate dig-wallet's mTLS listener
+  uses. Pin `rustls` 0.23 default-features-off `ring/std/tls12/logging` byte-identical to dig-cert /
+  dig-node-core / dig-dns, or a second `CryptoProvider` triggers the install panic.
+- **Test gotchas:** (1) an HTTPS integration test that runs the listener as a spawned task AND does a
+  synchronous rustls handshake probe MUST use a multi-thread runtime + `spawn_blocking`, else the
+  blocking probe starves the server on a current-thread executor → deadlock. (2) A raw rustls client
+  that VERIFIES the chain rejects the leaf with `MalformedDnsIdentifier` because webpki refuses the
+  `*.dig` single-label wildcard SAN (dig-cert SPEC §3.1) — use an accept-any verifier when the probe
+  only needs to CAPTURE the presented leaf; real CA-trust is proven by the reqwest request instead.
+- **Windows target-path gotcha:** building the fresh worktree failed compiling `libz-sys` via cmake
+  ("link.exe could not be run" / `DirectoryNotFoundException` on a `.tlog`) because the deep
+  `modules/.worktrees/dig-node-624/target/...` path trips MSBuild/cmake MAX_PATH — set a short
+  `CARGO_TARGET_DIR` (e.g. `C:\dnt624`) to build.

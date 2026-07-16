@@ -165,7 +165,7 @@ ARE `DIG_NODE_*`, full stop.
 | `DIG_NODE_HOST` | EXPLICIT localhost-listener bind IP override | *(unset)* | Parsed as `IpAddr`; unparsable/blank/unset ⇒ unset (§4.1's dual-stack default — see below), NOT a hardcoded `127.0.0.1` default. Setting it REPLACES the dual-stack default with exactly that one address (#288). |
 | `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | `https://rpc.dig.net` | Normalized (§3.3); highest precedence (§3.4). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
-| `DIG_NODE_DIGLOCAL` | toggle for the bare-`http://dig.local` listener | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
+| `DIG_NODE_DIGLOCAL` | toggle for the bare `dig.local` listeners (`http://dig.local` on `127.0.0.2:80` AND, when a dig-cert leaf is present, `https://dig.local` on `127.0.0.2:443` — §4.1a) | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
 
 The default port is the UNCOMMON high port **`9778`** (not `80`/`8080`). Port 80 requires elevation
 on most OSes, and both `80` and `8080` are the collision-prone common-dev ports most likely already
@@ -272,6 +272,46 @@ LAN-exposed. A service install (§9) forwards `DIG_NODE_HOST` into the installed
 environment ONLY when the operator gave an explicit override, so a plain `dig-node install` with
 no override yields a service that also dual-binds by default, rather than freezing an IPv4-only
 default into every future install.
+
+### 4.1a. Local HTTPS listeners — `https://dig.local` (#624, the #620 local-HTTPS epic)
+
+Beside the plaintext loopback listeners (§4.1) the node serves the SAME router over TLS so
+`https://dig.local` is a trusted origin in the browser. The certificate material is owned by the
+`dig-cert` crate (per-machine, name-constrained local CA; see `dig-cert` SPEC) and PROVISIONED by
+the dig-installer (#623); the node only READS the leaf to serve and OWNS leaf renewal.
+
+The node opens UP TO TWO HTTPS listeners for the SAME router, both **gated on `DIG_NODE_DIGLOCAL`
+being truthy AND a dig-cert leaf being present**:
+
+1. **`127.0.0.2:443`** — the bare-`https://dig.local` listener (the IPv4 alias the installer's
+   `127.0.0.2 dig.local` hosts entry resolves to). Best-effort: `:443` is privileged, so a bind
+   failure (no privilege, port in use, missing macOS loopback alias) MUST log a structured warning
+   and be non-fatal — the plaintext surface keeps serving.
+2. **`[::1]:443`** — the IPv6-loopback sibling (§5.2). The leaf's SAN covers `::1`, so an
+   IPv6-loopback client reaches the identical surface. Best-effort, non-fatal on bind failure.
+
+**Fail-soft when no CA/leaf (HARD RULE).** When `dig-cert`'s TLS root has no `leaf.crt`/`leaf.key`
+(the installer has not provisioned the CA yet), or the leaf cannot be loaded, the node MUST log an
+informational line and serve **plaintext only** — HTTPS is NEVER a hard requirement to start. No
+listener may bind `0.0.0.0` or `[::]`.
+
+**Leaf rotation (the node is the runtime OWNER; SPEC §6.4 of dig-cert).** When HTTPS is up the node
+drives `dig-cert`'s `RenewalManager::maintain` at service start and once daily. A pass re-issues the
+leaf from `ca.key` once it is within 30 days of its 90-day lifetime, atomically swaps
+`leaf.{key,crt}` (temp + rename, so no reader observes a torn or mismatched pair), and fires the
+reloadable rustls resolver's `reload()` so the running listener presents the new leaf **without a
+restart and without dropping connections**. Transient failures retry on a bounded backoff so a leaf
+never lapses; the listener keeps serving the previous leaf until a pass succeeds.
+
+**The CA trust anchor is NEVER auto-rotated by the node.** An approaching CA expiry is only REPORTED
+(`ca_renewal_due`); anchor rotation is an explicit, installer-coordinated `dig-cert rotate_ca` (it
+re-installs trust into every store), never an automatic maintenance side effect. Only two operations
+read `ca.key`: install (dig-installer) and leaf renewal (the node via `dig-cert`).
+
+**Transition posture.** The plaintext `127.0.0.2:80` listener (§4.1) is KEPT — no redirect to HTTPS
+yet — so existing plaintext consumers (extension/dig-dns/clients) do not break before the §5.3
+https-first ladder migration ships. The TLS stack is pinned byte-identical to `dig-cert`/`dig-dns`
+(`rustls` 0.23, `ring`, no aws-lc) so exactly one `CryptoProvider` is installed.
 
 ### 4.2. Host-header allowlist (anti-rebinding)
 

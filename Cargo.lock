@@ -1757,6 +1757,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
+name = "dig-cert"
+version = "0.1.0"
+source = "git+https://github.com/DIG-Network/dig-cert?tag=v0.1.0#408d604ad2fd398c635b9e5759eadeaf9ad4eb11"
+dependencies = [
+ "arc-swap",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tempfile",
+ "thiserror 2.0.18",
+ "time",
+ "tracing",
+ "x509-parser",
+]
+
+[[package]]
 name = "dig-clvm"
 version = "0.1.1"
 source = "git+https://github.com/DIG-Network/dig-clvm.git?rev=356771034afd54a61d6199bc5960786139e39988#356771034afd54a61d6199bc5960786139e39988"
@@ -1966,11 +1983,13 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "axum",
+ "axum-server",
  "base64",
  "clap",
+ "dig-cert",
  "dig-constants 0.3.0",
  "dig-node-core",
  "dig-wallet",
@@ -1979,10 +1998,12 @@ dependencies = [
  "digstore-stage",
  "futures-util",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "service-manager",
  "tempfile",
+ "time",
  "tokio",
  "tokio-tungstenite",
  "tower-http",
