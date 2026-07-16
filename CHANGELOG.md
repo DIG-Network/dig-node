@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.33.0] - 2026-07-16
+
+### Features
+- **serve:** HTTPS on dig.local (127.0.0.2:443) + live leaf rotation (#624) (#41)
+
 ## [0.32.0] - 2026-07-16
 
 ### Features
