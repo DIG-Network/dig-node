@@ -71,6 +71,21 @@ dig-wallet = { path = "../dig-wallet" }
 # and one server framework across the node and the service shell. `ws` enables
 # `axum::extract::ws` for the `GET /ws/status` liveness endpoint (#239).
 axum = { version = "0.7", features = ["ws"] }
+# TLS-terminating server for the local HTTPS surface (`https://dig.local`, #624). Same
+# crate + version dig-wallet already uses for the Sage-parity mTLS listener, so the node
+# and service shell share one TLS-serving framework. Feeds it the `rustls::ServerConfig`
+# dig-cert builds (its reloadable cert resolver) via `RustlsConfig::from_config`.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# The single source of truth for DIG local-TLS material (#620/#622): the reloadable rustls
+# loader + automatic leaf renewal for `https://dig.local`. PINNED to the released tag v0.1.0
+# (never `main`) — release-first (§4.1): the crate ships + releases before this consumer.
+dig-cert = { git = "https://github.com/DIG-Network/dig-cert", tag = "v0.1.0" }
+# The serving TLS stack — pinned byte-identical to dig-cert / dig-node-core / dig-dns (0.23,
+# default-features off, ring + std + tls12 + logging) so a build installs exactly ONE
+# `CryptoProvider` (ring) and never hits the "multiple CryptoProviders" install panic (#622 §7).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+# Wall-clock `OffsetDateTime::now_utc()` for the daily leaf-renewal maintenance pass (#624).
+time = { version = "0.3" }
 # `process` backs the async `tokio::process::Command` the `updater` module (#515) spawns the
 # `dig-updater` beacon CLI through — a non-blocking child-process wait alongside the axum runtime.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "process"] }

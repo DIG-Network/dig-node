@@ -58,6 +58,10 @@ pub mod service;
 /// paired-token store live so the daemon (which may run as a service under a different OS
 /// account) and the operator CLI resolve the SAME files. See [`state`].
 pub mod state;
+/// Local HTTPS TLS wiring for `https://dig.local` (#624): load the dig-cert leaf into a
+/// reloadable rustls config (fail-soft when no CA/leaf yet) and drive dig-cert's leaf
+/// renewal so the running listener hot-reloads a rotated leaf. See [`tls`].
+pub mod tls;
 /// The beacon (`dig-updater`) RPC proxy (#515): `control.updater.*` reads the DIG auto-update
 /// beacon's world-readable status and shells its elevation-gated CLI for channel/pause/resume/
 /// check-now — never a second implementation of the beacon's own trust logic. See [`updater`].

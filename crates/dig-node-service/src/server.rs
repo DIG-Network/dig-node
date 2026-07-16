@@ -1430,6 +1430,14 @@ where
         });
     }
 
+    // (4) Local HTTPS for `https://dig.local` (#624, the #620 epic): the SAME app served over
+    // TLS on `127.0.0.2:443` (plus the best-effort IPv6 loopback `[::1]:443`, §5.2), backed by a
+    // dig-cert leaf with live rotation. GATED on a leaf being present — fail-soft to plaintext
+    // when the installer (#623) has not provisioned the CA yet. Best-effort like the mTLS +
+    // bare-dig.local listeners: a bind failure logs and is non-fatal; the plaintext surface above
+    // keeps serving. Runs as spawned tasks driven to graceful stop by the shared shutdown signal.
+    bring_up_local_https(&config, &app, &shutdown_notify);
+
     let localhost_srv = {
         let app = app.clone();
         let n = shutdown_notify.clone();
@@ -1488,6 +1496,112 @@ fn warn_dig_local_bind_failed(dl_addr: &str, e: &std::io::Error) {
          loopback alias is missing (sudo ifconfig lo0 alias 127.0.0.2). \
          Set DIG_NODE_DIGLOCAL=0 to silence this and skip the attempt."
     );
+}
+
+/// Bring up the local HTTPS listeners for `https://dig.local` (#624). Fail-soft: when
+/// `dig_local` is disabled, the TLS root cannot be resolved, or no dig-cert leaf is present
+/// yet, this does NOTHING (the node keeps serving plaintext) — HTTPS is never required to
+/// start. When a leaf IS present it builds the reloadable rustls config once, spawns the
+/// leaf-rotation loop (dig-cert renewal manager, hot-reloading the shared resolver), and
+/// spawns a best-effort TLS listener on `127.0.0.2:443` and the IPv6 loopback `[::1]:443`,
+/// each serving `app` and stopped gracefully by `shutdown_notify`.
+fn bring_up_local_https(config: &Config, app: &Router, shutdown_notify: &Arc<tokio::sync::Notify>) {
+    // Only attempt HTTPS on the bare-dig.local surface (shares the `dig_local` toggle).
+    let Some(https_addr) = config.dig_local_https_addr() else {
+        return;
+    };
+
+    let paths = match dig_cert::TlsPaths::machine() {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!(
+                "dig-node: WARN cannot resolve the TLS material root ({e}); \
+                 https://dig.local disabled, serving plaintext only."
+            );
+            return;
+        }
+    };
+
+    // Fail-soft when the installer (#623) has not provisioned a CA + leaf yet.
+    let Some(material) = crate::tls::load_https_material(paths) else {
+        return;
+    };
+
+    // Drive leaf rotation off the SHARED resolver so a renewal hot-reloads every listener
+    // built from this config; the CA anchor is never auto-rotated (see `crate::tls`).
+    crate::tls::spawn_leaf_rotation(material.paths.clone(), material.resolver.clone());
+
+    // ONE rustls config shared by both loopback-family listeners: its cert resolver is the
+    // shared `ReloadableCertResolver`, so a rotation reload is served on both at once.
+    let rustls_config =
+        axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(material.config));
+
+    // (4a) The IPv4 dig.local alias `127.0.0.2:443` — the name `https://dig.local` resolves to.
+    spawn_https_listener(
+        &https_addr,
+        rustls_config.clone(),
+        app.clone(),
+        shutdown_notify,
+    );
+
+    // (4b) The best-effort IPv6 loopback sibling `[::1]:443` (§5.2), covered by the leaf SAN.
+    if let Some(v6_addr) = config.dig_local_https_addr_v6() {
+        spawn_https_listener(&v6_addr, rustls_config, app.clone(), shutdown_notify);
+    }
+}
+
+/// Bind `addr` and spawn a best-effort TLS listener serving `app`. A bind failure logs a
+/// structured warning and is non-fatal (the plaintext surface keeps serving), mirroring the
+/// bare-`http://dig.local` policy — `:443` is privileged (the installed service runs elevated).
+fn spawn_https_listener(
+    addr: &str,
+    rustls_config: axum_server::tls_rustls::RustlsConfig,
+    app: Router,
+    shutdown_notify: &Arc<tokio::sync::Notify>,
+) {
+    match std::net::TcpListener::bind(addr) {
+        Ok(listener) => {
+            eprintln!("dig-node: HTTPS (https://dig.local) listening on {addr}");
+            let shutdown = shutdown_notify.clone();
+            let addr = addr.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = serve_https(listener, rustls_config, app, shutdown).await {
+                    eprintln!("dig-node: WARN HTTPS listener on {addr} exited: {e}");
+                }
+            });
+        }
+        Err(e) => eprintln!(
+            "dig-node: WARN could not bind {addr} for https://dig.local ({e}); non-fatal — \
+             plaintext keeps serving. `:443` is privileged (run elevated / grant \
+             CAP_NET_BIND_SERVICE; the installed service runs elevated) and the 127.0.0.2 / ::1 \
+             loopback address must exist (macOS: sudo ifconfig lo0 alias 127.0.0.2)."
+        ),
+    }
+}
+
+/// Serve `app` over TLS on a pre-bound listener until `shutdown` fires, then stop gracefully.
+///
+/// Uses the same `axum-server` TLS stack as the wallet mTLS listener, fed the reloadable
+/// rustls config so a leaf rotation is picked up live (no restart, no dropped connections).
+/// `pub` so the HTTPS integration test can drive it against an ephemeral loopback port.
+pub async fn serve_https(
+    listener: std::net::TcpListener,
+    rustls_config: axum_server::tls_rustls::RustlsConfig,
+    app: Router,
+    shutdown: Arc<tokio::sync::Notify>,
+) -> std::io::Result<()> {
+    let handle = axum_server::Handle::new();
+    {
+        let handle = handle.clone();
+        tokio::spawn(async move {
+            shutdown.notified().await;
+            handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
+    }
+    axum_server::from_tcp_rustls(listener, rustls_config)
+        .handle(handle)
+        .serve(app.into_make_service())
+        .await
 }
 
 /// Resolve when the process receives Ctrl-C (all platforms) or SIGTERM (unix),

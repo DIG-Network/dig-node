@@ -74,6 +74,13 @@ pub const DIG_LOCAL_PORT: u16 = 80;
 /// list (`dig.local` / `localhost` / `127.0.0.1`).
 pub const DIG_LOCAL_HOST: &str = "dig.local";
 
+/// The port the local HTTPS listener binds for `https://dig.local` (#624, #620 epic).
+/// Port 443 means the URL carries no `:port`. Binding it is privileged like `:80`
+/// (root / `CAP_NET_BIND_SERVICE`; elevated on Windows — the installed service runs
+/// elevated). The bind is BEST-EFFORT and additionally GATED on a dig-cert leaf being
+/// present: with no CA/leaf yet the node serves plaintext only (see `crate::tls`).
+pub const DIG_LOCAL_HTTPS_PORT: u16 = 443;
+
 /// Resolved dig-node service configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -239,6 +246,29 @@ impl Config {
     pub fn dig_local_addr(&self) -> Option<String> {
         self.dig_local
             .then(|| format!("{DIG_LOCAL_IP}:{DIG_LOCAL_PORT}"))
+    }
+
+    /// The `host:port` for the BEST-EFFORT local HTTPS listener serving
+    /// `https://dig.local` (`127.0.0.2:443`, #624), or `None` when `dig_local` is
+    /// disabled. Shares the `dig_local` toggle with the plaintext `:80` listener —
+    /// both are the "bare dig.local" surface, one plaintext, one TLS. The TLS listener
+    /// is additionally gated on a dig-cert leaf being present (`crate::tls`); with no
+    /// leaf yet only plaintext serves.
+    pub fn dig_local_https_addr(&self) -> Option<String> {
+        self.dig_local
+            .then(|| format!("{DIG_LOCAL_IP}:{DIG_LOCAL_HTTPS_PORT}"))
+    }
+
+    /// The IPv6-loopback HTTPS bind (`[::1]:443`) to open BESIDE
+    /// [`Config::dig_local_https_addr`] (§5.2 IPv6-first loopback), or `None` when
+    /// `dig_local` is disabled. `https://dig.local` resolves to the IPv4 alias
+    /// `127.0.0.2` via the installer hosts entry, but the leaf's SAN also covers `::1`,
+    /// so an IPv6 loopback client (e.g. `https://localhost` where `localhost` resolves
+    /// to `::1` first) reaches the identical surface. BEST-EFFORT: a bind failure is
+    /// logged and the node continues on the IPv4 listener (see `server`).
+    pub fn dig_local_https_addr_v6(&self) -> Option<String> {
+        self.dig_local
+            .then(|| format!("[::1]:{DIG_LOCAL_HTTPS_PORT}"))
     }
 }
 
@@ -511,6 +541,25 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(c.dig_local_addr(), None);
+    }
+
+    #[test]
+    fn dig_local_https_addr_is_443_when_enabled() {
+        // The bare `https://dig.local` surface (#624) shares the dig_local toggle and
+        // binds 127.0.0.2:443, with the IPv6 loopback sibling on [::1]:443 (§5.2).
+        let c = Config::default();
+        assert_eq!(c.dig_local_https_addr().as_deref(), Some("127.0.0.2:443"));
+        assert_eq!(c.dig_local_https_addr_v6().as_deref(), Some("[::1]:443"));
+    }
+
+    #[test]
+    fn dig_local_https_addr_is_none_when_disabled() {
+        let c = Config {
+            dig_local: false,
+            ..Config::default()
+        };
+        assert_eq!(c.dig_local_https_addr(), None);
+        assert_eq!(c.dig_local_https_addr_v6(), None);
     }
 
     #[test]
