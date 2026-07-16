@@ -146,6 +146,10 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
+# `test-util` unlocks tokio's paused-clock test controls (`#[tokio::test(start_paused = true)]`,
+# `tokio::time::advance`) so the self-heal per-child timeout (#693) and the TLS leaf-renewal
+# missed-tick behaviour (#660) are tested deterministically without real waits.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 # The local plaintext content-serve integration test (#289, `tests/content_serve.rs`) compiles a real

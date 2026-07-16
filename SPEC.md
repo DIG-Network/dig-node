@@ -301,7 +301,19 @@ leaf from `ca.key` once it is within 30 days of its 90-day lifetime, atomically 
 `leaf.{key,crt}` (temp + rename, so no reader observes a torn or mismatched pair), and fires the
 reloadable rustls resolver's `reload()` so the running listener presents the new leaf **without a
 restart and without dropping connections**. Transient failures retry on a bounded backoff so a leaf
-never lapses; the listener keeps serving the previous leaf until a pass succeeds.
+never lapses; the listener keeps serving the previous leaf until a pass succeeds. The daily interval
+uses a **delay** missed-tick policy (#660): after a host sleep/suspend across several intervals the
+node runs ONE catch-up pass (which fully reconciles the leaf) rather than bursting one redundant pass
+per missed tick.
+
+**TLS-root owner gate (#661, defence-in-depth).** Before reading ANY TLS material — the leaf to
+serve, and `ca.key` on the renewal path — the node verifies the TLS root directory is owned by a
+privileged principal (Windows: the well-known `SYSTEM`/`Administrators` SID, by exact SID equality;
+unix: `root` and not group/world-writable) and **fails CLOSED to plaintext** otherwise. A
+user-writable TLS root could hold an attacker-swapped `ca.key` that this privileged service would
+otherwise read and sign with; refusing it removes that vector. The owner SID is read directly through
+the Win32 security API (launching no process — the same spawn-free check the self-heal LPE gate uses,
+§ the shared owner check), so the guard never itself executes an attacker-planted binary.
 
 **The CA trust anchor is NEVER auto-rotated by the node.** An approaching CA expiry is only REPORTED
 (`ca_renewal_due`); anchor rotation is an explicit, installer-coordinated `dig-cert rotate_ca` (it
@@ -336,6 +348,20 @@ CORS is not an auth boundary):
   operator opt-in `DIG_NODE_CORS_APP_ORIGINS` (a comma/semicolon-separated allowlist). This lets a
   native app consuming `dig-urn-resolver` reach the node-first content tier. A desktop app runs on
   the same machine as the node, so this stays loopback-trust only and broadens no trust surface.
+
+  **Wallet-read exposure (#693).** Reflecting the desktop-app origins on the shared CORS layer grants
+  any local Tauri app cross-origin READ access to the OPEN wallet-read methods (§7.2 / §18 `get_*`,
+  which carry no token) reachable over the same CORS-covered HTTP surface (`POST /` JSON-RPC and
+  `POST /{method}`). This is deliberately within the same-machine trust model — a program already
+  running as the local user could read that data directly — and does NOT extend to custody or
+  signing: every wallet MUTATION and every `control.*` call stays token-gated (§7.12), and the
+  bidirectional wallet transport (`/ws`, §4.5/§4.8) validates `Origin` against only the local
+  web/extension subset above, NEVER the desktop-app origins. Narrowing the wallet-read reflection to
+  the app-origin allowlist WITHOUT also narrowing content reads is not currently cheap: both share
+  one router-wide `CorsLayer` and the `POST /` endpoint multiplexes content and wallet reads by
+  method, so a clean split would require per-method CORS evaluation the layer does not offer. It is
+  therefore documented here rather than enforced; a future route/method-scoped CORS split can gate it
+  without broadening any origin.
 
 Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Type` and
 `X-Dig-Control-Token`.
@@ -1237,7 +1263,14 @@ binaries with SYSTEM/root privilege, the sibling CLI MUST be resolved by an ABSO
 running `dig-node` binary (the admin-only #565 install root), and that root MUST be REJECTED when it
 is user-writable — on Unix a non-root owner or any group/world write bit; on Windows an owner other
 than SYSTEM/Administrators. Resolution NEVER consults `$PATH` and NEVER accepts a bare name. A missing
-sibling or a user-writable root is a benign/logged skip, never a spawn.
+sibling or a user-writable root is a benign/logged skip, never a spawn. The user-writable-root check
+is the SAME spawn-free owner gate the TLS-root check uses (§4.1a) — one shared owner check, so the
+two never drift.
+
+**Bounded per-child timeout (#693).** Every self-heal child spawn (`dig-updater`/`dig-installer`)
+carries a bounded wall-clock timeout (120 s). A hung child (a wedged scheduler API, a stuck policy
+write) is cancelled and reported as a failed kick, so it can never block the pass or starve future
+6-hourly ticks — the pass logs the timeout and continues, and the serve path is never affected.
 
 ---
 
