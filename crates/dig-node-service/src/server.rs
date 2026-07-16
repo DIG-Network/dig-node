@@ -17,7 +17,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Request, State,
     },
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -116,7 +116,7 @@ pub fn router(state: AppState) -> Router {
     // loopback-only, so reflecting these local origins is not a public-exposure risk.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
-            origin.to_str().map(is_local_origin).unwrap_or(false)
+            origin.to_str().map(is_allowed_origin).unwrap_or(false)
         }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         // CONTENT_TYPE for the JSON body; the control-token header so a same-host
@@ -125,6 +125,13 @@ pub fn router(state: AppState) -> Router {
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderName::from_static("x-dig-control-token"),
         ])
+        // #669: EXPOSE the `X-Dig-*` verification/provenance headers to a cross-origin browser
+        // client (dig-urn-resolver's node-first path). By default a browser can read only a short
+        // safelist of response headers from a cross-origin fetch; without this the resolver cannot
+        // see `X-Dig-Verified` (and the Merkle-proof headers on the ciphertext path) and so fails
+        // CLOSED — silently dropping from the fast node tier to the verified rpc tier. Loopback-only
+        // and read-only provenance metadata, so exposing them broadens nothing but readability.
+        .expose_headers(EXPOSED_DIG_HEADERS.map(HeaderName::from_static))
         // #285: Chrome's Private Network Access blocks a page/extension-context request to a
         // private IP (127.0.0.1) unless the preflight response carries
         // `Access-Control-Allow-Private-Network: true` (sent only when the preflight itself
@@ -180,7 +187,63 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Whether a CORS `Origin` is a same-machine local origin we reflect (#91): the
+/// The `X-Dig-*` verification/provenance response headers a cross-origin browser client (the
+/// dig-urn-resolver node-first path) must be able to READ (#669). Exposed via
+/// `Access-Control-Expose-Headers` so a cross-origin fetch can see the "Verified by Chia"
+/// attestation + the Merkle-proof/chunk-length headers on the ciphertext path — without which the
+/// resolver fails closed and drops to the verified rpc tier. Lowercase (header names are
+/// case-insensitive; `HeaderName::from_static` requires lowercase).
+const EXPOSED_DIG_HEADERS: [&str; 10] = [
+    "x-dig-verified",
+    "x-dig-root",
+    "x-dig-inclusion-proof",
+    "x-dig-chunk-lens",
+    "x-dig-source",
+    "x-dig-store-id",
+    "x-dig-capsule",
+    "x-dig-resource-key",
+    "x-dig-owner-puzzle-hash",
+    "x-dig-generation",
+];
+
+/// Whether a CORS `Origin` is one this loopback node reflects. Two families, both loopback-only
+/// trust (the node binds loopback only; CORS is not an auth boundary):
+///
+/// - **Same-machine web/extension origins** ([`is_local_origin`]) — the extension's
+///   `chrome-extension://` scheme + `http://` pages served from a canonical local name (#91).
+/// - **Desktop-app origins** ([`is_app_origin`]) — Tauri's `tauri://localhost` /
+///   `https://tauri.localhost` + any origin in the operator-configured [`APP_ORIGINS_ENV`]
+///   allowlist (#669), so a native app consuming dig-urn-resolver reaches the node-first tier.
+///
+/// PURE so the policy is unit-testable.
+fn is_allowed_origin(origin: &str) -> bool {
+    is_local_origin(origin) || is_app_origin(origin)
+}
+
+/// Environment allowlist of extra desktop-app CORS origins (#669) — a comma/semicolon-separated
+/// list of exact origins an operator opts in (e.g. a custom Tauri/Electron scheme). Absent by
+/// default; the built-in Tauri origins need no configuration.
+pub const APP_ORIGINS_ENV: &str = "DIG_NODE_CORS_APP_ORIGINS";
+
+/// The built-in desktop-app origins reflected without configuration: Tauri's two canonical origins
+/// (`tauri://localhost` on Linux/Windows, `https://tauri.localhost` on macOS/Windows).
+const BUILTIN_APP_ORIGINS: [&str; 2] = ["tauri://localhost", "https://tauri.localhost"];
+
+/// Whether `origin` is an allowed desktop-app origin (#669): a built-in Tauri origin, or an exact
+/// match in the [`APP_ORIGINS_ENV`] opt-in allowlist. Kept loopback-trust only — a desktop app runs
+/// on the same machine as the node it reaches.
+fn is_app_origin(origin: &str) -> bool {
+    if BUILTIN_APP_ORIGINS.contains(&origin) {
+        return true;
+    }
+    std::env::var(APP_ORIGINS_ENV).is_ok_and(|list| {
+        list.split([',', ';'])
+            .map(str::trim)
+            .any(|allowed| !allowed.is_empty() && allowed == origin)
+    })
+}
+
+/// Whether a CORS `Origin` is a same-machine local WEB origin we reflect (#91): the
 /// extension's `chrome-extension://` scheme, or an `http://` page served from one
 /// of the canonical local names (`localhost` / `dig.local` / `127.0.0.1` /
 /// `127.0.0.2`, with or without a `:port`). PURE so the policy is unit-testable.
@@ -1330,6 +1393,16 @@ where
         dig_node_core::peer::spawn_peer_network(state.node.clone());
     }
 
+    // Always-on self-heal driver (#584 beacon re-arm + #651 ext-forcelist reconcile): on a
+    // privileged SERVICE run, periodically re-arm a drifted auto-update schedule (`dig-updater
+    // schedule ensure`, opt-out-respecting) and re-apply the extension force-install policy
+    // (`dig-installer --set-ext-forcelist-channel`). Gated to a service run — its repairs need
+    // elevation, and a dev/CLI run must not attempt privileged sibling spawns. Detached +
+    // best-effort: it never blocks or fails the serve path. See [`crate::self_heal`].
+    if crate::state::running_as_service() {
+        crate::self_heal::spawn_driver();
+    }
+
     // Best-effort mTLS `9257` listener (#368, Sage byte-parity, node-class clients, §5.3). Binds
     // loopback only; a bind failure (port in use) is NON-FATAL — the wallet stays reachable over
     // the plain-HTTP `POST /{method}` surface + the `/ws` transport, which is what the extension
@@ -1632,7 +1705,72 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_local_origin;
+    use super::{
+        is_allowed_origin, is_app_origin, is_local_origin, APP_ORIGINS_ENV, EXPOSED_DIG_HEADERS,
+    };
+
+    #[test]
+    fn tauri_desktop_app_origins_are_allowed_for_cors() {
+        // #669: a native app (Tauri) consuming dig-urn-resolver must reach the node-first tier.
+        for ok in ["tauri://localhost", "https://tauri.localhost"] {
+            assert!(
+                is_app_origin(ok),
+                "{ok:?} (Tauri) must be an allowed app origin"
+            );
+            assert!(
+                is_allowed_origin(ok),
+                "{ok:?} must pass the CORS allow predicate"
+            );
+        }
+    }
+
+    #[test]
+    fn app_origin_allowlist_env_opts_in_extra_origins() {
+        // A serialized guard is unnecessary here: this is the only test touching this env var.
+        std::env::set_var(APP_ORIGINS_ENV, "app://my-desktop-app , electron://dig ");
+        assert!(is_app_origin("app://my-desktop-app"));
+        assert!(is_app_origin("electron://dig"));
+        assert!(!is_app_origin("app://not-listed"));
+        std::env::remove_var(APP_ORIGINS_ENV);
+        // With the env cleared, a non-built-in origin is no longer allowed.
+        assert!(!is_app_origin("app://my-desktop-app"));
+    }
+
+    #[test]
+    fn non_app_origins_are_not_allowed() {
+        for bad in [
+            "https://evil.example.com",
+            "tauri://not-localhost",
+            "http://evil.com",
+        ] {
+            assert!(
+                !is_app_origin(bad),
+                "{bad:?} must NOT be an allowed app origin"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_headers_are_exposed_to_cross_origin_readers() {
+        // #669: the resolver's browser node-first path reads these; a missing exposed header makes
+        // it fail closed → drop to rpc. The four the ticket names MUST be present.
+        for required in [
+            "x-dig-verified",
+            "x-dig-root",
+            "x-dig-inclusion-proof",
+            "x-dig-chunk-lens",
+        ] {
+            assert!(
+                EXPOSED_DIG_HEADERS.contains(&required),
+                "{required} must be exposed via Access-Control-Expose-Headers"
+            );
+        }
+        // Every entry is a valid lowercase HeaderName (from_static panics otherwise) — this asserts
+        // the const stays constructible, the exact shape the CORS layer relies on.
+        for h in EXPOSED_DIG_HEADERS {
+            let _ = axum::http::HeaderName::from_static(h);
+        }
+    }
 
     #[test]
     fn local_origins_are_reflected_for_cors() {

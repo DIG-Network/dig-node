@@ -52,6 +52,11 @@ pub mod open;
 pub mod pair;
 pub mod pairing;
 pub mod rpc;
+/// The always-on self-heal driver (#584 beacon re-arm + #651 ext-forcelist reconcile): a privileged
+/// service periodically re-arms a drifted auto-update schedule + re-applies the extension
+/// force-install policy, resolving its sibling CLIs by an absolute, non-user-writable path. See
+/// [`self_heal`].
+pub mod self_heal;
 pub mod server;
 pub mod service;
 /// The machine-wide, identity-independent daemon STATE dir (#501): where the control token +

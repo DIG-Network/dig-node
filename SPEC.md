@@ -326,10 +326,28 @@ preflights to allowed origins always succeed.
 
 ### 4.3. CORS
 
-The CORS layer reflects only **local origins**: `chrome-extension://*` and `http://<host>[:port]`
-where `<host>` passes the §4.2 allowlist. `https://` and other schemes MUST NOT be reflected.
+The CORS layer reflects two families of **loopback-trust origins** (the node binds loopback only;
+CORS is not an auth boundary):
+
+- **Local web/extension origins:** `chrome-extension://*` and `http://<host>[:port]` where `<host>`
+  passes the §4.2 allowlist. `https://` for an arbitrary host and other schemes MUST NOT be reflected.
+- **Desktop-app origins (#669):** the two canonical Tauri origins `tauri://localhost` and
+  `https://tauri.localhost` (built-in, no configuration), plus any exact origin listed in the
+  operator opt-in `DIG_NODE_CORS_APP_ORIGINS` (a comma/semicolon-separated allowlist). This lets a
+  native app consuming `dig-urn-resolver` reach the node-first content tier. A desktop app runs on
+  the same machine as the node, so this stays loopback-trust only and broadens no trust surface.
+
 Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Type` and
 `X-Dig-Control-Token`.
+
+**Exposed response headers (#669).** The CORS layer MUST set `Access-Control-Expose-Headers` for the
+`X-Dig-*` verification/provenance headers so a CROSS-ORIGIN browser client (dig-urn-resolver's
+node-first path) can READ them — a cross-origin `fetch` can otherwise read only a short safelist, and
+a resolver that cannot see `X-Dig-Verified` fails CLOSED and drops to the verified rpc tier. The
+exposed set is: `X-Dig-Verified`, `X-Dig-Root`, `X-Dig-Inclusion-Proof`, `X-Dig-Chunk-Lens`,
+`X-Dig-Source`, `X-Dig-Store-Id`, `X-Dig-Capsule`, `X-Dig-Resource-Key`, `X-Dig-Owner-Puzzle-Hash`,
+`X-Dig-Generation`. These are read-only provenance metadata, so exposing them broadens only
+readability. (Cross-repo contract with dig-urn-resolver — mirrored in `SYSTEM.md`.)
 
 **Private Network Access (PNA, #285).** The server MUST advertise `allow_private_network` on the
 CORS layer, so a preflight that carries `Access-Control-Request-Private-Network: true` gets
@@ -371,8 +389,9 @@ right now" to the client; there is no separate "are you alive" request/response 
 **Origin validation (CSWSH defense).** Unlike `fetch`, a WebSocket handshake is not blocked by the
 browser based on `Access-Control-*` response headers — a page from ANY origin can attempt
 `new WebSocket(...)` against a listener the user's browser can reach. The server therefore
-validates the `Origin` header itself, with the SAME allowlist §4.3's CORS layer reflects
-(`chrome-extension://*` and an allowed local `http://` origin). A disallowed `Origin` MUST be
+validates the `Origin` header itself, against the **local web/extension** subset of §4.3
+(`chrome-extension://*` and an allowed local `http://` origin) — NOT the §4.3 desktop-app origins,
+which are for the content-read surface only. A disallowed `Origin` MUST be
 rejected `403 Forbidden` before the upgrade completes. A request with NO `Origin` header (a
 non-browser client — a CLI, an integration test) MUST be allowed; the loopback-only bind is that
 caller's defense.
@@ -1192,6 +1211,33 @@ the CLI's own `detail` message; the CLI produces unparsable output (a crash) →
 as opaque JSON, never re-typed into a dig-node-owned shape — the beacon's schema-versioned wire
 contract exists precisely so an independent reader can do this safely: a field the beacon adds later
 passes through unchanged, with no shape to keep in sync on this side.
+
+### 7.14. Always-on self-heal driver (#584 beacon re-arm + #651 ext-forcelist reconcile)
+
+On a **privileged service run** (Windows LocalSystem / a root daemon), dig-node MUST run a detached,
+best-effort self-heal driver: one pass on startup, then a pass every `SELF_HEAL_TICK` (**6 hours**).
+It is NOT run on a dev/CLI (non-service) run. A pass performs two independent repairs; neither
+failing ever blocks the serve path or the other repair:
+
+- **Beacon re-arm (#584).** Kicks `dig-updater schedule ensure --json` — the idempotent verb
+  (dig-updater ≥ v0.13.0) that re-registers a provably-ABSENT daily schedule. This closes the
+  chicken-and-egg where an already-dead schedule cannot resurrect itself because nothing runs the
+  beacon. `schedule ensure` itself respects a DELIBERATE opt-out (dig-updater writes an Admin-only
+  sentinel on `schedule uninstall`; `ensure` short-circuits to `SuppressedByOptOut`), so dig-node
+  keeps NO sentinel of its own — kicking `ensure` never re-arms an intentional uninstall.
+- **Ext-forcelist reconcile (#651).** Reads the persisted channel (`dig-updater channel get --json` →
+  `{ "channel": "stable"|"nightly" }`) and re-applies it to every detected browser via `dig-installer
+  --set-ext-forcelist-channel <channel> --json` (idempotent). This recovers the post-remove-failure
+  uninstall gap in the #613 staged channel switch (a crash after REMOVE but before RE-ADD leaves the
+  extension uninstalled with the new channel already persisted, so an operator's `channel set` no-ops
+  `Unchanged` and never retries).
+
+**Security — absolute, privileged-root resolution only (#565 LPE).** Because the service spawns these
+binaries with SYSTEM/root privilege, the sibling CLI MUST be resolved by an ABSOLUTE path beside the
+running `dig-node` binary (the admin-only #565 install root), and that root MUST be REJECTED when it
+is user-writable — on Unix a non-root owner or any group/world write bit; on Windows an owner other
+than SYSTEM/Administrators. Resolution NEVER consults `$PATH` and NEVER accepts a bare name. A missing
+sibling or a user-writable root is a benign/logged skip, never a spawn.
 
 ---
 
