@@ -10,13 +10,14 @@
 # `dign` alias (issue #548) for every supported OS/arch, and uploads them as run artifacts the
 # caller's publish job attaches to a GitHub Release.
 #
-# DUAL ASSET NAMING (SPEC §11.2) — every per-OS/arch binary is published under TWO names so both
-# downstream consumers resolve it with NO change on their side:
-#   * `dig-node-<ver>-<os>-<arch>[.exe]`      ← the CANONICAL name the dig-installer thin-shim
-#       PREFERS (its dig-node Repo stem is `dig-node`).
-#   * `dig-companion-<ver>-<os>-<arch>[.exe]` ← the legacy name. apt.dig.net's packaging resolves
-#       the Linux binary by this exact template, and the installer keeps it as its pre-rename
-#       fallback. The binary itself is identical; only the filename differs.
+# ASSET NAMING (SPEC §11.2) — every per-OS/arch binary is published under the CANONICAL name:
+#   * `dig-node-<ver>-<os>-<arch>[.exe]` ← the name every downstream consumer resolves: the
+#       dig-installer thin-shim (its dig-node Repo stem is `dig-node`) and apt.dig.net's packaging
+#       (whose Linux template is `dig-node-{ver}-linux-{arch}`).
+# The duplicate legacy `dig-companion-*` copy is NO LONGER published (#585). dig-node was formerly
+# dig-companion (#209); nothing resolves the legacy name from a dig-node RELEASE — the installer's
+# pre-rename fallback targets the SEPARATE `DIG-Network/dig-companion` repo's own frozen historical
+# releases, not this asset name — so the duplicate was pure release-noise.
 # `dign` is a FIRST-CLASS alias binary (issue #548): a SEPARATE `[[bin]]` target sharing the SAME
 # entrypoint, published alongside `dig-node` under its own stem `dign-<ver>-<os>-<arch>[.exe]`.
 #
@@ -146,10 +147,9 @@ jobs:
           SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
           test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
           # On Windows out_name already ends in .exe; on unix there is no extension. Publish the
-          # SAME binary under both the canonical dig-node-* name and the legacy dig-companion-*
-          # name (apt's template + the installer's pre-rename fallback). See the header comment.
+          # binary under the canonical dig-node-* name every consumer resolves (#585 dropped the
+          # duplicate legacy dig-companion-* copy). See the header comment.
           cp "$SRC" "dist/dig-node-${VER}-${{ matrix.out_name }}"
-          cp "$SRC" "dist/dig-companion-${VER}-${{ matrix.out_name }}"
           # The `dign` first-class alias (issue #548): a SEPARATE binary that behaves byte-for-byte
           # like `dig-node`, published under its own `dign-*` stem (same shape as `dig-node-*`) so
           # the dig-installer resolves it via Repo::dign(). Its filename differs from `dig-node`

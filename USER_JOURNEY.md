@@ -4,8 +4,8 @@
 > for the local DIG node (per `SYSTEM.md` → *Canonical terminology & branding*). Everything the user
 > sees and every machine-readable surface identifies itself as `dig-node`. The bind env-var names
 > are `DIG_NODE_PORT` / `DIG_NODE_HOST` — the stable configuration contract, and the GitHub
-> release also publishes each binary under the legacy `dig-companion-*` filename (identical bytes) for
-> the apt package + the installer's pre-rename fallback.
+> release publishes each binary under the canonical `dig-node-*` name (the apt package + the
+> installer both resolve it).
 
 `dig-node` is the **localhost DIG node** that the [DIG Chrome extension](https://github.com/DIG-Network/dig-chrome-extension)
 (and any DIG client) resolves `chia://` content through, so retrieval happens **on the user's own
@@ -153,7 +153,7 @@ every subcommand (machine output to stdout, prose to stderr).
 |---|---|
 | `POST /` | JSON-RPC 2.0 — the read path (`dig.getContent`, `dig.getAnchoredRoot`, `cache.*`, passthrough, `rpc.discover`) **and** the gated `control.*` admin surface. |
 | `GET /health` | Liveness + mode + cache stats, plus `service`, `commit`, bound `addr`, cache `dir`, and the `methods` catalogue. |
-| `GET /version` | Build fingerprint: `{ service, version, commit, dig_node_version, protocol }`. |
+| `GET /version` | Build fingerprint: `{ service, version, commit, protocol }`. |
 | `GET /openrpc.json` | The OpenRPC document for the JSON-RPC surface (methods + error catalogue). |
 | `GET /.well-known/dig-node.json` | Canonical discovery doc: identity, addr, cache, methods, errors, spec pointers. |
 

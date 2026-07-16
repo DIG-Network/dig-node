@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.36.0] - 2026-07-16
+
+### Changed
+- **status:** Consolidate the node-info/status contract to ONE canonical `version` field; remove the
+  ambiguous `dig_node_version` (the internal engine-library crate version) from `/version`,
+  `/.well-known/dig-node.json`, and `control.status` — `commit` already pins the in-repo engine
+  source (#586).
+- **release:** Drop the duplicate legacy `dig-companion-*` release assets; ship only the canonical
+  `dig-node-*` binaries (+ the `dign` alias). No downstream consumer resolves the legacy name from a
+  dig-node release (#585).
+
 ## [0.35.0] - 2026-07-16
 
 ### Features

@@ -118,13 +118,17 @@ The displayed program name is derived from arg0, so `dign --help`/`--version` re
 `dig-node --help`/`--version` report `dig-node`. A release publishes `dign` alongside the primary
 under the stem `dign-<ver>-<os>-<arch>[.exe]` (byte-identical shape to `dig-node-<ver>-<os>-<arch>`).
 
-2.2. **Node library version.** The node is the first-party `dig-node-core` engine library crate in
-this workspace. The constant `meta::DIG_NODE_VERSION` MUST equal the node library's crate version
-(`dig_node_core::NODE_VERSION`, its `CARGO_PKG_VERSION`) and is surfaced in `/version`,
-`/.well-known/dig-node.json`, and `control.status` as `dig_node_version`. When the node library
-version changes, or when the digstore store-format git dependencies (`digstore-*`) are bumped to a
-new rev, the method catalogue MUST be re-verified against the node's real dispatch (the drift
-guard, §5.6, enforces this).
+2.2. **One canonical version field (HARD RULE).** The node reports exactly ONE version — the
+`version` field (the shipped `dig-node` binary / workspace release version, `meta::VERSION`) —
+across `/version`, `/.well-known/dig-node.json`, and `control.status`; `commit` (`meta::GIT_SHA`)
+pins the exact source revision beside it. There is NO second version key: the former
+`dig_node_version` (the internal engine-library crate version, `dig_node_core::NODE_VERSION`) was
+removed in #585/#586 because it named a *different* value under a second key — ambiguous ("which
+version?") — and `commit` already fingerprints the now-in-repo engine. The node engine
+(`dig-node-core`) is a first-party sibling crate in this workspace; when its crate version changes,
+or when the digstore store-format git dependencies (`digstore-*`) are bumped to a new rev, the
+method catalogue MUST be re-verified against the node's real dispatch (the drift guard, §5.6,
+enforces this).
 
 2.3. **Protocol tag.** `meta::PROTOCOL` is the DIG read-protocol identifier (`"21"`, the
 rpc.dig.net §21 JSON-RPC read contract). It MUST be bumped only when the wire contract changes.
@@ -798,7 +802,7 @@ canonical one (`true`) or a process-private fallback (`false`), from the read pa
 
 ### 6.2. `GET /version`
 
-Returns `{ service, version, commit, dig_node_version, protocol }` (§2).
+Returns `{ service, version, commit, protocol }` (§2; `version` is the one canonical version).
 
 ### 6.3. `GET /openrpc.json` and `rpc.discover`
 
@@ -986,7 +990,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 
 | Method | Params | Result (essentials) |
 |---|---|---|
-| `control.status` | — | `running`, `service`, `version`, `commit`, `dig_node_version`, `protocol`, `uptime_secs`, `addr`, `upstream`, `cache`, `hosted_store_count`, `cached_capsule_count`, `pinned_store_count`, `sync.available` |
+| `control.status` | — | `running`, `service`, `version`, `commit`, `protocol`, `uptime_secs`, `addr`, `upstream`, `cache`, `hosted_store_count`, `cached_capsule_count`, `pinned_store_count`, `sync.available` |
 | `control.config.get` | — | `addr`, `port`, `upstream`, `upstream_override`, `cache_dir`, `cache_shared`, `config_path`, `sync_available` |
 | `control.config.setUpstream` | `upstream` (URL string; blank clears) | `upstream` (normalized), `requires_restart: true` — persisted, effective on next start (§3.4) |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `dir`, `shared` |
@@ -1531,17 +1535,18 @@ boolean, default `false`). It MUST NOT trigger on `push` to `main`.
 job is a no-op). The manual-dispatch `workflow_dispatch` on `release.yml` is a build-only "does main
 still build?" canary — it never publishes (publish is gated on a tag ref).
 
-11.2. **Dual asset naming (HARD RULE).** Every per-OS/arch binary MUST be published under TWO
-filenames containing identical bytes:
+11.2. **Asset naming (HARD RULE).** Every per-OS/arch binary MUST be published under the canonical
+name:
 
-- **`dig-node-<ver>-<os>-<arch>[.exe]`** — the canonical name; the dig-installer thin-shim's
-  preferred stem.
-- **`dig-companion-<ver>-<os>-<arch>[.exe]`** — the legacy name; apt.dig.net's Linux packaging
-  resolves by exactly this template (`dig-companion-{ver}-linux-x64`, bare binary), and the
-  installer keeps it as its pre-rename fallback.
+- **`dig-node-<ver>-<os>-<arch>[.exe]`** — the canonical name every downstream consumer resolves:
+  the dig-installer thin-shim's preferred stem AND apt.dig.net's Linux packaging template
+  (`dig-node-{ver}-linux-{arch}`, bare binary).
 
-`<ver>` is the tag without the leading `v`. Removing the legacy asset is a breaking change for
-those consumers and MUST NOT be done while either still resolves it.
+`<ver>` is the tag without the leading `v`. The duplicate legacy `dig-companion-*` copy (dig-node
+was formerly dig-companion, #209) is NO LONGER published (#585): no consumer resolves that name from
+a dig-node release — the installer's pre-rename fallback targets the SEPARATE
+`DIG-Network/dig-companion` repo's own frozen historical releases, not this asset name — so it was
+pure release-noise.
 
 11.3. **Matrix.** `windows-x64` (x86_64-pc-windows-msvc), `linux-x64` (x86_64-unknown-linux-gnu),
 `macos-arm64` (aarch64-apple-darwin), `macos-x64` (x86_64-apple-darwin, cross-compiled on
@@ -1564,8 +1569,8 @@ tags/releases and the rolling `nightly` are NEVER pruned. Neither `nightly-*` no
 
 11.6. **Reusable build.** The cross-OS build lives once in `.github/workflows/build-binaries.yml`
 (`on: workflow_call`, inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel
-call it, so the two paths can never diverge on HOW a binary is produced — including the dual
-`dig-node-*`/`dig-companion-*` naming (§11.2) and the `dign` alias.
+call it, so the two paths can never diverge on HOW a binary is produced — including the canonical
+`dig-node-*` naming (§11.2) and the `dign` alias.
 
 11.7. **RELEASE_TOKEN posture + 60-day cron caveat.** Releasing uses the `RELEASE_TOKEN` org PAT,
 not `GITHUB_TOKEN` (a tag pushed by `GITHUB_TOKEN` does not trigger downstream workflows, and it
@@ -1615,7 +1620,7 @@ ONLY automatic release trigger, a quiet repo can silently stop releasing. Detect
 | 7 | Error codes | Table §10 — stable numbers + UPPER_SNAKE names + origins | §10; `src/meta.rs` |
 | 8 | CLI exit codes + `--json` envelopes | Table §8.4; one JSON object on stdout | §8; `src/cli.rs`, `tests/cli.rs` |
 | 9 | Service label | `net.dignetwork.dig-node` across install/uninstall/start/stop/SCM dispatcher | §2.4, §9.4 |
-| 10 | Release assets | Dual-named `dig-node-*` + legacy `dig-companion-*`, identical bytes, per §11.3 matrix | §11; `.github/workflows/release.yml` |
+| 10 | Release assets | Canonical `dig-node-*` (+ `dign-*` alias), per §11.3 matrix | §11; `.github/workflows/release.yml` |
 | 11 | Control-token scheme | `<state_dir>/control-token` (machine-wide, ACL-restricted, §7.3a), 64-hex, `X-Dig-Control-Token` / `params._control_token`, constant-time | §7.2–7.3a |
 | 12 | Health/version/well-known shapes | §6 fields; additions additive only | §6; `src/meta.rs`, `src/server.rs` |
 | 13 | Subscription persistence | `<cache>/subscriptions.json` schema-versioned, atomic, cross-process-locked | §14.1; `subscription.rs` |

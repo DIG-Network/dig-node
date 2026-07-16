@@ -7,9 +7,9 @@ shipped as a **self-contained, cross-platform Rust binary** that installs as an 
 > **Naming.** The binary, crate, and service are all `dig-node` — the canonical, user-facing name
 > for the local DIG node. Every machine-readable surface (`/health`, `/version`, `--json`) identifies
 > itself as `dig-node`. The bind env-var names are `DIG_NODE_PORT` / `DIG_NODE_HOST` — the stable
-> configuration contract (see the Environment section). For the legacy Linux package + the
-> installer's pre-rename fallback, the GitHub release also publishes each binary under the old
-> `dig-companion-*` filename (identical bytes). See [`USER_JOURNEY.md`](USER_JOURNEY.md).
+> configuration contract (see the Environment section). Each GitHub release publishes every binary
+> under the canonical `dig-node-*` name (the apt package + the installer both resolve it). See
+> [`USER_JOURNEY.md`](USER_JOURNEY.md).
 >
 > **`dign` alias.** A shorter first-class alias binary, `dign`, ships alongside `dig-node` (mirroring
 > `digs`↔`digstore`): `dign <args>` behaves identically to `dig-node <args>` — same subcommands,
@@ -230,7 +230,7 @@ capsule reference `storeId` or `storeId:rootHash` (each part lowercase 64-hex).
 
 | Method | Params | Result |
 |---|---|---|
-| `control.status` | — | `{ running, service, version, commit, dig_node_version, protocol, uptime_secs, addr, upstream, cache:{cap_bytes,used_bytes,dir,shared}, hosted_store_count, cached_capsule_count, pinned_store_count, sync:{available} }` |
+| `control.status` | — | `{ running, service, version, commit, protocol, uptime_secs, addr, upstream, cache:{cap_bytes,used_bytes,dir,shared}, hosted_store_count, cached_capsule_count, pinned_store_count, sync:{available} }` |
 | `control.config.get` | — | `{ addr, port, upstream, upstream_override, cache_dir, cache_shared, config_path, sync_available }` |
 | `control.config.setUpstream` | `{ upstream }` | `{ upstream, requires_restart:true }` — persisted; the running node captured its upstream at startup, so the change takes effect on the next start. A blank `upstream` clears the override. |
 | `control.cache.get` | — | `{ cap_bytes, used_bytes, dir, shared }` |
@@ -264,7 +264,7 @@ A single fetch tells an agent what the node is, where it serves, and what it spe
 | Endpoint | Returns |
 |---|---|
 | `GET /health` | `{ status, service:"dig-node", version, commit, mode, addr, upstream, cache:{ dir, cap_bytes, used_bytes, shared }, methods:[…] }` — extends the original health body (existing probes keep parsing `status`/`version`/`mode`/`upstream`/`cache`). `cache.shared` (#96) tells whether the cache is the dir shared with the DIG Browser. |
-| `GET /version` | `{ service:"dig-node", version, commit, dig_node_version, protocol }` — the build fingerprint, to correlate a running node to an exact source revision. |
+| `GET /version` | `{ service:"dig-node", version, commit, protocol }` — the build fingerprint (`version` is the one canonical version; `commit` correlates a running node to an exact source revision). |
 | `GET /openrpc.json` | The OpenRPC document for the JSON-RPC surface (methods + error catalogue), generated from the method/error source so it cannot drift. |
 | `GET /.well-known/dig-node.json` | The canonical discovery doc: identity, bound `addr`, cache (`dir`/`cap_bytes`/`used_bytes`/`shared`), the method catalogue, the error catalogue, and pointers to the OpenRPC/health/version endpoints. |
 

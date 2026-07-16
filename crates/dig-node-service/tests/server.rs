@@ -337,7 +337,8 @@ async fn version_endpoint_reports_build_fingerprint() {
     assert_eq!(resp["service"], json!("dig-node"));
     assert_eq!(resp["version"], json!(dig_node_service::VERSION));
     assert!(resp["commit"].is_string());
-    assert!(resp["dig_node_version"].is_string());
+    // #586: exactly one version field — the ambiguous `dig_node_version` alias is gone.
+    assert!(resp.get("dig_node_version").is_none());
     assert_eq!(resp["protocol"], json!("21"));
 }
 

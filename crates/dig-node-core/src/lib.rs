@@ -62,10 +62,12 @@ pub mod subscription;
 /// read-only on the loopback browser surface (`GET /verify/...`).
 pub mod verification_ledger;
 
-/// The node library's crate version (its `Cargo.toml` `version`). Host shells (the
-/// OS-service `dig-node-service`, the DIG Browser's `dig_runtime`) surface this as the
-/// running node's `dig_node_version` in status/discovery documents, so a deployed node
-/// reports exactly which node implementation it runs.
+/// The node engine library's own crate version (its `Cargo.toml` `version`), for
+/// programmatic use by host shells. Host shells report the SHIPPED node version to
+/// consumers as the single canonical `version` field, and pin the exact engine source
+/// via the build `commit` (this engine is an in-repo sibling crate), so this crate
+/// version is NOT surfaced under a second status key (#586 removed the former
+/// `dig_node_version`).
 pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// JSON-RPC error code: the served/requested root is NOT the store's

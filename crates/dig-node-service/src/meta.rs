@@ -4,8 +4,8 @@
 //!
 //! This module is the single source of truth for:
 //!
-//! * [`build_info`] — service name + version + git commit + embedded dig-node
-//!   read-path version (the `GET /version` body).
+//! * [`build_info`] — service name + the one canonical version + git commit (the
+//!   `GET /version` body).
 //! * [`methods`] — the JSON-RPC method catalogue (drives `rpc.discover`, `/health`,
 //!   and `/.well-known/dig-node.json`).
 //! * [`ErrorCode`] — the catalogued, stable, machine-readable error codes on the
@@ -24,36 +24,19 @@ use serde_json::{json, Value};
 /// name for the local node (the binary, crate, and service all carry this name).
 pub const SERVICE_NAME: &str = "dig-node";
 
-/// The dig-node binary version (Cargo package version).
+/// THE canonical dig-node version — the shipped `dig-node` binary's version (its
+/// Cargo package version, the workspace release version). This is the single,
+/// unambiguous version field every consumer reads (`GET /version`,
+/// `/.well-known/dig-node.json`, `control.status`); `commit` pins the exact source
+/// revision beside it. (#586 removed the former `dig_node_version` — the internal
+/// engine-library crate version — because it named a *different* value under a
+/// second version key, and `commit` already fingerprints the now-in-repo engine.)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The git commit the binary was built from (captured by `build.rs`), or
 /// `"unknown"` when built outside a git checkout. Lets an agent correlate a
 /// running node back to an exact source revision.
 pub const GIT_SHA: &str = env!("DIG_NODE_GIT_SHA");
-
-/// The node-library version this service is built against. The node
-/// ([`dig_node_core`]) is now a FIRST-PARTY sibling crate in this repo (not a stale
-/// digstore git pin), so this tracks the node crate's own `CARGO_PKG_VERSION` — the
-/// SAME node the native DIG Browser runs in-process via `dig_runtime`.
-///
-/// What the node serves LOCALLY: `handle_rpc` resolves `dig.getContent`,
-/// `dig.getAnchoredRoot`, `dig.getManifest` (#176 Phase C), `dig.stage`, the
-/// collection reads (`dig.getCollection`/`dig.listCollectionItems`), the L7 peer
-/// surface (`dig.getNetworkInfo`/`dig.getPeers`/`dig.announce`/`dig.getAvailability`/
-/// `dig.listInventory`/`dig.fetchRange`), all `cache.*`, and the node-owned
-/// `control.*` (peerStatus/subscribe/unsubscribe/listSubscriptions). Everything else
-/// (e.g. `dig.getProof`, `dig.getCapsule`, `dig.listCapsules`) returns `-32601` and
-/// this service relays it to the upstream. The catalogue below reflects this, and
-/// the drift-guard test in `tests/openrpc_drift_guard.rs` enforces the match
-/// against the real dispatch.
-pub const DIG_NODE_VERSION: &str = dig_node_version();
-
-/// The node library's crate version, resolved at compile time from the `dig-node`
-/// dependency (its `CARGO_PKG_VERSION` re-exported as [`dig_node_core::NODE_VERSION`]).
-const fn dig_node_version() -> &'static str {
-    dig_node_core::NODE_VERSION
-}
 
 /// The DIG read protocol the node speaks (the rpc.dig.net §21 JSON-RPC read
 /// contract). Bumped only when the wire contract changes.
@@ -640,14 +623,13 @@ pub fn cache_shared() -> bool {
     dig_node_core::cache_dir_is_shared()
 }
 
-/// The `GET /version` body: service identity + build provenance + the embedded
-/// read-path version, so an agent can fingerprint exactly what is running.
+/// The `GET /version` body: service identity + the one canonical version + the git
+/// commit, so an agent can fingerprint exactly what is running.
 pub fn build_info() -> Value {
     json!({
         "service": SERVICE_NAME,
         "version": VERSION,
         "commit": GIT_SHA,
-        "dig_node_version": DIG_NODE_VERSION,
         "protocol": PROTOCOL,
     })
 }
@@ -699,7 +681,6 @@ pub fn well_known_document(addr: &str, upstream: &str, cap_bytes: u64, used_byte
         "service": SERVICE_NAME,
         "version": VERSION,
         "commit": GIT_SHA,
-        "dig_node_version": DIG_NODE_VERSION,
         "protocol": PROTOCOL,
         "addr": addr,
         "upstream": upstream,
@@ -843,14 +824,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_info_carries_service_version_commit_and_dig_node_version() {
+    fn build_info_carries_the_one_canonical_version_service_commit_and_protocol() {
         let info = build_info();
         assert_eq!(info["service"], json!(SERVICE_NAME));
         assert_eq!(info["service"], json!("dig-node"));
+        // `version` is THE canonical node version (the shipped `dig-node` binary /
+        // workspace release version) — the single field a consumer reads.
         assert_eq!(info["version"], json!(VERSION));
         assert_eq!(info["commit"], json!(GIT_SHA));
-        assert_eq!(info["dig_node_version"], json!(DIG_NODE_VERSION));
         assert_eq!(info["protocol"], json!(PROTOCOL));
+    }
+
+    /// **Proves (#586):** the build fingerprint exposes exactly ONE version field.
+    /// The former `dig_node_version` (the internal engine-library crate version) is
+    /// gone — `version` names the node's version and `commit` already pins the exact
+    /// engine source (now an in-repo sibling crate), so the dual naming that made
+    /// "which version?" ambiguous no longer exists.
+    #[test]
+    fn build_info_exposes_a_single_unambiguous_version_field() {
+        let info = build_info();
+        assert!(
+            info.get("dig_node_version").is_none(),
+            "the ambiguous `dig_node_version` alias must be gone (#586); `version` is canonical"
+        );
     }
 
     #[test]

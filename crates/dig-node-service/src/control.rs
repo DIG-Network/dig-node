@@ -614,7 +614,6 @@ async fn status(ctx: &ControlCtx) -> Value {
         "service": crate::meta::SERVICE_NAME,
         "version": crate::meta::VERSION,
         "commit": crate::meta::GIT_SHA,
-        "dig_node_version": crate::meta::DIG_NODE_VERSION,
         "protocol": crate::meta::PROTOCOL,
         "uptime_secs": ctx.started.elapsed().as_secs(),
         "addr": ctx.addr,
