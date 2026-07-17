@@ -235,8 +235,65 @@ fn summarize(method: &str, result: &Value) -> String {
             result["pinned_synced"].as_u64().unwrap_or(0),
             result["pinned_total"].as_u64().unwrap_or(0),
         ),
+        "control.hostedStores.status" => format!(
+            "store {} — {} · {} cached capsule(s) · {} bytes",
+            result["store_id"].as_str().unwrap_or("?"),
+            pinned(&result["pinned"]),
+            result["capsule_count"].as_u64().unwrap_or(0),
+            result["total_bytes"].as_u64().unwrap_or(0),
+        ),
+        "control.hostedStores.pin" => {
+            format!("pinned {}", result["store_id"].as_str().unwrap_or("?"),)
+        }
+        "control.hostedStores.unpin" => format!(
+            "unpinned {} · {} cached capsule(s) evicted",
+            result["store_id"].as_str().unwrap_or("?"),
+            result["evicted_capsules"].as_u64().unwrap_or(0),
+        ),
+        "control.listSubscriptions" => {
+            let count = result["subscriptions"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_else(|| result["count"].as_u64().unwrap_or(0) as usize);
+            format!("{count} subscription(s)")
+        }
+        "control.subscribe" => format!(
+            "subscribed to {}",
+            result["store_id"].as_str().unwrap_or("?"),
+        ),
+        "control.unsubscribe" => format!(
+            "unsubscribed from {}",
+            result["store_id"].as_str().unwrap_or("?"),
+        ),
+        "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
     }
+}
+
+/// A concise human line for the auto-update beacon status (`control.updater.status`). The rich
+/// beacon report is a deeply-nested object; a first-time operator wants the at-a-glance line
+/// (installed? which version + channel, paused-or-running, the last outcome), with the full detail
+/// still available via `--json`.
+fn summarize_updater_status(result: &Value) -> String {
+    if !result["installed"].as_bool().unwrap_or(false) {
+        return "auto-update beacon not installed".to_string();
+    }
+    let status = &result["status"];
+    let paused = if status["paused"].as_bool().unwrap_or(false) {
+        "paused"
+    } else {
+        "running"
+    };
+    format!(
+        "updater installed · v{} · channel {} · {}{}",
+        status["version"].as_str().unwrap_or("?"),
+        status["channel"].as_str().unwrap_or("?"),
+        paused,
+        match status["last_outcome"].as_str() {
+            Some(o) => format!(" · last outcome {o}"),
+            None => String::new(),
+        },
+    )
 }
 
 /// "available" / "unavailable" for a boolean sync/availability flag.
@@ -245,6 +302,15 @@ fn avail(v: &Value) -> &'static str {
         "available"
     } else {
         "unavailable"
+    }
+}
+
+/// "pinned" / "not pinned" for a store's boolean pin flag.
+fn pinned(v: &Value) -> &'static str {
+    if v.as_bool().unwrap_or(false) {
+        "pinned"
+    } else {
+        "not pinned"
     }
 }
 
@@ -335,7 +401,73 @@ mod tests {
 
     #[test]
     fn unknown_method_summary_falls_back_to_compact_json() {
-        let s = summarize("control.updater.status", &json!({ "channel": "stable" }));
-        assert_eq!(s, "{\"channel\":\"stable\"}");
+        // A method with no bespoke line still prints SOMETHING readable (compact JSON).
+        let s = summarize("control.some.unmapped", &json!({ "foo": "bar" }));
+        assert_eq!(s, "{\"foo\":\"bar\"}");
+    }
+
+    /// REGRESSION (#836 single-node walk): the walked read/list/pin control commands MUST render a
+    /// concise human line in the default (non-`--json`) mode, never a raw JSON dump. Each of these
+    /// used to fall through to `compact()` and print a `{...}` blob — jarring for a first-time
+    /// operator walking the CLI. The bar: a readable summary that does NOT start with `{`.
+    #[test]
+    fn walked_read_commands_render_human_summaries_not_raw_json() {
+        let cases = [
+            (
+                "control.updater.status",
+                json!({ "installed": true, "status": { "version": "0.14.0", "channel": "stable", "paused": false, "last_outcome": "applied" } }),
+                vec!["0.14.0", "stable"],
+            ),
+            (
+                "control.listSubscriptions",
+                json!({ "subscriptions": ["a".repeat(64)], "count": 1 }),
+                vec!["1 subscription"],
+            ),
+            (
+                "control.subscribe",
+                json!({ "subscribed": true, "added": true, "store_id": "abc" }),
+                vec!["subscribed", "abc"],
+            ),
+            (
+                "control.unsubscribe",
+                json!({ "subscribed": false, "removed": true, "store_id": "abc" }),
+                vec!["unsubscribed", "abc"],
+            ),
+            (
+                "control.hostedStores.status",
+                json!({ "store_id": "abc", "pinned": true, "capsule_count": 2, "total_bytes": 99 }),
+                vec!["abc", "pinned", "2 cached capsule"],
+            ),
+            (
+                "control.hostedStores.pin",
+                json!({ "store_id": "abc", "root": null, "pinned": true }),
+                vec!["pinned", "abc"],
+            ),
+            (
+                "control.hostedStores.unpin",
+                json!({ "store_id": "abc", "unpinned": true, "evicted_capsules": 3 }),
+                vec!["unpinned", "abc", "3"],
+            ),
+        ];
+        for (method, result, needles) in cases {
+            let s = summarize(method, &result);
+            assert!(
+                !s.starts_with('{'),
+                "{method} must render a human line, not raw JSON: {s}"
+            );
+            for needle in needles {
+                assert!(
+                    s.contains(needle),
+                    "{method} summary `{s}` missing `{needle}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn updater_status_summary_handles_not_installed() {
+        let s = summarize("control.updater.status", &json!({ "installed": false }));
+        assert!(!s.starts_with('{'));
+        assert!(s.contains("not installed"), "got: {s}");
     }
 }
