@@ -4,10 +4,10 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
-## [0.37.1] - 2026-07-16
+## [0.37.1] - 2026-07-17
 
 ### Bug Fixes
-- **service:** Refuse a system-level `install` whose binary is in a user-writable dir (#565 LPE gate)
+- **service:** Gate system-level install against a user-writable binary (#565 LPE) (#46)
 
 ## [0.37.0] - 2026-07-17
 
