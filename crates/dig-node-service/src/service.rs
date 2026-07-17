@@ -374,6 +374,46 @@ fn current_exe() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
 
+/// Refuse to register a PRIVILEGED (system-level) service whose program binary lives in a
+/// user-writable directory — the §565 privilege-escalation class.
+///
+/// A system-level service runs as a privileged principal (Windows LocalSystem / a root daemon).
+/// If its recorded `ExecStart` / SCM `binPath` / launchd `ProgramArguments` points at a binary a
+/// non-privileged user can replace, that user gains PERSISTENT privileged code execution: swap the
+/// file, wait for the next service start, and the swapped code runs as SYSTEM/root. So before
+/// registering a system-level service, its program's directory MUST be privileged-owned
+/// (root/SYSTEM, no group/world write) — verified through the SAME spawn-free owner gate the
+/// self-heal spawn root (#565) and the TLS material root (#661) use ([`crate::security`]), so the
+/// three never drift. Fails CLOSED: an indeterminate owner is refused.
+///
+/// A **user-level** install (Linux systemd / macOS launchd, the default there) runs as the very
+/// user who owns the binary — there is no privilege boundary to cross — so it is always allowed.
+fn ensure_service_target_is_safe(program: &std::path::Path, user_level: bool) -> io::Result<()> {
+    // A user-level service runs as the installing user: swapping a binary that user already owns
+    // grants that user nothing it lacked. No privilege boundary, no LPE — always allowed.
+    if user_level {
+        return Ok(());
+    }
+    // The program's directory is the surface an attacker would need write access to; a
+    // privileged-owned directory keeps a non-privileged user from replacing the binary in it.
+    let root = program.parent().unwrap_or(program);
+    if crate::security::dir_is_privileged(root) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "dig-node: refusing to register a system-level (privileged) service pointing at \
+             \"{}\", whose directory is writable by a non-privileged user. Registering it would \
+             let any local user replace that binary and gain persistent SYSTEM/root code \
+             execution (a privilege-escalation vector, #565). Install dig-node into a protected, \
+             admin-owned location — via the DIG installer or a native OS package — and re-run \
+             `dig-node install` from there.",
+            program.display()
+        ),
+    ))
+}
+
 /// On Windows, is this process running elevated (Administrator)? Used to fail
 /// `install`/`uninstall` early with a helpful message instead of a cryptic SCM
 /// access-denied. Always `true` off Windows (those paths are user-level).
@@ -620,6 +660,11 @@ pub fn install(config: &Config) -> io::Result<Outcome> {
 
     let backend = SystemServiceBackend::new()?;
     let program = current_exe()?;
+    // §565 LPE gate: before touching anything, refuse a privileged (system-level) registration
+    // whose program binary sits in a user-writable directory — a swapped binary would run as
+    // SYSTEM/root on the next start. Checked FIRST so a refusal has no side effects (no state-dir
+    // harden, no service create). A user-level install runs as the invoking user and is allowed.
+    ensure_service_target_is_safe(&program, backend.user_level())?;
     let plan = build_plan(config, program.clone());
 
     // HARDEN the machine-wide state dir NOW, as the INSTALLING (interactive) user, per the
@@ -1018,6 +1063,40 @@ SERVICE_NAME: net.dignetwork.dig-node
         assert!(!is_2xx_status_line("HTTP/1.1 500 Internal Server Error"));
         assert!(!is_2xx_status_line("garbage"));
         assert!(!is_2xx_status_line(""));
+    }
+
+    // -- §565 privileged-install LPE gate (ensure_service_target_is_safe) -------------------
+
+    #[test]
+    fn user_level_install_is_always_allowed_regardless_of_binary_owner() {
+        // A user-level service runs as the installing user, so a user-writable program dir crosses
+        // NO privilege boundary — the gate must not refuse it even from a plainly user-owned dir.
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("dig-node");
+        assert!(
+            ensure_service_target_is_safe(&program, /* user_level */ true).is_ok(),
+            "a user-level install from a user-owned dir must be allowed"
+        );
+    }
+
+    #[test]
+    fn system_level_install_from_a_user_writable_dir_is_refused() {
+        // The §565 LPE: a privileged (system-level) service pointing at a binary in a
+        // user-writable directory lets any local user swap it for persistent SYSTEM/root exec.
+        // A freshly-created tempdir is owned by the (non-privileged) test user — exactly that
+        // condition — so registration MUST fail closed with PERMISSION_DENIED.
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("dig-node");
+        let err = ensure_service_target_is_safe(&program, /* user_level */ false)
+            .expect_err("a system-level install from a user-writable dir must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        // The message must name the LPE class + the offending path so an operator can act.
+        let msg = err.to_string();
+        assert!(msg.contains("#565"), "message cites the LPE class: {msg}");
+        assert!(
+            msg.contains(&program.display().to_string()),
+            "message names the offending program path: {msg}"
+        );
     }
 
     // -- the real OS-backed path (no state mutation): probe + status only -------------------
