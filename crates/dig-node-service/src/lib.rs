@@ -37,6 +37,14 @@ pub mod config;
 /// served-store CSP. The wiring lives in [`server`].
 pub mod content;
 pub mod control;
+/// CLI parity with the node's `control.*` surface (#426): a `dig-node`/`dign` subcommand for every
+/// control the extension can drive (status, config, cache, hosted stores, §21 sync, updater,
+/// subscriptions), each a thin dispatch over [`control_client`] with `--json`. See [`control_cli`].
+pub mod control_cli;
+/// The shared OPERATOR-side loopback JSON-RPC client for the gated `control.*` surface: reads the
+/// master control token read-only and POSTs a control method to the node. The ONE transport every
+/// control-driving subcommand (`pair`, `control_cli`, `peers`) uses. See [`control_client`].
+pub mod control_client;
 /// The shared CLI entrypoint ([`run`]) for BOTH the `dig-node` binary and its first-class
 /// `dign` alias (issue #548). Both `src/main.rs` and `src/bin/dign.rs` are thin shims over
 /// it, so the two binaries share ONE codepath and each reports its own invoked name.
@@ -51,6 +59,9 @@ pub mod meta;
 pub mod open;
 pub mod pair;
 pub mod pairing;
+/// `dig-node peers` (#559): view + manage the node's peer connections from the CLI — parity with
+/// the extension's peer surface, driven over the token-gated `control.*` client. See [`peers`].
+pub mod peers;
 pub mod rpc;
 /// Shared OS-owner trust gate ([`security::dir_is_privileged`]): is a directory owned by a
 /// privileged principal (SYSTEM/Administrators or root) and not user-writable? Used by the self-heal

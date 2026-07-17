@@ -74,6 +74,48 @@ pub fn is_control_method(method: &str) -> bool {
     method.starts_with("control.")
 }
 
+/// The canonical set of `control.*` methods the node's control plane RESOLVES — the
+/// union of the methods this shell owns ([`dispatch_control`]) and the ones it delegates
+/// to the embedded node's own control surface (`control.peerStatus` +
+/// `control.subscribe`/`unsubscribe`/`listSubscriptions`). This is the SINGLE source of
+/// truth for "what can be controlled", consumed by:
+///
+/// * the CLI-parity drift test (#426) — every method here MUST have a `dig-node` CLI verb
+///   (see `crate::control_cli::cli_covered_control_methods`), so the CLI never silently
+///   falls behind the WS control surface the extension drives;
+/// * introspection — a stable list a machine can enumerate.
+///
+/// Keep it in lockstep with [`dispatch_control`]: a new `control.*` method added there MUST
+/// be added here (and given a CLI verb), or the drift test fails.
+pub const CONTROL_METHODS: &[&str] = &[
+    // Owned by this shell (dispatch_control).
+    "control.status",
+    "control.config.get",
+    "control.config.setUpstream",
+    "control.cache.get",
+    "control.cache.setCap",
+    "control.cache.clear",
+    "control.hostedStores.list",
+    "control.hostedStores.pin",
+    "control.hostedStores.unpin",
+    "control.hostedStores.status",
+    "control.sync.status",
+    "control.sync.trigger",
+    "control.updater.status",
+    "control.updater.setChannel",
+    "control.updater.pause",
+    "control.updater.resume",
+    "control.updater.checkNow",
+    "control.pairing.list",
+    "control.pairing.approve",
+    "control.pairing.revoke",
+    // Delegated to the embedded node's own control surface.
+    "control.peerStatus",
+    "control.subscribe",
+    "control.unsubscribe",
+    "control.listSubscriptions",
+];
+
 /// Is this a PAIRING-ADMINISTRATION control method (#280)? PURE.
 ///
 /// These manage the pairing lifecycle — list pending requests, approve one (minting

@@ -1284,11 +1284,59 @@ write) is cancelled and reported as a failed kick, so it can never block the pas
 
 `run` (default when no subcommand; serves in the foreground and is the unix-service entrypoint) ·
 `run-service` (hidden; the Windows SCM entrypoint, §9.4; behaves as `run` off Windows) ·
-`install` · `uninstall` · `start` · `stop` · `status` · `pair` (§7.11) · `open` (§8.5).
+`install` · `uninstall` · `start` · `stop` · `status` · `pair` (§7.11) · `open` (§8.5) ·
+the **control-parity** subcommands `info` · `config` · `cache` · `stores` · `sync` · `updater` ·
+`subscriptions` (§8.6) · `peers` (§8.7).
 
 The `dign` alias binary (§2.1a) exposes this SAME subcommand set with the SAME semantics — `dign
 <subcommand>` is equivalent to `dig-node <subcommand>` in every respect except the reported program
 name.
+
+### 8.6. Control-parity subcommands (#426)
+
+For EVERY gated `control.*` method the DIG Chrome extension drives (§7), the CLI exposes an
+equivalent subcommand, so an operator/agent can drive the node from a terminal exactly as the
+extension drives it from a browser. Each subcommand is a THIN dispatch — it calls the SAME
+`control.*` method over the node's loopback endpoint, presenting the MASTER control token
+(`X-Dig-Control-Token`, read WITHOUT minting — §7.11/#501); no CLI logic is forked from the control
+plane. A mutating CLI control is therefore gated by the identical capability as the WS surface (the
+on-disk master token = local-machine control), never an unauthenticated backdoor.
+
+- `info` → `control.status` — the rich node status (version, uptime, cache, hosted-store +
+  cached-capsule counts, §21 sync availability). DISTINCT from `status` (§8.3), which is an
+  unauthenticated `/health` liveness probe; `info` is the token-gated detailed view.
+- `config [get]` → `control.config.get`; `config set-upstream <url>` → `control.config.setUpstream`.
+- `cache [get]` → `control.cache.get`; `cache set-cap <bytes>` → `control.cache.setCap`;
+  `cache clear` → `control.cache.clear`.
+- `stores [list]` → `control.hostedStores.list`; `stores pin|unpin|status <store>` →
+  `control.hostedStores.pin|unpin|status`.
+- `sync [status]` → `control.sync.status`; `sync trigger <store>` → `control.sync.trigger`.
+- `updater [status]` → `control.updater.status`; `updater set-channel <ch>` / `pause [--until <s>]`
+  / `resume` / `check-now` → the matching `control.updater.*`.
+- `subscriptions [list]` → `control.listSubscriptions`; `subscriptions add|remove <store_id>` →
+  `control.subscribe`/`control.unsubscribe`.
+
+**Parity is enforced mechanically.** `control::CONTROL_METHODS` is the canonical set of every
+`control.*` method the node resolves; a compile-time-adjacent test asserts every method in it is
+reachable from a CLI verb, so a new node control method cannot ship without a CLI subcommand.
+
+### 8.7. `peers` — view + manage peer connections (#559)
+
+`peers` reaches parity with the extension's peer surface (`src/features/peers/peersApi.ts`):
+
+- `peers [list]` → `control.peerStatus` — the live peer status: running flag, connected count,
+  relay reservation, and (when a newer node fills the optional field) the per-peer list. Peer
+  addresses are displayed **IPv6-first, IPv4 second** per the ecosystem §5.2 address-family policy.
+- `peers connect <peer>` → `control.peers.connect`; `peers disconnect <peer>` →
+  `control.peers.disconnect`; `peers ban <peer> --state <ban|blacklist|none>` →
+  `control.peers.setBan`; `peers pool-config --max-connections <n>` → `control.peers.setPoolConfig`.
+
+The management verbs + the extended per-peer `control.peerStatus` payload are a **known node-side
+gap** (the same gap the extension documents): the node today implements only the running flag +
+connected count. Until it ships the management RPCs the `list` view degrades honestly (count only)
+and the management verbs surface the node's METHOD_NOT_FOUND. The CLI verbs exist now so the surface
+reaches parity and lights up with NO CLI change once the node implements them (tracked cross-repo
+follow-up).
 
 ### 8.5. `open` — the OS scheme handler (#389)
 

@@ -32,8 +32,10 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::cli::{error_envelope, success_envelope, ExitCode, Outcome};
 use crate::config::Config;
+use crate::control_cli::{self, ControlAction};
 use crate::open;
 use crate::pair::{self, PairAction};
+use crate::peers::{self, BanState, PeersAction};
 use crate::{serve, service, VERSION};
 
 #[derive(Parser)]
@@ -88,11 +90,183 @@ enum Command {
         /// The DIG link (`chia://<storeId>[:<root>]/<path>` or `urn:dig:chia:<…>`).
         link: String,
     },
+    /// Detailed node status (the gated `control.status`): version, uptime, cache, hosted-store +
+    /// cached-capsule counts, §21 sync availability. Distinct from `status` (an unauthenticated
+    /// liveness probe of /health); this is the token-gated rich view the extension shows.
+    Info,
+    /// View or change the node's config (the `control.config.*` surface the extension drives).
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigCommand>,
+    },
+    /// View or manage the local content cache (the `control.cache.*` surface).
+    Cache {
+        #[command(subcommand)]
+        action: Option<CacheCommand>,
+    },
+    /// List/pin/unpin hosted stores (the `control.hostedStores.*` surface).
+    Stores {
+        #[command(subcommand)]
+        action: Option<StoresCommand>,
+    },
+    /// View §21 whole-store sync status or trigger a capsule sync (the `control.sync.*` surface).
+    Sync {
+        #[command(subcommand)]
+        action: Option<SyncCommand>,
+    },
+    /// Drive the DIG auto-update beacon (the `control.updater.*` surface).
+    Updater {
+        #[command(subcommand)]
+        action: Option<UpdaterCommand>,
+    },
+    /// List/add/remove the node's store subscriptions (the `control.subscribe`/`unsubscribe`/
+    /// `listSubscriptions` surface).
+    Subscriptions {
+        #[command(subcommand)]
+        action: Option<SubscriptionsCommand>,
+    },
+    /// View + manage the node's peer connections (#559) — parity with the extension's peer surface.
+    /// With no sub-action, lists the live peer status (running flag, connected count, relay, and —
+    /// on a newer node — the per-peer list with addresses shown IPv6-first per §5.2).
+    Peers {
+        #[command(subcommand)]
+        action: Option<PeersCommand>,
+    },
     /// Internal: idempotently register the `dig.local` → `127.0.0.2` OS hosts entry (#91/#503),
     /// so `http://dig.local` resolves to the node. Invoked by the native install packages;
     /// requires write access to the hosts file (run elevated). Not meant to be run by hand.
     #[command(hide = true)]
     EnsureHosts,
+}
+
+/// `dig-node config` sub-actions. With none, prints the current config.
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Print the node's effective config (addr/port, upstream, cache dir).
+    Get,
+    /// Persist the upstream DIG RPC override (effective on next node start).
+    SetUpstream {
+        /// The upstream RPC URL (blank clears the override).
+        url: String,
+    },
+}
+
+/// `dig-node cache` sub-actions. With none, prints the cache config.
+#[derive(Subcommand)]
+enum CacheCommand {
+    /// Print the cache cap/used/dir/shared.
+    Get,
+    /// Set the on-disk cache size cap in bytes (floored at 64 MiB by the node).
+    SetCap {
+        /// The cap in bytes.
+        bytes: u64,
+    },
+    /// Delete all locally cached DIG content.
+    Clear,
+}
+
+/// `dig-node stores` sub-actions. With none, lists hosted stores.
+#[derive(Subcommand)]
+enum StoresCommand {
+    /// List every hosted/pinned store + its cached capsules.
+    List,
+    /// Pin a store (`storeId` or `storeId:rootHash`); pre-fetches when a root is given.
+    Pin {
+        /// The store reference (`storeId[:rootHash]`).
+        store: String,
+    },
+    /// Unpin a store + evict its cached capsules.
+    Unpin {
+        /// The store reference (`storeId[:rootHash]`).
+        store: String,
+    },
+    /// Show one store's pin/cache status.
+    Status {
+        /// The store reference (`storeId[:rootHash]`).
+        store: String,
+    },
+}
+
+/// `dig-node sync` sub-actions. With none, prints §21 sync status.
+#[derive(Subcommand)]
+enum SyncCommand {
+    /// Print §21 whole-store sync availability + pinned-store coverage.
+    Status,
+    /// Trigger a §21 sync for one capsule (`storeId:rootHash`).
+    Trigger {
+        /// The capsule reference (`storeId:rootHash`).
+        store: String,
+    },
+}
+
+/// `dig-node updater` sub-actions. With none, prints the beacon status.
+#[derive(Subcommand)]
+enum UpdaterCommand {
+    /// Print the DIG auto-update beacon's status.
+    Status,
+    /// Set the beacon update channel.
+    SetChannel {
+        /// The channel: `nightly` or `stable`.
+        channel: String,
+    },
+    /// Pause auto-updates, optionally until a unix-seconds deadline (else indefinitely).
+    Pause {
+        /// Resume automatically at this unix-seconds time (omit for an indefinite pause).
+        #[arg(long)]
+        until: Option<u64>,
+    },
+    /// Resume auto-updates.
+    Resume,
+    /// Check for an update now.
+    CheckNow,
+}
+
+/// `dig-node subscriptions` sub-actions. With none, lists subscriptions.
+#[derive(Subcommand)]
+enum SubscriptionsCommand {
+    /// List the node's persisted store subscriptions.
+    List,
+    /// Subscribe the node to a store id (chain-watch + gap-fill).
+    Add {
+        /// The store id (64-hex).
+        store_id: String,
+    },
+    /// Remove a store subscription.
+    Remove {
+        /// The store id (64-hex).
+        store_id: String,
+    },
+}
+
+/// `dig-node peers` sub-actions (#559). With none, lists the live peer status.
+#[derive(Subcommand)]
+enum PeersCommand {
+    /// List the live peer status (running flag, connected count, relay, per-peer list).
+    List,
+    /// Dial a peer by address or peer_id.
+    Connect {
+        /// The peer address or peer_id to dial.
+        peer: String,
+    },
+    /// Drop a connected peer.
+    Disconnect {
+        /// The peer address or peer_id to drop.
+        peer: String,
+    },
+    /// Block (`ban`), soft-block (`blacklist`), or clear (`none`) a peer.
+    Ban {
+        /// The peer address or peer_id.
+        peer: String,
+        /// The ban state: `ban`, `blacklist`, or `none`.
+        #[arg(long)]
+        state: String,
+    },
+    /// Set the peer-pool max-connections cap.
+    PoolConfig {
+        /// The maximum number of pool connections.
+        #[arg(long)]
+        max_connections: u32,
+    },
 }
 
 /// `dig-node pair` sub-actions. With none, lists pending requests + issued tokens.
@@ -124,6 +298,14 @@ impl Command {
             Command::Status => "status",
             Command::Pair { .. } => "pair",
             Command::Open { .. } => "open",
+            Command::Info => "info",
+            Command::Config { .. } => "config",
+            Command::Cache { .. } => "cache",
+            Command::Stores { .. } => "stores",
+            Command::Sync { .. } => "sync",
+            Command::Updater { .. } => "updater",
+            Command::Subscriptions { .. } => "subscriptions",
+            Command::Peers { .. } => "peers",
             Command::EnsureHosts => "ensure-hosts",
         }
     }
@@ -198,9 +380,109 @@ pub fn run() -> std::process::ExitCode {
             render(pair::run(&config, pair_action), action, json)
         }
         Command::Open { link } => render(open::run(&config, &link), action, json),
+        Command::Info => render(control_cli::run(&config, ControlAction::Info), action, json),
+        Command::Config { action: cmd } => {
+            render(control_cli::run(&config, config_action(cmd)), action, json)
+        }
+        Command::Cache { action: cmd } => {
+            render(control_cli::run(&config, cache_action(cmd)), action, json)
+        }
+        Command::Stores { action: cmd } => {
+            render(control_cli::run(&config, stores_action(cmd)), action, json)
+        }
+        Command::Sync { action: cmd } => {
+            render(control_cli::run(&config, sync_action(cmd)), action, json)
+        }
+        Command::Updater { action: cmd } => {
+            render(control_cli::run(&config, updater_action(cmd)), action, json)
+        }
+        Command::Subscriptions { action: cmd } => render(
+            control_cli::run(&config, subscriptions_action(cmd)),
+            action,
+            json,
+        ),
+        Command::Peers { action: cmd } => match peers_action(cmd) {
+            Ok(a) => render(peers::run(&config, a), action, json),
+            Err(e) => emit_error(&e, action, json),
+        },
         Command::EnsureHosts => render(crate::hosts::run(), action, json),
     };
     std::process::ExitCode::from(exit.code())
+}
+
+/// Map the `config` subcommand to its [`ControlAction`] (no sub-action → print the config).
+fn config_action(cmd: Option<ConfigCommand>) -> ControlAction {
+    match cmd {
+        None | Some(ConfigCommand::Get) => ControlAction::ConfigGet,
+        Some(ConfigCommand::SetUpstream { url }) => ControlAction::ConfigSetUpstream { url },
+    }
+}
+
+/// Map the `cache` subcommand to its [`ControlAction`] (no sub-action → print the cache config).
+fn cache_action(cmd: Option<CacheCommand>) -> ControlAction {
+    match cmd {
+        None | Some(CacheCommand::Get) => ControlAction::CacheGet,
+        Some(CacheCommand::SetCap { bytes }) => ControlAction::CacheSetCap { bytes },
+        Some(CacheCommand::Clear) => ControlAction::CacheClear,
+    }
+}
+
+/// Map the `stores` subcommand to its [`ControlAction`] (no sub-action → list hosted stores).
+fn stores_action(cmd: Option<StoresCommand>) -> ControlAction {
+    match cmd {
+        None | Some(StoresCommand::List) => ControlAction::StoresList,
+        Some(StoresCommand::Pin { store }) => ControlAction::StoresPin { store },
+        Some(StoresCommand::Unpin { store }) => ControlAction::StoresUnpin { store },
+        Some(StoresCommand::Status { store }) => ControlAction::StoresStatus { store },
+    }
+}
+
+/// Map the `sync` subcommand to its [`ControlAction`] (no sub-action → print §21 sync status).
+fn sync_action(cmd: Option<SyncCommand>) -> ControlAction {
+    match cmd {
+        None | Some(SyncCommand::Status) => ControlAction::SyncStatus,
+        Some(SyncCommand::Trigger { store }) => ControlAction::SyncTrigger { store },
+    }
+}
+
+/// Map the `updater` subcommand to its [`ControlAction`] (no sub-action → print beacon status).
+fn updater_action(cmd: Option<UpdaterCommand>) -> ControlAction {
+    match cmd {
+        None | Some(UpdaterCommand::Status) => ControlAction::UpdaterStatus,
+        Some(UpdaterCommand::SetChannel { channel }) => {
+            ControlAction::UpdaterSetChannel { channel }
+        }
+        Some(UpdaterCommand::Pause { until }) => ControlAction::UpdaterPause { until },
+        Some(UpdaterCommand::Resume) => ControlAction::UpdaterResume,
+        Some(UpdaterCommand::CheckNow) => ControlAction::UpdaterCheckNow,
+    }
+}
+
+/// Map the `subscriptions` subcommand to its [`ControlAction`] (no sub-action → list them).
+fn subscriptions_action(cmd: Option<SubscriptionsCommand>) -> ControlAction {
+    match cmd {
+        None | Some(SubscriptionsCommand::List) => ControlAction::SubsList,
+        Some(SubscriptionsCommand::Add { store_id }) => ControlAction::SubsAdd { store_id },
+        Some(SubscriptionsCommand::Remove { store_id }) => ControlAction::SubsRemove { store_id },
+    }
+}
+
+/// Map the `peers` subcommand to its [`PeersAction`] (no sub-action → list the peer status).
+/// The only fallible mapping: a bad `--state` on `ban` becomes a USAGE `io::Error`.
+fn peers_action(cmd: Option<PeersCommand>) -> std::io::Result<PeersAction> {
+    Ok(match cmd {
+        None | Some(PeersCommand::List) => PeersAction::List,
+        Some(PeersCommand::Connect { peer }) => PeersAction::Connect { peer },
+        Some(PeersCommand::Disconnect { peer }) => PeersAction::Disconnect { peer },
+        Some(PeersCommand::Ban { peer, state }) => {
+            let state = BanState::parse(&state)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            PeersAction::SetBan { peer, state }
+        }
+        Some(PeersCommand::PoolConfig { max_connections }) => {
+            PeersAction::SetPoolConfig { max_connections }
+        }
+    })
 }
 
 /// Render a one-shot subcommand outcome: under `--json` emit the success/error envelope
