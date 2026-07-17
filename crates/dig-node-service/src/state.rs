@@ -96,7 +96,7 @@ pub const RUN_CONTEXT_SERVICE: &str = "service";
 const MACHINE_FOLDER: &str = "DigNode";
 
 // ---------------------------------------------------------------------------
-// Well-known SIDs (locale-independent — icacls / Get-Acl accept + emit these).
+// Well-known SIDs (locale-independent — icacls + the Win32 security API accept + emit these).
 // ---------------------------------------------------------------------------
 
 /// LocalSystem — the daemon identity + the forced owner of the state dir.
@@ -375,9 +375,11 @@ pub(crate) fn restrict_file(path: &Path) {
 
 // ---------------------------------------------------------------------------
 // The hardening contract (#501): pure argv/parse helpers + the I/O orchestrator.
-// The SID parsing, the `icacls` argv builders, and the `Get-Acl` readback parser are
+// The SID parsing, the `icacls` argv builders, and the SID-based readback parser are
 // PURE and unit-tested; the create + ACL calls are the thin I/O layer (real ACL behaviour
-// is not exercised in CI, so correctness rests on careful code + the pure-logic tests).
+// is not exercised in CI, so correctness rests on careful code + the pure-logic tests). The
+// readback itself reads owner + DACL through the Win32 security API (#856), NOT a `Get-Acl`
+// spawn — so it never fails because the host cannot autoload the PowerShell Security module.
 // ---------------------------------------------------------------------------
 
 /// A well-known GROUP / broad SID that must NEVER appear in the control-token dir's DACL
@@ -455,23 +457,27 @@ pub fn windows_lockdown_grant_args(dir: &str, read_grant: Option<&str>) -> Vec<S
     args
 }
 
-/// The PowerShell one-liner that emits the dir's owner + each access ACE as SID-based lines
-/// (`OWNER;<sid>` / `ACE;<sid>;<isInherited>`) for the readback verification. SID-based (not
-/// name-based) so parsing is locale-independent. PURE (single-quotes in the path are doubled
-/// for PS literal safety).
-pub fn acl_verify_ps_command(dir: &str) -> String {
-    let dir = dir.replace('\'', "''");
-    format!(
-        "$ErrorActionPreference='Stop'; \
-         $acl = Get-Acl -LiteralPath '{dir}'; \
-         'OWNER;' + $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; \
-         foreach ($a in $acl.Access) {{ \
-           'ACE;' + $a.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value + ';' + $a.IsInherited \
-         }}"
-    )
+/// Decide the readback acceptance from the SID-based ACL lines the Win32 readback produced
+/// ([`crate::security::read_acl_verify_lines`]), against the interactive `read_grant`. PURE, so
+/// the fail-closed-vs-transient policy is unit-tested on every platform without a real ACL.
+///
+/// - `Some(lines)` — the DACL was read: defer to [`parse_acl_verify`]. A genuinely-wrong DACL
+///   returns `Err` (fail closed); a correct one returns `Ok`.
+/// - `None` — the DACL could NOT be read at all (a TRANSIENT/tool-unavailable condition). This
+///   returns `Ok`: the lockdown SET commands (setowner + reset + grant) already SUCCEEDED — that
+///   is the authoritative security action — so an inability to run the DEFENSE-IN-DEPTH readback
+///   MUST NOT be treated as a policy violation. Treating it as one is exactly the #849/#856 bug
+///   (a correctly-hardened dir was removed because the readback tool was unavailable, leaving the
+///   service unable to mint the control token). The readback tightens correctness; it does not
+///   gate the applied lockdown.
+pub fn readback_decision(lines: Option<String>, read_grant: Option<&str>) -> Result<(), String> {
+    match lines {
+        Some(lines) => parse_acl_verify(&lines, read_grant),
+        None => Ok(()),
+    }
 }
 
-/// Verify a locked-down DACL from [`acl_verify_ps_command`] output against the acceptance
+/// Verify a locked-down DACL from the SID-based readback lines against the acceptance
 /// gate (the security contract, step 6). Asserts: owner is SYSTEM (or Administrators); NO
 /// inherited ACE (inheritance disabled); NO Everyone/Users/Authenticated-Users/Anonymous
 /// ACE; SYSTEM + Administrators are present; and — strictly — NO principal beyond
@@ -537,7 +543,7 @@ pub fn parse_acl_verify(output: &str, read_grant: Option<&str>) -> Result<(), St
     Ok(())
 }
 
-/// From an [`acl_verify_ps_command`] readback of a TRUSTED pre-existing dir, discover an
+/// From a SID-based ACL readback of a TRUSTED pre-existing dir, discover an
 /// installer-set interactive read grant to PRESERVE: the first ACE SID that is a real
 /// per-user domain SID (`S-1-5-21-…`) — i.e. not a well-known/broad group and not
 /// SYSTEM/Administrators. `None` if there is none. PURE.
@@ -612,7 +618,7 @@ pub fn unix_token_owner_is_trusted(owner_uid: u32, mode: u32, current_euid: u32)
 /// the daemon trusts its contents (#501 residual). `is_service` is the caller's run context
 /// ([`running_as_service`]). Returns `true` when the file may be loaded as-is; `false` when it
 /// is foreign-owned (a planted/squatted token) and MUST be deleted + regenerated. Reads the
-/// real owner (Windows `Get-Acl` via [`path_owner_sid`]; unix `stat`) and defers the decision
+/// real owner (Windows Win32 security API via [`path_owner_sid`]; unix `stat`) and defers the decision
 /// to the pure [`windows_token_owner_is_trusted`] / [`unix_token_owner_is_trusted`].
 pub fn token_file_is_trusted(path: &Path, is_service: bool) -> bool {
     #[cfg(windows)]
@@ -729,29 +735,15 @@ fn current_user_sid() -> Option<String> {
     Some(sid)
 }
 
-/// The current owner SID of `path` (a dir OR a file) via `Get-Acl`, or `None` if it can't be
-/// read. Used both for the dir-trust checks (harden / discover) and the control-token FILE
-/// owner verification ([`token_file_is_trusted`]).
+/// The current owner SID of `path` (a dir OR a file), or `None` if it can't be read. Reads the
+/// owner directly through the Win32 security API ([`crate::security::read_owner_sid_string`],
+/// #856) — launching NO process — instead of the old `Get-Acl` PowerShell spawn, which failed
+/// whenever the host could not autoload `Microsoft.PowerShell.Security` (the #849-induced control-
+/// token failure). Used both for the dir-trust checks (harden / discover) and the control-token
+/// FILE owner verification ([`token_file_is_trusted`]).
 #[cfg(windows)]
 fn path_owner_sid(path: &Path) -> Option<String> {
-    let dir = path.to_string_lossy().replace('\'', "''");
-    let ps = format!(
-        "(Get-Acl -LiteralPath '{dir}').GetOwner([System.Security.Principal.SecurityIdentifier]).Value"
-    );
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.starts_with("S-1-") {
-        Some(s)
-    } else {
-        None
-    }
+    crate::security::read_owner_sid_string(path)
 }
 
 /// Discover an installer-set interactive read grant on a TRUSTED (SYSTEM/Administrators-owned)
@@ -770,16 +762,8 @@ fn discover_existing_read_grant(dir: &Path) -> Option<String> {
     if !trusted {
         return None;
     }
-    let ps = acl_verify_ps_command(&dir.to_string_lossy());
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_first_user_read_sid(&String::from_utf8_lossy(&out.stdout))
+    let lines = crate::security::read_acl_verify_lines(dir)?;
+    parse_first_user_read_sid(&lines)
 }
 
 /// Run `icacls` with `args`; `Ok(())` iff it exits 0, else an `Err` carrying the exit code +
@@ -801,21 +785,21 @@ fn run_icacls(args: &[String]) -> std::io::Result<()> {
     }
 }
 
-/// Read `dir`'s ACL back and verify it meets the acceptance gate ([`parse_acl_verify`]).
+/// Read `dir`'s ACL back through the Win32 security API (#856 — no PowerShell) and verify it
+/// meets the acceptance gate. A readable-but-wrong DACL is an `Err` (fail closed); a DACL that
+/// cannot be read AT ALL is treated as acceptable ([`readback_decision`]) because the lockdown
+/// SET already succeeded — never removing a correctly-hardened dir just because the readback
+/// could not run.
 #[cfg(windows)]
 fn read_and_verify_acl(dir: &Path, read_grant: Option<&str>) -> std::io::Result<()> {
-    let ps = acl_verify_ps_command(&dir.to_string_lossy());
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
-        .output()?;
-    if !out.status.success() {
-        return Err(std::io::Error::other(format!(
-            "Get-Acl readback exited non-zero: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
+    let lines = crate::security::read_acl_verify_lines(dir);
+    if lines.is_none() {
+        tracing::warn!(
+            dir = %dir.display(),
+            "ACL readback unavailable after lockdown; trusting the applied lockdown (state dir preserved)"
+        );
     }
-    parse_acl_verify(&String::from_utf8_lossy(&out.stdout), read_grant)
-        .map_err(std::io::Error::other)
+    readback_decision(lines, read_grant).map_err(std::io::Error::other)
 }
 
 /// Windows: the full #501 hardening contract, fail-closed (see the module docs). Purges a
@@ -1187,14 +1171,40 @@ mod tests {
         assert!(e.contains("unexpected principal"), "got: {e}");
     }
 
+    // -- readback decision: fail-closed on a wrong DACL, but NOT on an unreadable one (#856) ----
+
     #[test]
-    fn acl_verify_ps_command_targets_the_dir_and_emits_sids() {
-        let cmd = acl_verify_ps_command(r"C:\ProgramData\DigNode");
-        assert!(cmd.contains("Get-Acl"));
-        assert!(cmd.contains(r"C:\ProgramData\DigNode"));
-        assert!(cmd.contains("SecurityIdentifier"));
-        assert!(cmd.contains("OWNER;"));
-        assert!(cmd.contains("ACE;"));
+    fn readback_decision_accepts_a_correctly_hardened_dacl() {
+        let user = "S-1-5-21-1-2-3-1001";
+        assert!(readback_decision(Some(ok_acl_with_read(user)), Some(user)).is_ok());
+        assert!(readback_decision(Some(ok_acl_no_read()), None).is_ok());
+    }
+
+    #[test]
+    fn readback_decision_fails_closed_on_a_genuinely_wrong_dacl() {
+        // A world-readable ACE is a real policy violation — it MUST fail (dir removed by the
+        // caller), exactly as before. The PS-free mechanism does not weaken the §565 gate.
+        let world =
+            "OWNER;S-1-5-18\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\nACE;S-1-5-32-545;False\n"
+                .to_string();
+        assert!(readback_decision(Some(world), None).is_err());
+        // A squatter-owned dir still fails closed.
+        let squatter =
+            "OWNER;S-1-5-21-9-9-9-1001\nACE;S-1-5-18;False\nACE;S-1-5-32-544;False\n".to_string();
+        assert!(readback_decision(Some(squatter), None).is_err());
+    }
+
+    #[test]
+    fn readback_decision_does_not_fail_a_correct_dir_when_the_readback_is_unavailable() {
+        // THE #849/#856 REGRESSION: when the ACL cannot be read back at all (the old `Get-Acl`
+        // spawn threw because the host could not autoload the PowerShell Security module), the
+        // decision must be Ok — the lockdown SET already succeeded, so the dir is NOT treated as
+        // failed/removed. A tokenless, removed state dir is precisely what broke the mint.
+        assert!(
+            readback_decision(None, None).is_ok(),
+            "an unavailable readback must not be treated as a hardening failure"
+        );
+        assert!(readback_decision(None, Some("S-1-5-21-1-2-3-1001")).is_ok());
     }
 
     // -- discover an installer-set interactive read grant to preserve ------------

@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.38.6] - 2026-07-17
+
+### Bug Fixes
+- **cli:** Render human summaries for updater/subscriptions/stores control verbs (#52)- **service:** PowerShell-free Win32 ACL readback so the SYSTEM service mints the control token (#53)
+
 ## [0.38.4] - 2026-07-17
 
 ### Bug Fixes
