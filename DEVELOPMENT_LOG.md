@@ -4,6 +4,27 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## A `Get-Acl` readback in the security hot path fails on hosts that can't autoload the PS Security module (#849/#856)
+
+The #501 control-token state-dir hardening READBACK-VERIFIED the DACL by spawning `powershell
+Get-Acl`. `Get-Acl` lives in `Microsoft.PowerShell.Security`; on a host where PowerShell cannot
+autoload that module the cmdlet THROWS, the spawn exits non-zero, and `windows_harden_dir` read
+that as a hardening FAILURE → `remove_dir_all` (fail closed) → the LocalSystem service then had no
+state dir to mint the control token into → every `dign`/`control.*` call failed UNAUTHORIZED. On a
+pristine box (working PS) it worked, so it looked machine-specific rather than a universal bug.
+
+Durable lessons:
+- Read Windows ACLs/owners through the Win32 security API (`GetNamedSecurityInfoW` for owner + DACL,
+  `GetAce`, `ConvertSidToStringSidW`), NEVER a PowerShell/`Get-Acl` spawn: no module-autoload
+  dependency, no shell, no localized-name parsing, no LPE via a planted `powershell.exe` in the
+  application dir (the #565 second-order lesson). `windows-sys` already ships these; `security.rs`
+  centralizes them (`read_owner_sid_string`, `read_acl_verify_lines`). Standard allowed/denied ACE
+  trustee SIDs sit at the fixed `SidStart` offset (header 4 + mask 4 = 8) from the ACE pointer.
+- A DEFENSE-IN-DEPTH readback must NOT be able to destroy the thing it verifies. Distinguish
+  "read the ACL and it VIOLATES policy" (fail closed — remove + regenerate) from "could NOT read
+  the ACL at all" (the SET commands already succeeded → trust the applied lockdown, preserve the
+  dir). Conflating the two turns any readback-tool hiccup into data loss + a broken control plane.
+
 ## The node emitted tracing into the void — no subscriber was ever installed (#553)
 
 `dig-node-core` and its P2P/TLS stack emit `tracing` events, but `dig-node-service` installed NO
