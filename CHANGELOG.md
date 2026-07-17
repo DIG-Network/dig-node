@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.39.0] - 2026-07-17
+
+### Features
+- **peer:** Wire persistent relay-reservation discovery into the pool (WU-C, #870) (#54)
+
 ## [0.38.6] - 2026-07-17
 
 ### Bug Fixes
