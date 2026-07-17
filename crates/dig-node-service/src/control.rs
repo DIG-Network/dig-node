@@ -220,7 +220,12 @@ pub fn control_token_remedy_for(path: &Path) -> String {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     match std::fs::read_to_string(path) {
-        // Readable, yet the presented token was rejected — a state-dir mismatch, not an
+        // Blank token — treat as absent (not a state-dir mismatch).
+        Ok(s) if s.trim().is_empty() => format!(
+            "no control token found at {}. Start the node so it mints one (`dig-node run`, or `dig-node start` for the installed service), then retry. If the service IS already running, it is likely a STALE older build — reinstall the current dig-node (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`) so the running service mints the token here.",
+            path.display()
+        ),
+        // Readable and non-blank, yet the presented token was rejected — a state-dir mismatch, not an
         // ACL/mint problem.
         Ok(_) => format!(
             "the presented control token was not accepted. Ensure the node and this command resolve the SAME state dir ({dir}) — if you set DIG_NODE_STATE_DIR it must match on both the node and this command."

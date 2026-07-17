@@ -830,7 +830,8 @@ pub fn uninstall() -> io::Result<Outcome> {
 /// `io::Error` message), so this matches the per-OS signatures, case-insensitively:
 ///
 /// * **Windows SCM** — `sc start` exits non-zero with `[SC] StartService FAILED 1056: An instance
-///   of the service is already running.` (error 1056).
+///   of the service is already running.` (error 1056). The 1056 code must appear alongside
+///   "already" or "running" to avoid false-positives on unrelated errors containing "1056" in a path/PID.
 /// * **macOS launchd** — `launchctl load` of a loaded service → `service already loaded` /
 ///   `Operation already in progress`.
 /// * **Linux systemd** — `systemctl start` of an active unit is normally a silent no-op (exit 0),
@@ -839,7 +840,7 @@ pub fn uninstall() -> io::Result<Outcome> {
 /// PURE, so the idempotency contract is unit-tested without a real OS service.
 pub fn is_already_running_error(message: &str) -> bool {
     let m = message.to_ascii_lowercase();
-    m.contains("1056")
+    (m.contains("1056") && (m.contains("already") || m.contains("running")))
         || m.contains("already running")
         || m.contains("already loaded")
         || m.contains("already in progress")
@@ -1404,6 +1405,11 @@ An instance of the service is already running."
         ));
         assert!(!is_already_running_error(
             "The specified service does not exist"
+        ));
+        // Regression: a message merely containing "1056" (e.g. in a path/PID) without the
+        // "already" or "running" context must NOT be treated as already-running.
+        assert!(!is_already_running_error(
+            "An error occurred at pid 1056 in the resolver"
         ));
         assert!(!is_already_running_error(""));
     }
