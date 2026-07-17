@@ -321,19 +321,21 @@ fn resolve_state_dir_and_token() -> (std::path::PathBuf, String) {
                 match control::load_or_create_token_at(&dir.join(control::CONTROL_TOKEN_FILE)) {
                     Ok(token) => (dir, token),
                     Err(e) => {
-                        eprintln!(
-                            "dig-node: WARN could not persist the control token in the secured \
-                         state dir ({e}); using an in-memory token (control.* unauthorizable)"
+                        tracing::warn!(
+                            error = %e,
+                            "could not persist the control token in the secured state dir; using \
+                             an in-memory token (control.* unauthorizable)"
                         );
                         ephemeral()
                     }
                 }
             }
             Err(e) => {
-                eprintln!(
-                    "dig-node: WARN could not secure the machine state dir ({e}); refusing to \
-                     serve the control plane from it — {}",
-                    control::control_token_remedy()
+                tracing::warn!(
+                    error = %e,
+                    remedy = %control::control_token_remedy(),
+                    "could not secure the machine state dir; refusing to serve the control plane \
+                     from it"
                 );
                 ephemeral()
             }
@@ -343,9 +345,10 @@ fn resolve_state_dir_and_token() -> (std::path::PathBuf, String) {
         match control::load_or_create_token() {
             Ok(token) => (dir, token),
             Err(e) => {
-                eprintln!(
-                    "dig-node: WARN could not persist control token ({e}); using an in-memory \
-                     token (control.* will be unauthorizable until the state dir is writable)"
+                tracing::warn!(
+                    error = %e,
+                    "could not persist control token; using an in-memory token (control.* will be \
+                     unauthorizable until the state dir is writable)"
                 );
                 ephemeral()
             }
@@ -634,6 +637,12 @@ async fn rpc(
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
+
+    // Per-request diagnostics (SPEC §6). Routed through a helper that takes ONLY the method name
+    // so the request body — which for a control/pairing call carries tokens (§7 never-log) — is
+    // structurally unable to reach a log field. DEBUG keeps the per-request trail off the default
+    // INFO operator view.
+    crate::logging::log_rpc_dispatch(&method);
 
     // `rpc.discover` is answered by the shell itself (the standard OpenRPC
     // method-discovery method): return the OpenRPC document so an agent can
@@ -1414,17 +1423,19 @@ where
             let cert = wallet_cert.clone();
             tokio::spawn(async move {
                 if let Err(e) = serve_mtls(backend, l, &cert).await {
-                    eprintln!("dig-node: WARN wallet mTLS listener exited: {e}");
+                    tracing::warn!(error = %e, "wallet mTLS listener exited");
                 }
             });
-            eprintln!(
-                "dig-node: wallet mTLS (Sage-parity) listening on 127.0.0.1:{DEFAULT_MTLS_PORT}"
+            tracing::info!(
+                addr = %format!("127.0.0.1:{DEFAULT_MTLS_PORT}"),
+                "wallet mTLS (Sage-parity) listening"
             );
         }
-        Err(e) => eprintln!(
-            "dig-node: WARN could not bind 127.0.0.1:{DEFAULT_MTLS_PORT} for the wallet mTLS \
-             listener ({e}); node-class Sage-parity clients unavailable (non-fatal). The wallet \
-             is still served on the loopback HTTP surface + /ws."
+        Err(e) => tracing::warn!(
+            error = %e,
+            addr = %format!("127.0.0.1:{DEFAULT_MTLS_PORT}"),
+            "could not bind the wallet mTLS listener; node-class Sage-parity clients unavailable \
+             (non-fatal). The wallet is still served on the loopback HTTP surface + /ws"
         ),
     }
 
@@ -1458,7 +1469,7 @@ where
     let dig_local = match config.dig_local_addr() {
         Some(dl_addr) => match tokio::net::TcpListener::bind(&dl_addr).await {
             Ok(l) => {
-                eprintln!("dig-node: bare http://dig.local enabled (listening on {dl_addr})");
+                tracing::info!(addr = %dl_addr, "bare http://dig.local enabled");
                 Some((dl_addr, l))
             }
             Err(e) => {
@@ -1467,7 +1478,9 @@ where
             }
         },
         None => {
-            eprintln!("dig-node: bare http://dig.local listener disabled (DIG_NODE_DIGLOCAL=0)");
+            // A deliberately-disabled surface (DIG_NODE_DIGLOCAL=0) — a developer-diagnosis detail,
+            // not operator narrative, so DEBUG.
+            tracing::debug!("bare http://dig.local listener disabled (DIG_NODE_DIGLOCAL=0)");
             None
         }
     };
@@ -1483,12 +1496,12 @@ where
     if dig_local.is_some() {
         bound_addrs.push("http://dig.local (no port)".to_string());
     }
-    eprintln!(
-        "dig-node v{VERSION} (local-node) listening on: {}\n  \
-         upstream: {}\n  \
-         Point the DIG Chrome extension's \"server host\" at {addr}.",
-        bound_addrs.join(", "),
-        config.upstream
+    tracing::info!(
+        version = VERSION,
+        addrs = %bound_addrs.join(", "),
+        upstream = %config.upstream,
+        extension_host = %addr,
+        "dig-node (local-node) listening"
     );
 
     // A single shutdown signal fanned out to every listener: when it fires, all
@@ -1546,11 +1559,12 @@ where
 /// impossible: IPv6 disabled at the kernel/network-stack level, or a sandboxed/
 /// restricted environment without it.
 fn warn_ipv6_bind_failed(v6_addr: &str, e: &std::io::Error) {
-    eprintln!(
-        "dig-node: WARN could not bind {v6_addr} for the IPv6 loopback listener ({e}); \
-         continuing IPv4-only on {v6_addr}'s sibling 127.0.0.1 address. This is non-fatal. \
-         A client whose `localhost` resolves to `::1` first (e.g. Windows) may need to use \
-         127.0.0.1 explicitly until IPv6 loopback is available on this system."
+    tracing::warn!(
+        addr = %v6_addr,
+        error = %e,
+        "could not bind the IPv6 loopback listener; continuing IPv4-only on the sibling 127.0.0.1 \
+         address (non-fatal). A client whose `localhost` resolves to `::1` first (e.g. Windows) may \
+         need to use 127.0.0.1 explicitly until IPv6 loopback is available on this system"
     );
 }
 
@@ -1560,14 +1574,14 @@ fn warn_ipv6_bind_failed(v6_addr: &str, e: &std::io::Error) {
 /// `:80` is privileged on Linux (root / CAP_NET_BIND_SERVICE) and on macOS also
 /// needs the `127.0.0.2` loopback alias.
 fn warn_dig_local_bind_failed(dl_addr: &str, e: &std::io::Error) {
-    eprintln!(
-        "dig-node: WARN could not bind {dl_addr} for bare http://dig.local ({e}); \
-         continuing with localhost-only (http only via the configured port). \
-         This is non-fatal. Causes: the privileged port 80 needs elevation \
-         (Linux: run as root or grant CAP_NET_BIND_SERVICE; the installed service \
-         runs elevated), the port is already in use, or — on macOS — the 127.0.0.2 \
-         loopback alias is missing (sudo ifconfig lo0 alias 127.0.0.2). \
-         Set DIG_NODE_DIGLOCAL=0 to silence this and skip the attempt."
+    tracing::warn!(
+        addr = %dl_addr,
+        error = %e,
+        "could not bind bare http://dig.local; continuing with localhost-only (http via the \
+         configured port). Non-fatal. Causes: privileged port 80 needs elevation (Linux: run as \
+         root or grant CAP_NET_BIND_SERVICE; the installed service runs elevated), the port is in \
+         use, or — on macOS — the 127.0.0.2 loopback alias is missing (sudo ifconfig lo0 alias \
+         127.0.0.2). Set DIG_NODE_DIGLOCAL=0 to silence this and skip the attempt"
     );
 }
 
@@ -1587,9 +1601,10 @@ fn bring_up_local_https(config: &Config, app: &Router, shutdown_notify: &Arc<tok
     let paths = match dig_cert::TlsPaths::machine() {
         Ok(paths) => paths,
         Err(e) => {
-            eprintln!(
-                "dig-node: WARN cannot resolve the TLS material root ({e}); \
-                 https://dig.local disabled, serving plaintext only."
+            tracing::warn!(
+                error = %e,
+                "cannot resolve the TLS material root; https://dig.local disabled, serving \
+                 plaintext only"
             );
             return;
         }
@@ -1634,20 +1649,22 @@ fn spawn_https_listener(
 ) {
     match std::net::TcpListener::bind(addr) {
         Ok(listener) => {
-            eprintln!("dig-node: HTTPS (https://dig.local) listening on {addr}");
+            tracing::info!(addr = %addr, "HTTPS (https://dig.local) listening");
             let shutdown = shutdown_notify.clone();
             let addr = addr.to_string();
             tokio::spawn(async move {
                 if let Err(e) = serve_https(listener, rustls_config, app, shutdown).await {
-                    eprintln!("dig-node: WARN HTTPS listener on {addr} exited: {e}");
+                    tracing::warn!(addr = %addr, error = %e, "HTTPS listener exited");
                 }
             });
         }
-        Err(e) => eprintln!(
-            "dig-node: WARN could not bind {addr} for https://dig.local ({e}); non-fatal — \
-             plaintext keeps serving. `:443` is privileged (run elevated / grant \
-             CAP_NET_BIND_SERVICE; the installed service runs elevated) and the 127.0.0.2 / ::1 \
-             loopback address must exist (macOS: sudo ifconfig lo0 alias 127.0.0.2)."
+        Err(e) => tracing::warn!(
+            addr = %addr,
+            error = %e,
+            "could not bind https://dig.local; non-fatal — plaintext keeps serving. `:443` is \
+             privileged (run elevated / grant CAP_NET_BIND_SERVICE; the installed service runs \
+             elevated) and the 127.0.0.2 / ::1 loopback address must exist (macOS: sudo ifconfig \
+             lo0 alias 127.0.0.2)"
         ),
     }
 }
@@ -1700,7 +1717,7 @@ async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
-    eprintln!("dig-node: shutting down");
+    tracing::info!("dig-node shutting down");
 }
 
 #[cfg(test)]

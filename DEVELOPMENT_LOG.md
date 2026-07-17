@@ -4,6 +4,24 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## The node emitted tracing into the void — no subscriber was ever installed (#553)
+
+`dig-node-core` and its P2P/TLS stack emit `tracing` events, but `dig-node-service` installed NO
+`tracing-subscriber`, so every event was silently DROPPED and a Windows-service run (no console)
+produced no log at all. The fix adopts the shared `dig-logging` crate at the SERVE entrypoints
+(the foreground `run`/unix daemon in `entrypoint::block_on_serve`, and the Windows service body in
+`win_service::run_service` — one-shot CLI commands deliberately do NOT install it). Sharp edges:
+
+- `tracing` has ONE global subscriber per process, and `dig_logging::LogGuard` is not `Clone` and
+  must be HELD for the process lifetime (dropping it flushes/detaches the file writer). So the guard
+  lives in a process-global `OnceLock` in `logging.rs` rather than threaded through `serve`'s
+  signature + every test caller — that also gives `control.log.setLevel` the reload handle for free.
+- Per-request logging (`logging::log_rpc_dispatch`) takes ONLY the method name, never `params` — a
+  control/pairing body carries the control/paired token (dig-logging SPEC §7 never-log), so the
+  logger's signature makes leaking it impossible. A `tests/never_log.rs` capture test locks this in.
+- Windows MAX_PATH: a deeply-nested worktree overflows 260 chars building `libz-sys`/cmake; set
+  `CARGO_TARGET_DIR` to a short path (e.g. `C:/t553`) to build/test from such a worktree.
+
 ## Bare-git dependency version pins unify across the WHOLE dependency graph, not per-manifest (#494)
 
 A `git`-sourced Cargo dependency with NO `rev`/`branch`/`tag` is identified purely by its URL —

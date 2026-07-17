@@ -93,6 +93,20 @@ tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Structured logging. The node's engine library (`dig_node_core`) and its transitive
+# P2P/TLS stack emit `tracing` events; WITHOUT a subscriber installed here every one is
+# silently dropped and a Windows-service run leaves no log at all. `dig-logging` is the
+# shared building block (#547) that installs the dual sink — a rolling JSONL file (per-OS
+# machine log dir) + human stderr — behind one reloadable level filter, and ships the
+# reusable `logs` CLI verbs + the bundle-time redaction engine. Every DIG service binary
+# gets logging from HERE rather than hand-rolling a subscriber. Sourced from crates.io (no
+# git/path dep) per the ecosystem crates.io policy (#681).
+dig-logging = "0.1"
+# The logging facade the shell emits through. dig-node-core already depends on `tracing`;
+# the service shell now emits its own bring-up/lifecycle events through it, captured by the
+# `dig-logging` subscriber installed at the serve entrypoints.
+tracing = "0.1"
+
 # CLI + OS-service registration.
 clap = { version = "4", features = ["derive"] }
 # Cross-platform service manager: Windows SCM, Linux systemd, macOS launchd behind
@@ -146,6 +160,10 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
+# Capturing subscriber for the never-log regression tests (#553 SPEC §7): a `fmt` layer writing
+# into an in-memory buffer so a test can assert emitted records never contain secret values.
+# Pinned to the SAME 0.3 line `dig-logging` builds on, so exactly one `tracing-subscriber` resolves.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `test-util` unlocks tokio's paused-clock test controls (`#[tokio::test(start_paused = true)]`,
 # `tokio::time::advance`) so the self-heal per-child timeout (#693) and the TLS leaf-renewal
 # missed-tick behaviour (#660) are tested deterministically without real waits.

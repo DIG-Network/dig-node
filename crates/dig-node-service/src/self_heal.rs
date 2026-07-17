@@ -239,10 +239,12 @@ pub async fn reconcile_ext_forcelist() -> KickOutcome {
 /// Run one self-heal pass: re-arm the beacon schedule, then reconcile the ext-forcelist. Both are
 /// best-effort and independent — one failing never blocks the other.
 pub async fn run_once() {
+    // A per-tick maintenance pass: routine + frequent, so it is DEBUG (developer diagnosis of what
+    // the self-heal driver did this cycle), not operator-level INFO narrative.
     let rearm = rearm_beacon_schedule().await;
-    eprintln!("dig-node: self-heal beacon re-arm: {rearm:?}");
+    tracing::debug!(outcome = ?rearm, "self-heal: beacon schedule re-arm");
     let reconcile = reconcile_ext_forcelist().await;
-    eprintln!("dig-node: self-heal ext-forcelist reconcile: {reconcile:?}");
+    tracing::debug!(outcome = ?reconcile, "self-heal: ext-forcelist reconcile");
 }
 
 /// Spawn the always-on self-heal driver as a detached task: one pass immediately, then a pass every

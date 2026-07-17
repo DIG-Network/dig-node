@@ -993,6 +993,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.status` | — | `running`, `service`, `version`, `commit`, `protocol`, `uptime_secs`, `addr`, `upstream`, `cache`, `hosted_store_count`, `cached_capsule_count`, `pinned_store_count`, `sync.available` |
 | `control.config.get` | — | `addr`, `port`, `upstream`, `upstream_override`, `cache_dir`, `cache_shared`, `config_path`, `sync_available` |
 | `control.config.setUpstream` | `upstream` (URL string; blank clears) | `upstream` (normalized), `requires_restart: true` — persisted, effective on next start (§3.4) |
+| `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `dir`, `shared` |
 | `control.cache.setCap` | `cap_bytes` (number) | `cap_bytes` (floored at 64 MiB) |
 | `control.cache.clear` | — | `cleared: true` |
@@ -1286,7 +1287,7 @@ write) is cancelled and reported as a failed kick, so it can never block the pas
 `run-service` (hidden; the Windows SCM entrypoint, §9.4; behaves as `run` off Windows) ·
 `install` · `uninstall` · `start` · `stop` · `status` · `pair` (§7.11) · `open` (§8.5) ·
 the **control-parity** subcommands `info` · `config` · `cache` · `stores` · `sync` · `updater` ·
-`subscriptions` (§8.6) · `peers` (§8.7).
+`subscriptions` (§8.6) · `peers` (§8.7) · `logs` (§11).
 
 The `dign` alias binary (§2.1a) exposes this SAME subcommand set with the SAME semantics — `dign
 <subcommand>` is equivalent to `dig-node <subcommand>` in every respect except the reported program
@@ -2714,3 +2715,66 @@ node-side in the interim:
 Exercising the connected pool end-to-end is gated on the network-genesis bring-up (the pre-launch
 placeholder genesis is rejected by `GossipService::start`); these behaviors are unit-tested
 independently of a live pool.
+
+## 20. Logging — structured JSONL file + human stderr (#553)
+
+The node adopts the shared `dig-logging` building block (`dig-logging` crate, `dig_ecosystem` #547),
+so its sink layout, JSONL schema, log directory, rotation, level control, correlation ids, redaction,
+and `logs` verbs are byte-identical to every other DIG service binary. `dig-logging`'s own `SPEC.md`
+is the normative contract for those; this section records what dig-node MUST do.
+
+### 20.1. Where the subscriber is installed
+
+The node MUST install the `dig-logging` subscriber exactly once, at a SERVE entrypoint, and hold the
+returned guard for the process lifetime:
+
+- the foreground `run` path and the unix daemon (`serve` via the CLI entrypoint) install it as run
+  context `service` when the process is an installed OS-service run, else `cli`;
+- the Windows service body (`run-service`, §9.4) installs it as run context `service` immediately
+  after marking the process a service, BEFORE building the runtime — a Windows service has no
+  console, so the JSONL file is the only log.
+
+A one-shot CLI command (`status`, `pair`, `config`, …) does NOT install the subscriber: it neither
+needs a rolling log file nor the maintenance thread. Installation is best-effort — a logging failure
+(unwritable dir, subscriber already set) is reported on stderr and MUST NOT stop the node serving.
+
+The log directory follows `dig-logging` SPEC §3: the machine root `<…>/DigNetwork/logs/dig-node`
+(`C:\ProgramData\DigNetwork\logs\dig-node`, `/Library/Logs/DigNetwork/dig-node`,
+`/var/log/dig/dig-node`) for a service run, the per-user dev-fallback for an unprivileged `dig-node
+run`, and `DIG_LOG_DIR` overrides both — mirroring the #501 daemon/CLI state-dir split.
+
+### 20.2. Levels — used by MEANING
+
+Events are emitted at the level that matches their operational meaning, not uniformly: `error!`
+(operation failed / broken invariant), `warn!` (recoverable, degraded, or a fallback taken — a
+listener that failed to bind non-fatally, a TLS/plaintext downgrade, a control-token persist
+falling back to an in-memory token), `info!` (sparse operator lifecycle — the node listening with
+its bound addresses + upstream, a listener up, leaf renewed, shutting down), `debug!` (developer
+diagnosis — per-request RPC dispatch, a per-tick self-heal pass, a config-disabled surface),
+`trace!` (firehose). The default filter is `dig-logging`'s noise-trimmed `info`.
+
+### 20.3. `control.log.setLevel` — runtime level control
+
+`control.log.setLevel` (§7.4) live-swaps the process level filter via the `dig-logging` reload
+handle (`dig-logging` SPEC §5). It is a gated `control.*` method (loopback + control-token or paired
+token, §7.2), takes `params.filter` (an `EnvFilter` directive), applies immediately, and does NOT
+persist. A missing/malformed directive is `INVALID_PARAMS`; a process without logging installed is
+`CONTROL_ERROR`.
+
+### 20.4. `dig-node logs …` verbs
+
+The node mounts `dig-logging`'s shared subcommand verbatim as `dig-node logs …` (also `dign logs
+…`), so `logs path`, `logs tail [-f] [-n N] [--level L] [--json]`, `logs level [<filter>]`, and
+`logs bundle [-o out.zip] [--all] [--since <dur>]` behave identically to every DIG binary
+(`dig-logging` SPEC §8.1). `logs level <filter>` PERSISTS the directive (effective on the next node
+start) AND additionally live-applies it to a running node via `control.log.setLevel` (best-effort —
+a node that is not running leaves the persisted level in place and reports it, never an error). `logs
+bundle` writes a redacted zip safe to attach to a bug report (`dig-logging` SPEC §8.2).
+
+### 20.5. Never-log at source (SPEC §7 of dig-logging)
+
+No secret — a BIP39 mnemonic/seed, a wallet private key, the control token, a paired/session token,
+a passphrase — is EVER passed to a `tracing` field or message, at any level. Bundle-time redaction
+is only the second line of defence. The transport's per-request logging records ONLY the method name
+and a correlation `op_id`, never the request `params` (which for a control/pairing call carry a
+token); this is enforced by the request-logger's signature and a never-log regression test.

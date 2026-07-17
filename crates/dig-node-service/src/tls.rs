@@ -54,11 +54,11 @@ pub fn load_https_material(paths: TlsPaths) -> Option<HttpsMaterial> {
     // `ca.key`, and this service reads that key with privilege. Fail CLOSED to plaintext; the
     // installer (#623) provisions the root under a privileged owner.
     if !crate::security::dir_is_privileged(&paths.root) {
-        eprintln!(
-            "dig-node: WARN refusing HTTPS — the TLS root {} is not owned by a privileged \
-             principal (SYSTEM/Administrators or root) or is user-writable; serving plaintext only. \
-             The installer (#623) provisions this root under a privileged owner.",
-            paths.root.display()
+        tracing::warn!(
+            tls_root = %paths.root.display(),
+            "refusing HTTPS: TLS root is not privileged-owned (SYSTEM/Administrators or root) or is \
+             user-writable; serving plaintext only. The installer (#623) provisions this root under \
+             a privileged owner"
         );
         return None;
     }
@@ -72,10 +72,11 @@ fn load_leaf_material(paths: TlsPaths) -> Option<HttpsMaterial> {
     // Gate on BOTH files existing before touching rustls — the common "installer hasn't run
     // yet" case, reported as an informational line (not a warning), since it is expected.
     if !paths.leaf_cert().exists() || !paths.leaf_key().exists() {
-        eprintln!(
-            "dig-node: HTTPS (https://dig.local) unavailable — no TLS leaf under {} yet. \
-             The installer provisions the per-machine CA + leaf (#623); serving plaintext only.",
-            paths.root.display()
+        // Expected on a machine the installer has not provisioned yet — INFO, not WARN.
+        tracing::info!(
+            tls_root = %paths.root.display(),
+            "https://dig.local unavailable: no TLS leaf yet. The installer provisions the \
+             per-machine CA + leaf (#623); serving plaintext only"
         );
         return None;
     }
@@ -86,10 +87,11 @@ fn load_leaf_material(paths: TlsPaths) -> Option<HttpsMaterial> {
             paths,
         }),
         Err(e) => {
-            eprintln!(
-                "dig-node: WARN could not load the TLS leaf under {} ({e}); serving plaintext \
-                 only. HTTPS starts once a valid CA + leaf are present (#623).",
-                paths.root.display()
+            tracing::warn!(
+                tls_root = %paths.root.display(),
+                error = %e,
+                "could not load the TLS leaf; serving plaintext only. HTTPS starts once a valid \
+                 CA + leaf are present (#623)"
             );
             None
         }
@@ -142,27 +144,25 @@ async fn run_rotation_pass(manager: Arc<RenewalManager>, now: OffsetDateTime) {
     match tokio::task::spawn_blocking(move || manager.maintain(now)).await {
         Ok(Ok(report)) => {
             if report.leaf_renewed {
-                eprintln!(
-                    "dig-node: TLS leaf for https://dig.local renewed and hot-reloaded \
-                     (attempts={})",
-                    report.attempts
+                tracing::info!(
+                    attempts = report.attempts,
+                    "TLS leaf for https://dig.local renewed and hot-reloaded"
                 );
             }
             if report.ca_renewal_due {
-                eprintln!(
-                    "dig-node: WARN the local CA is within its renewal window. CA rotation \
-                     is installer-coordinated (dig-cert rotate_ca) and re-installs trust — \
-                     the node does NOT auto-rotate the anchor."
+                tracing::warn!(
+                    "the local CA is within its renewal window. CA rotation is \
+                     installer-coordinated (dig-cert rotate_ca) and re-installs trust — the node \
+                     does NOT auto-rotate the anchor"
                 );
             }
         }
-        Ok(Err(e)) => eprintln!(
-            "dig-node: WARN TLS leaf renewal pass failed ({e}); HTTPS keeps serving the \
-             current leaf and the next pass retries."
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "TLS leaf renewal pass failed; HTTPS keeps serving the current leaf and the next pass \
+             retries"
         ),
-        Err(e) => {
-            eprintln!("dig-node: WARN TLS leaf renewal task did not complete ({e})")
-        }
+        Err(e) => tracing::warn!(error = %e, "TLS leaf renewal task did not complete"),
     }
 }
 

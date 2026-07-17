@@ -178,6 +178,8 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
             store_id: String::new(),
         }
         .method(),
+        // `dig-node logs level <filter>` drives the live level change (#553).
+        "control.log.setLevel",
         // `dig-node peers` drives the live peer status (#559).
         "control.peerStatus",
         // `dig-node pair …` drives the pairing-admin methods (#280).

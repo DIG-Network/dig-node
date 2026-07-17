@@ -350,7 +350,18 @@ pub fn run() -> std::process::ExitCode {
     // leak. (`bin_name` takes `Into<String>`, so it takes the owned value directly.)
     let bin = invoked_bin_name();
     let bin_static: &'static str = Box::leak(bin.clone().into_boxed_str());
-    let matches = Cli::command().name(bin_static).bin_name(bin).get_matches();
+    // Mount the shared `logs` verb set (#553) beside the derived subcommands so
+    // `dig-node logs path|tail|level|bundle` behaves identically to every other DIG service
+    // binary. It is not part of the derived `Cli` enum, so we intercept it from the raw
+    // matches BEFORE `from_arg_matches` (which would reject the unknown subcommand).
+    let matches = Cli::command()
+        .name(bin_static)
+        .bin_name(bin)
+        .subcommand(dig_logging::logs::command())
+        .get_matches();
+    if let Some(("logs", logs_matches)) = matches.subcommand() {
+        return run_logs(logs_matches);
+    }
     let cli = match Cli::from_arg_matches(&matches) {
         Ok(c) => c,
         Err(e) => e.exit(),
@@ -564,9 +575,50 @@ fn hint_for(exit: ExitCode) -> Option<&'static str> {
     }
 }
 
+/// Run the shared `logs` verb set (#553): `dig-node logs path|tail|level|bundle`. The verbs
+/// operate on the on-disk log files (SPEC §8.1); `logs level <filter>` PERSISTS the level (it
+/// takes effect on the next node start) and ADDITIONALLY live-applies it to a running node via
+/// `control.log.setLevel` (best-effort — a not-running node is not an error for the persist).
+fn run_logs(matches: &clap::ArgMatches) -> std::process::ExitCode {
+    let service = crate::logging::service(crate::logging::run_context());
+    if let Err(e) = dig_logging::logs::run(&service, matches) {
+        eprintln!("error: {e}");
+        return std::process::ExitCode::from(ExitCode::IoError.code());
+    }
+    live_apply_level(matches);
+    std::process::ExitCode::from(ExitCode::Ok.code())
+}
+
+/// After `logs level <filter>` persisted the directive, push it to a RUNNING node so the change
+/// takes effect immediately rather than only on the next start (SPEC §5 runtime reload). Purely
+/// best-effort: a node that is not running (or rejects the directive) leaves the persisted level
+/// in place and prints an informational note — never a failure, since the persist already
+/// succeeded.
+fn live_apply_level(logs_matches: &clap::ArgMatches) {
+    let Some(("level", level_matches)) = logs_matches.subcommand() else {
+        return;
+    };
+    let Some(filter) = level_matches.get_one::<String>("filter") else {
+        return; // `logs level` with no argument only READS the level; nothing to apply.
+    };
+    let config = Config::from_env();
+    let params = serde_json::json!({ "filter": filter });
+    match crate::control_client::call_control(&config, "control.log.setLevel", params) {
+        Ok(_) => eprintln!("applied to the running node (effective now)"),
+        Err(_) => eprintln!("(the running node was not reachable; level applies on next start)"),
+    }
+}
+
 /// Build the multi-threaded tokio runtime and serve. Kept here (not in [`crate::server`])
 /// so the lib's `serve` stays a plain async fn callers can drive on their own runtime.
+///
+/// Installs the structured-logging stack (#553) FIRST so the bring-up narration + every
+/// `dig_node_core` event lands in the rolling JSONL file + stderr for the whole serve
+/// lifetime. The run context (machine vs dev-fallback log dir) mirrors the #501 daemon/CLI
+/// split — an installed service logs to the machine dir, a bare `dig-node run` to the per-user
+/// dev dir.
 fn block_on_serve(config: Config) -> std::io::Result<()> {
+    crate::logging::init(crate::logging::run_context());
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
