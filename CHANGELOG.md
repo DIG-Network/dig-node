@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.38.4] - 2026-07-17
+
+### Bug Fixes
+- **control:** Pin control-client to direct loopback + CONTROL_METHODS/dispatch lockstep guard (#711) (#49)- Route dign open through dig-urn-resolver (§5.3 ladder + branded errors) (#745) (#50)- **service:** Idempotent dign start (SCM 1056) + clearer control-token remedy (#772) (#51)
+
 ## [0.38.1] - 2026-07-17
 
 ### Features
