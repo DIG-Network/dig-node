@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.38.1] - 2026-07-17
+
+### Features
+- Adopt dig-logging for real retrievable node logs (#553) (#47)
+
+### Bug Fixes
+- **security:** Walk parent components + reject reparse points in dir_is_privileged (#712)
+
 ## [0.37.1] - 2026-07-17
 
 ### Bug Fixes
