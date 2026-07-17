@@ -132,18 +132,13 @@ dig-urn-resolver = "0.3.1"
 
 # `dig_constants::DIG_NODE_PORT` (§5.3) — the single-sourced canonical default localhost port
 # for client→node connections; `config.rs`'s DEFAULT_PORT reads it rather than re-declaring the
-# literal. Rev-PINNED deliberately, to a DISTINCT source from dig-node-core's own bare-git
-# `dig-constants = { version = "0.2", git = "..." }` (which the P2P stack — dig-nat/dig-gossip/
-# dig-dht/dig-onion — is release-ordered to stay on until 0.2.x reaches crates.io): a bare-git
-# dependency has no `rev`, so cargo unifies EVERY bare-git reference to that URL into ONE
-# resolved version, and ^0.2 + ^0.3 cannot both be satisfied by a single instance. Pinning this
-# crate's dependency to the exact v0.3.0 commit makes it a cargo-DISTINCT source (a `rev`-pinned
-# git dependency never unifies with a bare one, even at the identical commit), so this crate gets
-# its own 0.3.0 instance without forcing dig-node-core's 0.2.x pin forward. Safe because the only
-# thing crossing the boundary is a plain `u16` constant — the two instances never need to
-# interoperate. Bump the `rev` (and the `version` req) when dig-node-core's own pin moves past
-# 0.3.x and unification becomes possible again.
-dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants", rev = "438ac8caf9ffb80cadd10362deacd63763a7f141" }
+# literal. BARE git (no `rev`), matching dig-node-core's own `dig-constants = { version = "0.3",
+# git = "..." }` and the P2P stack (dig-nat/dig-gossip) that now all resolve dig-constants 0.3.x
+# from the same bare-git source, so cargo unifies EVERY bare-git reference to that URL into ONE
+# 0.3.0 instance. (The earlier rev-pin existed only to hold this crate on 0.3.0 while dig-node-core
+# was still on 0.2.x; core has since advanced to "0.3", so a single bare-git 0.3.0 now satisfies
+# every reference and the distinct-source workaround is no longer needed.)
+dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants" }
 
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the
 # SCM; the binary the SCM launches must itself speak the service protocol

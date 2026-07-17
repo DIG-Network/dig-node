@@ -56,3 +56,15 @@ overflow-checks = true
 [patch.crates-io]
 chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "9177a9b3af1db53e294d3407844f0dd986206ced" }
 chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "9177a9b3af1db53e294d3407844f0dd986206ced" }
+
+# -- Single-dig-nat unification -----------------------------------------------------------------------
+#
+# dig-nat IS on crates.io (0.2.1), but dig-gossip is NOT — it stays a git dependency and its manifest
+# resolves dig-nat from GIT (bare `{ version = "0.2", git = "…dig-nat" }`). The published peer stack
+# (dig-dht/dig-download/dig-peer-selector, all on crates.io) instead references dig-nat from crates.io
+# "^0.2". A git source and a registry source are DISTINCT to cargo even at the same version, so without
+# this patch the graph would fork into two incompatible dig-nat instances (dig-gossip's git copy vs the
+# crates.io copy the DHT/download/selector ride) and the shared `PeerId`/`Contact`/`PeerConnection`
+# types would not match at the seams. Redirecting the crates.io dig-nat onto the SAME bare-git source
+# dig-gossip + dig-node-core use collapses the whole graph to exactly ONE dig-nat 0.2.1.
+dig-nat = { git = "https://github.com/DIG-Network/dig-nat" }

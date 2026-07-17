@@ -1831,19 +1831,8 @@ dependencies = [
 
 [[package]]
 name = "dig-constants"
-version = "0.2.1"
-source = "git+https://github.com/DIG-Network/dig-constants#8a4c1670a7005b991611a796e17eccf8aff00e21"
-dependencies = [
- "chia-bls 0.26.0",
- "chia-consensus",
- "chia-protocol",
- "hex-literal",
-]
-
-[[package]]
-name = "dig-constants"
 version = "0.3.0"
-source = "git+https://github.com/DIG-Network/dig-constants?rev=438ac8caf9ffb80cadd10362deacd63763a7f141#438ac8caf9ffb80cadd10362deacd63763a7f141"
+source = "git+https://github.com/DIG-Network/dig-constants#438ac8caf9ffb80cadd10362deacd63763a7f141"
 dependencies = [
  "chia-consensus",
  "chia-protocol",
@@ -1852,8 +1841,9 @@ dependencies = [
 
 [[package]]
 name = "dig-dht"
-version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-dht#d5b4a7d9f5d9632a036b8c06cf7ae0da16d83ad1"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "333f949036608923a44293294a4755e0df5ba907be28deec40b94468dc02d6c6"
 dependencies = [
  "async-trait",
  "dig-nat",
@@ -1868,8 +1858,9 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-download#706bce6d1d7a9a38e70010bf94320160b725d2f3"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b0b176fe3c6f571e15ec07d1bd499ccb35ea9909095570b78aeef00f0845782"
 dependencies = [
  "async-trait",
  "dig-dht",
@@ -1885,15 +1876,15 @@ dependencies = [
 
 [[package]]
 name = "dig-gossip"
-version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=9177a9b3af1db53e294d3407844f0dd986206ced#9177a9b3af1db53e294d3407844f0dd986206ced"
+version = "0.2.1"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=bf1857edc497a9655e9f27c5bb8d4bef1403b73a#bf1857edc497a9655e9f27c5bb8d4bef1403b73a"
 dependencies = [
  "bincode",
  "chia-protocol",
  "chia-sha2 0.26.0",
  "chia-traits 0.26.0",
  "chia_streamable_macro 0.26.0",
- "dig-constants 0.2.1",
+ "dig-constants 0.3.0",
  "dig-nat",
  "dig-protocol",
  "futures-util",
@@ -1955,11 +1946,11 @@ dependencies = [
 
 [[package]]
 name = "dig-nat"
-version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-nat#00f438b5f0f18d37395448520c41b8b446afa700"
+version = "0.2.1"
+source = "git+https://github.com/DIG-Network/dig-nat#2523b8bbe4a194d0051bd961dbbcfa666a07703d"
 dependencies = [
  "async-trait",
- "dig-constants 0.2.1",
+ "dig-constants 0.3.0",
  "futures",
  "futures-util",
  "igd-next",
@@ -1989,7 +1980,7 @@ dependencies = [
  "axum",
  "base64",
  "chia-protocol",
- "dig-constants 0.2.1",
+ "dig-constants 0.3.0",
  "dig-dht",
  "dig-download",
  "dig-gossip",
@@ -2027,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.38.6"
+version = "0.39.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2061,8 +2052,9 @@ dependencies = [
 
 [[package]]
 name = "dig-peer-selector"
-version = "0.1.0"
-source = "git+https://github.com/DIG-Network/dig-peer-selector#b7aed526fb6c3f3bc7fedc3a874860db29ee2847"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a88dd49d5c092267e93a715f92de1d6f5634471e712281155bbf6fe49c8dcd4"
 dependencies = [
  "dig-dht",
  "dig-nat",
@@ -2444,7 +2436,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2570,7 +2562,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3339,7 +3331,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3667,7 +3659,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4252,7 +4244,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.4",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4621,7 +4613,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5233,10 +5225,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6294,7 +6286,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
