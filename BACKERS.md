@@ -6,12 +6,14 @@ The DIG Network is built in the open and funded by people who believe in a decen
 
 ## Our backers
 
+<!-- BEGIN: AUTO-GENERATED BACKERS LIST -->
 - Steve Stepp ([@steppsr](https://github.com/steppsr))
 - [@tgorm-xch](https://github.com/tgorm-xch)
 - Don Kackman ([@dkackman](https://github.com/dkackman))
 - Ken Griggs ([@fizpawiz](https://github.com/fizpawiz))
 - Jared ([@jaszaro](https://github.com/jaszaro))
 - [@trgarrett](https://github.com/trgarrett)
+<!-- END: AUTO-GENERATED BACKERS LIST -->
 
 ---
 

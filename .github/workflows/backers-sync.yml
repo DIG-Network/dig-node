@@ -1,0 +1,116 @@
+name: Sync backers
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Update BACKERS.md
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync public sponsors into BACKERS.md
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DIG_NETWORK_SPONSORS_TOKEN || github.token }}
+          script: |
+            const fs = require("node:fs");
+            const path = "BACKERS.md";
+            const orgLogin = "DIG-Network";
+
+            const query = `
+              query ($org: String!, $cursor: String) {
+                organization(login: $org) {
+                  sponsorshipsAsMaintainer(first: 100, after: $cursor, activeOnly: true) {
+                    nodes {
+                      privacyLevel
+                      sponsorEntity {
+                        __typename
+                        ... on User {
+                          login
+                          name
+                        }
+                        ... on Organization {
+                          login
+                          name
+                        }
+                      }
+                    }
+                    pageInfo {
+                      hasNextPage
+                      endCursor
+                    }
+                  }
+                }
+              }
+            `;
+
+            const sponsors = [];
+            let cursor = null;
+
+            while (true) {
+              const result = await github.graphql(query, { org: orgLogin, cursor });
+              const sponsorships = result.organization?.sponsorshipsAsMaintainer;
+              if (!sponsorships) {
+                core.setFailed(`Unable to read sponsorships for ${orgLogin}.`);
+                return;
+              }
+
+              for (const node of sponsorships.nodes) {
+                if (node.privacyLevel !== "PUBLIC") continue;
+                const login = node.sponsorEntity?.login;
+                if (!login) continue;
+                const name = (node.sponsorEntity?.name || "").trim();
+                if (name && name.toLowerCase() !== login.toLowerCase()) {
+                  sponsors.push(`- ${name} ([@${login}](https://github.com/${login}))`);
+                } else {
+                  sponsors.push(`- [@${login}](https://github.com/${login})`);
+                }
+              }
+
+              if (!sponsorships.pageInfo?.hasNextPage) break;
+              cursor = sponsorships.pageInfo.endCursor;
+            }
+
+            const uniqueSponsors = Array.from(new Set(sponsors)).sort((a, b) =>
+              a.localeCompare(b, undefined, { sensitivity: "base" })
+            );
+
+            const replacement = uniqueSponsors.length
+              ? uniqueSponsors.join("\n")
+              : "- _No public sponsors currently listed._";
+
+            const begin = "<!-- BEGIN: AUTO-GENERATED BACKERS LIST -->";
+            const end = "<!-- END: AUTO-GENERATED BACKERS LIST -->";
+            const source = fs.readFileSync(path, "utf8");
+            const pattern = new RegExp(`${begin}[\\s\\S]*?${end}`);
+            if (!pattern.test(source)) {
+              core.setFailed(`Could not find managed backers markers in ${path}.`);
+              return;
+            }
+
+            const updated = source.replace(pattern, `${begin}\n${replacement}\n${end}`);
+            fs.writeFileSync(path, updated);
+
+      - name: Create pull request if BACKERS.md changed
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ github.token }}
+          commit-message: "chore(backers): sync BACKERS.md from GitHub Sponsors"
+          title: "chore(backers): sync BACKERS.md from GitHub Sponsors"
+          body: |
+            Automated weekly sync of public sponsors for DIG-Network into BACKERS.md.
+          branch: chore/weekly-backers-sync
+          delete-branch: true
