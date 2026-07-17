@@ -1998,7 +1998,7 @@ dependencies = [
  "dig-pex",
  "digstore-chain",
  "digstore-compiler",
- "digstore-core",
+ "digstore-core 0.10.1",
  "digstore-crypto",
  "digstore-host",
  "digstore-remote",
@@ -2027,7 +2027,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.38.2"
+version = "0.38.3"
 dependencies = [
  "axum",
  "axum-server",
@@ -2037,8 +2037,9 @@ dependencies = [
  "dig-constants 0.3.0",
  "dig-logging",
  "dig-node-core",
+ "dig-urn-resolver",
  "dig-wallet",
- "digstore-core",
+ "digstore-core 0.10.1",
  "digstore-crypto",
  "digstore-stage",
  "futures-util",
@@ -2103,10 +2104,28 @@ dependencies = [
  "base64",
  "dig-node-core",
  "dig-wallet",
- "digstore-core",
+ "digstore-core 0.10.1",
  "hex",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dig-urn-resolver"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f33e087c437c97ace10aafe0c1e948f96338b2a7ea7ff1bc4c641eeb2167fca3"
+dependencies = [
+ "async-trait",
+ "base64",
+ "digstore-core 0.13.4",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -2127,7 +2146,7 @@ dependencies = [
  "dig-keystore",
  "dig-node-core",
  "digstore-chain",
- "digstore-core",
+ "digstore-core 0.10.1",
  "futures-core",
  "hex",
  "http-body-util",
@@ -2183,7 +2202,7 @@ dependencies = [
  "chia-sha2 0.26.0",
  "chia-wallet-sdk",
  "datalayer-driver",
- "digstore-core",
+ "digstore-core 0.10.1",
  "dirs 5.0.1",
  "getrandom 0.2.17",
  "hex",
@@ -2203,7 +2222,7 @@ name = "digstore-chunker"
 version = "0.10.1"
 source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
- "digstore-core",
+ "digstore-core 0.10.1",
  "sha2 0.10.9",
 ]
 
@@ -2213,7 +2232,7 @@ version = "1.0.0"
 source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "chacha20 0.9.1",
- "digstore-core",
+ "digstore-core 0.10.1",
  "digstore-store",
  "hex",
  "sha2 0.10.9",
@@ -2237,12 +2256,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "digstore-core"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da20d5cdc680f025058da0f6a3d2481b537a658683a294cf62a65e0f0e4d8412"
+dependencies = [
+ "aes-gcm-siv",
+ "hex",
+ "hkdf",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "digstore-crypto"
 version = "0.1.0"
 source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "chia-bls 0.45.0",
- "digstore-core",
+ "digstore-core 0.10.1",
  "hex",
  "serde",
  "serde_json",
@@ -2257,7 +2289,7 @@ source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b3
 dependencies = [
  "anyhow",
  "clap",
- "digstore-core",
+ "digstore-core 0.10.1",
  "digstore-crypto",
  "digstore-prover",
  "futures",
@@ -2277,7 +2309,7 @@ name = "digstore-prover"
 version = "0.1.0"
 source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
- "digstore-core",
+ "digstore-core 0.10.1",
  "digstore-crypto",
  "reqwest",
  "serde",
@@ -2294,7 +2326,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
- "digstore-core",
+ "digstore-core 0.10.1",
  "digstore-crypto",
  "digstore-host",
  "digstore-store",
@@ -2319,7 +2351,7 @@ source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b3
 dependencies = [
  "digstore-chunker",
  "digstore-compiler",
- "digstore-core",
+ "digstore-core 0.10.1",
  "digstore-crypto",
  "digstore-store",
  "hex",
@@ -2334,7 +2366,7 @@ version = "0.1.0"
 source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
 dependencies = [
  "digstore-chunker",
- "digstore-core",
+ "digstore-core 0.10.1",
  "digstore-crypto",
  "hex",
  "serde",

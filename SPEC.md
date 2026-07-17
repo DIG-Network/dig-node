@@ -1373,12 +1373,43 @@ DIG link that no in-browser DIG extension intercepted.
   resolved URL is launched via the OS "open a URL" facility with the URL as a SINGLE, non-shell argv
   entry (Windows `rundll32 url.dll,FileProtocolHandler`, Linux `xdg-open`, macOS `open`). A rejected
   link exits `USAGE` (2) and launches nothing.
-- **Behavior.** Opens the user's DEFAULT browser at the node's LOCAL serve URL
-  `http://<host>:<port>/s/<storeId>[:<root>]/<path>` (the §4.6 plaintext content route; host/port
-  from the node's own config, default `localhost:9778`), so the node — the resolver of record —
-  serves the content and any installed DIG extension can still verify it. It NEVER opens `chia://`
-  at the OS level (dig-node is itself the OS `chia://` handler, so that would recurse) and NEVER
-  opens a dig-node GUI (it has none). Under `--json`: `{ opened: true, url, store_id, root, path }`.
+- **Resolution (MUST route through the canonical resolver, #745).** `open` is a CLIENT operation, so
+  it MUST resolve the link through the shared **`dig-urn-resolver`** — the canonical §5.3 ladder
+  (`dig.local` → `localhost:9778` → `rpc.dig.net`) with FAIL-CLOSED integrity verification — exactly
+  like every other URN-consuming client (the extension URN bar, the SDK). It MUST NOT hard-roll a
+  single `localhost:9778/s/…` URL, and MUST NOT surface a raw upstream error string (e.g. a `502`) to
+  the user. The resolver — never this command — decides whether the content is loadable and NEVER
+  returns unverified bytes. This dependency lives ONLY in the service shell's open-command path, never
+  in the node engine (`dig-node-core`), where it would be a dependency cycle.
+- **Behavior on a verified `Success`.** Opens the user's DEFAULT browser at the best
+  browser-navigable form, in §5.3 preference order, opening the first tier that actually SERVES the
+  content (each cheaply probed):
+  1. `http://<storeId>.dig/<path>` — offered ONLY for a rootless link (the host cannot pin a root);
+  2. `http://dig.local/s/<storeId>[:<root>]/<path>`;
+  3. `http://<host>:<port>/s/<storeId>[:<root>]/<path>` (host/port from config, default `localhost:9778`).
+  If NO browser tier can serve the content (e.g. the local `/s/` chain-read is 502-ing) but the
+  resolver still returned VERIFIED bytes via `rpc.dig.net`, the command serves those verified bytes
+  over an EPHEMERAL LOOPBACK HTTP endpoint (`http://127.0.0.1:<port>/…`) and opens THAT — so the user
+  always sees the exact verified content, never a raw error.
+- **Resolved bytes MUST NOT be written to disk or OS-opened as a file (SECURITY, #745).** The resolved
+  bytes, their content type, and the resource name are ALL attacker-controlled (anyone may publish a
+  store), and a verified `Success` proves only chain-inclusion, NOT safety. Writing them to a temp file
+  and handing that to the OS default-open would bypass the browser's download protections and let an
+  attacker store execute code (e.g. a `.hta`/`.js` written without Mark-of-the-Web → RCE; HTML would
+  also gain a privileged `file://` origin). The command MUST therefore serve the bytes over a loopback
+  `http://127.0.0.1:<ephemeral>` origin instead (short-lived, `X-Content-Type-Options: nosniff`,
+  attacker-influenced header values sanitized of CR/LF), so the browser applies its normal
+  render-vs-download / Mark-of-the-Web / origin-sandbox handling.
+- **Behavior on a non-success / hard error.** On `IntegrityFailure`, `Unreachable`, or a hard resolve
+  error (not-found / rpc error), the command MUST show a BRANDED DIG error asset from the resolver
+  (`dig_urn_resolver::images`), served over the same loopback endpoint — NEVER a hand-rolled page and
+  never a raw error string. A branded page is shown only for a link that PARSES as a valid DIG URN but
+  fails to RESOLVE; a link that fails the untrusted-input validation above still exits `USAGE` and
+  shows nothing.
+- It NEVER opens `chia://` at the OS level (dig-node is itself the OS `chia://` handler, so that would
+  recurse) and NEVER opens a dig-node GUI (it has none). Under `--json`:
+  `{ opened: true, mode: "browser"|"content"|"error", outcome, url, store_id, root, path }` (`url` is
+  always an `http(s)` URL — never a local file path).
 
 ### 8.2. `--json` (global flag)
 
