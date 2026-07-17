@@ -997,7 +997,15 @@ did not pre-create it), the interactive user is not a trustee and cannot read th
 `UNAUTHORIZED` (`-32030`) error and the operator CLI MUST then print the PRECISE remedy — the exact
 token path, and that it needs elevation (Administrator / `sudo`) or the install-user read ACL —
 rather than a generic hint. The CLI distinguishes token-present-but-unreadable (the service-vs-user
-split → "elevate / grant read") from token-absent ("start the node so it mints one").
+split → "elevate / grant read") from token-absent ("start the node so it mints one"). This
+distinction MUST be made by the READ error KIND, NOT by `path.exists()`: under a locked-down DACL the
+invoking user cannot even STAT the file, so `path.exists()` reports `false` and would misclassify an
+ACL denial as "not found" (#772). A `PermissionDenied` read ⇒ present-but-unreadable; any other read
+error ⇒ absent. The token-absent remedy MUST also name the STALE-service recovery: a service left
+over from an older build (installed before the machine-wide state dir) never mints the token at this
+path, so reinstalling the current binary (`dig-node uninstall`, then an elevated `dig-node install`,
+then `dig-node start`) is the fix for a "service running yet token missing" report on an in-place
+upgrade.
 
 ### 7.4. Control methods
 
@@ -1535,6 +1543,17 @@ CI); it MUST NOT be set on an end-user machine.
 `Running` (accepting `Stop`) promptly — otherwise the SCM kills the process with error 1053 —
 serve until the SCM `Stop` control, drive the same graceful shutdown as a signal, and finally
 report `Stopped` (Win32 exit 0 on success, 1 on error).
+
+9.4a. **`start` is IDEMPOTENT (#772).** `dig-node start` requests the OS service manager start the
+registered service and reports SUCCESS (exit 0) when the service is EITHER freshly started OR
+ALREADY RUNNING — a running node is the desired end state, never an error. It MUST recognise the
+per-OS already-running signal, which surfaces only in the service manager's output: Windows SCM
+error **1056** ("An instance of the service is already running"), launchd "already loaded" /
+"already in progress", systemd "already active" (systemd `start` of an active unit is normally a
+silent no-op). `--json` reports `already_running: true|false` to distinguish the two success cases.
+Any OTHER start failure (e.g. the service is not registered) MUST still surface as an error. This is
+what lets the dig-installer call `install` then a separate `start` (§9.2b) without a spurious
+failure when the service is already up.
 
 9.5. **Graceful shutdown.** In the foreground, the serve loop MUST stop gracefully on Ctrl-C (all
 platforms) or SIGTERM (unix — how systemd/launchd stop the service). One shutdown event MUST fan

@@ -203,37 +203,40 @@ pub fn load_or_create_token() -> std::io::Result<String> {
 /// path from the CALLER's perspective and returns the exact fix (which dir + that it
 /// needs elevation or the install-user's read ACL), instead of the generic hint.
 pub fn control_token_remedy() -> String {
-    let path = control_token_path();
+    control_token_remedy_for(&control_token_path())
+}
+
+/// [`control_token_remedy`] for an explicit `path` (so the classification is unit-tested
+/// against a temp dir without touching the real state dir / `DIG_NODE_STATE_DIR`).
+///
+/// Classifies by the READ RESULT, NOT by `path.exists()`: a token the SYSTEM service minted
+/// under a locked-down DACL is UNreadable by the invoking (non-elevated) user, and
+/// `path.exists()` then reports `false` too (the denied ACL blocks even a stat) — which used to
+/// mis-render the ACL split as a bare "no control token found" (#772). The read error KIND
+/// distinguishes the cases: `PermissionDenied` = present-but-locked; anything else = absent.
+pub fn control_token_remedy_for(path: &Path) -> String {
     let dir = path
         .parent()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    // Read once: an Ok read = readable (whatever the contents); an Err with the file present
-    // = the service-vs-user ACL split; absent = the node has not minted one yet.
-    let read = std::fs::read_to_string(&path);
-    let readable = read.is_ok();
-    let present = readable || path.exists();
-    if present && !readable {
-        format!(
-            "the node's control token at {} exists but is NOT readable by your account — \
-             the node runs as a service under a different account (Windows LocalSystem / a \
-             root daemon). Re-run this command elevated (Administrator on Windows, sudo on \
-             Unix), or have the installer grant your account read access to {}.",
+    match std::fs::read_to_string(path) {
+        // Readable, yet the presented token was rejected — a state-dir mismatch, not an
+        // ACL/mint problem.
+        Ok(_) => format!(
+            "the presented control token was not accepted. Ensure the node and this command resolve the SAME state dir ({dir}) — if you set DIG_NODE_STATE_DIR it must match on both the node and this command."
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => format!(
+            "the node's control token at {} exists but is NOT readable by your account — the node runs as a service under a different account (Windows LocalSystem / a root daemon). Re-run this command elevated (Administrator on Windows, sudo on Unix), or reinstall the current dig-node so the service grants your account read access to {} (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`).",
             path.display(),
             dir
-        )
-    } else if !present {
-        format!(
-            "no control token found at {}. Start the node so it mints one \
-             (`dig-node run`, or `dig-node start` for the installed service), then retry.",
+        ),
+        // Absent (NotFound) — the node has not minted one here yet. Either it is not running,
+        // or a STALE older build (installed before the machine-wide state dir) is running and
+        // never mints the token at this path; reinstalling the current dig-node fixes the latter.
+        Err(_) => format!(
+            "no control token found at {}. Start the node so it mints one (`dig-node run`, or `dig-node start` for the installed service), then retry. If the service IS already running, it is likely a STALE older build — reinstall the current dig-node (`dig-node uninstall` then an elevated `dig-node install`, then `dig-node start`) so the running service mints the token here.",
             path.display()
-        )
-    } else {
-        format!(
-            "the presented control token was not accepted. Ensure the node and this command \
-             resolve the SAME state dir ({dir}) — if you set DIG_NODE_STATE_DIR it must match \
-             on both the node and this command."
-        )
+        ),
     }
 }
 
@@ -246,19 +249,28 @@ pub fn control_token_remedy() -> String {
 /// ([`crate::cli::ExitCode::from_io_error`]): `PermissionDenied` (the ACL split → "elevate")
 /// when the file is present but unreadable, else `NotFound` ("start the node").
 pub fn load_token_readonly() -> std::io::Result<String> {
-    let path = control_token_path();
-    match std::fs::read_to_string(&path) {
+    read_token_readonly_at(&control_token_path())
+}
+
+/// [`load_token_readonly`] for an explicit `path` — the service-mints ⇄ CLI-reads round-trip is
+/// unit-tested against a temp dir with this (no `DIG_NODE_STATE_DIR` env mutation, so it is
+/// race-free under parallel tests). Classifies the failure KIND by the READ error, not
+/// `path.exists()`, so an ACL-denied token maps to `PermissionDenied` ("elevate") rather than a
+/// misleading `NotFound` (#772).
+pub fn read_token_readonly_at(path: &Path) -> std::io::Result<String> {
+    match std::fs::read_to_string(path) {
         Ok(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
-        // Present but blank/unreadable, or absent → never mint; surface the exact remedy.
-        other => {
-            let kind = if path.exists() {
-                std::io::ErrorKind::PermissionDenied
-            } else {
-                std::io::ErrorKind::NotFound
+        // Present-but-blank counts as absent (never a real token). A read ERROR keeps its kind:
+        // PermissionDenied ⇒ the ACL split ("elevate"); anything else ⇒ NotFound ("start the node").
+        read => {
+            let kind = match &read {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    std::io::ErrorKind::PermissionDenied
+                }
+                _ => std::io::ErrorKind::NotFound,
             };
-            // Drop the raw read value; the remedy is the actionable message.
-            drop(other);
-            Err(std::io::Error::new(kind, control_token_remedy()))
+            drop(read);
+            Err(std::io::Error::new(kind, control_token_remedy_for(path)))
         }
     }
 }
@@ -1384,6 +1396,84 @@ mod tests {
                 || remedy.contains('\\'),
             "remedy should name a path or command: {remedy}"
         );
+    }
+
+    /// #772 symptom 2 — the SERVICE-mints ⇄ CLI-reads round-trip: a token minted by the
+    /// node-side writer at a path is read back byte-identically by the operator-side reader at
+    /// the SAME path. This is the coupling the bug broke (service running yet CLI cannot read
+    /// the token); a fresh mint must always be readable at its own path.
+    #[test]
+    fn service_mint_then_cli_read_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "dig-node-token-roundtrip-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = dir.join(CONTROL_TOKEN_FILE);
+        let _ = std::fs::remove_dir_all(&dir);
+        let minted = load_or_create_token_at(&path).unwrap();
+        let read_back = read_token_readonly_at(&path).unwrap();
+        assert_eq!(
+            minted, read_back,
+            "the CLI read must return the exact token the service minted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A genuinely-absent token reads as `NotFound` with the "no control token found" remedy that
+    /// now ALSO names the stale-service reinstall recovery (#772).
+    #[test]
+    fn read_readonly_reports_absent_token_as_not_found() {
+        let dir = std::env::temp_dir().join(format!(
+            "dig-node-token-absent-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = dir.join(CONTROL_TOKEN_FILE);
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = read_token_readonly_at(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let msg = err.to_string();
+        assert!(msg.contains("no control token found"), "{msg}");
+        assert!(
+            msg.contains("reinstall") && msg.contains("STALE"),
+            "the absent-token remedy must name the stale-service reinstall recovery: {msg}"
+        );
+    }
+
+    /// #772 symptom 2 (the ACL split): a token present but UNREADABLE by the invoking user must
+    /// map to `PermissionDenied` ("elevate / reinstall"), NEVER the misleading `NotFound` the old
+    /// `path.exists()` classification produced. Unix mode-bit gated; skipped as root (root
+    /// bypasses the mode bits).
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_token_maps_to_permission_denied_not_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "dig-node-token-denied-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let path = dir.join(CONTROL_TOKEN_FILE);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "a".repeat(64)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let running_as_root = std::fs::read_to_string(&path).is_ok();
+        if !running_as_root {
+            let err = read_token_readonly_at(&path).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "an unreadable token must be PermissionDenied, not NotFound"
+            );
+            assert!(
+                err.to_string().contains("NOT readable"),
+                "the remedy must explain the token is present but unreadable: {err}"
+            );
+        }
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

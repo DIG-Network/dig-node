@@ -57,6 +57,29 @@ to `false` even though the service is actually up and running fine. `dig-dns`'s 
 NOT mirrored here for this reason. Any future change to `dig-node install`'s start behavior must
 also update `dig-installer`'s `register_dig_node`/`install_service` in the SAME unit of work.
 
+## `dign start` is idempotent + the control-token "not found" message can really be an ACL denial (#772)
+
+Two coupled operator-CLI traps, fixed together:
+
+- **`dign start` must treat already-running as SUCCESS.** Windows `sc start` on a running service
+  exits non-zero with `[SC] StartService FAILED 1056: An instance of the service is already
+  running.` (`service-manager` surfaces that stdout as the `io::Error` message). `service::start`
+  now classifies the error text (`service::is_already_running_error`: SCM 1056 / launchd "already
+  loaded"/"already in progress" / systemd "already active" — systemd `start` is normally a silent
+  no-op) and reports success (`already_running: true`, exit 0). Idempotent start is the contract; a
+  running node is the desired end state, not a failure.
+- **"no control token found" was mis-reported for an ACL-denied token.** The control token lives at
+  `<state_dir>/control-token` and, on a real Windows install, the state dir is locked to
+  `{SYSTEM:F, Administrators:F, [install-user:R]}`. If the invoking user is NOT a trustee, they can't
+  even STAT the file, so `path.exists()` returns `false` — which made the remedy print the misleading
+  "no control token found … start the node" (the NotFound branch) even though the node WAS running
+  and HAD minted the token. Classify by the READ error KIND instead (`PermissionDenied` = present but
+  locked → "elevate / reinstall"; other = truly absent). The absent-token remedy now also names the
+  STALE-service recovery: a service from an older build (pre machine-wide-state-dir) never mints the
+  token at this path, so `dig-node uninstall` + an elevated `dig-node install` + `dig-node start`
+  (reinstalling the current binary) is the fix. That STALE-service case is the most likely cause of a
+  live "service running yet token missing" report on a box that upgraded dig-node in place.
+
 ## `service-manager`'s systemd backend registers under `to_script_name()`, not `to_qualified_name()` (#494)
 
 `ServiceLabel` has TWO different string renderings — `to_qualified_name()` (`{qualifier}.
