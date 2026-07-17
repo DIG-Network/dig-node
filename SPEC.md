@@ -1457,6 +1457,26 @@ service does not hit Windows `CreateService` error 1073 ("the specified service 
   service-manager-generated unit whose `Description` is the service id, matching `dig-dns`'s own
   established precedent for the CLI-only path.
 
+9.2c. **Privileged-target gate (`install`, #565 LPE).** A **system-level** registration (Windows
+SCM, always LocalSystem; a root systemd/launchd daemon) records the currently-running binary as its
+`ExecStart` / SCM `binPath` / launchd `ProgramArguments` (§9.2). If that binary sits in a
+user-writable directory, a non-privileged local user could replace it and gain persistent
+SYSTEM/root code execution on the next service start — a privilege-escalation vector. So before
+registering a system-level service, `install` MUST verify the program's directory is
+**privileged-owned** (Unix: `root`/uid 0 and no group/other write bit; Windows: an owner SID equal
+to the well-known LocalSystem `S-1-5-18` or BUILTIN\Administrators `S-1-5-32-544`) and **refuse with
+`PERMISSION_DENIED`** otherwise, before any side effect (no state-dir harden, no service create).
+This is the SAME spawn-free owner gate the self-heal spawn root (§7 #565) and the TLS material root
+(§4.1a #661) use — one shared check, fail-closed on an indeterminate owner. A **user-level** install
+(the Linux/macOS default) runs as the very user who owns the binary, crosses no privilege boundary,
+and is always allowed. The canonical install path (native OS package, §9.7) places the binary in a
+protected admin-owned location (`%ProgramFiles%\DIG Network\dig-node\`, `/usr/…`), so it satisfies
+the gate; a manual `dig-node install` from a user-writable download directory is what the gate
+refuses. A single explicit, **default-off** opt-out — the `DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET`
+env var (truthy `1`/`true`/`yes`) — bypasses the gate with a loud warning, intended ONLY for a
+controlled test/dev install of an unreleased build from a build directory (e.g. the `service-smoke`
+CI); it MUST NOT be set on an end-user machine.
+
 9.3. **Entrypoint per platform.** The installed service runs `dig-node run-service` on Windows and
 `dig-node run` on systemd/launchd (which exec the foreground process directly).
 

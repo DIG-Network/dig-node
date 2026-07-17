@@ -29,6 +29,13 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # This smoke test installs the freshly-built `target/release/dig-node` from the runner's
+  # user-writable checkout. On Windows that registration is system-level (LocalSystem), which the
+  # §565 privileged-target gate refuses for a user-writable binary dir (a real LPE protection —
+  # see service.rs). This explicit, default-off opt-out permits the controlled test install of an
+  # unreleased build; end users install via the native OS package into a protected admin-owned dir
+  # (never this env). It is a harmless no-op on the Linux/macOS user-level installs.
+  DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET: "1"
 
 jobs:
   smoke:
