@@ -73,8 +73,20 @@ pub const DEFAULT_RELAY_URL: &str = "wss://relay.dig.net:9450";
 /// Default network id a node registers + discovers under (matches dig-gossip / the relay wire).
 pub const DEFAULT_NETWORK_ID: &str = "DIG_MAINNET";
 
-/// Default P2P listen port for the mTLS peer-RPC server (matches dig-gossip `DEFAULT_P2P_PORT`).
+/// Default P2P listen port for the mTLS peer-RPC server (the L7 DIG peer RPC — what the node
+/// advertises in `dig.getNetworkInfo`'s `listen_addr` and what the DHT hands out as this node's
+/// dial address).
 pub const DEFAULT_P2P_PORT: u16 = 9444;
+
+/// Default listen port for the dig-gossip connected-peer pool.
+///
+/// The gossip pool and the mTLS peer-RPC server (`DEFAULT_P2P_PORT`) are TWO distinct listeners in
+/// the SAME process serving TWO distinct protocols (the gossip wire vs the L7 DIG peer RPC), so they
+/// MUST bind DIFFERENT ports. They both defaulted to `9444`: on Windows a dual-stack `SO_REUSEADDR`
+/// bind let both sockets coexist, masking the clash, but on Linux the second bind fails with
+/// `EADDRINUSE` and peer-RPC bring-up dies (#871). The pool takes `9444 + 1`; the mTLS peer-RPC keeps
+/// the canonical `9444` (it is the advertised/dialed address, so it must not move).
+pub const DEFAULT_GOSSIP_PORT: u16 = 9445;
 
 /// Per-window ciphertext cap for a `dig.fetchRange` frame (bytes) — the node window (3 MiB), the same
 /// cap the HTTP read path (`WINDOW`) uses.
@@ -128,9 +140,15 @@ pub struct PeerStatus {
     /// Whether the peer network (pool + peer-RPC server) is running.
     running: AtomicBool,
     /// Whether a relay reservation is currently held (NAT reachability via `relay.dig.net`).
+    /// Sourced from `dig-nat`'s live [`dig_nat::relay::RelayStatus::is_connected`] — the REAL
+    /// persistent-reservation state, not merely whether a relay is configured (#872).
     relay_reserved: AtomicBool,
-    /// Size of the connected peer pool.
+    /// Size of the directly-connected peer pool (`GossipStats::connected_peers`).
     connected_peers: AtomicU64,
+    /// Peers reachable via the relay reservation (`GossipStats::relay_peer_count`) — the peers
+    /// `dig-nat` discovered over the held socket and folded into the pool (#870). Reported
+    /// alongside `connected_peers` so `control.peerStatus` reflects relay-reachable peers.
+    relay_peer_count: AtomicU64,
     /// The node's own `peer_id` (64-hex SHA-256 of its TLS SPKI DER), once the identity is known.
     peer_id: std::sync::Mutex<Option<String>>,
     /// The most recent peer-network error (best-effort diagnostics).
@@ -150,10 +168,14 @@ impl PeerStatus {
         *self.last_error.lock().unwrap() = None;
     }
 
-    /// Update the connected-pool size + relay-reservation flag (called from the maintenance loop).
-    pub fn set_pool(&self, connected_peers: u64, relay_reserved: bool) {
+    /// Update the connected-pool size, the relay-reachable peer count, and the real relay-reservation
+    /// flag (called from the maintenance loop). `relay_reserved` is `dig-nat`'s live reservation state
+    /// ([`dig_nat::relay::RelayStatus::is_connected`]), not a "relay configured" proxy (#872).
+    pub fn set_pool(&self, connected_peers: u64, relay_peer_count: u64, relay_reserved: bool) {
         self.connected_peers
             .store(connected_peers, Ordering::Relaxed);
+        self.relay_peer_count
+            .store(relay_peer_count, Ordering::Relaxed);
         self.relay_reserved.store(relay_reserved, Ordering::Relaxed);
     }
 
@@ -176,6 +198,7 @@ impl PeerStatus {
             "relay": {
                 "url": endpoint,
                 "reserved": self.relay_reserved.load(Ordering::Relaxed),
+                "peer_count": self.relay_peer_count.load(Ordering::Relaxed),
             },
             "connected_peers": self.connected_peers.load(Ordering::Relaxed),
             // (Reachability posture — direct vs relayed — is reported by `dig.getNetworkInfo`, which
@@ -279,6 +302,15 @@ pub fn peer_port_from_env() -> u16 {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_P2P_PORT)
+}
+
+/// The dig-gossip pool listen port: `DIG_GOSSIP_PORT` if a valid u16, else [`DEFAULT_GOSSIP_PORT`].
+/// Kept distinct from [`peer_port_from_env`] so the two in-process listeners never clash (#871).
+pub fn gossip_port_from_env() -> u16 {
+    std::env::var("DIG_GOSSIP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(DEFAULT_GOSSIP_PORT)
 }
 
 // -- Local inventory → L7 availability / inventory / range -------------------------------------------
@@ -1083,6 +1115,36 @@ fn map_gossip_pool_event(ev: &dig_gossip::PoolEvent) -> dig_peer_selector::PoolE
     }
 }
 
+/// Wire the persistent relay reservation (#870) and share its status with the gossip pool.
+///
+/// Creates ONE [`dig_nat::relay::RelayStatus`], attaches it to the gossip `handle` (so the pool folds
+/// the peers the reservation discovers into its address book — see
+/// [`dig_gossip::GossipHandle::attach_relay_status`]), and — when the relay is enabled — spawns
+/// `dig-nat`'s [`run_relay_connection`](dig_nat::relay::run_relay_connection) loop against that SAME
+/// status. The gossip pool and the reservation loop therefore observe ONE shared status: without this
+/// single shared `Arc`, discovered peers never reach the pool. When the relay is disabled
+/// (`DIG_RELAY_URL=off`) the status is marked [`RelayStatus::set_disabled`] and no socket is opened.
+/// Returns the shared status so the node can report the REAL reservation state (#872).
+fn wire_relay_reservation(
+    handle: &dig_gossip::GossipHandle,
+    enabled: bool,
+    endpoint: String,
+    peer_id: String,
+    network_id: String,
+) -> Arc<dig_nat::relay::RelayStatus> {
+    let status = dig_nat::relay::RelayStatus::new();
+    handle.attach_relay_status(status.clone());
+    if enabled {
+        let status = status.clone();
+        tokio::spawn(async move {
+            dig_nat::relay::run_relay_connection(endpoint, peer_id, network_id, status).await;
+        });
+    } else {
+        status.set_disabled();
+    }
+    status
+}
+
 /// Bring up the peer network (the fallible body of [`spawn_peer_network`]).
 async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // Pin the rustls crypto provider (ring) before ANY TLS use (the pool + the mTLS listener + any
@@ -1133,6 +1195,9 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         key_path: gossip_dir.join("node.key").display().to_string(),
         peers_file_path: gossip_dir.join("peers.json"),
         peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
+        // Bind the gossip pool on its OWN port, distinct from the mTLS peer-RPC listener below — they
+        // are two listeners in one process and both defaulted to 9444, which fails on Linux (#871).
+        listen_addr: crate::net::dual_stack_listen_addr(gossip_port_from_env()),
         ..Default::default()
     };
     if relay_enabled() {
@@ -1156,17 +1221,37 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         .map_err(|e| format!("gossip start: {e}"))?;
     println!("dig-node peer network: connected peer pool up (discovery via {relay_endpoint})");
 
-    // 3. Keep the pool status fresh for `control.peerStatus` (connected count + relay reservation).
+    // 2b. Wire the PERSISTENT relay reservation (#870). `dig-nat` owns the transport: one long-lived
+    //     WebSocket that registers once, keepalives, reconnects with backoff, AND discovers peers over
+    //     the SAME socket (RLY-005 + pushes), exposing them via `RelayStatus::known_peers`. The node
+    //     owns the reservation loop and shares the SAME `Arc<RelayStatus>` with the gossip pool via
+    //     `attach_relay_status`, so those discovered peers flow into the pool's address book (the pool
+    //     maintenance loop reads the attached status each pass). Without sharing ONE status, discovery
+    //     never reaches the pool. Returns the shared status so the node reports the REAL reservation
+    //     state (#872) rather than a "relay configured" proxy.
+    let relay_status = wire_relay_reservation(
+        &handle,
+        relay_enabled(),
+        relay_endpoint.clone(),
+        peer_id_hex.clone(),
+        network_id_str.clone(),
+    );
+
+    // 3. Keep the pool status fresh for `control.peerStatus`: the directly-connected count, the
+    //    relay-reachable count (#870), and the REAL relay-reservation flag read from the shared
+    //    `dig-nat` status (#872) — never the synthetic "relay configured" value it replaced.
     {
         let status = status.clone();
         let handle = handle.clone();
+        let relay_status = relay_status.clone();
         tokio::spawn(async move {
             loop {
-                let stats = handle.pool_stats();
-                // A held relay reservation is implied by having a relay configured + the pool up; the
-                // pool does not surface the reservation flag directly in this rev, so we report the
-                // relay as reserved while the pool is running with a relay endpoint configured.
-                status.set_pool(stats.connected as u64, relay_enabled());
+                let stats = handle.stats().await;
+                status.set_pool(
+                    stats.connected_peers as u64,
+                    stats.relay_peer_count as u64,
+                    relay_status.is_connected(),
+                );
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
         });
@@ -1647,16 +1732,131 @@ mod tests {
     fn peer_status_transitions_to_running_and_reports_pool() {
         let s = PeerStatus::new();
         s.set_running("ab".repeat(32));
-        s.set_pool(5, true);
+        s.set_pool(5, 2, true);
         assert!(s.is_running());
         let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
         assert_eq!(v["running"], true);
         assert_eq!(v["peer_id"], json!("ab".repeat(32)));
         assert_eq!(v["connected_peers"], 5);
         assert_eq!(v["relay"]["reserved"], true);
+        assert_eq!(v["relay"]["peer_count"], 2);
         s.set_error("relay dropped".into());
         let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
         assert_eq!(v["last_error"], json!("relay dropped"));
+    }
+
+    // #872: `relay.reserved` is the REAL persistent-reservation state, not a "relay configured" proxy.
+    // A relay endpoint being present in the snapshot must NOT imply reserved — reserved flips only with
+    // the actual reservation being held.
+    #[test]
+    fn peer_status_reserved_flag_is_independent_of_relay_being_configured() {
+        let s = PeerStatus::new();
+        // Relay configured (endpoint present) but reservation NOT held → reserved is false.
+        s.set_pool(0, 0, false);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
+        assert_eq!(v["relay"]["url"], DEFAULT_RELAY_URL);
+        assert_eq!(
+            v["relay"]["reserved"], false,
+            "a configured-but-unheld relay must report reserved=false"
+        );
+        // Reservation established → reserved flips true.
+        s.set_pool(0, 3, true);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
+        assert_eq!(v["relay"]["reserved"], true);
+        assert_eq!(v["relay"]["peer_count"], 3);
+    }
+
+    // #871 regression: the gossip pool and the mTLS peer-RPC server are two listeners in one process
+    // and MUST bind different ports. The old code left both on 9444 (worked on Windows, EADDRINUSE on
+    // Linux). This asserts the fix invariant — distinct default ports — and would FAIL on the old
+    // shared-9444 build.
+    #[test]
+    fn gossip_pool_and_peer_rpc_use_distinct_ports() {
+        assert_eq!(DEFAULT_P2P_PORT, 9444);
+        assert_eq!(DEFAULT_GOSSIP_PORT, 9445);
+        assert_ne!(
+            DEFAULT_GOSSIP_PORT, DEFAULT_P2P_PORT,
+            "gossip pool and mTLS peer-RPC must not share a listen port (#871)"
+        );
+        assert_ne!(
+            gossip_port_from_env(),
+            peer_port_from_env(),
+            "resolved gossip + peer-RPC ports must differ"
+        );
+    }
+
+    // #871: both listeners bind cleanly when given distinct ports — the fix. Binds the mTLS peer-RPC
+    // dual-stack listener and starts a gossip pool on a DIFFERENT port, exactly as `run_peer_network`
+    // does; both must succeed (on the old shared-9444 build the second bind fails on Linux).
+    #[tokio::test]
+    async fn gossip_pool_and_peer_rpc_bind_together_on_distinct_ports() {
+        // The mTLS peer-RPC listener on an OS-assigned ephemeral port.
+        let peer_rpc = crate::net::bind_tcp_dual_stack(crate::net::dual_stack_listen_addr(0))
+            .expect("peer-RPC dual-stack bind must succeed");
+        let peer_port = peer_rpc.local_addr().unwrap().port();
+
+        // The gossip pool on its OWN OS-assigned ephemeral port (a different socket).
+        let dir = std::env::temp_dir().join(format!("dig-node-wuc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = dig_gossip::GossipConfig {
+            network_id: chia_protocol::Bytes32::new([1u8; 32]),
+            cert_path: dir.join("node.cert").display().to_string(),
+            key_path: dir.join("node.key").display().to_string(),
+            peers_file_path: dir.join("peers.json"),
+            peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
+            listen_addr: crate::net::dual_stack_listen_addr(0),
+            ..Default::default()
+        };
+        let service = dig_gossip::GossipService::new(cfg).expect("gossip config");
+        let handle = service.start().await.expect("gossip start must succeed");
+
+        // Both listeners are up simultaneously — no port clash.
+        assert!(peer_port != 0);
+        let _ = handle.pool_stats();
+    }
+
+    // #870 + #872: the node shares ONE `Arc<RelayStatus>` between the relay-reservation loop and the
+    // gossip pool. Proven by attaching the status returned from `wire_relay_reservation` and mutating
+    // THAT status: the change is visible through the gossip handle's stats, so the pool observes the
+    // same reservation the node drives.
+    #[tokio::test]
+    async fn wire_relay_reservation_shares_one_status_with_the_pool() {
+        let dir = std::env::temp_dir().join(format!("dig-node-wuc-share-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = dig_gossip::GossipConfig {
+            network_id: chia_protocol::Bytes32::new([2u8; 32]),
+            cert_path: dir.join("node.cert").display().to_string(),
+            key_path: dir.join("node.key").display().to_string(),
+            peers_file_path: dir.join("peers.json"),
+            peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
+            listen_addr: crate::net::dual_stack_listen_addr(0),
+            ..Default::default()
+        };
+        let handle = dig_gossip::GossipService::new(cfg)
+            .expect("gossip config")
+            .start()
+            .await
+            .expect("gossip start");
+
+        // Wire with the relay DISABLED so no real socket is opened; we drive the shared status by hand.
+        let status = wire_relay_reservation(
+            &handle,
+            false,
+            DEFAULT_RELAY_URL.to_string(),
+            "ab".repeat(32),
+            DEFAULT_NETWORK_ID.to_string(),
+        );
+
+        // Before: no reservation held → the pool reports the relay disconnected.
+        assert!(!handle.stats().await.relay_connected);
+
+        // Drive the SAME status the node passes to `run_relay_connection`: the pool must see it.
+        status.set_connected(4);
+        assert!(status.is_connected());
+        assert!(
+            handle.stats().await.relay_connected,
+            "the gossip pool must observe the reservation via the shared Arc<RelayStatus>"
+        );
     }
 
     #[test]

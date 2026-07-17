@@ -67,30 +67,33 @@ getrandom = "0.2"
 # consumes both to auto-discover peers via relay.dig.net, maintain a pool, and serve/issue the L7 peer
 # RPC over mTLS (peer_id = SHA256(TLS SPKI DER)).
 #
-# Sourcing: git-pinned to the exact revs the ecosystem tracks (dig-nat f200cbf, dig-gossip ad20521),
-# mirroring how the superproject + dig-gossip resolve dig-nat from git until it is on crates.io. The
-# release-first rule sequences the crates.io publish/tag swap; here we build against the real revs.
-# NB: dig-nat uses the BARE git form (no `rev`) to match dig-gossip's own `dig-nat = { git = "…dig-nat" }`
-# spec EXACTLY, so cargo unifies to ONE dig-nat copy. A `?rev=` form is a DISTINCT source to cargo even
-# at the same commit, which would fork dig-nat into two incompatible crate instances (the handle's
-# `connect_via_nat`/`query_availability` types would not match ours). Both still resolve to f200cbf via
-# the lockfile. dig-gossip is pinned by rev (its own manifest has no self-reference to worry about).
+# Sourcing (documented NC-7 git exception — dig-gossip forces it): dig-gossip is NOT on crates.io, so
+# it stays a git dependency, and its own manifest resolves `dig-nat = { version = "0.2", git = "…dig-nat" }`
+# from GIT. dig-nat here therefore uses the BARE git form (no `rev`) to match dig-gossip's git source
+# EXACTLY, so the two unify to ONE dig-nat copy — a `?rev=` form is a DISTINCT source to cargo even at
+# the same commit and would fork dig-nat into two incompatible crate instances (the handle's
+# `connect_via_nat`/`query_availability` types would not match ours). The crates.io stack
+# (dig-dht/dig-download/dig-peer-selector) references dig-nat from crates.io "^0.2"; the workspace
+# `[patch.crates-io] dig-nat` below redirects that onto this SAME git source, so the ENTIRE graph shares
+# exactly ONE dig-nat 0.2.1 instance. Resolved to the tracked commit via the lockfile.
 dig-nat = { git = "https://github.com/DIG-Network/dig-nat" }
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "9177a9b3af1db53e294d3407844f0dd986206ced", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "bf1857edc497a9655e9f27c5bb8d4bef1403b73a", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. No
 # `rev` so cargo unifies to the SAME dig-constants source dig-nat/dig-gossip already resolve (one copy).
-dig-constants = { version = "0.2", git = "https://github.com/DIG-Network/dig-constants" }
+dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants" }
 # -- L7 content-location DHT (PHASE-B, #163) ---------------------------------------------------------
 # The Kademlia DHT that maps DIG content (store / capsule / root / resource) to the peer_ids holding
 # it. The node LOCATES content it lacks via `find_providers`, and keeps its OWN held-inventory provider
 # records CURRENT in the DHT (`announce_provider` / `withdraw_provider` / `republish`). It rides the
 # SAME dig-nat mTLS transport as the rest of the peer network via a `DhtTransport` adapter (`dht.rs`).
 #
-# Sourcing: bare git form (no `rev`) so cargo unifies dig-dht's `dig-nat` dependency (also bare-git)
-# with dig-node's + dig-gossip's — ONE dig-nat crate instance across the graph, so dig-dht's `PeerId`
-# / `Contact` / `DhtTransport` share the exact types `dig_nat::connect` returns. A `?rev=` form would
-# fork dig-nat into a distinct, incompatible source. Resolved to the tracked rev via the lockfile.
-dig-dht = { git = "https://github.com/DIG-Network/dig-dht" }
+# Sourcing: the crates.io release (NC-7: prefer the published version over bare-git now that dig-dht
+# is on crates.io). dig-download + dig-peer-selector below ALSO resolve dig-dht from crates.io "0.1",
+# so cargo unifies to ONE dig-dht instance — dig-dht's `PeerId` / `Contact` / `DhtTransport` share the
+# exact types `dig_nat::connect` returns. dig-dht deps dig-nat "^0.2" (crates.io); the workspace
+# `[patch.crates-io] dig-nat = { git }` below redirects THAT onto the single git dig-nat instance
+# dig-gossip forces, so the whole graph shares ONE dig-nat 0.2.1.
+dig-dht = "0.1"
 # -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
 # The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
 # logical stream exchanges delta-based first-hand known-peer sets (handshake -> snapshot -> deltas),
@@ -112,10 +115,10 @@ dig-pex = { git = "https://github.com/DIG-Network/dig-pex" }
 # over our mTLS identity, MerkleVerifier bound to the digstore proof format, FileSink/FileStateStore
 # under the node's cache dir.
 #
-# Sourcing: bare git form (no `rev`), matching dig-dht/dig-nat above, so cargo unifies dig-download's
-# own dig-dht + dig-nat dependencies with ours — ONE crate instance each across the graph (its
-# re-exported `ContentId`/`ProviderRecord` ARE our dig-dht types). Resolved via the lockfile.
-dig-download = { git = "https://github.com/DIG-Network/dig-download" }
+# Sourcing: the crates.io release (NC-7), matching dig-dht above. dig-download deps dig-dht "0.1" +
+# dig-nat "^0.2" from crates.io, so cargo unifies its dig-dht + dig-nat with ours — ONE crate instance
+# each across the graph (its re-exported `ContentId`/`ProviderRecord` ARE our dig-dht types).
+dig-download = "0.1"
 # -- Self-optimizing peer selection (#178) ------------------------------------------------------------
 # The decision + learning layer between dig-dht discovery and dig-download execution: it ranks the
 # providers `find_providers` returns (learning throughput/rtt/reliability + a per-class saturation
@@ -124,13 +127,13 @@ dig-download = { git = "https://github.com/DIG-Network/dig-download" }
 # blindly. Every completed/failed range streams back via `record_outcome` in real time, and a dropped
 # source drives a `rebalance`. See `download.rs` (SelectorLocator + the outcome-feedback loop).
 #
-# Sourcing: bare git form (no `rev`), matching dig-dht/dig-nat/dig-download above, so cargo unifies the
-# selector's `dig-nat` + `dig-dht` dependencies with ours — ONE crate instance each (its re-used
-# `PeerId`/`ContentId`/`ProviderRecord`/`CandidateAddr` ARE our dig-nat/dig-dht types). Resolved via
-# the lockfile. The selector mirrors `dig_gossip::PoolEvent` LOCALLY (it does not depend on dig-gossip,
-# which lags as a git dep), so the node maps `dig_gossip::PoolEvent` → the selector's local `PoolEvent`
-# 1:1 (see `download.rs::pool_event_to_selector`).
-dig-peer-selector = { git = "https://github.com/DIG-Network/dig-peer-selector" }
+# Sourcing: the crates.io release (NC-7), matching dig-dht/dig-download above. It deps dig-dht "0.1" +
+# dig-nat "^0.2" from crates.io, so cargo unifies the selector's `dig-nat` + `dig-dht` with ours — ONE
+# crate instance each (its re-used `PeerId`/`ContentId`/`ProviderRecord`/`CandidateAddr` ARE our
+# dig-nat/dig-dht types). The selector mirrors `dig_gossip::PoolEvent` LOCALLY (it does not depend on
+# dig-gossip, which lags as a git dep), so the node maps `dig_gossip::PoolEvent` → the selector's local
+# `PoolEvent` 1:1 (see `download.rs::pool_event_to_selector`).
+dig-peer-selector = "0.1"
 # Deterministic self-signed node certificate derived from the node's persistent identity seed, so the
 # node's mTLS peer_id is stable across restarts. rustls-only (no OpenSSL), matching dig-nat.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }

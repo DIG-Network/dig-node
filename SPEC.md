@@ -197,11 +197,15 @@ does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see belo
 
 The peer-network layer additionally honors `DIG_PEER_NETWORK` (set to a falsy value to disable the L7
 peer network) and `DIG_RELAY_URL` (override or disable the relay), which gate the P2P bring-up, and
-**`DIG_PEER_PORT`** — the P2P listen port for the mTLS peer-RPC server (dig-node-to-dig-node
-traffic, §5.2/§14 — distinct from the client-facing `DIG_NODE_PORT` JSON-RPC listener above).
-Parsed as `u16`; unparsable/unset ⇒ the default **`9444`** (`peer::DEFAULT_P2P_PORT`, matching
-dig-gossip's own `DEFAULT_P2P_PORT` so a node and its gossip peers agree on the conventional port
-with no configuration). Bound dual-stack IPv6-first with an IPv4 fallback, per §5.2.
+**`DIG_PEER_PORT`** — the mTLS peer-RPC server listen port (dig-node-to-dig-node RPC traffic, §5.2).
+Parsed as `u16`; unparsable/unset ⇒ the default **`9444`** (`peer::DEFAULT_P2P_PORT`).
+Bound dual-stack IPv6-first with an IPv4 fallback, per §5.2.
+
+**`DIG_GOSSIP_PORT`** — the gossip pool listen port (distinct from the mTLS peer-RPC port above, #871).
+Parsed as `u16`; unparsable/unset ⇒ the default **`9445`** (`peer::DEFAULT_GOSSIP_PORT`).
+The peer-RPC (9444) is the node's advertised peer-network identity and the route peers dial to fetch
+content; the gossip pool (9445) is the internal connection manager for the node's own peer pool. Both
+bind dual-stack IPv6-first with an IPv4 fallback, per §5.2.
 
 ### 3.3. Upstream normalization
 
