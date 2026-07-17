@@ -822,14 +822,54 @@ pub fn uninstall() -> io::Result<Outcome> {
     ))
 }
 
-/// Start the installed service.
+/// Whether an OS service-start error actually means "the service is ALREADY running".
+///
+/// A `start` on an already-running service is not a failure — it is the desired end state, so
+/// `dig-node start` treats it as success (idempotent, #772). Each OS signals it differently and
+/// only in the error TEXT (the `service-manager` backend surfaces the tool's stdout/stderr as the
+/// `io::Error` message), so this matches the per-OS signatures, case-insensitively:
+///
+/// * **Windows SCM** — `sc start` exits non-zero with `[SC] StartService FAILED 1056: An instance
+///   of the service is already running.` (error 1056). The 1056 code must appear alongside
+///   "already" or "running" to avoid false-positives on unrelated errors containing "1056" in a path/PID.
+/// * **macOS launchd** — `launchctl load` of a loaded service → `service already loaded` /
+///   `Operation already in progress`.
+/// * **Linux systemd** — `systemctl start` of an active unit is normally a silent no-op (exit 0),
+///   but `already active` is matched for completeness.
+///
+/// PURE, so the idempotency contract is unit-tested without a real OS service.
+pub fn is_already_running_error(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    (m.contains("1056") && (m.contains("already") || m.contains("running")))
+        || m.contains("already running")
+        || m.contains("already loaded")
+        || m.contains("already in progress")
+        || m.contains("already active")
+}
+
+/// Map an OS `start` result to the CLI [`Outcome`], applying the idempotency rule (#772): a
+/// genuine start and an already-running service both report success (exit 0), distinguished by
+/// the `already_running` field; any other error propagates. PURE (given the backend result), so
+/// the mapping is unit-tested directly.
+fn start_outcome(result: io::Result<()>) -> io::Result<Outcome> {
+    match result {
+        Ok(()) => Ok(Outcome::new(
+            format!("dig-node: start requested for \"{SERVICE_LABEL}\""),
+            json!({ "started": true, "already_running": false, "label": SERVICE_LABEL }),
+        )),
+        Err(e) if is_already_running_error(&e.to_string()) => Ok(Outcome::new(
+            format!("dig-node: service \"{SERVICE_LABEL}\" is already running"),
+            json!({ "started": true, "already_running": true, "label": SERVICE_LABEL }),
+        )),
+        Err(e) => Err(e),
+    }
+}
+
+/// Start the installed service. Idempotent: an already-running service is reported as success
+/// (#772), never a hard error.
 pub fn start() -> io::Result<Outcome> {
     let backend = SystemServiceBackend::new()?;
-    backend.start()?;
-    Ok(Outcome::new(
-        format!("dig-node: start requested for \"{SERVICE_LABEL}\""),
-        json!({ "started": true, "label": SERVICE_LABEL }),
-    ))
+    start_outcome(backend.start())
 }
 
 /// Stop the running service.
@@ -1333,6 +1373,76 @@ SERVICE_NAME: net.dignetwork.dig-node
         let calls = backend.calls();
         assert!(calls.contains(&"delete".to_string()));
         assert!(calls.contains(&"create".to_string()));
+    }
+
+    // -- idempotent `dign start` (#772): already-running is SUCCESS, not a hard error --------
+
+    #[test]
+    fn already_running_is_recognised_across_all_os_signatures() {
+        // The exact Windows SCM 1056 message the user hit, plus the launchd/systemd equivalents.
+        assert!(is_already_running_error(
+            "[SC] StartService FAILED 1056:
+
+An instance of the service is already running."
+        ));
+        assert!(is_already_running_error("service already loaded"));
+        assert!(is_already_running_error("Operation already in progress"));
+        assert!(is_already_running_error(
+            "Job for x.service is already active"
+        ));
+        // Case-insensitive.
+        assert!(is_already_running_error(
+            "AN INSTANCE OF THE SERVICE IS ALREADY RUNNING"
+        ));
+    }
+
+    #[test]
+    fn a_genuine_start_failure_is_not_treated_as_already_running() {
+        // "access denied", "not found", etc. must still surface as real errors.
+        assert!(!is_already_running_error("Access is denied."));
+        assert!(!is_already_running_error(
+            "[SC] StartService FAILED 1058: The service cannot be started"
+        ));
+        assert!(!is_already_running_error(
+            "The specified service does not exist"
+        ));
+        // Regression: a message merely containing "1056" (e.g. in a path/PID) without the
+        // "already" or "running" context must NOT be treated as already-running.
+        assert!(!is_already_running_error(
+            "An error occurred at pid 1056 in the resolver"
+        ));
+        assert!(!is_already_running_error(""));
+    }
+
+    #[test]
+    fn start_outcome_maps_an_already_running_error_to_success() {
+        // The regression: an already-running service (SCM 1056) previously surfaced as a HARD
+        // error; `dign start` must now report success with `already_running: true` (exit 0).
+        let err = io::Error::other(
+            "[SC] StartService FAILED 1056:
+
+An instance of the service is already running.",
+        );
+        let outcome = start_outcome(Err(err)).expect("already-running must map to Ok");
+        assert_eq!(outcome.result["already_running"], serde_json::json!(true));
+        assert_eq!(outcome.result["started"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn start_outcome_reports_a_fresh_start_as_success() {
+        let outcome = start_outcome(Ok(())).expect("a fresh start is Ok");
+        assert_eq!(outcome.result["already_running"], serde_json::json!(false));
+        assert_eq!(outcome.result["started"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn start_outcome_propagates_a_real_start_failure() {
+        // A non-idempotent failure (e.g. service missing) must NOT be swallowed as success.
+        let err = io::Error::new(
+            io::ErrorKind::NotFound,
+            "The specified service does not exist",
+        );
+        assert!(start_outcome(Err(err)).is_err());
     }
 
     #[test]
