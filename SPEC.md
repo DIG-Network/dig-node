@@ -1472,7 +1472,10 @@ This is the SAME spawn-free owner gate the self-heal spawn root (§7 #565) and t
 and is always allowed. The canonical install path (native OS package, §9.7) places the binary in a
 protected admin-owned location (`%ProgramFiles%\DIG Network\dig-node\`, `/usr/…`), so it satisfies
 the gate; a manual `dig-node install` from a user-writable download directory is what the gate
-refuses.
+refuses. A single explicit, **default-off** opt-out — the `DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET`
+env var (truthy `1`/`true`/`yes`) — bypasses the gate with a loud warning, intended ONLY for a
+controlled test/dev install of an unreleased build from a build directory (e.g. the `service-smoke`
+CI); it MUST NOT be set on an end-user machine.
 
 9.3. **Entrypoint per platform.** The installed service runs `dig-node run-service` on Windows and
 `dig-node run` on systemd/launchd (which exec the foreground process directly).

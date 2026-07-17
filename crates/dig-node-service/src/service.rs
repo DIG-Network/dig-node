@@ -374,6 +374,25 @@ fn current_exe() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
 
+/// The opt-in escape hatch that bypasses the §565 privileged-target gate
+/// ([`ensure_service_target_is_safe`]). Set to a truthy value ONLY for a controlled test/dev
+/// install of an unreleased build from a build directory (e.g. the `service-smoke` CI job installs
+/// `target/release/dig-node` from the runner's user-writable checkout). It is default-OFF and MUST
+/// NOT be set on an end-user machine — the canonical install (native OS package, §9.7) always lands
+/// the binary in a protected admin-owned directory and never needs it.
+const ALLOW_INSECURE_SERVICE_TARGET_ENV: &str = "DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET";
+
+/// Whether [`ALLOW_INSECURE_SERVICE_TARGET_ENV`] is set to a truthy value (`1`/`true`/`yes`,
+/// case-insensitive). Any other value — or an unset var — leaves the gate ENABLED (default-safe).
+fn insecure_service_target_allowed() -> bool {
+    std::env::var(ALLOW_INSECURE_SERVICE_TARGET_ENV)
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
 /// Refuse to register a PRIVILEGED (system-level) service whose program binary lives in a
 /// user-writable directory — the §565 privilege-escalation class.
 ///
@@ -388,7 +407,13 @@ fn current_exe() -> io::Result<PathBuf> {
 ///
 /// A **user-level** install (Linux systemd / macOS launchd, the default there) runs as the very
 /// user who owns the binary — there is no privilege boundary to cross — so it is always allowed.
-fn ensure_service_target_is_safe(program: &std::path::Path, user_level: bool) -> io::Result<()> {
+/// `allow_insecure_override` is the explicit test/dev opt-out
+/// ([`ALLOW_INSECURE_SERVICE_TARGET_ENV`]); it is default-`false` in production.
+fn ensure_service_target_is_safe(
+    program: &std::path::Path,
+    user_level: bool,
+    allow_insecure_override: bool,
+) -> io::Result<()> {
     // A user-level service runs as the installing user: swapping a binary that user already owns
     // grants that user nothing it lacked. No privilege boundary, no LPE — always allowed.
     if user_level {
@@ -398,6 +423,18 @@ fn ensure_service_target_is_safe(program: &std::path::Path, user_level: bool) ->
     // privileged-owned directory keeps a non-privileged user from replacing the binary in it.
     let root = program.parent().unwrap_or(program);
     if crate::security::dir_is_privileged(root) {
+        return Ok(());
+    }
+    // Explicit, default-off test/dev opt-out — a controlled install of an unreleased build from a
+    // build directory (see the env-var doc). Never set on an end-user machine.
+    if allow_insecure_override {
+        eprintln!(
+            "dig-node: WARN {ALLOW_INSECURE_SERVICE_TARGET_ENV} is set — registering a \
+             system-level service pointing at \"{}\", a user-writable directory. This is a \
+             privilege-escalation risk (#565) and is intended ONLY for test/dev installs of an \
+             unreleased build.",
+            program.display()
+        );
         return Ok(());
     }
     Err(io::Error::new(
@@ -664,7 +701,11 @@ pub fn install(config: &Config) -> io::Result<Outcome> {
     // whose program binary sits in a user-writable directory — a swapped binary would run as
     // SYSTEM/root on the next start. Checked FIRST so a refusal has no side effects (no state-dir
     // harden, no service create). A user-level install runs as the invoking user and is allowed.
-    ensure_service_target_is_safe(&program, backend.user_level())?;
+    ensure_service_target_is_safe(
+        &program,
+        backend.user_level(),
+        insecure_service_target_allowed(),
+    )?;
     let plan = build_plan(config, program.clone());
 
     // HARDEN the machine-wide state dir NOW, as the INSTALLING (interactive) user, per the
@@ -1070,11 +1111,12 @@ SERVICE_NAME: net.dignetwork.dig-node
     #[test]
     fn user_level_install_is_always_allowed_regardless_of_binary_owner() {
         // A user-level service runs as the installing user, so a user-writable program dir crosses
-        // NO privilege boundary — the gate must not refuse it even from a plainly user-owned dir.
+        // NO privilege boundary — the gate must not refuse it even from a plainly user-owned dir,
+        // and without needing the insecure override.
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join("dig-node");
         assert!(
-            ensure_service_target_is_safe(&program, /* user_level */ true).is_ok(),
+            ensure_service_target_is_safe(&program, /* user_level */ true, false).is_ok(),
             "a user-level install from a user-owned dir must be allowed"
         );
     }
@@ -1087,7 +1129,7 @@ SERVICE_NAME: net.dignetwork.dig-node
         // condition — so registration MUST fail closed with PERMISSION_DENIED.
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join("dig-node");
-        let err = ensure_service_target_is_safe(&program, /* user_level */ false)
+        let err = ensure_service_target_is_safe(&program, /* user_level */ false, false)
             .expect_err("a system-level install from a user-writable dir must be refused");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         // The message must name the LPE class + the offending path so an operator can act.
@@ -1097,6 +1139,48 @@ SERVICE_NAME: net.dignetwork.dig-node
             msg.contains(&program.display().to_string()),
             "message names the offending program path: {msg}"
         );
+    }
+
+    #[test]
+    fn insecure_override_permits_a_system_level_install_from_a_user_writable_dir() {
+        // The explicit, default-off test/dev opt-out lets a controlled install of an unreleased
+        // build proceed from a user-writable build dir (e.g. the service-smoke CI job installing
+        // target/release/dig-node). It is default-off, so this branch only opens when set.
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("dig-node");
+        assert!(
+            ensure_service_target_is_safe(&program, /* user_level */ false, true).is_ok(),
+            "the explicit insecure override must permit the otherwise-refused system-level install"
+        );
+    }
+
+    #[test]
+    fn insecure_override_env_parses_only_truthy_values() {
+        // The env reader is default-safe: unset or any non-truthy value keeps the gate ENABLED.
+        // (Uses process env, so restore it to avoid leaking into sibling tests.)
+        let prev = std::env::var(ALLOW_INSECURE_SERVICE_TARGET_ENV).ok();
+        for (val, expected) in [
+            ("1", true),
+            ("true", true),
+            ("YES", true),
+            ("0", false),
+            ("false", false),
+            ("", false),
+            ("nope", false),
+        ] {
+            std::env::set_var(ALLOW_INSECURE_SERVICE_TARGET_ENV, val);
+            assert_eq!(
+                insecure_service_target_allowed(),
+                expected,
+                "{val:?} must parse to {expected}"
+            );
+        }
+        std::env::remove_var(ALLOW_INSECURE_SERVICE_TARGET_ENV);
+        assert!(!insecure_service_target_allowed(), "unset ⇒ gate enabled");
+        match prev {
+            Some(v) => std::env::set_var(ALLOW_INSECURE_SERVICE_TARGET_ENV, v),
+            None => std::env::remove_var(ALLOW_INSECURE_SERVICE_TARGET_ENV),
+        }
     }
 
     // -- the real OS-backed path (no state mutation): probe + status only -------------------
