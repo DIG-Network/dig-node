@@ -154,6 +154,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
 ] }
 
 # Test-only WS client for the `GET /ws/status` integration tests (#239): connects

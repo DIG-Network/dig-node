@@ -114,3 +114,13 @@ CLI path (not via a native package) needs the `sc config`/`sc qc` dance.
   ("link.exe could not be run" / `DirectoryNotFoundException` on a `.tlog`) because the deep
   `modules/.worktrees/dig-node-624/target/...` path trips MSBuild/cmake MAX_PATH — set a short
   `CARGO_TARGET_DIR` (e.g. `C:\dnt624`) to build.
+- **Privileged-owner check walks the WHOLE path (#712):** `crate::security::dir_is_privileged` (the
+  shared #565/#661/#46 gate) verifies EVERY ancestor component, not just the leaf, and rejects any
+  symlink/junction/reparse component — a privileged leaf under a user-writable or symlinked ancestor
+  is still swappable (intermediate rename/replace obeys the PARENT's perms; a reparse redirects the
+  whole path). Windows gotcha: `C:\Program Files` is owned by `NT SERVICE\TrustedInstaller`
+  (fixed SID `S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464`, byte-identical on
+  every host), NOT SYSTEM/Administrators — so the ancestor walk MUST accept that SID or it
+  false-rejects the canonical `%ProgramFiles%\DIG\bin` install root. Reparse detection uses the
+  no-follow `symlink_metadata` + `FILE_ATTRIBUTE_REPARSE_POINT` (catches junctions, not just
+  symlinks). Mirrors dig-dns's `ensure_prefix_root_owned_not_writable` (#701).
