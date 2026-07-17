@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::cli::Outcome;
 use crate::config::Config;
-use crate::control;
+use crate::control_client::call_control;
 
 /// The operator action, clap-agnostic (mapped from the CLI subcommand in `main.rs`).
 pub enum PairAction {
@@ -32,41 +32,22 @@ pub enum PairAction {
     Revoke { token_id: String },
 }
 
-/// Run a `pair` subcommand: read the master token, call the node, render an
-/// [`Outcome`]. Errors (node unreachable, bad id) surface as `io::Error` so
+/// Run a `pair` subcommand: read the master token, call the node's `control.pairing.*`,
+/// render an [`Outcome`]. The loopback transport + master-token auth is the shared
+/// [`call_control`] client. Errors (node unreachable, bad id) surface as `io::Error` so
 /// `main.rs` maps them to the differentiated exit code.
 pub fn run(config: &Config, action: PairAction) -> std::io::Result<Outcome> {
-    let addr = config.bind_addr();
-    // Read the master token WITHOUT minting one (#501): if the running node (a service under a
-    // different OS account) wrote a token this user cannot read, minting a fresh one here would
-    // recreate the exact bug — a token the node never trusts. `load_token_readonly` instead
-    // surfaces the precise service-vs-user remedy (elevate / grant read ACL / start the node).
-    let token = control::load_token_readonly()?;
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(run_async(&addr, &token, action))
-}
-
-async fn run_async(addr: &str, token: &str, action: PairAction) -> std::io::Result<Outcome> {
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(std::io::Error::other)?;
-    let url = format!("http://{addr}/");
     match action {
         PairAction::List => {
-            let result = call(&client, &url, token, "control.pairing.list", json!({})).await?;
+            let result = call_control(config, "control.pairing.list", json!({}))?;
             Ok(Outcome::new(format_list(&result), result))
         }
         PairAction::Approve { pairing_id } => {
-            let result = call(
-                &client,
-                &url,
-                token,
+            let result = call_control(
+                config,
                 "control.pairing.approve",
                 json!({ "pairing_id": pairing_id }),
-            )
-            .await?;
+            )?;
             let name = result["client_name"].as_str().unwrap_or("controller");
             let tid = result["token_id"].as_str().unwrap_or("");
             Ok(Outcome::new(
@@ -79,14 +60,11 @@ async fn run_async(addr: &str, token: &str, action: PairAction) -> std::io::Resu
             ))
         }
         PairAction::Revoke { token_id } => {
-            let result = call(
-                &client,
-                &url,
-                token,
+            let result = call_control(
+                config,
                 "control.pairing.revoke",
                 json!({ "token_id": token_id }),
-            )
-            .await?;
+            )?;
             let revoked = result["revoked"].as_bool().unwrap_or(false);
             let summary = if revoked {
                 format!("dig-node: revoked controller token {token_id}.")
@@ -96,43 +74,6 @@ async fn run_async(addr: &str, token: &str, action: PairAction) -> std::io::Resu
             Ok(Outcome::new(summary, result))
         }
     }
-}
-
-/// POST one JSON-RPC control method with the master token; return its `result` or an
-/// `io::Error` (a transport failure = the node isn't running; a JSON-RPC `error` =
-/// the node rejected it).
-async fn call(
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-    method: &str,
-    params: Value,
-) -> std::io::Result<Value> {
-    let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
-    let resp = client
-        .post(url)
-        .header(control::CONTROL_TOKEN_HEADER, token)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                format!(
-                    "could not reach the dig-node at {url}: {e} — is it running? \
-                     Start it with `dig-node run` (or `dig-node start` for the service)."
-                ),
-            )
-        })?;
-    let v: Value = resp.json().await.map_err(std::io::Error::other)?;
-    if let Some(err) = v.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown control error");
-        return Err(std::io::Error::other(format!("dig-node: {msg}")));
-    }
-    Ok(v.get("result").cloned().unwrap_or_else(|| json!({})))
 }
 
 /// Render `control.pairing.list` as an operator-friendly summary.

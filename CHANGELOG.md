@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.37.0] - 2026-07-16
+
+### Features
+- **cli:** Control-parity subcommands (`info`/`config`/`cache`/`stores`/`sync`/`updater`/`subscriptions`) — a CLI verb for every `control.*` method the extension drives, thin-dispatched over the loopback control plane with `--json` (#426)
+- **cli:** `peers` — view + manage peer connections, IPv6-first address display, parity with the extension's peer surface (#559)
+
 ## [0.35.0] - 2026-07-16
 
 ### Features
