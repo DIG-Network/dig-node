@@ -963,14 +963,23 @@ reads the control token, the resolved MACHINE state dir MUST be HARDENED and REA
    only when a valid interactive read grant survived step 1, append `<user_sid>:(OI)(CI)R` (READ only
    for the interactive user, never full). Principals are always addressed by SID literal, never the
    localized name.
-6. READBACK-VERIFY (`Get-Acl`, SID-based) as the acceptance gate: NO Everyone/Users/Authenticated-
-   Users/Anonymous ACE; owner is SYSTEM (or Administrators); SYSTEM + Administrators present with
-   full; the interactive read grant present iff one was applied; NO principal beyond those; and
-   inheritance disabled. Any violation FAILS.
-7. FAIL CLOSED: if any of steps 3-6 fails, hardening returns an error, the dir is best-effort
-   DELETED, and the daemon MUST NOT write the token there — it falls back to an ephemeral, unshared
-   dir + a random in-memory token so the control plane is UNAUTHORIZABLE (never served from an
-   attacker-controlled dir). The read plane is unaffected.
+6. READBACK-VERIFY as the acceptance gate, reading the owner SID + DACL ACEs directly through the
+   Win32 security API (`GetNamedSecurityInfoW` → owner + DACL, `GetAce`, `ConvertSidToStringSidW`),
+   SID-based and launching NO process. (It MUST NOT shell out to a PowerShell `Get-Acl`: on a host
+   that cannot autoload `Microsoft.PowerShell.Security` that spawn throws, which used to be
+   misread as a hardening failure and destroy a correctly-hardened dir.) The gate asserts: NO
+   Everyone/Users/Authenticated-Users/Anonymous ACE; owner is SYSTEM (or Administrators); SYSTEM +
+   Administrators present with full; the interactive read grant present iff one was applied; NO
+   principal beyond those; and inheritance disabled. A readable-but-violating DACL FAILS.
+7. FAIL CLOSED on a genuine failure: if step 3, 4, or 5 (the SET path) fails, OR step 6 reads a
+   DACL that VIOLATES the gate, hardening returns an error, the dir is best-effort DELETED, and the
+   daemon MUST NOT write the token there — it falls back to an ephemeral, unshared dir + a random
+   in-memory token so the control plane is UNAUTHORIZABLE (never served from an attacker-controlled
+   dir). The read plane is unaffected. But when step 6 cannot READ the DACL AT ALL (a transient
+   condition), hardening treats the applied lockdown (the step 3-5 SET commands that already
+   succeeded) as authoritative and PRESERVES the dir — the defense-in-depth readback never gates
+   the applied lockdown, so a correctly-hardened dir is never destroyed merely because it could not
+   be read back, and the service converges to a hardened dir with a minted control token.
 
 `dig-node install` (run elevated by the interactive user) applies the SAME hardening as the
 installing user, setting owner = SYSTEM and granting THAT user READ, so the LocalSystem service's

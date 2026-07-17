@@ -1425,6 +1425,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #856 mint-on-startup guarantee: minting on a PRE-EXISTING (already-created, tokenless)
+    /// state dir succeeds and is IDEMPOTENT — a second mint returns the SAME token, never leaving
+    /// the dir tokenless or churning the token. This models the service startup path re-securing a
+    /// half-hardened/recreated dir in place and always converging to a minted token.
+    #[test]
+    fn mint_on_a_pre_existing_dir_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!(
+            "dig-node-mint-idempotent-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The dir pre-exists but holds NO token (a freshly (re)created state dir).
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONTROL_TOKEN_FILE);
+        assert!(!path.exists(), "precondition: the dir starts tokenless");
+
+        let first = load_or_create_token_at(&path).unwrap();
+        assert!(!first.trim().is_empty(), "startup must MINT a token");
+        assert!(path.exists(), "the token must be persisted in the dir");
+
+        let second = load_or_create_token_at(&path).unwrap();
+        assert_eq!(
+            first, second,
+            "mint-on-startup must be idempotent — a re-secure of an existing dir keeps the token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A genuinely-absent token reads as `NotFound` with the "no control token found" remedy that
     /// now ALSO names the stale-service reinstall recovery (#772).
     #[test]

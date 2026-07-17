@@ -139,22 +139,16 @@ pub(crate) fn owner_sid_is_privileged(sid: &str) -> bool {
 /// Read `dir`'s owner SID as its canonical string form (`S-1-5-…`) via the Win32 security API,
 /// launching NO process. Returns `None` on any failure (missing path, access denied, allocation
 /// failure) so the caller can treat an indeterminate owner as untrusted (fail closed).
+///
+/// `pub(crate)` so the #501/#856 control-token state-dir readback ([`crate::state`]) reads the
+/// owner SID through this SAME PowerShell-free Win32 path (never a `Get-Acl` spawn).
 #[cfg(windows)]
-fn read_owner_sid_string(dir: &Path) -> Option<String> {
-    use std::os::windows::ffi::OsStrExt;
+pub(crate) fn read_owner_sid_string(dir: &Path) -> Option<String> {
     use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    };
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
 
-    // Null-terminated UTF-16 path for the wide Win32 call.
-    let wide: Vec<u16> = dir
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
+    let wide = wide_path(dir);
     let mut owner_sid = std::ptr::null_mut();
     let mut security_descriptor = std::ptr::null_mut();
 
@@ -182,26 +176,153 @@ fn read_owner_sid_string(dir: &Path) -> Option<String> {
         return None;
     }
 
-    // Convert the owner SID to its canonical string form. `ConvertSidToStringSidW` LocalAlloc's the
-    // string; we copy it out and free it below.
+    // SAFETY: `owner_sid` is a valid SID from the successful call, live until the descriptor free.
+    let result = unsafe { sid_ptr_to_string(owner_sid) };
+
+    // SAFETY: the descriptor is the exact LocalAlloc'd block the API returned; a null free is a
+    // documented no-op and the pointer is not used again.
+    unsafe { LocalFree(security_descriptor as _) };
+    result
+}
+
+/// Read `dir`'s OWNER SID + DACL ACEs via the Win32 security API and render them in the SID-based
+/// line format (`OWNER;<sid>` / `ACE;<sid>;<inherited>`) that [`crate::state::parse_acl_verify`]
+/// consumes. This is the PowerShell-free replacement (#856) for the old `Get-Acl` readback: no
+/// shell is spawned and no localized names are parsed, so it can never fail because PowerShell
+/// cannot autoload `Microsoft.PowerShell.Security` on the host.
+///
+/// Returns `None` ONLY when the security info cannot be read at all (a TRANSIENT/unreadable
+/// condition — the caller MUST NOT treat that as a policy violation). A readable-but-wrong DACL
+/// still yields lines that [`crate::state::parse_acl_verify`] rejects (fail closed). Each ACE's
+/// SID is read at the fixed `SidStart` offset of the standard (non-object) allowed/denied ACE
+/// layout; a rare object-ACE type would render an unconvertible SID that the policy parser rejects
+/// as an unexpected principal — still fail-closed, never a false pass.
+#[cfg(windows)]
+pub(crate) fn read_acl_verify_lines(dir: &Path) -> Option<String> {
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        GetAce, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, INHERITED_ACE,
+        OWNER_SECURITY_INFORMATION,
+    };
+
+    let wide = wide_path(dir);
+    let mut owner_sid = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut security_descriptor = std::ptr::null_mut();
+
+    // SAFETY: `wide` is a valid null-terminated UTF-16 string live for the whole call; the owner,
+    // DACL, and descriptor out-params are null-initialized and written by the OS. On ERROR_SUCCESS
+    // the descriptor owns both the owner SID and the DACL storage; all reads below happen BEFORE the
+    // single `LocalFree`, and nothing is dereferenced after it.
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner_sid,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS || owner_sid.is_null() {
+        if !security_descriptor.is_null() {
+            // SAFETY: freeing the LocalAlloc'd descriptor the API returned; null is a no-op.
+            unsafe { LocalFree(security_descriptor as _) };
+        }
+        return None;
+    }
+
+    let mut lines = String::new();
+    // SAFETY: `owner_sid` is a valid SID, live until the descriptor free below.
+    let owner = unsafe { sid_ptr_to_string(owner_sid) };
+    let result = match owner {
+        Some(owner) => {
+            lines.push_str("OWNER;");
+            lines.push_str(&owner);
+            lines.push('\n');
+            // A NULL DACL grants everyone full access — no ACE lines, so the policy parser fails
+            // "missing the required ACE" (a genuine violation, correctly fail-closed). A present
+            // DACL is walked ACE-by-ACE.
+            if !dacl.is_null() {
+                // SAFETY: `dacl` is a valid ACL pointer from the successful call; `AceCount` is its
+                // own field and each `GetAce` index is `< AceCount`.
+                let count = unsafe { (*dacl).AceCount };
+                for index in 0..count {
+                    let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                    // SAFETY: `dacl` is valid and `index < AceCount`; `ace` is null-initialized and,
+                    // on success (non-zero), points into the descriptor's DACL, live until the free.
+                    let got = unsafe { GetAce(dacl, index as u32, &mut ace) };
+                    if got == 0 || ace.is_null() {
+                        continue;
+                    }
+                    // SAFETY: `ace` points at a valid ACE; its first field is the `ACE_HEADER`, and
+                    // for the standard allowed/denied ACE layout the trustee SID begins at the
+                    // `SidStart` offset (header 4 bytes + access mask 4 bytes = 8).
+                    let (flags, sid) = unsafe {
+                        let header = &*(ace as *const ACE_HEADER);
+                        let sid_ptr = (ace as *const u8).add(8) as *mut core::ffi::c_void;
+                        (header.AceFlags as u32, sid_ptr_to_string(sid_ptr))
+                    };
+                    let inherited = flags & INHERITED_ACE != 0;
+                    // An unconvertible SID renders as a sentinel the policy parser rejects as an
+                    // unexpected principal (fail closed) rather than being silently dropped.
+                    let sid = sid.unwrap_or_else(|| "S-UNCONVERTIBLE-ACE".to_string());
+                    lines.push_str("ACE;");
+                    lines.push_str(&sid);
+                    lines.push(';');
+                    lines.push_str(if inherited { "true" } else { "false" });
+                    lines.push('\n');
+                }
+            }
+            Some(lines)
+        }
+        None => None,
+    };
+
+    // SAFETY: the descriptor is the exact LocalAlloc'd block the API returned (it backs both the
+    // owner SID and the DACL); all reads are done and neither pointer is used again.
+    unsafe { LocalFree(security_descriptor as _) };
+    result
+}
+
+/// A null-terminated UTF-16 path for the wide Win32 security calls.
+#[cfg(windows)]
+fn wide_path(dir: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    dir.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Convert a raw `PSID` to its canonical string form (`S-1-5-…`) via `ConvertSidToStringSidW`,
+/// launching NO process. `None` when the SID is null or conversion fails.
+///
+/// # Safety
+/// `sid` must be null or a valid SID pointer live for the duration of the call.
+#[cfg(windows)]
+unsafe fn sid_ptr_to_string(sid: *mut core::ffi::c_void) -> Option<String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+    if sid.is_null() {
+        return None;
+    }
     let mut sid_string_ptr: *mut u16 = std::ptr::null_mut();
-    // SAFETY: `owner_sid` is a valid SID (non-null, from a successful GetNamedSecurityInfoW); the
-    // out-pointer is null-initialized and, on success (non-zero), receives a LocalAlloc'd
-    // null-terminated wide string freed below.
-    let converted = unsafe { ConvertSidToStringSidW(owner_sid, &mut sid_string_ptr) };
+    // SAFETY (caller contract): `sid` is a valid SID; the out-pointer is null-initialized and, on
+    // success (non-zero), receives a LocalAlloc'd null-terminated wide string freed below.
+    let converted = unsafe { ConvertSidToStringSidW(sid, &mut sid_string_ptr) };
     let result = if converted != 0 && !sid_string_ptr.is_null() {
         Some(wide_ptr_to_string(sid_string_ptr))
     } else {
         None
     };
-
-    // SAFETY: both handles are the exact LocalAlloc'd blocks the two APIs returned; a null free is
-    // a documented no-op and neither pointer is used again.
-    unsafe {
-        if !sid_string_ptr.is_null() {
-            LocalFree(sid_string_ptr as _);
-        }
-        LocalFree(security_descriptor as _);
+    if !sid_string_ptr.is_null() {
+        // SAFETY: the exact LocalAlloc'd block `ConvertSidToStringSidW` returned; not used again.
+        unsafe { LocalFree(sid_string_ptr as _) };
     }
     result
 }
@@ -393,6 +514,34 @@ mod tests {
         assert!(
             !sentinel.exists(),
             "the owner probe must launch NO process — the planted powershell.exe must never run"
+        );
+    }
+
+    /// #856: the PowerShell-free Win32 ACL readback ([`super::read_acl_verify_lines`]) actually
+    /// reads a REAL directory's owner + DACL on Windows — proving the mechanism does not return
+    /// `None` (the "unreadable" branch) for an ordinary readable dir. This is the anti-false-fail
+    /// proof at the mechanism level: the old `Get-Acl` spawn could throw on a host missing the
+    /// PowerShell Security module; this Win32 path reads the ACL with no shell at all. The lines
+    /// carry an `OWNER;<sid>` header + at least one `ACE;<sid>;<inherited>` entry in the exact
+    /// SID-based format the state-dir policy parser consumes.
+    #[cfg(windows)]
+    #[test]
+    fn windows_acl_readback_reads_a_real_dir_without_powershell() {
+        use super::read_acl_verify_lines;
+        let dir = tempfile::tempdir().unwrap();
+        let lines = read_acl_verify_lines(dir.path())
+            .expect("a readable dir must yield ACL lines, not None");
+        let owner = lines
+            .lines()
+            .find_map(|l| l.strip_prefix("OWNER;"))
+            .expect("the readback must emit an OWNER; line");
+        assert!(
+            owner.trim().starts_with("S-1-"),
+            "the owner must be a canonical SID string, got {owner:?}"
+        );
+        assert!(
+            lines.lines().any(|l| l.starts_with("ACE;")),
+            "a real dir has at least one DACL ACE: {lines:?}"
         );
     }
 }
