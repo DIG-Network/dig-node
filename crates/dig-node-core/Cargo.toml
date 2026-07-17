@@ -76,10 +76,10 @@ getrandom = "0.2"
 # `connect_via_nat`/`query_availability` types would not match ours). Both still resolve to f200cbf via
 # the lockfile. dig-gossip is pinned by rev (its own manifest has no self-reference to worry about).
 dig-nat = { git = "https://github.com/DIG-Network/dig-nat" }
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "9177a9b3af1db53e294d3407844f0dd986206ced", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "bf1857edc497a9655e9f27c5bb8d4bef1403b73a", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. No
 # `rev` so cargo unifies to the SAME dig-constants source dig-nat/dig-gossip already resolve (one copy).
-dig-constants = { version = "0.2", git = "https://github.com/DIG-Network/dig-constants" }
+dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants" }
 # -- L7 content-location DHT (PHASE-B, #163) ---------------------------------------------------------
 # The Kademlia DHT that maps DIG content (store / capsule / root / resource) to the peer_ids holding
 # it. The node LOCATES content it lacks via `find_providers`, and keeps its OWN held-inventory provider
