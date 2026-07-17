@@ -92,6 +92,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.status",
     "control.config.get",
     "control.config.setUpstream",
+    "control.log.setLevel",
     "control.cache.get",
     "control.cache.setCap",
     "control.cache.clear",
@@ -605,6 +606,7 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
         "control.status" => control_ok(id, status(ctx).await),
         "control.config.get" => control_ok(id, config_get(ctx)),
         "control.config.setUpstream" => config_set_upstream(ctx, id, params),
+        "control.log.setLevel" => log_set_level(id, params),
         "control.cache.get" => control_ok(id, cache_get()),
         "control.cache.setCap" => cache_set_cap(id, params),
         "control.cache.clear" => {
@@ -725,6 +727,30 @@ fn cache_get() -> Value {
 }
 
 /// Set the cache cap (bytes, floored at 64 MiB by dig-node).
+/// `control.log.setLevel` (#553): live-swap the running node's `tracing` level filter via the
+/// `dig-logging` reload handle (SPEC §5). The filter is a standard `EnvFilter` directive, e.g.
+/// `debug` or `info,dig_node_core=debug`. This takes effect immediately WITHOUT persisting — the
+/// operator persists a level across restarts with `dig-node logs level <filter>`. Fails with
+/// `InvalidParams` on a missing/invalid directive and `ControlError` when logging is not installed
+/// in this process (never a serving node).
+fn log_set_level(id: Value, params: &Value) -> Value {
+    let Some(filter) = params.get("filter").and_then(|v| v.as_str()) else {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            "control.log.setLevel requires params.filter (an EnvFilter directive string)",
+        );
+    };
+    match crate::logging::set_level(filter) {
+        Ok(()) => control_ok(id, json!({ "filter": filter })),
+        Err(e) => control_error(
+            id,
+            ErrorCode::ControlError,
+            format!("failed to set level: {e}"),
+        ),
+    }
+}
+
 fn cache_set_cap(id: Value, params: &Value) -> Value {
     let Some(cap) = params.get("cap_bytes").and_then(|v| v.as_u64()) else {
         return control_error(
@@ -1069,6 +1095,26 @@ mod tests {
     #[test]
     fn control_method_with_correct_token_is_allowed() {
         assert!(is_authorized("control.status", Some("secret"), "secret"));
+    }
+
+    #[test]
+    fn log_set_level_rejects_a_missing_filter_param() {
+        // #553: `control.log.setLevel` needs `params.filter`; an empty body is an InvalidParams
+        // error, never a silent no-op.
+        let resp = log_set_level(json!(1), &json!({}));
+        assert_eq!(
+            resp["error"]["code"],
+            json!(ErrorCode::InvalidParams.code())
+        );
+    }
+
+    #[test]
+    fn log_set_level_errors_when_logging_is_not_installed() {
+        // #553: in a plain `cargo test` process no serve path installed the logging guard, so a
+        // live level change reports a ControlError (rather than pretending it applied). A valid
+        // directive still parses — the failure is specifically "logging not initialised".
+        let resp = log_set_level(json!(1), &json!({ "filter": "debug" }));
+        assert_eq!(resp["error"]["code"], json!(ErrorCode::ControlError.code()));
     }
 
     #[test]

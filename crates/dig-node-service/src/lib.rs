@@ -52,6 +52,10 @@ pub mod entrypoint;
 /// `dig-node ensure-hosts` (#91/#503): idempotently register the `dig.local` → `127.0.0.2` OS
 /// hosts entry so `http://dig.local` resolves to the node. Invoked by the native install packages.
 pub mod hosts;
+/// Structured logging (#553): install the shared [`dig_logging`] dual sink (rolling JSONL
+/// file + human stderr) at the serve entrypoints and expose the runtime level-reload handle
+/// the `control.log.setLevel` method + `logs level` verb drive. See [`logging`].
+pub mod logging;
 pub mod meta;
 /// `dig-node open <chia://… | urn:dig:chia:…>` (#389): the OS scheme-handler target the
 /// installer registers for `chia://` + `urn:dig:chia:`. Strictly validates the untrusted

@@ -47,8 +47,9 @@ define_windows_service!(ffi_service_main, service_main);
 /// startup leaves the SCM seeing a stopped service with a non-zero exit code).
 fn service_main(_args: Vec<OsString>) {
     if let Err(e) = run_service() {
-        // Best-effort: nothing to log to, but the non-zero exit is reported below.
-        eprintln!("dig-node service error: {e}");
+        // The service body installs structured logging early (#553), so a failure here is captured
+        // in the machine log file; the non-zero exit is still reported to the SCM below.
+        tracing::error!(error = %e, "dig-node service body exited with an error");
     }
 }
 
@@ -64,6 +65,12 @@ fn run_service() -> std::io::Result<()> {
         crate::state::RUN_CONTEXT_ENV,
         crate::state::RUN_CONTEXT_SERVICE,
     );
+
+    // Install structured logging (#553) NOW — a Windows service has no console, so before this the
+    // SCM-launched process produced NO log at all. The env above is already set, so this logs as a
+    // SERVICE run into the machine log dir. Best-effort: a logging failure never blocks the service.
+    crate::logging::init(dig_logging::RunContext::Service);
+
     let config = Config::from_env();
 
     // Channel the control handler signals on `Stop`; the server's graceful-shutdown
