@@ -21,6 +21,18 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::control;
 
+/// Build the reqwest client for the loopback control plane, PINNED to a DIRECT connection.
+///
+/// `.no_proxy()` disables reqwest's default env-proxy behaviour (`HTTP_PROXY`/`HTTPS_PROXY`/
+/// `http_proxy`/…), which has NO automatic loopback bypass. Without it, a hostile operator-env
+/// proxy could route the token-bearing `control.*` POST — carrying the master control token — to
+/// `127.0.0.1`/`::1` through an attacker-controlled proxy. The control plane is loopback-only and
+/// token-gated (#501/#553); pinning the transport DIRECT keeps the token on the wire it was
+/// minted for and never hands it to an interposed proxy.
+fn build_control_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder().no_proxy().build()
+}
+
 /// Call one `control.*` method on the running node and return its `result` object.
 ///
 /// Reads the master control token read-only, builds a single-shot current-thread runtime,
@@ -46,9 +58,7 @@ async fn call_async(
     method: &str,
     params: Value,
 ) -> std::io::Result<Value> {
-    let client = reqwest::Client::builder()
-        .build()
-        .map_err(std::io::Error::other)?;
+    let client = build_control_client().map_err(std::io::Error::other)?;
     let url = format!("http://{addr}/");
     let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let resp = client
@@ -75,4 +85,58 @@ async fn call_async(
         return Err(std::io::Error::other(format!("dig-node: {msg}")));
     }
     Ok(v.get("result").cloned().unwrap_or_else(|| json!({})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// SECURITY (#711): the control client MUST reach loopback DIRECTLY, ignoring a hostile
+    /// `HTTP_PROXY` in the environment — otherwise the token-bearing control POST could be routed
+    /// through an attacker-controlled proxy. We stand up a one-shot loopback HTTP server, point
+    /// `HTTP_PROXY` at a DEAD address, and assert the request still lands on the server. Without
+    /// `.no_proxy()`, reqwest would dial the dead proxy instead and the request would fail.
+    #[tokio::test]
+    async fn control_client_ignores_http_proxy_and_connects_direct() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // A one-shot server thread: accept a single connection, reply 200, signal it was hit.
+        let hit = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .unwrap();
+            true
+        });
+
+        // A dead proxy: nothing listens on this port. If the client honoured it, the send fails.
+        let dead_proxy = "http://127.0.0.1:9";
+        std::env::set_var("HTTP_PROXY", dead_proxy);
+        std::env::set_var("HTTPS_PROXY", dead_proxy);
+
+        let client = build_control_client().unwrap();
+        let resp = client
+            .post(format!("http://{addr}/"))
+            .body("{}")
+            .send()
+            .await;
+
+        std::env::remove_var("HTTP_PROXY");
+        std::env::remove_var("HTTPS_PROXY");
+
+        assert!(
+            resp.is_ok(),
+            "control client must connect DIRECT to loopback despite HTTP_PROXY: {resp:?}"
+        );
+        assert_eq!(resp.unwrap().status(), 200);
+        assert!(
+            hit.join().unwrap(),
+            "the direct loopback server was reached"
+        );
+    }
 }

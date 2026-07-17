@@ -894,6 +894,11 @@ token is NOT accepted for them.
 - **The daemon MAY create the token (write); an operator CLI MUST NOT mint one.** The CLI
   (`dig-node pair` / any control tool) reads the token READ-ONLY; if it is missing or unreadable it
   MUST fail with a precise remedy (§7.3a) rather than write a fresh token the daemon does not trust.
+- **The operator control client MUST connect DIRECT to loopback, ignoring proxy environment.** The
+  HTTP client that carries the master control token to the node's loopback address MUST be pinned to
+  a direct connection (`no_proxy`), so an `HTTP_PROXY`/`HTTPS_PROXY` in the operator's environment
+  can NEVER route the token-bearing `control.*` POST through an interposed proxy. (The default HTTP
+  proxy behaviour has no automatic loopback bypass.)
 - **Trust a pre-existing token file ONLY when it is owned by a TRUSTED principal (owner
   verification).** Before the daemon loads and trusts the bytes of an EXISTING `control-token`, it
   MUST verify the file's OWNER; a foreign-owned token is DELETED and REGENERATED, never returned.

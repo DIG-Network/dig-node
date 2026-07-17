@@ -117,6 +117,47 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.listSubscriptions",
 ];
 
+/// The control methods this shell HANDLES ITSELF, in [`dispatch_control`]'s owned arms — the
+/// ROUTING source of truth: [`dispatch_control`] delegates any method NOT in this set to the
+/// embedded node. Adding an owned `match` arm without listing it here leaves that arm
+/// unreachable (silently delegated); the lockstep test
+/// (`control_methods_partition_into_owned_and_delegated`) forces this set + [`CONTROL_METHODS`]
+/// to agree, so a shell-owned method can never be dispatched without also being declared.
+pub const OWNED_CONTROL_METHODS: &[&str] = &[
+    "control.status",
+    "control.config.get",
+    "control.config.setUpstream",
+    "control.log.setLevel",
+    "control.cache.get",
+    "control.cache.setCap",
+    "control.cache.clear",
+    "control.hostedStores.list",
+    "control.hostedStores.pin",
+    "control.hostedStores.unpin",
+    "control.hostedStores.status",
+    "control.sync.status",
+    "control.sync.trigger",
+    "control.updater.status",
+    "control.updater.setChannel",
+    "control.updater.pause",
+    "control.updater.resume",
+    "control.updater.checkNow",
+    "control.pairing.list",
+    "control.pairing.approve",
+    "control.pairing.revoke",
+];
+
+/// The control methods [`dispatch_control`] DELEGATES to the embedded node's own control surface
+/// (`dig_node_core::handle_rpc`) — the node-internal subscription set + peer-status snapshot.
+/// Together with [`OWNED_CONTROL_METHODS`] this partitions [`CONTROL_METHODS`] exactly (asserted
+/// by the lockstep test): the two disjoint sets union to the full control surface.
+pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
+    "control.peerStatus",
+    "control.subscribe",
+    "control.unsubscribe",
+    "control.listSubscriptions",
+];
+
 /// Is this a PAIRING-ADMINISTRATION control method (#280)? PURE.
 ///
 /// These manage the pairing lifecycle — list pending requests, approve one (minting
@@ -602,6 +643,27 @@ pub struct ControlCtx {
 /// auth gate ([`is_authorized`]); this performs the operation and returns the
 /// JSON-RPC response Value. Unknown `control.*` methods → METHOD_NOT_FOUND.
 pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params: &Value) -> Value {
+    // Route by the SINGLE source of truth: methods this shell owns go to `dispatch_owned`;
+    // everything else (the delegated set + any genuinely-unknown `control.*`) falls through to
+    // the embedded node's own control surface, which resolves it or returns -32601.
+    if OWNED_CONTROL_METHODS.contains(&method) {
+        return dispatch_owned(ctx, id, method, params).await;
+    }
+    // Control methods the shell does not own are delegated to the NODE's own control surface
+    // (`control.peerStatus` / `control.subscribe` / `control.unsubscribe` /
+    // `control.listSubscriptions` — the node's persisted subscription set + peer-status
+    // snapshot). The shell forwards them so the whole control surface is reachable through one
+    // loopback endpoint. A genuinely unknown control method falls through the node too and
+    // returns -32601.
+    let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    dig_node_core::handle_rpc(&ctx.node, req).await
+}
+
+/// Handle a control method OWNED by this shell (guaranteed by [`dispatch_control`] to be a member
+/// of [`OWNED_CONTROL_METHODS`]). The `_` arm is [`unreachable`] BY CONSTRUCTION: it fires only if
+/// [`OWNED_CONTROL_METHODS`] lists a method with no arm here (or vice-versa), i.e. the routing
+/// const and the arms drifted — the lockstep test exercises this correspondence.
+async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Value) -> Value {
     match method {
         "control.status" => control_ok(id, status(ctx).await),
         "control.config.get" => control_ok(id, config_get(ctx)),
@@ -634,17 +696,12 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
             crate::pairing::approve(&ctx.pairings, &ctx.state_dir, id, params)
         }
         "control.pairing.revoke" => crate::pairing::revoke(&ctx.state_dir, id, params),
-        // Control methods the shell does not own are delegated to the NODE's own
-        // control surface (`control.peerStatus` / `control.subscribe` /
-        // `control.unsubscribe` / `control.listSubscriptions` — the node's persisted
-        // subscription set + peer-status snapshot). These are node-internal control
-        // methods dig_node_core::handle_rpc resolves; the shell forwards them so the whole
-        // control surface is reachable through one loopback endpoint. A genuinely
-        // unknown control method falls through the node too and returns -32601.
-        _ => {
-            let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-            dig_node_core::handle_rpc(&ctx.node, req).await
-        }
+        // Unreachable: `dispatch_control` only routes here for `OWNED_CONTROL_METHODS` members.
+        // Reaching this arm means the routing const and these arms have drifted.
+        _ => unreachable!(
+            "dispatch_owned reached for non-owned control method {method:?}: \
+             OWNED_CONTROL_METHODS and dispatch_owned's arms have drifted"
+        ),
     }
 }
 
@@ -1063,6 +1120,53 @@ fn distinct_store_count(cached: &[dig_node_core::CachedCapsule]) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// LOCKSTEP GATE (#711): [`dispatch_control`] resolves EXACTLY [`CONTROL_METHODS`] — the
+    /// owned set it routes to `dispatch_owned` ([`OWNED_CONTROL_METHODS`]) plus the set it
+    /// delegates to the node ([`DELEGATED_CONTROL_METHODS`]) — the two disjoint, and their union
+    /// equal to the declared surface. This closes the shell-owned-method drift gap the CLI-parity
+    /// test (`cli_covers_every_node_control_method`) leaves open: a `dispatch_owned` arm added
+    /// without declaring it (in `OWNED_CONTROL_METHODS` + `CONTROL_METHODS`) fails HERE, and a
+    /// declared owned method with no arm makes `dispatch_owned`'s `unreachable!` fire.
+    #[test]
+    fn control_methods_partition_into_owned_and_delegated() {
+        use std::collections::BTreeSet;
+        let listed: BTreeSet<&str> = CONTROL_METHODS.iter().copied().collect();
+        let owned: BTreeSet<&str> = OWNED_CONTROL_METHODS.iter().copied().collect();
+        let delegated: BTreeSet<&str> = DELEGATED_CONTROL_METHODS.iter().copied().collect();
+
+        // Each list is duplicate-free.
+        assert_eq!(
+            owned.len(),
+            OWNED_CONTROL_METHODS.len(),
+            "OWNED has duplicates"
+        );
+        assert_eq!(
+            delegated.len(),
+            DELEGATED_CONTROL_METHODS.len(),
+            "DELEGATED has duplicates"
+        );
+        assert_eq!(
+            listed.len(),
+            CONTROL_METHODS.len(),
+            "CONTROL_METHODS has duplicates"
+        );
+
+        // Owned and delegated are disjoint — no method is both handled and forwarded.
+        let both: Vec<&&str> = owned.intersection(&delegated).collect();
+        assert!(
+            both.is_empty(),
+            "methods both owned AND delegated: {both:?}"
+        );
+
+        // The union is EXACTLY the declared surface — neither an undeclared handler nor a
+        // declared-but-unhandled method can slip through.
+        let union: BTreeSet<&str> = owned.union(&delegated).copied().collect();
+        assert_eq!(
+            listed, union,
+            "CONTROL_METHODS drifted from dispatch_control's owned+delegated set"
+        );
+    }
 
     #[test]
     fn is_control_method_only_matches_control_namespace() {
