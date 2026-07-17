@@ -311,13 +311,26 @@ node runs ONE catch-up pass (which fully reconciles the leaf) rather than bursti
 per missed tick.
 
 **TLS-root owner gate (#661, defence-in-depth).** Before reading ANY TLS material — the leaf to
-serve, and `ca.key` on the renewal path — the node verifies the TLS root directory is owned by a
-privileged principal (Windows: the well-known `SYSTEM`/`Administrators` SID, by exact SID equality;
-unix: `root` and not group/world-writable) and **fails CLOSED to plaintext** otherwise. A
-user-writable TLS root could hold an attacker-swapped `ca.key` that this privileged service would
-otherwise read and sign with; refusing it removes that vector. The owner SID is read directly through
-the Win32 security API (launching no process — the same spawn-free check the self-heal LPE gate uses,
-§ the shared owner check), so the guard never itself executes an attacker-planted binary.
+serve, and `ca.key` on the renewal path — the node verifies the TLS root directory is privileged-owned
+(§ the shared whole-path owner check) and **fails CLOSED to plaintext** otherwise. A user-writable TLS
+root could hold an attacker-swapped `ca.key` that this privileged service would otherwise read and sign
+with; refusing it removes that vector. The owner SID is read directly through the Win32 security API
+(launching no process — the same spawn-free check the self-heal LPE gate uses), so the guard never
+itself executes an attacker-planted binary.
+
+**Shared whole-path owner check (#565/#661/#46, #712).** The three gates above defer to ONE shared
+helper that classifies a directory as privileged-owned. It verifies the ENTIRE path, not just the leaf:
+EVERY existing ancestor component (the directory, its parent, … up to the filesystem root) MUST be
+privileged-owned AND MUST NOT be a symlink/junction/reparse point. A privileged-owned leaf under a
+user-writable or symlinked ANCESTOR is still tamperable — an intermediate rename/replace is governed by
+the parent's permissions, and a reparse point anywhere redirects the whole path — so a single weak
+component fails the check. Per component: **unix** — owned by `root`/uid 0, no group/other write bit,
+judged via `symlink_metadata` (lstat) so a symlink is rejected on its own identity; **Windows** — owner
+SID equal (exact equality) to the well-known LocalSystem `S-1-5-18`, BUILTIN\Administrators
+`S-1-5-32-544`, or `NT SERVICE\TrustedInstaller` (the fixed service SID that owns `C:\Program Files`
+and its protected subtree — required so the canonical `%ProgramFiles%` install root is not
+false-rejected), and the component carries no `FILE_ATTRIBUTE_REPARSE_POINT`. Fails CLOSED on any
+indeterminate or missing component.
 
 **The CA trust anchor is NEVER auto-rotated by the node.** An approaching CA expiry is only REPORTED
 (`ca_renewal_due`); anchor rotation is an explicit, installer-coordinated `dig-cert rotate_ca` (it
@@ -1464,11 +1477,11 @@ SCM, always LocalSystem; a root systemd/launchd daemon) records the currently-ru
 user-writable directory, a non-privileged local user could replace it and gain persistent
 SYSTEM/root code execution on the next service start — a privilege-escalation vector. So before
 registering a system-level service, `install` MUST verify the program's directory is
-**privileged-owned** (Unix: `root`/uid 0 and no group/other write bit; Windows: an owner SID equal
-to the well-known LocalSystem `S-1-5-18` or BUILTIN\Administrators `S-1-5-32-544`) and **refuse with
-`PERMISSION_DENIED`** otherwise, before any side effect (no state-dir harden, no service create).
-This is the SAME spawn-free owner gate the self-heal spawn root (§7 #565) and the TLS material root
-(§4.1a #661) use — one shared check, fail-closed on an indeterminate owner. A **user-level** install
+**privileged-owned across its whole path** (§ the shared whole-path owner check — every ancestor
+component privileged-owned, non-reparse) and **refuse with `PERMISSION_DENIED`** otherwise, before any
+side effect (no state-dir harden, no service create). This is the SAME spawn-free owner gate the
+self-heal spawn root (§7 #565) and the TLS material root (§4.1a #661) use — one shared check,
+fail-closed on an indeterminate owner. A **user-level** install
 (the Linux/macOS default) runs as the very user who owns the binary, crosses no privilege boundary,
 and is always allowed. The canonical install path (native OS package, §9.7) places the binary in a
 protected admin-owned location (`%ProgramFiles%\DIG Network\dig-node\`, `/usr/…`), so it satisfies
