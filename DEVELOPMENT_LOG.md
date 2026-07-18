@@ -168,3 +168,5 @@ CLI path (not via a native package) needs the `sc config`/`sc qc` dance.
   false-rejects the canonical `%ProgramFiles%\DIG\bin` install root. Reparse detection uses the
   no-follow `symlink_metadata` + `FILE_ATTRIBUTE_REPARSE_POINT` (catches junctions, not just
   symlinks). Mirrors dig-dns's `ensure_prefix_root_owned_not_writable` (#701).
+
+<!-- WU5 connect plumbing stub (#929) -->
