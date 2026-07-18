@@ -66,9 +66,13 @@ use crate::CachedCapsule;
 // -- Constants ---------------------------------------------------------------------------------------
 
 /// Default relay endpoint (canonical public relay). Overridable with `DIG_RELAY_URL`; `off` disables
-/// the reservation. Mirrors `dig_constants::DIG_RELAY_URL` / the retired relay client's default so an
-/// operator's existing `DIG_RELAY_URL` keeps working.
-pub const DEFAULT_RELAY_URL: &str = "wss://relay.dig.net:9450";
+/// the reservation.
+///
+/// Single-sourced from `dig_constants::DIG_RELAY_URL` so the node dials the ONE canonical relay
+/// endpoint and can never drift from it. The public relay serves the reservation wire on `:443`
+/// (a hard-coded `:9450` here silently failed every stock node's reservation — the port is closed
+/// on relay.dig.net; see the WU7 EC2 connect proof).
+pub const DEFAULT_RELAY_URL: &str = dig_constants::DIG_RELAY_URL;
 
 /// Default network id a node registers + discovers under (matches dig-gossip / the relay wire).
 pub const DEFAULT_NETWORK_ID: &str = "DIG_MAINNET";
@@ -2189,6 +2193,18 @@ mod tests {
             "case-insensitive opt-out"
         );
         assert!(is_relay_enabled(Some("wss://my-relay:9450")));
+    }
+
+    #[test]
+    fn default_relay_is_canonical_443_endpoint() {
+        // The default MUST be the canonical relay endpoint (`:443`, where relay.dig.net actually
+        // serves the reservation wire) — never a drifted hard-coded port. Regression for the WU7
+        // proof, where a stale `:9450` default silently failed every stock node's reservation.
+        assert_eq!(DEFAULT_RELAY_URL, dig_constants::DIG_RELAY_URL);
+        assert!(
+            DEFAULT_RELAY_URL.ends_with(":443"),
+            "canonical relay endpoint serves :443, got {DEFAULT_RELAY_URL}"
+        );
     }
 
     // #285: DIG_NETWORK_GENESIS env override — unset/invalid/zero fall back to the pre-launch
