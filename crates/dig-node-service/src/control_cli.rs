@@ -180,8 +180,10 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         .method(),
         // `dig-node logs level <filter>` drives the live level change (#553).
         "control.log.setLevel",
-        // `dig-node peers` drives the live peer status (#559).
+        // `dig-node peers` drives the live peer status (#559); `dig-node peers connect <peer>` dials
+        // a peer into the pool (#929).
         "control.peerStatus",
+        "control.peers.connect",
         // `dig-node pair …` drives the pairing-admin methods (#280).
         "control.pairing.list",
         "control.pairing.approve",

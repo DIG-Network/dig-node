@@ -14,14 +14,15 @@
 //!   * `dig-node peers ban <peer> --state <ban|blacklist|none>` — block / soft-block / clear a peer.
 //!   * `dig-node peers pool-config --max-connections <n>` — set the peer-pool connection cap.
 //!
-//! # Node-side gap (cross-repo follow-up, flagged NOT fixed here)
+//! # Node-side coverage + remaining gap
 //!
-//! Today the node implements ONLY `control.peerStatus` (a running flag + a connected COUNT); it
-//! does not yet return a per-peer list, nor implement the management RPCs
-//! (`control.peers.connect`/`disconnect`/`setBan`/`setPoolConfig`) — the SAME gap the extension
-//! documents. So the `list` view degrades honestly (count only) and the management verbs return
-//! the node's METHOD_NOT_FOUND until the node ships those methods. The CLI verbs exist now so the
-//! surface reaches parity and lights up with no CLI change once the node implements them.
+//! The node now returns the per-peer list — `control.peerStatus` emits a `peers[]` array of
+//! `{peer_id, address, via, direction}` (rendered IPv6-first below) — and implements
+//! `control.peers.connect` (dial a peer into the pool, #929). The remaining management RPCs
+//! (`control.peers.disconnect`/`setBan`/`setPoolConfig`) are still a node-side gap (the SAME gap the
+//! extension documents): those verbs return the node's METHOD_NOT_FOUND until the node ships them.
+//! The CLI verbs exist now so the surface reaches parity and each lights up with no CLI change once
+//! the node implements it.
 
 use serde_json::{json, Value};
 
@@ -143,13 +144,15 @@ fn format_status(result: &Value) -> String {
             if reserved { "held" } else { "none" }
         ));
     }
-    let peers = result["peers"].as_array().cloned().unwrap_or_default();
+    let mut peers = result["peers"].as_array().cloned().unwrap_or_default();
     if peers.is_empty() {
-        // Honest degradation: today's node reports a count but not a per-peer list.
+        // Honest degradation: no per-peer list (no peer network running, or an older node build).
         out.push_str(
             "\n  (this node build reports a count only — a per-peer list needs a newer node)",
         );
     } else {
+        // Render peers with IPv6-addressed ones first (§5.2 display policy).
+        peers.sort_by_key(|p| is_ipv4(p["address"].as_str().unwrap_or("")));
         out.push_str("\n  peers:");
         for p in &peers {
             out.push_str(&format!("\n    • {}", format_peer(p)));
@@ -158,35 +161,14 @@ fn format_status(result: &Value) -> String {
     out
 }
 
-/// One peer line: `peer_id  type/direction  addr, addr` with addresses IPv6-first (§5.2).
+/// One peer line: `peer_id  via/direction  address` (the per-peer `{peer_id, address, via, direction}`
+/// shape the node's `control.peerStatus` emits — #929).
 fn format_peer(p: &Value) -> String {
     let id = p["peer_id"].as_str().unwrap_or("?");
-    let ty = p["connection_type"].as_str().unwrap_or("?");
+    let via = p["via"].as_str().unwrap_or("?");
     let dir = p["direction"].as_str().unwrap_or("?");
-    let addrs = ipv6_first_addrs(p);
-    let addrs = if addrs.is_empty() {
-        "(no address)".to_string()
-    } else {
-        addrs.join(", ")
-    };
-    format!("{id}  {ty}/{dir}  {addrs}")
-}
-
-/// A peer's addresses ordered IPv6-FIRST, IPv4 second (§5.2 display policy). PURE.
-fn ipv6_first_addrs(p: &Value) -> Vec<String> {
-    let mut addrs: Vec<String> = p["addresses"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    // IPv6 literals contain ':' inside brackets; IPv4 do not. Stable sort by "is IPv4" so the
-    // relative order within each family is preserved but IPv6 sorts ahead.
-    addrs.sort_by_key(|a| is_ipv4(a));
-    addrs
+    let addr = p["address"].as_str().unwrap_or("(no address)");
+    format!("{id}  {via}/{dir}  {addr}")
 }
 
 /// Heuristic: does this address string look IPv4 (dotted quad, no bracketed IPv6)? PURE.
@@ -227,49 +209,34 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_addresses_sort_before_ipv4() {
-        let peer = json!({
-            "peer_id": "abc",
-            "addresses": ["1.2.3.4:9444", "[2001:db8::1]:9444", "5.6.7.8:9444"],
-        });
-        let ordered = ipv6_first_addrs(&peer);
-        assert_eq!(ordered[0], "[2001:db8::1]:9444", "IPv6 comes first (§5.2)");
-        assert_eq!(ordered[1], "1.2.3.4:9444");
-        assert_eq!(ordered[2], "5.6.7.8:9444");
-    }
-
-    #[test]
-    fn peer_line_shows_id_type_direction_and_ipv6_first() {
+    fn peer_line_shows_id_via_direction_and_address() {
         let peer = json!({
             "peer_id": "deadbeef",
-            "connection_type": "direct",
+            "via": "direct",
             "direction": "outbound",
-            "addresses": ["9.9.9.9:1", "[fe80::1]:2"],
+            "address": "[fe80::1]:2",
         });
         let line = format_peer(&peer);
         assert!(line.contains("deadbeef"));
         assert!(line.contains("direct/outbound"));
-        // IPv6 precedes IPv4 in the rendered address list.
-        let v6 = line.find("[fe80::1]:2").unwrap();
-        let v4 = line.find("9.9.9.9:1").unwrap();
-        assert!(v6 < v4, "IPv6 address must render before IPv4");
+        assert!(line.contains("[fe80::1]:2"));
     }
 
     #[test]
-    fn running_status_with_peer_list_renders_each_peer() {
+    fn peer_list_renders_ipv6_peers_before_ipv4() {
         let s = format_status(&json!({
             "running": true,
-            "connected_peers": 1,
-            "peers": [{
-                "peer_id": "p1",
-                "connection_type": "relayed",
-                "direction": "inbound",
-                "addresses": ["[2001:db8::9]:9444"],
-            }],
+            "connected_peers": 2,
+            "peers": [
+                {"peer_id": "v4", "via": "direct", "direction": "outbound", "address": "1.2.3.4:9444"},
+                {"peer_id": "v6", "via": "relay", "direction": "inbound", "address": "[2001:db8::9]:9444"},
+            ],
         }));
         assert!(s.contains("peers:"));
-        assert!(s.contains("p1"));
-        assert!(s.contains("relayed/inbound"));
+        // The IPv6-addressed peer renders before the IPv4 one (§5.2).
+        let v6 = s.find("v6").unwrap();
+        let v4 = s.find("v4").unwrap();
+        assert!(v6 < v4, "IPv6-addressed peer must render first");
         assert!(
             !s.contains("newer node"),
             "a filled list omits the degradation note"
