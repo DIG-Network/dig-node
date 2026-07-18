@@ -420,11 +420,24 @@ pub fn gossip_port_from_env() -> u16 {
 /// — it pairs the advertised PORT with the source IP it observes — so a peer behind a different NAT
 /// receives a DIALABLE `<reflexive-ip>:<gossip-port>` candidate (SPEC §19.8).
 pub fn gossip_listen_candidates(gossip_port: u16) -> Vec<std::net::SocketAddr> {
+    use dig_ip::{CandidateSource, Family, PeerCandidates};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-    vec![
+
+    // Aggregate + source-tag the two wildcard listen addresses, then emit them in dig_ip::Family
+    // preference order (IPv6 before IPv4) — the family ordering is dig-ip's, not hand-rolled here.
+    let mut candidates = PeerCandidates::new();
+    candidates.add(
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, gossip_port)),
+        CandidateSource::ListenAddr,
+    );
+    candidates.add(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, gossip_port)),
-    ]
+        CandidateSource::ListenAddr,
+    );
+    Family::PREFERENCE
+        .iter()
+        .flat_map(|family| candidates.of_family(*family))
+        .collect()
 }
 
 // -- Local inventory → L7 availability / inventory / range -------------------------------------------
@@ -1578,12 +1591,9 @@ async fn bring_up_dht(
     // with no routable address advertises nothing here and stays reachable via the relay tiers dig-nat
     // composes; loopback/in-process setups opt into a loopback candidate via DIG_NODE_ADVERTISE_LOOPBACK.
     let port = peer_port_from_env();
-    let local =
-        crate::net::advertised_socket_addrs(port, crate::net::advertise_loopback_from_env());
-    // Add this node's STUN-discovered server-reflexive (public) address to the advertised set (#385)
-    // so a remote peer behind a different NAT can dial / hole-punch to it, not just to a LAN-local
-    // address. Best-effort + bounded: a failure (no STUN server, timeout) advertises the local
-    // addresses only. The reflexive candidate is merged IPv6-first (§5.2) by `merge_reflexive`.
+    // This node's STUN-discovered server-reflexive (public) address (#385), so a remote peer behind a
+    // different NAT can dial / hole-punch to it, not just to a LAN-local address. Best-effort +
+    // bounded: a failure (no STUN server, timeout) advertises the local addresses only.
     let reflexive = match stun_server {
         Some(stun) => crate::net::reflexive_via_stun(stun, config.rpc_timeout).await,
         None => None,
@@ -1593,10 +1603,17 @@ async fn bring_up_dht(
             "dig-node peer network: STUN reflexive address {r} added to advertised candidates"
         );
     }
-    let local_addresses: Vec<CandidateAddr> = crate::net::merge_reflexive(local, reflexive)
-        .into_iter()
-        .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
-        .collect();
+    // Assemble the advertised candidate set, IPv6-first via dig_ip::Family (the reflexive leads its
+    // family group); see `crate::net::assemble_advertised`. The wildcard bind (`[::]` / `0.0.0.0`)
+    // is never a candidate.
+    let local_addresses: Vec<CandidateAddr> = crate::net::advertised_socket_addrs_with_reflexive(
+        port,
+        crate::net::advertise_loopback_from_env(),
+        reflexive,
+    )
+    .into_iter()
+    .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
+    .collect();
     let service = Arc::new(DhtService::new(
         identity.peer_id,
         local_addresses,
