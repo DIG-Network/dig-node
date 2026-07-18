@@ -63,12 +63,29 @@ pub const SIGNATURE_LEN: usize = 64;
 
 /// The largest single IPC frame the engine will read (1 MiB). Bounds a hostile app streaming a
 /// newline-less giant frame to OOM the engine. Mirrors dig-app's `MAX_FRAME_BYTES`.
+///
+/// This is the CONTRACT the `control.session.*` transport MUST enforce when it reads frames; the
+/// transport is the NODE-1 engine-carve follow-up, so this constant is the value that layer binds to
+/// (this module is transport-agnostic and never reads a socket itself).
 pub const MAX_FRAME_BYTES: u64 = 1024 * 1024;
 
 /// The most engine `sign` callbacks that may be in flight on one session before the engine stops
 /// issuing more. Bounds an app (or engine bug) that would otherwise wedge an unbounded callback
 /// stream. Mirrors dig-app's `MAX_INTERLEAVED_CALLBACKS`.
+///
+/// Like [`MAX_FRAME_BYTES`], this is the contract the (follow-up) transport enforces when it multiplexes
+/// callbacks over a session — this module defines the bound; the transport applies it.
 pub const MAX_INTERLEAVED_CALLBACKS: usize = 64;
+
+/// The most begun-but-not-yet-attached handshakes the registry will hold at once. Bounds the memory a
+/// caller could pin by calling `begin` repeatedly without ever attaching (each `begin` remembers a
+/// [`PendingCandidate`] until its `attach` consumes it). Once this many are outstanding, [`begin`] fails
+/// with [`AttachError::TooManyPending`] until an attach (or a future TTL sweep) frees a slot. TTL-based
+/// expiry needs a clock seam and lands with the transport in the NODE-1 engine-carve follow-up; this
+/// count cap is the memory bound enforceable in the transport-agnostic library today.
+///
+/// [`begin`]: EngineSessionRegistry::begin
+pub const MAX_PENDING_CANDIDATES: usize = 256;
 
 /// The capabilities the engine advertises to an attached session. Keyless by construction: content
 /// serving, whole-store sync, and BROADCAST of an already-signed bundle — never key custody.
@@ -121,13 +138,19 @@ pub fn verify_signature(
 /// not hold.
 ///
 /// The production resolver walks the DID singleton to its authoritative profile store and reads slot
-/// `0x0010` via the **dig-identity** read path (chia-wallet-sdk-backed — the DID HARD rule): parse the
-/// `did:chia:` DID to its launcher id, resolve the current singleton coin, read the paired profile
-/// store's slot `0x0010` (`dig_identity::resolve_did_keys` → `DidKeys::signing_public_key`). Wiring
-/// that impl consumes dig-identity as a dependency, which is deferred behind the shared bare-git
-/// dependency cascade (#947 — dig-nat/dig-constants HEADs have advanced past this engine's pinned
-/// version reqs, so adding a new git dep here would force an incompatible re-lock); it lands as the
-/// production `DidSigningKeyResolver` impl in the same coordinated dep bump.
+/// `0x0010` via the **dig-identity** read path (the DID HARD rule): parse the `did:chia:` DID to its
+/// launcher id, resolve the current singleton coin ON-CHAIN, read the paired profile store's slot
+/// `0x0010` (`dig_identity::resolve_did_keys` → `DidKeys::signing_public_key`).
+///
+/// That impl is deferred on a REAL, tracked blocker: dig-identity's on-chain DID→store resolution — the
+/// chain-resolution layer that turns a `did:chia:` into its authoritative on-chain singleton coin and
+/// paired profile-store metadata — is unshipped work (**#778, WU3, OPEN**). Today `dig_identity::
+/// IdentityProfile::resolve` requires the caller to supply the on-chain records it does not fetch, so
+/// there is no way for the engine to AUTHORITATIVELY resolve a DID's `0x0010` key on-chain yet. An
+/// "echo" resolver that returned the caller-presented key would defeat the custody boundary entirely
+/// (any caller could attach as any DID), so no production impl ships until #778 lands the real read
+/// path. The production `DidSigningKeyResolver` is the NODE-1 engine-carve follow-up (it also removes
+/// `dig-wallet` from the engine binary and wires the `control.session.*` transport).
 ///
 /// Regardless of that impl, the custody boundary this trait defines is complete and enforced today: a
 /// resolver that cannot resolve a DID returns `None`, and [`EngineSessionRegistry::attach`] fails
@@ -212,6 +235,9 @@ pub enum AttachError {
     /// The `session_candidate` is unknown (never begun, already consumed, or expired).
     #[error("unknown or expired session candidate")]
     UnknownCandidate,
+    /// Too many handshakes are begun-but-not-attached — [`MAX_PENDING_CANDIDATES`] is the memory bound.
+    #[error("too many pending session candidates")]
+    TooManyPending,
     /// The DID could not be resolved to an on-record signing key — attach fails closed.
     #[error("the profile DID could not be resolved to a signing key")]
     UnresolvableDid,
@@ -295,6 +321,11 @@ impl<E: SessionEntropy> EngineSessionRegistry<E> {
             return Err(AttachError::InvalidDid);
         }
         let presented_pubkey = decode_signing_key(signing_pubkey_hex)?;
+
+        // Bound the memory a caller can pin by begin-ing without ever attaching.
+        if self.pending.len() >= MAX_PENDING_CANDIDATES {
+            return Err(AttachError::TooManyPending);
+        }
 
         let nonce = self.entropy.nonce();
         let session_candidate = self.entropy.id();
@@ -757,6 +788,23 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, AttachError::UnknownCandidate);
+    }
+
+    #[test]
+    fn begin_rejects_when_too_many_candidates_are_pending() {
+        let key = signing_key();
+        let pubkey_hex = hex::encode(pubkey(&key));
+        let mut reg = registry();
+        // Fill the pending map to its cap; each begin uses a distinct candidate id.
+        for _ in 0..MAX_PENDING_CANDIDATES {
+            reg.begin(DID, &pubkey_hex).unwrap();
+        }
+        assert_eq!(reg.pending_count(), MAX_PENDING_CANDIDATES);
+        // One more must be refused rather than growing memory unbounded.
+        assert_eq!(
+            reg.begin(DID, &pubkey_hex),
+            Err(AttachError::TooManyPending)
+        );
     }
 
     #[test]
