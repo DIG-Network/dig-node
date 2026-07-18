@@ -1223,8 +1223,14 @@ fn wire_relay_reservation(
         tokio::spawn(async move {
             // B1 (#870): advertise the node's gossip listen candidates so the relay's reflexive
             // substitution can hand another peer a DIALABLE candidate for this node.
-            dig_nat::relay::run_relay_connection(endpoint, peer_id, network_id, listen_addrs, status)
-                .await;
+            dig_nat::relay::run_relay_connection(
+                endpoint,
+                peer_id,
+                network_id,
+                listen_addrs,
+                status,
+            )
+            .await;
         });
     } else {
         status.set_disabled();
