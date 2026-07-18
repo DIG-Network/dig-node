@@ -208,6 +208,66 @@ impl PeerStatus {
     }
 }
 
+// -- Per-peer enumeration for control.peerStatus (#929) ----------------------------------------------
+
+/// The connected pool as a per-peer JSON array — one object per connected peer:
+/// `{ peer_id, address, via, direction }`. This is the machine-checkable proof surface for a mutual
+/// A↔B connection (each side lists the OTHER's `peer_id`), beyond the bare `connected_peers` count.
+///
+/// Sourced from [`connected_pool_peers`](dig_gossip::GossipHandle::connected_pool_peers): each entry
+/// carries the dialable socket `address` + the `outbound`/`inbound` `direction`. Every pooled peer is
+/// a direct-TLS link (`via = "direct"`) — the connected pool currently admits only directly-dialed
+/// peers; the relay-transport peer kind (`via = "relay"`) is a forward-compatible field a later
+/// dig-gossip upgrade fills. Addresses render with the family implicit in the socket string; the CLI
+/// orders them IPv6-first (§5.2). Returns an empty vec when no peer network is running.
+pub(crate) fn connected_peers_json(handle: &dig_gossip::GossipHandle) -> Vec<Value> {
+    handle
+        .connected_pool_peers()
+        .into_iter()
+        .map(|(peer_id, addr, outbound)| {
+            json!({
+                "peer_id": hex::encode(peer_id),
+                "address": addr.to_string(),
+                "via": "direct",
+                "direction": if outbound { "outbound" } else { "inbound" },
+            })
+        })
+        .collect()
+}
+
+/// Dial a peer for `control.peers.connect` and return the connected peer's `peer_id` (64-hex).
+///
+/// The `peer` argument is EITHER a dialable socket address (`host:port`, IPv6 in brackets) OR a bare
+/// `peer_id` (64-hex). An address is dialed directly over the full NAT ladder; a `peer_id` that is
+/// ALREADY a connected pool member resolves immediately (idempotent). A bare `peer_id` that is NOT
+/// yet connected has no dialable address here and is rejected with a deterministic error (dial it by
+/// address, or wait for discovery to fold it into the pool). Fails deterministically — never panics.
+pub(crate) async fn connect_peer(
+    handle: &dig_gossip::GossipHandle,
+    peer: &str,
+) -> Result<String, String> {
+    let peer = peer.trim();
+    if let Ok(addr) = peer.parse::<std::net::SocketAddr>() {
+        return handle
+            .connect_to(addr)
+            .await
+            .map(hex::encode)
+            .map_err(|e| format!("dial {addr}: {e}"));
+    }
+    // Not an address — treat it as a peer_id and honour it only if already connected (idempotent).
+    let already_connected = handle
+        .connected_pool_peers()
+        .into_iter()
+        .any(|(peer_id, _, _)| hex::encode(peer_id).eq_ignore_ascii_case(peer));
+    if already_connected {
+        return Ok(peer.to_ascii_lowercase());
+    }
+    Err(format!(
+        "{peer:?} is neither a dialable address (host:port) nor an already-connected peer_id; \
+         dial the peer by its address"
+    ))
+}
+
 // -- Environment resolution (relay endpoint / network id / port) -------------------------------------
 
 /// Resolve the relay endpoint: `DIG_RELAY_URL` if set + non-empty, else [`DEFAULT_RELAY_URL`]. Pure
@@ -1220,6 +1280,9 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         .await
         .map_err(|e| format!("gossip start: {e}"))?;
     println!("dig-node peer network: connected peer pool up (discovery via {relay_endpoint})");
+    // Retain the pool handle on the node so the CONTROL surface can act on the live pool: dial a peer
+    // (`control.peers.connect`) and enumerate the connected peers per-peer (`control.peerStatus`).
+    node.set_gossip_handle(handle.clone());
 
     // 2b. Wire the PERSISTENT relay reservation (#870). `dig-nat` owns the transport: one long-lived
     //     WebSocket that registers once, keepalives, reconnects with backoff, AND discovers peers over
@@ -1859,6 +1922,44 @@ mod tests {
         );
     }
 
+    /// A fresh pool has no connected peers, so the per-peer array is empty (the honest "count only"
+    /// state before any peer connects). Uses a real `GossipHandle` — the same type the node retains.
+    #[tokio::test]
+    async fn connected_peers_json_is_empty_for_a_fresh_pool() {
+        let handle = fresh_pool_handle("cpjson-empty", [3u8; 32]).await;
+        assert!(connected_peers_json(&handle).is_empty());
+    }
+
+    /// `control.peers.connect` rejects an argument that is neither a dialable `host:port` nor an
+    /// already-connected `peer_id` — DETERMINISTICALLY (no dial attempt, no hang). Proves the error
+    /// path the RPC arm returns as a control error.
+    #[tokio::test]
+    async fn connect_peer_rejects_a_non_address_non_peer_id_argument() {
+        let handle = fresh_pool_handle("connect-bad-arg", [4u8; 32]).await;
+        let err = connect_peer(&handle, "not-an-address").await.unwrap_err();
+        assert!(err.contains("dialable address"), "got: {err}");
+    }
+
+    /// Build a real, freshly-started `GossipHandle` on an OS-assigned port for the pool-handle tests.
+    async fn fresh_pool_handle(tag: &str, network: [u8; 32]) -> dig_gossip::GossipHandle {
+        let dir = std::env::temp_dir().join(format!("dig-node-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = dig_gossip::GossipConfig {
+            network_id: chia_protocol::Bytes32::new(network),
+            cert_path: dir.join("node.cert").display().to_string(),
+            key_path: dir.join("node.key").display().to_string(),
+            peers_file_path: dir.join("peers.json"),
+            peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
+            listen_addr: crate::net::dual_stack_listen_addr(0),
+            ..Default::default()
+        };
+        dig_gossip::GossipService::new(cfg)
+            .expect("gossip config")
+            .start()
+            .await
+            .expect("gossip start")
+    }
+
     #[test]
     fn relay_url_defaults_and_opt_out() {
         // Pure cores — no process-global env mutation (so no cross-test env race).
@@ -2269,6 +2370,73 @@ mod tests {
                 "{m} is management/mutation/unknown and MUST NOT be reachable over the peer surface"
             );
         }
+    }
+
+    /// A→B peer RPC over REAL mTLS against the REAL node dispatch (#929): node B serves its
+    /// `NodeResponder` on an mTLS listener; node A dials it (peer_id-pinned), opens a stream, and
+    /// calls `dig.getNetworkInfo` — getting B's real dispatch result. The same channel REJECTS a
+    /// control-plane method (`control.peerStatus`) with -32601, proving the peer surface exposes only
+    /// the read/discovery allowlist even against a real node. This is the node half the WU7 EC2 proof
+    /// relies on: a node can call another node's RPC over the existing mTLS peer surface.
+    #[tokio::test]
+    async fn peer_to_peer_rpc_round_trip_against_the_real_node_over_mtls() {
+        use std::time::Duration;
+        install_crypto_provider();
+
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let server_identity = identity_from_seed(&[71u8; 32]).expect("server identity");
+        let server_peer_id = server_identity.peer_id;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder: Arc<dyn PeerRpcResponder> = Arc::new(NodeResponder::without_pool(node));
+        let server = tokio::spawn(serve_peer_rpc_listener(
+            listener,
+            server_identity,
+            responder,
+        ));
+
+        let client_identity = identity_from_seed(&[72u8; 32]).expect("client identity");
+        let target = dig_nat::PeerTarget::with_addr(server_peer_id, addr, "DIG_MAINNET");
+        let config = dig_nat::NatConfig::builder()
+            .enabled_methods(vec![dig_nat::TraversalKind::Direct])
+            .per_method_timeout(Duration::from_secs(5))
+            .build();
+        let mut conn = dig_nat::connect(&target, &client_identity, &config)
+            .await
+            .expect("A dials B over mTLS");
+
+        // A read method reaches B's real dispatch and returns a result.
+        {
+            let mut stream = conn.session.open_stream().await.expect("open stream");
+            write_framed(
+                &mut stream,
+                &json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"}),
+            )
+            .await
+            .unwrap();
+            let resp = read_framed(&mut stream).await.unwrap().expect("a frame");
+            assert!(
+                resp.get("result").is_some(),
+                "real node served the read: {resp}"
+            );
+        }
+        // A control-plane method is rejected -32601 over the peer channel.
+        {
+            let mut stream = conn.session.open_stream().await.expect("open stream");
+            write_framed(
+                &mut stream,
+                &json!({"jsonrpc":"2.0","id":2,"method":"control.peerStatus"}),
+            )
+            .await
+            .unwrap();
+            let resp = read_framed(&mut stream).await.unwrap().expect("a frame");
+            assert_eq!(
+                resp["error"]["code"],
+                json!(-32601),
+                "control method must be rejected: {resp}"
+            );
+        }
+        server.abort();
     }
 
     #[tokio::test]

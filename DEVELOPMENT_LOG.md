@@ -169,4 +169,16 @@ CLI path (not via a native package) needs the `sc config`/`sc qc` dance.
   no-follow `symlink_metadata` + `FILE_ATTRIBUTE_REPARSE_POINT` (catches junctions, not just
   symlinks). Mirrors dig-dns's `ensure_prefix_root_owned_not_writable` (#701).
 
-<!-- WU5 connect plumbing stub (#929) -->
+- **dig-gossip 0.3.0 needs dig-nat 0.3.0, which the crates.io peer stack blocks (WU5 #929).**
+  dig-gossip v0.3.0's code reads `dig_nat::wire::RelayPeerInfo.addresses` — a field that exists ONLY in
+  dig-nat 0.3.0 (its `>=0.2,<0.4` req is looser than the code). But dig-dht, dig-download, and
+  dig-peer-selector (crates.io 0.1.2 AND their git `main`) still pin dig-nat `^0.2`, and the workspace
+  `[patch.crates-io] dig-nat = { git }` can only redirect onto a version those consumers accept — 0.3.0
+  does NOT satisfy `^0.2`, so the graph forks into two incompatible dig-nat instances (crates.io 0.2.0
+  vs git 0.3.0) and fails to compile (`PeerId`/`Contact` type mismatch at the dht.rs seam). ADOPTION
+  ORDER: republish dig-dht + dig-download + dig-peer-selector accepting dig-nat `>=0.2,<0.4` → bump
+  dig-nat to 0.3.0 across the graph → then dig-gossip 0.3.0 is consumable (unlocking B1 dialable-fold,
+  B2 relay-transport connected-count + `connected_pool_peers_with_via`, and the `Register.listen_addrs`
+  advertisement). Until then the node stays on dig-gossip 0.2.1 (`connect_to` + `connected_pool_peers`
+  exist there), the per-peer `via` is always `"direct"` (0.2.1 has no relay-transport peer kind), and
+  `listen_addrs` is not advertised in the relay Register.

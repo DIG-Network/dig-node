@@ -112,6 +112,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.pairing.revoke",
     // Delegated to the embedded node's own control surface.
     "control.peerStatus",
+    "control.peers.connect",
     "control.subscribe",
     "control.unsubscribe",
     "control.listSubscriptions",
@@ -153,6 +154,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
 /// by the lockstep test): the two disjoint sets union to the full control surface.
 pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
     "control.peerStatus",
+    "control.peers.connect",
     "control.subscribe",
     "control.unsubscribe",
     "control.listSubscriptions",

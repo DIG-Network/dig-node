@@ -761,8 +761,8 @@ For the current node library (§2.2) the catalogue is:
   `dig.getContent`), `dig.getProof`, `dig.listCapsules`.
 - **shell**: `rpc.discover`.
 - **control**: the operator `control.*` methods of §7.4, plus the node-owned control methods the
-  shell delegates to the node (`control.peerStatus`, `control.subscribe`, `control.unsubscribe`,
-  `control.listSubscriptions`).
+  shell delegates to the node (`control.peerStatus`, `control.peers.connect`, `control.subscribe`,
+  `control.unsubscribe`, `control.listSubscriptions`).
 
 Param/result schemas for the `dig.*`/`cache.*` methods are owned by the digstore dig RPC and
 published on docs.dig.net (Protocol → the L7 read/RPC pages); this repo's OpenRPC document is a
@@ -1365,18 +1365,25 @@ reachable from a CLI verb, so a new node control method cannot ship without a CL
 `peers` reaches parity with the extension's peer surface (`src/features/peers/peersApi.ts`):
 
 - `peers [list]` → `control.peerStatus` — the live peer status: running flag, connected count,
-  relay reservation, and (when a newer node fills the optional field) the per-peer list. Peer
+  relay reservation, and a **per-peer array** `peers[]`, each element
+  `{ peer_id, address, via, direction }` where `via ∈ {"direct","relay"}` (transport; currently always
+  `"direct"` — the connected pool admits only directly-dialed peers, and `"relay"` is a
+  forward-compatible value a later dig-gossip upgrade fills) and `direction ∈ {"outbound","inbound"}`.
+  The array is present whenever a peer network is running and
+  omitted (count only) on the in-process FFI path / before bring-up. The per-peer `peer_id` is the
+  machine-checkable proof of a mutual A↔B connection (each side lists the other's `peer_id`). Peer
   addresses are displayed **IPv6-first, IPv4 second** per the ecosystem §5.2 address-family policy.
-- `peers connect <peer>` → `control.peers.connect`; `peers disconnect <peer>` →
-  `control.peers.disconnect`; `peers ban <peer> --state <ban|blacklist|none>` →
-  `control.peers.setBan`; `peers pool-config --max-connections <n>` → `control.peers.setPoolConfig`.
-
-The management verbs + the extended per-peer `control.peerStatus` payload are a **known node-side
-gap** (the same gap the extension documents): the node today implements only the running flag +
-connected count. Until it ships the management RPCs the `list` view degrades honestly (count only)
-and the management verbs surface the node's METHOD_NOT_FOUND. The CLI verbs exist now so the surface
-reaches parity and lights up with NO CLI change once the node implements them (tracked cross-repo
-follow-up).
+- `peers connect <peer>` → `control.peers.connect` — dial a peer via the live gossip pool. `peer` is
+  EITHER a dialable socket address (`host:port`, IPv6 in brackets) dialed over the full NAT ladder, OR
+  a `peer_id` (64-hex) honoured only if already connected (idempotent). Returns
+  `{ connected: true, peer_id }`; a bare unknown `peer_id`, a malformed argument, a dial failure, or no
+  running peer network each return a deterministic control error. CONTROL-plane — reachable only from
+  the loopback admin / in-process dispatch, NEVER over the mTLS peer surface.
+- `peers disconnect <peer>` → `control.peers.disconnect`; `peers ban <peer> --state <ban|blacklist|none>`
+  → `control.peers.setBan`; `peers pool-config --max-connections <n>` → `control.peers.setPoolConfig`
+  remain a **known node-side gap**: until the node ships those RPCs those verbs surface the node's
+  METHOD_NOT_FOUND. The CLI verbs exist now so the surface reaches parity and lights up with NO CLI
+  change once the node implements them.
 
 ### 8.5. `open` — the OS scheme handler (#389)
 
@@ -2796,6 +2803,21 @@ node-side in the interim:
 Exercising the connected pool end-to-end is gated on the network-genesis bring-up (the pre-launch
 placeholder genesis is rejected by `GossipService::start`); these behaviors are unit-tested
 independently of a live pool.
+
+### 19.8. Relay reservation — control dial + advertised listen candidates (partial)
+
+The node holds ONE persistent relay reservation (dig-nat `run_relay_connection`) sharing a single
+`Arc<RelayStatus>` with the gossip pool. Advertising the node's real gossip listen candidates in the
+RLY-001 `Register` message (`listen_addrs`, so the relay's reflexive substitution can hand another peer
+a DIALABLE candidate) is a **release-first follow-up**: it requires dig-nat 0.3.0's `Register.listen_addrs`
+field, and dig-nat 0.3.0 can only be adopted once dig-dht, dig-download, and dig-peer-selector are
+republished accepting dig-nat `>=0.2,<0.4` (they currently pin `^0.2`, so the graph cannot unify at
+dig-nat 0.3.0). Until then the reservation registers without advertised candidates.
+
+The node retains the live `GossipHandle` for the pool so the CONTROL surface can act on it:
+`control.peers.connect` dials a discovered/known peer into the connected pool, and `control.peerStatus`
+enumerates the pool as the per-peer array (§8.7). The in-process FFI host runs no peer network, so it
+retains no handle — connect reports "no peer network" and the peer array is omitted.
 
 ## 20. Logging — structured JSONL file + human stderr (#553)
 

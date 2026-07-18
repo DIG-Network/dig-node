@@ -294,6 +294,13 @@ pub struct Node {
     /// unaffected (no self-keep-alive cycle). NEVER set on the FFI path, so a backfill there upgrades
     /// to `None` and is a no-op (the browser consumer has no peer network to pull a capsule from).
     self_ref: OnceLock<std::sync::Weak<Node>>,
+    /// The live [`dig_gossip::GossipHandle`] for the node's connected peer pool, retained by the
+    /// standalone peer-network bring-up ([`peer::run_peer_network`]) so the CONTROL surface can act on
+    /// the pool: dial a peer (`control.peers.connect`) and enumerate the connected peers per-peer
+    /// (`control.peerStatus` → the `peers` array). Set ONCE via [`Node::set_gossip_handle`]; NEVER set
+    /// on the in-process FFI path (the browser is a pure consumer with no pool), where the connect verb
+    /// reports "no peer network" and the peer list is empty.
+    gossip: OnceLock<dig_gossip::GossipHandle>,
     /// The outgoing-bandwidth throttle (dig_ecosystem issue #30): tracks bytes served this second
     /// against a configurable cap (`DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC`, unlimited by default) so
     /// the serve path can redirect an over-budget request to a known alternate holder instead of
@@ -322,6 +329,19 @@ impl Node {
     /// the FFI path never does). Idempotent — a second install is ignored.
     pub(crate) fn set_inventory_refresher(&self, refresher: InventoryRefresher) {
         let _ = self.inventory_refresher.set(refresher);
+    }
+
+    /// Retain the live gossip pool handle (the standalone peer-network bring-up calls this once with
+    /// the [`dig_gossip::GossipHandle`] it starts; the FFI path never does). Idempotent — a second
+    /// install is ignored. Enables the control surface to dial peers + enumerate the connected pool.
+    pub(crate) fn set_gossip_handle(&self, handle: dig_gossip::GossipHandle) {
+        let _ = self.gossip.set(handle);
+    }
+
+    /// The live gossip pool handle, if the peer network is running. `None` on the FFI path (no pool)
+    /// and before bring-up — callers degrade honestly (empty peer list; "no peer network" on connect).
+    pub(crate) fn gossip_handle(&self) -> Option<&dig_gossip::GossipHandle> {
+        self.gossip.get()
     }
 
     /// Refresh the node's DHT provider records against its current inventory, if a peer network is
@@ -2580,8 +2600,35 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
     if method == "control.peerStatus" {
         let endpoint = peer::relay_url_from_env();
         let network_id = peer::network_id_from_env();
-        return json!({"jsonrpc":"2.0","id":id,
-            "result": node.peer_status.snapshot_json(&endpoint, &network_id)});
+        let mut snapshot = node.peer_status.snapshot_json(&endpoint, &network_id);
+        // Attach the per-peer array so the A↔B mutual-connection proof is machine-checkable (each
+        // side lists the OTHER's peer_id), not just a count. Sourced from the live pool handle; empty
+        // (and omitted-as-`[]`) on the FFI path / before bring-up. See `peer::connected_peers_json`.
+        if let Some(handle) = node.gossip_handle() {
+            snapshot["peers"] = Value::Array(peer::connected_peers_json(handle));
+        }
+        return json!({"jsonrpc":"2.0","id":id, "result": snapshot});
+    }
+    // control.peers.connect — dial a peer by address (or resolve an already-connected peer_id) via the
+    // live gossip pool, turning a relay-DISCOVERED peer into a COUNTED, RPC-reachable connected peer
+    // (#929). CONTROL-plane: reachable ONLY from the loopback admin / in-process FFI dispatch, NEVER
+    // over the mTLS peer surface (absent from `is_peer_reachable_method`). Deterministic success /
+    // failure; a no-op "no peer network" on the FFI path (no pool handle retained).
+    if method == "control.peers.connect" {
+        let params = req.get("params").cloned().unwrap_or(json!({}));
+        let peer = params.get("peer").and_then(Value::as_str).unwrap_or("");
+        let Some(handle) = node.gossip_handle() else {
+            return control_err(
+                &id,
+                CONTROL_ERROR,
+                "no peer network is running on this node",
+            );
+        };
+        return match peer::connect_peer(handle, peer).await {
+            Ok(peer_id) => json!({"jsonrpc":"2.0","id":id,
+                "result": {"connected": true, "peer_id": peer_id}}),
+            Err(e) => control_err(&id, CONTROL_ERROR, &format!("connect failed: {e}")),
+        };
     }
     // control.subscribe / control.unsubscribe / control.listSubscriptions (SPEC §6) — manage the
     // node's OWN persisted set of subscribed stores (the stores it actively watches + gap-fills). These
@@ -3023,6 +3070,7 @@ impl Node {
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
+            gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
         })
     }
@@ -3086,6 +3134,7 @@ pub(crate) mod test_support {
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
+            gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
         (Arc::new(node), td)
@@ -3293,6 +3342,7 @@ mod tests {
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
+            gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
         (node, td)
@@ -3366,6 +3416,7 @@ mod tests {
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
+            gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
 
@@ -3410,6 +3461,7 @@ mod tests {
             backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
+            gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         });
 
@@ -3495,6 +3547,7 @@ mod tests {
                 backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
+                gossip: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             });
 
@@ -3562,6 +3615,7 @@ mod tests {
                 backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
+                gossip: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             });
 
@@ -3947,6 +4001,54 @@ mod tests {
         assert!(cleared["result"].is_object());
 
         std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    // -- Peer connect + status control RPCs (#929) ------------------------------
+
+    /// **Proves:** `control.peers.connect` on a node with NO peer network running (the FFI path / before
+    /// bring-up — no retained gossip handle) returns a control error, never a panic or a false success.
+    /// **Catches:** a connect arm that dereferences an absent pool handle.
+    #[test]
+    fn peers_connect_without_a_pool_reports_no_peer_network() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"control.peers.connect",
+                   "params":{"peer":"[::1]:9444"}}),
+        ));
+        assert!(resp.get("result").is_none());
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no peer network"),
+            "expected a no-peer-network control error: {resp}"
+        );
+    }
+
+    /// **Proves:** `control.peerStatus` on a node with no peer network omits the per-peer array (there
+    /// is no live pool to enumerate) while still returning the running/relay snapshot.
+    /// **Catches:** a status handler that fabricates a `peers` array without a pool handle.
+    #[test]
+    fn peer_status_without_a_pool_omits_the_per_peer_array() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"control.peerStatus"}),
+        ));
+        assert!(resp["result"].is_object());
+        assert!(
+            resp["result"].get("peers").is_none(),
+            "no pool handle → no per-peer array: {resp}"
+        );
     }
 
     // -- Subscription management control RPCs (SPEC §6) -------------------------
