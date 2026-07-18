@@ -2755,6 +2755,15 @@ reflexive IPv4 address leads the IPv4 fallback group — so a peer behind a diff
 hole-punch to it. Discovery is best-effort + bounded; on failure the node advertises its local addresses
 only. The wildcard bind address (`[::]`/`0.0.0.0`) is never advertised as a candidate.
 
+The advertise path — candidate aggregation, family keying, de-duplication, and the IPv6-first family
+ordering — is delegated to the canonical [`dig-ip`](https://crates.io/crates/dig-ip) crate (CLAUDE.md
+§5.2, the ecosystem's single source of truth for the address-family / IPv6-first contract). Advertised
+candidates are aggregated + source-tagged (`dig_ip::CandidateSource::StunReflexive` / `ListenAddr`) +
+de-duplicated by `dig_ip::PeerCandidates`, then emitted in `dig_ip::Family` preference order (V6 before
+V4); the node MUST NOT hand-roll a family sort in the advertise path. The DIAL path inherits the
+local∩peer family intersection from dig-nat (which itself uses dig-ip), so the node does not duplicate
+that intersection logic.
+
 ### 19.3. Content location — dig-dht is the sole locator
 
 Content location ("which peers hold capsule X?") is the dig-dht provider index, and ONLY that: the live
