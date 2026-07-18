@@ -4177,6 +4177,11 @@ mod tests {
             "control.subscribe",
             "control.unsubscribe",
             "control.listSubscriptions",
+            // The peer-management + status control methods stay loopback/in-process only: a remote
+            // mTLS peer must NOT be able to drive a dial (`control.peers.connect`) or read the local
+            // pool snapshot (`control.peerStatus`) — the allowlist-by-construction property (#929).
+            "control.peers.connect",
+            "control.peerStatus",
         ] {
             assert!(
                 !peer::is_peer_reachable_method(m),

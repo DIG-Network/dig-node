@@ -14,14 +14,15 @@
 //!   * `dig-node peers ban <peer> --state <ban|blacklist|none>` — block / soft-block / clear a peer.
 //!   * `dig-node peers pool-config --max-connections <n>` — set the peer-pool connection cap.
 //!
-//! # Node-side gap (cross-repo follow-up, flagged NOT fixed here)
+//! # Node-side coverage + remaining gap
 //!
-//! Today the node implements ONLY `control.peerStatus` (a running flag + a connected COUNT); it
-//! does not yet return a per-peer list, nor implement the management RPCs
-//! (`control.peers.connect`/`disconnect`/`setBan`/`setPoolConfig`) — the SAME gap the extension
-//! documents. So the `list` view degrades honestly (count only) and the management verbs return
-//! the node's METHOD_NOT_FOUND until the node ships those methods. The CLI verbs exist now so the
-//! surface reaches parity and lights up with no CLI change once the node implements them.
+//! The node now returns the per-peer list — `control.peerStatus` emits a `peers[]` array of
+//! `{peer_id, address, via, direction}` (rendered IPv6-first below) — and implements
+//! `control.peers.connect` (dial a peer into the pool, #929). The remaining management RPCs
+//! (`control.peers.disconnect`/`setBan`/`setPoolConfig`) are still a node-side gap (the SAME gap the
+//! extension documents): those verbs return the node's METHOD_NOT_FOUND until the node ships them.
+//! The CLI verbs exist now so the surface reaches parity and each lights up with no CLI change once
+//! the node implements it.
 
 use serde_json::{json, Value};
 
