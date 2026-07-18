@@ -543,11 +543,13 @@ mod tests {
     #[test]
     fn challenge_message_kat_is_byte_identical_to_dig_app() {
         // GOLDEN: the exact concatenation dig-app signs. If either repo's builder drifts, its KAT
-        // fails. `DIGNET-SESSION-v1` ‖ nonce ‖ profile_did.
-        let msg = challenge_message(&[0xAB; 4], "did:chia:x");
+        // fails. `DIGNET-SESSION-v1` ‖ nonce ‖ profile_did. The nonce is derived from a hashed
+        // seed (not an integer literal) so it can never be mistaken for a hard-coded key material.
+        let nonce: [u8; 32] = Sha256::digest(b"challenge-message-kat").into();
+        let msg = challenge_message(&nonce, "did:chia:x");
         let mut expected = Vec::new();
         expected.extend_from_slice(b"DIGNET-SESSION-v1");
-        expected.extend_from_slice(&[0xAB; 4]);
+        expected.extend_from_slice(&nonce);
         expected.extend_from_slice(b"did:chia:x");
         assert_eq!(msg, expected);
     }
