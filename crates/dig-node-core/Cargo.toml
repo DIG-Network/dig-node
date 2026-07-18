@@ -75,12 +75,12 @@ getrandom = "0.2"
 # `connect_via_nat`/`query_availability` types would not match ours). The crates.io stack
 # (dig-dht/dig-download/dig-peer-selector) references dig-nat from crates.io "^0.2"; the workspace
 # `[patch.crates-io] dig-nat` below redirects that onto this SAME git source, so the ENTIRE graph shares
-# exactly ONE dig-nat 0.2.1 instance. Resolved to the tracked commit via the lockfile.
+# exactly ONE dig-nat 0.3.0 instance. Resolved to the tracked commit via the lockfile.
 dig-nat = { git = "https://github.com/DIG-Network/dig-nat" }
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "bf1857edc497a9655e9f27c5bb8d4bef1403b73a", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5f8b6fb8aa4127bd3c25805ecfc9f93b59dee58b", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. No
 # `rev` so cargo unifies to the SAME dig-constants source dig-nat/dig-gossip already resolve (one copy).
-dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants" }
+dig-constants = { version = "0.4", git = "https://github.com/DIG-Network/dig-constants" }
 # -- L7 content-location DHT (PHASE-B, #163) ---------------------------------------------------------
 # The Kademlia DHT that maps DIG content (store / capsule / root / resource) to the peer_ids holding
 # it. The node LOCATES content it lacks via `find_providers`, and keeps its OWN held-inventory provider
@@ -90,9 +90,9 @@ dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-con
 # Sourcing: the crates.io release (NC-7: prefer the published version over bare-git now that dig-dht
 # is on crates.io). dig-download + dig-peer-selector below ALSO resolve dig-dht from crates.io "0.1",
 # so cargo unifies to ONE dig-dht instance — dig-dht's `PeerId` / `Contact` / `DhtTransport` share the
-# exact types `dig_nat::connect` returns. dig-dht deps dig-nat "^0.2" (crates.io); the workspace
+# exact types `dig_nat::connect` returns. dig-dht deps dig-nat ">=0.2,<0.4" (crates.io); the workspace
 # `[patch.crates-io] dig-nat = { git }` below redirects THAT onto the single git dig-nat instance
-# dig-gossip forces, so the whole graph shares ONE dig-nat 0.2.1.
+# dig-gossip forces, so the whole graph shares ONE dig-nat 0.3.0.
 dig-dht = "0.1"
 # -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
 # The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
