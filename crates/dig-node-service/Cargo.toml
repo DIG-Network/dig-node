@@ -138,7 +138,7 @@ dig-urn-resolver = "0.3.1"
 # 0.3.0 instance. (The earlier rev-pin existed only to hold this crate on 0.3.0 while dig-node-core
 # was still on 0.2.x; core has since advanced to "0.3", so a single bare-git 0.3.0 now satisfies
 # every reference and the distinct-source workaround is no longer needed.)
-dig-constants = { version = "0.3", git = "https://github.com/DIG-Network/dig-constants" }
+dig-constants = { version = "0.4", git = "https://github.com/DIG-Network/dig-constants" }
 
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the
 # SCM; the binary the SCM launches must itself speak the service protocol

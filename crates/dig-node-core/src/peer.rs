@@ -214,21 +214,30 @@ impl PeerStatus {
 /// `{ peer_id, address, via, direction }`. This is the machine-checkable proof surface for a mutual
 /// A↔B connection (each side lists the OTHER's `peer_id`), beyond the bare `connected_peers` count.
 ///
-/// Sourced from [`connected_pool_peers`](dig_gossip::GossipHandle::connected_pool_peers): each entry
-/// carries the dialable socket `address` + the `outbound`/`inbound` `direction`. Every pooled peer is
-/// a direct-TLS link (`via = "direct"`) — the connected pool currently admits only directly-dialed
-/// peers; the relay-transport peer kind (`via = "relay"`) is a forward-compatible field a later
-/// dig-gossip upgrade fills. Addresses render with the family implicit in the socket string; the CLI
-/// orders them IPv6-first (§5.2). Returns an empty vec when no peer network is running.
+/// Sourced from [`connected_pool_peers`](dig_gossip::GossipHandle::connected_pool_peers) (dialable
+/// socket `address` + `outbound`/`inbound` `direction`) joined by `peer_id` with the REAL transport
+/// `via` from dig-gossip 0.3.0's
+/// [`connected_pool_peers_with_via`](dig_gossip::GossipHandle::connected_pool_peers_with_via) (#924 B2):
+/// a peer whose gossip rides the relay's RLY-002 forwarder reports `via = "relay"`, every other peer
+/// `via = "direct"`. Addresses render with the family implicit in the socket string; the CLI orders
+/// them IPv6-first (§5.2). Returns an empty vec when no peer network is running.
 pub(crate) fn connected_peers_json(handle: &dig_gossip::GossipHandle) -> Vec<Value> {
+    use dig_gossip::nat::peer_record::Via;
+    // The real per-peer transport kind, keyed by peer_id — joined onto the address/direction rows.
+    let via_by_peer: std::collections::HashMap<_, _> =
+        handle.connected_pool_peers_with_via().into_iter().collect();
     handle
         .connected_pool_peers()
         .into_iter()
         .map(|(peer_id, addr, outbound)| {
+            let via = match via_by_peer.get(&peer_id) {
+                Some(Via::Relay) => "relay",
+                _ => "direct",
+            };
             json!({
                 "peer_id": hex::encode(peer_id),
                 "address": addr.to_string(),
-                "via": "direct",
+                "via": via,
                 "direction": if outbound { "outbound" } else { "inbound" },
             })
         })
@@ -371,6 +380,20 @@ pub fn gossip_port_from_env() -> u16 {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_GOSSIP_PORT)
+}
+
+/// The node's gossip listen candidates to advertise in the relay reservation's RLY-001 `Register`
+/// (#870 B1, dig-nat 0.3.0 `Register.listen_addrs`). The gossip pool binds a dual-stack socket on
+/// `gossip_port`; the node advertises that port on the IPv6 unspecified address FIRST, then the IPv4
+/// unspecified address (§5.2 IPv6-first, IPv4-fallback). The relay performs reflexive-IP substitution
+/// — it pairs the advertised PORT with the source IP it observes — so a peer behind a different NAT
+/// receives a DIALABLE `<reflexive-ip>:<gossip-port>` candidate (SPEC §19.8).
+pub fn gossip_listen_candidates(gossip_port: u16) -> Vec<std::net::SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    vec![
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, gossip_port)),
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, gossip_port)),
+    ]
 }
 
 // -- Local inventory → L7 availability / inventory / range -------------------------------------------
@@ -1191,13 +1214,17 @@ fn wire_relay_reservation(
     endpoint: String,
     peer_id: String,
     network_id: String,
+    listen_addrs: Vec<std::net::SocketAddr>,
 ) -> Arc<dig_nat::relay::RelayStatus> {
     let status = dig_nat::relay::RelayStatus::new();
     handle.attach_relay_status(status.clone());
     if enabled {
         let status = status.clone();
         tokio::spawn(async move {
-            dig_nat::relay::run_relay_connection(endpoint, peer_id, network_id, status).await;
+            // B1 (#870): advertise the node's gossip listen candidates so the relay's reflexive
+            // substitution can hand another peer a DIALABLE candidate for this node.
+            dig_nat::relay::run_relay_connection(endpoint, peer_id, network_id, listen_addrs, status)
+                .await;
         });
     } else {
         status.set_disabled();
@@ -1298,6 +1325,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         relay_endpoint.clone(),
         peer_id_hex.clone(),
         network_id_str.clone(),
+        gossip_listen_candidates(gossip_port_from_env()),
     );
 
     // 3. Keep the pool status fresh for `control.peerStatus`: the directly-connected count, the
@@ -1908,6 +1936,7 @@ mod tests {
             DEFAULT_RELAY_URL.to_string(),
             "ab".repeat(32),
             DEFAULT_NETWORK_ID.to_string(),
+            gossip_listen_candidates(0),
         );
 
         // Before: no reservation held → the pool reports the relay disconnected.
