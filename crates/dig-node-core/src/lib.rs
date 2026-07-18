@@ -296,8 +296,9 @@ pub struct Node {
     self_ref: OnceLock<std::sync::Weak<Node>>,
     /// The live [`dig_gossip::GossipHandle`] for the node's connected peer pool, retained by the
     /// standalone peer-network bring-up ([`peer::run_peer_network`]) so the CONTROL surface can act on
-    /// the pool: dial a peer (`control.peers.connect`) and enumerate the connected peers per-peer
-    /// (`control.peerStatus` → the `peers` array). Set ONCE via [`Node::set_gossip_handle`]; NEVER set
+    /// the pool: dial a peer (`control.peers.connect`), drop one (`control.peers.disconnect`), and
+    /// enumerate the connected peers per-peer (`control.peerStatus` → the `peers` array). Set ONCE via
+    /// [`Node::set_gossip_handle`]; NEVER set
     /// on the in-process FFI path (the browser is a pure consumer with no pool), where the connect verb
     /// reports "no peer network" and the peer list is empty.
     gossip: OnceLock<dig_gossip::GossipHandle>,
@@ -2630,6 +2631,26 @@ pub async fn handle_rpc(node: &Node, req: Value) -> Value {
             Err(e) => control_err(&id, CONTROL_ERROR, &format!("connect failed: {e}")),
         };
     }
+    // control.peers.disconnect — drop a pooled peer by peer_id, closing its mTLS link (the inverse of
+    // control.peers.connect). CONTROL-plane: loopback admin / in-process FFI ONLY, NEVER over the mTLS
+    // peer surface (absent from `is_peer_reachable_method`). Idempotent: disconnecting a peer that is
+    // not connected succeeds as a no-op. A no-op "no peer network" on the FFI path.
+    if method == "control.peers.disconnect" {
+        let params = req.get("params").cloned().unwrap_or(json!({}));
+        let peer = params.get("peer").and_then(Value::as_str).unwrap_or("");
+        let Some(handle) = node.gossip_handle() else {
+            return control_err(
+                &id,
+                CONTROL_ERROR,
+                "no peer network is running on this node",
+            );
+        };
+        return match peer::disconnect_peer(handle, peer).await {
+            Ok(()) => json!({"jsonrpc":"2.0","id":id,
+                "result": {"disconnected": true, "peer_id": peer.trim().to_ascii_lowercase()}}),
+            Err(e) => control_err(&id, CONTROL_ERROR, &format!("disconnect failed: {e}")),
+        };
+    }
     // control.subscribe / control.unsubscribe / control.listSubscriptions (SPEC §6) — manage the
     // node's OWN persisted set of subscribed stores (the stores it actively watches + gap-fills). These
     // are CONTROL-plane methods: reachable ONLY from the loopback admin server / in-process FFI
@@ -4178,9 +4199,11 @@ mod tests {
             "control.unsubscribe",
             "control.listSubscriptions",
             // The peer-management + status control methods stay loopback/in-process only: a remote
-            // mTLS peer must NOT be able to drive a dial (`control.peers.connect`) or read the local
-            // pool snapshot (`control.peerStatus`) — the allowlist-by-construction property (#929).
+            // mTLS peer must NOT be able to drive a dial (`control.peers.connect`), drop a peer
+            // (`control.peers.disconnect`), or read the local pool snapshot (`control.peerStatus`) —
+            // the allowlist-by-construction property (#929).
             "control.peers.connect",
+            "control.peers.disconnect",
             "control.peerStatus",
         ] {
             assert!(
