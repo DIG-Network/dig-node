@@ -66,9 +66,13 @@ use crate::CachedCapsule;
 // -- Constants ---------------------------------------------------------------------------------------
 
 /// Default relay endpoint (canonical public relay). Overridable with `DIG_RELAY_URL`; `off` disables
-/// the reservation. Mirrors `dig_constants::DIG_RELAY_URL` / the retired relay client's default so an
-/// operator's existing `DIG_RELAY_URL` keeps working.
-pub const DEFAULT_RELAY_URL: &str = "wss://relay.dig.net:9450";
+/// the reservation.
+///
+/// Single-sourced from `dig_constants::DIG_RELAY_URL` so the node dials the ONE canonical relay
+/// endpoint and can never drift from it. The public relay serves the reservation wire on `:443`
+/// (a hard-coded `:9450` here silently failed every stock node's reservation — the port is closed
+/// on relay.dig.net; see the WU7 EC2 connect proof).
+pub const DEFAULT_RELAY_URL: &str = dig_constants::DIG_RELAY_URL;
 
 /// Default network id a node registers + discovers under (matches dig-gossip / the relay wire).
 pub const DEFAULT_NETWORK_ID: &str = "DIG_MAINNET";
@@ -277,6 +281,33 @@ pub(crate) async fn connect_peer(
     ))
 }
 
+/// Drop a pooled peer for `control.peers.disconnect`, closing its link and letting the pool
+/// replenish toward target.
+///
+/// The `peer` argument is a bare `peer_id` (64-hex, the `SHA-256(TLS SPKI DER)` a connect/peerStatus
+/// reported). It is decoded into the gossip [`PeerId`](dig_gossip::PeerId) (a chia `Bytes32`) and
+/// handed to [`disconnect`](dig_gossip::GossipHandle::disconnect), which closes the mTLS link and
+/// publishes the pool-churn event. Idempotent: disconnecting a `peer_id` that is not (or no longer) a
+/// pool member succeeds as a no-op — the post-state (that peer is not connected) is the same either
+/// way. Fails deterministically on a malformed `peer_id`; never panics.
+pub(crate) async fn disconnect_peer(
+    handle: &dig_gossip::GossipHandle,
+    peer: &str,
+) -> Result<(), String> {
+    let peer = peer.trim();
+    let bytes = hex::decode(peer)
+        .ok()
+        .filter(|b| b.len() == 32)
+        .ok_or_else(|| format!("{peer:?} is not a 64-hex peer_id"))?;
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    let peer_id = chia_protocol::Bytes32::new(arr);
+    handle
+        .disconnect(&peer_id)
+        .await
+        .map_err(|e| format!("disconnect {peer}: {e}"))
+}
+
 // -- Environment resolution (relay endpoint / network id / port) -------------------------------------
 
 /// Resolve the relay endpoint: `DIG_RELAY_URL` if set + non-empty, else [`DEFAULT_RELAY_URL`]. Pure
@@ -389,11 +420,24 @@ pub fn gossip_port_from_env() -> u16 {
 /// — it pairs the advertised PORT with the source IP it observes — so a peer behind a different NAT
 /// receives a DIALABLE `<reflexive-ip>:<gossip-port>` candidate (SPEC §19.8).
 pub fn gossip_listen_candidates(gossip_port: u16) -> Vec<std::net::SocketAddr> {
+    use dig_ip::{CandidateSource, Family, PeerCandidates};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-    vec![
+
+    // Aggregate + source-tag the two wildcard listen addresses, then emit them in dig_ip::Family
+    // preference order (IPv6 before IPv4) — the family ordering is dig-ip's, not hand-rolled here.
+    let mut candidates = PeerCandidates::new();
+    candidates.add(
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, gossip_port)),
+        CandidateSource::ListenAddr,
+    );
+    candidates.add(
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, gossip_port)),
-    ]
+        CandidateSource::ListenAddr,
+    );
+    Family::PREFERENCE
+        .iter()
+        .flat_map(|family| candidates.of_family(*family))
+        .collect()
 }
 
 // -- Local inventory → L7 availability / inventory / range -------------------------------------------
@@ -1547,12 +1591,9 @@ async fn bring_up_dht(
     // with no routable address advertises nothing here and stays reachable via the relay tiers dig-nat
     // composes; loopback/in-process setups opt into a loopback candidate via DIG_NODE_ADVERTISE_LOOPBACK.
     let port = peer_port_from_env();
-    let local =
-        crate::net::advertised_socket_addrs(port, crate::net::advertise_loopback_from_env());
-    // Add this node's STUN-discovered server-reflexive (public) address to the advertised set (#385)
-    // so a remote peer behind a different NAT can dial / hole-punch to it, not just to a LAN-local
-    // address. Best-effort + bounded: a failure (no STUN server, timeout) advertises the local
-    // addresses only. The reflexive candidate is merged IPv6-first (§5.2) by `merge_reflexive`.
+    // This node's STUN-discovered server-reflexive (public) address (#385), so a remote peer behind a
+    // different NAT can dial / hole-punch to it, not just to a LAN-local address. Best-effort +
+    // bounded: a failure (no STUN server, timeout) advertises the local addresses only.
     let reflexive = match stun_server {
         Some(stun) => crate::net::reflexive_via_stun(stun, config.rpc_timeout).await,
         None => None,
@@ -1562,10 +1603,17 @@ async fn bring_up_dht(
             "dig-node peer network: STUN reflexive address {r} added to advertised candidates"
         );
     }
-    let local_addresses: Vec<CandidateAddr> = crate::net::merge_reflexive(local, reflexive)
-        .into_iter()
-        .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
-        .collect();
+    // Assemble the advertised candidate set, IPv6-first via dig_ip::Family (the reflexive leads its
+    // family group); see `crate::net::assemble_advertised`. The wildcard bind (`[::]` / `0.0.0.0`)
+    // is never a candidate.
+    let local_addresses: Vec<CandidateAddr> = crate::net::advertised_socket_addrs_with_reflexive(
+        port,
+        crate::net::advertise_loopback_from_env(),
+        reflexive,
+    )
+    .into_iter()
+    .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
+    .collect();
     let service = Arc::new(DhtService::new(
         identity.peer_id,
         local_addresses,
@@ -1975,8 +2023,155 @@ mod tests {
         assert!(err.contains("dialable address"), "got: {err}");
     }
 
-    /// Build a real, freshly-started `GossipHandle` on an OS-assigned port for the pool-handle tests.
+    /// Whether the host has a usable IPv6 loopback stack. Some CI sandboxes disable IPv6 entirely,
+    /// in which case a `[::1]` dial cannot be exercised; the two-node test skips rather than reporting
+    /// a false failure unrelated to this crate's connect logic (mirrors dig-gossip's CON-002 guard).
+    async fn host_has_ipv6_loopback() -> bool {
+        tokio::net::TcpListener::bind("[::1]:0").await.is_ok()
+    }
+
+    /// Read a pooled peer's transport `via` from the per-peer JSON, or `None` if that `peer_id` is
+    /// not in the pool. The mutual-connection proof surface for the A↔B check below.
+    fn via_of(handle: &dig_gossip::GossipHandle, peer_id_hex: &str) -> Option<String> {
+        connected_peers_json(handle)
+            .into_iter()
+            .find(|p| p["peer_id"] == peer_id_hex)
+            .map(|p| p["via"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Poll `connected_peers_json` until it reports at least one peer (the inbound side registers the
+    /// dial asynchronously after the handshake completes), up to a short deadline. Returns the
+    /// per-peer rows once non-empty, else an empty vec on timeout.
+    async fn await_any_peer(handle: &dig_gossip::GossipHandle) -> Vec<Value> {
+        for _ in 0..50 {
+            let peers = connected_peers_json(handle);
+            if !peers.is_empty() {
+                return peers;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Vec::new()
+    }
+
+    /// Whether the gossip inbound-accept path registers a loopback peer into the connected pool on
+    /// this platform. Only asserted on Linux — the EC2 A↔B target and the CI test OS (`ubuntu-latest`).
+    /// The Windows/macOS native-tls (SChannel/Security.framework) inbound loopback path does not fold
+    /// an accepted peer into the pool the way OpenSSL does (the same `[::]`-v6only / native-tls class
+    /// of dev-host quirk tracked for the extension-offline path), so on those hosts the MUTUAL half is
+    /// skipped with a notice rather than reported as a false failure. A's OUTBOUND half + the
+    /// `control.peerStatus` remote-peer_id instrument + `control.peers.disconnect` are proven on every
+    /// platform.
+    const POOL_REGISTERS_INBOUND_LOOPBACK: bool = cfg!(target_os = "linux");
+
+    /// **The #853 bar in miniature (#980):** two real nodes handshake over loopback mTLS and each
+    /// lists the OTHER in `control.peerStatus` — the machine-checkable proof of a MUTUAL A↔B
+    /// connection, run locally BEFORE any EC2 time is spent. Node A dials node B IPv6-first
+    /// (`[::1]:<port>`, §5.2); the returned `peer_id` is B's real cert id (solid on every platform —
+    /// the server cert is always visible to the dialing client), and A's `connected_peers_json` (the
+    /// exact source `control.peerStatus` serves — see `handle_rpc`) lists B's REMOTE peer_id + `via` +
+    /// direction, proving the peerStatus instrument surfaces remote peers. On Linux (the CI + EC2
+    /// target) B's pool lists A as an INBOUND peer whose `peer_id` equals A's `local_peer_id` — the
+    /// full mutual-id proof. Then A disconnects B via `control.peers.disconnect` and its pool drops the
+    /// link.
+    #[tokio::test]
+    async fn two_nodes_connect_over_loopback_and_each_sees_the_other() {
+        if !host_has_ipv6_loopback().await {
+            eprintln!("skipping: host has no usable IPv6 loopback stack");
+            return;
+        }
+        // The gossip mTLS stack needs a process-global rustls crypto provider; install it up front so
+        // this test is order-independent (production installs it during node bring-up).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // Same network_id on both — a mismatch would be rejected at handshake. B binds a concrete
+        // IPv6 loopback (§5.2 IPv6-first) so the inbound accept registers on every platform.
+        let loopback_v6 = "[::1]:0".parse().expect("parse [::1]:0");
+        let node_a = fresh_pool_handle("loopback-a", [0x5au8; 32]).await;
+        let node_b = fresh_pool_handle_on("loopback-b", [0x5au8; 32], loopback_v6).await;
+
+        let a_peer_id = hex::encode(node_a.local_peer_id().expect("node A local_peer_id"));
+        let b_port = node_b
+            .__listen_bound_addr_for_tests()
+            .expect("node B bound listen addr")
+            .port();
+
+        // A dials B on the IPv6 loopback (§5.2 IPv6-first); connect_peer returns B's observed peer_id.
+        let b_addr = format!("[::1]:{b_port}");
+        let b_peer_id = connect_peer(&node_a, &b_addr)
+            .await
+            .expect("node A dials node B over loopback mTLS");
+
+        // A's pool lists B by B's real cert id (A initiated the dial → synchronous), over a DIRECT
+        // transport, in the OUTBOUND direction — A's half of the mutual proof.
+        let a_view = connected_peers_json(&node_a);
+        let a_sees_b = a_view
+            .iter()
+            .find(|p| p["peer_id"] == b_peer_id)
+            .expect("node A must list node B's peer_id");
+        assert_eq!(a_sees_b["via"], "direct", "A→B is a direct-TLS link");
+        assert_eq!(a_sees_b["direction"], "outbound", "A dialed B");
+
+        // B's pool lists A once the inbound handshake registers (asynchronous) — the MUTUAL half.
+        // Only the OpenSSL (Linux) native-tls path folds the accepted loopback peer into the pool.
+        if POOL_REGISTERS_INBOUND_LOOPBACK {
+            let b_view = await_any_peer(&node_b).await;
+            assert_eq!(
+                b_view.len(),
+                1,
+                "node B must list exactly one peer (node A) — proving a MUTUAL A↔B connection"
+            );
+            assert_eq!(b_view[0]["direction"], "inbound", "B accepted A's dial");
+            assert_eq!(
+                b_view[0]["peer_id"], a_peer_id,
+                "node B must list node A's REAL peer_id — the full mutual-id #853 proof"
+            );
+        } else {
+            eprintln!(
+                "skipping the inbound MUTUAL half: this platform's native-tls does not register an \
+                 accepted loopback peer into the pool (Linux/CI/EC2 enforces it)"
+            );
+        }
+
+        // control.peers.disconnect: A drops B; A's pool loses the link.
+        disconnect_peer(&node_a, &b_peer_id)
+            .await
+            .expect("node A disconnects node B");
+        assert!(
+            via_of(&node_a, &b_peer_id).is_none(),
+            "after disconnect, node A must no longer list node B"
+        );
+        // Disconnecting an already-gone peer_id is an idempotent no-op (still Ok).
+        disconnect_peer(&node_a, &b_peer_id)
+            .await
+            .expect("disconnect is idempotent");
+    }
+
+    /// `control.peers.disconnect` rejects a malformed `peer_id` DETERMINISTICALLY (not 64-hex),
+    /// mirroring the connect arg-validation path — no network touch, no hang.
+    #[tokio::test]
+    async fn disconnect_peer_rejects_a_malformed_peer_id() {
+        let handle = fresh_pool_handle("disconnect-bad-arg", [7u8; 32]).await;
+        let err = disconnect_peer(&handle, "not-hex").await.unwrap_err();
+        assert!(err.contains("64-hex peer_id"), "got: {err}");
+    }
+
+    /// Build a real, freshly-started `GossipHandle` on the production-shaped dual-stack unspecified
+    /// bind (`[::]:0`, §5.2) for the pool-handle tests.
     async fn fresh_pool_handle(tag: &str, network: [u8; 32]) -> dig_gossip::GossipHandle {
+        fresh_pool_handle_on(tag, network, crate::net::dual_stack_listen_addr(0)).await
+    }
+
+    /// Build a freshly-started `GossipHandle` bound on an explicit `listen_addr`.
+    ///
+    /// The two-node loopback proof binds its LISTENER on a CONCRETE IPv6 loopback (`[::1]:0`) rather
+    /// than the unspecified dual-stack `[::]:0`: on Windows a `[::]`-unspecified bind does not accept
+    /// inbound loopback connections into the pool (the native-tls dual-stack accept quirk — the same
+    /// family of `[::]`-v6only issue tracked for the extension-offline path), whereas a concrete
+    /// loopback bind does, on every platform. Production still binds dual-stack `[::]` (`run_peer_network`).
+    async fn fresh_pool_handle_on(
+        tag: &str,
+        network: [u8; 32],
+        listen_addr: std::net::SocketAddr,
+    ) -> dig_gossip::GossipHandle {
         let dir = std::env::temp_dir().join(format!("dig-node-{tag}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg = dig_gossip::GossipConfig {
@@ -1985,7 +2180,7 @@ mod tests {
             key_path: dir.join("node.key").display().to_string(),
             peers_file_path: dir.join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
-            listen_addr: crate::net::dual_stack_listen_addr(0),
+            listen_addr,
             ..Default::default()
         };
         dig_gossip::GossipService::new(cfg)
@@ -2015,6 +2210,18 @@ mod tests {
             "case-insensitive opt-out"
         );
         assert!(is_relay_enabled(Some("wss://my-relay:9450")));
+    }
+
+    #[test]
+    fn default_relay_is_canonical_443_endpoint() {
+        // The default MUST be the canonical relay endpoint (`:443`, where relay.dig.net actually
+        // serves the reservation wire) — never a drifted hard-coded port. Regression for the WU7
+        // proof, where a stale `:9450` default silently failed every stock node's reservation.
+        assert_eq!(DEFAULT_RELAY_URL, dig_constants::DIG_RELAY_URL);
+        assert!(
+            DEFAULT_RELAY_URL.ends_with(":443"),
+            "canonical relay endpoint serves :443, got {DEFAULT_RELAY_URL}"
+        );
     }
 
     // #285: DIG_NETWORK_GENESIS env override — unset/invalid/zero fall back to the pre-launch

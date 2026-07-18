@@ -1366,9 +1366,10 @@ reachable from a CLI verb, so a new node control method cannot ship without a CL
 
 - `peers [list]` → `control.peerStatus` — the live peer status: running flag, connected count,
   relay reservation, and a **per-peer array** `peers[]`, each element
-  `{ peer_id, address, via, direction }` where `via ∈ {"direct","relay"}` (transport; currently always
-  `"direct"` — the connected pool admits only directly-dialed peers, and `"relay"` is a
-  forward-compatible value a later dig-gossip upgrade fills) and `direction ∈ {"outbound","inbound"}`.
+  `{ peer_id, address, via, direction }` where `via ∈ {"direct","relay"}` is the REAL per-peer
+  transport (a peer whose gossip rides the relay's RLY-002 forwarder reports `"relay"`, every other
+  peer `"direct"`, sourced from dig-gossip's `connected_pool_peers_with_via`) and
+  `direction ∈ {"outbound","inbound"}`.
   The array is present whenever a peer network is running and
   omitted (count only) on the in-process FFI path / before bring-up. The per-peer `peer_id` is the
   machine-checkable proof of a mutual A↔B connection (each side lists the other's `peer_id`). Peer
@@ -1379,11 +1380,16 @@ reachable from a CLI verb, so a new node control method cannot ship without a CL
   `{ connected: true, peer_id }`; a bare unknown `peer_id`, a malformed argument, a dial failure, or no
   running peer network each return a deterministic control error. CONTROL-plane — reachable only from
   the loopback admin / in-process dispatch, NEVER over the mTLS peer surface.
-- `peers disconnect <peer>` → `control.peers.disconnect`; `peers ban <peer> --state <ban|blacklist|none>`
-  → `control.peers.setBan`; `peers pool-config --max-connections <n>` → `control.peers.setPoolConfig`
-  remain a **known node-side gap**: until the node ships those RPCs those verbs surface the node's
-  METHOD_NOT_FOUND. The CLI verbs exist now so the surface reaches parity and lights up with NO CLI
-  change once the node implements them.
+- `peers disconnect <peer>` → `control.peers.disconnect` — drop a pooled peer, closing its mTLS link
+  (the inverse of `connect`). `peer` is a `peer_id` (64-hex); the pool then replenishes toward target.
+  Returns `{ disconnected: true, peer_id }`. Idempotent — disconnecting a `peer_id` that is not (or no
+  longer) connected succeeds as a no-op. A malformed `peer_id` or no running peer network returns a
+  deterministic control error. CONTROL-plane — loopback admin / in-process dispatch only, NEVER over
+  the mTLS peer surface.
+- `peers ban <peer> --state <ban|blacklist|none>` → `control.peers.setBan`; `peers pool-config
+  --max-connections <n>` → `control.peers.setPoolConfig` remain a **known node-side gap**: until the
+  node ships those RPCs those verbs surface the node's METHOD_NOT_FOUND. The CLI verbs exist now so the
+  surface reaches parity and lights up with NO CLI change once the node implements them.
 
 ### 8.5. `open` — the OS scheme handler (#389)
 
@@ -2749,6 +2755,15 @@ reflexive IPv4 address leads the IPv4 fallback group — so a peer behind a diff
 hole-punch to it. Discovery is best-effort + bounded; on failure the node advertises its local addresses
 only. The wildcard bind address (`[::]`/`0.0.0.0`) is never advertised as a candidate.
 
+The advertise path — candidate aggregation, family keying, de-duplication, and the IPv6-first family
+ordering — is delegated to the canonical [`dig-ip`](https://crates.io/crates/dig-ip) crate (CLAUDE.md
+§5.2, the ecosystem's single source of truth for the address-family / IPv6-first contract). Advertised
+candidates are aggregated + source-tagged (`dig_ip::CandidateSource::StunReflexive` / `ListenAddr`) +
+de-duplicated by `dig_ip::PeerCandidates`, then emitted in `dig_ip::Family` preference order (V6 before
+V4); the node MUST NOT hand-roll a family sort in the advertise path. The DIAL path inherits the
+local∩peer family intersection from dig-nat (which itself uses dig-ip), so the node does not duplicate
+that intersection logic.
+
 ### 19.3. Content location — dig-dht is the sole locator
 
 Content location ("which peers hold capsule X?") is the dig-dht provider index, and ONLY that: the live
@@ -2804,20 +2819,23 @@ Exercising the connected pool end-to-end is gated on the network-genesis bring-u
 placeholder genesis is rejected by `GossipService::start`); these behaviors are unit-tested
 independently of a live pool.
 
-### 19.8. Relay reservation — control dial + advertised listen candidates (partial)
+### 19.8. Relay reservation — control dial + advertised listen candidates
 
 The node holds ONE persistent relay reservation (dig-nat `run_relay_connection`) sharing a single
-`Arc<RelayStatus>` with the gossip pool. Advertising the node's real gossip listen candidates in the
-RLY-001 `Register` message (`listen_addrs`, so the relay's reflexive substitution can hand another peer
-a DIALABLE candidate) is a **release-first follow-up**: it requires dig-nat 0.3.0's `Register.listen_addrs`
-field, and dig-nat 0.3.0 can only be adopted once dig-dht, dig-download, and dig-peer-selector are
-republished accepting dig-nat `>=0.2,<0.4` (they currently pin `^0.2`, so the graph cannot unify at
-dig-nat 0.3.0). Until then the reservation registers without advertised candidates.
+`Arc<RelayStatus>` with the gossip pool. The reservation advertises the node's real gossip listen
+candidates in the RLY-001 `Register` message (`listen_addrs`, dig-nat 0.3.0's `Register.listen_addrs`
+field): the node offers its `gossip_port` on the IPv6 unspecified address FIRST, then the IPv4
+unspecified address (§5.2 IPv6-first). The relay performs reflexive-IP substitution — it pairs the
+advertised PORT with the source IP it observes — so a peer behind a different NAT receives a DIALABLE
+`<reflexive-ip>:<gossip-port>` candidate. dig-nat 0.3.0 is adopted now that dig-dht, dig-download, and
+dig-peer-selector are republished accepting dig-nat `>=0.2,<0.4`, so the graph unifies at exactly one
+dig-nat 0.3.0.
 
 The node retains the live `GossipHandle` for the pool so the CONTROL surface can act on it:
-`control.peers.connect` dials a discovered/known peer into the connected pool, and `control.peerStatus`
-enumerates the pool as the per-peer array (§8.7). The in-process FFI host runs no peer network, so it
-retains no handle — connect reports "no peer network" and the peer array is omitted.
+`control.peers.connect` dials a discovered/known peer into the connected pool, `control.peers.disconnect`
+drops a pooled peer, and `control.peerStatus` enumerates the pool as the per-peer array (§8.7). The
+in-process FFI host runs no peer network, so it retains no handle — connect/disconnect report "no peer
+network" and the peer array is omitted.
 
 ## 20. Logging — structured JSONL file + human stderr (#553)
 

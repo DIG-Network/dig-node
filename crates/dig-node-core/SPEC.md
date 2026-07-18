@@ -586,7 +586,7 @@ unless `DIG_PEER_NETWORK` is `off`/`0`/`false`; the in-process FFI host never do
    whole-store sync, which needs neither, so a failed (or unavailable) P2P bring-up MUST NOT disable
    autonomous sync;
 3. bring up the dig-gossip connected pool + relay introducer registration (relay via `DIG_RELAY_URL`,
-   default `wss://relay.dig.net:9450`), and a background task that refreshes pool status (~10 s);
+   default `wss://relay.dig.net:443`), and a background task that refreshes pool status (~10 s);
 4. bring up the dig-dht content-location DHT (bootstrap from the gossip pool), and announce the held
    inventory (§6.2);
 5. wire the multi-source content engine (`NodeContent`) to the DHT + the selector (fed by pool churn),
@@ -909,7 +909,7 @@ cache cap is `config.json` > env > default).
 | `DIG_PEER_NETWORK` | `off`/`0`/`false` disables the peer network (read path only) | on |
 | `DIG_NETWORK_ID` | network id for peer discovery / handshake scope | `DIG_MAINNET` |
 | `DIG_NETWORK_GENESIS` | gossip `network_id` genesis-challenge override (64-hex, 32 bytes); invalid/unset/zero ⇒ placeholder (§7.2) | `dig_constants::DIG_MAINNET.genesis_challenge()` (all-zero placeholder) |
-| `DIG_RELAY_URL` | relay endpoint (`off`/`disabled` disables the reservation) | `wss://relay.dig.net:9450` |
+| `DIG_RELAY_URL` | relay endpoint (`off`/`disabled` disables the reservation) | `wss://relay.dig.net:443` |
 | `DIG_NODE_ADVERTISE_LOOPBACK` | advertise loopback candidates when no routable address (§7.3) | off |
 | `DIG_WALLET_WC_PROJECT_ID` | WalletConnect project id (persisted in `config.json`) | unset |
 | onion opt-in flag (target) | opt in as an `onion-relay` (§8.2) | off |

@@ -111,42 +111,94 @@ pub fn local_ipv4_addr() -> Option<Ipv4Addr> {
     }
 }
 
-/// The node's advertised, directly-dialable candidate addresses at `port`, ordered **IPv6-first**
-/// (the ecosystem rule): a routable IPv6 address (when discoverable) precedes the IPv4 fallback.
+/// Assemble the node's advertised, directly-dialable candidate addresses, ordered **IPv6-first**
+/// (the ecosystem rule, CLAUDE.md §5.2) via [`dig_ip`].
 ///
-/// `loopback` selects the fallback when NO routable address is discoverable (a test / air-gapped /
-/// loopback-only host): `true` → advertise the loopback pair (`::1` then `127.0.0.1`) so an
-/// in-process/loopback peer can still be reached; `false` → advertise nothing (an unreachable node
-/// relies on the relay tiers, and must never leak a wildcard `[::]` / `0.0.0.0` as a candidate).
+/// Candidates are aggregated + source-tagged + de-duplicated by [`dig_ip::PeerCandidates`], then
+/// emitted in [`dig_ip::Family`] preference order (IPv6 before IPv4) — the family sort is dig-ip's,
+/// never hand-rolled here. Within a family, discovery (insertion) order is preserved, and the
+/// STUN-discovered server-reflexive (public) address — the most-dialable candidate for a NAT'd node —
+/// is added FIRST so it leads its family group.
 ///
-/// This is a pure function of the discovered addresses so the ordering + fallback policy is
-/// unit-testable without a socket (the real discovery lives in [`local_ipv6_addr`]/[`local_ipv4_addr`]).
-pub fn order_advertised(
+/// - `ipv6` / `ipv4` are the host's discovered routable addresses (see [`local_ipv6_addr`] /
+///   [`local_ipv4_addr`]); each is advertised at `port`.
+/// - `reflexive` is the node's STUN server-reflexive address, when known (already carries its port).
+/// - `loopback` selects the fallback when NO routable address is discoverable (a test / air-gapped /
+///   loopback-only host): `true` → advertise the loopback pair (`::1` then `127.0.0.1`) so an
+///   in-process/loopback peer can still be reached; `false` → advertise no local pair (an unreachable
+///   node relies on the relay tiers, and must never leak a wildcard `[::]` / `0.0.0.0` as a candidate).
+///
+/// Pure over its inputs so the ordering + fallback policy is unit-testable without a socket.
+pub fn assemble_advertised(
     ipv6: Option<Ipv6Addr>,
     ipv4: Option<Ipv4Addr>,
+    reflexive: Option<SocketAddr>,
     port: u16,
     loopback: bool,
 ) -> Vec<SocketAddr> {
-    let mut addrs = Vec::new();
+    use dig_ip::{CandidateSource, Family, PeerCandidates};
+
+    let mut candidates = PeerCandidates::new();
+    // Reflexive first → it leads its family group (PeerCandidates keeps within-family insertion order).
+    if let Some(r) = reflexive {
+        candidates.add(r, CandidateSource::StunReflexive);
+    }
+    let mut have_local = false;
     if let Some(v6) = ipv6 {
-        addrs.push(SocketAddr::new(IpAddr::V6(v6), port));
+        candidates.add(
+            SocketAddr::new(IpAddr::V6(v6), port),
+            CandidateSource::ListenAddr,
+        );
+        have_local = true;
     }
     if let Some(v4) = ipv4 {
-        addrs.push(SocketAddr::new(IpAddr::V4(v4), port));
+        candidates.add(
+            SocketAddr::new(IpAddr::V4(v4), port),
+            CandidateSource::ListenAddr,
+        );
+        have_local = true;
     }
-    if addrs.is_empty() && loopback {
-        // Loopback/test fallback: IPv6 loopback FIRST, then IPv4 loopback.
-        addrs.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port));
-        addrs.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+    // Loopback fallback only when the host has no routable local address of its own.
+    if !have_local && loopback {
+        candidates.add(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+            CandidateSource::ListenAddr,
+        );
+        candidates.add(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            CandidateSource::ListenAddr,
+        );
     }
-    addrs
+    // IPv6-first family ordering is dig-ip's `Family::PREFERENCE`, discovery order within each family.
+    Family::PREFERENCE
+        .iter()
+        .flat_map(|family| candidates.of_family(*family))
+        .collect()
 }
 
 /// The node's advertised candidate addresses at `port`, discovering the host's real routable IPv6
-/// (preferred) + IPv4 (fallback) addresses and ordering them IPv6-first via [`order_advertised`].
-/// When nothing routable is discoverable, `loopback` selects the fallback (see [`order_advertised`]).
+/// (preferred) + IPv4 (fallback) addresses and ordering them IPv6-first via [`assemble_advertised`].
+/// When nothing routable is discoverable, `loopback` selects the fallback (see [`assemble_advertised`]).
+/// No reflexive address is included — see [`advertised_socket_addrs_with_reflexive`] for the full set.
 pub fn advertised_socket_addrs(port: u16, loopback: bool) -> Vec<SocketAddr> {
-    order_advertised(local_ipv6_addr(), local_ipv4_addr(), port, loopback)
+    assemble_advertised(local_ipv6_addr(), local_ipv4_addr(), None, port, loopback)
+}
+
+/// The node's advertised candidate addresses at `port`, including the STUN-discovered server-reflexive
+/// (public) address when known — the full set a peer behind a different NAT can dial / hole-punch to.
+/// Ordered IPv6-first via [`assemble_advertised`] (the reflexive leads its family group).
+pub fn advertised_socket_addrs_with_reflexive(
+    port: u16,
+    loopback: bool,
+    reflexive: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    assemble_advertised(
+        local_ipv6_addr(),
+        local_ipv4_addr(),
+        reflexive,
+        port,
+        loopback,
+    )
 }
 
 /// Whether the node should advertise loopback addresses when no routable address is discoverable.
@@ -224,42 +276,9 @@ pub fn stun_server_from_relay(relay_endpoint: &str) -> Option<SocketAddr> {
     use std::net::ToSocketAddrs;
     let host = parse_relay_host(relay_endpoint)?;
     let mut addrs: Vec<SocketAddr> = (host.as_str(), STUN_PORT).to_socket_addrs().ok()?.collect();
-    // IPv6-first: `false` (IPv6) sorts before `true` (IPv4).
-    addrs.sort_by_key(SocketAddr::is_ipv4);
+    // IPv6-first: `dig_ip::Family` orders V6 before V4 (the ecosystem's canonical family sort).
+    addrs.sort_by_key(dig_ip::Family::of);
     addrs.into_iter().next()
-}
-
-/// Merge a STUN-discovered server-reflexive candidate into the advertised set, preserving IPv6-first
-/// ordering + dedup. The reflexive (public) address is the most-dialable candidate for a NAT'd node, so
-/// it leads its family group: an IPv6 reflexive leads the whole list; an IPv4 reflexive leads the IPv4
-/// fallback group (after any IPv6). A reflexive already present is not duplicated. Pure so the ordering
-/// is unit-tested without a socket.
-pub fn merge_reflexive(local: Vec<SocketAddr>, reflexive: Option<SocketAddr>) -> Vec<SocketAddr> {
-    let Some(r) = reflexive else {
-        return local;
-    };
-    if local.contains(&r) {
-        return local;
-    }
-    let mut out = Vec::with_capacity(local.len() + 1);
-    if r.is_ipv6() {
-        out.push(r);
-        out.extend(local);
-        return out;
-    }
-    // IPv4 reflexive: insert before the first IPv4 (after all IPv6), else append.
-    let mut inserted = false;
-    for a in local {
-        if a.is_ipv4() && !inserted {
-            out.push(r);
-            inserted = true;
-        }
-        out.push(a);
-    }
-    if !inserted {
-        out.push(r);
-    }
-    out
 }
 
 /// Best-effort discover this node's server-reflexive (public) address via STUN against `stun_server`,
@@ -345,10 +364,10 @@ mod tests {
     }
 
     #[test]
-    fn order_advertised_puts_ipv6_before_ipv4() {
+    fn assemble_advertised_puts_ipv6_before_ipv4() {
         let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let v4: Ipv4Addr = "203.0.113.7".parse().unwrap();
-        let addrs = order_advertised(Some(v6), Some(v4), 9444, false);
+        let addrs = assemble_advertised(Some(v6), Some(v4), None, 9444, false);
         assert_eq!(addrs.len(), 2);
         assert!(addrs[0].is_ipv6(), "IPv6 candidate must come first");
         assert!(
@@ -360,11 +379,11 @@ mod tests {
     }
 
     #[test]
-    fn order_advertised_never_leaks_wildcard_and_falls_back_to_loopback() {
+    fn assemble_advertised_never_leaks_wildcard_and_falls_back_to_loopback() {
         // No routable address + loopback OFF → advertise NOTHING (never a wildcard / bogus candidate).
-        assert!(order_advertised(None, None, 9444, false).is_empty());
+        assert!(assemble_advertised(None, None, None, 9444, false).is_empty());
         // No routable address + loopback ON → the loopback pair, IPv6 (`::1`) FIRST.
-        let lo = order_advertised(None, None, 9444, true);
+        let lo = assemble_advertised(None, None, None, 9444, true);
         assert_eq!(lo.len(), 2);
         assert_eq!(
             lo[0],
@@ -377,10 +396,67 @@ mod tests {
     }
 
     #[test]
-    fn order_advertised_ipv4_only_host_advertises_ipv4() {
+    fn assemble_advertised_ipv4_only_host_advertises_ipv4() {
         let v4: Ipv4Addr = "203.0.113.7".parse().unwrap();
-        let addrs = order_advertised(None, Some(v4), 9444, false);
+        let addrs = assemble_advertised(None, Some(v4), None, 9444, false);
         assert_eq!(addrs, vec![SocketAddr::new(IpAddr::V4(v4), 9444)]);
+    }
+
+    /// The ticket's acceptance test (#1032): advertised candidates are keyed + ordered by
+    /// `dig_ip::Family` and aggregated via `PeerCandidates` from mixed sources (StunReflexive +
+    /// ListenAddr) across BOTH families — IPv6 group first, the reflexive leading its family group.
+    #[test]
+    fn advertised_candidates_use_dig_ip_family() {
+        let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let v4: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        let reflexive_v4: SocketAddr = "198.51.100.9:9444".parse().unwrap();
+
+        // Mixed sources, both families: local IPv6 + local IPv4 (ListenAddr) + an IPv4 reflexive.
+        let addrs = assemble_advertised(Some(v6), Some(v4), Some(reflexive_v4), 9444, false);
+        assert_eq!(
+            addrs,
+            vec![
+                SocketAddr::new(IpAddr::V6(v6), 9444), // IPv6 family first (dig_ip::Family::V6 < V4)
+                reflexive_v4,                          // IPv4 reflexive leads its family group
+                SocketAddr::new(IpAddr::V4(v4), 9444), // then the local IPv4 fallback
+            ]
+        );
+        // Every emitted address's family key agrees with dig_ip::Family, IPv6 before IPv4.
+        let families: Vec<dig_ip::Family> = addrs.iter().map(dig_ip::Family::of).collect();
+        assert_eq!(
+            families,
+            vec![dig_ip::Family::V6, dig_ip::Family::V4, dig_ip::Family::V4]
+        );
+    }
+
+    #[test]
+    fn assemble_advertised_ipv6_reflexive_leads_and_dedups() {
+        let v6: SocketAddr = "[2001:db8::1]:9444".parse().unwrap();
+        let v4: SocketAddr = "203.0.113.7:9444".parse().unwrap();
+        let reflexive_v6: SocketAddr = "[2606:4700::1]:9444".parse().unwrap();
+        let v6ip = match v6.ip() {
+            IpAddr::V6(a) => a,
+            IpAddr::V4(_) => unreachable!(),
+        };
+        let v4ip = match v4.ip() {
+            IpAddr::V4(a) => a,
+            IpAddr::V6(_) => unreachable!(),
+        };
+        // IPv6 reflexive leads the whole list.
+        assert_eq!(
+            assemble_advertised(Some(v6ip), Some(v4ip), Some(reflexive_v6), 9444, false),
+            vec![reflexive_v6, v6, v4]
+        );
+        // A reflexive equal to a local address is de-duplicated (kept once, in its family group).
+        assert_eq!(
+            assemble_advertised(Some(v6ip), Some(v4ip), Some(v6), 9444, false),
+            vec![v6, v4]
+        );
+        // No reflexive → local pair only.
+        assert_eq!(
+            assemble_advertised(Some(v6ip), Some(v4ip), None, 9444, false),
+            vec![v6, v4]
+        );
     }
 
     // -- #385: full NAT traversal ladder + STUN reflexive discovery ----------------------------------
@@ -442,38 +518,38 @@ mod tests {
     }
 
     #[test]
-    fn merge_reflexive_ipv6_leads_and_dedups() {
-        let v6: SocketAddr = "[2001:db8::1]:9444".parse().unwrap();
-        let v4: SocketAddr = "203.0.113.7:9444".parse().unwrap();
-        let reflexive_v6: SocketAddr = "[2606:4700::1]:9444".parse().unwrap();
-        // IPv6 reflexive leads the whole list.
-        let merged = merge_reflexive(vec![v6, v4], Some(reflexive_v6));
-        assert_eq!(merged, vec![reflexive_v6, v6, v4]);
-        // Already-present reflexive is not duplicated.
-        assert_eq!(merge_reflexive(vec![v6, v4], Some(v6)), vec![v6, v4]);
-        // No reflexive → unchanged.
-        assert_eq!(merge_reflexive(vec![v6, v4], None), vec![v6, v4]);
-    }
-
-    #[test]
-    fn merge_reflexive_ipv4_leads_ipv4_group_after_ipv6() {
-        let v6: SocketAddr = "[2001:db8::1]:9444".parse().unwrap();
-        let v4: SocketAddr = "203.0.113.7:9444".parse().unwrap();
+    fn assemble_advertised_ipv4_reflexive_leads_ipv4_group_after_ipv6() {
+        let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let v4: Ipv4Addr = "203.0.113.7".parse().unwrap();
+        let v6_sa = SocketAddr::new(IpAddr::V6(v6), 9444);
+        let v4_sa = SocketAddr::new(IpAddr::V4(v4), 9444);
         let reflexive_v4: SocketAddr = "198.51.100.9:9444".parse().unwrap();
         // IPv4 reflexive sits after IPv6, before the local IPv4 fallback.
         assert_eq!(
-            merge_reflexive(vec![v6, v4], Some(reflexive_v4)),
-            vec![v6, reflexive_v4, v4]
+            assemble_advertised(Some(v6), Some(v4), Some(reflexive_v4), 9444, false),
+            vec![v6_sa, reflexive_v4, v4_sa]
         );
         // With no local IPv6, the IPv4 reflexive leads.
         assert_eq!(
-            merge_reflexive(vec![v4], Some(reflexive_v4)),
-            vec![reflexive_v4, v4]
+            assemble_advertised(None, Some(v4), Some(reflexive_v4), 9444, false),
+            vec![reflexive_v4, v4_sa]
         );
         // With no local addresses at all, the reflexive is the sole candidate.
         assert_eq!(
-            merge_reflexive(vec![], Some(reflexive_v4)),
+            assemble_advertised(None, None, Some(reflexive_v4), 9444, false),
             vec![reflexive_v4]
         );
+    }
+
+    #[test]
+    fn stun_server_from_relay_prefers_ipv6() {
+        // A pure family-sort check of the dig_ip::Family::of key used by stun_server_from_relay:
+        // given both families, IPv6 sorts before IPv4.
+        let mut addrs: Vec<SocketAddr> = vec![
+            "203.0.113.5:3478".parse().unwrap(),
+            "[2001:db8::5]:3478".parse().unwrap(),
+        ];
+        addrs.sort_by_key(dig_ip::Family::of);
+        assert!(addrs[0].is_ipv6(), "IPv6 STUN address must sort first");
     }
 }

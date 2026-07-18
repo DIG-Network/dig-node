@@ -199,7 +199,7 @@ mod tests {
         let s = format_status(&json!({
             "running": true,
             "connected_peers": 4,
-            "relay": { "url": "wss://relay.dig.net:9450", "reserved": true },
+            "relay": { "url": "wss://relay.dig.net:443", "reserved": true },
         }));
         assert!(s.contains("4 connected peer"));
         assert!(s.contains("relay.dig.net"));
