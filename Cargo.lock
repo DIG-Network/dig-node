@@ -2014,13 +2014,16 @@ dependencies = [
  "hex",
  "rcgen",
  "reqwest",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha2 0.10.9",
  "socket2 0.5.10",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -2029,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.42.0"
+version = "0.43.0"
 dependencies = [
  "axum",
  "axum-server",

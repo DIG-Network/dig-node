@@ -156,12 +156,24 @@ tokio-util = { version = "0.7", features = ["compat"] }
 socket2 = "0.5"
 # RangeFrame ciphertext payloads over the peer stream.
 serde_bytes = "0.11"
+# -- Engine-side identity session (NODE-1, #910) -----------------------------------------------------
+# The engine is IDENTITY-AGNOSTIC: it holds NO user signing key. `control.session.attach` proves the
+# attaching dig-app holds the profile's slot-0x0010 identity key by VERIFYING an Ed25519 signature over
+# the byte-identical `DIGNET-SESSION-v1 ‖ nonce ‖ profile_did` challenge (session.rs). Ed25519
+# verification rides `ring` — ALREADY in the locked graph (the rustls/tokio-rustls transport uses it),
+# so it adds no new crate. VERIFY-ONLY: the engine never holds a signing key. (dig-app signs with
+# ed25519-dalek; ring verifies RFC-8032 signatures + is strict against malleable/small-order inputs.)
+ring = "0.17"
+# Ergonomic error enums (AttachError) — already in the locked graph.
+thiserror = "1"
 # The peer transport still frames JSON over the mux + speaks async stream traits.
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Derives deterministic test key seeds + nonces (no hard-coded crypto literals — CodeQL flags those).
+sha2 = "0.10"
 # axum is a TEST-ONLY dependency of the engine library: the node no longer serves its
 # own HTTP (the `dig-node-service` shell owns the axum transport, `dig-runtime` owns the
 # in-process FFI path — dispatch is `handle_rpc`, which is transport-agnostic). The

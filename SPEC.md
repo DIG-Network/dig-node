@@ -1316,6 +1316,59 @@ carries a bounded wall-clock timeout (120 s). A hung child (a wedged scheduler A
 write) is cancelled and reported as a failed kick, so it can never block the pass or starve future
 6-hourly ticks — the pass logs the timeout and continues, and the serve path is never affected.
 
+### 7.15. Engine-side identity session library (NODE-1 / U2, #910)
+
+The engine exposes a transport-agnostic LIBRARY (`dig_node_core::session`) that verifies an
+identity-authenticated IPC session on behalf of the `control.session.*` handshake. The engine is
+**identity-agnostic**: it holds NO user signing key and can NEVER mint a signature with one. A dig-app
+proves possession of a profile's slot-`0x0010` identity key; the engine only VERIFIES that proof and
+tracks the resulting session in memory.
+
+This subsection specifies the library's contract. The `control.session.*` WIRE transport, the
+production on-chain DID resolver, and the removal of the node-custodied wallet from the engine binary
+are the NODE-1 engine-carve follow-up (they depend on the on-chain DID→store resolution layer,
+dig-identity **#778 WU3**, which is not yet shipped); until then this module is a verified building
+block, not a wired transport.
+
+**Domain-separated signed messages (byte-identical to dig-app, HARD RULE).** Two, and ONLY two,
+messages are signed by the identity key. Their builders MUST agree byte-for-byte with dig-app's
+`session.rs` (a shared KAT proves it):
+
+- **Attach challenge:** `SESSION_CHALLENGE_DOMAIN ‖ nonce ‖ profile_did`, where
+  `SESSION_CHALLENGE_DOMAIN = "DIGNET-SESSION-v1"` and `nonce` is 32 bytes of OS randomness.
+- **Sign callback:** `SIGN_CALLBACK_DOMAIN ‖ len16(payload_type) ‖ payload_type ‖ payload`, where
+  `SIGN_CALLBACK_DOMAIN = "DIGNET-SIGN-v1"` and `len16` is the big-endian `u16` byte length of
+  `payload_type` (rejected when `payload_type` exceeds `u16::MAX` bytes).
+
+The distinct domain tags close the cross-protocol signing oracle: a signature minted for one purpose
+can NEVER validate as the other.
+
+**Handshake (engine's view).**
+
+1. `begin { profile_did, signing_pubkey_hex }` → the engine validates the DID + 32-byte hex key, mints
+   a random nonce + `session_candidate`, and remembers the pending `{ nonce, profile_did,
+   presented_pubkey }`. Returns `{ nonce_b64, session_candidate }`.
+2. `attach { session_candidate, signature_b64, profile }` → the engine consumes the candidate (one
+   nonce, one attempt), then: resolves the DID's on-record slot-`0x0010` key via a
+   `DidSigningKeyResolver`; **REQUIRES** the resolved key to equal the presented key; Ed25519-verifies
+   the challenge signature against it; only then opens an in-memory session. Returns `{ session_id,
+   engine_capabilities }` (`["content.serve", "sync", "wallet.broadcast"]` — keyless by construction).
+3. `detach { session_id }` → drops the in-memory session.
+
+**Custody invariants (HARD RULE).**
+
+- The engine only ever VERIFIES signatures; it never holds or derives a user key (VERIFY-ONLY).
+- Attach binds to the key the engine RESOLVED for the DID, not merely the key the caller presented — a
+  substituted key is rejected (`KeyMismatch`).
+- A DID the resolver cannot resolve FAILS CLOSED (`UnresolvableDid`): no session opens. An "echo"
+  resolver that returned the presented key is FORBIDDEN — it would let any caller attach as any DID.
+- The attach candidate is consumed whether or not attach succeeds, so a nonce cannot be replayed.
+
+**Bounds.** `MAX_FRAME_BYTES` (1 MiB) and `MAX_INTERLEAVED_CALLBACKS` (64) are the contracts the
+(follow-up) transport MUST enforce. The registry itself bounds `MAX_PENDING_CANDIDATES` (256)
+begun-but-not-attached handshakes, rejecting further `begin` with `TooManyPending` to cap memory; TTL
+expiry of stale candidates lands with the transport (needs a clock seam).
+
 ---
 
 ## 8. CLI contract
