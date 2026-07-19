@@ -861,37 +861,21 @@ where
     }
 }
 
-/// The methods reachable over the **mTLS peer surface** (other DIG nodes) — the L7
-/// read / discovery / announce subset (SPEC §2.3.1/§2.3.3, §7.4). This is an ALLOWLIST,
-/// not a denylist: any method not named here is loopback/in-process only.
+/// Whether `method` may be answered over the **mTLS peer surface** (other DIG nodes).
 ///
-/// The peer mTLS verifier accepts any well-formed self-signed leaf ("authenticated" means
-/// only "derived some peer_id", never "authorized"), so the node MUST NOT forward
-/// management/mutation methods (`cache.*`, `control.*`, `dig.stage`) to a remote peer —
-/// those stay reachable only from the loopback admin / in-process FFI dispatch
-/// ([`crate::handle_rpc`]). See audit #179 (CRITICAL auth-bypass).
+/// The allowlist itself lives in ONE place — [`dig_rpc_protocol::Method::is_peer_reachable`],
+/// the canonical node<->node contract crate both DIG node implementations share (#1075) —
+/// so the peer surface can never drift between them. This function only adapts the wire
+/// `&str` to that enum: an unknown method has no `Method` variant and is therefore never
+/// peer-reachable (fail-closed).
 ///
-/// Adding a new method here is a deliberate security decision: it exposes that method to any
-/// remote peer. New read/discovery methods that are safe for untrusted peers go in the list;
-/// anything that mutates node state or reads local resources stays OUT.
+/// It is an ALLOWLIST, not a denylist: the peer mTLS verifier accepts any well-formed
+/// self-signed leaf ("authenticated" means only "derived some peer_id", never "authorized"),
+/// so management/mutation methods (`cache.*`, `control.*`, `dig.stage`) MUST NOT be forwarded
+/// to a remote peer — they stay reachable only from the loopback admin / in-process FFI
+/// dispatch ([`crate::handle_rpc`]). See audit #179 (CRITICAL auth-bypass).
 pub(crate) fn is_peer_reachable_method(method: &str) -> bool {
-    matches!(
-        method,
-        // Content read (public-read tier) — self-verified client-side.
-        "dig.getContent"
-            // Peer discovery + posture + announce.
-            | "dig.getNetworkInfo"
-            | "dig.getPeers"
-            | "dig.announce"
-            // Availability + inventory + range fetch (the multi-source download surface).
-            | "dig.getAvailability"
-            | "dig.listInventory"
-            | "dig.fetchRange"
-            // Chain-anchored read helpers (public, owner-independent).
-            | "dig.getAnchoredRoot"
-            | "dig.getCollection"
-            | "dig.listCollectionItems"
-    )
+    dig_rpc_protocol::Method::from_name(method).is_some_and(|m| m.is_peer_reachable())
 }
 
 // -- The node's PeerRpcResponder — routes peer requests into the node's dispatch + inventory ----------
@@ -988,7 +972,7 @@ impl PeerRpcResponder for NodeResponder {
         // dig.getPeers is answered from the LIVE pool here (the base handle_rpc can't — it has no pool
         // handle). Everything else routes through the shared dispatch so the peer surface == the agent
         // surface (getAvailability / listInventory / fetchRange / getNetworkInfo / announce).
-        if method == "dig.getPeers" {
+        if dig_rpc_protocol::Method::from_name(method) == Some(dig_rpc_protocol::Method::GetPeers) {
             let network_id = network_id_from_env();
             let limit = req
                 .get("params")
@@ -2611,6 +2595,44 @@ mod tests {
                 !is_peer_reachable_method(m),
                 "{m} is management/mutation/unknown and MUST NOT be reachable over the peer surface"
             );
+        }
+    }
+
+    /// **Proves:** delegating the peer allowlist to `dig_rpc_protocol` (#1075) preserves
+    /// the EXACT set the node hand-rolled before — the ten L7 read/discovery/announce
+    /// methods, no more, no fewer. This is the security-critical regression guard for the
+    /// #179 auth-bypass surface: any method that gains or loses peer-reachability across the
+    /// crate adoption fails here.
+    /// **Catches:** a crate drift that adds a management method to the allowlist, or drops a
+    /// read method the peer download path relies on.
+    #[test]
+    fn peer_allowlist_is_byte_identical_to_the_pre_adoption_set() {
+        // The canonical set the hand-rolled `is_peer_reachable_method` matched verbatim.
+        let mut expected = [
+            "dig.getContent",
+            "dig.getNetworkInfo",
+            "dig.getPeers",
+            "dig.announce",
+            "dig.getAvailability",
+            "dig.listInventory",
+            "dig.fetchRange",
+            "dig.getAnchoredRoot",
+            "dig.getCollection",
+            "dig.listCollectionItems",
+        ];
+        expected.sort_unstable();
+
+        // The set the node now exposes, sourced entirely from the crate.
+        let mut got = dig_rpc_protocol::Method::peer_reachable_names();
+        got.sort_unstable();
+
+        assert_eq!(
+            got, expected,
+            "the dig-rpc-protocol peer allowlist diverged from the node's pre-adoption set"
+        );
+        // And the str-adapting wrapper agrees for every name in the set.
+        for m in expected {
+            assert!(is_peer_reachable_method(m), "{m} must be peer-reachable");
         }
     }
 

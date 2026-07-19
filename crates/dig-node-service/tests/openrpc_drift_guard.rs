@@ -155,6 +155,67 @@ fn reconciled_error_codes_are_catalogued_with_correct_origin() {
     );
 }
 
+/// **Proves (#1075):** the shell catalogue does not DRIFT below the canonical
+/// node<->node contract crate. Every method that `dig_rpc_protocol` marks
+/// peer-reachable (the public read/discovery/announce surface other DIG nodes call)
+/// is present in this shell's discovery catalogue and classified as a public read
+/// (`served` in {local, passthrough}, never `control`) — so the published OpenRPC can
+/// never omit or mis-auth a method the peer surface actually serves.
+/// **Catches:** a catalogue that drops a peer-reachable method (the class of gap that
+/// hid `control.peers.connect`/`disconnect`), or mislabels a public read as control.
+#[test]
+fn every_peer_reachable_crate_method_is_catalogued_as_a_public_read() {
+    use dig_rpc_protocol::Method;
+    let catalogue = meta::methods();
+    for m in Method::ALL.iter().filter(|m| m.is_peer_reachable()) {
+        let entry = catalogue
+            .iter()
+            .find(|e| e.name == m.name())
+            .unwrap_or_else(|| {
+                panic!("peer-reachable crate method {} is not catalogued", m.name())
+            });
+        assert!(
+            matches!(entry.served, "local" | "passthrough"),
+            "peer-reachable read {} must be a public read, not served={}",
+            m.name(),
+            entry.served
+        );
+        assert!(
+            !entry.requires_auth,
+            "peer-reachable read {} must not require auth",
+            m.name()
+        );
+    }
+}
+
+/// **Proves (#1075):** the two node-owned peer-management control methods — present in
+/// `handle_rpc` and the crate's `Method` catalogue but previously MISSING from this
+/// shell catalogue (the reviewer-found gap the crate adoption closes) — are now
+/// catalogued as loopback-only control methods, and are NEVER peer-reachable.
+#[test]
+fn control_peers_connect_disconnect_are_catalogued_and_not_peer_reachable() {
+    use dig_rpc_protocol::Method;
+    let catalogue = meta::methods();
+    for m in [Method::ControlPeersConnect, Method::ControlPeersDisconnect] {
+        let entry = catalogue
+            .iter()
+            .find(|e| e.name == m.name())
+            .unwrap_or_else(|| panic!("{} missing from the shell catalogue", m.name()));
+        assert_eq!(
+            entry.served,
+            "control",
+            "{} must be served=control",
+            m.name()
+        );
+        assert!(entry.requires_auth, "{} must require auth", m.name());
+        assert!(
+            !m.is_peer_reachable(),
+            "{} must NOT be peer-reachable",
+            m.name()
+        );
+    }
+}
+
 /// Every method the catalogue lists as a public read (`served` in {local,
 /// passthrough}) carries `requires_auth: false`, and every `control.*` method is
 /// `served: control` + `requires_auth: true` — a structural sanity check that the

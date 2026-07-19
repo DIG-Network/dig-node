@@ -424,6 +424,26 @@ pub fn methods() -> &'static [MethodInfo] {
             summary: "List the node's persisted store subscriptions.",
             requires_auth: true,
         },
+        MethodInfo {
+            // #1075: these node-owned peer-management methods exist in the read path's
+            // handle_rpc + the canonical dig-rpc-protocol Method catalogue but were
+            // MISSING from this shell catalogue (the reviewer-found gap the crate
+            // adoption closes). Loopback-only + token-gated, like every control.* method,
+            // and NEVER peer-reachable (dig_rpc_protocol::Method::is_peer_reachable).
+            name: "control.peers.connect",
+            served: "control",
+            summary: "Dial a discovered peer into the connected pool (turn a relay-\
+                      discovered peer into a counted, RPC-reachable connected peer). \
+                      Params { peer }.",
+            requires_auth: true,
+        },
+        MethodInfo {
+            name: "control.peers.disconnect",
+            served: "control",
+            summary: "Drop a pooled peer by peer_id, closing its mTLS link (the inverse \
+                      of control.peers.connect). Idempotent. Params { peer }.",
+            requires_auth: true,
+        },
     ]
 }
 

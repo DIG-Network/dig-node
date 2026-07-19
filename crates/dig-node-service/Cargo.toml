@@ -60,6 +60,12 @@ path = "src/lib.rs"
 # around it, and produces the `dig-node` binary (distinct name from the engine lib).
 dig-node-core = { path = "../dig-node-core" }
 
+# The canonical node<->node JSON-RPC contract crate — the shell's discovery catalogue
+# (meta.rs) drift-guards its node-surface method names against this single source of
+# truth so the published OpenRPC can never describe a method set that diverges from
+# the crate the node implementations share (#1075).
+dig-rpc-protocol = "0.3"
+
 # The Sage-parity wallet engine (crate `dig_wallet`) — the node-custodied wallet DB + dual-transport
 # dispatch + seed custody. This shell WIRES it into bring-up (#368): it builds one live
 # `WalletBackend` (`sage::service::WalletService`) and serves the Sage method surface on the

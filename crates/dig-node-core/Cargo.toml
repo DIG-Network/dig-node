@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -57,6 +57,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The canonical node<->node JSON-RPC contract: the Method catalogue (wire names +
+# per-method tier) and the mTLS peer-reachability allowlist. dig-node-core reads its
+# method names + the peer allowlist from HERE (never hand-rolled) so the contract
+# cannot drift from the other node implementation or the discovery document (#1075).
+dig-rpc-protocol = "0.3"
 base64 = "0.22"
 hex = "0.4"
 filetime = "0.2"
