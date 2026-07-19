@@ -182,3 +182,19 @@ CLI path (not via a native package) needs the `sc config`/`sc qc` dance.
   advertisement). Until then the node stays on dig-gossip 0.2.1 (`connect_to` + `connected_pool_peers`
   exist there), the per-peer `via` is always `"direct"` (0.2.1 has no relay-transport peer kind), and
   `listen_addrs` is not advertised in the relay Register.
+
+- **Adding a dep here needs a SURGICAL Cargo.lock merge (git-HEAD-drift makes re-resolution
+  impossible).** `dig-constants` (bare-git, req `^0.4`) and `dig-nat` (bare-git; dig-gossip pins it
+  `>=0.2,<0.4`) have both advanced their default-branch HEAD PAST their constraints (0.5.0 / 0.4.0), and
+  bare-git deps expose ONLY the version at HEAD. So ANY resolution that isn't `--locked` — including
+  `cargo build`/`cargo update <spec>`/`--offline` after editing a manifest — re-picks HEAD and FAILS to
+  select `dig-constants`/`dig-nat`; pinning via `rev=` forks the source (two incompatible copies) and is
+  forbidden (the manifest comments say so). CI only ever runs `--locked`. To ADD a new dependency without
+  the deferred `^0.5`/dig-nat cascade: resolve the NEW deps ALONE in a throwaway crate (same
+  `[patch.crates-io]` chia-protocol/chia-sdk-client pins) → `cargo generate-lockfile` → diff its lock vs
+  the repo's → hand-insert ONLY the genuinely-new package NAMES' `[[package]]` blocks (shared crates
+  already present at compatible versions are reused; rewrite each new block's versioned dep refs, e.g.
+  `thiserror 2.0.19`→the repo's `2.0.18`, matching by major) → add the new edges to the consuming crate's
+  lock block + bump its version → `cargo build --offline` finalizes the lock WITHOUT touching the pinned
+  drifted commits → verify `cargo build --locked` passes + `dig-constants`/`dig-nat` stayed at their
+  locked revs. (Used to add `dig-ipc-protocol` + `dig-identity` in #1080.)
