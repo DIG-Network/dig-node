@@ -1337,7 +1337,7 @@ pins the crate's builders to the frozen golden bytes.
 
 **Production DID resolver (#1080, over dig-identity #778).** `ChainDidSigningKeyResolver<S: ChainSource>`
 resolves a profile DID to its published slot-`0x0010` key by CHAIN-AUTHENTICATED on-chain lookup,
-delegating to `dig_identity::resolve_signing_key` (WU3): it walks the DID singleton lineage to its
+delegating to `dig_identity::resolve_bls_public_key` (WU3): it walks the DID singleton lineage to its
 authentic tip, finds the DID-paired store, binds the fetched profile body to the store's current
 on-chain root, and returns the published key — failing CLOSED (`None`) on every ambiguity, staleness,
 or mismatch. It never echoes the caller-presented key and never accepts a caller-supplied lineage; the
@@ -1361,12 +1361,12 @@ can NEVER validate as the other.
 
 **Handshake (engine's view).**
 
-1. `begin { profile_did, signing_pubkey_hex }` → the engine validates the DID + 32-byte hex key, mints
+1. `begin { profile_did, signing_pubkey_hex }` → the engine validates the DID + 48-byte hex key, mints
    a random nonce + `session_candidate`, and remembers the pending `{ nonce, profile_did,
    presented_pubkey }`. Returns `{ nonce_b64, session_candidate }`.
 2. `attach { session_candidate, signature_b64, profile }` → the engine consumes the candidate (one
    nonce, one attempt), then: resolves the DID's on-record slot-`0x0010` key via a
-   `DidSigningKeyResolver`; **REQUIRES** the resolved key to equal the presented key; Ed25519-verifies
+   `DidSigningKeyResolver`; **REQUIRES** the resolved key to equal the presented key; BLS12-381 G2 AugScheme-verifies
    the challenge signature against it; only then opens an in-memory session. Returns `{ session_id,
    engine_capabilities }` (`["content.serve", "content.fetch", "sync", "subscribe"]` — keyless by
    construction; the app MUST tolerate capabilities it does not recognize).
