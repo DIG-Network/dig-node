@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -50,6 +50,12 @@ chia-protocol = "0.26"
 # de-duplicated via `dig_ip::PeerCandidates` — never a hand-rolled family sort (epic #1020, #1032).
 # A leaf crate (no transitive DIG deps), so the crates.io release is used directly.
 dig-ip = "0.1"
+# The canonical dig-app ⇄ dig-node IPC session/signing contract (engine role-half + wire types +
+# domain builders + frame bounds). SSOT shared with dig-app so the two halves can never drift (#1080).
+dig-ipc-protocol = "0.1"
+# On-chain DID resolution (WU3, #778): the honest chain-authenticated read path the production
+# DidSigningKeyResolver delegates to. Not on crates.io — consumed via git tag (same pattern as dig-app).
+dig-identity = { git = "https://github.com/DIG-Network/dig-identity", tag = "v0.3.0" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 # Object-safe async trait for the injectable anchored-root resolver (the
 # mandatory read-path chain pin, #127): production walks coinset, tests inject a
@@ -179,6 +185,8 @@ tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+# Builds canonical `did:chia:` strings for the on-chain DID-resolver tests (matches dig-identity's codec).
+chia-sdk-utils = "0.30"
 # Derives deterministic test key seeds + nonces (no hard-coded crypto literals — CodeQL flags those).
 sha2 = "0.10"
 # axum is a TEST-ONLY dependency of the engine library: the node no longer serves its

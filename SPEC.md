@@ -1318,23 +1318,37 @@ carries a bounded wall-clock timeout (120 s). A hung child (a wedged scheduler A
 write) is cancelled and reported as a failed kick, so it can never block the pass or starve future
 6-hourly ticks — the pass logs the timeout and continues, and the serve path is never affected.
 
-### 7.15. Engine-side identity session library (NODE-1 / U2, #910)
+### 7.15. Engine-side identity session (NODE-1 / U2, #910, #1080)
 
-The engine exposes a transport-agnostic LIBRARY (`dig_node_core::session`) that verifies an
+The engine exposes a transport-agnostic session half (`dig_node_core::session`) that verifies an
 identity-authenticated IPC session on behalf of the `control.session.*` handshake. The engine is
 **identity-agnostic**: it holds NO user signing key and can NEVER mint a signature with one. A dig-app
 proves possession of a profile's slot-`0x0010` identity key; the engine only VERIFIES that proof and
 tracks the resulting session in memory.
 
-This subsection specifies the library's contract. The `control.session.*` WIRE transport, the
-production on-chain DID resolver, and the removal of the node-custodied wallet from the engine binary
-are the NODE-1 engine-carve follow-up (they depend on the on-chain DID→store resolution layer,
-dig-identity **#778 WU3**, which is not yet shipped); until then this module is a verified building
-block, not a wired transport.
+**Contract source of truth — `dig-ipc-protocol` (#1080).** The session/signing wire contract
+(the `EngineSessionRegistry` state machine, the domain-separated message builders, the
+`control.session.*` JSON-RPC types, the resource bounds, and the frame transport) is owned by the leaf
+crate **`dig-ipc-protocol`**, the SINGLE source of truth shared byte-identically with the app half
+(dig-app). `dig_node_core::session` RE-EXPORTS the crate's engine role-half at the established module
+path and adds the engine's own **production** `DidSigningKeyResolver` (below). The two halves consume
+one crate rather than each maintaining a copy, so they can never silently drift; a KAT cross-check
+pins the crate's builders to the frozen golden bytes.
 
-**Domain-separated signed messages (byte-identical to dig-app, HARD RULE).** Two, and ONLY two,
-messages are signed by the identity key. Their builders MUST agree byte-for-byte with dig-app's
-`session.rs` (a shared KAT proves it):
+**Production DID resolver (#1080, over dig-identity #778).** `ChainDidSigningKeyResolver<S: ChainSource>`
+resolves a profile DID to its published slot-`0x0010` key by CHAIN-AUTHENTICATED on-chain lookup,
+delegating to `dig_identity::resolve_signing_key` (WU3): it walks the DID singleton lineage to its
+authentic tip, finds the DID-paired store, binds the fetched profile body to the store's current
+on-chain root, and returns the published key — failing CLOSED (`None`) on every ambiguity, staleness,
+or mismatch. It never echoes the caller-presented key and never accepts a caller-supplied lineage; the
+`ChainSource` it is built over MUST be a genuine forward lineage walk (coinset / full node), NEVER a
+`SingletonLineage::single` echo. The concrete engine `ChainSource` (a coinset / full-node backed
+DataLayer store-discovery reader) and the `control.session.*` WIRE transport (the per-user pipe/UDS +
+its ACL, enforcing the re-exported frame bounds) remain the NODE-1 engine-carve follow-up.
+
+**Domain-separated signed messages (byte-identical across halves, HARD RULE).** Two, and ONLY two,
+messages are signed by the identity key. Their builders (now the `dig-ipc-protocol` builders) MUST
+agree byte-for-byte with dig-app's half (a shared KAT proves it):
 
 - **Attach challenge:** `SESSION_CHALLENGE_DOMAIN ‖ nonce ‖ profile_did`, where
   `SESSION_CHALLENGE_DOMAIN = "DIGNET-SESSION-v1"` and `nonce` is 32 bytes of OS randomness.
@@ -1354,7 +1368,8 @@ can NEVER validate as the other.
    nonce, one attempt), then: resolves the DID's on-record slot-`0x0010` key via a
    `DidSigningKeyResolver`; **REQUIRES** the resolved key to equal the presented key; Ed25519-verifies
    the challenge signature against it; only then opens an in-memory session. Returns `{ session_id,
-   engine_capabilities }` (`["content.serve", "sync", "wallet.broadcast"]` — keyless by construction).
+   engine_capabilities }` (`["content.serve", "content.fetch", "sync", "subscribe"]` — keyless by
+   construction; the app MUST tolerate capabilities it does not recognize).
 3. `detach { session_id }` → drops the in-memory session.
 
 **Custody invariants (HARD RULE).**
@@ -1362,14 +1377,14 @@ can NEVER validate as the other.
 - The engine only ever VERIFIES signatures; it never holds or derives a user key (VERIFY-ONLY).
 - Attach binds to the key the engine RESOLVED for the DID, not merely the key the caller presented — a
   substituted key is rejected (`KeyMismatch`).
-- A DID the resolver cannot resolve FAILS CLOSED (`UnresolvableDid`): no session opens. An "echo"
+- A DID the resolver cannot resolve FAILS CLOSED (`UnknownDid`): no session opens. An "echo"
   resolver that returned the presented key is FORBIDDEN — it would let any caller attach as any DID.
 - The attach candidate is consumed whether or not attach succeeds, so a nonce cannot be replayed.
 
 **Bounds.** `MAX_FRAME_BYTES` (1 MiB) and `MAX_INTERLEAVED_CALLBACKS` (64) are the contracts the
 (follow-up) transport MUST enforce. The registry itself bounds `MAX_PENDING_CANDIDATES` (256)
-begun-but-not-attached handshakes, rejecting further `begin` with `TooManyPending` to cap memory; TTL
-expiry of stale candidates lands with the transport (needs a clock seam).
+begun-but-not-attached handshakes: once at capacity, the OLDEST outstanding candidate is EVICTED so a
+flood of never-attached `begin`s cannot grow engine state without bound.
 
 ---
 
@@ -2954,3 +2969,4 @@ a passphrase — is EVER passed to a `tracing` field or message, at any level. B
 is only the second line of defence. The transport's per-request logging records ONLY the method name
 and a correlation `op_id`, never the request `params` (which for a control/pairing call carry a
 token); this is enforced by the request-logger's signature and a never-log regression test.
+

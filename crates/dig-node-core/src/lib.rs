@@ -56,10 +56,11 @@ pub mod download;
 pub mod net;
 pub mod peer;
 pub mod pex;
-/// The engine side of the identity-authenticated IPC session (NODE-1 / U2, #910): `control.session.*`
-/// verification + the multi-session registry + the `sign`-callback domain-separated verify. The engine
-/// holds NO user key — it only VERIFIES that an attaching dig-app holds the profile's slot-`0x0010`
-/// identity key (SPEC §5.3, byte-identical to dig-app's `session.rs`).
+/// The engine side of the identity-authenticated IPC session (NODE-1 / U2, #908): the
+/// `control.session.*` handshake registry + the `sign`-callback domain-separated verify, consumed from
+/// the canonical `dig-ipc-protocol` contract crate (the SSOT shared with dig-app), plus the engine's
+/// own **production** on-chain `DidSigningKeyResolver`. The engine holds NO user key — it only VERIFIES
+/// that an attaching dig-app holds the profile's chain-published slot-`0x0010` identity key (SPEC §5.3).
 pub mod session;
 pub mod subscription;
 /// Server-side verification ledger (#307): the bounded, short-TTL record of the per-resource
