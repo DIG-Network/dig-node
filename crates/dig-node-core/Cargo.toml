@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.11.0"
+version = "0.12.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -52,10 +52,10 @@ chia-protocol = "0.26"
 dig-ip = "0.1"
 # The canonical dig-app ⇄ dig-node IPC session/signing contract (engine role-half + wire types +
 # domain builders + frame bounds). SSOT shared with dig-app so the two halves can never drift (#1080).
-dig-ipc-protocol = "0.1"
+dig-ipc-protocol = "0.2"
 # On-chain DID resolution (WU3, #778): the honest chain-authenticated read path the production
 # DidSigningKeyResolver delegates to. Not on crates.io — consumed via git tag (same pattern as dig-app).
-dig-identity = { git = "https://github.com/DIG-Network/dig-identity", tag = "v0.3.0" }
+dig-identity = { git = "https://github.com/DIG-Network/dig-identity", tag = "v0.4.0" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "net", "io-util", "time", "signal"] }
 # Object-safe async trait for the injectable anchored-root resolver (the
 # mandatory read-path chain pin, #127): production walks coinset, tests inject a
@@ -189,6 +189,9 @@ tempfile = "3"
 chia-sdk-utils = "0.30"
 # Derives deterministic test key seeds + nonces (no hard-coded crypto literals — CodeQL flags those).
 sha2 = "0.10"
+# The session attach tests sign challenges with the BLS12-381 G2 AugScheme (the app's slot-0x0010
+# identity key), matching dig-ipc-protocol's signing contract and dig-identity's published G1 key.
+chia-bls = "0.26"
 # axum is a TEST-ONLY dependency of the engine library: the node no longer serves its
 # own HTTP (the `dig-node-service` shell owns the axum transport, `dig-runtime` owns the
 # in-process FFI path — dispatch is `handle_rpc`, which is transport-agnostic). The

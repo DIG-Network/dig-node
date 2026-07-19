@@ -39,19 +39,20 @@ pub use dig_ipc_protocol::{
     SESSION_CHALLENGE_DOMAIN, SIGNATURE_LEN, SIGNING_KEY_LEN, SIGN_CALLBACK_DOMAIN,
 };
 
-use dig_identity::{resolve_signing_key, ChainSource, ResolveError};
+use dig_identity::{resolve_bls_public_key, ChainSource, ResolveError};
 
 /// The engine's **production** [`DidSigningKeyResolver`]: it resolves a profile DID to its published
-/// slot-`0x0010` signing key by CHAIN-AUTHENTICATED on-chain lookup (dig-identity's WU3 read path,
-/// #778), so `attach` can bind a session only to a key the DID genuinely published.
+/// slot-`0x0010` **BLS12-381 G1** identity key (48 bytes) by CHAIN-AUTHENTICATED on-chain lookup
+/// (dig-identity's WU3 read path, #778; BLS-only key model, epic #1169), so `attach` can bind a session
+/// only to a key the DID genuinely published.
 ///
 /// This is the honest backend the contract's [`DidSigningKeyResolver`] seam demands. It delegates to
-/// [`dig_identity::resolve_signing_key`], which walks the DID singleton lineage to its authentic tip,
+/// [`dig_identity::resolve_bls_public_key`], which walks the DID singleton lineage to its authentic tip,
 /// finds the store the DID paired, binds the fetched profile body to the store's current on-chain root,
-/// and returns the published signing key — failing closed on every ambiguity, staleness, or mismatch.
-/// The resolver never echoes the caller-presented key and never accepts a caller-supplied lineage; the
-/// chain [`ChainSource`] it is built over MUST be a genuine forward lineage walk (coinset / full node),
-/// NEVER a `SingletonLineage::single` echo, or the custody boundary collapses.
+/// and returns the published G1 identity key — failing closed on every ambiguity, staleness, or
+/// mismatch. The resolver never echoes the caller-presented key and never accepts a caller-supplied
+/// lineage; the chain [`ChainSource`] it is built over MUST be a genuine forward lineage walk
+/// (coinset / full node), NEVER a `SingletonLineage::single` echo, or the custody boundary collapses.
 ///
 /// The private key never enters the engine: this type resolves only PUBLIC keys.
 pub struct ChainDidSigningKeyResolver<S: ChainSource> {
@@ -72,15 +73,15 @@ impl<S: ChainSource> ChainDidSigningKeyResolver<S> {
 }
 
 impl<S: ChainSource> DidSigningKeyResolver for ChainDidSigningKeyResolver<S> {
-    /// Resolve `profile_did` to its published slot-`0x0010` signing key, or `None` when the DID cannot be
-    /// AUTHORITATIVELY resolved on-chain.
+    /// Resolve `profile_did` to its published slot-`0x0010` BLS G1 identity key, or `None` when the DID
+    /// cannot be AUTHORITATIVELY resolved on-chain.
     ///
     /// Every resolution failure — an invalid DID, a melted singleton, no/ambiguous profile, a stale or
-    /// tampered root, no published signing key, or a chain-source error — collapses to `None` so
+    /// tampered root, no published identity key, or a chain-source error — collapses to `None` so
     /// [`EngineSessionRegistry::attach`] fails closed. A resolution that could not be fully
     /// chain-authenticated MUST NOT yield a key.
     fn resolve_signing_key(&self, profile_did: &str) -> Option<SigningPublicKey> {
-        match resolve_signing_key(profile_did, &self.source) {
+        match resolve_bls_public_key(profile_did, &self.source) {
             Ok(key) => Some(SigningPublicKey::new(key)),
             Err(reason) => {
                 // Fail closed; the DID is unusable for an attach. Logged at debug (not warn) because an
@@ -100,7 +101,7 @@ fn describe(error: &ResolveError) -> &'static str {
         ResolveError::NoProfile => "no-authoritative-profile",
         ResolveError::AmbiguousProfile => "ambiguous-profile",
         ResolveError::StaleOrTamperedRoot => "stale-or-tampered-root",
-        ResolveError::NoSigningKey => "no-signing-key",
+        ResolveError::NoIdentityKey => "no-identity-key",
         ResolveError::Format(_) => "profile-format-error",
         ResolveError::Chain(_) => "chain-source-error",
     }
@@ -111,16 +112,17 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
+    use chia_bls::SecretKey;
     use dig_identity::slot::standard;
     use dig_identity::{
         Bytes32, ChainStoreState, Coin, Did, Profile, ResolveError, SingletonLineage, StoreRecord,
         Value,
     };
-    use ring::signature::{Ed25519KeyPair, KeyPair};
     use sha2::{Digest, Sha256};
 
-    /// The Ed25519 signing key a well-formed test profile publishes (slot `0x0010`).
-    const SIGNING_KEY: [u8; 32] = [7u8; 32];
+    /// The BLS12-381 G1 identity key a well-formed test profile publishes (slot `0x0010`). Resolution
+    /// only reads the 48 published bytes; it does not curve-validate (the DH path does, dig-identity §6a.3).
+    const IDENTITY_KEY: [u8; 48] = [7u8; 48];
 
     // --- The KAT cross-check: the crate's builders equal the old golden bytes ------------------------
 
@@ -129,8 +131,10 @@ mod tests {
         assert_eq!(SESSION_CHALLENGE_DOMAIN, b"DIGNET-SESSION-v1");
         assert_eq!(SIGN_CALLBACK_DOMAIN, b"DIGNET-SIGN-v1");
         assert_eq!(NONCE_LEN, 32);
-        assert_eq!(SIGNING_KEY_LEN, 32);
-        assert_eq!(SIGNATURE_LEN, 64);
+        // BLS-only key model (epic #1169): G1 identity key = 48 bytes, G2 signature = 96 bytes. These
+        // constants are re-exported from dig-ipc-protocol (BLS-widened in v0.2.0, #1173).
+        assert_eq!(SIGNING_KEY_LEN, 48);
+        assert_eq!(SIGNATURE_LEN, 96);
         assert_eq!(MAX_FRAME_BYTES, 1024 * 1024);
         assert_eq!(MAX_PENDING_CANDIDATES, 256);
         assert_eq!(MAX_INTERLEAVED_CALLBACKS, 64);
@@ -224,12 +228,12 @@ mod tests {
         Coin::new(parent, Bytes32::new([9u8; 32]), 1)
     }
 
-    /// A profile publishing the standard signing key.
+    /// A profile publishing the standard BLS G1 identity key.
     fn keyed_profile() -> Profile {
-        let mut profile = Profile::with_schema_v1();
+        let mut profile = Profile::with_schema_v2();
         profile.set(
-            standard::SIGNING_PUBLIC_KEY,
-            Value::Bytes(SIGNING_KEY.to_vec()),
+            standard::BLS_G1_PUBLIC_KEY,
+            Value::Bytes(IDENTITY_KEY.to_vec()),
         );
         profile
     }
@@ -271,7 +275,7 @@ mod tests {
             .find_stores_for_did(&Did::parse(&did_uri).unwrap())
             .is_ok());
         let key = resolver.resolve_signing_key(&did_uri).expect("resolves");
-        assert_eq!(key, SigningPublicKey::new(SIGNING_KEY));
+        assert_eq!(key, SigningPublicKey::new(IDENTITY_KEY));
     }
 
     #[test]
@@ -302,31 +306,36 @@ mod tests {
     fn resolver_fails_closed_when_the_profile_publishes_no_signing_key() {
         let did_uri = did_for(Bytes32::new([42u8; 32]));
         let mut source = authoritative(&did_uri);
-        source.fetched = Profile::with_schema_v1(); // no slot 0x0010
+        source.fetched = Profile::with_schema_v2(); // no slot 0x0010
         source.stores[0].root_hash = Bytes32::new(source.fetched.build_root().unwrap());
         let resolver = ChainDidSigningKeyResolver::new(source);
         assert!(resolver.resolve_signing_key(&did_uri).is_none());
     }
 
     // --- The resolver drives a genuine engine attach end to end -------------------------------------
+    //
+    // These tests exercise dig-ipc-protocol's session sign/verify under the BLS-only key model (epic
+    // #1169): the app presents its 48-byte BLS12-381 G1 identity key and signs the challenge with the
+    // G2 AugScheme, exactly as the chain-published slot-0x0010 key does. The engine resolves the
+    // authorized key from the DID lineage and binds the session only when the signature verifies.
 
-    /// Derive a reproducible Ed25519 key from a label (hashed seed, never a literal).
-    fn key_from(label: &[u8]) -> Ed25519KeyPair {
+    /// Derive a reproducible BLS12-381 secret key from a label (hashed seed, never a literal).
+    fn key_from(label: &[u8]) -> SecretKey {
         let seed: [u8; 32] = Sha256::digest(label).into();
-        Ed25519KeyPair::from_seed_unchecked(&seed).expect("valid ed25519 seed")
+        SecretKey::from_seed(&seed)
     }
 
-    /// A profile publishing a specific signing key.
-    fn profile_with_key(key: &[u8; 32]) -> Profile {
-        let mut profile = Profile::with_schema_v1();
-        profile.set(standard::SIGNING_PUBLIC_KEY, Value::Bytes(key.to_vec()));
+    /// A profile publishing a specific BLS G1 identity key (slot `0x0010`, schema v2).
+    fn profile_with_key(key: &[u8; 48]) -> Profile {
+        let mut profile = Profile::with_schema_v2();
+        profile.set(standard::BLS_G1_PUBLIC_KEY, Value::Bytes(key.to_vec()));
         profile
     }
 
     #[test]
     fn honest_attach_binds_the_session_to_the_chain_resolved_key() {
         let app = key_from(b"engine-attach-app-key");
-        let app_pub: [u8; 32] = app.public_key().as_ref().try_into().unwrap();
+        let app_pub: [u8; 48] = app.public_key().to_bytes();
 
         let did_uri = did_for(Bytes32::new([5u8; 32]));
         let profile = profile_with_key(&app_pub);
@@ -354,11 +363,11 @@ mod tests {
             .unwrap();
 
         let nonce = BASE64.decode(&begin.nonce_b64).unwrap();
-        let signature = app.sign(&challenge_message(&nonce, &did_uri));
+        let signature = chia_bls::sign(&app, challenge_message(&nonce, &did_uri)).to_bytes();
         let attach = engine
             .attach(&AttachParams {
                 session_candidate: begin.session_candidate,
-                signature_b64: BASE64.encode(signature.as_ref()),
+                signature_b64: BASE64.encode(signature),
                 profile: ProfileAttachment {
                     did: did_uri.clone(),
                     subscriptions: vec![],
@@ -376,8 +385,8 @@ mod tests {
         // resolver returns the published key, which mismatches the advertised one → KeyMismatch.
         let app = key_from(b"engine-attach-app-key");
         let stranger = key_from(b"engine-attach-stranger");
-        let app_pub: [u8; 32] = app.public_key().as_ref().try_into().unwrap();
-        let stranger_pub: [u8; 32] = stranger.public_key().as_ref().try_into().unwrap();
+        let app_pub: [u8; 48] = app.public_key().to_bytes();
+        let stranger_pub: [u8; 48] = stranger.public_key().to_bytes();
 
         let did_uri = did_for(Bytes32::new([5u8; 32]));
         let profile = profile_with_key(&app_pub);
@@ -403,11 +412,11 @@ mod tests {
             })
             .unwrap();
         let nonce = BASE64.decode(&begin.nonce_b64).unwrap();
-        let signature = stranger.sign(&challenge_message(&nonce, &did_uri));
+        let signature = chia_bls::sign(&stranger, challenge_message(&nonce, &did_uri)).to_bytes();
         let err = engine
             .attach(&AttachParams {
                 session_candidate: begin.session_candidate,
-                signature_b64: BASE64.encode(signature.as_ref()),
+                signature_b64: BASE64.encode(signature),
                 profile: ProfileAttachment {
                     did: did_uri.clone(),
                     subscriptions: vec![],
@@ -428,7 +437,7 @@ mod tests {
             (ResolveError::NoProfile, "no-authoritative-profile"),
             (ResolveError::AmbiguousProfile, "ambiguous-profile"),
             (ResolveError::StaleOrTamperedRoot, "stale-or-tampered-root"),
-            (ResolveError::NoSigningKey, "no-signing-key"),
+            (ResolveError::NoIdentityKey, "no-identity-key"),
             (ResolveError::Chain("x".to_string()), "chain-source-error"),
         ] {
             assert_eq!(describe(&error), label);
