@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.43.0] - 2026-07-19
+
+### Features
+- **dig-node:** Connect plumbing — GossipHandle + peers.connect + peers --json (#929) (#55)- **dig-node:** B1 relay-listen-advertise + peers.disconnect + loopback connect test (#980) (#57)- **dig-node-core:** Migrate advertise-side family ordering + reflexive merge to dig-ip (#59)- **dig-node:** Engine-side identity IPC session library (NODE-1/U2, #910) (#56)
+
+### Bug Fixes
+- **peer:** Default relay endpoint to canonical :443 via dig-constants (#58)
+
 ## [0.39.0] - 2026-07-17
 
 ### Features
