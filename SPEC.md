@@ -12,7 +12,7 @@ lifecycle, and the release-asset contract.
 
 The **DIG read protocol wire shapes** (the `dig.getContent` ciphertext + Merkle-proof shapes, the
 URN grammar, anchored-root semantics, the §21 sync protocol) are the canonical DIG-node RPC
-interface defined in the `dig-rpc-types` crate and specified on the docs.dig.net Protocol pages.
+interface defined in the `dig-rpc-protocol` crate and specified on the docs.dig.net Protocol pages.
 For the `.dig` STORE FORMAT itself (byte layout, read/verify/decrypt, chain anchoring) dig-node
 depends on digstore's store-format LIBRARY crates. This document references those contracts; it
 does not restate them (§2.2, §5).
@@ -72,29 +72,31 @@ content-serve surface (§4.6) — a DISTINCT HTTP surface from this JSON-RPC rea
 SERVER-SIDE for a same-machine browser over loopback; the JSON-RPC `POST /` read plane, `rpc.dig.net`,
 and every peer surface stay blind ciphertext + proof.
 
-1.4. **Canonical RPC interface — `dig-rpc-types` + `dig-rpc`.** The RPC surface this node exposes
+1.4. **Canonical RPC interface — `dig-rpc-protocol` + `dig-rpc`.** The RPC surface this node exposes
 (method names + request/response types, the error-code taxonomy, and the tier classification) is
-the canonical DIG-node RPC interface defined ONCE in the **`dig-rpc-types`** crate
-(`modules/crates/dig-rpc-types`) — the single source of truth this node (the one implementation
+the canonical DIG-node RPC interface defined ONCE in the **`dig-rpc-protocol`** crate (published on
+crates.io; formerly `dig-rpc-types`) — the single source of truth this node (the one implementation
 shared by both host shells) and the `rpc.dig.net` gateway share, so the two can never drift. The
 JSON-RPC server framework (transport surfaces, tier allowlist enforcement, rate limiting, mTLS) is
-the **`dig-rpc`** crate (`modules/crates/dig-rpc`), which depends only on `dig-rpc-types`. This
+the **`dig-rpc`** crate, which depends only on `dig-rpc-protocol`. This
 SPEC's method catalogue (§5.5), envelope rules (§5.1), and error catalogue (§10) MUST match
-`dig-rpc-types` exactly; where they differ, `dig-rpc-types` is authoritative and this SPEC is the
-drift to fix. The OpenRPC document (§6.3) is generated from `dig-rpc-types`' own
-method/tier/error tables. (Full type-level adoption of `dig-rpc-types`/`dig-rpc` in this repo's
-code is a tracked follow-up — see §1.5; this SPEC records the contract they define, which the
-node's dispatch already conforms to byte-for-byte via the conformance vectors.)
+`dig-rpc-protocol` exactly; where they differ, `dig-rpc-protocol` is authoritative and this SPEC is
+the drift to fix. The OpenRPC document (§6.3) is generated from `dig-rpc-protocol`'s own
+method/tier/error tables.
 
-1.5. **dig-rpc / dig-rpc-types adoption status.** `dig-rpc-types` is a PRIVATE sibling repo and
-`dig-rpc` depends on it; this public repo's CI cannot fetch it without authenticated private-repo
-access. The node therefore currently mirrors the canonical contract (the control-plane error
-codes `-32030`/`-32031`/`-32032` and machine strings, the method set, the chunk object) as
-byte-identical constants + types rather than importing the crates, with the shared values asserted
-against the conformance vectors. Swapping to a direct `dig-rpc-types` type dependency + the
-`dig-rpc` server framework is a tracked follow-up gated on the private-repo CI-auth wiring (the
-`dig-rpc` repo itself already authenticates its `dig-rpc-types` sibling checkout). Until then the
-wire is guaranteed identical by the conformance vectors, not by a shared crate.
+1.5. **dig-rpc-protocol adoption status.** `dig-rpc-protocol` is published on crates.io (0.3.0) and
+this repo DEPENDS on it (#1075): `dig_node_core::handle_rpc` dispatches on `Method::from_name` + the
+`Method` enum (not string literals), and the mTLS peer-reachability allowlist is
+`Method::is_peer_reachable` — the single allowlist source both node implementations share (the #179
+auth-bypass surface). The dig-node-service discovery catalogue (`meta.rs`) is a SUPERSET (it adds the
+shell's HTTP control surface — pairing/control.status/hostedStores/updater — and the `served`/
+`requires_auth` model that the node↔node `Method` crate deliberately does not model); a drift guard
+ties its node-surface method names + the peer-reachable set to the crate. Not yet adopted: the crate's
+`RpcError`/`ErrorCode` types (the shell keeps its own `ErrorCode`, whose two shell-specific machine
+strings — `DISPATCH_FAILED` at `-32000`, `RESOURCE_NOT_AVAILABLE_AT_ROOT` at `-32004` — differ from
+the crate's `SERVER_ERROR`/`RESOURCE_UNAVAILABLE`; reconciling those wire strings is a separate,
+wire-visible decision) and the `dig-rpc` server framework. The numeric error codes remain guaranteed
+identical by the conformance vectors.
 
 ---
 
@@ -688,7 +690,7 @@ never relayed upstream. `pairing.request`/`pairing.poll` are open (the bootstrap
 ## 5. JSON-RPC surface (read plane)
 
 The method catalogue (§5.5), request/response types, tier classification, and error taxonomy (§10)
-below are the canonical set defined in the **`dig-rpc-types`** crate (§1.4) — the single source of
+below are the canonical set defined in the **`dig-rpc-protocol`** crate (§1.4) — the single source of
 truth shared with `rpc.dig.net`. This node MUST NOT diverge from it.
 
 ### 5.1. Envelope rules
@@ -1131,7 +1133,7 @@ The full authoritative method + error set (both families, the `control.*` operat
 read/peer methods) is the one defined by this SPEC and mirrored in `SYSTEM.md`; consumers implement
 SUBSETS of it (the extension drives `control.status` + `dig.getContent`; the browser a wider subset)
 but MUST NOT diverge names or shapes. The eventual single shared home for this catalogue is the
-`dig-rpc-types` crate (§1.4/§1.5) — until it is wired in, this SPEC is authoritative.
+`dig-rpc-protocol` crate (§1.4/§1.5); the node's dispatch + peer allowlist are adopted from it.
 
 ### 7.10. Cache LRU order + telemetry (#279)
 
@@ -1686,7 +1688,7 @@ remains for manual/dev use.
 ## 10. Error-code catalogue (JSON-RPC wire)
 
 Stable contract: numeric codes, symbolic names, and origins MUST NOT be renumbered or repurposed;
-additions are allowed. This catalogue is the canonical set from **`dig-rpc-types`** (§1.4) — it
+additions are allowed. This catalogue is the canonical set from **`dig-rpc-protocol`** (§1.4) — it
 MUST match that crate exactly. `origin` distinguishes who minted the error: `shell` (this service),
 `node` (the node library), `upstream` (relayed from the upstream DIG RPC), `boundary` (the
 method-not-found cue).
@@ -1694,7 +1696,7 @@ method-not-found cue).
 **Canonical control-code assignment.** The control-plane errors are `-32030`/`-32031`/`-32032`.
 `-32020`/`-32021`/`-32022` are RESERVED for onion-routing errors (`onion_circuit_unavailable` /
 `privacy_requires_local_node` / `onion_hops_out_of_range`) — the published normative contract on
-docs.dig.net — and MUST NOT be used for control. (`dig-rpc-types` is the source of this resolution;
+docs.dig.net — and MUST NOT be used for control. (`dig-rpc-protocol` is the source of this resolution;
 any client that branched on the old control numbers keys on the symbolic `data.code`, not the
 number.)
 
@@ -1827,7 +1829,7 @@ ONLY automatic release trigger, a quiet repo can silently stop releasing. Detect
 
 | # | Contract | Must match | Where enforced / specified |
 |---|---|---|---|
-| 1 | Read-plane wire contract | `rpc.dig.net` byte-for-byte (dispatch IS `dig_node_core::handle_rpc`) | §1.3, §5; `dig-rpc-types` + docs.dig.net Protocol pages |
+| 1 | Read-plane wire contract | `rpc.dig.net` byte-for-byte (dispatch IS `dig_node_core::handle_rpc`) | §1.3, §5; `dig-rpc-protocol` + docs.dig.net Protocol pages |
 | 2 | `DIG_NODE_PORT` / `DIG_NODE_HOST` names | dig-installer + apt.dig.net expectations — never renamed | §3.1 |
 | 3 | Shared cache default | Byte-identical dir to the DIG Browser's in-process node when `DIG_NODE_CACHE` unset | §3.5 |
 | 4 | `dig.local` addressing | dig-installer hosts entry `127.0.0.2  dig.local`; listener `127.0.0.2:80`, best-effort | §4.1–4.2 |
