@@ -1731,33 +1731,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
 
 [[package]]
-name = "curve25519-dalek"
-version = "4.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
-dependencies = [
- "cfg-if 1.0.4",
- "cpufeatures 0.2.17",
- "curve25519-dalek-derive",
- "digest 0.10.7",
- "fiat-crypto",
- "rustc_version",
- "subtle",
- "zeroize",
-]
-
-[[package]]
-name = "curve25519-dalek-derive"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1956,9 +1929,11 @@ dependencies = [
 
 [[package]]
 name = "dig-identity"
-version = "0.3.0"
-source = "git+https://github.com/DIG-Network/dig-identity?tag=v0.3.0#ba29906c5d098829f8939bfe485ade7e5b410a1e"
+version = "0.4.0"
+source = "git+https://github.com/DIG-Network/dig-identity?tag=v0.4.0#d2eb1f54a14459d380efcb0400920631ccb8acf6"
 dependencies = [
+ "blst",
+ "chia-bls 0.26.0",
  "chia-protocol",
  "chia-sdk-utils",
  "sha2 0.10.9",
@@ -1978,12 +1953,12 @@ dependencies = [
 
 [[package]]
 name = "dig-ipc-protocol"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aba073f3519f186b26508f8f35e277419a3b258c6660aeee09ab56f265a7667a"
+checksum = "5558929d2823b73a9ead6d617cc96ea4fe2284949fdb2cbe2309a160e01b60cc"
 dependencies = [
  "base64",
- "ed25519-dalek",
+ "chia-bls 0.26.0",
  "getrandom 0.2.17",
  "hex",
  "serde",
@@ -2060,11 +2035,12 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "chia-bls 0.26.0",
  "chia-protocol",
  "chia-sdk-utils",
  "dig-constants 0.4.0",
@@ -2112,7 +2088,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.45.0"
+version = "0.46.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2600,30 +2576,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ed25519"
-version = "2.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
-dependencies = [
- "pkcs8",
- "signature",
-]
-
-[[package]]
-name = "ed25519-dalek"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
-dependencies = [
- "curve25519-dalek",
- "ed25519",
- "serde",
- "sha2 0.10.9",
- "subtle",
- "zeroize",
-]
-
-[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2721,12 +2673,6 @@ dependencies = [
  "rand_core 0.6.4",
  "subtle",
 ]
-
-[[package]]
-name = "fiat-crypto"
-version = "0.2.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "filetime"
@@ -4716,15 +4662,6 @@ name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
-
-[[package]]
-name = "rustc_version"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
-dependencies = [
- "semver",
-]
 
 [[package]]
 name = "rusticata-macros"

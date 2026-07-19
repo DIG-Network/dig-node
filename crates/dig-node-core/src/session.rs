@@ -112,12 +112,12 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
+    use chia_bls::SecretKey;
     use dig_identity::slot::standard;
     use dig_identity::{
         Bytes32, ChainStoreState, Coin, Did, Profile, ResolveError, SingletonLineage, StoreRecord,
         Value,
     };
-    use ring::signature::{Ed25519KeyPair, KeyPair};
     use sha2::{Digest, Sha256};
 
     /// The BLS12-381 G1 identity key a well-formed test profile publishes (slot `0x0010`). Resolution
@@ -132,7 +132,7 @@ mod tests {
         assert_eq!(SIGN_CALLBACK_DOMAIN, b"DIGNET-SIGN-v1");
         assert_eq!(NONCE_LEN, 32);
         // BLS-only key model (epic #1169): G1 identity key = 48 bytes, G2 signature = 96 bytes. These
-        // constants are re-exported from dig-ipc-protocol and become BLS-wide once C5b (#1173) ships.
+        // constants are re-exported from dig-ipc-protocol (BLS-widened in v0.2.0, #1173).
         assert_eq!(SIGNING_KEY_LEN, 48);
         assert_eq!(SIGNATURE_LEN, 96);
         assert_eq!(MAX_FRAME_BYTES, 1024 * 1024);
@@ -314,30 +314,28 @@ mod tests {
 
     // --- The resolver drives a genuine engine attach end to end -------------------------------------
     //
-    // TODO(#1173 / C5b): these end-to-end attach tests exercise dig-ipc-protocol's session sign/verify
-    // with a ring **Ed25519** app keypair (`key_from` / `app.sign`). Under the BLS-only key model
-    // (epic #1169) the app presents a 48-byte BLS G1 key and signs with BLS G2 (AugSchemeMPL). They can
-    // only be migrated once C5b (dig-ipc-protocol #1173) ships its BLS signing/verify + test-support API
-    // — until then `SigningPublicKey`/`Signature`/`verify_signature` are still 32B/64B Ed25519 here.
-    // The RESOLVER migration above (production + resolver-only tests) is complete and forward-correct.
+    // These tests exercise dig-ipc-protocol's session sign/verify under the BLS-only key model (epic
+    // #1169): the app presents its 48-byte BLS12-381 G1 identity key and signs the challenge with the
+    // G2 AugScheme, exactly as the chain-published slot-0x0010 key does. The engine resolves the
+    // authorized key from the DID lineage and binds the session only when the signature verifies.
 
-    /// Derive a reproducible Ed25519 key from a label (hashed seed, never a literal).
-    fn key_from(label: &[u8]) -> Ed25519KeyPair {
+    /// Derive a reproducible BLS12-381 secret key from a label (hashed seed, never a literal).
+    fn key_from(label: &[u8]) -> SecretKey {
         let seed: [u8; 32] = Sha256::digest(label).into();
-        Ed25519KeyPair::from_seed_unchecked(&seed).expect("valid ed25519 seed")
+        SecretKey::from_seed(&seed)
     }
 
-    /// A profile publishing a specific signing key.
-    fn profile_with_key(key: &[u8; 32]) -> Profile {
-        let mut profile = Profile::with_schema_v1();
-        profile.set(standard::SIGNING_PUBLIC_KEY, Value::Bytes(key.to_vec()));
+    /// A profile publishing a specific BLS G1 identity key (slot `0x0010`, schema v2).
+    fn profile_with_key(key: &[u8; 48]) -> Profile {
+        let mut profile = Profile::with_schema_v2();
+        profile.set(standard::BLS_G1_PUBLIC_KEY, Value::Bytes(key.to_vec()));
         profile
     }
 
     #[test]
     fn honest_attach_binds_the_session_to_the_chain_resolved_key() {
         let app = key_from(b"engine-attach-app-key");
-        let app_pub: [u8; 32] = app.public_key().as_ref().try_into().unwrap();
+        let app_pub: [u8; 48] = app.public_key().to_bytes();
 
         let did_uri = did_for(Bytes32::new([5u8; 32]));
         let profile = profile_with_key(&app_pub);
@@ -365,11 +363,11 @@ mod tests {
             .unwrap();
 
         let nonce = BASE64.decode(&begin.nonce_b64).unwrap();
-        let signature = app.sign(&challenge_message(&nonce, &did_uri));
+        let signature = chia_bls::sign(&app, challenge_message(&nonce, &did_uri)).to_bytes();
         let attach = engine
             .attach(&AttachParams {
                 session_candidate: begin.session_candidate,
-                signature_b64: BASE64.encode(signature.as_ref()),
+                signature_b64: BASE64.encode(signature),
                 profile: ProfileAttachment {
                     did: did_uri.clone(),
                     subscriptions: vec![],
@@ -387,8 +385,8 @@ mod tests {
         // resolver returns the published key, which mismatches the advertised one → KeyMismatch.
         let app = key_from(b"engine-attach-app-key");
         let stranger = key_from(b"engine-attach-stranger");
-        let app_pub: [u8; 32] = app.public_key().as_ref().try_into().unwrap();
-        let stranger_pub: [u8; 32] = stranger.public_key().as_ref().try_into().unwrap();
+        let app_pub: [u8; 48] = app.public_key().to_bytes();
+        let stranger_pub: [u8; 48] = stranger.public_key().to_bytes();
 
         let did_uri = did_for(Bytes32::new([5u8; 32]));
         let profile = profile_with_key(&app_pub);
@@ -414,11 +412,11 @@ mod tests {
             })
             .unwrap();
         let nonce = BASE64.decode(&begin.nonce_b64).unwrap();
-        let signature = stranger.sign(&challenge_message(&nonce, &did_uri));
+        let signature = chia_bls::sign(&stranger, challenge_message(&nonce, &did_uri)).to_bytes();
         let err = engine
             .attach(&AttachParams {
                 session_candidate: begin.session_candidate,
-                signature_b64: BASE64.encode(signature.as_ref()),
+                signature_b64: BASE64.encode(signature),
                 profile: ProfileAttachment {
                     did: did_uri.clone(),
                     subscriptions: vec![],
