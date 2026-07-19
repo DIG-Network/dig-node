@@ -2954,3 +2954,5 @@ a passphrase — is EVER passed to a `tracing` field or message, at any level. B
 is only the second line of defence. The transport's per-request logging records ONLY the method name
 and a correlation `op_id`, never the request `params` (which for a control/pairing call carry a
 token); this is enforced by the request-logger's signature and a never-log regression test.
+
+<!-- #1080: consume dig-ipc-protocol engine session half (WIP) -->
