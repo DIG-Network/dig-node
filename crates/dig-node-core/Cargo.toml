@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -57,6 +57,11 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", 
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The canonical node<->node JSON-RPC contract: the Method catalogue (wire names +
+# per-method tier) and the mTLS peer-reachability allowlist. dig-node-core reads its
+# method names + the peer allowlist from HERE (never hand-rolled) so the contract
+# cannot drift from the other node implementation or the discovery document (#1075).
+dig-rpc-protocol = "0.3"
 base64 = "0.22"
 hex = "0.4"
 filetime = "0.2"
@@ -85,6 +90,8 @@ dig-nat = { git = "https://github.com/DIG-Network/dig-nat" }
 dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5f8b6fb8aa4127bd3c25805ecfc9f93b59dee58b", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. No
 # `rev` so cargo unifies to the SAME dig-constants source dig-nat/dig-gossip already resolve (one copy).
+# The exact compatible rev (0.4.0) is held by the committed Cargo.lock; the git HEAD has advanced to an
+# incompatible 0.5.0, so builds MUST use `--locked` (CI does) — a `^0.5` cascade is a separate task.
 dig-constants = { version = "0.4", git = "https://github.com/DIG-Network/dig-constants" }
 # -- L7 content-location DHT (PHASE-B, #163) ---------------------------------------------------------
 # The Kademlia DHT that maps DIG content (store / capsule / root / resource) to the peer_ids holding

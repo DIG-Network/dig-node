@@ -60,6 +60,12 @@ path = "src/lib.rs"
 # around it, and produces the `dig-node` binary (distinct name from the engine lib).
 dig-node-core = { path = "../dig-node-core" }
 
+# The canonical node<->node JSON-RPC contract crate — the shell's discovery catalogue
+# (meta.rs) drift-guards its node-surface method names against this single source of
+# truth so the published OpenRPC can never describe a method set that diverges from
+# the crate the node implementations share (#1075).
+dig-rpc-protocol = "0.3"
+
 # The Sage-parity wallet engine (crate `dig_wallet`) — the node-custodied wallet DB + dual-transport
 # dispatch + seed custody. This shell WIRES it into bring-up (#368): it builds one live
 # `WalletBackend` (`sage::service::WalletService`) and serves the Sage method surface on the
@@ -132,12 +138,9 @@ dig-urn-resolver = "0.3.1"
 
 # `dig_constants::DIG_NODE_PORT` (§5.3) — the single-sourced canonical default localhost port
 # for client→node connections; `config.rs`'s DEFAULT_PORT reads it rather than re-declaring the
-# literal. BARE git (no `rev`), matching dig-node-core's own `dig-constants = { version = "0.3",
-# git = "..." }` and the P2P stack (dig-nat/dig-gossip) that now all resolve dig-constants 0.3.x
-# from the same bare-git source, so cargo unifies EVERY bare-git reference to that URL into ONE
-# 0.3.0 instance. (The earlier rev-pin existed only to hold this crate on 0.3.0 while dig-node-core
-# was still on 0.2.x; core has since advanced to "0.3", so a single bare-git 0.3.0 now satisfies
-# every reference and the distinct-source workaround is no longer needed.)
+# literal. Bare git so cargo unifies every dig-constants reference (this crate, dig-node-core,
+# dig-nat, dig-gossip) into ONE instance; the exact compatible rev (0.4.0) is held by the committed
+# Cargo.lock (git HEAD has drifted to an incompatible 0.5.0, so builds MUST use `--locked`).
 dig-constants = { version = "0.4", git = "https://github.com/DIG-Network/dig-constants" }
 
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the
