@@ -1938,14 +1938,15 @@ impl Node {
     // learns what this node already holds. Every byte a peer fetches carries its own merkle proof
     // (verified by the caller against the chain-anchored root), so the node is never the trust anchor.
 
-    /// The node's own `peer_id` (64-hex) derived from its persistent §21 identity seed, or `None` if
-    /// no identity is configured. This is the mTLS SPKI-hash identity the node presents on the peer
-    /// network (see [`peer::identity_from_seed`]).
+    /// The node's own `peer_id` (64-hex) = SHA-256(SPKI DER) of its PERSISTENT, CA-signed
+    /// [`NodeCert`](dig_nat::NodeCert), or `None` if no identity seed is configured. This is the mTLS
+    /// identity the node presents on every peer path (loaded from — or minted into — the node's cert
+    /// dir, so it is stable across restarts; see [`peer::load_or_generate_node_cert`]).
     pub fn peer_id_hex(&self) -> Option<String> {
         let seed = self.identity_seed?;
-        peer::identity_from_seed(&seed)
+        peer::load_or_generate_node_cert(self.node_cert_dir(), &seed)
             .ok()
-            .map(|id| id.peer_id.to_hex())
+            .map(|cert| cert.peer_id().to_hex())
     }
 
     /// `dig.getAvailability` — answer one queried item against the local inventory, enriching the
@@ -3137,6 +3138,15 @@ impl Node {
     /// `peer-net/` subdir of the cache dir, so it shares the node's data root + writability handling).
     pub fn peer_cert_dir(&self) -> PathBuf {
         self.cache_dir.join("peer-net")
+    }
+
+    /// The directory the node's PERSISTENT, CA-signed [`NodeCert`](dig_nat::NodeCert) identity
+    /// (`node.crt` + `node.key`, 0600) lives under — an `identity/` subdir of [`Self::peer_cert_dir`],
+    /// kept SEPARATE from dig-gossip's own `node.key` in `peer-net/` so the two never clobber each
+    /// other. This is the node's stable machine transport identity (#908, #1280); its `peer_id`
+    /// survives restarts because the cert is loaded back from here.
+    pub fn node_cert_dir(&self) -> PathBuf {
+        self.peer_cert_dir().join("identity")
     }
 
     /// The node's cache dir root — the data root the P2P content engine's download staging

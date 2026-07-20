@@ -138,10 +138,9 @@ dig-urn-resolver = "0.3.1"
 
 # `dig_constants::DIG_NODE_PORT` (§5.3) — the single-sourced canonical default localhost port
 # for client→node connections; `config.rs`'s DEFAULT_PORT reads it rather than re-declaring the
-# literal. Bare git so cargo unifies every dig-constants reference (this crate, dig-node-core,
-# dig-nat, dig-gossip) into ONE instance; the exact compatible rev (0.4.0) is held by the committed
-# Cargo.lock (git HEAD has drifted to an incompatible 0.5.0, so builds MUST use `--locked`).
-dig-constants = { version = "0.4", git = "https://github.com/DIG-Network/dig-constants" }
+# literal. From crates.io "0.4" (#1280 cascade), matching dig-node-core / dig-nat 0.7 / dig-gossip
+# 0.7.1, so the whole graph resolves to ONE crates.io dig-constants 0.4.x.
+dig-constants = "0.4"
 
 # Windows Service Control Protocol. service-manager only REGISTERS the service in the
 # SCM; the binary the SCM launches must itself speak the service protocol

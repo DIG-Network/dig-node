@@ -717,7 +717,7 @@ impl NodeContent {
     /// hole-punch tier's reflexive-address discovery.
     pub fn for_dht(
         dht: Arc<dig_dht::DhtService>,
-        identity: dig_nat::LocalIdentity,
+        node: Arc<dig_nat::NodeCert>,
         network_id: &str,
         miss_mode: MissMode,
         self_peer_id: Option<String>,
@@ -727,7 +727,7 @@ impl NodeContent {
         let locator = Arc::new(DhtProviderLocator::new(dht));
         let nat_config =
             crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server);
-        let transport = Arc::new(NatRangeTransport::new(identity, nat_config, network_id));
+        let transport = Arc::new(NatRangeTransport::new(node, nat_config, network_id));
         Self::new(locator, transport, miss_mode, self_peer_id, cache_dir)
     }
 

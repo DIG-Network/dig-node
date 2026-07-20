@@ -21,6 +21,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -296,6 +297,65 @@ pub async fn reflexive_via_stun(stun_server: SocketAddr, timeout: Duration) -> O
     dig_nat::stun::query_reflexive_address(&socket, stun_server, timeout)
         .await
         .ok()
+}
+
+/// Resolve the relay's data endpoint (`<relay-host>:<port>`) to a [`SocketAddr`], IPv6-first. Used
+/// only as the observability endpoint of the relayed traversal tier — the actual byte tunnel rides
+/// the node's live reservation ([`dig_nat::relay::RelayStatus`]), not this address. Port comes from
+/// the URL when present, else 443 (the `wss://` default). Best-effort blocking DNS; call off the
+/// async runtime.
+pub fn relay_socket_addr(relay_endpoint: &str) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let host = parse_relay_host(relay_endpoint)?;
+    let port = relay_port(relay_endpoint).unwrap_or(443);
+    let mut addrs: Vec<SocketAddr> = (host.as_str(), port).to_socket_addrs().ok()?.collect();
+    addrs.sort_by_key(dig_ip::Family::of);
+    addrs.into_iter().next()
+}
+
+/// Parse an explicit `:port` out of a relay endpoint URL (`wss://host:9450/path` → `9450`). `None`
+/// when no port is present. Handles a bracketed IPv6 literal (`wss://[::1]:9450`).
+fn relay_port(endpoint: &str) -> Option<u16> {
+    let s = endpoint.trim();
+    let s = s.split_once("://").map(|(_, rest)| rest).unwrap_or(s);
+    let s = s.split(['/', '?']).next().unwrap_or(s);
+    let after_host = match s.strip_prefix('[') {
+        Some(rest) => rest.split_once(']').map(|(_, tail)| tail).unwrap_or(""),
+        None => s,
+    };
+    after_host.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+}
+
+/// Build the shared [`dig_nat::NatRuntime`] carrying this node's LIVE traversal handles, so every node
+/// dial ([`dig_nat::connect_with_runtime`]) auto-composes the FULL ladder rather than Direct-only
+/// (#836). Each tier is enabled only when its handle is present (the composition stays honest — an
+/// absent tier is skipped, never a silently-broken dial):
+///
+/// - `local_port` — the P2P listen port, enabling the UPnP port-mapping tier (with the real
+///   SSDP-discovered IGD gateway).
+/// - `my_external_addr` — this node's STUN-discovered reflexive address (`None` → the hole-punch tier
+///   stays inert until a coordinator + reflexive addr are both present).
+/// - `relayed` — the tier-6 TURN-last fallback over the node's LIVE relay reservation
+///   ([`dig_nat::ReservationRelayedTransport`] over the shared [`RelayStatus`](dig_nat::relay::RelayStatus)),
+///   wired only when the relay is enabled and its endpoint resolves. This is the path a fully-NAT'd
+///   node reaches peers over when every more-direct tier fails.
+///
+/// The NAT-PMP/PCP tiers (needing the local default-gateway + client IP) and the hole-punch tier
+/// (needing a live coordinator) are left for a follow-up once those handles are exposed — they are
+/// composed automatically the moment their runtime inputs are added here.
+pub fn build_node_nat_runtime(
+    local_port: u16,
+    my_external_addr: Option<SocketAddr>,
+    relayed: Option<Arc<dyn dig_nat::RelayedDialer>>,
+) -> dig_nat::NatRuntime {
+    let mut builder = dig_nat::NatRuntime::builder().local_port(local_port);
+    if let Some(addr) = my_external_addr {
+        builder = builder.my_external_addr(addr);
+    }
+    if let Some(dialer) = relayed {
+        builder = builder.relayed(dialer);
+    }
+    builder.build()
 }
 
 #[cfg(test)]
