@@ -4,6 +4,7 @@
 //! across the W1b sub-PR sequence (see #1285); a seam not yet listed here still lives at
 //! the crate root pending its carve.
 
+pub mod capsule;
 pub mod chia_peer;
 pub mod content;
 pub mod dig_peer;

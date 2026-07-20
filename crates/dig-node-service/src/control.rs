@@ -49,7 +49,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use dig_node_core::Node;
+use dig_node_core::{CapsuleStore, Node};
 use serde_json::{json, Value};
 
 use crate::meta::ErrorCode;

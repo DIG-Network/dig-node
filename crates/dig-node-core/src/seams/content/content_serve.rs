@@ -28,7 +28,7 @@ use digstore_core::wire::ContentResponse;
 use digstore_core::{resource_leaf, Bytes32, SecretSalt, Urn, CHAIN, DEFAULT_RESOURCE_KEY};
 use serde_json::{json, Value};
 
-use crate::{decide_pin, pin_enforced, Node, PinDecision};
+use crate::{decide_pin, pin_enforced, CapsuleStore, Node, PinDecision};
 
 /// JSON-RPC-style code for a serve that fetched bytes but could not verify/decrypt/reach them —
 /// distinct from a clean content miss (`NotFound`) and from the anchored-root pin (`RootError`).
