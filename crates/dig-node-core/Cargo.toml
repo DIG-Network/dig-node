@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -152,8 +152,17 @@ dig-download = "0.1"
 # dig-gossip, which lags as a git dep), so the node maps `dig_gossip::PoolEvent` → the selector's local
 # `PoolEvent` 1:1 (see `download.rs::pool_event_to_selector`).
 dig-peer-selector = "0.1"
+# The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
+# is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
+# the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the
+# legacy self-signed `rcgen` cert as the node dials/serves over the dig-nat CA-signed mTLS model
+# (#1280). `peer_id = SHA256(SPKI DER)` is stable across restarts. dig-tls re-exports chia-bls's
+# `SecretKey`, unifying with this crate's chia-bls 0.26.
+dig-tls = "0.1"
 # Deterministic self-signed node certificate derived from the node's persistent identity seed, so the
 # node's mTLS peer_id is stable across restarts. rustls-only (no OpenSSL), matching dig-nat.
+# NOTE (#1280): superseded by the CA-signed `dig_tls::NodeCert` above; retained until the peer-stack
+# cascade to dig-nat 0.7 lets the dial/serve seams accept the NodeCert (release-first gate).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # The PKCS#8 key-DER wrapper rcgen consumes (`KeyPair::from_pkcs8_der_and_sign_algo`) + the mTLS types.
 rustls-pki-types = "1"

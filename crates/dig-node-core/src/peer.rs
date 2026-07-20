@@ -652,6 +652,33 @@ pub fn identity_from_seed(seed: &[u8; 32]) -> Result<dig_nat::LocalIdentity, Str
         .ok_or_else(|| "cert did not parse back to a peer_id".to_string())
 }
 
+/// Load or mint the node's PERSISTENT, CA-signed [`NodeCert`](dig_tls::NodeCert) — its long-lived
+/// machine mTLS identity for the peer network (#908 identity boundary, #1280).
+///
+/// The cert is signed by the shipped DigNetwork CA and BLS-bound (#1204) to the node's OWN identity
+/// key, derived deterministically from the node's persistent 32-byte identity `seed` (the same seed
+/// the legacy [`identity_from_seed`] consumes). The cert + private key are persisted under `dir`
+/// (owner-only `0600`), so the node's `peer_id = SHA-256(SPKI DER)` is STABLE across restarts: the
+/// first call mints + writes them, every later call loads the identical cert back.
+///
+/// This is the node's MACHINE identity, never a user key — the user's DID/wallet keys live in the
+/// dig-app and never enter the node engine (NODE-1, #910). Unlike the self-signed
+/// [`identity_from_seed`], this cert chains to the DigNetwork CA, so dig-nat's CA-signed mTLS peers
+/// (#1280) accept it.
+///
+/// # Errors
+/// Returns the stringified [`dig_tls::DigTlsError`] if the cert dir cannot be created/secured, or a
+/// persisted cert fails to parse or chain to the CA.
+pub fn load_or_generate_node_cert(
+    dir: impl AsRef<std::path::Path>,
+    seed: &[u8; 32],
+) -> Result<std::sync::Arc<dig_tls::NodeCert>, String> {
+    let bls_sk = dig_tls::bls::SecretKey::from_seed(seed);
+    dig_tls::NodeCert::load_or_generate(dir, &bls_sk)
+        .map(std::sync::Arc::new)
+        .map_err(|e| format!("load or generate node cert: {e}"))
+}
+
 // -- Serving inbound peer streams over an established mTLS connection ---------------------------------
 
 /// A thing that answers peer requests — implemented by [`crate::Node`]. The transport layer
@@ -2408,6 +2435,75 @@ mod tests {
         let id = identity_from_seed(&[3u8; 32]).expect("id");
         let recomputed = dig_nat::peer_id_from_leaf_cert_der(&id.cert_der).expect("cert parses");
         assert_eq!(id.peer_id.to_hex(), recomputed.to_hex());
+    }
+
+    // -- Persistent CA-signed NodeCert (#908 identity boundary, #1280) ----------------------------
+
+    /// A deterministic 32-byte identity seed derived from a label — no hard-coded crypto literal
+    /// (CodeQL flags integer-literal key material in crypto tests).
+    fn node_seed(label: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(label.as_bytes()).into()
+    }
+
+    #[test]
+    fn node_cert_peer_id_is_stable_across_restart() {
+        // The node's machine identity must survive a restart: minting into a dir, then loading it
+        // back from that SAME dir (a "restart"), yields the IDENTICAL peer_id. This is the property
+        // the peer network relies on — a churning id would orphan the node from its reputation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = node_seed("restart-stability");
+
+        let first = load_or_generate_node_cert(dir.path(), &seed).expect("mint");
+        // The cert + key are now persisted; a second call must LOAD them, not mint afresh.
+        let second = load_or_generate_node_cert(dir.path(), &seed).expect("load");
+
+        assert_eq!(
+            first.peer_id().to_hex(),
+            second.peer_id().to_hex(),
+            "a restart (reload from the same dir) preserves the node peer_id"
+        );
+        assert_eq!(
+            first.cert_pem(),
+            second.cert_pem(),
+            "the reloaded cert is byte-identical to the persisted one"
+        );
+    }
+
+    #[test]
+    fn node_cert_peer_id_matches_spki_derivation() {
+        // peer_id MUST equal SHA-256(SPKI DER) — the identity every peer independently recomputes
+        // from the leaf cert on the wire (§5.2/§5.3).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = load_or_generate_node_cert(dir.path(), &node_seed("spki")).expect("mint");
+        let recomputed = dig_tls::peer_id_from_tls_spki_der(cert.spki_der());
+        assert_eq!(cert.peer_id().to_hex(), recomputed.to_hex());
+    }
+
+    #[test]
+    fn node_cert_distinct_seeds_yield_distinct_peer_ids() {
+        let a = tempfile::tempdir().expect("tempdir a");
+        let b = tempfile::tempdir().expect("tempdir b");
+        let ca = load_or_generate_node_cert(a.path(), &node_seed("alpha")).expect("mint a");
+        let cb = load_or_generate_node_cert(b.path(), &node_seed("beta")).expect("mint b");
+        assert_ne!(
+            ca.peer_id().to_hex(),
+            cb.peer_id().to_hex(),
+            "different machine identity seeds → different peer_ids"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_cert_private_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        load_or_generate_node_cert(dir.path(), &node_seed("perms")).expect("mint");
+        // dig-tls persists the leaf key as `node.key` (0600) — the node's long-lived transport
+        // secret. Confirm no group/other bits leaked (a readable key = full identity theft).
+        let key_path = dir.path().join("node.key");
+        let mode = std::fs::metadata(&key_path).expect("key file").permissions().mode();
+        assert_eq!(mode & 0o077, 0, "node private key must be owner-only 0600 (got {mode:o})");
     }
 
     // -- Peer-RPC stream dispatch over a loopback (no network) ------------------------------------
