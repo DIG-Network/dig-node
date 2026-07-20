@@ -45,31 +45,23 @@ use serde_json::{json, Value};
 use shared::ContentResponse;
 use tokio::sync::Mutex;
 
-pub mod address_book;
-pub mod bandwidth;
 pub mod chainwatch;
 /// Local plaintext content-serve (#289/#290): server-side verify+decrypt for the loopback
 /// `GET /s/...` surface the service shell exposes to a same-machine browser (SPEC §4.6).
 pub mod content_serve;
-pub mod dht;
 pub mod download;
-pub mod net;
 pub mod peer;
-pub mod pex;
-/// The engine side of the identity-authenticated IPC session (NODE-1 / U2, #908): the
-/// `control.session.*` handshake registry + the `sign`-callback domain-separated verify, consumed from
-/// the canonical `dig-ipc-protocol` contract crate (the SSOT shared with dig-app), plus the engine's
-/// own **production** on-chain `DidSigningKeyResolver`. The engine holds NO user key — it only VERIFIES
-/// that an attaching dig-app holds the profile's chain-published slot-`0x0010` identity key (SPEC §5.3).
-pub mod session;
+/// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
+/// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep
+/// every existing `crate::net`/`crate::pex`/… reference working unchanged (W1b-0 is a pure
+/// relocation — no behaviour change, no caller updates required).
+pub mod seams;
+pub use seams::content::{bandwidth, verification_ledger};
+pub use seams::dig_peer::{address_book, dht, net, pex, session};
 /// Cross-seam shared vocabulary (#1285 W1a) — the ONLY types the node's seams (peer, wallet, rpc,
 /// local-content, capsule, chain, key-management) are allowed to share; see the module doc.
 pub mod shared;
 pub mod subscription;
-/// Server-side verification ledger (#307): the bounded, short-TTL record of the per-resource
-/// verify verdict + Merkle inclusion-proof data the `/s/` serve path (#289) computes, exposed
-/// read-only on the loopback browser surface (`GET /verify/...`).
-pub mod verification_ledger;
 
 /// The node engine library's own crate version (its `Cargo.toml` `version`), for
 /// programmatic use by host shells. Host shells report the SHIPPED node version to
