@@ -24,7 +24,7 @@ use axum::{
     Json, Router,
 };
 use dig_node_core::content_serve::{PlaintextOutcome, ServeSource};
-use dig_node_core::{cache_cap_bytes, cache_used_bytes, handle_rpc, Node};
+use dig_node_core::{cache_cap_bytes, cache_used_bytes, handle_rpc, ContentServer, Node};
 use dig_wallet::sage::events::{SyncEvent, SyncLifecycle, SyncStatus};
 use dig_wallet::sage::rpc::WalletBackend;
 use dig_wallet::sage::service::WalletService;
