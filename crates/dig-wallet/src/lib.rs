@@ -24,6 +24,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+// `CapsuleStore` is seam 6's public surface (#1285 W1b-4) — brings `cache_list_cached` /
+// `cache_remove_cached` / `cache_fetch_and_cache` into scope for the fully-qualified
+// `dig_node_core::Node` calls below.
+use dig_node_core::CapsuleStore;
+
 use axum::{
     extract::State,
     http::{header, HeaderMap, HeaderValue, StatusCode},
