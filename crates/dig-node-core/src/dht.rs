@@ -172,10 +172,14 @@ impl DhtTransport for NatDhtTransport {
 
         // The whole dial+exchange is bounded so a lookup round never stalls on one peer.
         let exchange = async {
-            let mut conn =
-                dig_nat::connect_with_runtime(&target, &self.node, &self.nat_config(), &self.runtime)
-                    .await
-                    .map_err(|e| DhtError::transport(format!("connect {}: {e}", peer.peer_id)))?;
+            let mut conn = dig_nat::connect_with_runtime(
+                &target,
+                &self.node,
+                &self.nat_config(),
+                &self.runtime,
+            )
+            .await
+            .map_err(|e| DhtError::transport(format!("connect {}: {e}", peer.peer_id)))?;
             let mut stream = conn
                 .open_stream()
                 .await

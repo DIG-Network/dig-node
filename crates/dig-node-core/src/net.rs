@@ -323,7 +323,9 @@ fn relay_port(endpoint: &str) -> Option<u16> {
         Some(rest) => rest.split_once(']').map(|(_, tail)| tail).unwrap_or(""),
         None => s,
     };
-    after_host.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+    after_host
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse().ok())
 }
 
 /// Build the shared [`dig_nat::NatRuntime`] carrying this node's LIVE traversal handles, so every node

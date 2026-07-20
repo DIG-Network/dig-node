@@ -1431,8 +1431,15 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     let address_book = Arc::new(crate::address_book::AddressBook::default());
     let mut dial_ranker: Option<Arc<dyn crate::pex::DialRanker>> = None;
 
-    let dht = match bring_up_dht(&node, &identity, &nat_runtime, &network_id_str, &handle, stun_server)
-        .await
+    let dht = match bring_up_dht(
+        &node,
+        &identity,
+        &nat_runtime,
+        &network_id_str,
+        &handle,
+        stun_server,
+    )
+    .await
     {
         Ok(dht) => Some(dht),
         Err(e) => {
@@ -2382,8 +2389,15 @@ mod tests {
         // dig-tls persists the leaf key as `node.key` (0600) — the node's long-lived transport
         // secret. Confirm no group/other bits leaked (a readable key = full identity theft).
         let key_path = dir.path().join("node.key");
-        let mode = std::fs::metadata(&key_path).expect("key file").permissions().mode();
-        assert_eq!(mode & 0o077, 0, "node private key must be owner-only 0600 (got {mode:o})");
+        let mode = std::fs::metadata(&key_path)
+            .expect("key file")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "node private key must be owner-only 0600 (got {mode:o})"
+        );
     }
 
     // -- Peer-RPC stream dispatch over a loopback (no network) ------------------------------------
@@ -2626,16 +2640,22 @@ mod tests {
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
         let server_dir = tempfile::tempdir().expect("server cert dir");
         let server_identity =
-            load_or_generate_node_cert(server_dir.path(), &node_seed("p2p-server")).expect("server");
+            load_or_generate_node_cert(server_dir.path(), &node_seed("p2p-server"))
+                .expect("server");
         let server_peer_id = server_identity.peer_id();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let responder: Arc<dyn PeerRpcResponder> = Arc::new(NodeResponder::without_pool(node));
-        let server = tokio::spawn(serve_peer_rpc_listener(listener, server_identity, responder));
+        let server = tokio::spawn(serve_peer_rpc_listener(
+            listener,
+            server_identity,
+            responder,
+        ));
 
         let client_dir = tempfile::tempdir().expect("client cert dir");
         let client_identity =
-            load_or_generate_node_cert(client_dir.path(), &node_seed("p2p-client")).expect("client");
+            load_or_generate_node_cert(client_dir.path(), &node_seed("p2p-client"))
+                .expect("client");
         let target = dig_nat::PeerTarget::with_addr(server_peer_id, addr, "DIG_MAINNET");
         let config = dig_nat::NatConfig::builder()
             .enabled_methods(vec![dig_nat::TraversalKind::Direct])
