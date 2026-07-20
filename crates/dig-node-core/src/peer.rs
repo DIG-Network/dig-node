@@ -602,20 +602,6 @@ pub(crate) fn classify_request(v: &Value) -> PeerRequestKind {
 
 // -- Deterministic mTLS identity from the node's persistent seed --------------------------------------
 
-/// The fixed 16-byte ASN.1 prefix of an Ed25519 PKCS#8 v1 `OneAsymmetricKey`, before the 32-byte seed
-/// (`SEQUENCE { version 0, AlgorithmIdentifier { 1.3.101.112 }, OCTET STRING { OCTET STRING seed } }`).
-/// Concatenated with the 32-byte seed it is exactly the DER `ring`/`rcgen` accept via
-/// `Ed25519KeyPair::from_pkcs8_maybe_unchecked`. Making the key deterministic in the seed keeps the
-/// node's `peer_id` STABLE across restarts (a fresh random cert every boot would churn the id).
-const ED25519_PKCS8_V1_PREFIX: [u8; 16] = [
-    0x30, 0x2e, // SEQUENCE (46 bytes)
-    0x02, 0x01, 0x00, // INTEGER version = 0
-    0x30, 0x05, // SEQUENCE (AlgorithmIdentifier)
-    0x06, 0x03, 0x2b, 0x65, 0x70, // OID 1.3.101.112 (Ed25519)
-    0x04, 0x22, // OCTET STRING (34 bytes)
-    0x04, 0x20, // OCTET STRING (32 bytes) — the raw seed follows
-];
-
 /// Install the process-wide rustls crypto provider (ring), idempotently. rustls 0.23 refuses to
 /// auto-pick a provider when BOTH `ring` and `aws-lc-rs` are present in the dependency graph (aws-lc-rs
 /// arrives transitively via chia-sdk-client), so any TLS use — the mTLS listener AND `dig_nat::connect`
@@ -625,31 +611,31 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Build a deterministic [`dig_nat::LocalIdentity`] (self-signed Ed25519 mTLS cert) from a 32-byte
-/// seed, so the node's `peer_id = SHA-256(cert SPKI DER)` is STABLE across restarts and identical for
-/// the pool links it dials and the peer-RPC it serves. Used when no GossipService-managed cert is
-/// available (e.g. an isolated peer-RPC server or a test); the standalone `run()` prefers the
-/// GossipService's own `nat_identity()` so the pool + the RPC server present ONE cert.
-pub fn identity_from_seed(seed: &[u8; 32]) -> Result<dig_nat::LocalIdentity, String> {
-    use rcgen::{CertificateParams, KeyPair, PKCS_ED25519};
-    use rustls_pki_types::PrivatePkcs8KeyDer;
-
-    let mut pkcs8 = Vec::with_capacity(48);
-    pkcs8.extend_from_slice(&ED25519_PKCS8_V1_PREFIX);
-    pkcs8.extend_from_slice(seed);
-
-    let key =
-        KeyPair::from_pkcs8_der_and_sign_algo(&PrivatePkcs8KeyDer::from(pkcs8), &PKCS_ED25519)
-            .map_err(|e| format!("derive key from seed: {e}"))?;
-    let params = CertificateParams::new(vec!["dig-node".to_string()])
-        .map_err(|e| format!("cert params: {e}"))?;
-    let cert = params
-        .self_signed(&key)
-        .map_err(|e| format!("self-sign cert: {e}"))?;
-    let cert_der = cert.der().to_vec();
-    let key_der = key.serialize_der();
-    dig_nat::LocalIdentity::from_der(cert_der, key_der)
-        .ok_or_else(|| "cert did not parse back to a peer_id".to_string())
+/// Load or mint the node's PERSISTENT, CA-signed [`NodeCert`](dig_tls::NodeCert) — its long-lived
+/// machine mTLS identity for the peer network (#908 identity boundary, #1280).
+///
+/// The cert is signed by the shipped DigNetwork CA and BLS-bound (#1204) to the node's OWN identity
+/// key, derived deterministically from the node's persistent 32-byte identity `seed` (the same seed
+/// the legacy [`digstore_remote::identity::identity_from_seed`] consumes). The cert + private key are persisted under `dir`
+/// (owner-only `0600`), so the node's `peer_id = SHA-256(SPKI DER)` is STABLE across restarts: the
+/// first call mints + writes them, every later call loads the identical cert back.
+///
+/// This is the node's MACHINE identity, never a user key — the user's DID/wallet keys live in the
+/// dig-app and never enter the node engine (NODE-1, #910). Unlike the self-signed
+/// [`digstore_remote::identity::identity_from_seed`], this cert chains to the DigNetwork CA, so dig-nat's CA-signed mTLS peers
+/// (#1280) accept it.
+///
+/// # Errors
+/// Returns the stringified [`dig_tls::DigTlsError`] if the cert dir cannot be created/secured, or a
+/// persisted cert fails to parse or chain to the CA.
+pub fn load_or_generate_node_cert(
+    dir: impl AsRef<std::path::Path>,
+    seed: &[u8; 32],
+) -> Result<std::sync::Arc<dig_tls::NodeCert>, String> {
+    let bls_sk = dig_tls::bls::SecretKey::from_seed(seed);
+    dig_tls::NodeCert::load_or_generate(dir, &bls_sk)
+        .map(std::sync::Arc::new)
+        .map_err(|e| format!("load or generate node cert: {e}"))
 }
 
 // -- Serving inbound peer streams over an established mTLS connection ---------------------------------
@@ -1284,8 +1270,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     let seed = node
         .identity_seed_for_peer()
         .ok_or_else(|| "no identity seed; peer network needs a stable identity".to_string())?;
-    let identity = identity_from_seed(&seed)?;
-    let peer_id_hex = identity.peer_id.to_hex();
+    // The node's PERSISTENT, CA-signed mTLS identity (#908, #1280): minted once from the node's own
+    // BLS machine key (derived from the §21 seed) and persisted 0600 in the node's cert dir, so the
+    // transport `peer_id` is stable across restarts and ONE cert is presented on every path (the DHT
+    // dials, the peer-RPC server, the download transport all share this `Arc<NodeCert>`).
+    let identity = load_or_generate_node_cert(node.node_cert_dir(), &seed)?;
+    let peer_id_hex = identity.peer_id().to_hex();
     status.set_running(peer_id_hex.clone());
     println!("dig-node peer network: peer_id {peer_id_hex} (network {network_id_str})");
 
@@ -1403,6 +1393,40 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         println!("dig-node peer network: STUN server for reflexive discovery: {stun}");
     }
 
+    // The full-ladder runtime the DHT-lookup transport composes from (#836): the local listen port
+    // (UPnP tier) + this node's STUN reflexive address (hole-punch input) + the relayed / TURN-last
+    // tier over the node's LIVE relay reservation (`ReservationRelayedTransport` over the SAME
+    // `Arc<RelayStatus>` shared with the pool). It powers ONLY the DHT-lookup ladder (`bring_up_dht`
+    // below): that path traverses direct → port-mapping → relay so a NAT'd node reaches the DHT
+    // instead of only trying Direct. The content/range-DOWNLOAD ladder (`NodeContent::for_dht` →
+    // `NatRangeTransport`) is Direct-only today — dig-download 0.2.1 exposes no runtime-injecting
+    // dial API to thread this runtime through. Wiring the download path onto the same ladder is a
+    // #836 follow-up (tracked, pending a dig-download runtime-injecting dial API).
+    let reflexive = match stun_server {
+        Some(stun) => crate::net::reflexive_via_stun(stun, std::time::Duration::from_secs(2)).await,
+        None => None,
+    };
+    let relayed_dialer: Option<Arc<dyn dig_nat::RelayedDialer>> = if relay_enabled() {
+        let ep = relay_endpoint.clone();
+        let relay_addr = tokio::task::spawn_blocking(move || crate::net::relay_socket_addr(&ep))
+            .await
+            .ok()
+            .flatten();
+        relay_addr.map(|addr| {
+            Arc::new(dig_nat::ReservationRelayedTransport::new(
+                relay_status.clone(),
+                addr,
+            )) as Arc<dyn dig_nat::RelayedDialer>
+        })
+    } else {
+        None
+    };
+    let nat_runtime = Arc::new(crate::net::build_node_nat_runtime(
+        peer_port_from_env(),
+        reflexive,
+        relayed_dialer,
+    ));
+
     // The durable, IPv6-first peer address book (#381): every PEX-learned + otherwise-learned candidate
     // accumulates here (incl. relay-only hints) instead of being dial-and-dropped, seeding future dials.
     // The selector-driven dial ranker (#384) is wired below once the content engine (the shared
@@ -1410,7 +1434,16 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     let address_book = Arc::new(crate::address_book::AddressBook::default());
     let mut dial_ranker: Option<Arc<dyn crate::pex::DialRanker>> = None;
 
-    let dht = match bring_up_dht(&node, &identity, &network_id_str, &handle, stun_server).await {
+    let dht = match bring_up_dht(
+        &node,
+        &identity,
+        &nat_runtime,
+        &network_id_str,
+        &handle,
+        stun_server,
+    )
+    .await
+    {
         Ok(dht) => Some(dht),
         Err(e) => {
             tracing::warn!(error = %e, "dig-node DHT bring-up failed; continuing without the DHT");
@@ -1549,7 +1582,8 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
 /// [`crate::dht::DhtHandle`] the responder + inventory-change path use.
 async fn bring_up_dht(
     node: &Arc<crate::Node>,
-    identity: &dig_nat::LocalIdentity,
+    node_cert: &Arc<dig_nat::NodeCert>,
+    runtime: &Arc<dig_nat::NatRuntime>,
     network_id: &str,
     pool: &dig_gossip::GossipHandle,
     stun_server: Option<std::net::SocketAddr>,
@@ -1562,7 +1596,8 @@ async fn bring_up_dht(
     // the relay's STUN server feeding its hole-punch tier (#385).
     let transport = Arc::new(
         crate::dht::NatDhtTransport::new(
-            identity.clone(),
+            Arc::clone(node_cert),
+            Arc::clone(runtime),
             network_id.to_string(),
             config.rpc_timeout,
         )
@@ -1599,7 +1634,7 @@ async fn bring_up_dht(
     .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
     .collect();
     let service = Arc::new(DhtService::new(
-        identity.peer_id,
+        node_cert.peer_id(),
         local_addresses,
         config.clone(),
         transport,
@@ -1654,10 +1689,10 @@ async fn bring_up_dht(
 /// pre-bound listener + an injectable responder makes it drivable from a loopback integration test.
 pub async fn serve_peer_rpc_listener(
     listener: tokio::net::TcpListener,
-    identity: dig_nat::LocalIdentity,
+    node: Arc<dig_nat::NodeCert>,
     responder: Arc<dyn PeerRpcResponder>,
 ) -> Result<(), String> {
-    serve_peer_rpc_listener_with(listener, identity, responder, None).await
+    serve_peer_rpc_listener_with(listener, node, responder, None).await
 }
 
 /// Like [`serve_peer_rpc_listener`] but additionally running the node↔node **PEX** peer-sharing layer
@@ -1667,11 +1702,11 @@ pub async fn serve_peer_rpc_listener(
 /// leaving the serve path byte-identical to before.
 pub async fn serve_peer_rpc_listener_with(
     listener: tokio::net::TcpListener,
-    identity: dig_nat::LocalIdentity,
+    node: Arc<dig_nat::NodeCert>,
     responder: Arc<dyn PeerRpcResponder>,
     pex: Option<Arc<crate::pex::PexServing>>,
 ) -> Result<(), String> {
-    let server_config = Arc::new(build_server_tls_config(&identity)?);
+    let server_config = build_server_tls_config(&node)?;
     let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
 
     // Global accepted-connection concurrency cap (audit #179 HIGH). A permit is acquired BEFORE the
@@ -1733,102 +1768,16 @@ fn caller_from_tls(
     Some(crate::dht::caller_contact(&peer_id, remote_addr))
 }
 
-/// Build the rustls ServerConfig for the mTLS peer-RPC listener: present the node's leaf cert + key
-/// and REQUIRE a client certificate (`with_client_cert_verifier`), verified by
-/// [`PeerIdClientVerifier`] (self-signed, key-is-identity — no CA). A peer presenting no/invalid cert
-/// is rejected by rustls before any byte is processed.
-fn build_server_tls_config(
-    identity: &dig_nat::LocalIdentity,
-) -> Result<rustls::ServerConfig, String> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    // Install a process crypto provider (ring) once; ignore if already installed.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let cert = CertificateDer::from(identity.cert_der.clone());
-    // `identity.key_der` is a `Zeroizing<Vec<u8>>`; take an owned `Vec<u8>` copy of the
-    // inner bytes so `PrivatePkcs8KeyDer::from(Vec<u8>)` applies (the `From` impls are
-    // for `Vec<u8>` / `&[u8]`, not the `Zeroizing` wrapper).
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.key_der.to_vec()));
-    let verifier = Arc::new(PeerIdClientVerifier::new());
-    rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(vec![cert], key)
+/// Build the rustls `ServerConfig` for the mTLS peer-RPC listener from the node's CA-signed
+/// [`NodeCert`](dig_nat::NodeCert): present its leaf + key and REQUIRE a client certificate chaining
+/// to the shipped DigNetwork CA, with the #1204 BLS binding checked per the rollout policy
+/// ([`BindingPolicy::Opportunistic`](dig_nat::BindingPolicy)). dig-tls's verifier derives the caller
+/// `peer_id = SHA-256(SPKI DER)` during the handshake, so a peer presenting no/invalid cert is
+/// rejected by rustls before any byte is processed.
+fn build_server_tls_config(node: &dig_nat::NodeCert) -> Result<Arc<rustls::ServerConfig>, String> {
+    dig_tls::server_config(node, dig_nat::BindingPolicy::Opportunistic)
+        .map(|server_tls| server_tls.config)
         .map_err(|e| format!("server TLS config: {e}"))
-}
-
-/// A rustls [`ClientCertVerifier`](rustls::server::danger::ClientCertVerifier) for the DIG
-/// self-authenticating overlay: it REQUIRES a client certificate but does NOT check a CA chain (DIG
-/// certs are self-signed and the key IS the identity, mirroring dig-nat's server-side verifier). It
-/// derives `peer_id = SHA-256(SPKI DER)` from the presented leaf (rejecting an unparseable cert) and
-/// delegates the signature check to ring — so a peer must actually hold the private key. This is the
-/// inbound counterpart to dig-nat's outbound `PeerIdPinningVerifier`.
-#[derive(Debug)]
-struct PeerIdClientVerifier {
-    schemes: Vec<rustls::SignatureScheme>,
-}
-
-impl PeerIdClientVerifier {
-    fn new() -> Self {
-        PeerIdClientVerifier {
-            schemes: rustls::crypto::ring::default_provider()
-                .signature_verification_algorithms
-                .supported_schemes(),
-        }
-    }
-}
-
-impl rustls::server::danger::ClientCertVerifier for PeerIdClientVerifier {
-    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
-        &[]
-    }
-
-    fn verify_client_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        // The peer_id is derived (and thus authenticated by the mTLS signature check below); we accept
-        // any well-formed self-signed leaf, exactly as the DIG overlay's key-is-identity model requires.
-        dig_nat::peer_id_from_leaf_cert_der(end_entity.as_ref()).ok_or_else(|| {
-            rustls::Error::General(
-                "client leaf certificate could not be parsed as X.509".to_string(),
-            )
-        })?;
-        Ok(rustls::server::danger::ClientCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.schemes.clone()
-    }
 }
 
 #[cfg(test)]
@@ -2378,36 +2327,80 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
-    // -- Deterministic mTLS identity --------------------------------------------------------------
+    // -- Persistent CA-signed NodeCert (#908 identity boundary, #1280) ----------------------------
+
+    /// A deterministic 32-byte identity seed derived from a label — no hard-coded crypto literal
+    /// (CodeQL flags integer-literal key material in crypto tests).
+    fn node_seed(label: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(label.as_bytes()).into()
+    }
 
     #[test]
-    fn identity_from_seed_is_deterministic_and_yields_a_stable_peer_id() {
-        // The SAME seed → the SAME peer_id every time (stable across restarts); a DIFFERENT seed →
-        // a different peer_id. This is the property the mTLS layer relies on.
-        let a1 = identity_from_seed(&[7u8; 32]).expect("id a1");
-        let a2 = identity_from_seed(&[7u8; 32]).expect("id a2");
+    fn node_cert_peer_id_is_stable_across_restart() {
+        // The node's machine identity must survive a restart: minting into a dir, then loading it
+        // back from that SAME dir (a "restart"), yields the IDENTICAL peer_id. This is the property
+        // the peer network relies on — a churning id would orphan the node from its reputation.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seed = node_seed("restart-stability");
+
+        let first = load_or_generate_node_cert(dir.path(), &seed).expect("mint");
+        // The cert + key are now persisted; a second call must LOAD them, not mint afresh.
+        let second = load_or_generate_node_cert(dir.path(), &seed).expect("load");
+
         assert_eq!(
-            a1.peer_id.to_hex(),
-            a2.peer_id.to_hex(),
-            "same seed → same peer_id"
+            first.peer_id().to_hex(),
+            second.peer_id().to_hex(),
+            "a restart (reload from the same dir) preserves the node peer_id"
         );
-        // peer_id is 64-hex.
-        assert_eq!(a1.peer_id.to_hex().len(), 64);
-        let b = identity_from_seed(&[8u8; 32]).expect("id b");
-        assert_ne!(
-            a1.peer_id.to_hex(),
-            b.peer_id.to_hex(),
-            "different seed → different peer_id"
+        assert_eq!(
+            first.cert_pem(),
+            second.cert_pem(),
+            "the reloaded cert is byte-identical to the persisted one"
         );
     }
 
     #[test]
-    fn identity_from_seed_peer_id_matches_dig_nat_derivation() {
-        // The peer_id must equal SHA-256(cert SPKI DER) as dig-nat/dig-gossip compute it — proving
-        // the node presents an id peers will verify identically.
-        let id = identity_from_seed(&[3u8; 32]).expect("id");
-        let recomputed = dig_nat::peer_id_from_leaf_cert_der(&id.cert_der).expect("cert parses");
-        assert_eq!(id.peer_id.to_hex(), recomputed.to_hex());
+    fn node_cert_peer_id_matches_spki_derivation() {
+        // peer_id MUST equal SHA-256(SPKI DER) — the identity every peer independently recomputes
+        // from the leaf cert on the wire (§5.2/§5.3).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = load_or_generate_node_cert(dir.path(), &node_seed("spki")).expect("mint");
+        let recomputed = dig_tls::peer_id_from_tls_spki_der(cert.spki_der());
+        assert_eq!(cert.peer_id().to_hex(), recomputed.to_hex());
+    }
+
+    #[test]
+    fn node_cert_distinct_seeds_yield_distinct_peer_ids() {
+        let a = tempfile::tempdir().expect("tempdir a");
+        let b = tempfile::tempdir().expect("tempdir b");
+        let ca = load_or_generate_node_cert(a.path(), &node_seed("alpha")).expect("mint a");
+        let cb = load_or_generate_node_cert(b.path(), &node_seed("beta")).expect("mint b");
+        assert_ne!(
+            ca.peer_id().to_hex(),
+            cb.peer_id().to_hex(),
+            "different machine identity seeds → different peer_ids"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_cert_private_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        load_or_generate_node_cert(dir.path(), &node_seed("perms")).expect("mint");
+        // dig-tls persists the leaf key as `node.key` (0600) — the node's long-lived transport
+        // secret. Confirm no group/other bits leaked (a readable key = full identity theft).
+        let key_path = dir.path().join("node.key");
+        let mode = std::fs::metadata(&key_path)
+            .expect("key file")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "node private key must be owner-only 0600 (got {mode:o})"
+        );
     }
 
     // -- Peer-RPC stream dispatch over a loopback (no network) ------------------------------------
@@ -2648,8 +2641,11 @@ mod tests {
         install_crypto_provider();
 
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
-        let server_identity = identity_from_seed(&[71u8; 32]).expect("server identity");
-        let server_peer_id = server_identity.peer_id;
+        let server_dir = tempfile::tempdir().expect("server cert dir");
+        let server_identity =
+            load_or_generate_node_cert(server_dir.path(), &node_seed("p2p-server"))
+                .expect("server");
+        let server_peer_id = server_identity.peer_id();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let responder: Arc<dyn PeerRpcResponder> = Arc::new(NodeResponder::without_pool(node));
@@ -2659,7 +2655,10 @@ mod tests {
             responder,
         ));
 
-        let client_identity = identity_from_seed(&[72u8; 32]).expect("client identity");
+        let client_dir = tempfile::tempdir().expect("client cert dir");
+        let client_identity =
+            load_or_generate_node_cert(client_dir.path(), &node_seed("p2p-client"))
+                .expect("client");
         let target = dig_nat::PeerTarget::with_addr(server_peer_id, addr, "DIG_MAINNET");
         let config = dig_nat::NatConfig::builder()
             .enabled_methods(vec![dig_nat::TraversalKind::Direct])

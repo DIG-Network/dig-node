@@ -164,8 +164,8 @@ launchers).
 
 These are loopback-authorized control methods (in-process FFI or the local read port). They are
 **management/mutation** methods and MUST NOT be reachable over the mTLS peer surface (§7.4): the
-peer verifier accepts any well-formed self-signed leaf, so an "authenticated" peer is merely "some
-`peer_id`", never an authorized administrator. The peer responder enforces a method **allowlist**
+peer verifier authenticates a peer's `peer_id` from its CA-signed leaf, so an "authenticated" peer is
+merely "some `peer_id`", never an authorized administrator. The peer responder enforces a method **allowlist**
 (§7.4a) and returns `-32601` (method not found) for any method in this section — a remote peer can
 never call `cache.clear` / `cache.setCapBytes` / `cache.removeCached` / `cache.fetchAndCache` /
 `cache.listCached` / `cache.getConfig` / `control.peerStatus` / `control.subscribe` /
@@ -459,7 +459,15 @@ another node MUST be verified before it is used or served:
 
 A range failing any check is a HARD failure: the node discards it, re-fetches from a different holder,
 and drives that source to the bottom of the selector's ranking (§7.6). A capsule fetch carries no
-per-resource proof (None/None) and self-verifies on install. This is the user-facing guarantee: **when
+per-resource proof (None/None) and self-verifies on install.
+
+> **NOTE (traversal, #836 follow-up).** Every peer dial SHOULD traverse the full
+> direct → port-mapping → hole-punch → relay ladder (§7.3). Today that ladder is wired for the
+> DHT-lookup transport only; the content/range-DOWNLOAD dial path (`NatRangeTransport`) is **Direct-only**
+> because the current `dig-download` release exposes no runtime-injecting dial API to thread the shared
+> `NatRuntime` through. Wiring the range-download path onto the full ladder is tracked as a #836
+> follow-up; the normative requirement above is the target, not yet the shipped behaviour of the
+> download path. This is the user-facing guarantee: **when
 the dig-node pulls content from another node it verifies its merkle proof AND its on-chain anchor** — a
 malicious or hostile peer mix can never forge content.
 
@@ -564,15 +572,24 @@ The standalone node runs the full L7 peer network by composing the peer crates. 
 
 ### 7.1 Identity + transport
 
-- Every node↔node link is **mutual TLS**; a node presents ONE stable self-signed certificate and its
-  identity is `peer_id = SHA-256(TLS SubjectPublicKeyInfo DER)`, derived from the presented cert on
-  every link (never taken from a wire body — identity is not self-asserted).
-- The standalone node derives a deterministic mTLS identity from its persistent 32-byte seed
-  (`identity_from_seed`: an Ed25519 PKCS#8 key from the seed), so the node's `peer_id` is stable across
-  restarts. The identity seed is the same §21 seed used for authenticated sync (§5.2). If no seed is
-  available the peer network is disabled (the HTTP read path still serves).
-- The mTLS peer-RPC listener requires a client certificate (`rustls` `CERT_REQUIRED`, a
-  `PeerIdClientVerifier` that derives `peer_id` from the leaf, no CA chain).
+- Every node↔node link is **mutual TLS**. A node's peer identity is a PERSISTENT, CA-signed
+  `dig_tls::NodeCert`: its leaf MUST chain to the shipped DigNetwork CA. Chain verification is
+  **fail-closed on both inbound and outbound** — a foreign, unparseable, or non-chaining certificate is
+  rejected before any byte is processed. `peer_id = SHA-256(TLS SubjectPublicKeyInfo DER)`, derived from
+  the presented leaf on every link (never taken from a wire body — identity is not self-asserted).
+- The node's certificate is BLS-bound (#1204) to its identity key, verified under
+  `BindingPolicy::Opportunistic`: a binding that is PRESENT MUST be valid (present-but-invalid is
+  REJECTED); an ABSENT binding is tolerated during rollout. The policy is a LOCAL decision — it is NEVER
+  wire-negotiated, so a peer cannot downgrade the check.
+- The BLS key is the node's MACHINE identity key, derived from the node's persistent machine node seed
+  — NEVER a user DID or wallet key (the #908 identity boundary: user keys live in the dig-app and never
+  enter the node engine). The private key is held in `Zeroizing` and persisted mode `0600` (its
+  directory `0700`) under `cache/peer-net/identity/`; `NodeCert` is non-`Clone`. The cert + key are
+  minted once and reloaded on every later start, so the node's `peer_id` is stable across restarts. If
+  no seed is available the peer network is disabled (the HTTP read path still serves).
+- The mTLS peer-RPC listener REQUIRES a client certificate (`rustls` `CERT_REQUIRED`); the client leaf
+  MUST chain to the DigNetwork CA and pass the same `BindingPolicy::Opportunistic` BLS-binding check.
+  The verifier derives the caller's `peer_id` from its leaf during the handshake.
 - The in-process FFI path opens NO peer network and NO listener (§1.2).
 
 ### 7.2 Peer-network bring-up + status
@@ -580,7 +597,7 @@ The standalone node runs the full L7 peer network by composing the peer crates. 
 The OS-service bring-up (`dig-node run` / the Windows SCM entrypoint) calls `spawn_peer_network`
 unless `DIG_PEER_NETWORK` is `off`/`0`/`false`; the in-process FFI host never does (§1.2). Startup
 (`spawn_peer_network` → `run_peer_network`) proceeds in order:
-1. derive the deterministic mTLS identity from the seed;
+1. load or mint the node's persistent CA-signed `NodeCert` mTLS identity from the machine seed (§7.1);
 2. spawn the chain-watch + generation gap-fill loop over the subscribed store set (§4.3, §5.1)
    **FIRST**, INDEPENDENTLY of the pool/DHT — the proactive pull path is the authenticated §21
    whole-store sync, which needs neither, so a failed (or unavailable) P2P bring-up MUST NOT disable
@@ -685,9 +702,9 @@ All of these are PEER/CONTROL tier — reachable only over mTLS, never on the an
 ### 7.4a Peer-surface method allowlist (mandatory authorization boundary)
 
 The mTLS peer surface exposes an **allowlist**, not the full RPC dispatch. The peer client-cert
-verifier accepts ANY well-formed self-signed leaf (key-is-identity, no CA), so a peer that completes
-the handshake has only proven "I hold the key for some `peer_id`" — NOT "I am authorized to
-administer this node." The node MUST therefore route only the following methods to its dispatch when
+verifier authenticates a CA-chaining leaf to a `peer_id`, so a peer that completes the handshake has
+only proven "I hold the key for some CA-signed `peer_id`" — NOT "I am authorized to administer this
+node." The node MUST therefore route only the following methods to its dispatch when
 a JSON-RPC frame arrives over the peer surface, and MUST answer every other method with `-32601`
 (method not found) **before** any dispatch (so a mutation method never executes):
 
@@ -929,7 +946,8 @@ cache cap is `config.json` > env > default).
   `peer_id = SHA-256(SPKI DER)`, derived from the presented cert; no unauthenticated peer channel; the
   boundary invariant keeps every write/peer/control surface off the anonymous read tier (§2.1).
 - **Peer authorization is an allowlist, not just authentication.** The peer client-cert verifier
-  accepts any well-formed self-signed leaf, so "authenticated" means only "some `peer_id`". The peer
+  authenticates a CA-chaining leaf to a `peer_id`, so "authenticated" means only "some CA-signed
+  `peer_id`", never an authorized administrator. The peer
   JSON-RPC surface therefore exposes ONLY the §7.4a allowlist and answers `-32601` for every
   management/mutation method (`cache.*`, `control.*`, `dig.stage`) — those are loopback/in-process
   only. Peer-triggered chain fanout is bounded (`launcher_ids` ≤ 10,000; §2.3.1) and the `dig.stage`

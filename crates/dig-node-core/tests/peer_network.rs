@@ -15,9 +15,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dig_node_core::peer::{
-    identity_from_seed, serve_peer_rpc_listener, write_framed, PeerRpcResponder,
+    load_or_generate_node_cert, serve_peer_rpc_listener, write_framed, PeerRpcResponder,
 };
 use serde_json::{json, Value};
+
+/// A deterministic 32-byte machine-identity seed derived from a label — no hard-coded crypto literal
+/// (CodeQL flags integer-literal key material in crypto tests). The same label always yields the same
+/// seed, so a test's peer_id is reproducible across runs (deterministic mTLS assertions).
+fn node_seed(label: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(label.as_bytes()).into()
+}
+
+/// Mint a persistent CA-signed [`NodeCert`](dig_tls::NodeCert) mTLS identity from `label`'s
+/// deterministic seed. The cert is minted into a throwaway dir (dropped here — the loaded cert is
+/// self-contained in memory afterwards), so the identity's `peer_id` is a stable function of `label`.
+fn test_identity(label: &str) -> Arc<dig_tls::NodeCert> {
+    let dir = tempfile::tempdir().expect("cert tempdir");
+    load_or_generate_node_cert(dir.path(), &node_seed(label)).expect("node cert")
+}
 
 /// A minimal responder standing in for the node: it answers JSON-RPC + availability + range with
 /// canned, well-formed values so the test focuses on the mTLS transport + framing, not node internals.
@@ -55,8 +71,8 @@ async fn peer_rpc_is_served_over_mtls_end_to_end() {
     // rustls needs an explicit crypto provider (aws-lc-rs is also in the graph); install ring first.
     dig_node_core::peer::install_crypto_provider();
     // Server identity (stable, deterministic) + a loopback listener on an OS-assigned port.
-    let server_identity = identity_from_seed(&[9u8; 32]).expect("server identity");
-    let server_peer_id = server_identity.peer_id;
+    let server_identity = test_identity("peer-network-server");
+    let server_peer_id = server_identity.peer_id();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -68,7 +84,7 @@ async fn peer_rpc_is_served_over_mtls_end_to_end() {
     ));
 
     // Client dials the server over dig-nat DIRECT (mTLS; peer_id pinned to the server's).
-    let client_identity = identity_from_seed(&[11u8; 32]).expect("client identity");
+    let client_identity = test_identity("peer-network-client");
     let target = dig_nat::PeerTarget::with_addr(server_peer_id, addr, "DIG_MAINNET");
     let config = dig_nat::NatConfig::builder()
         .enabled_methods(vec![dig_nat::TraversalKind::Direct])
@@ -155,7 +171,7 @@ async fn dialing_with_the_wrong_expected_peer_id_is_rejected() {
     // peer_id than the one the server presents must have `dig_nat::connect` FAIL (peer_id mismatch),
     // never establishing a session. This is the core "no impersonation / authenticated peer" property
     // — dig-nat verifies `peer_id = SHA-256(SPKI)` during the handshake against the pinned id.
-    let server_identity = identity_from_seed(&[21u8; 32]).expect("server identity");
+    let server_identity = test_identity("mismatch-server");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let responder: Arc<dyn PeerRpcResponder> = Arc::new(TestResponder);
@@ -166,8 +182,8 @@ async fn dialing_with_the_wrong_expected_peer_id_is_rejected() {
     ));
 
     // Pin the WRONG expected peer_id (a different identity's) — the handshake must be rejected.
-    let wrong_peer_id = identity_from_seed(&[99u8; 32]).unwrap().peer_id;
-    let client_identity = identity_from_seed(&[22u8; 32]).expect("client identity");
+    let wrong_peer_id = test_identity("mismatch-other").peer_id();
+    let client_identity = test_identity("mismatch-client");
     let target = dig_nat::PeerTarget::with_addr(wrong_peer_id, addr, "DIG_MAINNET");
     let config = dig_nat::NatConfig::builder()
         .enabled_methods(vec![dig_nat::TraversalKind::Direct])

@@ -31,7 +31,7 @@ edition = "2021"
 # the ROOT manifest (`[workspace.package].version`), so it MUST be set here for a
 # release to fire (§3.6). The library crates (dig-node-core/dig-runtime/dig-wallet)
 # keep their own independent versions — only the released binary tracks the workspace version.
-version = "0.46.0"
+version = "0.47.0"
 
 # Release hardening, matching digstore: keep integer-overflow checks ON in release.
 # The node parses untrusted serialized input and does offset/length arithmetic over
@@ -54,17 +54,10 @@ overflow-checks = true
 # standalone. `native-tls` is NOT patched: dig-gossip is pulled with
 # `default-features = false, features = ["rustls", "relay"]`, so the OpenSSL/native-tls path is off.
 [patch.crates-io]
-chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5f8b6fb8aa4127bd3c25805ecfc9f93b59dee58b" }
-chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5f8b6fb8aa4127bd3c25805ecfc9f93b59dee58b" }
+chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "799df86d8cca453d8bfe262a9c7df2706f131aa6" }
+chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "799df86d8cca453d8bfe262a9c7df2706f131aa6" }
 
-# -- Single-dig-nat unification -----------------------------------------------------------------------
-#
-# dig-nat IS on crates.io (0.2.1), but dig-gossip is NOT — it stays a git dependency and its manifest
-# resolves dig-nat from GIT (bare `{ version = "0.2", git = "…dig-nat" }`). The published peer stack
-# (dig-dht/dig-download/dig-peer-selector, all on crates.io) instead references dig-nat from crates.io
-# "^0.2". A git source and a registry source are DISTINCT to cargo even at the same version, so without
-# this patch the graph would fork into two incompatible dig-nat instances (dig-gossip's git copy vs the
-# crates.io copy the DHT/download/selector ride) and the shared `PeerId`/`Contact`/`PeerConnection`
-# types would not match at the seams. Redirecting the crates.io dig-nat onto the SAME bare-git source
-# dig-gossip + dig-node-core use collapses the whole graph to exactly ONE dig-nat 0.2.1.
-dig-nat = { git = "https://github.com/DIG-Network/dig-nat" }
+# The dig-nat unification patch is RETIRED (#1280 crates.io cascade): dig-nat 0.7 is on crates.io and
+# the ENTIRE peer stack (dig-gossip 0.7.1, dig-dht 0.2.2, dig-download 0.2.1, dig-peer-selector 0.2.1,
+# dig-node-core) now depends on dig-nat "0.7" from crates.io, so cargo already resolves ONE dig-nat 0.7
+# instance without any git redirect. dig-constants is likewise a plain crates.io dep everywhere now.

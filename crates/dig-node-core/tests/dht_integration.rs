@@ -25,10 +25,24 @@ use dig_node_core::dht::{
     NatDhtTransport,
 };
 use dig_node_core::peer::{
-    identity_from_seed, install_crypto_provider, serve_peer_rpc_listener, PeerRpcResponder,
+    install_crypto_provider, load_or_generate_node_cert, serve_peer_rpc_listener, PeerRpcResponder,
 };
 use dig_node_core::CachedCapsule;
 use serde_json::{json, Value};
+
+/// Mint a persistent CA-signed [`NodeCert`](dig_tls::NodeCert) mTLS identity from `seed`. The cert is
+/// minted into a throwaway dir (dropped here — the loaded cert is self-contained in memory), so the
+/// identity's `peer_id` is a stable function of `seed` (deterministic DHT-routing assertions).
+fn identity_from(seed: &[u8; 32]) -> Arc<dig_tls::NodeCert> {
+    let dir = tempfile::tempdir().expect("cert tempdir");
+    load_or_generate_node_cert(dir.path(), seed).expect("node cert")
+}
+
+/// A live full-ladder [`NatRuntime`](dig_nat::NatRuntime) for the DHT transport under test. The Layer-1
+/// tests dial over loopback DIRECT (the ladder's first tier), so a default runtime suffices.
+fn test_runtime() -> Arc<dig_nat::NatRuntime> {
+    Arc::new(dig_nat::NatRuntime::default())
+}
 
 // =====================================================================================================
 // Layer 1 — NatDhtTransport + inbound DHT serving over REAL loopback mTLS
@@ -79,8 +93,8 @@ async fn start_dht_server(
     tokio::task::JoinHandle<Result<(), String>>,
 ) {
     install_crypto_provider();
-    let identity = identity_from_seed(&seed).expect("server identity");
-    let peer_id = identity.peer_id;
+    let identity = identity_from(&seed);
+    let peer_id = identity.peer_id();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -122,8 +136,13 @@ async fn dht_ping_round_trips_over_real_mtls() {
     let (server_peer_id, addr, _dht, _seen, server) = start_dht_server([31u8; 32]).await;
 
     // A client transport dials the server over dig-nat DIRECT (mTLS, peer_id pinned).
-    let client_identity = identity_from_seed(&[32u8; 32]).expect("client id");
-    let transport = NatDhtTransport::new(client_identity, "DIG_MAINNET", Duration::from_secs(5));
+    let client_identity = identity_from(&[32u8; 32]);
+    let transport = NatDhtTransport::new(
+        client_identity,
+        test_runtime(),
+        "DIG_MAINNET",
+        Duration::from_secs(5),
+    );
 
     let from = client_contact([32u8; 32]);
     let peer = Contact::new(
@@ -144,9 +163,14 @@ async fn dht_add_then_find_providers_over_real_mtls_and_caller_is_learned() {
     let (server_peer_id, addr, server_dht, seen, server) = start_dht_server([33u8; 32]).await;
 
     let client_seed = [34u8; 32];
-    let client_identity = identity_from_seed(&client_seed).expect("client id");
-    let client_peer_id = client_identity.peer_id;
-    let transport = NatDhtTransport::new(client_identity, "DIG_MAINNET", Duration::from_secs(5));
+    let client_identity = identity_from(&client_seed);
+    let client_peer_id = client_identity.peer_id();
+    let transport = NatDhtTransport::new(
+        client_identity,
+        test_runtime(),
+        "DIG_MAINNET",
+        Duration::from_secs(5),
+    );
     let from = Contact::new(&client_peer_id, vec![CandidateAddr::direct("127.0.0.1", 1)]);
     let peer = Contact::new(
         &server_peer_id,
@@ -223,8 +247,13 @@ async fn dht_rpc_to_an_unreachable_peer_is_a_transport_error() {
     install_crypto_provider();
     // Dial an address with nothing listening → the adapter maps the failure to DhtError::Transport
     // (the lookup treats it as "that peer is unreachable" and moves on), never a panic/hang.
-    let client_identity = identity_from_seed(&[40u8; 32]).expect("client id");
-    let transport = NatDhtTransport::new(client_identity, "DIG_MAINNET", Duration::from_secs(2));
+    let client_identity = identity_from(&[40u8; 32]);
+    let transport = NatDhtTransport::new(
+        client_identity,
+        test_runtime(),
+        "DIG_MAINNET",
+        Duration::from_secs(2),
+    );
     let from = client_contact([40u8; 32]);
     // 127.0.0.1:1 is (almost certainly) not accepting — a fast connection refusal.
     let dead = Contact::new(
@@ -241,7 +270,7 @@ async fn dht_rpc_to_an_unreachable_peer_is_a_transport_error() {
 }
 
 fn client_contact(seed: [u8; 32]) -> Contact {
-    let id = identity_from_seed(&seed).unwrap().peer_id;
+    let id = identity_from(&seed).peer_id();
     Contact::new(&id, vec![CandidateAddr::direct("127.0.0.1", 1)])
 }
 

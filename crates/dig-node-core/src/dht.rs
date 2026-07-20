@@ -76,9 +76,15 @@ const DEFAULT_DHT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// (a handful of small RPCs per lookup, on the maintenance cadence). A pooled dialer is a transparent
 /// future optimization behind this same trait.
 pub struct NatDhtTransport {
-    /// This node's mTLS identity — presented as the CLIENT cert on every dial, so the responder
-    /// authenticates THIS node's peer_id from the certificate (never from the wire body).
-    identity: dig_nat::LocalIdentity,
+    /// This node's persistent CA-signed mTLS identity ([`dig_tls::NodeCert`](dig_nat::NodeCert)) —
+    /// presented as the CLIENT cert on every dial, so the responder authenticates THIS node's peer_id
+    /// from the certificate (never from the wire body). Shared (`Arc`) with the peer-RPC server + the
+    /// download transport so the node presents ONE identity on every path (#908).
+    node: Arc<dig_nat::NodeCert>,
+    /// The live [`dig_nat::NatRuntime`] handles (relay reservation + reflexive addr + local port) the
+    /// full-ladder [`dig_nat::connect_with_runtime`] auto-composes each dial from (#836). Shared so
+    /// every DHT dial traverses direct → port-mapping → relay, not Direct-only.
+    runtime: Arc<dig_nat::NatRuntime>,
     /// The network id the target peers registered under (scopes relay-coordinated dials).
     network_id: String,
     /// Per-RPC timeout (dial + exchange).
@@ -90,15 +96,17 @@ pub struct NatDhtTransport {
 }
 
 impl NatDhtTransport {
-    /// A transport that dials peers as `identity`, scoping relay lookups to `network_id`, bounding
-    /// each RPC by `rpc_timeout`.
+    /// A transport that dials peers as `node` (its CA-signed [`NodeCert`](dig_nat::NodeCert)) over the
+    /// full-ladder `runtime`, scoping relay lookups to `network_id`, bounding each RPC by `rpc_timeout`.
     pub fn new(
-        identity: dig_nat::LocalIdentity,
+        node: Arc<dig_nat::NodeCert>,
+        runtime: Arc<dig_nat::NatRuntime>,
         network_id: impl Into<String>,
         rpc_timeout: Duration,
     ) -> Self {
         NatDhtTransport {
-            identity,
+            node,
+            runtime,
             network_id: network_id.into(),
             rpc_timeout,
             stun_server: None,
@@ -164,9 +172,14 @@ impl DhtTransport for NatDhtTransport {
 
         // The whole dial+exchange is bounded so a lookup round never stalls on one peer.
         let exchange = async {
-            let mut conn = dig_nat::connect(&target, &self.identity, &self.nat_config())
-                .await
-                .map_err(|e| DhtError::transport(format!("connect {}: {e}", peer.peer_id)))?;
+            let mut conn = dig_nat::connect_with_runtime(
+                &target,
+                &self.node,
+                &self.nat_config(),
+                &self.runtime,
+            )
+            .await
+            .map_err(|e| DhtError::transport(format!("connect {}: {e}", peer.peer_id)))?;
             let mut stream = conn
                 .open_stream()
                 .await
@@ -523,6 +536,21 @@ pub(crate) fn hex64(s: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `NatDhtTransport` over a throwaway persistent NodeCert + an empty runtime, for the pure
+    /// `target_for` address-ordering tests (which never dial).
+    fn test_transport(label: &str) -> NatDhtTransport {
+        use sha2::{Digest, Sha256};
+        let seed: [u8; 32] = Sha256::digest(label.as_bytes()).into();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = crate::peer::load_or_generate_node_cert(dir.path(), &seed).expect("node cert");
+        NatDhtTransport::new(
+            node,
+            Arc::new(dig_nat::NatRuntime::default()),
+            "DIG_MAINNET",
+            Duration::from_secs(1),
+        )
+    }
     use dig_dht::ContentId;
 
     fn cap(store: &str, root: &str) -> CachedCapsule {
@@ -720,8 +748,7 @@ mod tests {
     /// IPv6 and falls back to IPv4. Built through the real `NatDhtTransport::target_for` path.
     #[test]
     fn target_for_yields_ipv6_first_candidate_list() {
-        let identity = crate::peer::identity_from_seed(&[7u8; 32]).expect("deterministic identity");
-        let transport = NatDhtTransport::new(identity, "DIG_MAINNET", Duration::from_secs(1));
+        let transport = test_transport("dht-ipv6-first");
         // Advertised IPv4-BEFORE-IPv6 on the wire — target_for must still put IPv6 first.
         let contact = Contact::new(
             &PeerId::from_bytes([8u8; 32]),
@@ -744,8 +771,7 @@ mod tests {
 
     #[test]
     fn target_for_relay_only_contact_has_no_direct_addrs() {
-        let identity = crate::peer::identity_from_seed(&[9u8; 32]).expect("deterministic identity");
-        let transport = NatDhtTransport::new(identity, "DIG_MAINNET", Duration::from_secs(1));
+        let transport = test_transport("dht-relay-only");
         let contact = Contact::new(
             &PeerId::from_bytes([10u8; 32]),
             vec![CandidateAddr::relay_marker()],

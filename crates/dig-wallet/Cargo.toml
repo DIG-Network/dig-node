@@ -62,7 +62,6 @@ chia-query = { git = "https://github.com/DIG-Network/chia-query.git", rev = "48f
 # Dual transport (C.3): mTLS 9257 (Sage byte-parity) + plain-HTTP+CORS browser mirror.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 rcgen = "0.13"
 tower-http = { version = "0.6", features = ["cors"] }
 async-trait = "0.1"
