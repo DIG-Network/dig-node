@@ -59,7 +59,10 @@ pub mod seams;
 /// call `serve_content_plaintext`/`manifest_paths`/`resource_generation` on a `Node`.
 pub use seams::content::content_serve;
 pub use seams::content::{bandwidth, verification_ledger, ContentServer};
-pub use seams::dig_peer::{address_book, dht, net, pex, session};
+/// The `PeerNetwork` trait is seam 2's public surface (#1285 W1b-2) — bring it into scope to
+/// call `peer_status`/`set_inventory_refresher`/`set_gossip_handle`/`gossip_handle`/
+/// `refresh_dht_inventory` on a `Node`.
+pub use seams::dig_peer::{address_book, dht, net, pex, session, PeerNetwork};
 /// Cross-seam shared vocabulary (#1285 W1a) — the ONLY types the node's seams (peer, wallet, rpc,
 /// local-content, capsule, chain, key-management) are allowed to share; see the module doc.
 pub mod shared;
@@ -325,37 +328,10 @@ pub struct Node {
 /// bring-up ([`peer::spawn_peer_network`]); the FFI path installs none. The closure is `Send + Sync`
 /// and returns a boxed future so the async DHT `refresh_inventory` call can be driven from the
 /// FFI-safe [`Node`] without the node holding the DHT handle directly.
-type InventoryRefresher =
+pub(crate) type InventoryRefresher =
     Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 impl Node {
-    /// Install the DHT inventory-refresh hook (the standalone peer-network bring-up calls this once;
-    /// the FFI path never does). Idempotent — a second install is ignored.
-    pub(crate) fn set_inventory_refresher(&self, refresher: InventoryRefresher) {
-        let _ = self.inventory_refresher.set(refresher);
-    }
-
-    /// Retain the live gossip pool handle (the standalone peer-network bring-up calls this once with
-    /// the [`dig_gossip::GossipHandle`] it starts; the FFI path never does). Idempotent — a second
-    /// install is ignored. Enables the control surface to dial peers + enumerate the connected pool.
-    pub(crate) fn set_gossip_handle(&self, handle: dig_gossip::GossipHandle) {
-        let _ = self.gossip.set(handle);
-    }
-
-    /// The live gossip pool handle, if the peer network is running. `None` on the FFI path (no pool)
-    /// and before bring-up — callers degrade honestly (empty peer list; "no peer network" on connect).
-    pub(crate) fn gossip_handle(&self) -> Option<&dig_gossip::GossipHandle> {
-        self.gossip.get()
-    }
-
-    /// Refresh the node's DHT provider records against its current inventory, if a peer network is
-    /// running (SPEC §14.1). A no-op on the FFI path (no hook installed) or before bring-up.
-    pub(crate) async fn refresh_dht_inventory(&self) {
-        if let Some(refresh) = self.inventory_refresher.get() {
-            refresh().await;
-        }
-    }
-
     /// Install the WEAK self-reference (the standalone peer-network bring-up calls this once with the
     /// `Arc<Node>` it holds). Enables `&self` read handlers to spawn owned-`Arc` background tasks — the
     /// capsule backfill (§14.3). Idempotent; never set on the FFI path.
@@ -3072,12 +3048,6 @@ impl Node {
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
         })
-    }
-
-    /// The shared peer-network status (for the standalone `run` to hand to the peer-network task and
-    /// for `control.peerStatus`).
-    pub fn peer_status(&self) -> Arc<peer::PeerStatus> {
-        self.peer_status.clone()
     }
 
     /// The node's persistent identity seed, if configured — the source of the STABLE mTLS `peer_id`
