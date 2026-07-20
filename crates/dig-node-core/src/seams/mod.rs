@@ -8,3 +8,4 @@ pub mod capsule;
 pub mod chia_peer;
 pub mod content;
 pub mod dig_peer;
+pub mod dig_rpc;
