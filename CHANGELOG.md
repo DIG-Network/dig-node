@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.46.0] - 2026-07-20
+
+### Features
+- **dig-node:** Adopt dig-rpc-protocol crate, delete hand-rolled RPC duplicates (#1084) (#60)- **session:** Consume dig-ipc-protocol engine session half + production DID resolver (#1080) (#61)- **session:** Migrate DID resolver to dig-identity v0.4 BLS-G1 (resolve_bls_public_key, 48B) (#62)
+
 ## [0.43.0] - 2026-07-19
 
 ### Features
