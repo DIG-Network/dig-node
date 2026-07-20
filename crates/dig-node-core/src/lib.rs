@@ -34,7 +34,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use base64::Engine;
-use digstore_chain::coinset::Coinset;
 use digstore_chain::singleton::sync_datastore;
 use digstore_core::codec::{Decode, Encode};
 use digstore_core::Bytes32;
@@ -53,6 +52,11 @@ pub mod peer;
 /// every existing `crate::net`/`crate::pex`/… reference working unchanged (W1b-0 is a pure
 /// relocation — no behaviour change, no caller updates required).
 pub mod seams;
+pub(crate) use seams::chia_peer::{default_anchored_resolver, resolution_coinset};
+/// The `ChainSource` trait is seam 1's public surface (#1285 W1b-3) — bring it into scope to call
+/// `anchored_root_resolver_arc` on a `Node`. `CoinsetResolver` is public (production impl callers
+/// may reference); `default_anchored_resolver`/`resolution_coinset` stay crate-internal, as before.
+pub use seams::chia_peer::{ChainSource, CoinsetResolver};
 /// Local plaintext content-serve (#289/#290): server-side verify+decrypt for the loopback
 /// `GET /s/...` surface the service shell exposes to a same-machine browser (SPEC §4.6). The
 /// `ContentServer` trait is this seam's public surface (#1285 W1b-1) — bring it into scope to
@@ -2125,73 +2129,11 @@ fn touch(path: &Path) {
     let _ = filetime::set_file_mtime(path, filetime::FileTime::now());
 }
 
-/// Coinset client used to resolve chain-anchored roots. `DIG_NODE_COINSET`
-/// overrides the API base (tests / alternate endpoints); defaults to mainnet
-/// (api.coinset.org).
-fn resolution_coinset() -> Coinset {
-    match std::env::var("DIG_NODE_COINSET") {
-        Ok(url) if !url.is_empty() => Coinset::with_url(url),
-        _ => Coinset::mainnet(),
-    }
-}
-
 // `AnchoredRootResolver` + `AnchoredStoreState` moved to `crate::shared::chain_view` (#1285 W1a —
 // this is cross-seam vocabulary the local-content seam and `chainwatch` both depend on, not
 // content-serve-private); re-exported below so the existing `crate::AnchoredRootResolver` /
 // `crate::AnchoredStoreState` paths keep working unchanged.
 pub use shared::chain_view::{AnchoredRootResolver, AnchoredStoreState};
-
-/// Production resolver: walks the store's DataStore singleton lineage on
-/// coinset.org (`digstore_chain::singleton::sync_datastore`) to the unspent tip
-/// and returns its metadata root — exactly the source `dig.getAnchoredRoot` and
-/// `dig-resolver` already use, and the same authority the CLI clone/pull pin
-/// resolves against (`current_root`). NEVER consults the serving node.
-struct CoinsetResolver;
-
-#[async_trait::async_trait]
-impl AnchoredRootResolver for CoinsetResolver {
-    async fn anchored_root(&self, store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
-        Ok(self.anchored_state(store_id).await?.map(|s| s.root))
-    }
-
-    async fn anchored_state(
-        &self,
-        store_id: &[u8; 32],
-    ) -> Result<Option<AnchoredStoreState>, String> {
-        let launcher = chia_protocol::Bytes32::new(*store_id);
-        match sync_datastore(&resolution_coinset(), launcher).await {
-            Ok(store) => {
-                // Convert chia_protocol::Bytes32 → digstore_core::Bytes32 (the
-                // node's content-root type), mirroring the CLI clone/pull pin.
-                let mut a = [0u8; 32];
-                a.copy_from_slice(store.info.metadata.root_hash.as_ref());
-                let mut o = [0u8; 32];
-                o.copy_from_slice(store.info.owner_puzzle_hash.as_ref());
-                Ok(Some(AnchoredStoreState {
-                    root: Bytes32(a),
-                    owner_puzzle_hash: Some(Bytes32(o)),
-                }))
-            }
-            Err(e) => {
-                // A "not minted yet" / "launcher unspent" lineage error is a
-                // legitimate absence (no confirmed generation), distinct from an
-                // unreachable chain. Either way the read FAILS CLOSED at the
-                // caller; we only distinguish them for a clearer error message.
-                let msg = e.to_string();
-                if msg.contains("not minted") || msg.contains("unspent") {
-                    Ok(None)
-                } else {
-                    Err(msg)
-                }
-            }
-        }
-    }
-}
-
-/// The default anchored-root resolver (production coinset walk).
-fn default_anchored_resolver() -> Arc<dyn AnchoredRootResolver> {
-    Arc::new(CoinsetResolver)
-}
 
 /// Whether the mandatory read-path root pin is enforced. Default: ENFORCED
 /// (fail-closed). The ONLY opt-out is the explicit `DIG_NODE_PIN=off`
@@ -3076,13 +3018,6 @@ impl Node {
     /// (`<cache>/downloads`) + `.download.tmp` GC live under (shares the node's writability handling).
     pub fn cache_dir_path(&self) -> &Path {
         &self.cache_dir
-    }
-
-    /// The node's anchored-root resolver (the trusted-root source for the read-path pin AND the
-    /// chain-watch loop). Cloned `Arc` so the chain-watch loop shares the SAME resolver the read path
-    /// uses — production coinset walk, or a deterministic one in tests.
-    pub fn anchored_root_resolver_arc(&self) -> Arc<dyn AnchoredRootResolver> {
-        self.anchored_root_resolver.clone()
     }
 }
 

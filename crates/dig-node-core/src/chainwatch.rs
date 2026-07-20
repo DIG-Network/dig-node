@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::subscription::SubscriptionSet;
-use crate::{AnchoredRootResolver, Bytes32};
+use crate::{AnchoredRootResolver, Bytes32, ChainSource};
 
 /// Default interval between chain-watch polls of the subscribed store set. Deliberately modest — a new
 /// generation confirms on-chain in tens of seconds to minutes, so a ~30 s poll detects it promptly
