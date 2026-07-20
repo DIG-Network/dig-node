@@ -211,7 +211,13 @@ enum ProxyMiss {
     Error(String),
 }
 
-impl Node {
+/// Seam 5's public surface (#1285/#1303) — the loopback plaintext content-serve operations the
+/// `dig-node-service` HTTP layer drives. Implemented by [`Node`] with the method bodies carved
+/// unchanged from this module (W1b-1) — a behaviour-preserving trait extraction, not a new
+/// implementation. `async_trait`-boxed (matching [`crate::shared::AnchoredRootResolver`]) so the
+/// trait stays dyn-compatible for the future `Arc<dyn ContentServer>` handle (W1c).
+#[async_trait::async_trait]
+pub trait ContentServer: Send + Sync {
     /// Serve a store resource as DECRYPTED plaintext over the trusted loopback surface (#289).
     ///
     /// Resolution order (per `(store, resolved_root)`):
@@ -229,7 +235,37 @@ impl Node {
     ///
     /// `requested_root_hex` empty / `"latest"` ⇒ rootless (resolve the tip). `resource_key` empty ⇒
     /// `index.html`. `salt_hex` is the private-store secret salt (`None` ⇒ public store).
-    pub async fn serve_content_plaintext(
+    async fn serve_content_plaintext(
+        &self,
+        store_hex: &str,
+        requested_root_hex: &str,
+        resource_key: &str,
+        salt_hex: Option<&str>,
+    ) -> PlaintextOutcome;
+
+    /// The store's public file PATHS at `(store, root)` from the embedded `PublicManifest` (id 13),
+    /// or `None` when this node does not hold the capsule OR it carries no manifest (an older `.dig` /
+    /// a private store whose paths stay opaque). The HTTP layer uses this to distinguish a KNOWN file
+    /// genuinely missing at this root (an honest 404) from an SPA route (serve `index.html`).
+    async fn manifest_paths(&self, store_hex: &str, root_hex: &str) -> Option<Vec<String>>;
+
+    /// The store generation (0-based commit ordinal) that most recently wrote `resource_key`, per
+    /// the store's embedded `PublicManifest` (id 13) at `(store, root)` — surfaced as
+    /// `X-Dig-Generation` (#486). `None` when this node does not hold the capsule, the module
+    /// carries no manifest (an older `.dig` or a private store whose paths stay opaque), or the
+    /// manifest lists no entry for this exact key (a resource outside the normalized public-path
+    /// surface). Local-only (mirrors [`manifest_paths`](Self::manifest_paths)) — never a chain call.
+    async fn resource_generation(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        resource_key: &str,
+    ) -> Option<u64>;
+}
+
+#[async_trait::async_trait]
+impl ContentServer for Node {
+    async fn serve_content_plaintext(
         &self,
         store_hex: &str,
         requested_root_hex: &str,
@@ -436,6 +472,49 @@ impl Node {
         PlaintextOutcome::NotFound { root_hex }
     }
 
+    async fn manifest_paths(&self, store_hex: &str, root_hex: &str) -> Option<Vec<String>> {
+        let cache_dir = self.cache_dir.clone();
+        let (store, root) = (store_hex.to_string(), root_hex.to_string());
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::read_public_manifest_blocking(&cache_dir, &store, &root)
+        })
+        .await
+        .ok()?;
+        match outcome {
+            Ok(Some(Some(pm))) => Some(pm.entries.into_iter().map(|e| e.path).collect()),
+            _ => None,
+        }
+    }
+
+    async fn resource_generation(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        resource_key: &str,
+    ) -> Option<u64> {
+        let cache_dir = self.cache_dir.clone();
+        let (store, root, key) = (
+            store_hex.to_string(),
+            root_hex.to_string(),
+            resource_key.to_string(),
+        );
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::read_public_manifest_blocking(&cache_dir, &store, &root)
+        })
+        .await
+        .ok()?;
+        match outcome {
+            Ok(Some(Some(pm))) => pm
+                .entries
+                .into_iter()
+                .find(|e| e.path == key)
+                .map(|e| e.generation_index),
+            _ => None,
+        }
+    }
+}
+
+impl Node {
     /// Verify + decrypt a locally-decoded [`ContentResponse`] into a `Served` outcome, or `None` when
     /// the local module did not genuinely hold the resource at the anchored root — a cached module
     /// whose generation is not the anchored tip (#127), or a DECOY the module returns for a key it does
@@ -625,57 +704,6 @@ impl Node {
             ProxyMiss::Error("upstream response carried no inclusion proof".into())
         })?;
         Ok((ciphertext, proof, chunk_lens))
-    }
-
-    /// The store's public file PATHS at `(store, root)` from the embedded `PublicManifest` (id 13),
-    /// or `None` when this node does not hold the capsule OR it carries no manifest (an older `.dig` /
-    /// a private store whose paths stay opaque). The HTTP layer uses this to distinguish a KNOWN file
-    /// genuinely missing at this root (an honest 404) from an SPA route (serve `index.html`).
-    pub async fn manifest_paths(&self, store_hex: &str, root_hex: &str) -> Option<Vec<String>> {
-        let cache_dir = self.cache_dir.clone();
-        let (store, root) = (store_hex.to_string(), root_hex.to_string());
-        let outcome = tokio::task::spawn_blocking(move || {
-            crate::read_public_manifest_blocking(&cache_dir, &store, &root)
-        })
-        .await
-        .ok()?;
-        match outcome {
-            Ok(Some(Some(pm))) => Some(pm.entries.into_iter().map(|e| e.path).collect()),
-            _ => None,
-        }
-    }
-
-    /// The store generation (0-based commit ordinal) that most recently wrote `resource_key`, per
-    /// the store's embedded `PublicManifest` (id 13) at `(store, root)` — surfaced as
-    /// `X-Dig-Generation` (#486). `None` when this node does not hold the capsule, the module
-    /// carries no manifest (an older `.dig` or a private store whose paths stay opaque), or the
-    /// manifest lists no entry for this exact key (a resource outside the normalized public-path
-    /// surface). Local-only (mirrors [`manifest_paths`](Self::manifest_paths)) — never a chain call.
-    pub async fn resource_generation(
-        &self,
-        store_hex: &str,
-        root_hex: &str,
-        resource_key: &str,
-    ) -> Option<u64> {
-        let cache_dir = self.cache_dir.clone();
-        let (store, root, key) = (
-            store_hex.to_string(),
-            root_hex.to_string(),
-            resource_key.to_string(),
-        );
-        let outcome = tokio::task::spawn_blocking(move || {
-            crate::read_public_manifest_blocking(&cache_dir, &store, &root)
-        })
-        .await
-        .ok()?;
-        match outcome {
-            Ok(Some(Some(pm))) => pm
-                .entries
-                .into_iter()
-                .find(|e| e.path == key)
-                .map(|e| e.generation_index),
-            _ => None,
-        }
     }
 }
 

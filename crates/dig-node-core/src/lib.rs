@@ -46,9 +46,6 @@ use shared::ContentResponse;
 use tokio::sync::Mutex;
 
 pub mod chainwatch;
-/// Local plaintext content-serve (#289/#290): server-side verify+decrypt for the loopback
-/// `GET /s/...` surface the service shell exposes to a same-machine browser (SPEC §4.6).
-pub mod content_serve;
 pub mod download;
 pub mod peer;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
@@ -56,7 +53,12 @@ pub mod peer;
 /// every existing `crate::net`/`crate::pex`/… reference working unchanged (W1b-0 is a pure
 /// relocation — no behaviour change, no caller updates required).
 pub mod seams;
-pub use seams::content::{bandwidth, verification_ledger};
+/// Local plaintext content-serve (#289/#290): server-side verify+decrypt for the loopback
+/// `GET /s/...` surface the service shell exposes to a same-machine browser (SPEC §4.6). The
+/// `ContentServer` trait is this seam's public surface (#1285 W1b-1) — bring it into scope to
+/// call `serve_content_plaintext`/`manifest_paths`/`resource_generation` on a `Node`.
+pub use seams::content::content_serve;
+pub use seams::content::{bandwidth, verification_ledger, ContentServer};
 pub use seams::dig_peer::{address_book, dht, net, pex, session};
 /// Cross-seam shared vocabulary (#1285 W1a) — the ONLY types the node's seams (peer, wallet, rpc,
 /// local-content, capsule, chain, key-management) are allowed to share; see the module doc.
@@ -5796,6 +5798,7 @@ mod tests {
     #[test]
     fn serve_content_plaintext_serves_local_first_decrypted() {
         use crate::content_serve::{PlaintextOutcome, ServeSource};
+        use crate::ContentServer;
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
         let rt = pin_test_rt();
@@ -5909,6 +5912,7 @@ mod tests {
     #[test]
     fn serve_content_plaintext_reports_the_resolver_owner_puzzle_hash_when_pin_enforced() {
         use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
         let rt = pin_test_rt();
@@ -5953,6 +5957,7 @@ mod tests {
     #[test]
     fn serve_content_plaintext_omits_owner_puzzle_hash_when_pin_is_off() {
         use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::set_var("DIG_NODE_PIN", "off");
         let rt = pin_test_rt();
@@ -6001,6 +6006,7 @@ mod tests {
     #[test]
     fn serve_content_plaintext_omits_generation_when_manifest_absent() {
         use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN");
         let rt = pin_test_rt();
@@ -6036,6 +6042,7 @@ mod tests {
     #[test]
     fn serve_content_plaintext_rejects_a_non_anchored_root() {
         use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN");
         let rt = pin_test_rt();
@@ -6056,6 +6063,7 @@ mod tests {
     /// manifest, and is `None` when the capsule is not held (drives the shell's SPA-vs-404 decision).
     #[tokio::test]
     async fn manifest_paths_lists_public_paths_when_held_and_none_when_not() {
+        use crate::ContentServer;
         let (node, _td) = test_node(None);
         let store = Bytes32([23u8; 32]);
         let files = vec![
