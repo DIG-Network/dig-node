@@ -616,13 +616,13 @@ pub fn install_crypto_provider() {
 ///
 /// The cert is signed by the shipped DigNetwork CA and BLS-bound (#1204) to the node's OWN identity
 /// key, derived deterministically from the node's persistent 32-byte identity `seed` (the same seed
-/// the legacy [`identity_from_seed`] consumes). The cert + private key are persisted under `dir`
+/// the legacy [`digstore_remote::identity::identity_from_seed`] consumes). The cert + private key are persisted under `dir`
 /// (owner-only `0600`), so the node's `peer_id = SHA-256(SPKI DER)` is STABLE across restarts: the
 /// first call mints + writes them, every later call loads the identical cert back.
 ///
 /// This is the node's MACHINE identity, never a user key — the user's DID/wallet keys live in the
 /// dig-app and never enter the node engine (NODE-1, #910). Unlike the self-signed
-/// [`identity_from_seed`], this cert chains to the DigNetwork CA, so dig-nat's CA-signed mTLS peers
+/// [`digstore_remote::identity::identity_from_seed`], this cert chains to the DigNetwork CA, so dig-nat's CA-signed mTLS peers
 /// (#1280) accept it.
 ///
 /// # Errors
@@ -1393,12 +1393,15 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         println!("dig-node peer network: STUN server for reflexive discovery: {stun}");
     }
 
-    // The ONE shared full-ladder runtime every node dial composes from (#836): the local listen port
+    // The full-ladder runtime the DHT-lookup transport composes from (#836): the local listen port
     // (UPnP tier) + this node's STUN reflexive address (hole-punch input) + the relayed / TURN-last
     // tier over the node's LIVE relay reservation (`ReservationRelayedTransport` over the SAME
-    // `Arc<RelayStatus>` shared with the pool). Shared by the DHT transport AND the download transport
-    // (below) so EVERY path traverses direct → port-mapping → relay with the SAME identity — a NAT'd
-    // node actually reaches peers instead of only trying Direct.
+    // `Arc<RelayStatus>` shared with the pool). It powers ONLY the DHT-lookup ladder (`bring_up_dht`
+    // below): that path traverses direct → port-mapping → relay so a NAT'd node reaches the DHT
+    // instead of only trying Direct. The content/range-DOWNLOAD ladder (`NodeContent::for_dht` →
+    // `NatRangeTransport`) is Direct-only today — dig-download 0.2.1 exposes no runtime-injecting
+    // dial API to thread this runtime through. Wiring the download path onto the same ladder is a
+    // #836 follow-up (tracked, pending a dig-download runtime-injecting dial API).
     let reflexive = match stun_server {
         Some(stun) => crate::net::reflexive_via_stun(stun, std::time::Duration::from_secs(2)).await,
         None => None,

@@ -3128,7 +3128,7 @@ impl Node {
     }
 
     /// The node's persistent identity seed, if configured — the source of the STABLE mTLS `peer_id`
-    /// for the L7 peer network (see [`peer::identity_from_seed`]). `None` disables the peer network
+    /// for the L7 peer network (see [`peer::load_or_generate_node_cert`]). `None` disables the peer network
     /// (the node still serves the HTTP read path).
     pub fn identity_seed_for_peer(&self) -> Option<[u8; 32]> {
         self.identity_seed

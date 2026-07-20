@@ -604,6 +604,50 @@ mod tests {
     }
 
     #[test]
+    fn relay_port_parses_explicit_port_else_none() {
+        // Explicit port after the host.
+        assert_eq!(relay_port("wss://relay.dig.net:9450"), Some(9450));
+        assert_eq!(relay_port("relay.dig.net:9450/path?x=1"), Some(9450));
+        // Bracketed IPv6 literal: only the port after `]` counts, never a colon inside the address.
+        assert_eq!(relay_port("wss://[2001:db8::1]:9450"), Some(9450));
+        assert_eq!(relay_port("wss://[2001:db8::1]"), None);
+        // No port present.
+        assert_eq!(relay_port("wss://relay.dig.net"), None);
+        assert_eq!(relay_port("relay.dig.net/introducer"), None);
+        // Garbage / non-numeric port → None, never a panic.
+        assert_eq!(relay_port("wss://relay.dig.net:notaport"), None);
+        assert_eq!(relay_port(""), None);
+        assert_eq!(relay_port("::::"), None);
+    }
+
+    #[test]
+    fn relay_socket_addr_resolves_ipv6_literal_with_explicit_port() {
+        // A bracketed IPv6 literal resolves without DNS, exercising the full parse → resolve path.
+        let addr = relay_socket_addr("wss://[2001:db8::1]:9450").expect("literal must resolve");
+        assert!(addr.is_ipv6());
+        assert_eq!(addr.port(), 9450);
+        // No explicit port falls back to the wss:// default 443.
+        let addr = relay_socket_addr("wss://[2001:db8::1]").expect("literal must resolve");
+        assert_eq!(addr.port(), 443);
+        // Unparseable endpoint yields None (no panic).
+        assert_eq!(relay_socket_addr("wss://"), None);
+    }
+
+    #[test]
+    fn relay_socket_addr_prefers_ipv6() {
+        // relay_socket_addr sorts resolved addresses by dig_ip::Family::of (IPv6 before IPv4, §5.2).
+        let mut addrs: Vec<SocketAddr> = vec![
+            "203.0.113.5:9450".parse().unwrap(),
+            "[2001:db8::5]:9450".parse().unwrap(),
+        ];
+        addrs.sort_by_key(dig_ip::Family::of);
+        assert!(
+            addrs[0].is_ipv6(),
+            "IPv6 relay address must sort before IPv4"
+        );
+    }
+
+    #[test]
     fn stun_server_from_relay_prefers_ipv6() {
         // A pure family-sort check of the dig_ip::Family::of key used by stun_server_from_relay:
         // given both families, IPv6 sorts before IPv4.
