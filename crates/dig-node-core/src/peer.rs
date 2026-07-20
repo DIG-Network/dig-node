@@ -61,7 +61,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{CachedCapsule, CapsuleStore, PeerNetwork};
+use crate::{CachedCapsule, CapsuleStore, KeyManager, PeerNetwork};
 
 // -- Constants ---------------------------------------------------------------------------------------
 
