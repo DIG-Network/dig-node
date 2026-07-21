@@ -11,9 +11,15 @@
 //! AnchoredRootResolver>` every other seam already consumes.
 
 mod coinset_resolver;
+pub mod light_client;
 
 pub use coinset_resolver::CoinsetResolver;
 pub(crate) use coinset_resolver::{default_anchored_resolver, resolution_coinset};
+
+pub use light_client::{
+    confirmation_depth, connect_light_client, register_light_client_provider, submit_spend,
+    ChiaPeerSubscriptions, CHIA_PEER_INDEPENDENCE_GROUP,
+};
 
 use std::sync::Arc;
 

@@ -362,6 +362,36 @@ the current root.
   `api.coinset.org`, overridable by `DIG_NODE_COINSET`). Tests inject a deterministic resolver so the
   fail-closed gate is unit-testable without a chain.
 
+### 4.1a Chia light-client provider — confirmation + peak observability (seam 1, #1314)
+
+Beside the coinset content-root path, the node MAY run a subscribing Chia wallet-protocol **light
+client** (`chia-peer`, a thin driver over `chia-wallet-sdk` 0.30 / `chia-protocol` 0.26) for
+CONFIRMATION + PEAK observability. It tracks the peak height and the coin/puzzle-hash state of the
+coins it SUBSCRIBES to:
+
+- **COIN subscriptions** — DataStore/DataLayer singleton coins, collateral, and treasury/tip coins.
+- **PUZZLE-HASH subscriptions** — store-owner + collateral puzzle hashes (watched for every coin paying
+  to them, spent or unspent, hinted included).
+
+The light client's read side is a `dig-chainsource-interface` `ChainSourceProvider` registered into
+`chia-query`'s aggregating `ProviderRegistry` at **priority 20** (`chia-peer`'s
+`DEFAULT_PROVIDER_PRIORITY`) by dependency injection. It is constructed on node start using the node's
+EXISTING tokio runtime (no second runtime); peak-height arithmetic uses saturating subtraction so a
+coin read in the one-block window before the matching `NewPeakWallet` reports 0 confirmations, never an
+underflowed depth (#1326/#1346). Its `submit_spend` leg relays an already-built, already-signed bundle
+for the seam-1 write path.
+
+**Boundary (LOCKED, #1314):**
+
+- The light client does **NOT** resolve DataStore content roots. Content-root resolution STAYS on the
+  coinset `sync_datastore` singleton walk (`CoinsetResolver`, §4.1) — UNCHANGED.
+- The provider returns `Unsupported` for `resolve_singleton_lineage` and `block_timestamp` BY DESIGN
+  (a subscribing light client is not an archival index); the registry composes providers so those reads
+  fall through to the coinset provider. No `ChainSource` trait method is added or changed.
+- Money-path anchored-root verification stays on the coinset path; the light client never verifies it.
+- Public-quorum custody is OFF (the registry's safe default) — this is a single-provider observability
+  source, not a trust quorum.
+
 ### 4.2 The read-path pin (fail-closed, `-32005`)
 
 Before serving ANY content the node resolves the store's anchored root and gates on it:

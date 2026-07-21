@@ -45,6 +45,20 @@ digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "0
 digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
 digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
 chia-protocol = "0.26"
+# -- Seam 1: Chia light-client CONFIRMATION/PEAK observability (#1314) --------------------------------
+# `chia-peer` is a subscribing Chia wallet-protocol light client (a thin driver over chia-wallet-sdk
+# 0.30 / chia-protocol 0.26): it tracks the peak + coin/puzzle-hash confirmations for the coins the
+# node SUBSCRIBES to (DataStore singletons, collateral, treasury/tip) and submits spend bundles. Its
+# read side is a `dig-chainsource-interface` `ChainSourceProvider` the node registers into
+# `chia-query`'s aggregating `ProviderRegistry` at priority 20 (DI). This is DISTINCT from the
+# content-root path: DataStore content-root resolution STAYS on the coinset `sync_datastore` walk
+# (`CoinsetResolver`, seam 1's `AnchoredRootResolver`), UNCHANGED. The light client deliberately
+# returns `Unsupported` for singleton-lineage + block-timestamp reads, which fall through to
+# chia-query's coinset provider. All three crates share chia-protocol 0.26 + dig-chainsource-interface
+# 0.1, so their types unify with the workspace (crates.io, never git).
+chia-peer = "0.1"
+dig-chainsource-interface = "0.1"
+chia-query = "0.5"
 # The ecosystem's canonical address-family / IPv6-first primitive (CLAUDE.md §5.2). The advertise
 # path keys + orders candidate addresses via `dig_ip::Family` and aggregates them source-tagged +
 # de-duplicated via `dig_ip::PeerCandidates` — never a hand-rolled family sort (epic #1020, #1032).
