@@ -639,7 +639,7 @@ relay: { url, reserved: bool, peer_count: u64 }, connected_peers: u64, pool: { c
   - `in_flight` (u64) — dial attempts currently in flight to new candidates.
   - `target` (u64) — the desired pool size (between `min` and `max`).
   - `min` (u64) — minimum required peers before deferring non-critical tasks (pool underconnected when below).
-  - `max` (u64) — maximum concurrent dial attempts; connected count peaks at this when healthy.
+  - `max` (u64) — the hard cap on connected pool peers (the loop never dials past it); connected count peaks at this when healthy.
   - `backed_off` (u64) — peers temporarily unavailable due to recent failures (exponential backoff).
   - `under_connected` (bool) — whether `connected` is currently below `min`.
 
