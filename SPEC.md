@@ -1527,11 +1527,18 @@ DIG link that no in-browser DIG extension intercepted.
   attacker-influenced header values sanitized of CR/LF), so the browser applies its normal
   render-vs-download / Mark-of-the-Web / origin-sandbox handling.
 - **Behavior on a non-success / hard error.** On `IntegrityFailure`, `Unreachable`, or a hard resolve
-  error (not-found / rpc error), the command MUST show a BRANDED DIG error asset from the resolver
-  (`dig_urn_resolver::images`), served over the same loopback endpoint — NEVER a hand-rolled page and
-  never a raw error string. A branded page is shown only for a link that PARSES as a valid DIG URN but
-  fails to RESOLVE; a link that fails the untrusted-input validation above still exits `USAGE` and
-  shows nothing.
+  error (not-found / rpc error / **root-required** — a ROOTLESS link the untrusted `rpc.dig.net` tier
+  refuses to resolve without a chain-anchored root), the command MUST show a BRANDED DIG error asset
+  from the resolver (`dig_urn_resolver::images`), served over the same loopback endpoint — NEVER a
+  hand-rolled page and never a raw error string. A branded page is shown only for a link that PARSES as
+  a valid DIG URN but fails to RESOLVE; a link that fails the untrusted-input validation above still
+  exits `USAGE` and shows nothing.
+- **The branded asset's served filename MUST be OUTCOME-SPECIFIC** — `dig-error-<outcome>.png` (e.g.
+  `dig-error-root_required.png`, `dig-error-unreachable.png`, `dig-error-integrity_failure.png`), never
+  a single opaque `dig-error.png` for every outcome — so the opened `http://127.0.0.1:<port>/…` URL
+  itself names WHY the open failed. The command MUST also emit a one-line stderr diagnostic naming the
+  resolved URN + the outcome that fired, so a failing `open` is diagnosable (it MUST NOT log resolved
+  bytes).
 - It NEVER opens `chia://` at the OS level (dig-node is itself the OS `chia://` handler, so that would
   recurse) and NEVER opens a dig-node GUI (it has none). Under `--json`:
   `{ opened: true, mode: "browser"|"content"|"error", outcome, url, store_id, root, path }` (`url` is
