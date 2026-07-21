@@ -102,7 +102,7 @@ async fn two_pools_connect_over_loopback_and_count_each_other() {
     // B's half — proven on EVERY platform: B counts >=1 connected peer, and it is A, via a DIRECT
     // transport (a loopback dial is never relayed).
     assert!(
-        node_b.connected_pool_peers().len() >= 1,
+        !node_b.connected_pool_peers().is_empty(),
         "node B must count at least one connected peer (node A)"
     );
     assert_eq!(

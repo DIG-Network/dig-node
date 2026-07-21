@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.48.0"
+version = "0.49.0"
 dependencies = [
  "axum",
  "axum-server",
