@@ -629,11 +629,19 @@ behavior. This lets a dev/local deployment (or, at launch, the real mainnet gene
 decision (#214) and MUST NOT be hardcoded here.
 
 `control.peerStatus` reports a snapshot: `{ running: bool, peer_id: 64hex|null, network_id: string,
-relay: { url, reserved: bool, peer_count: u64 }, connected_peers: u64, last_error: string|null }`.
+relay: { url, reserved: bool, peer_count: u64 }, connected_peers: u64, pool: { connected, in_flight, target, min, max, backed_off, under_connected }, last_error: string|null }`.
 - `relay.reserved` — whether the node holds an active persistent relay reservation (real reservation
   state, #872).
 - `relay.peer_count` — the count of peers discovered over the held relay reservation (#872).
 - `connected_peers` — the pool's locally-connected peers.
+- `pool` — the peer-pool connectivity posture (#709/#846):
+  - `connected` (u64) — actively connected peers in the pool.
+  - `in_flight` (u64) — dial attempts currently in flight to new candidates.
+  - `target` (u64) — the desired pool size (between `min` and `max`).
+  - `min` (u64) — minimum required peers before deferring non-critical tasks (pool underconnected when below).
+  - `max` (u64) — maximum concurrent dial attempts; connected count peaks at this when healthy.
+  - `backed_off` (u64) — peers temporarily unavailable due to recent failures (exponential backoff).
+  - `under_connected` (bool) — whether `connected` is currently below `min`.
 
 Bring-up is best-effort — a failure logs, leaves `control.peerStatus` "not running", and the HTTP read
 path still serves.
