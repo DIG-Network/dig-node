@@ -37,13 +37,13 @@ path = "src/lib.rs"
 # Bumped to a rev past digstore's "Add normalized public manifest to the .dig format"
 # commit (08f5d39) so `PublicManifest`/`read_public_manifest`/`extract_data_section_blob`
 # exist. Bump all seven together.
-digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
-digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
-digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
-digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
-digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "099f88aecc63d767b392a1f70162a55b35023203" }
+digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
+digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
+digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
 chia-protocol = "0.26"
 # -- Seam 1: Chia light-client CONFIRMATION/PEAK observability (#1314) --------------------------------
 # `chia-peer` is a subscribing Chia wallet-protocol light client (a thin driver over chia-wallet-sdk

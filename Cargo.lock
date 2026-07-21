@@ -1779,6 +1779,40 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b365fabc795046672053e29c954733ec3b05e4be654ab130fe8f1f94d7051f35"
 
 [[package]]
+name = "darling"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cdf337090841a411e2a7f3deb9187445851f91b309c0c0a29e05f74a00a48c0"
+dependencies = [
+ "darling_core",
+ "darling_macro",
+]
+
+[[package]]
+name = "darling_core"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1247195ecd7e3c85f83c8d2a366e4210d588e802133e1e355180a9870b517ea4"
+dependencies = [
+ "fnv",
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "darling_macro"
+version = "0.21.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d38308df82d1080de0afee5d069fa14b0326a88c14f15c5ccda35b4a6c414c81"
+dependencies = [
+ "darling_core",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2151,7 +2185,7 @@ dependencies = [
  "dig-tls",
  "digstore-chain",
  "digstore-compiler",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "digstore-crypto",
  "digstore-host",
  "digstore-remote",
@@ -2190,7 +2224,7 @@ dependencies = [
  "dig-rpc-protocol",
  "dig-urn-resolver",
  "dig-wallet",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "digstore-crypto",
  "digstore-stage",
  "futures-util",
@@ -2268,7 +2302,7 @@ dependencies = [
  "base64",
  "dig-node-core",
  "dig-wallet",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "hex",
  "serde_json",
  "tokio",
@@ -2344,7 +2378,7 @@ dependencies = [
  "dig-keystore",
  "dig-node-core",
  "digstore-chain",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "futures-core",
  "hex",
  "http-body-util",
@@ -2361,6 +2395,26 @@ dependencies = [
  "tower 0.5.3",
  "tower-http",
  "zeroize",
+]
+
+[[package]]
+name = "dig-wallet-backend"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "358c03e260019ab36389b4cc82f58185ca1ae0c3b9fd95b2b10f57c324c18545"
+dependencies = [
+ "async-trait",
+ "chia",
+ "chia-wallet-sdk",
+ "clvmr",
+ "enumset",
+ "futures-core",
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -2386,8 +2440,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-chain"
-version = "0.10.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+version = "0.19.0"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2399,7 +2453,9 @@ dependencies = [
  "chia-sha2 0.26.0",
  "chia-wallet-sdk",
  "datalayer-driver",
- "digstore-core 0.10.1",
+ "dig-constants 0.5.1",
+ "dig-wallet-backend",
+ "digstore-core 0.19.0",
  "dirs 5.0.1",
  "getrandom 0.2.17",
  "hex",
@@ -2416,20 +2472,20 @@ dependencies = [
 
 [[package]]
 name = "digstore-chunker"
-version = "0.10.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+version = "0.19.0"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "digstore-compiler"
 version = "1.0.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
  "chacha20 0.9.1",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "digstore-store",
  "hex",
  "sha2 0.10.9",
@@ -2437,19 +2493,6 @@ dependencies = [
  "wasm-encoder 0.221.3",
  "wasmparser 0.221.3",
  "wat",
-]
-
-[[package]]
-name = "digstore-core"
-version = "0.10.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
-dependencies = [
- "aes-gcm-siv",
- "hex",
- "hkdf",
- "serde",
- "serde_json",
- "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2466,12 +2509,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "digstore-core"
+version = "0.19.0"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+dependencies = [
+ "aes-gcm-siv",
+ "hex",
+ "hkdf",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "digstore-crypto"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
  "chia-bls 0.45.0",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "hex",
  "serde",
  "serde_json",
@@ -2482,11 +2538,11 @@ dependencies = [
 [[package]]
 name = "digstore-host"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
  "anyhow",
  "clap",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "digstore-crypto",
  "digstore-prover",
  "futures",
@@ -2504,9 +2560,9 @@ dependencies = [
 [[package]]
 name = "digstore-prover"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "digstore-crypto",
  "reqwest",
  "serde",
@@ -2516,14 +2572,14 @@ dependencies = [
 
 [[package]]
 name = "digstore-remote"
-version = "0.10.1"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+version = "0.19.0"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
  "async-trait",
  "axum",
  "base64",
  "bytes",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "digstore-crypto",
  "digstore-host",
  "digstore-store",
@@ -2544,11 +2600,11 @@ dependencies = [
 [[package]]
 name = "digstore-stage"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
  "digstore-chunker",
  "digstore-compiler",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "digstore-crypto",
  "digstore-store",
  "hex",
@@ -2560,10 +2616,10 @@ dependencies = [
 [[package]]
 name = "digstore-store"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=099f88aecc63d767b392a1f70162a55b35023203#099f88aecc63d767b392a1f70162a55b35023203"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
 dependencies = [
  "digstore-chunker",
- "digstore-core 0.10.1",
+ "digstore-core 0.19.0",
  "digstore-crypto",
  "hex",
  "serde",
@@ -2641,7 +2697,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2755,6 +2811,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumset"
+version = "1.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccc5801fd11762e24d1e420d01d2ac518f2a2ca4329d4fbb6639f2412b6204e0"
+dependencies = [
+ "enumset_derive",
+ "serde",
+]
+
+[[package]]
+name = "enumset_derive"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4bd536557b58c682b217b8fb199afdff47cd3eff260623f19e77074eb073d63a"
+dependencies = [
+ "darling",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2767,7 +2845,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3337,7 +3415,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3452,6 +3530,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ident_case"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+
+[[package]]
 name = "idna"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3536,7 +3620,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3864,7 +3948,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4409,7 +4493,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -4447,9 +4531,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4818,7 +4902,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5474,10 +5558,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6535,7 +6619,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
