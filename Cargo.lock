@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.13.8"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2115,7 +2115,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.47.8"
+version = "0.48.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2234,13 +2234,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "dig-urn-resolver"
-version = "0.3.1"
+name = "dig-urn-protocol"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f33e087c437c97ace10aafe0c1e948f96338b2a7ea7ff1bc4c641eeb2167fca3"
+checksum = "197617ce594fadb31c784717ac37369cbdbe13dc8b5651866f5221fe55be0afc"
+dependencies = [
+ "hex",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "dig-urn-resolver"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29b4cac9eab4ac44ca4fd62a953a31620b5097e721fcc17b3e4f9a0eb0d65ca1"
 dependencies = [
  "async-trait",
  "base64",
+ "dig-urn-protocol",
  "digstore-core 0.13.4",
  "hex",
  "reqwest",

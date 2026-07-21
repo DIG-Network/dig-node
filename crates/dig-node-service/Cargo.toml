@@ -134,7 +134,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # in the SERVICE shell's open-command path ONLY — NEVER in dig-node-core (the server
 # engine), where it would be the real dependency cycle. Depends on the PUBLISHED crates.io
 # version (no git dep, #681); native feature (reqwest transport + blocking convenience).
-dig-urn-resolver = "0.3.1"
+dig-urn-resolver = "0.4.0"
 
 # `dig_constants::DIG_NODE_PORT` (§5.3) — the single-sourced canonical default localhost port
 # for client→node connections; `config.rs`'s DEFAULT_PORT reads it rather than re-declaring the
