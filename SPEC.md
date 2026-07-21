@@ -2840,12 +2840,25 @@ per-method timeout so a dial never hangs.
 ### 19.2. STUN reflexive-address discovery
 
 The node discovers its server-reflexive (public) transport address via STUN (RFC 5389) against the STUN
-server co-located with the relay (`<relay-host>:3478`, derived from `DIG_RELAY_URL`). The reflexive
-address is (a) configured on the NAT config so dig-nat's hole-punch tier can use it, and (b) merged into
-the node's advertised DHT candidate set **IPv6-first** — a reflexive IPv6 address leads the whole set; a
-reflexive IPv4 address leads the IPv4 fallback group — so a peer behind a different NAT can dial or
-hole-punch to it. Discovery is best-effort + bounded; on failure the node advertises its local addresses
-only. The wildcard bind address (`[::]`/`0.0.0.0`) is never advertised as a candidate.
+server co-located with the relay (`<relay-host>:3478`, derived from `DIG_RELAY_URL`). The STUN endpoints
+are resolved across **both address families** (every A + AAAA record) and the Binding transaction is run
+**IPv6-first with IPv4 fallback** (§5.2): the IPv6 STUN server is attempted first and IPv4 is used only
+when the IPv6 server is absent/unreachable — the reflexive address is never nulled merely because IPv6
+failed.
+
+The reflexive query is run from a UDP socket bound to the node's **ACTUAL listen port** (the peer-RPC
+port peers dial), not a throwaway ephemeral socket. The advertised candidate is therefore
+`<reflexive-ip>:<listen-port>` — the reflexive public IP paired with the real listen port. The raw STUN
+result's own port (the transient socket's NAT-mapping port) is deliberately DISCARDED: advertising it
+would be undialable (a remote peer dialing an ephemeral binding reaches no listener). Pairing the
+reflexive IP with the listen port yields the form a peer behind a different NAT can dial once the mapping
+for that port is open (via UPnP/NAT-PMP/PCP or an endpoint-independent NAT).
+
+The reflexive address is (a) configured on the NAT config so dig-nat's hole-punch tier can use it, and
+(b) merged into the node's advertised DHT candidate set **IPv6-first** — a reflexive IPv6 address leads
+the whole set; a reflexive IPv4 address leads the IPv4 fallback group — so a peer behind a different NAT
+can dial or hole-punch to it. Discovery is best-effort + bounded; on failure the node advertises its
+local addresses only. The wildcard bind address (`[::]`/`0.0.0.0`) is never advertised as a candidate.
 
 The advertise path — candidate aggregation, family keying, de-duplication, and the IPv6-first family
 ordering — is delegated to the canonical [`dig-ip`](https://crates.io/crates/dig-ip) crate (CLAUDE.md

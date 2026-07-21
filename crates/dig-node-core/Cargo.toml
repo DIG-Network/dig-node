@@ -97,20 +97,21 @@ getrandom = "0.2"
 # consumes both to auto-discover peers via relay.dig.net, maintain a pool, and serve/issue the L7 peer
 # RPC over mTLS (peer_id = SHA256(TLS SPKI DER)).
 #
-# Sourcing (#1280 crates.io cascade): dig-nat 0.7 is on crates.io — the whole peer stack (dig-gossip
-# 0.7.1, dig-dht 0.2.2, dig-download 0.2.1, dig-peer-selector 0.2.1) now depends on dig-nat "0.7" from
-# crates.io, so consuming it here as a plain crates.io version unifies the ENTIRE graph on ONE dig-nat
-# 0.7 instance (the old bare-git unification patch is retired). 0.7 auto-composes the FULL NAT ladder
-# via `connect_with_runtime` + `NatRuntime`, and takes a CA-signed `dig_tls::NodeCert` (#1280).
-dig-nat = "0.7"
-# dig-gossip is the ONE peer-stack exception: merged at 0.7.1 (on dig-nat 0.7 + dig-tls, crates.io
-# deps) but NOT yet published to crates.io — its own publish is guarded pending dig-protocol (#681).
-# So it stays a git dependency, PINNED to the v0.7.1 tag commit (rev 799df86), pulled rustls-only (no
+# Sourcing (#1280/#1393 crates.io cascade): dig-nat 0.8 is on crates.io — the whole peer stack
+# (dig-gossip 0.10.0, dig-dht 0.3.0, dig-download 0.3.0, dig-peer-selector 0.3.0) now depends on dig-nat
+# "0.8" from crates.io, so consuming it here as a plain crates.io version unifies the ENTIRE graph on
+# ONE dig-nat 0.8 instance (the old bare-git unification patch is retired). 0.8 adds STUN happy-eyeballs
+# reflexive discovery (`query_reflexive_address` from the ACTUAL listen socket, #1385/#1393) and auto-
+# composes the FULL NAT ladder via `connect_with_runtime` + `NatRuntime`, taking a CA-signed NodeCert.
+dig-nat = "0.8"
+# dig-gossip is the ONE peer-stack exception: merged at 0.10.0 (on dig-nat 0.8 + dig-tls, crates.io
+# deps) but NOT yet published to crates.io — its own publish is guarded pending dig-peer-protocol (#681).
+# So it stays a git dependency, PINNED to the v0.10.0 tag commit (rev ef27532), pulled rustls-only (no
 # native-tls). Its dig-nat/dig-tls/dig-constants come from crates.io (same versions as here), so the
 # graph still unifies to ONE of each. The vendored chia-protocol/chia-sdk-client forks it path-patches
 # are re-declared at this SAME rev in the workspace `[patch.crates-io]` (a git dep's own patches do not
 # apply transitively).
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "bef601ddacead7ed8753dedc4a100eb76e10d6c1", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "ef27532de09899d374d061e93afe2535cc91ca25", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. From
 # crates.io: dig-nat 0.7 requires `>=0.4, <0.6` and dig-gossip 0.7.1 requires `>=0.2, <0.5`, so `0.4`
 # sits in both windows and the whole graph resolves to ONE crates.io dig-constants 0.4.x.
@@ -127,7 +128,7 @@ dig-constants = "0.4"
 # exact types `dig_nat::connect` returns. dig-dht deps dig-nat ">=0.2,<0.4" (crates.io); the workspace
 # `[patch.crates-io] dig-nat = { git }` below redirects THAT onto the single git dig-nat instance
 # dig-gossip forces, so the whole graph shares ONE dig-nat 0.3.0.
-dig-dht = "0.2.2"
+dig-dht = "0.3.0"
 # -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
 # The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
 # logical stream exchanges delta-based first-hand known-peer sets (handshake -> snapshot -> deltas),
@@ -152,7 +153,7 @@ dig-pex = "0.1"
 # Sourcing: the crates.io release (NC-7), matching dig-dht above. dig-download deps dig-dht "0.1" +
 # dig-nat "^0.2" from crates.io, so cargo unifies its dig-dht + dig-nat with ours — ONE crate instance
 # each across the graph (its re-exported `ContentId`/`ProviderRecord` ARE our dig-dht types).
-dig-download = "0.2.1"
+dig-download = "0.3.0"
 # -- Self-optimizing peer selection (#178) ------------------------------------------------------------
 # The decision + learning layer between dig-dht discovery and dig-download execution: it ranks the
 # providers `find_providers` returns (learning throughput/rtt/reliability + a per-class saturation
@@ -167,7 +168,7 @@ dig-download = "0.2.1"
 # dig-nat/dig-dht types). The selector mirrors `dig_gossip::PoolEvent` LOCALLY (it does not depend on
 # dig-gossip, which lags as a git dep), so the node maps `dig_gossip::PoolEvent` → the selector's local
 # `PoolEvent` 1:1 (see `download.rs::pool_event_to_selector`).
-dig-peer-selector = "0.2.1"
+dig-peer-selector = "0.3.0"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the

@@ -270,33 +270,102 @@ pub fn parse_relay_host(endpoint: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_string())
 }
 
-/// Resolve the DIG STUN server (`<relay-host>:STUN_PORT`) from the relay endpoint URL, IPv6-first when
-/// the host resolves to both families (ecosystem rule). Best-effort blocking DNS resolution; `None`
-/// when the host can't be parsed/resolved. Call off the async runtime (e.g. via `spawn_blocking`).
-pub fn stun_server_from_relay(relay_endpoint: &str) -> Option<SocketAddr> {
+/// Resolve the DIG STUN servers (`<relay-host>:STUN_PORT`) from the relay endpoint URL across BOTH
+/// address families — every A + AAAA record — ordered IPv6-first (§5.2, `dig_ip::Family`). The caller
+/// MUST NOT pre-collapse to one family: the reflexive discovery below races IPv6 first and falls back
+/// to IPv4, so it needs a STUN endpoint per family (#1393). Best-effort blocking DNS resolution;
+/// returns an empty vec when the host can't be parsed/resolved. Call off the async runtime (e.g. via
+/// `spawn_blocking`).
+pub fn stun_servers_from_relay(relay_endpoint: &str) -> Vec<SocketAddr> {
     use std::net::ToSocketAddrs;
-    let host = parse_relay_host(relay_endpoint)?;
-    let mut addrs: Vec<SocketAddr> = (host.as_str(), STUN_PORT).to_socket_addrs().ok()?.collect();
+    let Some(host) = parse_relay_host(relay_endpoint) else {
+        return Vec::new();
+    };
+    let mut addrs: Vec<SocketAddr> = match (host.as_str(), STUN_PORT).to_socket_addrs() {
+        Ok(iter) => iter.collect(),
+        Err(_) => return Vec::new(),
+    };
     // IPv6-first: `dig_ip::Family` orders V6 before V4 (the ecosystem's canonical family sort).
     addrs.sort_by_key(dig_ip::Family::of);
-    addrs.into_iter().next()
+    addrs
 }
 
-/// Best-effort discover this node's server-reflexive (public) address via STUN against `stun_server`,
-/// so the node advertises a candidate a remote peer can dial / hole-punch to (not just its LAN-local
-/// address). Binds an ephemeral UDP socket in the STUN server's address family and runs ONE bounded
-/// Binding transaction ([`dig_nat::stun::query_reflexive_address`]); any failure (timeout, unreachable,
-/// no route) returns `None` and the node advertises its local addresses only.
-pub async fn reflexive_via_stun(stun_server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
-    let bind = if stun_server.is_ipv6() {
-        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+/// Resolve the single IPv6-first DIG STUN server (`<relay-host>:STUN_PORT`) for the traversal-ladder
+/// hole-punch tier + DHT transport (a single reflexive-input endpoint, dig-nat L7 spec §3). The
+/// reflexive-advertise path uses [`stun_servers_from_relay`] instead (it needs a per-family endpoint).
+/// `None` when the host can't be parsed/resolved. Call off the async runtime.
+pub fn stun_server_from_relay(relay_endpoint: &str) -> Option<SocketAddr> {
+    stun_servers_from_relay(relay_endpoint).into_iter().next()
+}
+
+/// Order the resolved STUN servers IPv6-first (`dig_ip::Family::PREFERENCE`) so reflexive discovery
+/// races the IPv6 endpoint before falling back to IPv4 (§5.2). Pure over its input for unit-testing
+/// the family order without a socket.
+fn stun_dial_order(stun_servers: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut servers = stun_servers.to_vec();
+    servers.sort_by_key(dig_ip::Family::of);
+    servers
+}
+
+/// Build the DIALABLE server-reflexive candidate from a raw STUN result and the node's ACTUAL listen
+/// `port`. The advertised candidate is `<reflexive-ip>:<listen-port>` — the reflexive public IP paired
+/// with the port peers actually dial the node's mTLS listener on.
+///
+/// The raw STUN result's own port is deliberately DISCARDED: a candidate carrying a throwaway/ephemeral
+/// binding's port is the #1388 trap (a remote peer dialing it reaches no listener). Pairing the
+/// reflexive IP with the real listen port yields the form a peer behind a different NAT can dial once
+/// the mapping for that port is open (via UPnP/NAT-PMP/PCP or an endpoint-independent NAT). Pure for
+/// unit-testing without a socket.
+fn reflexive_candidate(stun_result: SocketAddr, listen_port: u16) -> SocketAddr {
+    SocketAddr::new(stun_result.ip(), listen_port)
+}
+
+/// Bind a UDP socket to the node's ACTUAL listen `port` in `family`, with `SO_REUSEADDR` so it
+/// coexists with the peer-RPC TCP listener (a separate protocol namespace) and with a re-run of this
+/// discovery. This is the socket whose external NAT mapping STUN learns — bound to the real listen
+/// port, NOT a throwaway ephemeral port (#1388/#1393).
+fn bind_stun_socket(port: u16, ipv6: bool) -> io::Result<tokio::net::UdpSocket> {
+    let (domain, addr) = if ipv6 {
+        (
+            Domain::IPV6,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+        )
     } else {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        (
+            Domain::IPV4,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+        )
     };
-    let socket = tokio::net::UdpSocket::bind(bind).await.ok()?;
-    dig_nat::stun::query_reflexive_address(&socket, stun_server, timeout)
-        .await
-        .ok()
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
+/// Best-effort discover this node's DIALABLE server-reflexive (public) candidate via STUN, IPv6-first
+/// with IPv4 fallback (§5.2). For each STUN server in IPv6-first family order ([`stun_dial_order`]) we
+/// bind a UDP socket to the node's ACTUAL listen `port` ([`bind_stun_socket`] — NOT a throwaway
+/// ephemeral socket, the #1388 trap) and run ONE bounded Binding transaction
+/// ([`dig_nat::stun::query_reflexive_address`], which returns the mapping of THAT socket). The first
+/// family that answers wins; its result is paired with the real listen port via [`reflexive_candidate`]
+/// and returned. `None` when no family's STUN server answered (the node advertises its local addresses
+/// only). IPv4 is attempted ONLY after the IPv6 STUN server is absent/unreachable — never nulled just
+/// because IPv6 failed.
+pub async fn reflexive_via_stun(
+    stun_servers: &[SocketAddr],
+    port: u16,
+    timeout: Duration,
+) -> Option<SocketAddr> {
+    for server in stun_dial_order(stun_servers) {
+        let Ok(socket) = bind_stun_socket(port, server.is_ipv6()) else {
+            continue;
+        };
+        if let Ok(result) = dig_nat::stun::query_reflexive_address(&socket, server, timeout).await {
+            return Some(reflexive_candidate(result, port));
+        }
+    }
+    None
 }
 
 /// Resolve the relay's data endpoint (`<relay-host>:<port>`) to a [`SocketAddr`], IPv6-first. Used
@@ -657,5 +726,74 @@ mod tests {
         ];
         addrs.sort_by_key(dig_ip::Family::of);
         assert!(addrs[0].is_ipv6(), "IPv6 STUN address must sort first");
+    }
+
+    // -- #1393: DIALABLE reflexive candidate uses the ACTUAL listen port (not the #1388 throwaway) ----
+
+    /// The core #1393/#1388-trap fix: a raw STUN result carries the ephemeral/throwaway socket's NAT
+    /// binding port; the advertised candidate MUST discard it and pair the reflexive IP with the node's
+    /// ACTUAL listen port — the port a remote peer dials the mTLS listener on.
+    #[test]
+    fn reflexive_candidate_uses_actual_listen_port_not_stun_result_port() {
+        // STUN returned the reflexive IP with a throwaway ephemeral mapping port (54321).
+        let stun_result: SocketAddr = "203.0.113.9:54321".parse().unwrap();
+        let candidate = reflexive_candidate(stun_result, 9444);
+        assert_eq!(
+            candidate,
+            "203.0.113.9:9444".parse::<SocketAddr>().unwrap(),
+            "advertised candidate keeps the reflexive IP but uses the ACTUAL listen port"
+        );
+        assert_eq!(
+            candidate.port(),
+            9444,
+            "never the throwaway STUN-result port"
+        );
+    }
+
+    /// The IPv6 reflexive IP is likewise paired with the listen port (the fix is family-agnostic).
+    #[test]
+    fn reflexive_candidate_pairs_ipv6_reflexive_with_listen_port() {
+        let stun_result: SocketAddr = "[2606:4700::9]:61000".parse().unwrap();
+        let candidate = reflexive_candidate(stun_result, 9444);
+        assert_eq!(
+            candidate,
+            "[2606:4700::9]:9444".parse::<SocketAddr>().unwrap()
+        );
+        assert!(candidate.is_ipv6());
+    }
+
+    /// #1393 happy-eyeballs family order: reflexive discovery races the IPv6 STUN server before the
+    /// IPv4 one, so `stun_dial_order` must place every IPv6 server ahead of every IPv4 server (§5.2).
+    #[test]
+    fn stun_dial_order_is_ipv6_first_ipv4_fallback() {
+        let servers: Vec<SocketAddr> = vec![
+            "203.0.113.5:3478".parse().unwrap(),
+            "[2001:db8::5]:3478".parse().unwrap(),
+            "198.51.100.7:3478".parse().unwrap(),
+            "[2606:4700::7]:3478".parse().unwrap(),
+        ];
+        let ordered = stun_dial_order(&servers);
+        assert!(ordered[0].is_ipv6(), "IPv6 STUN server is attempted first");
+        assert!(ordered[1].is_ipv6(), "then the second IPv6 server");
+        assert!(
+            ordered[2].is_ipv4() && ordered[3].is_ipv4(),
+            "IPv4 servers are the fallback tail"
+        );
+    }
+
+    /// An IPv4-only STUN set still yields a (fallback) dial order without dropping candidates.
+    #[test]
+    fn stun_dial_order_ipv4_only_preserved() {
+        let servers: Vec<SocketAddr> = vec!["203.0.113.5:3478".parse().unwrap()];
+        let ordered = stun_dial_order(&servers);
+        assert_eq!(ordered.len(), 1);
+        assert!(ordered[0].is_ipv4());
+    }
+
+    /// An empty STUN set yields no reflexive candidate (the node advertises local addresses only).
+    #[tokio::test]
+    async fn reflexive_via_stun_empty_servers_yields_none() {
+        let reflexive = reflexive_via_stun(&[], 9444, Duration::from_millis(50)).await;
+        assert_eq!(reflexive, None);
     }
 }

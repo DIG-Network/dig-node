@@ -1427,15 +1427,19 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // node's own reflexive-address discovery (advertised-candidate set) and the hole-punch tier of the
     // FULL NAT ladder every node dial now uses (#385). Blocking DNS resolution is moved off the async
     // runtime; a failure leaves STUN unconfigured (the ladder still falls through to the relay).
-    let stun_server = if relay_enabled() {
+    // Resolve the STUN endpoints across BOTH address families (every A + AAAA record), IPv6-first: the
+    // reflexive-advertise path races IPv6 before falling back to IPv4 and so needs a per-family endpoint
+    // (#1393). The single IPv6-first server (`stun_servers.first()`) feeds the traversal-ladder
+    // hole-punch tier + DHT transport, which take one reflexive-input endpoint.
+    let stun_servers: Vec<std::net::SocketAddr> = if relay_enabled() {
         let ep = relay_endpoint.clone();
-        tokio::task::spawn_blocking(move || crate::net::stun_server_from_relay(&ep))
+        tokio::task::spawn_blocking(move || crate::net::stun_servers_from_relay(&ep))
             .await
-            .ok()
-            .flatten()
+            .unwrap_or_default()
     } else {
-        None
+        Vec::new()
     };
+    let stun_server = stun_servers.first().copied();
     if let Some(stun) = stun_server {
         println!("dig-node peer network: STUN server for reflexive discovery: {stun}");
     }
@@ -1449,10 +1453,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // `NatRangeTransport`) is Direct-only today — dig-download 0.2.1 exposes no runtime-injecting
     // dial API to thread this runtime through. Wiring the download path onto the same ladder is a
     // #836 follow-up (tracked, pending a dig-download runtime-injecting dial API).
-    let reflexive = match stun_server {
-        Some(stun) => crate::net::reflexive_via_stun(stun, std::time::Duration::from_secs(2)).await,
-        None => None,
-    };
+    let reflexive = crate::net::reflexive_via_stun(
+        &stun_servers,
+        peer_port_from_env(),
+        std::time::Duration::from_secs(2),
+    )
+    .await;
     let relayed_dialer: Option<Arc<dyn dig_nat::RelayedDialer>> = if relay_enabled() {
         let ep = relay_endpoint.clone();
         let relay_addr = tokio::task::spawn_blocking(move || crate::net::relay_socket_addr(&ep))
@@ -1487,7 +1493,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         &nat_runtime,
         &network_id_str,
         &handle,
-        stun_server,
+        &stun_servers,
     )
     .await
     {
@@ -1633,10 +1639,13 @@ async fn bring_up_dht(
     runtime: &Arc<dig_nat::NatRuntime>,
     network_id: &str,
     pool: &dig_gossip::GossipHandle,
-    stun_server: Option<std::net::SocketAddr>,
+    stun_servers: &[std::net::SocketAddr],
 ) -> Result<Arc<crate::dht::DhtHandle>, String> {
     use dig_dht::{CandidateAddr, DhtConfig, DhtService};
 
+    // The single IPv6-first STUN server feeds the DHT transport's hole-punch tier (one reflexive-input
+    // endpoint); the reflexive-advertise path below races the full per-family set (#1393).
+    let stun_server = stun_servers.first().copied();
     let config = DhtConfig::default();
     // The transport dials peers as THIS node (client cert = our identity), scoping relay lookups to
     // our network id, bounding each RPC by the config's per-RPC timeout, over the FULL NAT ladder with
@@ -1660,10 +1669,7 @@ async fn bring_up_dht(
     // This node's STUN-discovered server-reflexive (public) address (#385), so a remote peer behind a
     // different NAT can dial / hole-punch to it, not just to a LAN-local address. Best-effort +
     // bounded: a failure (no STUN server, timeout) advertises the local addresses only.
-    let reflexive = match stun_server {
-        Some(stun) => crate::net::reflexive_via_stun(stun, config.rpc_timeout).await,
-        None => None,
-    };
+    let reflexive = crate::net::reflexive_via_stun(stun_servers, port, config.rpc_timeout).await;
     if let Some(r) = reflexive {
         println!(
             "dig-node peer network: STUN reflexive address {r} added to advertised candidates"
