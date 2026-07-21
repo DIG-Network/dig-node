@@ -4009,6 +4009,57 @@ mod tests {
         assert_eq!(got["jsonrpc"], json!("2.0"));
     }
 
+    #[test]
+    fn control_peer_status_attaches_the_pool_posture_when_a_pool_is_running() {
+        // #709/#846: with a live gossip pool retained on the node, `control.peerStatus` attaches a
+        // `pool` object (connected/in_flight/target/min/max/backed_off/under_connected) — the
+        // operator's connectivity posture, sourced from `GossipHandle::pool_stats`. A freshly-started
+        // pool has zero connected peers and is under-connected, with an ordered min<=target<=max.
+        use crate::seams::dig_peer::peer_network::PeerNetwork;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        peer::install_crypto_provider();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (node, _td) = test_node(None);
+        // A real, freshly-started gossip pool on a concrete loopback bind (no discovery, no peers).
+        let handle = rt.block_on(async {
+            let dir = tempfile::tempdir().expect("gossip dir");
+            let cfg = dig_gossip::GossipConfig {
+                network_id: chia_protocol::Bytes32::new([0x33u8; 32]),
+                cert_path: dir.path().join("node.cert").display().to_string(),
+                key_path: dir.path().join("node.key").display().to_string(),
+                peers_file_path: dir.path().join("peers.json"),
+                peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
+                listen_addr: "[::1]:0".parse().unwrap(),
+                ..Default::default()
+            };
+            dig_gossip::GossipService::new(cfg)
+                .expect("gossip config")
+                .start()
+                .await
+                .expect("gossip start")
+        });
+        node.set_gossip_handle(handle);
+
+        let got = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":8,"method":"control.peerStatus"}),
+        ));
+        let pool = got["result"]["pool"]
+            .as_object()
+            .expect("peerStatus attaches a pool object when a pool is running");
+        assert_eq!(pool["connected"], json!(0), "a fresh pool has no peers");
+        assert_eq!(pool["under_connected"], json!(true));
+        let (min, target, max) = (
+            pool["min"].as_u64().expect("min"),
+            pool["target"].as_u64().expect("target"),
+            pool["max"].as_u64().expect("max"),
+        );
+        assert!(min <= target && target <= max, "{min}<={target}<={max}");
+    }
+
     // -- #127 MANDATORY anchored-root pin on the read path ----------------------
     //
     // Every `dig.getContent` resolves the store's CHIP-0035 chain-anchored TIP
