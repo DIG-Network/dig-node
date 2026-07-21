@@ -271,8 +271,11 @@ impl RpcDispatch for Node {
             // reachability now lives in dig-nat/dig-gossip and is reported here as the pool's relay flag.
             Some(Method::ControlPeerStatus) => {
                 let endpoint = peer::relay_url_from_env();
-                let network_id = peer::network_id_from_env();
-                let mut snapshot = node.peer_status.snapshot_json(&endpoint, &network_id);
+                let network_id = peer::effective_network_label_from_env();
+                let genesis = hex::encode(peer::genesis_challenge_from_env());
+                let mut snapshot = node
+                    .peer_status
+                    .snapshot_json(&endpoint, &network_id, &genesis);
                 // Attach the per-peer array so the A↔B mutual-connection proof is machine-checkable (each
                 // side lists the OTHER's peer_id), not just a count. Sourced from the live pool handle; empty
                 // (and omitted-as-`[]`) on the FFI path / before bring-up. See `peer::connected_peers_json`.

@@ -193,12 +193,15 @@ impl PeerStatus {
         self.running.load(Ordering::Relaxed)
     }
 
-    /// A JSON snapshot for the `control.peerStatus` RPC.
-    pub fn snapshot_json(&self, endpoint: &str, network_id: &str) -> Value {
+    /// A JSON snapshot for the `control.peerStatus` RPC. `genesis` is the effective L2 genesis
+    /// challenge (64-hex) the node is running on, surfaced so an operator can see the REAL network a
+    /// `DIG_NETWORK_GENESIS`-overridden node joined — not just the `network_id` label (#1372).
+    pub fn snapshot_json(&self, endpoint: &str, network_id: &str, genesis: &str) -> Value {
         json!({
             "running": self.running.load(Ordering::Relaxed),
             "peer_id": self.peer_id.lock().unwrap().clone(),
             "network_id": network_id,
+            "genesis": genesis,
             "relay": {
                 "url": endpoint,
                 "reserved": self.relay_reserved.load(Ordering::Relaxed),
@@ -374,12 +377,56 @@ fn is_peer_network_enabled(env: Option<&str>) -> bool {
     !matches!(env, Some("off") | Some("0") | Some("false"))
 }
 
-/// The network id a node registers/discovers under: `DIG_NETWORK_ID` if set, else the default.
-pub fn network_id_from_env() -> String {
-    std::env::var("DIG_NETWORK_ID")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_NETWORK_ID.to_string())
+/// The EFFECTIVE network label a node registers + discovers under — the string namespace shared by
+/// the relay introducer, the relay reservation, the DHT/PEX discovery layers, and the reported
+/// status. Resolves `DIG_NETWORK_ID` and `DIG_NETWORK_GENESIS` in precedence order; see
+/// [`effective_network_label`] for the invariants. Pure core: [`effective_network_label`].
+pub fn effective_network_label_from_env() -> String {
+    effective_network_label(
+        std::env::var("DIG_NETWORK_ID").ok().as_deref(),
+        genesis_challenge_from_env(),
+    )
+}
+
+/// Pure: resolve the effective network label from an optional explicit `DIG_NETWORK_ID` and the
+/// already-resolved gossip genesis (`network_id` `Bytes32`), in precedence order:
+///
+/// - (a) No explicit `DIG_NETWORK_ID` AND the DEFAULT genesis (no/blank/invalid/zero
+///   `DIG_NETWORK_GENESIS`, which [`genesis_challenge_from`] collapses to the canonical mainnet
+///   genesis) → BYTE-IDENTICAL [`DEFAULT_NETWORK_ID`] (`"DIG_MAINNET"`).
+/// - (b) Explicit `DIG_NETWORK_ID` set → that value verbatim (preserves today's operator override).
+/// - (c) No explicit `DIG_NETWORK_ID` but a non-default genesis override → a deterministic label
+///   [`derived_network_label`], DISTINCT from `"DIG_MAINNET"` and distinct per genesis.
+///
+/// WHY derive from the genesis (#1372): this label IS the relay introducer + reservation namespace —
+/// a relay-matched string. If a genesis-overridden dev/test node kept `"DIG_MAINNET"`, it would
+/// discover + be discovered by real mainnet peers through the relay (a test-isolation hazard AND a
+/// config-plumbing bug: the override reached the gossip `network_id` but not the advertised
+/// identity). Case (a) is a HARD backwards-compat requirement — the mainnet namespace MUST NOT
+/// change or it would fork mainnet peer discovery.
+fn effective_network_label(
+    network_id_env: Option<&str>,
+    genesis: chia_protocol::Bytes32,
+) -> String {
+    // (b) An explicit operator override always wins.
+    if let Some(id) = network_id_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return id.to_string();
+    }
+    // (a) The default genesis maps back to the canonical mainnet label (byte-identical to today).
+    if genesis == dig_constants::DIG_MAINNET.genesis_challenge() {
+        return DEFAULT_NETWORK_ID.to_string();
+    }
+    // (c) A non-default genesis gets its own discovery namespace.
+    derived_network_label(genesis)
+}
+
+/// A deterministic, per-genesis discovery namespace for a non-default genesis: `DIG_` + the first 16
+/// hex chars (8 bytes) of the genesis challenge. Deterministic (same genesis → same label), distinct
+/// per genesis, and never equal to `"DIG_MAINNET"` (which is non-hex, so the two forms can never
+/// collide). 8 bytes is ample to separate dev/test networks without carrying the full 32-byte hash
+/// in every discovery frame.
+fn derived_network_label(genesis: chia_protocol::Bytes32) -> String {
+    format!("DIG_{}", &hex::encode(genesis)[..16])
 }
 
 /// The gossip `GossipConfig.network_id` genesis-challenge: `DIG_NETWORK_GENESIS` (64-hex, 32
@@ -951,7 +998,7 @@ impl PeerRpcResponder for NodeResponder {
         // handle). Everything else routes through the shared dispatch so the peer surface == the agent
         // surface (getAvailability / listInventory / fetchRange / getNetworkInfo / announce).
         if dig_rpc_protocol::Method::from_name(method) == Some(dig_rpc_protocol::Method::GetPeers) {
-            let network_id = network_id_from_env();
+            let network_id = effective_network_label_from_env();
             let limit = req
                 .get("params")
                 .and_then(|p| p.get("limit"))
@@ -1253,7 +1300,11 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // task — the capsule backfill on a read-from-another-node (SPEC §5.6). Weak: no self-keep-alive.
     node.set_self_ref(Arc::downgrade(&node));
     let status = node.peer_status();
-    let network_id_str = network_id_from_env();
+    // The EFFECTIVE genesis (from `DIG_NETWORK_GENESIS`, else the canonical mainnet genesis) and the
+    // effective network label derived from it — the ONE resolution shared by the gossip config, the
+    // introducer/relay namespace, the discovery layers, and the operator-facing log below (#1372).
+    let genesis = genesis_challenge_from_env();
+    let network_id_str = effective_network_label_from_env();
     let relay_endpoint = relay_url_from_env();
 
     // 1. The node's stable mTLS identity, derived from its persistent §21 seed (so the peer_id is
@@ -1269,7 +1320,10 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     let identity = load_or_generate_node_cert(node.node_cert_dir(), &seed)?;
     let peer_id_hex = identity.peer_id().to_hex();
     status.set_running(peer_id_hex.clone());
-    println!("dig-node peer network: peer_id {peer_id_hex} (network {network_id_str})");
+    println!(
+        "dig-node peer network: peer_id {peer_id_hex} (network {network_id_str}, genesis {})",
+        hex::encode(genesis)
+    );
 
     // §14 autonomous sync — spawn the CHAIN-WATCH + GAP-FILL loop (SPEC §14.2 + §14.3) FIRST,
     // INDEPENDENTLY of the P2P layer below. The proactive pull path (`Node::gap_fill_generation` →
@@ -1294,7 +1348,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     let gossip_dir = node.peer_cert_dir();
     let _ = std::fs::create_dir_all(&gossip_dir);
     let mut cfg = dig_gossip::GossipConfig {
-        network_id: genesis_challenge_from_env(),
+        network_id: genesis,
         cert_path: gossip_dir.join("node.cert").display().to_string(),
         key_path: gossip_dir.join("node.key").display().to_string(),
         peers_file_path: gossip_dir.join("peers.json"),
@@ -1777,6 +1831,11 @@ fn build_server_tls_config(node: &dig_nat::NodeCert) -> Result<Arc<rustls::Serve
 mod tests {
     use super::*;
 
+    /// An opaque, representative genesis hex for the `snapshot_json` status tests (echoed verbatim
+    /// by the snapshot; its value is not asserted except by the dedicated genesis-field test).
+    const TEST_GENESIS_HEX: &str =
+        "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff";
+
     fn cap(store: &str, root: &str, size: u64, mtime: u64) -> CachedCapsule {
         CachedCapsule {
             store_id: store.to_string(),
@@ -1790,10 +1849,14 @@ mod tests {
     fn peer_status_reports_not_running_by_default() {
         let s = PeerStatus::new();
         assert!(!s.is_running());
-        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID, TEST_GENESIS_HEX);
         assert_eq!(v["running"], false);
         assert_eq!(v["peer_id"], Value::Null);
         assert_eq!(v["network_id"], DEFAULT_NETWORK_ID);
+        assert_eq!(
+            v["genesis"], TEST_GENESIS_HEX,
+            "the status snapshot surfaces the effective genesis for operator observability (#1372)"
+        );
         assert_eq!(v["relay"]["url"], DEFAULT_RELAY_URL);
         assert_eq!(v["relay"]["reserved"], false);
         assert_eq!(v["connected_peers"], 0);
@@ -1805,14 +1868,14 @@ mod tests {
         s.set_running("ab".repeat(32));
         s.set_pool(5, 2, true);
         assert!(s.is_running());
-        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID, TEST_GENESIS_HEX);
         assert_eq!(v["running"], true);
         assert_eq!(v["peer_id"], json!("ab".repeat(32)));
         assert_eq!(v["connected_peers"], 5);
         assert_eq!(v["relay"]["reserved"], true);
         assert_eq!(v["relay"]["peer_count"], 2);
         s.set_error("relay dropped".into());
-        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID, TEST_GENESIS_HEX);
         assert_eq!(v["last_error"], json!("relay dropped"));
     }
 
@@ -1824,7 +1887,7 @@ mod tests {
         let s = PeerStatus::new();
         // Relay configured (endpoint present) but reservation NOT held → reserved is false.
         s.set_pool(0, 0, false);
-        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID, TEST_GENESIS_HEX);
         assert_eq!(v["relay"]["url"], DEFAULT_RELAY_URL);
         assert_eq!(
             v["relay"]["reserved"], false,
@@ -1832,7 +1895,7 @@ mod tests {
         );
         // Reservation established → reserved flips true.
         s.set_pool(0, 3, true);
-        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID, TEST_GENESIS_HEX);
         assert_eq!(v["relay"]["reserved"], true);
         assert_eq!(v["relay"]["peer_count"], 3);
     }
@@ -2246,6 +2309,54 @@ mod tests {
             Ok(v) if !v.trim().is_empty() => genesis_challenge_from(None),
             _ => genesis_challenge_from_env(),
         }
+    }
+
+    // #1372: the effective network label — the relay introducer/reservation + discovery namespace —
+    // must reflect a `DIG_NETWORK_GENESIS` override, while the DEFAULT stays byte-identical
+    // `DIG_MAINNET` so mainnet peer discovery never forks.
+    #[test]
+    fn effective_network_label_invariants() {
+        let default_genesis = dig_constants::DIG_MAINNET.genesis_challenge();
+        let override_a = chia_protocol::Bytes32::new([0x11u8; 32]);
+        let override_b = chia_protocol::Bytes32::new([0x22u8; 32]);
+
+        // (a) No explicit id + the default genesis → BYTE-IDENTICAL `DIG_MAINNET` (hard back-compat).
+        assert_eq!(
+            effective_network_label(None, default_genesis),
+            DEFAULT_NETWORK_ID,
+            "the default (no override) MUST stay byte-identical DIG_MAINNET"
+        );
+        assert_eq!(
+            effective_network_label(Some("   "), default_genesis),
+            DEFAULT_NETWORK_ID
+        );
+
+        // (b) An explicit DIG_NETWORK_ID always wins — even over a non-default genesis override.
+        assert_eq!(
+            effective_network_label(Some("MY_NET"), default_genesis),
+            "MY_NET"
+        );
+        assert_eq!(
+            effective_network_label(Some("MY_NET"), override_a),
+            "MY_NET",
+            "explicit DIG_NETWORK_ID takes precedence over a genesis override"
+        );
+
+        // (c) A non-default genesis (no explicit id) → a derived label DISTINCT from DIG_MAINNET.
+        let label_a = effective_network_label(None, override_a);
+        assert_ne!(
+            label_a, DEFAULT_NETWORK_ID,
+            "an overridden network must not report DIG_MAINNET"
+        );
+        assert!(label_a.starts_with("DIG_"));
+        // Deterministic: the same genesis always yields the same label.
+        assert_eq!(label_a, effective_network_label(None, override_a));
+        // Distinct per genesis: a different genesis yields a different label (true isolation).
+        assert_ne!(
+            label_a,
+            effective_network_label(None, override_b),
+            "distinct geneses must land on distinct discovery namespaces"
+        );
     }
 
     #[test]

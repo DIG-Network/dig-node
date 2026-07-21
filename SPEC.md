@@ -209,6 +209,28 @@ The peer-RPC (9444) is the node's advertised peer-network identity and the route
 content; the gossip pool (9445) is the internal connection manager for the node's own peer pool. Both
 bind dual-stack IPv6-first with an IPv4 fallback, per §5.2.
 
+**Network identity — `DIG_NETWORK_GENESIS` + `DIG_NETWORK_ID`.** The node resolves TWO coupled
+network identities:
+
+- The **gossip `network_id`** — the L2 genesis challenge (`Bytes32`) the connected pool, DHT, and PEX
+  key on. It is `DIG_NETWORK_GENESIS` (a valid non-zero 64-hex value) when set, else the canonical
+  `DIG_MAINNET` genesis (a REAL non-zero Chia mainnet header hash pinned in `dig-constants`; a blank,
+  non-hex, wrong-length, or all-zero value falls back to it). It MUST be non-zero or `dig-gossip`
+  rejects the config at start.
+- The **effective network label** — the STRING namespace advertised to the relay introducer + relay
+  reservation and reported by `control.peerStatus` / `dig.getNetworkInfo` as `network_id`. Resolved in
+  precedence order: an explicit **`DIG_NETWORK_ID`** wins; otherwise, when `DIG_NETWORK_GENESIS`
+  selects a NON-default genesis, the label is DETERMINISTICALLY DERIVED from that genesis (`DIG_` + the
+  first 16 hex chars of the genesis), DISTINCT from `DIG_MAINNET` and distinct per genesis; otherwise
+  it is byte-identical **`DIG_MAINNET`**. Deriving the label from the genesis keeps a
+  `DIG_NETWORK_GENESIS`-isolated dev/test network genuinely isolated at discovery (it neither joins nor
+  is joined to the mainnet introducer namespace), while the default (no override) MUST remain
+  byte-identical `DIG_MAINNET` so mainnet peer discovery never forks.
+
+The EFFECTIVE genesis (64-hex) is surfaced alongside the label in the `control.peerStatus` and
+`dig.getNetworkInfo` status snapshots (the `genesis` field) so an operator can see the real network a
+node is running on.
+
 ### 3.3. Upstream normalization
 
 `normalize_upstream` MUST: trim whitespace, strip all trailing `/`, and prefix `https://` when the
