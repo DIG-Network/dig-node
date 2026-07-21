@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.48.0] - 2026-07-21
+
+### Features
+- **peer:** Adopt dig-tls persistent CA-signed NodeCert + dig-nat full ladder (#1280, #836) (#63)- **node:** W1c — composition root, Node exposes 7 seams as Arc<dyn> handles (#1285) (#72)
+
+### Refactor
+- **node:** W1a — extract shared/ cross-seam types (#1285, #1298)- **node:** W1b-0 — seams/ scaffold + relocate zero-coupling modules (#1285)- **node:** W1b-1 — carve content seam into ContentServer trait (#1285)- **node:** W1b-2 — carve dig_peer seam into PeerNetwork trait (#1285)- **node:** W1b-3 — carve chia_peer seam into ChainSource trait (#1285)- **node:** W1b-4 — carve capsule seam into CapsuleStore trait (#1285)- **node:** W1b-5 — carve dig_rpc seam into RpcDispatch trait (#1285)- **node:** W1b-6 — carve key_mgmt seam into KeyManager trait (#1285)
+
 ## [0.46.0] - 2026-07-20
 
 ### Features
