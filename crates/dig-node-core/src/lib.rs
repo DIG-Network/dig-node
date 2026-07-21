@@ -1869,7 +1869,8 @@ impl Node {
     /// path). Never touches the chain or an upstream.
     pub fn network_info(&self) -> Value {
         let peer_id = self.peer_id_hex();
-        let network_id = peer::network_id_from_env();
+        let network_id = peer::effective_network_label_from_env();
+        let genesis = hex::encode(peer::genesis_challenge_from_env());
         let endpoint = peer::relay_url_from_env();
         let port = peer::peer_port_from_env();
         // The node's REAL advertised candidate addresses, ordered IPv6-first (ecosystem HARD RULE):
@@ -1883,7 +1884,9 @@ impl Node {
             .first()
             .cloned()
             .unwrap_or_else(|| format!("[::]:{port}"));
-        let snap = self.peer_status.snapshot_json(&endpoint, &network_id);
+        let snap = self
+            .peer_status
+            .snapshot_json(&endpoint, &network_id, &genesis);
         let reserved = snap["relay"]["reserved"].as_bool().unwrap_or(false);
         // Conservative, honest reachability: while a relay reservation is held we report "relayed"
         // (a NAT'd node reached via the relay). A confirmed direct inbound mapping (UPnP/NAT-PMP/PCP)
@@ -1893,6 +1896,10 @@ impl Node {
         json!({
             "peer_id": peer_id,
             "network_id": network_id,
+            // The effective L2 genesis (64-hex) this node is running on — surfaced so an operator can
+            // see the REAL network a `DIG_NETWORK_GENESIS`-overridden node joined, not just the label
+            // (#1372). Byte-identical to the canonical mainnet genesis when unconfigured.
+            "genesis": genesis,
             "listen_addr": listen,
             "reflexive_addr": Value::Null,
             "candidate_addresses": candidate_addresses,
@@ -3987,6 +3994,7 @@ mod tests {
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_RELAY_URL");
         std::env::remove_var("DIG_NETWORK_ID");
+        std::env::remove_var("DIG_NETWORK_GENESIS");
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -4004,6 +4012,11 @@ mod tests {
             "defaults to relay.dig.net when DIG_RELAY_URL unset"
         );
         assert_eq!(result["network_id"], json!(peer::DEFAULT_NETWORK_ID));
+        assert_eq!(
+            result["genesis"],
+            json!(hex::encode(dig_constants::DIG_MAINNET.genesis_challenge())),
+            "the default node's status surfaces the canonical mainnet genesis (#1372)"
+        );
         assert_eq!(result["connected_peers"], json!(0));
         assert_eq!(got["id"], json!(7));
         assert_eq!(got["jsonrpc"], json!("2.0"));
