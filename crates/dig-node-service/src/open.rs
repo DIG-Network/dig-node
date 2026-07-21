@@ -406,8 +406,28 @@ fn open_branded(
     kind: &str,
     env: &OpenEnv,
 ) -> std::io::Result<Outcome> {
+    log_branded(link, kind);
     let data = ResolvedData::new(images::png(image).to_vec(), "image/png".to_string());
-    serve_locally(link, &data, "dig-error.png", "error", kind, env)
+    serve_locally(link, &data, &branded_filename(kind), "error", kind, env)
+}
+
+/// The last-segment filename for a branded error asset — OUTCOME-SPECIFIC (e.g.
+/// `dig-error-root_required.png`, `dig-error-unreachable.png`) so the opened
+/// `http://127.0.0.1:<port>/…` URL itself names WHY the open failed. Before #852 every branded
+/// outcome was served as an opaque `dig-error.png`, so the URL revealed nothing about which
+/// fail-closed outcome fired — the exact symptom the bug reported.
+fn branded_filename(kind: &str) -> String {
+    format!("dig-error-{kind}.png")
+}
+
+/// Emit a one-line stderr diagnostic when `open` shows a branded error, so a failing `dign open`
+/// is DIAGNOSABLE (which fail-closed outcome fired, for which store/root/path) instead of a silent
+/// branded page (#852). It never logs resolved bytes — only the already-public URN + outcome tag.
+fn log_branded(link: &DigLink, kind: &str) {
+    eprintln!(
+        "dig-node open: {} → showing the '{kind}' DIG error page",
+        link.to_urn()
+    );
 }
 
 /// Serve `data` over the loopback content server and open its `http://127.0.0.1:<port>/…` URL.
@@ -885,6 +905,73 @@ mod tests {
         );
         assert_eq!(out.result["outcome"], json!("not_found"));
         assert!(!out.summary.contains("502"));
+    }
+
+    // ---- #852 regression: branded errors are outcome-specific, never opaque `dig-error.png` ---
+
+    #[test]
+    fn rootless_open_over_rpc_tier_serves_a_root_required_branded_asset_not_dig_error_png() {
+        // #852 root cause (rootless case): a normal `chia://<store>/…` link (no root pin), when no
+        // local node tier serves it, falls through to the UNTRUSTED rpc gateway, which by security
+        // invariant refuses to resolve a rootless URN (`RootRequired`). The user saw the opaque
+        // `dig-error.png` for EVERY such open, revealing nothing. The branded asset must now be
+        // OUTCOME-SPECIFIC so the opened URL names the cause.
+        let cfg = Config::default();
+        let fakes = Fakes {
+            resolver: FakeResolver::new(Err(ResolveError::RootRequired)),
+            probe: FakeProbe::default(),
+            launcher: FakeLauncher::default(),
+            server: FakeServer::default(),
+        };
+        let out = run_with(
+            &cfg,
+            &format!("chia://{}/index.html", store()),
+            &fakes.env(),
+        )
+        .unwrap();
+        assert_eq!(out.result["mode"], json!("error"));
+        assert_eq!(out.result["outcome"], json!("root_required"));
+        let served = fakes.server.served.lock().unwrap();
+        assert_eq!(served[0].1, "dig-error-root_required.png");
+        let opened = fakes.opened();
+        assert!(
+            opened[0].ends_with("/dig-error-root_required.png"),
+            "the opened URL must name the outcome, not the opaque dig-error.png: {}",
+            opened[0]
+        );
+    }
+
+    #[test]
+    fn each_branded_outcome_has_a_distinct_filename() {
+        // Distinct outcomes must not collide on one opaque filename (the #852 symptom).
+        let cfg = Config::default();
+        let cases: [(Result<ResolveOutcome, ResolveError>, &str); 3] = [
+            (Ok(ResolveOutcome::Unreachable), "dig-error-unreachable.png"),
+            (Err(ResolveError::NotFound), "dig-error-not_found.png"),
+            (
+                Ok(ResolveOutcome::IntegrityFailure),
+                "dig-error-integrity_failure.png",
+            ),
+        ];
+        for (outcome, expected_filename) in cases {
+            let fakes = Fakes {
+                resolver: FakeResolver::new(outcome),
+                probe: FakeProbe::default(),
+                launcher: FakeLauncher::default(),
+                server: FakeServer::default(),
+            };
+            run_with(
+                &cfg,
+                &format!("chia://{}:{}/x", store(), root()),
+                &fakes.env(),
+            )
+            .unwrap();
+            assert_eq!(
+                fakes.server.served.lock().unwrap()[0].1,
+                expected_filename,
+                "outcome must carry its own filename"
+            );
+        }
     }
 
     // ---- security: hostile input never reaches the resolver, launcher, or server --------------
