@@ -54,6 +54,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone)]
 pub struct AppState {
     node: Arc<Node>,
+    /// The seam-5 (local content server) HANDLE — a composition-root upcast of the SAME
+    /// `Arc<Node>` above (#1285 W1c), not a separate object. This is the outer, injectable
+    /// seam boundary: a test/FFI caller can hold `Arc<dyn ContentServer>` instead of the
+    /// concrete `Node`, and W2-W5 can later repoint this ONE handle at a different concrete
+    /// implementation without touching `node` or the service's other seam calls.
+    content_server: Arc<dyn ContentServer>,
     upstream: String,
     http: reqwest::Client,
     /// The loopback `host:port` the server is bound to, surfaced in `/health` and
@@ -383,6 +389,7 @@ pub async fn build_state(config: &Config) -> AppState {
     // plane is unaffected either way. The CLI (non-service) never hardens — it only reads.
     let (state_dir, control_token) = resolve_state_dir_and_token();
     AppState {
+        content_server: node.as_content_server(),
         node,
         upstream: config.upstream.clone(),
         http: reqwest::Client::builder()
@@ -1181,7 +1188,7 @@ async fn serve_resource(state: &AppState, sp: StorePath) -> Response {
     // Public stores only for now (salt = None): a private store's secret salt is not yet provisioned
     // to the local serve surface, so such a store fails closed at decrypt (a documented follow-up).
     match state
-        .node
+        .content_server
         .serve_content_plaintext(&sp.store_id, root, &sp.resource, None)
         .await
     {
@@ -1224,14 +1231,18 @@ async fn serve_miss(state: &AppState, sp: &StorePath, root_hex: &str) -> Respons
     if is_static_asset_path(&sp.resource) {
         return not_found();
     }
-    if let Some(paths) = state.node.manifest_paths(&sp.store_id, root_hex).await {
+    if let Some(paths) = state
+        .content_server
+        .manifest_paths(&sp.store_id, root_hex)
+        .await
+    {
         if paths.iter().any(|p| p == &sp.resource) {
             return not_found();
         }
     }
     // SPA fallback: the store's default view, served against the SAME resolved root.
     match state
-        .node
+        .content_server
         .serve_content_plaintext(&sp.store_id, root_hex, "index.html", None)
         .await
     {

@@ -998,3 +998,54 @@ A change to any behaviour in this document MUST update this SPEC in the same uni
 shared contract (the read wire, the peer/DHT/PEX wire, the anchored-root pin, the `mode` field, the
 `dig.onion` stream, the `0x04` namespace) — the corresponding `SYSTEM.md` / docs.dig.net / peer-crate
 entries in the same unit of work (release-first for shared contracts, `CLAUDE.md` §4.1/§4.2).
+
+---
+
+## 13. Internal architecture — the 7 seams (epic #1285/#1303)
+
+`dig-node` is built as a thin composition root over **7 architecturally-separated seams**, each its
+own module boundary + a public trait implemented by `Node`:
+
+| # | Seam | Trait | Module |
+|---|------|-------|--------|
+| 1 | Chia peer connectivity (anchored-root resolution) | `ChainSource` | `seams::chia_peer` |
+| 2 | DIG peer connectivity | `PeerNetwork` | `seams::dig_peer` |
+| 3 | Chia backend wallet | *(placeholder — embedded `dig-wallet` stays external; W5)* | — |
+| 4 | Dig RPC server (JSON-RPC dispatch) | `RpcDispatch` | `seams::dig_rpc` |
+| 5 | Dig local content server | `ContentServer` | `seams::content` |
+| 6 | Capsule management (on-disk `.dig` cache) | `CapsuleStore` | `seams::capsule` |
+| 7 | Key management (machine identity_seed/NodeCert) | `KeyManager` | `seams::key_mgmt` |
+
+**Cross-seam vocabulary.** Seams communicate ONLY through `shared::` types (`AnchoredRootResolver`/
+`AnchoredStoreState`, `ContentResponse`, `NodeCert`/`peer_id`, cache-dir resolution) — never by reaching
+into another seam's private internals directly (a seam trait's method IS the sanctioned reach).
+
+**The outer composition root (locked shape, #1285 W1c).** `Node` stays ONE concrete struct
+implementing all 7 seam traits — it is NOT split into 7 separate structs. The composition root
+(`dig-node-service`, the single user-facing binary) constructs one `Arc<Node>` and hands out
+**self-referential trait-object upcasts** of that SAME object to whoever needs a seam — e.g.
+`Node::as_content_server(&Arc<Node>) -> Arc<dyn ContentServer>`. This is what makes the shape
+genuinely composition-root-like at the OUTER boundary: a consumer (the service, a test, the future
+FFI/browser path) holds `Arc<dyn SeamTrait>` — an injectable seam boundary — rather than the concrete
+`Node`, and a later wave (W2-W5) can repoint ONE such handle at a genuinely different concrete
+implementation (e.g. a `dig-peer`-backed `PeerNetwork`) without touching the other 6 or any consumer
+that holds a different seam's handle. `dig-node-service`'s `AppState` demonstrates this: it holds both
+`node: Arc<Node>` (used where the existing plumbing already calls through it) and
+`content_server: Arc<dyn ContentServer>` (used by the loopback plaintext serve path, `server::
+serve_resource`/`serve_miss`) — the SAME object, two shapes.
+
+**The binary holds no seam logic.** `dig-node-service` wires seam handles + HTTP/control transport; the
+actual dispatch/serve/cache/chain/peer/key logic lives in `dig-node-core`'s seam modules. A second
+competing binary, or seam logic leaking into the service crate, is an architecture violation.
+
+**Deferred: the INNER cross-seam de-tangle (epic #1357).** The W1b carves (behaviour-preserving,
+#1285) left several seams reaching DIRECTLY into another seam's private state rather than through a
+trait call — e.g. `ContentServer::serve_content_plaintext` reads `self.anchored_root_resolver` (seam 1)
+as a raw field and calls `self.proxy(..)` (a private seam-4 helper) and `self.maybe_backfill_capsule`
+(seam 6); `CapsuleStore::maybe_backfill_capsule` calls `self.p2p_content()`/`self.invalidate_content_cache`
+(seam 5) and `self.refresh_dht_inventory()` (seam 2, via `PeerNetwork`); `RpcDispatch::dispatch` calls
+directly into every other seam's methods. Because these edges run in BOTH directions (seam 4 ↔ 5,
+seam 5 ↔ 6), a true per-seam struct split today would require resolving genuine ownership cycles —
+and W2-W5 will reshape several of these exact edges anyway as each seam's concrete implementation is
+replaced (e.g. `ContentServer`'s local-first tier changes shape once `dig-capsule` is adopted in W4).
+De-tangling now risks redoing the same work again; **#1357** tracks the follow-up once W2-W5 land.

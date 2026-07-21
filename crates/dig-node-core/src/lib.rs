@@ -2143,6 +2143,56 @@ impl Node {
     }
 }
 
+/// The COMPOSITION-ROOT upcasts (#1285 W1c — the locked "Option A" shape). `Node` stays ONE
+/// concrete struct implementing all 7 seam traits (unchanged from W1b); these methods hand a
+/// caller a trait-object HANDLE to exactly one seam — a self-referential upcast of the SAME
+/// `Arc<Node>`, not a separate object (no `Arc::new_cyclic`, no possibility of the seam-4↔5 /
+/// 5↔6 cross-seam cycles the W1b carves left in place — see #1285's W1c design recon).
+///
+/// This is what makes the outer shape genuinely composition-root-like: a consumer (the
+/// `dig-node-service` binary, a test, the FFI/browser path) can hold `Arc<dyn ContentServer>`
+/// instead of `Arc<Node>` — an injectable seam boundary — and W2-W5 can later repoint ONE such
+/// handle at a genuinely different concrete type (e.g. a `dig-peer`-backed `PeerNetwork`) without
+/// touching the other 6. The INNER cross-seam reaches (`self.proxy`, `self.p2p_content()`, the
+/// direct `self.anchored_root_resolver` field read, …) are UNCHANGED by this pass — de-tangling
+/// them into true per-seam structs is deferred to the follow-up epic **#1357**, sequenced after
+/// W2-W5 reshape those exact edges (de-tangling now risks redoing the same work again once a
+/// seam's concrete implementation actually changes).
+///
+/// `wallet` (seam 3) has no upcast here — W1b left it a placeholder (the embedded `dig-wallet`
+/// stays external; its trait/handle is W5's job, the seam-3 custody cutover).
+impl Node {
+    /// Seam 1 (Chia peer connectivity) handle.
+    pub fn as_chain_source(self: &Arc<Self>) -> Arc<dyn ChainSource> {
+        Arc::clone(self) as Arc<dyn ChainSource>
+    }
+
+    /// Seam 2 (DIG peer connectivity) handle.
+    pub fn as_peer_network(self: &Arc<Self>) -> Arc<dyn PeerNetwork> {
+        Arc::clone(self) as Arc<dyn PeerNetwork>
+    }
+
+    /// Seam 4 (dig RPC server) handle.
+    pub fn as_rpc_dispatch(self: &Arc<Self>) -> Arc<dyn RpcDispatch> {
+        Arc::clone(self) as Arc<dyn RpcDispatch>
+    }
+
+    /// Seam 5 (local content server) handle.
+    pub fn as_content_server(self: &Arc<Self>) -> Arc<dyn ContentServer> {
+        Arc::clone(self) as Arc<dyn ContentServer>
+    }
+
+    /// Seam 6 (capsule management) handle.
+    pub fn as_capsule_store(self: &Arc<Self>) -> Arc<dyn CapsuleStore> {
+        Arc::clone(self) as Arc<dyn CapsuleStore>
+    }
+
+    /// Seam 7 (key management) handle.
+    pub fn as_key_manager(self: &Arc<Self>) -> Arc<dyn KeyManager> {
+        Arc::clone(self) as Arc<dyn KeyManager>
+    }
+}
+
 /// Crate-internal test helpers shared across module test suites (e.g. the peer-surface
 /// tests in [`crate::peer`] need a lightweight [`Node`]). Not compiled into the release build.
 #[cfg(test)]
