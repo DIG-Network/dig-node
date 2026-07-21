@@ -519,7 +519,14 @@ surface is never reachable off-machine.
 1. resolves `path` → `retrieval_key = SHA-256(canonical rootless URN)` (`urn:dig:chia:<storeId>[/<path>]`,
    empty → `index.html`) — byte-identical to `dig-client-wasm`/`dig-runtime`;
 2. resolves the store's chain-anchored tip root and PINS the serve to it (§14.4, #127) — a requested
-   root that is not the tip, an unconfirmable store, or an unreachable chain fails closed;
+   root that is not the tip, an unconfirmable store, or an unreachable chain fails closed. A ROOTED
+   request (`:<root>` present) anchors its pinned root by the singleton-lineage walk when that
+   succeeds (which also yields the owner puzzle hash, §4.6 serve-metadata), but a walk aborted by a
+   single unparseable intermediate generation (#747) falls back to a BOUNDED verify — one
+   launcher-hint query reading only the current unspent generation (`verify_pinned_root`) — so a
+   valid pinned root stays readable; both paths are fail-closed and enforce that the pinned root is
+   the current on-chain generation. A ROOTLESS request resolves the tip via the walk and serves
+   against it (surfaced as `X-Dig-Root` + `X-Dig-Verified: true`);
 3. fetches the resource's ciphertext + inclusion proof + chunk lengths LOCAL-FIRST, then peer, then the
    public RPC (§4.6 cache order below);
 4. verifies `resource_leaf(ciphertext) == proof.leaf`, `proof.verify()`, and `proof.root ==
@@ -1974,6 +1981,13 @@ against the on-chain current root or fails closed — it NEVER trusts an upstrea
 
 - For an **explicit-root** request the requested root MUST equal the resolved anchored tip; a mismatch
   is rejected. For a **rootless** request the node resolves the tip and serves against it.
+- The anchored tip is resolved by the store's singleton-lineage walk. For an **explicit-root** request,
+  a walk aborted by a single unparseable intermediate generation (#747 "parse next store: missing
+  child") MUST NOT block a valid pinned root: the pin falls back to a BOUNDED verify that reads only the
+  CURRENT unspent generation (one launcher-hint query — `digstore_chain::verify_pinned_root`), accepting
+  the pinned root only when it equals the live on-chain root. This is fail-closed and preserves #127
+  anti-rollback (a stale/never-anchored root is still rejected). A rootless request has no candidate to
+  bounded-verify and relies on the walk.
 - The pin fails closed with `-32005 ROOT_NOT_ANCHORED` (§10) on: a root mismatch, an unreachable chain,
   a store with no confirmed generation, or a rootless request under enforcement.
 - The pin is ENFORCED by default. The ONLY opt-out is the explicit `DIG_NODE_PIN=off` (also `0`/`false`)
