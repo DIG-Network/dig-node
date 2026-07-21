@@ -278,6 +278,9 @@ impl RpcDispatch for Node {
                 // (and omitted-as-`[]`) on the FFI path / before bring-up. See `peer::connected_peers_json`.
                 if let Some(handle) = node.gossip_handle() {
                     snapshot["peers"] = Value::Array(peer::connected_peers_json(handle));
+                    // The pool's connectivity posture vs the configured target/min/max (#709/#846) —
+                    // the peer-management view an operator needs beyond the per-peer array.
+                    snapshot["pool"] = peer::pool_stats_json(handle);
                 }
                 return json!({"jsonrpc":"2.0","id":id, "result": snapshot});
             }
