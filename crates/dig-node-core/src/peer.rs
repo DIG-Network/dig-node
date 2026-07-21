@@ -248,6 +248,26 @@ pub(crate) fn connected_peers_json(handle: &dig_gossip::GossipHandle) -> Vec<Val
         .collect()
 }
 
+/// The live pool's connectivity posture as a JSON object for `control.peerStatus` (#709/#846):
+/// `{ connected, in_flight, target, min, max, backed_off, under_connected }`. This is the
+/// peer-MANAGEMENT view an operator needs to reason about the pool — how many peers are connected
+/// versus the configured `target`/`min`/`max`, how many dials are in flight, how many candidates are
+/// currently backed off, and whether the pool is under-connected (below `min`) — sourced directly
+/// from dig-gossip's [`pool_stats`](dig_gossip::GossipHandle::pool_stats). Returns `null` when no
+/// peer network is running (the FFI path / before bring-up).
+pub(crate) fn pool_stats_json(handle: &dig_gossip::GossipHandle) -> Value {
+    let stats = handle.pool_stats();
+    json!({
+        "connected": stats.connected,
+        "in_flight": stats.in_flight,
+        "target": stats.target,
+        "min": stats.min,
+        "max": stats.max,
+        "backed_off": stats.backed_off,
+        "under_connected": stats.is_under_connected(),
+    })
+}
+
 /// Dial a peer for `control.peers.connect` and return the connected peer's `peer_id` (64-hex).
 ///
 /// The `peer` argument is EITHER a dialable socket address (`host:port`, IPv6 in brackets) OR a bare
@@ -364,34 +384,36 @@ pub fn network_id_from_env() -> String {
 
 /// The gossip `GossipConfig.network_id` genesis-challenge: `DIG_NETWORK_GENESIS` (64-hex, 32
 /// bytes) when set to a valid non-zero value, else `dig_constants::DIG_MAINNET.genesis_challenge()`
-/// — the pre-launch all-zero placeholder gossip currently rejects with "network_id must be
-/// non-zero" (the real mainnet value is a launch decision, #214, and MUST NOT be hardcoded here).
-/// Setting this lets a dev/local node — or, at launch, the real genesis — bring the gossip peer
-/// pool up without dig-node baking in an unreleased value. Pure core [`genesis_challenge_from`].
+/// — the canonical DIG mainnet genesis, a REAL non-zero Chia mainnet header hash
+/// (`0af981…1abf` @ height 9,021,277, pinned in dig-constants 0.4.0+). Because that default is
+/// non-zero, a stock node's gossip pool starts cleanly: `dig-gossip` rejects only an ALL-ZERO
+/// `network_id`. Setting the env var overrides the default for a dev/local network (#285). Pure
+/// core [`genesis_challenge_from`].
 pub fn genesis_challenge_from_env() -> chia_protocol::Bytes32 {
     genesis_challenge_from(std::env::var("DIG_NETWORK_GENESIS").ok().as_deref())
 }
 
 /// Pure: resolve an optional `DIG_NETWORK_GENESIS` value into the gossip `network_id` `Bytes32`,
-/// falling back to the placeholder constant for anything that isn't a valid non-zero 64-hex
-/// 32-byte value (unset, blank, non-hex, wrong length, or all-zero) — the same graceful-skip
-/// sentinel the pre-launch placeholder already is.
+/// falling back to the canonical `DIG_MAINNET` genesis for anything that isn't a valid non-zero
+/// 64-hex 32-byte value (unset, blank, non-hex, wrong length, or all-zero). The fallback is a REAL
+/// non-zero genesis (dig-constants 0.4.0+), so an unconfigured node still builds a valid, startable
+/// gossip config — `dig-gossip` only rejects an all-zero `network_id`.
 fn genesis_challenge_from(env: Option<&str>) -> chia_protocol::Bytes32 {
-    let placeholder = dig_constants::DIG_MAINNET.genesis_challenge();
+    let default_genesis = dig_constants::DIG_MAINNET.genesis_challenge();
     let Some(s) = env.map(str::trim).filter(|s| !s.is_empty()) else {
-        return placeholder;
+        return default_genesis;
     };
     if s.len() != 64 {
-        return placeholder;
+        return default_genesis;
     }
     let Ok(bytes) = hex::decode(s) else {
-        return placeholder;
+        return default_genesis;
     };
     let Ok(arr) = <[u8; 32]>::try_from(bytes) else {
-        return placeholder;
+        return default_genesis;
     };
     if arr == [0u8; 32] {
-        return placeholder;
+        return default_genesis;
     }
     chia_protocol::Bytes32::new(arr)
 }
@@ -1252,9 +1274,10 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // §14 autonomous sync — spawn the CHAIN-WATCH + GAP-FILL loop (SPEC §14.2 + §14.3) FIRST,
     // INDEPENDENTLY of the P2P layer below. The proactive pull path (`Node::gap_fill_generation` →
     // the authenticated §21 whole-store sync) needs NEITHER the connected pool NOR the DHT, so §14
-    // MUST NOT be gated behind them: a failed pool/DHT bring-up (a network hiccup, or the pre-launch
-    // placeholder network genesis the gossip config currently rejects) must never silently disable
-    // autonomous sync — the exact "declared complete but not running" gap (#213). The loop polls each
+    // MUST NOT be gated behind them: a failed pool/DHT bring-up (a network hiccup, or a misconfigured
+    // all-zero `DIG_NETWORK_GENESIS` override the gossip config rejects — the DEFAULT genesis is a
+    // real non-zero value that starts cleanly) must never silently disable autonomous sync — the
+    // exact "declared complete but not running" gap (#213). The loop polls each
     // subscribed store's anchored root on its interval and pulls any confirmed generation it lacks,
     // verifying against the chain-anchored root; once the DHT is up (below) a successful pull also
     // refreshes the provider records via the inventory hook. The in-process FFI path never reaches
@@ -2057,6 +2080,34 @@ mod tests {
         assert!(err.contains("64-hex peer_id"), "got: {err}");
     }
 
+    /// #709/#846: `control.peerStatus`'s `pool` object reports the pool's connectivity posture. A
+    /// freshly-started, unconnected pool has `connected == 0` and is `under_connected` (below the
+    /// configured `min`), with a coherent `min <= target <= max` triple exposed for an operator to
+    /// reason about the pool. Sourced from the live GossipHandle's `pool_stats` — no new RPC method
+    /// (the new peer-management VERBS `setBan`/`setPoolConfig` need a dig-rpc-protocol `Method`
+    /// variant, a cross-family contract release, so this PR extends the existing peerStatus surface).
+    #[tokio::test]
+    async fn pool_stats_json_reports_the_pool_posture() {
+        let handle = fresh_pool_handle("pool-stats", [9u8; 32]).await;
+        let stats = pool_stats_json(&handle);
+        assert_eq!(stats["connected"], 0, "a fresh pool has no connected peers");
+        assert_eq!(stats["in_flight"], 0, "no dials are in flight yet");
+        let (min, target, max) = (
+            stats["min"].as_u64().expect("min"),
+            stats["target"].as_u64().expect("target"),
+            stats["max"].as_u64().expect("max"),
+        );
+        assert!(
+            min <= target && target <= max,
+            "pool config triple must be ordered: {min} <= {target} <= {max}"
+        );
+        assert!(min >= 1, "a real pool wants at least one peer");
+        assert_eq!(
+            stats["under_connected"], true,
+            "0 connected is below min, so the pool is under-connected"
+        );
+    }
+
     /// Build a real, freshly-started `GossipHandle` on the production-shaped dual-stack unspecified
     /// bind (`[::]:0`, §5.2) for the pool-handle tests.
     async fn fresh_pool_handle(tag: &str, network: [u8; 32]) -> dig_gossip::GossipHandle {
@@ -2127,17 +2178,17 @@ mod tests {
         );
     }
 
-    // #285: DIG_NETWORK_GENESIS env override — unset/invalid/zero fall back to the pre-launch
-    // placeholder (the current graceful-skip behavior, #214 gates the real value); a valid
-    // non-zero 64-hex value is used verbatim as the gossip `network_id`.
+    // #285: DIG_NETWORK_GENESIS env override — unset/invalid/zero fall back to the canonical
+    // `DIG_MAINNET` genesis; a valid non-zero 64-hex value is used verbatim as the gossip
+    // `network_id`.
     #[test]
     fn genesis_challenge_env_override() {
-        let placeholder = dig_constants::DIG_MAINNET.genesis_challenge();
+        let default_genesis = dig_constants::DIG_MAINNET.genesis_challenge();
 
-        // Unset → placeholder (today's graceful-skip default is preserved).
-        assert_eq!(genesis_challenge_from(None), placeholder);
-        // Blank → placeholder.
-        assert_eq!(genesis_challenge_from(Some("   ")), placeholder);
+        // Unset → the canonical default genesis.
+        assert_eq!(genesis_challenge_from(None), default_genesis);
+        // Blank → default.
+        assert_eq!(genesis_challenge_from(Some("   ")), default_genesis);
 
         // Valid 64-hex, non-zero → used verbatim.
         let hex64 = "11".repeat(32);
@@ -2152,14 +2203,49 @@ mod tests {
             chia_protocol::Bytes32::new([0x11u8; 32])
         );
 
-        // All-zero 64-hex → placeholder (the graceful-skip sentinel, not a "real" genesis).
-        assert_eq!(genesis_challenge_from(Some(&"00".repeat(32))), placeholder);
-        // Too short → placeholder.
-        assert_eq!(genesis_challenge_from(Some("abcd")), placeholder);
-        // Too long → placeholder.
-        assert_eq!(genesis_challenge_from(Some(&"11".repeat(33))), placeholder);
-        // Non-hex → placeholder.
-        assert_eq!(genesis_challenge_from(Some(&"zz".repeat(32))), placeholder);
+        // All-zero 64-hex → default (the all-zero value is the one `network_id` gossip rejects).
+        assert_eq!(
+            genesis_challenge_from(Some(&"00".repeat(32))),
+            default_genesis
+        );
+        // Too short → default.
+        assert_eq!(genesis_challenge_from(Some("abcd")), default_genesis);
+        // Too long → default.
+        assert_eq!(
+            genesis_challenge_from(Some(&"11".repeat(33))),
+            default_genesis
+        );
+        // Non-hex → default.
+        assert_eq!(
+            genesis_challenge_from(Some(&"zz".repeat(32))),
+            default_genesis
+        );
+    }
+
+    /// #850 regression: the DEFAULT node's genesis (no `DIG_NETWORK_GENESIS` set) is a REAL,
+    /// non-zero value — dig-constants 0.4.0+ pins the Chia mainnet header hash @ height 9,021,277.
+    /// `dig-gossip` rejects an ALL-ZERO `network_id` ("network_id must be non-zero"), so this is the
+    /// property that lets a stock, unconfigured node bring its gossip pool up: the fallback must
+    /// never be the all-zero sentinel. Guards against a regression that re-introduces a zero default.
+    #[test]
+    fn default_genesis_is_non_zero_so_gossip_config_is_valid() {
+        let default_genesis = genesis_challenge_from(None);
+        assert_ne!(
+            default_genesis,
+            chia_protocol::Bytes32::new([0u8; 32]),
+            "the default gossip network_id must be non-zero or gossip rejects it at start"
+        );
+        // The env resolver mirrors the pure core, so a stock node reads the same non-zero value.
+        assert_eq!(genesis_challenge_from_env_uncontaminated(), default_genesis);
+    }
+
+    /// Read [`genesis_challenge_from_env`] only when `DIG_NETWORK_GENESIS` is unset, so the assertion
+    /// reflects the STOCK default rather than a value another test/process left in the environment.
+    fn genesis_challenge_from_env_uncontaminated() -> chia_protocol::Bytes32 {
+        match std::env::var("DIG_NETWORK_GENESIS") {
+            Ok(v) if !v.trim().is_empty() => genesis_challenge_from(None),
+            _ => genesis_challenge_from_env(),
+        }
     }
 
     #[test]
