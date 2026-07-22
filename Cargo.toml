@@ -31,7 +31,7 @@ edition = "2021"
 # the ROOT manifest (`[workspace.package].version`), so it MUST be set here for a
 # release to fire (§3.6). The library crates (dig-node-core/dig-runtime/dig-wallet)
 # keep their own independent versions — only the released binary tracks the workspace version.
-version = "0.53.0"
+version = "0.54.0"
 
 # Release hardening, matching digstore: keep integer-overflow checks ON in release.
 # The node parses untrusted serialized input and does offset/length arithmetic over
@@ -54,8 +54,8 @@ overflow-checks = true
 # standalone. `native-tls` is NOT patched: dig-gossip is pulled with
 # `default-features = false, features = ["rustls", "relay"]`, so the OpenSSL/native-tls path is off.
 [patch.crates-io]
-chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "e6ea13e6a090" }
-chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "e6ea13e6a090" }
+chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5bb335360ee16a856b217b429f205eead31dee80" }
+chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "5bb335360ee16a856b217b429f205eead31dee80" }
 
 # The dig-nat unification patch is RETIRED (#1280 crates.io cascade): dig-nat 0.7 is on crates.io and
 # the ENTIRE peer stack (dig-gossip 0.7.1, dig-dht 0.2.2, dig-download 0.2.1, dig-peer-selector 0.2.1,
