@@ -543,11 +543,42 @@ impl RpcDispatch for Node {
                 .anchored_root_resolver
                 .anchored_root(&store_id_arr)
                 .await;
-            match decide_pin(true, requested_root, anchored) {
-                PinDecision::ServeAt(root) => Some(root),
-                PinDecision::Reject(code, msg) => return err(&id, code, msg),
-                // `decide_pin(true, ..)` never returns Unpinned.
-                PinDecision::Unpinned => requested_root,
+            match requested_root {
+                // ROOTED (`dig://<store>:<root>`): the pinned root must equal the current on-chain
+                // root (#127 anti-rollback). Prefer the lineage walk's tip, but a walk aborted by a
+                // single unparseable intermediate generation (#747 "parse next store: missing child")
+                // MUST NOT block a valid pinned root — fall back to the BOUNDED verify (one
+                // launcher-hint query, no walk) so the read stays available (#747/#841). Fail-closed
+                // either way.
+                Some(req) => match &anchored {
+                    Ok(Some(tip)) if *tip == req => Some(req),
+                    Ok(Some(tip)) => {
+                        return err(
+                            &id,
+                            ROOT_NOT_ANCHORED,
+                            format!(
+                                "served root {} does not match the store's on-chain root {} (chain is the authority)",
+                                req.to_hex(),
+                                tip.to_hex()
+                            ),
+                        )
+                    }
+                    Ok(None) | Err(_) => match node
+                        .anchored_root_resolver
+                        .verify_pinned_root(&store_id_arr, req)
+                        .await
+                    {
+                        Ok(()) => Some(req),
+                        Err(msg) => return err(&id, ROOT_NOT_ANCHORED, msg),
+                    },
+                },
+                // ROOTLESS (`dig://<store>`): resolve the chain-anchored tip (the authority).
+                None => match decide_pin(true, None, anchored) {
+                    PinDecision::ServeAt(root) => Some(root),
+                    PinDecision::Reject(code, msg) => return err(&id, code, msg),
+                    // `decide_pin(true, ..)` never returns Unpinned.
+                    PinDecision::Unpinned => None,
+                },
             }
         } else {
             // Pin disabled (DIG_NODE_PIN=off, offline/local dev): serve against the

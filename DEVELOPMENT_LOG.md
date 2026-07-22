@@ -4,6 +4,26 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## digstore git-rev pins must move in LOCKSTEP across ALL crates (read-root hardening #1439/#1473)
+
+The digstore-* git deps are pinned by `rev` in FOUR crate manifests, not just the two obvious ones:
+`dig-node-core` (7 deps), `dig-node-service` (3, a test fixture), `dig-runtime` (1), and `dig-wallet`
+(2). They share ONE workspace `Cargo.lock`, so a partial bump leaves the lock resolving two revs of
+the same git source — two incompatible copies of `digstore-core` (its `Bytes32` from crate A ≠ from
+crate B) that fail to unify at crate boundaries. When bumping the digstore rev, `grep -rn 'rev =
+"<old>"' crates/` and move EVERY occurrence together, then let `cargo test`/`cargo check` re-resolve
+the lock (there is no single `cargo update -p digstore-core` — the spec is ambiguous because a
+crates.io `digstore-core 0.13.4` also lives in the tree via a separate dep path; leave that one).
+
+The #1473 hardening (`verify_pinned_root` anchoring identity on the unforgeable launcher coin,
+`coin_id == store_id`, via a bounded backward `parent_coin_info` coin-record walk instead of the
+forgeable curried `SingletonStruct.launcher_id`) shipped as a pure internal rewrite: the public
+signature `verify_pinned_root(&dyn ChainReads, store_id, pinned_root)` is UNCHANGED between d5e52fb
+and 4c34f0be, and `Coinset` already implements the `coin_record`/`coin_spend` `ChainReads` methods
+the new walk needs — so the dig-node call site (`CoinsetResolver::verify_pinned_root`) needed ZERO
+code change. Deep forge-rejection coverage lives in digstore's `golden_read_proof.rs`; the node layer
+only guards the fail-closed wiring.
+
 ## A `Get-Acl` readback in the security hot path fails on hosts that can't autoload the PS Security module (#849/#856)
 
 The #501 control-token state-dir hardening READBACK-VERIFIED the DACL by spawning `powershell

@@ -45,6 +45,40 @@ pub trait AnchoredRootResolver: Send + Sync {
                 owner_puzzle_hash: None,
             }))
     }
+
+    /// Fail-closed, BOUNDED verification that `pinned_root` is the store's CURRENT on-chain
+    /// generation — WITHOUT the full singleton-lineage walk [`anchored_root`](Self::anchored_root)
+    /// performs. A rooted local content read (`dig://<store>:<root>`, the §5.3 loopback tier) MUST
+    /// chain-anchor its pinned root before serving; the lineage walk parses every generation and
+    /// ABORTS on a single unparseable intermediate spend (#747 "parse next store: missing child"),
+    /// so a perfectly valid pinned root becomes unreadable.
+    ///
+    /// Production [`CoinsetResolver`](crate::CoinsetResolver) overrides this with
+    /// `digstore_chain::singleton::verify_pinned_root` — one `unspent_coins_by_hint` query on the
+    /// launcher id + a read of the ONE creating spend, no per-generation walk. The default impl
+    /// falls back to the walk-based [`anchored_root`](Self::anchored_root) + equality, so
+    /// deterministic test mocks (which only know the tip) keep working unchanged.
+    ///
+    /// Returns `Ok(())` only when `pinned_root` equals the live on-chain root. Any `Err` —
+    /// mismatch (stale/never-anchored root), no confirmed generation, or an unreachable chain —
+    /// means the caller MUST NOT serve (fail closed, §5.3 / NC-9 anti-rollback).
+    async fn verify_pinned_root(
+        &self,
+        store_id: &[u8; 32],
+        pinned_root: Bytes32,
+    ) -> Result<(), String> {
+        match self.anchored_root(store_id).await? {
+            Some(tip) if tip == pinned_root => Ok(()),
+            Some(tip) => Err(format!(
+                "pinned root {} is not the store's current on-chain root {} (chain is the authority)",
+                pinned_root.to_hex(),
+                tip.to_hex()
+            )),
+            None => {
+                Err("store has no confirmed on-chain generation (chain is the authority)".into())
+            }
+        }
+    }
 }
 
 /// The store's on-chain DataStore singleton state, as resolved by walking its lineage to the

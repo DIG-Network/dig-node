@@ -28,7 +28,7 @@ use digstore_core::wire::ContentResponse;
 use digstore_core::{resource_leaf, Bytes32, SecretSalt, Urn, CHAIN, DEFAULT_RESOURCE_KEY};
 use serde_json::{json, Value};
 
-use crate::{decide_pin, pin_enforced, CapsuleStore, Node, PinDecision};
+use crate::{decide_pin, pin_enforced, CapsuleStore, Node, PinDecision, ROOT_NOT_ANCHORED};
 
 /// JSON-RPC-style code for a serve that fetched bytes but could not verify/decrypt/reach them —
 /// distinct from a clean content miss (`NotFound`) and from the anchored-root pin (`RootError`).
@@ -303,6 +303,8 @@ impl ContentServer for Node {
         // pin is disabled (`DIG_NODE_PIN=off`) or the resolver can't supply it.
         let mut owner_puzzle_hash: Option<String> = None;
         let pinned_root: Option<Bytes32> = if enforced {
+            // Resolve the store's on-chain state via the full singleton-lineage walk. For a healthy
+            // store this yields both the tip root AND the owner puzzle hash (#486) in ONE chain read.
             let anchored_state = self
                 .anchored_root_resolver
                 .anchored_state(&store_id.0)
@@ -311,15 +313,58 @@ impl ContentServer for Node {
                 Ok(Some(state)) => state.owner_puzzle_hash.map(|ph| ph.to_hex()),
                 _ => None,
             };
-            let anchored: Result<Option<Bytes32>, String> =
-                anchored_state.map(|opt| opt.map(|state| state.root));
-            match decide_pin(true, requested_root, anchored) {
-                PinDecision::ServeAt(root) => Some(root),
-                PinDecision::Reject(code, message) => {
-                    return PlaintextOutcome::RootError { code, message }
+            match requested_root {
+                // ROOTED (`dig://<store>:<root>`): the pinned root must equal the current on-chain
+                // root (#127 anti-rollback). Prefer the walk's tip (it also carried the owner above);
+                // but a walk aborted by a single unparseable intermediate generation (#747 "parse
+                // next store: missing child") MUST NOT block a valid pinned root — fall back to the
+                // BOUNDED verify (one launcher-hint query, no walk) so the local `/s` tier (§5.3)
+                // stays readable (#747/#841). Both paths are fail-closed: the pinned root is accepted
+                // only when it is the live on-chain generation.
+                Some(req) => match &anchored_state {
+                    Ok(Some(state)) if state.root == req => Some(req),
+                    Ok(Some(state)) => {
+                        return PlaintextOutcome::RootError {
+                            code: ROOT_NOT_ANCHORED,
+                            message: format!(
+                                "served root {} does not match the store's on-chain root {} (chain is the authority)",
+                                req.to_hex(),
+                                state.root.to_hex()
+                            ),
+                        }
+                    }
+                    // Walk broken (#747) or no confirmed generation → bounded fallback anchors the
+                    // pinned root directly (owner stays `None`; the walk that carries it is broken).
+                    Ok(None) | Err(_) => match self
+                        .anchored_root_resolver
+                        .verify_pinned_root(&store_id.0, req)
+                        .await
+                    {
+                        Ok(()) => Some(req),
+                        Err(message) => {
+                            return PlaintextOutcome::RootError {
+                                code: ROOT_NOT_ANCHORED,
+                                message,
+                            }
+                        }
+                    },
+                },
+                // ROOTLESS (`dig://<store>`): serve against the resolved chain-anchored TIP — the
+                // resolved root surfaces to the client as `X-Dig-Root` + `X-Dig-Verified: true`
+                // (#852, SPEC §4.6/§14.4). A rootless request has no candidate to bounded-verify, so
+                // it relies on the lineage walk resolved above.
+                None => {
+                    let anchored: Result<Option<Bytes32>, String> =
+                        anchored_state.map(|opt| opt.map(|state| state.root));
+                    match decide_pin(true, None, anchored) {
+                        PinDecision::ServeAt(root) => Some(root),
+                        PinDecision::Reject(code, message) => {
+                            return PlaintextOutcome::RootError { code, message }
+                        }
+                        // decide_pin(true, ..) never returns Unpinned.
+                        PinDecision::Unpinned => None,
+                    }
                 }
-                // decide_pin(true, ..) never returns Unpinned.
-                PinDecision::Unpinned => requested_root,
             }
         } else {
             requested_root

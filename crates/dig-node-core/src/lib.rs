@@ -100,7 +100,7 @@ pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// silently downgraded to a no-op). Catalogued in docs.dig.net error tables and
 /// uniform with the CLI clone/pull pin (which fails closed with the same
 /// "chain is the authority" semantics).
-const ROOT_NOT_ANCHORED: i64 = -32005;
+pub(crate) const ROOT_NOT_ANCHORED: i64 = -32005;
 
 // -- Canonical control-plane error taxonomy (dig-rpc-types §10, #200) ------------------------------
 //
@@ -2334,6 +2334,12 @@ mod tests {
         /// Optional owner puzzle hash `anchored_state` reports alongside the root (#486 test
         /// support). `None` ⇒ the trait's default owner-less wrapping (most tests don't need it).
         owner: Option<Bytes32>,
+        /// Optional INDEPENDENT outcome for the bounded [`verify_pinned_root`](AnchoredRootResolver::verify_pinned_root)
+        /// (#747). `None` ⇒ the trait's DEFAULT walk-based fallback (tip equality via `anchored_root`).
+        /// `Some(..)` decouples the bounded verify from the (possibly broken) full-lineage walk, so a
+        /// test can model #747: the walk (`anchored_root`) errors ("missing child") while the bounded
+        /// verify still succeeds — exactly what `CoinsetResolver` does on chain.
+        verify_outcome: Option<Result<(), String>>,
     }
 
     impl MockResolver {
@@ -2344,6 +2350,22 @@ mod tests {
             Arc::new(MockResolver {
                 outcomes,
                 owner: None,
+                verify_outcome: None,
+            })
+        }
+        /// A resolver whose full-lineage walk (`anchored_root`) yields `walk` but whose BOUNDED
+        /// `verify_pinned_root` INDEPENDENTLY yields `verify` — models the #747 split (the walk can
+        /// be broken while the bounded verify succeeds, and vice versa). `walk` applies to `*`.
+        fn with_verify(
+            walk: Result<Option<Bytes32>, String>,
+            verify: Result<(), String>,
+        ) -> Arc<dyn AnchoredRootResolver> {
+            let mut outcomes = std::collections::HashMap::new();
+            outcomes.insert("*".to_string(), walk);
+            Arc::new(MockResolver {
+                outcomes,
+                owner: None,
+                verify_outcome: Some(verify),
             })
         }
         /// Like [`one`](Self::one) but ALSO reports `owner` from `anchored_state` (#486): the
@@ -2359,6 +2381,7 @@ mod tests {
             Arc::new(MockResolver {
                 outcomes,
                 owner: Some(owner),
+                verify_outcome: None,
             })
         }
         /// A resolver whose every lookup is `outcome` (e.g. chain-unreachable).
@@ -2370,6 +2393,7 @@ mod tests {
                     m
                 },
                 owner: None,
+                verify_outcome: None,
             })
         }
     }
@@ -2396,6 +2420,24 @@ mod tests {
                     root,
                     owner_puzzle_hash: self.owner,
                 }))
+        }
+
+        async fn verify_pinned_root(
+            &self,
+            store_id: &[u8; 32],
+            pinned_root: Bytes32,
+        ) -> Result<(), String> {
+            match &self.verify_outcome {
+                // Model the bounded on-chain verify INDEPENDENTLY of the (possibly broken) walk.
+                Some(outcome) => outcome.clone(),
+                // No explicit bounded outcome ⇒ mirror the trait's DEFAULT walk-based fallback
+                // (tip equality via `anchored_root`), so a test that doesn't override it keeps the
+                // walk semantics (this is what the existing #127 pin tests rely on).
+                None => match self.anchored_root(store_id).await? {
+                    Some(tip) if tip == pinned_root => Ok(()),
+                    Some(_) | None => Err("pinned root is not the current on-chain root".into()),
+                },
+            }
         }
     }
 
@@ -4227,6 +4269,97 @@ mod tests {
     }
 
     #[test]
+    fn get_content_rooted_read_fails_closed_when_walk_broken_and_bounded_verify_rejects_747() {
+        // Regression for #747/#841 anti-rollback: when the full lineage walk is BROKEN ("parse next
+        // store: missing child") the rooted pin falls back to the BOUNDED verify — which must still
+        // FAIL CLOSED for a root that is not the current on-chain generation. Both the walk and the
+        // bounded fallback reject here, so the read must never serve an unanchored root.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([7u8; 32]);
+        let req = Bytes32([0xAA; 32]);
+        let (node, _td) = test_node_with_resolver(
+            None,
+            // walk broken (#747) AND the bounded verify rejects the pinned root ⇒ fail closed.
+            MockResolver::with_verify(
+                Err("parse next store: missing child".into()),
+                Err("pinned root is not the current on-chain root".into()),
+            ),
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(),
+                "root": req.to_hex(),
+                "retrieval_key": any_rk_hex(),
+            }}),
+        ));
+
+        assert_eq!(
+            resp["error"]["code"], ROOT_NOT_ANCHORED,
+            "a broken walk + rejecting bounded verify must fail closed: {resp}"
+        );
+        assert!(resp.get("result").is_none(), "no content served: {resp}");
+    }
+
+    #[tokio::test]
+    async fn bounded_verify_pinned_root_succeeds_when_the_lineage_walk_is_broken_747() {
+        // The heart of the #747 fix: on chain a store can have an unparseable intermediate
+        // generation that aborts the full lineage walk ("parse next store: missing child"), yet the
+        // CURRENT pinned root is perfectly valid. The bounded verify (one launcher-hint query) must
+        // still ACCEPT it — decoupled from the broken walk. `CoinsetResolver` gets this from
+        // `digstore_chain::verify_pinned_root`; here the mock models the same split.
+        let resolver = MockResolver::with_verify(
+            Err("parse next store: missing child".into()), // the walk is broken (#747)
+            Ok(()),                                        // the bounded verify still anchors it
+        );
+        let store = [9u8; 32];
+        let pinned = Bytes32([0x11; 32]);
+
+        // The walk aborts...
+        assert!(
+            resolver.anchored_root(&store).await.is_err(),
+            "the lineage walk is broken in this scenario (#747)"
+        );
+        // ...but the bounded verify still anchors the pinned root.
+        assert!(
+            resolver.verify_pinned_root(&store, pinned).await.is_ok(),
+            "the bounded verify must succeed despite the broken walk (#747)"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_verify_pinned_root_falls_back_to_walk_equality() {
+        // A resolver that does NOT override `verify_pinned_root` (e.g. a deterministic test mock)
+        // gets the trait's DEFAULT: tip-equality via the walk. Ok only when the pinned root equals
+        // the walk's tip; Err on a mismatch or no confirmed generation.
+        struct WalkOnly(Option<Bytes32>);
+        #[async_trait::async_trait]
+        impl AnchoredRootResolver for WalkOnly {
+            async fn anchored_root(&self, _: &[u8; 32]) -> Result<Option<Bytes32>, String> {
+                Ok(self.0)
+            }
+        }
+        let tip = Bytes32([0x22; 32]);
+        let store = [3u8; 32];
+
+        assert!(WalkOnly(Some(tip))
+            .verify_pinned_root(&store, tip)
+            .await
+            .is_ok());
+        assert!(WalkOnly(Some(tip))
+            .verify_pinned_root(&store, Bytes32([0x33; 32]))
+            .await
+            .is_err());
+        assert!(WalkOnly(None)
+            .verify_pinned_root(&store, tip)
+            .await
+            .is_err());
+    }
+
+    #[test]
     fn get_content_fails_closed_when_store_has_no_confirmed_generation() {
         // A store with no confirmed on-chain generation has no anchored root to pin
         // to → fail closed (never serve a forgeable/unanchored generation).
@@ -5175,6 +5308,58 @@ mod tests {
             }
             other => panic!("expected a local Served, got {other:?}"),
         }
+    }
+
+    /// **Proves:** the #747/#841 fix end-to-end — a ROOTED local `/s` read whose full singleton-lineage
+    /// walk is BROKEN ("parse next store: missing child") STILL serves, because the pin falls back to the
+    /// bounded `verify_pinned_root` (which anchors the valid pinned root without the walk). **Catches:** a
+    /// regression to the old behaviour where a single unparseable intermediate generation made a perfectly
+    /// valid capsule unreadable. Owner is OMITTED here (the walk that carries it is broken) — the read
+    /// itself must succeed.
+    #[test]
+    fn serve_content_plaintext_rooted_read_survives_a_broken_lineage_walk_747() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([27u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>survived</h1>".to_vec())];
+        let (root, module) =
+            compile_fixture_module(store, digstore_core::Visibility::Public, true, &files);
+        // The walk is broken (#747), but the BOUNDED verify accepts the pinned root — exactly the
+        // on-chain scenario the fix targets.
+        let (node, _td) = test_node_with_resolver(
+            None,
+            MockResolver::with_verify(Err("parse next store: missing child".into()), Ok(())),
+        );
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root.to_hex(), &module);
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "index.html",
+            None,
+        ));
+        match out {
+            PlaintextOutcome::Served {
+                bytes,
+                root_hex,
+                verified,
+                owner_puzzle_hash,
+                ..
+            } => {
+                assert_eq!(bytes, b"<h1>survived</h1>");
+                assert_eq!(root_hex, root.to_hex());
+                assert!(verified, "the pin ran (bounded verify) ⇒ verified");
+                assert_eq!(
+                    owner_puzzle_hash, None,
+                    "owner is omitted when the owner-carrying walk is broken (#486 note)"
+                );
+            }
+            other => panic!("expected a local Served via the bounded fallback, got {other:?}"),
+        }
+        std::env::remove_var("DIG_NODE_PIN");
     }
 
     /// **Proves:** the serve path fails CLOSED when the requested root is not the chain-anchored tip
