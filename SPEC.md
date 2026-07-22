@@ -207,11 +207,15 @@ Bound dual-stack IPv6-first with an IPv4 fallback, per §5.2.
 Parsed as `u16`; unparsable/unset ⇒ the default **`9445`** (`peer::DEFAULT_GOSSIP_PORT`).
 The peer-RPC (9444) is the node's advertised peer-network identity and the route peers dial to fetch
 content; the gossip pool (9445) is the internal connection manager for the node's own peer pool. Both
-bind dual-stack IPv6-first with an IPv4 fallback, per §5.2. Both listeners MUST present the node's ONE
-persistent `NodeCert` identity, so the gossip pool's inbound TLS listener hashes to the SAME
-`peer_id = SHA-256(TLS SPKI DER)` the node registers/advertises/pins — the gossip pool loads its
-cert/key from the NodeCert files rather than minting its own, or every dial to this node fails closed
-with a `peer_id mismatch` (#1532).
+bind dual-stack IPv6-first with an IPv4 fallback, per §5.2. Both of these **chia-ssl** listeners MUST
+present the node's persistent `NodeCert` identity, so the direct-gossip pool's inbound TLS listener
+hashes to the SAME `peer_id = SHA-256(TLS SPKI DER)` the node registers/advertises/pins on :9444 — the
+gossip pool loads its cert/key from the NodeCert files rather than minting its own, or a direct dial to
+this node fails closed with a `peer_id mismatch` (#1532). This unification covers the chia-ssl path
+(:9444 peer-RPC + :9445 direct-gossip listener) ONLY; the dig-nat / DigPeer NAT-traversal transport
+(the relayed + hole-punch tiers) carries its OWN transport identity, which is unified with the
+persistent NodeCert SEPARATELY under #1541 — until that lands, the NAT-traversal path presents an
+ephemeral peer_id.
 
 **Network identity — `DIG_NETWORK_GENESIS` + `DIG_NETWORK_ID`.** The node resolves TWO coupled
 network identities:
