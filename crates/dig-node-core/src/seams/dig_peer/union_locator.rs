@@ -38,7 +38,10 @@ impl UnionLocator {
 
 #[async_trait]
 impl ProviderLocator for UnionLocator {
-    async fn find_providers(&self, content: &ContentId) -> Result<Vec<ProviderRecord>, DownloadError> {
+    async fn find_providers(
+        &self,
+        content: &ContentId,
+    ) -> Result<Vec<ProviderRecord>, DownloadError> {
         // Query every source CONCURRENTLY; join_all preserves the source order in its results, so the
         // dedup below keeps DHT-first precedence. Each source is best-effort — an error or empty result
         // simply contributes no records (a dormant PEX/relay source can never shrink the DHT set).
@@ -79,7 +82,9 @@ impl ProviderLocator for EmptyLocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dig_download::testkit::{mock_content_id, mock_peer_hex, mock_provider, MockProviderLocator};
+    use dig_download::testkit::{
+        mock_content_id, mock_peer_hex, mock_provider, MockProviderLocator,
+    };
 
     /// The union merges providers from all sources, deduplicated by peer_id in DHT-first order.
     #[tokio::test]
@@ -112,7 +117,11 @@ mod tests {
         let dht = Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)]));
         let union = UnionLocator::new(vec![dht, Arc::new(EmptyLocator)]);
         let got = union.find_providers(&cid).await.expect("union ok");
-        assert_eq!(got.len(), 1, "the DHT holder survives a dormant sibling source");
+        assert_eq!(
+            got.len(),
+            1,
+            "the DHT holder survives a dormant sibling source"
+        );
         assert_eq!(got[0].provider_peer_id, mock_peer_hex(1));
     }
 
@@ -121,6 +130,10 @@ mod tests {
     async fn no_sources_returns_empty() {
         let cid = mock_content_id();
         let union = UnionLocator::new(vec![Arc::new(EmptyLocator), Arc::new(EmptyLocator)]);
-        assert!(union.find_providers(&cid).await.expect("union ok").is_empty());
+        assert!(union
+            .find_providers(&cid)
+            .await
+            .expect("union ok")
+            .is_empty());
     }
 }

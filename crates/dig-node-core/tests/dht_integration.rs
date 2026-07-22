@@ -67,6 +67,7 @@ impl PeerRpcResponder for DhtServingResponder {
     async fn stream_range(
         &self,
         _req: Value,
+        _conn_key: &str,
         _out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     ) -> std::io::Result<()> {
         Ok(())

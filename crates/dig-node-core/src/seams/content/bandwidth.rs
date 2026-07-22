@@ -29,6 +29,42 @@ pub fn max_outgoing_bytes_per_sec_from_env() -> u64 {
     )
 }
 
+// -- Serve-side FCFS pacing caps (#1436) ---------------------------------------------------------
+//
+// Distinct from the fixed-window redirect throttle above (#30, which sheds overflow to another
+// holder): these two caps drive `dig_download::FcfsRateLimiter`, a first-come-first-serve token
+// bucket that PACES the `dig.fetchRange` serve path so a burst never overwhelms a single peer or this
+// node's uplink. Both default to `0` = UNLIMITED, so an unconfigured node serves exactly as before.
+
+/// Resolve the GLOBAL serve-pacing cap (bytes/second across ALL peer connections) from
+/// `DIG_NODE_SERVE_GLOBAL_BYTES_PER_SEC`. `0`/unset/unparsable ⇒ [`UNLIMITED`].
+pub fn serve_global_bytes_per_sec_from_env() -> u64 {
+    parse_cap(
+        std::env::var("DIG_NODE_SERVE_GLOBAL_BYTES_PER_SEC")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Resolve the PER-CONNECTION serve-pacing cap (bytes/second per peer) from
+/// `DIG_NODE_SERVE_PER_CONN_BYTES_PER_SEC`. `0`/unset/unparsable ⇒ [`UNLIMITED`].
+pub fn serve_per_conn_bytes_per_sec_from_env() -> u64 {
+    parse_cap(
+        std::env::var("DIG_NODE_SERVE_PER_CONN_BYTES_PER_SEC")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Build the shared serve-side [`FcfsRateLimiter`](dig_download::FcfsRateLimiter) from the two env
+/// caps (#1436). `new(0, 0)` is a no-op limiter, so the default node serves unthrottled.
+pub fn serve_rate_limiter_from_env() -> std::sync::Arc<dig_download::FcfsRateLimiter> {
+    dig_download::FcfsRateLimiter::new(
+        serve_global_bytes_per_sec_from_env(),
+        serve_per_conn_bytes_per_sec_from_env(),
+    )
+}
+
 /// The throttle's mutable accounting, behind a mutex (the serve path is multi-request-concurrent).
 struct ThrottleState {
     /// When the current 1-second accounting window started.
@@ -204,6 +240,18 @@ mod tests {
     fn env_cap_parses_a_positive_value() {
         assert_eq!(parse_cap(Some("500000")), 500_000);
         assert_eq!(parse_cap(Some(" 1024 ")), 1024, "trimmed");
+    }
+
+    /// The serve-side FCFS caps (#1436) share the `parse_cap` contract: default UNLIMITED, positive
+    /// values honored. A `0/0` limiter (the default) must be a no-op so an unconfigured node serves
+    /// unthrottled.
+    #[test]
+    fn serve_caps_default_unlimited_and_parse_positive() {
+        assert_eq!(parse_cap(None), UNLIMITED, "unset serve cap → unlimited");
+        assert_eq!(parse_cap(Some("2000000")), 2_000_000);
+        // A 0/0 limiter never paces (its own crate proves this; here we just confirm construction).
+        let rl = dig_download::FcfsRateLimiter::new(UNLIMITED, UNLIMITED);
+        assert_eq!(std::sync::Arc::strong_count(&rl), 1);
     }
 
     // -- the throttle's window accounting -------------------------------------------------------------

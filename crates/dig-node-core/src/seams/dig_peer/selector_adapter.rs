@@ -204,11 +204,17 @@ mod tests {
         let cands = vec![candidate_ref(1), candidate_ref(2), candidate_ref(3)];
         let plan = a.select(&request(&cands, 3));
 
-        assert!(!plan.ordered.is_empty(), "selector chose at least one source");
+        assert!(
+            !plan.ordered.is_empty(),
+            "selector chose at least one source"
+        );
         let offered: std::collections::HashSet<String> =
             cands.iter().map(|c| c.peer_id.clone()).collect();
         for id in &plan.ordered {
-            assert!(offered.contains(id), "a chosen source came from the offered set");
+            assert!(
+                offered.contains(id),
+                "a chosen source came from the offered set"
+            );
         }
         assert!(
             a.selector.registry_size() >= plan.ordered.len(),
@@ -303,7 +309,11 @@ mod tests {
             elapsed: Duration::from_millis(1),
             result: RangeResult::Ok,
         });
-        assert_eq!(a.selector.registry_size(), 0, "nothing recorded for a bad id");
+        assert_eq!(
+            a.selector.registry_size(),
+            0,
+            "nothing recorded for a bad id"
+        );
     }
 
     /// The address parser handles bare host:port and bracketed IPv6.

@@ -696,9 +696,14 @@ pub trait PeerRpcResponder: Send + Sync {
     /// Stream a `dig.fetchRange` response for `req` (the RangeRequest value) by writing framed
     /// [`dig_nat::mux::RangeFrame`]-shaped frames to `out`. Implementations write the first frame with
     /// the verification metadata + subsequent data frames, then return.
+    ///
+    /// `conn_key` is the authenticated caller's `peer_id` (64-hex; empty for a caller-less/test
+    /// session) — the per-connection key the serve-side outbound rate limiter paces by (#1436), so one
+    /// peer's burst cannot starve another's.
     async fn stream_range(
         &self,
         req: Value,
+        conn_key: &str,
         out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     ) -> std::io::Result<()>;
 
@@ -877,7 +882,15 @@ where
             let resp = responder.handle_availability(items).await;
             write_framed(&mut stream, &resp).await
         }
-        PeerRequestKind::Range => responder.stream_range(req, &mut stream).await,
+        PeerRequestKind::Range => {
+            // The per-connection rate-limit key is the mTLS-verified caller peer_id (empty when the
+            // session carries no authenticated caller — a test/loopback path, #1436).
+            let conn_key = caller
+                .as_ref()
+                .map(|c| c.peer_id.clone())
+                .unwrap_or_default();
+            responder.stream_range(req, &conn_key, &mut stream).await
+        }
         PeerRequestKind::Unknown => {
             let resp = json!({"jsonrpc":"2.0","id":Value::Null,
                 "error":{"code":-32600,"message":"unrecognized peer request frame"}});
@@ -918,6 +931,12 @@ pub(crate) struct NodeResponder {
     /// The live content-location DHT (#163), when the standalone peer network brought one up.
     /// `None` disables inbound DHT serving (the default trait method returns a "not running" frame).
     dht: Option<Arc<crate::dht::DhtHandle>>,
+    /// Serve-side FCFS outbound rate limiter (#1436): paces `dig.fetchRange` bytes per-connection +
+    /// globally so a burst never overwhelms one peer or this node's uplink. Caps come from env
+    /// (`0/0` = unlimited = behavior-preserving default). Keyed by the caller `peer_id`; the crate has
+    /// no eviction API, so a distinct peer leaves at most one bucket entry (bounded footprint) —
+    /// evicting on connection close is a tracked follow-up pending a `dig-download` `evict()` add.
+    serve_limiter: Arc<dig_download::FcfsRateLimiter>,
 }
 
 impl NodeResponder {
@@ -927,6 +946,7 @@ impl NodeResponder {
             node,
             handle: Some(handle),
             dht: None,
+            serve_limiter: crate::seams::content::bandwidth::serve_rate_limiter_from_env(),
         }
     }
 
@@ -940,6 +960,7 @@ impl NodeResponder {
             node,
             handle: None,
             dht: None,
+            serve_limiter: crate::seams::content::bandwidth::serve_rate_limiter_from_env(),
         }
     }
 
@@ -1018,6 +1039,7 @@ impl PeerRpcResponder for NodeResponder {
     async fn stream_range(
         &self,
         req: Value,
+        conn_key: &str,
         out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     ) -> std::io::Result<()> {
         let store = req.get("store_id").and_then(Value::as_str).unwrap_or("");
@@ -1062,6 +1084,10 @@ impl PeerRpcResponder for NodeResponder {
                         }
                     }
                     self.node.record_outgoing_bytes(this_len as u64);
+                    // FCFS outbound PACING (#1436): wait (in arrival order) until this frame's bytes
+                    // fit the global + per-connection budget before writing it, so a burst never
+                    // overwhelms one peer or this node's uplink. A `0/0` limiter returns instantly.
+                    self.serve_limiter.acquire(conn_key, this_len as u64).await;
                     write_framed(out, &frame).await?;
                     let complete = frame
                         .get("complete")
@@ -1084,7 +1110,15 @@ impl PeerRpcResponder for NodeResponder {
                             let depth = crate::download::redirect_depth(&req);
                             match self.node.miss_outcome(&content, depth).await {
                                 crate::download::MissOutcome::Fetched(f) => {
-                                    return stream_fetched_range(out, &f, off, length).await;
+                                    return stream_fetched_range(
+                                        out,
+                                        &f,
+                                        off,
+                                        length,
+                                        &self.serve_limiter,
+                                        conn_key,
+                                    )
+                                    .await;
                                 }
                                 crate::download::MissOutcome::Redirect {
                                     providers,
@@ -1129,17 +1163,21 @@ async fn stream_fetched_range(
     fetched: &crate::download::FetchedResource,
     offset: usize,
     length: usize,
+    limiter: &dig_download::FcfsRateLimiter,
+    conn_key: &str,
 ) -> std::io::Result<()> {
     let mut off = offset;
     loop {
         match fetched.range_frame(off, length) {
             Ok(frame) => {
+                let this_len = frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
+                // Pace fetch-through frames on the SAME FCFS budget as locally-held serves (#1436).
+                limiter.acquire(conn_key, this_len as u64).await;
                 write_framed(out, &frame).await?;
                 let complete = frame
                     .get("complete")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                let this_len = frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
                 if complete || this_len == 0 {
                     return Ok(());
                 }
@@ -2599,6 +2637,7 @@ mod tests {
         async fn stream_range(
             &self,
             _req: Value,
+            _conn_key: &str,
             out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
         ) -> std::io::Result<()> {
             // One terminal frame with the stub bytes.
@@ -3048,5 +3087,84 @@ mod tests {
         );
         assert_eq!(frame["complete"], json!(true));
         srv.await.unwrap().unwrap();
+    }
+
+    // -- serve-side FCFS outbound rate limiting (#1436) ------------------------------------------------
+    //
+    // These exercise `stream_fetched_range`, the free function that writes framed serve bytes on the
+    // fetch-through path and acquires the FCFS budget before EACH frame — the exact same
+    // `limiter.acquire(conn_key, this_len)` wiring the local-hold `NodeResponder::stream_range` uses.
+    // A tiny `length` forces many small frames over a small resource so pacing is observable, without
+    // needing a >3 MiB resource. tokio's paused clock advances virtual time on the limiter's sleeps.
+
+    /// A small fetched resource whose `range_frame` windows tile it into `frame_len`-byte frames.
+    fn tiny_fetched(total: usize) -> crate::download::FetchedResource {
+        crate::download::FetchedResource {
+            bytes: vec![7u8; total],
+            total_length: total as u64,
+            chunk_lens: vec![total as u64],
+            root: None,
+            inclusion_proof: None,
+        }
+    }
+
+    /// With a tight per-connection cap the serve path PACES: after the initial one-second burst, each
+    /// further frame waits for a token refill, so streaming more than one budget's worth takes time.
+    #[tokio::test(start_paused = true)]
+    async fn stream_range_paces_each_frame_under_a_tight_cap() {
+        // Per-conn cap 100 B/s (global unlimited); 300 bytes in 100-byte frames = 3 frames.
+        let limiter = dig_download::FcfsRateLimiter::new(0, 100);
+        let f = tiny_fetched(300);
+        let mut out = tokio::io::sink();
+        let start = tokio::time::Instant::now();
+        stream_fetched_range(&mut out, &f, 0, 100, &limiter, "peerA")
+            .await
+            .unwrap();
+        // First 100 B instant (burst); the next two 100-B frames each wait ~1s for a refill.
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(1500),
+            "paced serve should wait for refills, waited {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// An unlimited (0/0) limiter never paces — the default node serves at full speed.
+    #[tokio::test(start_paused = true)]
+    async fn stream_range_unlimited_cap_never_paces() {
+        let limiter = dig_download::FcfsRateLimiter::new(0, 0);
+        let f = tiny_fetched(1_000_000);
+        let mut out = tokio::io::sink();
+        let start = tokio::time::Instant::now();
+        stream_fetched_range(&mut out, &f, 0, 1000, &limiter, "peerA")
+            .await
+            .unwrap();
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::ZERO,
+            "no cap → no wait"
+        );
+    }
+
+    /// Two peers have independent per-connection budgets: exhausting peer A's burst does not slow a
+    /// first serve to peer B (keyed by the distinct `conn_key`).
+    #[tokio::test(start_paused = true)]
+    async fn stream_range_distinct_peers_have_independent_budgets() {
+        let limiter = dig_download::FcfsRateLimiter::new(0, 1000);
+        let f = tiny_fetched(1000);
+        let mut out = tokio::io::sink();
+        // Exhaust peer A's burst (one 1000-byte frame).
+        stream_fetched_range(&mut out, &f, 0, 1000, &limiter, "peerA")
+            .await
+            .unwrap();
+        // Peer B has its own fresh bucket → its first serve is instant.
+        let start = tokio::time::Instant::now();
+        stream_fetched_range(&mut out, &f, 0, 1000, &limiter, "peerB")
+            .await
+            .unwrap();
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::ZERO,
+            "peer B's budget is independent of peer A's"
+        );
     }
 }
