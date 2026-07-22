@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.51.1] - 2026-07-22
+
+### Features
+- **dig-node:** W2 connect proof + peer-mgmt controls (#73)- **dig-node:** Adopt chia-peer as seam-1 light-client chain-source provider (#1314) (#75)- **dig-node:** Adopt dig-nat 0.8 STUN reflexive discovery + peer-stack cascade (#1393) (#77)
+
+### Bug Fixes
+- **dig-node:** Derive network label from DIG_NETWORK_GENESIS override (#1372) (#76)- **dig-node:** Outcome-specific branded-error filename + diagnostic for dign open (#852) (#78)
+
+### Chores
+- **deps:** Adopt dig-gossip v0.9.0 (Linux inbound peer-cert fix) (#74)
+
 ## [0.48.0] - 2026-07-21
 
 ### Features
