@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.53.0] - 2026-07-22
+
+### Features
+- **dig-node:** Connect-adoption on the dig-nat 0.10 stack (#1439 #1442 #1443 #1436)
+
 ## [0.52.0] - 2026-07-22
 
 ### Bug Fixes
