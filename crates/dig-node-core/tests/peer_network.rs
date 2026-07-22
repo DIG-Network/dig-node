@@ -56,6 +56,7 @@ impl PeerRpcResponder for TestResponder {
     async fn stream_range(
         &self,
         _req: Value,
+        _conn_key: &str,
         out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     ) -> std::io::Result<()> {
         let frame = json!({

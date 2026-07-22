@@ -36,31 +36,25 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
-use async_trait::async_trait;
 use base64::Engine;
 use serde_json::{json, Value};
 
 use dig_dht::ContentId;
 use dig_download::{
-    download_key, DhtProviderLocator, DownloadConfig, DownloadError, DownloadEvent,
-    DownloadOptions, Downloader, FileSink, FileStateStore, GcConfig, MerkleVerifier,
-    NatRangeTransport, ProofVerifier, ProviderLocator, ProviderRecord, RangeTransport, StateStore,
+    download_key, DhtProviderLocator, DownloadConfig, DownloadError, DownloadOptions, Downloader,
+    FileSink, FileStateStore, GcConfig, MerkleVerifier, NatRangeTransport, ProofVerifier,
+    ProviderLocator, ProviderRecord, RangeTransport, StateStore,
 };
 use dig_peer_selector::{
-    Candidate, ContentRequest, FailureReason, OutcomeKind, OutcomeResult, PeerId, PeerSelector,
-    PoolEvent, PoolRemovalReason, RangePlanDelta, SelectorConfig, TransferOutcome, TraversalKind,
+    PeerId, PeerSelector, PoolEvent, PoolRemovalReason, SelectorConfig, TraversalKind,
 };
 use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
-
-/// How many parallel sources the node asks the selector to rank for a content fetch. Matches the
-/// dig-download default `max_concurrency` (8) so the selector's ranked subset is wide enough to feed
-/// the executor's fan-out without over-selecting a low-quality tail.
-const SELECT_PARALLELISM: usize = 8;
+use crate::seams::dig_peer::{EmptyLocator, SelectorAdapter, UnionLocator};
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
 /// hold it — the `error.data.redirect` names them (peer_id + candidate addresses) so the caller
@@ -282,8 +276,10 @@ impl FetchedResource {
 // discovery and dig-download execution (its SPEC §1, §6.1, §7.4): of the providers `find_providers`
 // returns, WHICH subset should serve this content and in what order — learned from the REAL measured
 // outcome of every range it influenced. dig-node owns the wiring (the selector crate defines only the
-// contract): it feeds the registry (pool churn + connection classes), drives source choice through the
-// [`SelectorLocator`] seam below, and streams every completed/failed range back via `record_outcome`.
+// contract): it feeds the registry (pool churn + connection classes) and bridges dig-download's
+// [`SourceSelector`] seam onto the selector via [`SelectorAdapter`](crate::seams::dig_peer::SelectorAdapter)
+// (#1442), so dig-download DELEGATES peer choice + reports every range outcome to the ONE shared brain
+// — dig-download 0.5 records outcomes internally through the seam (no node-side event translation).
 
 /// Map a `dig_gossip::PoolEvent` into the selector's local [`PoolEvent`] (SPEC §5.4 — the shapes are
 /// byte-identical; the selector mirrors the type LOCALLY rather than depending on dig-gossip, so the
@@ -343,117 +339,6 @@ pub(crate) enum GossipRemovalReason {
     Banned,
 }
 
-/// The [`ProviderLocator`] seam that makes the selector DRIVE dig-download's source choice (SPEC
-/// §6.1). dig-download picks sources from whatever its injected locator returns; this wrapper
-/// intercepts each `find_providers` call, runs the DHT-located providers through the shared
-/// [`PeerSelector`], and returns them **filtered to the ranked subset and ordered best-first** — so
-/// the executor fans byte-ranges across the peers the selector chose, not a blind least-loaded pick.
-///
-/// The FIRST `find_providers` for a content uses `select` (the initial ranking); a SUBSEQUENT call
-/// (dig-download's relocate, fired when live sources run low — its `ProvidersRefreshed`) uses
-/// `rebalance`, which re-queries the up-to-the-moment models (reflecting every `record_outcome`
-/// streamed back so far) and de-ranks the peers already active, so the selector DRIVES the
-/// replacement-source choice too (SPEC §5.5). Peers the selector omits (a low-quality / bad tail) are
-/// dropped from the set the executor sees.
-///
-/// When the DHT locate returns no providers, or the selector chooses none, the raw located set is
-/// passed through unchanged (never fewer than what discovery found when the selector abstains), so the
-/// selector can only REFINE the executor's source set, never starve a fetch that has holders.
-pub(crate) struct SelectorLocator {
-    /// The real discovery locator (the DHT in production, a mock in tests).
-    inner: Arc<dyn ProviderLocator>,
-    /// The shared selector — the same instance fed by pool churn + `record_outcome`.
-    selector: Arc<PeerSelector>,
-    /// Per-content call state: has this content been `select`ed yet? Drives select-vs-rebalance and
-    /// tracks the active (already-selected) peers a rebalance must de-rank. Keyed by content DHT key.
-    state: Mutex<HashMap<String, Vec<PeerId>>>,
-}
-
-impl SelectorLocator {
-    /// Wrap the real locator + the shared selector.
-    pub(crate) fn new(inner: Arc<dyn ProviderLocator>, selector: Arc<PeerSelector>) -> Arc<Self> {
-        Arc::new(SelectorLocator {
-            inner,
-            selector,
-            state: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// Order + filter `located` providers by the selector's decision for `content`. Pure over the
-    /// selector's current models (no I/O) so the select→order transformation is unit-tested directly.
-    /// Returns the located records reordered best-first and filtered to the selected subset; if the
-    /// selector returns an empty selection (e.g. abstains), the raw located set is returned unchanged.
-    fn rank(&self, content: &ContentId, located: Vec<ProviderRecord>) -> Vec<ProviderRecord> {
-        if located.is_empty() {
-            return located;
-        }
-        let key = download_key(content);
-        // Map located providers → selector candidates (a record whose peer_id is malformed hex is not
-        // addressable; it is dropped from the candidate set but kept as a raw fallback below).
-        let candidates: Vec<Candidate> = located
-            .iter()
-            .filter_map(Candidate::from_provider_record)
-            .collect();
-
-        // Decide select (first call for this content) vs rebalance (a relocate re-query).
-        let mut state = self.state.lock().expect("selector-locator mutex poisoned");
-        let first_time = !state.contains_key(&key);
-        let selection = if first_time {
-            let req = ContentRequest::new(*content, SELECT_PARALLELISM);
-            self.selector.select(&req, &candidates)
-        } else {
-            // A relocate: rebalance over the still-needed ranges, de-ranking the peers already active.
-            let active = state.get(&key).cloned().unwrap_or_default();
-            let req = ContentRequest::new(*content, SELECT_PARALLELISM);
-            let need = RangePlanDelta::of_count(SELECT_PARALLELISM);
-            self.selector.rebalance(&req, &active, &need)
-        };
-
-        if selection.is_empty() {
-            // The selector abstained (all candidates ineligible / none worth using). Record the raw
-            // located peers as active (so a later rebalance de-ranks them) and pass discovery through.
-            state.insert(
-                key,
-                candidates.iter().map(|c| c.peer_id).collect::<Vec<_>>(),
-            );
-            return located;
-        }
-
-        // Record the selected peers as active for this content (a later rebalance de-ranks them).
-        state.insert(key, selection.peers.iter().map(|p| p.peer_id).collect());
-
-        // Reorder `located` best-first, keeping only records whose peer_id the selector chose. A
-        // located record with the same peer_id keeps its addresses (the selector carries none of its
-        // own transport detail — it only decides identity + order).
-        let mut ordered = Vec::with_capacity(selection.peers.len());
-        for sp in &selection.peers {
-            let hex = sp.peer_id.to_hex();
-            if let Some(rec) = located.iter().find(|r| r.provider_peer_id == hex) {
-                ordered.push(rec.clone());
-            }
-        }
-        // A selected peer with no matching located record (should not happen — candidates come FROM
-        // `located`) is simply skipped; if that emptied the set, fall back to the raw located set so a
-        // fetch with holders is never starved by a ranking edge case.
-        if ordered.is_empty() {
-            located
-        } else {
-            ordered
-        }
-    }
-}
-
-#[async_trait]
-impl ProviderLocator for SelectorLocator {
-    async fn find_providers(
-        &self,
-        content: &ContentId,
-    ) -> Result<Vec<ProviderRecord>, DownloadError> {
-        let located = self.inner.find_providers(content).await?;
-        Ok(self.rank(content, located))
-    }
-}
-
 // -- Selector-driven DIAL ordering (#384) ------------------------------------------------------------
 
 /// A [`DialRanker`](crate::pex::DialRanker) over the shared [`PeerSelector`] — so the SAME learned
@@ -500,69 +385,6 @@ impl crate::pex::DialRanker for SelectorDialRanker {
     }
 }
 
-/// Current unix seconds (the `at` timestamp on a [`TransferOutcome`]).
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Map a `dig-download` `RangeFailed.reason` (stable text) to a selector [`FailureReason`] (SPEC §6.2,
-/// §6.3). A verify/integrity/merkle/decrypt reason is a HARD [`FailureReason::VerificationFailed`] (a
-/// bad/hostile source the selector drives below cold peers); a timeout/unavailable maps to its own
-/// class; everything else is a soft transport failure. Pure so the mapping is unit-tested.
-pub(crate) fn failure_reason_of(reason: &str) -> FailureReason {
-    let r = reason.to_ascii_lowercase();
-    if r.contains("verif")
-        || r.contains("integrity")
-        || r.contains("merkle")
-        || r.contains("decrypt")
-    {
-        FailureReason::VerificationFailed
-    } else if r.contains("timeout") || r.contains("timed out") {
-        FailureReason::Timeout
-    } else if r.contains("unavailable") || r.contains("not found") || r.contains("no provider") {
-        FailureReason::Unavailable
-    } else if r.contains("cancel") {
-        FailureReason::Cancelled
-    } else {
-        FailureReason::Transport
-    }
-}
-
-/// Build a `Range`-granularity [`TransferOutcome`] for `provider` (a 64-hex `peer_id`), or `None` if
-/// the provider hex is malformed (then no outcome is recorded — the selector attributes only to
-/// transport-verified identities, SPEC §9.1). `bytes`/`duration_ms` are the executor's MEASURED
-/// values; the selector derives throughput strictly from them (SPEC §9.3).
-fn range_outcome(
-    content: &ContentId,
-    provider: &str,
-    range: usize,
-    bytes: u64,
-    duration_ms: u64,
-    result: OutcomeResult,
-) -> Option<TransferOutcome> {
-    let peer_id = PeerId::from_hex(provider)?;
-    Some(TransferOutcome {
-        peer_id,
-        content: *content,
-        kind: OutcomeKind::Range {
-            index: range,
-            // The selector needs range identity (index) to attribute the outcome; the exact offset/
-            // length is not carried on the dig-download event, so it is left 0 (index is the key —
-            // SPEC §6.5). `bytes` is what actually transferred (the measured throughput input).
-            offset: 0,
-            length: bytes,
-        },
-        result,
-        bytes,
-        duration_ms,
-        rtt_ms: None,
-        at: now_unix(),
-    })
-}
-
 // -- The node's P2P content engine ------------------------------------------------------------------
 
 /// The standalone node's P2P content engine: the dig-download [`Downloader`] wired from the node's
@@ -576,14 +398,15 @@ pub struct NodeContent {
     /// selector's ranked subset (a redirect should offer the caller all known holders).
     locator: Arc<dyn ProviderLocator>,
     /// The self-optimizing peer selector (#178) — the decision + learning brain between discovery and
-    /// download. It ranks the located providers (driving the [`Downloader`]'s source choice via
-    /// [`SelectorLocator`]) and learns from every range outcome streamed back in [`Self::fetch_resource`].
-    /// Fed the pool churn + connection classes by the node ([`Self::on_pool_event`],
+    /// download. It ranks the download sources (bridged into dig-download's [`SourceSelector`] seam by
+    /// [`SelectorAdapter`], #1442) and learns from every range outcome dig-download reports back
+    /// through that seam. Fed the pool churn + connection classes by the node ([`Self::on_pool_event`],
     /// [`Self::on_connection_class`]).
     selector: Arc<PeerSelector>,
     /// The multi-source download engine (locate → confirm → fan out → verify → reassemble). Its
-    /// injected locator is a [`SelectorLocator`] wrapping `locator` + `selector`, so the executor fans
-    /// ranges across the selector's ranked subset instead of picking sources blindly.
+    /// injected `config.selector` is a [`SelectorAdapter`] over the shared [`PeerSelector`], so the
+    /// executor fans ranges across the selector's ranked subset — and records every outcome back to it —
+    /// instead of picking sources blindly.
     downloader: Downloader,
     /// The resume-state store the downloader checkpoints into, wrapped so the last-known commitment
     /// (chunk layout + root + proof) is captured BEFORE the download clears it on completion — a
@@ -684,16 +507,22 @@ impl NodeContent {
         // One selector per engine, wiring-only config (no behavior knobs — every tradeoff is learned).
         // Deterministic across runs so a node's ranking is reproducible for a given outcome stream.
         let selector = Arc::new(PeerSelector::new(SelectorConfig::default()));
-        // The Downloader's locator is the selector-driven wrapper: each `find_providers` (initial +
-        // relocate) is ranked/filtered by the selector, so the executor fans ranges across the chosen
-        // subset (SPEC §6.1). The RAW `locator` stays on the engine for the redirect-on-miss path.
-        let select_locator = SelectorLocator::new(locator.clone(), selector.clone());
+        // Bridge the shared selector into dig-download's SourceSelector seam (#1442): the executor
+        // delegates peer choice + ORDER to it and reports every range outcome back through it, so the
+        // ONE self-tuning brain informs every transfer. The Downloader's own locator is the RAW
+        // `locator` (the UnionLocator in production) — discovery is unfiltered; the selector refines
+        // the SOURCE choice at schedule time, not the discovered set. The same RAW `locator` stays on
+        // the engine for the redirect-on-miss path (a redirect offers ALL known holders).
+        let config = DownloadConfig {
+            selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
+            ..DownloadConfig::default()
+        };
         let downloader = Downloader::new(
-            select_locator,
+            locator.clone(),
             transport,
             verifier,
             state_store.clone(),
-            DownloadConfig::default(),
+            config,
         );
         Arc::new(NodeContent {
             locator,
@@ -709,12 +538,15 @@ impl NodeContent {
     }
 
     /// The PRODUCTION constructor — wire the engine from the live DHT + the node's mTLS identity,
-    /// exactly as dig-download's implementers' note prescribes: [`DhtProviderLocator`] over the
-    /// bootstrapped [`DhtService`](dig_dht::DhtService), [`NatRangeTransport`] dialing providers
-    /// over the FULL NAT traversal ladder (Direct → UPnP → NAT-PMP → PCP → hole-punch → Relayed) the
-    /// rest of the peer network now uses, so a range fetch reaches a NAT'd provider directly whenever
-    /// possible and relays only as the last resort (#385). `stun_server` (when `Some`) feeds the
-    /// hole-punch tier's reflexive-address discovery.
+    /// exactly as dig-download's implementers' note prescribes. Discovery is a [`UnionLocator`] (#1443)
+    /// over the live [`DhtProviderLocator`] plus DORMANT PEX + relay-introducer placeholders, so a
+    /// later source swap needs no wiring churn. The [`NatRangeTransport`] dials providers over the FULL
+    /// NAT traversal ladder (Direct → UPnP → NAT-PMP → PCP → hole-punch → Relayed) composed from the
+    /// SHARED live [`NatRuntime`](dig_nat::NatRuntime) `runtime` — the SAME handle carrier the node's
+    /// DHT-side dial uses (#1439) — so a range fetch reaches a NAT'd provider over hole-punch/relay, not
+    /// just Direct, instead of DISCOVERING a holder it can never FETCH from. `stun_server` (when `Some`)
+    /// feeds the hole-punch tier's reflexive-address discovery.
+    #[allow(clippy::too_many_arguments)]
     pub fn for_dht(
         dht: Arc<dig_dht::DhtService>,
         node: Arc<dig_nat::NodeCert>,
@@ -723,11 +555,23 @@ impl NodeContent {
         self_peer_id: Option<String>,
         cache_dir: &Path,
         stun_server: Option<std::net::SocketAddr>,
+        runtime: Arc<dig_nat::NatRuntime>,
     ) -> Arc<Self> {
-        let locator = Arc::new(DhtProviderLocator::new(dht));
+        // The provider union: dig-dht is live today; PEX + relay-introducer are wired-but-empty seams
+        // (#1443, real sources land in #1440 part B). Best-effort — a dormant source adds nothing.
+        let dht_locator: Arc<dyn ProviderLocator> = Arc::new(DhtProviderLocator::new(dht));
+        let locator: Arc<dyn ProviderLocator> = UnionLocator::new(vec![
+            dht_locator,
+            Arc::new(EmptyLocator), // PEX-as-provider-source (dormant)
+            Arc::new(EmptyLocator), // relay-introducer (dormant)
+        ]);
         let nat_config =
             crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server);
-        let transport = Arc::new(NatRangeTransport::new(node, nat_config, network_id));
+        // The fetch leg composes the SAME NAT ladder as the DHT dial from the shared runtime (#1439):
+        // an empty runtime would be Direct-only, silently unable to reach hole-punch/relay holders.
+        let transport = Arc::new(NatRangeTransport::new_with_runtime(
+            node, nat_config, network_id, runtime,
+        ));
         Self::new(locator, transport, miss_mode, self_peer_id, cache_dir)
     }
 
@@ -816,13 +660,14 @@ impl NodeContent {
         let sink: Arc<dyn dig_download::Sink> = Arc::new(FileSink::new(final_path.clone()));
 
         // 4. Run the multi-source download to completion (locate → confirm → fan ranges → verify per
-        //    range + whole-resource against the chain-anchored root → reassemble → finalize),
-        //    STREAMING every range outcome back into the selector in real time so the models learn and
-        //    the next select()/rebalance() is smarter (#178, SPEC §6.2).
+        //    range + whole-resource against the chain-anchored root → reassemble → finalize). The
+        //    injected SourceSelector seam (#1442) records every range outcome into the shared selector
+        //    internally, so the models learn and the next select() is smarter — this just drains the
+        //    progress stream + awaits the terminal result.
         let handle = self
             .downloader
             .download(*content, sink, DownloadOptions::default());
-        self.drive_download(content, handle)
+        self.drive_download(handle)
             .await
             .map_err(|e| format!("download failed: {e}"))?;
 
@@ -862,105 +707,21 @@ impl NodeContent {
         Ok(fetched)
     }
 
-    /// Drive a running download's [`DownloadEvent`] stream, translating each event into a selector
-    /// [`TransferOutcome`] (or a `rebalance`) IN REAL TIME (SPEC §6.2), then await the terminal result.
+    /// Drain a running download's progress [`DownloadEvent`](dig_download::DownloadEvent) stream to
+    /// exhaustion, then await the terminal result.
     ///
-    /// This is the node-side adapter that closes the `select → execute → record_outcome → rebalance`
-    /// loop (the selector crate defines no `dig-download` dependency, so the mapping lives here):
-    /// - `RangeCompleted { range, provider, progress }` → a `Range` `Success` outcome. The MEASURED
-    ///   `bytes` are the resource-byte delta since this provider's previous event, and `duration_ms` is
-    ///   the wall-clock since then — the throughput the executor actually observed on the wire (never a
-    ///   self-reported rate, SPEC §9.3).
-    /// - `RangeFailed { range, provider, reason }` → a `Failure` outcome; a verify/integrity reason maps
-    ///   to [`FailureReason::VerificationFailed`] (a HARD signal, SPEC §6.3), everything else to a soft
-    ///   transport/timeout failure the selector re-routes around.
-    /// - `ProvidersRefreshed` → the executor is relocating (its live sources ran low); the next
-    ///   `find_providers` through the [`SelectorLocator`] is a `rebalance` — the selector DRIVES the
-    ///   replacement-source choice (SPEC §5.5). (No quality change here; that comes from the per-range
-    ///   failures already recorded.)
-    /// - `Paused` is NOT a failure — no outcome is recorded (SPEC §6.4).
-    /// - `Completed { total_length }` → an aggregate `Request` outcome for whole-request (P99) learning
-    ///   (SPEC §4.4-C), attributed to the last provider that served a range.
+    /// dig-download 0.5 records every range outcome INTERNALLY through the injected
+    /// [`SourceSelector`](dig_download::SourceSelector) seam ([`SelectorAdapter`], #1442) — the node no
+    /// longer translates progress events into selector outcomes here. But the events channel is bounded,
+    /// so the download task blocks on a full channel if nothing drains it; this loop consumes (and
+    /// discards) events purely to keep the task making progress, then joins for the terminal result.
     async fn drive_download(
         &self,
-        content: &ContentId,
         mut handle: dig_download::DownloadHandle,
     ) -> Result<u64, DownloadError> {
-        // Per-provider clock for deriving MEASURED per-range throughput from the cumulative progress
-        // stream: bytes = Δ(progress.bytes_done) since this provider's previous event; duration =
-        // wall-clock since then. Falls back to the download start for a provider's first completion.
-        let start = Instant::now();
-        let mut last_event_at: HashMap<String, Instant> = HashMap::new();
-        let mut last_bytes_done: u64 = 0;
-        let mut last_provider: Option<String> = None;
-
-        // Consume the event stream to exhaustion (it closes when the task ends), feeding the selector.
-        while let Some(event) = handle.next_event().await {
-            match event {
-                DownloadEvent::RangeCompleted {
-                    range,
-                    provider,
-                    progress,
-                } => {
-                    let bytes = progress.bytes_done.saturating_sub(last_bytes_done);
-                    last_bytes_done = progress.bytes_done;
-                    let since = last_event_at.get(&provider).copied().unwrap_or(start);
-                    let duration_ms = since.elapsed().as_millis() as u64;
-                    last_event_at.insert(provider.clone(), Instant::now());
-                    last_provider = Some(provider.clone());
-                    if let Some(outcome) = range_outcome(
-                        content,
-                        &provider,
-                        range,
-                        bytes,
-                        duration_ms,
-                        OutcomeResult::Success,
-                    ) {
-                        self.selector.record_outcome(&outcome);
-                    }
-                }
-                DownloadEvent::RangeFailed {
-                    range,
-                    provider,
-                    reason,
-                } => {
-                    let since = last_event_at.get(&provider).copied().unwrap_or(start);
-                    let duration_ms = since.elapsed().as_millis() as u64;
-                    last_event_at.insert(provider.clone(), Instant::now());
-                    let result = OutcomeResult::Failure {
-                        reason: failure_reason_of(&reason),
-                    };
-                    if let Some(outcome) =
-                        range_outcome(content, &provider, range, 0, duration_ms, result)
-                    {
-                        self.selector.record_outcome(&outcome);
-                    }
-                }
-                DownloadEvent::Completed { total_length } => {
-                    // Aggregate whole-request outcome for P99 learning (attributed to the last server).
-                    if let Some(provider) = last_provider.clone() {
-                        if let Some(peer_id) = PeerId::from_hex(&provider) {
-                            let outcome = TransferOutcome {
-                                peer_id,
-                                content: *content,
-                                kind: OutcomeKind::Request { total_length },
-                                result: OutcomeResult::Success,
-                                bytes: total_length,
-                                duration_ms: start.elapsed().as_millis() as u64,
-                                rtt_ms: None,
-                                at: now_unix(),
-                            };
-                            self.selector.record_outcome(&outcome);
-                        }
-                    }
-                }
-                // ProvidersRefreshed → the executor relocated; the next SelectorLocator::find_providers
-                // is a rebalance (that is where the selector drives the replacement choice). Paused/
-                // Resumed/Planned/Failed carry no per-range quality signal beyond what is recorded above.
-                _ => {}
-            }
+        while handle.next_event().await.is_some() {
+            // Events are drained (not translated): the SourceSelector seam records outcomes internally.
         }
-
         handle.join().await
     }
 
@@ -1612,68 +1373,6 @@ mod tests {
                 }
             );
         }
-    }
-
-    /// The failure-reason classifier maps a verify/integrity reason to the HARD signal and other
-    /// reasons to their soft classes (SPEC §6.3).
-    #[test]
-    fn failure_reason_classification() {
-        assert_eq!(
-            failure_reason_of("range verification failed"),
-            FailureReason::VerificationFailed
-        );
-        assert_eq!(
-            failure_reason_of("merkle proof mismatch"),
-            FailureReason::VerificationFailed
-        );
-        assert_eq!(
-            failure_reason_of("request timed out"),
-            FailureReason::Timeout
-        );
-        assert_eq!(
-            failure_reason_of("provider unavailable"),
-            FailureReason::Unavailable
-        );
-        assert_eq!(
-            failure_reason_of("connection reset"),
-            FailureReason::Transport
-        );
-    }
-
-    /// The `SelectorLocator` CONSULTS the selector before download: given a fixed provider set, its
-    /// `find_providers` returns the located records ordered by the selector's ranking (all healthy
-    /// candidates chosen on the first, exploratory pass). This is the seam that makes the selector
-    /// drive the executor's source choice (SPEC §6.1).
-    #[tokio::test]
-    async fn selector_locator_consults_selector_and_returns_ranked_subset() {
-        let cid = mock_content_id();
-        let inner = Arc::new(MockProviderLocator::fixed(vec![
-            mock_provider(1, &cid),
-            mock_provider(2, &cid),
-            mock_provider(3, &cid),
-        ]));
-        let selector = Arc::new(PeerSelector::new(SelectorConfig::deterministic(1000, 7)));
-        let loc = SelectorLocator::new(inner, selector.clone());
-
-        let ranked = loc.find_providers(&cid).await.expect("locate ok");
-        // Every located holder is a candidate; on the cold pass the selector picks a subset (bounded by
-        // the exploration cap) — non-empty and drawn only from the located set.
-        assert!(!ranked.is_empty(), "selector chose at least one source");
-        let located_ids: std::collections::HashSet<String> =
-            [1u8, 2, 3].iter().map(|n| mock_peer_hex(*n)).collect();
-        for r in &ranked {
-            assert!(
-                located_ids.contains(&r.provider_peer_id),
-                "ranked source came from the located set"
-            );
-        }
-        // The selector's registry now knows the candidates (select registered them) — proving it was
-        // consulted, not bypassed.
-        let snap = selector.snapshot();
-        assert!(
-            snap.registry_size >= ranked.len(),
-            "selector registered the candidates it ranked"
-        );
     }
 
     /// The full loop end-to-end: a multi-source fetch over the mock DHT + transport drives the

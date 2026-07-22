@@ -503,13 +503,13 @@ A range failing any check is a HARD failure: the node discards it, re-fetches fr
 and drives that source to the bottom of the selector's ranking (§7.6). A capsule fetch carries no
 per-resource proof (None/None) and self-verifies on install.
 
-> **NOTE (traversal, #836 follow-up).** Every peer dial SHOULD traverse the full
-> direct → port-mapping → hole-punch → relay ladder (§7.3). Today that ladder is wired for the
-> DHT-lookup transport only; the content/range-DOWNLOAD dial path (`NatRangeTransport`) is **Direct-only**
-> because the current `dig-download` release exposes no runtime-injecting dial API to thread the shared
-> `NatRuntime` through. Wiring the range-download path onto the full ladder is tracked as a #836
-> follow-up; the normative requirement above is the target, not yet the shipped behaviour of the
-> download path. This is the user-facing guarantee: **when
+> **NOTE (traversal, #1439).** Every peer dial traverses the full
+> direct → port-mapping → hole-punch → relay ladder (§7.3), for BOTH the DHT-lookup transport AND the
+> content/range-DOWNLOAD dial path. `NatRangeTransport` is constructed via `new_with_runtime` with the
+> SAME shared `NatRuntime` the DHT dial uses, so a range fetch reaches a NAT'd holder over
+> hole-punch/relay — never merely DISCOVERING a provider it can only try Direct against. (The prior
+> Direct-only limitation is closed; `dig-download` 0.5 exposes the runtime-injecting dial API.) This is
+> the user-facing guarantee: **when
 the dig-node pulls content from another node it verifies its merkle proof AND its on-chain anchor** — a
 malicious or hostile peer mix can never forge content.
 
@@ -796,15 +796,37 @@ node state or reads local resources MUST stay off the list.
   across that ranked subset with each source's recommended concurrency. Every completed range (measured
   throughput) and every failed range streams back via `record_outcome` in real time; when live sources
   run low a re-query is a `rebalance` that re-ranks the learned models and de-ranks already-active
-  peers. Source choice MUST flow through the selector (`select`/`rebalance`) and every range outcome
-  MUST be fed back (`record_outcome`). A range failing merkle/decrypt verification (§5.3) is a HARD
-  failure that drives the source to the bottom of the ranking (below unmeasured peers); a `Banned` peer
-  is ineligible. Quality is refined ONLY from measured outcomes — no input path lets a peer raise its
-  own score, and observed capacity overrides advertised capacity. The selector opens no socket, runs no
-  discovery, fetches no bytes; its learned state is in-memory (a restart re-learns). Its
-  identity/candidate types are the SAME dig-nat/dig-dht `peer_id`/`ContentId`/`ProviderRecord`/
-  `CandidateAddr`; the node maps the `dig_gossip::PoolEvent` pool-churn event into the selector's local
-  `PoolEvent` shape 1:1.
+  peers. Source choice MUST flow through the selector and every range outcome MUST be fed back. The
+  selector is bridged into `dig-download`'s injected `SourceSelector` seam by the node's
+  `SelectorAdapter` (the @30↔@30 composition-root bridge, #1442 — `dig-download` does NOT depend on
+  `dig-peer-selector`): the executor calls `select` for peer choice/order and reports every range
+  outcome via `record`, which the adapter delegates to the shared `PeerSelector`. `dig-download` records
+  outcomes internally through this seam — the node performs no event→outcome translation. A range
+  failing merkle/decrypt verification (§5.3) is a HARD failure that drives the source to the bottom of
+  the ranking (below unmeasured peers); a `Banned` peer is ineligible. Quality is refined ONLY from
+  measured outcomes — no input path lets a peer raise its own score, and observed capacity overrides
+  advertised capacity. The selector opens no socket, runs no discovery, fetches no bytes; its learned
+  state is in-memory (a restart re-learns). Its identity/candidate types are the SAME dig-nat/dig-dht
+  `peer_id`/`ContentId`/`ProviderRecord`/`CandidateAddr`; the node maps the `dig_gossip::PoolEvent`
+  pool-churn event into the selector's local `PoolEvent` shape 1:1.
+- **Provider discovery is a UNION (#1443).** `find_providers` for a content is served by a
+  `UnionLocator` that merges the holder sets of several sources — the distributed `dig-dht`, PEX
+  first-hand holder gossip, and the relay-introducer — deduplicated by `peer_id` in first-seen
+  (DHT-first) order, best-effort (an erroring/empty source can never shrink the set). Today only the
+  `dig-dht` source is live; the PEX and relay-introducer sources are wired-but-empty seams that a later
+  change activates with no wiring churn. **Address hints are untrusted (#1490).** An advertised address
+  on a provider record (from any source) is a reach-HINT only — never an authenticator; the peer's
+  authenticated identity is its `peer_id = SHA-256(SPKI DER)`, enforced by the SPKI cert-pin at connect,
+  so a wrong/spoofed address simply fails the pinned dial and no impostor is accepted. To prevent dial
+  amplification, the union DEDUPES and CAPS each record's advertised addresses at ingest, so the
+  reach-hint set any consumer sees is bounded regardless of what a (possibly hostile) source advertised.
+- **Outbound serve pacing (#1436).** When this node SERVES `dig.fetchRange` bytes it paces them through
+  a first-come-first-serve token-bucket rate limiter (`dig_download::FcfsRateLimiter`) with a global cap
+  (across all peers) and a per-connection cap keyed by the authenticated caller `peer_id`, so a burst
+  never overwhelms a single peer or this node's uplink and arrival order is preserved. Both caps come
+  from env (`DIG_NODE_SERVE_GLOBAL_BYTES_PER_SEC`, `DIG_NODE_SERVE_PER_CONN_BYTES_PER_SEC`); `0` (the
+  default for each) is unlimited, so an unconfigured node serves unthrottled. Distinct from the §7.x
+  fixed-window outbound throttle that REDIRECTS overflow to another holder — this one PACES the stream.
 - **Selector runs for SPEED mode only.** In PRIVACY mode (§8) hop selection uses the dig-onion
   privacy-aware selector, NOT `dig-peer-selector`; the exit's real fetch still uses `dig-peer-selector`
   + `dig-download` normally (§8.4).
