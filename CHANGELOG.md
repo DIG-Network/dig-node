@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.52.0] - 2026-07-22
+
+### Bug Fixes
+- **dig-node:** Rooted /s read survives a broken lineage walk (#747, #841) (#79)
+
 ## [0.51.1] - 2026-07-22
 
 ### Features
