@@ -933,10 +933,18 @@ pub(crate) struct NodeResponder {
     dht: Option<Arc<crate::dht::DhtHandle>>,
     /// Serve-side FCFS outbound rate limiter (#1436): paces `dig.fetchRange` bytes per-connection +
     /// globally so a burst never overwhelms one peer or this node's uplink. Caps come from env
-    /// (`0/0` = unlimited = behavior-preserving default). Keyed by the caller `peer_id`; the crate has
-    /// no eviction API, so a distinct peer leaves at most one bucket entry (bounded footprint) —
-    /// evicting on connection close is a tracked follow-up pending a `dig-download` `evict()` add.
-    serve_limiter: Arc<dig_download::FcfsRateLimiter>,
+    /// (`0/0` = unlimited = behavior-preserving default).
+    ///
+    /// `None` on the DEFAULT (unlimited) config: the serve path then skips `acquire` entirely, so an
+    /// unconfigured node creates NO per-connection accounting state at all — closing the
+    /// memory-exhaustion DoS where a peer mints unlimited fresh mTLS peer_ids (dig-tls accepts any
+    /// self-signed leaf) to grow the crate's attacker-keyed, never-evicted per-conn map.
+    ///
+    /// `Some` only when an operator explicitly configures a non-zero cap. In that opt-in case the map
+    /// is keyed by the caller `peer_id` and the crate currently has no per-connection eviction, so the
+    /// residual per-conn footprint is a tracked follow-up (dig_ecosystem #1495 — a `dig-download`
+    /// `evict()`/skip-when-unlimited crate fix, release-first).
+    serve_limiter: Option<Arc<dig_download::FcfsRateLimiter>>,
 }
 
 impl NodeResponder {
@@ -1086,8 +1094,11 @@ impl PeerRpcResponder for NodeResponder {
                     self.node.record_outgoing_bytes(this_len as u64);
                     // FCFS outbound PACING (#1436): wait (in arrival order) until this frame's bytes
                     // fit the global + per-connection budget before writing it, so a burst never
-                    // overwhelms one peer or this node's uplink. A `0/0` limiter returns instantly.
-                    self.serve_limiter.acquire(conn_key, this_len as u64).await;
+                    // overwhelms one peer or this node's uplink. `None` (the default/unlimited config)
+                    // skips `acquire` entirely — no per-conn map is touched (#1495 DoS guard).
+                    if let Some(limiter) = &self.serve_limiter {
+                        limiter.acquire(conn_key, this_len as u64).await;
+                    }
                     write_framed(out, &frame).await?;
                     let complete = frame
                         .get("complete")
@@ -1115,7 +1126,7 @@ impl PeerRpcResponder for NodeResponder {
                                         &f,
                                         off,
                                         length,
-                                        &self.serve_limiter,
+                                        self.serve_limiter.as_deref(),
                                         conn_key,
                                     )
                                     .await;
@@ -1163,7 +1174,7 @@ async fn stream_fetched_range(
     fetched: &crate::download::FetchedResource,
     offset: usize,
     length: usize,
-    limiter: &dig_download::FcfsRateLimiter,
+    limiter: Option<&dig_download::FcfsRateLimiter>,
     conn_key: &str,
 ) -> std::io::Result<()> {
     let mut off = offset;
@@ -1172,7 +1183,10 @@ async fn stream_fetched_range(
             Ok(frame) => {
                 let this_len = frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
                 // Pace fetch-through frames on the SAME FCFS budget as locally-held serves (#1436).
-                limiter.acquire(conn_key, this_len as u64).await;
+                // `None` (default/unlimited) skips `acquire` — no per-conn map touched (#1495).
+                if let Some(limiter) = limiter {
+                    limiter.acquire(conn_key, this_len as u64).await;
+                }
                 write_framed(out, &frame).await?;
                 let complete = frame
                     .get("complete")
@@ -3117,7 +3131,7 @@ mod tests {
         let f = tiny_fetched(300);
         let mut out = tokio::io::sink();
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 100, &limiter, "peerA")
+        stream_fetched_range(&mut out, &f, 0, 100, Some(&limiter), "peerA")
             .await
             .unwrap();
         // First 100 B instant (burst); the next two 100-B frames each wait ~1s for a refill.
@@ -3128,14 +3142,14 @@ mod tests {
         );
     }
 
-    /// An unlimited (0/0) limiter never paces — the default node serves at full speed.
+    /// The default node has NO serve limiter (`None`, #1495): the serve path skips `acquire` and never
+    /// paces — full-speed serve, and no per-connection map is ever created.
     #[tokio::test(start_paused = true)]
     async fn stream_range_unlimited_cap_never_paces() {
-        let limiter = dig_download::FcfsRateLimiter::new(0, 0);
         let f = tiny_fetched(1_000_000);
         let mut out = tokio::io::sink();
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 1000, &limiter, "peerA")
+        stream_fetched_range(&mut out, &f, 0, 1000, None, "peerA")
             .await
             .unwrap();
         assert_eq!(
@@ -3153,12 +3167,12 @@ mod tests {
         let f = tiny_fetched(1000);
         let mut out = tokio::io::sink();
         // Exhaust peer A's burst (one 1000-byte frame).
-        stream_fetched_range(&mut out, &f, 0, 1000, &limiter, "peerA")
+        stream_fetched_range(&mut out, &f, 0, 1000, Some(&limiter), "peerA")
             .await
             .unwrap();
         // Peer B has its own fresh bucket → its first serve is instant.
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 1000, &limiter, "peerB")
+        stream_fetched_range(&mut out, &f, 0, 1000, Some(&limiter), "peerB")
             .await
             .unwrap();
         assert_eq!(

@@ -56,10 +56,26 @@ pub fn serve_per_conn_bytes_per_sec_from_env() -> u64 {
     )
 }
 
-/// Build the shared serve-side [`FcfsRateLimiter`](dig_download::FcfsRateLimiter) from the two env
-/// caps (#1436). `new(0, 0)` is a no-op limiter, so the default node serves unthrottled.
-pub fn serve_rate_limiter_from_env() -> std::sync::Arc<dig_download::FcfsRateLimiter> {
-    dig_download::FcfsRateLimiter::new(
+/// Build the serve-side [`FcfsRateLimiter`](dig_download::FcfsRateLimiter) from two caps, returning
+/// `None` when BOTH are [`UNLIMITED`] (#1436, #1495). `None` is the DEFAULT-CONFIG case: the serve
+/// path then skips `acquire` entirely, so an unconfigured node NEVER touches the limiter's
+/// attacker-keyed per-connection map — closing the memory-exhaustion DoS where a peer mints unlimited
+/// fresh mTLS peer_ids (dig-tls accepts any self-signed leaf) to grow a never-evicted map on a `0/0`
+/// node. Pure (no env) so the None/Some decision is unit-tested without touching process-global env.
+pub fn build_serve_rate_limiter(
+    global_bps: u64,
+    per_conn_bps: u64,
+) -> Option<std::sync::Arc<dig_download::FcfsRateLimiter>> {
+    if global_bps == UNLIMITED && per_conn_bps == UNLIMITED {
+        return None;
+    }
+    Some(dig_download::FcfsRateLimiter::new(global_bps, per_conn_bps))
+}
+
+/// [`build_serve_rate_limiter`] from the two env caps (#1436). `None` on the default (unconfigured)
+/// node, so it builds no limiter and creates no per-connection accounting state.
+pub fn serve_rate_limiter_from_env() -> Option<std::sync::Arc<dig_download::FcfsRateLimiter>> {
+    build_serve_rate_limiter(
         serve_global_bytes_per_sec_from_env(),
         serve_per_conn_bytes_per_sec_from_env(),
     )
@@ -249,9 +265,36 @@ mod tests {
     fn serve_caps_default_unlimited_and_parse_positive() {
         assert_eq!(parse_cap(None), UNLIMITED, "unset serve cap → unlimited");
         assert_eq!(parse_cap(Some("2000000")), 2_000_000);
-        // A 0/0 limiter never paces (its own crate proves this; here we just confirm construction).
-        let rl = dig_download::FcfsRateLimiter::new(UNLIMITED, UNLIMITED);
-        assert_eq!(std::sync::Arc::strong_count(&rl), 1);
+    }
+
+    /// REGRESSION (#1495 DoS): the default (unlimited) config builds NO serve limiter, so the serve
+    /// path skips `acquire` and never touches the crate's attacker-keyed, never-evicted per-connection
+    /// map — the memory-exhaustion vector (a peer minting unlimited fresh mTLS peer_ids) cannot grow a
+    /// map that is never created.
+    #[test]
+    fn serve_limiter_is_none_on_default_unlimited_config() {
+        assert!(
+            build_serve_rate_limiter(UNLIMITED, UNLIMITED).is_none(),
+            "0/0 (default) must yield None — no limiter, no per-conn map"
+        );
+    }
+
+    /// When an operator configures a non-zero cap the limiter IS built (#1436 pacing stays active):
+    /// a per-conn cap, a global cap, or both → `Some`. Only the both-zero default is `None`.
+    #[test]
+    fn serve_limiter_is_some_and_throttles_when_configured() {
+        assert!(
+            build_serve_rate_limiter(UNLIMITED, 100).is_some(),
+            "per-conn cap set → Some"
+        );
+        assert!(
+            build_serve_rate_limiter(2_000_000, UNLIMITED).is_some(),
+            "global cap set → Some"
+        );
+        assert!(
+            build_serve_rate_limiter(1_000, 500).is_some(),
+            "both caps set → Some"
+        );
     }
 
     // -- the throttle's window accounting -------------------------------------------------------------
