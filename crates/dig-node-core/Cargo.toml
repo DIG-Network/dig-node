@@ -206,6 +206,11 @@ socket2 = "0.5"
 # ed25519-dalek; ring verifies RFC-8032 signatures + is strict against malleable/small-order inputs.)
 ring = "0.17"
 tracing = "0.1"
+# Best-effort CONCURRENT fan-out of the multi-source provider union (`UnionLocator`, #1443): query
+# dig-dht + PEX + relay-introducer sources at once via `future::join_all` (order-preserving, so the
+# dedup keeps DHT-first precedence). rustls/tokio already pull futures transitively; declaring it here
+# makes it a first-class prod dep of the union seam. Minimal feature set (no executor).
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 [dev-dependencies]
 tempfile = "3"

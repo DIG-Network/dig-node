@@ -15,6 +15,10 @@ pub mod dht;
 pub mod net;
 pub mod peer_network;
 pub mod pex;
+pub mod selector_adapter;
 pub mod session;
+pub mod union_locator;
 
 pub use peer_network::PeerNetwork;
+pub(crate) use selector_adapter::SelectorAdapter;
+pub(crate) use union_locator::{EmptyLocator, UnionLocator};

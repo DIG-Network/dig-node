@@ -1447,12 +1447,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // The full-ladder runtime the DHT-lookup transport composes from (#836): the local listen port
     // (UPnP tier) + this node's STUN reflexive address (hole-punch input) + the relayed / TURN-last
     // tier over the node's LIVE relay reservation (`ReservationRelayedTransport` over the SAME
-    // `Arc<RelayStatus>` shared with the pool). It powers ONLY the DHT-lookup ladder (`bring_up_dht`
-    // below): that path traverses direct → port-mapping → relay so a NAT'd node reaches the DHT
-    // instead of only trying Direct. The content/range-DOWNLOAD ladder (`NodeContent::for_dht` →
-    // `NatRangeTransport`) is Direct-only today — dig-download 0.2.1 exposes no runtime-injecting
-    // dial API to thread this runtime through. Wiring the download path onto the same ladder is a
-    // #836 follow-up (tracked, pending a dig-download runtime-injecting dial API).
+    // `Arc<RelayStatus>` shared with the pool). It powers BOTH the DHT-lookup ladder (`bring_up_dht`
+    // below) AND the content/range-DOWNLOAD ladder (`NodeContent::for_dht` → `NatRangeTransport::
+    // new_with_runtime`, #1439): the SAME shared `Arc<NatRuntime>` is threaded into both, so a range
+    // fetch traverses direct → port-mapping → hole-punch → relay exactly like the DHT dial — a NAT'd
+    // node reaches a holder over hole-punch/relay instead of DISCOVERING a provider it can only try
+    // Direct against (dig-download 0.5's runtime-injecting dial API closes the prior #836 gap).
     let reflexive = crate::net::reflexive_via_stun(
         &stun_servers,
         peer_port_from_env(),
@@ -1520,6 +1520,8 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             Some(peer_id_hex.clone()),
             node.cache_dir_path(),
             stun_server,
+            // #1439: the fetch leg rides the SAME shared NAT runtime as the DHT dial (hole-punch/relay).
+            nat_runtime.clone(),
         );
         content.spawn_gc();
         // Feed the selector's registry from the connected pool (#178, SPEC §2.3): seed from the current
