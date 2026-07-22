@@ -36,14 +36,23 @@ path = "src/lib.rs"
 #
 # Bumped to a rev past digstore's "Add normalized public manifest to the .dig format"
 # commit (08f5d39) so `PublicManifest`/`read_public_manifest`/`extract_data_section_blob`
-# exist. Bump all seven together.
-digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
-digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
-digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
-digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
-digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
-digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
-digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "d5e52fb" }
+# exist.
+#
+# Bumped again to 4c34f0be (digstore v0.19.2, fix #1473) to adopt the HARDENED,
+# unforgeable `digstore_chain::singleton::verify_pinned_root`. The prior rev (d5e52fb)
+# anchored store identity on the attacker-controllable curried `SingletonStruct.launcher_id`,
+# so a forged singleton currying `launcher_id == store_id` (hinted to store_id) could pass as
+# chain-verified. 4c34f0be anchors identity on the UNFORGEABLE launcher coin (`coin_id ==
+# store_id`) via a bounded backward `parent_coin_info` walk, making the read-root anti-rollback
+# check (#747/#841/#852-node) SOUND. The public signature is unchanged (a pure rev bump). Bump
+# all seven together.
+digstore-host = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-remote = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-chain = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
+digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 chia-protocol = "0.26"
 # -- Seam 1: Chia light-client CONFIRMATION/PEAK observability (#1314) --------------------------------
 # `chia-peer` is a subscribing Chia wallet-protocol light client (a thin driver over chia-wallet-sdk

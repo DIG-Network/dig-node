@@ -2185,7 +2185,7 @@ dependencies = [
  "dig-tls",
  "digstore-chain",
  "digstore-compiler",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "digstore-crypto",
  "digstore-host",
  "digstore-remote",
@@ -2224,7 +2224,7 @@ dependencies = [
  "dig-rpc-protocol",
  "dig-urn-resolver",
  "dig-wallet",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "digstore-crypto",
  "digstore-stage",
  "futures-util",
@@ -2302,7 +2302,7 @@ dependencies = [
  "base64",
  "dig-node-core",
  "dig-wallet",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "hex",
  "serde_json",
  "tokio",
@@ -2378,7 +2378,7 @@ dependencies = [
  "dig-keystore",
  "dig-node-core",
  "digstore-chain",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "futures-core",
  "hex",
  "http-body-util",
@@ -2440,8 +2440,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-chain"
-version = "0.19.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+version = "0.19.2"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2455,7 +2455,7 @@ dependencies = [
  "datalayer-driver",
  "dig-constants 0.5.1",
  "dig-wallet-backend",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "dirs 5.0.1",
  "getrandom 0.2.17",
  "hex",
@@ -2472,20 +2472,20 @@ dependencies = [
 
 [[package]]
 name = "digstore-chunker"
-version = "0.19.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+version = "0.19.2"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "sha2 0.10.9",
 ]
 
 [[package]]
 name = "digstore-compiler"
 version = "1.0.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
  "chacha20 0.9.1",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "digstore-store",
  "hex",
  "sha2 0.10.9",
@@ -2510,8 +2510,8 @@ dependencies = [
 
 [[package]]
 name = "digstore-core"
-version = "0.19.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+version = "0.19.2"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
  "aes-gcm-siv",
  "hex",
@@ -2524,10 +2524,10 @@ dependencies = [
 [[package]]
 name = "digstore-crypto"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
  "chia-bls 0.45.0",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "hex",
  "serde",
  "serde_json",
@@ -2538,11 +2538,11 @@ dependencies = [
 [[package]]
 name = "digstore-host"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
  "anyhow",
  "clap",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "digstore-crypto",
  "digstore-prover",
  "futures",
@@ -2560,9 +2560,9 @@ dependencies = [
 [[package]]
 name = "digstore-prover"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "digstore-crypto",
  "reqwest",
  "serde",
@@ -2572,14 +2572,14 @@ dependencies = [
 
 [[package]]
 name = "digstore-remote"
-version = "0.19.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+version = "0.19.2"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
  "async-trait",
  "axum",
  "base64",
  "bytes",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "digstore-crypto",
  "digstore-host",
  "digstore-store",
@@ -2600,11 +2600,11 @@ dependencies = [
 [[package]]
 name = "digstore-stage"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
  "digstore-chunker",
  "digstore-compiler",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "digstore-crypto",
  "digstore-store",
  "hex",
@@ -2616,10 +2616,10 @@ dependencies = [
 [[package]]
 name = "digstore-store"
 version = "0.1.0"
-source = "git+https://github.com/DIG-Network/digstore.git?rev=d5e52fb#d5e52fb5df753f44aceeb2b1f9a63c0589069c8f"
+source = "git+https://github.com/DIG-Network/digstore.git?rev=4c34f0be#4c34f0be5a6b54848a8f562995b78010fe887ecd"
 dependencies = [
  "digstore-chunker",
- "digstore-core 0.19.0",
+ "digstore-core 0.19.2",
  "digstore-crypto",
  "hex",
  "serde",

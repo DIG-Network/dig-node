@@ -407,6 +407,18 @@ window, upstream proxy). A compromised upstream/host can never choose which gene
 module with no on-chain anchor is rejected, never silently downgraded to a no-op. This is uniform with
 the CLI `clone`/`pull` pin ("chain is the authority", fail closed).
 
+**Store identity is anchored on the unforgeable launcher coin, never the curried `launcher_id`.** The
+bounded pinned-root check (`digstore_chain::singleton::verify_pinned_root`) discovers the candidate
+unspent tip with one attacker-controllable `unspent_coins_by_hint(store_id)` query, but it NEVER trusts
+a candidate merely because its curried `SingletonStruct.launcher_id == store_id` — that curried value is
+not bound to the real launcher coin and can be forged. Each candidate tip is accepted only when it
+PROVABLY DESCENDS from the launcher coin whose `coin_id == store_id` (a 256-bit hash preimage an
+attacker cannot grind), via a bounded backward `parent_coin_info` walk of COIN RECORDS that reaches that
+launcher coin (which must exist, be spent, and carry the singleton launcher puzzle hash). The backward
+walk needs only coin records, never the intermediate generations' spends, so it preserves #747-immunity
+(a single unparseable intermediate spend never fails the check). A forged singleton currying `store_id`
+but not descending from its launcher is rejected (fix #1473).
+
 ### 4.3 State tracked + confirmation semantics
 
 - Per store the node needs only its `store_id`; the anchored root is resolved on demand and is the sole
