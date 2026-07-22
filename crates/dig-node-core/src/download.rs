@@ -513,8 +513,10 @@ impl NodeContent {
         // `locator` (the UnionLocator in production) — discovery is unfiltered; the selector refines
         // the SOURCE choice at schedule time, not the discovered set. The same RAW `locator` stays on
         // the engine for the redirect-on-miss path (a redirect offers ALL known holders).
-        let mut config = DownloadConfig::default();
-        config.selector = Some(Arc::new(SelectorAdapter::new(selector.clone())));
+        let config = DownloadConfig {
+            selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
+            ..DownloadConfig::default()
+        };
         let downloader = Downloader::new(
             locator.clone(),
             transport,
