@@ -677,6 +677,27 @@ pub(crate) fn classify_request(v: &Value) -> PeerRequestKind {
 // module's own tests included) keep working unchanged.
 pub use crate::shared::identity::{install_crypto_provider, load_or_generate_node_cert};
 
+/// The `(cert_path, key_path)` the dig-gossip pool listener loads its TLS material from — the node's
+/// OWN persisted [`NodeCert`](dig_tls::NodeCert) (`node.crt`/`node.key` under [`node_cert_dir`], the
+/// files [`load_or_generate_node_cert`] writes), NOT a gossip-minted throwaway cert.
+///
+/// Sharing these files is what makes the pool's inbound listener present the node's ADVERTISED
+/// identity, so `peer_id = SHA-256(SPKI DER)` is identical across every listener the node runs (the
+/// peer-RPC server, the DHT dials, and the gossip pool). Without this the pool would present a cert
+/// hashing to a different peer_id and every dial to this node fails closed with `peer_id mismatch`
+/// (#1532). dig-gossip only READS these files (`dig_peer_protocol::load_ssl_cert`), so pointing at the
+/// canonical identity files can never clobber them.
+///
+/// [`node_cert_dir`]: crate::seams::key_mgmt::key_manager::KeyManager::node_cert_dir
+fn gossip_identity_paths(node_cert_dir: &std::path::Path) -> (String, String) {
+    // `node.crt` / `node.key` are the stable, §5.1-additive file names dig-tls persists a NodeCert
+    // under (also asserted by the node-cert permission test + documented on `node_cert_dir`).
+    (
+        node_cert_dir.join("node.crt").display().to_string(),
+        node_cert_dir.join("node.key").display().to_string(),
+    )
+}
+
 // -- Serving inbound peer streams over an established mTLS connection ---------------------------------
 
 /// A thing that answers peer requests — implemented by [`crate::Node`]. The transport layer
@@ -1395,14 +1416,26 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     );
 
     // 2. Bring up the connected peer pool (dig-gossip) with discovery via the relay introducer + the
-    //    relay reservation for NAT reachability. The GossipService owns its own chia-ssl TLS cert
-    //    under the cache dir; the pool auto-discovers + maintains connected peers.
+    //    relay reservation for NAT reachability. The pool's inbound TLS listener MUST present the
+    //    node's ONE advertised identity — the SAME CA-signed `NodeCert` (peer_id = SHA-256(SPKI DER))
+    //    that the node registers with the relay, advertises, and the auto-dialer PINS. So we point the
+    //    pool's cert/key at the persisted `NodeCert` files themselves (dig-gossip only READS them);
+    //    letting the GossipService mint its OWN throwaway cert would hash to a DIFFERENT peer_id and
+    //    every dial to this node fails closed with `peer_id mismatch` (#1532 — the identity split).
+    //    `cfg.peer_id` is set to that same identity so the pool's self-dial guard + handshake agree.
+    //    The address book (`peers.json`) stays under `peer-net/`; only the identity is shared.
     let gossip_dir = node.peer_cert_dir();
     let _ = std::fs::create_dir_all(&gossip_dir);
+    let (gossip_cert_path, gossip_key_path) = gossip_identity_paths(&node.node_cert_dir());
     let mut cfg = dig_gossip::GossipConfig {
         network_id: genesis,
-        cert_path: gossip_dir.join("node.cert").display().to_string(),
-        key_path: gossip_dir.join("node.key").display().to_string(),
+        // The pool's OWN network fingerprint — derived from the SAME NodeCert SPKI the listener now
+        // presents, so `config.peer_id`, the on-wire handshake, and the presented leaf all agree on
+        // ONE identity (the pool's self-dial guard compares against this). Uses dig-gossip's own
+        // derivation so the type + hashing match the pool's internal `peer_id` exactly (#1532).
+        peer_id: dig_gossip::peer_id_from_tls_spki_der(identity.spki_der()),
+        cert_path: gossip_cert_path,
+        key_path: gossip_key_path,
         peers_file_path: gossip_dir.join("peers.json"),
         peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
         // Bind the gossip pool on its OWN port, distinct from the mTLS peer-RPC listener below — they
@@ -2607,6 +2640,36 @@ mod tests {
             ca.peer_id().to_hex(),
             cb.peer_id().to_hex(),
             "different machine identity seeds → different peer_ids"
+        );
+    }
+
+    #[test]
+    fn gossip_listener_presents_the_advertised_peer_id() {
+        // #1532 regression — NODE IDENTITY SPLIT. The dig-gossip pool's inbound TLS listener loads
+        // its cert/key from `gossip_identity_paths`, and it MUST present the SAME identity the node
+        // advertises/registers/pins (the persistent NodeCert). If the pool listener's leaf hashed to
+        // a DIFFERENT peer_id than the advertised one, every dial to this node fails closed with
+        // `peer_id mismatch: expected <advertised>, got <gossip-cert>` — exactly the Leg B failure.
+        //
+        // Prove the invariant end-to-end the way the pool loads it: mint the NodeCert into its dir,
+        // then reload the identity from the EXACT files `gossip_identity_paths` returns and confirm
+        // the reloaded peer_id equals the advertised one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let identity = load_or_generate_node_cert(dir.path(), &node_seed("1532-identity-split"))
+            .expect("mint node cert");
+
+        let (cert_path, key_path) = gossip_identity_paths(dir.path());
+        let cert_pem = std::fs::read_to_string(&cert_path)
+            .expect("the gossip pool loads its cert from the NodeCert file");
+        let key_pem = std::fs::read_to_string(&key_path)
+            .expect("the gossip pool loads its key from the NodeCert file");
+        let listener_identity =
+            dig_tls::NodeCert::from_pem(&cert_pem, &key_pem).expect("reload the listener identity");
+
+        assert_eq!(
+            listener_identity.peer_id().to_hex(),
+            identity.peer_id().to_hex(),
+            "the gossip pool listener must present the node's ADVERTISED peer_id (#1532)"
         );
     }
 

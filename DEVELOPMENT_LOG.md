@@ -4,6 +4,31 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## The node's chia-ssl listeners share ONE mTLS identity — the gossip pool MUST reuse the NodeCert (#1532)
+
+The node has two in-process **chia-ssl** TLS listeners: the peer-RPC server (:9444) and the dig-gossip
+DIRECT connected pool (:9445). The advertised/registered/pinned `peer_id`
+(`peer_id = SHA-256(TLS SPKI DER)`) comes from the persistent CA-signed `NodeCert` under
+`node_cert_dir()` (`peer-net/identity/node.crt`+`.key`). dig-gossip's `GossipConfig` loads its listener
+cert from `cert_path`/`key_path` via `dig_peer_protocol::load_ssl_cert`, and if those files are absent
+it mints its OWN throwaway `ChiaCertificate` — a DIFFERENT SPKI → a DIFFERENT `peer_id`. Pointing the
+pool at its own `peer-net/node.cert` (the original wiring) therefore made the pool listener present an
+identity that did NOT match the advertised one, so a DIRECT dial failed CLOSED with
+`peer_id mismatch: expected <advertised>, got <gossip-cert>` — even though a dial-by-address (Leg A)
+still "worked" because it accepted whatever cert the listener presented. The fix (`gossip_identity_paths`)
+points `cfg.cert_path`/`cfg.key_path` at the NodeCert files themselves (dig-gossip only READS them, so
+it can never clobber them) and sets `cfg.peer_id` from the SAME SPKI via
+`dig_gossip::peer_id_from_tls_spki_der(identity.spki_der())`. RULE: any new chia-ssl node listener
+presents the NodeCert; never let a sub-component mint its own transport identity. Regression:
+`peer::tests::gossip_listener_presents_the_advertised_peer_id`.
+
+SCOPE (important, #1532 vs #1541): this unifies the CHIA-SSL path (:9444 + :9445 direct-gossip) ONLY.
+The dig-nat / DigPeer NAT-traversal transport is SEPARATE: dig-gossip's `nat_node_cert`
+(`state.rs:643-654`) still mints a RANDOM EPHEMERAL cert, and `pex.rs:625/630` dials over dig-nat — so
+the RELAYED + hole-punch tiers still present an ephemeral peer_id. Unifying that NAT-traversal identity
+with the persistent NodeCert is tracked SEPARATELY as #1541 (Defect 1b, dig-gossip release-first). Do
+NOT claim "every listener" / full identity unification until #1541 lands.
+
 ## digstore git-rev pins must move in LOCKSTEP across ALL crates (read-root hardening #1439/#1473)
 
 The digstore-* git deps are pinned by `rev` in FOUR crate manifests, not just the two obvious ones:
