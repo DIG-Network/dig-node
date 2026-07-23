@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.54.1] - 2026-07-23
+
+### Bug Fixes
+- **peer:** Gossip pool presents the node's advertised mTLS identity (#1532) (#82)
+
+### Chores
+- **deps:** Bump dig-gossip -> v0.13.0 (#1517 connect-leg fix) (#81)
+
 ## [0.53.0] - 2026-07-22
 
 ### Features
