@@ -1333,7 +1333,30 @@ fn map_gossip_pool_event(ev: &dig_gossip::PoolEvent) -> dig_peer_selector::PoolE
 /// status. The gossip pool and the reservation loop therefore observe ONE shared status: without this
 /// single shared `Arc`, discovered peers never reach the pool. When the relay is disabled
 /// (`DIG_RELAY_URL=off`) the status is marked [`RelayStatus::set_disabled`] and no socket is opened.
-/// Returns the shared status so the node can report the REAL reservation state (#872).
+/// Bind a [`GossipConfig`](dig_gossip::GossipConfig) to the node's ONE persistent `identity` so the
+/// pool presents the SAME `peer_id = SHA-256(SPKI DER)` on EVERY transport (#1532/#1541):
+///
+/// * `peer_id` — the pool's advertised/handshake/self-dial-guard identity, derived from the persistent
+///   NodeCert's SPKI (dig-gossip's own derivation, so the type + hashing match the pool's internal id).
+/// * `nat_identity` — the persistent NodeCert INJECTED as the dig-nat transport identity. Without it
+///   dig-gossip mints a RANDOM per-boot ephemeral NodeCert for its DigPeer/relay dials, so the
+///   transport `peer_id` differed from the advertised/registered/pinned one and Leg B's relayed circuit
+///   failed closed with `peer_id mismatch`. Injecting THIS `Arc<NodeCert>` — the same one the chia-ssl
+///   path, the mTLS listener, the DHT dials, and the relay reservation present — makes ONE identity
+///   span all transports, the invariant that closes the Leg-B mismatch.
+///
+/// Pure (mutates only the config), so the one-identity invariant is unit-tested without a live pool.
+fn apply_persistent_identity(cfg: &mut dig_gossip::GossipConfig, identity: &Arc<dig_nat::NodeCert>) {
+    cfg.peer_id = dig_gossip::peer_id_from_tls_spki_der(identity.spki_der());
+    cfg.nat_identity = Some(identity.clone());
+}
+
+/// Returns the shared status so the node can report the REAL reservation state (#872), plus — when the
+/// relay is enabled — the receiver of INTRODUCED inbound relay circuits (Leg B's responder half): the
+/// accept path is turned on ([`RelayStatus::enable_accept`](dig_nat::relay::RelayStatus::enable_accept))
+/// BEFORE the reservation loop starts registering, so no circuit a NAT'd peer relays to us is dropped as
+/// unknown-peer before the accept channel exists. The caller drains it via [`spawn_relay_accept_loop`].
+/// `None` when the relay is disabled (no reservation, so no inbound circuits).
 fn wire_relay_reservation(
     handle: &dig_gossip::GossipHandle,
     enabled: bool,
@@ -1341,10 +1364,16 @@ fn wire_relay_reservation(
     peer_id: String,
     network_id: String,
     listen_addrs: Vec<std::net::SocketAddr>,
-) -> Arc<dig_nat::relay::RelayStatus> {
+) -> (
+    Arc<dig_nat::relay::RelayStatus>,
+    Option<tokio::sync::mpsc::Receiver<dig_nat::relay::RelayTunnel>>,
+) {
     let status = dig_nat::relay::RelayStatus::new();
     handle.attach_relay_status(status.clone());
     if enabled {
+        // Enable the RESPONDER path first: install the accept channel so the reservation loop hands us
+        // every introduced circuit from a peer we have no open outbound tunnel to (#1536, Leg B).
+        let inbound = status.enable_accept();
         let status = status.clone();
         tokio::spawn(async move {
             // B1 (#870): advertise the node's gossip listen candidates so the relay's reflexive
@@ -1358,10 +1387,71 @@ fn wire_relay_reservation(
             )
             .await;
         });
+        (status, Some(inbound))
     } else {
         status.set_disabled();
+        (status, None)
     }
-    status
+}
+
+/// Spawn the RESPONDER half of Leg B: for every INTRODUCED relay circuit surfaced by
+/// [`RelayStatus::enable_accept`](dig_nat::relay::RelayStatus::enable_accept) (drained from `inbound`),
+/// run the mTLS SERVER handshake ([`dig_nat::RelayAcceptor`], presenting THIS node's persistent
+/// `identity`) and serve the resulting authenticated session exactly like a direct inbound connection
+/// ([`serve_accepted_relay_conn`]). This is what lets a NAT'd peer's relayed circuit be ACCEPTED — the
+/// missing counterpart to the dialer that closes Leg B (#1532/#1536).
+///
+/// Bounded by its own accepted-connection semaphore (mirroring the direct listener, audit #179): a
+/// relay cannot make us spawn unbounded serve tasks. `relay_addr` (observability only) is recorded as
+/// the accepted [`PeerConnection`](dig_nat::PeerConnection)'s remote address.
+fn spawn_relay_accept_loop(
+    mut inbound: tokio::sync::mpsc::Receiver<dig_nat::relay::RelayTunnel>,
+    identity: Arc<dig_nat::NodeCert>,
+    responder: Arc<dyn PeerRpcResponder>,
+    relay_addr: Option<std::net::SocketAddr>,
+) {
+    let mut acceptor = dig_nat::RelayAcceptor::new(identity);
+    if let Some(addr) = relay_addr {
+        acceptor = acceptor.with_relay_endpoint(addr);
+    }
+    tokio::spawn(async move {
+        let conn_permits = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PEER_CONNECTIONS));
+        while let Some(tunnel) = inbound.recv().await {
+            let acceptor = acceptor.clone();
+            let responder = responder.clone();
+            let spawned = spawn_with_permit(&conn_permits, async move {
+                match acceptor.accept(tunnel).await {
+                    Ok(conn) => serve_accepted_relay_conn(conn, responder).await,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "relayed circuit mTLS accept failed; dropped")
+                    }
+                }
+            });
+            if !spawned {
+                tracing::debug!("relayed circuit shed: global connection cap reached");
+            }
+        }
+    });
+}
+
+/// Serve one ACCEPTED relayed circuit exactly like a direct inbound connection: build the authenticated
+/// caller [`dig_dht::Contact`] from the mTLS-verified `peer_id` + relay endpoint (identity comes from
+/// the certificate the handshake verified, never the wire body), then serve the muxed session against
+/// `responder` via [`serve_peer_session_from`]. Identical downstream handling to a direct inbound (§the
+/// accepted [`PeerConnection`](dig_nat::PeerConnection) carries the SAME authentication), so a NAT'd
+/// peer reaching us over a relay circuit gets the full L7 peer RPC (availability / range / DHT).
+async fn serve_accepted_relay_conn(
+    conn: dig_nat::PeerConnection,
+    responder: Arc<dyn PeerRpcResponder>,
+) {
+    let dig_nat::PeerConnection {
+        peer_id,
+        remote_addr,
+        mut session,
+        ..
+    } = conn;
+    let caller = Some(crate::dht::caller_contact(&peer_id, remote_addr));
+    serve_peer_session_from(caller, &mut session, responder).await;
 }
 
 /// Bring up the peer network (the fallible body of [`spawn_peer_network`]).
@@ -1429,11 +1519,6 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     let (gossip_cert_path, gossip_key_path) = gossip_identity_paths(&node.node_cert_dir());
     let mut cfg = dig_gossip::GossipConfig {
         network_id: genesis,
-        // The pool's OWN network fingerprint — derived from the SAME NodeCert SPKI the listener now
-        // presents, so `config.peer_id`, the on-wire handshake, and the presented leaf all agree on
-        // ONE identity (the pool's self-dial guard compares against this). Uses dig-gossip's own
-        // derivation so the type + hashing match the pool's internal `peer_id` exactly (#1532).
-        peer_id: dig_gossip::peer_id_from_tls_spki_der(identity.spki_der()),
         cert_path: gossip_cert_path,
         key_path: gossip_key_path,
         peers_file_path: gossip_dir.join("peers.json"),
@@ -1443,6 +1528,8 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         listen_addr: crate::net::dual_stack_listen_addr(gossip_port_from_env()),
         ..Default::default()
     };
+    // Bind the pool to the node's ONE persistent identity across every transport (#1532/#1541).
+    apply_persistent_identity(&mut cfg, &identity);
     if relay_enabled() {
         cfg.relay = Some(dig_gossip::RelayConfig {
             endpoint: relay_endpoint.clone(),
@@ -1475,7 +1562,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     //     maintenance loop reads the attached status each pass). Without sharing ONE status, discovery
     //     never reaches the pool. Returns the shared status so the node reports the REAL reservation
     //     state (#872) rather than a "relay configured" proxy.
-    let relay_status = wire_relay_reservation(
+    let (relay_status, relay_inbound) = wire_relay_reservation(
         &handle,
         relay_enabled(),
         relay_endpoint.clone(),
@@ -1544,21 +1631,24 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         std::time::Duration::from_secs(2),
     )
     .await;
-    let relayed_dialer: Option<Arc<dyn dig_nat::RelayedDialer>> = if relay_enabled() {
+    // The resolved relay socket address, shared by the relayed dialer (Leg B initiator) AND the relay
+    // accept loop below (Leg B responder, observability-only remote addr on accepted circuits).
+    let relay_socket_addr: Option<std::net::SocketAddr> = if relay_enabled() {
         let ep = relay_endpoint.clone();
-        let relay_addr = tokio::task::spawn_blocking(move || crate::net::relay_socket_addr(&ep))
+        tokio::task::spawn_blocking(move || crate::net::relay_socket_addr(&ep))
             .await
             .ok()
-            .flatten();
-        relay_addr.map(|addr| {
+            .flatten()
+    } else {
+        None
+    };
+    let relayed_dialer: Option<Arc<dyn dig_nat::RelayedDialer>> =
+        relay_socket_addr.map(|addr| {
             Arc::new(dig_nat::ReservationRelayedTransport::new(
                 relay_status.clone(),
                 addr,
             )) as Arc<dyn dig_nat::RelayedDialer>
-        })
-    } else {
-        None
-    };
+        });
     let nat_runtime = Arc::new(crate::net::build_node_nat_runtime(
         peer_port_from_env(),
         reflexive,
@@ -1711,6 +1801,20 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         node_responder = node_responder.with_dht(dht);
     }
     let responder: Arc<dyn PeerRpcResponder> = Arc::new(node_responder);
+
+    // Leg B responder half (#1532/#1536): drain the introduced relay circuits the reservation surfaces
+    // and serve each — over THIS node's persistent identity — exactly like a direct inbound. Wired only
+    // when the relay is enabled (else `relay_inbound` is `None`). This runs alongside the direct mTLS
+    // listener below so a NAT'd peer that could only reach us over a relay circuit is now ACCEPTED.
+    if let Some(inbound) = relay_inbound {
+        spawn_relay_accept_loop(
+            inbound,
+            identity.clone(),
+            responder.clone(),
+            relay_socket_addr,
+        );
+    }
+
     serve_peer_rpc_listener_with(listener, identity, responder, Some(pex)).await
 }
 
@@ -2066,7 +2170,7 @@ mod tests {
             .expect("gossip start");
 
         // Wire with the relay DISABLED so no real socket is opened; we drive the shared status by hand.
-        let status = wire_relay_reservation(
+        let (status, inbound) = wire_relay_reservation(
             &handle,
             false,
             DEFAULT_RELAY_URL.to_string(),
@@ -2074,6 +2178,8 @@ mod tests {
             DEFAULT_NETWORK_ID.to_string(),
             gossip_listen_candidates(0),
         );
+        // Relay disabled → no accept path is enabled (no reservation, so no inbound circuits).
+        assert!(inbound.is_none());
 
         // Before: no reservation held → the pool reports the relay disconnected.
         assert!(!handle.stats().await.relay_connected);
@@ -2991,6 +3097,110 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    /// #1532/#1541 — injecting the persistent identity makes ONE `peer_id` span every transport.
+    /// [`apply_persistent_identity`] must (a) set the advertised pool `peer_id` from the persistent
+    /// NodeCert's SPKI AND (b) inject that SAME NodeCert as `nat_identity`, so the dig-nat transport
+    /// presents the advertised id rather than a random per-boot ephemeral one — the invariant that
+    /// closes the Leg-B `peer_id mismatch`.
+    #[test]
+    fn apply_persistent_identity_makes_one_identity_span_all_transports() {
+        let dir = tempfile::tempdir().expect("cert dir");
+        let identity = load_or_generate_node_cert(dir.path(), &node_seed("legb-identity"))
+            .expect("persistent identity");
+
+        let mut cfg = dig_gossip::GossipConfig::default();
+        apply_persistent_identity(&mut cfg, &identity);
+
+        // (a) The advertised pool peer_id is derived from the persistent NodeCert's SPKI.
+        assert_eq!(
+            cfg.peer_id,
+            dig_gossip::peer_id_from_tls_spki_der(identity.spki_der())
+        );
+        // (b) The SAME NodeCert is injected as the dig-nat transport identity...
+        let injected = cfg.nat_identity.as_ref().expect("nat_identity injected");
+        assert!(
+            Arc::ptr_eq(injected, &identity),
+            "the transport identity must be the node's persistent NodeCert, not a copy/ephemeral"
+        );
+        // ...so the transport's peer_id == the advertised peer_id (one identity, all transports).
+        assert_eq!(
+            dig_gossip::peer_id_from_tls_spki_der(injected.spki_der()),
+            cfg.peer_id
+        );
+    }
+
+    /// Leg B responder half (#1532/#1536): an ACCEPTED relayed circuit is served exactly like a direct
+    /// inbound. `RelayAcceptor::accept` (which needs a live relay circuit) yields a server-role
+    /// [`dig_nat::PeerConnection`]; here we produce that SAME connection by running the identical mTLS
+    /// SERVER handshake over a real TCP link, then serve it via [`serve_accepted_relay_conn`]. The
+    /// client (dialing over dig-nat Direct) gets a real peer-RPC answer, proving the served session is a
+    /// fully-authenticated peer channel — a NAT'd peer's relayed circuit gets the full L7 peer RPC.
+    #[tokio::test]
+    async fn serve_accepted_relay_conn_serves_a_peer_rpc_over_an_authenticated_session() {
+        use std::time::Duration;
+        install_crypto_provider();
+
+        let server_dir = tempfile::tempdir().expect("server cert dir");
+        let server_identity =
+            load_or_generate_node_cert(server_dir.path(), &node_seed("legb-server"))
+                .expect("server identity");
+        let server_peer_id = server_identity.peer_id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_cert = server_identity.clone();
+        let server = tokio::spawn(async move {
+            let (tcp, peer_addr) = listener.accept().await.unwrap();
+            // The SAME server handshake `RelayAcceptor::accept` runs over an introduced circuit.
+            let server_tls =
+                dig_tls::server_config(&server_cert, dig_nat::BindingPolicy::Opportunistic)
+                    .expect("server config");
+            let captured = server_tls.captured_peer_id;
+            let captured_bls = server_tls.captured_bls;
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_tls.config);
+            let tls = acceptor.accept(tcp).await.expect("mtls accept");
+            let verified = captured.get().expect("client presented a cert");
+            let conn = dig_nat::PeerConnection {
+                peer_id: verified,
+                method: dig_nat::TraversalKind::Relayed,
+                remote_addr: peer_addr,
+                peer_bls_pub: captured_bls.get(),
+                session: dig_nat::mux::PeerSession::server(tls),
+            };
+            let responder: Arc<dyn PeerRpcResponder> = Arc::new(StubResponder);
+            serve_accepted_relay_conn(conn, responder).await;
+        });
+
+        let client_dir = tempfile::tempdir().expect("client cert dir");
+        let client_identity =
+            load_or_generate_node_cert(client_dir.path(), &node_seed("legb-client"))
+                .expect("client identity");
+        let target = dig_nat::PeerTarget::with_addr(server_peer_id, addr, "DIG_MAINNET");
+        let config = dig_nat::NatConfig::builder()
+            .enabled_methods(vec![dig_nat::TraversalKind::Direct])
+            .per_method_timeout(Duration::from_secs(5))
+            .build();
+        let mut conn = dig_nat::connect(&target, &client_identity, &config)
+            .await
+            .expect("client dials the accepted-circuit server");
+
+        let mut stream = conn.session.open_stream().await.expect("open stream");
+        write_framed(
+            &mut stream,
+            &json!({"jsonrpc":"2.0","id":7,"method":"dig.getNetworkInfo"}),
+        )
+        .await
+        .unwrap();
+        let resp = read_framed(&mut stream).await.unwrap().expect("a frame");
+        assert_eq!(resp["id"], json!(7));
+        assert_eq!(
+            resp["result"]["echo_method"],
+            json!("dig.getNetworkInfo"),
+            "the accepted relayed circuit must serve the peer RPC like a direct inbound"
+        );
+        let _ = server.await;
     }
 
     #[tokio::test]
