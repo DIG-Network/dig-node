@@ -1346,7 +1346,10 @@ fn map_gossip_pool_event(ev: &dig_gossip::PoolEvent) -> dig_peer_selector::PoolE
 ///   span all transports, the invariant that closes the Leg-B mismatch.
 ///
 /// Pure (mutates only the config), so the one-identity invariant is unit-tested without a live pool.
-fn apply_persistent_identity(cfg: &mut dig_gossip::GossipConfig, identity: &Arc<dig_nat::NodeCert>) {
+fn apply_persistent_identity(
+    cfg: &mut dig_gossip::GossipConfig,
+    identity: &Arc<dig_nat::NodeCert>,
+) {
     cfg.peer_id = dig_gossip::peer_id_from_tls_spki_der(identity.spki_der());
     cfg.nat_identity = Some(identity.clone());
 }
@@ -1374,7 +1377,7 @@ fn wire_relay_reservation(
         // Enable the RESPONDER path first: install the accept channel so the reservation loop hands us
         // every introduced circuit from a peer we have no open outbound tunnel to (#1536, Leg B).
         let inbound = status.enable_accept();
-        let status = status.clone();
+        let reservation_status = status.clone();
         tokio::spawn(async move {
             // B1 (#870): advertise the node's gossip listen candidates so the relay's reflexive
             // substitution can hand another peer a DIALABLE candidate for this node.
@@ -1383,7 +1386,7 @@ fn wire_relay_reservation(
                 peer_id,
                 network_id,
                 listen_addrs,
-                status,
+                reservation_status,
             )
             .await;
         });
@@ -1642,13 +1645,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     } else {
         None
     };
-    let relayed_dialer: Option<Arc<dyn dig_nat::RelayedDialer>> =
-        relay_socket_addr.map(|addr| {
-            Arc::new(dig_nat::ReservationRelayedTransport::new(
-                relay_status.clone(),
-                addr,
-            )) as Arc<dyn dig_nat::RelayedDialer>
-        });
+    let relayed_dialer: Option<Arc<dyn dig_nat::RelayedDialer>> = relay_socket_addr.map(|addr| {
+        Arc::new(dig_nat::ReservationRelayedTransport::new(
+            relay_status.clone(),
+            addr,
+        )) as Arc<dyn dig_nat::RelayedDialer>
+    });
     let nat_runtime = Arc::new(crate::net::build_node_nat_runtime(
         peer_port_from_env(),
         reflexive,
