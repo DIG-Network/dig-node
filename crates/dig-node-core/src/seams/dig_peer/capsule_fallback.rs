@@ -97,7 +97,7 @@ mod tests {
             &self,
             content: &ContentId,
         ) -> Result<Vec<ProviderRecord>, DownloadError> {
-            self.queried.lock().unwrap().push(content.clone());
+            self.queried.lock().unwrap().push(*content);
             if content == &self.answers_for {
                 Ok(self.providers.clone())
             } else {
@@ -128,7 +128,7 @@ mod tests {
 
         // The holder announced ONLY at capsule granularity (as real inventory does).
         let inner = Arc::new(GranularityLocator {
-            answers_for: capsule.clone(),
+            answers_for: capsule,
             providers: vec![holder(1, &capsule)],
             queried: Mutex::new(Vec::new()),
         });
@@ -182,7 +182,7 @@ mod tests {
             }
         }
         let locator = CapsuleFallbackLocator::new(Arc::new(BothLocator {
-            resource: resource.clone(),
+            resource,
             capsule,
         }));
 
@@ -205,7 +205,7 @@ mod tests {
         let root = [5u8; 32];
         let capsule = ContentId::capsule(store, root);
         let inner = Arc::new(GranularityLocator {
-            answers_for: capsule.clone(),
+            answers_for: capsule,
             providers: vec![holder(3, &capsule)],
             queried: Mutex::new(Vec::new()),
         });
