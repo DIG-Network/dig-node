@@ -274,6 +274,20 @@ pub fn caller_contact(peer_id: &PeerId, remote_addr: std::net::SocketAddr) -> Co
     )
 }
 
+/// Build the DHT [`Contact`] for an authenticated caller that reached us over a **relay** circuit.
+///
+/// Unlike [`caller_contact`], this records NO direct candidate: a relayed peer is NAT'd and not
+/// directly dialable, and the socket the connection arrived on is the RELAY's address — shared by
+/// every peer the relay forwards. Folding that address in as a `direct` candidate would fan ONE relay
+/// IP:port across the network under many different peer_ids as bogus direct-dial targets that every
+/// dialer then fails on the SPKI/peer_id pin, degrading the discover→connect flywheel (DiD-1 / #1532).
+/// Instead the caller carries a single relay-typed (non-dialable) marker: the peer still populates the
+/// routing table for response routing over the live session, but is never advertised as directly
+/// dialable. `peer_id` MUST come from the authenticated transport, never the request body.
+pub fn relayed_caller_contact(peer_id: &PeerId) -> Contact {
+    Contact::new(peer_id, vec![CandidateAddr::relay_marker()])
+}
+
 /// Decode + dispatch one inbound DHT-RPC frame against `dht`, folding the authenticated `caller` into
 /// the routing table, and return the framed [`DhtResponse`] bytes ready to write back on the stream.
 ///
@@ -682,6 +696,26 @@ mod tests {
         assert_eq!(a.host, "203.0.113.7");
         assert_eq!(a.port, 9444);
         assert!(a.kind.is_dialable());
+    }
+
+    #[test]
+    fn relayed_caller_contact_records_no_direct_candidate() {
+        // A peer that reached us over a RELAY circuit is NAT'd and NOT directly dialable; the socket
+        // we received it from is the RELAY's address (shared by every relayed peer). Recording that as
+        // a `direct` candidate would fan the relay IP:port network-wide under many peer_ids as bogus
+        // dial targets that fail the SPKI/peer_id pin (DiD-1 / #1532). The relayed caller MUST carry
+        // ONLY a relay-typed (non-dialable) hint — reachable for response routing, never a direct dial.
+        let pid = PeerId::from_bytes([9u8; 32]);
+        let c = relayed_caller_contact(&pid);
+        assert_eq!(c.peer_id, pid.to_hex(), "peer_id from the certificate");
+        assert!(
+            c.best_address().is_none(),
+            "a relayed caller must expose NO directly-dialable candidate"
+        );
+        assert!(
+            c.addresses.iter().all(|a| !a.kind.is_dialable()),
+            "every candidate on a relayed caller is a non-dialable relay hint"
+        );
     }
 
     // -- candidate_to_socket_addr --------------------------------------------------------------

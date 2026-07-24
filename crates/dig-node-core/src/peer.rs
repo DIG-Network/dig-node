@@ -1449,11 +1449,14 @@ async fn serve_accepted_relay_conn(
 ) {
     let dig_nat::PeerConnection {
         peer_id,
-        remote_addr,
         mut session,
         ..
     } = conn;
-    let caller = Some(crate::dht::caller_contact(&peer_id, remote_addr));
+    // A relayed peer is NAT'd and NOT directly dialable, and `remote_addr` here is the RELAY's socket
+    // (shared across every relayed peer). Record a relay-typed caller with NO direct candidate so we
+    // never fan the relay address network-wide as a bogus direct-dial target under this peer_id
+    // (DiD-1 / #1532) — the peer stays reachable for response routing on the live session.
+    let caller = Some(crate::dht::relayed_caller_contact(&peer_id));
     serve_peer_session_from(caller, &mut session, responder).await;
 }
 
