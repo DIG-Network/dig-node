@@ -11,6 +11,7 @@
 //! (matching W1b-0's pattern) but is out of scope for this trait carve.
 
 pub mod address_book;
+pub mod capsule_fallback;
 pub mod dht;
 pub mod net;
 pub mod peer_network;
@@ -19,6 +20,7 @@ pub mod selector_adapter;
 pub mod session;
 pub mod union_locator;
 
+pub(crate) use capsule_fallback::CapsuleFallbackLocator;
 pub use peer_network::PeerNetwork;
 pub(crate) use selector_adapter::SelectorAdapter;
 pub(crate) use union_locator::{EmptyLocator, UnionLocator};

@@ -2906,6 +2906,17 @@ the redirect-on-miss and the multi-source fetch paths. There is NO separate pool
 seam. The node keeps its own held-inventory provider records current (announce / republish / refresh /
 gc) and withdraws them on shutdown.
 
+**Announce vs. locate granularity (resource→capsule fallback).** Inventory is announced at STORE and
+CAPSULE (`store_id:root`) granularity ONLY; per-RESOURCE provider records are deliberately NOT announced
+(a capsule holder serves every resource inside it, so per-resource records would be redundant and would
+explode DHT write volume). A `/s` resource read miss, however, locates by a RESOURCE content id. The
+node's locator therefore MUST bridge the two: on a `ContentId::Resource` lookup it ALSO queries the
+parent `ContentId::capsule(store_id, root)` and unions the holders (deduped by `peer_id`, resource-key
+hits first), so Tier-2 peer fetch resolves the announced capsule holder and proceeds to
+`dig.getAvailability` + `dig.fetchRange` for the specific resource. Without this bridge a resource read
+finds no providers and dead-ends at the public-RPC tier even when a holder is discoverable
+(`CapsuleFallbackLocator`, #1580).
+
 ### 19.4. Address book — durable, IPv6-first, provenance + TTL
 
 The node maintains a durable peer address book: every learned peer candidate — from PEX, `dig.getPeers`,

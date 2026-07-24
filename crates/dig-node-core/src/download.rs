@@ -54,7 +54,7 @@ use dig_peer_selector::{
 use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
-use crate::seams::dig_peer::{EmptyLocator, SelectorAdapter, UnionLocator};
+use crate::seams::dig_peer::{CapsuleFallbackLocator, EmptyLocator, SelectorAdapter, UnionLocator};
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
 /// hold it — the `error.data.redirect` names them (peer_id + candidate addresses) so the caller
@@ -560,11 +560,16 @@ impl NodeContent {
         // The provider union: dig-dht is live today; PEX + relay-introducer are wired-but-empty seams
         // (#1443, real sources land in #1440 part B). Best-effort — a dormant source adds nothing.
         let dht_locator: Arc<dyn ProviderLocator> = Arc::new(DhtProviderLocator::new(dht));
-        let locator: Arc<dyn ProviderLocator> = UnionLocator::new(vec![
+        let union: Arc<dyn ProviderLocator> = UnionLocator::new(vec![
             dht_locator,
             Arc::new(EmptyLocator), // PEX-as-provider-source (dormant)
             Arc::new(EmptyLocator), // relay-introducer (dormant)
         ]);
+        // #1580: holders announce STORE + CAPSULE granularity only (never per-resource — see
+        // `dht::inventory_content_ids`), but a `/s` resource read locates by a RESOURCE content id.
+        // Bridge the two so a resource lookup also resolves the announced parent capsule holder;
+        // otherwise Tier-2 peer fetch finds nobody and the read 404s despite a discoverable holder.
+        let locator = CapsuleFallbackLocator::new(union);
         let nat_config =
             crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server);
         // The fetch leg composes the SAME NAT ladder as the DHT dial from the shared runtime (#1439):
