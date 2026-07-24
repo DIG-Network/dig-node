@@ -466,6 +466,29 @@ impl DhtHandle {
         self.service.find_providers(content).await
     }
 
+    /// Seed the routing table with a peer that just connected — the LIVE half of DHT bring-up
+    /// (#1574). [`bring_up_dht`]'s one-shot `bootstrap` runs BEFORE any peer connects, so in a
+    /// freshly-formed network routing starts empty and `find_providers` finds nobody. Feeding each
+    /// connected peer here (from a `dig-gossip` `PoolEvent::PeerAdded`) populates routing as the pool
+    /// fills, which is what makes cross-node discovery work. `peer_id` is the raw 32-byte gossip id;
+    /// `addr` its connected address. Idempotent-by-merge in dig-dht.
+    pub async fn add_peer(&self, peer_id: [u8; 32], addr: std::net::SocketAddr) {
+        self.service
+            .add_peer(
+                &PeerId::from_bytes(peer_id),
+                vec![CandidateAddr::direct(addr.ip().to_string(), addr.port())],
+            )
+            .await;
+    }
+
+    /// Evict a peer that left the pool (a `PoolEvent::PeerRemoved`) so lookups never seed from a dead
+    /// contact. `peer_id` is the raw 32-byte gossip id. Returns whether it was present.
+    pub async fn remove_peer(&self, peer_id: [u8; 32]) -> bool {
+        self.service
+            .remove_peer(&PeerId::from_bytes(peer_id).to_hex())
+            .await
+    }
+
     /// Best-effort withdraw of every announced content id (graceful shutdown): stop advertising this
     /// node as a provider so peers don't dial a node that is going away. The records still age out via
     /// TTL if this does not reach every replica. Returns how many ids were withdrawn.
@@ -872,5 +895,44 @@ mod tests {
         assert_eq!(hex64(&s), Some([0xabu8; 32]));
         assert_eq!(hex64("short"), None);
         assert_eq!(hex64(&"zz".repeat(32)), None);
+    }
+
+    // -- #1574: live routing seed from gossip PoolEvents ----------------------------------------
+
+    /// Regression for #1574: `DhtHandle::add_peer` (driven by `PoolEvent::PeerAdded`) seeds the
+    /// routing table LIVE as peers connect, and `remove_peer` (`PeerRemoved`) evicts. Before this the
+    /// routing table was seeded ONLY by the one-shot pre-connect `bootstrap`, so a freshly-formed
+    /// network's routing stayed empty and cross-node `find_providers` found nobody.
+    #[tokio::test]
+    async fn add_peer_seeds_routing_and_remove_peer_evicts() {
+        let transport = Arc::new(test_transport("routing-feed-1574"));
+        let service = Arc::new(DhtService::new(
+            PeerId::from_bytes([0x01; 32]),
+            vec![],
+            dig_dht::DhtConfig::default(),
+            transport,
+        ));
+        let dht = DhtHandle::new(service.clone(), vec![]);
+
+        assert_eq!(service.routing_len().await, 0, "empty at bring-up");
+
+        let peer = [0x02u8; 32];
+        let addr: std::net::SocketAddr = "[2001:db8::1]:9444".parse().unwrap();
+        dht.add_peer(peer, addr).await;
+        assert_eq!(
+            service.routing_len().await,
+            1,
+            "PoolEvent::PeerAdded seeds routing live (#1574)"
+        );
+
+        assert!(
+            dht.remove_peer(peer).await,
+            "PeerRemoved evicts the contact"
+        );
+        assert_eq!(service.routing_len().await, 0);
+        assert!(
+            !dht.remove_peer(peer).await,
+            "removing an absent peer returns false"
+        );
     }
 }

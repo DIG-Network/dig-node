@@ -4,6 +4,25 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## DHT routing is seeded LIVE from gossip PoolEvents, not just the pre-connect bootstrap (#1574)
+
+`bring_up_dht` seeds the dig-dht routing table with a ONE-SHOT `service.bootstrap(bootstrap_peers_from_pool(...))`
+— but that call runs BEFORE any peer connects (the pool is empty at bring-up in a freshly-formed
+network). dig-dht `find_providers` has no OTHER live source in a new network (PEX/relay-introducer are
+dormant EmptyLocators, republish/refresh are on ~1-hour cadences), so routing stayed empty and cross-node
+DISCOVER was impossible: a holder could ingest + serve + merkle-verify its OWN capsule and connect fine
+(direct + relay), yet a reader's `find_providers` returned empty (holder `capsule_count:1`, reader finds
+nobody). The gossip `PoolEvent::PeerAdded`/`PeerRemoved` stream was consumed by the peer-selector
+(`spawn_selector_registry_feed`) and PEX, but NOTHING fed it into dig-dht routing.
+
+Fix: `spawn_dht_routing_feed` mirrors the selector feed's shape (seed snapshot -> subscribe -> forward
+churn) but drives the DHT routing table — `PeerAdded` -> `DhtHandle::add_peer` (insert), `PeerRemoved` ->
+`remove_peer` (evict). This needed a NEW live dig-dht API (`DhtService::add_peer`/`remove_peer`, dig-dht
+0.5.2) because `bootstrap` is network-bound + one-shot; the new methods insert/evict a single contact
+with no round-trip. Both the ANNOUNCE (holder PUT) and FIND legs traverse dig-dht routing, so both are
+fixed by populating it. Lesson: any live peer-membership signal that must reach a subsystem needs its OWN
+`PoolEvent` consumer — a pre-connect snapshot is not enough for a network that forms after bring-up.
+
 ## The node's chia-ssl listeners share ONE mTLS identity — the gossip pool MUST reuse the NodeCert (#1532)
 
 The node has two in-process **chia-ssl** TLS listeners: the peer-RPC server (:9444) and the dig-gossip

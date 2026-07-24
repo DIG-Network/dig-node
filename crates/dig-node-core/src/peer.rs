@@ -1289,6 +1289,61 @@ fn spawn_selector_registry_feed(
     });
 }
 
+/// Feed the dig-dht routing table from the dig-gossip connected pool (#1574): seed it with the
+/// current pool snapshot, then forward every `PoolEvent` churn event so routing populates LIVE as
+/// peers connect — not just from the one-shot pre-connect `bootstrap` in [`bring_up_dht`].
+///
+/// This is the fix for the broken cross-node DISCOVER leg: `bootstrap` runs BEFORE any peer
+/// connects, so in a freshly-formed network the pool is empty at that moment and routing stays
+/// empty — `find_providers` then finds nobody even though a holder announced. Mirrors
+/// [`spawn_selector_registry_feed`]'s shape (seed snapshot → subscribe → forward churn), but drives
+/// the DHT routing table instead of the selector registry. `PeerAdded` inserts into routing;
+/// `PeerRemoved` evicts so lookups never seed from a dead contact. Best-effort: a subscribe failure
+/// logs + returns (bootstrap + the maintenance refresh still fill routing over time); the task ends
+/// when the pool event channel closes.
+fn spawn_dht_routing_feed(dht: Arc<crate::dht::DhtHandle>, handle: dig_gossip::GossipHandle) {
+    // Seed from the current snapshot so routing is populated before the first lookup.
+    for (peer_id, addr, _outbound) in handle.connected_pool_peers() {
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(peer_id.as_ref());
+        let dht = dht.clone();
+        tokio::spawn(async move {
+            dht.add_peer(bytes, addr).await;
+        });
+    }
+
+    let mut rx = match handle.subscribe_pool_events() {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::debug!(error = %e, "dht routing feed: could not subscribe to pool events");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev) => match &ev {
+                    dig_gossip::PoolEvent::PeerAdded { peer_id, addr } => {
+                        let mut bytes = [0u8; 32];
+                        bytes.copy_from_slice(peer_id.as_ref());
+                        dht.add_peer(bytes, *addr).await;
+                    }
+                    dig_gossip::PoolEvent::PeerRemoved { peer_id, .. } => {
+                        let mut bytes = [0u8; 32];
+                        bytes.copy_from_slice(peer_id.as_ref());
+                        dht.remove_peer(bytes).await;
+                    }
+                },
+                // Lagged (slow consumer) — keep going; a missed add/remove is re-seeded by the pool
+                // snapshot on the next churn and by bucket-refresh maintenance.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                // Channel closed (service stopped) — the feed is done.
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 /// Map a live `dig_gossip::PoolEvent` into the selector's local `PoolEvent` (the 1:1 field map —
 /// SPEC §5.4). This is the boundary where dig-gossip's concrete type is in scope; it destructures the
 /// event into the raw 32-byte peer id + a transport-free `PoolEventKind`, then defers the actual
@@ -1684,6 +1739,14 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             None
         }
     };
+
+    // 4a. Feed the DHT routing table LIVE from the gossip pool (#1574): bring_up_dht's one-shot
+    //     bootstrap runs BEFORE any peer connects, so in a freshly-formed network routing starts empty
+    //     and find_providers finds nobody. This forwards every PoolEvent (add → insert, remove →
+    //     evict) into routing so cross-node discovery works as the pool fills.
+    if let Some(dht) = dht.clone() {
+        spawn_dht_routing_feed(dht, handle.clone());
+    }
 
     // 4b. Bring up the P2P CONTENT engine (#164/#165) over the live DHT + this node's mTLS identity: the
     //     dig-download multi-source fetch path (locate→confirm→fan ranges→verify→reassemble) plus the
