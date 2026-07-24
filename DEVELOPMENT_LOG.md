@@ -4,6 +4,25 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## Resource reads locate by resource id, but inventory is announced only at capsule granularity (#1580)
+
+Inventory is announced into the DHT at STORE + CAPSULE (`store_id:root`) granularity ONLY —
+`dht::inventory_content_ids` deliberately does NOT announce per-resource records (a capsule holder serves
+every resource in it, so per-resource records would be redundant and explode DHT write volume). But a
+`/s` resource read miss builds a `ContentId::Resource` and dig-download's discover step
+(`locate_and_confirm`) locates providers by that EXACT key. So even after DISCOVER was fixed (#1574/#1575),
+DATA still 404'd: `find_providers(resource_id)` found nobody, Tier-2 peer fetch gave up, and the read
+dead-ended at the §21 whole-capsule backfill / public RPC — the holder never saw an inbound `fetchRange`.
+The serve-path tier ORDERING was already correct (Tier-2 peer runs before Tier-3 RPC); the fault was the
+announce-vs-locate granularity mismatch, not ordering.
+
+Fix: `CapsuleFallbackLocator` wraps the content engine's locator so a `ContentId::Resource` lookup ALSO
+queries the parent `ContentId::capsule(store_id, root)` and unions the holders. dig-download then confirms
+the specific resource against that holder via `dig.getAvailability` + `dig.fetchRange`. No dig-download /
+dig-dht API change — the bridge is pure dig-node. Gotcha for future work: anything that locates by a
+resource-granularity content id must apply the same capsule fallback, or announce resource granularity
+(the latter is intentionally avoided).
+
 ## DHT routing is seeded LIVE from gossip PoolEvents, not just the pre-connect bootstrap (#1574)
 
 `bring_up_dht` seeds the dig-dht routing table with a ONE-SHOT `service.bootstrap(bootstrap_peers_from_pool(...))`
