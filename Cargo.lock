@@ -787,7 +787,7 @@ dependencies = [
 [[package]]
 name = "chia-protocol"
 version = "0.26.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=90c12ac5a89a4d143ed86cc755cd42678aa1aa4f#7ce3bb4c2adc1d5c5e4ce907eefb56abff3d0d8c"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=9866eddeeee93d61ff0b9663dd03106d48e5ae12#9866eddeeee93d61ff0b9663dd03106d48e5ae12"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-serde",
@@ -880,7 +880,7 @@ dependencies = [
 [[package]]
 name = "chia-sdk-client"
 version = "0.28.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=90c12ac5a89a4d143ed86cc755cd42678aa1aa4f#7ce3bb4c2adc1d5c5e4ce907eefb56abff3d0d8c"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=9866eddeeee93d61ff0b9663dd03106d48e5ae12#9866eddeeee93d61ff0b9663dd03106d48e5ae12"
 dependencies = [
  "aws-lc-rs",
  "chia-protocol",
@@ -2030,8 +2030,8 @@ dependencies = [
 
 [[package]]
 name = "dig-gossip"
-version = "0.15.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=90c12ac5a89a4d143ed86cc755cd42678aa1aa4f#7ce3bb4c2adc1d5c5e4ce907eefb56abff3d0d8c"
+version = "0.15.1"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=9866eddeeee93d61ff0b9663dd03106d48e5ae12#9866eddeeee93d61ff0b9663dd03106d48e5ae12"
 dependencies = [
  "bincode",
  "chia-protocol",
@@ -2186,7 +2186,7 @@ checksum = "5074965e7951a0bbf8afc754a2179ddc0969190ed970bbb7648435c4b64eaca2"
 dependencies = [
  "arc-swap",
  "async-trait",
- "dig-constants 0.4.0",
+ "dig-constants 0.5.1",
  "dig-identity 0.4.2",
  "dig-ip",
  "dig-tls",
@@ -2261,7 +2261,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.56.2"
+version = "0.56.3"
 dependencies = [
  "axum",
  "axum-server",
@@ -2766,7 +2766,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2914,7 +2914,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3484,7 +3484,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3689,7 +3689,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4017,7 +4017,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4573,7 +4573,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -4611,9 +4611,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4982,7 +4982,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5641,7 +5641,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
