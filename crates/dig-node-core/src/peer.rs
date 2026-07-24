@@ -2216,8 +2216,16 @@ mod tests {
     fn dht_candidate_from_pool_addr_uses_dht_port_not_gossip_port() {
         let gossip: std::net::SocketAddr = "203.0.113.7:9445".parse().unwrap();
         let dht = dht_addr_from_gossip_addr(gossip);
-        assert_eq!(dht.port(), 9444, "DHT candidate must use the 9444 DHT port, not 9445 gossip");
-        assert_eq!(dht.ip(), gossip.ip(), "only the port shifts; the IP is preserved");
+        assert_eq!(
+            dht.port(),
+            9444,
+            "DHT candidate must use the 9444 DHT port, not 9445 gossip"
+        );
+        assert_eq!(
+            dht.ip(),
+            gossip.ip(),
+            "only the port shifts; the IP is preserved"
+        );
         // IPv6 (ecosystem IPv6-first) maps identically.
         let gossip6: std::net::SocketAddr = "[2001:db8::1]:9445".parse().unwrap();
         assert_eq!(dht_addr_from_gossip_addr(gossip6).port(), 9444);
