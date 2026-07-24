@@ -92,6 +92,26 @@ pub const DEFAULT_P2P_PORT: u16 = 9444;
 /// the canonical `9444` (it is the advertised/dialed address, so it must not move).
 pub const DEFAULT_GOSSIP_PORT: u16 = 9445;
 
+/// The fixed port offset from the gossip listener down to the DHT/peer-RPC listener
+/// (`DEFAULT_GOSSIP_PORT - DEFAULT_P2P_PORT`, i.e. 1). See [`dht_addr_from_gossip_addr`].
+pub const GOSSIP_TO_DHT_PORT_OFFSET: u16 = DEFAULT_GOSSIP_PORT - DEFAULT_P2P_PORT;
+
+/// Map a peer's GOSSIP address to its DHT/peer-RPC address (#1575 GAP 2).
+///
+/// `connected_pool_peers()` and `PoolEvent`s report a peer's GOSSIP endpoint (its `9445`), because the
+/// pool link is a gossip connection. But the DHT routing table must hold the peer's DHT/peer-RPC
+/// endpoint (its `9444`) — dialing the gossip port for a DHT RPC gets the gossip protocol on the wire
+/// and fails with `received corrupt message InvalidContentType`, so every DHT dial silently dies and
+/// `find_providers` finds nobody. Every node co-locates the two listeners with the gossip port exactly
+/// [`GOSSIP_TO_DHT_PORT_OFFSET`] above the DHT port, so we recover the DHT port by shifting down by
+/// that fixed offset. `saturating_sub` guards a pathological addr below the offset (never a real
+/// gossip port, but avoids underflow).
+pub fn dht_addr_from_gossip_addr(gossip: std::net::SocketAddr) -> std::net::SocketAddr {
+    let mut dht_addr = gossip;
+    dht_addr.set_port(gossip.port().saturating_sub(GOSSIP_TO_DHT_PORT_OFFSET));
+    dht_addr
+}
+
 /// Per-window ciphertext cap for a `dig.fetchRange` frame (bytes) — the node window (3 MiB), the same
 /// cap the HTTP read path (`WINDOW`) uses.
 pub const RANGE_WINDOW: usize = 3 * 1024 * 1024;
@@ -1302,13 +1322,15 @@ fn spawn_selector_registry_feed(
 /// logs + returns (bootstrap + the maintenance refresh still fill routing over time); the task ends
 /// when the pool event channel closes.
 fn spawn_dht_routing_feed(dht: Arc<crate::dht::DhtHandle>, handle: dig_gossip::GossipHandle) {
-    // Seed from the current snapshot so routing is populated before the first lookup.
+    // Seed from the current snapshot so routing is populated before the first lookup. The pool reports
+    // each peer's GOSSIP addr; map it to the peer's DHT addr before seeding routing (#1575 GAP 2).
     for (peer_id, addr, _outbound) in handle.connected_pool_peers() {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(peer_id.as_ref());
+        let dht_addr = dht_addr_from_gossip_addr(addr);
         let dht = dht.clone();
         tokio::spawn(async move {
-            dht.add_peer(bytes, addr).await;
+            dht.add_peer(bytes, dht_addr).await;
         });
     }
 
@@ -1326,7 +1348,8 @@ fn spawn_dht_routing_feed(dht: Arc<crate::dht::DhtHandle>, handle: dig_gossip::G
                     dig_gossip::PoolEvent::PeerAdded { peer_id, addr } => {
                         let mut bytes = [0u8; 32];
                         bytes.copy_from_slice(peer_id.as_ref());
-                        dht.add_peer(bytes, *addr).await;
+                        // Map the peer's gossip addr to its DHT addr before seeding routing (GAP 2).
+                        dht.add_peer(bytes, dht_addr_from_gossip_addr(*addr)).await;
                     }
                     dig_gossip::PoolEvent::PeerRemoved { peer_id, .. } => {
                         let mut bytes = [0u8; 32];
@@ -1960,7 +1983,8 @@ async fn bring_up_dht(
             // dig-gossip's PeerId is a chia Bytes32; take its raw 32 bytes for the dig-nat PeerId.
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(peer_id.as_ref());
-            (bytes, addr)
+            // The pool reports each peer's GOSSIP addr; the DHT must dial its DHT/peer-RPC addr (GAP 2).
+            (bytes, dht_addr_from_gossip_addr(addr))
         })
         .collect();
     let bootstrap = crate::dht::bootstrap_peers_from_pool(&pool_peers);
@@ -2181,6 +2205,27 @@ mod tests {
             gossip_port_from_env(),
             peer_port_from_env(),
             "resolved gossip + peer-RPC ports must differ"
+        );
+    }
+
+    // #1575 GAP 2 regression: the DHT routing candidate derived from a pool/PoolEvent addr must use
+    // the peer's DHT/peer-RPC port (9444), NOT the gossip port (9445) the pool reports. On the old
+    // build the gossip addr was fed straight into routing, so every DHT dial hit the gossip listener
+    // and failed with `InvalidContentType`. This would FAIL on that build (it would keep 9445).
+    #[test]
+    fn dht_candidate_from_pool_addr_uses_dht_port_not_gossip_port() {
+        let gossip: std::net::SocketAddr = "203.0.113.7:9445".parse().unwrap();
+        let dht = dht_addr_from_gossip_addr(gossip);
+        assert_eq!(dht.port(), 9444, "DHT candidate must use the 9444 DHT port, not 9445 gossip");
+        assert_eq!(dht.ip(), gossip.ip(), "only the port shifts; the IP is preserved");
+        // IPv6 (ecosystem IPv6-first) maps identically.
+        let gossip6: std::net::SocketAddr = "[2001:db8::1]:9445".parse().unwrap();
+        assert_eq!(dht_addr_from_gossip_addr(gossip6).port(), 9444);
+        // The offset is the single source of truth, so a custom gossip port maps consistently.
+        let custom: std::net::SocketAddr = "203.0.113.7:19445".parse().unwrap();
+        assert_eq!(
+            dht_addr_from_gossip_addr(custom).port(),
+            19445 - GOSSIP_TO_DHT_PORT_OFFSET
         );
     }
 
