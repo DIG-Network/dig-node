@@ -181,10 +181,7 @@ mod tests {
                 }
             }
         }
-        let locator = CapsuleFallbackLocator::new(Arc::new(BothLocator {
-            resource,
-            capsule,
-        }));
+        let locator = CapsuleFallbackLocator::new(Arc::new(BothLocator { resource, capsule }));
 
         let found = locator.find_providers(&resource).await.expect("locate ok");
         let ids: Vec<String> = found.iter().map(|p| p.provider_peer_id.clone()).collect();
