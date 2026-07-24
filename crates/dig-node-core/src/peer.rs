@@ -3188,21 +3188,34 @@ mod tests {
             .await
             .expect("client dials the accepted-circuit server");
 
-        let mut stream = conn.session.open_stream().await.expect("open stream");
-        write_framed(
-            &mut stream,
-            &json!({"jsonrpc":"2.0","id":7,"method":"dig.getNetworkInfo"}),
-        )
+        // Bound the whole client exchange in an explicit timeout so a mux/transport regression fails
+        // LOUDLY (a clear timeout panic) instead of hanging the test — and CI — forever.
+        let resp = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut stream = conn.session.open_stream().await.expect("open stream");
+            write_framed(
+                &mut stream,
+                &json!({"jsonrpc":"2.0","id":7,"method":"dig.getNetworkInfo"}),
+            )
+            .await
+            .unwrap();
+            read_framed(&mut stream).await.unwrap().expect("a frame")
+        })
         .await
-        .unwrap();
-        let resp = read_framed(&mut stream).await.unwrap().expect("a frame");
+        .expect("the accepted relayed circuit answered within 10s");
         assert_eq!(resp["id"], json!(7));
         assert_eq!(
             resp["result"]["echo_method"],
             json!("dig.getNetworkInfo"),
             "the accepted relayed circuit must serve the peer RPC like a direct inbound"
         );
-        let _ = server.await;
+
+        // Teardown: `serve_accepted_relay_conn` runs an inbound accept-loop that only returns once the
+        // client session closes. Drop the client `conn` to close the mux session (its driver ends, the
+        // server's `accept_stream` yields `None`, the serve loop returns), THEN bounded-join the
+        // server task. Awaiting `server` while `conn` was still alive was the deadlock: the loop never
+        // ended, so the test hung after the RPC had already succeeded.
+        drop(conn);
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
     }
 
     #[tokio::test]

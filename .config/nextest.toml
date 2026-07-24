@@ -1,0 +1,16 @@
+# nextest configuration — https://nexte.st/docs/configuration/
+#
+# Defense-in-depth against a single test hanging CI forever (issue dig_ecosystem#1532): a network /
+# async test that deadlocks used to sit in `SLOW` indefinitely and pin the whole `Test + coverage`
+# job until the job-level timeout. `terminate-after` hard-kills any test still running after N slow
+# periods, so a future hang FAILS the run in minutes with a clear "terminated after timeout" instead
+# of stalling for hours. Individual tests that legitimately need longer must be given an explicit
+# per-test override here rather than removing this backstop.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# CI runs `cargo llvm-cov nextest` with `--retries 2`; the same backstop must apply there so a hang
+# on CI is terminated identically to a local run.
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 3 }
+retries = 2
