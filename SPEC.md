@@ -2918,6 +2918,16 @@ not hold the content, and the whole-resource merkle check binds every served byt
 root, so a connected NON-holder is a safe, pool-bounded probe. This source is DOWNLOAD-only — it never
 feeds the redirect/availability hint above.
 
+The download locator (dig-dht ∪ connected pool) is itself SELF-EXCLUDED: THIS node's own `peer_id`
+(hex) is dropped from the fetch-candidate set before any dial, exactly as the DISCOVERY leg is (#1584).
+A relay-introduced self-connection can surface this node in its own gossip pool (`peer_id == local`);
+offered as a fetch candidate it would self-dial (Direct → own IP → connection refused; Relayed →
+refused self-dial), starving the download's confirm round and dead-ending the read at HTTP 404 despite a
+reachable holder being connected. Two defenses hold this: a self `PeerAdded` is dropped at the pool feed
+(`on_pool_event`) so self never enters the connected pool OR the selector registry, and the whole
+download locator is wrapped so NO source — DHT or pool — can ever offer self on the fetch/dial path
+(#836/#92, run e2e-836-arb-20260725-084501).
+
 **Announce vs. locate granularity (resource→capsule fallback).** Inventory is announced at STORE and
 CAPSULE (`store_id:root`) granularity ONLY; per-RESOURCE provider records are deliberately NOT announced
 (a capsule holder serves every resource inside it, so per-resource records would be redundant and would

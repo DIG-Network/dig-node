@@ -4,6 +4,30 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## Self-exclusion is per-PATH: the DISCOVERY leg and the FETCH-DIAL candidate set are SEPARATE (#1584 vs #836/#92)
+
+"The reader must never fetch from itself" has to be enforced on EVERY path that produces a dial candidate,
+not once. #1584 self-excluded the gossip pool AND the raw DISCOVERY locator (`SelfExcludingLocator` around
+the dig-dht union, plus `NodeContent::find_providers`), but the DOWNLOAD locator is a DIFFERENT set: it
+UNIONs that discovery locator with a `PoolProviderLocator` over the connected pool — and that pool branch
+was NOT self-excluded. A relay-introduced self-connection (the relay introduces the reader to itself)
+surfaces this node in its own gossip pool (`peer_id == local`), the pool feed mirrors it into the
+connected-pool map, and the un-excluded `PoolProviderLocator` then offers SELF as a fetch candidate.
+
+Symptom (run e2e-836-arb-20260725-084501): the fetch dials the reader's OWN reflexive addr at an ephemeral
+port (`Direct → own IP → Connection refused`) and the relayed fallback logs `refusing relayed self-dial
+(target == local peer_id)`; the confirm round is starved, so dig-download reports `no providers located`
+for the resource and the read 404s — EVEN THOUGH the real holder is connected at `:9444` and the pool
+locator correctly offered it. Both the self-dial AND the "no providers located" share ONE root: the
+self entry poisons the confirm so it never completes against the holder.
+
+Fix = two defenses: (1) drop a self `PeerAdded` at the pool feed (`on_pool_event`) so self never enters the
+connected pool OR the selector registry; (2) wrap the WHOLE download locator in `SelfExcludingLocator` so
+no source — DHT or pool — can offer self on the fetch/dial path. Gotcha for future work: any NEW locator
+unioned into the fetch/download path is a new instance of this class — self-exclude it at the point it is
+composed, and TEST it with a target-RECORDING transport (a mock that serves bytes regardless of dial target
+cannot tell a holder-dial from a self-dial and will falsely pass).
+
 ## Gossip-vs-peer-RPC port confusion is a recurring bug CLASS across pool-consuming feeds (#1575, #1590/#836)
 
 The dig-gossip connected pool reports each peer's GOSSIP endpoint (`:9445`, `DEFAULT_GOSSIP_PORT`), but
