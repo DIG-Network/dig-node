@@ -238,6 +238,14 @@ mod tests {
             hosts.contains(&("10.9.9.9", 1)),
             "the earlier source's hint is kept too (both are dial candidates)"
         );
+        // ORDER is load-bearing: the FIRST-seen source's addresses lead the merged list, so they win
+        // `best_address()` (the first dialable candidate) on the real single-address dial path. The
+        // download union relies on this by querying the connection-verified POOL source first (#836).
+        assert_eq!(
+            hosts.first().copied(),
+            Some(("10.9.9.9", 1)),
+            "the first-seen source's address leads the merged list (best_address ordering, #836)"
+        );
     }
 
     /// #1490: a provider record advertising many (untrusted) addresses — even duplicates — is capped

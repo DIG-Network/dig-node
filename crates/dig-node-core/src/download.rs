@@ -529,14 +529,27 @@ impl NodeContent {
             selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
             ..DownloadConfig::default()
         };
-        // The DOWNLOAD locator (#1590) = the raw discovery `locator` UNIONed with a
-        // [`PoolProviderLocator`] over the live connected-pool set. So a fetch's locate step also
-        // offers the peers the node is ALREADY CONNECTED to — reaching a holder whose DHT provider
-        // record is unreachable on a relayed net (the #836 read-leg blocker). dig-download's confirm
-        // step filters connected peers that do not hold the content, and the whole-resource merkle
-        // check binds every byte to the chain-anchored root, so a connected non-holder is a safe,
-        // bounded probe. The redirect-on-miss path keeps the RAW `locator` (below) — a redirect must
-        // name announced holders, never every connected peer.
+        // The DOWNLOAD locator (#1590) = a [`PoolProviderLocator`] over the live connected-pool set
+        // UNIONed with the raw discovery `locator`. So a fetch's locate step also offers the peers the
+        // node is ALREADY CONNECTED to — reaching a holder whose DHT provider record is unreachable on
+        // a relayed net (the #836 read-leg blocker). dig-download's confirm step filters connected peers
+        // that do not hold the content, and the whole-resource merkle check binds every byte to the
+        // chain-anchored root, so a connected non-holder is a safe, bounded probe. The redirect-on-miss
+        // path keeps the RAW `locator` (below) — a redirect must name announced holders, never every
+        // connected peer.
+        //
+        // #836 dial-order (arbiter e2e c0954369): the pool source MUST be FIRST in the union. The real
+        // content transport dials a SINGLE address — `provider.best_address()` = the FIRST *dialable*
+        // candidate in list order (dig-dht `record.rs`, `is_dialable` = Direct/Mapped/Reflexive) — NOT
+        // "any reachable address". The union merges same-peer_id address hints onto the FIRST-seen
+        // record (extend, order-preserving; the cap does NOT sort). So whichever source is queried first
+        // leads the address list and thus WINS `best_address()`. A pool entry is a LIVE,
+        // connection-verified address; a DHT hint is an untrusted, possibly-stale advertisement. Putting
+        // the pool FIRST makes the connection-verified address lead → `best_address()` selects the
+        // reachable :9444, so confirm/fetchRange dial the address that actually connects. (Pool-second —
+        // the prior order — left the stale DHT address leading, so every dial hit the unreachable hint
+        // and the read 404'd despite a connected, dialable holder.) This orders ONLY the download union;
+        // the DISCOVERY leg (`self.locator`, used by find_providers/redirect) is untouched.
         let connected_pool: ConnectedPool = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // #836/#92: the fetch-dial candidate set MUST exclude self, exactly like the DISCOVERY leg
         // (#1584). #1584 self-excluded only the raw discovery `locator`; the DOWNLOAD locator adds the
@@ -548,8 +561,10 @@ impl NodeContent {
         // source — DHT or pool — can ever offer self on the fetch/dial path.
         let download_locator: Arc<dyn ProviderLocator> = SelfExcludingLocator::new(
             UnionLocator::new(vec![
-                locator.clone(),
+                // Pool FIRST: a live connection-verified address must lead so `best_address()` (the
+                // first dialable candidate) selects the reachable :9444, not a stale DHT hint (#836).
                 PoolProviderLocator::new(connected_pool.clone()),
+                locator.clone(),
             ]),
             self_peer_id.clone(),
         );
@@ -1537,9 +1552,12 @@ mod tests {
         );
     }
 
-    /// A [`RangeTransport`] that models a REAL dial: it only answers for a provider record whose
-    /// advertised addresses INCLUDE a known-reachable address; a record carrying only unreachable
-    /// addresses fails (availability errors, fetch errors) exactly as a refused/black-holed dial does.
+    /// A [`RangeTransport`] that models a REAL dial FAITHFULLY: the real content transport dials a
+    /// SINGLE address — `provider.best_address()`, the FIRST *dialable* candidate in list order
+    /// (dig-dht `record.rs`; `NatRangeTransport::provider_to_target`) — so it connects IFF that ONE
+    /// address is the reachable one, NOT if ANY advertised address happens to be reachable. (A `.any()`
+    /// model is the false-green trap: it "passes" whenever the reachable address is present ANYWHERE in
+    /// the list, even when `best_address()` — the address actually dialed — is the unreachable one.)
     /// Records the peer_id of every `fetch_range` it actually served so a test can assert the fetch
     /// reached the holder over its reachable address.
     struct AddressAwareTransport {
@@ -1557,15 +1575,20 @@ mod tests {
             }
         }
 
-        /// Whether `provider`'s advertised addresses include the reachable one (IPv4-mapped IPv6
-        /// forms normalised) — i.e. whether a dial to this record would connect.
+        /// Whether the SINGLE address the real transport would dial — `best_address()`, the first
+        /// dialable candidate in list order (dig-dht `record.rs`) — is the reachable one (IPv4-mapped
+        /// IPv6 forms normalised). NOT `.any()`: a dial connects only to the one chosen address.
         fn is_reachable(&self, provider: &ProviderRecord) -> bool {
             let want_ip = self.reachable.ip().to_string();
             let want_port = self.reachable.port();
-            provider.addresses.iter().any(|a| {
-                let host = a.host.trim_start_matches("::ffff:");
-                host == want_ip && a.port == want_port
-            })
+            // Mirror dig-dht `ProviderRecord::best_address`: the first candidate whose kind is dialable.
+            match provider.addresses.iter().find(|a| a.kind.is_dialable()) {
+                Some(best) => {
+                    let host = best.host.trim_start_matches("::ffff:");
+                    host == want_ip && best.port == want_port
+                }
+                None => false,
+            }
         }
 
         async fn served_fetch_from(&self, peer: &str) -> bool {
@@ -1610,13 +1633,16 @@ mod tests {
     /// #1590/#836 regression (arbiter e2e c0954369, run e2e-836-arb-20260725-094734): the reader is
     /// CONNECTED to the capsule holder in the gossip pool at its REACHABLE address, but the DHT names
     /// the SAME peer_id at a DIFFERENT, UNREACHABLE address (a stale/relayed-net provider hint). The
-    /// download locator unions the DHT source with the connected-pool source; before the fix the
-    /// [`UnionLocator`] deduped by `peer_id` in DHT-first order and DISCARDED the pool source's
-    /// reachable address, so the confirm/fetch dialed ONLY the unreachable DHT address → every dial
-    /// refused → `NoProviders`/`NotFound` → the read fell through to §21 upstream → DATA 404 despite a
-    /// connected, dialable holder. The fix merges the (untrusted, capped) address hints of same-peer
-    /// records across sources, so the reachable pool address survives and a `fetchRange` reaches the
-    /// holder. This is the test that predicts the e2e DATA-green.
+    /// download locator unions the connected-pool source with the DHT source; the real transport dials
+    /// a SINGLE address — `best_address()`, the FIRST dialable candidate in the merged list. Both a
+    /// merge (so the reachable address is PRESENT) AND the right ORDER (so the reachable address LEADS)
+    /// are required: with the pool source SECOND the merge appended the reachable :9444 AFTER the stale
+    /// DHT hint, so `best_address()` still returned the unreachable address → every dial refused →
+    /// `NoProviders`/`NotFound` → the read fell through to §21 upstream → DATA 404 despite a connected,
+    /// dialable holder. The fix puts the connection-verified POOL source FIRST so its reachable address
+    /// leads the list and `best_address()` selects the :9444 that actually connects. The
+    /// [`AddressAwareTransport`] models `best_address()` (not `.any()`), so this test is RED under the
+    /// old append-order and GREEN once the pool leads — it is the test that predicts the e2e DATA-green.
     #[tokio::test]
     async fn resource_fetch_uses_the_reachable_pool_address_when_the_dht_hint_is_unreachable() {
         let td = tempfile::tempdir().unwrap();

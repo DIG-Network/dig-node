@@ -4,6 +4,34 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## The fetch transport dials ONE address — `best_address()`, the FIRST dialable — so union ORDER, not just the merge, decides reachability (#836/#1590)
+
+Merging same-peer address hints across discovery sources is necessary but NOT sufficient. The real content
+transport does not try every advertised address: `NatRangeTransport::provider_to_target` (dig-download
+`source.rs`) dials the SINGLE `provider.best_address()`, and dig-dht `record.rs` defines `best_address()` as
+"the FIRST candidate whose kind `is_dialable()`" (Direct/Mapped/Reflexive; Relay is not dialable) in LIST
+ORDER — `addresses` is not re-sorted at merge time (`UnionLocator::sanitize_address_hints` dedups+caps but
+does NOT sort). So the address that WINS the dial is whichever source's hint LEADS the merged list.
+
+The download union merges same-peer_id records onto the FIRST-SEEN record (`existing.addresses.extend(...)`),
+so the first-queried source leads. With the DHT source first and the pool second, a stale/unreachable DHT
+hint (e.g. `172.31.44.121`, or a relayed-net address the reader cannot dial) leads the list and becomes
+`best_address()`, so every confirm/fetchRange dial hits the unreachable address and the read 404s — even
+though the reachable pool address (`:9444`) is present in the record, just later. Fix: put the
+`PoolProviderLocator` FIRST in the DOWNLOAD union (`NodeContent::new`) — a pool entry is a LIVE,
+connection-verified address, strictly better than an untrusted advertised DHT hint — so it leads the list
+and `best_address()` selects the address that actually connects. This orders ONLY the download union; the
+DISCOVERY leg (`self.locator`, find_providers/redirect) is untouched, and the #1584 self-exclusion,
+#1580 capsule-fallback, and verify-then-decrypt fail-closed all still compose.
+
+Test gotcha — model `best_address()`, NOT `.any()`: a mock transport whose `is_reachable` checks
+`addresses.iter().any(|a| a == reachable)` FALSE-GREENS this bug. `.any()` passes whenever the reachable
+address is present ANYWHERE in the list, so it "passes" even under the broken append-order where the
+unreachable hint leads. The faithful model is `addresses.iter().find(|a| a.kind.is_dialable())` (the exact
+`best_address()` rule) — that test is RED under the old order (best_address = unreachable) and only GREEN
+once the reachable address leads. Any test that predicts this read-leg e2e MUST model the single-address
+`best_address()` dial, or it silently green-lights a still-broken dial path.
+
 ## Self-exclusion is per-PATH: the DISCOVERY leg and the FETCH-DIAL candidate set are SEPARATE (#1584 vs #836/#92)
 
 "The reader must never fetch from itself" has to be enforced on EVERY path that produces a dial candidate,
