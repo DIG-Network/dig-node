@@ -1275,13 +1275,19 @@ fn spawn_selector_registry_feed(
     content: Arc<crate::download::NodeContent>,
     handle: dig_gossip::GossipHandle,
 ) {
-    // Seed from the current snapshot so the registry is populated before the first fetch.
+    // Seed from the current snapshot so the registry is populated before the first fetch. The pool
+    // reports each peer's GOSSIP addr (:9445); the download-side `PoolProviderLocator` must offer the
+    // peer-RPC addr (:9444) — dialing the gossip port for a peer-RPC fetchRange gets the gossip
+    // protocol on the wire (`InvalidContentType`) and the Tier-2 fetch silently dies. Map it down
+    // BEFORE it enters the connected pool, exactly as the DHT routing feed does (#1575 GAP 2, #1590).
     for (peer_id, addr, _outbound) in handle.connected_pool_peers() {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(peer_id.as_ref());
         let event = crate::download::pool_event_to_selector(
             bytes,
-            crate::download::PoolEventKind::Added { addr },
+            crate::download::PoolEventKind::Added {
+                addr: dht_addr_from_gossip_addr(addr),
+            },
         );
         content.on_pool_event(&event);
     }
@@ -1372,14 +1378,19 @@ fn spawn_dht_routing_feed(dht: Arc<crate::dht::DhtHandle>, handle: dig_gossip::G
 /// event into the raw 32-byte peer id + a transport-free `PoolEventKind`, then defers the actual
 /// construction to `crate::download::pool_event_to_selector` (which owns the identity byte-copy + the
 /// removal-reason map, unit-tested there without dig-gossip in scope).
-fn map_gossip_pool_event(ev: &dig_gossip::PoolEvent) -> dig_peer_selector::PoolEvent {
+pub(crate) fn map_gossip_pool_event(ev: &dig_gossip::PoolEvent) -> dig_peer_selector::PoolEvent {
     match ev {
         dig_gossip::PoolEvent::PeerAdded { peer_id, addr } => {
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(peer_id.as_ref());
+            // The pool reports the peer's GOSSIP addr (:9445); the connected pool must hold its
+            // peer-RPC addr (:9444) so the download transport dials the fetchRange listener, not the
+            // gossip listener (#1575 GAP 2, recurring in the selector-registry/pool feed for #1590).
             crate::download::pool_event_to_selector(
                 bytes,
-                crate::download::PoolEventKind::Added { addr: *addr },
+                crate::download::PoolEventKind::Added {
+                    addr: dht_addr_from_gossip_addr(*addr),
+                },
             )
         }
         dig_gossip::PoolEvent::PeerRemoved { peer_id, reason } => {
@@ -2234,6 +2245,62 @@ mod tests {
         assert_eq!(
             dht_addr_from_gossip_addr(custom).port(),
             19445 - GOSSIP_TO_DHT_PORT_OFFSET
+        );
+    }
+
+    // #1590 / #836 read-leg DATA gate: the selector-registry/pool feed seeds the download-side
+    // connected pool from gossip `PoolEvent`s, which carry the peer's GOSSIP addr (:9445). If that raw
+    // addr enters the pool, the `PoolProviderLocator` offers a :9445 candidate and the Tier-2
+    // fetchRange dials the gossip listener → `InvalidContentType` → the read 404s despite a connected
+    // holder (the SAME class of bug #1575 fixed for the DHT routing feed). This drives the REAL live
+    // feed translation (`map_gossip_pool_event` → `on_pool_event`) and asserts the resulting locator
+    // candidate carries the peer-RPC port (:9444). It FAILS on the pre-fix build (candidate = :9445).
+    #[tokio::test]
+    async fn selector_pool_feed_candidate_uses_peer_rpc_port_not_gossip_port() {
+        use dig_download::testkit::{MockContent, MockProviderLocator, MockRangeTransport};
+        use dig_download::ProviderLocator;
+
+        let td = tempfile::tempdir().unwrap();
+        // A NodeContent with a real connected pool + PoolProviderLocator wiring (DHT locator empty:
+        // the connected pool is the only source, exactly the relayed/isolated-net DATA condition).
+        let pc = crate::download::NodeContent::new(
+            std::sync::Arc::new(MockProviderLocator::fixed(vec![])),
+            std::sync::Arc::new(MockRangeTransport::new(MockContent::even(10, 1))),
+            crate::download::MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+
+        // A gossip `PoolEvent` reports the peer's GOSSIP endpoint (:9445) — drive it through the REAL
+        // live-feed translation the selector-registry feed uses, NOT a hand-built :9444 pool entry (the
+        // #1590 test's miss). `map_gossip_pool_event` is the feed's per-event boundary translation.
+        let peer_id = dig_gossip::PeerId::from([7u8; 32]);
+        let gossip_addr: std::net::SocketAddr = "203.0.113.9:9445".parse().unwrap();
+        let selector_event = map_gossip_pool_event(&dig_gossip::PoolEvent::PeerAdded {
+            peer_id,
+            addr: gossip_addr,
+        });
+        pc.on_pool_event(&selector_event);
+
+        // The download-side locator candidate for a resource MUST carry the peer-RPC port (:9444).
+        let locator = crate::seams::dig_peer::PoolProviderLocator::new(pc.connected_pool());
+        let content = dig_dht::ContentId::resource([9u8; 32], [8u8; 32], [7u8; 32]);
+        let found = locator.find_providers(&content).await.expect("locate ok");
+
+        assert_eq!(
+            found.len(),
+            1,
+            "the fed pool peer is offered as a candidate"
+        );
+        let candidate = &found[0].addresses[0];
+        assert_eq!(
+            candidate.port, DEFAULT_P2P_PORT,
+            "the pool candidate must dial the peer-RPC port (:9444), not the gossip port (:9445)"
+        );
+        assert_eq!(
+            candidate.host,
+            gossip_addr.ip().to_string(),
+            "only the port is translated; the host is preserved"
         );
     }
 

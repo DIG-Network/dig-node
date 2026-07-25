@@ -513,6 +513,16 @@ per-resource proof (None/None) and self-verifies on install.
 the dig-node pulls content from another node it verifies its merkle proof AND its on-chain anchor** — a
 malicious or hostile peer mix can never forge content.
 
+> **NOTE (endpoint port, #1590/#836).** Tier-2 peer fetch dials the holder's **peer-RPC** endpoint
+> (`DIG_PEER_PORT`, default **9444**) — the listener that serves `dig.fetchRange`. The dig-gossip
+> connected pool reports each peer's **gossip** endpoint (default **9445**), so a candidate sourced
+> from the pool MUST be **port-translated** from the gossip endpoint down to the peer-RPC endpoint (the
+> two listeners co-locate at a fixed offset; see `dht_addr_from_gossip_addr`) before it is offered as a
+> fetch candidate. Dialing the gossip port for a `dig.fetchRange` stream gets the gossip protocol on
+> the wire (`InvalidContentType`) and the fetch fails — the same translation the DHT routing feed
+> applies (§7.6). This holds for BOTH the DHT routing feed and the selector-registry connected-pool
+> feed.
+
 ### 5.4 Redirect-on-miss vs fetch-through
 
 When the node receives a read for content it does not hold, it consults the DHT and, if a holder

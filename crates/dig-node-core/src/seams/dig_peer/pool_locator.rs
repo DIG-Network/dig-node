@@ -70,10 +70,19 @@ impl ProviderLocator for PoolProviderLocator {
                 // A pool peer always has a transport-verified 64-hex identity; skip a malformed one
                 // defensively rather than surface an error (best-effort — never break locate).
                 let peer = PeerId::from_hex(peer_hex)?;
-                let candidates = addrs
+                let candidates: Vec<CandidateAddr> = addrs
                     .iter()
                     .map(|a| CandidateAddr::direct(a.ip().to_string(), a.port()))
                     .collect();
+                // Tier-2 observability (#836): the DATA gate silently failed for six iterations because
+                // the pool candidate carried the gossip port (:9445) not the peer-RPC port (:9444), and
+                // nothing logged the chosen dial target. Surface the exact addrs + ports offered.
+                tracing::debug!(
+                    peer = %peer_hex,
+                    content = %key.to_hex(),
+                    dial_targets = ?addrs,
+                    "pool locator: offering connected peer as a fetch candidate"
+                );
                 // `u64::MAX` expiry: a live pool entry is authoritative for as long as it is present;
                 // staleness is governed by pool churn removing it, not a wall-clock TTL.
                 Some(ProviderRecord::new(&key, &peer, candidates, u64::MAX))

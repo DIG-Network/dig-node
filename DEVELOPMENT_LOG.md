@@ -4,6 +4,26 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## Gossip-vs-peer-RPC port confusion is a recurring bug CLASS across pool-consuming feeds (#1575, #1590/#836)
+
+The dig-gossip connected pool reports each peer's GOSSIP endpoint (`:9445`, `DEFAULT_GOSSIP_PORT`), but
+every service dialed for content/routing lives on the peer-RPC endpoint (`:9444`, `DIG_PEER_PORT`) — the
+two listeners co-locate at a fixed offset of 1 (`GOSSIP_TO_DHT_PORT_OFFSET`). Any code that takes a pool /
+`PoolEvent` address and DIALS it MUST translate `9445 → 9444` via `dht_addr_from_gossip_addr` first; a raw
+gossip addr dials the GOSSIP listener for a peer-RPC/`dig.fetchRange` stream and dies with
+`received corrupt message InvalidContentType` — a SILENT failure (best-effort feeds swallow it), so the
+symptom is a downstream 404, not an error at the dial site.
+
+This bit TWICE: #1575 fixed it for the DHT routing feed (`spawn_dht_routing_feed`); #1590/#836 was the
+SAME bug recurring in the selector-registry / connected-pool feed (`spawn_selector_registry_feed` →
+`PoolProviderLocator`), which fed raw `:9445` addrs into the download-side connected pool, so Tier-2
+`fetchRange` dialed `:9445` and every read 404'd despite a connected holder. Fix pattern (both feeds):
+translate at the gossip BOUNDARY (the feed), keep `on_pool_event` / the locator addr-agnostic. Gotcha for
+future work: a NEW consumer of a gossip/pool address is a new instance of this class — port-translate on
+sight. The trap that hid it for six iterations: the fetch path (`peer_serve_plaintext`/`fetch_resource`)
+and the pool locator emitted ZERO tracing, so a live-but-misdialing path looked like "never invoked";
+they now log the located provider count + the chosen dial target INCLUDING PORT.
+
 ## Resource reads locate by resource id, but inventory is announced only at capsule granularity (#1580)
 
 Inventory is announced into the DHT at STORE + CAPSULE (`store_id:root`) granularity ONLY —

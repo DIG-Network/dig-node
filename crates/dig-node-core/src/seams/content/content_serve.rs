@@ -636,9 +636,32 @@ impl Node {
         salt: Option<&[u8; 32]>,
         verified: bool,
     ) -> Option<PlaintextOutcome> {
-        let engine = self.p2p_content()?;
+        // Tier-2 observability (#836): this path emitted zero tracing, so a live-but-failing peer
+        // fetch was indistinguishable from "engine never attached". Log each decision point.
+        let Some(engine) = self.p2p_content() else {
+            tracing::debug!(store = %store_hex, root = %root_hex, "peer serve: no P2P engine attached");
+            return None;
+        };
         let content = crate::download::miss_content_for(store_hex, root_hex, rk_hex)?;
-        let fetched = engine.fetch_resource(&content).await.ok()?;
+        tracing::info!(
+            store = %store_hex,
+            root = %root_hex,
+            rk = %rk_hex,
+            "peer serve: fetching resource from the P2P content engine"
+        );
+        let fetched = match engine.fetch_resource(&content).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::info!(store = %store_hex, root = %root_hex, error = %e, "peer serve: fetch missed");
+                return None;
+            }
+        };
+        tracing::info!(
+            store = %store_hex,
+            root = %root_hex,
+            bytes = fetched.bytes.len(),
+            "peer serve: fetched bytes; verifying + decrypting"
+        );
         let proof = decode_proof_b64(fetched.inclusion_proof.as_deref()?)?;
         let chunk_lens: Vec<u32> = fetched.chunk_lens.iter().map(|l| *l as u32).collect();
         let trusted = pinned_root.unwrap_or(proof.root);
@@ -652,6 +675,12 @@ impl Node {
             &chunk_lens,
         ) {
             Ok(bytes) => {
+                tracing::info!(
+                    store = %store_hex,
+                    root = %root_hex,
+                    bytes = bytes.len(),
+                    "peer serve: verified + decrypted — serving from a peer"
+                );
                 // Ledger (#307): record the verified peer serve + its proof.
                 self.record_verification(
                     store_hex,
@@ -674,7 +703,15 @@ impl Node {
             }
             // A verify/decrypt failure on the peer bytes is NOT fatal to the serve — fall through to
             // the public RPC (a different holder / the gateway may serve the correct bytes).
-            Err(_) => None,
+            Err(e) => {
+                tracing::info!(
+                    store = %store_hex,
+                    root = %root_hex,
+                    error = %e,
+                    "peer serve: fetched bytes failed verify/decrypt — falling through"
+                );
+                None
+            }
         }
     }
 
