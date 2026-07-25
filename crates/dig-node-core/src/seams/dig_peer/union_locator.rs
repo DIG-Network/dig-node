@@ -65,18 +65,40 @@ impl ProviderLocator for UnionLocator {
         let results =
             futures::future::join_all(self.sources.iter().map(|s| s.find_providers(content))).await;
 
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut index_of: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         let mut merged: Vec<ProviderRecord> = Vec::new();
         for result in results {
             let Ok(records) = result else {
                 continue; // best-effort: skip a failed source
             };
-            for mut record in records {
-                if seen.insert(record.provider_peer_id.clone()) {
-                    // #1490: the advertised addresses are untrusted hints — dedup + cap them so a
-                    // hostile record can never fan a single provider into a dial storm.
-                    sanitize_address_hints(&mut record);
-                    merged.push(record);
+            for record in records {
+                match index_of.get(&record.provider_peer_id).copied() {
+                    // #1590/#836: the SAME authenticated peer_id named by a later source (e.g. the
+                    // connected-pool locator) carries an ADDITIONAL reach hint for that peer — MERGE it
+                    // into the first-seen record rather than discarding the whole record. The peer_id is
+                    // the authenticated identity (SPKI-pinned at connect); its addresses are untrusted
+                    // hints, so unioning them across sources is safe. Dropping the later record instead
+                    // (the prior behaviour) let an earlier source's UNREACHABLE hint (a stale DHT provider
+                    // record) SHADOW a later source's REACHABLE one (the live pool connection) for the
+                    // same peer, so the fetch dialed only the unreachable address and the read 404'd
+                    // despite a connected, dialable holder (arbiter e2e c0954369). First-seen record
+                    // ORDER is preserved (dig-dht stays authoritative for ordering).
+                    Some(i) => {
+                        let existing: &mut ProviderRecord = &mut merged[i];
+                        existing.addresses.extend(record.addresses);
+                        // #1490: re-dedup + re-cap the combined hint set so merging can never let a
+                        // provider's advertised addresses grow past the dial-amplification bound.
+                        sanitize_address_hints(existing);
+                    }
+                    None => {
+                        let mut record = record;
+                        // #1490: the advertised addresses are untrusted hints — dedup + cap them so a
+                        // hostile record can never fan a single provider into a dial storm.
+                        sanitize_address_hints(&mut record);
+                        index_of.insert(record.provider_peer_id.clone(), merged.len());
+                        merged.push(record);
+                    }
                 }
             }
         }
@@ -173,6 +195,49 @@ mod tests {
             .await
             .expect("union ok")
             .is_empty());
+    }
+
+    /// #1590/#836: when two sources name the SAME peer_id with DIFFERENT addresses, the union MERGES
+    /// their address hints into one record (deduped by peer_id) rather than dropping the later record —
+    /// so a reachable hint from a later source (the connected pool) is never shadowed by an earlier
+    /// source's unreachable hint (a stale DHT provider record) for the same authenticated peer.
+    #[tokio::test]
+    async fn same_peer_across_sources_merges_address_hints() {
+        use dig_dht::CandidateAddr;
+        let cid = mock_content_id();
+        // Source A (DHT) names peer 1 at an unreachable address; source B (pool) names the SAME peer 1
+        // at a reachable address.
+        let dht_hint = ProviderRecord {
+            content_key: cid.to_key().to_hex(),
+            provider_peer_id: mock_peer_hex(1),
+            addresses: vec![CandidateAddr::direct("10.9.9.9", 1)],
+            expires_at: u64::MAX,
+        };
+        let pool_hint = ProviderRecord {
+            content_key: cid.to_key().to_hex(),
+            provider_peer_id: mock_peer_hex(1),
+            addresses: vec![CandidateAddr::direct("10.0.0.1", 9444)],
+            expires_at: u64::MAX,
+        };
+        let dht = Arc::new(MockProviderLocator::fixed(vec![dht_hint]));
+        let pool = Arc::new(MockProviderLocator::fixed(vec![pool_hint]));
+        let union = UnionLocator::new(vec![dht, pool]);
+
+        let got = union.find_providers(&cid).await.expect("union ok");
+        assert_eq!(got.len(), 1, "the same peer is one record, not two");
+        let hosts: Vec<(&str, u16)> = got[0]
+            .addresses
+            .iter()
+            .map(|a| (a.host.as_str(), a.port))
+            .collect();
+        assert!(
+            hosts.contains(&("10.0.0.1", 9444)),
+            "the later source's reachable hint survives the merge (got {hosts:?})"
+        );
+        assert!(
+            hosts.contains(&("10.9.9.9", 1)),
+            "the earlier source's hint is kept too (both are dial candidates)"
+        );
     }
 
     /// #1490: a provider record advertising many (untrusted) addresses — even duplicates — is capped

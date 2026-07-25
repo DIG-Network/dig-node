@@ -1537,6 +1537,130 @@ mod tests {
         );
     }
 
+    /// A [`RangeTransport`] that models a REAL dial: it only answers for a provider record whose
+    /// advertised addresses INCLUDE a known-reachable address; a record carrying only unreachable
+    /// addresses fails (availability errors, fetch errors) exactly as a refused/black-holed dial does.
+    /// Records the peer_id of every `fetch_range` it actually served so a test can assert the fetch
+    /// reached the holder over its reachable address.
+    struct AddressAwareTransport {
+        inner: MockRangeTransport,
+        reachable: std::net::SocketAddr,
+        served_fetch: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl AddressAwareTransport {
+        fn new(content: MockContent, reachable: std::net::SocketAddr) -> Self {
+            AddressAwareTransport {
+                inner: MockRangeTransport::new(content),
+                reachable,
+                served_fetch: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Whether `provider`'s advertised addresses include the reachable one (IPv4-mapped IPv6
+        /// forms normalised) — i.e. whether a dial to this record would connect.
+        fn is_reachable(&self, provider: &ProviderRecord) -> bool {
+            let want_ip = self.reachable.ip().to_string();
+            let want_port = self.reachable.port();
+            provider.addresses.iter().any(|a| {
+                let host = a.host.trim_start_matches("::ffff:");
+                host == want_ip && a.port == want_port
+            })
+        }
+
+        async fn served_fetch_from(&self, peer: &str) -> bool {
+            self.served_fetch.lock().await.iter().any(|p| p == peer)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RangeTransport for AddressAwareTransport {
+        async fn query_availability(
+            &self,
+            provider: &ProviderRecord,
+            items: Vec<dig_nat::AvailabilityItem>,
+        ) -> Result<dig_nat::AvailabilityResponse, DownloadError> {
+            if !self.is_reachable(provider) {
+                return Err(DownloadError::transport(
+                    &provider.provider_peer_id,
+                    "mock: unreachable address (dial refused)",
+                ));
+            }
+            self.inner.query_availability(provider, items).await
+        }
+        async fn fetch_range(
+            &self,
+            provider: &ProviderRecord,
+            req: &dig_nat::RangeRequest,
+        ) -> Result<dig_download::FetchedRange, DownloadError> {
+            if !self.is_reachable(provider) {
+                return Err(DownloadError::transport(
+                    &provider.provider_peer_id,
+                    "mock: unreachable address (dial refused)",
+                ));
+            }
+            self.served_fetch
+                .lock()
+                .await
+                .push(provider.provider_peer_id.clone());
+            self.inner.fetch_range(provider, req).await
+        }
+    }
+
+    /// #1590/#836 regression (arbiter e2e c0954369, run e2e-836-arb-20260725-094734): the reader is
+    /// CONNECTED to the capsule holder in the gossip pool at its REACHABLE address, but the DHT names
+    /// the SAME peer_id at a DIFFERENT, UNREACHABLE address (a stale/relayed-net provider hint). The
+    /// download locator unions the DHT source with the connected-pool source; before the fix the
+    /// [`UnionLocator`] deduped by `peer_id` in DHT-first order and DISCARDED the pool source's
+    /// reachable address, so the confirm/fetch dialed ONLY the unreachable DHT address → every dial
+    /// refused → `NoProviders`/`NotFound` → the read fell through to §21 upstream → DATA 404 despite a
+    /// connected, dialable holder. The fix merges the (untrusted, capped) address hints of same-peer
+    /// records across sources, so the reachable pool address survives and a `fetchRange` reaches the
+    /// holder. This is the test that predicts the e2e DATA-green.
+    #[tokio::test]
+    async fn resource_fetch_uses_the_reachable_pool_address_when_the_dht_hint_is_unreachable() {
+        let td = tempfile::tempdir().unwrap();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        let reachable: std::net::SocketAddr = "10.0.0.1:9444".parse().unwrap();
+        let transport = Arc::new(AddressAwareTransport::new(content.clone(), reachable));
+
+        // DISCOVER: the DHT names the holder (peer 1) at an UNREACHABLE address (the exact e2e
+        // condition — the advertised provider record carries an address the reader cannot dial).
+        let holder = dig_dht::PeerId::from_bytes([1u8; 32]);
+        let dht_record = ProviderRecord::new(
+            &cid.to_key(),
+            &holder,
+            vec![dig_dht::CandidateAddr::direct("10.9.9.9", 1)],
+            u64::MAX,
+        );
+        let locator = Arc::new(MockProviderLocator::fixed(vec![dht_record]));
+        let pc = NodeContent::new(
+            locator,
+            transport.clone(),
+            MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+
+        // CONNECT ✅: the reader IS connected to the SAME peer at the REACHABLE address in the pool.
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addr: reachable,
+        });
+
+        // DATA: the fetch must reach the holder over its reachable pool address (was Err → 404 before).
+        let f = pc
+            .fetch_resource(&cid)
+            .await
+            .expect("fetch reaches the holder at its reachable pool address");
+        assert_eq!(f.bytes, content.bytes, "served bytes match the source");
+        assert!(
+            transport.served_fetch_from(&mock_peer_hex(1)).await,
+            "a fetchRange must reach the holder over its reachable pool address"
+        );
+    }
+
     /// #836/#92: a self `PeerAdded` (relay-introduced self-connection) is dropped at the pool feed —
     /// it never enters the download-side connected pool, so it can never be offered as a fetch
     /// candidate. A genuine peer add is still recorded.

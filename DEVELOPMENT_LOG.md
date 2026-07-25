@@ -28,6 +28,35 @@ unioned into the fetch/download path is a new instance of this class — self-ex
 composed, and TEST it with a target-RECORDING transport (a mock that serves bytes regardless of dial target
 cannot tell a holder-dial from a self-dial and will falsely pass).
 
+## UnionLocator dedup-by-peer_id was DROPPING a reachable address, not just a duplicate record (#1590/#836)
+
+The download locator unions two provider sources that can name the SAME authenticated peer_id with
+DIFFERENT addresses: the raw DHT discovery locator (a peer's *advertised* provider record — an untrusted,
+often stale/relayed-net reach hint) and the `PoolProviderLocator` (the peer's *live connection* address,
+connection-verified and reachable). `UnionLocator` deduped by `peer_id` keeping the FIRST-SEEN record whole
+and DISCARDING every later same-peer record — so the DHT's UNREACHABLE hint (seen first) SHADOWED the pool's
+REACHABLE address for the same holder. The confirm/fetch then dialed only the unreachable address, every
+dial refused, dig-download reported `no providers located for ContentId::Resource {…}`, and the read fell
+through to §21 upstream → DATA 404 — even though the reader was CONNECTED to a dialable holder.
+
+Symptom (arbiter e2e c0954369, run e2e-836-arb-20260725-094734): `fetch_resource: located providers before
+download … located=1 connected_pool=1` and the pool locator logs it is offering the holder at `:9444`, yet
+the fetch still fails with `no providers located for the resource` and dials a DIFFERENT, refused address
+(`172.31.44.121:<ephemeral>`) — the DHT hint — instead of the pool's `172.31.29.67:9444`. The tell is that
+locate found "1" but the fetch dialed an address the pool never offered.
+
+Fix = `UnionLocator` now MERGES the (untrusted, `MAX_ADDRS_PER_PROVIDER`-capped) address hints of same-peer
+records across sources instead of dropping the later record. peer_id stays the authenticated identity
+(SPKI-pinned at connect); addresses are only reach hints, so unioning them is safe, and the reachable pool
+address survives so a `fetchRange` reaches the holder. First-seen record ORDER is preserved (dig-dht stays
+authoritative for ordering; this is a no-op on the DISCOVERY union `[dht, empty, empty]`, so redirect hints
+stay capsule/announced-holder granularity — unpolluted).
+
+Gotcha for future work: a peer_id-keyed dedup across sources that each contribute their own ADDRESS hints
+must MERGE addresses, never keep-first-drop-rest — otherwise the "best" (reachable/verified) address can be
+lost purely because a worse source named the peer first. Test it with an ADDRESS-aware transport (fail the
+dial unless the record carries the reachable address); a peer_id-only mock cannot catch this.
+
 ## Gossip-vs-peer-RPC port confusion is a recurring bug CLASS across pool-consuming feeds (#1575, #1590/#836)
 
 The dig-gossip connected pool reports each peer's GOSSIP endpoint (`:9445`, `DEFAULT_GOSSIP_PORT`), but
