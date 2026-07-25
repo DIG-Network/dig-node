@@ -2900,11 +2900,23 @@ that intersection logic.
 
 ### 19.3. Content location — dig-dht is the sole locator
 
-Content location ("which peers hold capsule X?") is the dig-dht provider index, and ONLY that: the live
-locator is `DhtProviderLocator → find_providers` inside the content engine (`NodeContent`), used by both
-the redirect-on-miss and the multi-source fetch paths. There is NO separate pool-availability provider
-seam. The node keeps its own held-inventory provider records current (announce / republish / refresh /
-gc) and withdraws them on shutdown.
+Content location ("which peers hold capsule X?") is the dig-dht provider index: the live locator is
+`DhtProviderLocator → find_providers` inside the content engine (`NodeContent`). The
+REDIRECT-ON-MISS / `dig.getAvailability` hint path uses this dig-dht locator EXCLUSIVELY (a redirect
+must name genuine announced holders). The node keeps its own held-inventory provider records current
+(announce / republish / refresh / gc) and withdraws them on shutdown.
+
+**Download-side connected-pool fetch source (`PoolProviderLocator`, #1590).** The multi-source FETCH
+path (`peer_serve_plaintext` → `NodeContent::fetch_resource`) uses a locator that UNIONS the dig-dht
+locator with the node's currently-CONNECTED gossip-pool peers. This closes the #836 read-leg gap: on a
+relayed / isolated network a holder is discovered in the DHT but its advertised provider record carries
+addresses the reader cannot dial, so a DHT-only locate yields no REACHABLE source and the read
+dead-ends at the §21 upstream backfill (404) even though the reader is ALREADY CONNECTED to that holder.
+Offering every connected pool peer as a fetch candidate lets the download reach the holder over the
+established connection; dig-download's `dig.getAvailability` confirm step filters connected peers that do
+not hold the content, and the whole-resource merkle check binds every served byte to the chain-anchored
+root, so a connected NON-holder is a safe, pool-bounded probe. This source is DOWNLOAD-only — it never
+feeds the redirect/availability hint above.
 
 **Announce vs. locate granularity (resource→capsule fallback).** Inventory is announced at STORE and
 CAPSULE (`store_id:root`) granularity ONLY; per-RESOURCE provider records are deliberately NOT announced

@@ -55,7 +55,8 @@ use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
 use crate::seams::dig_peer::{
-    CapsuleFallbackLocator, EmptyLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
+    CapsuleFallbackLocator, ConnectedPool, EmptyLocator, PoolProviderLocator, SelectorAdapter,
+    SelfExcludingLocator, UnionLocator,
 };
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
@@ -429,6 +430,12 @@ pub struct NodeContent {
     /// Serializes fetch-through downloads (one at a time keeps the staging/state simple; the
     /// download itself is internally multi-source concurrent).
     fetch_lock: tokio::sync::Mutex<()>,
+    /// The live set of currently-connected pool peers (64-hex `peer_id` → observed addresses), fed
+    /// from gossip pool churn ([`Self::on_pool_event`]). A [`PoolProviderLocator`] over this map is
+    /// unioned into the DOWNLOAD locator (#1590) so a fetch also tries the peers the node is already
+    /// connected to — reaching a holder whose DHT record is unreachable on a relayed net. NOT part of
+    /// the raw discovery `locator` (a redirect must name announced holders, not every connected peer).
+    connected_pool: ConnectedPool,
 }
 
 /// A [`StateStore`] wrapper over a [`FileStateStore`] that SNAPSHOTS every saved [`DownloadState`]
@@ -522,8 +529,21 @@ impl NodeContent {
             selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
             ..DownloadConfig::default()
         };
-        let downloader = Downloader::new(
+        // The DOWNLOAD locator (#1590) = the raw discovery `locator` UNIONed with a
+        // [`PoolProviderLocator`] over the live connected-pool set. So a fetch's locate step also
+        // offers the peers the node is ALREADY CONNECTED to — reaching a holder whose DHT provider
+        // record is unreachable on a relayed net (the #836 read-leg blocker). dig-download's confirm
+        // step filters connected peers that do not hold the content, and the whole-resource merkle
+        // check binds every byte to the chain-anchored root, so a connected non-holder is a safe,
+        // bounded probe. The redirect-on-miss path keeps the RAW `locator` (below) — a redirect must
+        // name announced holders, never every connected peer.
+        let connected_pool: ConnectedPool = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let download_locator: Arc<dyn ProviderLocator> = UnionLocator::new(vec![
             locator.clone(),
+            PoolProviderLocator::new(connected_pool.clone()),
+        ]);
+        let downloader = Downloader::new(
+            download_locator,
             transport,
             verifier,
             state_store.clone(),
@@ -539,6 +559,7 @@ impl NodeContent {
             self_peer_id,
             fetched: tokio::sync::Mutex::new(HashMap::new()),
             fetch_lock: tokio::sync::Mutex::new(()),
+            connected_pool,
         })
     }
 
@@ -621,6 +642,24 @@ impl NodeContent {
     /// marks disconnected (retaining history) or, for `Banned`, ineligible until re-added.
     pub fn on_pool_event(&self, event: &PoolEvent) {
         self.selector.on_pool_event(event);
+        // Mirror the churn into the connected-pool set the download-side PoolProviderLocator reads
+        // (#1590): a joined peer becomes a fetch candidate (over the connection we already hold); a
+        // departed/banned peer is dropped so a stale entry never keeps offering an unreachable peer.
+        let mut pool = self
+            .connected_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match event {
+            PoolEvent::PeerAdded { peer_id, addr } => {
+                let addrs = pool.entry(peer_id.to_hex()).or_default();
+                if !addrs.contains(addr) {
+                    addrs.push(*addr);
+                }
+            }
+            PoolEvent::PeerRemoved { peer_id, .. } => {
+                pool.remove(&peer_id.to_hex());
+            }
+        }
     }
 
     /// Feed a `dig-nat` connection class for a peer into the selector (SPEC §5.4, §7.3), seeding its
@@ -1290,6 +1329,51 @@ mod tests {
         assert_eq!(
             attempts_before, attempts_after,
             "no re-download on a cache hit"
+        );
+    }
+
+    /// #1590 regression (the #836 read-leg blocker, run e2e-1062-20260725-043357): a capsule holder
+    /// the reader is ALREADY CONNECTED to in the gossip pool — but whose DHT provider record the
+    /// reader cannot dial (a direct address unreachable on a relayed/isolated net) — must still be a
+    /// FETCH source. Before the fix the download's locate saw only the (empty/unreachable) DHT set and
+    /// gave up, so Tier-2 peer fetch failed and the read fell through to the §21 upstream backfill →
+    /// 404 despite a discoverable + connected holder. The connected pool peer is now offered to the
+    /// downloader, so the fetch reaches it.
+    #[tokio::test]
+    async fn fetch_resource_uses_a_connected_pool_holder_when_dht_has_none() {
+        let td = tempfile::tempdir().unwrap();
+        let content = anchored_mock_content(30, 3);
+        // The content-id root MUST equal the transport-reported root (dig-download #179 cross-check).
+        let cid = anchored_cid_for(&content);
+        let transport = Arc::new(MockRangeTransport::new(content.clone()));
+        // DISCOVER via the DHT finds NOBODY reachable (the relayed-net holder's advertised record is
+        // absent/undialable) — the exact e2e condition.
+        let locator = Arc::new(MockProviderLocator::fixed(vec![]));
+        let pc = NodeContent::new(
+            locator,
+            transport.clone(),
+            MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+
+        // CONNECT ✅: the reader IS connected to the holder (peer 1) in the gossip pool.
+        let holder = PeerId::from_bytes([1u8; 32]);
+        let addr: std::net::SocketAddr = "10.0.0.1:9444".parse().unwrap();
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: holder,
+            addr,
+        });
+
+        // DATA: the fetch must now reach the connected holder (was Err → 404 before the fix).
+        let f = pc
+            .fetch_resource(&cid)
+            .await
+            .expect("fetch from the connected-pool holder");
+        assert_eq!(f.bytes, content.bytes, "served bytes match the source");
+        assert!(
+            transport.attempts_for(&mock_peer_hex(1)).await >= 1,
+            "the connected pool holder was actually fetched from"
         );
     }
 
