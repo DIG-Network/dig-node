@@ -2121,4 +2121,163 @@ mod tests {
         let snap = pc.selector().peer_snapshot(&peer).expect("peer retained");
         assert!(snap.banned, "banned peer is retained but ineligible");
     }
+
+    // -- #1586 read-leg: the REAL transport against a loopback mTLS holder -------------------------
+
+    /// A [`crate::peer::PeerRpcResponder`] standing in for a CONNECTED HOLDER on a real loopback mTLS
+    /// listener. It serves `content` over `dig.fetchRange` in the SAME frame shape the node serves
+    /// (`NodeContent`'s `fetch_range_frame`: first frame carries `total_length`/`chunk_lens`/`root`/
+    /// `inclusion_proof`) and RECORDS every fetchRange it receives — so a test can assert the RPC was
+    /// actually TRANSMITTED, not merely that a provider was located.
+    /// The holder frames its answer in windows of this many bytes (the node's `RANGE_WINDOW`, scaled
+    /// down) so the test exercises MULTI-FRAME reassembly, not just a one-frame answer.
+    const HOLDER_FRAME_LEN: u64 = 8;
+
+    struct RecordingHolder {
+        content: MockContent,
+        fetch_ranges: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::peer::PeerRpcResponder for RecordingHolder {
+        async fn handle_json_rpc(&self, req: Value) -> Value {
+            let id = req.get("id").cloned().unwrap_or(json!(1));
+            json!({"jsonrpc":"2.0","id":id,"result":{}})
+        }
+
+        async fn handle_availability(&self, items: Value) -> Value {
+            let n = items.as_array().map(|a| a.len()).unwrap_or(0);
+            let answers: Vec<Value> = (0..n).map(|_| json!({"available": true})).collect();
+            json!({"items": answers})
+        }
+
+        async fn stream_range(
+            &self,
+            req: Value,
+            _conn_key: &str,
+            out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+        ) -> std::io::Result<()> {
+            let offset = req.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            let length = req.get("length").and_then(Value::as_u64).unwrap_or(0);
+            self.fetch_ranges.lock().unwrap().push((offset, length));
+            let total = self.content.bytes.len() as u64;
+            let requested_end = (offset + length).min(total);
+            // Frame the window exactly as the node does: successive frames of at most
+            // `HOLDER_FRAME_LEN` bytes, each carrying its own offset, the last one `complete`.
+            let mut start = offset.min(total);
+            loop {
+                let end = (start + HOLDER_FRAME_LEN).min(requested_end);
+                let window = &self.content.bytes[start as usize..end as usize];
+                let complete = end >= requested_end;
+                let mut frame = json!({
+                    "offset": start,
+                    "length": window.len(),
+                    "bytes": base64::engine::general_purpose::STANDARD.encode(window),
+                    "complete": complete,
+                });
+                if start == 0 {
+                    if let Some(obj) = frame.as_object_mut() {
+                        obj.insert("total_length".into(), json!(total));
+                        obj.insert("chunk_lens".into(), json!(self.content.chunk_lens));
+                        obj.insert("chunk_index".into(), json!(0));
+                        obj.insert("root".into(), json!(self.content.root));
+                        if let Some(proof) = &self.content.inclusion_proof {
+                            obj.insert("inclusion_proof".into(), json!(proof));
+                        }
+                    }
+                }
+                crate::peer::write_framed(out, &frame).await?;
+                if complete {
+                    return Ok(());
+                }
+                start = end;
+            }
+        }
+    }
+
+    /// A deterministic 32-byte identity seed from a label (no hard-coded crypto literal).
+    fn keytrace_seed(label: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(label.as_bytes()).into()
+    }
+
+    fn keytrace_identity(label: &str) -> Arc<dig_tls::NodeCert> {
+        let dir = tempfile::tempdir().expect("cert tempdir");
+        crate::peer::load_or_generate_node_cert(dir.path(), &keytrace_seed(label)).expect("cert")
+    }
+
+    /// #1586 read-leg GROUND TRUTH over the REAL transport: the reader is CONNECTED to the holder in
+    /// the gossip pool, and the fetch must TRANSMIT a `dig.fetchRange` RPC to it. Every prior #836
+    /// regression test asserted at a MOCK `RangeTransport` — so the whole real leg (dig-download's
+    /// `NatRangeTransport` → dig-peer mTLS → the holder's range stream → frame reassembly) was
+    /// unexercised, and the arbiter e2e kept failing with ZERO inbound at the holder. This drives the
+    /// production wiring end-to-end over a loopback mTLS listener and asserts the HOLDER SAW the RPC.
+    #[tokio::test]
+    async fn connected_pool_holder_receives_a_real_fetch_range_rpc_over_mtls() {
+        crate::peer::install_crypto_provider();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        let fetch_ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // HOLDER: a real mTLS peer-RPC listener on loopback serving the anchored content.
+        let holder_identity = keytrace_identity("keytrace-holder");
+        let holder_peer_id = holder_identity.peer_id();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let responder: Arc<dyn crate::peer::PeerRpcResponder> = Arc::new(RecordingHolder {
+            content: content.clone(),
+            fetch_ranges: fetch_ranges.clone(),
+        });
+        let server = tokio::spawn(crate::peer::serve_peer_rpc_listener(
+            listener,
+            holder_identity,
+            responder,
+        ));
+
+        // READER: the PRODUCTION download wiring over the REAL dig-nat/dig-peer transport.
+        let td = tempfile::tempdir().unwrap();
+        let reader_identity = keytrace_identity("keytrace-reader");
+        let nat_config = dig_nat::NatConfig::builder()
+            .enabled_methods(vec![dig_nat::TraversalKind::Direct])
+            .per_method_timeout(Duration::from_secs(5))
+            .build();
+        let transport: Arc<dyn RangeTransport> = Arc::new(NatRangeTransport::new(
+            reader_identity,
+            nat_config,
+            "DIG_MAINNET",
+        ));
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            transport,
+            MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+
+        // CONNECT: the holder is in the reader's connected pool at its real loopback address.
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: holder_peer_id,
+            addr,
+        });
+
+        let fetched = pc.fetch_resource(&cid).await;
+
+        // The load-bearing assertion: the RPC LEFT THE MACHINE and the holder SAW it.
+        let seen = fetch_ranges.lock().unwrap().clone();
+        assert!(
+            !seen.is_empty(),
+            "a dig.fetchRange RPC must be TRANSMITTED to the connected holder (holder saw none; \
+             fetch result: {:?})",
+            fetched.as_ref().map(|_| "ok").map_err(|e| e.clone())
+        );
+        let bytes = fetched
+            .expect("the connected holder serves the resource")
+            .bytes
+            .clone();
+        assert_eq!(
+            bytes, content.bytes,
+            "served bytes match the holder's content"
+        );
+        server.abort();
+    }
 }

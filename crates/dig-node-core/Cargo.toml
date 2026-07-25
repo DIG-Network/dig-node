@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.18.3"
+version = "0.18.4"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -114,7 +114,12 @@ getrandom = "0.2"
 # `RelayTunnel`, and `RelayAcceptor` runs the mTLS SERVER half over it (#1536, Leg B) — on top of
 # 0.10's SPKI-pinned dialer (#1422) and the STUN happy-eyeballs reflexive discovery, and auto-composes
 # the FULL NAT ladder via `connect_with_runtime` + `NatRuntime`, taking a CA-signed NodeCert.
-dig-nat = "0.11"
+# 0.11.2 is REQUIRED (#1586): before it, `RangeFrame::bytes` was read with `serde_bytes`, which over
+# the JSON frame wire takes the served base64 string as its literal characters — so every
+# `dig.fetchRange` window arrived as its own base64 text, the reassembler rejected the frame, and the
+# read leg aborted before reading a byte. 0.11.2 reads/writes `bytes` as base64 (the canonical
+# `dig_rpc_protocol::types::RangeFrame` wire the node's own serve path emits).
+dig-nat = "0.11.2"
 # dig-gossip is the ONE peer-stack exception: at v0.15.2 (on dig-nat 0.11 + dig-tls 0.3, crates.io
 # deps) but NOT yet published to crates.io — its own publish is guarded pending dig-peer-protocol (#681).
 # So it stays a git dependency, PINNED to the v0.15.2 tag commit (rev dbb03430f2a9, #1584 — both

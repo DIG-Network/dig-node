@@ -2927,6 +2927,12 @@ is dropped there, a safe pool-bounded probe. A DHT-only (non-pool) provider stil
 `dig.getAvailability` confirm. This source is DOWNLOAD-only — it never feeds the redirect/availability
 hint above.
 
+A `dig.fetchRange` answer is a stream of `u32`-BE length-prefixed JSON frames, each frame's `bytes`
+field the **base64** encoding of that window's ciphertext (the canonical
+`dig_rpc_protocol::types::RangeFrame` wire this node's serve path emits). A reader MUST base64-decode
+it; reading the field as raw bytes yields the base64 TEXT and every frame is rejected as
+over-length — the #1586 read-leg blocker, which required dig-nat >= 0.11.2 to fix.
+
 The download locator (dig-dht ∪ connected pool) is itself SELF-EXCLUDED: THIS node's own `peer_id`
 (hex) is dropped from the fetch-candidate set before any dial, exactly as the DISCOVERY leg is (#1584).
 A relay-introduced self-connection can surface this node in its own gossip pool (`peer_id == local`);
