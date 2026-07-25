@@ -54,7 +54,9 @@ use dig_peer_selector::{
 use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
-use crate::seams::dig_peer::{CapsuleFallbackLocator, EmptyLocator, SelectorAdapter, UnionLocator};
+use crate::seams::dig_peer::{
+    CapsuleFallbackLocator, EmptyLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
+};
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
 /// hold it — the `error.data.redirect` names them (peer_id + candidate addresses) so the caller
@@ -565,6 +567,13 @@ impl NodeContent {
             Arc::new(EmptyLocator), // PEX-as-provider-source (dormant)
             Arc::new(EmptyLocator), // relay-introducer (dormant)
         ]);
+        // #1584 belt-and-suspenders: never discover THIS node as its own provider. dig-gossip is the
+        // authoritative guard (no self entry enters the pool → selector), but a self-`peer_id` record
+        // could still reach discovery from another source (a stale self-published DHT `add_provider`
+        // record, a future PEX/relay-introducer source, a replay). Filter it at the INNERMOST source so
+        // the exclusion covers every granularity, including CapsuleFallbackLocator's non-resource
+        // pass-through — otherwise the reader self-dials (own IP → refused) and dead-ends the read (404).
+        let union = SelfExcludingLocator::new(union, self_peer_id.clone());
         // #1580: holders announce STORE + CAPSULE granularity only (never per-resource — see
         // `dht::inventory_content_ids`), but a `/s` resource read locates by a RESOURCE content id.
         // Bridge the two so a resource lookup also resolves the announced parent capsule holder;

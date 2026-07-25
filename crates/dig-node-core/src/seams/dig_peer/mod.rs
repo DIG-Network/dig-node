@@ -17,10 +17,12 @@ pub mod net;
 pub mod peer_network;
 pub mod pex;
 pub mod selector_adapter;
+pub mod self_excluding_locator;
 pub mod session;
 pub mod union_locator;
 
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;
 pub use peer_network::PeerNetwork;
 pub(crate) use selector_adapter::SelectorAdapter;
+pub(crate) use self_excluding_locator::SelfExcludingLocator;
 pub(crate) use union_locator::{EmptyLocator, UnionLocator};
