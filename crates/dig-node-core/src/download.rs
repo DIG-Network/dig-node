@@ -396,8 +396,10 @@ impl crate::pex::DialRanker for SelectorDialRanker {
 /// before.
 pub struct NodeContent {
     /// "Which peers hold this content?" — the DHT in production, a mock in tests. This is the RAW
-    /// discovery locator (unfiltered): the redirect-on-miss path names EVERY holder here, not the
-    /// selector's ranked subset (a redirect should offer the caller all known holders).
+    /// discovery locator: the redirect-on-miss path names EVERY holder here, not the selector's ranked
+    /// subset (a redirect should offer the caller all known holders). In production it is wrapped in a
+    /// [`SelfExcludingLocator`] (#1584), so discovery is already self-filtered — this node's own
+    /// `peer_id` never appears as a holder — but is otherwise unranked.
     locator: Arc<dyn ProviderLocator>,
     /// The self-optimizing peer selector (#178) — the decision + learning brain between discovery and
     /// download. It ranks the download sources (bridged into dig-download's [`SourceSelector`] seam by
@@ -512,9 +514,10 @@ impl NodeContent {
         // Bridge the shared selector into dig-download's SourceSelector seam (#1442): the executor
         // delegates peer choice + ORDER to it and reports every range outcome back through it, so the
         // ONE self-tuning brain informs every transfer. The Downloader's own locator is the RAW
-        // `locator` (the UnionLocator in production) — discovery is unfiltered; the selector refines
-        // the SOURCE choice at schedule time, not the discovered set. The same RAW `locator` stays on
-        // the engine for the redirect-on-miss path (a redirect offers ALL known holders).
+        // `locator` (the SelfExcludingLocator-wrapped UnionLocator in production, #1584) — discovery is
+        // already self-filtered but otherwise unranked; the selector refines the SOURCE choice at
+        // schedule time, not the discovered set. The same RAW `locator` stays on the engine for the
+        // redirect-on-miss path (a redirect offers ALL known non-self holders).
         let config = DownloadConfig {
             selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
             ..DownloadConfig::default()
