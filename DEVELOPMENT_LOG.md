@@ -330,3 +330,23 @@ CLI path (not via a native package) needs the `sc config`/`sc qc` dance.
   lock block + bump its version → `cargo build --offline` finalizes the lock WITHOUT touching the pinned
   drifted commits → verify `cargo build --locked` passes + `dig-constants`/`dig-nat` stayed at their
   locked revs. (Used to add `dig-ipc-protocol` + `dig-identity` in #1080.)
+
+- **DISCOVER ≠ FETCH: a discovered holder must be REACHABLE, not just located (#1590, the final #836
+  read-leg blocker).** On a relayed / isolated network the read path could DISCOVER a capsule holder
+  (`find_providers`/`dig.getAvailability` returned it via the shared DHT) yet still 404, because the
+  multi-source FETCH dead-ends: dig-download's locate offered only the holder's DHT provider record,
+  whose advertised addresses (a direct `10.x`) the reader cannot dial on a relayed net. With no
+  REACHABLE source the download failed, Tier-2 `peer_serve_plaintext` returned `None`, and the read fell
+  through to the §21 whole-store backfill against `self.upstream` (hardwired to rpc.dig.net in
+  `cache_fetch_and_cache`) → 400 → 404. The holder served ZERO `fetchRange` because no dial ever reached
+  it (run e2e-1062-20260725-043357). The engine's `find_providers` (availability/redirect hint) and the
+  Downloader's locate SHARE the same `CapsuleFallbackLocator`, so "discovered but not fetched" was NOT a
+  divergent-locator bug — it was a REACHABILITY bug: the DHT record's addresses were undialable while the
+  reader was ALREADY CONNECTED to the same holder in the gossip pool. Fix: `PoolProviderLocator` unions
+  the currently-connected pool peers into the DOWNLOAD locator ONLY (never the redirect/availability
+  hint — a redirect must name announced holders), so a fetch also tries peers reachable over the
+  connection already held. dig-download's `getAvailability` confirm filters connected non-holders and the
+  whole-resource merkle check binds bytes to the chain-anchored root, so offering the (pool-bounded) set
+  is a safe probe. Lesson: on any relayed/NAT'd topology, "which peers hold X" (discovery) and "which
+  peers can I actually pull X from right now" (reachable fetch sources) are DIFFERENT questions — a
+  connected pool peer is the most reachable source there is, and must be a first-class fetch candidate.
