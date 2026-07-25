@@ -1687,6 +1687,151 @@ mod tests {
         );
     }
 
+    /// A DHT source that answers a FIXED provider set ONLY for the EXACT `ContentId` it was primed with
+    /// — modelling the REAL distributed DHT, where holders announce their inventory at STORE + CAPSULE
+    /// granularity ONLY (never per-resource; see `dht::inventory_content_ids`). The prior read-leg tests
+    /// used `MockProviderLocator`, which IGNORES the content id and answers EVERY query (resource key
+    /// included) — so they silently bypassed the resource→capsule bridge and could never reproduce the
+    /// real "the resource key resolves nobody; only the capsule key does" condition (#1590/#836).
+    struct CapsuleOnlyDht {
+        capsule: ContentId,
+        providers: Vec<ProviderRecord>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderLocator for CapsuleOnlyDht {
+        async fn find_providers(
+            &self,
+            content: &ContentId,
+        ) -> Result<Vec<ProviderRecord>, DownloadError> {
+            if content == &self.capsule {
+                Ok(self.providers.clone())
+            } else {
+                // A resource-granularity (or any other) key was never announced → nobody.
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// Compose the EXACT production download-locator chain `for_dht` builds (minus the live DHT/NAT
+    /// runtime) around a given DHT source: `CapsuleFallbackLocator(SelfExcludingLocator(UnionLocator))`
+    /// as the engine's `locator`, which `NodeContent::new` then unions (pool-first) with the
+    /// `PoolProviderLocator` and self-excludes again. Feeding this to `new` exercises the real bridge +
+    /// pool + self-exclusion composition — the piece the `MockProviderLocator`-based tests skipped.
+    fn real_chain_locator(dht: Arc<dyn ProviderLocator>) -> Arc<dyn ProviderLocator> {
+        CapsuleFallbackLocator::new(SelfExcludingLocator::new(
+            UnionLocator::new(vec![dht, Arc::new(EmptyLocator), Arc::new(EmptyLocator)]),
+            None,
+        ))
+    }
+
+    /// #1590/#836 GROUND TRUTH (the read-leg DATA root, arbiter e2e a51980f0): a `/s` resource read
+    /// drives a `ContentId::Resource`, but holders announce the DHT record at CAPSULE granularity ONLY,
+    /// at an address unreachable on the relayed/isolated net. The reader IS connected to the holder in
+    /// the gossip pool at its reachable address. This test composes the REAL production download-locator
+    /// chain (resource→capsule bridge + pool union + self-exclusion) — the chain the prior
+    /// `MockProviderLocator` tests bypassed — and a `best_address()`-faithful transport, and proves the
+    /// resource download resolves + fetches from the connected holder. It REFUTES the "the Downloader's
+    /// resource locate returns empty / the bridge is not applied on the download path" hypothesis: the
+    /// `PoolProviderLocator` offers the connected holder for the resource key directly AND the
+    /// `CapsuleFallbackLocator` bridges the resource key to the announced capsule record, so a
+    /// pool-connected holder is always a download source for the resource.
+    #[tokio::test]
+    async fn resource_read_resolves_via_the_real_chain_when_only_the_capsule_is_announced() {
+        let td = tempfile::tempdir().unwrap();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content); // ContentId::Resource{store [1;32], root, rk [3;32]}
+        let (store_id, root) = match &cid {
+            ContentId::Resource { store_id, root, .. } => (*store_id, *root),
+            _ => unreachable!("anchored_cid_for builds a resource id"),
+        };
+        let capsule = ContentId::capsule(store_id, root);
+        let reachable: std::net::SocketAddr = "10.0.0.1:9444".parse().unwrap();
+        let transport = Arc::new(AddressAwareTransport::new(content.clone(), reachable));
+
+        // The DHT announced the holder at CAPSULE granularity ONLY, at an UNREACHABLE address (the
+        // exact relayed-net condition): a resource-key lookup against the real DHT resolves NOBODY.
+        let holder = dig_dht::PeerId::from_bytes([1u8; 32]);
+        let dht_capsule_record = ProviderRecord::new(
+            &capsule.to_key(),
+            &holder,
+            vec![dig_dht::CandidateAddr::direct("10.9.9.9", 1)],
+            u64::MAX,
+        );
+        let dht = Arc::new(CapsuleOnlyDht {
+            capsule,
+            providers: vec![dht_capsule_record],
+        });
+        let pc = NodeContent::new(
+            real_chain_locator(dht),
+            transport.clone(),
+            MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+
+        // CONNECT: the reader is connected to the SAME holder in the pool at its REACHABLE address.
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addr: reachable,
+        });
+
+        let f = pc
+            .fetch_resource(&cid)
+            .await
+            .expect("the resource resolves through the real bridge+pool chain and serves");
+        assert_eq!(f.bytes, content.bytes, "served bytes match the source");
+        assert!(
+            transport.served_fetch_from(&mock_peer_hex(1)).await,
+            "a fetchRange reached the connected holder over its reachable pool address"
+        );
+    }
+
+    /// #1590/#836 GROUND TRUTH, pool-free variant: with NO connected-pool entry, a resource read must
+    /// STILL resolve the holder through the `CapsuleFallbackLocator` bridge alone — i.e. the bridge IS
+    /// applied on the Downloader's own locate path, not only on the engine's `find_providers` probe.
+    /// Here the announced CAPSULE record is reachable, so the resource read succeeds purely via the
+    /// resource→capsule bridge over the DHT source. Proves the download path bridges resource→capsule.
+    #[tokio::test]
+    async fn resource_read_bridges_to_capsule_on_the_download_locate_without_a_pool_entry() {
+        let td = tempfile::tempdir().unwrap();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        let (store_id, root) = match &cid {
+            ContentId::Resource { store_id, root, .. } => (*store_id, *root),
+            _ => unreachable!(),
+        };
+        let capsule = ContentId::capsule(store_id, root);
+        // MockRangeTransport serves regardless of address (this variant isolates the LOCATE/bridge, not
+        // address selection — the reachable-address case is covered by the pool variant above).
+        let transport = Arc::new(MockRangeTransport::new(content.clone()));
+
+        let holder = dig_dht::PeerId::from_bytes([1u8; 32]);
+        let dht = Arc::new(CapsuleOnlyDht {
+            capsule: capsule.clone(),
+            providers: vec![ProviderRecord::new(
+                &capsule.to_key(),
+                &holder,
+                vec![dig_dht::CandidateAddr::direct("10.0.0.1", 9444)],
+                u64::MAX,
+            )],
+        });
+        let pc = NodeContent::new(
+            real_chain_locator(dht),
+            transport,
+            MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+
+        // NO on_pool_event: the pool is EMPTY — resolution relies solely on the resource→capsule bridge.
+        let f = pc
+            .fetch_resource(&cid)
+            .await
+            .expect("resource read bridges to the announced capsule holder on the download locate");
+        assert_eq!(f.bytes, content.bytes, "served bytes match the source");
+    }
+
     /// #836/#92: a self `PeerAdded` (relay-introduced self-connection) is dropped at the pool feed —
     /// it never enters the download-side connected pool, so it can never be offered as a fetch
     /// candidate. A genuine peer add is still recorded.

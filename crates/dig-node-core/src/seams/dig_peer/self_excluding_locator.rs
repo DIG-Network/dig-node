@@ -49,8 +49,20 @@ impl ProviderLocator for SelfExcludingLocator {
         content: &ContentId,
     ) -> Result<Vec<ProviderRecord>, DownloadError> {
         let mut records = self.inner.find_providers(content).await?;
+        let before = records.len();
         if let Some(me) = self.self_peer_id.as_deref() {
             records.retain(|record| record.provider_peer_id != me);
+        }
+        // Tier-2 ground-truth tracing (#1590/#836): log the input content id + how many providers the
+        // inner source returned vs. how many survived self-exclusion, so an e2e run distinguishes
+        // "the inner locate found nobody" from "self-exclusion dropped the only candidate".
+        if before != records.len() || tracing::enabled!(tracing::Level::TRACE) {
+            tracing::debug!(
+                content = %content.to_key().to_hex(),
+                inner = before,
+                kept = records.len(),
+                "self_excluding: filtered discovered providers"
+            );
         }
         Ok(records)
     }

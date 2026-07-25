@@ -66,6 +66,7 @@ impl ProviderLocator for CapsuleFallbackLocator {
             .await
             .unwrap_or_default();
 
+        let (n_resource, n_capsule) = (by_resource.len(), by_capsule.len());
         let mut merged: Vec<ProviderRecord> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for record in by_resource.into_iter().chain(by_capsule) {
@@ -73,6 +74,18 @@ impl ProviderLocator for CapsuleFallbackLocator {
                 merged.push(record);
             }
         }
+        // Tier-2 ground-truth tracing (#1590/#836): the read-leg was misdiagnosed repeatedly because
+        // nothing logged which locator resolved (or failed to resolve) the RESOURCE id. Surface the
+        // bridge's inputs (resource key + parent capsule key) and outputs (per-branch + merged counts)
+        // so an e2e run shows exactly whether the resource→capsule bridge found the announced holder.
+        tracing::debug!(
+            resource_key = %content.to_key().to_hex(),
+            capsule_key = %capsule.to_key().to_hex(),
+            by_resource = n_resource,
+            by_capsule = n_capsule,
+            merged = merged.len(),
+            "capsule_fallback: resource lookup bridged to parent capsule"
+        );
         Ok(merged)
     }
 }

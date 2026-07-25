@@ -65,6 +65,14 @@ impl ProviderLocator for UnionLocator {
         let results =
             futures::future::join_all(self.sources.iter().map(|s| s.find_providers(content))).await;
 
+        // Tier-2 ground-truth tracing (#1590/#836): per-source output counts for the queried content
+        // id, so an e2e run shows WHICH source (pool vs DHT/capsule-fallback) offered the holder — the
+        // decisive fact the prior misdiagnoses lacked.
+        let per_source: Vec<usize> = results
+            .iter()
+            .map(|r| r.as_ref().map(Vec::len).unwrap_or(0))
+            .collect();
+
         let mut index_of: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut merged: Vec<ProviderRecord> = Vec::new();
@@ -102,6 +110,12 @@ impl ProviderLocator for UnionLocator {
                 }
             }
         }
+        tracing::debug!(
+            content = %content.to_key().to_hex(),
+            per_source = ?per_source,
+            merged = merged.len(),
+            "union_locator: merged provider sources"
+        );
         Ok(merged)
     }
 }
