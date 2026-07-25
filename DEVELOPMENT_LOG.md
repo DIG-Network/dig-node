@@ -4,6 +4,33 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## A mock-transport regression test proves NOTHING about the wire — the read leg died in JSON serde (#1586)
+
+`dig.fetchRange` frames are JSON, so the ciphertext window travels as **base64** — the canonical
+`dig_rpc_protocol::types::RangeFrame` says so ("this window's ciphertext, base64") and the node's own
+`fetch_range_frame` emits exactly that. dig-nat's `RangeFrame` (< 0.11.2) read the same field with
+`#[serde(with = "serde_bytes")]`, which over JSON takes a string as its LITERAL UTF-8 characters. So a
+served 1-byte window arrived as the 4 characters of `"AA=="`, `assemble_range_stream` rejected it as
+"range frame overflows expected length 1", and the download aborted. Two traps compounded it:
+
+- **The error text lied.** dig-download's `establish_commitment` (the 1-byte meta-probe that seeds the
+  chunk layout) returns `DownloadError::NotFound`, whose Display read *"no providers located for
+  `content id`"* — identical to a genuinely empty locate. Four investigations chased a
+  provider-key mismatch that did not exist; the locate had in fact returned the holder and the
+  connected-pool confirm-bypass had fired. Ordering in the log was the tell: a `fetch_range` line
+  BEFORE the "no providers" line can only come from the probe, which runs *after* a non-empty locate.
+  (dig-download >= 0.7.2 now names the failing step.)
+- **Every prior regression test asserted at a MOCK `RangeTransport`.** The mocks return a
+  `FetchedRange` struct directly, so the whole wire — serde, framing, mTLS, dig-peer — was unexercised
+  and green while production could not read a byte. A read-leg test is only meaningful if it asserts a
+  `dig.fetchRange` RPC was **received by a real holder**;
+  `connected_pool_holder_receives_a_real_fetch_range_rpc_over_mtls` (dig-node-core `download.rs`) does
+  that over a loopback mTLS `serve_peer_rpc_listener`, which is cheap and needs no EC2.
+
+Rule of thumb: a cross-repo wire contract needs a CONFORMANCE test that pins the actual serialized
+shape (dig-nat `tests/wire_conformance.rs`), plus at least one test that puts real bytes on a real
+socket. Type-level agreement across two crates is not wire agreement.
+
 ## The fetch transport dials ONE address — `best_address()`, the FIRST dialable — so union ORDER, not just the merge, decides reachability (#836/#1590)
 
 Merging same-peer address hints across discovery sources is necessary but NOT sufficient. The real content
