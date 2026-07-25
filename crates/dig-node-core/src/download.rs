@@ -54,7 +54,9 @@ use dig_peer_selector::{
 use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
-use crate::seams::dig_peer::{CapsuleFallbackLocator, EmptyLocator, SelectorAdapter, UnionLocator};
+use crate::seams::dig_peer::{
+    CapsuleFallbackLocator, EmptyLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
+};
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
 /// hold it — the `error.data.redirect` names them (peer_id + candidate addresses) so the caller
@@ -394,8 +396,10 @@ impl crate::pex::DialRanker for SelectorDialRanker {
 /// before.
 pub struct NodeContent {
     /// "Which peers hold this content?" — the DHT in production, a mock in tests. This is the RAW
-    /// discovery locator (unfiltered): the redirect-on-miss path names EVERY holder here, not the
-    /// selector's ranked subset (a redirect should offer the caller all known holders).
+    /// discovery locator: the redirect-on-miss path names EVERY holder here, not the selector's ranked
+    /// subset (a redirect should offer the caller all known holders). In production it is wrapped in a
+    /// [`SelfExcludingLocator`] (#1584), so discovery is already self-filtered — this node's own
+    /// `peer_id` never appears as a holder — but is otherwise unranked.
     locator: Arc<dyn ProviderLocator>,
     /// The self-optimizing peer selector (#178) — the decision + learning brain between discovery and
     /// download. It ranks the download sources (bridged into dig-download's [`SourceSelector`] seam by
@@ -510,9 +514,10 @@ impl NodeContent {
         // Bridge the shared selector into dig-download's SourceSelector seam (#1442): the executor
         // delegates peer choice + ORDER to it and reports every range outcome back through it, so the
         // ONE self-tuning brain informs every transfer. The Downloader's own locator is the RAW
-        // `locator` (the UnionLocator in production) — discovery is unfiltered; the selector refines
-        // the SOURCE choice at schedule time, not the discovered set. The same RAW `locator` stays on
-        // the engine for the redirect-on-miss path (a redirect offers ALL known holders).
+        // `locator` (the SelfExcludingLocator-wrapped UnionLocator in production, #1584) — discovery is
+        // already self-filtered but otherwise unranked; the selector refines the SOURCE choice at
+        // schedule time, not the discovered set. The same RAW `locator` stays on the engine for the
+        // redirect-on-miss path (a redirect offers ALL known non-self holders).
         let config = DownloadConfig {
             selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
             ..DownloadConfig::default()
@@ -565,6 +570,13 @@ impl NodeContent {
             Arc::new(EmptyLocator), // PEX-as-provider-source (dormant)
             Arc::new(EmptyLocator), // relay-introducer (dormant)
         ]);
+        // #1584 belt-and-suspenders: never discover THIS node as its own provider. dig-gossip is the
+        // authoritative guard (no self entry enters the pool → selector), but a self-`peer_id` record
+        // could still reach discovery from another source (a stale self-published DHT `add_provider`
+        // record, a future PEX/relay-introducer source, a replay). Filter it at the INNERMOST source so
+        // the exclusion covers every granularity, including CapsuleFallbackLocator's non-resource
+        // pass-through — otherwise the reader self-dials (own IP → refused) and dead-ends the read (404).
+        let union = SelfExcludingLocator::new(union, self_peer_id.clone());
         // #1580: holders announce STORE + CAPSULE granularity only (never per-resource — see
         // `dht::inventory_content_ids`), but a `/s` resource read locates by a RESOURCE content id.
         // Bridge the two so a resource lookup also resolves the announced parent capsule holder;
