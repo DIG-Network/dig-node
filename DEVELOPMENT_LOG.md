@@ -31,6 +31,19 @@ Rule of thumb: a cross-repo wire contract needs a CONFORMANCE test that pins the
 shape (dig-nat `tests/wire_conformance.rs`), plus at least one test that puts real bytes on a real
 socket. Type-level agreement across two crates is not wire agreement.
 
+**A consumer's `Cargo.lock` can silently re-pin an old patch of a TRANSITIVE dep even after you bump
+it elsewhere.** Bumping dig-node's own `dig-nat` requirement to 0.11.2 did NOT put the fix on the
+`fetchRange` path, because the decode actually runs inside `dig-download`'s `NatRangeTransport`, and
+dig-download's OWN `Cargo.lock` — resolved independently at dig-download's last release — still
+pinned `dig-nat 0.11.0`. dig-node's caret dep on `dig-download = "0.7"` was satisfied by 0.7.1, which
+carried the stale transitive lock forward untouched; `cargo update -p dig-nat` at the dig-node level
+does nothing for a dep dig-download links in from ITS OWN lockfile-pinned graph position once
+dig-download itself isn't rebuilt/republished. The fix required bumping dig-download to 0.7.2 (a
+release that itself picked up dig-nat 0.11.2), THEN `cargo update -p dig-download --precise 0.7.2` in
+dig-node. **Lesson: when a fix lives N layers down a dependency chain, verify the FIRST direct
+dependency's OWN lockfile carries the fix — a same-repo, direct-dep-only bump can leave the actual
+decode path on the old code for iterations.**
+
 ## The fetch transport dials ONE address — `best_address()`, the FIRST dialable — so union ORDER, not just the merge, decides reachability (#836/#1590)
 
 Merging same-peer address hints across discovery sources is necessary but NOT sufficient. The real content
