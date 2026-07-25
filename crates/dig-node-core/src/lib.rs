@@ -5830,6 +5830,147 @@ mod tests {
         }
     }
 
+    /// A [`RangeTransport`](dig_download::RangeTransport) that a provider can only reach at the peer-RPC
+    /// port (:9444). It delegates to an inner [`MockRangeTransport`](dig_download::testkit::MockRangeTransport)
+    /// ONLY when the provider record's dial address carries the peer-RPC port; a provider offered at any
+    /// other port (e.g. the gossip :9445) answers "not held" and every fetch fails — modelling the real
+    /// wire, where dialing the gossip listener for a `dig.fetchRange` stream dies with `InvalidContentType`.
+    /// This makes the connected-pool candidate PORT load-bearing in a test (the gap the #1590 mock had:
+    /// its transport ignored the port entirely, so the wrong-port bug slipped through six iterations).
+    struct PeerRpcPortGatingTransport {
+        inner: dig_download::testkit::MockRangeTransport,
+    }
+
+    impl PeerRpcPortGatingTransport {
+        fn new(content: dig_download::testkit::MockContent) -> Self {
+            Self {
+                inner: dig_download::testkit::MockRangeTransport::new(content),
+            }
+        }
+
+        /// True when the provider is dialable at the peer-RPC port (:9444) — the only port a real
+        /// `dig.fetchRange` stream is served on.
+        fn reachable_at_peer_rpc(provider: &dig_download::ProviderRecord) -> bool {
+            provider
+                .addresses
+                .iter()
+                .any(|a| a.port == peer::DEFAULT_P2P_PORT)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl dig_download::RangeTransport for PeerRpcPortGatingTransport {
+        async fn query_availability(
+            &self,
+            provider: &dig_download::ProviderRecord,
+            items: Vec<dig_nat::AvailabilityItem>,
+        ) -> Result<dig_nat::AvailabilityResponse, dig_download::DownloadError> {
+            if !Self::reachable_at_peer_rpc(provider) {
+                // Reached at the wrong port (the gossip listener) → the availability probe never gets a
+                // valid answer; report "not held" so the orchestrator drops this (mis-dialed) source.
+                let answers = items
+                    .iter()
+                    .map(|_| dig_nat::AvailabilityAnswer {
+                        available: false,
+                        roots: None,
+                        total_length: None,
+                        chunk_count: None,
+                        complete: None,
+                    })
+                    .collect();
+                return Ok(dig_nat::AvailabilityResponse { items: answers });
+            }
+            self.inner.query_availability(provider, items).await
+        }
+
+        async fn fetch_range(
+            &self,
+            provider: &dig_download::ProviderRecord,
+            req: &dig_nat::RangeRequest,
+        ) -> Result<dig_download::FetchedRange, dig_download::DownloadError> {
+            if !Self::reachable_at_peer_rpc(provider) {
+                return Err(dig_download::DownloadError::transport(
+                    &provider.provider_peer_id,
+                    "mock: gossip-port dial gets InvalidContentType (wrong listener)",
+                ));
+            }
+            self.inner.fetch_range(provider, req).await
+        }
+    }
+
+    /// Attach a P2P engine whose ONLY source is the connected gossip pool (no DHT provider), with the
+    /// holder fed in THROUGH the real selector-registry feed translation
+    /// ([`crate::peer::map_gossip_pool_event`]) from its GOSSIP address — so the connected-pool
+    /// candidate's port is whatever the feed produces, not a hand-planted value. The transport is
+    /// port-gated to the peer-RPC listener, making the translation load-bearing for the serve.
+    fn attach_p2p_pool_via_gossip(
+        node: &Node,
+        content: dig_download::testkit::MockContent,
+        gossip_addr: std::net::SocketAddr,
+        td: &tempfile::TempDir,
+    ) {
+        let locator = Arc::new(dig_download::testkit::MockProviderLocator::fixed(vec![]));
+        let transport = Arc::new(PeerRpcPortGatingTransport::new(content));
+        let pc = NodeContent::new(locator, transport, MissMode::FetchThrough, None, td.path());
+        // Drive the REAL live-feed translation: a gossip PoolEvent carrying the peer's :9445 endpoint.
+        let peer_id = dig_gossip::PeerId::from([1u8; 32]);
+        let selector_event =
+            crate::peer::map_gossip_pool_event(&dig_gossip::PoolEvent::PeerAdded {
+                peer_id,
+                addr: gossip_addr,
+            });
+        pc.on_pool_event(&selector_event);
+        node.set_p2p_content(pc);
+    }
+
+    /// **Regression (#1590 / #836 read-leg DATA gate):** a loopback `/s/` read that MISSES locally, whose
+    /// §21 upstream is UNREACHABLE, served by a holder the reader knows ONLY through the connected gossip
+    /// pool (its DHT record is unreachable) — where the holder's fetchRange listener is the peer-RPC port
+    /// (:9444) while the pool reports its gossip port (:9445) — MUST still fetch + verify + decrypt + serve
+    /// (`ServeSource::Peer`). Unlike the #1586/#1590 tests, the holder is fed through the REAL gossip→pool
+    /// feed translation and the transport is PORT-GATED to :9444, so the read only succeeds when the feed
+    /// correctly translates :9445 → :9444. On the pre-fix build the pool candidate keeps :9445, the gated
+    /// transport refuses it, Tier-2 misses, and the unroutable upstream yields NOT `Served{Peer}` → RED.
+    #[test]
+    fn serve_content_plaintext_reaches_pool_holder_at_peer_rpc_port() {
+        use crate::content_serve::{PlaintextOutcome, ServeSource};
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("DIG_NODE_PIN", "off"); // isolate the tier routing from the chain pin
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let store = Bytes32([0x52; 32]);
+        let plaintext = b"<h1>served from a connected pool holder</h1>";
+        let (content, root, _pt) = anchored_sealed_content(store, "index.html", plaintext);
+        let (node, td) = test_node(None); // unroutable upstream — a Served result can only be P2P
+                                          // The holder is a CONNECTED pool peer whose gossip endpoint is :9445 (its peer-RPC
+                                          // listener is one below, :9444) — exactly what a real pool reports.
+        let gossip_addr: std::net::SocketAddr = "203.0.113.5:9445".parse().unwrap();
+        attach_p2p_pool_via_gossip(&node, content, gossip_addr, &td);
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "index.html",
+            None,
+        ));
+        std::env::remove_var("DIG_NODE_PIN");
+        match out {
+            PlaintextOutcome::Served { bytes, source, .. } => {
+                assert_eq!(
+                    source,
+                    ServeSource::Peer,
+                    "must serve from the connected-pool holder over its peer-RPC port"
+                );
+                assert_eq!(bytes, plaintext, "the decrypted P2P bytes match the source");
+            }
+            other => panic!(
+                "expected a peer Served via the :9444-gated pool holder, got {other:?} \
+                 (a :9445 candidate means the gossip→pool feed did not translate the port)"
+            ),
+        }
+    }
+
     // -- OUTGOING-BANDWIDTH THROTTLE + REDIRECT-ON-SATURATION (dig_ecosystem #30) --------------------
     //
     // These extend the #165 redirect-on-miss drives above to "the node DOES hold the content, but

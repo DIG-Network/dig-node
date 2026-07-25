@@ -662,6 +662,14 @@ impl NodeContent {
         }
     }
 
+    /// The live connected-pool map the download-side [`PoolProviderLocator`] reads (#1590). Exposed to
+    /// tests so the gossip→pool feed's port translation can be exercised end-to-end (a `PoolEvent` fed
+    /// through the real feed must land as a peer-RPC candidate, #836).
+    #[cfg(test)]
+    pub(crate) fn connected_pool(&self) -> ConnectedPool {
+        self.connected_pool.clone()
+    }
+
     /// Feed a `dig-nat` connection class for a peer into the selector (SPEC §5.4, §7.3), seeding its
     /// per-class saturation prior + the relayed-penalty prior. Observational only — subordinate to the
     /// peer's measured outcomes.
@@ -696,6 +704,23 @@ impl NodeContent {
         content: &ContentId,
     ) -> Result<Arc<FetchedResource>, String> {
         let key = download_key(content);
+
+        // Tier-2 observability (#836): the read-leg fetch was invisible for six iterations because it
+        // emitted no tracing — a live-but-misdialing path looked like "never invoked". Log the located
+        // provider count (DHT ∪ connected pool) up front so a DATA miss shows whether locate found
+        // anyone at all, and the terminal result below shows whether the fetch itself succeeded.
+        let located = self.find_providers(content).await.len();
+        let pool_size = self
+            .connected_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        tracing::debug!(
+            content = %key,
+            located,
+            connected_pool = pool_size,
+            "fetch_resource: located providers before download"
+        );
 
         // 1. Serve from the bounded in-memory cache if we recently fetched this resource.
         if let Some(hit) = self.fetched.lock().await.get(&key).cloned() {
@@ -756,10 +781,15 @@ impl NodeContent {
                     cache.remove(&k);
                 }
             }
-            cache.insert(key, fetched.clone());
+            cache.insert(key.clone(), fetched.clone());
         }
         let _ = std::fs::remove_file(&final_path);
 
+        tracing::debug!(
+            content = %key,
+            bytes = fetched.bytes.len(),
+            "fetch_resource: download complete"
+        );
         Ok(fetched)
     }
 
