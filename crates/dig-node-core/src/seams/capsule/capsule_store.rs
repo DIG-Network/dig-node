@@ -207,7 +207,18 @@ impl CapsuleStore for Node {
             .await;
         let path = crate::module_path(&self.cache_dir, store_id_hex, root_hex);
         match std::fs::metadata(&path) {
-            Ok(md) => Ok((md.len(), root_hex.to_string())),
+            Ok(md) => {
+                // A capsule just entered this node's served set at runtime. Landing a capsule MUST make
+                // this node a DISCOVERABLE holder — the reshare/flywheel invariant (#1423/#1425): every
+                // path that lands a capsule (a hosted pin, the read-side backfill-cache, gap-fill, the
+                // CacheFetchAndCache RPC) flows through here, so announcing ONCE at this single site
+                // makes them all discoverable. We only reach this point on a FRESH land (an
+                // already-cached capsule returned at the top before any network), so the announce fires
+                // exactly once per newly-held capsule — no double-announce. Best-effort + a no-op on the
+                // FFI path (no refresher installed).
+                self.refresh_dht_inventory().await;
+                Ok((md.len(), root_hex.to_string()))
+            }
             Err(_) if matched => {
                 // matched but no file: should not happen, surface it.
                 Err("sync reported a match but the module is not cached".to_string())
@@ -232,16 +243,13 @@ impl CapsuleStore for Node {
         self.cache_fetch_and_cache(&store_hex, &root_hex).await?;
 
         // Confirm the generation actually landed (a sync whose served root differed leaves it absent).
+        // The DHT re-announce that makes this node a discoverable holder (§14.1) already fired inside
+        // `cache_fetch_and_cache` on the fresh land above — the single centralized announce site.
         if !module_exists(&self.cache_dir, &store_hex, &root_hex) {
             return Err(format!(
                 "gap-fill for {store_hex}:{root_hex} pulled a module but not at the confirmed root"
             ));
         }
-
-        // Best-effort: refresh the DHT provider records so peers find this node as a holder of the
-        // newly-synced capsule (§14.1). The peer-network bring-up installs the announce hook; when no
-        // peer network is running (FFI path) this is a no-op.
-        self.refresh_dht_inventory().await;
         Ok(())
     }
 

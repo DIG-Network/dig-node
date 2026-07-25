@@ -3703,6 +3703,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_and_cache_announces_dht_inventory_once_on_fresh_land() {
+        // #1586 reshare/flywheel invariant: landing a capsule at runtime (via ANY
+        // caller of cache_fetch_and_cache — hosted_pin, backfill-cache, the RPC,
+        // gap-fill) makes this node a DISCOVERABLE holder. So a fresh cache MUST
+        // fire the DHT inventory refresh exactly once; an already-cached call must
+        // NOT re-announce (unchanged inventory).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let module = b"announce-on-land-module".to_vec();
+        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
+        let (mut node, _td) = test_node(Some([7u8; 32]));
+        node.upstream = base;
+        let root_hex = "10".repeat(32);
+
+        let announces = Arc::new(AtomicUsize::new(0));
+        let counter = announces.clone();
+        node.set_inventory_refresher(Box::new(move || {
+            let counter = counter.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+
+        // Fresh land → exactly one announce.
+        node.cache_fetch_and_cache(&store_hex, &root_hex)
+            .await
+            .unwrap();
+        assert_eq!(
+            announces.load(Ordering::SeqCst),
+            1,
+            "a freshly-landed capsule announces its DHT inventory once"
+        );
+
+        // Already cached → no re-announce (dedupe; inventory unchanged).
+        node.cache_fetch_and_cache(&store_hex, &root_hex)
+            .await
+            .unwrap();
+        assert_eq!(
+            announces.load(Ordering::SeqCst),
+            1,
+            "an already-cached fetch does not re-announce"
+        );
+    }
+
+    #[tokio::test]
+    async fn gap_fill_announces_exactly_once_no_double_announce() {
+        // gap_fill_generation lands a capsule via cache_fetch_and_cache, which now
+        // owns the announce. The previously-explicit refresh at the gap_fill site is
+        // removed, so a gap-fill announces EXACTLY once — not twice.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let module = b"gap-fill-announce-module".to_vec();
+        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
+        let (mut node, _td) = test_node(Some([8u8; 32]));
+        node.upstream = base;
+        let root_hex = "10".repeat(32);
+
+        let announces = Arc::new(AtomicUsize::new(0));
+        let counter = announces.clone();
+        node.set_inventory_refresher(Box::new(move || {
+            let counter = counter.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+        }));
+
+        let store_id: [u8; 32] = hex::decode(&store_hex).unwrap().try_into().unwrap();
+        let root = digstore_core::Bytes32::from_hex(&root_hex).unwrap();
+        node.gap_fill_generation(store_id, root).await.unwrap();
+        assert_eq!(
+            announces.load(Ordering::SeqCst),
+            1,
+            "gap-fill announces exactly once (announce centralized in cache_fetch_and_cache)"
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_and_cache_without_identity_fails() {
         // No §21 identity → the authed sync can't run, so the fetch reports failed
         // rather than silently succeeding.
@@ -5673,6 +5748,86 @@ mod tests {
             "fetch-through serves the holder's bytes"
         );
         assert_eq!(frame["root"], json!(content.root));
+    }
+
+    /// Build an anchored, SEALED single-chunk resource for `(store, resource_key)` the loopback serve
+    /// path (`serve_content_plaintext`) can verify + decrypt: the bytes are the REAL per-URN ciphertext
+    /// (so `verify_and_decrypt` opens them), the inclusion proof folds `resource_leaf(ciphertext)` to a
+    /// single-leaf root, and `MockContent.root` is that root — matching the dig-download #179 content-id
+    /// cross-check. Returns `(content, root, plaintext)`.
+    fn anchored_sealed_content(
+        store: Bytes32,
+        resource_key: &str,
+        plaintext: &[u8],
+    ) -> (dig_download::testkit::MockContent, Bytes32, Vec<u8>) {
+        use digstore_core::codec::Encode;
+        use digstore_core::crypto::{derive_decryption_key, encrypt_chunk};
+        use digstore_core::merkle::{resource_leaf, MerkleTree};
+        let urn = digstore_core::Urn {
+            chain: digstore_core::CHAIN.to_string(),
+            store_id: store,
+            root_hash: None,
+            resource_key: Some(resource_key.to_string()),
+        };
+        let key = derive_decryption_key(&urn.canonical(), None);
+        let ciphertext = encrypt_chunk(&key, plaintext);
+        let leaf = resource_leaf(&ciphertext);
+        let tree = MerkleTree::from_leaves(vec![leaf]);
+        let root = tree.root();
+        let proof = tree.prove(0).expect("single-leaf proof");
+        let mut content = dig_download::testkit::MockContent::new(
+            ciphertext.clone(),
+            vec![ciphertext.len() as u64],
+        );
+        content.root = root.to_hex();
+        content.inclusion_proof =
+            Some(base64::engine::general_purpose::STANDARD.encode(Encode::to_bytes(&proof)));
+        (content, root, plaintext.to_vec())
+    }
+
+    /// **Regression (#1586):** a loopback `/s/` read that MISSES locally, whose §21 upstream is
+    /// UNREACHABLE, but for which a P2P provider holds the resource, MUST fetch + merkle-verify + decrypt
+    /// the bytes FROM THE PROVIDER and serve them (`ServeSource::Peer`) — never dead-end at the upstream
+    /// backfill. Proves the read leg completes PURELY P2P on an isolated network (the #836 blocker): the
+    /// e2e showed this 404 because the read reached only rpc.dig.net, never the discovered holder.
+    #[test]
+    fn serve_content_plaintext_fetches_from_peer_when_upstream_unreachable() {
+        use crate::content_serve::{derive_retrieval_key, PlaintextOutcome, ServeSource};
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("DIG_NODE_PIN", "off"); // isolate the tier routing from the chain pin
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let store = Bytes32([0x51; 32]);
+        let plaintext = b"<h1>served over p2p</h1>";
+        let (content, root, _pt) = anchored_sealed_content(store, "index.html", plaintext);
+        let (node, td) = test_node(None); // unroutable upstream — a Served result can only be P2P
+                                          // The provider advertises the resource content id the serve path derives (store, root,
+                                          // retrieval_key = SHA-256(rootless URN)); the mock locator returns it for any query.
+        let rk = derive_retrieval_key(&store, "index.html");
+        let cid = ContentId::resource(store.0, root.0, rk.0);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(1, &cid)],
+            content,
+            MissMode::FetchThrough,
+            &td,
+        );
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "index.html",
+            None,
+        ));
+        std::env::remove_var("DIG_NODE_PIN");
+        match out {
+            PlaintextOutcome::Served { bytes, source, .. } => {
+                assert_eq!(source, ServeSource::Peer, "must serve from the P2P holder");
+                assert_eq!(bytes, plaintext, "the decrypted P2P bytes match the source");
+            }
+            other => panic!("expected a peer Served (no upstream), got {other:?}"),
+        }
     }
 
     // -- OUTGOING-BANDWIDTH THROTTLE + REDIRECT-ON-SATURATION (dig_ecosystem #30) --------------------
