@@ -23,6 +23,55 @@ dig-dht API change — the bridge is pure dig-node. Gotcha for future work: anyt
 resource-granularity content id must apply the same capsule fallback, or announce resource granularity
 (the latter is intentionally avoided).
 
+## The read-leg 404 after DISCOVER is a FETCH-LEG TRANSPORT fault, not serve routing (#1586/#836)
+
+After #1584 (self-dial) + #1580 (capsule-fallback locate) + #1574/#1575 (live DHT routing), the #836 e2e
+still 404'd on DATA: reader CONNECTs (Direct :9444/:9445 + relay) and DISCOVERs the holder
+(`getAvailability providers_count=1`), but the holder logs ZERO inbound `fetchRange` and the read
+dead-ends at the §21 upstream (`rpc.dig.net` 400 on an isolated net) → 404.
+
+Root-caused by ELIMINATION, not by guessing at the cited `capsule_store.rs` backfill:
+- The loopback `/s` serve path (`serve_content_plaintext`) tier ordering is CORRECT — Tier-2 peer fetch
+  runs BEFORE Tier-3 RPC, and it verify-then-decrypts fail-closed. Locked by the regression test
+  `tests::serve_content_plaintext_fetches_from_peer_when_upstream_unreachable`: with an UNREACHABLE
+  upstream + a provider holding a sealed resource, the serve returns `ServeSource::Peer` (it does today,
+  via the mock engine). So the fault is NOT the serve routing the issue hypothesized.
+- `CapsuleFallbackLocator` (#1580) IS wired into BOTH the enrichment `find_providers` AND the Downloader's
+  own locator (`for_dht` builds ONE `CapsuleFallbackLocator` and `NodeContent::new` clones it into the
+  Downloader), so LOCATE resolves the capsule-granularity holder for a resource-id read. Not the fault.
+- What is left is the FETCH LEG: `NatRangeTransport` (dig-download, over dig-nat via the shared
+  `NatRuntime`) dials the located holder to confirm + `fetchRange`. The holder never sees the request, so
+  the dial/handshake to the holder fails BEFORE any range is requested.
+
+Leading cause (evidence: this log's #1532/#1541 entries): the dig-nat / DigPeer NAT-traversal transport
+still mints a RANDOM EPHEMERAL cert (`nat_node_cert`, dig-gossip `state.rs`), so the holder's NAT-leg
+listener presents a `peer_id` that does NOT match its advertised NodeCert `peer_id`. The fetch dial
+expects the advertised `peer_id` and fails CLOSED on the mismatch — exactly the #1532 gossip bug, but on
+the fetch transport (tracked as #1541, dig-gossip release-first, still open). #1532 unified only the
+CHIA-SSL :9444/:9445 listeners; the NAT-traversal identity used by the range-fetch leg is still ephemeral.
+
+Two remediation shapes (orchestrator's release-first call): (a) land #1541 in dig-gossip so the NAT
+transport presents the NodeCert (fixes the fetch handshake at the root); or (b) an MVP-green dig-node
+bypass — issue `dig.fetchRange` DIRECTLY over the EXISTING connected mTLS peer-RPC session to :9444 (the
+one that already succeeded for CONNECT/DISCOVER), skipping the separate dig-nat re-dial entirely. (b) is a
+new in-dig-node client path (enumerate connected pool peers that are providers → open a stream on the live
+session → `dig.fetchRange` → verify-then-decrypt) and needs a mockable peer-RPC seam to test. Confirm the
+peer_id-mismatch hypothesis first from the e2e handshake logs before choosing.
+
+## Runtime capsule GAIN must announce, or the holder is invisible to find_providers (#1586/#1423)
+
+A pinned/backfilled capsule that lands on disk at runtime (a hosted pin via `control.rs`, the read-side
+backfill-cache, chain-watch gap-fill, or the `CacheFetchAndCache` RPC) is USELESS to the network unless the
+node also re-announces its DHT inventory — otherwise `find_providers` never learns this node holds it, and
+a hosted-pin capsule 404'd even though it was sitting on disk. Every one of those landing paths ultimately
+calls `CapsuleStore::cache_fetch_and_cache`, so the fix centralizes the re-announce there (fire once on a
+FRESH land; an already-cached hit is a no-op) instead of scattering `refresh_dht_inventory` calls at each
+call site — `gap_fill_generation` and the `CacheFetchAndCache` RPC handler both had their own explicit
+(redundant, idempotent-but-dead) refresh calls, now removed. This is the reshare/flywheel discoverability
+invariant (#1423/#1425): every runtime capsule-gain, from ANY path, must make the node a discoverable
+holder — the fix generalizes past the single hosted-pin bug by centralizing at the one shared choke point
+rather than patching each caller.
+
 ## DHT routing is seeded LIVE from gossip PoolEvents, not just the pre-connect bootstrap (#1574)
 
 `bring_up_dht` seeds the dig-dht routing table with a ONE-SHOT `service.bootstrap(bootstrap_peers_from_pool(...))`

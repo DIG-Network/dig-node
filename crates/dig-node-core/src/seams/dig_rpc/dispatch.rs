@@ -469,12 +469,10 @@ impl RpcDispatch for Node {
                 let already = module_path(&node.cache_dir, store_hex, root_hex).exists();
                 return match node.cache_fetch_and_cache(store_hex, root_hex).await {
                     Ok((size_bytes, served_root)) => {
-                        // A freshly-cached capsule entered the served set — refresh the DHT provider records so
-                        // peers immediately find this node as a holder (§14.1). No-op on the FFI path / before
-                        // peer-network bring-up. (Already-cached is unchanged inventory, so skip the refresh.)
-                        if !already {
-                            node.refresh_dht_inventory().await;
-                        }
+                        // A freshly-cached capsule makes this node a discoverable DHT holder — that
+                        // re-announce (§14.1) now fires once inside `cache_fetch_and_cache` on the fresh
+                        // land, so every caller announces uniformly and this handler needs no explicit
+                        // refresh.
                         json!({"jsonrpc":"2.0","id":id,"result":{
                     "status": if already { "already_cached" } else { "cached" },
                     "size_bytes": size_bytes,

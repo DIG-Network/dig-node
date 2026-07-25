@@ -2917,6 +2917,17 @@ hits first), so Tier-2 peer fetch resolves the announced capsule holder and proc
 finds no providers and dead-ends at the public-RPC tier even when a holder is discoverable
 (`CapsuleFallbackLocator`, #1580).
 
+**Announce-on-inventory-gain (the reshare / flywheel invariant).** A node that GAINS a capsule at runtime
+— by ANY path: a hosted pin, a §21 whole-store sync, a chain-watch gap-fill, or the read-side
+backfill-cache (a reader that caches what it just fetched) — MUST re-announce its DHT inventory so peers
+immediately discover it as a NEW holder of that capsule (§14.1). This is the discoverability half of the
+content-replication flywheel (#1423/#1425): every read makes content more available because the reader,
+on caching, becomes a discoverable holder. The re-announce is fired ONCE per freshly-landed capsule at the
+single centralized landing site (`CapsuleStore::cache_fetch_and_cache`, through which every runtime
+capsule-gain path flows), guarded so an already-held capsule is a no-op (unchanged inventory → no
+re-announce). It is best-effort and a no-op on the in-process FFI path (no peer network / inventory
+refresher installed).
+
 ### 19.4. Address book — durable, IPv6-first, provenance + TTL
 
 The node maintains a durable peer address book: every learned peer candidate — from PEX, `dig.getPeers`,
