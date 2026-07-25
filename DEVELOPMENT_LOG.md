@@ -451,3 +451,36 @@ CLI path (not via a native package) needs the `sc config`/`sc qc` dance.
   is a safe probe. Lesson: on any relayed/NAT'd topology, "which peers hold X" (discovery) and "which
   peers can I actually pull X from right now" (reachable fetch sources) are DIFFERENT questions — a
   connected pool peer is the most reachable source there is, and must be a first-class fetch candidate.
+
+## #836 read-leg DATA miss — the `getAvailability` confirm gate drops a connected holder
+
+The prior #97 fix (pool address FIRST → `best_address()` reachable) fixed the DIAL address but not the
+NEXT layer of the same 404. dig-download's `Job::locate_and_confirm` (orchestrator.rs) keeps ONLY
+providers whose `dig.getAvailability` answer is `available` — it DROPS every other provider BEFORE any
+`dig.fetchRange`. On a relayed/isolated net a holder the reader is already CONNECTED to (offered by
+`PoolProviderLocator`) can answer availability=NOT-available as a false negative (its capsule may not be
+in the `cache_list_cached` inventory `availability_presence` walks, a resource-vs-capsule granularity
+quirk, or a transient probe failure). The confirm then drops it → `providers.is_empty()` →
+`DownloadError::NotFound` ("no providers located for ContentId::Resource {…}") → ZERO `dig.fetchRange`
+issued → the read falls through to the §21 upstream backfill → 404. This is the EXACT e2e symptom
+("reader dials the holder :9444 [the availability probe] but never issues a fetchRange").
+
+Ground truth on the two logged keys (ends the "key mismatch" misdiagnosis): `fetch_resource` logs
+`content=%download_key(content)` and `download_key = ContentId::to_key().to_hex()`. For a
+`ContentId::Resource{rk}`, `to_key()` hashes store+root+rk, so the logged `ea12da62…` IS the RESOURCE
+key (NOT the capsule key — `capsule.to_key() != resource.to_key()`, dig-dht content.rs), and the
+`befbbaf9…` in the `ContentId::Resource` Debug is that resource's raw `retrieval_key`. Same resource,
+no key mismatch. The locate CHAIN (CapsuleFallback bridge + pool union + self-exclusion) resolves the
+holder correctly in-process (PR#98's unit tests are green) — the drop is downstream, in the CONFIRM.
+
+Fix (reader-side, dig-node): `PoolConfirmTransport` (download.rs) wraps the real range transport and
+short-circuits `query_availability` to `available=true` for any provider whose `peer_id` is in the
+connected pool — a live, connection-verified holder is confirmed by the connection itself; the
+whole-resource merkle verify (NOT the self-reported availability flag) is the real integrity gate. A
+DHT-only provider still goes through the real confirm. A connected non-holder simply fails its ranges and
+is dropped there (bounded, safe).
+
+Test gotcha — model a holder that answers availability=FALSE but WOULD serve: every prior read-leg mock
+(`MockRangeTransport`, `AddressAwareTransport`) answers availability=true, so none could reproduce the
+confirm-gate drop. The faithful model (`AvailabilityFalseButServesTransport`) answers availability=false
+yet serves `fetch_range` — RED (no fetchRange, "no providers located") pre-fix, GREEN post-fix.

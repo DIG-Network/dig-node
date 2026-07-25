@@ -2913,10 +2913,19 @@ relayed / isolated network a holder is discovered in the DHT but its advertised 
 addresses the reader cannot dial, so a DHT-only locate yields no REACHABLE source and the read
 dead-ends at the §21 upstream backfill (404) even though the reader is ALREADY CONNECTED to that holder.
 Offering every connected pool peer as a fetch candidate lets the download reach the holder over the
-established connection; dig-download's `dig.getAvailability` confirm step filters connected peers that do
-not hold the content, and the whole-resource merkle check binds every served byte to the chain-anchored
-root, so a connected NON-holder is a safe, pool-bounded probe. This source is DOWNLOAD-only — it never
-feeds the redirect/availability hint above.
+established connection. A connected-pool holder is NOT gated behind a separate `dig.getAvailability`
+confirm probe: the download transport short-circuits the confirm to *available* for any provider whose
+`peer_id` is currently in the connected pool (`PoolConfirmTransport`, #836), so the fetch proceeds
+straight to `dig.fetchRange`. This is required because dig-download's `locate_and_confirm` DROPS any
+provider whose availability answer is not *available*, and a connected holder can answer
+not-available as a FALSE NEGATIVE on a relayed / isolated net (a cache-inventory lag, a
+resource-vs-capsule granularity quirk) or have its probe transiently fail — either of which would drop
+the connected holder, issue ZERO `dig.fetchRange`, and dead-end the read at the §21 upstream backfill
+(404) despite a connected, serving holder. Safety is preserved by the whole-resource merkle check, which
+binds every served byte to the chain-anchored root: a connected NON-holder simply fails its ranges and
+is dropped there, a safe pool-bounded probe. A DHT-only (non-pool) provider still goes through the real
+`dig.getAvailability` confirm. This source is DOWNLOAD-only — it never feeds the redirect/availability
+hint above.
 
 The download locator (dig-dht ∪ connected pool) is itself SELF-EXCLUDED: THIS node's own `peer_id`
 (hex) is dropped from the fetch-candidate set before any dial, exactly as the DISCOVERY leg is (#1584).

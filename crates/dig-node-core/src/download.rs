@@ -495,6 +495,90 @@ impl StateStore for CapturingStateStore {
     }
 }
 
+/// A [`RangeTransport`] wrapper that BYPASSES the `getAvailability` confirm probe for a holder the node
+/// is already CONNECTED to in the gossip pool (#836 read-leg confirm-gate fix).
+///
+/// dig-download's `locate_and_confirm` keeps only providers whose `query_availability` answer is
+/// `available`, dropping the rest before any `fetchRange`. For a DHT-discovered provider that probe is a
+/// useful pre-filter. But for a CONNECTED-POOL holder it is actively harmful: the peer is a live,
+/// connection-verified holder offered specifically because we hold a connection to it, and its
+/// self-reported availability flag can be a false negative on a relayed/isolated net (a cache-inventory
+/// lag, a resource-vs-capsule granularity quirk) or its probe can transiently fail — either of which
+/// drops the holder and dead-ends the read at a 404 with ZERO `fetchRange` issued, even though the holder
+/// holds and would serve the bytes. The whole-resource merkle verify (not the availability flag) is the
+/// real integrity gate, so skipping the probe for a connected peer is safe: a genuine non-holder simply
+/// fails its ranges and is dropped there.
+///
+/// So `query_availability` short-circuits to `available = true` (no network round-trip) for any provider
+/// whose `peer_id` is currently in the connected pool, and delegates to the inner transport for every
+/// other (DHT-only) provider. `fetch_range` always delegates unchanged, with DEBUG tracing of the dial
+/// target so a live e2e run shows exactly which holder each range reached (#836 observability).
+struct PoolConfirmTransport {
+    inner: Arc<dyn RangeTransport>,
+    connected_pool: ConnectedPool,
+}
+
+impl PoolConfirmTransport {
+    fn new(inner: Arc<dyn RangeTransport>, connected_pool: ConnectedPool) -> Self {
+        PoolConfirmTransport {
+            inner,
+            connected_pool,
+        }
+    }
+
+    /// Whether `peer_id_hex` is a currently-connected pool peer (a live, connection-verified holder).
+    fn is_connected(&self, peer_id_hex: &str) -> bool {
+        self.connected_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(peer_id_hex)
+    }
+}
+
+#[async_trait::async_trait]
+impl RangeTransport for PoolConfirmTransport {
+    async fn query_availability(
+        &self,
+        provider: &ProviderRecord,
+        items: Vec<dig_nat::AvailabilityItem>,
+    ) -> Result<dig_nat::AvailabilityResponse, DownloadError> {
+        // A connected-pool holder is confirmed by the live connection itself — skip the probe (which can
+        // false-negative on a relayed net) and let the fetch + merkle verify be the gate.
+        if self.is_connected(&provider.provider_peer_id) {
+            tracing::debug!(
+                peer = %provider.provider_peer_id,
+                "pool confirm bypass: connected holder skips the getAvailability probe (#836)"
+            );
+            let answers = items
+                .iter()
+                .map(|_| dig_nat::AvailabilityAnswer {
+                    available: true,
+                    roots: None,
+                    total_length: None,
+                    chunk_count: None,
+                    complete: None,
+                })
+                .collect();
+            return Ok(dig_nat::AvailabilityResponse { items: answers });
+        }
+        self.inner.query_availability(provider, items).await
+    }
+
+    async fn fetch_range(
+        &self,
+        provider: &ProviderRecord,
+        req: &dig_nat::RangeRequest,
+    ) -> Result<dig_download::FetchedRange, DownloadError> {
+        tracing::debug!(
+            peer = %provider.provider_peer_id,
+            offset = req.offset,
+            length = req.length,
+            "fetch_range: dialing holder for a range (#836)"
+        );
+        self.inner.fetch_range(provider, req).await
+    }
+}
+
 impl NodeContent {
     /// Build the engine from injected locate + transport seams (the constructor tests use with the
     /// dig-download [`testkit`](dig_download::testkit) mocks; production goes through
@@ -568,9 +652,23 @@ impl NodeContent {
             ]),
             self_peer_id.clone(),
         );
+        // #836 read-leg confirm-gate fix: wrap the real transport so a CONNECTED-POOL holder skips the
+        // separate `getAvailability` confirm probe. dig-download's `locate_and_confirm` drops any provider
+        // whose availability answer is not `available` — but a pool peer was offered specifically because
+        // the node is ALREADY CONNECTED to it (a live, connection-verified holder), and the whole-resource
+        // merkle verify — not the peer's self-reported availability flag — is the real integrity gate. On a
+        // relayed/isolated net a connected holder can answer availability=not-available (a cache-inventory
+        // lag, a granularity quirk) or have its probe transiently fail, and the confirm gate then drops it
+        // → ZERO fetchRange issued → the read 404s despite a connected, serving holder. Bypassing the probe
+        // for pool peers lets the fetch reach them; a genuine non-holder simply fails its ranges and is
+        // dropped there (bounded, safe). DHT-only providers still go through the real availability confirm.
+        let confirm_transport: Arc<dyn RangeTransport> = Arc::new(PoolConfirmTransport::new(
+            transport,
+            connected_pool.clone(),
+        ));
         let downloader = Downloader::new(
             download_locator,
-            transport,
+            confirm_transport,
             verifier,
             state_store.clone(),
             config,
@@ -1684,6 +1782,125 @@ mod tests {
         assert!(
             transport.served_fetch_from(&mock_peer_hex(1)).await,
             "a fetchRange must reach the holder over its reachable pool address"
+        );
+    }
+
+    /// A [`RangeTransport`] modelling a connected holder that ANSWERS `getAvailability` = NOT-available
+    /// for the resource, yet WOULD serve the bytes if a `fetchRange` reached it. This is the read-leg
+    /// sub-cause the address fix (#97) did NOT cover: the holder is connected AND reachable, `find_providers`
+    /// offers it, but dig-download's `locate_and_confirm` drops every provider whose `query_availability`
+    /// answer is not `available` — so NO `fetchRange` is ever issued and the read 404s, even though the
+    /// holder holds (and would serve) the resource. Records the peer_id of every `fetch_range` served, so a
+    /// test can assert whether a `fetchRange` was actually issued (the exact e2e symptom: a dial for the
+    /// availability probe, then zero `fetchRange`).
+    struct AvailabilityFalseButServesTransport {
+        inner: MockRangeTransport,
+        avail_calls: tokio::sync::Mutex<Vec<String>>,
+        fetch_calls: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl AvailabilityFalseButServesTransport {
+        fn new(content: MockContent) -> Self {
+            AvailabilityFalseButServesTransport {
+                inner: MockRangeTransport::new(content),
+                avail_calls: tokio::sync::Mutex::new(Vec::new()),
+                fetch_calls: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+        async fn fetched_from(&self, peer: &str) -> bool {
+            self.fetch_calls.lock().await.iter().any(|p| p == peer)
+        }
+        async fn availability_probed(&self, peer: &str) -> bool {
+            self.avail_calls.lock().await.iter().any(|p| p == peer)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RangeTransport for AvailabilityFalseButServesTransport {
+        async fn query_availability(
+            &self,
+            provider: &ProviderRecord,
+            items: Vec<dig_nat::AvailabilityItem>,
+        ) -> Result<dig_nat::AvailabilityResponse, DownloadError> {
+            self.avail_calls
+                .lock()
+                .await
+                .push(provider.provider_peer_id.clone());
+            // The holder answers NOT-available for every queried item (the confirm-says-no sub-cause).
+            let answers = items
+                .iter()
+                .map(|_| dig_nat::AvailabilityAnswer {
+                    available: false,
+                    roots: None,
+                    total_length: None,
+                    chunk_count: None,
+                    complete: None,
+                })
+                .collect();
+            Ok(dig_nat::AvailabilityResponse { items: answers })
+        }
+        async fn fetch_range(
+            &self,
+            provider: &ProviderRecord,
+            req: &dig_nat::RangeRequest,
+        ) -> Result<dig_download::FetchedRange, DownloadError> {
+            self.fetch_calls
+                .lock()
+                .await
+                .push(provider.provider_peer_id.clone());
+            self.inner.fetch_range(provider, req).await
+        }
+    }
+
+    /// #836 read-leg GROUND TRUTH (the confirm-gate sub-cause, arbiter e2e d1d1f728): the reader is
+    /// CONNECTED to the capsule holder in the gossip pool at its REACHABLE address and `find_providers`
+    /// offers it — but the holder's `getAvailability` answer for the resource is NOT-available, so
+    /// dig-download's `locate_and_confirm` drops it and issues ZERO `fetchRange` (the exact e2e symptom:
+    /// the availability probe dials :9444, then no `fetchRange`, then §21 upstream 400 → DATA 404). A
+    /// connected-pool holder must NOT be gated behind a separate availability probe: it was specifically
+    /// offered as a holder over a live connection, and the whole-resource merkle verify — not the
+    /// self-reported availability flag — is the real integrity gate. This test drives the REAL
+    /// fetch_resource→Downloader handoff and asserts a `fetchRange` reaches the connected holder. It is
+    /// RED before the pool-confirm bypass (no `fetchRange` issued) and GREEN after.
+    #[tokio::test]
+    async fn connected_pool_holder_is_fetched_even_when_it_answers_availability_false() {
+        let td = tempfile::tempdir().unwrap();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        let transport = Arc::new(AvailabilityFalseButServesTransport::new(content.clone()));
+
+        // The DHT discovers nobody reachable (the exact relayed-net condition) — the ONLY source of the
+        // holder is the live connected pool.
+        let locator = Arc::new(MockProviderLocator::fixed(vec![]));
+        let pc = NodeContent::new(
+            locator,
+            transport.clone(),
+            MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+
+        // CONNECT ✅: the reader IS connected to the holder (peer 1) in the pool at a reachable address.
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addr: "10.0.0.1:9444".parse().unwrap(),
+        });
+
+        // DATA: the fetch must reach the connected holder despite its availability=false answer.
+        let f = pc
+            .fetch_resource(&cid)
+            .await
+            .expect("a connected-pool holder is fetched even when it answers availability=false");
+        assert_eq!(f.bytes, content.bytes, "served bytes match the source");
+        assert!(
+            transport.fetched_from(&mock_peer_hex(1)).await,
+            "a fetchRange MUST reach the connected holder (the exact e2e miss: zero fetchRange issued)"
+        );
+        // Sanity: the connected-pool holder's availability probe is bypassed (we go straight to fetch),
+        // so a not-available answer can never drop a peer we are already connected to.
+        assert!(
+            !transport.availability_probed(&mock_peer_hex(1)).await,
+            "a connected-pool holder must not be gated behind a separate availability probe"
         );
     }
 
