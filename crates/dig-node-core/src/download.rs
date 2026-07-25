@@ -538,10 +538,21 @@ impl NodeContent {
         // bounded probe. The redirect-on-miss path keeps the RAW `locator` (below) — a redirect must
         // name announced holders, never every connected peer.
         let connected_pool: ConnectedPool = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let download_locator: Arc<dyn ProviderLocator> = UnionLocator::new(vec![
-            locator.clone(),
-            PoolProviderLocator::new(connected_pool.clone()),
-        ]);
+        // #836/#92: the fetch-dial candidate set MUST exclude self, exactly like the DISCOVERY leg
+        // (#1584). #1584 self-excluded only the raw discovery `locator`; the DOWNLOAD locator adds the
+        // [`PoolProviderLocator`] over the connected pool, and a relay-introduced self-connection can
+        // surface THIS node in that pool (peer_id == local). Offered as a fetch candidate it becomes a
+        // self-dial (Direct → own IP → connection refused; Relayed → refused self-dial) that starves
+        // the download's confirm round and dead-ends the read at HTTP 404 despite a reachable holder
+        // being connected (run e2e-836-arb-20260725-084501). Wrap the WHOLE download locator so NO
+        // source — DHT or pool — can ever offer self on the fetch/dial path.
+        let download_locator: Arc<dyn ProviderLocator> = SelfExcludingLocator::new(
+            UnionLocator::new(vec![
+                locator.clone(),
+                PoolProviderLocator::new(connected_pool.clone()),
+            ]),
+            self_peer_id.clone(),
+        );
         let downloader = Downloader::new(
             download_locator,
             transport,
@@ -641,6 +652,17 @@ impl NodeContent {
     /// is 1:1. A `PeerAdded` upserts (provenance Gossip, preserving learned quality); a `PeerRemoved`
     /// marks disconnected (retaining history) or, for `Banned`, ineligible until re-added.
     pub fn on_pool_event(&self, event: &PoolEvent) {
+        // Never register THIS node as its own source (#836/#92). A relay-introduced self-connection can
+        // surface self in gossip pool churn (peer_id == local); a self entry then becomes a fetch
+        // candidate that self-dials (own IP → connection refused; relayed → refused self-dial) and
+        // dead-ends the read. Drop a self `PeerAdded` at the source, before it reaches EITHER the
+        // selector registry or the download-side connected pool. (The download locator is also
+        // self-excluded above — belt-and-suspenders; this keeps the selector ranking clean too.)
+        if let PoolEvent::PeerAdded { peer_id, .. } = event {
+            if self.self_peer_id.as_deref() == Some(peer_id.to_hex().as_str()) {
+                return;
+            }
+        }
         self.selector.on_pool_event(event);
         // Mirror the churn into the connected-pool set the download-side PoolProviderLocator reads
         // (#1590): a joined peer becomes a fetch candidate (over the connection we already hold); a
@@ -1409,6 +1431,155 @@ mod tests {
         assert!(
             transport.attempts_for(&mock_peer_hex(1)).await >= 1,
             "the connected pool holder was actually fetched from"
+        );
+    }
+
+    /// A [`RangeTransport`] that RECORDS the peer_id of EVERY dial it is asked to make (availability
+    /// AND fetch), delegating the bytes to an inner [`MockRangeTransport`]. This closes the test gap
+    /// that hid the #836 self-dial for nine iterations: a mock that serves bytes regardless of target
+    /// cannot distinguish a holder-dial from a self-dial, so a fetch that dialed self could still
+    /// "pass". Recording the target lets the test assert the dial went to the HOLDER, never self.
+    struct TargetRecordingTransport {
+        inner: MockRangeTransport,
+        dialed: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl TargetRecordingTransport {
+        fn new(content: MockContent) -> Self {
+            TargetRecordingTransport {
+                inner: MockRangeTransport::new(content),
+                dialed: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+        async fn was_dialed(&self, peer: &str) -> bool {
+            self.dialed.lock().await.iter().any(|p| p == peer)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RangeTransport for TargetRecordingTransport {
+        async fn query_availability(
+            &self,
+            provider: &ProviderRecord,
+            items: Vec<dig_nat::AvailabilityItem>,
+        ) -> Result<dig_nat::AvailabilityResponse, DownloadError> {
+            self.dialed
+                .lock()
+                .await
+                .push(provider.provider_peer_id.clone());
+            self.inner.query_availability(provider, items).await
+        }
+        async fn fetch_range(
+            &self,
+            provider: &ProviderRecord,
+            req: &dig_nat::RangeRequest,
+        ) -> Result<dig_download::FetchedRange, DownloadError> {
+            self.dialed
+                .lock()
+                .await
+                .push(provider.provider_peer_id.clone());
+            self.inner.fetch_range(provider, req).await
+        }
+    }
+
+    /// #836/#92 regression (run e2e-836-arb-20260725-084501): a reader whose OWN peer_id has leaked
+    /// into the connected pool (a relay-introduced self-connection) must NEVER dial itself on the
+    /// fetch path, and MUST dial the real connected holder. Before the fix the download locator's
+    /// [`PoolProviderLocator`] was not self-excluded, so self was offered as a fetch candidate → the
+    /// confirm dialed self (own IP → connection refused; relayed → refused self-dial), starving the
+    /// round and dead-ending the read at 404 despite a reachable holder. The transport RECORDS every
+    /// dial target, so a self-dial is caught even though a target-blind mock would have "passed".
+    #[tokio::test]
+    async fn fetch_never_dials_self_and_reaches_the_connected_holder() {
+        let td = tempfile::tempdir().unwrap();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        let transport = Arc::new(TargetRecordingTransport::new(content.clone()));
+
+        // This node's own identity — and the self peer_id the engine must exclude on the fetch path.
+        let self_id = mock_peer_hex(9);
+        // The DHT discovers nobody reachable (the exact relayed-net condition).
+        let locator = Arc::new(MockProviderLocator::fixed(vec![]));
+        let pc = NodeContent::new(
+            locator,
+            transport.clone(),
+            MissMode::FetchThrough,
+            Some(self_id.clone()),
+            td.path(),
+        );
+
+        // Model the e2e defect: BOTH the real holder (peer 1) AND this node itself (peer 9, via a
+        // relay-introduced self-connection) appear in the connected pool.
+        let holder = PeerId::from_bytes([1u8; 32]);
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: holder,
+            addr: "10.0.0.1:9444".parse().unwrap(),
+        });
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: PeerId::from_bytes([9u8; 32]),
+            addr: "10.0.0.9:9444".parse().unwrap(),
+        });
+
+        // The fetch must succeed by reaching the holder — never self.
+        let f = pc
+            .fetch_resource(&cid)
+            .await
+            .expect("fetch reaches the connected holder");
+        assert_eq!(f.bytes, content.bytes, "served bytes match the source");
+
+        assert!(
+            !transport.was_dialed(&self_id).await,
+            "the reader must NEVER dial itself on the fetch path (self-dial dead-ends the read)"
+        );
+        assert!(
+            transport.was_dialed(&mock_peer_hex(1)).await,
+            "the fetch must dial the real connected holder"
+        );
+    }
+
+    /// #836/#92: a self `PeerAdded` (relay-introduced self-connection) is dropped at the pool feed —
+    /// it never enters the download-side connected pool, so it can never be offered as a fetch
+    /// candidate. A genuine peer add is still recorded.
+    #[tokio::test]
+    async fn on_pool_event_drops_a_self_peer_added() {
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(10, 1))),
+            MissMode::Redirect,
+            Some(mock_peer_hex(9)),
+            td.path(),
+        );
+        // A self add is ignored — neither the connected pool nor the selector registry learns it.
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: PeerId::from_bytes([9u8; 32]),
+            addr: "10.0.0.9:9444".parse().unwrap(),
+        });
+        assert!(
+            pc.connected_pool()
+                .lock()
+                .unwrap()
+                .get(&mock_peer_hex(9))
+                .is_none(),
+            "a self entry must never enter the connected pool"
+        );
+        assert_eq!(
+            pc.selector().snapshot().registry_size,
+            0,
+            "self is never registered as a selectable source"
+        );
+        // A genuine, non-self peer is still recorded.
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addr: "10.0.0.1:9444".parse().unwrap(),
+        });
+        assert!(
+            pc.connected_pool()
+                .lock()
+                .unwrap()
+                .get(&mock_peer_hex(1))
+                .is_some(),
+            "a genuine peer still enters the connected pool"
         );
     }
 
