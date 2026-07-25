@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.56.4] - 2026-07-25
+
+### Features
+- **peer:** Leg B relayed-connect responder + nat_identity injection (#1532)
+
+### Bug Fixes
+- **peer:** Seed DHT routing live from gossip PoolEvents (#1574) (#84)- **dht:** Seed routing with peer DHT port not gossip port (#1575 GAP 2) (#85)- **read:** Resource read miss resolves the announced capsule holder (#1580) (#86)- Exclude self peer_id from discovered providers on the read leg (#1584) (#89)
+
+### Chores
+- **deps:** Bump dig-gossip 0.15.0 -> 0.15.1 (#1581 direct-path discover) (#88)
+
 ## [0.54.1] - 2026-07-23
 
 ### Bug Fixes
