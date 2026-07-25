@@ -4,6 +4,34 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## The fetch transport dials ONE address — `best_address()`, the FIRST dialable — so union ORDER, not just the merge, decides reachability (#836/#1590)
+
+Merging same-peer address hints across discovery sources is necessary but NOT sufficient. The real content
+transport does not try every advertised address: `NatRangeTransport::provider_to_target` (dig-download
+`source.rs`) dials the SINGLE `provider.best_address()`, and dig-dht `record.rs` defines `best_address()` as
+"the FIRST candidate whose kind `is_dialable()`" (Direct/Mapped/Reflexive; Relay is not dialable) in LIST
+ORDER — `addresses` is not re-sorted at merge time (`UnionLocator::sanitize_address_hints` dedups+caps but
+does NOT sort). So the address that WINS the dial is whichever source's hint LEADS the merged list.
+
+The download union merges same-peer_id records onto the FIRST-SEEN record (`existing.addresses.extend(...)`),
+so the first-queried source leads. With the DHT source first and the pool second, a stale/unreachable DHT
+hint (e.g. `172.31.44.121`, or a relayed-net address the reader cannot dial) leads the list and becomes
+`best_address()`, so every confirm/fetchRange dial hits the unreachable address and the read 404s — even
+though the reachable pool address (`:9444`) is present in the record, just later. Fix: put the
+`PoolProviderLocator` FIRST in the DOWNLOAD union (`NodeContent::new`) — a pool entry is a LIVE,
+connection-verified address, strictly better than an untrusted advertised DHT hint — so it leads the list
+and `best_address()` selects the address that actually connects. This orders ONLY the download union; the
+DISCOVERY leg (`self.locator`, find_providers/redirect) is untouched, and the #1584 self-exclusion,
+#1580 capsule-fallback, and verify-then-decrypt fail-closed all still compose.
+
+Test gotcha — model `best_address()`, NOT `.any()`: a mock transport whose `is_reachable` checks
+`addresses.iter().any(|a| a == reachable)` FALSE-GREENS this bug. `.any()` passes whenever the reachable
+address is present ANYWHERE in the list, so it "passes" even under the broken append-order where the
+unreachable hint leads. The faithful model is `addresses.iter().find(|a| a.kind.is_dialable())` (the exact
+`best_address()` rule) — that test is RED under the old order (best_address = unreachable) and only GREEN
+once the reachable address leads. Any test that predicts this read-leg e2e MUST model the single-address
+`best_address()` dial, or it silently green-lights a still-broken dial path.
+
 ## Self-exclusion is per-PATH: the DISCOVERY leg and the FETCH-DIAL candidate set are SEPARATE (#1584 vs #836/#92)
 
 "The reader must never fetch from itself" has to be enforced on EVERY path that produces a dial candidate,
@@ -27,6 +55,35 @@ no source — DHT or pool — can offer self on the fetch/dial path. Gotcha for 
 unioned into the fetch/download path is a new instance of this class — self-exclude it at the point it is
 composed, and TEST it with a target-RECORDING transport (a mock that serves bytes regardless of dial target
 cannot tell a holder-dial from a self-dial and will falsely pass).
+
+## UnionLocator dedup-by-peer_id was DROPPING a reachable address, not just a duplicate record (#1590/#836)
+
+The download locator unions two provider sources that can name the SAME authenticated peer_id with
+DIFFERENT addresses: the raw DHT discovery locator (a peer's *advertised* provider record — an untrusted,
+often stale/relayed-net reach hint) and the `PoolProviderLocator` (the peer's *live connection* address,
+connection-verified and reachable). `UnionLocator` deduped by `peer_id` keeping the FIRST-SEEN record whole
+and DISCARDING every later same-peer record — so the DHT's UNREACHABLE hint (seen first) SHADOWED the pool's
+REACHABLE address for the same holder. The confirm/fetch then dialed only the unreachable address, every
+dial refused, dig-download reported `no providers located for ContentId::Resource {…}`, and the read fell
+through to §21 upstream → DATA 404 — even though the reader was CONNECTED to a dialable holder.
+
+Symptom (arbiter e2e c0954369, run e2e-836-arb-20260725-094734): `fetch_resource: located providers before
+download … located=1 connected_pool=1` and the pool locator logs it is offering the holder at `:9444`, yet
+the fetch still fails with `no providers located for the resource` and dials a DIFFERENT, refused address
+(`172.31.44.121:<ephemeral>`) — the DHT hint — instead of the pool's `172.31.29.67:9444`. The tell is that
+locate found "1" but the fetch dialed an address the pool never offered.
+
+Fix = `UnionLocator` now MERGES the (untrusted, `MAX_ADDRS_PER_PROVIDER`-capped) address hints of same-peer
+records across sources instead of dropping the later record. peer_id stays the authenticated identity
+(SPKI-pinned at connect); addresses are only reach hints, so unioning them is safe, and the reachable pool
+address survives so a `fetchRange` reaches the holder. First-seen record ORDER is preserved (dig-dht stays
+authoritative for ordering; this is a no-op on the DISCOVERY union `[dht, empty, empty]`, so redirect hints
+stay capsule/announced-holder granularity — unpolluted).
+
+Gotcha for future work: a peer_id-keyed dedup across sources that each contribute their own ADDRESS hints
+must MERGE addresses, never keep-first-drop-rest — otherwise the "best" (reachable/verified) address can be
+lost purely because a worse source named the peer first. Test it with an ADDRESS-aware transport (fail the
+dial unless the record carries the reachable address); a peer_id-only mock cannot catch this.
 
 ## Gossip-vs-peer-RPC port confusion is a recurring bug CLASS across pool-consuming feeds (#1575, #1590/#836)
 

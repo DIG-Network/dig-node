@@ -529,14 +529,27 @@ impl NodeContent {
             selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
             ..DownloadConfig::default()
         };
-        // The DOWNLOAD locator (#1590) = the raw discovery `locator` UNIONed with a
-        // [`PoolProviderLocator`] over the live connected-pool set. So a fetch's locate step also
-        // offers the peers the node is ALREADY CONNECTED to — reaching a holder whose DHT provider
-        // record is unreachable on a relayed net (the #836 read-leg blocker). dig-download's confirm
-        // step filters connected peers that do not hold the content, and the whole-resource merkle
-        // check binds every byte to the chain-anchored root, so a connected non-holder is a safe,
-        // bounded probe. The redirect-on-miss path keeps the RAW `locator` (below) — a redirect must
-        // name announced holders, never every connected peer.
+        // The DOWNLOAD locator (#1590) = a [`PoolProviderLocator`] over the live connected-pool set
+        // UNIONed with the raw discovery `locator`. So a fetch's locate step also offers the peers the
+        // node is ALREADY CONNECTED to — reaching a holder whose DHT provider record is unreachable on
+        // a relayed net (the #836 read-leg blocker). dig-download's confirm step filters connected peers
+        // that do not hold the content, and the whole-resource merkle check binds every byte to the
+        // chain-anchored root, so a connected non-holder is a safe, bounded probe. The redirect-on-miss
+        // path keeps the RAW `locator` (below) — a redirect must name announced holders, never every
+        // connected peer.
+        //
+        // #836 dial-order (arbiter e2e c0954369): the pool source MUST be FIRST in the union. The real
+        // content transport dials a SINGLE address — `provider.best_address()` = the FIRST *dialable*
+        // candidate in list order (dig-dht `record.rs`, `is_dialable` = Direct/Mapped/Reflexive) — NOT
+        // "any reachable address". The union merges same-peer_id address hints onto the FIRST-seen
+        // record (extend, order-preserving; the cap does NOT sort). So whichever source is queried first
+        // leads the address list and thus WINS `best_address()`. A pool entry is a LIVE,
+        // connection-verified address; a DHT hint is an untrusted, possibly-stale advertisement. Putting
+        // the pool FIRST makes the connection-verified address lead → `best_address()` selects the
+        // reachable :9444, so confirm/fetchRange dial the address that actually connects. (Pool-second —
+        // the prior order — left the stale DHT address leading, so every dial hit the unreachable hint
+        // and the read 404'd despite a connected, dialable holder.) This orders ONLY the download union;
+        // the DISCOVERY leg (`self.locator`, used by find_providers/redirect) is untouched.
         let connected_pool: ConnectedPool = Arc::new(std::sync::Mutex::new(HashMap::new()));
         // #836/#92: the fetch-dial candidate set MUST exclude self, exactly like the DISCOVERY leg
         // (#1584). #1584 self-excluded only the raw discovery `locator`; the DOWNLOAD locator adds the
@@ -548,8 +561,10 @@ impl NodeContent {
         // source — DHT or pool — can ever offer self on the fetch/dial path.
         let download_locator: Arc<dyn ProviderLocator> = SelfExcludingLocator::new(
             UnionLocator::new(vec![
-                locator.clone(),
+                // Pool FIRST: a live connection-verified address must lead so `best_address()` (the
+                // first dialable candidate) selects the reachable :9444, not a stale DHT hint (#836).
                 PoolProviderLocator::new(connected_pool.clone()),
+                locator.clone(),
             ]),
             self_peer_id.clone(),
         );
@@ -1534,6 +1549,141 @@ mod tests {
         assert!(
             transport.was_dialed(&mock_peer_hex(1)).await,
             "the fetch must dial the real connected holder"
+        );
+    }
+
+    /// A [`RangeTransport`] that models a REAL dial FAITHFULLY: the real content transport dials a
+    /// SINGLE address — `provider.best_address()`, the FIRST *dialable* candidate in list order
+    /// (dig-dht `record.rs`; `NatRangeTransport::provider_to_target`) — so it connects IFF that ONE
+    /// address is the reachable one, NOT if ANY advertised address happens to be reachable. (A `.any()`
+    /// model is the false-green trap: it "passes" whenever the reachable address is present ANYWHERE in
+    /// the list, even when `best_address()` — the address actually dialed — is the unreachable one.)
+    /// Records the peer_id of every `fetch_range` it actually served so a test can assert the fetch
+    /// reached the holder over its reachable address.
+    struct AddressAwareTransport {
+        inner: MockRangeTransport,
+        reachable: std::net::SocketAddr,
+        served_fetch: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl AddressAwareTransport {
+        fn new(content: MockContent, reachable: std::net::SocketAddr) -> Self {
+            AddressAwareTransport {
+                inner: MockRangeTransport::new(content),
+                reachable,
+                served_fetch: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Whether the SINGLE address the real transport would dial — `best_address()`, the first
+        /// dialable candidate in list order (dig-dht `record.rs`) — is the reachable one (IPv4-mapped
+        /// IPv6 forms normalised). NOT `.any()`: a dial connects only to the one chosen address.
+        fn is_reachable(&self, provider: &ProviderRecord) -> bool {
+            let want_ip = self.reachable.ip().to_string();
+            let want_port = self.reachable.port();
+            // Mirror dig-dht `ProviderRecord::best_address`: the first candidate whose kind is dialable.
+            match provider.addresses.iter().find(|a| a.kind.is_dialable()) {
+                Some(best) => {
+                    let host = best.host.trim_start_matches("::ffff:");
+                    host == want_ip && best.port == want_port
+                }
+                None => false,
+            }
+        }
+
+        async fn served_fetch_from(&self, peer: &str) -> bool {
+            self.served_fetch.lock().await.iter().any(|p| p == peer)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RangeTransport for AddressAwareTransport {
+        async fn query_availability(
+            &self,
+            provider: &ProviderRecord,
+            items: Vec<dig_nat::AvailabilityItem>,
+        ) -> Result<dig_nat::AvailabilityResponse, DownloadError> {
+            if !self.is_reachable(provider) {
+                return Err(DownloadError::transport(
+                    &provider.provider_peer_id,
+                    "mock: unreachable address (dial refused)",
+                ));
+            }
+            self.inner.query_availability(provider, items).await
+        }
+        async fn fetch_range(
+            &self,
+            provider: &ProviderRecord,
+            req: &dig_nat::RangeRequest,
+        ) -> Result<dig_download::FetchedRange, DownloadError> {
+            if !self.is_reachable(provider) {
+                return Err(DownloadError::transport(
+                    &provider.provider_peer_id,
+                    "mock: unreachable address (dial refused)",
+                ));
+            }
+            self.served_fetch
+                .lock()
+                .await
+                .push(provider.provider_peer_id.clone());
+            self.inner.fetch_range(provider, req).await
+        }
+    }
+
+    /// #1590/#836 regression (arbiter e2e c0954369, run e2e-836-arb-20260725-094734): the reader is
+    /// CONNECTED to the capsule holder in the gossip pool at its REACHABLE address, but the DHT names
+    /// the SAME peer_id at a DIFFERENT, UNREACHABLE address (a stale/relayed-net provider hint). The
+    /// download locator unions the connected-pool source with the DHT source; the real transport dials
+    /// a SINGLE address — `best_address()`, the FIRST dialable candidate in the merged list. Both a
+    /// merge (so the reachable address is PRESENT) AND the right ORDER (so the reachable address LEADS)
+    /// are required: with the pool source SECOND the merge appended the reachable :9444 AFTER the stale
+    /// DHT hint, so `best_address()` still returned the unreachable address → every dial refused →
+    /// `NoProviders`/`NotFound` → the read fell through to §21 upstream → DATA 404 despite a connected,
+    /// dialable holder. The fix puts the connection-verified POOL source FIRST so its reachable address
+    /// leads the list and `best_address()` selects the :9444 that actually connects. The
+    /// [`AddressAwareTransport`] models `best_address()` (not `.any()`), so this test is RED under the
+    /// old append-order and GREEN once the pool leads — it is the test that predicts the e2e DATA-green.
+    #[tokio::test]
+    async fn resource_fetch_uses_the_reachable_pool_address_when_the_dht_hint_is_unreachable() {
+        let td = tempfile::tempdir().unwrap();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        let reachable: std::net::SocketAddr = "10.0.0.1:9444".parse().unwrap();
+        let transport = Arc::new(AddressAwareTransport::new(content.clone(), reachable));
+
+        // DISCOVER: the DHT names the holder (peer 1) at an UNREACHABLE address (the exact e2e
+        // condition — the advertised provider record carries an address the reader cannot dial).
+        let holder = dig_dht::PeerId::from_bytes([1u8; 32]);
+        let dht_record = ProviderRecord::new(
+            &cid.to_key(),
+            &holder,
+            vec![dig_dht::CandidateAddr::direct("10.9.9.9", 1)],
+            u64::MAX,
+        );
+        let locator = Arc::new(MockProviderLocator::fixed(vec![dht_record]));
+        let pc = NodeContent::new(
+            locator,
+            transport.clone(),
+            MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+
+        // CONNECT ✅: the reader IS connected to the SAME peer at the REACHABLE address in the pool.
+        pc.on_pool_event(&PoolEvent::PeerAdded {
+            peer_id: PeerId::from_bytes([1u8; 32]),
+            addr: reachable,
+        });
+
+        // DATA: the fetch must reach the holder over its reachable pool address (was Err → 404 before).
+        let f = pc
+            .fetch_resource(&cid)
+            .await
+            .expect("fetch reaches the holder at its reachable pool address");
+        assert_eq!(f.bytes, content.bytes, "served bytes match the source");
+        assert!(
+            transport.served_fetch_from(&mock_peer_hex(1)).await,
+            "a fetchRange must reach the holder over its reachable pool address"
         );
     }
 
