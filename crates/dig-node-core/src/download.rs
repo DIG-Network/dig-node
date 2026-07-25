@@ -662,10 +662,8 @@ impl NodeContent {
         // → ZERO fetchRange issued → the read 404s despite a connected, serving holder. Bypassing the probe
         // for pool peers lets the fetch reach them; a genuine non-holder simply fails its ranges and is
         // dropped there (bounded, safe). DHT-only providers still go through the real availability confirm.
-        let confirm_transport: Arc<dyn RangeTransport> = Arc::new(PoolConfirmTransport::new(
-            transport,
-            connected_pool.clone(),
-        ));
+        let confirm_transport: Arc<dyn RangeTransport> =
+            Arc::new(PoolConfirmTransport::new(transport, connected_pool.clone()));
         let downloader = Downloader::new(
             download_locator,
             confirm_transport,
