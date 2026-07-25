@@ -59,7 +59,9 @@ impl ProviderLocator for SelfExcludingLocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dig_download::testkit::{mock_content_id, mock_peer_hex, mock_provider, MockProviderLocator};
+    use dig_download::testkit::{
+        mock_content_id, mock_peer_hex, mock_provider, MockProviderLocator,
+    };
 
     /// #1584 regression: the reader's OWN `peer_id`, if it ever appears in a discovered provider set,
     /// is filtered out before the fetch dial — so the reader can never self-dial and dead-end the read.
