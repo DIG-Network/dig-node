@@ -705,23 +705,6 @@ impl NodeContent {
     ) -> Result<Arc<FetchedResource>, String> {
         let key = download_key(content);
 
-        // Tier-2 observability (#836): the read-leg fetch was invisible for six iterations because it
-        // emitted no tracing — a live-but-misdialing path looked like "never invoked". Log the located
-        // provider count (DHT ∪ connected pool) up front so a DATA miss shows whether locate found
-        // anyone at all, and the terminal result below shows whether the fetch itself succeeded.
-        let located = self.find_providers(content).await.len();
-        let pool_size = self
-            .connected_pool
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len();
-        tracing::debug!(
-            content = %key,
-            located,
-            connected_pool = pool_size,
-            "fetch_resource: located providers before download"
-        );
-
         // 1. Serve from the bounded in-memory cache if we recently fetched this resource.
         if let Some(hit) = self.fetched.lock().await.get(&key).cloned() {
             return Ok(hit);
@@ -732,6 +715,28 @@ impl NodeContent {
         let _serial = self.fetch_lock.lock().await;
         if let Some(hit) = self.fetched.lock().await.get(&key).cloned() {
             return Ok(hit);
+        }
+
+        // Tier-2 observability (#836): the read-leg fetch was invisible for six iterations because it
+        // emitted no tracing — a live-but-misdialing path looked like "never invoked". Log the located
+        // provider count (DHT ∪ connected pool) up front so a DATA miss shows whether locate found
+        // anyone at all, and the terminal result below shows whether the fetch itself succeeded.
+        // Gated on DEBUG being enabled (and placed after both cache-hit checks above) so a cached
+        // re-serve — the common case — never pays this locate's cost; only an actual cache-miss
+        // download does, and only when someone is watching at DEBUG.
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let located = self.find_providers(content).await.len();
+            let pool_size = self
+                .connected_pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len();
+            tracing::debug!(
+                content = %key,
+                located,
+                connected_pool = pool_size,
+                "fetch_resource: located providers before download"
+            );
         }
 
         // 3. Stage into a per-download final path under `<downloads>` (the FileSink writes
