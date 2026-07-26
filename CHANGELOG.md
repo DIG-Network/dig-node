@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.58.8] - 2026-07-26
+
+### Bug Fixes
+- **read:** Announce DHT inventory on runtime capsule gain (#1586) (#90)- **read:** Fetch from connected pool holders when the DHT record is unreachable (#1590) (#93)- **read:** Translate gossip→peer-RPC port in selector-registry pool feed (#1590, #836 DATA leg) (#95)- **read:** Never self-dial on the fetch path; self-exclude the download locator (#836, #92) (#96)- **read:** Merge same-peer address hints so a reachable pool address is not shadowed (#1590, #836) (#97)- **read:** Bypass getAvailability confirm for connected-pool holders (#836) (#100)- **read:** Consume dig-nat 0.11.2 fetchRange base64 wire fix + real-wire regression test (#836) (#101)
+
+### Chores
+- **deps:** Cascade dig-nat 0.11.1 (self-dial chokepoint fix, #836 read leg) (#99)- **deps:** Bump dig-download 0.7.2 (delivers dig-nat 0.11.2 fetchRange base64 fix, #836) (#102)- **deps:** Bump dig-download 0.7.3 (IPv6 provider-addr parse + v6->v4 fallback, #836) (#103)
+
 ## [0.56.4] - 2026-07-25
 
 ### Features
