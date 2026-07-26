@@ -119,8 +119,10 @@ pub fn router(state: AppState) -> Router {
     // The extension calls from a `chrome-extension://` origin; a same-machine page
     // calls from `http://localhost`, `http://dig.local`, or a loopback IP (#91 —
     // the dual listener means a page can be served from any of the canonical local
-    // names). Reflect those so the browser's CORS preflight passes. The node is
-    // loopback-only, so reflecting these local origins is not a public-exposure risk.
+    // names). Reflect those so the browser's CORS preflight passes. The node binds
+    // loopback-only by default (a non-loopback DIG_NODE_HOST is refused unless
+    // DIG_NODE_ALLOW_REMOTE=1, #1662), so reflecting these local origins is not a
+    // public-exposure risk.
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
             origin.to_str().map(is_allowed_origin).unwrap_or(false)
@@ -146,8 +148,9 @@ pub fn router(state: AppState) -> Router {
         // itself, see `is_local_origin`'s callers). Without it Chrome silently blocks every
         // extension→node request and the extension (correctly) reports the node offline, even
         // though `/health` answers fine to a direct curl/fetch from a non-PNA-checked context.
-        // The node is loopback-only, so allowing this to every reflected local origin is not a
-        // public-exposure risk (mirrors the existing origin-reflection trust boundary above).
+        // The node binds loopback-only (enforced — non-loopback DIG_NODE_HOST refused unless
+        // DIG_NODE_ALLOW_REMOTE=1, #1662), so allowing this to every reflected local origin is not
+        // a public-exposure risk (mirrors the existing origin-reflection trust boundary above).
         .allow_private_network(true);
 
     Router::new()
@@ -214,7 +217,8 @@ const EXPOSED_DIG_HEADERS: [&str; 10] = [
 ];
 
 /// Whether a CORS `Origin` is one this loopback node reflects. Two families, both loopback-only
-/// trust (the node binds loopback only; CORS is not an auth boundary):
+/// trust (the node binds loopback only — a non-loopback DIG_NODE_HOST is refused unless
+/// DIG_NODE_ALLOW_REMOTE=1, #1662; CORS is not an auth boundary):
 ///
 /// - **Same-machine web/extension origins** ([`is_local_origin`]) — the extension's
 ///   `chrome-extension://` scheme + `http://` pages served from a canonical local name (#91).
@@ -272,7 +276,8 @@ fn is_local_origin(origin: &str) -> bool {
 /// Axum middleware enforcing the [`host_is_allowed`] allowlist (#91). A request
 /// whose `Host` header is not a canonical local name is rejected `421 Misdirected
 /// Request` with a catalogued JSON-RPC-style error body, so even though the node
-/// binds loopback-only it never serves a foreign-named (rebinding) request. Allowed
+/// binds loopback-only (enforced — a non-loopback DIG_NODE_HOST is refused unless
+/// DIG_NODE_ALLOW_REMOTE=1, #1662) it never serves a foreign-named (rebinding) request. Allowed
 /// requests pass through untouched. `OPTIONS` (CORS preflight) is exempt so the
 /// browser's preflight to an allowed origin always succeeds.
 async fn host_guard(req: Request, next: Next) -> Response {
@@ -429,6 +434,11 @@ impl AppState {
     /// documents: a caller holding a built state can substitute an `Arc<dyn ContentServer>` — a
     /// recording double in a test, or a different concrete server in a later composition root —
     /// without reaching into the node.
+    ///
+    /// TEST-CONSTRUCTION ONLY (#1664a): `pub` solely so integration tests can inject a recording
+    /// double; `#[doc(hidden)]` keeps it out of the public API surface — no production path
+    /// substitutes the content server, and none should discover this via the docs.
+    #[doc(hidden)]
     pub fn with_content_server(mut self, content_server: Arc<dyn ContentServer>) -> Self {
         self.content_server = content_server;
         self
@@ -510,7 +520,8 @@ const WS_PONG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// the browser based on CORS response headers, so the server itself must reject
 /// a disallowed Origin (Cross-Site WebSocket Hijacking defense). A request with
 /// NO Origin header (a non-browser client, e.g. this repo's own tests, or a CLI)
-/// is allowed — loopback-only binding is that caller's defense.
+/// is allowed — loopback-only binding (enforced — a non-loopback DIG_NODE_HOST is
+/// refused unless DIG_NODE_ALLOW_REMOTE=1, #1662) is that caller's defense.
 async fn ws_status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -630,19 +641,26 @@ async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
 ///
 /// This is a SECURITY LABEL (#1619 follow-up), and the derivation is deliberately the ONLY way any
 /// handler obtains one — a handler must never assert an origin from "this endpoint is the loopback
-/// server", because that premise is false: an explicit `DIG_NODE_HOST` override replaces the
-/// loopback dual-bind with any operator-chosen address ([`crate::Config::bind_addr`] is
-/// `host.unwrap_or(127.0.0.1)`, with no loopback validation on the override), and the Host-header
-/// allowlist is a DNS-rebinding defense rather than an origin one — a remote client can still send
-/// `Host: localhost`. An operator who deliberately binds non-loopback therefore gets a CORRECT
-/// `Peer` label for remote callers instead of a silently-forged `Local` one.
+/// server". The bind IS loopback-only by default, and a `DIG_NODE_HOST` override off loopback is
+/// refused at startup unless the operator sets `DIG_NODE_ALLOW_REMOTE=1` ([`crate::config::host_override_refusal`],
+/// #1662) — but the Host-header allowlist is a DNS-rebinding defense rather than an origin one (a
+/// remote client can still send `Host: localhost`), and an operator MAY deliberately opt into a
+/// remote bind. So the label is derived from the connection's real remote address, not the bind:
+/// a deliberately-remote operator gets a CORRECT `Peer` label for remote callers, never a
+/// silently-forged `Local` one.
 ///
-/// A forged `Local` is not reachable from the wire: an IPv4-mapped IPv6 remote does not satisfy
-/// `Ipv6Addr::is_loopback` (which is `== ::1` only), and a failure to extract
-/// [`ConnectInfo`](axum::extract::ConnectInfo) is an axum REJECTION (`500`), never a defaulted
-/// `Local`.
+/// The loopback check is [`crate::config::is_loopback_addr`], which correctly treats an IPv4-mapped
+/// IPv6 loopback (`::ffff:127.0.0.1`, seen on a `::` dual-stack bind) as `Local` (#1664b) — the bare
+/// `Ipv6Addr::is_loopback` (`== ::1` only) would misclassify it as `Peer`. A remote IPv4-mapped
+/// address is still non-loopback, and a failure to extract
+/// [`ConnectInfo`](axum::extract::ConnectInfo) is an axum REJECTION (`500`), never a defaulted `Local`.
 fn read_origin_for(peer_addr: &SocketAddr) -> dig_node_core::download::ReadOrigin {
-    if peer_addr.ip().is_loopback() {
+    // Use the SHARED loopback predicate (#1664b): on a `::` dual-stack bind an IPv4
+    // loopback client arrives as the IPv4-mapped form `::ffff:127.0.0.1`, which the bare
+    // `IpAddr::is_loopback` misclassifies as non-loopback (`Ipv6Addr::is_loopback` is
+    // `== ::1` only) — silently mislabelling the operator's OWN reads as `Peer` and
+    // disabling the local warm-up flywheel. `is_loopback_addr` unwraps the mapping.
+    if crate::config::is_loopback_addr(&peer_addr.ip()) {
         dig_node_core::download::ReadOrigin::Local
     } else {
         dig_node_core::download::ReadOrigin::Peer
@@ -721,10 +739,13 @@ async fn rpc(
         return (StatusCode::OK, Json(resp));
     }
 
-    // CONTROL plane: the `control.*` (admin/management) methods are loopback-only
-    // (the whole server binds 127.0.0.1) AND locally authorized — a same-host
-    // controller must present the local control token (the X-Dig-Control-Token
-    // header or params._control_token). The READ methods below are NOT gated.
+    // CONTROL plane: the `control.*` (admin/management) methods are gated fail-closed on a
+    // presented token — the REAL protection (#1663). A same-host controller must present the
+    // local control token (the X-Dig-Control-Token header or params._control_token) or a valid
+    // paired token; an unauthorized call is rejected below regardless of where it arrives from.
+    // The loopback bind (enforced — a non-loopback DIG_NODE_HOST is refused unless
+    // DIG_NODE_ALLOW_REMOTE=1, #1662) is defense-in-depth beneath this gate, not the gate itself.
+    // The READ methods below are NOT token-gated.
     if control::is_control_method(&method) {
         let header_tok = headers
             .get(control::CONTROL_TOKEN_HEADER)
@@ -1453,6 +1474,16 @@ pub async fn serve_with_shutdown<F>(config: Config, shutdown: F) -> std::io::Res
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    // Fail CLOSED on an unauthorized non-loopback bind (#1662): a `DIG_NODE_HOST`
+    // pointing off loopback without the explicit `DIG_NODE_ALLOW_REMOTE=1` escape hatch
+    // would expose the local RPC/content API to the network, silently falsifying the
+    // ~25 "loopback-only / never peer-reachable" invariants this service relies on. A
+    // deliberate remote bind (e.g. a remote-API test rig) sets the flag; everything else
+    // is a hard startup error — never a silent LAN exposure.
+    if let Some(msg) = crate::config::host_override_refusal(config.host, config.allow_remote) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
+    }
+
     let addr = config.bind_addr();
     let state = build_state(&config).await;
 
@@ -1812,8 +1843,41 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_allowed_origin, is_app_origin, is_local_origin, APP_ORIGINS_ENV, EXPOSED_DIG_HEADERS,
+        is_allowed_origin, is_app_origin, is_local_origin, read_origin_for, APP_ORIGINS_ENV,
+        EXPOSED_DIG_HEADERS,
     };
+    use dig_node_core::download::ReadOrigin;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn read_origin_for_classifies_ipv4_mapped_loopback_as_local() {
+        // #1664b: on a `::` dual-stack bind an IPv4 loopback client arrives as the
+        // IPv4-mapped form `::ffff:127.0.0.1`, which the bare `Ipv6Addr::is_loopback`
+        // (== ::1 only) would misclassify as `Peer` — silently disabling the operator's
+        // own warm-up flywheel. The shared `is_loopback_addr` helper unwraps the mapping.
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:9778".parse().unwrap();
+        assert_eq!(read_origin_for(&mapped), ReadOrigin::Local);
+
+        // Native loopback of both families is Local too.
+        assert_eq!(
+            read_origin_for(&SocketAddr::from((Ipv4Addr::LOCALHOST, 9778))),
+            ReadOrigin::Local
+        );
+        assert_eq!(
+            read_origin_for(&"[::1]:9778".parse().unwrap()),
+            ReadOrigin::Local
+        );
+
+        // A real remote address — and an IPv4-mapped NON-loopback — stay `Peer`.
+        assert_eq!(
+            read_origin_for(&SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 9444))),
+            ReadOrigin::Peer
+        );
+        assert_eq!(
+            read_origin_for(&"[::ffff:203.0.113.7]:9444".parse().unwrap()),
+            ReadOrigin::Peer
+        );
+    }
 
     #[test]
     fn tauri_desktop_app_origins_are_allowed_for_cors() {

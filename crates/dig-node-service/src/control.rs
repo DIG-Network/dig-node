@@ -12,11 +12,15 @@
 //!
 //! # Security — loopback-only + locally authorized
 //!
-//! Two layers:
+//! Two layers, and the SECOND is the real one:
 //!
-//! 1. **Loopback-only.** The whole server binds `127.0.0.1` (see [`crate::config`]),
-//!    so nothing off-machine can reach any method.
-//! 2. **Local authorization** for the mutating control namespace. A random
+//! 1. **Loopback bind (defense-in-depth, not the primary control).** By default the
+//!    server binds loopback only (see [`crate::config`]); a non-loopback `DIG_NODE_HOST`
+//!    is REFUSED at startup unless the operator sets `DIG_NODE_ALLOW_REMOTE=1` (#1662),
+//!    so this is now an ENFORCED invariant rather than an assumption. But because an
+//!    operator MAY deliberately opt into a remote bind, the control surface never relies
+//!    on the bind for its protection — layer 2 does.
+//! 2. **Local authorization** (the actual gate) for the mutating control namespace. A random
 //!    **control token** is generated at first run into the machine-wide, identity-
 //!    INDEPENDENT state dir (`<state_dir>/control-token` — [`crate::state`], #501) with
 //!    a restrictive ACL. A same-host controller reads that file and presents the token
@@ -367,8 +371,9 @@ fn fill_random(buf: &mut [u8]) {
     // Fallback (Windows, or a Unix box without /dev/urandom): mix several
     // non-deterministic sources through a splitmix64 stream. Not a CSPRNG, but the
     // token's security model is "readable only by a same-host process", not
-    // secrecy from a network attacker; combined with loopback-only binding this is
-    // sufficient, and it never blocks the build on a platform crypto crate.
+    // secrecy from a network attacker; combined with the default loopback-only binding
+    // (a non-loopback DIG_NODE_HOST is refused unless DIG_NODE_ALLOW_REMOTE=1, #1662) this
+    // is sufficient, and it never blocks the build on a platform crypto crate.
     let mut seed = {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -675,7 +680,11 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
     // loopback endpoint. A genuinely unknown control method falls through the node too and
     // returns -32601.
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    // The control surface is loopback-admin-only (never peer-reachable, #179) — always Local.
+    // Always `Local`: reaching this point means the caller already cleared the paired-token gate
+    // (enforced fail-closed in `server::rpc`, #1663) — the REAL protection on the control surface,
+    // not the bind. (The bind is also loopback-only by default and a non-loopback `DIG_NODE_HOST`
+    // is refused unless `DIG_NODE_ALLOW_REMOTE=1` (#1662), but the token gate is what authorizes a
+    // control call regardless of where it arrives from.)
     dig_node_core::handle_rpc(&ctx.node, req, dig_node_core::download::ReadOrigin::Local).await
 }
 

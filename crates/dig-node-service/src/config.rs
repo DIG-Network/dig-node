@@ -121,6 +121,13 @@ pub struct Config {
     /// a real `chia_query` broadcaster + confirmer + lineage so node-custodied spends execute +
     /// confirm on mainnet. Enabling it means REAL $DIG movement — opt-in only.
     pub enable_live_broadcast: bool,
+    /// Whether a NON-loopback `DIG_NODE_HOST` override is permitted (#1662). From
+    /// `DIG_NODE_ALLOW_REMOTE` (`1`/`true`/`yes`/`on` ⇒ permitted); **default `false`**
+    /// — the security-safe default. When `false`, a non-loopback `host` is refused at
+    /// startup ([`host_override_refusal`], enforced in `server::serve_with_shutdown`) so
+    /// the local RPC/content API is never silently exposed to the network. Loopback
+    /// overrides and the no-override dual-stack default never need this flag.
+    pub allow_remote: bool,
 }
 
 impl Default for Config {
@@ -135,6 +142,8 @@ impl Default for Config {
             dig_local: true,
             // Money-safe default: live broadcast is OFF unless explicitly enabled.
             enable_live_broadcast: false,
+            // Security-safe default: a non-loopback bind is opt-in only (#1662).
+            allow_remote: false,
         }
     }
 }
@@ -182,6 +191,11 @@ impl Config {
         let enable_live_broadcast =
             parse_live_broadcast_flag(std::env::var("DIG_WALLET_ENABLE_LIVE_BROADCAST").ok());
 
+        // A non-loopback DIG_NODE_HOST is opt-in only (#1662); enforcement happens at
+        // the bind site (server::serve_with_shutdown) so `status`/`install` — which
+        // never bind — still resolve the config the operator set.
+        let allow_remote = parse_allow_remote_flag(std::env::var("DIG_NODE_ALLOW_REMOTE").ok());
+
         Config {
             host,
             port,
@@ -189,6 +203,7 @@ impl Config {
             cache_dir,
             dig_local,
             enable_live_broadcast,
+            allow_remote,
         }
     }
 
@@ -310,6 +325,63 @@ pub fn parse_host_override(raw: Option<String>) -> Option<IpAddr> {
     raw.as_deref().and_then(|s| s.trim().parse::<IpAddr>().ok())
 }
 
+/// Parse the `DIG_NODE_ALLOW_REMOTE` escape hatch (#1662): truthy
+/// (`1`/`true`/`yes`/`on`) ⇒ permit a NON-loopback `DIG_NODE_HOST`; **anything else
+/// — including unset, blank, or unrecognised — ⇒ the security-safe default `false`**
+/// (loopback-only). Same opt-in-only shape as [`parse_live_broadcast_flag`]: exposing
+/// the local RPC/content API to the network is a deliberate act, never on by accident.
+/// Case/whitespace-insensitive. PURE so the policy is unit-testable without process env.
+pub fn parse_allow_remote_flag(raw: Option<String>) -> bool {
+    matches!(
+        raw.as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Whether `ip` is a loopback address — the SHARED loopback predicate for the whole
+/// service. Beyond the stdlib [`IpAddr::is_loopback`] it also treats an IPv4-MAPPED
+/// IPv6 loopback (`::ffff:127.0.0.1`) as loopback: on a `::` dual-stack bind the OS
+/// reports an IPv4 loopback client in that mapped form, which `Ipv6Addr::is_loopback`
+/// (true only for `::1`) would otherwise miss (#1664b). Shared so the origin classifier
+/// (`server::read_origin_for`) and the `DIG_NODE_HOST` enforcement below apply ONE rule,
+/// and so #1646 can reuse it rather than re-deriving the mapped-loopback case.
+pub fn is_loopback_addr(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        // `::1` directly, or an IPv4-mapped loopback like `::ffff:127.0.0.1`.
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// Enforce the loopback-only invariant on a `DIG_NODE_HOST` override (#1662):
+/// returns `Some(message)` when the override MUST be refused — a non-loopback bind
+/// address without the explicit `DIG_NODE_ALLOW_REMOTE=1` escape hatch — and `None`
+/// when the bind is permitted (no override, a loopback override, or `allow_remote`).
+///
+/// This is what makes the ~25 "loopback-only / never peer-reachable" invariants across
+/// the service TRUE rather than merely asserted: the local RPC/content API is either
+/// bound to loopback, or the operator has DELIBERATELY opted into a remote bind. The
+/// caller (`server::serve_with_shutdown`) fails CLOSED on `Some` — a bad override is a
+/// hard startup error, never a silent LAN exposure. PURE so the policy is unit-testable.
+///
+/// This governs ONLY the local RPC/content bind ([`Config::bind_addr`]); the peer P2P
+/// wire (mTLS `:9444`, in dig-node-core) and the loopback wallet mTLS `:9257` listener
+/// bind independently, so enforcing loopback here never affects peer connectivity.
+pub fn host_override_refusal(host: Option<IpAddr>, allow_remote: bool) -> Option<String> {
+    match host {
+        Some(ip) if !is_loopback_addr(&ip) && !allow_remote => Some(format!(
+            "refusing to bind the local API to a non-loopback address ({ip}); this exposes the \
+             node's RPC/content API to the network. Set DIG_NODE_ALLOW_REMOTE=1 to override."
+        )),
+        _ => None,
+    }
+}
+
 /// Whether a request `Host` header is allowed (#91, #288). The node is
 /// loopback-only and answers to the canonical local names — bare `dig.local`,
 /// `localhost`, the loopback IPs `127.0.0.1`/`127.0.0.2`, and the IPv6 loopback
@@ -318,7 +390,9 @@ pub fn parse_host_override(raw: Option<String>) -> Option<IpAddr> {
 /// with or without a `:port` suffix; a missing Host is allowed (HTTP/1.0 / health
 /// probes). Any OTHER host (e.g. a public domain pointed at the machine, the
 /// classic DNS-rebinding vector) is rejected, so even though the listeners are
-/// loopback-only the node never serves a foreign-named request. PURE: takes the
+/// loopback-only (enforced — a non-loopback `DIG_NODE_HOST` is refused unless
+/// `DIG_NODE_ALLOW_REMOTE=1`, [`host_override_refusal`], #1662) the node never serves
+/// a foreign-named request. PURE: takes the
 /// raw header value, returns the decision.
 pub fn host_is_allowed(host_header: Option<&str>) -> bool {
     // No Host header at all (HTTP/1.0, some probes) → allow: it cannot be a
@@ -658,5 +732,100 @@ mod tests {
         for bad in ["[::2]", "[fe80::1]", "[::1", "[]", "[::1]evil"] {
             assert!(!host_is_allowed(Some(bad)), "{bad:?} must be rejected");
         }
+    }
+
+    // ----- #1662: enforce a loopback-only DIG_NODE_HOST unless DIG_NODE_ALLOW_REMOTE ----
+
+    #[test]
+    fn allow_remote_flag_is_off_by_default_and_only_truthy_enables() {
+        for on in ["1", "true", "YES", "on", " On "] {
+            assert!(
+                parse_allow_remote_flag(Some(on.to_string())),
+                "{on:?} should permit a non-loopback bind"
+            );
+        }
+        // Unset, blank, falsy, or unrecognised → the security-safe default OFF.
+        assert!(
+            !parse_allow_remote_flag(None),
+            "unset ⇒ OFF (loopback-only)"
+        );
+        assert!(!parse_allow_remote_flag(Some(String::new())));
+        assert!(!parse_allow_remote_flag(Some("maybe".to_string())));
+        for off in ["0", "false", "no", "off"] {
+            assert!(!parse_allow_remote_flag(Some(off.to_string())));
+        }
+        // The resolved Config default is loopback-only (opt-in remote only).
+        assert!(!Config::default().allow_remote);
+    }
+
+    #[test]
+    fn is_loopback_addr_covers_v4_v6_and_ipv4_mapped_loopback() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // Native loopback, both families.
+        assert!(is_loopback_addr(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_loopback_addr(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))));
+        assert!(is_loopback_addr(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // #1664b: the IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`) seen on a `::`
+        // dual-stack bind is loopback too, even though `Ipv6Addr::is_loopback` misses it.
+        assert!(is_loopback_addr(&IpAddr::V6(
+            Ipv4Addr::LOCALHOST.to_ipv6_mapped()
+        )));
+        // Non-loopback of either family is not loopback.
+        assert!(!is_loopback_addr(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+        assert!(!is_loopback_addr(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+        assert!(!is_loopback_addr(&IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        // An IPv4-mapped NON-loopback stays non-loopback.
+        assert!(!is_loopback_addr(&IpAddr::V6(
+            Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped()
+        )));
+    }
+
+    #[test]
+    fn non_loopback_host_override_is_refused_without_the_flag() {
+        // #1662: binding the local API to a non-loopback address without the explicit
+        // escape hatch is a hard configuration error (fail-closed at startup).
+        let host = Some(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        let refusal = host_override_refusal(host, /* allow_remote */ false);
+        assert!(
+            refusal.is_some(),
+            "0.0.0.0 without DIG_NODE_ALLOW_REMOTE must be refused"
+        );
+        assert!(
+            refusal.unwrap().contains("DIG_NODE_ALLOW_REMOTE"),
+            "the message must name the escape hatch"
+        );
+        // A LAN address is refused the same way.
+        assert!(
+            host_override_refusal(Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))), false).is_some()
+        );
+    }
+
+    #[test]
+    fn non_loopback_host_override_is_accepted_with_the_flag() {
+        // #1662: the explicit DIG_NODE_ALLOW_REMOTE=1 escape hatch permits a
+        // deliberate non-loopback bind (e.g. a remote-API test rig, #1062).
+        let host = Some(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+        assert!(host_override_refusal(host, /* allow_remote */ true).is_none());
+    }
+
+    #[test]
+    fn loopback_host_override_is_accepted_without_the_flag() {
+        use std::net::Ipv6Addr;
+        // #1662: loopback overrides (IPv4 AND IPv6) never need the flag — they are
+        // not peer-reachable, so they preserve the loopback-only invariant.
+        for host in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            assert!(
+                host_override_refusal(Some(host), false).is_none(),
+                "{host:?} is loopback and must be accepted without the flag"
+            );
+        }
+        // And the no-override default (dual-stack loopback) is always accepted.
+        assert!(host_override_refusal(None, false).is_none());
     }
 }
