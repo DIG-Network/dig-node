@@ -604,3 +604,69 @@ The constraint that bounds the fix: the served window must stay EXACTLY the requ
 it to chunk boundaries (tempting, since a chunk-aligned span is the verifiable unit) breaks every
 verifying client, because `verify_range` fails closed on any length but the one the client planned.
 When a server and a client both compute a span, the client's plan is the contract.
+
+## Reshare: the announce is driven by a FILE PATH, not by a function call (#1576)
+
+The node's DHT provider records are derived from its cache inventory, so **the existence of
+`<cache>/modules/<store>/<root>.module` IS this node's network-wide claim to be an authoritative holder
+of that capsule.** There is no "announce()" you can forget to guard — writing the file is the announce.
+
+Consequence for any code that produces a module (a gap-fill, a §21 sync, a reshare pull): it MUST NOT
+stage anywhere under the cache. A whole-capsule pull that staged at the cache path would advertise a
+half-downloaded capsule for the duration of the download, and a *failed* pull would leave a permanent
+claim to content the node cannot serve. The reshare leg therefore stages under `<downloads>` and moves
+into the cache (write-then-rename) only after the pull succeeded AND the artifact was re-proven.
+
+## A hash gate cannot detect the empty module (#1576)
+
+`ModuleDownloader` runs two hash gates before admitting a module: every chunk against `chunk_hashes`,
+then the whole blob against `module_hash`. **Both pass trivially for a 0-byte module.** The attacker
+declares `total_size: 0` and `module_hash: sha256("")`, serves nothing, and `sha256(&[])` genuinely
+equals the declared value — the arithmetic is correct and the module is worthless.
+
+More generally: every check before the chain-anchor gate compares attacker-chosen bytes against
+attacker-chosen hashes. They prove SELF-CONSISTENCY, never authenticity. The anchor gate — the module's
+committed `CurrentRoot` versus a root resolved from the CHAIN — is the only check that says anything
+about authenticity, which is why the empty-blob and unparseable-blob rejections live in the verifier and
+not somewhere more convenient.
+
+## "verified artifact" and "promoted artifact" are different objects (#1576)
+
+`ModuleDownloader` verifies an in-memory blob, then promotes a STAGING FILE. Those are two objects, and
+`download() == Ok` only speaks about the first. Anything that can touch the staging file between the gate
+and the promotion (another process, a leftover tail from a longer earlier attempt, a crash mid-rename)
+breaks the equivalence silently — the caller sees success and caches something that was never verified.
+
+The external check is to re-hash the file about to be promoted. The reference for that comparison must
+NOT be the descriptor's `module_hash`: that value was chosen by the serving peer. Instead the anchor
+verifier records the digest of the bytes it actually ADMITTED — it is the only component that ever sees
+the fully-assembled, gate-passed blob — and the promotion compares against that. Both sides of the
+comparison are then the node's own.
+
+## A caret dep can be right while the resolved tree is wrong (#1576, sibling of #836)
+
+dig-download 0.8.0 depended on dig-rpc-protocol `"0.5"` — correct — and still resolved **0.3.1 as well**,
+because dig-peer 0.4.1 pulled the older major. Two `ModuleInfo` types then sat either side of the module
+pull's trust boundary, on `chunk_hashes`/`chunk_lens`: the fields that drive the whole pull plan. Rust
+compiles that happily; it presents as content that arrives and never verifies (exactly #836's
+`serde_bytes`-vs-base64 range-frame skew, six blind diagnosis rounds).
+
+Two lessons, both now enforced by tests that read `Cargo.lock`:
+
+1. Assert the invariant against the **resolved lock**, not the manifest. `cargo tree -i <crate>@<version>`
+   names the culprit in one command.
+2. The culprit is often **your own workspace**. After bumping dig-node-core to dig-rpc-protocol 0.5, the
+   lock STILL carried 0.3.1 — from `dig-node-service`, the shell in the same repo, whose own pin nobody
+   had thought to bump. A cross-repo cascade is not finished until every crate in the consuming workspace
+   is on the new major.
+
+## Cargo features can smuggle a fail-open bypass past every test (#1576)
+
+dig-download compiles its fail-OPEN `AcceptAnyModuleAnchor` out of a default build (`cfg(any(test,
+feature = "testkit"))`) precisely so a production wiring cannot name it. That protection is a **manifest
+edit** away from gone — and the edit compiles, and every existing test still passes.
+
+So the protection needs a test that reads the manifest: `testkit` must appear only under
+`[dev-dependencies]`, never on the production edge (dev-dependency features do not propagate to
+consumers, so the binaries never see it). A guarantee enforced by build configuration needs an assertion
+at the build-configuration level; a unit test cannot reach it.

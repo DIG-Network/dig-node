@@ -187,6 +187,31 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
+            // #1576 reshare leg — the whole-`.dig`-module pull that lets a node which READ a
+            // resource become a complete resharer of the capsule (SPEC §21). A public read of
+            // content this node already serves at resource granularity: the descriptor names a
+            // capsule whose resources `dig.getAvailability`/`dig.fetchRange` already expose.
+            name: "dig.getModuleInfo",
+            served: "local",
+            summary: "The transfer descriptor of a whole `.dig` module this node HOLDS: \
+                      { total_size, module_hash, chunk_hashes[], chunk_lens[] }. Params \
+                      { store_id, root } (both 64-hex). -32004 when the module isn't held \
+                      locally. The descriptor is NOT a trust anchor — a puller must bind the \
+                      assembled module to its on-chain root before admitting or resharing it.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            // #1576 — the streaming half. Its response is a sequence of RangeFrame-shaped frames
+            // rather than one envelope, so it is routed by method NAME on the peer surface.
+            name: "dig.fetchModuleRange",
+            served: "local",
+            summary: "A byte window of a whole `.dig` module this node holds, streamed as \
+                      RangeFrame-shaped frames (`bytes` base64), `total_length` on the first \
+                      frame, terminated by `complete: true`. Params { store_id, root, offset?, \
+                      length } (window clamped to 4 MiB). -32004 when the module isn't held.",
+            requires_auth: false,
+        },
+        MethodInfo {
             // #39 public collection reads — served LOCALLY by the node (resolved from
             // coinset data), no upstream relay. Result shape is the canonical one.
             name: "dig.getCollection",

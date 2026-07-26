@@ -437,6 +437,15 @@ pub struct NodeContent {
     /// connected to — reaching a holder whose DHT record is unreachable on a relayed net. NOT part of
     /// the raw discovery `locator` (a redirect must name announced holders, not every connected peer).
     connected_pool: ConnectedPool,
+    /// The reshare leg (#1576): after a resource read completes, this pulls the WHOLE `.dig` capsule so
+    /// the reader becomes a discoverable holder of it — the step that makes each read leave the content
+    /// more available than it found it.
+    ///
+    /// Installed by the composition root once the peer stack is up
+    /// ([`Self::set_capsule_warmer`]), because the warmer needs the same live transport + DHT the engine
+    /// uses. `None` until then, and permanently `None` on the FFI/base path — a read behaves identically
+    /// with or without the reshare leg.
+    capsule_warmer: std::sync::OnceLock<Arc<crate::seams::dig_peer::CapsuleWarmer>>,
 }
 
 /// A [`StateStore`] wrapper over a [`FileStateStore`] that SNAPSHOTS every saved [`DownloadState`]
@@ -683,6 +692,7 @@ impl NodeContent {
             fetched: tokio::sync::Mutex::new(HashMap::new()),
             fetch_lock: tokio::sync::Mutex::new(()),
             connected_pool,
+            capsule_warmer: std::sync::OnceLock::new(),
         })
     }
 
@@ -929,7 +939,98 @@ impl NodeContent {
             bytes = fetched.bytes.len(),
             "fetch_resource: download complete"
         );
+
+        // 7. RESHARE (#1576) — the step that closes the content-replication flywheel. The read above
+        //    fetched only the bytes asked for, which leaves this node faster but the NETWORK no stronger:
+        //    a `.dig` is served whole, so a node holding one resource can serve nothing. Kick a
+        //    background pull of the ENTIRE capsule so this reader becomes a discoverable HOLDER of it,
+        //    and every read makes the content MORE available than it found it.
+        //
+        //    Deliberately fire-and-forget: the read's latency is user-facing and a whole-capsule pull is
+        //    orders of magnitude larger than the resource that revealed it, so the read never waits and a
+        //    failed warm never fails the read. See `seams::dig_peer::module_reshare`.
+        self.spawn_capsule_reshare(content);
         Ok(fetched)
+    }
+
+    /// Start a background whole-capsule pull for the capsule `content` belongs to, if a
+    /// [`CapsuleWarmer`](crate::seams::dig_peer::CapsuleWarmer) is wired.
+    ///
+    /// A no-op when no warmer is installed (the FFI/base path, and any deployment that has not opted
+    /// into resharing) — a read must work identically with or without the reshare leg.
+    fn spawn_capsule_reshare(&self, content: &ContentId) {
+        let Some(warmer) = self.capsule_warmer.get() else {
+            return;
+        };
+        // Only a GENERATION-bearing id names a capsule to reshare. A store-granularity read does not say
+        // WHICH generation to pull, and guessing (the chain tip, say) would reshare a capsule nobody
+        // asked for.
+        let (store, root) = match content {
+            ContentId::Root { store_id, root } => (*store_id, *root),
+            ContentId::Resource { store_id, root, .. } => (*store_id, *root),
+            ContentId::Store { .. } => return,
+        };
+        crate::seams::dig_peer::spawn_capsule_warm(
+            Arc::clone(warmer),
+            hex::encode(store),
+            hex::encode(root),
+        );
+    }
+
+    /// Install the capsule warmer (the reshare leg, #1576). Called once by the composition root after
+    /// the peer stack is up, since the warmer needs the live transport + DHT the engine also uses.
+    ///
+    /// Idempotent by `OnceLock`: a second install is ignored rather than swapping the warmer under a
+    /// pull that is already in flight.
+    pub fn set_capsule_warmer(&self, warmer: Arc<crate::seams::dig_peer::CapsuleWarmer>) {
+        let _ = self.capsule_warmer.set(warmer);
+    }
+
+    /// Build + install the reshare leg from the pieces only the composition root has (#1576): this
+    /// node's mTLS identity + shared NAT runtime, the CHAIN's root resolver, and the announce hook.
+    ///
+    /// Everything else — the discovery locator, the resume-state store, the live connected pool, the
+    /// staging directory — is taken from the engine itself, so the reshare pull discovers and dials
+    /// through exactly the same machinery the resource read does. Two independent locators would be two
+    /// things to keep in sync, and the read leg's history is a catalogue of what happens when a dial path
+    /// diverges from the one that was debugged (#836/#1590).
+    ///
+    /// `cache_dir` is the node's cache root; a promoted module lands at
+    /// `<cache_dir>/modules/<store>/<root>.module`, the path whose existence IS this node's holder claim.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wire_capsule_reshare(
+        self: &Arc<Self>,
+        node_cert: Arc<dig_nat::NodeCert>,
+        nat_config: dig_nat::NatConfig,
+        network_id: &str,
+        runtime: Arc<dig_nat::NatRuntime>,
+        anchor_resolver: Arc<dyn crate::shared::AnchoredRootResolver>,
+        announce: Arc<dyn crate::seams::dig_peer::AnnounceHolder>,
+        cache_dir: &Path,
+    ) {
+        let transport = Arc::new(crate::seams::dig_peer::NatModuleTransport::new(
+            node_cert,
+            nat_config,
+            network_id,
+            runtime,
+            self.connected_pool.clone(),
+            self.locator.clone(),
+        ));
+        self.set_capsule_warmer(crate::seams::dig_peer::CapsuleWarmer::new(
+            self.locator.clone(),
+            transport,
+            self.state_store.clone(),
+            anchor_resolver,
+            crate::seams::dig_peer::WarmPaths {
+                // Stage under the downloads dir, NOT the cache: a module file at the cache path is
+                // already this node's holder claim, so a partial pull must never live there.
+                staging_dir: self.downloads_dir.clone(),
+                cache_dir: cache_dir.to_path_buf(),
+            },
+            announce,
+            Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+        ));
     }
 
     /// Drain a running download's progress [`DownloadEvent`](dig_download::DownloadEvent) stream to

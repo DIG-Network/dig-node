@@ -1304,6 +1304,135 @@ impl Node {
         }
     }
 
+    /// `dig.getModuleInfo` (#1576, the reshare leg): the transfer descriptor for a whole `.dig` module
+    /// this node HOLDS — the handshake a peer reads before range-pulling the entire capsule so it can
+    /// become a resharer of it.
+    ///
+    /// Params `{store_id, root}` (both 64-hex), matching the other capsule-scoped read methods. The
+    /// blocking module read + hashing runs on a `spawn_blocking` thread (a `.dig` is large; hashing it
+    /// must never stall the async runtime), mirroring [`Self::get_manifest`].
+    ///
+    /// - Module held → `result` is the [`ModuleInfo`](dig_rpc_protocol::types::ModuleInfo) descriptor.
+    /// - Module NOT held (or a 0-byte file, which is not a module) → the same
+    ///   `RESOURCE_UNAVAILABLE` code `dig.fetchRange` reports on a miss. Declining is the honest answer:
+    ///   describing a module this node cannot serve would advertise a capsule it does not have.
+    async fn get_module_info(&self, params: &Value, id: Value) -> Value {
+        let store_hex = params
+            .get("store_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let root_hex = params
+            .get("root")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if !is_canonical_hex_id(&store_hex) || !is_canonical_hex_id(&root_hex) {
+            return rpc_err(
+                &id,
+                -32602,
+                "dig.getModuleInfo requires store_id + root (64-hex each)",
+            );
+        }
+        let cache_dir = self.cache_dir.clone();
+        let (store, root) = (store_hex.clone(), root_hex.clone());
+        let info = tokio::task::spawn_blocking(move || {
+            seams::dig_peer::module_serve::describe_module(&cache_dir, &store, &root)
+        })
+        .await
+        .unwrap_or(None);
+        // The serve log records both outcomes with sentinelled ids, so "was this holder asked for the
+        // descriptor, and did it have it?" is answerable from the log alone (#1595).
+        seams::dig_peer::module_serve::module_info_answered(
+            "",
+            &store_hex,
+            &root_hex,
+            info.as_ref(),
+        );
+        match info {
+            Some(info) => match serde_json::to_value(&info) {
+                Ok(value) => json!({"jsonrpc":"2.0","id":id,"result": value}),
+                Err(_) => rpc_err(&id, -32000, "could not encode the module descriptor"),
+            },
+            None => rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "module not held locally at the requested root",
+            ),
+        }
+    }
+
+    /// `dig.fetchModuleRange` (#1576) over the request/response surface: ONE frame carrying the
+    /// requested window of a held `.dig` module.
+    ///
+    /// The PEER surface streams this method (many frames until `complete`); a JSON-RPC envelope cannot
+    /// express a stream, so the loopback / in-process surface answers with a single frame in `result`.
+    /// The frame shape is identical either way, so an agent reads a module through the plain
+    /// request/response form without implementing the frame protocol (§6.2) — it simply issues one call
+    /// per window, advancing `offset` until a frame reports `complete`.
+    ///
+    /// Params `{store_id, root, offset?, length}`; the window is clamped to the serve cap. A module this
+    /// node does not hold answers the same `RESOURCE_UNAVAILABLE` code the streaming form reports.
+    async fn fetch_module_range_frame(&self, params: &Value, id: Value) -> Value {
+        use seams::dig_peer::module_serve;
+
+        let store_hex = params
+            .get("store_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let root_hex = params
+            .get("root")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if !is_canonical_hex_id(&store_hex) || !is_canonical_hex_id(&root_hex) {
+            return rpc_err(
+                &id,
+                -32602,
+                "dig.fetchModuleRange requires store_id + root (64-hex each)",
+            );
+        }
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let length = params
+            .get("length")
+            .and_then(Value::as_u64)
+            .unwrap_or(module_serve::MAX_MODULE_WINDOW);
+
+        let cache_dir = self.cache_dir.clone();
+        let (store, root) = (store_hex.clone(), root_hex.clone());
+        let window = tokio::task::spawn_blocking(move || {
+            module_serve::read_module_window(&cache_dir, &store, &root, offset, length)
+        })
+        .await
+        .unwrap_or(None);
+
+        match window {
+            Some(bytes) => {
+                // `complete` is honest about THIS call: the window ends the module only when it reached
+                // the module's end, which is exactly when fewer bytes came back than were asked for.
+                let complete = (bytes.len() as u64) < length.min(module_serve::MAX_MODULE_WINDOW);
+                let frame = module_serve::module_frame(offset, &bytes, complete, None);
+                module_serve::module_range_outcome(
+                    "",
+                    &store_hex,
+                    &root_hex,
+                    offset,
+                    Some((bytes.len() as u64, 1)),
+                );
+                json!({"jsonrpc":"2.0","id":id,"result": frame})
+            }
+            None => {
+                module_serve::module_range_outcome("", &store_hex, &root_hex, offset, None);
+                rpc_err(
+                    &id,
+                    download::RESOURCE_UNAVAILABLE,
+                    "module not held locally at the requested root",
+                )
+            }
+        }
+    }
+
     /// `dig.getManifest` (#176 Phase C): resolve the normalized [`PublicManifest`](digstore_core::PublicManifest)
     /// (data-section id 13) embedded in a locally held CAPSULE's compiled `.dig` module.
     ///
@@ -3066,6 +3195,98 @@ mod tests {
         assert_eq!(resp["id"], json!(7));
         assert_eq!(resp["error"]["code"], json!(-32602));
         assert!(resp.get("result").is_none());
+    }
+
+    // -- #1576 the whole-module serve surface (no network, no chain) -------------
+
+    /// Write `bytes` as this node's cached module for `(store, root)`.
+    fn cache_module(node: &Node, store: &str, root: &str, bytes: &[u8]) {
+        let path = module_path(&node.cache_dir, store, root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    fn id_hex(byte: u8) -> String {
+        [byte; 32].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// **Proves:** `dig.getModuleInfo` describes a HELD module over the real dispatch, and reports the
+    /// held/not-held distinction with the same `-32004` a resource miss uses — so a puller can tell
+    /// "this holder does not have it" from "something went wrong".
+    #[tokio::test]
+    async fn get_module_info_describes_a_held_module_and_declines_an_unheld_one() {
+        let (node, _td) = test_node(None);
+        let (store, root) = (id_hex(0x11), id_hex(0x22));
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        cache_module(&node, &store, &root, &bytes);
+
+        let held = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getModuleInfo",
+                   "params":{"store_id":store,"root":root}}),
+        )
+        .await;
+        assert_eq!(held["result"]["total_size"], json!(bytes.len() as u64));
+        assert_eq!(
+            held["result"]["chunk_hashes"].as_array().unwrap().len(),
+            held["result"]["chunk_lens"].as_array().unwrap().len(),
+            "the descriptor must cover every chunk it declares a length for"
+        );
+
+        let missing = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getModuleInfo",
+                   "params":{"store_id":id_hex(0x99),"root":root}}),
+        )
+        .await;
+        assert_eq!(
+            missing["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE)
+        );
+    }
+
+    /// **Proves:** the request/response form of `dig.fetchModuleRange` returns the EXACT requested
+    /// window in the same frame shape the streaming peer form emits, so an agent can read a module by
+    /// advancing `offset` without implementing the frame protocol (§6.2).
+    /// **Catches:** the catalogue claiming `served: local` for a method the read path answers with
+    /// -32601 — a discovery document that describes a method the node does not actually resolve.
+    #[tokio::test]
+    async fn fetch_module_range_answers_one_frame_over_json_rpc() {
+        let (node, _td) = test_node(None);
+        let (store, root) = (id_hex(0x33), id_hex(0x44));
+        let bytes: Vec<u8> = (0..500u32).map(|i| i as u8).collect();
+        cache_module(&node, &store, &root, &bytes);
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":3,"method":"dig.fetchModuleRange",
+                   "params":{"store_id":store,"root":root,"offset":100,"length":50}}),
+        )
+        .await;
+        let frame = &resp["result"];
+        assert_eq!(frame["offset"], json!(100));
+        assert_eq!(frame["length"], json!(50));
+        // The frame decodes as a real RangeFrame, so producer + puller agree on the encoding — the
+        // #836 class of skew (base64 vs raw bytes) fails here rather than on a live network.
+        let decoded: dig_nat::RangeFrame =
+            serde_json::from_value(frame.clone()).expect("decodes as a RangeFrame");
+        assert_eq!(decoded.bytes, bytes[100..150]);
+    }
+
+    /// **Proves:** a non-canonical id on either module method is a -32602 that never reaches the
+    /// filesystem — a store id concatenated into a path would be a traversal primitive.
+    #[tokio::test]
+    async fn the_module_methods_reject_non_canonical_ids() {
+        let (node, _td) = test_node(None);
+        for method in ["dig.getModuleInfo", "dig.fetchModuleRange"] {
+            let resp = handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":4,"method":method,
+                       "params":{"store_id":"../../etc/passwd","root":id_hex(1),"length":8}}),
+            )
+            .await;
+            assert_eq!(resp["error"]["code"], json!(-32602), "{method}");
+        }
     }
 
     // -- #39 public collection reads (param validation + pagination, no chain) --

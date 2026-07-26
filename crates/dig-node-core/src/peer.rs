@@ -685,6 +685,10 @@ pub async fn write_framed<W: AsyncWriteExt + Unpin + ?Sized>(
 /// Classify one inbound peer-request frame by its shape.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PeerRequestKind {
+    /// A `dig.fetchModuleRange` request — a JSON-RPC request whose response is a FRAME STREAM rather
+    /// than one envelope, so it is classified ahead of the generic JSON-RPC case by its method name
+    /// (#1576). Checked first because it is a strict subset of the JSON-RPC shape.
+    ModuleRange,
     /// A JSON-RPC 2.0 request (`method` present).
     JsonRpc,
     /// A `dig.fetchRange` RangeRequest (`length` present, `method` absent).
@@ -697,9 +701,16 @@ pub(crate) enum PeerRequestKind {
 
 /// Dispatch an inbound frame by shape (pure — no I/O), so the stream-routing policy is unit-tested.
 pub(crate) fn classify_request(v: &Value) -> PeerRequestKind {
-    if v.get("method").and_then(Value::as_str).is_some() {
-        PeerRequestKind::JsonRpc
-    } else if v.get("length").is_some() {
+    match v.get("method").and_then(Value::as_str) {
+        // The one JSON-RPC method whose response is a frame stream (#1576) — checked before the generic
+        // JSON-RPC case, which it is a subset of.
+        Some(m) if m == dig_rpc_protocol::Method::FetchModuleRange.name() => {
+            return PeerRequestKind::ModuleRange
+        }
+        Some(_) => return PeerRequestKind::JsonRpc,
+        None => {}
+    }
+    if v.get("length").is_some() {
         PeerRequestKind::Range
     } else if v.get("items").is_some() {
         PeerRequestKind::Availability
@@ -767,6 +778,32 @@ pub trait PeerRpcResponder: Send + Sync {
         out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     ) -> std::io::Result<()>;
 
+    /// Stream a `dig.fetchModuleRange` response by writing framed `dig_nat::RangeFrame`-shaped frames
+    /// for the requested window of a locally-held whole `.dig` module (#1576, the reshare leg).
+    ///
+    /// `params` is the request's `params` object (`store_id` / `root` / `offset` / `length`). A module
+    /// this node does not hold answers with ONE error frame, so the caller distinguishes "not held" from
+    /// a dropped stream instead of waiting for bytes that will never come.
+    ///
+    /// Defaults to "not held": a responder with no cache (the FFI path, test stubs) needs no override,
+    /// and fail-closed is the right default for a serve — claiming to hold a module and then serving
+    /// nothing is worse than declining.
+    async fn stream_module_range(
+        &self,
+        params: Value,
+        conn_key: &str,
+        out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+    ) -> std::io::Result<()> {
+        let _ = (params, conn_key);
+        write_framed(
+            out,
+            &crate::seams::dig_peer::module_serve::module_unavailable_frame(
+                crate::download::RESOURCE_UNAVAILABLE,
+            ),
+        )
+        .await
+    }
+
     /// Answer an inbound DHT-RPC frame (#163): decode `frame` as a `dig_dht::DhtRequest`, dispatch it
     /// against the node's DHT service folding in the authenticated `caller` (so the routing table
     /// populates bidirectionally), and return the framed `dig_dht::DhtResponse` bytes to write back.
@@ -783,6 +820,30 @@ pub trait PeerRpcResponder: Send + Sync {
             message: "DHT not running on this node".to_string(),
         }
         .encode()
+    }
+}
+
+/// Announces this node's inventory to the DHT after a capsule warm caches one — the step that makes a
+/// freshly-held capsule DISCOVERABLE (#1576 + #1586).
+///
+/// Reuses `refresh_inventory`, the SAME reconcile the gap-fill / explicit-cache paths use, rather than
+/// announcing the one new capsule directly: one announce path means the reshare leg can never advertise a
+/// content id shape the rest of the node does not (and a withdrawal it should have made is not skipped).
+struct DhtInventoryAnnouncer {
+    node: Arc<crate::Node>,
+    dht: Arc<crate::dht::DhtHandle>,
+}
+
+#[async_trait::async_trait]
+impl crate::seams::dig_peer::AnnounceHolder for DhtInventoryAnnouncer {
+    async fn announce_inventory(&self) {
+        let cached = self.node.cache_list_cached().await;
+        let (announced, withdrawn) = self.dht.refresh_inventory(&cached).await;
+        tracing::info!(
+            announced,
+            withdrawn,
+            "capsule warm: announced this node as a holder of the newly cached capsule"
+        );
     }
 }
 
@@ -933,6 +994,19 @@ where
         return Ok(());
     }
     match classify_request(&req) {
+        PeerRequestKind::ModuleRange => {
+            // Routed by METHOD NAME, not by request shape: this request's RESPONSE is a frame stream
+            // rather than one envelope, and its shape (store_id/root/offset/length) cannot express that.
+            // dig-peer's SPEC §3.5 records the same contract on the client side, so the two cannot drift.
+            let conn_key = caller
+                .as_ref()
+                .map(|c| c.peer_id.clone())
+                .unwrap_or_default();
+            let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+            responder
+                .stream_module_range(params, &conn_key, &mut stream)
+                .await
+        }
         PeerRequestKind::JsonRpc => {
             let resp = responder.handle_json_rpc(req).await;
             write_framed(&mut stream, &resp).await
@@ -1102,6 +1176,87 @@ impl PeerRpcResponder for NodeResponder {
     async fn handle_availability(&self, items: Value) -> Value {
         let items = items.as_array().cloned().unwrap_or_default();
         self.node.availability_batch(&items).await
+    }
+
+    /// Serve a window of a locally-held whole `.dig` module (#1576, the reshare leg).
+    ///
+    /// The module is read + framed on a blocking thread (a `.dig` is large, and a multi-MiB read must
+    /// never stall the async runtime), then paced by the SAME FCFS outbound limiter `dig.fetchRange`
+    /// uses — a whole-capsule pull is the largest thing this node ever serves, so exempting it would
+    /// leave the biggest transfer as the one path that can starve every other peer.
+    async fn stream_module_range(
+        &self,
+        params: Value,
+        conn_key: &str,
+        out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+    ) -> std::io::Result<()> {
+        use crate::seams::dig_peer::module_serve;
+
+        let store = params
+            .get("store_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let root = params
+            .get("root")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let length = params
+            .get("length")
+            .and_then(Value::as_u64)
+            .unwrap_or(module_serve::MAX_MODULE_WINDOW);
+        module_serve::module_range_requested(conn_key, &store, &root, offset, length);
+
+        let cache = self.node.cache_dir_path().to_path_buf();
+        let (s, r) = (store.clone(), root.clone());
+        let window = tokio::task::spawn_blocking(move || {
+            module_serve::read_module_window(&cache, &s, &r, offset, length)
+        })
+        .await
+        .unwrap_or(None);
+
+        let Some(window) = window else {
+            module_serve::module_range_outcome(conn_key, &store, &root, offset, None);
+            return write_framed(
+                out,
+                &module_serve::module_unavailable_frame(crate::download::RESOURCE_UNAVAILABLE),
+            )
+            .await;
+        };
+
+        // One frame per node window, so a large module rides many bounded frames rather than one
+        // unbounded one (the caller reassembles by offset and stops on `complete`).
+        let total = window.len() as u64;
+        let mut written = 0usize;
+        let mut frames = 0u64;
+        while written < window.len() {
+            let take = (RANGE_WINDOW).min(window.len() - written);
+            let complete = written + take == window.len();
+            if let Some(limiter) = &self.serve_limiter {
+                limiter.acquire(conn_key, take as u64).await;
+            }
+            self.node.record_outgoing_bytes(take as u64);
+            let frame = module_serve::module_frame(
+                offset + written as u64,
+                &window[written..written + take],
+                complete,
+                (written == 0).then_some(total),
+            );
+            write_framed(out, &frame).await?;
+            written += take;
+            frames += 1;
+        }
+        if frames == 0 {
+            // An empty window (an offset at/past the end) still needs a terminating frame, or the caller
+            // waits forever for a `complete` that never arrives.
+            let frame = module_serve::module_frame(offset, &[], true, Some(0));
+            write_framed(out, &frame).await?;
+            frames = 1;
+        }
+        module_serve::module_range_outcome(conn_key, &store, &root, offset, Some((total, frames)));
+        Ok(())
     }
 
     async fn stream_range(
@@ -1926,6 +2081,25 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         dial_ranker = Some(Arc::new(crate::download::SelectorDialRanker::new(
             content.selector().clone(),
         )));
+        // 4b-ii. RESHARE (#1576) — wire the whole-capsule warm so a node that READS content ends up
+        //        HOLDING and ANNOUNCING the whole capsule. This is what closes the content-replication
+        //        flywheel: without it a reader gets faster while the network's copy count stays flat.
+        //
+        //        The anchored-root resolver is passed in explicitly and is the pull's ONLY root of trust:
+        //        the generation root every assembled module is verified against is resolved from the
+        //        CHAIN through it, never from the peer that served the module.
+        content.wire_capsule_reshare(
+            identity.clone(),
+            crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server),
+            &network_id_str,
+            nat_runtime.clone(),
+            crate::ChainSource::anchored_root_resolver_arc(node.as_ref()),
+            Arc::new(DhtInventoryAnnouncer {
+                node: node.clone(),
+                dht: dht.clone(),
+            }),
+            node.cache_dir_path(),
+        );
         node.set_p2p_content(content);
         println!(
             "dig-node peer network: P2P content engine up (selector-driven, miss mode: {:?})",
@@ -3294,16 +3468,25 @@ mod tests {
         }
     }
 
-    /// **Proves:** delegating the peer allowlist to `dig_rpc_protocol` (#1075) preserves
-    /// the EXACT set the node hand-rolled before — the ten L7 read/discovery/announce
-    /// methods, no more, no fewer. This is the security-critical regression guard for the
-    /// #179 auth-bypass surface: any method that gains or loses peer-reachability across the
-    /// crate adoption fails here.
-    /// **Catches:** a crate drift that adds a management method to the allowlist, or drops a
-    /// read method the peer download path relies on.
+    /// **Proves:** the peer allowlist this node exposes is EXACTLY the enumerated
+    /// read/discovery/announce set — no more, no fewer. This is the security-critical regression guard
+    /// for the #179 auth-bypass surface: the peer mTLS verifier accepts any well-formed self-signed leaf,
+    /// so "authenticated" never means "authorized", and a management/mutation method reaching this list
+    /// is a privilege escalation. Any method that gains or loses peer-reachability fails here.
+    /// **Catches:** a `dig-rpc-protocol` bump that quietly adds a method to the allowlist — which is
+    /// precisely what happened when the module-pull methods landed, and the point of listing the set
+    /// literally is that such an addition must be a DELIBERATE edit here, reviewed on its own merits,
+    /// never an incidental consequence of a dependency bump.
     #[test]
     fn peer_allowlist_is_byte_identical_to_the_pre_adoption_set() {
-        // The canonical set the hand-rolled `is_peer_reachable_method` matched verbatim.
+        // The canonical set the hand-rolled `is_peer_reachable_method` matched verbatim, PLUS the two
+        // whole-module-pull methods added deliberately in #1576.
+        //
+        // Both are READS of content this node already serves at resource granularity, so they widen no
+        // privilege: `getModuleInfo` describes a capsule whose resources `getAvailability`/`fetchRange`
+        // already expose, and `fetchModuleRange` serves bytes of that same public, content-addressed
+        // `.dig`. Neither mutates any node state, and both are paced by the same outbound limiter as
+        // `fetchRange`. They are what let a reader become a resharer (SPEC §21).
         let mut expected = [
             "dig.getContent",
             "dig.getNetworkInfo",
@@ -3315,6 +3498,8 @@ mod tests {
             "dig.getAnchoredRoot",
             "dig.getCollection",
             "dig.listCollectionItems",
+            "dig.getModuleInfo",
+            "dig.fetchModuleRange",
         ];
         expected.sort_unstable();
 

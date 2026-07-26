@@ -64,6 +64,26 @@ impl RpcDispatch for Node {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
                 return node.get_manifest(&params, id).await;
             }
+            // dig.getModuleInfo (#1576, the reshare leg): the transfer descriptor for a whole `.dig`
+            // module this node HOLDS — total size, whole-blob content id, and the per-chunk hashes a
+            // puller attributes each range against. It describes only local content, so it is a read of
+            // this node's own cache, never a chain or network call.
+            Some(Method::GetModuleInfo) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.get_module_info(&params, id).await;
+            }
+            // dig.fetchModuleRange (#1576): one window of a held `.dig` module.
+            //
+            // On the PEER surface this method STREAMS frames, and the stream router intercepts it
+            // before this dispatch is reached (see `peer::classify_request`). Here — the loopback /
+            // in-process JSON-RPC surface — it answers with a SINGLE frame in the `result`, because a
+            // JSON-RPC envelope has no way to express a stream. Both forms carry the identical frame
+            // shape, so an agent can read a module through the machine-friendly request/response form
+            // (§6.2) without implementing the frame protocol.
+            Some(Method::FetchModuleRange) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.fetch_module_range_frame(&params, id).await;
+            }
             // dig.stage (#95 Pass C): turn a local folder into a capsule (.dig module) IN
             // PROCESS — the staging/compile half of a local deploy. The DIG Browser's
             // in-process node calls this (no CLI binary) to produce the artifact, then
