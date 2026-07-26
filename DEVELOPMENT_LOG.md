@@ -708,3 +708,21 @@ proving every failure mode is handled, and a suite that only does the latter loo
 leaving the former provably untested. When adding a test for a success path that was missing, confirm it
 is non-vacuous by breaking the success arm (return the refusal unconditionally, or point the promotion at
 the wrong path) and watching the new test — and ONLY the new test — go red.
+
+## `dig-download`'s `FileStateStore` key exceeds Windows' filename length limit (#1639)
+
+`FileStateStore::path_for` hex-encodes its key (doubling its length, to keep it filesystem-safe) before
+writing `<dir>/<hex>.json`. That is safe in isolation, but `module_download_key` builds the key as
+`"module:<64hex-store>:<64hex-root>"` (136 chars) — hex-encoded, 272 chars, plus `.json` — comfortably
+over the ~255 UTF-16-code-unit limit NTFS enforces on a path COMPONENT without long-path opt-in
+(`\\?\` prefixing). The result is a real `ERROR_INVALID_NAME` (os error 123) the moment a warm actually
+reaches `state_store.save()` — which the #1576 reshare leg's own refusal-only test suite never did,
+since every refusal short-circuited before a checkpoint was ever written (see the entry above: N
+refusals prove nothing about the path only the success case exercises). `CapsuleWarmer` wires a REAL
+`FileStateStore` in production (`download.rs`'s `wire_capsule_reshare`), so a Windows-hosted dig-node
+running the reshare leg hits this for real, not just in a test harness.
+
+Composing a filesystem key from two 64-hex ids plus a literal prefix, then doubling it via hex-encoding,
+is the kind of length math that is easy to miss until a REAL save actually runs — worth checking against
+the OS limit (255 for a bare NTFS component, ~32,767 with `\\?\` long-path opt-in) whenever a cache/state
+key is built by concatenating content ids rather than hashing them down to a fixed width.
