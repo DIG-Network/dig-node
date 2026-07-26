@@ -675,7 +675,8 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
     // loopback endpoint. A genuinely unknown control method falls through the node too and
     // returns -32601.
     let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-    dig_node_core::handle_rpc(&ctx.node, req).await
+    // The control surface is loopback-admin-only (never peer-reachable, #179) — always Local.
+    dig_node_core::handle_rpc(&ctx.node, req, dig_node_core::download::ReadOrigin::Local).await
 }
 
 /// Handle a control method OWNED by this shell (guaranteed by [`dispatch_control`] to be a member

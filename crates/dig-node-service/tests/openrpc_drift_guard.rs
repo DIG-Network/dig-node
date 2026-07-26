@@ -55,7 +55,7 @@ fn ephemeral_node() -> Arc<Node> {
 /// numeric JSON-RPC error code, or `None` when the read path returned a `result`.
 async fn dispatch_error_code(node: &Node, method: &str) -> Option<i64> {
     let req = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
-    let resp = handle_rpc(node, req).await;
+    let resp = handle_rpc(node, req, dig_node_core::download::ReadOrigin::Local).await;
     resp.get("error")
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_i64())

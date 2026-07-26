@@ -604,3 +604,157 @@ The constraint that bounds the fix: the served window must stay EXACTLY the requ
 it to chunk boundaries (tempting, since a chunk-aligned span is the verifiable unit) breaks every
 verifying client, because `verify_range` fails closed on any length but the one the client planned.
 When a server and a client both compute a span, the client's plan is the contract.
+
+## Reshare: the announce is driven by a FILE PATH, not by a function call (#1576)
+
+The node's DHT provider records are derived from its cache inventory, so **the existence of
+`<cache>/modules/<store>/<root>.module` IS this node's network-wide claim to be an authoritative holder
+of that capsule.** There is no "announce()" you can forget to guard — writing the file is the announce.
+
+Consequence for any code that produces a module (a gap-fill, a §21 sync, a reshare pull): it MUST NOT
+stage anywhere under the cache. A whole-capsule pull that staged at the cache path would advertise a
+half-downloaded capsule for the duration of the download, and a *failed* pull would leave a permanent
+claim to content the node cannot serve. The reshare leg therefore stages under `<downloads>` and moves
+into the cache (write-then-rename) only after the pull succeeded AND the artifact was re-proven.
+
+## A hash gate cannot detect the empty module (#1576)
+
+`ModuleDownloader` runs two hash gates before admitting a module: every chunk against `chunk_hashes`,
+then the whole blob against `module_hash`. **Both pass trivially for a 0-byte module.** The attacker
+declares `total_size: 0` and `module_hash: sha256("")`, serves nothing, and `sha256(&[])` genuinely
+equals the declared value — the arithmetic is correct and the module is worthless.
+
+More generally: every check before the chain-anchor gate compares attacker-chosen bytes against
+attacker-chosen hashes. They prove SELF-CONSISTENCY, never authenticity. The anchor gate — the module's
+committed `CurrentRoot` versus a root resolved from the CHAIN — is the only check that says anything
+about authenticity, which is why the empty-blob and unparseable-blob rejections live in the verifier and
+not somewhere more convenient.
+
+## "verified artifact" and "promoted artifact" are different objects (#1576)
+
+`ModuleDownloader` verifies an in-memory blob, then promotes a STAGING FILE. Those are two objects, and
+`download() == Ok` only speaks about the first. Anything that can touch the staging file between the gate
+and the promotion (another process, a leftover tail from a longer earlier attempt, a crash mid-rename)
+breaks the equivalence silently — the caller sees success and caches something that was never verified.
+
+The external check is to re-hash the file about to be promoted. The reference for that comparison must
+NOT be the descriptor's `module_hash`: that value was chosen by the serving peer. Instead the anchor
+verifier records the digest of the bytes it actually ADMITTED — it is the only component that ever sees
+the fully-assembled, gate-passed blob — and the promotion compares against that. Both sides of the
+comparison are then the node's own.
+
+## A caret dep can be right while the resolved tree is wrong (#1576, sibling of #836)
+
+dig-download 0.8.0 depended on dig-rpc-protocol `"0.5"` — correct — and still resolved **0.3.1 as well**,
+because dig-peer 0.4.1 pulled the older major. Two `ModuleInfo` types then sat either side of the module
+pull's trust boundary, on `chunk_hashes`/`chunk_lens`: the fields that drive the whole pull plan. Rust
+compiles that happily; it presents as content that arrives and never verifies (exactly #836's
+`serde_bytes`-vs-base64 range-frame skew, six blind diagnosis rounds).
+
+Two lessons, both now enforced by tests that read `Cargo.lock`:
+
+1. Assert the invariant against the **resolved lock**, not the manifest. `cargo tree -i <crate>@<version>`
+   names the culprit in one command.
+2. The culprit is often **your own workspace**. After bumping dig-node-core to dig-rpc-protocol 0.5, the
+   lock STILL carried 0.3.1 — from `dig-node-service`, the shell in the same repo, whose own pin nobody
+   had thought to bump. A cross-repo cascade is not finished until every crate in the consuming workspace
+   is on the new major.
+
+## Cargo features can smuggle a fail-open bypass past every test (#1576)
+
+dig-download compiles its fail-OPEN `AcceptAnyModuleAnchor` out of a default build (`cfg(any(test,
+feature = "testkit"))`) precisely so a production wiring cannot name it. That protection is a **manifest
+edit** away from gone — and the edit compiles, and every existing test still passes.
+
+So the protection needs a test that reads the manifest: `testkit` must appear only under
+`[dev-dependencies]`, never on the production edge (dev-dependency features do not propagate to
+consumers, so the binaries never see it). A guarantee enforced by build configuration needs an assertion
+at the build-configuration level; a unit test cannot reach it.
+
+## `complete: false` means "the RESOURCE continues", not "the STREAM isn't done" (#1619)
+
+`dig.fetchRange`'s per-frame `complete` flag reports whether the assembled window has reached the
+RESOURCE's end. It says nothing about whether the caller's REQUESTED SPAN (`offset..offset+length`) has
+been satisfied — those are two different bounds, and `stream_range`/`stream_fetched_range` conflated
+them: the streaming loop kept re-requesting more frames until `complete` (or an empty frame), ignoring
+`length` entirely past the first call. dig-download sends `{offset:0, length:1}` as a routine
+metadata-probe on EVERY download (`establish_commitment`), so this silently turned a ~100-byte probe
+into the ENTIRE resource streamed over the wire — real production traffic amplification, not a
+theoretical edge case, and it shipped for as long as no test's fixture happened to exceed one node
+window (dig-node's own #836/#1592 e2e proofs passed only because those fixtures were 20477 and 27067
+bytes, both under the per-frame cap — the corrected record is in dig_ecosystem#836).
+
+**The fix is a SEPARATE bound, not a replacement one:** stop the loop when EITHER `complete` (resource
+exhausted) OR the requested span is satisfied (`off + this_len >= offset + length`) — and request only
+the REMAINING span each iteration, never the original `length` again. A reimplementer who reads
+`complete` as "the stream may stop now" will get exactly this bug; the two concepts need distinct names
+in any port of this logic.
+
+**Test-design corollary:** a "streams N frames" test whose frame count comes from a small `length` on a
+small fixture cannot tell this bug apart from correct bounded behaviour once `length` genuinely spans
+multiple node windows — the fixture has to actually EXCEED one window ([`crate::peer::RANGE_WINDOW`], 3
+MiB) for a multi-frame assertion to mean anything.
+
+## N refusal tests + zero success tests cannot tell "correctly refuses" from "can only refuse" (#1576)
+
+`CapsuleWarmer::warm()` shipped with four tests, all four asserting a REFUSAL (`PullFailed`,
+`NoChainAnchor` ×2, a bad id) — `WarmOutcome::Held` appeared only at its construction site, never in an
+assertion. A wiring slip that made `warm()` ALWAYS refuse (e.g. a broken staged→cache path, a dropped
+`Ok` arm) would have shipped green: every existing test passes whether the code can succeed or not.
+
+The general shape: a function with several distinct outcomes needs at least ONE test per REACHABLE
+outcome, not just per REFUSAL reason — proving the happy path exists is a different assertion than
+proving every failure mode is handled, and a suite that only does the latter looks complete while
+leaving the former provably untested. When adding a test for a success path that was missing, confirm it
+is non-vacuous by breaking the success arm (return the refusal unconditionally, or point the promotion at
+the wrong path) and watching the new test — and ONLY the new test — go red.
+
+## `dig-download`'s `FileStateStore` key exceeds Windows' filename length limit (#1639)
+
+`FileStateStore::path_for` hex-encodes its key (doubling its length, to keep it filesystem-safe) before
+writing `<dir>/<hex>.json`. That is safe in isolation, but `module_download_key` builds the key as
+`"module:<64hex-store>:<64hex-root>"` (136 chars) — hex-encoded, 272 chars, plus `.json` — comfortably
+over the ~255 UTF-16-code-unit limit NTFS enforces on a path COMPONENT without long-path opt-in
+(`\\?\` prefixing). The result is a real `ERROR_INVALID_NAME` (os error 123) the moment a warm actually
+reaches `state_store.save()` — which the #1576 reshare leg's own refusal-only test suite never did,
+since every refusal short-circuited before a checkpoint was ever written (see the entry above: N
+refusals prove nothing about the path only the success case exercises). `CapsuleWarmer` wires a REAL
+`FileStateStore` in production (`download.rs`'s `wire_capsule_reshare`), so a Windows-hosted dig-node
+running the reshare leg hits this for real, not just in a test harness.
+
+Composing a filesystem key from two 64-hex ids plus a literal prefix, then doubling it via hex-encoding,
+is the kind of length math that is easy to miss until a REAL save actually runs — worth checking against
+the OS limit (255 for a bare NTFS component, ~32,767 with `\\?\` long-path opt-in) whenever a cache/state
+key is built by concatenating content ids rather than hashing them down to a fixed width.
+
+## A comment asserting an invariant is how a security defect survives an audit (#1576)
+
+The reshare leg's origin gate was fixed on the JSON-RPC plane, and then the SAME false premise turned up
+one file over, written as a comment above `peer_serve_plaintext`'s `fetch_resource` call: "this whole tier
+only runs behind the LOCAL loopback plaintext read … never the peer wire". It read like a checked fact, so
+a reviewer walking the call graph stopped there instead of walking to the two production callers — which
+are on the single flat `Router` served on EVERY listener, with `Config::bind_addr()` = `host.unwrap_or
+(127.0.0.1)` and no loopback validation on the `DIG_NODE_HOST` override. `GET /s/<store>:<root>/index.html`
+with `Host: localhost` therefore reached the reshare leg unauthenticated. The PR made it worse than the
+pre-existing state: before, that door reached only the §21-AUTHENTICATED upstream sync, which can fail for
+want of authorization; after, it reached a peer-to-peer pull that needs none.
+
+Two durable lessons:
+
+1. **A security label must be a PARAMETER, never a comment.** If a function's correctness depends on who
+   is calling it, the caller must pass that fact in. A comment claiming "the caller is always local"
+   cannot be enforced by the compiler, does not survive a new caller, and — worse — actively suppresses
+   the check a reviewer would otherwise perform. Replace such a comment with the derivation itself
+   (`SPEC.md` §21.7 now states the rule normatively).
+2. **Fixing an instance is not fixing the premise.** When a false assumption is found at one call site,
+   grep for the ASSUMPTION (here: any place asserting a read is local because of the endpoint it arrived
+   on), not just the symbol that was patched. The second instance was three call sites plus a fourth in
+   the same file.
+
+Testing note: the label's derivation could not be exercised by a server bound to loopback, which can never
+produce a non-loopback remote address. The test drives the REAL router through `tower::ServiceExt::oneshot`
+with a FORGED `axum::extract::ConnectInfo` — the same extension `into_make_service_with_connect_info`
+inserts in production — so the two arms differ ONLY in the connection's address. That matters for more than
+convenience: asserting the OUTCOME ("no warm started") alone would have been satisfied by a guard at the
+wrong layer, since a filter anywhere below produces the same empty result. Recording the label at the seam
+boundary makes a RELOCATED guard observable.

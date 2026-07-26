@@ -134,6 +134,26 @@ fn resolve_backfill_on_miss(v: Option<&str>) -> bool {
     )
 }
 
+// -- Where a read request came from — the reshare trigger's ONLY gate ------------------------------
+
+/// Who asked for this read: this node's OWN operator (loopback HTTP / in-process FFI / the
+/// node-internal control surface), or a REMOTE peer over the peer wire protocol.
+///
+/// This is the guard that keeps the reshare leg (#1576) from being a remotely-triggerable
+/// amplification primitive: "a reader that reads becomes a holder" means a LOCAL user's read, never
+/// a remote peer's `dig.fetchRange`/`dig.getContent` miss served through this node. `handle_rpc` is
+/// the one dispatch entry every transport shares (loopback HTTP, FFI, AND the peer-RPC server), so
+/// this is threaded through it EXPLICITLY from each transport's own call site — never inferred from
+/// an address, a header, or any other heuristic a remote caller could spoof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOrigin {
+    /// This node's own operator, via the loopback HTTP shell, the in-process FFI, or the
+    /// node-internal control/subscription surface.
+    Local,
+    /// A remote peer, via the peer-RPC server or the peer stream's own miss handling.
+    Peer,
+}
+
 // -- The digstore-bound proof verifier -------------------------------------------------------------
 
 /// The REAL [`ProofVerifier`] for dig-download's whole-resource check: decodes the digstore
@@ -437,6 +457,15 @@ pub struct NodeContent {
     /// connected to — reaching a holder whose DHT record is unreachable on a relayed net. NOT part of
     /// the raw discovery `locator` (a redirect must name announced holders, not every connected peer).
     connected_pool: ConnectedPool,
+    /// The reshare leg (#1576): after a resource read completes, this pulls the WHOLE `.dig` capsule so
+    /// the reader becomes a discoverable holder of it — the step that makes each read leave the content
+    /// more available than it found it.
+    ///
+    /// Installed by the composition root once the peer stack is up
+    /// ([`Self::set_capsule_warmer`]), because the warmer needs the same live transport + DHT the engine
+    /// uses. `None` until then, and permanently `None` on the FFI/base path — a read behaves identically
+    /// with or without the reshare leg.
+    capsule_warmer: std::sync::OnceLock<Arc<crate::seams::dig_peer::CapsuleWarmer>>,
 }
 
 /// A [`StateStore`] wrapper over a [`FileStateStore`] that SNAPSHOTS every saved [`DownloadState`]
@@ -683,6 +712,7 @@ impl NodeContent {
             fetched: tokio::sync::Mutex::new(HashMap::new()),
             fetch_lock: tokio::sync::Mutex::new(()),
             connected_pool,
+            capsule_warmer: std::sync::OnceLock::new(),
         })
     }
 
@@ -836,6 +866,7 @@ impl NodeContent {
     pub async fn fetch_resource(
         &self,
         content: &ContentId,
+        origin: ReadOrigin,
     ) -> Result<Arc<FetchedResource>, String> {
         let key = download_key(content);
 
@@ -929,7 +960,114 @@ impl NodeContent {
             bytes = fetched.bytes.len(),
             "fetch_resource: download complete"
         );
+
+        // 7. RESHARE (#1576) — the step that closes the content-replication flywheel. The read above
+        //    fetched only the bytes asked for, which leaves this node faster but the NETWORK no stronger:
+        //    a `.dig` is served whole, so a node holding one resource can serve nothing. Kick a
+        //    background pull of the ENTIRE capsule so this reader becomes a discoverable HOLDER of it,
+        //    and every read makes the content MORE available than it found it.
+        //
+        //    Deliberately fire-and-forget: the read's latency is user-facing and a whole-capsule pull is
+        //    orders of magnitude larger than the resource that revealed it, so the read never waits and a
+        //    failed warm never fails the read. See `seams::dig_peer::module_reshare`.
+        self.spawn_capsule_reshare(content, origin);
         Ok(fetched)
+    }
+
+    /// Start a background whole-capsule pull for the capsule `content` belongs to, if a
+    /// [`CapsuleWarmer`](crate::seams::dig_peer::CapsuleWarmer) is wired.
+    ///
+    /// Refuses on any of three gates, each independently sufficient to skip the warm:
+    /// - **`origin != Local`.** A REMOTE peer's `dig.fetchRange`/`dig.getContent` miss must NEVER
+    ///   trigger a whole-capsule pull: unauthenticated (any well-formed self-signed mTLS leaf is
+    ///   accepted, #179) and effectively free for the peer, it would let a stranger drive this node
+    ///   into pulling + caching + DHT-announcing capsules of the ATTACKER'S choosing — a few hundred
+    ///   bytes in for an entire capsule's worth of bandwidth + disk out, an attacker-shaped holder
+    ///   inventory, and eviction pressure on the operator's own content (LRU evicts oldest-mtime
+    ///   first, so a freshly-promoted attacker capsule outlives what it displaced). "A reader that
+    ///   reads becomes a holder" means THIS node's own operator read, never a peer's.
+    /// - **`!backfill_on_miss_enabled()`.** The documented, default-on, operator-facing
+    ///   `DIG_NODE_BACKFILL_ON_MISS` kill switch — this leg is more of the SAME background
+    ///   whole-capsule warm-up `maybe_backfill_capsule` already gates on it, so an operator who
+    ///   turned it off must not have it silently re-enabled through a different code path.
+    /// - **no warmer wired** — the FFI/base path, and any deployment that has not opted into
+    ///   resharing; a read must work identically with or without the reshare leg.
+    fn spawn_capsule_reshare(&self, content: &ContentId, origin: ReadOrigin) {
+        if origin != ReadOrigin::Local || !backfill_on_miss_enabled() {
+            return;
+        }
+        let Some(warmer) = self.capsule_warmer.get() else {
+            return;
+        };
+        // Only a GENERATION-bearing id names a capsule to reshare. A store-granularity read does not say
+        // WHICH generation to pull, and guessing (the chain tip, say) would reshare a capsule nobody
+        // asked for.
+        let (store, root) = match content {
+            ContentId::Root { store_id, root } => (*store_id, *root),
+            ContentId::Resource { store_id, root, .. } => (*store_id, *root),
+            ContentId::Store { .. } => return,
+        };
+        crate::seams::dig_peer::spawn_capsule_warm(
+            Arc::clone(warmer),
+            hex::encode(store),
+            hex::encode(root),
+        );
+    }
+
+    /// Install the capsule warmer (the reshare leg, #1576). Called once by the composition root after
+    /// the peer stack is up, since the warmer needs the live transport + DHT the engine also uses.
+    ///
+    /// Idempotent by `OnceLock`: a second install is ignored rather than swapping the warmer under a
+    /// pull that is already in flight.
+    pub fn set_capsule_warmer(&self, warmer: Arc<crate::seams::dig_peer::CapsuleWarmer>) {
+        let _ = self.capsule_warmer.set(warmer);
+    }
+
+    /// Build + install the reshare leg from the pieces only the composition root has (#1576): this
+    /// node's mTLS identity + shared NAT runtime, the CHAIN's root resolver, and the announce hook.
+    ///
+    /// Everything else — the discovery locator, the resume-state store, the live connected pool, the
+    /// staging directory — is taken from the engine itself, so the reshare pull discovers and dials
+    /// through exactly the same machinery the resource read does. Two independent locators would be two
+    /// things to keep in sync, and the read leg's history is a catalogue of what happens when a dial path
+    /// diverges from the one that was debugged (#836/#1590).
+    ///
+    /// `cache_dir` is the node's cache root; a promoted module lands at
+    /// `<cache_dir>/modules/<store>/<root>.module`, the path whose existence IS this node's holder claim.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wire_capsule_reshare(
+        self: &Arc<Self>,
+        node_cert: Arc<dig_nat::NodeCert>,
+        nat_config: dig_nat::NatConfig,
+        network_id: &str,
+        runtime: Arc<dig_nat::NatRuntime>,
+        anchor_resolver: Arc<dyn crate::shared::AnchoredRootResolver>,
+        announce: Arc<dyn crate::seams::dig_peer::AnnounceHolder>,
+        cache_dir: &Path,
+    ) {
+        let transport = Arc::new(crate::seams::dig_peer::NatModuleTransport::new(
+            node_cert,
+            nat_config,
+            network_id,
+            runtime,
+            self.connected_pool.clone(),
+            self.locator.clone(),
+        ));
+        self.set_capsule_warmer(crate::seams::dig_peer::CapsuleWarmer::new(
+            self.locator.clone(),
+            transport,
+            self.state_store.clone(),
+            anchor_resolver,
+            crate::seams::dig_peer::WarmPaths {
+                // Stage under the downloads dir, NOT the cache: a module file at the cache path is
+                // already this node's holder claim, so a partial pull must never live there.
+                staging_dir: self.downloads_dir.clone(),
+                cache_dir: cache_dir.to_path_buf(),
+            },
+            announce,
+            Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+        ));
     }
 
     /// Drain a running download's progress [`DownloadEvent`](dig_download::DownloadEvent) stream to
@@ -1013,7 +1151,12 @@ impl crate::Node {
     /// Decide the #165 miss outcome for `content` at redirect depth `depth`: fetch-through when
     /// configured (falling back to redirect if the fetch fails), else locate + redirect within the
     /// hop budget, else not-found. NEVER a silent 404 while a provider exists.
-    pub(crate) async fn miss_outcome(&self, content: &ContentId, depth: u64) -> MissOutcome {
+    pub(crate) async fn miss_outcome(
+        &self,
+        content: &ContentId,
+        depth: u64,
+        origin: ReadOrigin,
+    ) -> MissOutcome {
         // No P2P content engine (the in-process FFI path) → the caller's own not-found stands.
         let Some(pc) = self.p2p_content() else {
             return MissOutcome::NotFound;
@@ -1023,7 +1166,7 @@ impl crate::Node {
         // directly. On any failure, fall through to the redirect so a provider-held resource is never
         // silently 404'd.
         if pc.miss_mode() == MissMode::FetchThrough {
-            if let Ok(fetched) = pc.fetch_resource(content).await {
+            if let Ok(fetched) = pc.fetch_resource(content, origin).await {
                 return MissOutcome::Fetched(fetched);
             }
         }
@@ -1057,8 +1200,9 @@ impl crate::Node {
         depth: u64,
         offset: usize,
         length: usize,
+        origin: ReadOrigin,
     ) -> Option<Value> {
-        match self.miss_outcome(content, depth).await {
+        match self.miss_outcome(content, depth, origin).await {
             MissOutcome::Fetched(f) => Some(match f.range_frame(offset, length) {
                 Ok(frame) => json!({"jsonrpc":"2.0","id":id,"result":frame}),
                 Err((code, message)) => crate::rpc_err(id, code, &message),
@@ -1083,8 +1227,9 @@ impl crate::Node {
         depth: u64,
         offset: usize,
         pinned_root_hex: Option<&str>,
+        origin: ReadOrigin,
     ) -> Option<Value> {
-        match self.miss_outcome(content, depth).await {
+        match self.miss_outcome(content, depth, origin).await {
             MissOutcome::Fetched(f) => {
                 let root_ok = match pinned_root_hex {
                     Some(pin) => f.root.as_deref() == Some(pin),
@@ -1222,7 +1367,7 @@ pub(crate) fn range_content_id(req: &Value) -> Option<ContentId> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use dig_download::testkit::{
         mock_content_id, mock_peer_hex, mock_provider, MockContent, MockProviderLocator,
@@ -1486,7 +1631,10 @@ mod tests {
             td.path(),
         );
 
-        let f = pc.fetch_resource(&cid).await.expect("download succeeds");
+        let f = pc
+            .fetch_resource(&cid, ReadOrigin::Local)
+            .await
+            .expect("download succeeds");
         assert_eq!(f.bytes, content.bytes, "reassembled bytes match the source");
         assert_eq!(f.total_length, 30);
         assert_eq!(f.chunk_lens, content.chunk_lens);
@@ -1496,7 +1644,10 @@ mod tests {
         // A second fetch is served from the in-memory cache — no new peer fetches.
         let attempts_before = transport.attempts_for(&mock_peer_hex(1)).await
             + transport.attempts_for(&mock_peer_hex(2)).await;
-        let f2 = pc.fetch_resource(&cid).await.expect("cache hit");
+        let f2 = pc
+            .fetch_resource(&cid, ReadOrigin::Local)
+            .await
+            .expect("cache hit");
         assert_eq!(f2.bytes, f.bytes);
         let attempts_after = transport.attempts_for(&mock_peer_hex(1)).await
             + transport.attempts_for(&mock_peer_hex(2)).await;
@@ -1541,7 +1692,7 @@ mod tests {
 
         // DATA: the fetch must now reach the connected holder (was Err → 404 before the fix).
         let f = pc
-            .fetch_resource(&cid)
+            .fetch_resource(&cid, ReadOrigin::Local)
             .await
             .expect("fetch from the connected-pool holder");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
@@ -1639,7 +1790,7 @@ mod tests {
 
         // The fetch must succeed by reaching the holder — never self.
         let f = pc
-            .fetch_resource(&cid)
+            .fetch_resource(&cid, ReadOrigin::Local)
             .await
             .expect("fetch reaches the connected holder");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
@@ -1779,7 +1930,7 @@ mod tests {
 
         // DATA: the fetch must reach the holder over its reachable pool address (was Err → 404 before).
         let f = pc
-            .fetch_resource(&cid)
+            .fetch_resource(&cid, ReadOrigin::Local)
             .await
             .expect("fetch reaches the holder at its reachable pool address");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
@@ -1892,7 +2043,7 @@ mod tests {
 
         // DATA: the fetch must reach the connected holder despite its availability=false answer.
         let f = pc
-            .fetch_resource(&cid)
+            .fetch_resource(&cid, ReadOrigin::Local)
             .await
             .expect("a connected-pool holder is fetched even when it answers availability=false");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
@@ -1965,7 +2116,10 @@ mod tests {
             None,
             td.path(),
         );
-        assert!(pc.fetch_resource(&mock_content_id()).await.is_err());
+        assert!(pc
+            .fetch_resource(&mock_content_id(), ReadOrigin::Local)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -2074,7 +2228,10 @@ mod tests {
         let before = pc.selector().snapshot();
         assert_eq!(before.measured_peers, 0, "no measured peers before a fetch");
 
-        let f = pc.fetch_resource(&cid).await.expect("download succeeds");
+        let f = pc
+            .fetch_resource(&cid, ReadOrigin::Local)
+            .await
+            .expect("download succeeds");
         assert_eq!(f.bytes, content.bytes, "reassembled bytes match the source");
 
         // After the fetch the selector has folded in measured outcomes for the peer(s) that served the
@@ -2266,7 +2423,7 @@ mod tests {
             addr,
         });
 
-        let fetched = pc.fetch_resource(&cid).await;
+        let fetched = pc.fetch_resource(&cid, ReadOrigin::Local).await;
 
         // The load-bearing assertion: the RPC LEFT THE MACHINE and the holder SAW it.
         let seen = fetch_ranges.lock().unwrap().clone();
@@ -2285,5 +2442,180 @@ mod tests {
             "served bytes match the holder's content"
         );
         server.abort();
+    }
+
+    // -- spawn_capsule_reshare's ReadOrigin gate — exercised, not merely present (#1619 follow-up) --
+    //
+    // A guard nothing ever fails to satisfy is a guard a later refactor can drop or invert with every
+    // existing test staying green. These prove each term of `origin != Local ||
+    // !backfill_on_miss_enabled()` independently, and are designed to fail LOUDLY (not merely time
+    // out) if either term is deleted: `spawn_capsule_reshare_would_start_a_warm_when_gated_open`
+    // below is the control that proves the harness itself can observe a started warm at all.
+
+    /// A resolver whose `anchored_root` NEVER completes. Wiring this onto a [`CapsuleWarmer`] parks
+    /// any started `warm()` inside its first await point for the life of the test — turning "did a
+    /// warm even start" from a race against a fast mock success/failure into a STABLE fact: the
+    /// registry claim (synchronous, the very first thing `warm()` does) either happened before the
+    /// parked await, or it never happened at all.
+    struct HangingResolver;
+
+    #[async_trait::async_trait]
+    impl crate::shared::AnchoredRootResolver for HangingResolver {
+        async fn anchored_root(
+            &self,
+            _store_id: &[u8; 32],
+        ) -> Result<Option<digstore_core::Bytes32>, String> {
+            std::future::pending().await
+        }
+    }
+
+    /// An [`AnnounceHolder`](crate::seams::dig_peer::AnnounceHolder) that is never reached (the
+    /// hanging resolver means no warm in these tests ever gets past its first await).
+    struct UnreachedAnnounce;
+
+    #[async_trait::async_trait]
+    impl crate::seams::dig_peer::AnnounceHolder for UnreachedAnnounce {
+        async fn announce_inventory(&self) {
+            unreachable!("no warm in this test should ever reach an announce")
+        }
+    }
+
+    /// Wire a permanently-parked [`CapsuleWarmer`] onto `pc` and return its [`WarmRegistry`] plus the
+    /// exact generation key `warm()` claims — so a test can poll `registry.is_warming(&key)` to learn
+    /// whether `spawn_capsule_reshare` actually reached the point of starting a pull.
+    pub(crate) fn wire_hanging_warmer(
+        pc: &NodeContent,
+        td: &tempfile::TempDir,
+    ) -> (Arc<crate::seams::dig_peer::WarmRegistry>, ContentId, String) {
+        let registry = Arc::new(crate::seams::dig_peer::WarmRegistry::new());
+        let warmer = crate::seams::dig_peer::CapsuleWarmer::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                &hex::encode([0xaa; 32]),
+                &hex::encode([0xbb; 32]),
+                vec![],
+                8,
+            )),
+            Arc::new(FileStateStore::new(td.path().join("warm-state"))),
+            Arc::new(HangingResolver),
+            crate::seams::dig_peer::WarmPaths {
+                staging_dir: td.path().join("warm-staging"),
+                cache_dir: td.path().join("warm-cache"),
+            },
+            Arc::new(UnreachedAnnounce),
+            Arc::clone(&registry),
+            dig_download::ModuleDownloadConfig::default(),
+        );
+        pc.set_capsule_warmer(warmer);
+        let content = ContentId::resource([0xaa; 32], [0xbb; 32], [0xcc; 32]);
+        let key = format!("{}:{}", hex::encode([0xaa; 32]), hex::encode([0xbb; 32]));
+        (registry, content, key)
+    }
+
+    /// Poll `registry.is_warming(key)` for up to `bound` for it to become `true`, so a positive
+    /// assertion never races a `tokio::spawn`'s scheduling latency. Returns whether it was observed.
+    pub(crate) async fn wait_for_warm_started(
+        registry: &crate::seams::dig_peer::WarmRegistry,
+        key: &str,
+        bound: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        while tokio::time::Instant::now() < deadline {
+            if registry.is_warming(key) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        registry.is_warming(key)
+    }
+
+    /// **The control:** with the gate wide open (`Local`, backfill on), `spawn_capsule_reshare` DOES
+    /// start a warm — proving the harness above can observe a started warm at all, so the two refusal
+    /// tests below are not merely "nothing ever happens here regardless".
+    #[tokio::test]
+    async fn spawn_capsule_reshare_would_start_a_warm_when_gated_open() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(1, 1))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let (registry, content, key) = wire_hanging_warmer(&pc, &td);
+
+        pc.spawn_capsule_reshare(&content, ReadOrigin::Local);
+        drop(_g); // the env decision is already made (synchronously, above) — never held across an await
+
+        assert!(
+            wait_for_warm_started(&registry, &key, std::time::Duration::from_millis(500)).await,
+            "the control case must observe a started warm, or the two refusal tests below prove nothing"
+        );
+    }
+
+    /// **Proves:** a `Peer`-origin read NEVER starts a capsule warm, however long the harness waits —
+    /// the exact defect this PR's security gate closes (a remote peer driving this node into pulling,
+    /// caching, and DHT-announcing a capsule of the PEER'S choosing).
+    /// **Catches:** `origin != ReadOrigin::Local` being dropped or inverted from `spawn_capsule_reshare`
+    /// — deleting that term made this test the ONLY one in the crate that fails (verified: RED).
+    #[tokio::test]
+    async fn spawn_capsule_reshare_refuses_a_peer_origin() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON — origin alone must refuse
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(1, 1))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let (registry, content, key) = wire_hanging_warmer(&pc, &td);
+
+        pc.spawn_capsule_reshare(&content, ReadOrigin::Peer);
+        drop(_g); // the env decision is already made (synchronously, above) — never held across an await
+
+        assert!(
+            !wait_for_warm_started(&registry, &key, std::time::Duration::from_millis(500)).await,
+            "a Peer-origin read must never start a capsule warm"
+        );
+    }
+
+    /// **Proves:** the `DIG_NODE_BACKFILL_ON_MISS` kill switch refuses a warm even at `Local` origin —
+    /// the operator-facing off switch must not be silently bypassed by the reshare leg.
+    /// **Catches:** `!backfill_on_miss_enabled()` being dropped from `spawn_capsule_reshare` —
+    /// deleting that term made this test the ONLY one in the crate that fails (verified: RED).
+    #[tokio::test]
+    async fn spawn_capsule_reshare_refuses_when_backfill_is_disabled() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("DIG_NODE_BACKFILL_ON_MISS", "off");
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(1, 1))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let (registry, content, key) = wire_hanging_warmer(&pc, &td);
+
+        pc.spawn_capsule_reshare(&content, ReadOrigin::Local);
+        drop(_g); // the env decision is already made (synchronously, above) — never held across an await
+
+        let started =
+            wait_for_warm_started(&registry, &key, std::time::Duration::from_millis(500)).await;
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        assert!(
+            !started,
+            "DIG_NODE_BACKFILL_ON_MISS=off must refuse even a Local-origin read"
+        );
     }
 }

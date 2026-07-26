@@ -2970,6 +2970,29 @@ would contradict.
 The served window is EXACTLY the requested span, never widened to a chunk boundary: a verifying client
 fails a range closed on any length but the one it planned.
 
+**A `dig.fetchRange` STREAM MUST NOT serve past the requested `[offset, offset+length)` span, however
+far the resource itself continues (#1619).** The per-frame window cap above bounds one FRAME; a holder
+answering a request whose span exceeds one node window still streams MULTIPLE frames (advancing
+`offset`) to cover it, and that multi-frame loop MUST stop the instant the requested span is satisfied
+— NOT merely when the frame's own `complete` flag reports the resource exhausted. `complete: false` on
+the LAST frame of a satisfied request is normal and expected: it means the RESOURCE continues past the
+request, not that more of the STREAM is still to come. A holder that keeps streaming past the requested
+`length` turns a client's small probe range (e.g. `{offset:0, length:1}` — dig-download's own
+metadata-probe pattern, sent on every download) into an unbounded amplification: hundreds of bytes in
+for the WHOLE resource's verification-metadata-laden frames out. The client-side clip
+(dig-download's own defensive re-clamp of an over-length frame) is defense in depth, never a substitute
+for the holder's own bound — re-introducing a client-side REJECTION of an over-long frame is the #836
+class of defect (a false negative that makes an honest holder look like a liar) and MUST NOT return.
+
+**KNOWN CONSTRAINT (dig_ecosystem#1640): the per-frame window ([`crate::peer::RANGE_WINDOW`], 3 MiB)
+exceeds `dig-nat`'s wire framing cap (`MAX_FRAMED_BODY`, 64 KiB) once base64 encoding and #1577's
+per-frame verification metadata are counted.** A real peer-to-peer `dig.fetchRange`/reshare window
+this large cannot actually be decoded on arrival over the real wire — the wiring in this spec is
+correct and the bound above holds regardless of window size, but the reshare leg's "a reader becomes a
+discoverable holder" flywheel is NOT demonstrable end to end at realistic capsule sizes until the
+framing ceiling is published by `dig-nat` and this node's per-frame split is brought under it
+(release-first, cross-repo — tracked at #1640, not fixed in this pass).
+
 A serve MUST NOT emit a per-CHUNK inclusion proof (`range_proof`). No such proof is derivable from the
 store format: the generation root's merkle leaves are per-RESOURCE (`resource_leaf(ciphertext)` =
 SHA-256 of a resource's WHOLE ciphertext, folded by `MerkleTree::from_leaves`), so a single chunk has no
@@ -3181,3 +3204,163 @@ is only the second line of defence. The transport's per-request logging records 
 and a correlation `op_id`, never the request `params` (which for a control/pairing call carry a
 token); this is enforced by the request-logger's signature and a never-log regression test.
 
+## 21. Reshare — the whole-`.dig`-module pull (a reader becomes a holder)
+
+A node that reads content MUST be able to become a complete resharer of the capsule it read from. A
+resource read fetches only the bytes requested, which leaves the reader faster but the network no
+stronger: a `.dig` module is served WHOLE (every retrieval key, with proofs), so a node holding one
+resource can serve nothing. The reshare leg pulls the entire module for the generation that was read, and
+only then does the node become a holder — so each read leaves the content MORE available than it found it.
+
+This closes the content-replication flywheel: `install -> connect -> discover -> read -> cache -> reshare`.
+
+### 21.1. Wire surface (peer tier)
+
+Two peer-reachable methods, both public-read (unsealed §5.4 exemption — the content is public-by-nature
+and content-addressed):
+
+- **`dig.getModuleInfo` `{store_id, root}` → `ModuleInfo`** — the transfer descriptor of a module the
+  answering node HOLDS: `total_size`, `module_hash` (SHA-256 of the whole blob, 64-hex), and per-chunk
+  `chunk_hashes` + `chunk_lens` in ascending order. `chunk_lens` MUST have the same length as
+  `chunk_hashes` and MUST sum to `total_size`. A node that does not hold the module (including a 0-byte
+  local file, which is not a module) MUST answer the `RESOURCE_UNAVAILABLE` error, never a descriptor.
+- **`dig.fetchModuleRange` `{store_id, root, offset?, length}`** — a byte window of the module blob,
+  answered as a STREAM of `RangeFrame`-shaped frames (`bytes` base64), `total_length` on the first frame
+  only, terminated by a frame with `complete: true`. A server MUST send a terminating frame even for an
+  empty window, or a caller waits forever. A server MAY answer at its own, narrower frame granularity; a
+  caller MUST read until `complete`.
+
+**Routing (normative).** `dig.fetchModuleRange` is dispatched by its METHOD NAME, not by request shape:
+its response is a frame stream rather than one envelope, and its shape cannot express that. The client
+half records the same contract (dig-peer SPEC §3.5), so the two cannot drift.
+
+**Chunking.** The descriptor is one framed response inside the 64 KiB control-frame cap, and each chunk
+costs descriptor bytes. A server therefore scales its chunk size with the module — at least 1 MiB, and
+always large enough to keep the chunk count at or below 512 — so the descriptor is bounded BY
+CONSTRUCTION and no capsule is made unpullable by a framing limit unrelated to its content. A single
+`fetchModuleRange` window is clamped to 4 MiB, so one request never sizes the server's work.
+
+### 21.2. The anchor verifier is the ONLY root of trust (MUST)
+
+Every check before the anchor gate compares peer-supplied bytes against peer-supplied hashes. Those
+checks prove SELF-CONSISTENCY, not authenticity: a holder that fabricates a module and describes it
+correctly passes all of them. Whatever the anchor gate admits, the node then caches, SERVES, and
+ANNOUNCES itself a holder of — so a weak gate makes an honest node an authoritative-looking source of
+corrupt content network-wide. Therefore:
+
+1. **The expected generation root MUST be resolved from the CHAIN, before any peer is contacted**, via
+   the anchored-root resolver (`verify_pinned_root`, the bounded check). It MUST NOT be taken from, or
+   influenced by, the peer that serves the module. If the anchor came from the serving peer, the entire
+   fail-closed property is void.
+2. **Comparisons MUST be over decoded 32-byte values, never hex text.** Hex is case-insensitive and
+   length-forgiving in a way byte equality is not; a peer that influences either side of a TEXT
+   comparison gets a bypass for free.
+3. **An unparseable or 0-byte blob MUST be rejected explicitly.** Both hash gates pass TRIVIALLY for the
+   empty module (SHA-256 of no bytes is a declarable `module_hash`), so the verifier is the only check.
+4. **The module MUST commit the store and generation it claims to be.** Its embedded `StoreId` (data
+   section 1) and `CurrentRoot` (section 2) MUST equal the store being pulled and the CHAIN's root. A
+   section of the wrong width, or an absent one, MUST be rejected — never zero-extended or truncated
+   into a comparison it could pass. A module committing a DIFFERENT real generation is a rollback
+   primitive and MUST fail closed.
+5. A verifier is bound to ONE generation and MUST refuse a pull of any other, so it can never be reused
+   to check the wrong anchor.
+
+The production verifier MUST NOT be, or be replaceable by, a fail-open one. dig-download's
+`AcceptAnyModuleAnchor` exists only under its `testkit` feature; that feature MUST NOT be enabled on a
+production dependency edge.
+
+### 21.3. Becoming a holder — promote, then announce (MUST)
+
+This node's DHT provider records are derived from its CACHE INVENTORY (§19), so the moment a module file
+appears at `<cache>/modules/<store>/<root>.module` this node is advertising itself network-wide as an
+authoritative source of that capsule. The promotion ladder is therefore:
+
+```
+<downloads>/modules/<store>-<root>.dig.download.tmp   staging
+<downloads>/modules/<store>-<root>.dig                verified, NOT yet a holder
+<cache>/modules/<store>/<root>.module                 CACHED == ANNOUNCED AS HOLDER
+```
+
+- **A pull MUST stage OUTSIDE the cache**, so a partial or failed pull is never a candidate for
+  announcement — there is no window in which a half-pulled capsule sits at the cache path.
+- **The move into the cache MUST happen only on the pull returning success** — never on
+  finalize-observed, never on partial staging, never after a failure.
+- **Success MUST NOT be taken on faith.** Before the move, the artifact on disk MUST be re-hashed and
+  compared against the digest of the bytes the anchor gate actually ADMITTED. Both sides of that
+  comparison are then the node's own; a re-hash against the descriptor's `module_hash` would compare
+  against a value the serving peer chose. A mismatch MUST abandon the promotion (never "repair" it) and
+  MUST NOT announce.
+- The move into the cache MUST be write-then-rename, so a reader never observes a partial module at the
+  path whose existence is the holder claim.
+- **The announce MUST reuse the node's one inventory-reconcile path** (§19), never a bespoke announce, so
+  the reshare leg cannot advertise a content-id shape the rest of the node does not.
+- A failed pull MUST leave no staging artifact behind that a later run could mistake for progress.
+
+### 21.4. The warm is a background pull (MUST NOT slow the read)
+
+The read that triggers a warm MUST NOT wait for it, and a failed warm MUST NOT fail that read: a
+whole-capsule pull is orders of magnitude larger than the resource that revealed the capsule, and the
+read's latency is user-facing. Serving a module range is paced by the SAME FCFS outbound limiter
+`dig.fetchRange` uses (§17) — a whole-capsule pull is the largest thing a node serves, so exempting it
+would leave the biggest transfer as the one path able to starve every other peer.
+
+At most ONE warm per generation runs at a time, so a burst of reads across a capsule's resources cannot
+start N concurrent pulls of the same module. A store-granularity read starts no warm: it does not name
+WHICH generation to pull, and guessing would reshare a capsule nobody asked for.
+
+### 21.5. Dial path (MUST)
+
+A module dial MUST resolve candidate addresses through the shared candidate resolver — IPv6 first, then
+IPv4 (§5.2), each socket CONSTRUCTED from a parsed IP rather than a formatted string — and MUST try every
+candidate in order before reporting failure, so one unusable IPv6 candidate cannot mask a working IPv4
+one. Building a socket address by formatting host and port into a string and reparsing it is FORBIDDEN:
+it is invalid for every IPv6 literal, whose grammar requires brackets. The live connected pool is
+consulted before DHT hints (a connection-verified address before an untrusted advertisement), and a DHT
+failure MUST NOT discard a pool address.
+
+A failure reason MUST NOT embed peer-supplied text; ids reaching a log MUST go through the serve log's
+sentinel (§19).
+
+### 21.6. Serve observability
+
+Both module methods emit the §19 serve vocabulary: an INFO outcome line per request (`described` /
+`not-held` for the descriptor; `served` with byte + frame counts, or `not-held`, for a range) plus DEBUG
+detail. Every id is rendered through the serve log's sentinel, so a peer can neither bloat a log line nor
+forge a record. No module bytes are ever logged.
+
+### 21.7. Only the operator's own read may effect the network (MUST)
+
+A read can trigger background legs that spend this node's bandwidth and disk and change what it
+advertises network-wide: the whole-capsule warm (`maybe_backfill_capsule`, §21.4) and the reshare pull
+plus holder-announce (§21.3). Those legs MUST be reachable only from a read this node's OWN OPERATOR
+made. A read that arrived from the network is SERVED normally and effects NOTHING: it starts no warm, no
+reshare, no promotion, and no announce.
+
+The rule is not optional hardening. Every peer-facing read surface is unauthenticated in the sense that
+matters here — any well-formed self-signed mTLS leaf is accepted (§13), and the plaintext `/s/` surface
+carries no token at all — so an ungated leg lets a stranger name a capsule and have this node pull it,
+cache it, evict the operator's own content to make room, and then advertise itself as an authoritative
+holder of the stranger's choosing, at a cost to the stranger of a few hundred bytes.
+
+Therefore:
+
+1. **Every read carries a read-origin label**, and only a `Local` label may reach a network-effecting
+   leg. The label MUST be threaded from the surface that accepted the request down to the leg — a
+   function that starts a warm or a reshare MUST take the label as a parameter and MUST NOT assert one.
+2. **The label MUST be DERIVED from the accepting connection's real remote address** (loopback ⇒ `Local`,
+   anything else ⇒ `Peer`), and from nothing else. Deriving it from the identity of the endpoint or the
+   handler is FORBIDDEN, because "this handler is the loopback server" is not a fact: the operator-facing
+   `DIG_NODE_HOST` override replaces the loopback bind with any address, and the whole router — the
+   JSON-RPC plane, `GET /s/*path`, and the router fallback alike — is served on every listener. The
+   Host-header allowlist (§4.2) is a DNS-rebinding defense and MUST NOT be read as an origin check: a
+   remote client can send `Host: localhost`.
+3. **The derivation MUST fail closed.** A request from which the remote address cannot be recovered MUST
+   be rejected, never defaulted to `Local`. An IPv4-mapped IPv6 address MUST NOT satisfy the loopback
+   test (IPv6 loopback is `::1` alone), so a remote peer cannot forge a `Local` label by address family.
+4. **The operator's off switch still wins.** `DIG_NODE_BACKFILL_ON_MISS=off` refuses these legs even for
+   a `Local` read; the origin gate narrows them further and never re-enables them.
+
+The peer-tier read (`dig.fetchRange` / `dig.getContent` on the peer wire) and the local plaintext serve
+(`GET /s/…`, and the root-absolute reroot that shares its path) are BOTH subject to this rule — the
+serve path reaches the same legs through its P2P tier, so gating one door and not the other leaves the
+property unheld.

@@ -13,6 +13,10 @@
 pub mod address_book;
 pub mod capsule_fallback;
 pub mod dht;
+pub mod module_anchor;
+pub mod module_reshare;
+pub mod module_serve;
+pub mod module_transport;
 pub mod net;
 pub mod peer_network;
 pub mod pex;
@@ -24,6 +28,12 @@ pub mod session;
 pub mod union_locator;
 
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;
+pub use module_anchor::ChainAnchoredModuleVerifier;
+pub use module_reshare::{
+    spawn_capsule_warm, AnnounceHolder, CapsuleWarmer, WarmFailure, WarmOutcome, WarmPaths,
+    WarmRegistry,
+};
+pub use module_transport::NatModuleTransport;
 pub use peer_network::PeerNetwork;
 pub(crate) use pool_locator::{ConnectedPool, PoolProviderLocator};
 pub(crate) use selector_adapter::SelectorAdapter;

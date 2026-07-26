@@ -115,6 +115,16 @@ pub fn dht_addr_from_gossip_addr(gossip: std::net::SocketAddr) -> std::net::Sock
 
 /// Per-window ciphertext cap for a `dig.fetchRange` frame (bytes) — the node window (3 MiB), the same
 /// cap the HTTP read path (`WINDOW`) uses.
+///
+/// KNOWN CONSTRAINT (dig_ecosystem#1640): this is chosen without reference to `dig-nat`'s wire framing
+/// cap (`MAX_FRAMED_BODY`, 64 KiB) — a 3 MiB frame plus #1577's per-frame verification metadata
+/// (`root`, the whole `chunk_lens` array, `total_length`, a base64 `inclusion_proof`) cannot actually
+/// be base64-encoded and framed within that limit, so a real peer-to-peer window this large fails to
+/// decode on arrival. The reshare leg's whole-module pull (`seams/dig_peer/module_serve.rs`) rides the
+/// SAME constant and inherits the same defect for any module above a few tens of KB. The fix belongs
+/// at `dig-nat` (publish the real payload ceiling; every framer targets it) — this constant is a
+/// single source of truth for the per-frame split, so lowering it here (once the true ceiling is
+/// known) requires touching only this line, not the streaming loops that consume it.
 pub const RANGE_WINDOW: usize = 3 * 1024 * 1024;
 
 /// Maximum concurrent accepted mTLS peer CONNECTIONS the listener will serve at once (audit #179
@@ -685,6 +695,10 @@ pub async fn write_framed<W: AsyncWriteExt + Unpin + ?Sized>(
 /// Classify one inbound peer-request frame by its shape.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PeerRequestKind {
+    /// A `dig.fetchModuleRange` request — a JSON-RPC request whose response is a FRAME STREAM rather
+    /// than one envelope, so it is classified ahead of the generic JSON-RPC case by its method name
+    /// (#1576). Checked first because it is a strict subset of the JSON-RPC shape.
+    ModuleRange,
     /// A JSON-RPC 2.0 request (`method` present).
     JsonRpc,
     /// A `dig.fetchRange` RangeRequest (`length` present, `method` absent).
@@ -697,9 +711,16 @@ pub(crate) enum PeerRequestKind {
 
 /// Dispatch an inbound frame by shape (pure — no I/O), so the stream-routing policy is unit-tested.
 pub(crate) fn classify_request(v: &Value) -> PeerRequestKind {
-    if v.get("method").and_then(Value::as_str).is_some() {
-        PeerRequestKind::JsonRpc
-    } else if v.get("length").is_some() {
+    match v.get("method").and_then(Value::as_str) {
+        // The one JSON-RPC method whose response is a frame stream (#1576) — checked before the generic
+        // JSON-RPC case, which it is a subset of.
+        Some(m) if m == dig_rpc_protocol::Method::FetchModuleRange.name() => {
+            return PeerRequestKind::ModuleRange
+        }
+        Some(_) => return PeerRequestKind::JsonRpc,
+        None => {}
+    }
+    if v.get("length").is_some() {
         PeerRequestKind::Range
     } else if v.get("items").is_some() {
         PeerRequestKind::Availability
@@ -767,6 +788,32 @@ pub trait PeerRpcResponder: Send + Sync {
         out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     ) -> std::io::Result<()>;
 
+    /// Stream a `dig.fetchModuleRange` response by writing framed `dig_nat::RangeFrame`-shaped frames
+    /// for the requested window of a locally-held whole `.dig` module (#1576, the reshare leg).
+    ///
+    /// `params` is the request's `params` object (`store_id` / `root` / `offset` / `length`). A module
+    /// this node does not hold answers with ONE error frame, so the caller distinguishes "not held" from
+    /// a dropped stream instead of waiting for bytes that will never come.
+    ///
+    /// Defaults to "not held": a responder with no cache (the FFI path, test stubs) needs no override,
+    /// and fail-closed is the right default for a serve — claiming to hold a module and then serving
+    /// nothing is worse than declining.
+    async fn stream_module_range(
+        &self,
+        params: Value,
+        conn_key: &str,
+        out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+    ) -> std::io::Result<()> {
+        let _ = (params, conn_key);
+        write_framed(
+            out,
+            &crate::seams::dig_peer::module_serve::module_unavailable_frame(
+                crate::download::RESOURCE_UNAVAILABLE,
+            ),
+        )
+        .await
+    }
+
     /// Answer an inbound DHT-RPC frame (#163): decode `frame` as a `dig_dht::DhtRequest`, dispatch it
     /// against the node's DHT service folding in the authenticated `caller` (so the routing table
     /// populates bidirectionally), and return the framed `dig_dht::DhtResponse` bytes to write back.
@@ -783,6 +830,30 @@ pub trait PeerRpcResponder: Send + Sync {
             message: "DHT not running on this node".to_string(),
         }
         .encode()
+    }
+}
+
+/// Announces this node's inventory to the DHT after a capsule warm caches one — the step that makes a
+/// freshly-held capsule DISCOVERABLE (#1576 + #1586).
+///
+/// Reuses `refresh_inventory`, the SAME reconcile the gap-fill / explicit-cache paths use, rather than
+/// announcing the one new capsule directly: one announce path means the reshare leg can never advertise a
+/// content id shape the rest of the node does not (and a withdrawal it should have made is not skipped).
+struct DhtInventoryAnnouncer {
+    node: Arc<crate::Node>,
+    dht: Arc<crate::dht::DhtHandle>,
+}
+
+#[async_trait::async_trait]
+impl crate::seams::dig_peer::AnnounceHolder for DhtInventoryAnnouncer {
+    async fn announce_inventory(&self) {
+        let cached = self.node.cache_list_cached().await;
+        let (announced, withdrawn) = self.dht.refresh_inventory(&cached).await;
+        tracing::info!(
+            announced,
+            withdrawn,
+            "capsule warm: announced this node as a holder of the newly cached capsule"
+        );
     }
 }
 
@@ -933,6 +1004,19 @@ where
         return Ok(());
     }
     match classify_request(&req) {
+        PeerRequestKind::ModuleRange => {
+            // Routed by METHOD NAME, not by request shape: this request's RESPONSE is a frame stream
+            // rather than one envelope, and its shape (store_id/root/offset/length) cannot express that.
+            // dig-peer's SPEC §3.5 records the same contract on the client side, so the two cannot drift.
+            let conn_key = caller
+                .as_ref()
+                .map(|c| c.peer_id.clone())
+                .unwrap_or_default();
+            let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+            responder
+                .stream_module_range(params, &conn_key, &mut stream)
+                .await
+        }
         PeerRequestKind::JsonRpc => {
             let resp = responder.handle_json_rpc(req).await;
             write_framed(&mut stream, &resp).await
@@ -1096,12 +1180,94 @@ impl PeerRpcResponder for NodeResponder {
             let peers = self.pool_peers(&network_id, limit);
             return json!({"jsonrpc":"2.0","id":id,"result":{"peers": peers}});
         }
-        crate::handle_rpc(&self.node, req).await
+        // This is the peer-RPC server's OWN dispatch — a REMOTE peer's request, always (#179/#1576).
+        crate::handle_rpc(&self.node, req, crate::download::ReadOrigin::Peer).await
     }
 
     async fn handle_availability(&self, items: Value) -> Value {
         let items = items.as_array().cloned().unwrap_or_default();
         self.node.availability_batch(&items).await
+    }
+
+    /// Serve a window of a locally-held whole `.dig` module (#1576, the reshare leg).
+    ///
+    /// The module is read + framed on a blocking thread (a `.dig` is large, and a multi-MiB read must
+    /// never stall the async runtime), then paced by the SAME FCFS outbound limiter `dig.fetchRange`
+    /// uses — a whole-capsule pull is the largest thing this node ever serves, so exempting it would
+    /// leave the biggest transfer as the one path that can starve every other peer.
+    async fn stream_module_range(
+        &self,
+        params: Value,
+        conn_key: &str,
+        out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+    ) -> std::io::Result<()> {
+        use crate::seams::dig_peer::module_serve;
+
+        let store = params
+            .get("store_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let root = params
+            .get("root")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let length = params
+            .get("length")
+            .and_then(Value::as_u64)
+            .unwrap_or(module_serve::MAX_MODULE_WINDOW);
+        module_serve::module_range_requested(conn_key, &store, &root, offset, length);
+
+        let cache = self.node.cache_dir_path().to_path_buf();
+        let (s, r) = (store.clone(), root.clone());
+        let window = tokio::task::spawn_blocking(move || {
+            module_serve::read_module_window(&cache, &s, &r, offset, length)
+        })
+        .await
+        .unwrap_or(None);
+
+        let Some(window) = window else {
+            module_serve::module_range_outcome(conn_key, &store, &root, offset, None);
+            return write_framed(
+                out,
+                &module_serve::module_unavailable_frame(crate::download::RESOURCE_UNAVAILABLE),
+            )
+            .await;
+        };
+
+        // One frame per node window, so a large module rides many bounded frames rather than one
+        // unbounded one (the caller reassembles by offset and stops on `complete`).
+        let total = window.len() as u64;
+        let mut written = 0usize;
+        let mut frames = 0u64;
+        while written < window.len() {
+            let take = (RANGE_WINDOW).min(window.len() - written);
+            let complete = written + take == window.len();
+            if let Some(limiter) = &self.serve_limiter {
+                limiter.acquire(conn_key, take as u64).await;
+            }
+            self.node.record_outgoing_bytes(take as u64);
+            let frame = module_serve::module_frame(
+                offset + written as u64,
+                &window[written..written + take],
+                complete,
+                (written == 0).then_some(total),
+            );
+            write_framed(out, &frame).await?;
+            written += take;
+            frames += 1;
+        }
+        if frames == 0 {
+            // An empty window (an offset at/past the end) still needs a terminating frame, or the caller
+            // waits forever for a `complete` that never arrives.
+            let frame = module_serve::module_frame(offset, &[], true, Some(0));
+            write_framed(out, &frame).await?;
+            frames = 1;
+        }
+        module_serve::module_range_outcome(conn_key, &store, &root, offset, Some((total, frames)));
+        Ok(())
     }
 
     async fn stream_range(
@@ -1121,6 +1287,12 @@ impl PeerRpcResponder for NodeResponder {
             .get("length")
             .and_then(Value::as_u64)
             .unwrap_or(RANGE_WINDOW as u64) as usize;
+        // The REQUESTED SPAN's exclusive end — the loop below must never serve past it, however far
+        // the resource itself continues (#1619). `fetch_range_frame`'s own `complete` flag means
+        // "the RESOURCE is exhausted"; it says nothing about "the CALLER's requested span is
+        // satisfied", which is the bound this streaming loop actually owes — `length` was previously
+        // used only to size one frame, never to bound the whole stream.
+        let requested_end = offset.saturating_add(length);
         // #1595: announce the inbound request, then EVERY termination path below reports its outcome —
         // so "did the holder get it, and what did it answer?" is answerable from the log alone.
         let target = serve_log::ServeTarget::from_range_request(conn_key, &req);
@@ -1131,9 +1303,12 @@ impl PeerRpcResponder for NodeResponder {
         let mut off = offset;
         let (mut served_bytes, mut frames, mut proof_attached) = (0u64, 0u64, false);
         loop {
+            // Ask for only what the REMAINING requested span still needs — never the original
+            // `length` again, which would let a single frame overshoot the caller's request.
+            let remaining = requested_end.saturating_sub(off);
             match self
                 .node
-                .fetch_range_frame(store, root, rk, off, length)
+                .fetch_range_frame(store, root, rk, off, remaining)
                 .await
             {
                 Ok(frame) => {
@@ -1190,7 +1365,12 @@ impl PeerRpcResponder for NodeResponder {
                         .get("complete")
                         .and_then(Value::as_bool)
                         .unwrap_or(true);
-                    if complete || this_len == 0 {
+                    // Stop on WHICHEVER bound is hit first: the resource ended (`complete`), or the
+                    // caller's own requested span is now fully served (`span_satisfied`) — the second
+                    // is the one `complete` alone cannot express, and is exactly what let this loop
+                    // stream a whole multi-MiB resource off a `{offset:0, length:1}` probe (#1619).
+                    let span_satisfied = off + this_len >= requested_end;
+                    if complete || span_satisfied || this_len == 0 {
                         serve_log::range_outcome(
                             &target,
                             offset,
@@ -1214,7 +1394,12 @@ impl PeerRpcResponder for NodeResponder {
                     if code == crate::download::RESOURCE_UNAVAILABLE {
                         if let Some(content) = crate::download::range_content_id(&req) {
                             let depth = crate::download::redirect_depth(&req);
-                            match self.node.miss_outcome(&content, depth).await {
+                            // A remote peer's own fetchRange stream miss (#179/#1576) — never local.
+                            match self
+                                .node
+                                .miss_outcome(&content, depth, crate::download::ReadOrigin::Peer)
+                                .await
+                            {
                                 crate::download::MissOutcome::Fetched(f) => {
                                     // Fetched-through: the bytes come from a holder but are served
                                     // here, so the outcome is a serve (its frames carry the same
@@ -1327,10 +1512,13 @@ async fn stream_fetched_range(
     limiter: Option<&dig_download::FcfsRateLimiter>,
     conn_key: &str,
 ) -> std::io::Result<StreamOutcome> {
+    // Same bound as `stream_range` (#1619): `length` is the WHOLE stream's span, not one frame's size.
+    let requested_end = offset.saturating_add(length);
     let mut off = offset;
     let mut outcome = StreamOutcome::default();
     loop {
-        match fetched.range_frame(off, length) {
+        let remaining = requested_end.saturating_sub(off);
+        match fetched.range_frame(off, remaining) {
             Ok(frame) => {
                 let this_len = frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
                 // Pace fetch-through frames on the SAME FCFS budget as locally-held serves (#1436).
@@ -1341,11 +1529,12 @@ async fn stream_fetched_range(
                 write_framed(out, &frame).await?;
                 outcome.bytes += this_len as u64;
                 outcome.frames += 1;
+                let span_satisfied = off + this_len >= requested_end;
                 let complete = frame
                     .get("complete")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                if complete || this_len == 0 {
+                if complete || span_satisfied || this_len == 0 {
                     return Ok(outcome);
                 }
                 off += this_len;
@@ -1926,6 +2115,25 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         dial_ranker = Some(Arc::new(crate::download::SelectorDialRanker::new(
             content.selector().clone(),
         )));
+        // 4b-ii. RESHARE (#1576) — wire the whole-capsule warm so a node that READS content ends up
+        //        HOLDING and ANNOUNCING the whole capsule. This is what closes the content-replication
+        //        flywheel: without it a reader gets faster while the network's copy count stays flat.
+        //
+        //        The anchored-root resolver is passed in explicitly and is the pull's ONLY root of trust:
+        //        the generation root every assembled module is verified against is resolved from the
+        //        CHAIN through it, never from the peer that served the module.
+        content.wire_capsule_reshare(
+            identity.clone(),
+            crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server),
+            &network_id_str,
+            nat_runtime.clone(),
+            crate::ChainSource::anchored_root_resolver_arc(node.as_ref()),
+            Arc::new(DhtInventoryAnnouncer {
+                node: node.clone(),
+                dht: dht.clone(),
+            }),
+            node.cache_dir_path(),
+        );
         node.set_p2p_content(content);
         println!(
             "dig-node peer network: P2P content engine up (selector-driven, miss mode: {:?})",
@@ -3294,16 +3502,25 @@ mod tests {
         }
     }
 
-    /// **Proves:** delegating the peer allowlist to `dig_rpc_protocol` (#1075) preserves
-    /// the EXACT set the node hand-rolled before — the ten L7 read/discovery/announce
-    /// methods, no more, no fewer. This is the security-critical regression guard for the
-    /// #179 auth-bypass surface: any method that gains or loses peer-reachability across the
-    /// crate adoption fails here.
-    /// **Catches:** a crate drift that adds a management method to the allowlist, or drops a
-    /// read method the peer download path relies on.
+    /// **Proves:** the peer allowlist this node exposes is EXACTLY the enumerated
+    /// read/discovery/announce set — no more, no fewer. This is the security-critical regression guard
+    /// for the #179 auth-bypass surface: the peer mTLS verifier accepts any well-formed self-signed leaf,
+    /// so "authenticated" never means "authorized", and a management/mutation method reaching this list
+    /// is a privilege escalation. Any method that gains or loses peer-reachability fails here.
+    /// **Catches:** a `dig-rpc-protocol` bump that quietly adds a method to the allowlist — which is
+    /// precisely what happened when the module-pull methods landed, and the point of listing the set
+    /// literally is that such an addition must be a DELIBERATE edit here, reviewed on its own merits,
+    /// never an incidental consequence of a dependency bump.
     #[test]
     fn peer_allowlist_is_byte_identical_to_the_pre_adoption_set() {
-        // The canonical set the hand-rolled `is_peer_reachable_method` matched verbatim.
+        // The canonical set the hand-rolled `is_peer_reachable_method` matched verbatim, PLUS the two
+        // whole-module-pull methods added deliberately in #1576.
+        //
+        // Both are READS of content this node already serves at resource granularity, so they widen no
+        // privilege: `getModuleInfo` describes a capsule whose resources `getAvailability`/`fetchRange`
+        // already expose, and `fetchModuleRange` serves bytes of that same public, content-addressed
+        // `.dig`. Neither mutates any node state, and both are paced by the same outbound limiter as
+        // `fetchRange`. They are what let a reader become a resharer (SPEC §21).
         let mut expected = [
             "dig.getContent",
             "dig.getNetworkInfo",
@@ -3315,6 +3532,8 @@ mod tests {
             "dig.getAnchoredRoot",
             "dig.getCollection",
             "dig.listCollectionItems",
+            "dig.getModuleInfo",
+            "dig.fetchModuleRange",
         ];
         expected.sort_unstable();
 
@@ -3714,22 +3933,40 @@ mod tests {
         }
     }
 
-    /// With a tight per-connection cap the serve path PACES: after the initial one-second burst, each
-    /// further frame waits for a token refill, so streaming more than one budget's worth takes time.
+    /// With a tight per-connection cap the serve path PACES: after the initial burst, a further frame
+    /// waits for a token refill, so streaming more than one budget's worth takes time.
+    ///
+    /// Rebased on a request whose span genuinely spans MULTIPLE frames (#1619: a single
+    /// `stream_fetched_range` call no longer streams past its requested `length`, so a request has to
+    /// exceed one node window — [`crate::peer::RANGE_WINDOW`] — to observe more than one frame at
+    /// all). A resource just over one window, requested in full, yields exactly two frames: one
+    /// window-sized frame (admitted immediately — an oversized frame is never split, only debited)
+    /// then a small tail frame that must wait out that debt at the tight per-connection rate.
     #[tokio::test(start_paused = true)]
     async fn stream_range_paces_each_frame_under_a_tight_cap() {
-        // Per-conn cap 100 B/s (global unlimited); 300 bytes in 100-byte frames = 3 frames.
-        let limiter = dig_download::FcfsRateLimiter::new(0, 100);
-        let f = tiny_fetched(300);
+        let total = RANGE_WINDOW + 100;
+        let limiter = dig_download::FcfsRateLimiter::new(0, 100); // 100 B/s per-conn (global unlimited)
+        let f = tiny_fetched(total);
         let mut out = tokio::io::sink();
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 100, Some(&limiter), "peerA")
+        let streamed = stream_fetched_range(&mut out, &f, 0, total, Some(&limiter), "peerA")
             .await
             .unwrap();
-        // First 100 B instant (burst); the next two 100-B frames each wait ~1s for a refill.
+        assert_eq!(
+            streamed,
+            StreamOutcome {
+                bytes: total as u64,
+                frames: 2,
+                refusal: None
+            },
+            "one window-sized frame, then the 100-byte tail"
+        );
+        // The window-sized frame is admitted at once (oversized chunks are never blocked, only
+        // debited, per `FcfsRateLimiter::acquire`'s own contract) but leaves a debt the tiny cap pays
+        // off slowly — the tail frame waits well past this floor before it is admitted.
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(1500),
-            "paced serve should wait for refills, waited {:?}",
+            "paced serve should wait for the window frame's debt to clear, waited {:?}",
             start.elapsed()
         );
     }
@@ -3853,17 +4090,86 @@ mod tests {
             logs.contains("outcome=served"),
             "the served OUTCOME: {logs}"
         );
-        // `stream_range` streams from the requested offset to the END of the resource, so the tail
-        // (chunks 1 and 2) is served in two frames — the counts report what really went out.
-        let tail: u64 = chunk_lens[1..].iter().sum();
+        // `stream_range` is bounded by the REQUESTED span (#1619), not the resource's end: a request
+        // for exactly chunk 1's bytes serves exactly chunk 1's bytes, in one frame.
         assert!(
-            logs.contains(&format!("served_bytes={tail}")),
+            logs.contains(&format!("served_bytes={}", chunk_lens[1])),
             "the byte count actually served: {logs}"
         );
-        assert!(logs.contains("frames=2"), "the frame granularity: {logs}");
+        assert!(logs.contains("frames=1"), "the frame granularity: {logs}");
         assert!(
             logs.contains("proof_attached=true"),
             "whether a proof rode the frames: {logs}"
+        );
+    }
+
+    /// **Proves, at the REAL wire (not a mocked/symmetric harness), that a `{offset:0, length:1}`
+    /// probe against a multi-KiB held resource gets exactly ONE small frame — never the whole
+    /// resource streamed to its end (#1619).** dig-download's own orchestrator sends exactly this
+    /// probe on EVERY download (`orchestrator.rs:930`), so this pins the actual trigger, not a
+    /// contrived one.
+    ///
+    /// This drives the PRODUCTION `NodeResponder::stream_range` over a real `tokio::io::duplex` —
+    /// the caller side decodes with the same [`read_framed`] a real peer connection uses, looping
+    /// until `complete`, so a regression that resumes streaming past the requested span would show
+    /// up as MORE than one frame arriving on the wire, not merely a wrong assertion value on a
+    /// hand-built struct.
+    #[tokio::test]
+    async fn a_one_byte_probe_gets_one_frame_not_the_whole_resource_over_the_real_wire() {
+        use digstore_core::merkle::{resource_leaf, MerkleTree};
+
+        // A real multi-KiB held resource — many times larger than the `{offset:0, length:1}` probe,
+        // so "streamed to the end" and "bounded to the request" are unmistakably different outcomes.
+        let ciphertext: Vec<u8> = (0..10_000u32).map(|i| (i % 256) as u8).collect();
+        let tree = MerkleTree::from_leaves(vec![resource_leaf(&ciphertext)]);
+        let resource = Arc::new(digstore_core::wire::ContentResponse {
+            merkle_proof: tree.prove(0).expect("single-leaf proof"),
+            roothash: tree.root(),
+            chunk_lens: vec![ciphertext.len() as u32],
+            ciphertext,
+        });
+
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let (store, root, rk) = crate::test_support::seed_served_resource(&node, resource);
+        let responder = NodeResponder::without_pool(node);
+        let req = json!({
+            "store_id": store, "root": root, "retrieval_key": rk,
+            "offset": 0, "length": 1,
+        });
+
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn(async move {
+            responder
+                .stream_range(req, &test_caller(), &mut server)
+                .await
+        });
+
+        // Join the serve task FIRST: `stream_range` returns only once it is done writing, and
+        // dropping its `server` half on return is what closes the duplex's write end — so the
+        // client's read-to-EOF below terminates on the real number of frames actually sent, never on
+        // a `complete` flag this fix explicitly decouples from "the stream is over" (a bounded
+        // request's LAST frame can legitimately carry `complete: false`, #1619).
+        served.await.expect("serve task join").expect("served");
+
+        // Read every frame the wire actually carried, exactly as a real peer caller would, until EOF.
+        let mut frames = Vec::new();
+        while let Some(frame) = read_framed(&mut client)
+            .await
+            .expect("no I/O error reading the frame stream")
+        {
+            frames.push(frame);
+        }
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a length=1 probe must yield exactly one frame on the real wire, got: {frames:?}"
+        );
+        assert_eq!(frames[0]["length"], json!(1), "the probe's requested span");
+        assert_eq!(
+            frames[0]["complete"],
+            json!(false),
+            "the RESOURCE is far from exhausted — only the REQUEST was satisfied"
         );
     }
 
@@ -4070,7 +4376,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_fetch_through_serve_logs_the_real_frame_and_byte_counts() {
-        // 300 bytes in 100-byte windows = 3 frames, 300 bytes — never `frames=0`.
+        // A request for 100 bytes out of a 300-byte resource is satisfied by EXACTLY the requested
+        // span — one 100-byte frame, never streamed on to the resource's own end (#1619: `length`
+        // bounds the WHOLE stream, not just one frame's size).
         let f = tiny_fetched(300);
         let req = canonical_range_request();
         let caller = test_caller();
@@ -4083,8 +4391,8 @@ mod tests {
             assert_eq!(
                 streamed,
                 StreamOutcome {
-                    bytes: 300,
-                    frames: 3,
+                    bytes: 100,
+                    frames: 1,
                     refusal: None
                 }
             );
@@ -4098,10 +4406,30 @@ mod tests {
 
         assert!(logs.contains("outcome=served"), "{logs}");
         assert!(
-            logs.contains("served_bytes=300"),
+            logs.contains("served_bytes=100"),
             "the real byte total: {logs}"
         );
-        assert!(logs.contains("frames=3"), "the real frame count: {logs}");
+        assert!(logs.contains("frames=1"), "the real frame count: {logs}");
+    }
+
+    /// **Proves:** a requested span that runs PAST the resource's end is clipped by the resource, not
+    /// by the request — `offset=250, length=100` on a 300-byte resource serves only the 50 bytes that
+    /// exist, the OTHER bound this streaming loop must respect (#1619).
+    #[tokio::test]
+    async fn a_fetch_through_serve_clips_a_request_that_overruns_the_resource() {
+        let f = tiny_fetched(300);
+        let mut out = tokio::io::sink();
+        let streamed = stream_fetched_range(&mut out, &f, 250, 100, None, &test_caller())
+            .await
+            .expect("streamed");
+        assert_eq!(
+            streamed,
+            StreamOutcome {
+                bytes: 50,
+                frames: 1,
+                refusal: None
+            }
+        );
     }
 
     #[tokio::test]

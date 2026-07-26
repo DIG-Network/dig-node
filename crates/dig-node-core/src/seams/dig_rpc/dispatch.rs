@@ -29,12 +29,17 @@ use crate::*;
 pub trait RpcDispatch: Send + Sync {
     /// Dispatch one JSON-RPC request `Value`, returning its response `Value`. See
     /// [`crate::handle_rpc`] (the stable free-function entry point every caller uses).
-    async fn dispatch(&self, req: Value) -> Value;
+    ///
+    /// `origin` says who is asking — this node's OWN operator or a REMOTE peer — because this ONE
+    /// dispatch is shared by every transport (loopback HTTP, in-process FFI, AND the peer-RPC
+    /// server, #179/#1576): it is the single place the two are told apart, so it is threaded through
+    /// EXPLICITLY by each caller rather than inferred here.
+    async fn dispatch(&self, req: Value, origin: crate::download::ReadOrigin) -> Value;
 }
 
 #[async_trait::async_trait]
 impl RpcDispatch for Node {
-    async fn dispatch(&self, req: Value) -> Value {
+    async fn dispatch(&self, req: Value, origin: crate::download::ReadOrigin) -> Value {
         // `node` alias: the body below is relocated VERBATIM from the pre-#1285-W1b-5
         // `handle_rpc(node: &Node, req: Value)` free function — byte-identical, just bound to
         // `self` here instead of taking `node` as a parameter.
@@ -63,6 +68,26 @@ impl RpcDispatch for Node {
             Some(Method::GetManifest) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
                 return node.get_manifest(&params, id).await;
+            }
+            // dig.getModuleInfo (#1576, the reshare leg): the transfer descriptor for a whole `.dig`
+            // module this node HOLDS — total size, whole-blob content id, and the per-chunk hashes a
+            // puller attributes each range against. It describes only local content, so it is a read of
+            // this node's own cache, never a chain or network call.
+            Some(Method::GetModuleInfo) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.get_module_info(&params, id).await;
+            }
+            // dig.fetchModuleRange (#1576): one window of a held `.dig` module.
+            //
+            // On the PEER surface this method STREAMS frames, and the stream router intercepts it
+            // before this dispatch is reached (see `peer::classify_request`). Here — the loopback /
+            // in-process JSON-RPC surface — it answers with a SINGLE frame in the `result`, because a
+            // JSON-RPC envelope has no way to express a stream. Both forms carry the identical frame
+            // shape, so an agent can read a module through the machine-friendly request/response form
+            // (§6.2) without implementing the frame protocol.
+            Some(Method::FetchModuleRange) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.fetch_module_range_frame(&params, id).await;
             }
             // dig.stage (#95 Pass C): turn a local folder into a capsule (.dig module) IN
             // PROCESS — the staging/compile half of a local deploy. The DIG Browser's
@@ -233,12 +258,16 @@ impl RpcDispatch for Node {
                             {
                                 let depth = download::redirect_depth(&params);
                                 if let Some(envelope) = node
-                                    .range_miss_envelope(&id, &content, depth, offset, length)
+                                    .range_miss_envelope(
+                                        &id, &content, depth, offset, length, origin,
+                                    )
                                     .await
                                 {
                                     // Served from another node — background-backfill the whole capsule so the
                                     // next read is local (SPEC §14.3). Deduped + detached; no delay here.
-                                    node.maybe_backfill_capsule(store_hex, root_hex);
+                                    // `origin` is the SAME gate the reshare leg uses: a peer-origin
+                                    // miss must never trigger this pull (#1619 follow-up).
+                                    node.maybe_backfill_capsule(store_hex, root_hex, origin);
                                     return envelope;
                                 }
                             }
@@ -680,14 +709,16 @@ impl RpcDispatch for Node {
             let depth = download::redirect_depth(&params);
             let pin_hex = pinned_root.map(|r| r.to_hex());
             if let Some(envelope) = node
-                .content_miss_envelope(&id, &content, depth, offset, pin_hex.as_deref())
+                .content_miss_envelope(&id, &content, depth, offset, pin_hex.as_deref(), origin)
                 .await
             {
                 // This resource is being served FROM ANOTHER NODE (a redirect/fetch-through). In the
                 // background, ALSO pull the whole `.dig` capsule for this generation so the NEXT read of
                 // the store is served locally (SPEC §14.3, `DIG_NODE_BACKFILL_ON_MISS`, default on). This
                 // does not delay the current response — it spawns a deduped detached pull and returns.
-                node.maybe_backfill_capsule(store_hex, &root_hex);
+                // `origin` is the SAME gate the reshare leg uses: a peer-origin miss must never
+                // trigger this pull (#1619 follow-up).
+                node.maybe_backfill_capsule(store_hex, &root_hex, origin);
                 return envelope;
             }
         }

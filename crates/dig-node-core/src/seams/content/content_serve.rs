@@ -235,12 +235,21 @@ pub trait ContentServer: Send + Sync {
     ///
     /// `requested_root_hex` empty / `"latest"` ⇒ rootless (resolve the tip). `resource_key` empty ⇒
     /// `index.html`. `salt_hex` is the private-store secret salt (`None` ⇒ public store).
+    ///
+    /// `origin` is the SECURITY LABEL of the connection that asked for this read, derived by the
+    /// transport from the accepting connection's real remote address — never assumed from the
+    /// endpoint. Only a `Local` read may trigger the network-effecting background legs a miss
+    /// reaches (the whole-capsule warm `maybe_backfill_capsule`, and the reshare
+    /// `spawn_capsule_reshare` behind the peer tier's `fetch_resource`); a `Peer` read is served
+    /// but effects nothing, so a stranger can never drive this node into pulling, caching, and
+    /// DHT-announcing capsules of the STRANGER'S choosing (#1576).
     async fn serve_content_plaintext(
         &self,
         store_hex: &str,
         requested_root_hex: &str,
         resource_key: &str,
         salt_hex: Option<&str>,
+        origin: crate::download::ReadOrigin,
     ) -> PlaintextOutcome;
 
     /// The store's public file PATHS at `(store, root)` from the embedded `PublicManifest` (id 13),
@@ -271,6 +280,7 @@ impl ContentServer for Node {
         requested_root_hex: &str,
         resource_key: &str,
         salt_hex: Option<&str>,
+        origin: crate::download::ReadOrigin,
     ) -> PlaintextOutcome {
         let store_id = match Bytes32::from_hex(store_hex.trim()) {
             Ok(b) => b,
@@ -425,11 +435,12 @@ impl ContentServer for Node {
                     pinned_root,
                     salt.as_ref(),
                     verified,
+                    origin,
                 )
                 .await
             {
                 // A peer served the resource; warm the whole capsule locally for next time (#290).
-                self.maybe_backfill_capsule(store_hex, &root_hex);
+                self.maybe_backfill_capsule(store_hex, &root_hex, origin);
                 return with_serve_metadata(peer, owner_puzzle_hash, generation);
             }
         }
@@ -440,7 +451,7 @@ impl ContentServer for Node {
                 Ok((ciphertext, proof, chunk_lens)) => {
                     let trusted = pinned_root.unwrap_or(proof.root);
                     // Warm the whole capsule locally so the next read is local-first (#290).
-                    self.maybe_backfill_capsule(store_hex, &root_hex);
+                    self.maybe_backfill_capsule(store_hex, &root_hex, origin);
                     return match verify_and_decrypt(
                         &store_id,
                         effective_key,
@@ -498,7 +509,7 @@ impl ContentServer for Node {
                     };
                 }
                 Err(ProxyMiss::NotFound) => {
-                    self.maybe_backfill_capsule(store_hex, &root_hex);
+                    self.maybe_backfill_capsule(store_hex, &root_hex, origin);
                     return PlaintextOutcome::NotFound {
                         root_hex: root_hex.clone(),
                     };
@@ -635,6 +646,7 @@ impl Node {
         pinned_root: Option<Bytes32>,
         salt: Option<&[u8; 32]>,
         verified: bool,
+        origin: crate::download::ReadOrigin,
     ) -> Option<PlaintextOutcome> {
         // Tier-2 observability (#836): this path emitted zero tracing, so a live-but-failing peer
         // fetch was indistinguishable from "engine never attached". Log each decision point.
@@ -649,7 +661,13 @@ impl Node {
             rk = %rk_hex,
             "peer serve: fetching resource from the P2P content engine"
         );
-        let fetched = match engine.fetch_resource(&content).await {
+        // `origin` is the CALLER'S label, derived by the transport from the accepting connection's
+        // real remote address and carried down through `serve_content_plaintext` — never re-asserted
+        // here. It is load-bearing: `fetch_resource` fires `spawn_capsule_reshare`, so a hardcoded
+        // `Local` would let a stranger's `GET /s/…` (reachable, unauthenticated, whenever
+        // `DIG_NODE_HOST` binds non-loopback) drive this node into a whole-capsule pull, cache
+        // promotion, and DHT holder-announce for a capsule of the STRANGER'S naming (#1576).
+        let fetched = match engine.fetch_resource(&content, origin).await {
             Ok(f) => f,
             Err(e) => {
                 tracing::info!(store = %store_hex, root = %root_hex, error = %e, "peer serve: fetch missed");

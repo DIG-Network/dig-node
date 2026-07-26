@@ -122,7 +122,10 @@ async fn start_server(upstream: &str) -> (SocketAddr, PathBuf, EnvHold) {
         ..dig_node_service::Config::default()
     };
     let state = dig_node_service::server::build_state(&config).await;
-    let app = dig_node_service::server::router(state);
+    // `into_make_service_with_connect_info` — not the plain `app` — is what makes
+    // `ConnectInfo<SocketAddr>` extractable in the real `rpc()` handler (#1619 follow-up).
+    let app =
+        dig_node_service::server::router(state).into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -557,4 +560,178 @@ async fn rpc_verification_failure_is_recorded_and_fails_closed() {
     // Proof data for the (failed) resource is exposed for the modal.
     assert_eq!(failed["proof"]["leafHash"].as_str().unwrap().len(), 64);
     assert!(failed["proof"].get("proofRoot").is_some());
+}
+
+// -- `/s/` ReadOrigin derivation (#1576) ---------------------------------------------------------
+//
+// The `/s/` handlers may NOT assume their caller is local. The whole router is served on EVERY
+// listener, and `Config::bind_addr()` is `host.unwrap_or(127.0.0.1)` with no loopback validation on
+// the `DIG_NODE_HOST` override — so with `DIG_NODE_HOST=0.0.0.0` a stranger reaches `GET /s/…`
+// unauthenticated (no §21 token, no mTLS) and, with a `Local` label, would drive this node into a
+// whole-capsule pull + cache promotion + DHT holder-announce for a capsule of the STRANGER'S naming.
+// The label must therefore come from the accepting connection's real remote address.
+//
+// A test server bound to loopback can never PRODUCE a non-loopback remote address, so these tests
+// drive the REAL router through `tower::ServiceExt::oneshot` with a FORGED `ConnectInfo` — the same
+// extension `into_make_service_with_connect_info` inserts in production — and observe the origin at
+// the seam-5 boundary via a recording `ContentServer` double.
+
+/// A [`ContentServer`](dig_node_core::ContentServer) that serves nothing and records the
+/// [`ReadOrigin`](dig_node_core::download::ReadOrigin) of every read that reaches it.
+///
+/// Returning `NotFound` deliberately drives the SPA-miss leg too, so the recorded sequence covers
+/// BOTH `serve_resource`'s read and the `serve_miss` `index.html` read — a hardcoded origin left
+/// behind at either one shows up as a wrong label rather than passing unnoticed.
+#[derive(Default)]
+struct RecordingContentServer {
+    origins: std::sync::Mutex<Vec<dig_node_core::download::ReadOrigin>>,
+}
+
+impl RecordingContentServer {
+    fn recorded(&self) -> Vec<dig_node_core::download::ReadOrigin> {
+        self.origins.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl dig_node_core::ContentServer for RecordingContentServer {
+    async fn serve_content_plaintext(
+        &self,
+        _store_hex: &str,
+        _requested_root_hex: &str,
+        _resource_key: &str,
+        _salt_hex: Option<&str>,
+        origin: dig_node_core::download::ReadOrigin,
+    ) -> dig_node_core::content_serve::PlaintextOutcome {
+        self.origins.lock().unwrap().push(origin);
+        dig_node_core::content_serve::PlaintextOutcome::NotFound {
+            root_hex: String::new(),
+        }
+    }
+
+    async fn manifest_paths(&self, _store_hex: &str, _root_hex: &str) -> Option<Vec<String>> {
+        None
+    }
+
+    async fn resource_generation(
+        &self,
+        _store_hex: &str,
+        _root_hex: &str,
+        _resource_key: &str,
+    ) -> Option<u64> {
+        None
+    }
+}
+
+/// Drive `GET <path>` through the real router from `peer` (a forged connection remote address) and
+/// return every `ReadOrigin` the content server was asked with.
+async fn origins_seen_for(
+    peer: &str,
+    path: &str,
+    referer: Option<&str>,
+) -> Vec<dig_node_core::download::ReadOrigin> {
+    use tower::ServiceExt;
+
+    let hold = env_guard().lock_owned().await;
+    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let base = std::env::temp_dir().join(format!(
+        "dig-node-origin-test-{}-{}",
+        std::process::id(),
+        unique
+    ));
+    std::fs::create_dir_all(base.join("cache")).unwrap();
+    std::env::set_var("DIG_NODE_CACHE", base.join("cache"));
+    std::env::set_var("DIG_NODE_STATE_DIR", &base);
+    std::env::set_var("DIG_NODE_PIN", "off");
+    let config = dig_node_service::Config {
+        upstream: "http://127.0.0.1:1/unreachable".to_string(),
+        port: 0,
+        dig_local: false,
+        ..dig_node_service::Config::default()
+    };
+    let recorder = Arc::new(RecordingContentServer::default());
+    let state = dig_node_service::server::build_state(&config)
+        .await
+        .with_content_server(recorder.clone());
+
+    // `Host: localhost` is exactly what a remote client sends to clear the DNS-rebinding host guard:
+    // the guard is not an origin check, which is why the origin must be derived from the connection.
+    let mut builder = axum::http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(axum::http::header::HOST, "localhost");
+    if let Some(referer) = referer {
+        builder = builder.header(axum::http::header::REFERER, referer);
+    }
+    let mut request = builder.body(axum::body::Body::empty()).unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<SocketAddr>()
+            .expect("a valid forged peer addr"),
+    ));
+
+    let response = dig_node_service::server::router(state)
+        .oneshot(request)
+        .await
+        .expect("the router answers");
+    assert_ne!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "a missing ConnectInfo would be an axum rejection (500), not a defaulted origin"
+    );
+    drop(EnvHold(hold));
+    recorder.recorded()
+}
+
+/// **Proves:** `GET /s/…` labels its read from the CONNECTION — a non-loopback reader is `Peer`
+/// (so the miss effects nothing on the network) while the paired loopback control over the IDENTICAL
+/// route is `Local` (so the operator's own read still warms + reshares).
+///
+/// **Catches:** `store_serve` (or `serve_resource`/`serve_miss`) hardcoding `ReadOrigin::Local`
+/// rather than carrying `read_origin_for(&peer_addr)`. Because the two arms differ ONLY in the
+/// connection's remote address, a relocated or reasserted label changes the observable — the
+/// property cannot be satisfied by a guard placed at the wrong layer.
+#[tokio::test]
+async fn store_serve_labels_the_read_from_the_connection_not_the_endpoint() {
+    use dig_node_core::download::ReadOrigin;
+    let store = "31".repeat(32);
+    let path = format!("/s/{store}/app/deep/route");
+
+    let stranger = origins_seen_for("203.0.113.7:51234", &path, None).await;
+    assert!(
+        !stranger.is_empty(),
+        "the read must reach the content server at all, or this test observes nothing"
+    );
+    assert!(
+        stranger.iter().all(|o| *o == ReadOrigin::Peer),
+        "a non-loopback /s/ reader must be labelled Peer at every read, got {stranger:?}"
+    );
+
+    // The control: the same route, the same store, only the connection differs.
+    let operator = origins_seen_for("127.0.0.1:51234", &path, None).await;
+    assert!(
+        operator.iter().all(|o| *o == ReadOrigin::Local) && !operator.is_empty(),
+        "the loopback control must be labelled Local, got {operator:?}"
+    );
+}
+
+/// **Proves:** the ROUTER FALLBACK — the root-absolute-subresource path (`GET /foo.js` rerooted via
+/// `Referer`) — derives its label the same way. It is a SECOND door into the identical serve path, so
+/// gating only `/s/*path` would leave the defect reachable.
+#[tokio::test]
+async fn fallback_serve_labels_a_rerooted_read_from_the_connection() {
+    use dig_node_core::download::ReadOrigin;
+    let store = "31".repeat(32);
+    // A ROOT-ABSOLUTE subresource (no `/s/` prefix) that the router sends to the fallback, carrying
+    // the same-origin `Referer` a store page always sends — so the reroot succeeds and the read
+    // genuinely reaches the content server through the fallback door.
+    let seen = origins_seen_for(
+        "203.0.113.7:51235",
+        "/bundle.js",
+        Some(&format!("http://localhost/s/{store}/index.html")),
+    )
+    .await;
+    assert!(
+        seen.iter().all(|o| *o == ReadOrigin::Peer) && !seen.is_empty(),
+        "a non-loopback reader must be Peer on the fallback door too, got {seen:?}"
+    );
 }

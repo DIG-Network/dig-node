@@ -92,7 +92,17 @@ pub trait CapsuleStore: Send + Sync {
     /// [`Self::gap_fill_generation`] — the authenticated §21 whole-store sync, chain-anchored-root
     /// pinned + DHT-announced — so a backfilled capsule is verified exactly like every other cached
     /// generation.
-    fn maybe_backfill_capsule(&self, store_hex: &str, root_hex: &str);
+    ///
+    /// `origin` is the SAME gate the #1576 reshare leg uses and for the SAME reason: a remote peer's
+    /// `dig.fetchRange`/`dig.getContent` miss must never trigger a whole-capsule pull + cache
+    /// promotion + DHT holder-announce of a capsule THAT PEER named — this is a no-op unless
+    /// `origin == ReadOrigin::Local`.
+    fn maybe_backfill_capsule(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        origin: crate::download::ReadOrigin,
+    );
 
     /// Install the WEAK self-reference (the standalone peer-network bring-up calls this once with the
     /// `Arc<Node>` it holds). Enables `&self` read handlers to spawn owned-`Arc` background tasks — the
@@ -253,7 +263,19 @@ impl CapsuleStore for Node {
         Ok(())
     }
 
-    fn maybe_backfill_capsule(&self, store_hex: &str, root_hex: &str) {
+    fn maybe_backfill_capsule(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        origin: crate::download::ReadOrigin,
+    ) {
+        // ORIGIN GATE FIRST (checked before the config gate deliberately): a remote peer must never
+        // be able to make this node pull, cache, and DHT-announce a capsule of the PEER'S choosing —
+        // the exact primitive the #1576 reshare leg's own `ReadOrigin` gate exists to close. This is
+        // the sibling call site that gate had NOT yet reached.
+        if origin != crate::download::ReadOrigin::Local {
+            return;
+        }
         // Config gate (default on) + only where a peer network / upstream exists to pull from.
         if !crate::download::backfill_on_miss_enabled() || self.p2p_content().is_none() {
             return;
