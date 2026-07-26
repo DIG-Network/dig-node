@@ -2977,8 +2977,11 @@ committed digest to prove and recomputing the leaf requires every other chunk's 
 chain-anchored binding is therefore established once, over the assembled resource, via
 `inclusion_proof`; a per-chunk proof would be unverifiable decoration inviting a client to trust bytes it
 cannot check, and is REFUSED rather than fabricated. Real per-chunk proofs require a store-format
-prerequisite (a per-resource chunk tree whose root becomes the resource leaf, additive per the
-backwards-compatibility rule) and are out of scope until it exists.
+prerequisite: a per-resource chunk-commitment structure added as a NEW leaf-kind / data-section id with
+version dispatch (or carried as a parallel commitment alongside today's leaf) — NEVER a redefinition of
+`resource_leaf` itself, since `dig-client-wasm`/`dig-capsule-wasm` check that value byte-identically and
+`PublicManifest.sha256_latest` is normatively pinned to it (digs `SPEC.md` §8), so existing capsules keep
+reading unchanged. Out of scope until that prerequisite exists (dig_ecosystem#1601).
 
 The download locator (dig-dht ∪ connected pool) is itself SELF-EXCLUDED: THIS node's own `peer_id`
 (hex) is dropped from the fetch-candidate set before any dial, exactly as the DISCOVERY leg is (#1584).
