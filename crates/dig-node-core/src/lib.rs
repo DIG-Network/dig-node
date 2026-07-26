@@ -5984,6 +5984,7 @@ mod tests {
             &root.to_hex(),
             "index.html",
             None,
+            crate::download::ReadOrigin::Local,
         ));
         match out {
             PlaintextOutcome::Served {
@@ -6016,6 +6017,7 @@ mod tests {
             &root.to_hex(),
             "assets/app.js",
             None,
+            crate::download::ReadOrigin::Local,
         ));
         assert!(
             matches!(js, PlaintextOutcome::Served { ref bytes, .. } if bytes == b"console.log(1)"),
@@ -6023,8 +6025,13 @@ mod tests {
         );
 
         // The EMPTY resource resolves to the default view index.html (same bytes).
-        let bare =
-            rt.block_on(node.serve_content_plaintext(&store.to_hex(), &root.to_hex(), "", None));
+        let bare = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root.to_hex(),
+            "",
+            None,
+            crate::download::ReadOrigin::Local,
+        ));
         assert!(
             matches!(bare, PlaintextOutcome::Served { ref bytes, .. } if bytes == b"<h1>hi</h1>"),
             "empty resource must default to index.html, got {bare:?}"
@@ -6097,6 +6104,7 @@ mod tests {
             &root.to_hex(),
             "index.html",
             None,
+            crate::download::ReadOrigin::Local,
         ));
         match out {
             PlaintextOutcome::Served {
@@ -6143,6 +6151,7 @@ mod tests {
             &root.to_hex(),
             "index.html",
             None,
+            crate::download::ReadOrigin::Local,
         ));
         match out {
             PlaintextOutcome::Served {
@@ -6189,6 +6198,7 @@ mod tests {
             &root.to_hex(),
             "secret.txt",
             None,
+            crate::download::ReadOrigin::Local,
         ));
         match out {
             PlaintextOutcome::Served { generation, .. } => {
@@ -6231,6 +6241,7 @@ mod tests {
             &root.to_hex(),
             "index.html",
             None,
+            crate::download::ReadOrigin::Local,
         ));
         match out {
             PlaintextOutcome::Served {
@@ -6268,8 +6279,13 @@ mod tests {
         let (node, _td) =
             test_node_with_resolver(None, MockResolver::one(&store.to_hex(), anchored));
         let wrong = Bytes32([0x44; 32]).to_hex();
-        let out =
-            rt.block_on(node.serve_content_plaintext(&store.to_hex(), &wrong, "index.html", None));
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &wrong,
+            "index.html",
+            None,
+            crate::download::ReadOrigin::Local,
+        ));
         assert!(
             matches!(out, PlaintextOutcome::RootError { .. }),
             "a non-anchored requested root must fail closed, got {out:?}"
@@ -6739,6 +6755,7 @@ mod tests {
             &root.to_hex(),
             "index.html",
             None,
+            crate::download::ReadOrigin::Local,
         ));
         std::env::remove_var("DIG_NODE_PIN");
         match out {
@@ -6748,6 +6765,92 @@ mod tests {
             }
             other => panic!("expected a peer Served (no upstream), got {other:?}"),
         }
+    }
+
+    /// **Proves:** a `/s/` resource read that arrived from a NON-LOOPBACK connection is still SERVED,
+    /// but starts NO whole-capsule warm — so a stranger cannot spend this node's bandwidth, disk, and
+    /// DHT holder-inventory on a capsule of the STRANGER'S choosing (#1576). The read reaches the P2P
+    /// tier (`ServeSource::Peer`), which is exactly the leg whose `fetch_resource` fires
+    /// `spawn_capsule_reshare`, so "no warm" here is a fact about the gate rather than about a read
+    /// that never got far enough to matter.
+    ///
+    /// **The paired control** (the `Local` arm below) drives the IDENTICAL fixture with the only
+    /// difference being the origin label and observes a warm that DID start — without it, "no warm
+    /// observed" would be satisfied just as well by a harness that can never observe one.
+    ///
+    /// **Catches:** `peer_serve_plaintext` hardcoding `ReadOrigin::Local` into `fetch_resource`
+    /// instead of carrying the caller's origin (the state this test was written RED against), and any
+    /// later regression that re-asserts an origin inside the serve path.
+    #[test]
+    fn serve_content_plaintext_starts_no_capsule_warm_for_a_peer_origin_read() {
+        use crate::content_serve::{derive_retrieval_key, PlaintextOutcome, ServeSource};
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("DIG_NODE_PIN", "off"); // isolate the tier routing from the chain pin
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON — the ORIGIN alone must refuse
+        let rt = pin_test_rt();
+
+        // One fixture, driven twice: `Peer` (the defect's entry point) then `Local` (the control).
+        for (origin, expect_warm) in [
+            (crate::download::ReadOrigin::Peer, false),
+            (crate::download::ReadOrigin::Local, true),
+        ] {
+            let store = Bytes32([0x52; 32]);
+            let plaintext = b"<h1>served to a stranger</h1>";
+            let (content, root, _pt) = anchored_sealed_content(store, "index.html", plaintext);
+            let (node, td) = test_node(None); // unroutable upstream — a Served result can only be P2P
+            let rk = derive_retrieval_key(&store, "index.html");
+            let cid = ContentId::resource(store.0, root.0, rk.0);
+            attach_p2p(
+                &node,
+                vec![dig_download::testkit::mock_provider(1, &cid)],
+                content,
+                MissMode::FetchThrough,
+                &td,
+            );
+            // A permanently-parked warmer: "a warm started" stays observable instead of racing a fast
+            // mock outcome. The registry key is this capsule's own generation key.
+            let (registry, _unused_content, _unused_key) =
+                crate::download::tests::wire_hanging_warmer(
+                    node.p2p_content().expect("p2p attached above"),
+                    &td,
+                );
+            let key = format!("{}:{}", store.to_hex(), root.to_hex());
+
+            let out = rt.block_on(node.serve_content_plaintext(
+                &store.to_hex(),
+                &root.to_hex(),
+                "index.html",
+                None,
+                origin,
+            ));
+            match out {
+                PlaintextOutcome::Served { bytes, source, .. } => {
+                    assert_eq!(
+                        source,
+                        ServeSource::Peer,
+                        "{origin:?}: the read must reach the P2P tier — the leg that fires the reshare"
+                    );
+                    assert_eq!(
+                        bytes, plaintext,
+                        "{origin:?}: a peer-origin read is still SERVED"
+                    );
+                }
+                other => panic!("{origin:?}: expected a peer Served (no upstream), got {other:?}"),
+            }
+
+            let started = rt.block_on(crate::download::tests::wait_for_warm_started(
+                &registry,
+                &key,
+                std::time::Duration::from_millis(500),
+            ));
+            assert_eq!(
+                started, expect_warm,
+                "{origin:?}: expected warm-started == {expect_warm} for this origin                  (Peer must effect nothing; the Local control must prove a warm is observable)"
+            );
+        }
+        std::env::remove_var("DIG_NODE_PIN");
     }
 
     /// A [`RangeTransport`](dig_download::RangeTransport) that a provider can only reach at the peer-RPC
@@ -6873,6 +6976,7 @@ mod tests {
             &root.to_hex(),
             "index.html",
             None,
+            crate::download::ReadOrigin::Local,
         ));
         std::env::remove_var("DIG_NODE_PIN");
         match out {

@@ -726,3 +726,35 @@ Composing a filesystem key from two 64-hex ids plus a literal prefix, then doubl
 is the kind of length math that is easy to miss until a REAL save actually runs — worth checking against
 the OS limit (255 for a bare NTFS component, ~32,767 with `\\?\` long-path opt-in) whenever a cache/state
 key is built by concatenating content ids rather than hashing them down to a fixed width.
+
+## A comment asserting an invariant is how a security defect survives an audit (#1576)
+
+The reshare leg's origin gate was fixed on the JSON-RPC plane, and then the SAME false premise turned up
+one file over, written as a comment above `peer_serve_plaintext`'s `fetch_resource` call: "this whole tier
+only runs behind the LOCAL loopback plaintext read … never the peer wire". It read like a checked fact, so
+a reviewer walking the call graph stopped there instead of walking to the two production callers — which
+are on the single flat `Router` served on EVERY listener, with `Config::bind_addr()` = `host.unwrap_or
+(127.0.0.1)` and no loopback validation on the `DIG_NODE_HOST` override. `GET /s/<store>:<root>/index.html`
+with `Host: localhost` therefore reached the reshare leg unauthenticated. The PR made it worse than the
+pre-existing state: before, that door reached only the §21-AUTHENTICATED upstream sync, which can fail for
+want of authorization; after, it reached a peer-to-peer pull that needs none.
+
+Two durable lessons:
+
+1. **A security label must be a PARAMETER, never a comment.** If a function's correctness depends on who
+   is calling it, the caller must pass that fact in. A comment claiming "the caller is always local"
+   cannot be enforced by the compiler, does not survive a new caller, and — worse — actively suppresses
+   the check a reviewer would otherwise perform. Replace such a comment with the derivation itself
+   (`SPEC.md` §21.7 now states the rule normatively).
+2. **Fixing an instance is not fixing the premise.** When a false assumption is found at one call site,
+   grep for the ASSUMPTION (here: any place asserting a read is local because of the endpoint it arrived
+   on), not just the symbol that was patched. The second instance was three call sites plus a fourth in
+   the same file.
+
+Testing note: the label's derivation could not be exercised by a server bound to loopback, which can never
+produce a non-loopback remote address. The test drives the REAL router through `tower::ServiceExt::oneshot`
+with a FORGED `axum::extract::ConnectInfo` — the same extension `into_make_service_with_connect_info`
+inserts in production — so the two arms differ ONLY in the connection's address. That matters for more than
+convenience: asserting the OUTCOME ("no warm started") alone would have been satisfied by a guard at the
+wrong layer, since a filter anywhere below produces the same empty result. Recording the label at the seam
+boundary makes a RELOCATED guard observable.

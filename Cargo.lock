@@ -2267,6 +2267,7 @@ dependencies = [
 name = "dig-node-service"
 version = "0.60.0"
 dependencies = [
+ "async-trait",
  "axum",
  "axum-server",
  "base64",
@@ -2291,6 +2292,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-tungstenite",
+ "tower 0.5.3",
  "tower-http",
  "tracing",
  "tracing-subscriber",

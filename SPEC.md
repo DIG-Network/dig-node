@@ -3327,3 +3327,40 @@ Both module methods emit the §19 serve vocabulary: an INFO outcome line per req
 `not-held` for the descriptor; `served` with byte + frame counts, or `not-held`, for a range) plus DEBUG
 detail. Every id is rendered through the serve log's sentinel, so a peer can neither bloat a log line nor
 forge a record. No module bytes are ever logged.
+
+### 21.7. Only the operator's own read may effect the network (MUST)
+
+A read can trigger background legs that spend this node's bandwidth and disk and change what it
+advertises network-wide: the whole-capsule warm (`maybe_backfill_capsule`, §21.4) and the reshare pull
+plus holder-announce (§21.3). Those legs MUST be reachable only from a read this node's OWN OPERATOR
+made. A read that arrived from the network is SERVED normally and effects NOTHING: it starts no warm, no
+reshare, no promotion, and no announce.
+
+The rule is not optional hardening. Every peer-facing read surface is unauthenticated in the sense that
+matters here — any well-formed self-signed mTLS leaf is accepted (§13), and the plaintext `/s/` surface
+carries no token at all — so an ungated leg lets a stranger name a capsule and have this node pull it,
+cache it, evict the operator's own content to make room, and then advertise itself as an authoritative
+holder of the stranger's choosing, at a cost to the stranger of a few hundred bytes.
+
+Therefore:
+
+1. **Every read carries a read-origin label**, and only a `Local` label may reach a network-effecting
+   leg. The label MUST be threaded from the surface that accepted the request down to the leg — a
+   function that starts a warm or a reshare MUST take the label as a parameter and MUST NOT assert one.
+2. **The label MUST be DERIVED from the accepting connection's real remote address** (loopback ⇒ `Local`,
+   anything else ⇒ `Peer`), and from nothing else. Deriving it from the identity of the endpoint or the
+   handler is FORBIDDEN, because "this handler is the loopback server" is not a fact: the operator-facing
+   `DIG_NODE_HOST` override replaces the loopback bind with any address, and the whole router — the
+   JSON-RPC plane, `GET /s/*path`, and the router fallback alike — is served on every listener. The
+   Host-header allowlist (§4.2) is a DNS-rebinding defense and MUST NOT be read as an origin check: a
+   remote client can send `Host: localhost`.
+3. **The derivation MUST fail closed.** A request from which the remote address cannot be recovered MUST
+   be rejected, never defaulted to `Local`. An IPv4-mapped IPv6 address MUST NOT satisfy the loopback
+   test (IPv6 loopback is `::1` alone), so a remote peer cannot forge a `Local` label by address family.
+4. **The operator's off switch still wins.** `DIG_NODE_BACKFILL_ON_MISS=off` refuses these legs even for
+   a `Local` read; the origin gate narrows them further and never re-enables them.
+
+The peer-tier read (`dig.fetchRange` / `dig.getContent` on the peer wire) and the local plaintext serve
+(`GET /s/…`, and the root-absolute reroot that shares its path) are BOTH subject to this rule — the
+serve path reaches the same legs through its P2P tier, so gating one door and not the other leaves the
+property unheld.

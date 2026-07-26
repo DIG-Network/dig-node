@@ -1367,7 +1367,7 @@ pub(crate) fn range_content_id(req: &Value) -> Option<ContentId> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use dig_download::testkit::{
         mock_content_id, mock_peer_hex, mock_provider, MockContent, MockProviderLocator,
@@ -2483,7 +2483,7 @@ mod tests {
     /// Wire a permanently-parked [`CapsuleWarmer`] onto `pc` and return its [`WarmRegistry`] plus the
     /// exact generation key `warm()` claims — so a test can poll `registry.is_warming(&key)` to learn
     /// whether `spawn_capsule_reshare` actually reached the point of starting a pull.
-    fn wire_hanging_warmer(
+    pub(crate) fn wire_hanging_warmer(
         pc: &NodeContent,
         td: &tempfile::TempDir,
     ) -> (Arc<crate::seams::dig_peer::WarmRegistry>, ContentId, String) {
@@ -2514,7 +2514,7 @@ mod tests {
 
     /// Poll `registry.is_warming(key)` for up to `bound` for it to become `true`, so a positive
     /// assertion never races a `tokio::spawn`'s scheduling latency. Returns whether it was observed.
-    async fn wait_for_warm_started(
+    pub(crate) async fn wait_for_warm_started(
         registry: &crate::seams::dig_peer::WarmRegistry,
         key: &str,
         bound: std::time::Duration,

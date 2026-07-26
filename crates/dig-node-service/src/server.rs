@@ -421,6 +421,18 @@ impl AppState {
     pub fn wallet_backend(&self) -> Arc<WalletBackend> {
         self.wallet.clone()
     }
+
+    /// Repoint the seam-5 content-server handle (#1285 W1c) at another implementation, leaving every
+    /// other field of the built state intact.
+    ///
+    /// This is the injectable boundary the [`content_server`](AppState::content_server) field
+    /// documents: a caller holding a built state can substitute an `Arc<dyn ContentServer>` — a
+    /// recording double in a test, or a different concrete server in a later composition root —
+    /// without reaching into the node.
+    pub fn with_content_server(mut self, content_server: Arc<dyn ContentServer>) -> Self {
+        self.content_server = content_server;
+        self
+    }
 }
 
 /// The [`ControlCtx`] for one request — borrows the long-lived node + config and
@@ -612,6 +624,31 @@ async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
     ))
 }
 
+/// The [`ReadOrigin`](dig_node_core::download::ReadOrigin) label for one accepted connection,
+/// derived SOLELY from that connection's real remote address: a loopback peer is this node's own
+/// operator (`Local`); anything else is a stranger on the wire (`Peer`).
+///
+/// This is a SECURITY LABEL (#1619 follow-up), and the derivation is deliberately the ONLY way any
+/// handler obtains one — a handler must never assert an origin from "this endpoint is the loopback
+/// server", because that premise is false: an explicit `DIG_NODE_HOST` override replaces the
+/// loopback dual-bind with any operator-chosen address ([`crate::Config::bind_addr`] is
+/// `host.unwrap_or(127.0.0.1)`, with no loopback validation on the override), and the Host-header
+/// allowlist is a DNS-rebinding defense rather than an origin one — a remote client can still send
+/// `Host: localhost`. An operator who deliberately binds non-loopback therefore gets a CORRECT
+/// `Peer` label for remote callers instead of a silently-forged `Local` one.
+///
+/// A forged `Local` is not reachable from the wire: an IPv4-mapped IPv6 remote does not satisfy
+/// `Ipv6Addr::is_loopback` (which is `== ::1` only), and a failure to extract
+/// [`ConnectInfo`](axum::extract::ConnectInfo) is an axum REJECTION (`500`), never a defaulted
+/// `Local`.
+fn read_origin_for(peer_addr: &SocketAddr) -> dig_node_core::download::ReadOrigin {
+    if peer_addr.ip().is_loopback() {
+        dig_node_core::download::ReadOrigin::Local
+    } else {
+        dig_node_core::download::ReadOrigin::Peer
+    }
+}
+
 /// `POST /` — JSON-RPC. Normalises the request params for dig-node, dispatches via
 /// `handle_rpc`, and returns the node's JSON-RPC envelope. A non-object body (e.g.
 /// a batch array, which dig-node does not handle) is rejected in-band so the client
@@ -629,18 +666,7 @@ async fn rpc(
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
-    // ReadOrigin is a SECURITY LABEL (#1619 follow-up): it must come from the ACCEPTING
-    // CONNECTION'S REAL remote address, never from "this is the loopback server" alone — an
-    // explicit `DIG_NODE_HOST` override can replace the loopback dual-bind with a non-loopback
-    // address (`Config::bind_addr`), and the Host-header allowlist below is a DNS-rebinding
-    // defense, not an origin one (a remote client can still send `Host: localhost`). A operator
-    // who deliberately binds non-loopback gets a CORRECT `Peer` label, not a silently-forged
-    // `Local` one.
-    let origin = if peer_addr.ip().is_loopback() {
-        dig_node_core::download::ReadOrigin::Local
-    } else {
-        dig_node_core::download::ReadOrigin::Peer
-    };
+    let origin = read_origin_for(&peer_addr);
     if !req.is_object() {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         return (
@@ -1160,9 +1186,13 @@ async fn ws_wallet_session(mut socket: WebSocket, state: AppState) {
 // crosses loopback (the Host allowlist + CORS answer only loopback names), never the public gateway.
 
 /// `GET /s/<storeId>[:<root>]/<path>` — serve a store resource as decrypted plaintext.
-async fn store_serve(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+async fn store_serve(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Path(path): Path<String>,
+) -> Response {
     match parse_store_path(&path) {
-        Some(sp) => serve_resource(&state, sp).await,
+        Some(sp) => serve_resource(&state, sp, read_origin_for(&peer_addr)).await,
         None => not_found(),
     }
 }
@@ -1190,23 +1220,36 @@ async fn verify_ledger(State(state): State<AppState>, Path(path): Path<String>) 
 /// carries (`<meta name="referrer" content="same-origin">` guarantees it is sent); an unattributable
 /// request is a plain `404` (an asset) or is SPA-handled inside [`serve_resource`] (a route). Any
 /// non-store / non-GET request lands here too and 404s.
-async fn fallback_serve(State(state): State<AppState>, headers: HeaderMap, uri: Uri) -> Response {
+async fn fallback_serve(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
     let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
     match reroot_via_referer(referer, uri.path()) {
-        Some(sp) => serve_resource(&state, sp).await,
+        Some(sp) => serve_resource(&state, sp, read_origin_for(&peer_addr)).await,
         None => not_found(),
     }
 }
 
 /// Resolve → verify → decrypt one store resource and shape the HTTP response, applying the
 /// SPA-fallback-vs-404 decision on a miss.
-async fn serve_resource(state: &AppState, sp: StorePath) -> Response {
+///
+/// `origin` is the calling connection's [`read_origin_for`] label, carried down to the read so the
+/// network-effecting legs a miss can trigger (whole-capsule warm/reshare, DHT holder-announce) stay
+/// gated on the read being THIS node's operator rather than a stranger's request.
+async fn serve_resource(
+    state: &AppState,
+    sp: StorePath,
+    origin: dig_node_core::download::ReadOrigin,
+) -> Response {
     let root = sp.root.as_deref().unwrap_or("");
     // Public stores only for now (salt = None): a private store's secret salt is not yet provisioned
     // to the local serve surface, so such a store fails closed at decrypt (a documented follow-up).
     match state
         .content_server
-        .serve_content_plaintext(&sp.store_id, root, &sp.resource, None)
+        .serve_content_plaintext(&sp.store_id, root, &sp.resource, None, origin)
         .await
     {
         PlaintextOutcome::Served {
@@ -1226,7 +1269,7 @@ async fn serve_resource(state: &AppState, sp: StorePath) -> Response {
             owner_puzzle_hash.as_deref(),
             generation,
         ),
-        PlaintextOutcome::NotFound { root_hex } => serve_miss(state, &sp, &root_hex).await,
+        PlaintextOutcome::NotFound { root_hex } => serve_miss(state, &sp, &root_hex, origin).await,
         PlaintextOutcome::InvalidParams { message } => {
             error_response(StatusCode::BAD_REQUEST, &message)
         }
@@ -1244,7 +1287,12 @@ async fn serve_resource(state: &AppState, sp: StorePath) -> Response {
 /// - a KNOWN file (in the store's public manifest) missing at this root → honest `404`;
 /// - otherwise a ROUTE (or a store with no manifest) → serve the store's `index.html` (`200`,
 ///   `text/html`) so an SPA client-side deep link boots.
-async fn serve_miss(state: &AppState, sp: &StorePath, root_hex: &str) -> Response {
+async fn serve_miss(
+    state: &AppState,
+    sp: &StorePath,
+    root_hex: &str,
+    origin: dig_node_core::download::ReadOrigin,
+) -> Response {
     if is_static_asset_path(&sp.resource) {
         return not_found();
     }
@@ -1260,7 +1308,7 @@ async fn serve_miss(state: &AppState, sp: &StorePath, root_hex: &str) -> Respons
     // SPA fallback: the store's default view, served against the SAME resolved root.
     match state
         .content_server
-        .serve_content_plaintext(&sp.store_id, root_hex, "index.html", None)
+        .serve_content_plaintext(&sp.store_id, root_hex, "index.html", None, origin)
         .await
     {
         PlaintextOutcome::Served {

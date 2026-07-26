@@ -190,6 +190,13 @@ digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "4
 digstore-core = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 tempfile = "3"
+# The `/s/` origin-derivation test (#1576) drives the REAL router with a FORGED non-loopback
+# `ConnectInfo` — the one remote address a loopback-bound test server can never produce — via
+# `tower::ServiceExt::oneshot`, and substitutes a recording `dig_node_core::ContentServer` double
+# (`AppState::with_content_server`). `async-trait` is needed to implement that boxed trait here;
+# both match the versions dig-node-core already resolves, so no extra graph entry appears.
+tower = { version = "0.5", features = ["util"] }
+async-trait = "0.1"
 # The verification-ledger fail-closed integration test (#307, `tests/content_serve.rs`) crafts a
 # self-consistent Merkle proof whose root is NOT the requested (anchored) root and base64-encodes it
 # into a mock `dig.getContent` window, so the node's RPC tier verifies-then-fails-closed and records
