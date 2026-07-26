@@ -524,3 +524,34 @@ Test gotcha — model a holder that answers availability=FALSE but WOULD serve: 
 (`MockRangeTransport`, `AddressAwareTransport`) answers availability=true, so none could reproduce the
 confirm-gate drop. The faithful model (`AvailabilityFalseButServesTransport`) answers availability=false
 yet serves `fetch_range` — RED (no fetchRange, "no providers located") pre-fix, GREEN post-fix.
+
+## An answer derived from an inventory SNAPSHOT while the serve path reads the FILE (#1592)
+
+A whole class of "the node says no but would have said yes" bugs comes from two code paths answering
+the same question from two different sources of truth. `dig.getAvailability` answered from the
+`cache_list_cached()` DIRECTORY WALK of `<cache>/modules/<store>/`, while the serve path
+(`serve_local_blocking` → `fetchRange`) reads `<cache>/modules/<store>/<root>.module` DIRECTLY. The
+walk is a SNAPSHOT: `availability_batch` takes it once, then answers each item against that slice —
+and every answer can await a `spawn_blocking` module decode, so the window between "snapshot taken"
+and "answer produced" is real, not theoretical. Anything that lands a capsule inside that window (a
+hosted pin, a §21 sync, an on-demand fetch-and-cache, a chain-watch gap-fill, the read-side backfill)
+is SERVABLE but absent from the snapshot → the node answers *not available* for content it would serve
+one millisecond later. The reverse also holds: a snapshot that predates an EVICTION claims
+availability the node can no longer serve.
+
+Why that specific false negative is read-killing rather than cosmetic: dig-download's
+`locate_and_confirm` drops every provider whose availability answer is not *available* BEFORE issuing
+any `fetchRange`. So a single stale *no* removes a genuine holder from the download entirely and the
+read 404s. PR#100 worked around it reader-side for CONNECTED-pool holders only (connection =
+confirmation); a DHT-discovered stranger still runs the real confirm, which is why the
+discover-from-a-stranger leg stayed broken after the connected-pool leg was proven.
+
+The durable lesson: when a peer-facing ANSWER and the ACTION it gates read different sources, the
+answer will eventually lie. Derive the answer from the source the action uses — here a single
+`module_exists()` path check, the same file the serve reads — so the two cannot drift by construction.
+"Refresh the snapshot more often" only shrinks the window; it never closes it. Two bonuses fall out of
+answering from the servable source: the cost drops from a whole-cache directory walk per peer request
+to one `stat` per queried item (this is a peer-reachable path, so a per-request walk is a cost
+amplifier a peer controls), and the walk is now needed only for the STORE-granularity `roots`
+enumeration. The trade to watch: the keys are PEER-supplied and now feed a path, so they MUST be
+validated canonical 64-hex before the join (the same guard `cache.removeCached` applies).

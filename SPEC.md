@@ -2927,6 +2927,29 @@ is dropped there, a safe pool-bounded probe. A DHT-only (non-pool) provider stil
 `dig.getAvailability` confirm. This source is DOWNLOAD-only — it never feeds the redirect/availability
 hint above.
 
+**The availability answer MUST agree with what the node can SERVE (#1592).** `dig.getAvailability` is
+the gate every DHT-discovered holder must pass — dig-download's `locate_and_confirm` DROPS a provider
+whose answer is not *available* BEFORE any `dig.fetchRange` — so at ROOT / RESOURCE granularity the
+answer is DERIVED FROM THE SERVABLE SOURCE: the existence of the very capsule module
+(`<cache>/modules/<store>/<root>.module`) the serve path reads. It MUST NOT be derived from an
+inventory snapshot that can lag a write, and any cache retained for cost MUST be invalidated on every
+inventory-changing write (pin, §21 sync, on-demand fetch-and-cache, gap-fill, backfill, eviction).
+A snapshot lags in BOTH damaging directions: a capsule that landed after the snapshot was taken (a
+gap-fill / §21 sync / fetch-through / pin write concurrent with the peer-facing inventory walk) is
+already servable, and answering *not available* for it drops a holder that would have served the bytes
+— the DHT-only discover→read leg's false negative; conversely a snapshot that lags an EVICTION would
+claim availability the node cannot serve. Consequently: a capsule gained at runtime is IMMEDIATELY
+reported available, an evicted one IMMEDIATELY is not, and a capsule genuinely not held is still
+reported not available (the answer is never weakened to an unconditional *available* — the merkle
+verify remains the integrity gate downstream, but availability MUST NOT lie in either direction).
+STORE granularity (`root` absent) still enumerates the held `roots` from the inventory walk, which a
+single-path existence check cannot answer. Because this method is peer-reachable (§7.4), the
+per-request cost is bounded: one path existence check per queried item, and the whole-cache directory
+walk is performed AT MOST once per batch and ONLY when some item asks at store granularity. Every
+caller-supplied `store_id`/`root` is validated canonical 64-hex before any path is built from it (the
+same path-traversal guard `cache.removeCached` applies), so a crafted key answers *not available*
+without touching the filesystem.
+
 A `dig.fetchRange` answer is a stream of `u32`-BE length-prefixed JSON frames, each frame's `bytes`
 field the **base64** encoding of that window's ciphertext (the canonical
 `dig_rpc_protocol::types::RangeFrame` wire this node's serve path emits). A reader MUST base64-decode
