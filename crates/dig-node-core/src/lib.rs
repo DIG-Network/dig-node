@@ -927,6 +927,15 @@ fn response_key(store: &str, root: &str, rk: &str, offset: usize) -> String {
 /// URNs to a concrete root via dig-resolver *before* calling, so a non-concrete
 /// root here means the synced module could not be keyed deterministically.
 fn sync_eligible(store_hex: &str, root_hex: &str) -> bool {
+    is_canonical_capsule_key(store_hex, root_hex)
+}
+
+/// Is `(store_hex, root_hex)` a canonical capsule key — both a 32-byte value in 64-hex? The
+/// PATH-TRAVERSAL guard for every path built from CALLER-SUPPLIED keys (mirroring
+/// [`Node::cache_remove_cached`]): with 64-hex inputs `module_path` can only ever name a file
+/// directly under `<cache>/modules/<store>/`, so a crafted `store_id`/`root` from a peer can never
+/// escape the cache directory.
+fn is_canonical_capsule_key(store_hex: &str, root_hex: &str) -> bool {
     fn is_hex64(s: &str) -> bool {
         s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
     }
@@ -1733,14 +1742,28 @@ impl Node {
     /// `chunk_count` when the item is at resource granularity (`store_id` + `root` + `retrieval_key`)
     /// and the resource is actually served locally. Returns one `AvailabilityAnswer` value.
     ///
-    /// Takes a `cached` inventory SNAPSHOT (audit #179): the caller
-    /// ([`Node::availability_batch`]) walks the cache directory ONCE per batch and passes the slice
-    /// in, so an N-item batch does O(1) directory walks instead of O(N).
+    /// Takes a `cached` inventory SNAPSHOT (audit #179) used for the STORE-granularity `roots`
+    /// enumeration only: the caller ([`Node::availability_batch`]) walks the cache directory at most
+    /// ONCE per batch and passes the slice in, so an N-item batch does O(1) directory walks.
+    ///
+    /// ROOT/RESOURCE granularity does NOT consult that snapshot (#1592): the held answer is
+    /// [`module_exists`] — a single on-disk existence check of the very file
+    /// [`serve_local_blocking`] reads — so the answer cannot drift from what the node can serve in
+    /// either direction (a capsule landing after the snapshot is immediately available; an evicted
+    /// one immediately is not). One `stat` per item is also strictly cheaper than the walk on this
+    /// peer-facing path.
     async fn availability_answer(&self, item: &Value, cached: &[CachedCapsule]) -> Value {
         let store = item.get("store_id").and_then(Value::as_str).unwrap_or("");
         let root = item.get("root").and_then(Value::as_str);
         let rk = item.get("retrieval_key").and_then(Value::as_str);
-        let mut answer = peer::availability_presence(cached, store, root, rk);
+        // The peer supplies `store`/`root`, so the keys are validated canonical 64-hex BEFORE any path
+        // is built from them (the same guard `cache_remove_cached` applies) — a non-canonical key can
+        // never name a held capsule, so it answers not-available without touching the filesystem.
+        let servable = root
+            .filter(|r| is_canonical_capsule_key(store, r))
+            .map(|r| module_exists(&self.cache_dir, store, r))
+            .unwrap_or(false);
+        let mut answer = peer::availability_presence(cached, store, root, rk, servable);
 
         // Resource granularity: if we hold this capsule AND can serve the resource, report its
         // ciphertext length + chunk count so the caller can plan ranges without a probe fetch.
@@ -1781,15 +1804,26 @@ impl Node {
     /// `dig.getAvailability` — batch answer for `items` (positionally aligned). Wraps
     /// [`Node::availability_answer`] per item into the `{ "items": [...] }` result shape.
     ///
-    /// The cache inventory is snapshotted ONCE here and shared across every item (audit #179): each
-    /// answer used to walk the whole `<cache>/modules` directory, so an N-item batch did N full
-    /// directory walks; it now does one. The batch is CAPPED at [`MAX_AVAILABILITY_ITEMS`] — this is
-    /// a peer-reachable path (§7.4) and the item count is caller-controlled — with the excess simply
-    /// not answered (the result array is aligned to the answered prefix).
+    /// The cache inventory is snapshotted at most ONCE here and shared across every item (audit
+    /// #179): each answer used to walk the whole `<cache>/modules` directory, so an N-item batch did
+    /// N full directory walks. Since #1592 the walk is needed ONLY to enumerate the `roots` of a
+    /// STORE-granularity item (`root` absent) — root/resource items answer from a single
+    /// [`module_exists`] check — so a batch of root/resource items (what a downloading peer actually
+    /// sends) does ZERO directory walks. That matters here: this is a peer-reachable path (§7.4), and
+    /// a per-request walk of the whole cache is a cost amplifier a peer controls.
+    ///
+    /// The batch is CAPPED at [`MAX_AVAILABILITY_ITEMS`] — the item count is caller-controlled — with
+    /// the excess simply not answered (the result array is aligned to the answered prefix).
     pub async fn availability_batch(&self, items: &[Value]) -> Value {
         let capped = &items[..items.len().min(MAX_AVAILABILITY_ITEMS)];
-        // One directory walk for the whole batch (was one per item).
-        let cached = self.cache_list_cached().await;
+        // At most one directory walk for the whole batch, and none at all unless some item asks at
+        // STORE granularity (the only answer that needs the held-roots enumeration).
+        let needs_inventory = capped.iter().any(|i| i.get("root").is_none());
+        let cached = if needs_inventory {
+            self.cache_list_cached().await
+        } else {
+            Vec::new()
+        };
         let mut answers = Vec::with_capacity(capped.len());
         for item in capped {
             answers.push(self.availability_answer(item, &cached).await);
@@ -4658,6 +4692,153 @@ mod tests {
             MAX_AVAILABILITY_ITEMS,
             "batch is capped at MAX_AVAILABILITY_ITEMS"
         );
+    }
+
+    // -- #1592: the availability answer MUST agree with what the node can SERVE -------------------
+    //
+    // `dig.getAvailability` is the gate a DHT-discovered holder must pass: dig-download's
+    // `locate_and_confirm` drops every provider whose answer is not `available` BEFORE any
+    // `fetchRange`. So an answer that lags the servable state is a read-killing false negative for a
+    // holder that would serve the bytes (and, in the other direction, a lie that costs a round trip).
+    // These tests pin the invariant at the capsule granularity that matters: the answer is derived
+    // from the SAME on-disk module `serve_local_blocking` reads, never from an inventory snapshot.
+
+    /// Seed a real compiled module into the SERVED cache (`module_path`) and return its root — the
+    /// state that makes a capsule genuinely servable by [`serve_local_blocking`].
+    fn seed_served_capsule(node: &Node, store: &Bytes32, files: &[(&str, &[u8])]) -> Bytes32 {
+        let (root, module) = stage_real_module(node, store, files);
+        let path = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &module).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn availability_answer_reports_a_capsule_that_landed_after_the_inventory_snapshot() {
+        // REGRESSION (#1592): a capsule that lands AFTER the batch took its inventory snapshot — a
+        // gap-fill / §21 sync / fetch-through / pin write concurrent with the peer-facing walk — is
+        // immediately servable, so it MUST be reported available. Answering from the snapshot made
+        // this a false negative that dropped the holder before any fetchRange.
+        let (node, _td) = test_node(None);
+        let store = Bytes32([0xc3; 32]);
+
+        // The snapshot the batch would have taken BEFORE the capsule landed.
+        let stale_snapshot = node.cache_list_cached().await;
+        assert!(stale_snapshot.is_empty(), "nothing held at snapshot time");
+
+        // The capsule lands (post-snapshot) and is genuinely servable.
+        let root = seed_served_capsule(&node, &store, &[("index.html", b"hello")]);
+        let rk = content_serve::derive_retrieval_key(&store, "index.html").0;
+        assert!(
+            node.serve_local_cached(&store.to_hex(), &root.to_hex(), &rk)
+                .await
+                .is_some(),
+            "precondition: the landed capsule is servable on disk"
+        );
+
+        let item = json!({
+            "store_id": store.to_hex(),
+            "root": root.to_hex(),
+            "retrieval_key": hex::encode(rk),
+        });
+        let answer = node.availability_answer(&item, &stale_snapshot).await;
+        assert_eq!(
+            answer["available"], true,
+            "a servable capsule must be reported available even if the snapshot predates it"
+        );
+        assert!(
+            answer.get("total_length").is_some(),
+            "the resource totals come from the same served module the answer agrees with"
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_answer_reports_not_available_when_the_snapshot_lags_an_eviction() {
+        // The OTHER direction (#1592): a snapshot that still lists a capsule the node no longer has
+        // on disk must NOT make the node claim availability it cannot serve.
+        let (node, _td) = test_node(None);
+        let store = Bytes32([0xc4; 32]);
+        let root = seed_served_capsule(&node, &store, &[("index.html", b"hello")]);
+
+        // Snapshot while held, then evict — the snapshot is now stale in the "claims held" direction.
+        let stale_snapshot = node.cache_list_cached().await;
+        assert_eq!(stale_snapshot.len(), 1, "held at snapshot time");
+        assert!(
+            node.cache_remove_cached(&store.to_hex(), &root.to_hex())
+                .await
+                .unwrap(),
+            "capsule evicted"
+        );
+
+        let item = json!({ "store_id": store.to_hex(), "root": root.to_hex() });
+        let answer = node.availability_answer(&item, &stale_snapshot).await;
+        assert_eq!(
+            answer["available"], false,
+            "an evicted capsule must not be reported available"
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_batch_reports_a_capsule_landed_at_runtime_and_stops_after_eviction() {
+        // The public peer-facing path: land a capsule at runtime → available; evict it → not
+        // available; a capsule never held → not available.
+        let (node, _td) = test_node(None);
+        let store = Bytes32([0xc5; 32]);
+        let root = seed_served_capsule(&node, &store, &[("index.html", b"hi")]);
+        let item = json!({ "store_id": store.to_hex(), "root": root.to_hex() });
+        let never_held = json!({ "store_id": "ab".repeat(32), "root": "cd".repeat(32) });
+
+        let resp = node
+            .availability_batch(&[item.clone(), never_held.clone()])
+            .await;
+        assert_eq!(resp["items"][0]["available"], true, "landed → available");
+        assert_eq!(
+            resp["items"][1]["available"], false,
+            "never held → not available"
+        );
+
+        node.cache_remove_cached(&store.to_hex(), &root.to_hex())
+            .await
+            .unwrap();
+        let resp = node.availability_batch(&[item]).await;
+        assert_eq!(
+            resp["items"][0]["available"], false,
+            "evicted → no longer available"
+        );
+    }
+
+    #[tokio::test]
+    async fn availability_batch_rejects_a_non_canonical_key_without_touching_the_filesystem() {
+        // The keys are PEER-supplied and now feed a path (`module_exists`), so a non-64-hex key must
+        // answer not-available via the canonical-key guard — never escape `<cache>/modules`.
+        let (node, td) = test_node(None);
+        let store = Bytes32([0xc6; 32]);
+        let root = seed_served_capsule(&node, &store, &[("index.html", b"hi")]);
+        // A real file OUTSIDE the modules tree that a traversal would reach.
+        let outside = td.path().join("secret.module");
+        std::fs::write(&outside, b"not a capsule").unwrap();
+
+        let traversal = json!({
+            "store_id": "..",
+            "root": format!("../{}", outside.file_name().unwrap().to_string_lossy())
+                .trim_end_matches(".module"),
+        });
+        let resp = node
+            .availability_batch(&[traversal, json!({ "store_id": "zz".repeat(32) })])
+            .await;
+        assert_eq!(
+            resp["items"][0]["available"], false,
+            "a traversal-shaped key is never available"
+        );
+        assert_eq!(
+            resp["items"][1]["available"], false,
+            "a non-hex store id holds nothing"
+        );
+        // The genuine capsule still answers correctly beside the rejected keys.
+        let ok = node
+            .availability_batch(&[json!({ "store_id": store.to_hex(), "root": root.to_hex() })])
+            .await;
+        assert_eq!(ok["items"][0]["available"], true);
     }
 
     // -- launcher_ids cap (audit #179 HIGH — peer-triggered unbounded chain fanout) ---------------

@@ -588,11 +588,29 @@ pub fn list_inventory(
 /// This pure form answers presence + store-granularity `roots`; the resource/root totals
 /// (`total_length`/`chunk_count`/`complete`) are enriched by the node from the actual module (see
 /// [`crate::Node::availability_answer`]).
+///
+/// # The answer is derived from the SERVABLE source, never from the inventory snapshot (#1592)
+///
+/// At ROOT/RESOURCE granularity the caller passes `capsule_servable` — whether the exact capsule
+/// module exists on disk ([`crate::module_exists`], the same file [`serve_local_blocking`] reads to
+/// serve a range). It is NOT re-derived from `cached`, because an inventory snapshot can lag the
+/// servable state in BOTH directions and this answer is a read-killing gate: dig-download's
+/// `locate_and_confirm` drops every provider whose answer is not `available` BEFORE any `fetchRange`,
+/// so a capsule that landed after the snapshot (a gap-fill / §21 sync / fetch-through / pin write
+/// concurrent with the peer-facing walk) would false-negative and drop a holder that would have
+/// served the bytes — and a snapshot that lags an eviction would claim availability the node cannot
+/// serve. Deriving the answer from the servable source makes both drifts impossible by construction.
+///
+/// `cached` remains the source for the STORE-granularity `roots` list (an enumeration, which a
+/// single-path existence check cannot answer).
+///
+/// [`serve_local_blocking`]: crate::Node::availability_answer
 pub fn availability_presence(
     cached: &[CachedCapsule],
     store_id: &str,
     root: Option<&str>,
     _retrieval_key: Option<&str>,
+    capsule_servable: bool,
 ) -> Value {
     // Roots held for the store, newest-first (by last-used mtime desc, matching the on-disk recency).
     let mut store_caps: Vec<&CachedCapsule> =
@@ -605,10 +623,10 @@ pub fn availability_presence(
             let roots: Vec<String> = store_caps.iter().map(|c| c.root.clone()).collect();
             json!({ "available": !roots.is_empty(), "roots": roots })
         }
-        Some(want_root) => {
-            // ROOT / RESOURCE granularity: available iff this exact capsule is held.
-            let held = store_caps.iter().any(|c| c.root == want_root);
-            json!({ "available": held })
+        Some(_want_root) => {
+            // ROOT / RESOURCE granularity: available iff this exact capsule is SERVABLE right now —
+            // the caller's on-disk check, not a snapshot lookup (see the note above, #1592).
+            json!({ "available": capsule_servable })
         }
     }
 }
@@ -2803,7 +2821,7 @@ mod tests {
             cap(&store, &"22".repeat(32), 10, 300), // newest
             cap(&store, &"33".repeat(32), 10, 200),
         ];
-        let a = availability_presence(&cached, &store, None, None);
+        let a = availability_presence(&cached, &store, None, None, false);
         assert_eq!(a["available"], true);
         let roots = a["roots"].as_array().unwrap();
         // Newest-first by mtime: 22.. (300), 33.. (200), 11.. (100).
@@ -2814,22 +2832,26 @@ mod tests {
 
     #[test]
     fn availability_store_granularity_unavailable_when_no_roots() {
-        let a = availability_presence(&[], &"aa".repeat(32), None, None);
+        let a = availability_presence(&[], &"aa".repeat(32), None, None, false);
         assert_eq!(a["available"], false);
         assert_eq!(a["roots"], json!([]));
     }
 
     #[test]
-    fn availability_root_granularity_presence() {
+    fn availability_root_granularity_answers_from_the_servable_flag_not_the_snapshot() {
+        // #1592: at root granularity the answer is the caller's SERVABLE-on-disk check, so it agrees
+        // with what a `fetchRange` would serve even when the inventory snapshot disagrees.
         let store = "aa".repeat(32);
         let root = "11".repeat(32);
-        let cached = vec![cap(&store, &root, 10, 1)];
-        // Held.
-        let held = availability_presence(&cached, &store, Some(&root), None);
-        assert_eq!(held["available"], true);
-        // Not held (different root).
-        let miss = availability_presence(&cached, &store, Some(&"99".repeat(32)), None);
-        assert_eq!(miss["available"], false);
+        let stale_says_held = vec![cap(&store, &root, 10, 1)];
+
+        // Servable → available, whatever the snapshot says (here it predates the capsule).
+        let held = availability_presence(&[], &store, Some(&root), None, true);
+        assert_eq!(held["available"], true, "servable on disk → available");
+
+        // Not servable → not available, even though the (post-eviction stale) snapshot lists it.
+        let miss = availability_presence(&stale_says_held, &store, Some(&root), None, false);
+        assert_eq!(miss["available"], false, "not servable → not available");
     }
 
     #[test]
