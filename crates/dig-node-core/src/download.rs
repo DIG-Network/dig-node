@@ -208,9 +208,11 @@ pub struct FetchedResource {
 
 impl FetchedResource {
     /// Build one `dig.fetchRange` frame over the fetched bytes — the same window/verification
-    /// shape as [`crate::Node::fetch_range_frame`] over a locally-held resource (first frame
-    /// carries `total_length`/`chunk_lens`/`chunk_index`/`inclusion_proof`/`root`). `-32007` for an
-    /// offset beyond the resource, mirroring the local path.
+    /// shape as [`crate::Node::fetch_range_frame`] over a locally-held resource: EVERY frame carries
+    /// `total_length`/`chunk_lens`/`root`/`inclusion_proof` plus `first_chunk_index` when the window
+    /// starts on a chunk boundary (see
+    /// [`range_frame`](crate::seams::content::range_frame)). `-32007` for an offset beyond the
+    /// resource, mirroring the local path.
     pub fn range_frame(&self, offset: usize, length: usize) -> Result<Value, (i64, String)> {
         let total = self.bytes.len();
         if offset > total {
@@ -229,19 +231,18 @@ impl FetchedResource {
             "bytes": base64::engine::general_purpose::STANDARD.encode(window),
             "complete": complete,
         });
-        if start == 0 {
-            if let Some(obj) = frame.as_object_mut() {
-                obj.insert("total_length".into(), json!(self.total_length));
-                obj.insert("chunk_lens".into(), json!(self.chunk_lens));
-                obj.insert("chunk_index".into(), json!(0));
-                if let Some(proof) = &self.inclusion_proof {
-                    obj.insert("inclusion_proof".into(), json!(proof));
-                }
-                if let Some(root) = &self.root {
-                    obj.insert("root".into(), json!(root));
-                }
-            }
-        }
+        // Byte-shape-identical to the locally-held path: every frame carries its own verification
+        // metadata (#1577), so a fetch-through serve is indistinguishable from a local one.
+        crate::seams::content::range_frame::attach_verification(
+            &mut frame,
+            &crate::seams::content::range_frame::RangeVerification {
+                total_length: self.total_length,
+                chunk_lens: &self.chunk_lens,
+                root: self.root.as_deref(),
+                inclusion_proof: self.inclusion_proof.as_deref(),
+            },
+            start as u64,
+        );
         Ok(frame)
     }
 
@@ -1426,15 +1427,20 @@ mod tests {
     }
 
     #[test]
-    fn range_frame_later_window_omits_metadata_and_bounds_offset() {
+    fn range_frame_later_window_still_carries_metadata_and_bounds_offset() {
+        // #1577: a fetch-through frame at a later offset carries its OWN verification metadata (the
+        // metadata used to ride the first frame only, leaving later ranges with no declared root to
+        // check them against). Byte-shape-identical to the locally-held serve path.
         let (f, content) = fetched(30, 3);
         let frame = f.range_frame(10, 10).expect("frame");
         assert_eq!(frame["offset"], json!(10));
         assert_eq!(frame["complete"], json!(false));
-        assert!(
-            frame.get("chunk_lens").is_none(),
-            "meta on first frame only"
+        assert_eq!(
+            frame["chunk_lens"],
+            json!(f.chunk_lens),
+            "every frame declares the resource layout"
         );
+        assert_eq!(frame["total_length"], json!(f.total_length));
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(frame["bytes"].as_str().unwrap())
             .unwrap();

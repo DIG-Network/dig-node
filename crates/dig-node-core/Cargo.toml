@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.18.5"
+version = "0.19.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -226,6 +226,10 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 
 [dev-dependencies]
 tempfile = "3"
+# Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
+# serve-observability tests (#1595) assert what an operator would actually see in the node log —
+# and that no payload byte or proof ever reaches it.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # Builds canonical `did:chia:` strings for the on-chain DID-resolver tests (matches dig-identity's codec).
 chia-sdk-utils = "0.30"
 # Derives deterministic test key seeds + nonces (no hard-coded crypto literals — CodeQL flags those).

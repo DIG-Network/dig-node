@@ -19,6 +19,7 @@ pub mod pex;
 pub mod pool_locator;
 pub mod selector_adapter;
 pub mod self_excluding_locator;
+pub mod serve_log;
 pub mod session;
 pub mod union_locator;
 
