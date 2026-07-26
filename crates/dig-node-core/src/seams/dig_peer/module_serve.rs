@@ -24,7 +24,10 @@
 //! them against the chain anchor, so this side's only job is to answer accurately about content it
 //! actually holds — and to say so plainly when it does not.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use dig_rpc_protocol::types::ModuleInfo;
 use serde_json::{json, Value};
@@ -66,6 +69,26 @@ fn module_path(cache_dir: &Path, store_hex: &str, root_hex: &str) -> PathBuf {
         .join(format!("{root_hex}.module"))
 }
 
+/// A descriptor memoized against the file metadata it was computed from, so a later request for an
+/// UNCHANGED file can be answered without re-reading or re-hashing it.
+struct CachedDescriptor {
+    len: u64,
+    modified: Option<SystemTime>,
+    info: ModuleInfo,
+}
+
+/// The process-wide descriptor memo, keyed by `(store_hex, root_hex)`.
+///
+/// A `dig.getModuleInfo` costs a full-file read PLUS a SHA-256 of every chunk (#1615/G2) — real work a
+/// ~100-byte peer request can trigger on every call. The module a descriptor describes changes only when
+/// this node re-warms it (a brand-new file, written via write-then-rename — never edited in place), so
+/// `(len, mtime)` is a safe fingerprint: a cache hit means the file is provably the one the memo was
+/// built from, and any change invalidates it automatically.
+fn descriptor_memo() -> &'static Mutex<HashMap<(String, String), CachedDescriptor>> {
+    static MEMO: OnceLock<Mutex<HashMap<(String, String), CachedDescriptor>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Build the [`ModuleInfo`] descriptor for a locally-held capsule, or `None` if this node does not hold
 /// it (or the ids are not canonical).
 ///
@@ -74,20 +97,53 @@ pub fn describe_module(cache_dir: &Path, store_hex: &str, root_hex: &str) -> Opt
     if !is_canonical(store_hex) || !is_canonical(root_hex) {
         return None;
     }
-    let bytes = std::fs::read(module_path(cache_dir, store_hex, root_hex)).ok()?;
-    if bytes.is_empty() {
+    let path = module_path(cache_dir, store_hex, root_hex);
+    let metadata = std::fs::metadata(&path).ok()?;
+    let len = metadata.len();
+    if len == 0 {
         // A 0-byte file is not a module. Describing it would produce a descriptor whose hash gates all
         // PASS (sha256 of no bytes is a real digest), leaving the puller's anchor gate as the only thing
         // between a truncated local file and a peer caching it — so refuse at the source instead.
         return None;
     }
+    let modified = metadata.modified().ok();
+    let key = (store_hex.to_string(), root_hex.to_string());
+
+    if let Some(cached) = descriptor_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+    {
+        if cached.len == len && cached.modified == modified {
+            return Some(cached.info.clone());
+        }
+    }
+
+    let bytes = std::fs::read(&path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
     let chunk = chunk_size_for(bytes.len() as u64) as usize;
-    Some(ModuleInfo {
+    let info = ModuleInfo {
         total_size: bytes.len() as u64,
         module_hash: hex32(&sha256(&bytes)),
         chunk_hashes: bytes.chunks(chunk).map(|c| hex32(&sha256(c))).collect(),
         chunk_lens: bytes.chunks(chunk).map(|c| c.len() as u64).collect(),
-    })
+    };
+
+    descriptor_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            key,
+            CachedDescriptor {
+                len,
+                modified,
+                info: info.clone(),
+            },
+        );
+
+    Some(info)
 }
 
 /// Read the `[offset, offset+length)` window of a locally-held module.
@@ -104,16 +160,23 @@ pub fn read_module_window(
     offset: u64,
     length: u64,
 ) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
     if !is_canonical(store_hex) || !is_canonical(root_hex) {
         return None;
     }
-    let bytes = std::fs::read(module_path(cache_dir, store_hex, root_hex)).ok()?;
-    let start = usize::try_from(offset)
-        .unwrap_or(usize::MAX)
-        .min(bytes.len());
-    let want = usize::try_from(length.min(MAX_MODULE_WINDOW)).unwrap_or(usize::MAX);
-    let end = start.saturating_add(want).min(bytes.len());
-    Some(bytes[start..end].to_vec())
+    // Seek to the window instead of `fs::read`-ing the whole module (#1615/G1): a 512 MiB capsule
+    // served in 4 MiB windows would otherwise cost a full-file read PER request — ~256 GiB of IO to
+    // serve one pull, with up to 512 MiB resident per in-flight request. Only the bytes this request
+    // actually asked for are ever pulled off disk.
+    let mut file = std::fs::File::open(module_path(cache_dir, store_hex, root_hex)).ok()?;
+    let total = file.metadata().ok()?.len();
+    let start = offset.min(total);
+    let want = length.min(MAX_MODULE_WINDOW).min(total - start);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut window = vec![0u8; want as usize];
+    file.read_exact(&mut window).ok()?;
+    Some(window)
 }
 
 /// One `RangeFrame`-shaped response frame for a module window, in the SAME wire shape
@@ -365,6 +428,63 @@ mod tests {
                 .len(),
             100
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Proves:** a window read against a module several times larger than the per-request window still
+    /// returns exactly the requested window, byte-identical — the seek-based read (#1615/G1) must behave
+    /// like the old whole-file read even when the seek lands well past the start of a large file.
+    /// **Catches:** an off-by-one or wrong-origin `seek`, which the small fixtures above (well under one
+    /// window) could not expose.
+    #[test]
+    fn reads_one_window_of_a_module_larger_than_the_window_cap() {
+        let (store, root) = (hex_id(13), hex_id(14));
+        let total = (MAX_MODULE_WINDOW * 3) as usize;
+        let bytes: Vec<u8> = (0..total).map(|i| (i % 256) as u8).collect();
+        let dir = cache_with(&bytes, &store, &root);
+
+        let offset = MAX_MODULE_WINDOW * 2 + 17;
+        let want = 4096u64;
+        let window = read_module_window(&dir, &store, &root, offset, want).expect("held");
+
+        assert_eq!(window.len(), want as usize);
+        assert_eq!(window, bytes[offset as usize..(offset + want) as usize]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Proves:** a second `describe_module` call for an UNCHANGED file is answered from the memo
+    /// rather than recomputed — proven by seeding the memo with a distinguishable sentinel value (under
+    /// the real, unchanged `(len, mtime)` fingerprint) and observing the sentinel come back. If this call
+    /// had recomputed from disk it would have recovered the true hash, not the sentinel.
+    /// **Catches:** re-reading and re-hashing the whole module on every `dig.getModuleInfo` (#1615/G2) —
+    /// real work a ~100-byte peer request could otherwise trigger without bound.
+    #[test]
+    fn an_unchanged_module_descriptor_is_served_from_the_memo() {
+        let (store, root) = (hex_id(15), hex_id(16));
+        let bytes: Vec<u8> = (0..2000u32).map(|i| (i % 200) as u8).collect();
+        let dir = cache_with(&bytes, &store, &root);
+
+        let real = describe_module(&dir, &store, &root).expect("held");
+        let metadata = std::fs::metadata(module_path(&dir, &store, &root)).unwrap();
+        let sentinel = ModuleInfo {
+            module_hash: "0".repeat(64),
+            ..real.clone()
+        };
+        descriptor_memo().lock().unwrap().insert(
+            (store.clone(), root.clone()),
+            CachedDescriptor {
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                info: sentinel.clone(),
+            },
+        );
+
+        let second = describe_module(&dir, &store, &root).expect("held");
+        assert_eq!(
+            second.module_hash, sentinel.module_hash,
+            "the unchanged file's second describe_module call is answered from the memo"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

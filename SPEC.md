@@ -2970,6 +2970,20 @@ would contradict.
 The served window is EXACTLY the requested span, never widened to a chunk boundary: a verifying client
 fails a range closed on any length but the one it planned.
 
+**A `dig.fetchRange` STREAM MUST NOT serve past the requested `[offset, offset+length)` span, however
+far the resource itself continues (#1619).** The per-frame window cap above bounds one FRAME; a holder
+answering a request whose span exceeds one node window still streams MULTIPLE frames (advancing
+`offset`) to cover it, and that multi-frame loop MUST stop the instant the requested span is satisfied
+— NOT merely when the frame's own `complete` flag reports the resource exhausted. `complete: false` on
+the LAST frame of a satisfied request is normal and expected: it means the RESOURCE continues past the
+request, not that more of the STREAM is still to come. A holder that keeps streaming past the requested
+`length` turns a client's small probe range (e.g. `{offset:0, length:1}` — dig-download's own
+metadata-probe pattern, sent on every download) into an unbounded amplification: hundreds of bytes in
+for the WHOLE resource's verification-metadata-laden frames out. The client-side clip
+(dig-download's own defensive re-clamp of an over-length frame) is defense in depth, never a substitute
+for the holder's own bound — re-introducing a client-side REJECTION of an over-long frame is the #836
+class of defect (a false negative that makes an honest holder look like a liar) and MUST NOT return.
+
 A serve MUST NOT emit a per-CHUNK inclusion proof (`range_proof`). No such proof is derivable from the
 store format: the generation root's merkle leaves are per-RESOURCE (`resource_leaf(ciphertext)` =
 SHA-256 of a resource's WHOLE ciphertext, folded by `MerkleTree::from_leaves`), so a single chunk has no

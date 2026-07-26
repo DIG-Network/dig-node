@@ -649,7 +649,13 @@ impl Node {
             rk = %rk_hex,
             "peer serve: fetching resource from the P2P content engine"
         );
-        let fetched = match engine.fetch_resource(&content).await {
+        // This whole tier only runs behind `serve_content_plaintext` — the LOCAL loopback plaintext
+        // read (dig-node-service's `server.rs`), never the peer wire — so the origin here is always
+        // this node's own operator.
+        let fetched = match engine
+            .fetch_resource(&content, crate::download::ReadOrigin::Local)
+            .await
+        {
             Ok(f) => f,
             Err(e) => {
                 tracing::info!(store = %store_hex, root = %root_hex, error = %e, "peer serve: fetch missed");

@@ -29,12 +29,17 @@ use crate::*;
 pub trait RpcDispatch: Send + Sync {
     /// Dispatch one JSON-RPC request `Value`, returning its response `Value`. See
     /// [`crate::handle_rpc`] (the stable free-function entry point every caller uses).
-    async fn dispatch(&self, req: Value) -> Value;
+    ///
+    /// `origin` says who is asking — this node's OWN operator or a REMOTE peer — because this ONE
+    /// dispatch is shared by every transport (loopback HTTP, in-process FFI, AND the peer-RPC
+    /// server, #179/#1576): it is the single place the two are told apart, so it is threaded through
+    /// EXPLICITLY by each caller rather than inferred here.
+    async fn dispatch(&self, req: Value, origin: crate::download::ReadOrigin) -> Value;
 }
 
 #[async_trait::async_trait]
 impl RpcDispatch for Node {
-    async fn dispatch(&self, req: Value) -> Value {
+    async fn dispatch(&self, req: Value, origin: crate::download::ReadOrigin) -> Value {
         // `node` alias: the body below is relocated VERBATIM from the pre-#1285-W1b-5
         // `handle_rpc(node: &Node, req: Value)` free function — byte-identical, just bound to
         // `self` here instead of taking `node` as a parameter.
@@ -253,7 +258,9 @@ impl RpcDispatch for Node {
                             {
                                 let depth = download::redirect_depth(&params);
                                 if let Some(envelope) = node
-                                    .range_miss_envelope(&id, &content, depth, offset, length)
+                                    .range_miss_envelope(
+                                        &id, &content, depth, offset, length, origin,
+                                    )
                                     .await
                                 {
                                     // Served from another node — background-backfill the whole capsule so the
@@ -700,7 +707,7 @@ impl RpcDispatch for Node {
             let depth = download::redirect_depth(&params);
             let pin_hex = pinned_root.map(|r| r.to_hex());
             if let Some(envelope) = node
-                .content_miss_envelope(&id, &content, depth, offset, pin_hex.as_deref())
+                .content_miss_envelope(&id, &content, depth, offset, pin_hex.as_deref(), origin)
                 .await
             {
                 // This resource is being served FROM ANOTHER NODE (a redirect/fetch-through). In the

@@ -1170,7 +1170,8 @@ impl PeerRpcResponder for NodeResponder {
             let peers = self.pool_peers(&network_id, limit);
             return json!({"jsonrpc":"2.0","id":id,"result":{"peers": peers}});
         }
-        crate::handle_rpc(&self.node, req).await
+        // This is the peer-RPC server's OWN dispatch — a REMOTE peer's request, always (#179/#1576).
+        crate::handle_rpc(&self.node, req, crate::download::ReadOrigin::Peer).await
     }
 
     async fn handle_availability(&self, items: Value) -> Value {
@@ -1276,6 +1277,12 @@ impl PeerRpcResponder for NodeResponder {
             .get("length")
             .and_then(Value::as_u64)
             .unwrap_or(RANGE_WINDOW as u64) as usize;
+        // The REQUESTED SPAN's exclusive end — the loop below must never serve past it, however far
+        // the resource itself continues (#1619). `fetch_range_frame`'s own `complete` flag means
+        // "the RESOURCE is exhausted"; it says nothing about "the CALLER's requested span is
+        // satisfied", which is the bound this streaming loop actually owes — `length` was previously
+        // used only to size one frame, never to bound the whole stream.
+        let requested_end = offset.saturating_add(length);
         // #1595: announce the inbound request, then EVERY termination path below reports its outcome —
         // so "did the holder get it, and what did it answer?" is answerable from the log alone.
         let target = serve_log::ServeTarget::from_range_request(conn_key, &req);
@@ -1286,9 +1293,12 @@ impl PeerRpcResponder for NodeResponder {
         let mut off = offset;
         let (mut served_bytes, mut frames, mut proof_attached) = (0u64, 0u64, false);
         loop {
+            // Ask for only what the REMAINING requested span still needs — never the original
+            // `length` again, which would let a single frame overshoot the caller's request.
+            let remaining = requested_end.saturating_sub(off);
             match self
                 .node
-                .fetch_range_frame(store, root, rk, off, length)
+                .fetch_range_frame(store, root, rk, off, remaining)
                 .await
             {
                 Ok(frame) => {
@@ -1345,7 +1355,12 @@ impl PeerRpcResponder for NodeResponder {
                         .get("complete")
                         .and_then(Value::as_bool)
                         .unwrap_or(true);
-                    if complete || this_len == 0 {
+                    // Stop on WHICHEVER bound is hit first: the resource ended (`complete`), or the
+                    // caller's own requested span is now fully served (`span_satisfied`) — the second
+                    // is the one `complete` alone cannot express, and is exactly what let this loop
+                    // stream a whole multi-MiB resource off a `{offset:0, length:1}` probe (#1619).
+                    let span_satisfied = off + this_len >= requested_end;
+                    if complete || span_satisfied || this_len == 0 {
                         serve_log::range_outcome(
                             &target,
                             offset,
@@ -1369,7 +1384,12 @@ impl PeerRpcResponder for NodeResponder {
                     if code == crate::download::RESOURCE_UNAVAILABLE {
                         if let Some(content) = crate::download::range_content_id(&req) {
                             let depth = crate::download::redirect_depth(&req);
-                            match self.node.miss_outcome(&content, depth).await {
+                            // A remote peer's own fetchRange stream miss (#179/#1576) — never local.
+                            match self
+                                .node
+                                .miss_outcome(&content, depth, crate::download::ReadOrigin::Peer)
+                                .await
+                            {
                                 crate::download::MissOutcome::Fetched(f) => {
                                     // Fetched-through: the bytes come from a holder but are served
                                     // here, so the outcome is a serve (its frames carry the same
@@ -1482,10 +1502,13 @@ async fn stream_fetched_range(
     limiter: Option<&dig_download::FcfsRateLimiter>,
     conn_key: &str,
 ) -> std::io::Result<StreamOutcome> {
+    // Same bound as `stream_range` (#1619): `length` is the WHOLE stream's span, not one frame's size.
+    let requested_end = offset.saturating_add(length);
     let mut off = offset;
     let mut outcome = StreamOutcome::default();
     loop {
-        match fetched.range_frame(off, length) {
+        let remaining = requested_end.saturating_sub(off);
+        match fetched.range_frame(off, remaining) {
             Ok(frame) => {
                 let this_len = frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
                 // Pace fetch-through frames on the SAME FCFS budget as locally-held serves (#1436).
@@ -1496,11 +1519,12 @@ async fn stream_fetched_range(
                 write_framed(out, &frame).await?;
                 outcome.bytes += this_len as u64;
                 outcome.frames += 1;
+                let span_satisfied = off + this_len >= requested_end;
                 let complete = frame
                     .get("complete")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                if complete || this_len == 0 {
+                if complete || span_satisfied || this_len == 0 {
                     return Ok(outcome);
                 }
                 off += this_len;
@@ -3899,22 +3923,40 @@ mod tests {
         }
     }
 
-    /// With a tight per-connection cap the serve path PACES: after the initial one-second burst, each
-    /// further frame waits for a token refill, so streaming more than one budget's worth takes time.
+    /// With a tight per-connection cap the serve path PACES: after the initial burst, a further frame
+    /// waits for a token refill, so streaming more than one budget's worth takes time.
+    ///
+    /// Rebased on a request whose span genuinely spans MULTIPLE frames (#1619: a single
+    /// `stream_fetched_range` call no longer streams past its requested `length`, so a request has to
+    /// exceed one node window — [`crate::peer::RANGE_WINDOW`] — to observe more than one frame at
+    /// all). A resource just over one window, requested in full, yields exactly two frames: one
+    /// window-sized frame (admitted immediately — an oversized frame is never split, only debited)
+    /// then a small tail frame that must wait out that debt at the tight per-connection rate.
     #[tokio::test(start_paused = true)]
     async fn stream_range_paces_each_frame_under_a_tight_cap() {
-        // Per-conn cap 100 B/s (global unlimited); 300 bytes in 100-byte frames = 3 frames.
-        let limiter = dig_download::FcfsRateLimiter::new(0, 100);
-        let f = tiny_fetched(300);
+        let total = RANGE_WINDOW + 100;
+        let limiter = dig_download::FcfsRateLimiter::new(0, 100); // 100 B/s per-conn (global unlimited)
+        let f = tiny_fetched(total);
         let mut out = tokio::io::sink();
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 100, Some(&limiter), "peerA")
+        let streamed = stream_fetched_range(&mut out, &f, 0, total, Some(&limiter), "peerA")
             .await
             .unwrap();
-        // First 100 B instant (burst); the next two 100-B frames each wait ~1s for a refill.
+        assert_eq!(
+            streamed,
+            StreamOutcome {
+                bytes: total as u64,
+                frames: 2,
+                refusal: None
+            },
+            "one window-sized frame, then the 100-byte tail"
+        );
+        // The window-sized frame is admitted at once (oversized chunks are never blocked, only
+        // debited, per `FcfsRateLimiter::acquire`'s own contract) but leaves a debt the tiny cap pays
+        // off slowly — the tail frame waits well past this floor before it is admitted.
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(1500),
-            "paced serve should wait for refills, waited {:?}",
+            "paced serve should wait for the window frame's debt to clear, waited {:?}",
             start.elapsed()
         );
     }
@@ -4038,17 +4080,86 @@ mod tests {
             logs.contains("outcome=served"),
             "the served OUTCOME: {logs}"
         );
-        // `stream_range` streams from the requested offset to the END of the resource, so the tail
-        // (chunks 1 and 2) is served in two frames — the counts report what really went out.
-        let tail: u64 = chunk_lens[1..].iter().sum();
+        // `stream_range` is bounded by the REQUESTED span (#1619), not the resource's end: a request
+        // for exactly chunk 1's bytes serves exactly chunk 1's bytes, in one frame.
         assert!(
-            logs.contains(&format!("served_bytes={tail}")),
+            logs.contains(&format!("served_bytes={}", chunk_lens[1])),
             "the byte count actually served: {logs}"
         );
-        assert!(logs.contains("frames=2"), "the frame granularity: {logs}");
+        assert!(logs.contains("frames=1"), "the frame granularity: {logs}");
         assert!(
             logs.contains("proof_attached=true"),
             "whether a proof rode the frames: {logs}"
+        );
+    }
+
+    /// **Proves, at the REAL wire (not a mocked/symmetric harness), that a `{offset:0, length:1}`
+    /// probe against a multi-KiB held resource gets exactly ONE small frame — never the whole
+    /// resource streamed to its end (#1619).** dig-download's own orchestrator sends exactly this
+    /// probe on EVERY download (`orchestrator.rs:930`), so this pins the actual trigger, not a
+    /// contrived one.
+    ///
+    /// This drives the PRODUCTION `NodeResponder::stream_range` over a real `tokio::io::duplex` —
+    /// the caller side decodes with the same [`read_framed`] a real peer connection uses, looping
+    /// until `complete`, so a regression that resumes streaming past the requested span would show
+    /// up as MORE than one frame arriving on the wire, not merely a wrong assertion value on a
+    /// hand-built struct.
+    #[tokio::test]
+    async fn a_one_byte_probe_gets_one_frame_not_the_whole_resource_over_the_real_wire() {
+        use digstore_core::merkle::{resource_leaf, MerkleTree};
+
+        // A real multi-KiB held resource — many times larger than the `{offset:0, length:1}` probe,
+        // so "streamed to the end" and "bounded to the request" are unmistakably different outcomes.
+        let ciphertext: Vec<u8> = (0..10_000u32).map(|i| (i % 256) as u8).collect();
+        let tree = MerkleTree::from_leaves(vec![resource_leaf(&ciphertext)]);
+        let resource = Arc::new(digstore_core::wire::ContentResponse {
+            merkle_proof: tree.prove(0).expect("single-leaf proof"),
+            roothash: tree.root(),
+            chunk_lens: vec![ciphertext.len() as u32],
+            ciphertext,
+        });
+
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let (store, root, rk) = crate::test_support::seed_served_resource(&node, resource);
+        let responder = NodeResponder::without_pool(node);
+        let req = json!({
+            "store_id": store, "root": root, "retrieval_key": rk,
+            "offset": 0, "length": 1,
+        });
+
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let served = tokio::spawn(async move {
+            responder
+                .stream_range(req, &test_caller(), &mut server)
+                .await
+        });
+
+        // Join the serve task FIRST: `stream_range` returns only once it is done writing, and
+        // dropping its `server` half on return is what closes the duplex's write end — so the
+        // client's read-to-EOF below terminates on the real number of frames actually sent, never on
+        // a `complete` flag this fix explicitly decouples from "the stream is over" (a bounded
+        // request's LAST frame can legitimately carry `complete: false`, #1619).
+        served.await.expect("serve task join").expect("served");
+
+        // Read every frame the wire actually carried, exactly as a real peer caller would, until EOF.
+        let mut frames = Vec::new();
+        while let Some(frame) = read_framed(&mut client)
+            .await
+            .expect("no I/O error reading the frame stream")
+        {
+            frames.push(frame);
+        }
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a length=1 probe must yield exactly one frame on the real wire, got: {frames:?}"
+        );
+        assert_eq!(frames[0]["length"], json!(1), "the probe's requested span");
+        assert_eq!(
+            frames[0]["complete"],
+            json!(false),
+            "the RESOURCE is far from exhausted — only the REQUEST was satisfied"
         );
     }
 
@@ -4255,7 +4366,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_fetch_through_serve_logs_the_real_frame_and_byte_counts() {
-        // 300 bytes in 100-byte windows = 3 frames, 300 bytes — never `frames=0`.
+        // A request for 100 bytes out of a 300-byte resource is satisfied by EXACTLY the requested
+        // span — one 100-byte frame, never streamed on to the resource's own end (#1619: `length`
+        // bounds the WHOLE stream, not just one frame's size).
         let f = tiny_fetched(300);
         let req = canonical_range_request();
         let caller = test_caller();
@@ -4268,8 +4381,8 @@ mod tests {
             assert_eq!(
                 streamed,
                 StreamOutcome {
-                    bytes: 300,
-                    frames: 3,
+                    bytes: 100,
+                    frames: 1,
                     refusal: None
                 }
             );
@@ -4283,10 +4396,30 @@ mod tests {
 
         assert!(logs.contains("outcome=served"), "{logs}");
         assert!(
-            logs.contains("served_bytes=300"),
+            logs.contains("served_bytes=100"),
             "the real byte total: {logs}"
         );
-        assert!(logs.contains("frames=3"), "the real frame count: {logs}");
+        assert!(logs.contains("frames=1"), "the real frame count: {logs}");
+    }
+
+    /// **Proves:** a requested span that runs PAST the resource's end is clipped by the resource, not
+    /// by the request — `offset=250, length=100` on a 300-byte resource serves only the 50 bytes that
+    /// exist, the OTHER bound this streaming loop must respect (#1619).
+    #[tokio::test]
+    async fn a_fetch_through_serve_clips_a_request_that_overruns_the_resource() {
+        let f = tiny_fetched(300);
+        let mut out = tokio::io::sink();
+        let streamed = stream_fetched_range(&mut out, &f, 250, 100, None, &test_caller())
+            .await
+            .expect("streamed");
+        assert_eq!(
+            streamed,
+            StreamOutcome {
+                bytes: 50,
+                frames: 1,
+                refusal: None
+            }
+        );
     }
 
     #[tokio::test]

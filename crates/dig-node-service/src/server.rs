@@ -771,7 +771,17 @@ async fn rpc(
     // envelope — but guard the dispatch anyway so a future change can't take the
     // server down on one bad request.
     let node = state.node.clone();
-    let resp = match tokio::task::spawn(async move { handle_rpc(&node, normalized).await }).await {
+    // The loopback HTTP JSON-RPC endpoint — this node's own operator/agent, always Local.
+    let resp = match tokio::task::spawn(async move {
+        handle_rpc(
+            &node,
+            normalized,
+            dig_node_core::download::ReadOrigin::Local,
+        )
+        .await
+    })
+    .await
+    {
         Ok(v) => v,
         Err(e) => rpc_error(
             id.clone(),

@@ -134,6 +134,26 @@ fn resolve_backfill_on_miss(v: Option<&str>) -> bool {
     )
 }
 
+// -- Where a read request came from — the reshare trigger's ONLY gate ------------------------------
+
+/// Who asked for this read: this node's OWN operator (loopback HTTP / in-process FFI / the
+/// node-internal control surface), or a REMOTE peer over the peer wire protocol.
+///
+/// This is the guard that keeps the reshare leg (#1576) from being a remotely-triggerable
+/// amplification primitive: "a reader that reads becomes a holder" means a LOCAL user's read, never
+/// a remote peer's `dig.fetchRange`/`dig.getContent` miss served through this node. `handle_rpc` is
+/// the one dispatch entry every transport shares (loopback HTTP, FFI, AND the peer-RPC server), so
+/// this is threaded through it EXPLICITLY from each transport's own call site — never inferred from
+/// an address, a header, or any other heuristic a remote caller could spoof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadOrigin {
+    /// This node's own operator, via the loopback HTTP shell, the in-process FFI, or the
+    /// node-internal control/subscription surface.
+    Local,
+    /// A remote peer, via the peer-RPC server or the peer stream's own miss handling.
+    Peer,
+}
+
 // -- The digstore-bound proof verifier -------------------------------------------------------------
 
 /// The REAL [`ProofVerifier`] for dig-download's whole-resource check: decodes the digstore
@@ -846,6 +866,7 @@ impl NodeContent {
     pub async fn fetch_resource(
         &self,
         content: &ContentId,
+        origin: ReadOrigin,
     ) -> Result<Arc<FetchedResource>, String> {
         let key = download_key(content);
 
@@ -949,16 +970,32 @@ impl NodeContent {
         //    Deliberately fire-and-forget: the read's latency is user-facing and a whole-capsule pull is
         //    orders of magnitude larger than the resource that revealed it, so the read never waits and a
         //    failed warm never fails the read. See `seams::dig_peer::module_reshare`.
-        self.spawn_capsule_reshare(content);
+        self.spawn_capsule_reshare(content, origin);
         Ok(fetched)
     }
 
     /// Start a background whole-capsule pull for the capsule `content` belongs to, if a
     /// [`CapsuleWarmer`](crate::seams::dig_peer::CapsuleWarmer) is wired.
     ///
-    /// A no-op when no warmer is installed (the FFI/base path, and any deployment that has not opted
-    /// into resharing) — a read must work identically with or without the reshare leg.
-    fn spawn_capsule_reshare(&self, content: &ContentId) {
+    /// Refuses on any of three gates, each independently sufficient to skip the warm:
+    /// - **`origin != Local`.** A REMOTE peer's `dig.fetchRange`/`dig.getContent` miss must NEVER
+    ///   trigger a whole-capsule pull: unauthenticated (any well-formed self-signed mTLS leaf is
+    ///   accepted, #179) and effectively free for the peer, it would let a stranger drive this node
+    ///   into pulling + caching + DHT-announcing capsules of the ATTACKER'S choosing — a few hundred
+    ///   bytes in for an entire capsule's worth of bandwidth + disk out, an attacker-shaped holder
+    ///   inventory, and eviction pressure on the operator's own content (LRU evicts oldest-mtime
+    ///   first, so a freshly-promoted attacker capsule outlives what it displaced). "A reader that
+    ///   reads becomes a holder" means THIS node's own operator read, never a peer's.
+    /// - **`!backfill_on_miss_enabled()`.** The documented, default-on, operator-facing
+    ///   `DIG_NODE_BACKFILL_ON_MISS` kill switch — this leg is more of the SAME background
+    ///   whole-capsule warm-up `maybe_backfill_capsule` already gates on it, so an operator who
+    ///   turned it off must not have it silently re-enabled through a different code path.
+    /// - **no warmer wired** — the FFI/base path, and any deployment that has not opted into
+    ///   resharing; a read must work identically with or without the reshare leg.
+    fn spawn_capsule_reshare(&self, content: &ContentId, origin: ReadOrigin) {
+        if origin != ReadOrigin::Local || !backfill_on_miss_enabled() {
+            return;
+        }
         let Some(warmer) = self.capsule_warmer.get() else {
             return;
         };
@@ -1114,7 +1151,12 @@ impl crate::Node {
     /// Decide the #165 miss outcome for `content` at redirect depth `depth`: fetch-through when
     /// configured (falling back to redirect if the fetch fails), else locate + redirect within the
     /// hop budget, else not-found. NEVER a silent 404 while a provider exists.
-    pub(crate) async fn miss_outcome(&self, content: &ContentId, depth: u64) -> MissOutcome {
+    pub(crate) async fn miss_outcome(
+        &self,
+        content: &ContentId,
+        depth: u64,
+        origin: ReadOrigin,
+    ) -> MissOutcome {
         // No P2P content engine (the in-process FFI path) → the caller's own not-found stands.
         let Some(pc) = self.p2p_content() else {
             return MissOutcome::NotFound;
@@ -1124,7 +1166,7 @@ impl crate::Node {
         // directly. On any failure, fall through to the redirect so a provider-held resource is never
         // silently 404'd.
         if pc.miss_mode() == MissMode::FetchThrough {
-            if let Ok(fetched) = pc.fetch_resource(content).await {
+            if let Ok(fetched) = pc.fetch_resource(content, origin).await {
                 return MissOutcome::Fetched(fetched);
             }
         }
@@ -1158,8 +1200,9 @@ impl crate::Node {
         depth: u64,
         offset: usize,
         length: usize,
+        origin: ReadOrigin,
     ) -> Option<Value> {
-        match self.miss_outcome(content, depth).await {
+        match self.miss_outcome(content, depth, origin).await {
             MissOutcome::Fetched(f) => Some(match f.range_frame(offset, length) {
                 Ok(frame) => json!({"jsonrpc":"2.0","id":id,"result":frame}),
                 Err((code, message)) => crate::rpc_err(id, code, &message),
@@ -1184,8 +1227,9 @@ impl crate::Node {
         depth: u64,
         offset: usize,
         pinned_root_hex: Option<&str>,
+        origin: ReadOrigin,
     ) -> Option<Value> {
-        match self.miss_outcome(content, depth).await {
+        match self.miss_outcome(content, depth, origin).await {
             MissOutcome::Fetched(f) => {
                 let root_ok = match pinned_root_hex {
                     Some(pin) => f.root.as_deref() == Some(pin),
@@ -1587,7 +1631,10 @@ mod tests {
             td.path(),
         );
 
-        let f = pc.fetch_resource(&cid).await.expect("download succeeds");
+        let f = pc
+            .fetch_resource(&cid, ReadOrigin::Local)
+            .await
+            .expect("download succeeds");
         assert_eq!(f.bytes, content.bytes, "reassembled bytes match the source");
         assert_eq!(f.total_length, 30);
         assert_eq!(f.chunk_lens, content.chunk_lens);
@@ -1597,7 +1644,10 @@ mod tests {
         // A second fetch is served from the in-memory cache — no new peer fetches.
         let attempts_before = transport.attempts_for(&mock_peer_hex(1)).await
             + transport.attempts_for(&mock_peer_hex(2)).await;
-        let f2 = pc.fetch_resource(&cid).await.expect("cache hit");
+        let f2 = pc
+            .fetch_resource(&cid, ReadOrigin::Local)
+            .await
+            .expect("cache hit");
         assert_eq!(f2.bytes, f.bytes);
         let attempts_after = transport.attempts_for(&mock_peer_hex(1)).await
             + transport.attempts_for(&mock_peer_hex(2)).await;
@@ -1642,7 +1692,7 @@ mod tests {
 
         // DATA: the fetch must now reach the connected holder (was Err → 404 before the fix).
         let f = pc
-            .fetch_resource(&cid)
+            .fetch_resource(&cid, ReadOrigin::Local)
             .await
             .expect("fetch from the connected-pool holder");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
@@ -1740,7 +1790,7 @@ mod tests {
 
         // The fetch must succeed by reaching the holder — never self.
         let f = pc
-            .fetch_resource(&cid)
+            .fetch_resource(&cid, ReadOrigin::Local)
             .await
             .expect("fetch reaches the connected holder");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
@@ -1880,7 +1930,7 @@ mod tests {
 
         // DATA: the fetch must reach the holder over its reachable pool address (was Err → 404 before).
         let f = pc
-            .fetch_resource(&cid)
+            .fetch_resource(&cid, ReadOrigin::Local)
             .await
             .expect("fetch reaches the holder at its reachable pool address");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
@@ -1993,7 +2043,7 @@ mod tests {
 
         // DATA: the fetch must reach the connected holder despite its availability=false answer.
         let f = pc
-            .fetch_resource(&cid)
+            .fetch_resource(&cid, ReadOrigin::Local)
             .await
             .expect("a connected-pool holder is fetched even when it answers availability=false");
         assert_eq!(f.bytes, content.bytes, "served bytes match the source");
@@ -2066,7 +2116,10 @@ mod tests {
             None,
             td.path(),
         );
-        assert!(pc.fetch_resource(&mock_content_id()).await.is_err());
+        assert!(pc
+            .fetch_resource(&mock_content_id(), ReadOrigin::Local)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -2175,7 +2228,10 @@ mod tests {
         let before = pc.selector().snapshot();
         assert_eq!(before.measured_peers, 0, "no measured peers before a fetch");
 
-        let f = pc.fetch_resource(&cid).await.expect("download succeeds");
+        let f = pc
+            .fetch_resource(&cid, ReadOrigin::Local)
+            .await
+            .expect("download succeeds");
         assert_eq!(f.bytes, content.bytes, "reassembled bytes match the source");
 
         // After the fetch the selector has folded in measured outcomes for the peer(s) that served the
@@ -2367,7 +2423,7 @@ mod tests {
             addr,
         });
 
-        let fetched = pc.fetch_resource(&cid).await;
+        let fetched = pc.fetch_resource(&cid, ReadOrigin::Local).await;
 
         // The load-bearing assertion: the RPC LEFT THE MACHINE and the holder SAW it.
         let seen = fetch_ranges.lock().unwrap().clone();

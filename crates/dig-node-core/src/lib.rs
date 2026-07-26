@@ -2240,7 +2240,11 @@ fn parse_store_id_arg(params: &Value) -> Result<chia_protocol::Bytes32, ()> {
 /// (`dig-runtime`): parse the JSON-RPC request text, dispatch, return the
 /// response as JSON text. Keeps serde out of the FFI crate so the browser side
 /// is a plain `*const c_char -> *mut c_char` call.
-pub async fn handle_rpc_json(node: &Node, req_json: &str) -> String {
+pub async fn handle_rpc_json(
+    node: &Node,
+    req_json: &str,
+    origin: crate::download::ReadOrigin,
+) -> String {
     let req: Value = match serde_json::from_str(req_json) {
         Ok(v) => v,
         Err(e) => {
@@ -2249,7 +2253,7 @@ pub async fn handle_rpc_json(node: &Node, req_json: &str) -> String {
             .to_string()
         }
     };
-    handle_rpc(node, req).await.to_string()
+    handle_rpc(node, req, origin).await.to_string()
 }
 
 /// Build a JSON-RPC 2.0 error response envelope. A free function (not the local `err` closure inside
@@ -2269,8 +2273,8 @@ fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
 /// [`RpcDispatch::dispatch`] (seam 4's public surface, `seams/dig_rpc/dispatch.rs`) — relocated
 /// unchanged. Kept as a free function (rather than requiring every caller to import a trait) so
 /// no external caller (`dig-node-service`, `dig-runtime`, the peer-RPC server) needed to change.
-pub async fn handle_rpc(node: &Node, req: Value) -> Value {
-    RpcDispatch::dispatch(node, req).await
+pub async fn handle_rpc(node: &Node, req: Value, origin: crate::download::ReadOrigin) -> Value {
+    RpcDispatch::dispatch(node, req, origin).await
 }
 
 /// Return a clone of the JSON-RPC `req` with `params.root` forced to `root_hex`
@@ -3224,6 +3228,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getModuleInfo",
                    "params":{"store_id":store,"root":root}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(held["result"]["total_size"], json!(bytes.len() as u64));
@@ -3237,6 +3242,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":2,"method":"dig.getModuleInfo",
                    "params":{"store_id":id_hex(0x99),"root":root}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(
@@ -3261,6 +3267,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":3,"method":"dig.fetchModuleRange",
                    "params":{"store_id":store,"root":root,"offset":100,"length":50}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         let frame = &resp["result"];
@@ -3283,6 +3290,7 @@ mod tests {
                 &node,
                 json!({"jsonrpc":"2.0","id":4,"method":method,
                        "params":{"store_id":"../../etc/passwd","root":id_hex(1),"length":8}}),
+                crate::download::ReadOrigin::Local,
             )
             .await;
             assert_eq!(resp["error"]["code"], json!(-32602), "{method}");
@@ -3304,6 +3312,7 @@ mod tests {
         let resp = handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":3,"method":"dig.listCollectionItems","params":{}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(resp["id"], json!(3));
@@ -3318,6 +3327,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":4,"method":"dig.listCollectionItems",
                    "params":{"launcher_ids":["nope"]}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(resp["error"]["code"], json!(-32602));
@@ -3332,6 +3342,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":5,"method":"dig.listCollectionItems",
                    "params":{"launcher_ids":[], "offset":0, "limit":10}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         let result = &resp["result"];
@@ -3355,6 +3366,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":6,"method":"dig.listCollectionItems",
                    "params":{"launcher_ids":[], "limit":100000}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(resp["result"]["limit"], json!(200), "limit clamped to 200");
@@ -3369,6 +3381,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":8,"method":"dig.getCollection",
                    "params":{"launcher_ids":[], "did":"ab".repeat(32)}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         let result = &resp["result"];
@@ -3386,6 +3399,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":9,"method":"dig.getCollection",
                    "params":{"launcher_ids":"not-an-array"}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(resp["error"]["code"], json!(-32602));
@@ -3434,6 +3448,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"cache.setCapBytes",
                    "params":{"cap_bytes": five_gib}}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(set["result"]["cap_bytes"].as_u64(), Some(five_gib));
 
@@ -3441,6 +3456,7 @@ mod tests {
         let got = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":2,"method":"cache.getConfig"}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(got["result"]["cap_bytes"].as_u64(), Some(five_gib));
         assert!(got["result"]["used_bytes"].as_u64().is_some());
@@ -3451,6 +3467,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":3,"method":"cache.setCapBytes",
                    "params":{"cap_bytes": 1}}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(low["result"]["cap_bytes"].as_u64(), Some(64 * 1024 * 1024));
 
@@ -3458,6 +3475,7 @@ mod tests {
         let cleared = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":4,"method":"cache.clear"}),
+            crate::download::ReadOrigin::Local,
         ));
         assert!(cleared["result"].is_object());
 
@@ -3480,6 +3498,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"control.peers.connect",
                    "params":{"peer":"[::1]:9444"}}),
+            crate::download::ReadOrigin::Local,
         ));
         assert!(resp.get("result").is_none());
         assert!(
@@ -3504,6 +3523,7 @@ mod tests {
         let resp = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"control.peerStatus"}),
+            crate::download::ReadOrigin::Local,
         ));
         assert!(resp["result"].is_object());
         assert!(
@@ -3539,6 +3559,7 @@ mod tests {
         let empty = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"control.listSubscriptions"}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(empty["result"]["count"], json!(0));
         assert_eq!(empty["result"]["subscriptions"], json!([]));
@@ -3548,6 +3569,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":2,"method":"control.subscribe",
                    "params":{"store_id": store}}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(sub["result"]["subscribed"], json!(true));
         assert_eq!(sub["result"]["added"], json!(true));
@@ -3557,6 +3579,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":3,"method":"control.subscribe",
                    "params":{"store_id": store}}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(again["result"]["added"], json!(false));
 
@@ -3564,6 +3587,7 @@ mod tests {
         let listed = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":4,"method":"control.listSubscriptions"}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(listed["result"]["count"], json!(1));
         assert_eq!(listed["result"]["subscriptions"], json!([store]));
@@ -3574,6 +3598,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":5,"method":"control.unsubscribe",
                    "params":{"store_id": store}}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(unsub["result"]["removed"], json!(true));
         assert!(
@@ -3602,6 +3627,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"control.subscribe",
                    "params":{"store_id": "not-hex"}}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(resp["error"]["code"], json!(CONTROL_ERROR), "-32032");
         assert_eq!(resp["error"]["data"]["code"], json!("CONTROL_ERROR"));
@@ -3694,6 +3720,7 @@ mod tests {
         let resp = handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"cache.listCached"}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         let items = resp["result"]["cached"].as_array().unwrap();
@@ -3738,6 +3765,7 @@ mod tests {
         let resp = handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"cache.listCached"}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         let items = resp["result"]["cached"].as_array().unwrap().clone();
@@ -3785,6 +3813,7 @@ mod tests {
         let resp = handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         let r = &resp["result"];
@@ -3821,6 +3850,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":7,"method":"dig.stage",
                 "params":{"dir": src.path().display().to_string()}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
 
@@ -3863,6 +3893,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.stage",
                 "params":{"dir": src.path().display().to_string(), "store_id": store}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         let r = &resp["result"];
@@ -3883,6 +3914,7 @@ mod tests {
         let resp = handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.stage","params":{}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(
@@ -3898,6 +3930,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.stage",
                 "params":{"dir":"/no/such/folder/xyzzy"}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(resp["error"]["code"], -32011, "bad dir ⇒ -32011: {resp}");
@@ -3911,6 +3944,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.stage",
                 "params":{"dir": src.path().display().to_string()}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(
@@ -3928,6 +3962,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.stage",
                 "params":{"dir": src.path().display().to_string(), "store_id":"nothex"}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(
@@ -3948,6 +3983,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"cache.removeCached",
                    "params":{"store_id": store, "root": root}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert!(resp["result"]["removed"].as_bool() == Some(true));
@@ -3995,6 +4031,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"cache.fetchAndCache",
                    "params":{"store_id": store_hex, "root": root_hex}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(resp["result"]["status"].as_str(), Some("cached"));
@@ -4021,6 +4058,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":2,"method":"cache.fetchAndCache",
                    "params":{"store_id": store_hex, "root": root_hex}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(
@@ -4118,6 +4156,7 @@ mod tests {
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"cache.fetchAndCache",
                    "params":{"store_id": store, "root": root}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(resp["result"]["status"].as_str(), Some("failed"));
@@ -4401,6 +4440,7 @@ mod tests {
         let got = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":42,"method":"cache.getConfig"}),
+            crate::download::ReadOrigin::Local,
         ));
         let result = got["result"].as_object().expect("result is an object");
 
@@ -4447,6 +4487,7 @@ mod tests {
         let got = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":7,"method":"control.peerStatus"}),
+            crate::download::ReadOrigin::Local,
         ));
         let result = got["result"].as_object().expect("result object");
         assert_eq!(result["running"], json!(false));
@@ -4503,6 +4544,7 @@ mod tests {
         let got = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":8,"method":"control.peerStatus"}),
+            crate::download::ReadOrigin::Local,
         ));
         let pool = got["result"]["pool"]
             .as_object()
@@ -4637,6 +4679,7 @@ mod tests {
                 "root": attacker_root.to_hex(),
                 "retrieval_key": any_rk_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         ));
 
         assert_eq!(
@@ -4664,6 +4707,7 @@ mod tests {
                 "root": Bytes32([0xAA; 32]).to_hex(),
                 "retrieval_key": any_rk_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         ));
 
         assert_eq!(resp["error"]["code"], ROOT_NOT_ANCHORED, "{resp}");
@@ -4697,6 +4741,7 @@ mod tests {
                 "root": req.to_hex(),
                 "retrieval_key": any_rk_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         ));
 
         assert_eq!(
@@ -4778,6 +4823,7 @@ mod tests {
                 "root": Bytes32([0xAA; 32]).to_hex(),
                 "retrieval_key": any_rk_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         ));
 
         assert_eq!(resp["error"]["code"], ROOT_NOT_ANCHORED, "{resp}");
@@ -4797,6 +4843,7 @@ mod tests {
                 "root": Bytes32([0xAA; 32]).to_hex(),
                 "retrieval_key": any_rk_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
     }
@@ -5301,6 +5348,7 @@ mod tests {
                 "root": advanced_tip.to_hex(),
                 "retrieval_key": any_rk_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         // It must not have served the stale cached module as the current generation.
         let served_local = resp["result"]["source"].as_str() == Some("local");
@@ -5331,6 +5379,7 @@ mod tests {
                 "root": Bytes32([0xAA; 32]).to_hex(),
                 "retrieval_key": any_rk_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         std::env::remove_var("DIG_NODE_PIN");
         assert_ne!(
@@ -5661,6 +5710,7 @@ mod tests {
                 "store_id": Bytes32([1u8; 32]).to_hex(),
                 "retrieval_key": any_rk_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(
             resp["error"]["code"],
@@ -5702,7 +5752,7 @@ mod tests {
         ];
         for req in cases {
             let method = req["method"].as_str().unwrap().to_string();
-            let resp = rt.block_on(handle_rpc(&node, req));
+            let resp = rt.block_on(handle_rpc(&node, req, crate::download::ReadOrigin::Local));
             assert_eq!(
                 resp["error"]["code"],
                 json!(-32601),
@@ -5787,6 +5837,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{
                 "store_id": store_id.to_hex(), "root": root.to_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert!(resp.get("error").is_none(), "unexpected error: {resp}");
@@ -5834,6 +5885,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{
                 "store_id": store_id.to_hex(), "root": root.to_hex(),
             }}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert!(
@@ -5860,6 +5912,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{
                 "store_id": store_hex, "root": root_hex,
             }}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(resp["error"]["code"], json!(-32004), "unexpected: {resp}");
@@ -5875,6 +5928,7 @@ mod tests {
         let empty = handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getManifest","params":{}}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(empty["error"]["code"], json!(-32602), "{empty}");
@@ -5884,6 +5938,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":2,"method":"dig.getManifest","params":{
                 "store_id": Bytes32([1u8; 32]).to_hex(), "root": "not-hex",
             }}),
+            crate::download::ReadOrigin::Local,
         )
         .await;
         assert_eq!(bad_root["error"]["code"], json!(-32602), "{bad_root}");
@@ -6327,6 +6382,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         // Not held locally, but a provider exists → a REDIRECT (never a silent miss/upstream error).
         assert_eq!(
@@ -6365,6 +6421,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         // No provider anywhere → NOT a redirect. The engine yields None and the request falls through
         // to the upstream proxy, which (unroutable in tests) returns a -32000 upstream error, never a
@@ -6400,6 +6457,7 @@ mod tests {
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
                 "redirect_depth": REDIRECT_HOP_CAP,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_ne!(
             resp["error"]["code"],
@@ -6431,6 +6489,7 @@ mod tests {
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
                 "length": 4096, "offset": 0,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(
             resp["error"]["code"],
@@ -6487,6 +6546,7 @@ mod tests {
                 "store_id": store_hex, "root": tip_hex, "retrieval_key": rk_hex,
                 "length": 4096, "offset": 0,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         // A fetched-through frame is served (NOT a redirect, NOT a miss): the first frame carries the
         // reassembled bytes + verification metadata.
@@ -6787,6 +6847,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(
             resp["error"]["code"],
@@ -6832,6 +6893,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_ne!(
             resp["error"]["code"],
@@ -6867,6 +6929,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(resp["result"]["source"], json!("local"), "{resp}");
     }
@@ -6901,6 +6964,7 @@ mod tests {
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(resp["result"]["source"], json!("local"), "{resp}");
     }
@@ -6937,6 +7001,7 @@ mod tests {
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
                 "redirect_depth": REDIRECT_HOP_CAP,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_ne!(
             resp["error"]["code"],
@@ -6974,6 +7039,7 @@ mod tests {
                 "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk_hex,
                 "length": 4096, "offset": 0,
             }}),
+            crate::download::ReadOrigin::Local,
         ));
         assert_eq!(
             resp["error"]["code"],

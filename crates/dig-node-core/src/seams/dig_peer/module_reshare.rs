@@ -53,23 +53,53 @@ use digstore_core::Bytes32;
 
 use super::module_anchor::{sha256, ChainAnchoredModuleVerifier};
 
-/// The set of `(store, root)` generations a warm pull is currently in flight for.
+/// The default cap on DISTINCT generations [`WarmRegistry`] admits at once.
+///
+/// The per-generation dedup below stops a burst of reads across ONE capsule from starting N concurrent
+/// pulls of it, but says nothing about breadth: reads across K DISTINCT capsules start K concurrent
+/// pulls, each able to assemble up to a whole `.dig` module in memory/disk at once (#1615/G3). This cap
+/// bounds that — reachable from ordinary read breadth, no attacker required.
+const DEFAULT_MAX_CONCURRENT_WARMS: usize = 4;
+
+/// The set of `(store, root)` generations a warm pull is currently in flight for, bounded to at most
+/// [`Self::max_concurrent`] distinct generations at once.
 ///
 /// A capsule read typically fetches several resources in quick succession, each of which would
 /// otherwise trigger its own whole-module pull of the SAME module — N concurrent pulls of one capsule,
-/// racing each other into the same staging file. This registry makes the warm idempotent while it runs.
-#[derive(Debug, Default)]
+/// racing each other into the same staging file. This registry makes the warm idempotent while it runs,
+/// AND caps how many DIFFERENT generations may warm concurrently.
+#[derive(Debug)]
 pub struct WarmRegistry {
     in_flight: Mutex<HashSet<String>>,
+    max_concurrent: usize,
+}
+
+impl Default for WarmRegistry {
+    fn default() -> Self {
+        WarmRegistry::with_limit(DEFAULT_MAX_CONCURRENT_WARMS)
+    }
 }
 
 impl WarmRegistry {
-    /// An empty registry.
+    /// An empty registry, capped at [`DEFAULT_MAX_CONCURRENT_WARMS`] concurrent generations.
     pub fn new() -> Self {
         WarmRegistry::default()
     }
 
-    /// Claim `key` for a warm pull, or `None` if one is already in flight for it.
+    /// An empty registry capped at `max_concurrent` distinct generations warming at once.
+    pub fn with_limit(max_concurrent: usize) -> Self {
+        WarmRegistry {
+            in_flight: Mutex::new(HashSet::new()),
+            max_concurrent,
+        }
+    }
+
+    /// Claim `key` for a warm pull.
+    ///
+    /// Refuses (`None`) in two cases: a warm for `key` is already in flight, or the registry is already
+    /// at its concurrency cap for OTHER generations. The cap SKIPS rather than queues — a warm is a
+    /// best-effort background nicety, and queueing it would only defer holding the same memory a bit
+    /// later; the next read of that capsule will simply try again.
     ///
     /// The claim is released when the returned guard drops — including on panic, so a panicking pull
     /// cannot permanently block a generation from ever being warmed again.
@@ -78,9 +108,18 @@ impl WarmRegistry {
             .in_flight
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !guard.insert(key.clone()) {
+        if guard.contains(&key) {
             return None;
         }
+        if guard.len() >= self.max_concurrent {
+            tracing::debug!(
+                generation = %key,
+                max_concurrent = self.max_concurrent,
+                "capsule warm skipped: at the concurrent-warm cap"
+            );
+            return None;
+        }
+        guard.insert(key.clone());
         Some(WarmClaim {
             registry: Arc::clone(self),
             key,
@@ -142,8 +181,13 @@ pub enum WarmOutcome {
     },
     /// The node did NOT become a holder. See [`WarmFailure`].
     Refused(WarmFailure),
-    /// A warm for this generation was already in flight; this call did nothing.
+    /// A warm for this generation was already in flight, OR the registry was already at its
+    /// concurrent-warm cap for other generations (see [`WarmRegistry`]) — either way, this call did
+    /// nothing and started no pull.
     AlreadyWarming,
+    /// This node already holds the capsule (the cache path exists) — nothing to pull, nothing to
+    /// announce again.
+    AlreadyHeld,
 }
 
 /// Where a capsule warm stages + promotes to, and how it announces.
@@ -290,6 +334,13 @@ impl CapsuleWarmer {
     /// Callers on the read path use [`spawn_capsule_warm`] instead; this is the awaitable core so the
     /// behaviour is testable without a background task.
     pub async fn warm(self: &Arc<Self>, store_hex: &str, root_hex: &str) -> WarmOutcome {
+        // Already a holder → nothing to pull, nothing to announce again. Checked BEFORE claiming a
+        // registry slot: a burst of reads across an already-cached capsule should cost one stat call
+        // each, never a wasted concurrency slot another generation could have used.
+        if self.paths.cached_module(store_hex, root_hex).exists() {
+            return WarmOutcome::AlreadyHeld;
+        }
+
         let key = format!("{store_hex}:{root_hex}");
         let Some(_claim) = self.registry.claim(key.clone()) else {
             return WarmOutcome::AlreadyWarming;
@@ -654,6 +705,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **Proves:** a warm that actually SUCCEEDS returns `Held`, announces exactly once, leaves the
+    /// verified bytes at the CACHE path (byte-identical), and discards the staging artifact.
+    ///
+    /// **Catches:** every other test in this module exercises a REFUSAL — `PullFailed`,
+    /// `NoChainAnchor` (twice), a bad id. None of them can tell the difference between "the wiring
+    /// correctly refused" and "the wiring is broken and can only ever refuse" — a `warm()` that always
+    /// returned `Refused` would pass all four and ship green. This is the one test that proves the
+    /// success path exists at all: `WarmOutcome::Held` is asserted here for the first and only time.
+    #[tokio::test]
+    async fn a_successful_pull_is_held_cached_and_announced_once() {
+        let dir = temp_dir("happy-path");
+        let (store_hex, root_hex) = (hex32(STORE), hex32(CHAIN_ROOT));
+        let module = module_committing(STORE, CHAIN_ROOT);
+
+        // One real holder, served through dig-download's own mock transport — the SAME production
+        // `ModuleDownloader`/`FileSink` path the refusal tests exercise, just with a source that
+        // actually answers.
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        let locator = Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+            dig_download::testkit::mock_providers(1, &content),
+        ));
+        let transport = Arc::new(dig_download::testkit::MockModuleTransport::serving(
+            &store_hex,
+            &root_hex,
+            module.clone(),
+            8,
+        ));
+
+        let spy = Arc::new(AnnounceSpy::default());
+        let warmer = CapsuleWarmer::new(
+            locator,
+            transport,
+            // In-memory, not `FileStateStore`: the resume-checkpoint backing store is orthogonal to
+            // what this test proves (staged->cache promotion + announce-once), and `FileStateStore`'s
+            // hex-doubled `module:<64hex>:<64hex>` key exceeds Windows' ~255-char filename limit
+            // (verified via a scratch reproduction: `ERROR_INVALID_NAME`, os error 123) — a real sharp
+            // edge in the upstream crate worth its own ticket, not something this test should trip over.
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::clone(&spy) as Arc<dyn AnnounceHolder>,
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+        );
+
+        let outcome = warmer.warm(&store_hex, &root_hex).await;
+
+        assert_eq!(
+            outcome,
+            WarmOutcome::Held {
+                bytes: module.len() as u64
+            },
+            "a genuinely successful pull must report Held with the verified length"
+        );
+        assert_eq!(
+            spy.calls.load(Ordering::SeqCst),
+            1,
+            "exactly one announce fires for a successful warm"
+        );
+
+        let cached_path = dir
+            .join("cache")
+            .join("modules")
+            .join(&store_hex)
+            .join(format!("{root_hex}.module"));
+        assert_eq!(
+            std::fs::read(&cached_path).expect("module is at the cache path"),
+            module,
+            "the cached artifact is byte-identical to the verified module"
+        );
+
+        let staged_path = dir
+            .join("staging")
+            .join("modules")
+            .join(format!("{store_hex}-{root_hex}.dig"));
+        assert!(
+            !staged_path.exists(),
+            "staging is discarded once the module has been promoted into the cache"
+        );
+        assert!(
+            !dig_download::staging_path_for(&staged_path).exists(),
+            "the download's own .tmp staging file is discarded too"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **Proves:** with no chain anchor the pull never STARTS — the node does not even attempt to fetch
     /// a generation it could not verify, and announces nothing.
     /// **Catches:** pulling first and hoping to verify later, which is how a peer-supplied root ends up
@@ -725,5 +867,34 @@ mod tests {
             registry.claim("s:r".into()).is_some(),
             "the generation is warmable again once the claim is released"
         );
+    }
+
+    /// **Proves:** breadth across DISTINCT generations is capped — the (N+1)th distinct generation is
+    /// SKIPPED, not queued, once `max_concurrent` are already in flight; a slot freed by a finished warm
+    /// makes the registry warmable again.
+    /// **Catches:** K distinct capsule reads starting K concurrent whole-module pulls with no bound
+    /// (#1615/G3) — reachable from ordinary read breadth, no attacker required.
+    #[test]
+    fn distinct_generations_are_capped_and_skip_rather_than_queue() {
+        let registry = Arc::new(WarmRegistry::with_limit(2));
+
+        let first = registry.claim("s:1".into()).expect("first of two admitted");
+        let second = registry
+            .claim("s:2".into())
+            .expect("second of two admitted");
+        assert!(
+            registry.claim("s:3".into()).is_none(),
+            "a third DISTINCT generation is skipped once the cap is reached"
+        );
+        // Skipped means gone, not waiting: releasing a slot does not retroactively grant the skipped
+        // claim — the caller must ask again (which the read path naturally does on its next read).
+        assert!(!registry.is_warming("s:3"));
+
+        drop(first);
+        assert!(
+            registry.claim("s:3".into()).is_some(),
+            "a freed slot admits a fresh claim"
+        );
+        drop(second);
     }
 }
