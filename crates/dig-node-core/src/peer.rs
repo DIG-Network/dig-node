@@ -115,6 +115,16 @@ pub fn dht_addr_from_gossip_addr(gossip: std::net::SocketAddr) -> std::net::Sock
 
 /// Per-window ciphertext cap for a `dig.fetchRange` frame (bytes) — the node window (3 MiB), the same
 /// cap the HTTP read path (`WINDOW`) uses.
+///
+/// KNOWN CONSTRAINT (dig_ecosystem#1640): this is chosen without reference to `dig-nat`'s wire framing
+/// cap (`MAX_FRAMED_BODY`, 64 KiB) — a 3 MiB frame plus #1577's per-frame verification metadata
+/// (`root`, the whole `chunk_lens` array, `total_length`, a base64 `inclusion_proof`) cannot actually
+/// be base64-encoded and framed within that limit, so a real peer-to-peer window this large fails to
+/// decode on arrival. The reshare leg's whole-module pull (`seams/dig_peer/module_serve.rs`) rides the
+/// SAME constant and inherits the same defect for any module above a few tens of KB. The fix belongs
+/// at `dig-nat` (publish the real payload ceiling; every framer targets it) — this constant is a
+/// single source of truth for the per-frame split, so lowering it here (once the true ceiling is
+/// known) requires touching only this line, not the streaming loops that consume it.
 pub const RANGE_WINDOW: usize = 3 * 1024 * 1024;
 
 /// Maximum concurrent accepted mTLS peer CONNECTIONS the listener will serve at once (audit #179

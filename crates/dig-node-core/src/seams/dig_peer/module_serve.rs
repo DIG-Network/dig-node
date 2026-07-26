@@ -24,12 +24,13 @@
 //! them against the chain anchor, so this side's only job is to answer accurately about content it
 //! actually holds — and to say so plainly when it does not.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use dig_rpc_protocol::types::ModuleInfo;
+use lru::LruCache;
 use serde_json::{json, Value};
 
 use super::module_anchor::sha256;
@@ -77,16 +78,30 @@ struct CachedDescriptor {
     info: ModuleInfo,
 }
 
-/// The process-wide descriptor memo, keyed by `(store_hex, root_hex)`.
+/// The descriptor memo's entry cap.
+///
+/// Each entry is tens of KB (up to [`MAX_DESCRIPTOR_CHUNKS`] `chunk_hashes` + `chunk_lens`), and every
+/// entry is created by a peer-driven `dig.getModuleInfo` — an UNBOUNDED memo would let a long-running
+/// node accumulate one entry per module it has EVER described, including modules since evicted from
+/// the actual capsule cache and no longer servable at all. 512 entries bounds the memo to tens of MB
+/// however many distinct capsules a peer has ever asked about.
+const DESCRIPTOR_MEMO_CAP: usize = 512;
+
+/// The process-wide descriptor memo, keyed by `(store_hex, root_hex)`, evicting least-recently-used
+/// once [`DESCRIPTOR_MEMO_CAP`] is reached.
 ///
 /// A `dig.getModuleInfo` costs a full-file read PLUS a SHA-256 of every chunk (#1615/G2) — real work a
 /// ~100-byte peer request can trigger on every call. The module a descriptor describes changes only when
 /// this node re-warms it (a brand-new file, written via write-then-rename — never edited in place), so
 /// `(len, mtime)` is a safe fingerprint: a cache hit means the file is provably the one the memo was
 /// built from, and any change invalidates it automatically.
-fn descriptor_memo() -> &'static Mutex<HashMap<(String, String), CachedDescriptor>> {
-    static MEMO: OnceLock<Mutex<HashMap<(String, String), CachedDescriptor>>> = OnceLock::new();
-    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+fn descriptor_memo() -> &'static Mutex<LruCache<(String, String), CachedDescriptor>> {
+    static MEMO: OnceLock<Mutex<LruCache<(String, String), CachedDescriptor>>> = OnceLock::new();
+    MEMO.get_or_init(|| {
+        Mutex::new(LruCache::new(
+            NonZeroUsize::new(DESCRIPTOR_MEMO_CAP).expect("512 is nonzero"),
+        ))
+    })
 }
 
 /// Build the [`ModuleInfo`] descriptor for a locally-held capsule, or `None` if this node does not hold
@@ -114,6 +129,8 @@ pub fn describe_module(cache_dir: &Path, store_hex: &str, root_hex: &str) -> Opt
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(&key)
     {
+        // `get` (not `peek`) bumps this entry to most-recently-used, so a capsule still being asked
+        // about survives the cap even as new ones are described.
         if cached.len == len && cached.modified == modified {
             return Some(cached.info.clone());
         }
@@ -134,7 +151,7 @@ pub fn describe_module(cache_dir: &Path, store_hex: &str, root_hex: &str) -> Opt
     descriptor_memo()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(
+        .put(
             key,
             CachedDescriptor {
                 len,
@@ -470,7 +487,7 @@ mod tests {
             module_hash: "0".repeat(64),
             ..real.clone()
         };
-        descriptor_memo().lock().unwrap().insert(
+        descriptor_memo().lock().unwrap().put(
             (store.clone(), root.clone()),
             CachedDescriptor {
                 len: metadata.len(),
@@ -483,6 +500,53 @@ mod tests {
         assert_eq!(
             second.module_hash, sentinel.module_hash,
             "the unchanged file's second describe_module call is answered from the memo"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Proves:** the descriptor memo is BOUNDED — describing more distinct modules than
+    /// `DESCRIPTOR_MEMO_CAP` evicts the earliest entries rather than growing without limit.
+    /// **Catches:** an unbounded memo (#1615/G2 follow-up), which would let a long-running node
+    /// accumulate one entry per module it has EVER described, including modules long since evicted
+    /// from the actual capsule cache and no longer servable at all.
+    ///
+    /// Asserts only the invariant that holds regardless of what OTHER tests concurrently insert into
+    /// this process-global memo: describing `DESCRIPTOR_MEMO_CAP + 1` never-touched-again modules
+    /// guarantees the FIRST one is evicted (nothing else in the process ever re-touches it to save
+    /// it), however many extra entries other tests happen to interleave in.
+    #[test]
+    fn the_descriptor_memo_is_capped_and_evicts_stale_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "dig-node-modserve-memocap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // DESCRIPTOR_MEMO_CAP + 1 distinct (store, root) keys, none shared with any other test in
+        // this file (those use small repeated-byte ids; these are sequential integers padded to
+        // 64-hex) — so this test's own fill is the only thing that can evict or preserve them.
+        let keys: Vec<(String, String)> = (0..=DESCRIPTOR_MEMO_CAP)
+            .map(|i| (format!("{i:064x}"), format!("{:064x}", i + 10_000_000)))
+            .collect();
+        for (store, root) in &keys {
+            let path = module_path(&dir, store, root);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            describe_module(&dir, store, root).expect("held");
+        }
+
+        let first = keys[0].clone();
+        assert!(
+            !descriptor_memo()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&first),
+            "the earliest-described module's memo entry must be evicted once the cap is exceeded"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

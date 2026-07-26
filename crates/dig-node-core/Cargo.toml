@@ -10,6 +10,12 @@ name = "dig_node_core"
 path = "src/lib.rs"
 
 [dependencies]
+# Bounds the whole-module descriptor memo (`seams/dig_peer/module_serve.rs`, #1615/G2): a per-process
+# cache of `dig.getModuleInfo` answers keyed by (store, root), capped so a long-running node cannot
+# accumulate one entry per module it has EVER described (each entry is tens of KB — up to 512
+# chunk_hashes + chunk_lens). Already a transitive dependency (pulled in via the workspace's other
+# crates); promoted to a direct one now that this crate uses it itself.
+lru = "0.12"
 # The `.dig` STORE-FORMAT LIBRARY crates. These live in the digstore repo (the store
 # CLI + format/read libraries) and are consumed here as GIT dependencies: the node
 # depends on the store libs, NEVER the reverse (digstore is only ever an RPC client of

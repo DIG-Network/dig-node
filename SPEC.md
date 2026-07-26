@@ -2984,6 +2984,15 @@ for the WHOLE resource's verification-metadata-laden frames out. The client-side
 for the holder's own bound — re-introducing a client-side REJECTION of an over-long frame is the #836
 class of defect (a false negative that makes an honest holder look like a liar) and MUST NOT return.
 
+**KNOWN CONSTRAINT (dig_ecosystem#1640): the per-frame window ([`crate::peer::RANGE_WINDOW`], 3 MiB)
+exceeds `dig-nat`'s wire framing cap (`MAX_FRAMED_BODY`, 64 KiB) once base64 encoding and #1577's
+per-frame verification metadata are counted.** A real peer-to-peer `dig.fetchRange`/reshare window
+this large cannot actually be decoded on arrival over the real wire — the wiring in this spec is
+correct and the bound above holds regardless of window size, but the reshare leg's "a reader becomes a
+discoverable holder" flywheel is NOT demonstrable end to end at realistic capsule sizes until the
+framing ceiling is published by `dig-nat` and this node's per-frame split is brought under it
+(release-first, cross-repo — tracked at #1640, not fixed in this pass).
+
 A serve MUST NOT emit a per-CHUNK inclusion proof (`range_proof`). No such proof is derivable from the
 store format: the generation root's merkle leaves are per-RESOURCE (`resource_leaf(ciphertext)` =
 SHA-256 of a resource's WHOLE ciphertext, folded by `MerkleTree::from_leaves`), so a single chunk has no

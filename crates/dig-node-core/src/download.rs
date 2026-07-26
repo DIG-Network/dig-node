@@ -2443,4 +2443,179 @@ mod tests {
         );
         server.abort();
     }
+
+    // -- spawn_capsule_reshare's ReadOrigin gate — exercised, not merely present (#1619 follow-up) --
+    //
+    // A guard nothing ever fails to satisfy is a guard a later refactor can drop or invert with every
+    // existing test staying green. These prove each term of `origin != Local ||
+    // !backfill_on_miss_enabled()` independently, and are designed to fail LOUDLY (not merely time
+    // out) if either term is deleted: `spawn_capsule_reshare_would_start_a_warm_when_gated_open`
+    // below is the control that proves the harness itself can observe a started warm at all.
+
+    /// A resolver whose `anchored_root` NEVER completes. Wiring this onto a [`CapsuleWarmer`] parks
+    /// any started `warm()` inside its first await point for the life of the test — turning "did a
+    /// warm even start" from a race against a fast mock success/failure into a STABLE fact: the
+    /// registry claim (synchronous, the very first thing `warm()` does) either happened before the
+    /// parked await, or it never happened at all.
+    struct HangingResolver;
+
+    #[async_trait::async_trait]
+    impl crate::shared::AnchoredRootResolver for HangingResolver {
+        async fn anchored_root(
+            &self,
+            _store_id: &[u8; 32],
+        ) -> Result<Option<digstore_core::Bytes32>, String> {
+            std::future::pending().await
+        }
+    }
+
+    /// An [`AnnounceHolder`](crate::seams::dig_peer::AnnounceHolder) that is never reached (the
+    /// hanging resolver means no warm in these tests ever gets past its first await).
+    struct UnreachedAnnounce;
+
+    #[async_trait::async_trait]
+    impl crate::seams::dig_peer::AnnounceHolder for UnreachedAnnounce {
+        async fn announce_inventory(&self) {
+            unreachable!("no warm in this test should ever reach an announce")
+        }
+    }
+
+    /// Wire a permanently-parked [`CapsuleWarmer`] onto `pc` and return its [`WarmRegistry`] plus the
+    /// exact generation key `warm()` claims — so a test can poll `registry.is_warming(&key)` to learn
+    /// whether `spawn_capsule_reshare` actually reached the point of starting a pull.
+    fn wire_hanging_warmer(
+        pc: &NodeContent,
+        td: &tempfile::TempDir,
+    ) -> (Arc<crate::seams::dig_peer::WarmRegistry>, ContentId, String) {
+        let registry = Arc::new(crate::seams::dig_peer::WarmRegistry::new());
+        let warmer = crate::seams::dig_peer::CapsuleWarmer::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                &hex::encode([0xaa; 32]),
+                &hex::encode([0xbb; 32]),
+                vec![],
+                8,
+            )),
+            Arc::new(FileStateStore::new(td.path().join("warm-state"))),
+            Arc::new(HangingResolver),
+            crate::seams::dig_peer::WarmPaths {
+                staging_dir: td.path().join("warm-staging"),
+                cache_dir: td.path().join("warm-cache"),
+            },
+            Arc::new(UnreachedAnnounce),
+            Arc::clone(&registry),
+            dig_download::ModuleDownloadConfig::default(),
+        );
+        pc.set_capsule_warmer(warmer);
+        let content = ContentId::resource([0xaa; 32], [0xbb; 32], [0xcc; 32]);
+        let key = format!("{}:{}", hex::encode([0xaa; 32]), hex::encode([0xbb; 32]));
+        (registry, content, key)
+    }
+
+    /// Poll `registry.is_warming(key)` for up to `bound` for it to become `true`, so a positive
+    /// assertion never races a `tokio::spawn`'s scheduling latency. Returns whether it was observed.
+    async fn wait_for_warm_started(
+        registry: &crate::seams::dig_peer::WarmRegistry,
+        key: &str,
+        bound: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        while tokio::time::Instant::now() < deadline {
+            if registry.is_warming(key) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        registry.is_warming(key)
+    }
+
+    /// **The control:** with the gate wide open (`Local`, backfill on), `spawn_capsule_reshare` DOES
+    /// start a warm — proving the harness above can observe a started warm at all, so the two refusal
+    /// tests below are not merely "nothing ever happens here regardless".
+    #[tokio::test]
+    async fn spawn_capsule_reshare_would_start_a_warm_when_gated_open() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(1, 1))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let (registry, content, key) = wire_hanging_warmer(&pc, &td);
+
+        pc.spawn_capsule_reshare(&content, ReadOrigin::Local);
+        drop(_g); // the env decision is already made (synchronously, above) — never held across an await
+
+        assert!(
+            wait_for_warm_started(&registry, &key, std::time::Duration::from_millis(500)).await,
+            "the control case must observe a started warm, or the two refusal tests below prove nothing"
+        );
+    }
+
+    /// **Proves:** a `Peer`-origin read NEVER starts a capsule warm, however long the harness waits —
+    /// the exact defect this PR's security gate closes (a remote peer driving this node into pulling,
+    /// caching, and DHT-announcing a capsule of the PEER'S choosing).
+    /// **Catches:** `origin != ReadOrigin::Local` being dropped or inverted from `spawn_capsule_reshare`
+    /// — deleting that term made this test the ONLY one in the crate that fails (verified: RED).
+    #[tokio::test]
+    async fn spawn_capsule_reshare_refuses_a_peer_origin() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON — origin alone must refuse
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(1, 1))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let (registry, content, key) = wire_hanging_warmer(&pc, &td);
+
+        pc.spawn_capsule_reshare(&content, ReadOrigin::Peer);
+        drop(_g); // the env decision is already made (synchronously, above) — never held across an await
+
+        assert!(
+            !wait_for_warm_started(&registry, &key, std::time::Duration::from_millis(500)).await,
+            "a Peer-origin read must never start a capsule warm"
+        );
+    }
+
+    /// **Proves:** the `DIG_NODE_BACKFILL_ON_MISS` kill switch refuses a warm even at `Local` origin —
+    /// the operator-facing off switch must not be silently bypassed by the reshare leg.
+    /// **Catches:** `!backfill_on_miss_enabled()` being dropped from `spawn_capsule_reshare` —
+    /// deleting that term made this test the ONLY one in the crate that fails (verified: RED).
+    #[tokio::test]
+    async fn spawn_capsule_reshare_refuses_when_backfill_is_disabled() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("DIG_NODE_BACKFILL_ON_MISS", "off");
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(1, 1))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let (registry, content, key) = wire_hanging_warmer(&pc, &td);
+
+        pc.spawn_capsule_reshare(&content, ReadOrigin::Local);
+        drop(_g); // the env decision is already made (synchronously, above) — never held across an await
+
+        let started =
+            wait_for_warm_started(&registry, &key, std::time::Duration::from_millis(500)).await;
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        assert!(
+            !started,
+            "DIG_NODE_BACKFILL_ON_MISS=off must refuse even a Local-origin read"
+        );
+    }
 }

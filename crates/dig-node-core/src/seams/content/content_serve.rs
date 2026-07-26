@@ -429,7 +429,11 @@ impl ContentServer for Node {
                 .await
             {
                 // A peer served the resource; warm the whole capsule locally for next time (#290).
-                self.maybe_backfill_capsule(store_hex, &root_hex);
+                self.maybe_backfill_capsule(
+                    store_hex,
+                    &root_hex,
+                    crate::download::ReadOrigin::Local,
+                );
                 return with_serve_metadata(peer, owner_puzzle_hash, generation);
             }
         }
@@ -440,7 +444,11 @@ impl ContentServer for Node {
                 Ok((ciphertext, proof, chunk_lens)) => {
                     let trusted = pinned_root.unwrap_or(proof.root);
                     // Warm the whole capsule locally so the next read is local-first (#290).
-                    self.maybe_backfill_capsule(store_hex, &root_hex);
+                    self.maybe_backfill_capsule(
+                        store_hex,
+                        &root_hex,
+                        crate::download::ReadOrigin::Local,
+                    );
                     return match verify_and_decrypt(
                         &store_id,
                         effective_key,
@@ -498,7 +506,11 @@ impl ContentServer for Node {
                     };
                 }
                 Err(ProxyMiss::NotFound) => {
-                    self.maybe_backfill_capsule(store_hex, &root_hex);
+                    self.maybe_backfill_capsule(
+                        store_hex,
+                        &root_hex,
+                        crate::download::ReadOrigin::Local,
+                    );
                     return PlaintextOutcome::NotFound {
                         root_hex: root_hex.clone(),
                     };

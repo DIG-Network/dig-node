@@ -265,7 +265,9 @@ impl RpcDispatch for Node {
                                 {
                                     // Served from another node — background-backfill the whole capsule so the
                                     // next read is local (SPEC §14.3). Deduped + detached; no delay here.
-                                    node.maybe_backfill_capsule(store_hex, root_hex);
+                                    // `origin` is the SAME gate the reshare leg uses: a peer-origin
+                                    // miss must never trigger this pull (#1619 follow-up).
+                                    node.maybe_backfill_capsule(store_hex, root_hex, origin);
                                     return envelope;
                                 }
                             }
@@ -714,7 +716,9 @@ impl RpcDispatch for Node {
                 // background, ALSO pull the whole `.dig` capsule for this generation so the NEXT read of
                 // the store is served locally (SPEC §14.3, `DIG_NODE_BACKFILL_ON_MISS`, default on). This
                 // does not delay the current response — it spawns a deduped detached pull and returns.
-                node.maybe_backfill_capsule(store_hex, &root_hex);
+                // `origin` is the SAME gate the reshare leg uses: a peer-origin miss must never
+                // trigger this pull (#1619 follow-up).
+                node.maybe_backfill_capsule(store_hex, &root_hex, origin);
                 return envelope;
             }
         }

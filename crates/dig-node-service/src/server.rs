@@ -8,6 +8,7 @@
 //! it byte-for-byte, with the bonus that resources are served local-first from any
 //! `.dig` modules the node has cached.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,7 +16,7 @@ use axum::{
     body::{Body, Bytes},
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Request, State,
+        ConnectInfo, Path, Request, State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
@@ -624,9 +625,22 @@ async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
 /// reference server and the surface clients expect from an rpc.dig.net endpoint.
 async fn rpc(
     State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
+    // ReadOrigin is a SECURITY LABEL (#1619 follow-up): it must come from the ACCEPTING
+    // CONNECTION'S REAL remote address, never from "this is the loopback server" alone — an
+    // explicit `DIG_NODE_HOST` override can replace the loopback dual-bind with a non-loopback
+    // address (`Config::bind_addr`), and the Host-header allowlist below is a DNS-rebinding
+    // defense, not an origin one (a remote client can still send `Host: localhost`). A operator
+    // who deliberately binds non-loopback gets a CORRECT `Peer` label, not a silently-forged
+    // `Local` one.
+    let origin = if peer_addr.ip().is_loopback() {
+        dig_node_core::download::ReadOrigin::Local
+    } else {
+        dig_node_core::download::ReadOrigin::Peer
+    };
     if !req.is_object() {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         return (
@@ -771,16 +785,9 @@ async fn rpc(
     // envelope — but guard the dispatch anyway so a future change can't take the
     // server down on one bad request.
     let node = state.node.clone();
-    // The loopback HTTP JSON-RPC endpoint — this node's own operator/agent, always Local.
-    let resp = match tokio::task::spawn(async move {
-        handle_rpc(
-            &node,
-            normalized,
-            dig_node_core::download::ReadOrigin::Local,
-        )
+    // `origin` was derived above from the ACCEPTING CONNECTION'S remote address, not assumed.
+    let resp = match tokio::task::spawn(async move { handle_rpc(&node, normalized, origin).await })
         .await
-    })
-    .await
     {
         Ok(v) => v,
         Err(e) => rpc_error(
@@ -1545,19 +1552,32 @@ where
     // keeps serving. Runs as spawned tasks driven to graceful stop by the shared shutdown signal.
     bring_up_local_https(&config, &app, &shutdown_notify);
 
+    // `into_make_service_with_connect_info::<SocketAddr>()` — NOT the plain `app` — is what makes
+    // `ConnectInfo<SocketAddr>` extractable in `rpc()` at all: a bare `axum::serve(listener, router)`
+    // never populates it (`Router<()>`'s `Service<IncomingStream>` impl ignores the incoming stream's
+    // address entirely), so without this every request would fail that extraction. This is the
+    // ONLY thing that makes the `ReadOrigin` label in `rpc()` a REAL fact about the accepting
+    // connection rather than an assumption baked in at the call site (#1619 follow-up).
     let localhost_srv = {
-        let app = app.clone();
+        let app = app
+            .clone()
+            .into_make_service_with_connect_info::<SocketAddr>();
         let n = shutdown_notify.clone();
         axum::serve(localhost, app).with_graceful_shutdown(async move { n.notified().await })
     };
 
     let ipv6_srv = ipv6.map(|(_, l)| {
-        let app = app.clone();
+        let app = app
+            .clone()
+            .into_make_service_with_connect_info::<SocketAddr>();
         let n = shutdown_notify.clone();
         axum::serve(l, app).with_graceful_shutdown(async move { n.notified().await })
     });
 
     let dig_local_srv = dig_local.map(|(_, l)| {
+        let app = app
+            .clone()
+            .into_make_service_with_connect_info::<SocketAddr>();
         let n = shutdown_notify.clone();
         axum::serve(l, app).with_graceful_shutdown(async move { n.notified().await })
     });
@@ -1711,7 +1731,7 @@ pub async fn serve_https(
     }
     axum_server::from_tcp_rustls(listener, rustls_config)
         .handle(handle)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await
 }
 

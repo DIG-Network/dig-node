@@ -670,3 +670,41 @@ So the protection needs a test that reads the manifest: `testkit` must appear on
 `[dev-dependencies]`, never on the production edge (dev-dependency features do not propagate to
 consumers, so the binaries never see it). A guarantee enforced by build configuration needs an assertion
 at the build-configuration level; a unit test cannot reach it.
+
+## `complete: false` means "the RESOURCE continues", not "the STREAM isn't done" (#1619)
+
+`dig.fetchRange`'s per-frame `complete` flag reports whether the assembled window has reached the
+RESOURCE's end. It says nothing about whether the caller's REQUESTED SPAN (`offset..offset+length`) has
+been satisfied — those are two different bounds, and `stream_range`/`stream_fetched_range` conflated
+them: the streaming loop kept re-requesting more frames until `complete` (or an empty frame), ignoring
+`length` entirely past the first call. dig-download sends `{offset:0, length:1}` as a routine
+metadata-probe on EVERY download (`establish_commitment`), so this silently turned a ~100-byte probe
+into the ENTIRE resource streamed over the wire — real production traffic amplification, not a
+theoretical edge case, and it shipped for as long as no test's fixture happened to exceed one node
+window (dig-node's own #836/#1592 e2e proofs passed only because those fixtures were 20477 and 27067
+bytes, both under the per-frame cap — the corrected record is in dig_ecosystem#836).
+
+**The fix is a SEPARATE bound, not a replacement one:** stop the loop when EITHER `complete` (resource
+exhausted) OR the requested span is satisfied (`off + this_len >= offset + length`) — and request only
+the REMAINING span each iteration, never the original `length` again. A reimplementer who reads
+`complete` as "the stream may stop now" will get exactly this bug; the two concepts need distinct names
+in any port of this logic.
+
+**Test-design corollary:** a "streams N frames" test whose frame count comes from a small `length` on a
+small fixture cannot tell this bug apart from correct bounded behaviour once `length` genuinely spans
+multiple node windows — the fixture has to actually EXCEED one window ([`crate::peer::RANGE_WINDOW`], 3
+MiB) for a multi-frame assertion to mean anything.
+
+## N refusal tests + zero success tests cannot tell "correctly refuses" from "can only refuse" (#1576)
+
+`CapsuleWarmer::warm()` shipped with four tests, all four asserting a REFUSAL (`PullFailed`,
+`NoChainAnchor` ×2, a bad id) — `WarmOutcome::Held` appeared only at its construction site, never in an
+assertion. A wiring slip that made `warm()` ALWAYS refuse (e.g. a broken staged→cache path, a dropped
+`Ok` arm) would have shipped green: every existing test passes whether the code can succeed or not.
+
+The general shape: a function with several distinct outcomes needs at least ONE test per REACHABLE
+outcome, not just per REFUSAL reason — proving the happy path exists is a different assertion than
+proving every failure mode is handled, and a suite that only does the latter looks complete while
+leaving the former provably untested. When adding a test for a success path that was missing, confirm it
+is non-vacuous by breaking the success arm (return the refusal unconditionally, or point the promotion at
+the wrong path) and watching the new test — and ONLY the new test — go red.

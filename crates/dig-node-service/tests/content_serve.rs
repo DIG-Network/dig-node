@@ -122,7 +122,10 @@ async fn start_server(upstream: &str) -> (SocketAddr, PathBuf, EnvHold) {
         ..dig_node_service::Config::default()
     };
     let state = dig_node_service::server::build_state(&config).await;
-    let app = dig_node_service::server::router(state);
+    // `into_make_service_with_connect_info` — not the plain `app` — is what makes
+    // `ConnectInfo<SocketAddr>` extractable in the real `rpc()` handler (#1619 follow-up).
+    let app =
+        dig_node_service::server::router(state).into_make_service_with_connect_info::<SocketAddr>();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {

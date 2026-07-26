@@ -2248,6 +2248,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hex",
+ "lru",
  "reqwest",
  "ring",
  "rustls",

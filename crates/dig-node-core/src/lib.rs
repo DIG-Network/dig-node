@@ -2410,6 +2410,13 @@ impl Node {
 pub(crate) mod test_support {
     use super::*;
 
+    /// Serializes every test in the crate (any module, not just [`crate::tests`]) that mutates
+    /// PROCESS-GLOBAL env (`DIG_NODE_CACHE`, `DIG_NODE_ON_MISS`, `DIG_NODE_BACKFILL_ON_MISS`, …),
+    /// since cargo runs tests in parallel threads of one process and the env is process-wide.
+    /// Acquire with `.unwrap_or_else(|p| p.into_inner())` so one test's failure (which poisons the
+    /// mutex) does not cascade into spurious failures of every other env-touching test.
+    pub(crate) static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A minimal in-memory [`Node`] over a fresh temp cache dir, with an unroutable upstream
     /// and the production anchored-root resolver (peer-surface tests never reach the chain).
     /// Returned with its [`tempfile::TempDir`] so the cache dir outlives the node. Used to
@@ -3024,7 +3031,7 @@ mod tests {
         let store_hex = "ab".repeat(32);
         let root_hex = "cd".repeat(32);
         // No p2p_content and no self_ref installed (FFI path) → must be an immediate no-op.
-        node.maybe_backfill_capsule(&store_hex, &root_hex);
+        node.maybe_backfill_capsule(&store_hex, &root_hex, crate::download::ReadOrigin::Local);
         // Nothing pulled, nothing left in-flight.
         assert!(!module_exists(&node.cache_dir, &store_hex, &root_hex));
         assert!(
@@ -3047,7 +3054,7 @@ mod tests {
         let store_hex = "ab".repeat(32);
         let root_hex = "cd".repeat(32);
         seed_module(&node, &store_hex, &root_hex, b"already-here");
-        node.maybe_backfill_capsule(&store_hex, &root_hex);
+        node.maybe_backfill_capsule(&store_hex, &root_hex, crate::download::ReadOrigin::Local);
         assert!(
             node.backfilling
                 .lock()
@@ -4167,11 +4174,9 @@ mod tests {
     // Tests that drive the PROCESS-GLOBAL `cache_dir()` (via the `DIG_NODE_CACHE`
     // env) must not run concurrently with each other or with
     // `cache_rpc_config_roundtrip_and_clear`, since cargo runs tests in parallel
-    // threads of one process. `ENV_GUARD` serializes them. Acquire it with
-    // `.unwrap_or_else(|p| p.into_inner())` so that ONE test's failure (which
-    // poisons the mutex) does not cascade into spurious failures of every other
-    // env-touching test — each failure should stand on its own.
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // threads of one process. `ENV_GUARD` (now crate-shared, `test_support::ENV_GUARD`, so
+    // `download`'s env-touching tests serialize against these too) handles that.
+    use test_support::ENV_GUARD;
 
     // Item 1 — Atomic content-addressed module writes.
 
@@ -6499,6 +6504,105 @@ mod tests {
         assert_eq!(
             resp["error"]["data"]["redirect"]["providers"][0]["peer_id"],
             json!(dig_download::testkit::mock_peer_hex(5))
+        );
+    }
+
+    /// **Proves:** a `Peer`-origin `dig.fetchRange` miss WITH A LIVE PROVIDER — the exact condition
+    /// that makes the miss envelope `Some` and reaches `maybe_backfill_capsule` at `dispatch.rs` —
+    /// spawns NO background backfill. This is the sibling call site the reshare leg's `origin` gate
+    /// had not yet reached: a remote peer must not be able to make this node pull, cache, and
+    /// DHT-announce a capsule of the peer's own choosing via the PRE-EXISTING backfill mechanism
+    /// either, not just via the new reshare leg.
+    /// **Catches:** `maybe_backfill_capsule`'s own origin check being dropped or inverted — verified
+    /// RED against `97914fab` by deleting that check (the only two failures in the crate were this
+    /// test and its `Local`-origin control below).
+    #[test]
+    fn a_peer_origin_fetch_range_miss_with_a_provider_spawns_no_backfill() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Peer,
+        ));
+        // The miss genuinely redirected — proving a live provider made the envelope `Some`, the exact
+        // precondition for `maybe_backfill_capsule` being called at all.
+        assert_eq!(
+            resp["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "the miss must genuinely redirect for this test to mean anything: {resp}"
+        );
+
+        let key = format!("{}:{}", store.to_hex(), tip.to_hex());
+        assert!(
+            !node
+                .backfilling
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&key),
+            "a Peer-origin miss must never spawn a background backfill"
+        );
+    }
+
+    /// **The control:** the identical miss at `Local` origin DOES spawn a backfill — proving the
+    /// harness above can observe a spawned backfill at all, so the refusal test is not merely
+    /// "nothing ever happens here regardless".
+    #[test]
+    fn a_local_origin_fetch_range_miss_with_a_provider_spawns_a_backfill() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+        ));
+        assert_eq!(resp["error"]["code"], json!(CONTENT_REDIRECT), "{resp}");
+
+        let key = format!("{}:{}", store.to_hex(), tip.to_hex());
+        assert!(
+            node.backfilling
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains(&key),
+            "a Local-origin miss (the control) must spawn a background backfill"
         );
     }
 
