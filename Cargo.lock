@@ -2210,7 +2210,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.18.5"
+version = "0.19.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2257,11 +2257,12 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "dig-node-service"
-version = "0.58.10"
+version = "0.59.0"
 dependencies = [
  "axum",
  "axum-server",

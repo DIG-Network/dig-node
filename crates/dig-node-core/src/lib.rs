@@ -84,6 +84,11 @@ pub use seams::key_mgmt::KeyManager;
 pub mod shared;
 pub mod subscription;
 
+// The one place the per-range verification contract of a `dig.fetchRange` frame is built (#1577).
+use seams::content::range_frame;
+// Serve-side observability vocabulary for the peer-facing read surface (#1595).
+use seams::dig_peer::serve_log;
+
 /// The node engine library's own crate version (its `Cargo.toml` `version`), for
 /// programmatic use by host shells. Host shells report the SHIPPED node version to
 /// consumers as the single canonical `version` field, and pin the exact engine source
@@ -936,10 +941,16 @@ fn sync_eligible(store_hex: &str, root_hex: &str) -> bool {
 /// directly under `<cache>/modules/<store>/`, so a crafted `store_id`/`root` from a peer can never
 /// escape the cache directory.
 fn is_canonical_capsule_key(store_hex: &str, root_hex: &str) -> bool {
-    fn is_hex64(s: &str) -> bool {
-        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-    }
-    is_hex64(store_hex) && is_hex64(root_hex)
+    is_canonical_hex_id(store_hex) && is_canonical_hex_id(root_hex)
+}
+
+/// Is `s` a canonical DIG content id — a 32-byte value written as exactly 64 hex digits?
+///
+/// The single predicate every guard over a CALLER-SUPPLIED id shares: the path-traversal check above,
+/// and the serve log's [`crate::seams::dig_peer::serve_log::SafeId`] (which refuses to echo anything
+/// else). One definition, so "canonical" can never mean two different things across those guards.
+pub(crate) fn is_canonical_hex_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Decide which cached files to evict so total bytes fit under `cap`. LRU:
@@ -1759,11 +1770,30 @@ impl Node {
         // The peer supplies `store`/`root`, so the keys are validated canonical 64-hex BEFORE any path
         // is built from them (the same guard `cache_remove_cached` applies) — a non-canonical key can
         // never name a held capsule, so it answers not-available without touching the filesystem.
-        let servable = root
-            .filter(|r| is_canonical_capsule_key(store, r))
+        let canonical_root = root.filter(|r| is_canonical_capsule_key(store, r));
+        let servable = canonical_root
             .map(|r| module_exists(&self.cache_dir, store, r))
             .unwrap_or(false);
         let mut answer = peer::availability_presence(cached, store, root, rk, servable);
+
+        // #1595: name the answer AND why it was given, so a read diagnosis can tell "we do not hold
+        // it" apart from "that key could never name a capsule" — the availability gate a
+        // DHT-discovered holder must pass is otherwise silent.
+        let reason = match (root, canonical_root, servable) {
+            (None, _, _) => serve_log::AvailabilityReason::StoreRoots {
+                held: answer["roots"].as_array().map(Vec::len).unwrap_or(0),
+            },
+            (Some(_), None, _) => serve_log::AvailabilityReason::RejectedNonCanonicalKey,
+            (Some(_), Some(_), true) => serve_log::AvailabilityReason::Held,
+            (Some(_), Some(_), false) => serve_log::AvailabilityReason::NotHeld,
+        };
+        serve_log::availability_answered(
+            store,
+            root,
+            rk,
+            answer["available"].as_bool().unwrap_or(false),
+            &reason,
+        );
 
         // Resource granularity: if we hold this capsule AND can serve the resource, report its
         // ciphertext length + chunk count so the caller can plan ranges without a probe fetch.
@@ -1835,10 +1865,13 @@ impl Node {
 
     /// `dig.fetchRange` — build ONE range frame (the node window is a single frame; the caller streams
     /// further windows by advancing `offset`). Serves the resource's ciphertext from a locally cached
-    /// module and slices `[offset, offset+length)` (clamped to the node window). The FIRST frame
-    /// (`offset == 0`) carries the verification metadata (`total_length`, `chunk_lens`, `chunk_index`,
-    /// `inclusion_proof`, `root`) so the range is independently verifiable against the chain-anchored
-    /// root. Returns `Err((code, message))` with the catalogued `-32004`/`-32007` on a miss / bad
+    /// module and slices `[offset, offset+length)` (clamped to the node window) — exactly the span
+    /// asked for, never widened. EVERY frame carries the verification metadata (`total_length`,
+    /// `chunk_lens`, `root`, `inclusion_proof`, and `first_chunk_index`/`chunk_index` when the window
+    /// starts on a chunk boundary) so a range fetched at ANY offset from ANY holder is independently
+    /// checkable against the chain-anchored root on arrival — see
+    /// [`range_frame`](crate::seams::content::range_frame) for the contract, and for why no per-CHUNK
+    /// proof is served. Returns `Err((code, message))` with the catalogued `-32004`/`-32007` on a miss / bad
     /// range. (Capsule fetches — `capsule: true` — are not yet served here; that lands with the whole
     /// `.dig` streaming path and returns `-32004` for now, a clean seam.)
     pub async fn fetch_range_frame(
@@ -1882,20 +1915,22 @@ impl Node {
             "bytes": base64::engine::general_purpose::STANDARD.encode(&window),
             "complete": complete,
         });
-        // First frame carries the per-range verification metadata (spec §9).
-        if start == 0 {
-            if let Some(obj) = frame.as_object_mut() {
-                obj.insert("total_length".into(), json!(total));
-                obj.insert("chunk_lens".into(), json!(resp.chunk_lens));
-                obj.insert("chunk_index".into(), json!(0));
-                obj.insert(
-                    "inclusion_proof".into(),
-                    json!(base64::engine::general_purpose::STANDARD
-                        .encode(resp.merkle_proof.to_bytes())),
-                );
-                obj.insert("root".into(), json!(resp.roothash.to_hex()));
-            }
-        }
+        // EVERY frame carries the per-range verification metadata (#1577, L7 SPEC §9) so a range
+        // fetched at any offset from any holder is checkable on arrival — see the `range_frame`
+        // module for the contract and for why no per-CHUNK proof is (or can be) served.
+        let chunk_lens: Vec<u64> = resp.chunk_lens.iter().map(|&l| u64::from(l)).collect();
+        let root = resp.roothash.to_hex();
+        let proof = base64::engine::general_purpose::STANDARD.encode(resp.merkle_proof.to_bytes());
+        range_frame::attach_verification(
+            &mut frame,
+            &range_frame::RangeVerification {
+                total_length: total as u64,
+                chunk_lens: &chunk_lens,
+                root: Some(&root),
+                inclusion_proof: Some(&proof),
+            },
+            start as u64,
+        );
         Ok(frame)
     }
 
@@ -2266,6 +2301,41 @@ pub(crate) mod test_support {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
         };
         (Arc::new(node), td)
+    }
+
+    /// A REAL multi-chunk served resource: three chunk ciphertexts concatenated, committed under a
+    /// single-leaf generation root, carrying the genuine digstore inclusion proof for that leaf.
+    /// This is what a decoded, locally-held `.dig` resource looks like to the serve path, so tests
+    /// exercise `fetch_range_frame`'s real metadata contract instead of a hand-built frame.
+    pub(crate) fn multi_chunk_served_resource() -> (Arc<ContentResponse>, Vec<u64>) {
+        use digstore_core::merkle::{resource_leaf, MerkleTree};
+
+        let chunks: Vec<Vec<u8>> = vec![vec![0xa1; 40], vec![0xb2; 25], vec![0xc3; 17]];
+        let ciphertext: Vec<u8> = chunks.iter().flatten().copied().collect();
+        let tree = MerkleTree::from_leaves(vec![resource_leaf(&ciphertext)]);
+        let resp = ContentResponse {
+            merkle_proof: tree.prove(0).expect("single-leaf proof"),
+            roothash: tree.root(),
+            chunk_lens: chunks.iter().map(|c| c.len() as u32).collect(),
+            ciphertext,
+        };
+        let chunk_lens = resp.chunk_lens.iter().map(|&l| u64::from(l)).collect();
+        (Arc::new(resp), chunk_lens)
+    }
+
+    /// Seed `resource` into `node`'s memoized serve cache so [`Node::fetch_range_frame`] serves it,
+    /// and return the `(store_id, root, retrieval_key)` hex triple that names it.
+    pub(crate) fn seed_served_resource(
+        node: &Node,
+        resource: Arc<ContentResponse>,
+    ) -> (String, String, String) {
+        let (store, rk) = ("7e".repeat(32), [0x9fu8; 32]);
+        let root = resource.roothash.to_hex();
+        node.content_cache
+            .lock()
+            .unwrap()
+            .insert((store.clone(), root.clone(), rk), resource);
+        (store, root, hex::encode(rk))
     }
 }
 
@@ -5057,6 +5127,245 @@ mod tests {
         // Other params are preserved.
         assert_eq!(pinned["params"]["store_id"], json!("aa"));
         assert_eq!(pinned["params"]["retrieval_key"], json!("rk"));
+    }
+
+    // -- #1577 per-range verification metadata on EVERY fetchRange frame ---------------------------
+    //
+    // The chain-anchored generation tree commits RESOURCES, not chunks
+    // (`digstore_core::merkle::resource_leaf` = SHA-256 of the WHOLE resource ciphertext, folded by
+    // `MerkleTree::from_leaves`), so no proof can bind a single chunk to the root — see the
+    // `range_frame` module header. What a frame CAN carry, and what these tests pin, is its own
+    // complete verification metadata: the generation `root`, `chunk_lens`, `total_length`, the
+    // whole-resource `inclusion_proof`, and the TRUE chunk index the frame starts at — on every
+    // frame, so a range fetched from any peer at any offset is checkable on arrival.
+    //
+    // Every assertion here runs the REAL client verifier (dig-download's `MerkleVerifier` over the
+    // node's own `DigstoreProofVerifier`), never a hand-rolled re-implementation of the check.
+
+    // The client-side range/resource checks these tests drive live on this trait.
+    use dig_download::Verifier as _;
+
+    use test_support::{multi_chunk_served_resource, seed_served_resource};
+
+    /// The real client verifier: dig-download's `MerkleVerifier` bound to the node's
+    /// `DigstoreProofVerifier`, i.e. exactly what a downloading peer checks a served frame with.
+    fn real_client_verifier() -> impl dig_download::Verifier {
+        dig_download::MerkleVerifier::with_proof_verifier(Arc::new(
+            crate::download::DigstoreProofVerifier,
+        ))
+    }
+
+    /// Build the client's `ResourceCommitment` from ONE served frame's metadata — the whole point of
+    /// #1577: any frame, not just the first, must be able to establish the commitment.
+    fn commitment_from_frame(frame: &Value) -> dig_download::ResourceCommitment {
+        dig_download::ResourceCommitment::from_first_frame(
+            frame["total_length"].as_u64().expect("total_length served"),
+            frame["chunk_lens"]
+                .as_array()
+                .expect("chunk_lens served")
+                .iter()
+                .map(|l| l.as_u64().unwrap())
+                .collect(),
+            frame["root"].as_str().map(str::to_string),
+            frame["inclusion_proof"].as_str().map(str::to_string),
+        )
+        .expect("the served metadata is self-consistent")
+    }
+
+    fn frame_bytes(frame: &Value) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(frame["bytes"].as_str().expect("bytes served"))
+            .expect("base64 window")
+    }
+
+    #[tokio::test]
+    async fn a_mid_resource_frame_carries_metadata_the_real_client_verifier_accepts() {
+        // The #1577 gap: metadata used to ride the `offset == 0` frame ONLY, so a peer serving a
+        // mid-resource range declared no root and the client had nothing to check it against. Now the
+        // frame for chunk 1 alone is a self-describing, verifiable unit.
+        let (node, _td) = test_node(None);
+        let (resource, chunk_lens) = multi_chunk_served_resource();
+        let (store, root, rk) = seed_served_resource(&node, resource.clone());
+
+        let (offset, length) = (chunk_lens[0] as usize, chunk_lens[1] as usize);
+        let frame = node
+            .fetch_range_frame(&store, &root, &rk, offset, length)
+            .await
+            .expect("chunk 1 is servable");
+
+        assert_eq!(frame["root"], json!(root), "every frame declares its root");
+        assert_eq!(frame["chunk_lens"], json!(chunk_lens));
+        assert_eq!(frame["total_length"], json!(resource.ciphertext.len()));
+        assert!(
+            frame["inclusion_proof"].is_string(),
+            "the whole-resource proof rides every frame: {frame}"
+        );
+        assert_eq!(
+            frame["first_chunk_index"],
+            json!(1),
+            "the TRUE first chunk index of the served span, not a hardcoded 0: {frame}"
+        );
+        assert_eq!(
+            frame["chunk_index"], frame["first_chunk_index"],
+            "the legacy `chunk_index` field agrees (§5.1: same meaning, now truthful)"
+        );
+
+        // The REAL client verifier accepts this frame as a verifiable range.
+        let commitment = commitment_from_frame(&frame);
+        real_client_verifier()
+            .verify_range(
+                &commitment,
+                frame["first_chunk_index"].as_u64().unwrap(),
+                length as u64,
+                &frame_bytes(&frame),
+            )
+            .expect("the real verifier accepts the served range");
+    }
+
+    #[tokio::test]
+    async fn the_served_proof_binds_the_assembled_resource_to_the_generation_root() {
+        // End-to-end on the serve side: stream every frame, assemble, and let the REAL verifier bind
+        // the result to the chain-anchored root through the proof the node served.
+        let (node, _td) = test_node(None);
+        let (resource, chunk_lens) = multi_chunk_served_resource();
+        let (store, root, rk) = seed_served_resource(&node, resource.clone());
+
+        let mut assembled = Vec::new();
+        let mut commitment = None;
+        for (index, &len) in chunk_lens.iter().enumerate() {
+            let frame = node
+                .fetch_range_frame(&store, &root, &rk, assembled.len(), len as usize)
+                .await
+                .expect("each chunk-aligned span is servable");
+            assert_eq!(frame["first_chunk_index"], json!(index as u64));
+            commitment.get_or_insert_with(|| commitment_from_frame(&frame));
+            assembled.extend(frame_bytes(&frame));
+        }
+
+        let commitment = commitment.expect("at least one frame");
+        real_client_verifier()
+            .verify_resource(&commitment, &assembled)
+            .expect("the served proof binds the assembled bytes to the generation root");
+        assert_eq!(assembled, resource.ciphertext);
+    }
+
+    #[tokio::test]
+    async fn a_tampered_range_fails_closed_against_the_served_proof() {
+        // Fail-closed: the served proof must REJECT bytes that are not the committed resource. A
+        // proof that accepted tampered content would be worse than no proof at all.
+        let (node, _td) = test_node(None);
+        let (resource, _chunk_lens) = multi_chunk_served_resource();
+        let (store, root, rk) = seed_served_resource(&node, resource.clone());
+
+        let frame = node
+            .fetch_range_frame(&store, &root, &rk, 0, resource.ciphertext.len())
+            .await
+            .expect("the whole resource is servable in one frame");
+        let commitment = commitment_from_frame(&frame);
+        let verifier = real_client_verifier();
+
+        let mut tampered = frame_bytes(&frame);
+        tampered[0] ^= 0xff;
+        assert!(
+            verifier.verify_resource(&commitment, &tampered).is_err(),
+            "a flipped byte must fail the served inclusion proof"
+        );
+
+        // …and a frame whose proof is stripped cannot be verified either (half-specified binding).
+        let unproven = dig_download::ResourceCommitment::from_first_frame(
+            commitment.total_length,
+            commitment.layout.chunk_lens().to_vec(),
+            commitment.root.clone(),
+            None,
+        )
+        .expect("self-consistent metadata");
+        assert!(
+            verifier
+                .verify_resource(&unproven, &frame_bytes(&frame))
+                .is_err(),
+            "a root with no proof to check it against must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrong_generation_mid_resource_frame_is_now_detectable() {
+        // The integrity win of serving metadata on every frame: a peer serving a mid-resource range
+        // from a DIFFERENT generation declares that root, so the client's consistency check catches
+        // it on arrival. Before #1577 such a frame declared nothing and passed unchallenged.
+        let (node, _td) = test_node(None);
+        let (resource, chunk_lens) = multi_chunk_served_resource();
+        let (store, root, rk) = seed_served_resource(&node, resource.clone());
+
+        let frame = node
+            .fetch_range_frame(&store, &root, &rk, chunk_lens[0] as usize, 1)
+            .await
+            .expect("servable");
+        let committed_to_another_generation = dig_download::ResourceCommitment::from_first_frame(
+            resource.ciphertext.len() as u64,
+            chunk_lens.clone(),
+            Some("ab".repeat(32)),
+            None,
+        )
+        .expect("self-consistent metadata");
+
+        let err = committed_to_another_generation.check_consistent(
+            frame["total_length"].as_u64(),
+            frame["chunk_lens"].as_array().map(|_| &chunk_lens[..]),
+            frame["root"].as_str(),
+        );
+        assert!(
+            err.is_err(),
+            "a mid-resource frame declaring a different root is rejected: {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unaligned_offset_asserts_no_chunk_index_rather_than_a_false_one() {
+        // A frame starting mid-chunk is not a chunk-aligned verifiable unit, so the node reports NO
+        // chunk index rather than a wrong one — the client must never be handed an alignment claim
+        // that its own `verify_range` would then contradict.
+        let (node, _td) = test_node(None);
+        let (resource, _chunk_lens) = multi_chunk_served_resource();
+        let (store, root, rk) = seed_served_resource(&node, resource);
+
+        let frame = node
+            .fetch_range_frame(&store, &root, &rk, 7, 4)
+            .await
+            .expect("servable");
+        assert!(frame.get("first_chunk_index").is_none(), "{frame}");
+        assert!(frame.get("chunk_index").is_none(), "{frame}");
+        assert!(
+            frame["root"].is_string(),
+            "the generation binding still rides an unaligned frame: {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_frame_data_fields_are_unchanged_for_a_client_that_ignores_the_new_metadata() {
+        // §5.1 additive: a pre-#1577 client reads only offset/length/bytes/complete. Those must be
+        // byte-identical to what v0.58.10 served — the clip contract dig-download 0.7.4 verifies
+        // against (`verify_range` fails closed on any length that is not the PLANNED one).
+        let (node, _td) = test_node(None);
+        let (resource, chunk_lens) = multi_chunk_served_resource();
+        let (store, root, rk) = seed_served_resource(&node, resource.clone());
+
+        let requested = chunk_lens[1] as usize;
+        let frame = node
+            .fetch_range_frame(&store, &root, &rk, chunk_lens[0] as usize, requested)
+            .await
+            .expect("servable");
+        assert_eq!(frame["offset"], json!(chunk_lens[0]));
+        assert_eq!(
+            frame["length"],
+            json!(requested),
+            "the served span is exactly what was asked for — never widened to a chunk boundary"
+        );
+        assert_eq!(frame["complete"], json!(false));
+        assert_eq!(
+            frame_bytes(&frame),
+            resource.ciphertext[chunk_lens[0] as usize..][..requested],
+            "the window bytes are unchanged"
+        );
     }
 
     // -- #126 honest read-path: real inclusion proof + chain root, NO mock proof --

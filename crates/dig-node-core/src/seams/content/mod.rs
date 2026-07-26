@@ -10,6 +10,7 @@
 
 pub mod bandwidth;
 pub mod content_serve;
+pub mod range_frame;
 pub mod verification_ledger;
 
 pub use content_serve::ContentServer;

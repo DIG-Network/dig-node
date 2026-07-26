@@ -2956,6 +2956,33 @@ field the **base64** encoding of that window's ciphertext (the canonical
 it; reading the field as raw bytes yields the base64 TEXT and every frame is rejected as
 over-length — the #1586 read-leg blocker, which required dig-nat >= 0.11.2 to fix.
 
+**Per-range verification metadata — EVERY frame, not just the first.** A served frame MUST carry the
+metadata that makes it independently checkable against the chain-anchored generation root:
+`total_length`, `chunk_lens`, `root`, the whole-resource `inclusion_proof`, and — when the window
+begins exactly on a chunk boundary — `first_chunk_index` (with `chunk_index` as its pre-existing alias
+for the same value). A downloading peer fetches ranges in parallel from many holders, so a frame that
+declared no `root` (as only-the-first-frame metadata left every later range doing) could not be checked
+for generation consistency on arrival: a wrong-generation source was detectable only after the whole
+resource had been paid for in bandwidth. A frame whose window starts MID-chunk MUST omit
+`first_chunk_index`/`chunk_index` entirely rather than assert an index the caller's own alignment check
+would contradict.
+
+The served window is EXACTLY the requested span, never widened to a chunk boundary: a verifying client
+fails a range closed on any length but the one it planned.
+
+A serve MUST NOT emit a per-CHUNK inclusion proof (`range_proof`). No such proof is derivable from the
+store format: the generation root's merkle leaves are per-RESOURCE (`resource_leaf(ciphertext)` =
+SHA-256 of a resource's WHOLE ciphertext, folded by `MerkleTree::from_leaves`), so a single chunk has no
+committed digest to prove and recomputing the leaf requires every other chunk's bytes. The
+chain-anchored binding is therefore established once, over the assembled resource, via
+`inclusion_proof`; a per-chunk proof would be unverifiable decoration inviting a client to trust bytes it
+cannot check, and is REFUSED rather than fabricated. Real per-chunk proofs require a store-format
+prerequisite: a per-resource chunk-commitment structure added as a NEW leaf-kind / data-section id with
+version dispatch (or carried as a parallel commitment alongside today's leaf) — NEVER a redefinition of
+`resource_leaf` itself, since `dig-client-wasm`/`dig-capsule-wasm` check that value byte-identically and
+`PublicManifest.sha256_latest` is normatively pinned to it (digs `SPEC.md` §8), so existing capsules keep
+reading unchanged. Out of scope until that prerequisite exists (dig_ecosystem#1601).
+
 The download locator (dig-dht ∪ connected pool) is itself SELF-EXCLUDED: THIS node's own `peer_id`
 (hex) is dropped from the fetch-candidate set before any dial, exactly as the DISCOVERY leg is (#1584).
 A relay-introduced self-connection can surface this node in its own gossip pool (`peer_id == local`);
@@ -3089,6 +3116,44 @@ falling back to an in-memory token), `info!` (sparse operator lifecycle — the 
 its bound addresses + upstream, a listener up, leaf renewed, shutting down), `debug!` (developer
 diagnosis — per-request RPC dispatch, a per-tick self-heal pass, a config-disabled surface),
 `trace!` (firehose). The default filter is `dig-logging`'s noise-trimmed `info`.
+
+### 20.2a. Peer-facing serves MUST announce their outcome
+
+Every inbound peer-facing serve MUST record its OUTCOME in the log, so a read can be diagnosed from
+logs alone and never requires a packet capture. Concretely:
+
+- An inbound `dig.fetchRange` MUST emit one `info!` line per request naming the requesting `peer_id`,
+  the content id (`store_id`, `root`, `retrieval_key`), the requested `offset`, and the outcome — one of
+  `served` (with the total `served_bytes`, the `frames` those bytes were split into, and whether a proof
+  was attached), `not-held`, `bad-range`, or `redirect` (each with the catalogued error code the caller
+  was given and a short reason). The reported `offset` is always the offset the caller REQUESTED, never
+  how far a partial stream advanced. Per-frame detail (offset, byte count, chunk index, chunk alignment)
+  is `debug!`, and a frame whose window does not start on a chunk boundary OMITS `first_chunk_index`
+  rather than reporting `0` — the same omit-what-cannot-be-stated-truthfully rule the frame metadata
+  itself follows (§19.3, *Per-range verification metadata*).
+- `served` means bytes were streamed. A serve path that answers an unsatisfiable range with an error
+  frame (the fetch-through miss path, §19.3) MUST report that refusal, NOT `served` with a zero byte count,
+  and `frames` MUST be the frame count actually written. An outcome line that says `served` for a
+  request that served nothing reintroduces the exact ambiguity this section removes.
+- An inbound `dig.getAvailability` MUST emit one `info!` line per answered item naming the queried
+  content id, the `available` answer, and the REASON for it: `held`, `not-held`,
+  `rejected-non-canonical-key` (a `root` that is not canonical 64-hex, refused without a filesystem
+  touch), or `store-roots` (a store-granularity query, with the count of held roots).
+
+These lines carry **ids, counts, and outcomes ONLY** — never a served byte, never a proof, never a
+secret (§20.4 / the never-log rule). A silent serve is a specification violation: silence is
+indistinguishable from a request that never arrived, which is exactly the ambiguity that made the
+read-leg bring-up dependent on `tcpdump`.
+
+**A peer-supplied identifier MUST NOT be logged verbatim.** Every id on this surface arrives inside an
+untrusted, 64 KiB-capped frame, so a verbatim id would let any peer amplify the operator's log by
+~64 KiB per request and — since a JSON string may contain `\n` — FORGE an additional record, including a
+counterfeit `served` outcome. An id therefore MUST be recorded only when it is a canonical 64-hex content
+id; otherwise a short fixed sentinel (`<non-canonical>` for an unusable id, `<absent>` for one the request
+did not carry) MUST be recorded in its place. This applies to `store_id`, `root`, AND `retrieval_key` on
+both the `dig.fetchRange` and `dig.getAvailability` paths. Nothing diagnostic is lost: a non-canonical id
+could never have named held content, and the outcome/reason on the same line already states why the
+request failed.
 
 ### 20.3. `control.log.setLevel` — runtime level control
 

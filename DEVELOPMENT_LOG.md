@@ -555,3 +555,52 @@ to one `stat` per queried item (this is a peer-reachable path, so a per-request 
 amplifier a peer controls), and the walk is now needed only for the STORE-granularity `roots`
 enumeration. The trade to watch: the keys are PEER-supplied and now feed a path, so they MUST be
 validated canonical 64-hex before the join (the same guard `cache.removeCached` applies).
+
+## A serve that logs nothing is indistinguishable from a request that never arrived (#1595)
+
+Through the whole #836 read-leg bring-up the holder emitted **zero** log lines for an inbound
+`dig.fetchRange`, at any filter level. So the single most valuable question in a read diagnosis — *did
+the holder receive the request, and what did it answer?* — could only be answered by running `tcpdump`
+on the instance, and "holder inbound = ZERO" stayed ambiguous for many rounds: silence looked exactly
+like "never asked". Meanwhile the CLIENT side had already been instrumented (dig-download 0.7.2/0.7.3's
+named-failing-step + per-candidate lines), which is precisely what turned six blind iterations into
+one-run diagnoses on that side. The asymmetry was the whole problem: one end of the wire narrated
+itself and the other was mute, so every failure landed in the mute half by elimination.
+
+The durable rule: a peer-facing serve MUST announce its OUTCOME, not just its errors. Logging only the
+failures is the trap — a *successful* serve that says nothing still leaves you unable to distinguish
+"served fine, the reader broke" from "never reached us". The outcome vocabulary has to be a CLOSED set
+(`served` / `not-held` / `bad-range` / `redirect`, and for availability `held` / `not-held` /
+`rejected-non-canonical-key` / `store-roots`) with stable field names, so a diagnosis is a `grep` and
+not a prose search. Two boundaries make it safe to keep on at INFO: it carries ids, counts and outcomes
+ONLY — never payload bytes (which would make every operator log a copy of the served content) and never
+proofs — and the ids logged are all values the peer itself supplied on the wire, so nothing is
+disclosed that was not already public to that peer. Both boundaries are worth a real test; a log
+assertion over captured records is cheap and it is the only thing that stops a future edit from
+quietly reintroducing silence.
+
+## The generation root commits RESOURCES, not chunks — so a per-range merkle proof does not exist (#1577)
+
+"Per-range integrity" reads as though each served range should carry its own merkle inclusion proof
+folded to the chain-anchored generation root. It cannot, and the reason is structural rather than a
+missing feature: `digstore_core::merkle::resource_leaf(ciphertext)` is `SHA-256` of a resource's WHOLE
+ciphertext, and every real tree in the store is `MerkleTree::from_leaves(resource_leaves)`. A chunk has
+no committed digest of its own, and recomputing its resource's leaf requires every other chunk's bytes.
+`MerkleTree::build` — the chunk-leaf constructor that makes the idea look feasible — has **no callers**
+anywhere in the store; it is dead code, not the committed tree. Before building on a proof shape,
+follow it to the code that actually COMMITS it; a constructor existing is not evidence a tree is built
+that way.
+
+Emitting a `range_proof` anyway would have been worse than emitting nothing: an unverifiable proof
+invites a client to trust bytes it cannot check, which is the exact inversion of fail-closed. What was
+genuinely missing, and is worth remembering as the general shape, is cheaper and real: the verification
+metadata (`root`, `chunk_lens`, `total_length`, the whole-resource proof) used to ride the FIRST frame
+only, while a downloader fetches ranges in PARALLEL from many holders. A peer serving only `offset > 0`
+frames therefore declared no root at all, so the client's consistency check had nothing to compare and
+a wrong-generation source was undetectable until the whole resource had been paid for in bandwidth.
+Making every frame self-describing closes that at the cost of a few dozen bytes per frame.
+
+The constraint that bounds the fix: the served window must stay EXACTLY the requested span. Expanding
+it to chunk boundaries (tempting, since a chunk-aligned span is the verifiable unit) breaks every
+verifying client, because `verify_range` fails closed on any length but the one the client planned.
+When a server and a client both compute a span, the client's plan is the contract.
