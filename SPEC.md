@@ -3123,8 +3123,15 @@ logs alone and never requires a packet capture. Concretely:
   the content id (`store_id`, `root`, `retrieval_key`), the requested `offset`, and the outcome — one of
   `served` (with the total `served_bytes`, the `frames` those bytes were split into, and whether a proof
   was attached), `not-held`, `bad-range`, or `redirect` (each with the catalogued error code the caller
-  was given and a short reason). Per-frame detail (offset, byte count, chunk index, chunk alignment) is
-  `debug!`.
+  was given and a short reason). The reported `offset` is always the offset the caller REQUESTED, never
+  how far a partial stream advanced. Per-frame detail (offset, byte count, chunk index, chunk alignment)
+  is `debug!`, and a frame whose window does not start on a chunk boundary OMITS `first_chunk_index`
+  rather than reporting `0` — the same omit-what-cannot-be-stated-truthfully rule the frame metadata
+  itself follows (§19.3, *Per-range verification metadata*).
+- `served` means bytes were streamed. A serve path that answers an unsatisfiable range with an error
+  frame (the fetch-through miss path, §19.3) MUST report that refusal, NOT `served` with a zero byte count,
+  and `frames` MUST be the frame count actually written. An outcome line that says `served` for a
+  request that served nothing reintroduces the exact ambiguity this section removes.
 - An inbound `dig.getAvailability` MUST emit one `info!` line per answered item naming the queried
   content id, the `available` answer, and the REASON for it: `held`, `not-held`,
   `rejected-non-canonical-key` (a `root` that is not canonical 64-hex, refused without a filesystem
@@ -3134,6 +3141,16 @@ These lines carry **ids, counts, and outcomes ONLY** — never a served byte, ne
 secret (§20.4 / the never-log rule). A silent serve is a specification violation: silence is
 indistinguishable from a request that never arrived, which is exactly the ambiguity that made the
 read-leg bring-up dependent on `tcpdump`.
+
+**A peer-supplied identifier MUST NOT be logged verbatim.** Every id on this surface arrives inside an
+untrusted, 64 KiB-capped frame, so a verbatim id would let any peer amplify the operator's log by
+~64 KiB per request and — since a JSON string may contain `\n` — FORGE an additional record, including a
+counterfeit `served` outcome. An id therefore MUST be recorded only when it is a canonical 64-hex content
+id; otherwise a short fixed sentinel (`<non-canonical>` for an unusable id, `<absent>` for one the request
+did not carry) MUST be recorded in its place. This applies to `store_id`, `root`, AND `retrieval_key` on
+both the `dig.fetchRange` and `dig.getAvailability` paths. Nothing diagnostic is lost: a non-canonical id
+could never have named held content, and the outcome/reason on the same line already states why the
+request failed.
 
 ### 20.3. `control.log.setLevel` — runtime level control
 

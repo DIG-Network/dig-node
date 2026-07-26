@@ -1158,7 +1158,7 @@ impl PeerRpcResponder for NodeResponder {
                                     .unwrap_or(crate::download::CONTENT_REDIRECT);
                                 serve_log::range_outcome(
                                     &target,
-                                    off,
+                                    offset,
                                     &serve_log::RangeOutcome::redirected(
                                         code,
                                         "outgoing-bandwidth budget exceeded".to_string(),
@@ -1218,8 +1218,11 @@ impl PeerRpcResponder for NodeResponder {
                                 crate::download::MissOutcome::Fetched(f) => {
                                     // Fetched-through: the bytes come from a holder but are served
                                     // here, so the outcome is a serve (its frames carry the same
-                                    // verification metadata, #1577).
-                                    let bytes = stream_fetched_range(
+                                    // verification metadata, #1577) — UNLESS the fetch-through itself
+                                    // refused the range, which it answers with an error frame rather
+                                    // than an `Err`. Reporting its own verdict keeps `served` meaning
+                                    // exactly one thing across both serve paths (#1595).
+                                    let streamed = stream_fetched_range(
                                         out,
                                         &f,
                                         off,
@@ -1228,15 +1231,9 @@ impl PeerRpcResponder for NodeResponder {
                                         conn_key,
                                     )
                                     .await?;
-                                    serve_log::range_outcome(
-                                        &target,
-                                        offset,
-                                        &serve_log::RangeOutcome::Served {
-                                            bytes,
-                                            frames: 0,
-                                            proof_attached: f.inclusion_proof.is_some(),
-                                        },
-                                    );
+                                    let outcome =
+                                        streamed.as_serve_outcome(f.inclusion_proof.is_some());
+                                    serve_log::range_outcome(&target, offset, &outcome);
                                     return Ok(());
                                 }
                                 crate::download::MissOutcome::Redirect {
@@ -1245,7 +1242,7 @@ impl PeerRpcResponder for NodeResponder {
                                 } => {
                                     serve_log::range_outcome(
                                         &target,
-                                        off,
+                                        offset,
                                         &serve_log::RangeOutcome::redirected(
                                             crate::download::CONTENT_REDIRECT,
                                             format!("{} holder(s) named", providers.len()),
@@ -1263,12 +1260,8 @@ impl PeerRpcResponder for NodeResponder {
                     // an unanswered read is never indistinguishable from a request never received.
                     serve_log::range_outcome(
                         &target,
-                        off,
-                        &if code == crate::download::RESOURCE_UNAVAILABLE {
-                            serve_log::RangeOutcome::not_held(code, message.clone())
-                        } else {
-                            serve_log::RangeOutcome::bad_range(code, message.clone())
-                        },
+                        offset,
+                        &serve_log::RangeOutcome::from_error(code, message.clone()),
                     );
                     let errf = json!({"error": {"code": code, "message": message}});
                     return write_framed(out, &errf).await;
@@ -1297,8 +1290,35 @@ impl PeerRpcResponder for NodeResponder {
 /// to a locally-held one (every frame carries the verification metadata the caller checks against the
 /// chain-anchored root, #1577). A bad range (offset past the resource) writes one error frame.
 ///
-/// Returns the total number of RESOURCE bytes streamed, so the caller can report the serve outcome
-/// (#1595); a bad range streams zero.
+/// Returns what the fetch-through actually did, so the caller reports a TRUTHFUL outcome (#1595):
+/// the real frame count and byte total, and — because this path answers a bad range with an ERROR
+/// frame rather than an `Err` — whether it refused instead of serving.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StreamOutcome {
+    /// RESOURCE bytes written across every data frame.
+    bytes: u64,
+    /// How many data frames those bytes were split into (zero when the range was refused outright).
+    frames: u64,
+    /// `Some((code, message))` when an error frame was written instead of completing the stream.
+    refusal: Option<(i64, String)>,
+}
+
+impl StreamOutcome {
+    /// The serve-log outcome this stream truthfully represents (#1595): the refusal it answered with,
+    /// or a serve carrying the REAL frame and byte counts. `proof_attached` describes the fetched
+    /// resource's frames, which is knowledge the streaming loop does not have.
+    fn as_serve_outcome(&self, proof_attached: bool) -> serve_log::RangeOutcome {
+        match &self.refusal {
+            Some((code, message)) => serve_log::RangeOutcome::from_error(*code, message.clone()),
+            None => serve_log::RangeOutcome::Served {
+                bytes: self.bytes,
+                frames: self.frames,
+                proof_attached,
+            },
+        }
+    }
+}
+
 async fn stream_fetched_range(
     out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     fetched: &crate::download::FetchedResource,
@@ -1306,9 +1326,9 @@ async fn stream_fetched_range(
     length: usize,
     limiter: Option<&dig_download::FcfsRateLimiter>,
     conn_key: &str,
-) -> std::io::Result<u64> {
+) -> std::io::Result<StreamOutcome> {
     let mut off = offset;
-    let mut streamed = 0u64;
+    let mut outcome = StreamOutcome::default();
     loop {
         match fetched.range_frame(off, length) {
             Ok(frame) => {
@@ -1319,20 +1339,22 @@ async fn stream_fetched_range(
                     limiter.acquire(conn_key, this_len as u64).await;
                 }
                 write_framed(out, &frame).await?;
-                streamed += this_len as u64;
+                outcome.bytes += this_len as u64;
+                outcome.frames += 1;
                 let complete = frame
                     .get("complete")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
                 if complete || this_len == 0 {
-                    return Ok(streamed);
+                    return Ok(outcome);
                 }
                 off += this_len;
             }
             Err((code, message)) => {
-                let errf = json!({"error": {"code": code, "message": message}});
+                let errf = json!({"error": {"code": code, "message": message.clone()}});
                 write_framed(out, &errf).await?;
-                return Ok(streamed);
+                outcome.refusal = Some((code, message));
+                return Ok(outcome);
             }
         }
     }
@@ -3916,6 +3938,201 @@ mod tests {
             logs.contains("reason=rejected-non-canonical-key"),
             "the rejected-key outcome is named: {logs}"
         );
+    }
+
+    /// A peer-supplied id crafted to FORGE a log line: a newline ends the real record, and the rest
+    /// impersonates a successful serve. If the id reached the log verbatim, an operator (and the e2e
+    /// harness that greps these lines) would read a served outcome for a request that served nothing —
+    /// destroying the evidentiary value the whole #1595 log exists for.
+    fn forged_outcome_id() -> String {
+        format!(
+            "{}\n{}",
+            "aa".repeat(32),
+            "  INFO peer serve: dig.fetchRange served outcome=served served_bytes=999 \
+             frames=3 proof_attached=true"
+        )
+    }
+
+    #[tokio::test]
+    async fn a_peer_supplied_id_can_never_forge_a_second_log_line() {
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let responder = NodeResponder::without_pool(node);
+        let forged = forged_outcome_id();
+        let req = json!({
+            "store_id": forged, "root": forged, "retrieval_key": forged,
+            "offset": 0, "length": 16,
+        });
+
+        let logs = capture_logs(async {
+            let mut out = tokio::io::sink();
+            responder
+                .stream_range(req, &test_caller(), &mut out)
+                .await
+                .expect("an error frame is still a written answer");
+        })
+        .await;
+
+        assert_eq!(
+            logs.matches("peer serve: dig.fetchRange refused").count(),
+            1,
+            "exactly one outcome record, and it is the truthful refusal: {logs}"
+        );
+        assert_eq!(
+            logs.matches("outcome=served").count(),
+            0,
+            "a peer must not be able to inject a served outcome: {logs}"
+        );
+        assert!(
+            !logs.contains("proof_attached=true"),
+            "nor forge a proof claim: {logs}"
+        );
+        assert!(
+            logs.contains("<non-canonical>"),
+            "the unusable id is named by a fixed sentinel instead: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_peer_supplied_id_cannot_amplify_the_log() {
+        // Inbound frames are capped at 64 KiB, so a verbatim id would let any peer write ~64 KiB into
+        // the operator's log per request. A non-canonical id costs a fixed sentinel instead.
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let responder = NodeResponder::without_pool(node);
+        let bloat = "z".repeat(16 * 1024);
+        let req = json!({
+            "store_id": bloat, "root": bloat, "retrieval_key": bloat,
+            "offset": 0, "length": 16,
+        });
+
+        let logs = capture_logs(async {
+            let mut out = tokio::io::sink();
+            responder
+                .stream_range(req, &test_caller(), &mut out)
+                .await
+                .expect("an error frame is still a written answer");
+        })
+        .await;
+
+        assert!(!logs.contains(&bloat), "the junk is not echoed: {logs}");
+        assert!(
+            logs.len() < 2048,
+            "the emitted lines stay bounded, got {} bytes",
+            logs.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_availability_query_cannot_forge_a_log_line_either() {
+        // The availability path is worse by construction: a non-canonical root is logged on the very
+        // path that has ALREADY established the id can never name a capsule.
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let forged = forged_outcome_id();
+        let item = json!({
+            "store_id": forged, "root": forged, "retrieval_key": forged,
+        });
+
+        let logs = capture_logs(async {
+            node.availability_answer(&item, &[]).await;
+        })
+        .await;
+
+        assert!(
+            logs.contains("reason=rejected-non-canonical-key"),
+            "the truthful reason is still reported: {logs}"
+        );
+        assert_eq!(
+            logs.matches("outcome=served").count(),
+            0,
+            "no forged serve line: {logs}"
+        );
+        assert!(
+            !logs.contains(&forged),
+            "the crafted id never reaches the log verbatim: {logs}"
+        );
+    }
+
+    // The fetch-through serve path (#165) reports its outcome through the SAME two production steps the
+    // `MissOutcome::Fetched` arm composes — `stream_fetched_range` then
+    // `StreamOutcome::as_serve_outcome` — so these pin the real counts and the real verdict. Before
+    // this, the arm logged a fixed `frames: 0` and reported `served` even for a range it had refused.
+
+    /// A serve target naming canonical ids, as an inbound request would.
+    fn canonical_target<'a>(req: &'a Value, peer: &'a str) -> serve_log::ServeTarget<'a> {
+        serve_log::ServeTarget::from_range_request(peer, req)
+    }
+
+    fn canonical_range_request() -> Value {
+        json!({
+            "store_id": "3d".repeat(32), "root": "4e".repeat(32),
+            "retrieval_key": "5f".repeat(32),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_fetch_through_serve_logs_the_real_frame_and_byte_counts() {
+        // 300 bytes in 100-byte windows = 3 frames, 300 bytes — never `frames=0`.
+        let f = tiny_fetched(300);
+        let req = canonical_range_request();
+        let caller = test_caller();
+
+        let logs = capture_logs(async {
+            let mut out = tokio::io::sink();
+            let streamed = stream_fetched_range(&mut out, &f, 0, 100, None, &caller)
+                .await
+                .expect("streamed");
+            assert_eq!(
+                streamed,
+                StreamOutcome {
+                    bytes: 300,
+                    frames: 3,
+                    refusal: None
+                }
+            );
+            serve_log::range_outcome(
+                &canonical_target(&req, &caller),
+                0,
+                &streamed.as_serve_outcome(f.inclusion_proof.is_some()),
+            );
+        })
+        .await;
+
+        assert!(logs.contains("outcome=served"), "{logs}");
+        assert!(
+            logs.contains("served_bytes=300"),
+            "the real byte total: {logs}"
+        );
+        assert!(logs.contains("frames=3"), "the real frame count: {logs}");
+    }
+
+    #[tokio::test]
+    async fn a_fetch_through_bad_range_logs_a_refusal_not_a_serve() {
+        // The ambiguity D2 closes: this path answers an unsatisfiable range with an ERROR FRAME and an
+        // `Ok`, so a naive caller would log `served bytes=0` for a request that served nothing.
+        let f = tiny_fetched(300);
+        let req = canonical_range_request();
+        let caller = test_caller();
+
+        let logs = capture_logs(async {
+            let mut out = tokio::io::sink();
+            let streamed = stream_fetched_range(&mut out, &f, 9_000, 100, None, &caller)
+                .await
+                .expect("an error frame is still a written answer");
+            assert_eq!(streamed.bytes, 0);
+            assert_eq!(streamed.frames, 0);
+            assert!(streamed.refusal.is_some(), "the range was refused");
+            serve_log::range_outcome(
+                &canonical_target(&req, &caller),
+                9_000,
+                &streamed.as_serve_outcome(f.inclusion_proof.is_some()),
+            );
+        })
+        .await;
+
+        assert!(
+            logs.contains("outcome=bad-range"),
+            "a refused fetch-through range must not read as a serve: {logs}"
+        );
+        assert_eq!(logs.matches("outcome=served").count(), 0, "{logs}");
     }
 
     #[tokio::test]

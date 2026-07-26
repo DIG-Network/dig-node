@@ -22,30 +22,77 @@
 //! ids** — a log that echoed the payload would make every operator log file a copy of the served
 //! content, and one that echoed proofs would bloat it for no diagnostic gain. Pinned by the
 //! `serve_logs_carry_ids_counts_and_outcomes_but_never_payload_or_proof` test.
+//!
+//! ## Why every id is a [`SafeId`]
+//!
+//! Every id on this surface arrives from an UNTRUSTED peer, inside a frame capped only at 64 KiB. A
+//! verbatim id would hand any peer two attacks on the log's evidentiary value: writing ~64 KiB of junk
+//! per request (an amplification the operator pays for in disk and IO), and — because a JSON string may
+//! contain `\n` — FORGING a whole extra record, e.g. a fake `outcome=served proof_attached=true` for a
+//! request that served nothing. That destroys the exact property this module exists to provide.
+//!
+//! So no `&str` id ever reaches a `tracing` macro here. Ids are logged through [`SafeId`], which emits
+//! the value only when it is a canonical 64-hex content id and a short fixed sentinel otherwise — a
+//! form that is bounded and control-character-free by construction, not by remembering to escape.
 
 use serde_json::Value;
+use std::fmt;
+
+/// Emitted in place of an id that is not a canonical content id — bounded, and no control characters.
+const NON_CANONICAL: &str = "<non-canonical>";
+
+/// Emitted in place of an id the request did not carry at all (a store-granularity query, say).
+const ABSENT: &str = "<absent>";
+
+/// A peer-supplied identifier in a form that is SAFE to put in a log record.
+///
+/// `Display` renders the id verbatim only if it is a canonical 64-hex content id
+/// ([`crate::is_canonical_hex_id`]) — the only shape that can name real content, and the shape a
+/// diagnosis actually needs to read. Anything else renders as a fixed sentinel, so an id can neither
+/// bloat a line nor inject one. A non-canonical id loses no diagnostic value: it could never have named
+/// held content, and the accompanying outcome/reason already says why the request failed.
+pub(crate) struct SafeId<'a>(&'a str);
+
+impl<'a> SafeId<'a> {
+    /// Wrap a peer-supplied id for logging. Total, by design: there is no fallible path that could
+    /// tempt a call site into logging the raw value instead.
+    pub(crate) fn new(id: &'a str) -> Self {
+        SafeId(id)
+    }
+}
+
+impl fmt::Display for SafeId<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            "" => f.write_str(ABSENT),
+            id if crate::is_canonical_hex_id(id) => f.write_str(id),
+            _ => f.write_str(NON_CANONICAL),
+        }
+    }
+}
 
 /// The public ids naming what an inbound peer-facing serve was asked for, and by whom.
 ///
 /// Every field is already public on the wire (the caller supplied the content ids and its own
-/// mTLS-verified `peer_id`), so recording them leaks nothing the peer did not itself send.
+/// mTLS-verified `peer_id`), so recording them leaks nothing the peer did not itself send — but each is
+/// held as a [`SafeId`] so that what reaches the log is bounded and unforgeable regardless.
 pub(crate) struct ServeTarget<'a> {
-    /// The mTLS-verified caller `peer_id` (64-hex), or empty on a caller-less/test session.
-    pub peer: &'a str,
+    /// The mTLS-verified caller `peer_id` (64-hex), or absent on a caller-less/test session.
+    pub peer: SafeId<'a>,
     /// The requested store id (64-hex).
-    pub store: &'a str,
+    pub store: SafeId<'a>,
     /// The requested generation root (64-hex).
-    pub root: &'a str,
+    pub root: SafeId<'a>,
     /// The requested resource retrieval key (64-hex).
-    pub retrieval_key: &'a str,
+    pub retrieval_key: SafeId<'a>,
 }
 
 impl<'a> ServeTarget<'a> {
     /// Read the content ids straight off an inbound `dig.fetchRange` request body.
     pub(crate) fn from_range_request(peer: &'a str, req: &'a Value) -> Self {
-        let field = |name: &str| req.get(name).and_then(Value::as_str).unwrap_or("");
+        let field = |name: &str| SafeId::new(req.get(name).and_then(Value::as_str).unwrap_or(""));
         ServeTarget {
-            peer,
+            peer: SafeId::new(peer),
             store: field("store_id"),
             root: field("root"),
             retrieval_key: field("retrieval_key"),
@@ -94,6 +141,17 @@ impl RangeOutcome {
         }
     }
 
+    /// Name the refusal a catalogued serve error represents: a resource this node does not hold, or
+    /// else an unsatisfiable request over one it does. Shared by every path that answers with an error
+    /// frame, so the same error code can never be reported under two different outcome names.
+    pub(crate) fn from_error(code: i64, message: String) -> Self {
+        if code == crate::download::RESOURCE_UNAVAILABLE {
+            RangeOutcome::not_held(code, message)
+        } else {
+            RangeOutcome::bad_range(code, message)
+        }
+    }
+
     /// The caller was pointed at other holders instead of being served here — either because this
     /// node lacks the content (#165) or because serving it would exceed its outgoing budget (#30).
     pub(crate) fn redirected(code: i64, reason: String) -> Self {
@@ -119,17 +177,32 @@ pub(crate) fn range_requested(target: &ServeTarget<'_>, offset: usize, length: u
 }
 
 /// Record one streamed frame (DEBUG) — the granularity behind the INFO outcome line.
+/// An UNALIGNED frame has no first chunk index, so the field is OMITTED rather than defaulted: a `0`
+/// there would claim the frame starts at chunk 0, which is exactly the falsehood the per-frame metadata
+/// contract avoids by omitting what it cannot state truthfully.
 pub(crate) fn range_frame_served(offset: usize, bytes: usize, first_chunk_index: Option<u64>) {
-    tracing::debug!(
-        offset,
-        bytes,
-        first_chunk_index = first_chunk_index.unwrap_or_default(),
-        chunk_aligned = first_chunk_index.is_some(),
-        "peer serve: dig.fetchRange frame"
-    );
+    match first_chunk_index {
+        Some(index) => tracing::debug!(
+            offset,
+            bytes,
+            first_chunk_index = index,
+            chunk_aligned = true,
+            "peer serve: dig.fetchRange frame"
+        ),
+        None => tracing::debug!(
+            offset,
+            bytes,
+            chunk_aligned = false,
+            "peer serve: dig.fetchRange frame"
+        ),
+    }
 }
 
 /// Record how an inbound `dig.fetchRange` ended (INFO) — the one line a read diagnosis needs.
+///
+/// `offset` is always the offset the CALLER REQUESTED, never how far a partial stream advanced: there is
+/// exactly one outcome line per request, so it must key to the request the harness greps for. The
+/// per-frame DEBUG lines carry the advancing offsets.
 pub(crate) fn range_outcome(target: &ServeTarget<'_>, offset: usize, outcome: &RangeOutcome) {
     match outcome {
         RangeOutcome::Served {
@@ -208,9 +281,9 @@ pub(crate) fn availability_answered(
         _ => 0,
     };
     tracing::info!(
-        store_id = %store,
-        root = %root.unwrap_or(""),
-        retrieval_key = %retrieval_key.unwrap_or(""),
+        store_id = %SafeId::new(store),
+        root = %SafeId::new(root.unwrap_or("")),
+        retrieval_key = %SafeId::new(retrieval_key.unwrap_or("")),
         available,
         held_roots,
         reason = %reason.name(),
@@ -223,14 +296,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// What a target's ids actually render as in a log record.
+    fn rendered(target: &ServeTarget<'_>) -> (String, String, String, String) {
+        (
+            target.peer.to_string(),
+            target.store.to_string(),
+            target.root.to_string(),
+            target.retrieval_key.to_string(),
+        )
+    }
+
     #[test]
-    fn serve_target_reads_the_content_ids_off_the_request() {
-        let req = json!({"store_id": "aa", "root": "bb", "retrieval_key": "cc", "offset": 4});
-        let target = ServeTarget::from_range_request("peer1", &req);
-        assert_eq!(
-            (target.peer, target.store, target.root, target.retrieval_key),
-            ("peer1", "aa", "bb", "cc")
+    fn serve_target_reads_the_canonical_content_ids_off_the_request() {
+        let (peer, store, root, rk) = (
+            "1c".repeat(32),
+            "aa".repeat(32),
+            "bb".repeat(32),
+            "cc".repeat(32),
         );
+        let req = json!({"store_id": store, "root": root, "retrieval_key": rk, "offset": 4});
+        let target = ServeTarget::from_range_request(&peer, &req);
+        assert_eq!(rendered(&target), (peer, store, root, rk));
     }
 
     #[test]
@@ -240,9 +326,39 @@ mod tests {
         let empty = json!({});
         let target = ServeTarget::from_range_request("", &empty);
         assert_eq!(
-            (target.store, target.root, target.retrieval_key),
-            ("", "", "")
+            rendered(&target),
+            (
+                ABSENT.to_string(),
+                ABSENT.to_string(),
+                ABSENT.to_string(),
+                ABSENT.to_string()
+            )
         );
+    }
+
+    #[test]
+    fn a_non_canonical_id_renders_as_a_fixed_sentinel_never_verbatim() {
+        // The two peer-reachable abuses of a verbatim id, in one predicate: a newline that would end the
+        // record and forge another, and bulk that would amplify the log. Both cost a fixed string.
+        for hostile in [
+            "aa\n  INFO peer serve: dig.fetchRange served outcome=served proof_attached=true",
+            &"z".repeat(64 * 1024),
+            "not-a-root",
+            "../../etc/passwd",
+            &format!("{}!", "aa".repeat(32)), // 65 chars: right alphabet, wrong length
+        ] {
+            let rendered = SafeId::new(hostile).to_string();
+            assert_eq!(rendered, NON_CANONICAL, "{hostile:?} must not be echoed");
+        }
+    }
+
+    #[test]
+    fn a_canonical_id_is_logged_in_full_so_no_diagnostic_value_is_lost() {
+        let canonical = "9f".repeat(32);
+        assert_eq!(SafeId::new(&canonical).to_string(), canonical);
+        // Mixed case is still canonical hex — a diagnosis must be able to match what the peer sent.
+        let mixed = format!("{}{}", "Ab".repeat(16), "cD".repeat(16));
+        assert_eq!(SafeId::new(&mixed).to_string(), mixed);
     }
 
     #[test]

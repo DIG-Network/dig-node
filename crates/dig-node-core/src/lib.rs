@@ -941,10 +941,16 @@ fn sync_eligible(store_hex: &str, root_hex: &str) -> bool {
 /// directly under `<cache>/modules/<store>/`, so a crafted `store_id`/`root` from a peer can never
 /// escape the cache directory.
 fn is_canonical_capsule_key(store_hex: &str, root_hex: &str) -> bool {
-    fn is_hex64(s: &str) -> bool {
-        s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-    }
-    is_hex64(store_hex) && is_hex64(root_hex)
+    is_canonical_hex_id(store_hex) && is_canonical_hex_id(root_hex)
+}
+
+/// Is `s` a canonical DIG content id — a 32-byte value written as exactly 64 hex digits?
+///
+/// The single predicate every guard over a CALLER-SUPPLIED id shares: the path-traversal check above,
+/// and the serve log's [`crate::seams::dig_peer::serve_log::SafeId`] (which refuses to echo anything
+/// else). One definition, so "canonical" can never mean two different things across those guards.
+pub(crate) fn is_canonical_hex_id(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Decide which cached files to evict so total bytes fit under `cap`. LRU:
