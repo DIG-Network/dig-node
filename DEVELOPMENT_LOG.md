@@ -758,3 +758,7 @@ inserts in production — so the two arms differ ONLY in the connection's addres
 convenience: asserting the OUTCOME ("no warm started") alone would have been satisfied by a guard at the
 wrong layer, since a filter anywhere below produces the same empty result. Recording the label at the seam
 boundary makes a RELOCATED guard observable.
+
+## Lane anchor — dig_ecosystem#1662/#1663/#1664 (loopback/origin false-premise + enforcement)
+
+WIP: enforce `DIG_NODE_HOST` non-loopback bind behind `DIG_NODE_ALLOW_REMOTE=1` (Option A), rewrite the ~25 "loopback-only" comments to cite the enforcement, fix control.rs token-gate premise (#1663), gate `AppState::with_content_server` test-only (#1664a), and correctly classify IPv4-mapped `::ffff:127.0.0.1` loopback (#1664b). Full anchor commit; implementation follows.
