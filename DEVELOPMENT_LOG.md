@@ -758,3 +758,32 @@ inserts in production — so the two arms differ ONLY in the connection's addres
 convenience: asserting the OUTCOME ("no warm started") alone would have been satisfied by a guard at the
 wrong layer, since a filter anywhere below produces the same empty result. Recording the label at the seam
 boundary makes a RELOCATED guard observable.
+
+## A security property asserted from an unenforced config assumption is a false premise — enforce it or cite the real control (#1662/#1663/#1664)
+
+For ~25 comments the service asserted the local API was "loopback-only / never peer-reachable", but
+`parse_host_override` accepted ANY IP literal with no loopback check — so `DIG_NODE_HOST=0.0.0.0`
+silently made the RPC/content API peer-reachable while every one of those comments claimed it could
+not be. An assertion that a bind "is loopback-only" is worthless when nothing enforces it. Two ways
+to make such a claim TRUE, both applied here:
+
+- **ENFORCE the assumption.** `host_override_refusal` (config.rs) refuses a non-loopback
+  `DIG_NODE_HOST` at startup unless `DIG_NODE_ALLOW_REMOTE=1` (opt-in, same money-safe shape as the
+  live-broadcast flag). Fail-closed at the bind site (`serve_with_shutdown`), NOT in `from_env`, so
+  the non-binding CLI commands (`status`/`install`) still resolve whatever the operator set. Now the
+  loopback comments are enforced invariants, not hopes.
+- **Cite the REAL control, not the bind.** The control surface was documented "loopback-admin-only
+  (never peer-reachable, #179)" — but its actual protection is the paired-token gate enforced
+  fail-closed in `server::rpc` (#1663). An operator MAY deliberately opt into a remote bind, so the
+  control plane must never lean on the bind for authorization; the token gate holds regardless of
+  where the call arrives from. The bind is defense-in-depth beneath it.
+
+Sharp edge — **IPv4-mapped loopback (#1664b).** On a `::` dual-stack bind the OS reports an IPv4
+loopback client as `::ffff:127.0.0.1`, and `Ipv6Addr::is_loopback` is `== ::1` ONLY, so the origin
+classifier mislabelled the operator's OWN reads as `Peer` and silently disabled the local warm-up
+flywheel. The shared `is_loopback_addr` helper unwraps the mapping with `to_ipv4_mapped()` — one
+loopback predicate reused by both the origin label and the `DIG_NODE_HOST` enforcement (and #1646).
+
+Coherence: `DIG_NODE_HOST` governs ONLY the local RPC/content bind; the peer P2P wire (mTLS, in
+dig-node-core) and the loopback wallet mTLS `:9257` listener bind independently, so enforcing
+loopback here never breaks peer connectivity. A remote-API test rig (#1062) just sets the flag.

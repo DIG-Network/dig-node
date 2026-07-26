@@ -168,7 +168,8 @@ ARE `DIG_NODE_*`, full stop.
 | Variable | Meaning | Default | Rules |
 |---|---|---|---|
 | `DIG_NODE_PORT` | localhost-listener bind port | `9778` | Parsed as `u16`; `0`, unparsable, or unset → default. |
-| `DIG_NODE_HOST` | EXPLICIT localhost-listener bind IP override | *(unset)* | Parsed as `IpAddr`; unparsable/blank/unset ⇒ unset (§4.1's dual-stack default — see below), NOT a hardcoded `127.0.0.1` default. Setting it REPLACES the dual-stack default with exactly that one address (#288). |
+| `DIG_NODE_HOST` | EXPLICIT localhost-listener bind IP override | *(unset)* | Parsed as `IpAddr`; unparsable/blank/unset ⇒ unset (§4.1's dual-stack default — see below), NOT a hardcoded `127.0.0.1` default. Setting it REPLACES the dual-stack default with exactly that one address (#288). A NON-loopback value is REFUSED at startup unless `DIG_NODE_ALLOW_REMOTE` is truthy (§3.2.1, #1662). |
+| `DIG_NODE_ALLOW_REMOTE` | permit a non-loopback `DIG_NODE_HOST` bind | `false` | Truthy = `1`/`true`/`yes`/`on`; anything else (unset/blank/falsy/unrecognized) ⇒ the security-safe default **false**. When false, a non-loopback `DIG_NODE_HOST` is a fatal configuration error at startup (§3.2.1). Loopback overrides and the no-override default never require it. |
 | `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | `https://rpc.dig.net` | Normalized (§3.3); highest precedence (§3.4). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
 | `DIG_NODE_DIGLOCAL` | toggle for the bare `dig.local` listeners (`http://dig.local` on `127.0.0.2:80` AND, when a dig-cert leaf is present, `https://dig.local` on `127.0.0.2:443` — §4.1a) | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
@@ -182,6 +183,23 @@ digstore §5.3 resolver already expects (`DEFAULT_LOCAL_NODE_PORT`). Every consu
 `localhost` tier — the DIG Chrome extension's `server.host` default, the dig-installer, and the DIG
 Browser — MUST target `localhost:9778` to match. `DIG_NODE_PORT` overrides it; the `http://dig.local`
 listener (`127.0.0.2:80`) is unaffected — only this localhost port changed (#132).
+
+### 3.2.1. Loopback-only enforcement (HARD RULE, #1662)
+
+The local RPC/content API bind is loopback-only by default AND that property is ENFORCED, not
+merely assumed. The node MUST refuse to start when `DIG_NODE_HOST` resolves to a NON-loopback
+address unless `DIG_NODE_ALLOW_REMOTE` is truthy: an unauthorized non-loopback override is a fatal
+startup configuration error with a clear message naming the escape hatch. This makes the service's
+"loopback-only / never peer-reachable" invariants TRUE rather than asserted — the local API is
+never silently exposed to the network from an unenforced config assumption.
+
+- **Loopback** = an IPv4 loopback (`127.0.0.0/8`), the IPv6 loopback (`::1`), or an IPv4-mapped IPv6
+  loopback (`::ffff:127.0.0.1`). All are accepted without the flag.
+- **Escape hatch** — `DIG_NODE_ALLOW_REMOTE=1` (truthy per the table) permits a deliberate
+  non-loopback bind (e.g. a remote-API test rig). This is opt-in only; it is never on by accident.
+- **Scope** — this governs ONLY the local RPC/content bind ([`Config::bind_addr`]). The peer P2P
+  wire (mTLS, dig-node-core) and the loopback wallet mTLS listener bind independently, so
+  enforcement never affects peer connectivity.
 
 The variables above are the shell's public bind/upstream/cache knobs. The node ENGINE library
 (`dig-node-core`) additionally reads the following variables directly from the environment; the shell

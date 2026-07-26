@@ -29,8 +29,9 @@
 //!
 //! # Security properties
 //!
-//! - **Loopback-only** — the whole server binds `127.0.0.1` (same boundary as
-//!   `control.*`).
+//! - **Loopback bind (enforced)** — the server binds loopback by default; a non-loopback
+//!   `DIG_NODE_HOST` is refused unless `DIG_NODE_ALLOW_REMOTE=1` (#1662). Defense-in-depth
+//!   beneath the token gate (same boundary as `control.*`), not the primary control.
 //! - **Consent = the master token.** APPROVE requires the master token (a local FILE
 //!   read), so only the machine's operator can grant a pairing; the compare-codes
 //!   step defeats a concurrent rogue request (a visited page's) being approved by

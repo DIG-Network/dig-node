@@ -26,8 +26,9 @@ use crate::control;
 /// `.no_proxy()` disables reqwest's default env-proxy behaviour (`HTTP_PROXY`/`HTTPS_PROXY`/
 /// `http_proxy`/…), which has NO automatic loopback bypass. Without it, a hostile operator-env
 /// proxy could route the token-bearing `control.*` POST — carrying the master control token — to
-/// `127.0.0.1`/`::1` through an attacker-controlled proxy. The control plane is loopback-only and
-/// token-gated (#501/#553); pinning the transport DIRECT keeps the token on the wire it was
+/// `127.0.0.1`/`::1` through an attacker-controlled proxy. The control plane is token-gated
+/// (#501/#553, the real protection) and binds loopback by default (a non-loopback DIG_NODE_HOST is
+/// refused unless DIG_NODE_ALLOW_REMOTE=1, #1662); pinning the transport DIRECT keeps the token on the wire it was
 /// minted for and never hands it to an interposed proxy.
 fn build_control_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder().no_proxy().build()
