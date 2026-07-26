@@ -1818,7 +1818,9 @@ impl Node {
         let capped = &items[..items.len().min(MAX_AVAILABILITY_ITEMS)];
         // At most one directory walk for the whole batch, and none at all unless some item asks at
         // STORE granularity (the only answer that needs the held-roots enumeration).
-        let needs_inventory = capped.iter().any(|i| i.get("root").is_none());
+        let needs_inventory = capped
+            .iter()
+            .any(|i| i.get("root").and_then(Value::as_str).is_none());
         let cached = if needs_inventory {
             self.cache_list_cached().await
         } else {
@@ -4814,24 +4816,34 @@ mod tests {
         let (node, td) = test_node(None);
         let store = Bytes32([0xc6; 32]);
         let root = seed_served_capsule(&node, &store, &[("index.html", b"hi")]);
-        // A real file OUTSIDE the modules tree that a traversal would reach.
+        // A real file ONE LEVEL ABOVE `<cache>/modules/` — `module_path` joins
+        // `<cache>/modules/<store_id>/<root>.module`, so a `..` in EITHER `store_id` or `root`
+        // collapses that join back to exactly this file (verified: `store_id=".."` cancels the
+        // `modules` segment; `store_id="."` + a leading `../` in `root` does the same one level
+        // later). Without the canonical-key guard, either traversal below would stat this file and
+        // answer `available:true`.
         let outside = td.path().join("secret.module");
         std::fs::write(&outside, b"not a capsule").unwrap();
 
-        let traversal = json!({
-            "store_id": "..",
-            "root": format!("../{}", outside.file_name().unwrap().to_string_lossy())
-                .trim_end_matches(".module"),
-        });
+        let traversal_via_store = json!({ "store_id": "..", "root": "secret" });
+        let traversal_via_root = json!({ "store_id": ".", "root": "../secret" });
         let resp = node
-            .availability_batch(&[traversal, json!({ "store_id": "zz".repeat(32) })])
+            .availability_batch(&[
+                traversal_via_store,
+                traversal_via_root,
+                json!({ "store_id": "zz".repeat(32) }),
+            ])
             .await;
         assert_eq!(
             resp["items"][0]["available"], false,
-            "a traversal-shaped key is never available"
+            "a `store_id=\"..\"` traversal is never available"
         );
         assert_eq!(
             resp["items"][1]["available"], false,
+            "a `root=\"../secret\"` traversal is never available"
+        );
+        assert_eq!(
+            resp["items"][2]["available"], false,
             "a non-hex store id holds nothing"
         );
         // The genuine capsule still answers correctly beside the rejected keys.
@@ -4839,6 +4851,39 @@ mod tests {
             .availability_batch(&[json!({ "store_id": store.to_hex(), "root": root.to_hex() })])
             .await;
         assert_eq!(ok["items"][0]["available"], true);
+    }
+
+    #[tokio::test]
+    async fn availability_batch_null_root_still_takes_the_inventory_snapshot() {
+        // REGRESSION: `availability_batch`'s `needs_inventory` gate and `availability_answer`'s
+        // granularity switch both key off `root`, and MUST agree on what counts as "absent" — an
+        // item shaped `{ "root": null }` (or any non-string root) has `Value::get("root")` return
+        // `Some(Value::Null)`, so a predicate that only checks `.is_none()` misses it and skips the
+        // inventory snapshot, while `availability_answer` still treats it as STORE granularity (its
+        // `and_then(Value::as_str)` collapses null to `None`). The result was a false
+        // `available:false, roots:[]` for a store the node genuinely holds.
+        let (node, _td) = test_node(None);
+        let store = Bytes32([0xc7; 32]);
+        let root = seed_served_capsule(&node, &store, &[("index.html", b"hi")]);
+
+        let null_root = json!({ "store_id": store.to_hex(), "root": Value::Null });
+        let resp = node.availability_batch(&[null_root]).await;
+        assert_eq!(
+            resp["items"][0]["available"], true,
+            "a null root asks store granularity, not a specific (missing) root"
+        );
+        assert_eq!(
+            resp["items"][0]["roots"].as_array().unwrap(),
+            &[json!(root.to_hex())],
+            "the held root is enumerated once the snapshot the store answer needs is actually taken"
+        );
+
+        let numeric_root = json!({ "store_id": store.to_hex(), "root": 1 });
+        let resp = node.availability_batch(&[numeric_root]).await;
+        assert_eq!(
+            resp["items"][0]["available"], true,
+            "a non-string root is likewise store granularity, not a servable-root miss"
+        );
     }
 
     // -- launcher_ids cap (audit #179 HIGH — peer-triggered unbounded chain fanout) ---------------
