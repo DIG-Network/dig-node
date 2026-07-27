@@ -1557,24 +1557,6 @@ fn module_window_frame(
     frame
 }
 
-/// Stream `[offset, requested_end)` of ONE resource as conforming `dig.fetchRange` frames.
-///
-/// This is the single framing loop behind BOTH serve paths — a locally-held resource and a
-/// fetched-through one — because they owe the caller byte-identical frames, and two loops maintaining
-/// one wire contract is the shape of defect that produced #1640 in the first place.
-///
-/// Three genuinely different bounds are enforced here:
-///
-/// * each frame's payload is at most [`range_frame::FRAME_PAYLOAD`], the per-FRAME cap — NOT
-///   [`RANGE_WINDOW`], which bounds a whole REQUEST and is 96x larger;
-/// * the stream never serves past `requested_end`, the caller's own requested span (#1619), a bound
-///   the resource's own exhaustion cannot express;
-/// * the stream does not END until the prologue is fully delivered, because a reader must discard a
-///   partial `chunk_lens` entirely — it is a DECRYPT input whose entries must sum to `total_length`,
-///   so a layout short even one entry is unusable rather than partially useful.
-///
-/// Frames go out through [`range_frame::write_range_frame`], i.e. dig-nat's own encoder, so this path
-/// cannot emit a frame a conforming receiver must reject even if a future change miscomputed a window.
 /// What a range stream owes its caller: the span requested, whether the resource-scaling metadata was
 /// waived, and the budget the bytes must be paced against.
 ///
@@ -1601,6 +1583,25 @@ pub(crate) struct RangeStreamPlan<'a> {
     pub(crate) egress: &'a (dyn Fn(u64) + Send + Sync),
 }
 
+/// Stream `[offset, requested_end)` of ONE resource as conforming `dig.fetchRange` frames.
+///
+/// This is the single framing loop behind BOTH serve paths — a locally-held resource and a
+/// fetched-through one — because they owe the caller byte-identical frames, and two loops maintaining
+/// one wire contract is the shape of defect that produced #1640 in the first place.
+///
+/// Three genuinely different bounds are enforced here:
+///
+/// * each frame's payload is at most [`range_frame::FRAME_PAYLOAD`], the per-FRAME cap — NOT
+///   [`RANGE_WINDOW`], which bounds a whole REQUEST and is 96x larger;
+/// * the stream never serves past `requested_end`, the caller's own requested span (#1619), a bound
+///   the resource's own exhaustion cannot express;
+/// * the stream does not END until the prologue is fully delivered, because a reader must discard a
+///   partial `chunk_lens` entirely — it is a DECRYPT input whose entries must sum to `total_length`,
+///   so a layout short even one entry is unusable rather than partially useful.
+///
+/// Frames are encoded by [`range_frame::encode_range_frame`] — the sole caller of dig-nat's own
+/// encoder in this crate — so this path cannot emit a frame a conforming receiver must reject even
+/// if a future change miscomputed a window.
 async fn stream_range_frames(
     out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     bytes: &[u8],

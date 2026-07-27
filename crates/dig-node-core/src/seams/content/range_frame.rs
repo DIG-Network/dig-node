@@ -50,9 +50,11 @@
 //!
 //! ## Why this module builds the dig-nat type rather than a `json!`
 //!
-//! [`RangeStreamFramer`] returns a real [`dig_nat::RangeFrame`], and the serve paths write it with
-//! [`write_range_frame`], which goes through [`dig_nat::RangeFrame::encode`] — the encoder that
-//! REFUSES an over-ceiling payload. Building frames as raw JSON and writing them with an uncapped
+//! [`RangeStreamFramer`] returns a real [`dig_nat::RangeFrame`], and every serve path turns it into
+//! wire bytes through [`encode_range_frame`] — the SOLE caller of [`dig_nat::RangeFrame::encode`] in
+//! this crate, which REFUSES an over-ceiling payload. Keeping that one chokepoint is the guarantee, not
+//! a tidiness preference: two inline `.encode()` sites would put the ceiling property in two places.
+//! Building frames as raw JSON and writing them with an uncapped
 //! `write_framed` is what made the defect possible in the first place: the sender had no way to learn
 //! it had produced something the receiver must reject, so the asymmetry could only surface as a failed
 //! read in production. Routing every frame through the type the receiver decodes makes the two sides
