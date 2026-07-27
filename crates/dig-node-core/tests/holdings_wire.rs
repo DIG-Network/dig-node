@@ -17,8 +17,10 @@
 //! 3. The ingested record is discoverable through the real `find_providers`, i.e. the flywheel's
 //!    DISCOVER stage actually sees the new holder.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use dig_dht::{
@@ -27,11 +29,12 @@ use dig_dht::{
 };
 use dig_gossip::{
     frame_holdings_announce, holdings_announce_payload, GossipConfig, GossipHandle, GossipService,
-    PeerPoolConfig, HOLDINGS_ANNOUNCE,
+    HoldingsAnnounce, HoldingsDelta, PeerPoolConfig, HOLDINGS_ANNOUNCE,
 };
 use dig_node_core::peer::{install_crypto_provider, load_or_generate_node_cert};
 use dig_node_core::seams::dig_peer::holdings::{
-    announcement_for, signer_from_node_cert, HoldingsIngress,
+    announcement_for, reconcile_and_announce, signer_from_node_cert, AnnounceTransport,
+    HoldingsBroadcaster, HoldingsIngress,
 };
 
 /// The clock this test announces against — deliberately **real wall-clock**, unlike the pure-policy
@@ -123,6 +126,33 @@ impl WireNode {
 /// Lowercase-hex a gossip `PeerId` (a chia `Bytes32`).
 fn hex_of(peer_id: &dig_gossip::PeerId) -> String {
     hex::encode(peer_id.to_bytes())
+}
+
+/// Mint a persisted `NodeCert` from `seed` (its temp dir is dropped; the cert is self-contained).
+fn node_cert_for(seed: [u8; 32]) -> Arc<dig_tls::NodeCert> {
+    let dir = tempfile::tempdir().expect("cert tempdir");
+    load_or_generate_node_cert(dir.path(), &seed).expect("NodeCert")
+}
+
+/// The pinned fixture clock for the reconcile tests — these never reach dig-dht's expiry clamp with a
+/// past value, because they assert on the LOCAL provider store immediately after the reconcile.
+const NOW: u64 = 1_782_000_000;
+
+/// Records every announcement handed to the transport, in order.
+#[derive(Default)]
+struct RecordingTransport {
+    sent: Mutex<Vec<HoldingsAnnounce>>,
+}
+
+#[async_trait::async_trait]
+impl AnnounceTransport for RecordingTransport {
+    async fn flood(&self, announce: &HoldingsAnnounce) -> usize {
+        self.sent
+            .lock()
+            .expect("transport mutex")
+            .push(announce.clone());
+        1
+    }
 }
 
 /// A transport that reaches nobody: the ingesting node's DHT only answers LOCAL queries here, so a
@@ -392,5 +422,179 @@ async fn a_signed_retract_crosses_the_real_wire_and_spares_the_other_holder() {
     assert!(
         ids.contains(&other_id),
         "the OTHER honest holder of the same capsule must survive the retract; got {ids:?}"
+    );
+}
+
+// =============================================================================================
+// Inventory reconcile — the declared behaviour change, and the reconcile->flood COMPOSITION
+// =============================================================================================
+//
+// These exercise a REAL `DhtService` through a real `DhtHandle`, because the two properties at stake
+// are both about what the DHT ends up holding, and neither is visible from either half alone.
+
+/// A cached-capsule inventory entry for `(store, root)`.
+fn cached_capsule(store: u8, root: u8) -> dig_node_core::CachedCapsule {
+    dig_node_core::CachedCapsule {
+        store_id: hex::encode([store; 32]),
+        root: hex::encode([root; 32]),
+        size_bytes: 4_096,
+        last_used_unix_ms: 1_782_000_000_000,
+    }
+}
+
+/// A local-only DHT handle: its transport reaches nobody, so every `find_providers` answer comes from
+/// this node's OWN provider store — which is exactly the state under test.
+fn local_dht_handle(port: u16) -> Arc<dig_node_core::dht::DhtHandle> {
+    let service = Arc::new(DhtService::new(
+        PeerId::from_bytes([0x7eu8; 32]),
+        vec![CandidateAddr::direct("::1".to_string(), port)],
+        DhtConfig::default(),
+        Arc::new(UnreachableTransport),
+    ));
+    dig_node_core::dht::DhtHandle::new(service, Vec::new())
+}
+
+/// PROPERTY (the declared MEDIUM behaviour change): losing a capsule must make this node STOP being
+/// returned by `find_providers` IMMEDIATELY, not at TTL expiry.
+///
+/// This is the difference between `retract_own_provider` and the passive `withdraw_provider` it
+/// replaced, and it is the whole justification for the change: `withdraw_provider` only unmarks the
+/// key for republish and LEAVES the local record, so for the remainder of its TTL this node keeps
+/// answering `find_providers` with itself for content it can no longer serve — one wasted dial per
+/// reader. Reverting the call in `sync_inventory` reds this test on the final assertion.
+#[tokio::test]
+async fn losing_a_capsule_stops_this_node_being_returned_as_a_provider_at_once() {
+    let dht = local_dht_handle(9_301);
+    let capsule = ContentId::capsule([0x01u8; 32], [0x02u8; 32]);
+
+    // GAIN: the node caches the capsule and reconciles.
+    let gained = dht.reconcile_inventory(&[cached_capsule(0x01, 0x02)]).await;
+    assert!(
+        gained.gained.contains(&capsule),
+        "the reconcile must report the capsule as gained; got {gained:?}"
+    );
+    let providers = dht
+        .service()
+        .find_providers(&capsule)
+        .await
+        .expect("local provider-store lookup");
+    assert_eq!(
+        providers.len(),
+        1,
+        "after caching, this node is discoverable as a holder"
+    );
+
+    // LOSE: the capsule leaves the inventory (an eviction, a cache-remove, a store deletion).
+    let lost = dht.reconcile_inventory(&[]).await;
+    assert!(
+        lost.lost.contains(&capsule),
+        "the reconcile must report the capsule as lost; got {lost:?}"
+    );
+
+    let after = dht
+        .service()
+        .find_providers(&capsule)
+        .await
+        .expect("local provider-store lookup");
+    assert!(
+        after.is_empty(),
+        "a node that no longer holds a capsule must NOT still be returned as its provider — a \
+         passive withdraw leaves the record to lapse via TTL and costs every reader a failed dial; \
+         got {after:?}"
+    );
+}
+
+/// PROPERTY (the COMPOSITION — the point of this feature): a reconcile that changes the inventory must
+/// flood an announcement whose deltas are EXACTLY the ids the reconcile moved.
+///
+/// The two halves passing in isolation says nothing about the wiring between them. The fixture makes
+/// the two directions distinguishable — one capsule GAINED while a different one is LOST in the SAME
+/// reconcile — so an implementation that floods only adds, only removes, or the wrong id set is
+/// observably different from a correct one.
+#[tokio::test]
+async fn a_reconcile_floods_exactly_the_deltas_it_moved() {
+    let dht = local_dht_handle(9_302);
+    let transport = RecordingTransport::default();
+    let signer = signer_from_node_cert(&node_cert_for([0x64u8; 32])).expect("P-256 leaf");
+    let broadcaster = HoldingsBroadcaster::new(signer, Vec::new(), 0);
+
+    // Establish a first capsule, then reconcile to a DIFFERENT one: one gain plus one loss at once.
+    let first = ContentId::capsule([0x11u8; 32], [0x12u8; 32]);
+    let second = ContentId::capsule([0x21u8; 32], [0x22u8; 32]);
+    reconcile_and_announce(
+        &dht,
+        &[cached_capsule(0x11, 0x12)],
+        Some((&broadcaster, &transport)),
+        NOW,
+    )
+    .await;
+    transport.sent.lock().expect("mutex").clear();
+
+    let delta = reconcile_and_announce(
+        &dht,
+        &[cached_capsule(0x21, 0x22)],
+        Some((&broadcaster, &transport)),
+        NOW,
+    )
+    .await;
+
+    assert!(delta.gained.contains(&second), "the new capsule is gained");
+    assert!(delta.lost.contains(&first), "the old capsule is lost");
+
+    let sent = transport.sent.lock().expect("mutex");
+    assert_eq!(sent.len(), 1, "one reconcile, one frame");
+    let announced_adds: BTreeSet<_> = sent[0]
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            HoldingsDelta::Add { content_key, .. } => Some(*content_key),
+            HoldingsDelta::Remove { .. } => None,
+        })
+        .collect();
+    let announced_removes: BTreeSet<_> = sent[0]
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            HoldingsDelta::Remove { content_key } => Some(*content_key),
+            HoldingsDelta::Add { .. } => None,
+        })
+        .collect();
+    let expected_adds: BTreeSet<_> = delta
+        .gained
+        .iter()
+        .map(|c| *c.to_key().as_bytes())
+        .collect();
+    let expected_removes: BTreeSet<_> = delta.lost.iter().map(|c| *c.to_key().as_bytes()).collect();
+
+    assert_eq!(
+        announced_adds, expected_adds,
+        "the flooded Add deltas must be exactly the ids the reconcile gained"
+    );
+    assert_eq!(
+        announced_removes, expected_removes,
+        "the flooded Remove deltas must be exactly the ids the reconcile lost — a retract that the \
+         DHT applied but the flood omitted leaves peers dialling a node that has evicted the capsule"
+    );
+}
+
+/// PROPERTY: a reconcile that changes nothing floods nothing, so a steady-state node is silent.
+#[tokio::test]
+async fn an_unchanged_reconcile_floods_nothing() {
+    let dht = local_dht_handle(9_303);
+    let transport = RecordingTransport::default();
+    let signer = signer_from_node_cert(&node_cert_for([0x65u8; 32])).expect("P-256 leaf");
+    let broadcaster = HoldingsBroadcaster::new(signer, Vec::new(), 0);
+    let inventory = [cached_capsule(0x31, 0x32)];
+
+    reconcile_and_announce(&dht, &inventory, Some((&broadcaster, &transport)), NOW).await;
+    transport.sent.lock().expect("mutex").clear();
+
+    let delta =
+        reconcile_and_announce(&dht, &inventory, Some((&broadcaster, &transport)), NOW).await;
+
+    assert!(delta.is_empty(), "an identical inventory changed nothing");
+    assert!(
+        transport.sent.lock().expect("mutex").is_empty(),
+        "a no-op reconcile must not put a frame on the wire"
     );
 }

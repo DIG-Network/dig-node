@@ -25,12 +25,13 @@
 //!
 //! | Class | Guard |
 //! |---|---|
-//! | **Forged attribution** — naming another peer as a holder, or as *not* a holder | An announce's provider identity is [`HoldingsAnnounce::provider_peer_id`], which `verify_holdings_announce` proves equals `SHA-256(provider_spki)` and which signed the batch. [`HoldingsIngress::accept`] takes **no** caller-supplied provider id, so no code path can name a peer the signature does not attribute (see [`HoldingsIngress::accept`]). |
+//! | **Forged attribution** — naming another peer as a holder, or as *not* a holder | An announce's provider identity is [`HoldingsAnnounce::provider_peer_id`], which `verify_holdings_announce` proves equals `SHA-256(provider_spki)` and which signed the batch. [`HoldingsIngress::accept`] takes **no** caller-supplied provider id, so no code path can name a peer the signature does not attribute. |
+//! | **Identity re-spelling** — the same signer wearing many names | Hex is case-INSENSITIVE and the signature covers the DECODED bytes, so one identity has many spellings that all verify. [`HoldingsIngress::accept`] canonicalizes ONCE, up front, and every later comparison, map key and sink argument uses only that value — otherwise each spelling is a fresh provider with no replay watermark, and a lowercase self-id comparison misses all of them. |
 //! | **Amplification** — one cheap inbound message causing outbound work | The ingress performs **zero egress**: it never re-broadcasts, dials, probes, or fetches. Its whole cost is bounded local map work. |
 //! | **Flood / Sybil eviction** — evicting an honest holder from a full provider set | Two token buckets at ONE chokepoint ([`RateLimits`]): announcements per *provider* and deltas per *transport sender*. They are keyed differently on purpose — see [`MAX_DELTAS_PER_SENDER`] for why each covers the other's weakness. A rejected announcement charges neither, so the limiter cannot itself be turned into the denial of service. |
-//! | **Replay** — resurrecting a retracted record, or undoing a newer announce | Per-provider monotonic [`HoldingsAnnounce::seq`]; an announce at or below the highest seq already applied for that provider is dropped. |
+//! | **Replay** — resurrecting a retracted record, or undoing a newer announce | TWO independent barriers, because either alone is escapable: a per-provider monotonic [`HoldingsAnnounce::seq`] watermark (keyed by the CANONICAL id), and a bounded-freshness check on the signed `announced_at` ([`MAX_ANNOUNCE_AGE_SECS`]). The watermark is in-memory, so a restart or a capacity eviction clears it; freshness holds regardless of watermark state, which matters most for a `Remove` — it carries no expiry of its own. |
 //! | **Self-poisoning** — replaying our own announce back at us | An announce attributed to this node's own `peer_id` is dropped; only this node decides what it holds. |
-//! | **Unbounded state** — the guard maps themselves becoming the DoS | Both maps are capacity-bounded with LRU eviction ([`MAX_TRACKED_SENDERS`], [`MAX_TRACKED_PROVIDERS`]). |
+//! | **Unbounded state** — the guard maps themselves becoming the DoS | A REJECTED announcement allocates nothing at all: [`IngressState::admit`] decides every gate against borrowed state and inserts only after all of them pass, so no reject path can grow a map. Admitted entries are then capacity-bounded with LRU eviction ([`MAX_TRACKED_SENDERS`], [`MAX_TRACKED_PROVIDERS`]). |
 //!
 //! A false claim is cheap to disprove and costs the liar, not the reader: a bogus provider record
 //! only ever yields a *dial that fails* or a `dig.getAvailability` that answers "no", after which
@@ -83,6 +84,23 @@ pub const MAX_DELTAS_PER_SENDER: u32 = 4 * HOLDINGS_MAX_CHANGES as u32;
 /// The token-bucket refill window, in seconds.
 pub const RATE_WINDOW_SECS: u64 = 60;
 
+/// How far `announced_at` may be from the receiver's clock, in either direction, before the
+/// announcement is refused as stale.
+///
+/// This bound is what makes a captured announcement stop being useful, and it is required rather
+/// than merely defensive: a `Remove` delta carries NO expiry of its own, so without it the only
+/// barrier to replaying a captured retract forever is the in-memory per-provider `seq` watermark —
+/// which a restart clears and a capacity eviction drops. That would let anyone de-list an honest
+/// holder by replaying the holder's own old retract at a freshly started peer, which is censorship,
+/// not staleness. Persisting the watermark is complementary (#1477) but is NOT a substitute: the
+/// signature binds WHO announced, and only this comparison binds WHEN.
+///
+/// Five minutes is generous enough to absorb ordinary NTP skew and flood propagation delay while
+/// keeping a captured frame useful for minutes rather than indefinitely. It is symmetric because a
+/// future-dated frame is the same attack: an attacker who could post-date `announced_at` would mint a
+/// retract that stays replayable long after capture.
+pub const MAX_ANNOUNCE_AGE_SECS: u64 = 300;
+
 /// Transport senders tracked before the least-recently-seen is evicted.
 ///
 /// The key is a peer this node holds a live mTLS link to, so the live key space is the connected
@@ -91,10 +109,14 @@ pub const MAX_TRACKED_SENDERS: usize = 1_024;
 
 /// Providers tracked (latest `seq` + announce bucket) before the least-recently-seen is evicted.
 ///
-/// Bounded because the provider id inside an announce is attacker-chosen. Eviction degrades
-/// gracefully in both directions: losing a seq permits a replay of *that provider's own* signed
-/// announce (bounded staleness, never cross-peer censorship — the retract path can still only touch
-/// the signer's own record), and losing an announce bucket is backstopped by
+/// Bounded because the provider id inside an announce is attacker-chosen.
+///
+/// Losing an entry to eviction costs a provider its replay watermark. That is NOT harmless on its own
+/// — an earlier version of this comment claimed it meant "bounded staleness, never cross-peer
+/// censorship", which was wrong: the signature binds WHO announced but not WHEN, so replaying a
+/// holder's own captured `Remove` (which carries no expiry) at a peer with no watermark de-lists an
+/// honest holder. [`MAX_ANNOUNCE_AGE_SECS`] is what actually closes that class, independently of
+/// watermark state. Losing an announce bucket is separately backstopped by
 /// [`MAX_DELTAS_PER_SENDER`], which cannot be evicted out from under an attacker.
 pub const MAX_TRACKED_PROVIDERS: usize = 8_192;
 
@@ -252,6 +274,14 @@ pub enum Rejected {
     },
     /// The transport sender exhausted its announce or delta budget for the current window.
     RateLimited,
+    /// `announced_at` is further from now than [`RateLimits::max_announce_age_secs`], in either
+    /// direction — the announcement is too old to act on, or dated too far ahead to be honest.
+    Stale {
+        /// The rejected announcement's signed `announced_at`.
+        announced_at: u64,
+        /// The receiver's clock when it was evaluated.
+        now: u64,
+    },
 }
 
 /// How many deltas of each kind an accepted announcement applied.
@@ -264,9 +294,14 @@ pub struct Applied {
 }
 
 /// Per-provider state: the highest applied `seq` plus that provider's announce bucket.
+///
+/// `highest_seq` is an `Option` rather than a sentinel: a provider that has never been seen has NO
+/// watermark, which is different from one whose watermark is zero. Seeding a first sighting at
+/// `seq - 1` would reject a conforming implementation that starts numbering at `0`, and SPEC does not
+/// require `seq >= 1`.
 #[derive(Debug, Clone, Copy)]
 struct ProviderState {
-    highest_seq: u64,
+    highest_seq: Option<u64>,
     window_start: u64,
     announces: u32,
     last_seen: u64,
@@ -289,6 +324,8 @@ pub struct RateLimits {
     pub deltas_per_sender: u32,
     /// Window length in seconds.
     pub window_secs: u64,
+    /// Maximum absolute distance between `announced_at` and the receiver's clock.
+    pub max_announce_age_secs: u64,
 }
 
 impl Default for RateLimits {
@@ -297,6 +334,7 @@ impl Default for RateLimits {
             announces_per_provider: MAX_ANNOUNCES_PER_PROVIDER,
             deltas_per_sender: MAX_DELTAS_PER_SENDER,
             window_secs: RATE_WINDOW_SECS,
+            max_announce_age_secs: MAX_ANNOUNCE_AGE_SECS,
         }
     }
 }
@@ -326,12 +364,33 @@ impl HoldingsIngress {
         Self::with_limits(self_peer_id, RateLimits::default())
     }
 
+    /// Whether the real-time ingress is enabled for this process.
+    ///
+    /// `DIG_HOLDINGS_INGEST=0` (or `false`/`off`) disables it, leaving the node ANNOUNCING and
+    /// discoverable through the durable DHT provider records. An operator facing an announcement flood
+    /// needs a switch that does not require a downgrade; without one the only remedy is to stop the
+    /// node.
+    #[must_use]
+    pub fn ingest_enabled_from_env() -> bool {
+        !matches!(
+            std::env::var("DIG_HOLDINGS_INGEST")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    }
+
     /// [`Self::new`] with explicit budgets — used by tests to reach the limits deterministically
     /// without emitting thousands of frames.
     #[must_use]
     pub fn with_limits(self_peer_id: String, limits: RateLimits) -> Self {
         Self {
-            self_peer_id,
+            // Canonicalized so gate 3 compares like with like. A caller that passes an
+            // upper-case-spelled id would otherwise never match an inbound announcement, silently
+            // disabling the self-attribution gate.
+            self_peer_id: PeerId::from_hex(&self_peer_id).map_or(self_peer_id, |p| p.to_hex()),
             limits,
             state: tokio::sync::Mutex::new(IngressState::default()),
         }
@@ -372,16 +431,38 @@ impl HoldingsIngress {
         announce: &HoldingsAnnounce,
         now: u64,
     ) -> Result<Applied, Rejected> {
-        // Gate 1 — authenticity. Fail-closed: everything after this point trusts
-        // `announce.provider_peer_id` as the signer, and nothing else.
+        // Gate 1 — authenticity. Fail-closed.
         verify_holdings_announce(announce).map_err(Rejected::Unverified)?;
 
-        // Gate 2 — never let the network tell us what we hold.
-        if announce.provider_peer_id == self.self_peer_id {
+        // Gate 2 — CANONICALIZE the identity, once, before it is compared to or keyed on anything.
+        //
+        // This is not defensive tidying, it is a correctness gate. Hex decoding is case-INSENSITIVE
+        // and the signature covers the 32 DECODED bytes, so one identity has many valid spellings and
+        // every one of them verifies. Treating the field as an opaque `String` therefore gives an
+        // attacker a free bypass of any check built on it: a `String ==` against a lowercase self id
+        // misses `0xAB…`, and a map keyed by spelling makes each variant a fresh provider with no
+        // replay watermark. `PeerId::from_hex(..).to_hex()` collapses all of them to one value, and
+        // NOTHING below this line may read `announce.provider_peer_id` again.
+        let provider = PeerId::from_hex(&announce.provider_peer_id)
+            .ok_or(Rejected::Unverified(HoldingsError::BadPeerIdHex))?;
+        let provider_hex = provider.to_hex();
+
+        // Gate 3 — never let the network tell us what we hold.
+        if provider_hex == self.self_peer_id {
             return Err(Rejected::SelfAttributed);
         }
 
-        // Gates 3, 4 and 5 — replay rejection and the two rate buckets, decided together under one
+        // Gate 4 — bounded freshness. Evaluated before any state is touched, because a stale frame
+        // must cost the receiver nothing at all. See [`MAX_ANNOUNCE_AGE_SECS`] for why a `Remove`
+        // cannot be left to the `seq` watermark alone.
+        if now.abs_diff(announce.announced_at) > self.limits.max_announce_age_secs {
+            return Err(Rejected::Stale {
+                announced_at: announce.announced_at,
+                now,
+            });
+        }
+
+        // Gates 5, 6 and 7 — replay rejection and the two rate buckets, decided together under one
         // lock so a concurrent flood cannot interleave two accepts past the same budget. The whole
         // decision is committed before any `await` on the sink, so a replay of this same seq is
         // already rejected while this batch is still being applied.
@@ -390,7 +471,7 @@ impl HoldingsIngress {
             let mut state = self.state.lock().await;
             state.admit(
                 sender_peer_id,
-                &announce.provider_peer_id,
+                &provider_hex,
                 announce.seq,
                 delta_cost,
                 now,
@@ -398,16 +479,20 @@ impl HoldingsIngress {
             )?;
         }
 
-        Ok(self.apply(sink, announce).await)
+        Ok(self.apply(sink, &provider, &provider_hex, announce).await)
     }
 
     /// Apply a verified, budgeted batch. No egress — purely local provider-set mutation.
-    async fn apply(&self, sink: &dyn HoldingsSink, announce: &HoldingsAnnounce) -> Applied {
-        let Some(provider) = PeerId::from_hex(&announce.provider_peer_id) else {
-            // Unreachable: gate 1 proved the hex decodes. Treated as "apply nothing" rather than
-            // panicking, so a future wire change can never turn a parse skew into a node crash.
-            return Applied::default();
-        };
+    ///
+    /// Takes the CANONICAL provider identity as both its typed and hex forms, so neither the ingest
+    /// nor the remove path can reach for the raw wire spelling.
+    async fn apply(
+        &self,
+        sink: &dyn HoldingsSink,
+        provider: &PeerId,
+        provider_hex: &str,
+        announce: &HoldingsAnnounce,
+    ) -> Applied {
         let mut applied = Applied::default();
         for change in &announce.changes {
             match change {
@@ -419,8 +504,16 @@ impl HoldingsIngress {
                     if sink
                         .ingest(ProviderRecord::new(
                             &Key::from_bytes(*content_key),
-                            &provider,
-                            addresses.iter().map(to_dht_addr).collect(),
+                            provider,
+                            // Truncated to what dig-dht will keep anyway. The wire's address count is
+                            // an attacker-declared `u16`, so mapping the whole list first would let a
+                            // ~180-byte frame make this node allocate megabytes before dig-dht capped
+                            // it — work bought far too cheaply.
+                            addresses
+                                .iter()
+                                .take(dig_dht::MAX_ADDRESSES_PER_RECORD)
+                                .map(to_dht_addr)
+                                .collect(),
                             *expires_at,
                         ))
                         .await
@@ -429,13 +522,12 @@ impl HoldingsIngress {
                     }
                 }
                 HoldingsDelta::Remove { content_key } => {
-                    // The provider id is the VERIFIED signer, never a caller- or wire-supplied
-                    // value: this is what makes a retract unable to de-list an honest holder.
+                    // The provider id is the CANONICALIZED verified signer, never a caller- or
+                    // wire-supplied value: this is what makes a retract unable to de-list an honest
+                    // holder, and the canonical form is what makes it resolve to the signer's own
+                    // record rather than to a spelling that matches nothing.
                     if sink
-                        .remove(
-                            &Key::from_bytes(*content_key).to_hex(),
-                            &announce.provider_peer_id,
-                        )
+                        .remove(&Key::from_bytes(*content_key).to_hex(), provider_hex)
                         .await
                     {
                         applied.removed += 1;
@@ -467,71 +559,81 @@ impl IngressState {
         now: u64,
         limits: &RateLimits,
     ) -> Result<(), Rejected> {
-        let provider_state = self
-            .providers
-            .entry(provider.to_string())
-            .or_insert_with(|| ProviderState {
-                // `highest_seq` starts one below the incoming seq so a provider's FIRST announcement
-                // is admitted at whatever seq it carries; only a non-advancing seq is a replay.
-                highest_seq: seq.saturating_sub(1),
-                window_start: now,
-                announces: 0,
-                last_seen: now,
-            });
-        if now.saturating_sub(provider_state.window_start) >= limits.window_secs {
-            provider_state.window_start = now;
-            provider_state.announces = 0;
+        // DECIDE FIRST, ALLOCATE ONLY ON SUCCESS.
+        //
+        // Nothing below reads through a `HashMap::entry`, because inserting before the gates is what
+        // makes a REJECTED announcement grow the tracked set: the reject paths return early, so they
+        // would skip the eviction at the end and the map would follow an attacker-minted key space
+        // for the price of one ~180-byte frame per entry. Reading the current state into locals keeps
+        // every rejection allocation-free.
+        let current_provider = self.providers.get(provider).copied();
+        let (provider_window, provider_announces, watermark) = match current_provider {
+            // A window that has fully elapsed resets the bucket but NEVER the watermark: replay
+            // protection is not a rate limit and must not lapse with one.
+            Some(p) if now.saturating_sub(p.window_start) >= limits.window_secs => {
+                (now, 0, p.highest_seq)
+            }
+            Some(p) => (p.window_start, p.announces, p.highest_seq),
+            None => (now, 0, None),
+        };
+        if let Some(highest) = watermark {
+            if seq <= highest {
+                return Err(Rejected::StaleSeq { seq, highest });
+            }
         }
-        if seq <= provider_state.highest_seq {
-            return Err(Rejected::StaleSeq {
-                seq,
-                highest: provider_state.highest_seq,
-            });
-        }
-        if provider_state.announces >= limits.announces_per_provider {
+        if provider_announces >= limits.announces_per_provider {
             return Err(Rejected::RateLimited);
         }
 
-        let sender_state = self
-            .senders
-            .entry(sender.to_string())
-            .or_insert_with(|| SenderState {
-                window_start: now,
-                deltas: 0,
-                last_seen: now,
-            });
-        if now.saturating_sub(sender_state.window_start) >= limits.window_secs {
-            sender_state.window_start = now;
-            sender_state.deltas = 0;
-        }
-        let charged = sender_state.deltas.saturating_add(deltas);
+        let current_sender = self.senders.get(sender).copied();
+        let (sender_window, sender_deltas) = match current_sender {
+            Some(s) if now.saturating_sub(s.window_start) >= limits.window_secs => (now, 0),
+            Some(s) => (s.window_start, s.deltas),
+            None => (now, 0),
+        };
+        let charged = sender_deltas.saturating_add(deltas);
         if charged > limits.deltas_per_sender {
             return Err(Rejected::RateLimited);
         }
-        sender_state.deltas = charged;
-        sender_state.last_seen = now;
 
-        // Both buckets fit — commit the provider side too. Re-looked-up because the sender borrow
-        // above ended; the entry is present since it was just inserted.
-        if let Some(p) = self.providers.get_mut(provider) {
-            p.announces = p.announces.saturating_add(1);
-            p.highest_seq = seq;
-            p.last_seen = now;
-        }
+        // Every gate passed — NOW commit both sides.
+        self.senders.insert(
+            sender.to_string(),
+            SenderState {
+                window_start: sender_window,
+                deltas: charged,
+                last_seen: now,
+            },
+        );
+        self.providers.insert(
+            provider.to_string(),
+            ProviderState {
+                highest_seq: Some(seq),
+                window_start: provider_window,
+                announces: provider_announces.saturating_add(1),
+                last_seen: now,
+            },
+        );
 
-        // Evict AFTER charging so an entry just charged is never the victim of its own admission.
+        // Evict AFTER committing so an entry just charged is never the victim of its own admission.
         evict_lru(&mut self.senders, MAX_TRACKED_SENDERS, |s| s.last_seen);
         evict_lru(&mut self.providers, MAX_TRACKED_PROVIDERS, |p| p.last_seen);
         Ok(())
     }
 }
 
-/// Drop least-recently-stamped entries until `map` holds at most `cap`.
+/// Drop least-recently-stamped entries until `map` holds at most `cap`, oldest first.
+///
+/// Comparison allocates NOTHING: an earlier version built a `(stamp, String)` sort key, cloning a key
+/// for every entry examined, on every removal, while holding the ingress lock — quadratic allocation
+/// that turned a large tracked set into a wedged ingest task and a pinned worker thread. The tie-break
+/// on key text is kept (it makes eviction deterministic for tests) but borrows instead of cloning, and
+/// only the single chosen victim is cloned, which the borrow checker does require.
 fn evict_lru<V>(map: &mut HashMap<String, V>, cap: usize, stamp: impl Fn(&V) -> u64) {
     while map.len() > cap {
         let Some(oldest) = map
             .iter()
-            .min_by_key(|(k, v)| (stamp(v), (*k).clone()))
+            .min_by(|(a_key, a), (b_key, b)| stamp(a).cmp(&stamp(b)).then_with(|| a_key.cmp(b_key)))
             .map(|(k, _)| k.clone())
         else {
             return;
@@ -637,6 +739,33 @@ impl HoldingsBroadcaster {
     }
 }
 
+/// Reconcile the node's DHT provider records against `cached` AND flood the matching real-time
+/// announcement — the composition that actually turns caching a capsule into being discovered.
+///
+/// This is the node's ONE inventory-change reaction. Both halves take the SAME
+/// [`InventoryDelta`](crate::dht::InventoryDelta), so the flood can never disagree with the provider
+/// records it announces: a capsule cannot be announced as gained while its record says otherwise, and
+/// a retract cannot be skipped. `holdings` is `None` on a node that cannot sign (it stays discoverable
+/// through the durable records alone).
+///
+/// It lives here, taking the pieces it needs rather than a `Node`, so the composition is testable
+/// against a real `DhtService` — the two halves passing in isolation says nothing about the wiring
+/// between them, which is the whole point of the feature.
+pub async fn reconcile_and_announce(
+    dht: &crate::dht::DhtHandle,
+    cached: &[crate::CachedCapsule],
+    holdings: Option<(&HoldingsBroadcaster, &dyn AnnounceTransport)>,
+    now: u64,
+) -> crate::dht::InventoryDelta {
+    let delta = dht.reconcile_inventory(cached).await;
+    if let (Some((broadcaster, transport)), false) = (holdings, delta.is_empty()) {
+        broadcaster
+            .announce_change(transport, &delta.gained, &delta.lost, now)
+            .await;
+    }
+    delta
+}
+
 /// Consume inbound opcode-222 frames from the gossip pool forever, applying each through `ingress`.
 ///
 /// Spawned once at bring-up. Non-222 frames are ignored (other subscribers handle them), and a lagged
@@ -663,21 +792,28 @@ pub async fn run_holdings_ingest(
         let Some(announce) = dig_gossip::holdings_announce_payload(&msg) else {
             continue; // not an opcode-222 frame (or an undecodable one)
         };
+        // `provider_peer_id` is a `u16`-length-prefixed WIRE string: up to 65,535 bytes of arbitrary
+        // UTF-8, newlines and terminal escapes included. Normalising it here means no peer-supplied
+        // text can reach a log line, forge one, or drive a terminal escape. Logging at `debug` bounds
+        // the VOLUME an attacker can cause; it does nothing about CONTENT, so content is handled by
+        // never emitting the raw field at all.
+        let canonical_provider =
+            dig_dht::PeerId::from_hex(&announce.provider_peer_id).map(|p| p.to_hex());
         let now = now_unix_secs();
         match ingress
             .accept(&sink, &hex::encode(sender.to_bytes()), &announce, now)
             .await
         {
             Ok(applied) => tracing::debug!(
-                provider = %announce.provider_peer_id,
+                // Present whenever `accept` succeeded — it canonicalizes the same value.
+                provider = canonical_provider.as_deref().unwrap_or("<unverified>"),
                 ingested = applied.ingested,
                 removed = applied.removed,
                 "dig-node holdings: applied a verified announcement"
             ),
-            // Rejections are the common case under adversarial load, so they stay at debug: an
-            // attacker must never be able to inflate this node's log volume.
             Err(reason) => tracing::debug!(
-                provider = %announce.provider_peer_id,
+                // `None` exactly when the id was not canonical hex, which is itself the diagnosis.
+                provider = canonical_provider.as_deref().unwrap_or("<malformed>"),
                 ?reason,
                 "dig-node holdings: rejected an announcement"
             ),

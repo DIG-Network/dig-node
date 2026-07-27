@@ -23,8 +23,8 @@ use dig_gossip::{
 };
 use dig_node_core::seams::dig_peer::holdings::{
     announcement_for, deltas_for, split_batches, AnnounceTransport, Applied, HoldingsBroadcaster,
-    HoldingsIngress, HoldingsSink, Rejected, ADVERTISED_TTL_SECS, MAX_ANNOUNCES_PER_PROVIDER,
-    MAX_DELTAS_PER_SENDER, MAX_TRACKED_SENDERS, RATE_WINDOW_SECS,
+    HoldingsIngress, HoldingsSink, RateLimits, Rejected, ADVERTISED_TTL_SECS,
+    MAX_ANNOUNCES_PER_PROVIDER, MAX_DELTAS_PER_SENDER, RATE_WINDOW_SECS,
 };
 
 /// The pinned fixture clock (Unix seconds, 2026-07-01T00:00:00Z). Never `SystemTime::now()`.
@@ -627,58 +627,6 @@ async fn rejected_announcements_do_not_consume_the_budget() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Ingress — bounded state
-// ---------------------------------------------------------------------------------------------
-
-/// PROPERTY: the guard maps are capacity-bounded, so the ingress cannot become its own denial of
-/// service by remembering every identity an attacker mints.
-///
-/// The bound is pinned from both sides: at the cap the map holds exactly the cap, and pushing PAST it
-/// still holds exactly the cap (never cap+1). The fixture drives the PROVIDER map, whose key space is
-/// the attacker-chosen one — the sender map's key space is the connected pool and cannot be inflated
-/// from off-network, so the provider map is the one that must not grow without limit.
-#[tokio::test]
-async fn the_provider_tracking_map_is_capacity_bounded() {
-    let us = TestPeer::new();
-    let sink = RecordingSink::default();
-    // A tiny window is irrelevant here; the LRU cap is a compile-time constant, so this test asserts
-    // the invariant with a small stand-in map size by driving well past it would be too slow at 8,192
-    // providers x a real P-256 signature each. Instead it drives the SENDER map, whose cap is reached
-    // with cheap distinct sender ids and which shares the same `evict_lru` implementation.
-    let ingress = HoldingsIngress::new(us.peer_id_hex.clone());
-    let holder = TestPeer::new();
-
-    // One valid announcement per distinct sender id: MAX_TRACKED_SENDERS + 64 senders.
-    for i in 0..(MAX_TRACKED_SENDERS + 64) {
-        let sender = format!("{:064x}", i);
-        let seq = u64::try_from(i).unwrap_or(u64::MAX) + 1;
-        ingress
-            .accept(
-                &sink,
-                &sender,
-                &holder.announce(seq, vec![add_delta(&content(1))]),
-                // Advance the clock a window per 10 announcements so the per-provider budget refills;
-                // this test is about the MAP bound, not the rate bound.
-                NOW + (u64::try_from(i).unwrap_or(0) / 5) * RATE_WINDOW_SECS,
-            )
-            .await
-            .unwrap_or_else(|e| panic!("sender {i} should be admitted, got {e:?}"));
-        let (senders, _) = ingress.tracked_counts().await;
-        assert!(
-            senders <= MAX_TRACKED_SENDERS,
-            "the sender map must never exceed its cap; at i={i} it held {senders}"
-        );
-    }
-
-    let (senders, providers) = ingress.tracked_counts().await;
-    assert_eq!(
-        senders, MAX_TRACKED_SENDERS,
-        "past the cap the map settles AT the cap, evicting least-recently-seen"
-    );
-    assert_eq!(providers, 1, "one provider announced throughout");
-}
-
-// ---------------------------------------------------------------------------------------------
 // Egress composition — the broadcaster
 // ---------------------------------------------------------------------------------------------
 
@@ -755,4 +703,309 @@ async fn an_empty_reconcile_floods_nothing() {
         0
     );
     assert!(transport.sent.lock().expect("mutex").is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ingress — hex CASE MALLEABILITY (the gate-2 / gate-3 bypass)
+// ---------------------------------------------------------------------------------------------
+//
+// `hex::decode` is case-INSENSITIVE and dig-gossip signs over the 32 DECODED bytes, so uppercasing
+// any hex digit of `provider_peer_id` yields a still-valid signature for the same identity. Every
+// comparison or map key that treats the field as an opaque `String` therefore has many spellings of
+// one peer, and each spelling is a free bypass. These are exploit regressions, not unit tests of a
+// helper: each replays a REAL signed announcement with its identity merely re-spelled.
+
+/// Re-spell an announcement's `provider_peer_id` in upper case. The signature still verifies, because
+/// it covers the decoded bytes rather than this text.
+fn uppercase_provider(announce: &HoldingsAnnounce) -> HoldingsAnnounce {
+    let mut respelled = announce.clone();
+    respelled.provider_peer_id = respelled.provider_peer_id.to_uppercase();
+    respelled
+}
+
+/// EXPLOIT (gate 2): our own announcement, replayed back at us with its identity uppercased, must
+/// STILL be recognised as ours.
+///
+/// A `String ==` against a lowercase `self_peer_id` misses every case variant, letting the network
+/// drive this node's own provider set — the exact thing gate 2 exists to prevent.
+#[tokio::test]
+async fn an_uppercased_replay_of_our_own_announce_is_still_self_attributed() {
+    let us = TestPeer::new();
+    let attacker = TestPeer::new();
+    let sink = RecordingSink::default();
+    let ours = us.announce(1, vec![add_delta(&content(31))]);
+
+    let rejected = ingress(&us.peer_id_hex)
+        .accept(
+            &sink,
+            &attacker.peer_id_hex,
+            &uppercase_provider(&ours),
+            NOW,
+        )
+        .await
+        .expect_err("a case-respelled replay of OUR OWN announce must be self-attributed");
+
+    assert_eq!(rejected, Rejected::SelfAttributed);
+    assert_eq!(sink.len(), 0, "the network must not drive our own holdings");
+}
+
+/// EXPLOIT (gate 3): a case-respelled replay of an older announcement must NOT resurrect a record
+/// its provider has since retracted.
+///
+/// Keying the replay watermark by hex SPELLING makes each variant a fresh provider seeded below its
+/// own seq, so the stale frame is admitted; the Add path then normalises the id and writes to the
+/// CANONICAL record. This also silently undoes the active-retract fix: a holder that evicted a
+/// capsule is re-listed as a holder of content it cannot serve for the remaining TTL.
+#[tokio::test]
+async fn a_case_respelled_replay_cannot_resurrect_a_retracted_record() {
+    let holder = TestPeer::new();
+    let us = TestPeer::new();
+    let sink = RecordingSink::default();
+    let id = content(37);
+    let ingress = ingress(&us.peer_id_hex);
+
+    let add = holder.announce(5, vec![add_delta(&id)]);
+    ingress
+        .accept(&sink, &holder.peer_id_hex, &add, NOW)
+        .await
+        .expect("seq 5 add");
+    ingress
+        .accept(
+            &sink,
+            &holder.peer_id_hex,
+            &holder.announce(6, vec![remove_delta(&id)]),
+            NOW,
+        )
+        .await
+        .expect("seq 6 retract");
+    assert!(!sink.holds(&id, &holder.peer_id_hex), "the retract applied");
+
+    let rejected = ingress
+        .accept(&sink, &holder.peer_id_hex, &uppercase_provider(&add), NOW)
+        .await
+        .expect_err("a case-respelled stale seq must still be stale");
+
+    assert_eq!(rejected, Rejected::StaleSeq { seq: 5, highest: 6 });
+    assert!(
+        !sink.holds(&id, &holder.peer_id_hex),
+        "a retracted record must STAY retracted under any spelling of the provider id"
+    );
+}
+
+/// EXPLOIT (attribution): a case-respelled RETRACT must still resolve to the signer's own CANONICAL
+/// record, and must not reach another holder's.
+///
+/// The truthful control holder must survive; and the attacker's own record — stored canonically by
+/// the Add path — must be the one removed, which only happens if the remove argument is normalised.
+#[tokio::test]
+async fn a_case_respelled_retract_resolves_to_the_signers_canonical_record() {
+    let attacker = TestPeer::new();
+    let honest = TestPeer::new();
+    let us = TestPeer::new();
+    let sink = RecordingSink::default();
+    let id = content(41);
+    sink.seed(&id, &honest.peer_id_hex);
+    sink.seed(&id, &attacker.peer_id_hex);
+
+    let applied = ingress(&us.peer_id_hex)
+        .accept(
+            &sink,
+            &attacker.peer_id_hex,
+            &uppercase_provider(&attacker.announce(1, vec![remove_delta(&id)])),
+            NOW,
+        )
+        .await
+        .expect("a validly signed retract is accepted");
+
+    assert_eq!(
+        applied.removed, 1,
+        "the retract must resolve to the signer's CANONICAL record, not a case variant that \
+         matches nothing"
+    );
+    assert!(
+        sink.holds(&id, &honest.peer_id_hex),
+        "the honest holder must survive a case-respelled retract"
+    );
+    assert!(!sink.holds(&id, &attacker.peer_id_hex));
+}
+
+/// PROPERTY: a provider id that is not canonical 64-hex is refused before anything else, so no
+/// downstream comparison, map key or log ever sees attacker-shaped text.
+///
+/// The field is a `u16`-length-prefixed wire string, so it may carry tens of kilobytes of arbitrary
+/// UTF-8 including newlines and terminal escapes.
+#[tokio::test]
+async fn a_non_canonical_provider_id_is_refused_outright() {
+    let holder = TestPeer::new();
+    let us = TestPeer::new();
+    let sink = RecordingSink::default();
+
+    let mut hostile = holder.announce(1, vec![add_delta(&content(53))]);
+    hostile.provider_peer_id = "\n\u{1b}[31mFORGED LOG LINE ".repeat(64);
+
+    let rejected = ingress(&us.peer_id_hex)
+        .accept(&sink, &holder.peer_id_hex, &hostile, NOW)
+        .await
+        .expect_err("a non-hex provider id must be refused");
+
+    assert!(
+        matches!(rejected, Rejected::Unverified(_)),
+        "expected a verification rejection, got {rejected:?}"
+    );
+    assert_eq!(sink.len(), 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ingress — bounded FRESHNESS (a captured Remove must not replay forever)
+// ---------------------------------------------------------------------------------------------
+
+/// EXPLOIT (censorship across a restart): a captured retract, replayed at a node whose replay
+/// watermark is empty, must NOT de-list an honest holder.
+///
+/// `HoldingsDelta::Remove` carries no expiry, so without a freshness check the ONLY barrier to an
+/// indefinite replay is the in-memory per-provider watermark — which a fresh process does not have.
+/// A victim restart (or a capacity eviction of its watermark) would therefore hand an attacker a free
+/// de-listing of an honest peer: censorship, not the "bounded staleness" this module used to claim.
+/// The fixture models the restart as a FRESH ingress; `announced_at` is signed, so the captured
+/// frame's age cannot be rewritten.
+#[tokio::test]
+async fn a_captured_retract_replayed_after_a_restart_cannot_delist_an_honest_holder() {
+    let honest = TestPeer::new();
+    let attacker = TestPeer::new();
+    let us = TestPeer::new();
+    let sink = RecordingSink::default();
+    let id = content(43);
+
+    // The honest holder's own signed retract, captured off the wire a day earlier.
+    let captured = honest.announce(9, vec![remove_delta(&id)]);
+    // ... and since then the honest holder is serving the capsule again.
+    sink.seed(&id, &honest.peer_id_hex);
+
+    // A FRESH ingress: the process restarted, so nothing remembers seq 9.
+    let rejected = ingress(&us.peer_id_hex)
+        .accept(&sink, &attacker.peer_id_hex, &captured, NOW + 86_400)
+        .await
+        .expect_err("a day-old captured retract must be refused on freshness alone");
+
+    assert!(
+        matches!(rejected, Rejected::Stale { .. }),
+        "expected a freshness rejection, got {rejected:?}"
+    );
+    assert!(
+        sink.holds(&id, &honest.peer_id_hex),
+        "an honest holder must NOT be de-listable by replaying its own old retract"
+    );
+}
+
+/// PROPERTY: freshness is bounded on BOTH sides, and AT the bound it passes.
+///
+/// A clock skew inside the window must not reject honest announcements; a future-dated frame must be
+/// refused too, or an attacker could mint a retract that stays replayable long after it was captured.
+#[tokio::test]
+async fn the_freshness_window_binds_on_both_sides_of_its_bound() {
+    let holder = TestPeer::new();
+    let us = TestPeer::new();
+    let window = RateLimits::default().max_announce_age_secs;
+
+    for (label, at_now) in [
+        ("at the bound, frame in the past", NOW + window),
+        ("at the bound, frame in the future", NOW - window),
+    ] {
+        let sink = RecordingSink::default();
+        ingress(&us.peer_id_hex)
+            .accept(
+                &sink,
+                &holder.peer_id_hex,
+                &holder.announce(1, vec![add_delta(&content(47))]),
+                at_now,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label} must be accepted (at-bound passes), got {e:?}"));
+    }
+
+    for (label, at_now) in [
+        ("one second past the bound, in the past", NOW + window + 1),
+        ("one second past the bound, in the future", NOW - window - 1),
+    ] {
+        let sink = RecordingSink::default();
+        let outcome = ingress(&us.peer_id_hex)
+            .accept(
+                &sink,
+                &holder.peer_id_hex,
+                &holder.announce(1, vec![add_delta(&content(47))]),
+                at_now,
+            )
+            .await;
+        assert!(
+            matches!(outcome, Err(Rejected::Stale { .. })),
+            "{label} must be refused (one-over fails), got {outcome:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ingress — rejections must not allocate tracking state
+// ---------------------------------------------------------------------------------------------
+
+/// PROPERTY: a REJECTED announcement leaves NO tracking state behind.
+///
+/// This replaces an earlier test that drove only the sender map through ACCEPTED announcements and
+/// asserted `providers == 1` — a false green, because it never entered a reject path, so deleting the
+/// provider-map eviction kept it passing. The leak this pins is the real one: an entry allocated
+/// BEFORE the gates, on a path that returns early and therefore skips eviction, is unbounded growth
+/// bought for ~180 wire bytes per entry.
+#[tokio::test]
+async fn rejected_announcements_allocate_no_tracking_state() {
+    let us = TestPeer::new();
+    let relayer = TestPeer::new();
+    let sink = RecordingSink::default();
+    let ingress = ingress(&us.peer_id_hex);
+
+    // Exhaust the relaying sender's DELTA budget with maximal batches from a few real providers.
+    // Every announcement after this is rejected on the sender bucket — which is decided AFTER the
+    // provider entry would be allocated, so it is precisely the leak path.
+    let maximal: Vec<_> = (0..HOLDINGS_MAX_CHANGES)
+        .map(|i| add_delta(&content(u8::try_from(i % 251).unwrap_or(0))))
+        .collect();
+    let admitted = MAX_DELTAS_PER_SENDER / HOLDINGS_MAX_CHANGES as u32;
+    for _ in 0..admitted {
+        let holder = TestPeer::new();
+        ingress
+            .accept(
+                &sink,
+                &relayer.peer_id_hex,
+                &holder.announce(1, maximal.clone()),
+                NOW,
+            )
+            .await
+            .expect("a maximal batch within the sender budget is admitted");
+    }
+    let (_, tracked_after_admits) = ingress.tracked_counts().await;
+
+    // 50 announcements from 50 DISTINCT, freshly-minted providers — the attacker-chosen key space this
+    // map must not follow — all refused on the exhausted sender budget.
+    for i in 0..50u8 {
+        let stranger = TestPeer::new();
+        let refused = ingress
+            .accept(
+                &sink,
+                &relayer.peer_id_hex,
+                &stranger.announce(1, vec![add_delta(&content(i))]),
+                NOW,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(Rejected::RateLimited)),
+            "the sender budget is exhausted, so this must be refused; got {refused:?}"
+        );
+    }
+
+    let (senders, providers) = ingress.tracked_counts().await;
+    assert_eq!(
+        providers, tracked_after_admits,
+        "50 REJECTED announcements from 50 distinct providers must leave the tracked set UNCHANGED; \
+         an entry allocated before the gates would show {} extra",
+        50
+    );
+    assert_eq!(senders, 1, "one relaying sender throughout");
 }

@@ -8,6 +8,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 
 ### Features
 - **holdings:** Real-time opcode-222 announce/retract + verified rate-limited inbound ingest (#1429)
+- **holdings:** Canonicalize provider identity, bound announcement freshness, keep rejections allocation-free (#1429)
 
 ## [0.63.0] - 2026-07-27
 

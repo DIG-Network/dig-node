@@ -878,19 +878,20 @@ async fn reconcile_and_flood(
     holdings: Option<&HoldingsFlood>,
 ) -> crate::dht::InventoryDelta {
     let cached = node.cache_list_cached().await;
-    let delta = dht.reconcile_inventory(&cached).await;
-    if let (Some(flood), false) = (holdings, delta.is_empty()) {
-        flood
-            .broadcaster
-            .announce_change(
-                &flood.pool,
-                &delta.gained,
-                &delta.lost,
-                crate::seams::dig_peer::holdings::now_unix_secs(),
+    // Reading the inventory is this shell's job; the reconcile-plus-flood composition itself lives in
+    // `holdings` so it can be tested against a real DhtService without a `Node`.
+    crate::seams::dig_peer::holdings::reconcile_and_announce(
+        dht,
+        &cached,
+        holdings.map(|f| {
+            (
+                f.broadcaster.as_ref(),
+                &f.pool as &dyn crate::seams::dig_peer::holdings::AnnounceTransport,
             )
-            .await;
-    }
-    delta
+        }),
+        crate::seams::dig_peer::holdings::now_unix_secs(),
+    )
+    .await
 }
 
 /// Serve peer requests over one established, mTLS-authenticated [`dig_nat::mux::PeerSession`] (the
@@ -2565,6 +2566,14 @@ async fn bring_up_dht(
                 crate::seams::dig_peer::holdings::now_unix_secs(),
             ));
             match pool.inbound_receiver() {
+                Ok(_) if !crate::seams::dig_peer::holdings::HoldingsIngress::ingest_enabled_from_env() => {
+                    // Operator kill switch: keep ANNOUNCING (so this node stays discoverable in real
+                    // time) but stop applying peers' announcements. Discovery falls back to the
+                    // durable DHT records, which is a degradation, not an outage.
+                    println!(
+                        "dig-node peer network: holdings ingest DISABLED by DIG_HOLDINGS_INGEST;                          still announcing"
+                    );
+                }
                 Ok(inbound) => {
                     let ingress = Arc::new(crate::seams::dig_peer::holdings::HoldingsIngress::new(
                         node_cert.peer_id().to_hex(),
