@@ -787,3 +787,7 @@ loopback predicate reused by both the origin label and the `DIG_NODE_HOST` enfor
 Coherence: `DIG_NODE_HOST` governs ONLY the local RPC/content bind; the peer P2P wire (mTLS, in
 dig-node-core) and the loopback wallet mTLS `:9257` listener bind independently, so enforcing
 loopback here never breaks peer connectivity. A remote-API test rig (#1062) just sets the flag.
+
+## Lane anchor — dig_ecosystem#1667 (loopback-enforcement residuals)
+
+A fail-closed guard is only good UX if it fires at the EARLIEST point the bad config is known. #1662 enforced the non-loopback `DIG_NODE_HOST` refusal at the bind site, but `dig-node install` baked the host into the service env WITHOUT re-checking — so an unauthorized `DIG_NODE_HOST=0.0.0.0` installed cleanly and only failed closed on first service start (confusing: the failure is detached from the action that caused it). Fix (#1667): `install()` now calls the SAME `config::host_override_refusal` before any side effect, so the refusal surfaces the identical message up front. Reuse the one canonical predicate — never re-derive the loopback rule. Also swept the residual bare "loopback-only" comments in meta.rs/lib.rs: the control surface is token-gated REGARDLESS of bind (loopback-bound only by default; non-loopback with `DIG_NODE_ALLOW_REMOTE=1`), and control.* is never peer-reachable regardless of bind — the imprecise adjective, though safe today, understated the real invariant.

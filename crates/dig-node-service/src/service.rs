@@ -678,6 +678,23 @@ fn query_windows_display_name(service_name: &str) -> io::Result<Option<String>> 
     Ok(parse_sc_qc_display_name(&stdout).map(str::to_string))
 }
 
+/// Apply the SAME non-loopback-bind refusal at INSTALL time that the bind site enforces
+/// ([`crate::config::host_override_refusal`], #1662): baking a non-loopback `DIG_NODE_HOST`
+/// into the service env WITHOUT `DIG_NODE_ALLOW_REMOTE=1` would otherwise install a service
+/// that fails closed on its first start — a confusing operator experience. Refusing here
+/// surfaces the identical guard message up front, before anything is registered. PURE, so the
+/// policy is unit-tested without touching the OS; reuses the one canonical predicate rather
+/// than re-deriving the loopback rule.
+fn ensure_install_host_allowed(config: &Config) -> io::Result<()> {
+    match crate::config::host_override_refusal(config.host, config.allow_remote) {
+        Some(msg) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("dig-node: {msg}"),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Install dig-node as an auto-starting OS service that runs `dig-node run` on the configured
 /// loopback port, via the clean-reinstall contract (stop → delete → recreate on an existing
 /// service; create otherwise — see the module doc for why this never auto-starts). On Windows,
@@ -686,6 +703,10 @@ fn query_windows_display_name(service_name: &str) -> io::Result<Option<String>> 
 /// (`Restart=on-failure`) and launchd (`KeepAlive`) already do for Linux/macOS via
 /// `service-manager`'s own defaults.
 pub fn install(config: &Config) -> io::Result<Outcome> {
+    // #1667: fail fast on a remote bind that lacks the escape hatch, BEFORE any side effect
+    // (service registration, state-dir harden), so the refusal leaves nothing behind.
+    ensure_install_host_allowed(config)?;
+
     if cfg!(windows) && !is_elevated() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1123,6 +1144,43 @@ SERVICE_NAME: net.dignetwork.dig-node
             env.get("DIG_NODE_CACHE").map(String::as_str),
             Some("D:/dig/shared-cache")
         );
+    }
+
+    // #1667: the install path must apply the SAME non-loopback-bind refusal that the
+    // bind site does, so `dig-node install DIG_NODE_HOST=0.0.0.0` (no escape hatch) is
+    // refused AT INSTALL rather than installing a service that fails closed on first start.
+    #[test]
+    fn ensure_install_host_allowed_refuses_remote_host_without_escape_hatch_1667() {
+        let config = Config {
+            host: Some(std::net::Ipv4Addr::new(0, 0, 0, 0).into()),
+            allow_remote: false,
+            ..Config::default()
+        };
+        let err = ensure_install_host_allowed(&config).expect_err(
+            "a non-loopback host without DIG_NODE_ALLOW_REMOTE=1 must be refused at install",
+        );
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("non-loopback"));
+    }
+
+    #[test]
+    fn ensure_install_host_allowed_permits_remote_host_with_escape_hatch_1667() {
+        let config = Config {
+            host: Some(std::net::Ipv4Addr::new(0, 0, 0, 0).into()),
+            allow_remote: true,
+            ..Config::default()
+        };
+        assert!(ensure_install_host_allowed(&config).is_ok());
+    }
+
+    #[test]
+    fn ensure_install_host_allowed_permits_loopback_and_default_1667() {
+        let loopback = Config {
+            host: Some(std::net::Ipv4Addr::LOCALHOST.into()),
+            ..Config::default()
+        };
+        assert!(ensure_install_host_allowed(&loopback).is_ok());
+        assert!(ensure_install_host_allowed(&Config::default()).is_ok());
     }
 
     #[test]
