@@ -33,7 +33,7 @@
 //! installs) — and set the SAME value for both the service and the browser launch
 //! so they keep sharing it.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Default loopback bind port — an UNCOMMON high port, deliberately clear of the
 /// collision-prone common-dev ports (80/443/3000/5000/8000/8080/8888/9000) that a
@@ -233,12 +233,17 @@ impl Config {
     /// `server::serve_with_shutdown`) — every consumer (CLI `status`/`pair`, the
     /// installed-service summary, `/health`'s `addr` field) treats it as THE
     /// address, so its shape never changes based on the dual-stack default below.
+    ///
+    /// Rendered through [`SocketAddr`] rather than by text (#1682/#1593): an IPv6 literal's
+    /// authority REQUIRES brackets, so `format!("{host}:{port}")` yielded the unbindable
+    /// `::1:9778` for a v6 `DIG_NODE_HOST` — and this bind failure is fatal, so that one
+    /// missing pair of brackets bricked the node.
     pub fn bind_addr(&self) -> String {
-        format!(
-            "{}:{}",
+        SocketAddr::new(
             self.host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            self.port
+            self.port,
         )
+        .to_string()
     }
 
     /// The IPv6 loopback bind address (`[::1]:<port>`) to open BESIDE
@@ -251,7 +256,9 @@ impl Config {
     /// IPv6-loopback-unavailable system falls back to IPv4-only, mirroring the
     /// existing [`Config::dig_local_addr`] best-effort pattern.
     pub fn bind_addr_v6(&self) -> Option<String> {
-        self.host.is_none().then(|| format!("[::1]:{}", self.port))
+        self.host
+            .is_none()
+            .then(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), self.port).to_string())
     }
 
     /// The `host:port` socket string for the BEST-EFFORT bare-`http://dig.local`
@@ -533,6 +540,48 @@ mod tests {
         };
         assert_eq!(c.bind_addr(), "10.0.0.5:9778");
         assert_eq!(c.bind_addr_v6(), None);
+    }
+
+    // ----- #1682: an IPv6 `DIG_NODE_HOST` must not brick the node -------------
+
+    /// **Proves:** every address [`Config::bind_addr`] renders PARSES as a socket address,
+    /// for an IPv6 host as much as an IPv4 one.
+    ///
+    /// **Catches:** the text-concatenated authority (#1593) that produced the unbracketed
+    /// `::1:9778`. That string binds nowhere, and the primary bind failure is FATAL, so an
+    /// operator who set a v6 host got a node that could not start at all.
+    ///
+    /// The fixture varies ONE thing — the host family — and keeps the IPv4 case beside it as
+    /// the honest control, because a v6-only fixture cannot distinguish "renders v6 right"
+    /// from "renders nothing right".
+    #[test]
+    fn bind_addr_is_parseable_for_every_host_family() {
+        use std::net::{Ipv6Addr, SocketAddr};
+
+        // A compressed loopback and a full global literal: `::1` alone would leave a
+        // special-case for the shortest possible v6 spelling indistinguishable from a
+        // general fix.
+        let cases: [(IpAddr, &str); 3] = [
+            (IpAddr::V4(Ipv4Addr::LOCALHOST), "127.0.0.1:9778"),
+            (IpAddr::V6(Ipv6Addr::LOCALHOST), "[::1]:9778"),
+            (
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x1)),
+                "[2001:db8::1]:9778",
+            ),
+        ];
+        for (host, expected) in cases {
+            let c = Config {
+                host: Some(host),
+                ..Config::default()
+            };
+            assert_eq!(c.bind_addr(), expected, "rendering for {host}");
+            let parsed: SocketAddr = c
+                .bind_addr()
+                .parse()
+                .unwrap_or_else(|e| panic!("bind_addr for {host} must parse ({e})"));
+            assert_eq!(parsed.ip(), host);
+            assert_eq!(parsed.port(), DEFAULT_PORT);
+        }
     }
 
     #[test]

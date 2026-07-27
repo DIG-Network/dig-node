@@ -61,7 +61,7 @@
 //!    "open" facility as a SINGLE non-shell argv entry.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use dig_urn_resolver::images::{self, ErrorImage};
@@ -69,7 +69,7 @@ use dig_urn_resolver::{ResolveError, ResolveOutcome, ResolvedData};
 use serde_json::json;
 
 use crate::cli::Outcome;
-use crate::config::Config;
+use crate::config::{Config, DIG_LOCAL_HOST};
 
 /// Shell metacharacters (and quoting/grouping characters) rejected anywhere in the link. The
 /// launch path never uses a shell, so this is defense-in-depth against the untrusted OS argument
@@ -455,19 +455,19 @@ fn candidate_urls(config: &Config, link: &DigLink) -> Vec<String> {
     if link.root.is_none() {
         urls.push(format!("http://{}.dig/{}", link.store_id, path));
     }
-    urls.push(serve_url("dig.local", None, &store_ref, path));
-    let host = browser_host(config);
-    urls.push(serve_url(&host, Some(config.port), &store_ref, path));
+    urls.push(serve_url(DIG_LOCAL_HOST, &store_ref, path));
+    urls.push(serve_url(&browser_authority(config), &store_ref, path));
     urls
 }
 
-/// Build a node `/s/<ref>/<path>` serve URL for `host` (with an optional explicit `port`). A
-/// store-root (empty path) keeps a trailing slash (the #289 route contract).
-fn serve_url(host: &str, port: Option<u16>, store_ref: &str, path: &str) -> String {
-    let authority = match port {
-        Some(p) => format!("{host}:{p}"),
-        None => host.to_string(),
-    };
+/// Build a node `/s/<ref>/<path>` serve URL for an already-rendered `authority`
+/// (`host` or `host:port`). A store-root (empty path) keeps a trailing slash (the #289
+/// route contract).
+///
+/// The authority arrives pre-rendered rather than as `(host, port)` so that the one place
+/// that has to reconcile a port with a possibly-IPv6 host is [`browser_authority`], where
+/// it is done through [`SocketAddr`] (#1682/#1593) instead of by text.
+fn serve_url(authority: &str, store_ref: &str, path: &str) -> String {
     if path.is_empty() {
         format!("http://{authority}/s/{store_ref}/")
     } else {
@@ -475,13 +475,17 @@ fn serve_url(host: &str, port: Option<u16>, store_ref: &str, path: &str) -> Stri
     }
 }
 
-/// The host for the `localhost` tier URL: the operator's explicit `DIG_NODE_HOST` when set
-/// (bracketed for IPv6), else `localhost` — friendlier than `127.0.0.1` and equally reachable.
-fn browser_host(config: &Config) -> String {
+/// The authority for the `localhost` tier URL: the operator's explicit `DIG_NODE_HOST` with
+/// the node's port, else the `localhost` NAME with its port — friendlier than `127.0.0.1`
+/// and equally reachable.
+///
+/// An explicit host is rendered through [`SocketAddr`], which brackets an IPv6 literal for
+/// free; the name case interpolates only the port, so no host is ever concatenated onto a
+/// colon by hand (#1682/#1593).
+fn browser_authority(config: &Config) -> String {
     match config.host {
-        Some(ip) if ip.is_ipv6() => format!("[{ip}]"),
-        Some(ip) => ip.to_string(),
-        None => "localhost".to_string(),
+        Some(ip) => SocketAddr::new(ip, config.port).to_string(),
+        None => format!("localhost:{}", config.port),
     }
 }
 
@@ -605,6 +609,48 @@ mod tests {
     }
     fn root() -> String {
         "b".repeat(64)
+    }
+
+    /// **Proves:** every `localhost`-tier candidate URL carries a PARSEABLE authority,
+    /// whatever family the operator's `DIG_NODE_HOST` is (#1682).
+    ///
+    /// **Catches:** a v6 host reaching the URL as a bare `::1:9778`, which no browser can
+    /// navigate. The v4 and the default-name cases sit beside the v6 one as honest
+    /// controls — a v6-only fixture could not tell a general fix from a broken renderer.
+    #[test]
+    fn the_localhost_tier_url_has_a_parseable_authority_for_every_host_family() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let cases: [(Option<IpAddr>, &str); 3] = [
+            (None, "http://localhost:9778/s/"),
+            (
+                Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                "http://127.0.0.1:9778/s/",
+            ),
+            (
+                Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+                "http://[::1]:9778/s/",
+            ),
+        ];
+        for (host, expected_prefix) in cases {
+            let config = Config {
+                host,
+                port: 9778,
+                ..Config::default()
+            };
+            let link = DigLink {
+                store_id: store(),
+                root: None,
+                path: String::new(),
+            };
+            let localhost_tier = candidate_urls(&config, &link)
+                .pop()
+                .expect("the localhost tier is always offered");
+            assert!(
+                localhost_tier.starts_with(expected_prefix),
+                "host {host:?} produced {localhost_tier}, expected it to start {expected_prefix}"
+            );
+        }
     }
 
     /// A test launcher recording every URL it was asked to open (proving the real launcher — and

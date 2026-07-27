@@ -312,6 +312,12 @@ The server opens UP TO THREE listeners for the SAME router:
 
 1. **`<DIG_NODE_HOST>:<DIG_NODE_PORT>`** (default `127.0.0.1:9778`, §3.2) — always on. A bind
    failure here is FATAL (`serve` returns the error; CLI exit `BIND_FAILED`, §8.4).
+   The rendered authority MUST be a valid socket address for BOTH address families: an IPv6
+   `DIG_NODE_HOST` MUST be bracketed (`DIG_NODE_HOST=::1` ⇒ `[::1]:9778`). Implementations MUST
+   render it from the parsed `IpAddr` and the port (e.g. `SocketAddr`) and MUST NOT concatenate
+   host and port as text — the unbracketed form binds nowhere, and this bind failure is fatal.
+   The same rendering applies wherever the node reports or reuses that address: the
+   `/health` `addr` field, the CLI control-plane URL, and the `localhost`-tier serve URL (§5.3).
 2. **`[::1]:<DIG_NODE_PORT>`** (§5.2 dual-stack loopback) — the SAME `localhost:<port>` on the
    IPv6 loopback. Present ONLY when `DIG_NODE_HOST` is unset (the default): some resolvers return
    `::1` before `127.0.0.1` for `localhost` (Windows by default), so without this listener such a
