@@ -7,10 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.63.0] - 2026-07-27
 
 ### Bug Fixes
-- **peer:** Serve a conforming multi-frame range stream (#1668 / #1640) - frame on `MAX_RANGE_FRAME_PAYLOAD` (32,768 B) rather than the per-request `RANGE_WINDOW` (3 MiB), emit `chunk_count` on every frame, page the `chunk_lens` prologue, honour `skip_layout`, and route every frame through `dig_nat::RangeFrame::encode` so the sender cannot emit what a conforming receiver must reject. Reads above ~48 KiB were previously unserveable by any holder. **BREAKING:** range and module-range responses are now split into 32 KiB frames.
-
-### Chores
-- **deps:** Cascade to the dig-nat 0.13 capped-encoder line - dig-nat 0.13, dig-dht 0.7, dig-peer 0.6, dig-download 0.11, dig-rpc-protocol 0.6, dig-peer-selector 0.6, dig-gossip 0.16 (verified single-instance tree; the dig-nat 0.14 line awaits dig-gossip + dig-peer-selector publishing on it -- a duplicate dig-nat is a compile break here, not a size regression)
+- **peer:** Serve a conforming multi-frame range stream (#1668 step 3) (#113)
 
 ## [0.62.0] - 2026-07-27
 
