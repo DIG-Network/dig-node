@@ -51,7 +51,8 @@ pub struct MethodInfo {
     /// read path (local-first, blind-fetch+verify+decrypt+cache), `passthrough` =
     /// relayed verbatim to the upstream DIG RPC, `shell` = answered by the dig-node
     /// service shell itself (discovery methods), `control` = the CONTROL/admin surface
-    /// answered by the shell, loopback-only AND gated behind the local control token.
+    /// answered by the shell; loopback-bound by default (non-loopback only with
+    /// `DIG_NODE_ALLOW_REMOTE=1`) and token-gated regardless of bind.
     pub served: &'static str,
     /// Human/agent one-liner describing what the method does.
     pub summary: &'static str,
@@ -281,7 +282,7 @@ pub fn methods() -> &'static [MethodInfo] {
                       download fan-out). Params { store_id, offset?, length }.",
             requires_auth: false,
         },
-        // -- CONTROL / admin surface (loopback-only + local-token gated) ----------
+        // -- CONTROL / admin surface (loopback-bound by default; token-gated regardless of bind) --
         // The DIG Browser "My Node" controller drives these to MANAGE the node.
         // Every `control.*` method requires the local control token (requires_auth).
         MethodInfo {
@@ -421,8 +422,8 @@ pub fn methods() -> &'static [MethodInfo] {
         },
         // -- node-owned control methods (delegated to dig_node_core::handle_rpc) ----------
         // These live in the node library's own control surface; the shell forwards any
-        // control method it does not own to the node. Loopback-only + token-gated,
-        // like the shell's control methods above.
+        // control method it does not own to the node. Token-gated regardless of bind
+        // (loopback-bound by default), like the shell's control methods above.
         MethodInfo {
             name: "control.peerStatus",
             served: "control",
@@ -453,8 +454,9 @@ pub fn methods() -> &'static [MethodInfo] {
             // #1075: these node-owned peer-management methods exist in the read path's
             // handle_rpc + the canonical dig-rpc-protocol Method catalogue but were
             // MISSING from this shell catalogue (the reviewer-found gap the crate
-            // adoption closes). Loopback-only + token-gated, like every control.* method,
-            // and NEVER peer-reachable (dig_rpc_protocol::Method::is_peer_reachable).
+            // adoption closes). Token-gated regardless of bind (loopback-bound by default),
+            // like every control.* method, and NEVER peer-reachable regardless of bind
+            // (dig_rpc_protocol::Method::is_peer_reachable — the peer wire never dispatches control.*).
             name: "control.peers.connect",
             served: "control",
             summary: "Dial a discovered peer into the connected pool (turn a relay-\
@@ -512,8 +514,9 @@ pub enum ErrorCode {
     /// proxy failure from an upstream-returned JSON-RPC error.
     UpstreamError,
     /// `-32030` — a `control.*` (CONTROL/admin) method was called without a valid
-    /// local control token. The control surface is loopback-only AND locally
-    /// authorized: a same-host controller (the DIG Browser "My Node" UI) must read
+    /// local control token. The control surface is token-gated regardless of bind
+    /// (loopback-bound by default; non-loopback only with `DIG_NODE_ALLOW_REMOTE=1`):
+    /// a same-host controller (the DIG Browser "My Node" UI) must read
     /// the node's control token from the machine-wide state dir and present it. Read
     /// methods are NOT gated; only the mutating/management control namespace is. Shell error.
     /// (Canonical dig-rpc-types §10 code; `-32020` is RESERVED for onion routing.)
@@ -768,8 +771,8 @@ pub fn openrpc_document() -> Value {
             // and via the machine-readable `x-requires-auth` extension, so a
             // controller learns the gate from the spec rather than by trial.
             let auth_note = if m.requires_auth {
-                " CONTROL method: requires the local control token (loopback-only + \
-                  locally authorized — present it as the X-Dig-Control-Token header or \
+                " CONTROL method: requires the local control token (token-gated \
+                  regardless of bind, loopback-bound by default — present it as the X-Dig-Control-Token header or \
                   params._control_token; read it from the machine-wide state dir's \
                   control-token file, e.g. via `dig-node pair`)."
             } else {
@@ -806,7 +809,7 @@ pub fn openrpc_document() -> Value {
             "description": "The local DIG node's JSON-RPC surface (rpc.dig.net-compatible), \
                             served at POST /. The read methods (dig.*/cache.*) are open to local \
                             consumers; the CONTROL/admin methods (control.*) MANAGE the node and \
-                            are loopback-only AND locally authorized — present the local control \
+                            are token-gated regardless of bind (loopback-bound by default) — present the local control \
                             token (the X-Dig-Control-Token header or params._control_token, read \
                             from <config_dir>/control-token). The canonical dig RPC param/result \
                             schemas are published by docs.dig.net; this document is the \

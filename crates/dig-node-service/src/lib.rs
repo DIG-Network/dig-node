@@ -25,7 +25,8 @@
 //! - [`cli`] — the `--json` envelopes + the differentiated exit-code table.
 //! - [`rpc`] — pure JSON-RPC routing + request normalisation (the testable core).
 //! - [`control`] — the CONTROL/admin RPC surface (`control.*`): manage hosted
-//!   stores, cache, §21 sync, config — loopback-only + local-token gated.
+//!   stores, cache, §21 sync, config — token-gated regardless of bind
+//!   (loopback-bound by default; non-loopback only with `DIG_NODE_ALLOW_REMOTE=1`).
 //! - [`server`] — the axum HTTP server (`/health`, `/version`, `/openrpc.json`,
 //!   `/.well-known/dig-node.json`, CORS, `POST /` → read RPC + the control plane).
 //! - [`service`] — OS-service install/uninstall/start/stop/status.
