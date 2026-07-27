@@ -530,9 +530,9 @@ impl ContentServer for Node {
 
     async fn manifest_paths(&self, store_hex: &str, root_hex: &str) -> Option<Vec<String>> {
         let cache_dir = self.cache_dir.clone();
-        let (store, root) = (store_hex.to_string(), root_hex.to_string());
+        let capsule = crate::CapsuleKey::parse(store_hex, root_hex)?;
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::read_public_manifest_blocking(&cache_dir, &store, &root)
+            crate::read_public_manifest_blocking(&cache_dir, &capsule)
         })
         .await
         .ok()?;
@@ -549,13 +549,10 @@ impl ContentServer for Node {
         resource_key: &str,
     ) -> Option<u64> {
         let cache_dir = self.cache_dir.clone();
-        let (store, root, key) = (
-            store_hex.to_string(),
-            root_hex.to_string(),
-            resource_key.to_string(),
-        );
+        let capsule = crate::CapsuleKey::parse(store_hex, root_hex)?;
+        let key = resource_key.to_string();
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::read_public_manifest_blocking(&cache_dir, &store, &root)
+            crate::read_public_manifest_blocking(&cache_dir, &capsule)
         })
         .await
         .ok()?;

@@ -73,6 +73,22 @@ pub const REDIRECT_HOP_CAP: u64 = 4;
 /// existing L7 range/content serve — see docs.dig.net error catalog).
 pub(crate) const RESOURCE_UNAVAILABLE: i64 = -32004;
 
+/// The hard ceiling on total bytes held in whole-capsule staging (`<downloads>/modules`), enforced by
+/// [`NodeContent::enforce_staging_cap`] (#1615).
+///
+/// DERIVED from the two bounds that already govern a warm rather than chosen: at most
+/// [`DEFAULT_MAX_CONCURRENT_WARMS`] generations may pull at once, and each is capped at
+/// [`DEFAULT_MAX_MODULE_SIZE`](dig_download::DEFAULT_MAX_MODULE_SIZE). The ceiling must therefore sit
+/// ABOVE what legitimate concurrent pulls need, or the cap would spend its time evicting healthy
+/// in-flight work; one extra generation's worth is the headroom that absorbs scratch abandoned by a pull
+/// that has only just died and is not yet TTL-stale.
+///
+/// Deriving it this way means raising either underlying bound raises this one automatically, instead of
+/// leaving a literal behind that silently becomes too small.
+const MAX_MODULE_STAGING_BYTES: u64 = (crate::seams::dig_peer::DEFAULT_MAX_CONCURRENT_WARMS as u64
+    + 1)
+    * dig_download::DEFAULT_MAX_MODULE_SIZE;
+
 /// How many fetched-through resources are retained in memory for re-serving (windows of the same
 /// resource, immediate re-reads). Small by design: fetch-through is a miss-path cache, not the
 /// module cache — the LRU module cache stays the durable store.
@@ -1091,11 +1107,110 @@ impl NodeContent {
     /// One staging-file GC sweep now: reap `.download.tmp` files older than `ttl` that no
     /// live/paused download owns (their sidecar resume state goes with them). Returns how many
     /// were removed.
+    ///
+    /// Sweeps BOTH staging locations, because dig-download's sweeper lists a single directory and does
+    /// not recurse (#1615): resource downloads stage directly in `<downloads>/`, while whole-capsule
+    /// warms stage in `<downloads>/modules/`. Sweeping only the former left every capsule pull that
+    /// crashed mid-flight on disk permanently — growth an ordinary breadth of reads is enough to drive,
+    /// with no attacker needed.
+    ///
+    /// Reaping is by AGE and by OWNERSHIP only: a staging file registered as live or paused-resumable is
+    /// never touched, whatever its age. It therefore cannot interrupt a pull in progress, and — because
+    /// it acts on download SCRATCH and never on a cached capsule — it can never evict content this node
+    /// holds.
     pub async fn gc_once(&self, ttl: Duration) -> usize {
-        self.downloader
-            .gc(self.downloads_dir.clone(), ttl)
-            .await
-            .unwrap_or(0)
+        let mut reaped = 0usize;
+        for dir in [self.downloads_dir.clone(), self.module_staging_dir()] {
+            reaped += self.downloader.gc(dir, ttl).await.unwrap_or(0);
+        }
+        // Age alone bounds staging only by what one TTL window can accumulate; the cap makes the
+        // ceiling a fixed byte count (see [`Self::enforce_staging_cap`] for what it may and may not
+        // evict).
+        reaped + self.enforce_staging_cap().await
+    }
+
+    /// Where whole-capsule warms stage — `<downloads>/modules`, the subdirectory
+    /// [`crate::seams::dig_peer::WarmPaths`] pulls into.
+    fn module_staging_dir(&self) -> PathBuf {
+        self.downloads_dir
+            .join(crate::capsule_key::MODULE_STAGING_SUBDIR)
+    }
+
+    /// Bring total capsule-staging bytes back under [`MAX_MODULE_STAGING_BYTES`], reaping the OLDEST
+    /// unprotected staging files first. Returns how many were removed.
+    ///
+    /// This is the bound the age sweep cannot give. Reaping at a TTL means staging is bounded by how
+    /// much a caller can start within one TTL window, which breadth of reads alone can make large; this
+    /// makes the ceiling a fixed number of bytes regardless of arrival rate.
+    ///
+    /// # What this policy does and does not permit
+    ///
+    /// Oldest-first eviction is safe HERE, and would not be one directory up. Everything this touches is
+    /// whole-capsule download SCRATCH: an unprotected `.download.tmp` is an abandoned partial pull, and
+    /// re-fetching it costs bandwidth and nothing else. So the worst a peer can achieve by driving reads
+    /// is the deletion of incomplete scratch, which is re-derivable from the network.
+    ///
+    /// It specifically CANNOT reach two things. It never touches `<cache>/modules/` — the operator's
+    /// held capsules — so a peer cannot use staging pressure to evict content this node hosts. And it
+    /// never touches a staging file the registry reports as live or paused-resumable, so it cannot
+    /// cancel a pull that is making progress. Those two exclusions are what make oldest-first acceptable
+    /// here: applied to CACHED content, the same ordering would let a peer walk an operator's own oldest
+    /// capsules off the disk simply by reading a lot of other ones.
+    async fn enforce_staging_cap(&self) -> usize {
+        self.reap_staging_over(MAX_MODULE_STAGING_BYTES).await
+    }
+
+    /// [`Self::enforce_staging_cap`] against an explicit `cap`, so the ordering + protection behaviour is
+    /// testable without staging gigabytes.
+    async fn reap_staging_over(&self, cap: u64) -> usize {
+        let mut staging = Vec::new();
+        let Ok(entries) = std::fs::read_dir(self.module_staging_dir()) else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_staging = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".download.tmp"));
+            if !is_staging {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            staging.push((path, modified, meta.len()));
+        }
+
+        let mut total: u64 = staging.iter().map(|(_, _, len)| *len).sum();
+        if total <= cap {
+            return 0;
+        }
+        staging.sort_by_key(|(_, modified, _)| *modified); // oldest first
+
+        let mut removed = 0usize;
+        for (path, _, len) in staging {
+            if total <= cap {
+                break;
+            }
+            if self.active_downloads().is_protected(&path).await {
+                continue; // a pull in progress is never sacrificed to the cap
+            }
+            if std::fs::remove_file(&path).is_err() {
+                continue;
+            }
+            let _ = std::fs::remove_file(path.with_extension("tmp.state"));
+            total = total.saturating_sub(len);
+            removed += 1;
+        }
+        if removed > 0 {
+            tracing::info!(
+                removed,
+                remaining_bytes = total,
+                cap_bytes = cap,
+                "capsule staging over cap: reaped abandoned partial pulls"
+            );
+        }
+        removed
     }
 
     /// Run the staging GC on startup and then on an interval (mirroring the DHT gc/republish
@@ -2171,6 +2286,167 @@ pub(crate) mod tests {
         assert_eq!(removed, 1, "exactly the stale orphan is reaped");
         assert!(!stale.exists(), "stale orphan removed");
         assert!(live.exists(), "protected staging file kept");
+    }
+
+    /// **Proves:** abandoned WHOLE-CAPSULE staging under `<downloads>/modules/` is reaped, sidecar and
+    /// all, and a protected one there is not (#1615).
+    ///
+    /// **Catches:** sweeping only the top-level downloads directory. dig-download's `TmpGc::sweep_at`
+    /// lists ONE directory and does not recurse, while module staging lives in the `modules/`
+    /// SUBDIRECTORY — so a crash mid-pull left `<store>-<root>.dig.download.tmp` plus its `.state`
+    /// sidecar on disk **forever**, unbounded and remote-triggerable.
+    ///
+    /// The fixture puts a stale orphan in EACH directory and a protected file alongside the subdirectory
+    /// orphan. That shape matters: a sweep that reached only the top level would still reap one file and
+    /// satisfy a bare "something was reaped" assertion, so the test names WHICH files survive.
+    #[tokio::test]
+    async fn gc_reaps_abandoned_module_staging_in_the_subdirectory_too() {
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(10, 1))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let downloads = pc.downloads_dir().to_path_buf();
+        let modules = downloads.join("modules");
+        std::fs::create_dir_all(&modules).unwrap();
+        let two_hours_ago = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - Duration::from_secs(7200),
+        );
+        let age = |p: &Path| filetime::set_file_mtime(p, two_hours_ago).unwrap();
+
+        // A resource-level orphan at the top level (the case already covered) …
+        let resource_orphan = downloads.join("dead.res.download.tmp");
+        std::fs::write(&resource_orphan, b"x").unwrap();
+        age(&resource_orphan);
+
+        // … and an abandoned whole-capsule staging pair in the SUBDIRECTORY. Both paths are derived from
+        // the FINAL capsule path the way the real warm derives them (`staging_path_for`), so the fixture
+        // cannot drift from the names dig-download actually writes.
+        let capsule_final = modules.join(format!("{}-{}.dig", "aa".repeat(32), "bb".repeat(32)));
+        let capsule_orphan = dig_download::staging_path_for(&capsule_final);
+        std::fs::write(&capsule_orphan, b"partial capsule").unwrap();
+        age(&capsule_orphan);
+        let sidecar = capsule_orphan.with_extension("tmp.state");
+        std::fs::write(&sidecar, b"resume state").unwrap();
+        age(&sidecar);
+
+        // A capsule pull still in flight, equally old, in the same subdirectory.
+        let capsule_live = dig_download::staging_path_for(&modules.join(format!(
+            "{}-{}.dig",
+            "cc".repeat(32),
+            "dd".repeat(32)
+        )));
+        std::fs::write(&capsule_live, b"in flight").unwrap();
+        age(&capsule_live);
+        pc.active_downloads().register(capsule_live.clone()).await;
+
+        let removed = pc.gc_once(Duration::from_secs(3600)).await;
+
+        assert!(
+            !capsule_orphan.exists(),
+            "abandoned capsule staging in modules/ must be reaped"
+        );
+        assert!(
+            !sidecar.exists(),
+            "its .state sidecar goes with it, or the resume state outlives the staging it describes"
+        );
+        assert!(
+            capsule_live.exists(),
+            "an in-flight capsule pull must never be reaped out from under itself"
+        );
+        assert!(
+            !resource_orphan.exists(),
+            "the top-level orphan is still reaped"
+        );
+        assert_eq!(removed, 2, "both orphans counted, the protected pull not");
+    }
+
+    /// **Proves:** the staging cap is DERIVED from the bounds that govern a warm, so it always sits above
+    /// what the maximum number of legitimate concurrent pulls needs (#1615).
+    ///
+    /// **Catches:** a hand-picked literal ceiling that a later raise of either underlying bound would
+    /// leave too small — at which point the cap would evict healthy in-flight pulls on every sweep. Pinned
+    /// from BOTH sides: strictly above the concurrent-warm worst case, and not absurdly above it.
+    #[test]
+    fn the_staging_cap_sits_above_the_worst_case_of_legitimate_concurrent_warms() {
+        let concurrent_worst_case = crate::seams::dig_peer::DEFAULT_MAX_CONCURRENT_WARMS as u64
+            * dig_download::DEFAULT_MAX_MODULE_SIZE;
+        assert!(
+            MAX_MODULE_STAGING_BYTES > concurrent_worst_case,
+            "the cap ({MAX_MODULE_STAGING_BYTES}) must exceed what {} concurrent warms may legitimately \
+             stage ({concurrent_worst_case}), or the cap fights the concurrency limit",
+            crate::seams::dig_peer::DEFAULT_MAX_CONCURRENT_WARMS
+        );
+        assert!(
+            MAX_MODULE_STAGING_BYTES
+                <= concurrent_worst_case + dig_download::DEFAULT_MAX_MODULE_SIZE,
+            "the headroom above the worst case is one generation, not an unbounded margin"
+        );
+    }
+
+    /// **Proves:** when capsule staging exceeds the byte cap, the OLDEST unprotected partial pulls are
+    /// reaped until it is back under — and an in-flight pull is never sacrificed, however old (#1615).
+    ///
+    /// **Catches:** a cap that evicts by arrival order without consulting the registry, which would let
+    /// staging pressure cancel a pull that is actively making progress.
+    ///
+    /// The cap is driven with an injected ceiling rather than the 2.5 GiB production value, so the test
+    /// does not have to write gigabytes; the ordering + protection logic under test is the same code.
+    #[tokio::test]
+    async fn the_staging_cap_reaps_the_oldest_abandoned_pull_but_never_a_live_one() {
+        let td = tempfile::tempdir().unwrap();
+        let pc = NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(10, 1))),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let modules = pc.downloads_dir().join("modules");
+        std::fs::create_dir_all(&modules).unwrap();
+
+        // Three staging files, ages strictly ordered oldest → newest, all YOUNGER than any TTL so the age
+        // sweep cannot be what removes them. The oldest is also the PROTECTED one, so a cap that ignored
+        // the registry would take it first and the assertion below would catch that specifically.
+        let now = std::time::SystemTime::now();
+        let mut paths = Vec::new();
+        for (index, minutes) in [("old-live", 3u64), ("mid", 2), ("new", 1)] {
+            let path = dig_download::staging_path_for(&modules.join(format!("{index}.dig")));
+            std::fs::write(&path, vec![0u8; 4096]).unwrap();
+            std::fs::write(path.with_extension("tmp.state"), b"resume").unwrap();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_system_time(now - Duration::from_secs(minutes * 60)),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        let (live, mid, new) = (paths[0].clone(), paths[1].clone(), paths[2].clone());
+        pc.active_downloads().register(live.clone()).await;
+
+        // A cap of 8 KiB against 12 KiB staged: exactly one file must go.
+        let removed = pc.reap_staging_over(8192).await;
+
+        assert_eq!(
+            removed, 1,
+            "one 4 KiB file brings 12 KiB under an 8 KiB cap"
+        );
+        assert!(
+            live.exists(),
+            "the oldest file is an in-flight pull and must survive the cap"
+        );
+        assert!(
+            !mid.exists(),
+            "the oldest UNPROTECTED partial pull is the one reaped"
+        );
+        assert!(
+            !mid.with_extension("tmp.state").exists(),
+            "its resume sidecar goes with it, or the state outlives the staging it describes"
+        );
+        assert!(new.exists(), "the newest partial pull is kept");
     }
 
     // -- the peer selector (#178): the discovery → select → download → record_outcome loop ----------

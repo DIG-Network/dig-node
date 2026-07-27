@@ -298,12 +298,26 @@ pub fn relayed_caller_contact(peer_id: &PeerId) -> Contact {
 pub async fn handle_dht_frame(dht: &DhtService, caller: Option<Contact>, frame: &Value) -> Vec<u8> {
     let response = match serde_json::from_value::<DhtRequest>(frame.clone()) {
         Ok(req) => dht.handle_request_from(caller, req).await,
-        Err(e) => DhtResponse::Error {
-            code: 2,
-            message: format!("malformed DHT request: {e}"),
-        },
+        Err(e) => malformed_request_response(&e),
     };
     response.encode()
+}
+
+/// The advisory error a frame that does not deserialize to a [`DhtRequest`] is answered with.
+///
+/// The parse error is DERIVED FROM the peer's own frame — a serde message quotes the input it choked on
+/// (`unknown variant \`…\``) — so echoing it verbatim would hand the caller control of this string's
+/// content and its length. It is neutralized and bounded like every other free-form explanation on the
+/// peer surface (#1603/#1609). The `code` is what a caller acts on; the text is a courtesy, and a
+/// courtesy is not worth an injection vector.
+fn malformed_request_response(e: &serde_json::Error) -> DhtResponse {
+    DhtResponse::Error {
+        code: 2,
+        message: format!(
+            "malformed DHT request: {}",
+            super::serve_log::SafeText::new(e.to_string())
+        ),
+    }
 }
 
 // -- Inventory → ContentId publishing ----------------------------------------------------------------
@@ -597,6 +611,48 @@ mod tests {
             size_bytes: 1,
             last_used_unix_ms: 1,
         }
+    }
+
+    /// **Proves:** the advisory error returned for an unparseable DHT frame carries no control
+    /// characters and is bounded, even though its text is derived from the peer's own bytes
+    /// (#1603/#1609).
+    ///
+    /// **Catches:** echoing `serde_json`'s message verbatim. The fixture is deliberately NOT a
+    /// hand-written string: it is a REAL `serde_json::Error` produced by deserializing a real hostile
+    /// frame, because serde is what decides how much of the input ends up in the message. Asserting
+    /// against a literal would prove only that the wrapper works on a literal — the #1609 failure mode.
+    #[test]
+    fn a_malformed_dht_frame_is_answered_without_echoing_the_peers_bytes() {
+        // The frame is `type`-tagged, so an unknown tag makes serde quote the tag back — the shortest
+        // path from peer bytes into an error message.
+        let hostile_tag = format!(
+            "ping\nINFO forged record outcome=served{}",
+            "A".repeat(4096)
+        );
+        let frame = serde_json::json!({"type": hostile_tag});
+        let error = serde_json::from_value::<DhtRequest>(frame)
+            .expect_err("an unknown request type must not deserialize");
+
+        // Precondition: serde really does put the peer's bytes in the message, or this test is
+        // asserting a property of a message that never contained them.
+        assert!(
+            error.to_string().contains("forged record"),
+            "serde must echo the tag for this test to mean anything: {error}"
+        );
+
+        let DhtResponse::Error { message, code } = malformed_request_response(&error) else {
+            panic!("a malformed frame is answered with an error response");
+        };
+        assert_eq!(code, 2, "the catalogued code is what a caller acts on");
+        assert!(
+            !message.chars().any(char::is_control),
+            "the peer must not be able to put a newline in this reply: {message:?}"
+        );
+        assert!(
+            message.chars().count() <= 256,
+            "the reply is bounded regardless of how much the peer sent: {} chars",
+            message.chars().count()
+        );
     }
 
     // -- inventory_content_ids -----------------------------------------------------------------

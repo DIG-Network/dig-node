@@ -29,6 +29,7 @@ pub mod union_locator;
 
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;
 pub use module_anchor::ChainAnchoredModuleVerifier;
+pub(crate) use module_reshare::DEFAULT_MAX_CONCURRENT_WARMS;
 pub use module_reshare::{
     spawn_capsule_warm, AnnounceHolder, CapsuleWarmer, WarmFailure, WarmOutcome, WarmPaths,
     WarmRegistry,

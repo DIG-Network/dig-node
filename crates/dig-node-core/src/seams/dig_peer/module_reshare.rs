@@ -51,6 +51,8 @@ use std::sync::{Arc, Mutex};
 
 use digstore_core::Bytes32;
 
+use crate::capsule_key::CapsuleKey;
+
 use super::module_anchor::{sha256, ChainAnchoredModuleVerifier};
 
 /// The default cap on DISTINCT generations [`WarmRegistry`] admits at once.
@@ -59,7 +61,7 @@ use super::module_anchor::{sha256, ChainAnchoredModuleVerifier};
 /// pulls of it, but says nothing about breadth: reads across K DISTINCT capsules start K concurrent
 /// pulls, each able to assemble up to a whole `.dig` module in memory/disk at once (#1615/G3). This cap
 /// bounds that — reachable from ordinary read breadth, no attacker required.
-const DEFAULT_MAX_CONCURRENT_WARMS: usize = 4;
+pub(crate) const DEFAULT_MAX_CONCURRENT_WARMS: usize = 4;
 
 /// The set of `(store, root)` generations a warm pull is currently in flight for, bounded to at most
 /// [`Self::max_concurrent`] distinct generations at once.
@@ -204,20 +206,15 @@ pub struct WarmPaths {
 }
 
 impl WarmPaths {
-    /// The staging target for `(store, root)` — the path dig-download's `FileSink` finalizes onto,
-    /// having staged in `<that>.download.tmp`.
-    fn staged_module(&self, store_hex: &str, root_hex: &str) -> PathBuf {
-        self.staging_dir
-            .join("modules")
-            .join(format!("{store_hex}-{root_hex}.dig"))
+    /// The staging target for a capsule — the path dig-download's `FileSink` finalizes onto, having
+    /// staged in `<that>.download.tmp`.
+    fn staged_module(&self, capsule: &CapsuleKey) -> PathBuf {
+        capsule.staged_module_path(&self.staging_dir)
     }
 
-    /// The cache path whose EXISTENCE makes this node a holder (matches `crate::module_path`).
-    fn cached_module(&self, store_hex: &str, root_hex: &str) -> PathBuf {
-        self.cache_dir
-            .join("modules")
-            .join(store_hex)
-            .join(format!("{root_hex}.module"))
+    /// The cache path whose EXISTENCE makes this node a holder.
+    fn cached_module(&self, capsule: &CapsuleKey) -> PathBuf {
+        capsule.module_path(&self.cache_dir)
     }
 }
 
@@ -337,12 +334,17 @@ impl CapsuleWarmer {
         // Already a holder → nothing to pull, nothing to announce again. Checked BEFORE claiming a
         // registry slot: a burst of reads across an already-cached capsule should cost one stat call
         // each, never a wasted concurrency slot another generation could have used.
-        if self.paths.cached_module(store_hex, root_hex).exists() {
+        // The ids arrive from the read path, so they are validated into a `CapsuleKey` BEFORE any
+        // staging or cache path is built from them (#1599). A non-canonical key names no generation the
+        // chain could anchor, so the pull is refused outright rather than attempted.
+        let Some(capsule) = CapsuleKey::parse(store_hex, root_hex) else {
+            return WarmOutcome::Refused(WarmFailure::NoChainAnchor);
+        };
+        if self.paths.cached_module(&capsule).exists() {
             return WarmOutcome::AlreadyHeld;
         }
 
-        let key = format!("{store_hex}:{root_hex}");
-        let Some(_claim) = self.registry.claim(key.clone()) else {
+        let Some(_claim) = self.registry.claim(capsule.to_string()) else {
             return WarmOutcome::AlreadyWarming;
         };
 
@@ -365,7 +367,7 @@ impl CapsuleWarmer {
         //    announcement). dig-download's `FileSink` is used as-is — it implements the fail-closed
         //    `truncate` + `read_at` the engine's promotion probe requires, so there is no bespoke sink
         //    here to accidentally inherit a default from.
-        let staged = self.paths.staged_module(store_hex, root_hex);
+        let staged = self.paths.staged_module(&capsule);
         let sink = dig_download::FileSink::new(&staged);
         let downloader = dig_download::ModuleDownloader::new(
             Arc::clone(&self.locator),
@@ -392,7 +394,7 @@ impl CapsuleWarmer {
         };
 
         // 4. Promote into the cache, re-proving the artifact is the admitted one, THEN announce.
-        let cached = self.paths.cached_module(store_hex, root_hex);
+        let cached = self.paths.cached_module(&capsule);
         match promote_into_cache(&staged, &cached, &verifier) {
             Ok(promoted) => {
                 discard_staging(&staged);

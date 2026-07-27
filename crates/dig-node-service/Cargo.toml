@@ -49,6 +49,12 @@ path = "tests/fixtures/fake_beacon_cli.rs"
 name = "dig_node_service"
 path = "src/lib.rs"
 
+# Test-construction seams that must NOT be reachable from a production build. `#[doc(hidden)]` hides a
+# symbol from the docs but leaves it fully callable, so it is not access control (#1609) — a real feature
+# flag is. Off by default; the crate's own integration tests enable it via dev-dependencies below.
+[features]
+testkit = []
+
 [dependencies]
 # The canonical NODE engine library (crate `dig_node_core`) — a first-party sibling
 # crate in this workspace (no longer a stale git-pinned digstore alias). It IS the
@@ -172,6 +178,10 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
+# The crate's own integration tests need its test-construction seams (the `testkit` feature above).
+# Depending on self with the feature on is what keeps those seams available to `tests/` while staying
+# absent from any production build of this crate.
+dig-node-service = { path = ".", features = ["testkit"] }
 # Capturing subscriber for the never-log regression tests (#553 SPEC §7): a `fmt` layer writing
 # into an in-memory buffer so a test can assert emitted records never contain secret values.
 # Pinned to the SAME 0.3 line `dig-logging` builds on, so exactly one `tracing-subscriber` resolves.

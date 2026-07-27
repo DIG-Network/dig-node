@@ -25,13 +25,15 @@
 //! actually holds — and to say so plainly when it does not.
 
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use dig_rpc_protocol::types::ModuleInfo;
 use lru::LruCache;
 use serde_json::{json, Value};
+
+use crate::capsule_key::CapsuleKey;
 
 use super::module_anchor::sha256;
 
@@ -59,15 +61,6 @@ pub const MAX_MODULE_WINDOW: u64 = 4 * 1024 * 1024;
 pub fn chunk_size_for(total_size: u64) -> u64 {
     let by_cap = total_size.div_ceil(MAX_DESCRIPTOR_CHUNKS.max(1));
     MIN_CHUNK_SIZE.max(by_cap).max(1)
-}
-
-/// The `.dig` module path for `(store_hex, root_hex)` under `cache_dir` — the same layout the local
-/// serve path reads, so a module this node can serve resources from is a module it can also reshare.
-fn module_path(cache_dir: &Path, store_hex: &str, root_hex: &str) -> PathBuf {
-    cache_dir
-        .join("modules")
-        .join(store_hex)
-        .join(format!("{root_hex}.module"))
 }
 
 /// A descriptor memoized against the file metadata it was computed from, so a later request for an
@@ -109,10 +102,8 @@ fn descriptor_memo() -> &'static Mutex<LruCache<(String, String), CachedDescript
 ///
 /// Blocking file I/O — call from `spawn_blocking`, like the rest of the module-reading serve path.
 pub fn describe_module(cache_dir: &Path, store_hex: &str, root_hex: &str) -> Option<ModuleInfo> {
-    if !is_canonical(store_hex) || !is_canonical(root_hex) {
-        return None;
-    }
-    let path = module_path(cache_dir, store_hex, root_hex);
+    let capsule = CapsuleKey::parse(store_hex, root_hex)?;
+    let path = capsule.module_path(cache_dir);
     let metadata = std::fs::metadata(&path).ok()?;
     let len = metadata.len();
     if len == 0 {
@@ -179,14 +170,12 @@ pub fn read_module_window(
 ) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
-    if !is_canonical(store_hex) || !is_canonical(root_hex) {
-        return None;
-    }
+    let capsule = CapsuleKey::parse(store_hex, root_hex)?;
     // Seek to the window instead of `fs::read`-ing the whole module (#1615/G1): a 512 MiB capsule
     // served in 4 MiB windows would otherwise cost a full-file read PER request — ~256 GiB of IO to
     // serve one pull, with up to 512 MiB resident per in-flight request. Only the bytes this request
     // actually asked for are ever pulled off disk.
-    let mut file = std::fs::File::open(module_path(cache_dir, store_hex, root_hex)).ok()?;
+    let mut file = std::fs::File::open(capsule.module_path(cache_dir)).ok()?;
     let total = file.metadata().ok()?.len();
     let start = offset.min(total);
     let want = length.min(MAX_MODULE_WINDOW).min(total - start);
@@ -221,11 +210,6 @@ pub fn module_frame(offset: u64, bytes: &[u8], complete: bool, total_length: Opt
 /// (the log's sentinel is where ids are rendered, #1603).
 pub fn module_unavailable_frame(code: i64) -> Value {
     json!({"error": {"code": code, "message": "this node does not hold the requested .dig module"}})
-}
-
-/// Whether `id` is a canonical 64-hex content id — the only shape that can name real content.
-fn is_canonical(id: &str) -> bool {
-    crate::is_canonical_hex_id(id)
 }
 
 /// Lower-case hex of 32 raw bytes.
@@ -322,9 +306,19 @@ pub(crate) fn module_range_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn hex_id(byte: u8) -> String {
         [byte; 32].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The cached-module path for a capsule named by hex ids, for fixtures that seed the cache
+    /// directly. Panics on a non-canonical id: a hostile key must reach the code under test through its
+    /// real entry point, never through a fixture that rebuilds the path by hand.
+    fn module_path(dir: &Path, store_hex: &str, root_hex: &str) -> PathBuf {
+        CapsuleKey::parse(store_hex, root_hex)
+            .expect("a fixture names a capsule with canonical ids")
+            .module_path(dir)
     }
 
     /// Write `bytes` as the cached module for `(store, root)` under a fresh temp cache dir.
