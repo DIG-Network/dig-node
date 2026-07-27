@@ -3122,6 +3122,62 @@ capsule-gain path flows), guarded so an already-held capsule is a no-op (unchang
 re-announce). It is best-effort and a no-op on the in-process FFI path (no peer network / inventory
 refresher installed).
 
+### 19.3a. Real-time holdings announce — dig-gossip opcode 222 (#1429)
+
+Beside the DURABLE provider records above, the node maintains a REAL-TIME holder signal. The durable
+records converge only as fast as the last PUT reached and a departed holder lingers for its record's TTL;
+the announce closes that gap.
+
+**Egress (MUST).** Every inventory reconcile MUST derive both effects from ONE delta: the DHT records
+(announce gained ids, ACTIVELY retract lost ids via `retract_own_provider`, never the passive
+`withdraw_provider` — a passively withdrawn record keeps answering `find_providers` with this node for
+content it can no longer serve, costing each reader a wasted dial), AND a signed opcode-222
+`HoldingsAnnounce` carrying `Add`/`Remove` deltas for exactly those ids. A reconcile larger than
+`HOLDINGS_MAX_CHANGES` (256) deltas MUST be SPLIT across frames, never truncated — truncation would drop
+retracts and leave this node advertising content it does not hold.
+
+- The announcement MUST be signed by the node's own `NodeCert` leaf (ECDSA-P256), because the wire
+  derives `provider_peer_id` from `SHA-256(provider_spki)`; signing with any other key announces an
+  identity no peer can dial.
+- The advertised addresses MUST be the SAME advertised candidate set the DHT provider records carry.
+- `seq` MUST strictly increase per node. It MUST be seeded above any value already announced (a
+  wall-clock seed); a node resuming from zero after a restart has its announcements dropped as replays.
+  Persisting the counter is deferred (#1477).
+- A degraded node (no signable leaf, no inbound receiver) MUST remain discoverable through the durable
+  DHT records — the real-time layer is additive and MUST NOT be a hard dependency of discoverability.
+
+**Ingress (MUST).** An inbound announcement is applied ONLY after all of the following, fail-closed, at a
+single chokepoint. dig-dht is crypto-free by design, and `ingest_verified_provider` is the sole sanctioned
+bypass of its mTLS self-announce check, so these are the whole of the authentication:
+
+1. `verify_holdings_announce` passes (batch cap, `SHA-256(provider_spki) == provider_peer_id`, P-256 SPKI,
+   valid signature over the `dig:holdings:v1` domain-separated message).
+2. The announcement is NOT attributed to this node's own `peer_id` — the network MUST NOT be able to tell
+   a node what it holds.
+3. `seq` strictly advances beyond the highest already applied FOR THAT PROVIDER; otherwise the
+   announcement is dropped (a replayed older frame MUST NOT resurrect a retracted record).
+4. Two token buckets, both within a 60-second window: at most **10 announcements per PROVIDER**, and at
+   most **1,024 (`4 × HOLDINGS_MAX_CHANGES`) deltas per TRANSPORT SENDER**. They are keyed differently on
+   purpose — a provider id is attacker-minted so its bucket map must be capacity-bounded and is therefore
+   evictable, whereas the sender key space is the connected pool and cannot be inflated from off-network,
+   making it the unbypassable backstop. A REJECTED announcement MUST charge neither bucket, or the
+   limiter itself becomes the denial of service.
+
+**Attribution (MUST).** The provider identity used for both `ingest_verified_provider` and
+`remove_provider_record` MUST be the VERIFIED signer and nothing else. A retract therefore removes only
+the signer's own record and can never de-list another holder of the same content key. The wire carries no
+per-delta peer field, so this holds structurally: the receive path accepts no caller-supplied provider id.
+
+**No amplification (MUST).** The ingress performs NO egress — it never re-broadcasts, dials, probes or
+fetches. One inbound announcement costs the receiver bounded local map work only, so a cheap
+anonymous message can never make honest peers do more work than the sender did. Dissemination itself is
+dig-gossip's Plumtree flood with its own seen-set dedup, not a per-message re-send by this layer.
+
+**False claims.** A peer MAY announce content it does not hold. This is bounded by cost asymmetry rather
+than prevented: the liar pays a signature and a flood, and buys at most one failed dial or a
+`dig.getAvailability` answering "no", after which the peer-selector deranks it. No merkle- or
+chain-verification decision ever rests on an announcement.
+
 ### 19.4. Address book — durable, IPv6-first, provenance + TTL
 
 The node maintains a durable peer address book: every learned peer candidate — from PEX, `dig.getPeers`,

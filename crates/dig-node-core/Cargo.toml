@@ -1,6 +1,6 @@
 [package]
 name = "dig-node-core"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -272,6 +272,11 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 
 [dev-dependencies]
 tempfile = "3"
+# Generates the P-256 leaf key pairs the opcode-222 holdings tests sign with: `public_key_der()` IS the
+# leaf `SubjectPublicKeyInfo` DER the wire carries as `provider_spki`, and whose SHA-256 is the
+# announcing peer_id — so a test signer is a real §5.2 identity rather than a stand-in that could hide
+# an attribution bug (#1429).
+rcgen = "0.13"
 # dig-download's in-memory harness (`MockRangeTransport`, `MockContent`, …), which the download-path
 # tests drive the real orchestrator over.
 #

@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.64.0] - 2026-07-27
+
+### Features
+- **holdings:** Real-time opcode-222 announce/retract + verified rate-limited inbound ingest (#1429)
+
 ## [0.63.0] - 2026-07-27
 
 ### Bug Fixes

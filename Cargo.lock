@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2249,6 +2249,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "lru",
+ "rcgen",
  "reqwest",
  "ring",
  "rustls",
@@ -2265,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.63.0"
+version = "0.64.0"
 dependencies = [
  "async-trait",
  "axum",
