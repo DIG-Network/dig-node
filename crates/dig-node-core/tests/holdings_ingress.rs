@@ -14,16 +14,16 @@
 //! Numeric bounds are pinned from BOTH sides: at-bound must pass, one-over must fail.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dig_dht::{ContentId, ProviderRecord};
 use dig_gossip::{
-    CandidateAddr as GossipAddr, EcdsaHoldingsSigner, HoldingsAnnounce, HoldingsDelta,
-    HoldingsError, HOLDINGS_MAX_CHANGES,
+    frame_holdings_announce, CandidateAddr as GossipAddr, EcdsaHoldingsSigner, HoldingsAnnounce,
+    HoldingsDelta, HoldingsError, HOLDINGS_MAX_CHANGES,
 };
 use dig_node_core::seams::dig_peer::holdings::{
-    announcement_for, deltas_for, split_batches, AnnounceTransport, Applied, HoldingsBroadcaster,
-    HoldingsIngress, HoldingsSink, RateLimits, Rejected, ADVERTISED_TTL_SECS,
+    announcement_for, deltas_for, run_holdings_ingest, split_batches, AnnounceTransport, Applied,
+    HoldingsBroadcaster, HoldingsIngress, HoldingsSink, RateLimits, Rejected, ADVERTISED_TTL_SECS,
     MAX_ANNOUNCES_PER_PROVIDER, MAX_DELTAS_PER_SENDER, RATE_WINDOW_SECS,
 };
 
@@ -139,6 +139,51 @@ impl HoldingsSink for RecordingSink {
             .expect("sink mutex")
             .remove(&(content_key.to_string(), provider_peer_id.to_string()))
     }
+}
+
+/// A sink that keeps every ingested [`ProviderRecord`] intact.
+///
+/// [`RecordingSink`] projects each record to `(content_key, provider)`, which is the right narrowness
+/// for the attribution tests but physically cannot express an address-count or expiry lie. Where the
+/// property under test is about a field that projection discards, the double is WIDENED rather than the
+/// assertion weakened.
+#[derive(Default)]
+struct RecordingRecords {
+    records: Mutex<Vec<ProviderRecord>>,
+}
+
+#[async_trait::async_trait]
+impl HoldingsSink for RecordingRecords {
+    async fn ingest(&self, record: ProviderRecord) -> bool {
+        self.records.lock().expect("sink mutex").push(record);
+        true
+    }
+
+    async fn remove(&self, _content_key: &str, _provider_peer_id: &str) -> bool {
+        false
+    }
+}
+
+/// A local-only [`DhtService`]: its transport reaches nobody, so it serves purely as a real sink.
+fn local_dht_service(port: u16) -> Arc<dig_dht::DhtService> {
+    struct Unreachable;
+    #[async_trait::async_trait]
+    impl dig_dht::DhtTransport for Unreachable {
+        async fn rpc(
+            &self,
+            _from: &dig_dht::Contact,
+            _target: &dig_dht::Contact,
+            _request: &dig_dht::DhtRequest,
+        ) -> Result<dig_dht::DhtResponse, dig_dht::DhtError> {
+            Err(dig_dht::DhtError::Transport("unreachable".to_string()))
+        }
+    }
+    Arc::new(dig_dht::DhtService::new(
+        dig_dht::PeerId::from_bytes([0x5du8; 32]),
+        vec![dig_dht::CandidateAddr::direct("::1".to_string(), port)],
+        dig_dht::DhtConfig::default(),
+        Arc::new(Unreachable),
+    ))
 }
 
 /// An ingress for a node whose own peer_id is `self_peer`, with the production limits.
@@ -1008,4 +1053,180 @@ async fn rejected_announcements_allocate_no_tracking_state() {
         50
     );
     assert_eq!(senders, 1, "one relaying sender throughout");
+}
+
+// =============================================================================================
+// The three guards the round-2 defect-revert probe found UNVERIFIED
+// =============================================================================================
+
+/// Captures everything logged inside a scope, so an assertion can read exactly what an operator
+/// tailing the node log would see.
+#[derive(Clone, Default)]
+struct CaptureBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("capture mutex").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuffer {
+    type Writer = CaptureBuffer;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// PROPERTY (item 6): no peer-supplied byte ever reaches the log, on ANY path.
+///
+/// `provider_peer_id` is a `u16`-length-prefixed wire string, so a hostile peer may put tens of
+/// kilobytes of arbitrary UTF-8 there — newlines that forge whole log lines, ANSI escapes that drive
+/// an operator's terminal. This is asserted against the REAL ingest loop's REAL emitted records
+/// (captured through a `tracing` subscriber), not against a return value, because the defect is in
+/// what the loop *emits*: keeping the record at `debug` bounds log VOLUME and says nothing about
+/// CONTENT, so a level-based rationale cannot substitute for not emitting the field.
+#[tokio::test]
+async fn no_peer_supplied_bytes_ever_reach_the_log() {
+    let holder = TestPeer::new();
+    let us = TestPeer::new();
+
+    // A forged log line, a terminal escape, and enough length to be obvious in a diff.
+    let hostile = "\n\u{1b}[2J\u{1b}[31mnode: CRITICAL forged line ".repeat(40);
+    let mut announce = holder.announce(1, vec![add_delta(&content(59))]);
+    announce.provider_peer_id = hostile.clone();
+
+    let (tx, rx) = tokio::sync::broadcast::channel(8);
+    tx.send((
+        dig_gossip::PeerId::from([0x33u8; 32]),
+        frame_holdings_announce(&announce),
+    ))
+    .expect("the receiver is live");
+    drop(tx); // closes the channel so `run_holdings_ingest` returns after draining
+
+    let buffer = CaptureBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(buffer.clone())
+        .finish();
+    {
+        let _guard = tracing::subscriber::set_default(subscriber);
+        run_holdings_ingest(
+            rx,
+            Arc::new(HoldingsIngress::new(us.peer_id_hex.clone())),
+            local_dht_service(9_401),
+        )
+        .await;
+    }
+    let logged =
+        String::from_utf8_lossy(&buffer.0.lock().expect("capture mutex").clone()).into_owned();
+
+    assert!(
+        !logged.contains("forged line"),
+        "the peer-supplied provider id must NEVER be logged; captured:\n{logged}"
+    );
+    assert!(
+        !logged.contains('\u{1b}'),
+        "no terminal escape from a peer-supplied field may reach the log; captured:\n{logged}"
+    );
+    assert!(
+        logged.contains("<malformed>"),
+        "the rejection should still be observable, just without attacker-shaped text; captured:\n{logged}"
+    );
+}
+
+/// PROPERTY (address cap): an `Add` delta's address list is truncated to what dig-dht will keep, so a
+/// tiny frame cannot make this node allocate a huge candidate vector.
+///
+/// The fixture declares far more addresses than the cap. Note the sink here records the WHOLE
+/// `ProviderRecord`: the narrower `(content_key, provider)` double used elsewhere physically cannot
+/// express an address-count lie, so widening the double is what makes the property observable at all.
+#[tokio::test]
+async fn an_oversized_address_list_is_truncated_before_it_is_mapped() {
+    let holder = TestPeer::new();
+    let us = TestPeer::new();
+    let sink = RecordingRecords::default();
+    let cap = dig_dht::MAX_ADDRESSES_PER_RECORD;
+
+    let declared = cap * 4;
+    let addresses: Vec<_> = (0..declared)
+        .map(|i| dig_gossip::CandidateAddr {
+            host: format!("::{i:x}"),
+            port: 9_257,
+        })
+        .collect();
+    let announce = holder.announce(
+        1,
+        vec![HoldingsDelta::Add {
+            content_key: *content(61).to_key().as_bytes(),
+            addresses,
+            expires_at: NOW + 3_600,
+        }],
+    );
+
+    HoldingsIngress::new(us.peer_id_hex.clone())
+        .accept(&sink, &holder.peer_id_hex, &announce, NOW)
+        .await
+        .expect("a validly signed announcement is accepted");
+
+    let records = sink.records.lock().expect("sink mutex");
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0].addresses.len() <= cap,
+        "an attacker-declared address count must be truncated to MAX_ADDRESSES_PER_RECORD ({cap}) \
+         before the list is mapped; got {} from {declared} declared",
+        records[0].addresses.len()
+    );
+}
+
+/// PROPERTY (watermark lifetime): a rate window elapsing must NOT reset the replay watermark.
+///
+/// Replay protection is not a rate limit. Folding the two together means simply waiting out one
+/// 60-second window makes every captured frame replayable again — so a retracted record can be
+/// resurrected on a timer. The fixture waits exactly one window (still well inside the freshness
+/// bound, so that gate cannot be what rejects the replay — otherwise this test would pass for the
+/// wrong reason).
+#[tokio::test]
+async fn a_rate_window_elapsing_does_not_reset_the_replay_watermark() {
+    let holder = TestPeer::new();
+    let us = TestPeer::new();
+    let sink = RecordingSink::default();
+    let id = content(67);
+    let ingress = ingress(&us.peer_id_hex);
+
+    let add = holder.announce(5, vec![add_delta(&id)]);
+    ingress
+        .accept(&sink, &holder.peer_id_hex, &add, NOW)
+        .await
+        .expect("seq 5 add");
+    ingress
+        .accept(
+            &sink,
+            &holder.peer_id_hex,
+            &holder.announce(6, vec![remove_delta(&id)]),
+            NOW,
+        )
+        .await
+        .expect("seq 6 retract");
+
+    // One full rate window later — inside MAX_ANNOUNCE_AGE_SECS, so freshness still accepts it.
+    let later = NOW + RATE_WINDOW_SECS;
+    assert!(
+        RATE_WINDOW_SECS < RateLimits::default().max_announce_age_secs,
+        "the fixture is only meaningful while a window is shorter than the freshness bound"
+    );
+    let rejected = ingress
+        .accept(&sink, &holder.peer_id_hex, &add, later)
+        .await
+        .expect_err("the watermark must outlive the rate window");
+
+    assert_eq!(rejected, Rejected::StaleSeq { seq: 5, highest: 6 });
+    assert!(
+        !sink.holds(&id, &holder.peer_id_hex),
+        "waiting out one rate window must not make a retracted record resurrectable"
+    );
 }
