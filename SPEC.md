@@ -200,6 +200,10 @@ never silently exposed to the network from an unenforced config assumption.
 - **Scope** — this governs ONLY the local RPC/content bind ([`Config::bind_addr`]). The peer P2P
   wire (mTLS, dig-node-core) and the loopback wallet mTLS listener bind independently, so
   enforcement never affects peer connectivity.
+- **Install-time fail-fast (#1667)** — the SAME refusal is applied at `dig-node install`: an
+  unauthorized non-loopback `DIG_NODE_HOST` is rejected with the identical error BEFORE the service
+  is registered, so an operator learns of the misconfiguration immediately instead of installing a
+  service that fails closed on its first start.
 
 The variables above are the shell's public bind/upstream/cache knobs. The node ENGINE library
 (`dig-node-core`) additionally reads the following variables directly from the environment; the shell

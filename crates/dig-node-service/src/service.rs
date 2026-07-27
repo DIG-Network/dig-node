@@ -1156,8 +1156,9 @@ SERVICE_NAME: net.dignetwork.dig-node
             allow_remote: false,
             ..Config::default()
         };
-        let err = ensure_install_host_allowed(&config)
-            .expect_err("a non-loopback host without DIG_NODE_ALLOW_REMOTE=1 must be refused at install");
+        let err = ensure_install_host_allowed(&config).expect_err(
+            "a non-loopback host without DIG_NODE_ALLOW_REMOTE=1 must be refused at install",
+        );
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("non-loopback"));
     }
