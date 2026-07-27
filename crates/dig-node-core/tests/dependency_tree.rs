@@ -78,7 +78,7 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
         .collect()
 }
 
-/// **Proves:** exactly ONE `dig-rpc-protocol` resolves in the workspace, and it is the 0.5 line that
+/// **Proves:** exactly ONE `dig-rpc-protocol` resolves in the workspace, and it is the 0.6 line that
 /// defines the module wire (`ModuleInfo` / `GetModuleInfoParams` / `FetchModuleRangeParams`).
 ///
 /// **Catches:** the obligation-8 skew directly. Before the #1576 cascade, dig-download consumed
@@ -97,8 +97,8 @@ fn the_workspace_carries_exactly_one_module_wire_crate() {
          majors means two `ModuleInfo` shapes across the module pull's trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.5."),
-        "the module wire ships in dig-rpc-protocol 0.5; the workspace resolved {}",
+        versions[0].starts_with("0.6."),
+        "the module wire ships in dig-rpc-protocol 0.6; the workspace resolved {}",
         versions[0]
     );
 }
@@ -108,7 +108,13 @@ fn the_workspace_carries_exactly_one_module_wire_crate() {
 /// `NatRangeTransport` are talking through the SAME client, not two independent mTLS stacks.
 #[test]
 fn the_peer_client_and_pull_engine_are_not_duplicated() {
-    for crate_name in ["dig-peer", "dig-download", "dig-nat", "dig-tls"] {
+    // `dig-nat` and `dig-dht` are here for the same reason and it is not hypothetical: this node hands
+    // its OWN `dig_nat` `NodeCert`/`NatConfig`/`NatRuntime` values INTO dig-download
+    // (`NatRangeTransport::new_with_runtime`) and dig-gossip, so a second dig-nat instance is not a
+    // size regression — those calls stop typechecking. Requesting the dig-nat 0.14 line while
+    // dig-download 0.11 and dig-gossip 0.16 sit on ^0.13 resolves THREE dig-nat instances, which is
+    // what this assertion exists to catch before a manifest edit ships (#1668).
+    for crate_name in ["dig-peer", "dig-download", "dig-nat", "dig-tls", "dig-dht"] {
         let versions = locked_versions(crate_name);
         assert_eq!(
             versions.len(),

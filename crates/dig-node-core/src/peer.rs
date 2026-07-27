@@ -61,6 +61,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use crate::seams::content::range_frame;
 use crate::seams::dig_peer::serve_log;
 use crate::{CachedCapsule, CapsuleStore, KeyManager, PeerNetwork};
 
@@ -1237,33 +1238,44 @@ impl PeerRpcResponder for NodeResponder {
             .await;
         };
 
-        // One frame per node window, so a large module rides many bounded frames rather than one
-        // unbounded one (the caller reassembles by offset and stops on `complete`).
+        // One frame per FRAME PAYLOAD, so a large module rides many bounded frames. The puller decodes
+        // these with `dig_nat::RangeFrame` (see `module_serve::module_frame`), so they are bound by the
+        // SAME ceiling as `dig.fetchRange` frames — framing them on `RANGE_WINDOW` made every module
+        // window over roughly 48 KiB undecodable, which is a whole-capsule pull, i.e. the reshare leg
+        // (#1640/#1668).
         let total = window.len() as u64;
         let mut written = 0usize;
         let mut frames = 0u64;
         while written < window.len() {
-            let take = (RANGE_WINDOW).min(window.len() - written);
+            let take = range_frame::FRAME_PAYLOAD.min(window.len() - written);
             let complete = written + take == window.len();
-            if let Some(limiter) = &self.serve_limiter {
-                limiter.acquire(conn_key, take as u64).await;
-            }
-            self.node.record_outgoing_bytes(take as u64);
-            let frame = module_serve::module_frame(
+            let frame = module_window_frame(
                 offset + written as u64,
                 &window[written..written + take],
                 complete,
-                (written == 0).then_some(total),
+                total,
             );
-            write_framed(out, &frame).await?;
+            // Charge the REAL encoded size, before the write, and to BOTH throttles. The payload length
+            // understates a metadata-carrying frame, and each frame is debited before it is written so a
+            // peer that resets the stream mid-serve is still accounted for the bytes it already cost.
+            let bytes = range_frame::encode_range_frame(&frame)?;
+            if let Some(limiter) = &self.serve_limiter {
+                limiter.acquire(conn_key, bytes.len() as u64).await;
+            }
+            self.node.record_outgoing_bytes(bytes.len() as u64);
+            out.write_all(&bytes).await?;
+            out.flush().await?;
             written += take;
             frames += 1;
         }
         if frames == 0 {
             // An empty window (an offset at/past the end) still needs a terminating frame, or the caller
             // waits forever for a `complete` that never arrives.
-            let frame = module_serve::module_frame(offset, &[], true, Some(0));
-            write_framed(out, &frame).await?;
+            let frame = module_window_frame(offset, &[], true, 0);
+            let bytes = range_frame::encode_range_frame(&frame)?;
+            self.node.record_outgoing_bytes(bytes.len() as u64);
+            out.write_all(&bytes).await?;
+            out.flush().await?;
             frames = 1;
         }
         module_serve::module_range_outcome(conn_key, &store, &root, offset, Some((total, frames)));
@@ -1287,172 +1299,165 @@ impl PeerRpcResponder for NodeResponder {
             .get("length")
             .and_then(Value::as_u64)
             .unwrap_or(RANGE_WINDOW as u64) as usize;
-        // The REQUESTED SPAN's exclusive end — the loop below must never serve past it, however far
-        // the resource itself continues (#1619). `fetch_range_frame`'s own `complete` flag means
-        // "the RESOURCE is exhausted"; it says nothing about "the CALLER's requested span is
-        // satisfied", which is the bound this streaming loop actually owes — `length` was previously
-        // used only to size one frame, never to bound the whole stream.
+        // A client that already holds the commitment for this root asks us not to resend the
+        // resource-scaling metadata (SPEC §5.1.1). Absent or false preserves the pre-0.13.0 behaviour,
+        // so a client that does not know the field is never broken by it.
+        let skip_layout = req
+            .get("skip_layout")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        // The REQUESTED SPAN's exclusive end — the stream must never serve past it, however far the
+        // resource itself continues (#1619). A resource's own exhaustion says nothing about "the
+        // CALLER's requested span is satisfied", which is the bound this serve actually owes.
         let requested_end = offset.saturating_add(length);
         // #1595: announce the inbound request, then EVERY termination path below reports its outcome —
         // so "did the holder get it, and what did it answer?" is answerable from the log alone.
         let target = serve_log::ServeTarget::from_range_request(conn_key, &req);
         serve_log::range_requested(&target, offset, length);
 
-        // Stream node-window frames advancing offset until complete (the peer reassembles by offset).
-        // A miss / bad range writes one error frame (JSON-RPC-shaped) so the caller can distinguish it.
-        let mut off = offset;
-        let (mut served_bytes, mut frames, mut proof_attached) = (0u64, 0u64, false);
-        loop {
-            // Ask for only what the REMAINING requested span still needs — never the original
-            // `length` again, which would let a single frame overshoot the caller's request.
-            let remaining = requested_end.saturating_sub(off);
-            match self
-                .node
-                .fetch_range_frame(store, root, rk, off, remaining)
-                .await
-            {
-                Ok(frame) => {
-                    let this_len =
-                        frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
-                    // OUTGOING-BANDWIDTH THROTTLE (#30): this is the node-to-node range-stream wire
-                    // multi-source downloaders hammer — the busiest outgoing-bytes path. Redirect the
-                    // caller to a known holder instead of streaming this frame over-budget (same #165
-                    // redirect shape as a genuine miss); serve it anyway when no alternate is known
-                    // (never drop a request the node could answer).
-                    if this_len > 0 {
-                        if let Some(content) = crate::download::range_content_id(&req) {
-                            let depth = crate::download::redirect_depth(&req);
-                            if let Some(obj) = self
-                                .node
-                                .bandwidth_redirect(&content, this_len as u64, depth)
-                                .await
-                            {
-                                let code = obj
-                                    .get("code")
-                                    .and_then(Value::as_i64)
-                                    .unwrap_or(crate::download::CONTENT_REDIRECT);
+        // The resource is resolved ONCE for the whole stream, because the prologue's paging state
+        // belongs to the stream rather than to any one frame (see `Node::range_source`).
+        let resource = match self.node.range_source(store, root, rk).await {
+            Ok(resource) => resource,
+            Err((code, message)) => {
+                // A LOCAL MISS (-32004) over the peer stream: try the #165 P2P miss path first —
+                // stream the fetched-through frames (transparent to the caller), or write a
+                // redirect ERROR FRAME naming the holder(s) so the caller re-requests there. An
+                // empty engine / no provider falls back to the bare error frame (no silent miss
+                // when a provider exists). The redirect frame carries the SAME `-32008` +
+                // `data.redirect` shape as the JSON-RPC redirect (the read-tier redirect response).
+                if code == crate::download::RESOURCE_UNAVAILABLE {
+                    if let Some(content) = crate::download::range_content_id(&req) {
+                        let depth = crate::download::redirect_depth(&req);
+                        // A remote peer's own fetchRange stream miss (#179/#1576) — never local.
+                        match self
+                            .node
+                            .miss_outcome(&content, depth, crate::download::ReadOrigin::Peer)
+                            .await
+                        {
+                            crate::download::MissOutcome::Fetched(f) => {
+                                // Fetched-through: the bytes come from a holder but are served
+                                // here, so the outcome is a serve (its frames carry the same
+                                // verification metadata, #1577) — UNLESS the fetch-through itself
+                                // refused the range, which it answers with an error frame rather
+                                // than an `Err`. Reporting its own verdict keeps `served` meaning
+                                // exactly one thing across both serve paths (#1595).
+                                let node = self.node.clone();
+                                let streamed = stream_fetched_range(
+                                    out,
+                                    &f,
+                                    RangeStreamPlan {
+                                        offset,
+                                        requested_end: offset.saturating_add(length),
+                                        skip_layout,
+                                        limiter: self.serve_limiter.as_deref(),
+                                        conn_key,
+                                        egress: &|n| node.record_outgoing_bytes(n),
+                                    },
+                                )
+                                .await?;
+                                let outcome =
+                                    streamed.as_serve_outcome(f.inclusion_proof.is_some());
+                                serve_log::range_outcome(&target, offset, &outcome);
+                                return Ok(());
+                            }
+                            crate::download::MissOutcome::Redirect {
+                                providers,
+                                next_depth,
+                            } => {
                                 serve_log::range_outcome(
                                     &target,
                                     offset,
                                     &serve_log::RangeOutcome::redirected(
-                                        code,
-                                        "outgoing-bandwidth budget exceeded".to_string(),
+                                        crate::download::CONTENT_REDIRECT,
+                                        format!("{} holder(s) named", providers.len()),
                                     ),
                                 );
-                                let errf = json!({"error": obj});
+                                let errf = json!({"error": crate::download::redirect_error_object(
+                                    &content, &providers, next_depth)});
                                 return write_framed(out, &errf).await;
                             }
+                            crate::download::MissOutcome::NotFound => {}
                         }
                     }
-                    self.node.record_outgoing_bytes(this_len as u64);
-                    // FCFS outbound PACING (#1436): wait (in arrival order) until this frame's bytes
-                    // fit the global + per-connection budget before writing it, so a burst never
-                    // overwhelms one peer or this node's uplink. `None` (the default/unlimited config)
-                    // skips `acquire` entirely — no per-conn map is touched (#1495 DoS guard).
-                    if let Some(limiter) = &self.serve_limiter {
-                        limiter.acquire(conn_key, this_len as u64).await;
-                    }
-                    write_framed(out, &frame).await?;
-                    served_bytes += this_len as u64;
-                    frames += 1;
-                    proof_attached |= frame.get("inclusion_proof").is_some();
-                    serve_log::range_frame_served(
-                        off,
-                        this_len,
-                        frame.get("first_chunk_index").and_then(Value::as_u64),
-                    );
-                    let complete = frame
-                        .get("complete")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(true);
-                    // Stop on WHICHEVER bound is hit first: the resource ended (`complete`), or the
-                    // caller's own requested span is now fully served (`span_satisfied`) — the second
-                    // is the one `complete` alone cannot express, and is exactly what let this loop
-                    // stream a whole multi-MiB resource off a `{offset:0, length:1}` probe (#1619).
-                    let span_satisfied = off + this_len >= requested_end;
-                    if complete || span_satisfied || this_len == 0 {
-                        serve_log::range_outcome(
-                            &target,
-                            offset,
-                            &serve_log::RangeOutcome::Served {
-                                bytes: served_bytes,
-                                frames,
-                                proof_attached,
-                            },
-                        );
-                        return Ok(());
-                    }
-                    off += this_len;
                 }
-                Err((code, message)) => {
-                    // A LOCAL MISS (-32004) over the peer stream: try the #165 P2P miss path first —
-                    // stream the fetched-through frames (transparent to the caller), or write a
-                    // redirect ERROR FRAME naming the holder(s) so the caller re-requests there. An
-                    // empty engine / no provider falls back to the bare error frame (no silent miss
-                    // when a provider exists). The redirect frame carries the SAME `-32008` +
-                    // `data.redirect` shape as the JSON-RPC redirect (the read-tier redirect response).
-                    if code == crate::download::RESOURCE_UNAVAILABLE {
-                        if let Some(content) = crate::download::range_content_id(&req) {
-                            let depth = crate::download::redirect_depth(&req);
-                            // A remote peer's own fetchRange stream miss (#179/#1576) — never local.
-                            match self
-                                .node
-                                .miss_outcome(&content, depth, crate::download::ReadOrigin::Peer)
-                                .await
-                            {
-                                crate::download::MissOutcome::Fetched(f) => {
-                                    // Fetched-through: the bytes come from a holder but are served
-                                    // here, so the outcome is a serve (its frames carry the same
-                                    // verification metadata, #1577) — UNLESS the fetch-through itself
-                                    // refused the range, which it answers with an error frame rather
-                                    // than an `Err`. Reporting its own verdict keeps `served` meaning
-                                    // exactly one thing across both serve paths (#1595).
-                                    let streamed = stream_fetched_range(
-                                        out,
-                                        &f,
-                                        off,
-                                        length,
-                                        self.serve_limiter.as_deref(),
-                                        conn_key,
-                                    )
-                                    .await?;
-                                    let outcome =
-                                        streamed.as_serve_outcome(f.inclusion_proof.is_some());
-                                    serve_log::range_outcome(&target, offset, &outcome);
-                                    return Ok(());
-                                }
-                                crate::download::MissOutcome::Redirect {
-                                    providers,
-                                    next_depth,
-                                } => {
-                                    serve_log::range_outcome(
-                                        &target,
-                                        offset,
-                                        &serve_log::RangeOutcome::redirected(
-                                            crate::download::CONTENT_REDIRECT,
-                                            format!("{} holder(s) named", providers.len()),
-                                        ),
-                                    );
-                                    let errf = json!({"error": crate::download::redirect_error_object(
-                                        &content, &providers, next_depth)});
-                                    return write_framed(out, &errf).await;
-                                }
-                                crate::download::MissOutcome::NotFound => {}
-                            }
-                        }
-                    }
-                    // Nothing to serve and nowhere to point the caller: name the refusal (#1595) so
-                    // an unanswered read is never indistinguishable from a request never received.
+                // Nothing to serve and nowhere to point the caller: name the refusal (#1595) so
+                // an unanswered read is never indistinguishable from a request never received.
+                serve_log::range_outcome(
+                    &target,
+                    offset,
+                    &serve_log::RangeOutcome::from_error(code, message.clone()),
+                );
+                let errf = json!({"error": {"code": code, "message": message}});
+                return write_framed(out, &errf).await;
+            }
+        };
+
+        // OUTGOING-BANDWIDTH THROTTLE (#30): this is the node-to-node range-stream wire multi-source
+        // downloaders hammer — the busiest outgoing-bytes path. Redirect the caller to a known holder
+        // instead of streaming over-budget (same #165 redirect shape as a genuine miss); serve it
+        // anyway when no alternate is known (never drop a request the node could answer).
+        //
+        // Checked ONCE, before the first frame, against the span this stream will actually serve.
+        // Previously it was re-checked per frame, which could only ever fire on the first frame in
+        // practice — and a redirect written MID-stream, after real bytes have gone out, is not a
+        // coherent answer to the caller anyway.
+        let total = resource.ciphertext.len();
+        let will_serve = requested_end.min(total).saturating_sub(offset.min(total)) as u64;
+        if will_serve > 0 {
+            if let Some(content) = crate::download::range_content_id(&req) {
+                let depth = crate::download::redirect_depth(&req);
+                if let Some(obj) = self
+                    .node
+                    .bandwidth_redirect(&content, will_serve, depth)
+                    .await
+                {
+                    let code = obj
+                        .get("code")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(crate::download::CONTENT_REDIRECT);
                     serve_log::range_outcome(
                         &target,
                         offset,
-                        &serve_log::RangeOutcome::from_error(code, message.clone()),
+                        &serve_log::RangeOutcome::redirected(
+                            code,
+                            "outgoing-bandwidth budget exceeded".to_string(),
+                        ),
                     );
-                    let errf = json!({"error": {"code": code, "message": message}});
+                    let errf = json!({"error": obj});
                     return write_framed(out, &errf).await;
                 }
             }
         }
+
+        let chunk_lens: Vec<u64> = resource.chunk_lens.iter().map(|&l| u64::from(l)).collect();
+        let root_hex = resource.roothash.to_hex();
+        let proof = {
+            use base64::Engine as _;
+            use digstore_core::codec::Encode as _;
+            base64::engine::general_purpose::STANDARD.encode(resource.merkle_proof.to_bytes())
+        };
+        let streamed = stream_range_frames(
+            out,
+            &resource.ciphertext,
+            range_frame::RangeVerification {
+                total_length: total as u64,
+                chunk_lens: &chunk_lens,
+                root: Some(&root_hex),
+                inclusion_proof: Some(&proof),
+            },
+            RangeStreamPlan {
+                offset,
+                requested_end,
+                skip_layout,
+                limiter: self.serve_limiter.as_deref(),
+                conn_key,
+                egress: &|n| self.node.record_outgoing_bytes(n),
+            },
+        )
+        .await?;
+        serve_log::range_outcome(&target, offset, &streamed.as_serve_outcome(!skip_layout));
+        Ok(())
     }
 
     async fn handle_dht(&self, caller: Option<dig_dht::Contact>, frame: Value) -> Vec<u8> {
@@ -1479,13 +1484,16 @@ impl PeerRpcResponder for NodeResponder {
 /// the real frame count and byte total, and — because this path answers a bad range with an ERROR
 /// frame rather than an `Err` — whether it refused instead of serving.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct StreamOutcome {
+pub(crate) struct StreamOutcome {
     /// RESOURCE bytes written across every data frame.
-    bytes: u64,
+    pub(crate) bytes: u64,
     /// How many data frames those bytes were split into (zero when the range was refused outright).
-    frames: u64,
+    pub(crate) frames: u64,
+    /// Total ENCODED wire bytes written — always >= `bytes`, and non-zero even for a frame whose
+    /// payload is empty (a prologue page). This is the quantity the throttles are charged.
+    pub(crate) encoded_bytes: u64,
     /// `Some((code, message))` when an error frame was written instead of completing the stream.
-    refusal: Option<(i64, String)>,
+    pub(crate) refusal: Option<(i64, String)>,
 }
 
 impl StreamOutcome {
@@ -1504,47 +1512,188 @@ impl StreamOutcome {
     }
 }
 
-async fn stream_fetched_range(
+pub(crate) async fn stream_fetched_range(
     out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     fetched: &crate::download::FetchedResource,
-    offset: usize,
-    length: usize,
-    limiter: Option<&dig_download::FcfsRateLimiter>,
-    conn_key: &str,
+    plan: RangeStreamPlan<'_>,
 ) -> std::io::Result<StreamOutcome> {
-    // Same bound as `stream_range` (#1619): `length` is the WHOLE stream's span, not one frame's size.
-    let requested_end = offset.saturating_add(length);
-    let mut off = offset;
+    stream_range_frames(
+        out,
+        &fetched.bytes,
+        range_frame::RangeVerification {
+            total_length: fetched.total_length,
+            chunk_lens: &fetched.chunk_lens,
+            root: fetched.root.as_deref(),
+            inclusion_proof: fetched.inclusion_proof.as_deref(),
+        },
+        plan,
+    )
+    .await
+}
+
+/// One `dig.fetchModuleRange` frame over a window of a locally-held `.dig` module.
+///
+/// The puller decodes these with `dig_nat::RangeFrame`, so they obey the same framing ceiling as
+/// `dig.fetchRange` frames, and `total_length` — the served WINDOW's length — rides EVERY frame rather
+/// than only the first. It is fixed-size, and it is what lets the puller size its staging file and
+/// notice a holder describing a different window as frames arrive instead of after paying for the whole
+/// capsule.
+///
+/// `total_length` is ASSIGNED, not built. `RangeFrame` has no `with_total_length` (only `with_identity`
+/// sets it, and that needs a generation root, which a `.dig` window has none of — a capsule is
+/// self-verifying against the chain anchor on install). The similarly-named `with_declared_length` sets
+/// `length`, the frame's own payload length, and dig-nat documents that a serve path has no reason to
+/// call it: a frame whose `length` disagrees with its payload is one the reader distrusts. No
+/// `chunk_count` is emitted, because this leg carries no per-resource chunk layout to count — inventing
+/// one would be a claim about a structure that is not there.
+fn module_window_frame(
+    offset: u64,
+    bytes: &[u8],
+    complete: bool,
+    total_length: u64,
+) -> dig_nat::RangeFrame {
+    let mut frame = dig_nat::RangeFrame::data(offset, bytes.to_vec()).with_complete(complete);
+    frame.total_length = Some(total_length);
+    frame
+}
+
+/// What a range stream owes its caller: the span requested, whether the resource-scaling metadata was
+/// waived, and the budget the bytes must be paced against.
+///
+/// Grouped rather than passed loose because these five travel together through every serve path, and
+/// the two length-ish `usize`s are the pair a positional call site is most likely to transpose — the
+/// span bound (#1619) and the frame ceiling (#1640) are already easy enough to confuse.
+pub(crate) struct RangeStreamPlan<'a> {
+    /// First byte of the requested span.
+    pub(crate) offset: usize,
+    /// Exclusive end of the requested span — never widened, however far the resource continues.
+    pub(crate) requested_end: usize,
+    /// The client already holds this root's commitment and waived `chunk_lens` + `inclusion_proof`.
+    pub(crate) skip_layout: bool,
+    /// FCFS outbound budget, or `None` for the default unlimited config (which touches no per-conn
+    /// accounting state at all — #1495).
+    pub(crate) limiter: Option<&'a dig_download::FcfsRateLimiter>,
+    /// The connection this stream is serving, for per-connection pacing.
+    pub(crate) conn_key: &'a str,
+    /// Charged the REAL encoded size of each frame, immediately before that frame is written.
+    ///
+    /// A sink rather than a returned total, deliberately: a returned total is only added up if the
+    /// stream runs to completion, and the case that matters is the one where it does NOT — a peer that
+    /// reads a few frames and resets the stream has already cost real egress.
+    pub(crate) egress: &'a (dyn Fn(u64) + Send + Sync),
+}
+
+/// Stream `[offset, requested_end)` of ONE resource as conforming `dig.fetchRange` frames.
+///
+/// This is the single framing loop behind BOTH serve paths — a locally-held resource and a
+/// fetched-through one — because they owe the caller byte-identical frames, and two loops maintaining
+/// one wire contract is the shape of defect that produced #1640 in the first place.
+///
+/// Three genuinely different bounds are enforced here:
+///
+/// * each frame's payload is at most [`range_frame::FRAME_PAYLOAD`], the per-FRAME cap — NOT
+///   [`RANGE_WINDOW`], which bounds a whole REQUEST and is 96x larger;
+/// * the stream never serves past `requested_end`, the caller's own requested span (#1619), a bound
+///   the resource's own exhaustion cannot express;
+/// * the stream does not END until the prologue is fully delivered, because a reader must discard a
+///   partial `chunk_lens` entirely — it is a DECRYPT input whose entries must sum to `total_length`,
+///   so a layout short even one entry is unusable rather than partially useful.
+///
+/// Frames are encoded by [`range_frame::encode_range_frame`] — the sole caller of dig-nat's own
+/// encoder in this crate — so this path cannot emit a frame a conforming receiver must reject even
+/// if a future change miscomputed a window.
+async fn stream_range_frames(
+    out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
+    bytes: &[u8],
+    verification: range_frame::RangeVerification<'_>,
+    plan: RangeStreamPlan<'_>,
+) -> std::io::Result<StreamOutcome> {
+    let RangeStreamPlan {
+        offset,
+        requested_end,
+        skip_layout,
+        limiter,
+        conn_key,
+        egress,
+    } = plan;
+    let total = bytes.len();
     let mut outcome = StreamOutcome::default();
+    if offset > total {
+        // Unsatisfiable range (spec -32007), answered with an error frame rather than an empty stream
+        // so the caller can tell "refused" from "served nothing".
+        let refusal = (
+            -32007i64,
+            format!("offset {offset} beyond resource length {total}"),
+        );
+        let errf = json!({"error": {"code": refusal.0, "message": refusal.1.clone()}});
+        write_framed(out, &errf).await?;
+        outcome.refusal = Some(refusal);
+        return Ok(outcome);
+    }
+
+    let mut framer = range_frame::RangeStreamFramer::new(verification, skip_layout);
+    let end_of_span = requested_end.min(total);
+    let mut off = offset;
     loop {
-        let remaining = requested_end.saturating_sub(off);
-        match fetched.range_frame(off, remaining) {
-            Ok(frame) => {
-                let this_len = frame.get("length").and_then(Value::as_u64).unwrap_or(0) as usize;
-                // Pace fetch-through frames on the SAME FCFS budget as locally-held serves (#1436).
-                // `None` (default/unlimited) skips `acquire` — no per-conn map touched (#1495).
-                if let Some(limiter) = limiter {
-                    limiter.acquire(conn_key, this_len as u64).await;
-                }
-                write_framed(out, &frame).await?;
-                outcome.bytes += this_len as u64;
-                outcome.frames += 1;
-                let span_satisfied = off + this_len >= requested_end;
-                let complete = frame
-                    .get("complete")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                if complete || span_satisfied || this_len == 0 {
-                    return Ok(outcome);
-                }
-                off += this_len;
-            }
-            Err((code, message)) => {
-                let errf = json!({"error": {"code": code, "message": message.clone()}});
+        let take = range_frame::FRAME_PAYLOAD.min(end_of_span.saturating_sub(off));
+        let window = bytes[off..off + take].to_vec();
+        let frame = framer.next_frame(off as u64, window);
+        // This frame is the FINAL one only when the bytes are done AND the prologue is fully sent.
+        // The page this frame just took is already accounted for, so `prologue_pending` here answers
+        // "are there pages still to come AFTER this frame".
+        let bytes_done = off + take >= end_of_span || off + take >= total;
+        let last = bytes_done && !framer.prologue_pending();
+        let frame = frame.with_complete(last && off + take >= total);
+
+        // Encode BEFORE charging anything, because the wire cost of a frame is its ENCODED size, not
+        // its payload: a prologue page is ~14 KB of metadata on a frame whose payload may be zero, and
+        // charging `take` would score that frame as free. A peer can ask for exactly that shape — a
+        // one-byte span without `skip_layout`, which is a client-set flag it simply omits — so this is
+        // a serve it can request, not a corner case.
+        let encoded = match range_frame::encode_range_frame(&frame) {
+            Ok(encoded) => encoded,
+            Err(e) => {
+                // This resource has NO conforming range stream from this holder (an inclusion proof
+                // over `MAX_INCLUSION_PROOF_B64` is the real case). Name it with the catalogued
+                // `-32009` instead of letting the error propagate: a propagated `Err` truncates the
+                // stream with no frame and skips the serve-log outcome entirely, leaving a
+                // `range_requested` with no verdict — the exact ambiguity #1595 exists to remove.
+                let refusal = (
+                    dig_rpc_protocol::ErrorCode::RangeMetadataUnrepresentable as i64,
+                    format!("this holder cannot frame a conforming range for this resource: {e}"),
+                );
+                let errf = json!({"error": {"code": refusal.0, "message": refusal.1.clone()}});
                 write_framed(out, &errf).await?;
-                outcome.refusal = Some((code, message));
+                outcome.refusal = Some(refusal);
                 return Ok(outcome);
             }
+        };
+        // FCFS outbound PACING (#1436): wait (in arrival order) until this frame's bytes fit the
+        // global + per-connection budget before writing. `None` (the default/unlimited config) skips
+        // `acquire` entirely — no per-conn map is touched (#1495 DoS guard).
+        if let Some(limiter) = limiter {
+            limiter.acquire(conn_key, encoded.len() as u64).await;
+        }
+        // Charged per frame, BEFORE the write. Accounting only after the whole stream returned means a
+        // peer that requests a large span, reads a few frames and then resets the yamux stream causes
+        // real egress recorded as zero — repeatable indefinitely, so the throttle never engages.
+        egress(encoded.len() as u64);
+        out.write_all(&encoded).await?;
+        out.flush().await?;
+        outcome.bytes += take as u64;
+        outcome.encoded_bytes += encoded.len() as u64;
+        outcome.frames += 1;
+        serve_log::range_frame_served(off, take, frame.chunk_index);
+        off += take;
+
+        if last {
+            return Ok(outcome);
+        }
+        // The remaining pages ride zero-payload frames once the bytes run out. That is bounded by the
+        // page count (itself bounded by the layout), so a resource with a large layout and a tiny
+        // requested span finishes its prologue instead of spinning.
+        if take == 0 && !framer.prologue_pending() {
+            return Ok(outcome);
         }
     }
 }
@@ -3949,21 +4098,42 @@ mod tests {
         let f = tiny_fetched(total);
         let mut out = tokio::io::sink();
         let start = tokio::time::Instant::now();
-        let streamed = stream_fetched_range(&mut out, &f, 0, total, Some(&limiter), "peerA")
-            .await
-            .unwrap();
-        assert_eq!(
-            streamed,
-            StreamOutcome {
-                bytes: total as u64,
-                frames: 2,
-                refusal: None
+        let streamed = stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 0,
+                requested_end: total,
+                skip_layout: false,
+                limiter: Some(&limiter),
+                conn_key: "peerA",
+                egress: &|_| {},
             },
-            "one window-sized frame, then the 100-byte tail"
+        )
+        .await
+        .unwrap();
+        // The frame COUNT is derived from the payload ceiling, never written as a literal. This
+        // assertion previously read `frames: 2` — one 3 MiB "window-sized frame" plus a tail — which
+        // is what the serve path actually did and what no conforming receiver could decode. It stayed
+        // green because this path writes into a sink, never through `RangeFrame::encode` (#1640/#1668).
+        let expected_frames = total.div_ceil(range_frame::FRAME_PAYLOAD) as u64;
+        assert_eq!(
+            (streamed.bytes, streamed.frames, streamed.refusal.clone()),
+            (total as u64, expected_frames, None),
+            "the span must be tiled into ceiling-sized frames plus a short tail"
         );
-        // The window-sized frame is admitted at once (oversized chunks are never blocked, only
-        // debited, per `FcfsRateLimiter::acquire`'s own contract) but leaves a debt the tiny cap pays
-        // off slowly — the tail frame waits well past this floor before it is admitted.
+        // The throttles are charged the ENCODED size, which is strictly larger than the payload (base64
+        // plus the metadata every frame carries). Asserting the relation rather than a literal keeps
+        // this honest without pinning it to a serialization detail.
+        assert!(
+            streamed.encoded_bytes > streamed.bytes,
+            "encoded wire bytes ({}) must exceed payload bytes ({})",
+            streamed.encoded_bytes,
+            streamed.bytes
+        );
+        // Each frame is admitted only once its bytes fit the budget, so a tiny cap makes a
+        // many-frame serve wait — the pacing property, now observed across real ceiling-sized frames
+        // rather than one oversized one.
         assert!(
             start.elapsed() >= std::time::Duration::from_millis(1500),
             "paced serve should wait for the window frame's debt to clear, waited {:?}",
@@ -3978,9 +4148,20 @@ mod tests {
         let f = tiny_fetched(1_000_000);
         let mut out = tokio::io::sink();
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 1000, None, "peerA")
-            .await
-            .unwrap();
+        stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 0,
+                requested_end: 1000,
+                skip_layout: false,
+                limiter: None,
+                conn_key: "peerA",
+                egress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             start.elapsed(),
             std::time::Duration::ZERO,
@@ -3996,14 +4177,36 @@ mod tests {
         let f = tiny_fetched(1000);
         let mut out = tokio::io::sink();
         // Exhaust peer A's burst (one 1000-byte frame).
-        stream_fetched_range(&mut out, &f, 0, 1000, Some(&limiter), "peerA")
-            .await
-            .unwrap();
+        stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 0,
+                requested_end: 1000,
+                skip_layout: false,
+                limiter: Some(&limiter),
+                conn_key: "peerA",
+                egress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
         // Peer B has its own fresh bucket → its first serve is instant.
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 1000, Some(&limiter), "peerB")
-            .await
-            .unwrap();
+        stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 0,
+                requested_end: 1000,
+                skip_layout: false,
+                limiter: Some(&limiter),
+                conn_key: "peerB",
+                egress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             start.elapsed(),
             std::time::Duration::ZERO,
@@ -4385,16 +4588,23 @@ mod tests {
 
         let logs = capture_logs(async {
             let mut out = tokio::io::sink();
-            let streamed = stream_fetched_range(&mut out, &f, 0, 100, None, &caller)
-                .await
-                .expect("streamed");
+            let streamed = stream_fetched_range(
+                &mut out,
+                &f,
+                RangeStreamPlan {
+                    offset: 0,
+                    requested_end: 100,
+                    skip_layout: false,
+                    limiter: None,
+                    conn_key: &caller,
+                    egress: &|_| {},
+                },
+            )
+            .await
+            .expect("streamed");
             assert_eq!(
-                streamed,
-                StreamOutcome {
-                    bytes: 100,
-                    frames: 1,
-                    refusal: None
-                }
+                (streamed.bytes, streamed.frames, streamed.refusal.clone()),
+                (100, 1, None)
             );
             serve_log::range_outcome(
                 &canonical_target(&req, &caller),
@@ -4419,16 +4629,23 @@ mod tests {
     async fn a_fetch_through_serve_clips_a_request_that_overruns_the_resource() {
         let f = tiny_fetched(300);
         let mut out = tokio::io::sink();
-        let streamed = stream_fetched_range(&mut out, &f, 250, 100, None, &test_caller())
-            .await
-            .expect("streamed");
+        let streamed = stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 250,
+                requested_end: 250 + 100,
+                skip_layout: false,
+                limiter: None,
+                conn_key: &test_caller(),
+                egress: &|_| {},
+            },
+        )
+        .await
+        .expect("streamed");
         assert_eq!(
-            streamed,
-            StreamOutcome {
-                bytes: 50,
-                frames: 1,
-                refusal: None
-            }
+            (streamed.bytes, streamed.frames, streamed.refusal.clone()),
+            (50, 1, None)
         );
     }
 
@@ -4442,9 +4659,20 @@ mod tests {
 
         let logs = capture_logs(async {
             let mut out = tokio::io::sink();
-            let streamed = stream_fetched_range(&mut out, &f, 9_000, 100, None, &caller)
-                .await
-                .expect("an error frame is still a written answer");
+            let streamed = stream_fetched_range(
+                &mut out,
+                &f,
+                RangeStreamPlan {
+                    offset: 9_000,
+                    requested_end: 9_000 + 100,
+                    skip_layout: false,
+                    limiter: None,
+                    conn_key: &caller,
+                    egress: &|_| {},
+                },
+            )
+            .await
+            .expect("an error frame is still a written answer");
             assert_eq!(streamed.bytes, 0);
             assert_eq!(streamed.frames, 0);
             assert!(streamed.refusal.is_some(), "the range was refused");

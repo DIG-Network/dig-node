@@ -2989,9 +2989,10 @@ over-length — the #1586 read-leg blocker, which required dig-nat >= 0.11.2 to 
 
 **Per-range verification metadata — EVERY frame, not just the first.** A served frame MUST carry the
 metadata that makes it independently checkable against the chain-anchored generation root:
-`total_length`, `chunk_lens`, `root`, the whole-resource `inclusion_proof`, and — when the window
-begins exactly on a chunk boundary — `first_chunk_index` (with `chunk_index` as its pre-existing alias
-for the same value). A downloading peer fetches ranges in parallel from many holders, so a frame that
+`total_length`, `root`, `chunk_count`, and — when the window begins exactly on a chunk boundary —
+`first_chunk_index` (with `chunk_index` as its pre-existing alias for the same value). `chunk_lens` and
+`inclusion_proof` are the resource-scaling PROLOGUE and ride the stream once rather than every frame
+(see the framing rules below). A downloading peer fetches ranges in parallel from many holders, so a frame that
 declared no `root` (as only-the-first-frame metadata left every later range doing) could not be checked
 for generation consistency on arrival: a wrong-generation source was detectable only after the whole
 resource had been paid for in bandwidth. A frame whose window starts MID-chunk MUST omit
@@ -3015,14 +3016,66 @@ for the WHOLE resource's verification-metadata-laden frames out. The client-side
 for the holder's own bound — re-introducing a client-side REJECTION of an over-long frame is the #836
 class of defect (a false negative that makes an honest holder look like a liar) and MUST NOT return.
 
-**KNOWN CONSTRAINT (dig_ecosystem#1640): the per-frame window ([`crate::peer::RANGE_WINDOW`], 3 MiB)
-exceeds `dig-nat`'s wire framing cap (`MAX_FRAMED_BODY`, 64 KiB) once base64 encoding and #1577's
-per-frame verification metadata are counted.** A real peer-to-peer `dig.fetchRange`/reshare window
-this large cannot actually be decoded on arrival over the real wire — the wiring in this spec is
-correct and the bound above holds regardless of window size, but the reshare leg's "a reader becomes a
-discoverable holder" flywheel is NOT demonstrable end to end at realistic capsule sizes until the
-framing ceiling is published by `dig-nat` and this node's per-frame split is brought under it
-(release-first, cross-repo — tracked at #1640, not fixed in this pass).
+**A FRAME is bounded by `MAX_RANGE_FRAME_PAYLOAD`, not by the request window.** A serving node MUST
+split a requested span into frames carrying at most `dig_nat::MAX_RANGE_FRAME_PAYLOAD` (32,768) raw
+payload bytes each, and MUST write each frame through `dig_nat::RangeFrame::encode`. `RANGE_WINDOW`
+(3 MiB) is the default and maximum a single REQUEST may ask for; it is NOT a valid per-frame size. The
+two are 96x apart, and `bytes` travels base64, so a frame sized by the request window produces a body
+past `dig_nat::MAX_FRAMED_BODY` (65,536) which a conforming receiver is REQUIRED to reject — making
+every resource over roughly 48 KiB unserveable by any holder (dig_ecosystem#1640/#1668). The same
+ceiling binds `dig.fetchModuleRange`, whose frames the puller also decodes with `dig_nat::RangeFrame`.
+
+Frames MUST be produced through the dig-nat type rather than hand-built as JSON and written with an
+uncapped framer. The encoder's refusal is what makes an unserveable frame impossible to emit rather
+than merely unlikely: a sender that builds its own JSON has no way to learn it produced something the
+receiver must reject, so the divergence can only surface as a failed read in production.
+
+**Which metadata rides which frame.** The metadata splits by whether it scales with the RESOURCE
+(dig-nat `SPEC.md` §5.1.1 is normative):
+
+- The **identity set** — `root`, `total_length`, `chunk_count`, plus `chunk_index`/`first_chunk_index`
+  where the window is chunk-aligned — is fixed-size and MUST ride EVERY frame. It is what lets a reader
+  reject a wrong-generation or wrong-layout holder the moment a frame arrives.
+- The **prologue** — `chunk_lens` and `inclusion_proof` — scales with the resource and MUST be sent
+  once per range stream, never repeated on later frames. A layout exceeding
+  `dig_nat::MAX_CHUNK_LENS_PER_FRAME` (2,048) entries MUST be sent as a **paged prologue**: successive
+  frames each carrying at most that many entries, each stamped with the `chunk_lens_offset` at which its
+  page begins. Pages MUST tile the array exactly — no page may be empty, and every page except the tail
+  MUST be exactly `MAX_CHUNK_LENS_PER_FRAME` entries, since a short non-tail page leaves a gap no
+  page-aligned page can ever fill.
+- A stream MUST NOT report `complete` while prologue pages are still owed, and MUST NOT end before the
+  prologue is delivered whole — including when the requested span needs FEWER frames than the prologue
+  does, in which case the remaining pages ride zero-payload frames. `chunk_lens` is a DECRYPT input
+  whose entries must sum to `total_length`, so a reader MUST discard a partial layout entirely: a
+  layout short even one entry cannot decrypt the resource, making it unusable rather than partially
+  useful.
+- A request MAY set `skip_layout` when the client already holds the commitment for this `root`; a
+  holder honouring it omits the resource-scaling set and ONLY that. The identity set is never
+  suppressed, because it is what detects a wrong-generation holder on arrival. `skip_layout` absent or
+  false preserves the earlier behaviour, so a holder that does not understand the field is never broken
+  by it.
+
+Every frame's declared `length` MUST equal its own payload length. A frame whose `length` disagrees
+with its `bytes` is one a reader distrusts, and no receiver in this tree validates the relation, so the
+obligation is the sender's alone.
+
+**`dig.fetchModuleRange` frames** obey the same framing ceiling, and carry `total_length` — the served
+window's length — on EVERY frame rather than only the first. They carry no `root` or `chunk_count`: a
+`.dig` capsule is self-verifying against the chain anchor on install (§the module-anchor gate), and this
+leg has no per-resource chunk layout to count, so a `chunk_count` here would be a claim about a structure
+that is not present.
+
+**KNOWN CONSTRAINT — the paged prologue has no RECEIVER in this dependency tree.** dig-download 0.11
+reads `chunk_lens` from the first frame only and ignores `chunk_lens_offset` and every later page
+(`ChunkLensAssembler` ships in dig-nat 0.14 / dig-download 0.12; this node is held at 0.13 / 0.11 by
+dig-gossip and dig-peer-selector — see `crates/dig-node-core/Cargo.toml`). So a resource whose layout
+exceeds `MAX_CHUNK_LENS_PER_FRAME` — roughly **128 MiB** at the 64 KiB chunk target — is served
+correctly by this node but still fails at the reader, now at its `chunk_lens`-sum check rather than at
+frame decode. This is FAIL-CLOSED and cannot mis-verify: a partial layout is refused, never used. It is
+resolved by the same cascade as the rest of the 0.14 move (dig_ecosystem#1686).
+
+`chunk_count`, `chunk_lens_offset` and `skip_layout` are additive wire fields (§5.1 backwards
+compatibility): an older reader ignores them, and a newer reader parses an older frame with each absent.
 
 A serve MUST NOT emit a per-CHUNK inclusion proof (`range_proof`). No such proof is derivable from the
 store format: the generation root's merkle leaves are per-RESOURCE (`resource_leaf(ciphertext)` =

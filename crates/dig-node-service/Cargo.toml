@@ -76,7 +76,7 @@ dig-node-core = { path = "../dig-node-core" }
 # longer has — the shell would omit `dig.getModuleInfo` / `dig.fetchModuleRange` while the engine served
 # them. Two majors in one workspace also duplicates the wire TYPES; pinned by
 # `dig-node-core/tests/dependency_tree.rs`.
-dig-rpc-protocol = "0.5"
+dig-rpc-protocol = "0.6"
 
 # The Sage-parity wallet engine (crate `dig_wallet`) — the node-custodied wallet DB + dual-transport
 # dispatch + seed custody. This shell WIRES it into bring-up (#368): it builds one live

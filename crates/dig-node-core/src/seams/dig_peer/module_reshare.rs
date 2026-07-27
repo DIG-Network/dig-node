@@ -530,12 +530,15 @@ mod tests {
 
         let verifier =
             ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
-        assert!(dig_download::ModuleAnchorVerifier::verify_module_anchor(
-            &verifier,
-            &module,
-            &hex32(STORE),
-            &hex32(CHAIN_ROOT)
-        ));
+        assert_eq!(
+            dig_download::ModuleAnchorVerifier::verify_module_anchor(
+                &verifier,
+                &module,
+                &hex32(STORE),
+                &hex32(CHAIN_ROOT)
+            ),
+            dig_download::ModuleAnchor::Anchored
+        );
 
         let cached = dir.join("cached.module");
         assert_eq!(
@@ -557,12 +560,15 @@ mod tests {
         let module = module_committing(STORE, CHAIN_ROOT);
         let verifier =
             ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
-        assert!(dig_download::ModuleAnchorVerifier::verify_module_anchor(
-            &verifier,
-            &module,
-            &hex32(STORE),
-            &hex32(CHAIN_ROOT)
-        ));
+        assert_eq!(
+            dig_download::ModuleAnchorVerifier::verify_module_anchor(
+                &verifier,
+                &module,
+                &hex32(STORE),
+                &hex32(CHAIN_ROOT)
+            ),
+            dig_download::ModuleAnchor::Anchored
+        );
 
         // The gate admitted `module`; what is on disk is something else (one flipped byte, and a
         // trailing tail — both invisible to a caller that only checks the Ok).

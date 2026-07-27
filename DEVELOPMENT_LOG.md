@@ -791,3 +791,51 @@ loopback here never breaks peer connectivity. A remote-API test rig (#1062) just
 ## Lane anchor — dig_ecosystem#1667 (loopback-enforcement residuals)
 
 A fail-closed guard is only good UX if it fires at the EARLIEST point the bad config is known. #1662 enforced the non-loopback `DIG_NODE_HOST` refusal at the bind site, but `dig-node install` baked the host into the service env WITHOUT re-checking — so an unauthorized `DIG_NODE_HOST=0.0.0.0` installed cleanly and only failed closed on first service start (confusing: the failure is detached from the action that caused it). Fix (#1667): `install()` now calls the SAME `config::host_override_refusal` before any side effect, so the refusal surfaces the identical message up front. Reuse the one canonical predicate — never re-derive the loopback rule. Also swept the residual bare "loopback-only" comments in meta.rs/lib.rs: the control surface is token-gated REGARDLESS of bind (loopback-bound only by default; non-loopback with `DIG_NODE_ALLOW_REMOTE=1`), and control.* is never peer-reachable regardless of bind — the imprecise adjective, though safe today, understated the real invariant.
+
+## Lane anchor — dig_ecosystem#1668 / #1640 (the range-frame ceiling)
+
+**One confused quantity made every DIG read above ~48 KiB impossible, network-wide.** `RANGE_WINDOW`
+(3 MiB) bounds how much ONE REQUEST may ask for. `dig_nat::MAX_RANGE_FRAME_PAYLOAD` (32,768 B) bounds
+ONE FRAME. The serve path framed on the former against the latter — 96x over — and because `bytes`
+travels base64, any resource past roughly 48 KiB produced a body over `MAX_FRAMED_BODY` (65,536) that
+every conforming receiver is REQUIRED to reject. Both names contain "range" and both are byte counts,
+which is precisely why they were interchanged.
+
+**The defect was structurally invited.** The serve path hand-built frames as `json!` and wrote them
+with `peer::write_framed`, which has NO cap: it serialises and writes a raw `u32` length prefix. So the
+SENDER could not learn it had produced something the receiver must reject — the asymmetry could only
+surface as a failed read in production. Frames are now built as real `dig_nat::RangeFrame` values and
+written through `RangeFrame::encode`, which refuses an over-ceiling payload/proof/body. **The durable
+lesson: when one side of a wire rule can be maintained separately from the other, it eventually will
+be. Route both sides through the same type.** (dig-nat's own `MAX_FRAMED_BODY` doc names dig-node's
+`write_framed` explicitly as an implementation that must use the value.)
+
+**A test suite can be complete and still blind.** Every pre-existing range-serve test either inspected
+the `serde_json::Value` the serve path built or streamed into `tokio::io::sink()` — neither touches the
+encoder, so all of them passed against a 96x-oversized frame. Worse,
+`stream_range_paces_each_frame_under_a_tight_cap` asserted `frames: 2` for a 3 MiB resource: it PINNED
+the bug as correct behaviour. The read-leg e2e proofs that "passed" served 20,477 B and 27,067 B —
+both under the ceiling. **Size a fixture FROM the protocol's own published limits and say why; a
+fixture that cannot exceed a bound cannot detect an unbounded encoder.**
+
+**Narrowness, not error — proved on this lane's own tests.** The paged-prologue test (six data frames
+carrying three pages) genuinely CANNOT detect setting `complete` as soon as the bytes are done: the
+prologue finishes long before the last frame, so withholding it changes nothing observable. Only a
+span SMALLER than the prologue separates the behaviours (one data frame, three pages). Reverting that
+one line left the paged test green and failed only the dedicated fixture. **When a fix is about
+ORDERING or PLACEMENT, ask what input makes relocation observable — the obvious "bigger" fixture is
+often the blinder one.**
+
+**dig-nat 0.13 vs 0.14 — a version is not automatically the right target.** 0.13 introduced the whole
+capped/paged SENDER API (fallible `encode`, `with_identity`/`chunk_count`, `with_chunk_lens_page`,
+`skip_layout`); everything 0.14 adds is the RECEIVER (`ChunkLensAssembler`) plus `split_chunk_lens_pages`.
+This node cannot reach 0.14 yet: it passes its OWN `dig_nat` `NodeCert`/`NatConfig`/`NatRuntime` values
+INTO dig-download (`NatRangeTransport::new_with_runtime`) and dig-gossip, and those sit on `^0.13`, so
+requesting 0.14 resolves THREE dig-nat instances and the calls stop typechecking. **A duplicate wire
+crate is a compile break here, not a size regression** — `tests/dependency_tree.rs` asserts the
+TRANSITIVE LOCK entry for exactly this reason, and a caret dep looking correct proves nothing.
+
+**`chunk_lens` is a DECRYPT input, not a verify input.** Per-chunk AES-256-GCM-SIV needs the whole
+array summing to `total_length`, so a partial layout is unusable rather than partially useful. That is
+why a paged prologue must complete before a stream ends — including on a one-byte request, where the
+remaining pages ride zero-payload frames — and why `complete` is withheld until the last page is out.
