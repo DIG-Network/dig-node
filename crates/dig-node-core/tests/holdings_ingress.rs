@@ -1173,7 +1173,8 @@ async fn the_provider_map_evicts_the_least_recently_seen_at_its_capacity() {
     let last = seen_at(CAP);
     let (_, over_cap) = ingress.tracked_counts().await;
     assert_eq!(
-        over_cap, CAP,
+        over_cap,
+        CAP,
         "admitting a {n}th distinct provider must leave the map at its capacity",
         n = CAP + 1
     );

@@ -3140,9 +3140,15 @@ retracts and leave this node advertising content it does not hold.
   derives `provider_peer_id` from `SHA-256(provider_spki)`; signing with any other key announces an
   identity no peer can dial.
 - The advertised addresses MUST be the SAME advertised candidate set the DHT provider records carry.
-- `seq` MUST strictly increase per node. It MUST be seeded above any value already announced (a
-  wall-clock seed); a node resuming from zero after a restart has its announcements dropped as replays.
-  Persisting the counter is deferred (#1477).
+- `seq` MUST strictly increase per node, and MUST NOT restart from zero — a node resuming from zero has
+  every announcement dropped as a replay by peers that remember its previous watermark. The
+  implementation seeds from the wall clock and increments once per batch. Note the two limits of that
+  seed, neither of which a receiver can be harmed by: it does NOT guarantee the seed exceeds every value
+  previously announced (a node averaging more than one batch per second outruns its own clock, so the
+  seed after a restart can be below the counter it reached), and a backwards clock adjustment has the
+  same effect. The consequence is self-inflicted silence — this node's announcements are ignored until
+  the counter it left behind is passed — never an accepted replay. Seeding above the last value
+  announced requires persisting the counter, which is deferred (#1477).
 - A degraded node (no signable leaf, no inbound receiver) MUST remain discoverable through the durable
   DHT records — the real-time layer is additive and MUST NOT be a hard dependency of discoverability.
 

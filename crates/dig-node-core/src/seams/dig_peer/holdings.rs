@@ -924,7 +924,14 @@ mod tests {
                 "{off:?} must disable the ingress"
             );
         }
-        for on in [None, Some(""), Some("1"), Some("true"), Some("yes"), Some("x")] {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("yes"),
+            Some("x"),
+        ] {
             assert!(
                 ingest_enabled(on),
                 "{on:?} must leave the ingress enabled — the switch fails OPEN"
