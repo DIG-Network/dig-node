@@ -595,17 +595,14 @@ impl RangeTransport for PoolConfirmTransport {
                 peer = %provider.provider_peer_id,
                 "pool confirm bypass: connected holder skips the getAvailability probe (#836)"
             );
+            // Built through the constructors, not struct literals: these types are
+            // `#[non_exhaustive]`, which is what makes every future additive wire field a PATCH for
+            // this crate rather than a break (dig-nat SPEC §5.1.1).
             let answers = items
                 .iter()
-                .map(|_| dig_nat::AvailabilityAnswer {
-                    available: true,
-                    roots: None,
-                    total_length: None,
-                    chunk_count: None,
-                    complete: None,
-                })
+                .map(|_| dig_nat::AvailabilityAnswer::available())
                 .collect();
-            return Ok(dig_nat::AvailabilityResponse { items: answers });
+            return Ok(dig_nat::AvailabilityResponse::new(answers));
         }
         self.inner.query_availability(provider, items).await
     }
@@ -2099,15 +2096,9 @@ pub(crate) mod tests {
             // The holder answers NOT-available for every queried item (the confirm-says-no sub-cause).
             let answers = items
                 .iter()
-                .map(|_| dig_nat::AvailabilityAnswer {
-                    available: false,
-                    roots: None,
-                    total_length: None,
-                    chunk_count: None,
-                    complete: None,
-                })
+                .map(|_| dig_nat::AvailabilityAnswer::unavailable())
                 .collect();
-            Ok(dig_nat::AvailabilityResponse { items: answers })
+            Ok(dig_nat::AvailabilityResponse::new(answers))
         }
         async fn fetch_range(
             &self,

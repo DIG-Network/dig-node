@@ -115,16 +115,8 @@ async fn peer_rpc_is_served_over_mtls_end_to_end() {
     // 2. A typed availability batch via dig-nat's own client helper.
     {
         let items = vec![
-            dig_nat::AvailabilityItem {
-                store_id: "aa".repeat(32),
-                root: None,
-                retrieval_key: None,
-            },
-            dig_nat::AvailabilityItem {
-                store_id: "bb".repeat(32),
-                root: Some("11".repeat(32)),
-                retrieval_key: None,
-            },
+            dig_nat::AvailabilityItem::store("aa".repeat(32)),
+            dig_nat::AvailabilityItem::store("bb".repeat(32)).with_root("11".repeat(32)),
         ];
         let resp = conn
             .query_availability(items)

@@ -1987,6 +1987,35 @@ impl Node {
     /// proof is served. Returns `Err((code, message))` with the catalogued `-32004`/`-32007` on a miss / bad
     /// range. (Capsule fetches — `capsule: true` — are not yet served here; that lands with the whole
     /// `.dig` streaming path and returns `-32004` for now, a clean seam.)
+    /// The locally-held resource a `dig.fetchRange` stream serves, or the catalogued refusal
+    /// (`-32602` for a malformed retrieval key, `-32004` for a resource this node does not hold).
+    ///
+    /// Split out of [`fetch_range_frame`](Self::fetch_range_frame) so a STREAM resolves its resource
+    /// ONCE and then frames it. That matters beyond efficiency: the prologue's paging state — which
+    /// `chunk_lens` page is next, whether the inclusion proof has gone out — belongs to the STREAM,
+    /// and a per-frame lookup has nowhere to keep it. It is the concrete reason the layout could
+    /// previously only ever ride the first frame, and therefore why a layout too large for one frame
+    /// had no representation at all (#1668).
+    pub(crate) async fn range_source(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        rk_hex: &str,
+    ) -> Result<Arc<ContentResponse>, (i64, String)> {
+        let rk = decode_rk(rk_hex).map_err(|_| {
+            (
+                -32602,
+                "retrieval_key must be 32 bytes (64-hex)".to_string(),
+            )
+        })?;
+        self.serve_local_cached(store_hex, root_hex, &rk)
+            .await
+            .ok_or((
+                -32004,
+                "resource not held at the requested root".to_string(),
+            ))
+    }
+
     pub async fn fetch_range_frame(
         &self,
         store_hex: &str,
@@ -1995,19 +2024,7 @@ impl Node {
         offset: usize,
         length: usize,
     ) -> Result<Value, (i64, String)> {
-        let rk = decode_rk(rk_hex).map_err(|_| {
-            (
-                -32602,
-                "retrieval_key must be 32 bytes (64-hex)".to_string(),
-            )
-        })?;
-        let resp = self
-            .serve_local_cached(store_hex, root_hex, &rk)
-            .await
-            .ok_or((
-                -32004,
-                "resource not held at the requested root".to_string(),
-            ))?;
+        let resp = self.range_source(store_hex, root_hex, rk_hex).await?;
 
         let total = resp.ciphertext.len();
         // offset past the end is unsatisfiable (spec -32007). offset == total is the empty terminal.
@@ -2018,7 +2035,10 @@ impl Node {
             ));
         }
         let start = offset.min(total);
-        let end = (start + length.min(peer::RANGE_WINDOW)).min(total);
+        // Clamped to the per-FRAME payload cap, not [`peer::RANGE_WINDOW`] (the per-REQUEST window,
+        // 96x larger). A caller streams further windows by advancing `offset`; sizing one frame by the
+        // request window is what made every read over roughly 48 KiB unserveable (#1640/#1668).
+        let end = (start + length.min(range_frame::FRAME_PAYLOAD)).min(total);
         let window = resp.ciphertext[start..end].to_vec();
         let complete = end >= total;
 
@@ -2441,6 +2461,62 @@ pub(crate) mod test_support {
             merkle_proof: tree.prove(0).expect("single-leaf proof"),
             roothash: tree.root(),
             chunk_lens: chunks.iter().map(|c| c.len() as u32).collect(),
+            ciphertext,
+        };
+        let chunk_lens = resp.chunk_lens.iter().map(|&l| u64::from(l)).collect();
+        (Arc::new(resp), chunk_lens)
+    }
+
+    /// A REAL served resource whose ciphertext is deliberately LARGER than the range wire's own
+    /// ceilings, chunked into `chunk_len`-byte chunks, committed under a single-leaf generation root
+    /// with its genuine digstore inclusion proof.
+    ///
+    /// # Why the size is computed from the protocol's constants
+    ///
+    /// Every bound here is read from dig-nat rather than written as a round number, because a fixture
+    /// that happens to sit UNDER a limit cannot detect a sender that ignores the limit. That is not a
+    /// hypothetical: the read-leg end-to-end proofs that passed while the serve path framed on a 3 MiB
+    /// window served 20,477 B and 27,067 B — both below the ceiling, so both were satisfied by the
+    /// unbounded encoder they were meant to catch (#1640).
+    ///
+    /// `frame_payloads` full [`dig_nat::MAX_RANGE_FRAME_PAYLOAD`] payloads plus a deliberate partial
+    /// tail therefore guarantees three things at once:
+    ///
+    /// * the ciphertext exceeds [`dig_nat::MAX_FRAMED_BODY`], so serving it as ONE frame is refused by
+    ///   any conforming receiver — `bytes` travels base64, so a payload over ~48 KiB already overflows
+    ///   the 64 KiB body ceiling;
+    /// * a conforming serve MUST tile it into several frames, so single-frame framing cannot pass; and
+    /// * the last frame is SHORT, so "tiles exactly" is tested against a partial tail rather than a
+    ///   suspiciously even division.
+    pub(crate) fn oversized_served_resource(
+        frame_payloads: usize,
+        tail: usize,
+        chunk_len: usize,
+    ) -> (Arc<ContentResponse>, Vec<u64>) {
+        use digstore_core::merkle::{resource_leaf, MerkleTree};
+
+        let total = dig_nat::MAX_RANGE_FRAME_PAYLOAD * frame_payloads + tail;
+        assert!(
+            total > dig_nat::MAX_FRAMED_BODY,
+            "a fixture at or below MAX_FRAMED_BODY cannot exhibit the multi-frame contract"
+        );
+        // Byte i is `i mod 251` (a prime, so the pattern never aligns with a chunk or frame boundary):
+        // reassembling frames in the wrong ORDER, or dropping one, changes the bytes. A constant fill
+        // would let a mis-ordered reassembly still compare equal.
+        let ciphertext: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let chunk_lens: Vec<u32> = std::iter::repeat_n(chunk_len as u32, total / chunk_len)
+            .chain((!total.is_multiple_of(chunk_len)).then_some((total % chunk_len) as u32))
+            .collect();
+        debug_assert_eq!(
+            chunk_lens.iter().map(|&l| l as usize).sum::<usize>(),
+            total,
+            "chunk_lens must sum to the ciphertext length (it is a DECRYPT input)"
+        );
+        let tree = MerkleTree::from_leaves(vec![resource_leaf(&ciphertext)]);
+        let resp = ContentResponse {
+            merkle_proof: tree.prove(0).expect("single-leaf proof"),
+            roothash: tree.root(),
+            chunk_lens,
             ciphertext,
         };
         let chunk_lens = resp.chunk_lens.iter().map(|&l| u64::from(l)).collect();
@@ -7034,15 +7110,9 @@ mod tests {
                 // valid answer; report "not held" so the orchestrator drops this (mis-dialed) source.
                 let answers = items
                     .iter()
-                    .map(|_| dig_nat::AvailabilityAnswer {
-                        available: false,
-                        roots: None,
-                        total_length: None,
-                        chunk_count: None,
-                        complete: None,
-                    })
+                    .map(|_| dig_nat::AvailabilityAnswer::unavailable())
                     .collect();
-                return Ok(dig_nat::AvailabilityResponse { items: answers });
+                return Ok(dig_nat::AvailabilityResponse::new(answers));
             }
             self.inner.query_availability(provider, items).await
         }

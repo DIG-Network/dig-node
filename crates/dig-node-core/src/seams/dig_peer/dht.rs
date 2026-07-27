@@ -548,20 +548,21 @@ pub async fn run_maintenance(handle: Arc<DhtHandle>, interval: Duration) {
 /// (the finder would first pick a concrete root). Pure so it is unit-tested without a connection.
 pub fn availability_item_for(content: &dig_dht::ContentId) -> Option<AvailabilityItem> {
     match content {
-        dig_dht::ContentId::Root { store_id, root } => Some(AvailabilityItem {
-            store_id: hex::encode(store_id),
-            root: Some(hex::encode(root)),
-            retrieval_key: None,
-        }),
+        // Built through the constructors, not struct literals: `AvailabilityItem` is
+        // `#[non_exhaustive]`, which is what makes every future additive wire field a PATCH for this
+        // crate rather than a break (dig-nat SPEC §5.1.1).
+        dig_dht::ContentId::Root { store_id, root } => {
+            Some(AvailabilityItem::store(hex::encode(store_id)).with_root(hex::encode(root)))
+        }
         dig_dht::ContentId::Resource {
             store_id,
             root,
             retrieval_key,
-        } => Some(AvailabilityItem {
-            store_id: hex::encode(store_id),
-            root: Some(hex::encode(root)),
-            retrieval_key: Some(hex::encode(retrieval_key)),
-        }),
+        } => Some(
+            AvailabilityItem::store(hex::encode(store_id))
+                .with_root(hex::encode(root))
+                .with_retrieval_key(hex::encode(retrieval_key)),
+        ),
         // Store granularity has no single concrete capsule to probe.
         dig_dht::ContentId::Store { .. } => None,
     }

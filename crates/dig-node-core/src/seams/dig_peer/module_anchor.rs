@@ -41,7 +41,26 @@ use digstore_core::datasection::{DataView, SectionId};
 use digstore_core::Bytes32;
 use sha2::{Digest, Sha256};
 
-use dig_download::ModuleAnchorVerifier;
+use dig_download::{ModuleAnchor, ModuleAnchorVerifier};
+
+/// Why a blob was not admitted, and — crucially — WHOSE fault that is.
+///
+/// The distinction is the whole reason [`ModuleAnchor`] is three-valued rather than a `bool`: a
+/// rejection is either EVIDENCE against the peer that supplied the descriptor, or a failure of this
+/// node's own wiring that says nothing whatsoever about that peer. Collapsing the two lets a local
+/// bug brand every honest holder it is tried against, and a durable demotion of honest holders
+/// inverts the node's preference toward unremembered peers — which is what a sybil is.
+///
+/// So: **demote only on evidence about the BLOB; never on a fact about ourselves.**
+enum Rejection {
+    /// The blob is definitively not the chain-anchored module — established from the blob's OWN
+    /// committed bytes. Real evidence against the descriptor's source, so it earns a demotion.
+    NotAnchored(&'static str),
+    /// This verifier could not reach a verdict because it was asked about a generation it is not
+    /// bound to. The blob was never examined, so there is nothing to hold against the holder:
+    /// terminal for the pull, and no verdict.
+    Indeterminate(&'static str),
+}
 
 /// `SHA-256` of `bytes` as raw 32 bytes — the module pull's one content-addressing primitive.
 pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
@@ -118,29 +137,37 @@ impl ChainAnchoredModuleVerifier {
     /// each produce a `Some(reason)`. Writing this with `?` on the `Option`-returning helpers would make
     /// each of those return `None` — i.e. ACCEPT the module — which is the fail-OPEN inversion of the one
     /// guarantee this whole file exists to provide. Hence the explicit `else` on every lookup.
-    fn rejection_reason(&self, module: &[u8], store_id: &str, root: &str) -> Option<&'static str> {
+    fn rejection_reason(&self, module: &[u8], store_id: &str, root: &str) -> Option<Rejection> {
         // The generation being pulled must be the one this verifier was BOUND to. A verifier is built
-        // per pull from a chain-resolved root, so a mismatch here means the wiring reused a verifier
-        // across generations — which would silently check the wrong anchor.
+        // per pull from a chain-resolved root, so a mismatch here means THIS NODE reused a verifier
+        // across generations — it would silently check the wrong anchor. That is our own wiring fault
+        // and the blob is never even examined, so it is `Indeterminate`: the pull dies, and the holder
+        // earns nothing (see [`Rejection`]).
         let Some(pulled_store) = decode_id(store_id) else {
-            return Some("the pulled store_id is not a canonical 64-hex id");
+            return Some(Rejection::Indeterminate(
+                "the pulled store_id is not a canonical 64-hex id",
+            ));
         };
         if pulled_store != self.store_id {
-            return Some("the pulled store_id is not the one this verifier was bound to");
+            return Some(Rejection::Indeterminate(
+                "the pulled store_id is not the one this verifier was bound to",
+            ));
         }
         let Some(pulled_root) = decode_id(root) else {
-            return Some("the pulled root is not a canonical 64-hex id");
+            return Some(Rejection::Indeterminate(
+                "the pulled root is not a canonical 64-hex id",
+            ));
         };
         if pulled_root != self.chain_root {
-            return Some(
+            return Some(Rejection::Indeterminate(
                 "the pulled root is not the chain-resolved root this verifier was bound to",
-            );
+            ));
         }
 
         // Rule 3: an empty module is rejected BEFORE any parse. Both of the engine's hash gates accept
         // it (sha256 of no bytes is a real, declarable digest), so this is the only rejection there is.
         if module.is_empty() {
-            return Some("an empty blob is not a .dig module");
+            return Some(Rejection::NotAnchored("an empty blob is not a .dig module"));
         }
         let blob = digstore_compiler::extract_data_section_blob(module)
             .ok()
@@ -151,33 +178,45 @@ impl ChainAnchoredModuleVerifier {
                 DataView::parse(module).ok().map(|_| module.to_vec())
             });
         let Some(blob) = blob else {
-            return Some("the blob is neither a .dig container nor a DIGS data section");
+            return Some(Rejection::NotAnchored(
+                "the blob is neither a .dig container nor a DIGS data section",
+            ));
         };
         let Ok(view) = DataView::parse(&blob) else {
-            return Some("the module's data section does not parse");
+            return Some(Rejection::NotAnchored(
+                "the module's data section does not parse",
+            ));
         };
 
         // Rule 4 + rule 1: the module's OWN committed ids, compared as decoded bytes (rule 2) against
         // the store being pulled and the CHAIN's root.
         let Some(committed_store) = section_id32(&view, SectionId::StoreId) else {
-            return Some("the module commits no 32-byte store_id");
+            return Some(Rejection::NotAnchored(
+                "the module commits no 32-byte store_id",
+            ));
         };
         if committed_store != self.store_id {
-            return Some("the module commits a different store_id than the one being pulled");
+            return Some(Rejection::NotAnchored(
+                "the module commits a different store_id than the one being pulled",
+            ));
         }
         let Some(committed_root) = section_id32(&view, SectionId::CurrentRoot) else {
-            return Some("the module commits no 32-byte generation root");
+            return Some(Rejection::NotAnchored(
+                "the module commits no 32-byte generation root",
+            ));
         };
         if committed_root != self.chain_root {
-            return Some("the module's committed root is not the store's chain-anchored root");
+            return Some(Rejection::NotAnchored(
+                "the module's committed root is not the store's chain-anchored root",
+            ));
         }
         None
     }
 }
 
 impl ModuleAnchorVerifier for ChainAnchoredModuleVerifier {
-    fn verify_module_anchor(&self, module: &[u8], store_id: &str, root: &str) -> bool {
-        match self.rejection_reason(module, store_id, root) {
+    fn verify_module_anchor(&self, module: &[u8], store_id: &str, root: &str) -> ModuleAnchor {
+        let rejection = match self.rejection_reason(module, store_id, root) {
             None => {
                 // Record the digest of exactly what was admitted, so the caller can prove the artifact
                 // it promotes is this one (see `admitted_digest`). Written only on ACCEPT: a rejected
@@ -186,18 +225,26 @@ impl ModuleAnchorVerifier for ChainAnchoredModuleVerifier {
                     .admitted_digest
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sha256(module));
-                true
+                return ModuleAnchor::Anchored;
             }
-            Some(reason) => {
-                tracing::warn!(
-                    store = %crate::seams::dig_peer::serve_log::SafeId::new(store_id),
-                    root = %crate::seams::dig_peer::serve_log::SafeId::new(root),
-                    reason,
-                    "module pull: refusing to admit an assembled module that is not chain-anchored"
-                );
-                false
+            Some(rejection) => rejection,
+        };
+        let (reason, verdict) = match rejection {
+            Rejection::NotAnchored(reason) => (reason, ModuleAnchor::NotAnchored),
+            // Report our own wiring fault as `Unavailable`, never `NotAnchored`: the blob was not
+            // examined, so there is no evidence, and `NotAnchored` would durably demote a holder for
+            // something it did not do (see [`Rejection`]).
+            Rejection::Indeterminate(reason) => {
+                (reason, ModuleAnchor::Unavailable(reason.to_string()))
             }
-        }
+        };
+        tracing::warn!(
+            store = %crate::seams::dig_peer::serve_log::SafeId::new(store_id),
+            root = %crate::seams::dig_peer::serve_log::SafeId::new(root),
+            reason,
+            "module pull: refusing to admit an assembled module that is not chain-anchored"
+        );
+        verdict
     }
 }
 
@@ -254,11 +301,23 @@ mod tests {
         ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT))
     }
 
+    /// The verifier's verdict on `module` pulled as `(store, root)`.
+    ///
+    /// Tests assert the VARIANT, never a boolean: `NotAnchored` and `Unavailable` are both refusals
+    /// but only the first is evidence against the holder, and a test that cannot tell them apart
+    /// cannot notice a local fault being mislabelled as a peer's misbehaviour (see [`Rejection`]).
+    fn verdict(module: &[u8], store: &str, root: &str) -> ModuleAnchor {
+        verifier().verify_module_anchor(module, store, root)
+    }
+
     /// **Proves:** the genuine module — the one whose committed root IS the chain's root — is admitted.
     #[test]
     fn admits_the_module_committing_the_chain_anchored_root() {
         let module = module_committing(STORE, CHAIN_ROOT);
-        assert!(verifier().verify_module_anchor(&module, &hex32(STORE), &hex32(CHAIN_ROOT)));
+        assert_eq!(
+            verdict(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
+            ModuleAnchor::Anchored
+        );
     }
 
     /// **Proves:** a module whose committed root is a DIFFERENT real generation is refused — the
@@ -266,8 +325,13 @@ mod tests {
     /// **Catches:** a verifier that checked only that the module parses + commits *some* root.
     #[test]
     fn rejects_a_module_committing_a_different_generation() {
+        // The blob's OWN committed root is wrong, so this is real evidence against whoever served
+        // it — `NotAnchored`, the one verdict that earns a demotion.
         let module = module_committing(STORE, OTHER_ROOT);
-        assert!(!verifier().verify_module_anchor(&module, &hex32(STORE), &hex32(CHAIN_ROOT)));
+        assert_eq!(
+            verdict(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
+            ModuleAnchor::NotAnchored
+        );
     }
 
     /// **Proves:** THE attack this whole file exists to stop — the "anchored root" offered by the
@@ -284,15 +348,19 @@ mod tests {
         let peer_offered_root = OTHER_ROOT;
         let module = module_committing(STORE, peer_offered_root);
 
-        assert!(
-            !verifier().verify_module_anchor(&module, &hex32(STORE), &hex32(peer_offered_root)),
+        assert_ne!(
+            verdict(&module, &hex32(STORE), &hex32(peer_offered_root)),
+            ModuleAnchor::Anchored,
             "a peer-offered root must never satisfy the anchor gate"
         );
 
         // And the reason names the anchor, so the rejection is diagnosable rather than a bare false.
-        let reason = verifier()
+        let reason = match verifier()
             .rejection_reason(&module, &hex32(STORE), &hex32(peer_offered_root))
-            .expect("rejected");
+            .expect("rejected")
+        {
+            Rejection::NotAnchored(reason) | Rejection::Indeterminate(reason) => reason,
+        };
         assert!(
             reason.contains("chain-resolved root"),
             "the rejection must name the chain anchor, got: {reason}"
@@ -304,18 +372,24 @@ mod tests {
     /// module (`sha256("")` is a perfectly declarable `module_hash`) — this verifier is the only check.
     #[test]
     fn rejects_an_empty_blob() {
-        assert!(!verifier().verify_module_anchor(&[], &hex32(STORE), &hex32(CHAIN_ROOT)));
+        assert_eq!(
+            verdict(&[], &hex32(STORE), &hex32(CHAIN_ROOT)),
+            ModuleAnchor::NotAnchored
+        );
     }
 
     /// **Proves:** bytes that are not a parseable `.dig` are refused, rather than falling through some
     /// "could not parse, assume fine" path.
     #[test]
     fn rejects_an_unparseable_blob() {
-        assert!(!verifier().verify_module_anchor(
-            b"this is not a DIGS container",
-            &hex32(STORE),
-            &hex32(CHAIN_ROOT)
-        ));
+        assert_eq!(
+            verdict(
+                b"this is not a DIGS container",
+                &hex32(STORE),
+                &hex32(CHAIN_ROOT)
+            ),
+            ModuleAnchor::NotAnchored
+        );
     }
 
     /// **Proves:** the root comparison is over DECODED bytes, so hex CASE cannot change the outcome —
@@ -325,11 +399,14 @@ mod tests {
     #[test]
     fn hex_case_does_not_change_the_verdict() {
         let module = module_committing(STORE, CHAIN_ROOT);
-        assert!(verifier().verify_module_anchor(
-            &module,
-            &hex32(STORE).to_uppercase(),
-            &hex32(CHAIN_ROOT).to_uppercase()
-        ));
+        assert_eq!(
+            verdict(
+                &module,
+                &hex32(STORE).to_uppercase(),
+                &hex32(CHAIN_ROOT).to_uppercase()
+            ),
+            ModuleAnchor::Anchored
+        );
     }
 
     /// **Proves:** a module committing the right root but a DIFFERENT store is refused — a real capsule
@@ -337,7 +414,10 @@ mod tests {
     #[test]
     fn rejects_a_module_committing_a_different_store() {
         let module = module_committing([0xee; 32], CHAIN_ROOT);
-        assert!(!verifier().verify_module_anchor(&module, &hex32(STORE), &hex32(CHAIN_ROOT)));
+        assert_eq!(
+            verdict(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
+            ModuleAnchor::NotAnchored
+        );
     }
 
     /// **Proves:** a module whose `CurrentRoot` body is the wrong WIDTH is refused, never
@@ -348,7 +428,10 @@ mod tests {
             (SectionId::StoreId as u16, STORE.to_vec()),
             (SectionId::CurrentRoot as u16, CHAIN_ROOT[..31].to_vec()),
         ]);
-        assert!(!verifier().verify_module_anchor(&module, &hex32(STORE), &hex32(CHAIN_ROOT)));
+        assert_eq!(
+            verdict(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
+            ModuleAnchor::NotAnchored
+        );
     }
 
     /// **Proves:** a module missing its `CurrentRoot` section entirely is refused (absence is not
@@ -356,17 +439,31 @@ mod tests {
     #[test]
     fn rejects_a_module_with_no_committed_root() {
         let module = encode_blob(&[(SectionId::StoreId as u16, STORE.to_vec())]);
-        assert!(!verifier().verify_module_anchor(&module, &hex32(STORE), &hex32(CHAIN_ROOT)));
+        assert_eq!(
+            verdict(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
+            ModuleAnchor::NotAnchored
+        );
     }
 
     /// **Proves:** a non-canonical id (wrong length, non-hex) is refused rather than treated as a
     /// wildcard.
     #[test]
     fn rejects_non_canonical_ids() {
+        // A malformed id is OUR caller's fault, not the holder's: the blob is never examined, so the
+        // refusal must carry no verdict about whoever served it.
         let module = module_committing(STORE, CHAIN_ROOT);
-        let v = verifier();
-        assert!(!v.verify_module_anchor(&module, "short", &hex32(CHAIN_ROOT)));
-        assert!(!v.verify_module_anchor(&module, &hex32(STORE), &"zz".repeat(32)));
+        for (store, root) in [
+            ("short".to_string(), hex32(CHAIN_ROOT)),
+            (hex32(STORE), "zz".repeat(32)),
+        ] {
+            assert!(
+                matches!(
+                    verdict(&module, &store, &root),
+                    ModuleAnchor::Unavailable(_)
+                ),
+                "a non-canonical id must refuse WITHOUT blaming the holder: {store}/{root}"
+            );
+        }
     }
 
     /// **Proves:** the admitted digest is the digest of exactly the bytes that passed the gate, so the
@@ -376,7 +473,10 @@ mod tests {
         let module = module_committing(STORE, CHAIN_ROOT);
         let v = verifier();
         assert_eq!(v.admitted_digest(), None, "nothing admitted yet");
-        assert!(v.verify_module_anchor(&module, &hex32(STORE), &hex32(CHAIN_ROOT)));
+        assert_eq!(
+            v.verify_module_anchor(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
+            ModuleAnchor::Anchored
+        );
         assert_eq!(v.admitted_digest(), Some(sha256(&module)));
     }
 
@@ -386,11 +486,14 @@ mod tests {
     #[test]
     fn a_rejected_blob_never_becomes_the_promotion_reference() {
         let v = verifier();
-        assert!(!v.verify_module_anchor(
-            &module_committing(STORE, OTHER_ROOT),
-            &hex32(STORE),
-            &hex32(CHAIN_ROOT)
-        ));
+        assert_eq!(
+            v.verify_module_anchor(
+                &module_committing(STORE, OTHER_ROOT),
+                &hex32(STORE),
+                &hex32(CHAIN_ROOT)
+            ),
+            ModuleAnchor::NotAnchored
+        );
         assert_eq!(
             v.admitted_digest(),
             None,
@@ -405,6 +508,12 @@ mod tests {
         let module = module_committing(STORE, OTHER_ROOT);
         // The module is genuine for OTHER_ROOT, and the pull names OTHER_ROOT — but this verifier was
         // built for CHAIN_ROOT, so it must refuse rather than validate a generation it never resolved.
-        assert!(!verifier().verify_module_anchor(&module, &hex32(STORE), &hex32(OTHER_ROOT)));
+        // Refused, but with NO verdict about the holder: reusing a verifier across generations is
+        // THIS node's wiring fault, and `NotAnchored` here would durably demote an honest holder that
+        // served a perfectly genuine capsule (see [`Rejection`]).
+        assert!(matches!(
+            verdict(&module, &hex32(STORE), &hex32(OTHER_ROOT)),
+            ModuleAnchor::Unavailable(_)
+        ));
     }
 }
