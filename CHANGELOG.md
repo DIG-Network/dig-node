@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.61.1] - 2026-07-27
+
+### Features
+- **peer:** Per-frame range verification metadata + serve observability (#1577/#1595) (#87)- **reshare:** Pull the whole capsule after a read so a reader becomes a holder (#1576) (#108)- **node:** Enforce loopback bind, settle loopback-only false-premise (#1662)
+
+### Bug Fixes
+- **peer:** Derive dig.getAvailability from the servable module, not a snapshot (#106)- **node:** Install-time loopback guard, finish loopback-only comment sweep (#1667)
+
+### Chores
+- **deps:** Bump dig-download 0.7.4 (clip over-long range frame, #836) (#105)
+
 ## [0.58.8] - 2026-07-26
 
 ### Bug Fixes
