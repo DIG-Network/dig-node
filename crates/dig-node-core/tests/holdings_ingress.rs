@@ -1139,14 +1139,19 @@ async fn no_peer_supplied_bytes_ever_reach_the_log() {
     );
 }
 
-/// PROPERTY (address cap): an `Add` delta's address list is truncated to what dig-dht will keep, so a
-/// tiny frame cannot make this node allocate a huge candidate vector.
+/// PROPERTY (end to end): an announcement declaring far more addresses than the cap is still ACCEPTED,
+/// and the record it produces is bounded — an oversized list is trimmed, never a rejection.
 ///
-/// The fixture declares far more addresses than the cap. Note the sink here records the WHOLE
-/// `ProviderRecord`: the narrower `(content_key, provider)` double used elsewhere physically cannot
-/// express an address-count lie, so widening the double is what makes the property observable at all.
+/// Deliberately NOT the guard test for the cap's placement. `ProviderRecord::new` truncates as well, so
+/// this assertion stays green with `bounded_dht_addresses`' `take` deleted; it can only see the stored
+/// record, and both placements store the same one. The placement — mapping at most the cap, so the
+/// allocation and not merely the record is bounded — is pinned by the colocated unit test
+/// `the_address_cap_is_applied_where_the_mapping_happens`, which observes the mapper's own output.
+///
+/// The sink here records the WHOLE `ProviderRecord`: the narrower `(content_key, provider)` double used
+/// elsewhere physically cannot express an address-count lie.
 #[tokio::test]
-async fn an_oversized_address_list_is_truncated_before_it_is_mapped() {
+async fn an_oversized_address_list_still_yields_a_bounded_record() {
     let holder = TestPeer::new();
     let us = TestPeer::new();
     let sink = RecordingRecords::default();

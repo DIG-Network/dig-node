@@ -2571,7 +2571,8 @@ async fn bring_up_dht(
                     // time) but stop applying peers' announcements. Discovery falls back to the
                     // durable DHT records, which is a degradation, not an outage.
                     println!(
-                        "dig-node peer network: holdings ingest DISABLED by DIG_HOLDINGS_INGEST;                          still announcing"
+                        "dig-node peer network: holdings ingest DISABLED by \
+                         DIG_HOLDINGS_INGEST; still announcing"
                     );
                 }
                 Ok(inbound) => {

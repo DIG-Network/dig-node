@@ -372,14 +372,7 @@ impl HoldingsIngress {
     /// node.
     #[must_use]
     pub fn ingest_enabled_from_env() -> bool {
-        !matches!(
-            std::env::var("DIG_HOLDINGS_INGEST")
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str(),
-            "0" | "false" | "off" | "no"
-        )
+        ingest_enabled(std::env::var("DIG_HOLDINGS_INGEST").ok().as_deref())
     }
 
     /// [`Self::new`] with explicit budgets — used by tests to reach the limits deterministically
@@ -505,15 +498,7 @@ impl HoldingsIngress {
                         .ingest(ProviderRecord::new(
                             &Key::from_bytes(*content_key),
                             provider,
-                            // Truncated to what dig-dht will keep anyway. The wire's address count is
-                            // an attacker-declared `u16`, so mapping the whole list first would let a
-                            // ~180-byte frame make this node allocate megabytes before dig-dht capped
-                            // it — work bought far too cheaply.
-                            addresses
-                                .iter()
-                                .take(dig_dht::MAX_ADDRESSES_PER_RECORD)
-                                .map(to_dht_addr)
-                                .collect(),
+                            bounded_dht_addresses(addresses),
                             *expires_at,
                         ))
                         .await
@@ -648,6 +633,28 @@ fn evict_lru<V>(map: &mut HashMap<String, V>, cap: usize, stamp: impl Fn(&V) -> 
 /// announced address is by definition one the holder claims to serve on directly.
 fn to_dht_addr(addr: &GossipAddr) -> DhtAddr {
     DhtAddr::direct(addr.host.clone(), addr.port)
+}
+
+/// Map a wire address list to DHT addresses, mapping AT MOST
+/// [`MAX_ADDRESSES_PER_RECORD`](dig_dht::MAX_ADDRESSES_PER_RECORD) of them.
+///
+/// The cap is applied HERE, before the map, and that placement is the whole point.
+/// `ProviderRecord::new` also truncates, so the record this node ends up storing is correctly bounded
+/// either way — but a wire announcement's address count is an attacker-declared `u16`, so mapping the
+/// full list first would let a ~180-byte frame make this node allocate tens of thousands of owned
+/// `String`s before dig-dht discarded all but eight. The observable property is therefore how many
+/// addresses this function MAPS, not how many survive downstream; a test that can only see the stored
+/// record cannot tell the two placements apart.
+///
+/// Taking the leading prefix (rather than ranking first) loses nothing: every wire address becomes a
+/// [`DhtAddr::direct`], so all candidates share one rank and dig-dht's own rank-then-truncate would
+/// keep the same prefix.
+fn bounded_dht_addresses(addresses: &[GossipAddr]) -> Vec<DhtAddr> {
+    addresses
+        .iter()
+        .take(dig_dht::MAX_ADDRESSES_PER_RECORD)
+        .map(to_dht_addr)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -827,4 +834,85 @@ pub fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Whether an unset or given `DIG_HOLDINGS_INGEST` value leaves the ingress enabled.
+///
+/// Split out from [`HoldingsIngress::ingest_enabled_from_env`] so the decision is a pure function of
+/// its input: reading the process environment inside a test would make the kill switch's own coverage
+/// depend on test execution order.
+///
+/// FAIL-OPEN is deliberate and the safe direction here: an unrecognised value leaves the node
+/// behaving exactly as it does today. The switch exists to let an operator SHED inbound work under a
+/// flood, so a typo must never silently disable discovery instead.
+fn ingest_enabled(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.unwrap_or_default().trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PROPERTY: the address cap is applied BEFORE the map, so an attacker-declared count bounds the
+    /// work this node does rather than only the record it keeps.
+    ///
+    /// Asserted on the mapper's own output because that is the only place the two placements differ:
+    /// `ProviderRecord::new` truncates too, so any assertion made on the STORED record stays green
+    /// with this cap deleted. Pinned from both sides — one over the bound must be cut, exactly at the
+    /// bound must pass through whole — since a bound tested only from above cannot show it is the
+    /// right bound.
+    #[test]
+    fn the_address_cap_is_applied_where_the_mapping_happens() {
+        let cap = dig_dht::MAX_ADDRESSES_PER_RECORD;
+        let declared = |n: usize| -> Vec<GossipAddr> {
+            (0..n)
+                .map(|i| GossipAddr {
+                    host: format!("::{i:x}"),
+                    port: 9_257,
+                })
+                .collect()
+        };
+
+        let over = bounded_dht_addresses(&declared(cap * 4));
+        assert_eq!(
+            over.len(),
+            cap,
+            "an oversized wire list must be cut to {cap} AT THE MAPPING, not merely stored bounded"
+        );
+        assert_eq!(
+            over[0].host, "::0",
+            "the kept addresses must be the declared prefix, in order"
+        );
+
+        assert_eq!(
+            bounded_dht_addresses(&declared(cap)).len(),
+            cap,
+            "a list exactly at the bound must pass through whole"
+        );
+        assert!(
+            bounded_dht_addresses(&[]).is_empty(),
+            "an empty list maps to nothing"
+        );
+    }
+
+    /// PROPERTY: the operator kill switch reads as OFF only for an explicit falsey value, and
+    /// fail-opens on everything else including an unset variable.
+    #[test]
+    fn the_ingest_kill_switch_is_off_only_for_an_explicit_falsey_value() {
+        for off in ["0", "false", "off", "no", "  OFF  ", "False"] {
+            assert!(
+                !ingest_enabled(Some(off)),
+                "{off:?} must disable the ingress"
+            );
+        }
+        for on in [None, Some(""), Some("1"), Some("true"), Some("yes"), Some("x")] {
+            assert!(
+                ingest_enabled(on),
+                "{on:?} must leave the ingress enabled — the switch fails OPEN"
+            );
+        }
+    }
 }
