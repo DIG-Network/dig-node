@@ -167,16 +167,13 @@ impl CapsuleStore for Node {
         store_id_hex: &str,
         root_hex: &str,
     ) -> Result<bool, String> {
-        fn is_hex64(s: &str) -> bool {
-            s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-        }
-        if !is_hex64(store_id_hex) {
-            return Err(format!("invalid store_id (want 64-hex): {store_id_hex}"));
-        }
-        if !is_hex64(root_hex) {
-            return Err(format!("invalid root (want 64-hex): {root_hex}"));
-        }
-        let path = crate::module_path(&self.cache_dir, store_id_hex, root_hex);
+        // The rejection message names WHICH component was bad but never ECHOES it: the caller supplied
+        // these bytes, and this error string is logged (#1603/#1609). The caller already knows what it
+        // sent, so quoting it back adds no diagnostic value and would hand an attacker the log.
+        let Some(capsule) = crate::CapsuleKey::parse(store_id_hex, root_hex) else {
+            return Err("invalid capsule key: store_id and root must each be 64-hex".to_string());
+        };
+        let path = capsule.module_path(&self.cache_dir);
 
         let _guard = self.cache_lock.lock().await;
         if !path.exists() {
@@ -202,9 +199,13 @@ impl CapsuleStore for Node {
         store_id_hex: &str,
         root_hex: &str,
     ) -> Result<(u64, String), String> {
+        // Validated once, up front: a non-canonical key can name no capsule to report and no capsule to
+        // fetch, so it is refused before either the stat or the network hop (#1599).
+        let capsule = crate::CapsuleKey::parse(store_id_hex, root_hex).ok_or_else(|| {
+            "invalid capsule key: store_id and root must each be 64-hex".to_string()
+        })?;
         // Already cached → report its size, no network.
-        let existing = crate::module_path(&self.cache_dir, store_id_hex, root_hex);
-        if let Ok(md) = std::fs::metadata(&existing) {
+        if let Ok(md) = std::fs::metadata(capsule.module_path(&self.cache_dir)) {
             return Ok((md.len(), root_hex.to_string()));
         }
         // Serialize on-demand writes so two fetches of the same capsule don't race.
@@ -215,7 +216,7 @@ impl CapsuleStore for Node {
         let matched = self
             .sync_module_from(&self.upstream, store_id_hex, root_hex)
             .await;
-        let path = crate::module_path(&self.cache_dir, store_id_hex, root_hex);
+        let path = capsule.module_path(&self.cache_dir);
         match std::fs::metadata(&path) {
             Ok(md) => {
                 // A capsule just entered this node's served set at runtime. Landing a capsule MUST make

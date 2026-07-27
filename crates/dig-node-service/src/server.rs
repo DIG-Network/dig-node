@@ -436,9 +436,11 @@ impl AppState {
     /// without reaching into the node.
     ///
     /// TEST-CONSTRUCTION ONLY (#1664a): `pub` solely so integration tests can inject a recording
-    /// double; `#[doc(hidden)]` keeps it out of the public API surface — no production path
-    /// substitutes the content server, and none should discover this via the docs.
-    #[doc(hidden)]
+    /// double. Gated behind the `testkit` feature rather than `#[doc(hidden)]` (#1609): hiding a symbol
+    /// from the documentation leaves it entirely callable, so it hides the seam from readers without
+    /// closing it — the feature flag makes it genuinely absent from a production build, which is what
+    /// "test-only" has to mean to be worth stating.
+    #[cfg(any(test, feature = "testkit"))]
     pub fn with_content_server(mut self, content_server: Arc<dyn ContentServer>) -> Self {
         self.content_server = content_server;
         self

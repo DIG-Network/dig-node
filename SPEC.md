@@ -1901,6 +1901,15 @@ ONLY automatic release trigger, a quiet repo can silently stop releasing. Detect
   §8.5) strictly validates its argument and launches the resolved URL without a shell.
 - **Blind serving:** content reads return ciphertext + proofs; verification/decryption is the
   client's job (§1.3). The node never returns plaintext for content reads.
+- **A filesystem path is never built from unvalidated caller input:** every cache/staging path is
+  constructed from a VALIDATED capsule key — two canonical 64-hex ids — and a caller-supplied
+  `store_id`/`root` pair that is not canonical is REFUSED (answered not-held) without any filesystem
+  access. The validation is a TYPE that only the validating constructor can produce and that the path
+  builders exclusively accept, so the check cannot be omitted at a new call site rather than a predicate
+  each site must remember to call. Canonical 64-hex is a whitelist over an ALPHABET containing no `/`,
+  `\`, `.`, `:`, NUL or control character, so it is complete by construction — unlike a blacklist of
+  `..`, absolute prefixes and UNC roots, which would have to be complete against every platform's path
+  grammar. Merkle verification is NOT a substitute: it proves provenance, not that a path is safe.
 - **No secrets in artifacts:** the control token is generated at runtime, ACL-restricted (§7.3a),
   and never committed or logged.
 
@@ -3200,6 +3209,20 @@ both the `dig.fetchRange` and `dig.getAvailability` paths. Nothing diagnostic is
 could never have named held content, and the outcome/reason on the same line already states why the
 request failed.
 
+**Free-form explanatory text MUST be neutralized and bounded.** A `reason` string has no canonical shape
+to check against, so it cannot be rejected the way an id is — it MUST instead have every control
+character replaced (one glyph per character, so the bound below survives substitution) and MUST be
+truncated to at most 200 characters. This covers the `reason` on every `dig.fetchRange` refusal and any
+advisory `message` returned to a peer whose text derives from that peer's own bytes — notably the
+malformed-DHT-frame reply, where the deserializer quotes the offending input back.
+
+**Both guards MUST be enforced by the TYPE that holds the field, not at the log call site.** The record
+structures MUST store the validated/neutralized wrappers, so a raw peer-supplied `&str`/`String` cannot be
+placed in a log record however the record is constructed. Sanitizing where a value is REPORTED is not
+sanitizing it: the next construction of the same record starts again from the raw value, and a test whose
+fixture happens to use a benign id will not notice. A guard that depends on every future caller
+remembering it is not a guard.
+
 ### 20.3. `control.log.setLevel` — runtime level control
 
 `control.log.setLevel` (§7.4) live-swaps the process level filter via the `dig-logging` reload
@@ -3317,6 +3340,21 @@ authoritative source of that capsule. The promotion ladder is therefore:
 - **The announce MUST reuse the node's one inventory-reconcile path** (§19), never a bespoke announce, so
   the reshare leg cannot advertise a content-id shape the rest of the node does not.
 - A failed pull MUST leave no staging artifact behind that a later run could mistake for progress.
+- **Abandoned staging MUST be reaped, and total staging MUST be bounded in bytes.** A pull whose process
+  dies mid-flight cannot clean up after itself, so the node MUST sweep the capsule-staging directory
+  (`<downloads>/modules`, a SUBDIRECTORY — a sweep of the parent directory alone does not reach it) on
+  startup and on an interval, removing each staging file older than the staleness TTL together with its
+  resume-state sidecar. Because a TTL bounds staging only by what one TTL window can accumulate, the node
+  MUST additionally enforce a fixed BYTE ceiling, derived from the per-warm size cap times the
+  concurrent-warm cap plus one generation of headroom — a ceiling below that product would evict healthy
+  in-flight work.
+  Reaping MUST be by age and ownership only, and its permitted scope is narrow BY DESIGN: it MUST NOT
+  remove a staging file the node reports as live or paused-resumable (whatever its age), and it MUST NOT
+  touch `<cache>/modules` — the operator's held capsules. Those two exclusions are what make oldest-first
+  eviction acceptable here: everything in scope is re-fetchable download scratch, so a peer driving reads
+  can at worst destroy incomplete partial pulls. Applied to CACHED content the same ordering would be a
+  remote eviction primitive, letting a peer walk an operator's own oldest capsules off the disk simply by
+  causing reads of others.
 
 ### 21.4. The warm is a background pull (MUST NOT slow the read)
 

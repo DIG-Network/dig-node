@@ -140,16 +140,28 @@ fn candidate_from_ref(peer_id_hex: &str, addrs: &[String]) -> Option<Candidate> 
     Some(Candidate::new(peer_id, addresses))
 }
 
-/// Parse a dig-download `host:port` address string into a [`CandidateAddr`]. Tries a full
-/// [`SocketAddr`](std::net::SocketAddr) parse first (handles bracketed IPv6), falling back to a
-/// right-split on the last `:` for a bare `host:port`.
+/// Parse a `host:port` address hint into a [`CandidateAddr`], or `None` if it does not name a usable
+/// endpoint.
+///
+/// Two spellings both have to work. A BRACKETED address (`[2001:db8::1]:9444`) is what
+/// [`SocketAddr`](std::net::SocketAddr) itself accepts. An UNBRACKETED one (`2001:db8::1:9444`) is what
+/// a peer that built the string by hand sends — and since §5.2 makes the ecosystem IPv6-first, that is
+/// the DEFAULT shape here, not an edge case.
+///
+/// The unbracketed case splits at the last `:` and then REQUIRES the host half to parse as an
+/// [`IpAddr`](std::net::IpAddr). That requirement is the whole fix (#1593): without it, a bare IPv6
+/// address with no port at all — `::1` — split into host `::` and port `1`, inventing a candidate
+/// pointing at a different host on a port nobody advertised. A portless hint is unusable, so it is
+/// dropped; the selector ranks on identity and learned quality, so losing one unparseable hint costs
+/// nothing, while acting on a mangled one dials the wrong place.
 fn parse_addr(s: &str) -> Option<CandidateAddr> {
     if let Ok(sa) = s.parse::<std::net::SocketAddr>() {
         return Some(CandidateAddr::direct(sa.ip().to_string(), sa.port()));
     }
     let (host, port) = s.rsplit_once(':')?;
+    let ip: std::net::IpAddr = host.parse().ok()?;
     let port: u16 = port.parse().ok()?;
-    Some(CandidateAddr::direct(host, port))
+    Some(CandidateAddr::direct(ip.to_string(), port))
 }
 
 /// Current unix seconds (the `at` timestamp on a [`TransferOutcome`]).
@@ -316,11 +328,63 @@ mod tests {
         );
     }
 
-    /// The address parser handles bare host:port and bracketed IPv6.
+    /// **Proves:** every address spelling a provider hint can arrive in yields the CORRECT host and
+    /// port — bracketed IPv6, UNBRACKETED IPv6 (the shape §5.2's IPv6-first default produces), IPv4,
+    /// and a non-canonically-spelled v6 literal (#1593).
+    ///
+    /// **Catches:** a host half that is passed through as TEXT instead of being parsed as an
+    /// [`IpAddr`](std::net::IpAddr). Only the last two cases catch it, and they are marked; the first
+    /// four do not discriminate at all, because for those inputs the last-colon split already yields
+    /// exactly the right host text. They are breadth — a regression net over the spellings that must
+    /// keep working — not a proof of the guard.
+    ///
+    /// This is stated because it was measured, not assumed: with the `IpAddr` parse removed, the first
+    /// four cases still pass. The mangling that motivated the guard is proven by
+    /// [`an_address_hint_without_a_port_is_dropped_not_mangled`], which is the discriminator for the
+    /// portless case, and by the two marked cases here for the parsed-not-copied property.
     #[test]
-    fn parse_addr_handles_ipv4_and_ipv6() {
-        assert!(parse_addr("10.0.0.1:9444").is_some());
-        assert!(parse_addr("[2001:db8::1]:9444").is_some());
-        assert!(parse_addr("garbage").is_none());
+    fn an_address_hint_parses_to_the_right_host_and_port_in_every_spelling() {
+        for (input, host, port) in [
+            ("10.0.0.1:9444", "10.0.0.1", 9444u16),
+            ("[2001:db8::1]:9444", "2001:db8::1", 9444),
+            // Unbracketed v6 — what a peer that formatted `host:port` by hand actually sends, and the
+            // exact shape (`::ffff:172.31.79.22`) that blocked the #836 read leg.
+            ("2001:db8::1:9444", "2001:db8::1", 9444),
+            ("::ffff:172.31.79.22:9444", "::ffff:172.31.79.22", 9444),
+            // DISCRIMINATING — a peer may spell the same address non-canonically (uppercase hextets,
+            // unabbreviated zeroes). Parsing normalizes it, so one address yields ONE host string;
+            // copying the text through yields two spellings of one peer, which the selector would
+            // then model as two candidates. Passing the text through returns "2001:0DB8::0001" here.
+            ("2001:0DB8::0001:9444", "2001:db8::1", 9444),
+            // DISCRIMINATING — uppercase alone is enough to expose it.
+            ("2001:DB8::1:9444", "2001:db8::1", 9444),
+        ] {
+            let parsed = parse_addr(input).unwrap_or_else(|| panic!("{input} must parse"));
+            assert_eq!(
+                (parsed.host.as_str(), parsed.port),
+                (host, port),
+                "{input} parsed to the wrong endpoint"
+            );
+        }
+    }
+
+    /// **Proves:** an address carrying NO port is rejected, rather than silently split into a bogus
+    /// endpoint (#1593).
+    ///
+    /// **Catches:** the specific defect the last-colon split had — `"::1"` split into host `":"` and
+    /// port `1`, inventing a candidate address that names a different host on a port nobody advertised.
+    /// A portless hint is unusable, so the only honest answer is to drop it.
+    ///
+    /// (The host was measured, not inferred: `rsplit_once(':')` splits at the LAST colon, so `"::1"`
+    /// yields `":"`, not the `"::"` a left-split would give.)
+    #[test]
+    fn an_address_hint_without_a_port_is_dropped_not_mangled() {
+        for portless in ["::1", "2001:db8::1", "10.0.0.1", "garbage", "", "::"] {
+            assert!(
+                parse_addr(portless).is_none(),
+                "{portless:?} carries no port and must be dropped, got {:?}",
+                parse_addr(portless).map(|a| (a.host, a.port))
+            );
+        }
     }
 }

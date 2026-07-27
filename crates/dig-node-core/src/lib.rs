@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use base64::Engine;
+use capsule_key::{is_canonical_hex_id, CapsuleKey};
 use digstore_chain::singleton::sync_datastore;
 use digstore_core::codec::{Decode, Encode};
 use digstore_core::Bytes32;
@@ -44,6 +45,7 @@ use serde_json::{json, Value};
 use shared::ContentResponse;
 use tokio::sync::Mutex;
 
+mod capsule_key;
 pub mod chainwatch;
 pub mod download;
 pub mod peer;
@@ -759,20 +761,16 @@ pub fn unsubscribe_store(store_id: &str) -> Result<bool, String> {
     update_subscriptions_locked(|set| set.remove(store_id))
 }
 
-/// Path of a cached store module for (store_id, root), if present. Modules live
-/// under `<cache>/modules/` — populated out-of-band (a local digstore store, or
-/// authed whole-store sync) and served via `serve_blind`.
-fn module_path(dir: &Path, store_hex: &str, root_hex: &str) -> PathBuf {
-    dir.join("modules")
-        .join(store_hex)
-        .join(format!("{root_hex}.module"))
-}
-
 /// Whether the module for `(store_id, root)` is held locally under `dir` — the "is this generation
 /// missing?" check the chain-watch gap-fill loop keys on (SPEC §14.2). Thin over
-/// [`module_path`] so the loop's held-check seam ([`chainwatch::HeldCheck`]) has one source of truth.
+/// [`CapsuleKey::module_path`] so the loop's held-check seam ([`chainwatch::HeldCheck`]) has one
+/// source of truth.
+///
+/// A non-canonical key is NOT HELD, without a filesystem call: it could never have named a module this
+/// node wrote, so "not held" is the honest answer and the only one that requires no path to exist
+/// (#1599).
 pub(crate) fn module_exists(dir: &Path, store_hex: &str, root_hex: &str) -> bool {
-    module_path(dir, store_hex, root_hex).exists()
+    CapsuleKey::parse(store_hex, root_hex).is_some_and(|key| key.module_path(dir).exists())
 }
 
 /// Hard bound on the total bytes [`walk_dir_files`] will read into memory before aborting.
@@ -932,25 +930,7 @@ fn response_key(store: &str, root: &str, rk: &str, offset: usize) -> String {
 /// URNs to a concrete root via dig-resolver *before* calling, so a non-concrete
 /// root here means the synced module could not be keyed deterministically.
 fn sync_eligible(store_hex: &str, root_hex: &str) -> bool {
-    is_canonical_capsule_key(store_hex, root_hex)
-}
-
-/// Is `(store_hex, root_hex)` a canonical capsule key — both a 32-byte value in 64-hex? The
-/// PATH-TRAVERSAL guard for every path built from CALLER-SUPPLIED keys (mirroring
-/// [`Node::cache_remove_cached`]): with 64-hex inputs `module_path` can only ever name a file
-/// directly under `<cache>/modules/<store>/`, so a crafted `store_id`/`root` from a peer can never
-/// escape the cache directory.
-fn is_canonical_capsule_key(store_hex: &str, root_hex: &str) -> bool {
-    is_canonical_hex_id(store_hex) && is_canonical_hex_id(root_hex)
-}
-
-/// Is `s` a canonical DIG content id — a 32-byte value written as exactly 64 hex digits?
-///
-/// The single predicate every guard over a CALLER-SUPPLIED id shares: the path-traversal check above,
-/// and the serve log's [`crate::seams::dig_peer::serve_log::SafeId`] (which refuses to echo anything
-/// else). One definition, so "canonical" can never mean two different things across those guards.
-pub(crate) fn is_canonical_hex_id(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    CapsuleKey::parse(store_hex, root_hex).is_some()
 }
 
 /// Decide which cached files to evict so total bytes fit under `cap`. LRU:
@@ -1017,13 +997,12 @@ fn build_result(resp: &ContentResponse, offset: usize) -> Value {
 /// `None` on a cache miss / decode failure. Touches the module file for on-disk LRU recency.
 fn serve_local_blocking(
     cache_dir: &Path,
-    store_hex: &str,
-    root_hex: &str,
+    key: &CapsuleKey,
     retrieval_key: &[u8; 32],
 ) -> Option<ContentResponse> {
-    let path = module_path(cache_dir, store_hex, root_hex);
+    let path = key.module_path(cache_dir);
     let module = std::fs::read(&path).ok()?;
-    let store_id = Bytes32::from_hex(store_hex).ok()?;
+    let store_id = Bytes32::from_hex(key.store()).ok()?;
     // Ephemeral host key: the browser verifies the merkle proof against the chain-anchored root, not
     // a host signature, so the serve key is local-only.
     let cfg = BlindServeConfig::from_seed(store_id, &[0u8; 32]);
@@ -1049,10 +1028,9 @@ fn serve_local_blocking(
 /// - `Err(_)` — the on-disk module's data section is corrupt/malformed.
 fn read_public_manifest_blocking(
     cache_dir: &Path,
-    store_hex: &str,
-    root_hex: &str,
+    key: &CapsuleKey,
 ) -> Result<Option<Option<digstore_core::PublicManifest>>, String> {
-    let path = module_path(cache_dir, store_hex, root_hex);
+    let path = key.module_path(cache_dir);
     let module = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
@@ -1072,12 +1050,18 @@ impl Node {
     /// (so the fs::read + wasmtime decrypt never stalls the async runtime), then caches the result so
     /// successive windows of the same resource slice from RAM — turning a window-by-window streamed
     /// resource from O(n²) re-decrypts into O(n) (audit #179).
+    /// This is also the ONE place caller-supplied capsule ids become a [`CapsuleKey`] on the async
+    /// serve surface (#1599). Validating here rather than at each entry point means every async caller
+    /// — `dig.fetchRange` frames, `dig.getContent` windows, resource-granularity availability — is
+    /// covered by construction, and a future caller cannot be added without it: below this line the ids
+    /// exist only as a validated key, and there is no path builder that would accept anything else.
     async fn serve_local_cached(
         &self,
         store_hex: &str,
         root_hex: &str,
         retrieval_key: &[u8; 32],
     ) -> Option<Arc<ContentResponse>> {
+        let capsule = CapsuleKey::parse(store_hex, root_hex)?;
         let key = (store_hex.to_string(), root_hex.to_string(), *retrieval_key);
         // Fast path: an in-memory hit (no disk, no decrypt).
         if let Some(hit) = self.content_cache.lock().unwrap().get(&key) {
@@ -1086,14 +1070,12 @@ impl Node {
         // Miss: read + decrypt off the async runtime (spawn_blocking), then memoize. Only the cache
         // dir + key are moved into the closure, so no Node borrow escapes into the blocking thread.
         let cache_dir = self.cache_dir.clone();
-        let (store_owned, root_owned, rk) =
-            (store_hex.to_string(), root_hex.to_string(), *retrieval_key);
-        let decoded = tokio::task::spawn_blocking(move || {
-            serve_local_blocking(&cache_dir, &store_owned, &root_owned, &rk)
-        })
-        .await
-        .ok()
-        .flatten()?;
+        let rk = *retrieval_key;
+        let decoded =
+            tokio::task::spawn_blocking(move || serve_local_blocking(&cache_dir, &capsule, &rk))
+                .await
+                .ok()
+                .flatten()?;
         let arc = Arc::new(decoded);
         self.content_cache.lock().unwrap().insert(key, arc.clone());
         Some(arc)
@@ -1261,7 +1243,14 @@ impl Node {
         // produce identical bytes. `write_atomic` (temp + rename) guarantees a
         // reader never observes a torn/partial file and that the two writers
         // converge on the same final file.
-        let path = module_path(&self.cache_dir, store_hex, &served_root.to_hex());
+        //
+        // The SERVED root (not the requested one) keys the write, and both components are re-validated
+        // here: `store_hex` came from the caller, and re-parsing costs nothing next to the write it
+        // guards (#1599).
+        let Some(served_key) = CapsuleKey::parse(store_hex, &served_root.to_hex()) else {
+            return false;
+        };
+        let path = served_key.module_path(&self.cache_dir);
         if write_atomic(&path, &bytes).is_err() {
             return false;
         }
@@ -1457,21 +1446,16 @@ impl Node {
     async fn get_manifest(&self, params: &Value, id: Value) -> Value {
         let store_hex = params.get("store_id").and_then(Value::as_str).unwrap_or("");
         let root_hex = params.get("root").and_then(Value::as_str).unwrap_or("");
-        fn is_hex64(s: &str) -> bool {
-            s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-        }
-        if !is_hex64(store_hex) || !is_hex64(root_hex) {
+        let Some(capsule) = CapsuleKey::parse(store_hex, root_hex) else {
             return rpc_err(
                 &id,
                 -32602,
                 "dig.getManifest requires store_id + root (64-hex each)",
             );
-        }
+        };
         let cache_dir = self.cache_dir.clone();
-        let store = store_hex.to_string();
-        let root = root_hex.to_string();
         let outcome = tokio::task::spawn_blocking(move || {
-            read_public_manifest_blocking(&cache_dir, &store, &root)
+            read_public_manifest_blocking(&cache_dir, &capsule)
         })
         .await;
         match outcome {
@@ -1899,7 +1883,7 @@ impl Node {
         // The peer supplies `store`/`root`, so the keys are validated canonical 64-hex BEFORE any path
         // is built from them (the same guard `cache_remove_cached` applies) — a non-canonical key can
         // never name a held capsule, so it answers not-available without touching the filesystem.
-        let canonical_root = root.filter(|r| is_canonical_capsule_key(store, r));
+        let canonical_root = root.filter(|r| CapsuleKey::parse(store, r).is_some());
         let servable = canonical_root
             .map(|r| module_exists(&self.cache_dir, store, r))
             .unwrap_or(false);
@@ -2483,6 +2467,19 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    /// The cached-module path for a capsule named by hex ids, for fixtures that seed or inspect the
+    /// cache directly.
+    ///
+    /// Panics on a non-canonical id BY DESIGN: production code cannot build a path from unvalidated ids
+    /// at all (that is [`CapsuleKey`]'s whole purpose), so a test that wants a hostile path must go
+    /// through the surface under test — never around it via a fixture helper that would quietly
+    /// re-create the hole.
+    fn module_path(dir: &Path, store_hex: &str, root_hex: &str) -> PathBuf {
+        CapsuleKey::parse(store_hex, root_hex)
+            .expect("a fixture names a capsule with canonical ids")
+            .module_path(dir)
+    }
 
     #[test]
     fn response_key_is_stable_and_safe() {
@@ -5056,6 +5053,150 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &module).unwrap();
         root
+    }
+
+    /// **Proves:** the peer-facing `dig.fetchRange` serve refuses a capsule key that would name a file
+    /// OUTSIDE `<cache>/modules/<store>/`, and refuses it without reading that file (#1599).
+    ///
+    /// **Catches:** removing the key validation from the serve chokepoint. The fixture is built so the
+    /// escape is OBSERVABLE rather than merely attempted: the only copy of a real, decodable module is
+    /// planted outside the modules tree, and the traversal is in the ROOT component. That matters —
+    /// the blind serve derives its decode key from the STORE id alone and never consults the root, so
+    /// with the store id left canonical the escaped file decodes and STREAMS. Unguarded, this call
+    /// returns served bytes; guarded, it cannot.
+    ///
+    /// The `serves_the_same_module_from_its_legitimate_path` control below is half of this proof: it
+    /// shows the fixture can express a SUCCESSFUL serve, so the `Err` asserted here is the guard's doing
+    /// and not some unrelated failure the fixture would have produced anyway.
+    #[tokio::test]
+    async fn fetch_range_refuses_a_capsule_key_that_escapes_the_modules_directory() {
+        let (node, _td) = test_node(None);
+        let store = Bytes32([0xc3; 32]);
+        let root = seed_served_capsule(&node, &store, &[("index.html", b"secret bytes")]);
+        let rk = content_serve::derive_retrieval_key(&store, "index.html").0;
+
+        // Move the ONLY copy of the module outside the modules tree, and point a traversal at it. A
+        // pass therefore cannot come from the legitimate file: it no longer exists.
+        let legitimate = module_path(&node.cache_dir, &store.to_hex(), &root.to_hex());
+        let escaped = node
+            .cache_dir
+            .join("outside")
+            .join(format!("{}.module", root.to_hex()));
+        std::fs::create_dir_all(escaped.parent().unwrap()).unwrap();
+        std::fs::rename(&legitimate, &escaped).unwrap();
+
+        // Both traversal grammars a platform might honour, each pointed at the SAME planted module, so
+        // the guard is pinned against the CLASS of separator rather than against one spelling of it.
+        for hostile_root in [
+            format!("../../outside/{}", root.to_hex()),
+            format!("..\\..\\outside\\{}", root.to_hex()),
+        ] {
+            // Precondition: this traversal really does resolve to the planted module. Without it the
+            // test would assert a refusal of a path that named nothing — which every implementation,
+            // guarded or not, passes.
+            let would_reach = node
+                .cache_dir
+                .join("modules")
+                .join(store.to_hex())
+                .join(format!("{hostile_root}.module"));
+            let Ok(reached) = std::fs::canonicalize(&would_reach) else {
+                // This platform does not honour this separator, so the traversal cannot name the module
+                // here and the case proves nothing on it. Skipping is honest; asserting would be a
+                // false green.
+                continue;
+            };
+            assert_eq!(
+                reached,
+                std::fs::canonicalize(&escaped).unwrap(),
+                "the fixture's traversal must name the planted module, or it proves nothing"
+            );
+
+            let served = node
+                .fetch_range_frame(&store.to_hex(), &hostile_root, &hex::encode(rk), 0, 4096)
+                .await;
+            assert!(
+                served.is_err(),
+                "a key escaping <cache>/modules/<store>/ must never be served ({hostile_root}): {served:?}"
+            );
+            assert_eq!(
+                served.unwrap_err().0,
+                -32004,
+                "the refusal is the ordinary not-held answer, so a peer learns nothing about the path"
+            );
+        }
+    }
+
+    /// The control for the escape test above: with the SAME module at its LEGITIMATE path and a
+    /// canonical key, the same call serves bytes. Without this, an `Err` in that test could mean the
+    /// fixture was simply unservable.
+    #[tokio::test]
+    async fn fetch_range_serves_the_same_module_from_its_legitimate_path() {
+        let (node, _td) = test_node(None);
+        let store = Bytes32([0xc3; 32]);
+        let root = seed_served_capsule(&node, &store, &[("index.html", b"secret bytes")]);
+        let rk = content_serve::derive_retrieval_key(&store, "index.html").0;
+
+        let frame = node
+            .fetch_range_frame(&store.to_hex(), &root.to_hex(), &hex::encode(rk), 0, 4096)
+            .await
+            .expect("the capsule at its canonical path is servable");
+        assert!(
+            frame["length"].as_u64().unwrap_or(0) > 0,
+            "the control must actually serve bytes: {frame}"
+        );
+    }
+
+    /// **Proves:** no non-canonical key in the class is ever SERVED, in either component — absolute
+    /// paths, UNC roots, wrong length, wrong alphabet, control characters (#1599).
+    ///
+    /// **Catches:** a guard narrowed to `..`-rejection that then serves an absolute or UNC key.
+    ///
+    /// **Does NOT on its own pin the path guard**, and is documented as such deliberately: most shapes
+    /// here name no existing file, so they refuse whether or not the guard is present (verified — this
+    /// test stays green with the guard reverted). The load-bearing proof is
+    /// `fetch_range_refuses_a_capsule_key_that_escapes_the_modules_directory`, whose fixture plants a
+    /// real decodable module at the escape target so an unguarded serve SUCCEEDS. This test's job is
+    /// breadth of the rejected alphabet, not depth on the escape.
+    #[tokio::test]
+    async fn fetch_range_refuses_every_non_canonical_capsule_key() {
+        let (node, _td) = test_node(None);
+        let store = Bytes32([0xc3; 32]);
+        let root = seed_served_capsule(&node, &store, &[("index.html", b"hello")]);
+        let (store_hex, root_hex) = (store.to_hex(), root.to_hex());
+        let rk = hex::encode(content_serve::derive_retrieval_key(&store, "index.html").0);
+
+        let hostile = [
+            "..".to_string(),
+            format!("../../{root_hex}"),
+            format!("..\\..\\{root_hex}"),
+            format!("/etc/{root_hex}"),
+            format!("C:\\Windows\\{root_hex}"),
+            format!("\\\\host\\share\\{root_hex}"),
+            format!("{root_hex}\ninjected"),
+            root_hex[..63].to_string(),
+            format!("{root_hex}a"),
+            String::new(),
+            "z".repeat(64),
+        ];
+        for bad in hostile {
+            for (s, r) in [
+                (store_hex.as_str(), bad.as_str()),
+                (bad.as_str(), root_hex.as_str()),
+            ] {
+                let served = node.fetch_range_frame(s, r, &rk, 0, 4096).await;
+                assert!(
+                    served.is_err(),
+                    "non-canonical key ({:?}, {:?}) must be refused",
+                    &s[..s.len().min(40)],
+                    &r[..r.len().min(40)]
+                );
+            }
+        }
+        // And the canonical key still works after all of that — the guard rejects, it does not wedge.
+        assert!(node
+            .fetch_range_frame(&store_hex, &root_hex, &rk, 0, 4096)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

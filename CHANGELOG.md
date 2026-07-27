@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.62.0] - 2026-07-27
+
+### Features
+- **security!:** Treat every peer-supplied capsule id as untrusted at the boundary — a validated
+  `CapsuleKey` is the only thing the cache/staging path builders accept, so a filesystem path can no
+  longer be built from raw peer input (#1599)
+- **reshare:** Reap abandoned whole-capsule staging in `<downloads>/modules` and bound total staging by
+  bytes (#1615)
+
+### Bug Fixes
+- **peer:** Parse an IPv6 address hint without mangling it — `"::1"` no longer becomes host `"::"` port
+  `1` — and ban the `format!("{host}:{port}")` socket-address round-trip with a workspace source scan
+  (#1593)
+- **security:** Neutralize and bound free-form reason text in the peer serve log and in the
+  malformed-DHT-frame reply, enforced by the type that HOLDS the field rather than at each log site
+  (#1603, #1609)
+- **security:** Gate the test-only content-server injection seam behind a `testkit` feature instead of
+  `#[doc(hidden)]`, which hides a symbol without closing it (#1609)
+
 ## [0.61.1] - 2026-07-27
 
 ### Features

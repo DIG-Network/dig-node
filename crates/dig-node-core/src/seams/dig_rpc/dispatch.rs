@@ -495,7 +495,9 @@ impl RpcDispatch for Node {
                 let root_hex = params.get("root").and_then(|v| v.as_str()).unwrap_or("");
                 // Was it already present before this call? (so we can report
                 // already_cached vs a fresh cached, per the spec's status field.)
-                let already = module_path(&node.cache_dir, store_hex, root_hex).exists();
+                // `module_exists` re-validates the caller's key, so a non-canonical one reports
+                // not-already-cached without a path ever being built (#1599).
+                let already = crate::module_exists(&node.cache_dir, store_hex, root_hex);
                 return match node.cache_fetch_and_cache(store_hex, root_hex).await {
                     Ok((size_bytes, served_root)) => {
                         // A freshly-cached capsule makes this node a discoverable DHT holder — that

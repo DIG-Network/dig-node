@@ -34,6 +34,17 @@
 //! So no `&str` id ever reaches a `tracing` macro here. Ids are logged through [`SafeId`], which emits
 //! the value only when it is a canonical 64-hex content id and a short fixed sentinel otherwise — a
 //! form that is bounded and control-character-free by construction, not by remembering to escape.
+//!
+//! ## Why the wrappers live in the STRUCT, not at the log site
+//!
+//! Wrapping at the `tracing!` call would be a guard every future log line has to remember, and #1609
+//! records what that is worth in practice: a sibling crate carefully sentinelled a peer id where it was
+//! REPORTED, while the error type's own `Display` went on re-embedding the raw id — so the raw value
+//! still reached the log, and a test passed because its mock happened to use a benign id.
+//!
+//! Hence [`ServeTarget`] holds [`SafeId`]s and [`RangeOutcome::Refused`] holds a [`SafeText`], rather
+//! than either holding a `&str`/`String` that a call site wraps on the way out. The neutralizing happens
+//! at construction, once, so there is no way to build one of these records around a raw peer string.
 
 use serde_json::Value;
 use std::fmt;
@@ -68,6 +79,56 @@ impl fmt::Display for SafeId<'_> {
             id if crate::is_canonical_hex_id(id) => f.write_str(id),
             _ => f.write_str(NON_CANONICAL),
         }
+    }
+}
+
+/// The longest free-form explanation a log record will carry.
+///
+/// Free-form text cannot be whitelisted the way an id can, so it is BOUNDED instead. 200 characters
+/// holds every catalogued serve message with room to spare, while capping what one request can write to
+/// the log at a constant — the amplification half of the same attack a 64 KiB frame otherwise permits.
+const MAX_REASON_CHARS: usize = 200;
+
+/// Replaces each control character in free-form text — one glyph per character, so the bound above still
+/// holds after substitution.
+const CONTROL_REPLACEMENT: char = '\u{fffd}';
+
+/// Free-form explanatory text in a form that is SAFE to put in a log record.
+///
+/// Unlike an id, an explanation has no canonical shape to check against, so this cannot reject — it
+/// NEUTRALIZES: every control character becomes [`CONTROL_REPLACEMENT`] and the result is truncated to
+/// [`MAX_REASON_CHARS`]. That removes both hazards a verbatim string carries — a `\n` that would end the
+/// record and forge another, and unbounded length — while keeping the text readable.
+///
+/// It exists as a TYPE, and [`RangeOutcome::Refused`] stores it rather than a `String`, for the reason
+/// #1609 records: sanitizing at the log site is not sanitizing, because the next `Refused` anyone
+/// constructs starts again from a raw `String`. Holding the wrapper in the struct means the neutralizing
+/// happens once, at the boundary, however the outcome is built.
+pub(crate) struct SafeText(String);
+
+impl SafeText {
+    /// Neutralize free-form text for logging. Total: there is no failure mode a call site could handle
+    /// by logging the raw value instead.
+    pub(crate) fn new(text: impl AsRef<str>) -> Self {
+        SafeText(
+            text.as_ref()
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        CONTROL_REPLACEMENT
+                    } else {
+                        c
+                    }
+                })
+                .take(MAX_REASON_CHARS)
+                .collect(),
+        )
+    }
+}
+
+impl fmt::Display for SafeText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -117,8 +178,9 @@ pub(crate) enum RangeOutcome {
         outcome: &'static str,
         /// The catalogued JSON-RPC error code the caller was given.
         code: i64,
-        /// A short, non-sensitive explanation.
-        reason: String,
+        /// A short, non-sensitive explanation. A [`SafeText`], not a `String`, so the neutralizing
+        /// happens at construction however this variant is built (#1609).
+        reason: SafeText,
     },
 }
 
@@ -128,7 +190,7 @@ impl RangeOutcome {
         RangeOutcome::Refused {
             outcome: "not-held",
             code,
-            reason,
+            reason: SafeText::new(reason),
         }
     }
 
@@ -137,7 +199,7 @@ impl RangeOutcome {
         RangeOutcome::Refused {
             outcome: "bad-range",
             code,
-            reason,
+            reason: SafeText::new(reason),
         }
     }
 
@@ -158,7 +220,7 @@ impl RangeOutcome {
         RangeOutcome::Refused {
             outcome: "redirect",
             code,
-            reason,
+            reason: SafeText::new(reason),
         }
     }
 }
@@ -359,6 +421,71 @@ mod tests {
         // Mixed case is still canonical hex — a diagnosis must be able to match what the peer sent.
         let mixed = format!("{}{}", "Ab".repeat(16), "cD".repeat(16));
         assert_eq!(SafeId::new(&mixed).to_string(), mixed);
+    }
+
+    /// **Proves:** free-form reason text can neither end a log record nor grow one without bound
+    /// (#1603/#1609).
+    ///
+    /// **Catches:** storing a raw `String` in `Refused`. The payload is the SAME forged-record attack the
+    /// id sentinel exists for, arriving through the one field on this surface that has no canonical shape
+    /// to check against — so it must be neutralized rather than rejected.
+    #[test]
+    fn free_form_reason_text_cannot_forge_or_bloat_a_record() {
+        let forged = "miss\n  INFO peer serve: dig.fetchRange served outcome=served frames=3";
+        let rendered = SafeText::new(forged).to_string();
+        assert!(
+            !rendered.contains('\n'),
+            "a newline would end this record and begin an attacker's: {rendered:?}"
+        );
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "CR and ESC forge and rewrite records too, not just LF: {rendered:?}"
+        );
+        // The text is still READABLE — neutralizing must not cost the diagnosis.
+        assert!(rendered.starts_with("miss"));
+
+        // Bounded from BOTH sides of the limit: one over is truncated, and at-bound is untouched.
+        let over = "x".repeat(MAX_REASON_CHARS + 1);
+        assert_eq!(
+            SafeText::new(&over).to_string().chars().count(),
+            MAX_REASON_CHARS
+        );
+        let at_bound = "y".repeat(MAX_REASON_CHARS);
+        assert_eq!(SafeText::new(&at_bound).to_string(), at_bound);
+
+        // Substitution is one glyph per character, so the bound still holds for all-control input.
+        let controls = "\n".repeat(MAX_REASON_CHARS * 2);
+        assert_eq!(
+            SafeText::new(&controls).to_string().chars().count(),
+            MAX_REASON_CHARS
+        );
+    }
+
+    /// **Proves:** a refusal built through the crate's REAL constructors carries neutralized text — not
+    /// merely that `SafeText` works when called directly (#1609).
+    ///
+    /// **Catches:** the exact bypass #1609 documents: a wrapper that works in isolation while the type
+    /// that owns the field still stores the raw value. Using the real constructors is the point — a test
+    /// that hand-built a `Refused` would prove nothing about how the code actually builds one.
+    #[test]
+    fn every_refusal_constructor_neutralizes_its_reason() {
+        let hostile = "boom\nINFO forged outcome=served";
+        for outcome in [
+            RangeOutcome::not_held(-32004, hostile.into()),
+            RangeOutcome::bad_range(-32007, hostile.into()),
+            RangeOutcome::redirected(-32008, hostile.into()),
+            // The shared dispatcher every error-frame path funnels through.
+            RangeOutcome::from_error(-32004, hostile.into()),
+            RangeOutcome::from_error(-32007, hostile.into()),
+        ] {
+            match outcome {
+                RangeOutcome::Refused { reason, .. } => assert!(
+                    !reason.to_string().contains('\n'),
+                    "a refusal built the real way still carried a raw newline"
+                ),
+                RangeOutcome::Served { .. } => panic!("these constructors build refusals"),
+            }
+        }
     }
 
     #[test]

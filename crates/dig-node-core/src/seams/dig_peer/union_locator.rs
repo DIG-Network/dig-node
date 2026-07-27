@@ -284,7 +284,10 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for a in &got[0].addresses {
             assert!(
-                seen.insert(format!("{}:{}", a.host, a.port)),
+                // Keyed on the PAIR, never on a `host:port` string: for an IPv6 host that text form is
+                // ambiguous (and is the pattern #1593 bans outright), so two distinct endpoints could
+                // collide into one key and a real duplicate would slip through this very assertion.
+                seen.insert((a.host.clone(), a.port)),
                 "no duplicate address hint survives ingest"
             );
         }
