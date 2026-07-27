@@ -23,8 +23,9 @@ use dig_gossip::{
 };
 use dig_node_core::seams::dig_peer::holdings::{
     announcement_for, deltas_for, run_holdings_ingest, split_batches, AnnounceTransport, Applied,
-    HoldingsBroadcaster, HoldingsIngress, HoldingsSink, RateLimits, Rejected, ADVERTISED_TTL_SECS,
-    MAX_ANNOUNCES_PER_PROVIDER, MAX_DELTAS_PER_SENDER, RATE_WINDOW_SECS,
+    HoldingsBroadcaster, HoldingsIngress, HoldingsSink, IngressLimits, Rejected,
+    ADVERTISED_TTL_SECS, MAX_ANNOUNCES_PER_PROVIDER, MAX_ANNOUNCE_AGE_SECS, MAX_DELTAS_PER_SENDER,
+    RATE_WINDOW_SECS,
 };
 
 /// The pinned fixture clock (Unix seconds, 2026-07-01T00:00:00Z). Never `SystemTime::now()`.
@@ -58,9 +59,19 @@ impl TestPeer {
         }
     }
 
-    /// Sign `changes` as this peer at `seq`.
+    /// Sign `changes` as this peer at `seq`, dated at the fixture clock.
     fn announce(&self, seq: u64, changes: Vec<HoldingsDelta>) -> HoldingsAnnounce {
-        HoldingsAnnounce::new_signed(&self.signer, seq, NOW, changes)
+        self.announce_at(seq, NOW, changes)
+    }
+
+    /// [`Self::announce`] with an explicit signed `announced_at`, for the freshness bound.
+    fn announce_at(
+        &self,
+        seq: u64,
+        announced_at: u64,
+        changes: Vec<HoldingsDelta>,
+    ) -> HoldingsAnnounce {
+        HoldingsAnnounce::new_signed(&self.signer, seq, announced_at, changes)
             .expect("the fixture batch is within HOLDINGS_MAX_CHANGES")
     }
 }
@@ -950,7 +961,7 @@ async fn a_captured_retract_replayed_after_a_restart_cannot_delist_an_honest_hol
 async fn the_freshness_window_binds_on_both_sides_of_its_bound() {
     let holder = TestPeer::new();
     let us = TestPeer::new();
-    let window = RateLimits::default().max_announce_age_secs;
+    let window = IngressLimits::default().max_announce_age_secs;
 
     for (label, at_now) in [
         ("at the bound, frame in the past", NOW + window),
@@ -1053,6 +1064,135 @@ async fn rejected_announcements_allocate_no_tracking_state() {
         50
     );
     assert_eq!(senders, 1, "one relaying sender throughout");
+}
+
+/// PROPERTY: the PROVIDER map is capacity-bounded, and the entry it drops at the bound is the
+/// LEAST-RECENTLY-SEEN one.
+///
+/// This is the guard the previous round's `the_provider_tracking_map_is_capacity_bounded` claimed and
+/// did not test: that test drove the SENDER map and closed on `providers == 1`, so deleting the
+/// provider-side `evict_lru` kept it green. Two fixture choices make this one able to see the guard:
+///
+/// - **A reachable cap.** [`IngressLimits::tracked_providers`] is parameterised, so the bound is
+///   crossed with four P-256 identities instead of 8,193. A bound that can only be reached by an
+///   unaffordable fixture is a bound that never gets tested.
+/// - **A second observable besides the count.** A count alone cannot distinguish LRU eviction from
+///   evicting an arbitrary entry — or from evicting the entry just admitted. Eviction is therefore
+///   observed through its CONSEQUENCE: losing an entry loses that provider's replay watermark, so the
+///   victim's already-applied `seq` becomes admissible again while a retained provider's stays
+///   `StaleSeq`. The same replay is asserted to be REFUSED before the bound is crossed, so the later
+///   admission is attributable to the eviction and to nothing else.
+///
+/// A rejected announcement from a fifth, never-seen provider sits in the middle of the fixture: it
+/// must neither grow the map nor evict anybody, which is the composition of this bound with the
+/// allocate-nothing-on-reject rule above.
+#[tokio::test]
+async fn the_provider_map_evicts_the_least_recently_seen_at_its_capacity() {
+    const CAP: usize = 3;
+    let us = TestPeer::new();
+    let relayer = TestPeer::new();
+    let sink = RecordingSink::default();
+    let ingress = HoldingsIngress::with_limits(
+        us.peer_id_hex.clone(),
+        IngressLimits {
+            tracked_providers: CAP,
+            ..IngressLimits::default()
+        },
+    );
+
+    // Four holders, each seen at a distinct second so the least-recently-seen order is unambiguous.
+    // All four stamps stay well inside MAX_ANNOUNCE_AGE_SECS of the announcements' `announced_at`.
+    let holders: Vec<TestPeer> = (0..4).map(|_| TestPeer::new()).collect();
+    let seen_at = |i: usize| NOW + i as u64;
+    let admit = |i: usize| {
+        let announce = holders[i].announce(7, vec![add_delta(&content(70 + i as u8))]);
+        let ingress = &ingress;
+        let sink = &sink;
+        let sender = &relayer.peer_id_hex;
+        let provider = &holders[i].peer_id_hex;
+        async move {
+            ingress
+                .accept(sink, sender, &announce, seen_at(i))
+                .await
+                .unwrap_or_else(|e| panic!("holder {i} ({provider}) must be admitted, got {e:?}"));
+        }
+    };
+    // A replay of holder `i`'s seq-7 announcement, judged at the clock of the last admitted holder.
+    let replay = |i: usize, at: u64| {
+        let announce = holders[i].announce(7, vec![add_delta(&content(70 + i as u8))]);
+        let ingress = &ingress;
+        let sink = &sink;
+        let sender = &relayer.peer_id_hex;
+        async move { ingress.accept(sink, sender, &announce, at).await }
+    };
+
+    for i in 0..CAP {
+        admit(i).await;
+    }
+    let (_, at_cap) = ingress.tracked_counts().await;
+    assert_eq!(
+        at_cap, CAP,
+        "exactly at the capacity nothing may be evicted — a bound tested only from above cannot \
+         show it is the RIGHT bound"
+    );
+    assert_eq!(
+        replay(0, seen_at(CAP)).await,
+        Err(Rejected::StaleSeq {
+            seq: 7,
+            highest: 7
+        }),
+        "before the bound is crossed the oldest provider still holds its watermark; without this the \
+         admission asserted below would not be attributable to eviction"
+    );
+
+    // A rejected announcement in the mix: a never-seen provider whose frame is too old to act on. It
+    // is judged at the live clock, so it cannot disturb the eviction order it must not affect.
+    let stranger = TestPeer::new();
+    let stale = stranger.announce_at(
+        1,
+        NOW - MAX_ANNOUNCE_AGE_SECS - 1,
+        vec![add_delta(&content(99))],
+    );
+    assert!(
+        matches!(
+            ingress
+                .accept(&sink, &relayer.peer_id_hex, &stale, seen_at(CAP))
+                .await,
+            Err(Rejected::Stale { .. })
+        ),
+        "the fixture's rejected frame must be rejected on FRESHNESS, not on the capacity bound"
+    );
+    let (_, after_reject) = ingress.tracked_counts().await;
+    assert_eq!(
+        after_reject, CAP,
+        "a rejected announcement must neither allocate an entry nor evict one"
+    );
+
+    // One over the bound.
+    admit(CAP).await;
+    let last = seen_at(CAP);
+    let (_, over_cap) = ingress.tracked_counts().await;
+    assert_eq!(
+        over_cap, CAP,
+        "admitting a {n}th distinct provider must leave the map at its capacity",
+        n = CAP + 1
+    );
+    // The retained provider is asserted FIRST: a readmitted provider evicts a new victim, so probing
+    // the evicted one first would destroy the very watermark the next assertion reads.
+    assert_eq!(
+        replay(1, last).await,
+        Err(Rejected::StaleSeq {
+            seq: 7,
+            highest: 7
+        }),
+        "a provider that was NOT the least-recently-seen must keep its watermark — otherwise the map \
+         is being cleared, or the wrong victim chosen, rather than evicted least-recently-seen first"
+    );
+    assert!(
+        replay(0, last).await.is_ok(),
+        "the LEAST-recently-seen provider is the one evicted, so its watermark is gone and its own \
+         seq-7 frame is admissible again"
+    );
 }
 
 // =============================================================================================
@@ -1221,7 +1361,7 @@ async fn a_rate_window_elapsing_does_not_reset_the_replay_watermark() {
     // One full rate window later — inside MAX_ANNOUNCE_AGE_SECS, so freshness still accepts it.
     let later = NOW + RATE_WINDOW_SECS;
     assert!(
-        RATE_WINDOW_SECS < RateLimits::default().max_announce_age_secs,
+        RATE_WINDOW_SECS < IngressLimits::default().max_announce_age_secs,
         "the fixture is only meaningful while a window is shorter than the freshness bound"
     );
     let rejected = ingress

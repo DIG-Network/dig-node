@@ -28,7 +28,7 @@
 //! | **Forged attribution** — naming another peer as a holder, or as *not* a holder | An announce's provider identity is [`HoldingsAnnounce::provider_peer_id`], which `verify_holdings_announce` proves equals `SHA-256(provider_spki)` and which signed the batch. [`HoldingsIngress::accept`] takes **no** caller-supplied provider id, so no code path can name a peer the signature does not attribute. |
 //! | **Identity re-spelling** — the same signer wearing many names | Hex is case-INSENSITIVE and the signature covers the DECODED bytes, so one identity has many spellings that all verify. [`HoldingsIngress::accept`] canonicalizes ONCE, up front, and every later comparison, map key and sink argument uses only that value — otherwise each spelling is a fresh provider with no replay watermark, and a lowercase self-id comparison misses all of them. |
 //! | **Amplification** — one cheap inbound message causing outbound work | The ingress performs **zero egress**: it never re-broadcasts, dials, probes, or fetches. Its whole cost is bounded local map work. |
-//! | **Flood / Sybil eviction** — evicting an honest holder from a full provider set | Two token buckets at ONE chokepoint ([`RateLimits`]): announcements per *provider* and deltas per *transport sender*. They are keyed differently on purpose — see [`MAX_DELTAS_PER_SENDER`] for why each covers the other's weakness. A rejected announcement charges neither, so the limiter cannot itself be turned into the denial of service. |
+//! | **Flood / Sybil eviction** — evicting an honest holder from a full provider set | Two token buckets at ONE chokepoint ([`IngressLimits`]): announcements per *provider* and deltas per *transport sender*. They are keyed differently on purpose — see [`MAX_DELTAS_PER_SENDER`] for why each covers the other's weakness. A rejected announcement charges neither, so the limiter cannot itself be turned into the denial of service. |
 //! | **Replay** — resurrecting a retracted record, or undoing a newer announce | TWO independent barriers, because either alone is escapable: a per-provider monotonic [`HoldingsAnnounce::seq`] watermark (keyed by the CANONICAL id), and a bounded-freshness check on the signed `announced_at` ([`MAX_ANNOUNCE_AGE_SECS`]). The watermark is in-memory, so a restart or a capacity eviction clears it; freshness holds regardless of watermark state, which matters most for a `Remove` — it carries no expiry of its own. |
 //! | **Self-poisoning** — replaying our own announce back at us | An announce attributed to this node's own `peer_id` is dropped; only this node decides what it holds. |
 //! | **Unbounded state** — the guard maps themselves becoming the DoS | A REJECTED announcement allocates nothing at all: [`IngressState::admit`] decides every gate against borrowed state and inserts only after all of them pass, so no reject path can grow a map. Admitted entries are then capacity-bounded with LRU eviction ([`MAX_TRACKED_SENDERS`], [`MAX_TRACKED_PROVIDERS`]). |
@@ -274,7 +274,7 @@ pub enum Rejected {
     },
     /// The transport sender exhausted its announce or delta budget for the current window.
     RateLimited,
-    /// `announced_at` is further from now than [`RateLimits::max_announce_age_secs`], in either
+    /// `announced_at` is further from now than [`IngressLimits::max_announce_age_secs`], in either
     /// direction — the announcement is too old to act on, or dated too far ahead to be honest.
     Stale {
         /// The rejected announcement's signed `announced_at`.
@@ -315,9 +315,17 @@ struct SenderState {
     last_seen: u64,
 }
 
-/// The two budgets enforced at the ingress chokepoint.
+/// Every bound the ingress enforces: the two token buckets, the freshness window, and the capacity
+/// of the two maps that hold the buckets themselves.
+///
+/// The map capacities live here — beside the budgets rather than as bare constants read at the point
+/// of use — for one reason: a bound reachable only by an unaffordable fixture is a bound that never
+/// gets tested. Crossing `tracked_providers` at its production value costs 8,193 P-256 identities, so
+/// a suite that could not lower it asserted the map's growth against the SENDER map instead and left
+/// the provider-side eviction unverified. Every field is therefore tunable by a test, and every
+/// default is the production constant.
 #[derive(Debug, Clone, Copy)]
-pub struct RateLimits {
+pub struct IngressLimits {
     /// Applied announcements per **provider** per window.
     pub announces_per_provider: u32,
     /// Applied deltas per **transport sender** per window.
@@ -326,15 +334,21 @@ pub struct RateLimits {
     pub window_secs: u64,
     /// Maximum absolute distance between `announced_at` and the receiver's clock.
     pub max_announce_age_secs: u64,
+    /// Transport senders tracked before the least-recently-seen is evicted.
+    pub tracked_senders: usize,
+    /// Providers tracked before the least-recently-seen is evicted.
+    pub tracked_providers: usize,
 }
 
-impl Default for RateLimits {
+impl Default for IngressLimits {
     fn default() -> Self {
         Self {
             announces_per_provider: MAX_ANNOUNCES_PER_PROVIDER,
             deltas_per_sender: MAX_DELTAS_PER_SENDER,
             window_secs: RATE_WINDOW_SECS,
             max_announce_age_secs: MAX_ANNOUNCE_AGE_SECS,
+            tracked_senders: MAX_TRACKED_SENDERS,
+            tracked_providers: MAX_TRACKED_PROVIDERS,
         }
     }
 }
@@ -345,7 +359,7 @@ impl Default for RateLimits {
 pub struct HoldingsIngress {
     /// This node's own 64-hex `peer_id`, so a self-attributed announce is dropped.
     self_peer_id: String,
-    limits: RateLimits,
+    limits: IngressLimits,
     state: tokio::sync::Mutex<IngressState>,
 }
 
@@ -361,7 +375,7 @@ impl HoldingsIngress {
     /// Build an ingress for a node whose own `peer_id` is `self_peer_id` (64-hex).
     #[must_use]
     pub fn new(self_peer_id: String) -> Self {
-        Self::with_limits(self_peer_id, RateLimits::default())
+        Self::with_limits(self_peer_id, IngressLimits::default())
     }
 
     /// Whether the real-time ingress is enabled for this process.
@@ -375,10 +389,10 @@ impl HoldingsIngress {
         ingest_enabled(std::env::var("DIG_HOLDINGS_INGEST").ok().as_deref())
     }
 
-    /// [`Self::new`] with explicit budgets — used by tests to reach the limits deterministically
-    /// without emitting thousands of frames.
+    /// [`Self::new`] with explicit bounds — used by tests to reach the budgets, the freshness window
+    /// and the map capacities deterministically, without minting thousands of identities.
     #[must_use]
-    pub fn with_limits(self_peer_id: String, limits: RateLimits) -> Self {
+    pub fn with_limits(self_peer_id: String, limits: IngressLimits) -> Self {
         Self {
             // Canonicalized so gate 3 compares like with like. A caller that passes an
             // upper-case-spelled id would otherwise never match an inbound announcement, silently
@@ -542,7 +556,7 @@ impl IngressState {
         seq: u64,
         deltas: u32,
         now: u64,
-        limits: &RateLimits,
+        limits: &IngressLimits,
     ) -> Result<(), Rejected> {
         // DECIDE FIRST, ALLOCATE ONLY ON SUCCESS.
         //
@@ -601,8 +615,10 @@ impl IngressState {
         );
 
         // Evict AFTER committing so an entry just charged is never the victim of its own admission.
-        evict_lru(&mut self.senders, MAX_TRACKED_SENDERS, |s| s.last_seen);
-        evict_lru(&mut self.providers, MAX_TRACKED_PROVIDERS, |p| p.last_seen);
+        evict_lru(&mut self.senders, limits.tracked_senders, |s| s.last_seen);
+        evict_lru(&mut self.providers, limits.tracked_providers, |p| {
+            p.last_seen
+        });
         Ok(())
     }
 }
