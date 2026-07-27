@@ -787,3 +787,7 @@ loopback predicate reused by both the origin label and the `DIG_NODE_HOST` enfor
 Coherence: `DIG_NODE_HOST` governs ONLY the local RPC/content bind; the peer P2P wire (mTLS, in
 dig-node-core) and the loopback wallet mTLS `:9257` listener bind independently, so enforcing
 loopback here never breaks peer connectivity. A remote-API test rig (#1062) just sets the flag.
+
+## Lane anchor — dig_ecosystem#1667 (loopback-enforcement residuals)
+
+WIP: (a) reword the residual bare "loopback-only" comments in meta.rs/lib.rs to cite the DIG_NODE_ALLOW_REMOTE default + token gate; (b) run host_override_refusal at install time (service.rs) so `dig-node install DIG_NODE_HOST=0.0.0.0` without the flag fails fast with the guard message instead of installing and then failing at service start. TDD for (b). Implementation follows.
