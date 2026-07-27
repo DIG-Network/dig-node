@@ -678,13 +678,6 @@ fn query_windows_display_name(service_name: &str) -> io::Result<Option<String>> 
     Ok(parse_sc_qc_display_name(&stdout).map(str::to_string))
 }
 
-/// Install dig-node as an auto-starting OS service that runs `dig-node run` on the configured
-/// loopback port, via the clean-reinstall contract (stop → delete → recreate on an existing
-/// service; create otherwise — see the module doc for why this never auto-starts). On Windows,
-/// also configures SCM recovery actions (restart-on-crash) — see
-/// [`configure_windows_recovery`] — so a crashed service comes back up the same way systemd
-/// (`Restart=on-failure`) and launchd (`KeepAlive`) already do for Linux/macOS via
-/// `service-manager`'s own defaults.
 /// Apply the SAME non-loopback-bind refusal at INSTALL time that the bind site enforces
 /// ([`crate::config::host_override_refusal`], #1662): baking a non-loopback `DIG_NODE_HOST`
 /// into the service env WITHOUT `DIG_NODE_ALLOW_REMOTE=1` would otherwise install a service
@@ -702,6 +695,13 @@ fn ensure_install_host_allowed(config: &Config) -> io::Result<()> {
     }
 }
 
+/// Install dig-node as an auto-starting OS service that runs `dig-node run` on the configured
+/// loopback port, via the clean-reinstall contract (stop → delete → recreate on an existing
+/// service; create otherwise — see the module doc for why this never auto-starts). On Windows,
+/// also configures SCM recovery actions (restart-on-crash) — see
+/// [`configure_windows_recovery`] — so a crashed service comes back up the same way systemd
+/// (`Restart=on-failure`) and launchd (`KeepAlive`) already do for Linux/macOS via
+/// `service-manager`'s own defaults.
 pub fn install(config: &Config) -> io::Result<Outcome> {
     // #1667: fail fast on a remote bind that lacks the escape hatch, BEFORE any side effect
     // (service registration, state-dir harden), so the refusal leaves nothing behind.
