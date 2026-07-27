@@ -3055,6 +3055,25 @@ receiver must reject, so the divergence can only surface as a failed read in pro
   false preserves the earlier behaviour, so a holder that does not understand the field is never broken
   by it.
 
+Every frame's declared `length` MUST equal its own payload length. A frame whose `length` disagrees
+with its `bytes` is one a reader distrusts, and no receiver in this tree validates the relation, so the
+obligation is the sender's alone.
+
+**`dig.fetchModuleRange` frames** obey the same framing ceiling, and carry `total_length` — the served
+window's length — on EVERY frame rather than only the first. They carry no `root` or `chunk_count`: a
+`.dig` capsule is self-verifying against the chain anchor on install (§the module-anchor gate), and this
+leg has no per-resource chunk layout to count, so a `chunk_count` here would be a claim about a structure
+that is not present.
+
+**KNOWN CONSTRAINT — the paged prologue has no RECEIVER in this dependency tree.** dig-download 0.11
+reads `chunk_lens` from the first frame only and ignores `chunk_lens_offset` and every later page
+(`ChunkLensAssembler` ships in dig-nat 0.14 / dig-download 0.12; this node is held at 0.13 / 0.11 by
+dig-gossip and dig-peer-selector — see `crates/dig-node-core/Cargo.toml`). So a resource whose layout
+exceeds `MAX_CHUNK_LENS_PER_FRAME` — roughly **128 MiB** at the 64 KiB chunk target — is served
+correctly by this node but still fails at the reader, now at its `chunk_lens`-sum check rather than at
+frame decode. This is FAIL-CLOSED and cannot mis-verify: a partial layout is refused, never used. It is
+resolved by the same cascade as the rest of the 0.14 move (dig_ecosystem#1686).
+
 `chunk_count`, `chunk_lens_offset` and `skip_layout` are additive wire fields (§5.1 backwards
 compatibility): an older reader ignores them, and a newer reader parses an older frame with each absent.
 

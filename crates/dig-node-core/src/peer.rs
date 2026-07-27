@@ -1249,30 +1249,33 @@ impl PeerRpcResponder for NodeResponder {
         while written < window.len() {
             let take = range_frame::FRAME_PAYLOAD.min(window.len() - written);
             let complete = written + take == window.len();
-            if let Some(limiter) = &self.serve_limiter {
-                limiter.acquire(conn_key, take as u64).await;
-            }
-            self.node.record_outgoing_bytes(take as u64);
-            // `total_length` rides EVERY frame, not just the first: it is fixed-size, and it is what
-            // lets the puller size its staging file and detect a holder describing a different module
-            // as frames arrive rather than after paying for the whole capsule.
-            let frame = dig_nat::RangeFrame::data(
+            let frame = module_window_frame(
                 offset + written as u64,
-                window[written..written + take].to_vec(),
-            )
-            .with_complete(complete)
-            .with_declared_length(total);
-            range_frame::write_range_frame(out, &frame).await?;
+                &window[written..written + take],
+                complete,
+                total,
+            );
+            // Charge the REAL encoded size, before the write, and to BOTH throttles. The payload length
+            // understates a metadata-carrying frame, and each frame is debited before it is written so a
+            // peer that resets the stream mid-serve is still accounted for the bytes it already cost.
+            let bytes = range_frame::encode_range_frame(&frame)?;
+            if let Some(limiter) = &self.serve_limiter {
+                limiter.acquire(conn_key, bytes.len() as u64).await;
+            }
+            self.node.record_outgoing_bytes(bytes.len() as u64);
+            out.write_all(&bytes).await?;
+            out.flush().await?;
             written += take;
             frames += 1;
         }
         if frames == 0 {
             // An empty window (an offset at/past the end) still needs a terminating frame, or the caller
             // waits forever for a `complete` that never arrives.
-            let frame = dig_nat::RangeFrame::data(offset, Vec::new())
-                .with_complete(true)
-                .with_declared_length(0);
-            range_frame::write_range_frame(out, &frame).await?;
+            let frame = module_window_frame(offset, &[], true, 0);
+            let bytes = range_frame::encode_range_frame(&frame)?;
+            self.node.record_outgoing_bytes(bytes.len() as u64);
+            out.write_all(&bytes).await?;
+            out.flush().await?;
             frames = 1;
         }
         module_serve::module_range_outcome(conn_key, &store, &root, offset, Some((total, frames)));
@@ -1339,14 +1342,18 @@ impl PeerRpcResponder for NodeResponder {
                                 // refused the range, which it answers with an error frame rather
                                 // than an `Err`. Reporting its own verdict keeps `served` meaning
                                 // exactly one thing across both serve paths (#1595).
+                                let node = self.node.clone();
                                 let streamed = stream_fetched_range(
                                     out,
                                     &f,
-                                    offset,
-                                    length,
-                                    skip_layout,
-                                    self.serve_limiter.as_deref(),
-                                    conn_key,
+                                    RangeStreamPlan {
+                                        offset,
+                                        requested_end: offset.saturating_add(length),
+                                        skip_layout,
+                                        limiter: self.serve_limiter.as_deref(),
+                                        conn_key,
+                                        egress: &|n| node.record_outgoing_bytes(n),
+                                    },
                                 )
                                 .await?;
                                 let outcome =
@@ -1445,10 +1452,10 @@ impl PeerRpcResponder for NodeResponder {
                 skip_layout,
                 limiter: self.serve_limiter.as_deref(),
                 conn_key,
+                egress: &|n| self.node.record_outgoing_bytes(n),
             },
         )
         .await?;
-        self.node.record_outgoing_bytes(streamed.bytes);
         serve_log::range_outcome(&target, offset, &streamed.as_serve_outcome(!skip_layout));
         Ok(())
     }
@@ -1477,13 +1484,16 @@ impl PeerRpcResponder for NodeResponder {
 /// the real frame count and byte total, and — because this path answers a bad range with an ERROR
 /// frame rather than an `Err` — whether it refused instead of serving.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct StreamOutcome {
+pub(crate) struct StreamOutcome {
     /// RESOURCE bytes written across every data frame.
-    bytes: u64,
+    pub(crate) bytes: u64,
     /// How many data frames those bytes were split into (zero when the range was refused outright).
-    frames: u64,
+    pub(crate) frames: u64,
+    /// Total ENCODED wire bytes written — always >= `bytes`, and non-zero even for a frame whose
+    /// payload is empty (a prologue page). This is the quantity the throttles are charged.
+    pub(crate) encoded_bytes: u64,
     /// `Some((code, message))` when an error frame was written instead of completing the stream.
-    refusal: Option<(i64, String)>,
+    pub(crate) refusal: Option<(i64, String)>,
 }
 
 impl StreamOutcome {
@@ -1502,14 +1512,10 @@ impl StreamOutcome {
     }
 }
 
-async fn stream_fetched_range(
+pub(crate) async fn stream_fetched_range(
     out: &mut (dyn tokio::io::AsyncWrite + Send + Unpin),
     fetched: &crate::download::FetchedResource,
-    offset: usize,
-    length: usize,
-    skip_layout: bool,
-    limiter: Option<&dig_download::FcfsRateLimiter>,
-    conn_key: &str,
+    plan: RangeStreamPlan<'_>,
 ) -> std::io::Result<StreamOutcome> {
     stream_range_frames(
         out,
@@ -1520,15 +1526,35 @@ async fn stream_fetched_range(
             root: fetched.root.as_deref(),
             inclusion_proof: fetched.inclusion_proof.as_deref(),
         },
-        RangeStreamPlan {
-            offset,
-            requested_end: offset.saturating_add(length),
-            skip_layout,
-            limiter,
-            conn_key,
-        },
+        plan,
     )
     .await
+}
+
+/// One `dig.fetchModuleRange` frame over a window of a locally-held `.dig` module.
+///
+/// The puller decodes these with `dig_nat::RangeFrame`, so they obey the same framing ceiling as
+/// `dig.fetchRange` frames, and `total_length` — the served WINDOW's length — rides EVERY frame rather
+/// than only the first. It is fixed-size, and it is what lets the puller size its staging file and
+/// notice a holder describing a different window as frames arrive instead of after paying for the whole
+/// capsule.
+///
+/// `total_length` is ASSIGNED, not built. `RangeFrame` has no `with_total_length` (only `with_identity`
+/// sets it, and that needs a generation root, which a `.dig` window has none of — a capsule is
+/// self-verifying against the chain anchor on install). The similarly-named `with_declared_length` sets
+/// `length`, the frame's own payload length, and dig-nat documents that a serve path has no reason to
+/// call it: a frame whose `length` disagrees with its payload is one the reader distrusts. No
+/// `chunk_count` is emitted, because this leg carries no per-resource chunk layout to count — inventing
+/// one would be a claim about a structure that is not there.
+fn module_window_frame(
+    offset: u64,
+    bytes: &[u8],
+    complete: bool,
+    total_length: u64,
+) -> dig_nat::RangeFrame {
+    let mut frame = dig_nat::RangeFrame::data(offset, bytes.to_vec()).with_complete(complete);
+    frame.total_length = Some(total_length);
+    frame
 }
 
 /// Stream `[offset, requested_end)` of ONE resource as conforming `dig.fetchRange` frames.
@@ -1555,18 +1581,24 @@ async fn stream_fetched_range(
 /// Grouped rather than passed loose because these five travel together through every serve path, and
 /// the two length-ish `usize`s are the pair a positional call site is most likely to transpose — the
 /// span bound (#1619) and the frame ceiling (#1640) are already easy enough to confuse.
-struct RangeStreamPlan<'a> {
+pub(crate) struct RangeStreamPlan<'a> {
     /// First byte of the requested span.
-    offset: usize,
+    pub(crate) offset: usize,
     /// Exclusive end of the requested span — never widened, however far the resource continues.
-    requested_end: usize,
+    pub(crate) requested_end: usize,
     /// The client already holds this root's commitment and waived `chunk_lens` + `inclusion_proof`.
-    skip_layout: bool,
+    pub(crate) skip_layout: bool,
     /// FCFS outbound budget, or `None` for the default unlimited config (which touches no per-conn
     /// accounting state at all — #1495).
-    limiter: Option<&'a dig_download::FcfsRateLimiter>,
+    pub(crate) limiter: Option<&'a dig_download::FcfsRateLimiter>,
     /// The connection this stream is serving, for per-connection pacing.
-    conn_key: &'a str,
+    pub(crate) conn_key: &'a str,
+    /// Charged the REAL encoded size of each frame, immediately before that frame is written.
+    ///
+    /// A sink rather than a returned total, deliberately: a returned total is only added up if the
+    /// stream runs to completion, and the case that matters is the one where it does NOT — a peer that
+    /// reads a few frames and resets the stream has already cost real egress.
+    pub(crate) egress: &'a (dyn Fn(u64) + Send + Sync),
 }
 
 async fn stream_range_frames(
@@ -1581,6 +1613,7 @@ async fn stream_range_frames(
         skip_layout,
         limiter,
         conn_key,
+        egress,
     } = plan;
     let total = bytes.len();
     let mut outcome = StreamOutcome::default();
@@ -1611,14 +1644,43 @@ async fn stream_range_frames(
         let last = bytes_done && !framer.prologue_pending();
         let frame = frame.with_complete(last && off + take >= total);
 
+        // Encode BEFORE charging anything, because the wire cost of a frame is its ENCODED size, not
+        // its payload: a prologue page is ~14 KB of metadata on a frame whose payload may be zero, and
+        // charging `take` would score that frame as free. A peer can ask for exactly that shape — a
+        // one-byte span without `skip_layout`, which is a client-set flag it simply omits — so this is
+        // a serve it can request, not a corner case.
+        let encoded = match range_frame::encode_range_frame(&frame) {
+            Ok(encoded) => encoded,
+            Err(e) => {
+                // This resource has NO conforming range stream from this holder (an inclusion proof
+                // over `MAX_INCLUSION_PROOF_B64` is the real case). Name it with the catalogued
+                // `-32009` instead of letting the error propagate: a propagated `Err` truncates the
+                // stream with no frame and skips the serve-log outcome entirely, leaving a
+                // `range_requested` with no verdict — the exact ambiguity #1595 exists to remove.
+                let refusal = (
+                    dig_rpc_protocol::ErrorCode::RangeMetadataUnrepresentable as i64,
+                    format!("this holder cannot frame a conforming range for this resource: {e}"),
+                );
+                let errf = json!({"error": {"code": refusal.0, "message": refusal.1.clone()}});
+                write_framed(out, &errf).await?;
+                outcome.refusal = Some(refusal);
+                return Ok(outcome);
+            }
+        };
         // FCFS outbound PACING (#1436): wait (in arrival order) until this frame's bytes fit the
         // global + per-connection budget before writing. `None` (the default/unlimited config) skips
         // `acquire` entirely — no per-conn map is touched (#1495 DoS guard).
         if let Some(limiter) = limiter {
-            limiter.acquire(conn_key, take as u64).await;
+            limiter.acquire(conn_key, encoded.len() as u64).await;
         }
-        range_frame::write_range_frame(out, &frame).await?;
+        // Charged per frame, BEFORE the write. Accounting only after the whole stream returned means a
+        // peer that requests a large span, reads a few frames and then resets the yamux stream causes
+        // real egress recorded as zero — repeatable indefinitely, so the throttle never engages.
+        egress(encoded.len() as u64);
+        out.write_all(&encoded).await?;
+        out.flush().await?;
         outcome.bytes += take as u64;
+        outcome.encoded_bytes += encoded.len() as u64;
         outcome.frames += 1;
         serve_log::range_frame_served(off, take, frame.chunk_index);
         off += take;
@@ -4035,22 +4097,38 @@ mod tests {
         let f = tiny_fetched(total);
         let mut out = tokio::io::sink();
         let start = tokio::time::Instant::now();
-        let streamed = stream_fetched_range(&mut out, &f, 0, total, false, Some(&limiter), "peerA")
-            .await
-            .unwrap();
+        let streamed = stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 0,
+                requested_end: total,
+                skip_layout: false,
+                limiter: Some(&limiter),
+                conn_key: "peerA",
+                egress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
         // The frame COUNT is derived from the payload ceiling, never written as a literal. This
         // assertion previously read `frames: 2` — one 3 MiB "window-sized frame" plus a tail — which
         // is what the serve path actually did and what no conforming receiver could decode. It stayed
         // green because this path writes into a sink, never through `RangeFrame::encode` (#1640/#1668).
         let expected_frames = total.div_ceil(range_frame::FRAME_PAYLOAD) as u64;
         assert_eq!(
-            streamed,
-            StreamOutcome {
-                bytes: total as u64,
-                frames: expected_frames,
-                refusal: None
-            },
+            (streamed.bytes, streamed.frames, streamed.refusal.clone()),
+            (total as u64, expected_frames, None),
             "the span must be tiled into ceiling-sized frames plus a short tail"
+        );
+        // The throttles are charged the ENCODED size, which is strictly larger than the payload (base64
+        // plus the metadata every frame carries). Asserting the relation rather than a literal keeps
+        // this honest without pinning it to a serialization detail.
+        assert!(
+            streamed.encoded_bytes > streamed.bytes,
+            "encoded wire bytes ({}) must exceed payload bytes ({})",
+            streamed.encoded_bytes,
+            streamed.bytes
         );
         // Each frame is admitted only once its bytes fit the budget, so a tiny cap makes a
         // many-frame serve wait — the pacing property, now observed across real ceiling-sized frames
@@ -4069,9 +4147,20 @@ mod tests {
         let f = tiny_fetched(1_000_000);
         let mut out = tokio::io::sink();
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 1000, false, None, "peerA")
-            .await
-            .unwrap();
+        stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 0,
+                requested_end: 1000,
+                skip_layout: false,
+                limiter: None,
+                conn_key: "peerA",
+                egress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             start.elapsed(),
             std::time::Duration::ZERO,
@@ -4087,14 +4176,36 @@ mod tests {
         let f = tiny_fetched(1000);
         let mut out = tokio::io::sink();
         // Exhaust peer A's burst (one 1000-byte frame).
-        stream_fetched_range(&mut out, &f, 0, 1000, false, Some(&limiter), "peerA")
-            .await
-            .unwrap();
+        stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 0,
+                requested_end: 1000,
+                skip_layout: false,
+                limiter: Some(&limiter),
+                conn_key: "peerA",
+                egress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
         // Peer B has its own fresh bucket → its first serve is instant.
         let start = tokio::time::Instant::now();
-        stream_fetched_range(&mut out, &f, 0, 1000, false, Some(&limiter), "peerB")
-            .await
-            .unwrap();
+        stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 0,
+                requested_end: 1000,
+                skip_layout: false,
+                limiter: Some(&limiter),
+                conn_key: "peerB",
+                egress: &|_| {},
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             start.elapsed(),
             std::time::Duration::ZERO,
@@ -4476,16 +4587,23 @@ mod tests {
 
         let logs = capture_logs(async {
             let mut out = tokio::io::sink();
-            let streamed = stream_fetched_range(&mut out, &f, 0, 100, false, None, &caller)
-                .await
-                .expect("streamed");
+            let streamed = stream_fetched_range(
+                &mut out,
+                &f,
+                RangeStreamPlan {
+                    offset: 0,
+                    requested_end: 100,
+                    skip_layout: false,
+                    limiter: None,
+                    conn_key: &caller,
+                    egress: &|_| {},
+                },
+            )
+            .await
+            .expect("streamed");
             assert_eq!(
-                streamed,
-                StreamOutcome {
-                    bytes: 100,
-                    frames: 1,
-                    refusal: None
-                }
+                (streamed.bytes, streamed.frames, streamed.refusal.clone()),
+                (100, 1, None)
             );
             serve_log::range_outcome(
                 &canonical_target(&req, &caller),
@@ -4510,16 +4628,23 @@ mod tests {
     async fn a_fetch_through_serve_clips_a_request_that_overruns_the_resource() {
         let f = tiny_fetched(300);
         let mut out = tokio::io::sink();
-        let streamed = stream_fetched_range(&mut out, &f, 250, 100, false, None, &test_caller())
-            .await
-            .expect("streamed");
+        let streamed = stream_fetched_range(
+            &mut out,
+            &f,
+            RangeStreamPlan {
+                offset: 250,
+                requested_end: 250 + 100,
+                skip_layout: false,
+                limiter: None,
+                conn_key: &test_caller(),
+                egress: &|_| {},
+            },
+        )
+        .await
+        .expect("streamed");
         assert_eq!(
-            streamed,
-            StreamOutcome {
-                bytes: 50,
-                frames: 1,
-                refusal: None
-            }
+            (streamed.bytes, streamed.frames, streamed.refusal.clone()),
+            (50, 1, None)
         );
     }
 
@@ -4533,9 +4658,20 @@ mod tests {
 
         let logs = capture_logs(async {
             let mut out = tokio::io::sink();
-            let streamed = stream_fetched_range(&mut out, &f, 9_000, 100, false, None, &caller)
-                .await
-                .expect("an error frame is still a written answer");
+            let streamed = stream_fetched_range(
+                &mut out,
+                &f,
+                RangeStreamPlan {
+                    offset: 9_000,
+                    requested_end: 9_000 + 100,
+                    skip_layout: false,
+                    limiter: None,
+                    conn_key: &caller,
+                    egress: &|_| {},
+                },
+            )
+            .await
+            .expect("an error frame is still a written answer");
             assert_eq!(streamed.bytes, 0);
             assert_eq!(streamed.frames, 0);
             assert!(streamed.refusal.is_some(), "the range was refused");

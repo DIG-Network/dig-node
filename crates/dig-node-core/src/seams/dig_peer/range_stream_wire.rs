@@ -475,6 +475,164 @@ async fn a_prologue_longer_than_the_requested_span_is_still_delivered_whole() {
     );
 }
 
+/// **Proves:** every frame's declared `length` equals its own payload, and the identity set is present
+/// on EVERY frame — including the rootless branch, where no builder can set `total_length`.
+///
+/// **Catches:** calling `RangeFrame::with_declared_length` in the belief that it sets `total_length`.
+/// It does not; it overrides `length`, the frame's OWN payload length, and dig-nat documents that a
+/// serve path has no reason to call it because a frame whose `length` disagrees with its payload is one
+/// the reader distrusts. The mistake is invisible to a test that never compares the two — neither
+/// `dig_nat::decode_framed_opt` nor this node's own puller validates the relation — and it is worse than
+/// a wrong number: `ResourceCommitment::check_consistent` is written `if let Some(..)`, so an ABSENT
+/// `total_length`/`root` SKIPS the wrong-generation check rather than failing it. Omitting the field
+/// silently disables the gate.
+///
+/// The rootless branch is reached with a `FetchedResource` carrying no `root`, which is what the
+/// fetch-through serve path hands over when the engine reported none.
+#[tokio::test]
+async fn every_frame_declares_its_own_payload_length_and_the_identity_set() {
+    use crate::peer::stream_fetched_range;
+
+    let (resource, chunk_lens) = oversized_served_resource(3, 511, 24_576);
+    let total = resource.ciphertext.len() as u64;
+
+    // A rootless fetched resource: `root` and `inclusion_proof` are None, so `next_frame` takes the
+    // branch that cannot use `with_identity`.
+    let fetched = crate::download::FetchedResource {
+        bytes: resource.ciphertext.clone(),
+        total_length: total,
+        chunk_lens: chunk_lens.clone(),
+        root: None,
+        inclusion_proof: None,
+    };
+
+    let (client, server) = tokio::io::duplex(1 << 20);
+    let mut out = server;
+    let charged = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let sink = charged.clone();
+    let streamed = stream_fetched_range(
+        &mut out,
+        &fetched,
+        crate::peer::RangeStreamPlan {
+            offset: 0,
+            requested_end: total as usize,
+            skip_layout: false,
+            limiter: None,
+            conn_key: "reader",
+            egress: &move |n| sink.lock().unwrap().push(n),
+        },
+    )
+    .await
+    .expect("the rootless path streams");
+    drop(out);
+
+    let mut reader = client;
+    let mut frames = Vec::new();
+    while let Some(frame) = dig_nat::RangeFrame::decode(&mut reader)
+        .await
+        .expect("every frame decodes")
+    {
+        frames.push(frame);
+    }
+    assert!(
+        frames.len() > 1,
+        "a multi-frame stream, got {}",
+        frames.len()
+    );
+    assert_eq!(frames.len() as u64, streamed.frames);
+
+    for (index, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            frame.length,
+            frame.bytes.len() as u64,
+            "frame {index} declares length {} over a {}-byte payload",
+            frame.length,
+            frame.bytes.len()
+        );
+        assert_eq!(
+            frame.total_length,
+            Some(total),
+            "frame {index} must state total_length even with no root — an absent field SKIPS the \
+             reader's consistency check rather than failing it"
+        );
+        assert_eq!(
+            frame.chunk_count,
+            Some(chunk_lens.len() as u64),
+            "frame {index} must state chunk_count"
+        );
+    }
+
+    // Egress is charged per frame, on the ENCODED size, before each write.
+    let charged = charged.lock().unwrap().clone();
+    assert_eq!(
+        charged.len(),
+        frames.len(),
+        "every frame must be charged exactly once"
+    );
+    assert!(
+        charged.iter().all(|&n| n > 0),
+        "no frame may be charged zero: {charged:?}"
+    );
+    assert_eq!(charged.iter().sum::<u64>(), streamed.encoded_bytes);
+}
+
+/// **Proves:** a prologue page riding a ZERO-payload frame is still charged its real wire cost.
+///
+/// **Catches:** charging the throttles the payload length. Once the requested span is served the
+/// payload is empty while the frame still carries a full ~14 KB `chunk_lens` page, so a payload-based
+/// debit scores it as free. A peer asks for exactly this by requesting one byte and simply NOT setting
+/// `skip_layout` — it is a client-set flag — turning a ~200-byte request into a large unaccounted serve.
+#[tokio::test]
+async fn a_zero_payload_prologue_frame_is_still_charged_its_wire_cost() {
+    use crate::peer::stream_fetched_range;
+
+    // Many small chunks so the prologue needs several pages, and a one-byte span so all but the first
+    // page rides a zero-payload frame.
+    let (resource, chunk_lens) = oversized_served_resource(6, 777, 40);
+    let pages = chunk_lens.len().div_ceil(dig_nat::MAX_CHUNK_LENS_PER_FRAME);
+    assert!(pages >= 3, "need a middle page; got {pages}");
+
+    let fetched = crate::download::FetchedResource {
+        bytes: resource.ciphertext.clone(),
+        total_length: resource.ciphertext.len() as u64,
+        chunk_lens,
+        root: None,
+        inclusion_proof: None,
+    };
+
+    let charged = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let sink = charged.clone();
+    let mut out = tokio::io::sink();
+    let streamed = stream_fetched_range(
+        &mut out,
+        &fetched,
+        crate::peer::RangeStreamPlan {
+            offset: 0,
+            requested_end: 1,
+            skip_layout: false,
+            limiter: None,
+            conn_key: "reader",
+            egress: &move |n| sink.lock().unwrap().push(n),
+        },
+    )
+    .await
+    .expect("streamed");
+
+    let charged = charged.lock().unwrap().clone();
+    assert_eq!(charged.len(), pages, "one frame per owed page: {charged:?}");
+    // One payload byte in total, yet every frame costs real bytes on the wire.
+    assert_eq!(streamed.bytes, 1);
+    assert!(
+        charged.iter().all(|&n| n > 1_000),
+        "each page frame costs kilobytes and must be charged as such: {charged:?}"
+    );
+    assert!(
+        streamed.encoded_bytes > 10_000,
+        "a one-byte request that pulls a paged prologue is a real serve, charged {} bytes",
+        streamed.encoded_bytes
+    );
+}
+
 /// **Proves:** `skip_layout` suppresses the resource-scaling set (`chunk_lens` + `inclusion_proof`)
 /// while the fixed identity set still rides every frame, and the bytes still read correctly.
 ///

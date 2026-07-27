@@ -108,7 +108,10 @@ pub(crate) struct RangeVerification<'a> {
 /// This mirrors `dig_nat::RangeFrame::split_chunk_lens_pages`, which is the normative split and the
 /// reassembler's own mirror. It is reproduced here ONLY because that helper landed in dig-nat 0.14,
 /// while this node is held at 0.13 by dig-download and dig-gossip (see the dependency rationale in
-/// `Cargo.toml`); the moment the tree reaches 0.14 this function should be deleted in favour of it,
+/// `Cargo.toml`); the moment the tree reaches 0.14 this function MUST be deleted in favour of it —
+/// tracked as DIG-Network/dig_ecosystem#1686 (the dig-gossip + dig-peer-selector cascade onto dig-nat
+/// ^0.14 / dig-dht ^0.8), so the mirror's removal is traceable from here rather than depending on
+/// someone remembering why it exists,
 /// because #1640 was precisely two sides of one rule maintained separately. The page SIZE is read from
 /// dig-nat either way, so the one number that matters cannot drift.
 ///
@@ -208,11 +211,21 @@ impl<'a> RangeStreamFramer<'a> {
         if let Some(root) = self.verification.root {
             frame = frame.with_identity(root, self.verification.total_length, chunk_count);
         } else {
-            // No generation root to bind to (a capsule fetch, which is self-verifying on install).
-            // `chunk_count` exists to let a reader detect a wrong-generation or wrong-LAYOUT holder,
-            // and dig-nat deliberately sets it only together with the root it is a fact about, so a
-            // rootless frame states the one thing that is still true of it: the declared length.
-            frame = frame.with_declared_length(self.verification.total_length);
+            // No generation root to bind to (a capsule fetch, or a fetch-through whose root the engine
+            // did not report). The identity set is still owed: `ResourceCommitment::check_consistent`
+            // is written as `if let Some(..)`, so an ABSENT field does not fail the check — it SKIPS
+            // it. Omitting `total_length` here would therefore not be a smaller claim, it would
+            // silently disable the reader's wrong-layout gate.
+            //
+            // These are assigned rather than built, deliberately. `RangeFrame` has NO
+            // `with_total_length`: the only builder that sets it is `with_identity`, which requires a
+            // root this branch does not have. The similarly-named `with_declared_length` sets `length`
+            // — the frame's OWN payload length — and dig-nat's own doc says a serve path has no reason
+            // to call it, because a frame whose `length` disagrees with its payload is one the reader
+            // distrusts. Calling it here is exactly that mistake, and it is invisible to any test that
+            // does not compare `length` against `bytes.len()`.
+            frame.total_length = Some(self.verification.total_length);
+            frame.chunk_count = Some(chunk_count);
         }
         if let Some(index) = chunk_index_at(self.verification.chunk_lens, start) {
             frame = frame.with_chunk_index(index);
@@ -257,24 +270,20 @@ impl<'a> RangeStreamFramer<'a> {
     }
 }
 
-/// Write one range frame through dig-nat's own encoder.
+/// Encode one range frame through dig-nat's own encoder, yielding the exact bytes that go on the wire.
 ///
 /// The encoder is what makes an over-ceiling frame IMPOSSIBLE to emit rather than merely unlikely: it
 /// refuses a payload over [`dig_nat::MAX_RANGE_FRAME_PAYLOAD`], a proof over
 /// [`dig_nat::MAX_INCLUSION_PROOF_B64`], and any body over [`dig_nat::MAX_FRAMED_BODY`]. Every serve
-/// path writes frames through here, so no path can regain the ability to produce something a
-/// conforming receiver is required to reject.
-pub(crate) async fn write_range_frame<W>(
-    w: &mut W,
-    frame: &dig_nat::RangeFrame,
-) -> std::io::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin + ?Sized,
-{
-    use tokio::io::AsyncWriteExt as _;
-    let bytes = frame.encode()?;
-    w.write_all(&bytes).await?;
-    w.flush().await
+/// path encodes through here, so no path can regain the ability to produce something a conforming
+/// receiver is required to reject.
+///
+/// It returns the BYTES rather than writing them so a caller can charge its throttles the real wire
+/// cost before committing to the write. Charging the payload length instead understates a
+/// metadata-heavy frame and scores a zero-payload prologue frame as free, which is a serve a peer can
+/// ask for and a throttle would never see.
+pub(crate) fn encode_range_frame(frame: &dig_nat::RangeFrame) -> std::io::Result<Vec<u8>> {
+    frame.encode()
 }
 
 /// Attach `verification` to a range `frame` whose window starts at absolute byte `start`.

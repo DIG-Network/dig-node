@@ -142,7 +142,8 @@ getrandom = "0.2"
 # the tree -- those calls stop typechecking (verified: E0308 `expected dig_nat::relay::RelayStatus,
 # found dig_nat::RelayStatus`). dig-download 0.12 is now on dig-nat ^0.14, but dig-gossip 0.16 and
 # dig-peer-selector 0.6 are still on ^0.13, so requesting 0.14 resolves TWO dig-nat and TWO dig-dht.
-# Moving to the 0.14 line needs dig-gossip and dig-peer-selector published on it FIRST (release-first,
+# Moving to the 0.14 line needs dig-gossip and dig-peer-selector published on it FIRST -- tracked as
+# DIG-Network/dig_ecosystem#1686 (release-first,
 # §4.1); `tests/dependency_tree.rs` asserts the single-instance invariant against the resolved LOCK so
 # a manifest edit cannot quietly reintroduce the duplicate.
 dig-nat = "0.13"

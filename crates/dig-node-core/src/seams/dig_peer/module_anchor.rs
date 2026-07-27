@@ -340,6 +340,11 @@ mod tests {
     /// verifier compares against is the one the CHAIN gave the caller.
     /// **Catches:** any wiring in which the anchor is resolved from, or influenced by, the peer that
     /// served the module — the single defect that collapses the entire fail-closed story.
+    ///
+    /// Covers BOTH refusal arms deliberately. Asserting only the self-consistent lie stops at the
+    /// generation-binding guard and never reaches rule 4, so it cannot distinguish
+    /// `Indeterminate` from `NotAnchored` — a test that would stay green if the two verdicts were
+    /// swapped is claiming more than it checks.
     #[test]
     fn rejects_a_module_whose_root_is_the_one_the_serving_peer_offered() {
         // The peer serves a perfectly well-formed module and *tells us* its root is OTHER_ROOT, both in
@@ -364,6 +369,17 @@ mod tests {
         assert!(
             reason.contains("chain-resolved root"),
             "the rejection must name the chain anchor, got: {reason}"
+        );
+
+        // The assertion above stops at the GENERATION-BINDING guard, because the pull argument names a
+        // root this verifier is not bound to — so it never reaches rule 4, and it cannot tell the two
+        // verdict arms apart. Drive rule 4 explicitly: the pull names the CHAIN root (clearing the
+        // binding guard) while the module still commits the peer's root, which is the shape rule 4
+        // exists for. It is EVIDENCE about the blob, so it must be `NotAnchored`, not `Indeterminate`.
+        assert_eq!(
+            verdict(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
+            ModuleAnchor::NotAnchored,
+            "a module committing the peer's root, pulled at the chain root, is evidence against the              holder — the arm matters, because only NotAnchored earns a demotion"
         );
     }
 
