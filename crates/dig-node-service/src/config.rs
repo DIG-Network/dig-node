@@ -33,7 +33,7 @@
 //! installs) — and set the SAME value for both the service and the browser launch
 //! so they keep sharing it.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// Default loopback bind port — an UNCOMMON high port, deliberately clear of the
 /// collision-prone common-dev ports (80/443/3000/5000/8000/8080/8888/9000) that a
@@ -227,17 +227,22 @@ impl Config {
         }
     }
 
-    /// The `host:port` socket string for the always-on localhost listener
-    /// (binding / logging): the explicit `DIG_NODE_HOST` override, or the default
-    /// `127.0.0.1` when unset. A bind failure on THIS address is fatal (see
-    /// `server::serve_with_shutdown`) — every consumer (CLI `status`/`pair`, the
-    /// installed-service summary, `/health`'s `addr` field) treats it as THE
-    /// address, so its shape never changes based on the dual-stack default below.
-    pub fn bind_addr(&self) -> String {
-        format!(
-            "{}:{}",
+    /// The socket address for the always-on localhost listener (binding / logging): the
+    /// explicit `DIG_NODE_HOST` override, or the default `127.0.0.1` when unset. A bind
+    /// failure on THIS address is fatal (see `server::serve_with_shutdown`) — every
+    /// consumer (CLI `status`/`pair`, the installed-service summary, `/health`'s `addr`
+    /// field) treats it as THE address, so its shape never changes based on the
+    /// dual-stack default below.
+    ///
+    /// Returns a [`SocketAddr`] rather than a string so the authority can only ever be
+    /// rendered by [`SocketAddr`]'s own `Display`, which brackets an IPv6 literal. The
+    /// previous text-concatenated form (#1682) produced the unbracketed `::1:9778` for an
+    /// IPv6 host, which is not a socket address at all — and the FATAL bind failure that
+    /// followed meant configuring the family §5.2 prefers took the node down.
+    pub fn bind_addr(&self) -> SocketAddr {
+        SocketAddr::new(
             self.host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            self.port
+            self.port,
         )
     }
 
@@ -250,28 +255,30 @@ impl Config {
     /// adding to it). This listener is BEST-EFFORT at bind time (see `serve`): an
     /// IPv6-loopback-unavailable system falls back to IPv4-only, mirroring the
     /// existing [`Config::dig_local_addr`] best-effort pattern.
-    pub fn bind_addr_v6(&self) -> Option<String> {
-        self.host.is_none().then(|| format!("[::1]:{}", self.port))
+    pub fn bind_addr_v6(&self) -> Option<SocketAddr> {
+        self.host
+            .is_none()
+            .then(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), self.port))
     }
 
-    /// The `host:port` socket string for the BEST-EFFORT bare-`http://dig.local`
-    /// listener (`127.0.0.2:80`), or `None` when `dig_local` is disabled (#91).
+    /// The socket address for the BEST-EFFORT bare-`http://dig.local` listener
+    /// (`127.0.0.2:80`), or `None` when `dig_local` is disabled (#91).
     /// `serve` tries to bind this in ADDITION to [`bind_addr`]; a failure is
     /// logged and ignored (localhost keeps serving).
-    pub fn dig_local_addr(&self) -> Option<String> {
+    pub fn dig_local_addr(&self) -> Option<SocketAddr> {
         self.dig_local
-            .then(|| format!("{DIG_LOCAL_IP}:{DIG_LOCAL_PORT}"))
+            .then(|| SocketAddr::new(IpAddr::V4(DIG_LOCAL_IP), DIG_LOCAL_PORT))
     }
 
-    /// The `host:port` for the BEST-EFFORT local HTTPS listener serving
+    /// The socket address for the BEST-EFFORT local HTTPS listener serving
     /// `https://dig.local` (`127.0.0.2:443`, #624), or `None` when `dig_local` is
     /// disabled. Shares the `dig_local` toggle with the plaintext `:80` listener —
     /// both are the "bare dig.local" surface, one plaintext, one TLS. The TLS listener
     /// is additionally gated on a dig-cert leaf being present (`crate::tls`); with no
     /// leaf yet only plaintext serves.
-    pub fn dig_local_https_addr(&self) -> Option<String> {
+    pub fn dig_local_https_addr(&self) -> Option<SocketAddr> {
         self.dig_local
-            .then(|| format!("{DIG_LOCAL_IP}:{DIG_LOCAL_HTTPS_PORT}"))
+            .then(|| SocketAddr::new(IpAddr::V4(DIG_LOCAL_IP), DIG_LOCAL_HTTPS_PORT))
     }
 
     /// The IPv6-loopback HTTPS bind (`[::1]:443`) to open BESIDE
@@ -281,9 +288,9 @@ impl Config {
     /// so an IPv6 loopback client (e.g. `https://localhost` where `localhost` resolves
     /// to `::1` first) reaches the identical surface. BEST-EFFORT: a bind failure is
     /// logged and the node continues on the IPv4 listener (see `server`).
-    pub fn dig_local_https_addr_v6(&self) -> Option<String> {
+    pub fn dig_local_https_addr_v6(&self) -> Option<SocketAddr> {
         self.dig_local
-            .then(|| format!("[::1]:{DIG_LOCAL_HTTPS_PORT}"))
+            .then(|| SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), DIG_LOCAL_HTTPS_PORT))
     }
 }
 
@@ -507,7 +514,10 @@ mod tests {
         // #132: the default localhost port is the uncommon high port 9778 (the
         // dig-wallet 9777 sibling), NOT the collision-prone 8080.
         assert_eq!(DEFAULT_PORT, 9778);
-        assert_eq!(c.bind_addr(), "127.0.0.1:9778");
+        assert_eq!(
+            c.bind_addr(),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9778)
+        );
         assert_eq!(c.upstream, DEFAULT_UPSTREAM);
     }
 
@@ -519,8 +529,14 @@ mod tests {
         // IPv4 loopback AND the additional (best-effort) IPv6 loopback, same port.
         let c = Config::default();
         assert_eq!(c.host, None);
-        assert_eq!(c.bind_addr(), "127.0.0.1:9778");
-        assert_eq!(c.bind_addr_v6().as_deref(), Some("[::1]:9778"));
+        assert_eq!(
+            c.bind_addr(),
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 9778)
+        );
+        assert_eq!(
+            c.bind_addr_v6(),
+            Some(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 9778))
+        );
     }
 
     #[test]
@@ -531,8 +547,99 @@ mod tests {
             host: Some(std::net::Ipv4Addr::new(10, 0, 0, 5).into()),
             ..Config::default()
         };
-        assert_eq!(c.bind_addr(), "10.0.0.5:9778");
+        assert_eq!(
+            c.bind_addr(),
+            SocketAddr::new(Ipv4Addr::new(10, 0, 0, 5).into(), 9778)
+        );
         assert_eq!(c.bind_addr_v6(), None);
+    }
+
+    // ----- #1682: an IPv6 authority is never rendered by text concatenation -----
+
+    /// Every bind address this config can produce, as the string the node actually binds,
+    /// paired with a label naming the accessor it came from.
+    ///
+    /// Collected through `to_string()` deliberately: that is the exact rendering the bind
+    /// path and every operator-facing URL consume, so a test that goes through it cannot
+    /// pass by inspecting typed parts the render then discards.
+    fn rendered_bind_addresses(c: &Config) -> Vec<(&'static str, String)> {
+        let mut out = vec![("bind_addr", c.bind_addr().to_string())];
+        if let Some(v6) = c.bind_addr_v6() {
+            out.push(("bind_addr_v6", v6.to_string()));
+        }
+        if let Some(dl) = c.dig_local_addr() {
+            out.push(("dig_local_addr", dl.to_string()));
+        }
+        if let Some(dl) = c.dig_local_https_addr() {
+            out.push(("dig_local_https_addr", dl.to_string()));
+        }
+        if let Some(dl) = c.dig_local_https_addr_v6() {
+            out.push(("dig_local_https_addr_v6", dl.to_string()));
+        }
+        out
+    }
+
+    /// **Proves:** a literal IPv6 `DIG_NODE_HOST` produces a bind address that PARSES —
+    /// asserted against the exact [`SocketAddr`] expected, not against a substring.
+    ///
+    /// **Catches:** the #1682 defect exactly. `bind_addr` rendered host and port by text, so
+    /// `DIG_NODE_HOST=::1` yielded the unbracketed `::1:9778`, which is not a socket address in
+    /// the grammar — and the bind failure on THIS address is documented FATAL. So configuring
+    /// the family §5.2 makes preferred took the node down.
+    ///
+    /// Two hosts, both real: the loopback an operator on Windows actually reaches the node by,
+    /// and a full-form global-unicast address whose own embedded colons are what make the
+    /// missing brackets ambiguous rather than merely ugly.
+    #[test]
+    fn an_ipv6_host_override_binds_a_parseable_address() {
+        for (host, expected) in [
+            (
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                "[::1]:9778".parse::<SocketAddr>().expect("v6 loopback"),
+            ),
+            (
+                "2001:db8::1".parse::<IpAddr>().expect("v6 global literal"),
+                "[2001:db8::1]:9778"
+                    .parse::<SocketAddr>()
+                    .expect("v6 global"),
+            ),
+        ] {
+            let c = Config {
+                host: Some(host),
+                ..Config::default()
+            };
+            let rendered = c.bind_addr().to_string();
+            let parsed = rendered.parse::<SocketAddr>().unwrap_or_else(|e| {
+                panic!("DIG_NODE_HOST={host} renders {rendered:?}, which does not parse: {e}")
+            });
+            assert_eq!(parsed, expected);
+        }
+    }
+
+    /// **Proves:** EVERY address accessor renders a parseable authority under an IPv6 host —
+    /// not only the one accessor #1682 named.
+    ///
+    /// **Catches:** a fix applied at the single site that was reported while a sibling accessor
+    /// keeps concatenating. The set is enumerated from the config rather than listed per test,
+    /// so a NEW accessor is covered the moment it is added to `rendered_bind_addresses`.
+    #[test]
+    fn every_bind_accessor_renders_a_parseable_authority_for_an_ipv6_host() {
+        for host in [
+            None,
+            Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ] {
+            let c = Config {
+                host,
+                ..Config::default()
+            };
+            for (label, rendered) in rendered_bind_addresses(&c) {
+                assert!(
+                    rendered.parse::<SocketAddr>().is_ok(),
+                    "host={host:?}: {label} rendered {rendered:?}, which is not a socket address"
+                );
+            }
+        }
     }
 
     #[test]
@@ -605,7 +712,10 @@ mod tests {
         // bare-dig.local listener, addressed 127.0.0.2:80.
         let c = Config::default();
         assert!(c.dig_local);
-        assert_eq!(c.dig_local_addr().as_deref(), Some("127.0.0.2:80"));
+        assert_eq!(
+            c.dig_local_addr(),
+            Some(SocketAddr::new(DIG_LOCAL_IP.into(), 80))
+        );
     }
 
     #[test]
@@ -622,8 +732,14 @@ mod tests {
         // The bare `https://dig.local` surface (#624) shares the dig_local toggle and
         // binds 127.0.0.2:443, with the IPv6 loopback sibling on [::1]:443 (§5.2).
         let c = Config::default();
-        assert_eq!(c.dig_local_https_addr().as_deref(), Some("127.0.0.2:443"));
-        assert_eq!(c.dig_local_https_addr_v6().as_deref(), Some("[::1]:443"));
+        assert_eq!(
+            c.dig_local_https_addr(),
+            Some(SocketAddr::new(DIG_LOCAL_IP.into(), 443))
+        );
+        assert_eq!(
+            c.dig_local_https_addr_v6(),
+            Some(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 443))
+        );
     }
 
     #[test]

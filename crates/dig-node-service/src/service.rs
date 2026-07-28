@@ -57,6 +57,7 @@
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -916,7 +917,7 @@ pub fn status(config: &Config) -> io::Result<Outcome> {
     // A tiny blocking probe with a std TcpStream + manual HTTP keeps `status` free
     // of an async runtime and an HTTP client dependency in the binary path. A
     // 2-second connect/read timeout is plenty for loopback.
-    let (serving, summary) = match probe_health(&addr) {
+    let (serving, summary) = match probe_health(addr) {
         Ok(true) => (true, format!("dig-node: SERVING on http://{addr} ({url})")),
         Ok(false) => (
             false,
@@ -932,14 +933,15 @@ pub fn status(config: &Config) -> io::Result<Outcome> {
     };
     Ok(Outcome::new(
         summary,
-        json!({ "serving": serving, "addr": addr, "health_url": url }),
+        json!({ "serving": serving, "addr": addr.to_string(), "health_url": url }),
     ))
 }
 
 /// Minimal blocking HTTP/1.0 `GET /health` probe over loopback. Returns whether
 /// the response status line is `2xx`. Avoids pulling an async HTTP client into the
-/// status path. `addr` is `host:port`.
-fn probe_health(addr: &str) -> io::Result<bool> {
+/// status path. Takes a typed [`SocketAddr`] so an IPv6 target is connected to — and
+/// rendered into the probe URL — without the authority ever being spelled by hand (#1682).
+fn probe_health(addr: SocketAddr) -> io::Result<bool> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -1297,7 +1299,7 @@ SERVICE_NAME: net.dignetwork.dig-node
     #[test]
     fn probe_health_false_on_refused_connection() {
         // 127.0.0.1:1 has nothing listening in the test environment.
-        assert!(!probe_health("127.0.0.1:1").unwrap());
+        assert!(!probe_health(SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 1)).unwrap());
     }
 
     #[test]
