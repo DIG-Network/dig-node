@@ -797,6 +797,135 @@ pub async fn reconcile_and_announce(
     delta
 }
 
+/// Announce this node's ENTIRE current holdings as `Add` deltas, ignoring any diff. Returns how many
+/// frames were sent.
+///
+/// Distinct from [`reconcile_and_announce`] on purpose, and the distinction is the #1734 fix. That
+/// function announces a DELTA computed against the node's OWN local DHT records, which answers "what
+/// changed here", not "what do my peers know". Those two diverge silently the moment an inventory
+/// change happens with nobody listening: the local records move, the flood reaches zero peers, and
+/// every later reconcile of the same inventory is a no-op — so a node that pinned before its first peer
+/// (or restarted with content already cached, where the remembered set is seeded from disk) holds the
+/// capsule, believes it announced, and is invisible to every peer it later connects to.
+///
+/// This function has no such state to be wrong about: it re-states the whole truth. Re-stating is safe
+/// and cheap because an `Add` is idempotent at every receiver — a re-ingested record refreshes the same
+/// provider entry under an advancing `seq` — so the repair costs one frame per inventory batch and can
+/// never contradict the durable records it mirrors.
+pub async fn announce_all_holdings(
+    broadcaster: &HoldingsBroadcaster,
+    transport: &dyn AnnounceTransport,
+    cached: &[crate::CachedCapsule],
+    now: u64,
+) -> usize {
+    let held = crate::dht::inventory_content_ids(cached);
+    if held.is_empty() {
+        return 0; // nothing to state; a node holding nothing has nothing to be invisible about
+    }
+    broadcaster
+        .announce_change(transport, &held, &[], now)
+        .await
+}
+
+/// The node's current cached inventory, as the holdings layer needs to read it.
+///
+/// A trait rather than a `&Node` so the peer-presence announcer below is drivable over a real gossip
+/// wire without a node or a disk — the wiring across two nodes is the only place the #1734 defect is
+/// visible, so that path has to be testable.
+#[async_trait::async_trait]
+pub trait HoldingsInventory: Send + Sync {
+    /// The capsules this node currently holds.
+    async fn current(&self) -> Vec<crate::CachedCapsule>;
+}
+
+/// Whether this node currently observes any connected peer — the edge the announce hangs on.
+///
+/// Kept as a tiny explicit state machine, separate from the task that drives it, because the EDGE
+/// definition is the whole policy: it must fire on `0 -> N` (the node was unheard, so its holdings must
+/// be re-stated) and must NOT fire when an already-peered pool merely grows (that would re-flood the
+/// full inventory on every pool addition). A total loss of peers re-arms it, since a node whose only
+/// peer went away is invisible again the moment one returns.
+#[derive(Debug, Default)]
+pub struct PoolPresence {
+    has_peers: bool,
+}
+
+impl PoolPresence {
+    /// Fold in an observed connected-peer count; `true` means "announce now".
+    pub fn observe(&mut self, connected: usize) -> bool {
+        let rising = connected > 0 && !self.has_peers;
+        self.has_peers = connected > 0;
+        rising
+    }
+}
+
+/// Re-state this node's holdings to its peers whenever the pool rises from zero peers to some (#1734).
+///
+/// Spawned once at bring-up, and the reason "I hold X" and "peers know I hold X" cannot drift apart for
+/// long: the very first non-empty pool observation announces the current inventory in full, so a pin
+/// that happened with nobody connected — and a restart whose remembered inventory came off disk — both
+/// repair themselves the moment a peer arrives, with no unpin/repin dance. Ends when the pool's event
+/// channel closes.
+///
+/// Best-effort by construction: a failed subscribe logs and returns, leaving the durable DHT provider
+/// records as the discovery path (a freshness degradation, never an outage).
+pub async fn run_first_peer_announcer(
+    pool: dig_gossip::GossipHandle,
+    inventory: Arc<dyn HoldingsInventory>,
+    broadcaster: Arc<HoldingsBroadcaster>,
+) {
+    // Subscribed BEFORE the first count is read, so a peer that connects between the two is still seen
+    // as an event rather than silently falling into the gap.
+    let mut events = match pool.subscribe_pool_events() {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "holdings announce: no pool events; holdings pinned before the first peer will only \
+                 be discoverable through the durable DHT records"
+            );
+            return;
+        }
+    };
+    let mut presence = PoolPresence::default();
+    let mut announce_if_rising = |connected: usize| presence.observe(connected);
+
+    if announce_if_rising(pool.connected_pool_peers().len()) {
+        restate_holdings(&pool, inventory.as_ref(), broadcaster.as_ref()).await;
+    }
+    loop {
+        match events.recv().await {
+            // The count is re-read from the pool rather than tracked from the event stream: the pool is
+            // the authority on who is connected, and a lagged receiver would otherwise leave a
+            // reconstructed count permanently wrong.
+            Ok(_) => {
+                if announce_if_rising(pool.connected_pool_peers().len()) {
+                    restate_holdings(&pool, inventory.as_ref(), broadcaster.as_ref()).await;
+                }
+            }
+            // Lagged: the count is re-read anyway, so a missed event costs nothing but a re-check.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Flood the node's whole current inventory to the pool, logging what it re-stated.
+async fn restate_holdings(
+    pool: &dig_gossip::GossipHandle,
+    inventory: &dyn HoldingsInventory,
+    broadcaster: &HoldingsBroadcaster,
+) {
+    let cached = inventory.current().await;
+    let held = cached.len();
+    let frames = announce_all_holdings(broadcaster, pool, &cached, now_unix_secs()).await;
+    tracing::info!(
+        held,
+        frames,
+        "dig-node holdings: peers arrived — re-announced this node's current holdings"
+    );
+}
+
 /// Consume inbound opcode-222 frames from the gossip pool forever, applying each through `ingress`.
 ///
 /// Spawned once at bring-up. Non-222 frames are ignored (other subscribers handle them), and a lagged

@@ -3152,6 +3152,20 @@ retracts and leave this node advertising content it does not hold.
 - A degraded node (no signable leaf, no inbound receiver) MUST remain discoverable through the durable
   DHT records — the real-time layer is additive and MUST NOT be a hard dependency of discoverability.
 
+**Peer-presence re-announce (MUST, #1734).** A node MUST re-announce its CURRENT holdings in full — every
+held content id as an `Add`, with no diff — whenever its connected peer pool rises from ZERO peers to one
+or more, including the first such observation after bring-up. It MUST NOT re-announce merely because an
+already-peered pool grew.
+
+The reconcile delta above is computed against this node's OWN local provider records, so it answers "what
+changed here", never "what do my peers know". Those two diverge silently as soon as an inventory change
+happens with nobody connected: the local records move, the flood reaches zero peers, and every later
+reconcile of the same inventory is a no-op. Without this rule a node that pinned before its first peer — or
+that RESTARTED with content already cached, where the remembered inventory is seeded from disk before any
+peer connects — holds the content, has recorded it as announced, and is invisible to every peer it later
+connects to, with a restart re-entering the same state. Re-stating the whole inventory is safe because an
+`Add` is idempotent at every receiver under an advancing `seq`.
+
 **Ingress (MUST).** An inbound announcement is applied ONLY after all of the following, fail-closed, at a
 single chokepoint. dig-dht is crypto-free by design, and `ingest_verified_provider` is the sole sanctioned
 bypass of its mTLS self-announce check, so these are the whole of the authentication:

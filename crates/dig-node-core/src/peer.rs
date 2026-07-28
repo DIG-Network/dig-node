@@ -859,6 +859,16 @@ impl crate::seams::dig_peer::AnnounceHolder for DhtInventoryAnnouncer {
     }
 }
 
+/// The node's cache list, as the holdings layer's peer-presence announcer reads it (#1734).
+struct NodeHoldingsInventory(Arc<crate::Node>);
+
+#[async_trait::async_trait]
+impl crate::seams::dig_peer::holdings::HoldingsInventory for NodeHoldingsInventory {
+    async fn current(&self) -> Vec<crate::CachedCapsule> {
+        self.0.cache_list_cached().await
+    }
+}
+
 /// The signer plus the pool it floods to — everything needed to emit an opcode-222 announcement.
 #[derive(Clone)]
 struct HoldingsFlood {
@@ -2268,6 +2278,20 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         broadcaster,
         pool: handle.clone(),
     });
+
+    // Re-state the node's holdings the first time it sees a connected peer, and on every later
+    // return-from-zero (#1734). Without this a node is only ever heard when its inventory CHANGES while
+    // a peer happens to be listening: a pin at zero peers — and a restart, whose remembered inventory is
+    // seeded from disk before any peer connects — moves the local records and leaves every later
+    // reconcile a no-op, so the node holds the content, believes it announced, and is invisible.
+    if let Some(flood) = holdings_flood.as_ref() {
+        tokio::spawn(crate::seams::dig_peer::holdings::run_first_peer_announcer(
+            handle.clone(),
+            Arc::new(NodeHoldingsInventory(node.clone()))
+                as Arc<dyn crate::seams::dig_peer::holdings::HoldingsInventory>,
+            flood.broadcaster.clone(),
+        ));
+    }
 
     // 4a. Feed the DHT routing table LIVE from the gossip pool (#1574): bring_up_dht's one-shot
     //     bootstrap runs BEFORE any peer connects, so in a freshly-formed network routing starts empty
