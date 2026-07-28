@@ -4,6 +4,40 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## A git-pinned peer-stack dep hides shipped fixes indefinitely — the network looked dead for 11 minors (#1771)
+
+dig-gossip is a **git dependency pinned by rev** (it cannot go to crates.io until dig-peer-protocol
+#681 lands), so it does not participate in any automated dependency cascade: nothing bumps it, and
+`cargo update` will not move it. It sat at a v0.16.0-era rev while eleven minors accumulated upstream,
+including all THREE duplicate-connection fixes (#1691 inbound, #1703 `connect_to`, #1762
+`adopt_nat_connection`). A live EC2 run reproduced all three symptoms *simultaneously* — the fixes were
+real, released, tested, and simply not present in the binary. **A rev-pinned dep needs a deliberate,
+scheduled bump; treat "the fix is released" as unproven until the pin says so.**
+
+Two couplings make that bump non-trivial, and both are structural rather than incidental:
+
+- **The peer stack's dig-nat major moves as ONE atomic step.** dig-node-core constructs its own
+  `NodeCert` / `NatConfig` / `NatRuntime` / `RelayStatus` / `TraversalKind` values and passes them INTO
+  dig-download, dig-gossip and dig-peer-selector. Two dig-nat instances in the tree therefore do not
+  merely bloat it — those calls stop typechecking (`E0308 expected dig_nat::relay::RelayStatus, found
+  dig_nat::RelayStatus`). So bumping dig-gossip across a dig-nat major forces dig-nat + dig-dht +
+  dig-download + dig-peer + dig-peer-selector in the same commit, and it is blocked outright until every
+  member of the line is published. `tests/dependency_tree.rs` asserts the single-instance invariant
+  against the resolved lock, which is what makes a partial cascade fail loudly instead of oddly.
+- **The vendored-fork patch revs move in lockstep with the dep rev (the #1529 3-rev rule).** A git
+  dep's own `[patch.crates-io]` does NOT apply transitively, so the workspace re-declares dig-gossip's
+  vendored additive `chia-protocol`/`chia-sdk-client` at the SAME rev. Leaving the patch rev behind
+  resolves two copies of a patched crate — a tree that builds green and behaves oddly.
+
+**The behavioural half of a bump matters more than the compile half.** The v0.17 pool republishes
+`PoolEvent::PeerAdded` when a fresh session supersedes a stale slot for the same `peer_id`, so any
+consumer that counts `PeerAdded` events over-counts under reconnect churn — all of dig-node's consumers
+are keyed by `peer_id` and idempotent, so they were safe, but the download-side connected pool APPENDED
+the new address and left the superseded (typically dead) one leading the dial order, costing a failed
+dial per fetch. Likewise `GossipStats::total_connections` is a LIFETIME counter a supersede increments;
+only `connected_peers` / `pool_stats().connected` (live keyed-map sizes) are unique-peer counts. When
+bumping a dep whose fix removes a REFUSAL, audit what the refusal was silently keeping rare.
+
 ## A mock-transport regression test proves NOTHING about the wire — the read leg died in JSON serde (#1586)
 
 `dig.fetchRange` frames are JSON, so the ciphertext window travels as **base64** — the canonical
