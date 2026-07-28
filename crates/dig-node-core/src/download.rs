@@ -652,10 +652,10 @@ impl NodeContent {
         // already self-filtered but otherwise unranked; the selector refines the SOURCE choice at
         // schedule time, not the discovered set. The same RAW `locator` stays on the engine for the
         // redirect-on-miss path (a redirect offers ALL known non-self holders).
-        let config = DownloadConfig {
-            selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
-            ..DownloadConfig::default()
-        };
+        // dig-download 0.12 marked `DownloadConfig` `#[non_exhaustive]`, so it is built by mutating a
+        // default rather than by a struct literal — every future field stays a minor bump for us.
+        let mut config = DownloadConfig::default();
+        config.selector = Some(Arc::new(SelectorAdapter::new(selector.clone())));
         // The DOWNLOAD locator (#1590) = a [`PoolProviderLocator`] over the live connected-pool set
         // UNIONed with the raw discovery `locator`. So a fetch's locate step also offers the peers the
         // node is ALREADY CONNECTED to — reaching a holder whose DHT provider record is unreachable on
