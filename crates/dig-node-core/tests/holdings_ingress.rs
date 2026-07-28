@@ -1196,6 +1196,136 @@ async fn the_provider_map_evicts_the_least_recently_seen_at_its_capacity() {
     );
 }
 
+/// PROPERTY: the SENDER map is capacity-bounded, and the entry it drops at the bound is the
+/// LEAST-RECENTLY-SEEN one.
+///
+/// The sender half of `SPEC.md` §19.3a's "capacity-bounded (1,024 senders, 8,192 providers) with
+/// least-recently-seen eviction" was, until this test, an untested claim: deleting
+/// `evict_lru(&mut self.senders, …)` left the whole suite green. It is a real bound, not bookkeeping
+/// — a `peer_id` is `SHA-256(NodeCert SPKI)` and therefore self-minted, so connect → announce →
+/// disconnect churn offers an unbounded key space and nothing else ever removes a sender entry.
+///
+/// The fixture mirrors the provider-side test's two disciplines, because a count alone cannot tell
+/// LRU eviction from evicting an arbitrary entry:
+///
+/// - **A reachable cap.** [`IngressLimits::tracked_senders`] is parameterised, so the bound is
+///   crossed with four transport identities instead of 1,025.
+/// - **A second observable besides the count.** Eviction is read through its CONSEQUENCE: a sender
+///   entry IS that sender's delta budget, so losing the entry restores an exhausted sender's ability
+///   to relay. Every sender is driven to exhaustion first, the same relay is asserted REFUSED before
+///   the bound is crossed, and a RETAINED sender is probed before the evicted one — so the final
+///   admission is attributable to eviction of the least-recently-seen entry and to nothing else.
+///
+/// A too-old frame from a never-seen fifth sender sits in the middle: it must neither allocate a
+/// sender entry nor evict one, composing this bound with the allocate-nothing-on-reject rule.
+#[tokio::test]
+async fn the_sender_map_evicts_the_least_recently_seen_at_its_capacity() {
+    const CAP: usize = 3;
+    /// Deltas one sender may relay per window — small enough that two relays exhaust it.
+    const BUDGET: u32 = 2;
+
+    let us = TestPeer::new();
+    let sink = RecordingSink::default();
+    let ingress = HoldingsIngress::with_limits(
+        us.peer_id_hex.clone(),
+        IngressLimits {
+            tracked_senders: CAP,
+            deltas_per_sender: BUDGET,
+            ..IngressLimits::default()
+        },
+    );
+
+    // Four relaying transports, each last seen at a distinct second so the least-recently-seen order
+    // is unambiguous. All stamps stay well inside both RATE_WINDOW_SECS and MAX_ANNOUNCE_AGE_SECS.
+    let relays: Vec<TestPeer> = (0..=CAP).map(|_| TestPeer::new()).collect();
+    let seen_at = |i: usize| NOW + i as u64;
+
+    // One relay through transport `i`, carrying a single delta from a FRESHLY minted provider — so
+    // every provider-side gate passes and the only budget in play is the sender's.
+    let relay = |i: usize, seed: u8, at: u64| {
+        let announce = TestPeer::new().announce(1, vec![add_delta(&content(seed))]);
+        let ingress = &ingress;
+        let sink = &sink;
+        let sender = &relays[i].peer_id_hex;
+        async move { ingress.accept(sink, sender, &announce, at).await }
+    };
+
+    // Fill the map to capacity, exhausting each sender's budget as we go.
+    for i in 0..CAP {
+        for d in 0..BUDGET {
+            let seed = 10 + (i as u32 * BUDGET + d) as u8;
+            relay(i, seed, seen_at(i))
+                .await
+                .unwrap_or_else(|e| panic!("sender {i} relay {d} must be admitted, got {e:?}"));
+        }
+    }
+    let (at_cap, _) = ingress.tracked_counts().await;
+    assert_eq!(
+        at_cap, CAP,
+        "exactly at the capacity nothing may be evicted — a bound tested only from above cannot \
+         show it is the RIGHT bound"
+    );
+    assert_eq!(
+        relay(0, 90, seen_at(CAP)).await,
+        Err(Rejected::RateLimited),
+        "before the bound is crossed the oldest sender still holds its exhausted budget; without \
+         this the admission asserted below would not be attributable to eviction"
+    );
+
+    // A rejected frame in the mix, from a transport this ingress has never seen.
+    let stranger_sender = TestPeer::new();
+    let stale = TestPeer::new().announce_at(
+        1,
+        NOW - MAX_ANNOUNCE_AGE_SECS - 1,
+        vec![add_delta(&content(91))],
+    );
+    assert!(
+        matches!(
+            ingress
+                .accept(&sink, &stranger_sender.peer_id_hex, &stale, seen_at(CAP))
+                .await,
+            Err(Rejected::Stale { .. })
+        ),
+        "the fixture's rejected frame must be rejected on FRESHNESS, not on the capacity bound"
+    );
+    let (after_reject, _) = ingress.tracked_counts().await;
+    assert_eq!(
+        after_reject, CAP,
+        "a rejected announcement must neither allocate a sender entry nor evict one"
+    );
+
+    // One over the bound.
+    let last = seen_at(CAP);
+    relay(CAP, 92, last).await.unwrap_or_else(|e| {
+        panic!(
+            "a {n}th distinct sender must be admitted, got {e:?}",
+            n = CAP + 1
+        )
+    });
+    let (over_cap, _) = ingress.tracked_counts().await;
+    assert_eq!(
+        over_cap,
+        CAP,
+        "admitting a {n}th distinct sender must leave the map at its capacity",
+        n = CAP + 1
+    );
+
+    // The retained sender is asserted FIRST: readmitting the evicted one evicts a new victim, which
+    // would destroy the very budget the other assertion reads.
+    assert_eq!(
+        relay(1, 93, last).await,
+        Err(Rejected::RateLimited),
+        "a sender that was NOT the least-recently-seen must keep its exhausted budget — otherwise \
+         the map is being cleared, or the wrong victim chosen, rather than evicted \
+         least-recently-seen first"
+    );
+    assert!(
+        relay(0, 94, last).await.is_ok(),
+        "the LEAST-recently-seen sender is the one evicted, so its budget is gone with its entry \
+         and it may relay again"
+    );
+}
+
 // =============================================================================================
 // The three guards the round-2 defect-revert probe found UNVERIFIED
 // =============================================================================================

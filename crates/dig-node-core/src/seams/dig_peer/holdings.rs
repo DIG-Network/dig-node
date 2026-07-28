@@ -53,6 +53,10 @@ use dig_gossip::{
 /// DHT's TTL is silently truncated and claiming *shorter* under-advertises a holder that is in fact
 /// still serving. One hour sits inside every current provider TTL, so the clamp is a no-op and the
 /// advertised lifetime is the one the announcer actually meant.
+///
+/// COUPLING: this value MUST track [`dig_dht::DhtConfig::provider_ttl`] (default 2 hours) and stay
+/// `<=` the smallest one any receiving node configures. Reducing that field below one hour, without a
+/// matching reduction here, silently truncates every advertisement this node makes.
 pub const ADVERTISED_TTL_SECS: u64 = 3_600;
 
 /// Announcements one **provider** may have applied per [`RATE_WINDOW_SECS`].
@@ -103,8 +107,12 @@ pub const MAX_ANNOUNCE_AGE_SECS: u64 = 300;
 
 /// Transport senders tracked before the least-recently-seen is evicted.
 ///
-/// The key is a peer this node holds a live mTLS link to, so the live key space is the connected
-/// pool; this cap is headroom over any realistic pool rather than the primary bound.
+/// The key is a peer this node holds a live mTLS link to, but "headroom over a realistic connected
+/// pool" is the wrong reading of this number: it is a HARD BOUND on unbounded growth. A `peer_id` is
+/// `SHA-256(NodeCert SPKI)` — self-minted, costing one key pair — and an entry is never removed by
+/// disconnection, so the key space this map follows is the set of transports that have EVER relayed
+/// an accepted announcement, which connect → announce → disconnect churn grows without limit. The
+/// eviction, not the pool size, is what keeps the map finite.
 pub const MAX_TRACKED_SENDERS: usize = 1_024;
 
 /// Providers tracked (latest `seq` + announce bucket) before the least-recently-seen is evicted.
