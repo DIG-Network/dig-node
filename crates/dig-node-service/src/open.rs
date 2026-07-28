@@ -61,7 +61,7 @@
 //!    "open" facility as a SINGLE non-shell argv entry.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use dig_urn_resolver::images::{self, ErrorImage};
@@ -69,7 +69,7 @@ use dig_urn_resolver::{ResolveError, ResolveOutcome, ResolvedData};
 use serde_json::json;
 
 use crate::cli::Outcome;
-use crate::config::Config;
+use crate::config::{Config, DIG_LOCAL_HOST};
 
 /// Shell metacharacters (and quoting/grouping characters) rejected anywhere in the link. The
 /// launch path never uses a shell, so this is defense-in-depth against the untrusted OS argument
@@ -455,19 +455,55 @@ fn candidate_urls(config: &Config, link: &DigLink) -> Vec<String> {
     if link.root.is_none() {
         urls.push(format!("http://{}.dig/{}", link.store_id, path));
     }
-    urls.push(serve_url("dig.local", None, &store_ref, path));
-    let host = browser_host(config);
-    urls.push(serve_url(&host, Some(config.port), &store_ref, path));
+    urls.push(serve_url(
+        &UrlAuthority::Named {
+            name: DIG_LOCAL_HOST,
+            port: None,
+        },
+        &store_ref,
+        path,
+    ));
+    urls.push(serve_url(&browser_authority(config), &store_ref, path));
     urls
 }
 
-/// Build a node `/s/<ref>/<path>` serve URL for `host` (with an optional explicit `port`). A
-/// store-root (empty path) keeps a trailing slash (the #289 route contract).
-fn serve_url(host: &str, port: Option<u16>, store_ref: &str, path: &str) -> String {
-    let authority = match port {
-        Some(p) => format!("{host}:{p}"),
-        None => host.to_string(),
-    };
+/// A URL authority — a `host` or `host:port` — that can only be assembled from TYPED parts.
+///
+/// The point of the type is what it makes IMPOSSIBLE: an IPv6 literal can only reach a URL
+/// through [`UrlAuthority::Socket`], whose rendering is [`SocketAddr`]'s own `Display`, and that
+/// always brackets. Concatenating an `IpAddr` and a port by text (#1682, §5.2) produces
+/// `::1:9778` — which is not an authority in the URL grammar — and no amount of care at a call
+/// site keeps that out of a signature that accepts `&str`. Here there is no such signature.
+enum UrlAuthority {
+    /// A DNS name with an optional port. A name never needs bracketing, so this arm carries
+    /// `&'static str`: only names this binary itself knows (`dig.local`, `localhost`) belong
+    /// here — never operator- or peer-supplied text.
+    Named {
+        /// The registered name, e.g. `dig.local`.
+        name: &'static str,
+        /// The port, or `None` for the scheme default.
+        port: Option<u16>,
+    },
+    /// An IP address and port. Rendered by [`SocketAddr`], so an IPv6 literal is bracketed.
+    Socket(SocketAddr),
+}
+
+impl std::fmt::Display for UrlAuthority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UrlAuthority::Named {
+                name,
+                port: Some(port),
+            } => write!(f, "{name}:{port}"),
+            UrlAuthority::Named { name, port: None } => write!(f, "{name}"),
+            UrlAuthority::Socket(addr) => write!(f, "{addr}"),
+        }
+    }
+}
+
+/// Build a node `/s/<ref>/<path>` serve URL for `authority`. A store-root (empty path) keeps a
+/// trailing slash (the #289 route contract).
+fn serve_url(authority: &UrlAuthority, store_ref: &str, path: &str) -> String {
     if path.is_empty() {
         format!("http://{authority}/s/{store_ref}/")
     } else {
@@ -475,13 +511,16 @@ fn serve_url(host: &str, port: Option<u16>, store_ref: &str, path: &str) -> Stri
     }
 }
 
-/// The host for the `localhost` tier URL: the operator's explicit `DIG_NODE_HOST` when set
-/// (bracketed for IPv6), else `localhost` — friendlier than `127.0.0.1` and equally reachable.
-fn browser_host(config: &Config) -> String {
+/// The authority for the `localhost` tier URL: the operator's explicit `DIG_NODE_HOST` when set,
+/// else the name `localhost` — friendlier than `127.0.0.1` and equally reachable, and the form
+/// that follows the resolver to whichever loopback family answers (§5.2).
+fn browser_authority(config: &Config) -> UrlAuthority {
     match config.host {
-        Some(ip) if ip.is_ipv6() => format!("[{ip}]"),
-        Some(ip) => ip.to_string(),
-        None => "localhost".to_string(),
+        Some(ip) => UrlAuthority::Socket(SocketAddr::new(ip, config.port)),
+        None => UrlAuthority::Named {
+            name: "localhost",
+            port: Some(config.port),
+        },
     }
 }
 
@@ -599,6 +638,74 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
+
+    /// **Proves:** the `localhost`-tier candidate URL carries a BRACKETED authority for an IPv6
+    /// `DIG_NODE_HOST`, asserted as the exact full URL.
+    ///
+    /// **Catches:** the [`UrlAuthority`] typing being unwound back to text concatenation (#1682,
+    /// §5.2) — an unbracketed `http://::1:9778/s/…` is not a URL a browser can navigate.
+    ///
+    /// Honest about what this is: unlike the `bind_addr` case, this was NEVER live. The former
+    /// `browser_host` already bracketed, so no fixture could have made the old code fail here. It
+    /// is a REGRESSION PIN on the typed construction, and its load-bearing-ness was proven by
+    /// deleting the bracketing and watching it fail, not by a red-first run.
+    ///
+    /// The global-unicast address is chosen over `::1` deliberately: its own interior `::` is what
+    /// makes a missing bracket ambiguous rather than merely unusual, and a full-form address also
+    /// exercises `SocketAddr`'s zero-compression rendering.
+    #[test]
+    fn the_localhost_tier_url_brackets_an_ipv6_host() {
+        let link = DigLink {
+            store_id: store(),
+            root: None,
+            path: "index.html".to_string(),
+        };
+        for (host, expected_authority) in [
+            (
+                "2001:db8::1".parse().expect("v6 global literal"),
+                "[2001:db8::1]:9778",
+            ),
+            ("::1".parse().expect("v6 loopback literal"), "[::1]:9778"),
+            ("10.0.0.5".parse().expect("v4 literal"), "10.0.0.5:9778"),
+        ] {
+            let config = Config {
+                host: Some(host),
+                port: 9778,
+                ..Config::default()
+            };
+            let urls = candidate_urls(&config, &link);
+            let expected = format!("http://{expected_authority}/s/{}/index.html", store());
+            assert!(
+                urls.contains(&expected),
+                "host={host}: expected the exact URL {expected:?} among {urls:?}"
+            );
+        }
+    }
+
+    /// **Proves:** with no `DIG_NODE_HOST` override the `localhost`-tier URL uses the NAME
+    /// `localhost`, not a literal address.
+    ///
+    /// **Catches:** the default collapsing to `127.0.0.1`, which would pin the URL to one loopback
+    /// family and lose the §5.2 property that the resolver picks whichever family answers — the
+    /// exact failure #288 exists to prevent, in URL form.
+    #[test]
+    fn the_default_localhost_tier_url_uses_the_name_not_a_literal_address() {
+        let link = DigLink {
+            store_id: store(),
+            root: None,
+            path: String::new(),
+        };
+        let config = Config {
+            host: None,
+            port: 9778,
+            ..Config::default()
+        };
+        let urls = candidate_urls(&config, &link);
+        assert!(
+            urls.contains(&format!("http://localhost:9778/s/{}/", store())),
+            "expected the localhost NAME form among {urls:?}"
+        );
+    }
 
     fn store() -> String {
         "a".repeat(64)

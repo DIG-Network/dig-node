@@ -839,3 +839,34 @@ TRANSITIVE LOCK entry for exactly this reason, and a caret dep looking correct p
 array summing to `total_length`, so a partial layout is unusable rather than partially useful. That is
 why a paged prologue must complete before a stream ends — including on a one-byte request, where the
 remaining pages ride zero-payload frames — and why `complete` is withheld until the last page is out.
+
+## An address is a TYPE, not a string — and a fixed guard's allowlist takes its detectors with it (#1682, #1722)
+
+`Config::bind_addr` rendered `DIG_NODE_HOST` and the port with `format!("{host}:{port}")`. For an
+IPv6 host that yields `::1:9778`, which is not a socket address in the grammar — and since a bind
+failure on that listener is documented FATAL, configuring the address family §5.2 PREFERS took the
+node down. The lesson is not "remember to bracket": it is that a function returning `String` cannot
+stop the next caller, so the accessors now return `SocketAddr` and the authority can only be rendered
+by `SocketAddr`'s own `Display`. Typing it found two further live defects nobody had ticketed — the
+control client's `http://{addr}/` JSON-RPC URL and the `extension_host` operator log line — because
+both consumed the same broken string.
+
+Two things worth carrying beyond this fix:
+
+**A guard's allowlist can be load-bearing for the guard itself.** The #1593 source scanner proved it
+had escaped its own crate by asserting `waived == KNOWN_VIOLATIONS.len()`: both tracked violations
+lived in the sibling crate `dig-node-service`, so reaching them proved the scan's reach. Fixing both
+defects emptied the list and turned that assertion into `0 == 0` — the check evaporated at exactly
+the moment it succeeded, and nothing would have reported it. When you pay off a tracked-violation
+list, look for what the list was incidentally proving; here the reach detector was replaced with a
+direct assertion that the scan read files from the sibling crate. Same property, no dependence on
+debt existing.
+
+**A ticket saying "the margin is zero" may be measuring a different relation than the one it names.**
+#1722 reported dig-node's `ADVERTISED_TTL_SECS` as having zero margin against dig-dht's
+`provider_ttl`. It has an hour of margin against `provider_ttl` (1h vs 2h) and zero against
+`republish_interval` (1h vs 1h) — two distinct relations with opposite failure modes: exceeding
+`provider_ttl` gets the claim silently clamped, while a `republish_interval` above the advertised TTL
+makes records expire before the holder re-announces. Pinning only the named relation would have left
+the real one unguarded. No single value satisfies both bounds with margin, so closing the zero margin
+is a wire-behaviour decision, not a test fix.

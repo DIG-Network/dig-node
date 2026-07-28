@@ -402,7 +402,7 @@ pub async fn build_state(config: &Config) -> AppState {
             .user_agent(concat!("dig-node/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("dig-node: build http client"),
-        addr: config.bind_addr(),
+        addr: config.bind_addr().to_string(),
         config_path,
         state_dir,
         control_token,
@@ -1566,7 +1566,7 @@ where
         Some(v6_addr) => match tokio::net::TcpListener::bind(&v6_addr).await {
             Ok(l) => Some((v6_addr, l)),
             Err(e) => {
-                warn_ipv6_bind_failed(&v6_addr, &e);
+                warn_ipv6_bind_failed(v6_addr, &e);
                 None
             }
         },
@@ -1582,7 +1582,7 @@ where
                 Some((dl_addr, l))
             }
             Err(e) => {
-                warn_dig_local_bind_failed(&dl_addr, &e);
+                warn_dig_local_bind_failed(dl_addr, &e);
                 None
             }
         },
@@ -1680,7 +1680,7 @@ where
 /// loopback bind failure is uncommon (most OSes always provide `::1`) but not
 /// impossible: IPv6 disabled at the kernel/network-stack level, or a sandboxed/
 /// restricted environment without it.
-fn warn_ipv6_bind_failed(v6_addr: &str, e: &std::io::Error) {
+fn warn_ipv6_bind_failed(v6_addr: SocketAddr, e: &std::io::Error) {
     tracing::warn!(
         addr = %v6_addr,
         error = %e,
@@ -1695,7 +1695,7 @@ fn warn_ipv6_bind_failed(v6_addr: &str, e: &std::io::Error) {
 /// continue, never abort") is obvious at the call site. The hint is platform-aware:
 /// `:80` is privileged on Linux (root / CAP_NET_BIND_SERVICE) and on macOS also
 /// needs the `127.0.0.2` loopback alias.
-fn warn_dig_local_bind_failed(dl_addr: &str, e: &std::io::Error) {
+fn warn_dig_local_bind_failed(dl_addr: SocketAddr, e: &std::io::Error) {
     tracing::warn!(
         addr = %dl_addr,
         error = %e,
@@ -1748,7 +1748,7 @@ fn bring_up_local_https(config: &Config, app: &Router, shutdown_notify: &Arc<tok
 
     // (4a) The IPv4 dig.local alias `127.0.0.2:443` — the name `https://dig.local` resolves to.
     spawn_https_listener(
-        &https_addr,
+        https_addr,
         rustls_config.clone(),
         app.clone(),
         shutdown_notify,
@@ -1756,7 +1756,7 @@ fn bring_up_local_https(config: &Config, app: &Router, shutdown_notify: &Arc<tok
 
     // (4b) The best-effort IPv6 loopback sibling `[::1]:443` (§5.2), covered by the leaf SAN.
     if let Some(v6_addr) = config.dig_local_https_addr_v6() {
-        spawn_https_listener(&v6_addr, rustls_config, app.clone(), shutdown_notify);
+        spawn_https_listener(v6_addr, rustls_config, app.clone(), shutdown_notify);
     }
 }
 
@@ -1764,7 +1764,7 @@ fn bring_up_local_https(config: &Config, app: &Router, shutdown_notify: &Arc<tok
 /// structured warning and is non-fatal (the plaintext surface keeps serving), mirroring the
 /// bare-`http://dig.local` policy — `:443` is privileged (the installed service runs elevated).
 fn spawn_https_listener(
-    addr: &str,
+    addr: SocketAddr,
     rustls_config: axum_server::tls_rustls::RustlsConfig,
     app: Router,
     shutdown_notify: &Arc<tokio::sync::Notify>,
@@ -1773,7 +1773,6 @@ fn spawn_https_listener(
         Ok(listener) => {
             tracing::info!(addr = %addr, "HTTPS (https://dig.local) listening");
             let shutdown = shutdown_notify.clone();
-            let addr = addr.to_string();
             tokio::spawn(async move {
                 if let Err(e) = serve_https(listener, rustls_config, app, shutdown).await {
                     tracing::warn!(addr = %addr, error = %e, "HTTPS listener exited");

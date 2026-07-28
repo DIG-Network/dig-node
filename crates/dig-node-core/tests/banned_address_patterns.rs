@@ -22,39 +22,33 @@ use std::path::{Path, PathBuf};
 
 /// Violations that already existed when this guard was strengthened — TRACKED, not waived.
 ///
-/// Each entry is a real instance of the banned construct that a weaker version of this scanner (one that
-/// matched three literal spellings) never saw. They are recorded here rather than fixed in the same
-/// change because fixing them alters production bind/URL behaviour, which belongs in its own reviewed
-/// change; they are recorded rather than hidden because weakening the matcher to make the guard green
-/// would trade a real defect for a comfortable test.
+/// **Currently EMPTY**, and that is the intended steady state: both original entries were the
+/// #1682 defects and both are now fixed at the source. It is kept rather than deleted because the
+/// mechanism — an exception matched on its distinguishing SNIPPET and its FILE, never on a line
+/// number or a filename alone — is what makes a future tracked violation recordable without going
+/// blind, and [`a_tracked_violation_excuses_only_its_own_call_not_its_whole_file`] keeps that
+/// property honest against an empty list too.
 ///
-/// Both are live IPv6 defects, not stylistic:
-/// - `config.rs` renders `DIG_NODE_HOST` + port by text, so an operator setting a v6 host gets the
-///   unbracketed `::1:9333`, which then fails to parse at bind time — and that bind failure is
-///   documented as FATAL.
-/// - `open.rs` builds a URL authority the same way, so a v6 host yields an unparseable URL.
-///
-/// An entry is matched on its distinguishing snippet, not a line number, so unrelated edits to these
-/// files do not silently move the exception onto different code. **Delete the entry when the site is
-/// fixed**, which also drops it from the waived-count assertion in
-/// [`no_source_file_builds_a_socket_address_from_concatenated_text`] — the two maintain each other.
-///
-/// Tracked as **#1682**.
-const KNOWN_VIOLATIONS: &[(&str, &str)] = &[
-    // #1682 — `Config::bind_addr` renders host + port by text, so `DIG_NODE_HOST=::1` yields the
-    // unbracketed `::1:9333` and the bind then fails — a failure documented as FATAL.
-    (
-        "dig-node-service/src/config.rs",
-        "self.host.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))",
-    ),
-    // #1682 — `serve_url` builds a URL authority the same way, so a v6 host yields an unparseable URL.
-    ("dig-node-service/src/open.rs", r#""{host}:{p}""#),
-];
+/// Adding an entry is a debt, not a waiver: it needs a ticket, and the reason fixing it does not
+/// belong in the same change. Weakening the matcher instead is never the answer — that trades a
+/// real defect for a comfortable test, which is precisely how these two defects stayed invisible.
+const KNOWN_VIOLATIONS: &[(&str, &str)] = &[];
 
-/// Is this call one of the [`KNOWN_VIOLATIONS`], in the file that entry names?
-fn is_known_violation(relative_path: &str, call: &str) -> bool {
-    let normalized = relative_path.replace('\\', "/");
-    KNOWN_VIOLATIONS
+/// A relative path with platform separators normalized to `/`, so every path comparison in this
+/// scanner reads the same on Windows and Unix.
+fn normalize(relative_path: &str) -> String {
+    relative_path.replace('\\', "/")
+}
+
+/// Is this call excused by `tracked`, in the file that entry names?
+///
+/// Takes the list as a PARAMETER rather than reading [`KNOWN_VIOLATIONS`] directly so the matching
+/// rule stays provable while the real list is empty. A self-test that could only feed it real
+/// entries would go vacuous the moment the debt was paid — and the rule it proves (an entry excuses
+/// its own call, never its whole file) is exactly what must not rot before the NEXT entry is added.
+fn is_known_violation(tracked: &[(&str, &str)], relative_path: &str, call: &str) -> bool {
+    let normalized = normalize(relative_path);
+    tracked
         .iter()
         .any(|(file, snippet)| normalized.ends_with(file) && call.contains(snippet))
 }
@@ -317,6 +311,14 @@ fn without_comment_lines(source: &str) -> String {
 const MINIMUM_FILES_SCANNED: usize = 100;
 const MINIMUM_FORMAT_CALLS_SEEN: usize = 600;
 
+/// How many `dig-node-service` files the scan must read — the SIBLING-crate reach detector.
+///
+/// One would prove the point; the floor sits higher so a partial read is caught too, and well under
+/// the real count (measured 20 at introduction) to survive ordinary churn. Any value above zero
+/// gives the property the waived count used to give and no longer can: proof that the scan looked
+/// OUTSIDE the crate it lives in.
+const MINIMUM_SIBLING_CRATE_FILES: usize = 5;
+
 /// **Proves:** no source file in the workspace builds a socket address by string concatenation (#1593) —
 /// AND that the scan actually reached the workspace to find that out.
 ///
@@ -334,10 +336,15 @@ const MINIMUM_FORMAT_CALLS_SEEN: usize = 600;
 /// `crates/00-foundation/dig-node-core`, [`crates_root`] resolves to `crates/00-foundation` — `read_dir`
 /// SUCCEEDS, the self-test stays green, and every sibling level goes silently unscanned.
 ///
-/// The waived-count assertion is what makes that detectable rather than merely unlikely: both tracked
-/// sites live in the SIBLING crate `dig-node-service`, so reaching them proves the scan escaped its own
-/// crate. It also self-maintains — fixing a site deletes its entry and its share of this assertion
-/// together, and a stale entry turns the scan RED rather than green.
+/// The SIBLING-CRATE assertion is what makes that detectable rather than merely unlikely: the scan
+/// must have read files from `dig-node-service`, which lives beside this crate and not under it, so a
+/// [`crates_root`] that collapsed to one crate's directory fails LOUDLY instead of passing clean.
+///
+/// That detector replaced the waived-count one (#1682). The original relied on both tracked
+/// violations living in `dig-node-service`: reaching them proved the scan escaped its own crate. But
+/// that check was only ever as strong as the debt was long — fixing both defects took the waived
+/// count to `0 == 0`, which is exactly the vacuous shape the file floor alone already was. Pinning
+/// the sibling crate directly says the same thing and keeps saying it with an empty allowlist.
 #[test]
 fn no_source_file_builds_a_socket_address_from_concatenated_text() {
     let root = crates_root();
@@ -345,6 +352,7 @@ fn no_source_file_builds_a_socket_address_from_concatenated_text() {
     let mut files_scanned = 0usize;
     let mut format_calls_seen = 0usize;
     let mut waived = 0usize;
+    let mut sibling_crate_files = 0usize;
     for file in rust_sources(&root) {
         // This file necessarily CONTAINS the banned pattern — as the strings it matches on, and as the
         // fixtures that prove the matcher works. Scanning itself would make the ban permanently red.
@@ -363,13 +371,16 @@ fn no_source_file_builds_a_socket_address_from_concatenated_text() {
             .unwrap_or(&file)
             .display()
             .to_string();
+        if normalize(&relative).starts_with("dig-node-service/") {
+            sibling_crate_files += 1;
+        }
         for (line, call) in format_calls(&without_comment_lines(&contents)) {
             format_calls_seen += 1;
             let collapsed = call.split_whitespace().collect::<Vec<_>>().join(" ");
             if !builds_an_address_from_text(&call) {
                 continue;
             }
-            if is_known_violation(&relative, &collapsed) {
+            if is_known_violation(KNOWN_VIOLATIONS, &relative, &collapsed) {
                 waived += 1;
             } else {
                 offenders.push(format!("{relative} line {line}: format!({collapsed})"));
@@ -399,10 +410,12 @@ fn no_source_file_builds_a_socket_address_from_concatenated_text() {
     assert_eq!(
         waived,
         KNOWN_VIOLATIONS.len(),
-        "expected to reach all {} tracked violations and reached {waived}. Both live in the SIBLING \
-         crate `dig-node-service`, so this failing means either the scan no longer escapes its own \
-         crate, or a tracked site was fixed — in which case delete its `KNOWN_VIOLATIONS` entry (#1682).",
+        "expected to reach all {} tracked violations and reached {waived}. A stale entry — one whose          site was fixed — turns this RED rather than green: delete it (#1682).",
         KNOWN_VIOLATIONS.len()
+    );
+    assert!(
+        sibling_crate_files >= MINIMUM_SIBLING_CRATE_FILES,
+        "the scan read only {sibling_crate_files} files from the SIBLING crate `dig-node-service`          (expected at least {MINIMUM_SIBLING_CRATE_FILES}), so it never escaped its own crate and a          clean result proves nothing about the workspace. Check `crates_root` — a move into an          Appendix-B level directory does exactly this while leaving every other assertion green."
     );
 }
 
@@ -414,21 +427,31 @@ fn no_source_file_builds_a_socket_address_from_concatenated_text() {
 /// filename alone would pass this file and fail this test.
 #[test]
 fn a_tracked_violation_excuses_only_its_own_call_not_its_whole_file() {
-    let (tracked_file, tracked_snippet) = KNOWN_VIOLATIONS[0];
+    // A SYNTHETIC list, so this holds while `KNOWN_VIOLATIONS` is empty. The snippet and file are
+    // shaped like a real entry; nothing here depends on the real one existing.
+    const TRACKED: &[(&str, &str)] = &[("dig-node-service/src/config.rs", "the_tracked_call()")];
+    let (tracked_file, tracked_snippet) = TRACKED[0];
     assert!(
-        is_known_violation(tracked_file, tracked_snippet),
+        is_known_violation(TRACKED, tracked_file, tracked_snippet),
         "the tracked site must be recognised in its own file"
     );
     assert!(
-        !is_known_violation(tracked_file, r#""{ip}:{port}""#),
+        !is_known_violation(TRACKED, tracked_file, r#""{ip}:{port}""#),
         "a DIFFERENT offending call in a tracked file must still be an offender"
     );
     assert!(
         !is_known_violation(
+            TRACKED,
             "dig-node-core/src/seams/dig_peer/union_locator.rs",
             tracked_snippet
         ),
         "a tracked snippet must not be excused in a file the entry does not name"
+    );
+    // An EMPTY list excuses nothing — the state the list is actually in, asserted rather than
+    // assumed, so a bug that made an empty list match everything could not pass unnoticed.
+    assert!(
+        !is_known_violation(&[], tracked_file, tracked_snippet),
+        "an empty tracked list must excuse nothing"
     );
 }
 

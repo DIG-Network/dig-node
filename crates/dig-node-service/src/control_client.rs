@@ -47,14 +47,14 @@ pub fn call_control(config: &Config, method: &str, params: Value) -> std::io::Re
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(call_async(&addr, &token, method, params))
+    rt.block_on(call_async(addr, &token, method, params))
 }
 
 /// POST one JSON-RPC control method with the master token; return its `result` (or `{}` when
 /// the node omits one). A transport failure = the node isn't running; a JSON-RPC `error` =
 /// the node rejected the call (e.g. a method it does not implement → METHOD_NOT_FOUND).
 async fn call_async(
-    addr: &str,
+    addr: std::net::SocketAddr,
     token: &str,
     method: &str,
     params: Value,

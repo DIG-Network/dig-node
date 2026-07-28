@@ -320,6 +320,15 @@ The server opens UP TO THREE listeners for the SAME router:
    address — this listener is then skipped, not added to. This bind is **best-effort**: on
    failure (IPv6 loopback unavailable/disabled) the node MUST log a structured warning to stderr
    and continue IPv4-only — it MUST NOT abort.
+**Authority construction (§5.2, #1682).** Every socket authority the node binds, reports, or embeds
+in a URL MUST be built from a typed address and port — never by concatenating the two as text. A
+literal IPv6 address therefore always appears BRACKETED (`[::1]:9778`, `[2001:db8::1]:9778`), which
+is what the socket-address and URL grammars require. `DIG_NODE_HOST` set to any IPv6 literal MUST
+bind successfully; because a failure on listener 1 is FATAL, rendering that authority as unbracketed
+text would make configuring the address family this ecosystem PREFERS a self-inflicted outage. This
+governs the `/health` `addr` field, the `status` output, the control-client's JSON-RPC URL, and the
+`open` command's browser-navigable candidate URLs equally.
+
 3. **`127.0.0.2:80`** — the bare-`http://dig.local` listener (constants `DIG_LOCAL_IP` =
    `127.0.0.2`, `DIG_LOCAL_PORT` = `80`, `DIG_LOCAL_HOST` = `dig.local`). This bind is
    **best-effort**: on failure (no privilege, port in use, missing macOS `127.0.0.2` loopback

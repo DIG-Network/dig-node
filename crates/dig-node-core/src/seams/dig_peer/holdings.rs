@@ -54,9 +54,17 @@ use dig_gossip::{
 /// still serving. One hour sits inside every current provider TTL, so the clamp is a no-op and the
 /// advertised lifetime is the one the announcer actually meant.
 ///
-/// COUPLING: this value MUST track [`dig_dht::DhtConfig::provider_ttl`] (default 2 hours) and stay
-/// `<=` the smallest one any receiving node configures. Reducing that field below one hour, without a
-/// matching reduction here, silently truncates every advertisement this node makes.
+/// COUPLING — ENFORCED, not merely described (#1722). Two relations bind this value to dig-dht, and
+/// `tests/holdings_ttl_coupling.rs` fails if either breaks:
+/// - `ADVERTISED_TTL_SECS <= `[`dig_dht::DhtConfig::provider_ttl`] (default 2h) — exceeding it makes
+///   every claim silently clamped, so the announcer's intent is lost.
+/// - [`dig_dht::DhtConfig::republish_interval`]` <= ADVERTISED_TTL_SECS` (default 1h) — a record that
+///   expires before the holder re-announces drops the holder out of discovery until it does.
+///
+/// The second currently holds EXACTLY, with zero margin: dig-dht republishes hourly and this claims
+/// one hour. That is measured, not designed; the test records it so neither side can drift silently.
+/// It also stays `<=` the smallest `provider_ttl` any receiving node configures — which is why the
+/// value is not simply raised to 2h to buy refresh margin.
 pub const ADVERTISED_TTL_SECS: u64 = 3_600;
 
 /// Announcements one **provider** may have applied per [`RATE_WINDOW_SECS`].
