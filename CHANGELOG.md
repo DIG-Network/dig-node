@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.65.0] - 2026-07-28
+
+### Bug Fixes
+- **holdings:** Re-state all holdings when the first peer arrives
+
 ## [0.64.0] - 2026-07-28
 
 ### Features
