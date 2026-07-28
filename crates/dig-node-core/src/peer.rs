@@ -2991,6 +2991,156 @@ mod tests {
         );
     }
 
+    /// Build a `NatPeerConnection` over a loopback duplex with a chosen `peer_id`, remote address and
+    /// traversal tier, so the node's adoption path can be exercised WITHOUT a real network (a real
+    /// yamux session, just not over TLS). The returned [`dig_nat::PeerSession`] is the SERVER half:
+    /// hold it to keep the session live, **drop it to kill the session** — which is how the test below
+    /// makes a relay circuit genuinely dead rather than merely asserting about one.
+    fn loopback_nat_conn(
+        peer_id_bytes: [u8; 32],
+        remote: std::net::SocketAddr,
+        method: dig_nat::TraversalKind,
+    ) -> (dig_gossip::NatPeerConnection, dig_nat::PeerSession) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let inner = dig_nat::PeerConnection {
+            peer_id: dig_nat::PeerId::from_bytes(peer_id_bytes),
+            method,
+            remote_addr: remote,
+            peer_bls_pub: None,
+            session: dig_nat::PeerSession::client(client_io),
+        };
+        (
+            dig_gossip::NatPeerConnection::new(inner),
+            dig_nat::PeerSession::server(server_io),
+        )
+    }
+
+    /// **dig_ecosystem#1771 — the supersession the dig-gossip v0.17.12 bump delivers is reachable from
+    /// the node, and the node's own peer views report the re-adopted peer ONCE.**
+    ///
+    /// `adopt_nat_connection` is the single path every dig-nat connection is adopted through. Before
+    /// v0.17.12 it refused a held slot outright, so a relay circuit that registered a slot and then
+    /// died refused the DIRECT adoption that would have worked — the node reported `duplicate
+    /// connection` while the peer reported zero connections (#1762, with #1691 inbound and #1703
+    /// `connect_to` the two siblings). This test pins the property from the node's side: a stale
+    /// RELAYED adoption followed by a DIRECT adoption of the SAME `peer_id` succeeds, and the two
+    /// surfaces the node derives from the pool — [`pool_stats_json`] and [`connected_peers_json`] —
+    /// each report exactly one peer, at the NEWEST address, over the NEWEST tier.
+    ///
+    /// Fixture design: only ONE actor varies (the tier + address of the same identity), and the second
+    /// peer is a truthful control proving the surfaces can still count to two — a test that only
+    /// asserted "1" would pass against a pool that had silently dropped the peer entirely. The `via`
+    /// assertion is what distinguishes a genuine supersede from a guard that returns `Ok` while
+    /// leaving the dead relayed slot in place, and every assertion is on observable pool state rather
+    /// than a log line, which prints on the broken path too.
+    #[tokio::test]
+    async fn a_stale_relayed_slot_does_not_refuse_the_direct_adoption() {
+        let handle = fresh_pool_handle("readopt-supersede", [11u8; 32]).await;
+        let peer = [0xAB; 32];
+
+        // A relayed adoption lands first, then its session DIES (the server half is dropped) — the
+        // #1761 dead-circuit condition, with no reap to notice it.
+        let (relayed, relayed_server) = loopback_nat_conn(
+            peer,
+            "203.0.113.7:9445".parse().unwrap(),
+            dig_nat::TraversalKind::Relayed,
+        );
+        handle
+            .adopt_nat_connection(relayed)
+            .await
+            .expect("the first adoption is uncontested");
+        drop(relayed_server);
+
+        // The direct dial that the pre-0.17.12 pool refused.
+        let (direct, _direct_server) = loopback_nat_conn(
+            peer,
+            "203.0.113.7:9444".parse().unwrap(),
+            dig_nat::TraversalKind::Direct,
+        );
+        let adopted = handle
+            .adopt_nat_connection(direct)
+            .await
+            .expect("a stale slot must not refuse a newer verified session for the same identity");
+        assert_eq!(adopted, dig_gossip::PeerId::from(peer));
+
+        // The node's operator view: ONE peer, not two — the supersede replaced the slot.
+        let stats = pool_stats_json(&handle);
+        assert_eq!(stats["connected"], 1, "one identity holds one slot");
+
+        // The node's per-peer view: the NEWEST session's address and tier, proving the dead relayed
+        // slot was replaced rather than merely tolerated.
+        let peers = connected_peers_json(&handle);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0]["address"], "203.0.113.7:9444");
+        assert_eq!(peers[0]["via"], "direct");
+
+        // Control: a genuinely DIFFERENT identity still occupies its own slot, so the assertions above
+        // pin supersession and not a pool that quietly stopped admitting peers.
+        let (other, _other_server) = loopback_nat_conn(
+            [0xCD; 32],
+            // A DIFFERENT /16: the outbound INT-006 diversity cap allows one outbound connection per
+            // /16 group, so a control peer in 203.0.113.0/16 would be filtered for the wrong reason.
+            "198.51.100.8:9444".parse().unwrap(),
+            dig_nat::TraversalKind::Direct,
+        );
+        handle
+            .adopt_nat_connection(other)
+            .await
+            .expect("a net-new identity is admitted");
+        assert_eq!(pool_stats_json(&handle)["connected"], 2);
+    }
+
+    /// **#1771 — the node must not COUNT a re-adopted peer twice.** v0.17.12 republishes
+    /// `PoolEvent::PeerAdded` on a supersede, so any consumer treating each `PeerAdded` as a distinct
+    /// peer over-counts under reconnect churn. The node's download-side feed keys candidates by
+    /// `peer_id`, so a second `PeerAdded` for the same identity UPSERTS: one candidate, at the newest
+    /// address. The second identity is the control that proves the feed still counts distinct peers.
+    #[tokio::test]
+    async fn the_selector_pool_feed_upserts_a_readopted_peer_instead_of_counting_it_twice() {
+        use dig_download::testkit::{MockContent, MockProviderLocator, MockRangeTransport};
+        use dig_download::ProviderLocator;
+
+        let td = tempfile::tempdir().unwrap();
+        let pc = crate::download::NodeContent::new(
+            std::sync::Arc::new(MockProviderLocator::fixed(vec![])),
+            std::sync::Arc::new(MockRangeTransport::new(MockContent::even(10, 1))),
+            crate::download::MissMode::FetchThrough,
+            None,
+            td.path(),
+        );
+        let peer_id = dig_gossip::PeerId::from([0xAB; 32]);
+
+        // The relayed adoption's PeerAdded, then the supersede's republished PeerAdded for the SAME
+        // identity at a new address — driven through the real live-feed translation.
+        for host in ["203.0.113.7", "203.0.113.70"] {
+            pc.on_pool_event(&map_gossip_pool_event(&dig_gossip::PoolEvent::PeerAdded {
+                peer_id,
+                addr: format!("{host}:9445").parse().unwrap(),
+            }));
+        }
+
+        let locator = crate::seams::dig_peer::PoolProviderLocator::new(pc.connected_pool());
+        let content = dig_dht::ContentId::resource([9u8; 32], [8u8; 32], [7u8; 32]);
+        let found = locator.find_providers(&content).await.expect("locate ok");
+        assert_eq!(
+            found.len(),
+            1,
+            "a re-adopted peer is ONE candidate, not two (PeerAdded upserts by peer_id)"
+        );
+        assert_eq!(
+            found[0].addresses[0].host, "203.0.113.70",
+            "the upsert carries the newest session's address"
+        );
+
+        // Control: a distinct identity is a distinct candidate.
+        pc.on_pool_event(&map_gossip_pool_event(&dig_gossip::PoolEvent::PeerAdded {
+            peer_id: dig_gossip::PeerId::from([0xCD; 32]),
+            addr: "198.51.100.8:9445".parse().unwrap(),
+        }));
+        let found = locator.find_providers(&content).await.expect("locate ok");
+        assert_eq!(found.len(), 2, "two identities are two candidates");
+    }
+
     /// A fresh pool has no connected peers, so the per-peer array is empty (the honest "count only"
     /// state before any peer connects). Uses a real `GossipHandle` — the same type the node retains.
     #[tokio::test]

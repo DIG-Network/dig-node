@@ -828,10 +828,15 @@ impl NodeContent {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match event {
             PoolEvent::PeerAdded { peer_id, addr } => {
+                // The NEWEST session's address leads the candidate's dial order, older ones trailing
+                // as fallbacks (#1771). dig-gossip republishes `PeerAdded` when a fresh verified
+                // session supersedes a stale slot for the same identity (#1691/#1703/#1762), which is
+                // typically a MOVE — a dead relay circuit replaced by a direct dial. Appending would
+                // leave the dead address first and spend a failed dial on it for every later fetch,
+                // and dropping the older ones would discard a still-working fallback.
                 let addrs = pool.entry(peer_id.to_hex()).or_default();
-                if !addrs.contains(addr) {
-                    addrs.push(*addr);
-                }
+                addrs.retain(|known| known != addr);
+                addrs.insert(0, *addr);
             }
             PoolEvent::PeerRemoved { peer_id, .. } => {
                 pool.remove(&peer_id.to_hex());
