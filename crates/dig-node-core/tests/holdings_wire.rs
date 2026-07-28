@@ -33,8 +33,8 @@ use dig_gossip::{
 };
 use dig_node_core::peer::{install_crypto_provider, load_or_generate_node_cert};
 use dig_node_core::seams::dig_peer::holdings::{
-    announcement_for, reconcile_and_announce, signer_from_node_cert, AnnounceTransport,
-    HoldingsBroadcaster, HoldingsIngress,
+    announcement_for, reconcile_and_announce, run_first_peer_announcer, signer_from_node_cert,
+    AnnounceTransport, HoldingsBroadcaster, HoldingsIngress, HoldingsInventory, PoolPresence,
 };
 
 /// The clock this test announces against — deliberately **real wall-clock**, unlike the pure-policy
@@ -647,5 +647,168 @@ async fn an_unchanged_reconcile_floods_nothing() {
     assert!(
         transport.sent.lock().expect("mutex").is_empty(),
         "a no-op reconcile must not put a frame on the wire"
+    );
+}
+
+// =============================================================================================
+// The 0 -> N peer transition (#1734) — the ordering that made a holder invisible
+// =============================================================================================
+
+/// A fixed inventory, standing in for the node's cache list without a `Node` or a disk.
+struct StubInventory(Vec<dig_node_core::CachedCapsule>);
+
+#[async_trait::async_trait]
+impl HoldingsInventory for StubInventory {
+    async fn current(&self) -> Vec<dig_node_core::CachedCapsule> {
+        self.0.clone()
+    }
+}
+
+/// PROPERTY (#1734): content pinned while the pool is EMPTY reaches the first peer that connects —
+/// without an unpin/repin dance and without a restart.
+///
+/// This is the P0 that made the live network show zero providers. The inventory-change reaction floods
+/// only a NON-EMPTY delta diffed against the node's own local DHT records, and the pin at zero peers
+/// moves those records — so the "announced" bookkeeping is already satisfied while nothing left the
+/// box, and every later reconcile is a no-op. The node holds the capsule, believes it announced, and
+/// is invisible to every peer.
+///
+/// WHERE THIS ASSERTS, and why it must: at the RECEIVING node's ingest, over a real two-node mTLS
+/// wire. The sender's `flooded an opcode-222 announcement` log line **already prints on the broken
+/// path** (with `peers=0`), so any assertion keyed on the sender passes against the defect. Only a
+/// frame a peer actually decoded, verified and ingested distinguishes the two implementations.
+///
+/// The fixture drives the REAL ordering — pin at zero peers through the real `reconcile_and_announce`
+/// with the real pool as the transport, THEN connect — because the whole defect is an ordering across
+/// two nodes; a symmetric or mocked harness cannot see it. It also excludes the nearest wrong fix: an
+/// announcer that re-runs the inventory RECONCILE on the peer edge computes an empty delta (the pin
+/// already moved the records) and puts nothing on the wire, so this test reds for that variant too.
+#[tokio::test]
+async fn holdings_pinned_before_the_first_peer_reach_that_peer_when_it_connects() {
+    install_crypto_provider();
+    let network = [0x5bu8; 32];
+    let holder = WireNode::start([0x66u8; 32], network).await;
+    let receiver = WireNode::start([0x77u8; 32], network).await;
+    let serve_addr = dig_gossip::CandidateAddr {
+        host: "::1".to_string(),
+        port: 9_257,
+    };
+
+    // -- The trap's ordering, step one: PIN while the pool is empty ------------------------------
+    let inventory = vec![cached_capsule(0x9a, 0x9b)];
+    let capsule = ContentId::capsule([0x9au8; 32], [0x9bu8; 32]);
+    let dht = local_dht_handle(9_305);
+    let signer = signer_from_node_cert(&holder.cert).expect("the NodeCert leaf is ECDSA-P256");
+    let broadcaster = Arc::new(HoldingsBroadcaster::new(
+        signer,
+        vec![serve_addr.clone()],
+        now_secs(),
+    ));
+    assert!(
+        holder.handle.connected_pool_peers().is_empty(),
+        "the defect's precondition: the pin happens with ZERO peers connected"
+    );
+    let pinned = reconcile_and_announce(
+        &dht,
+        &inventory,
+        Some((
+            broadcaster.as_ref(),
+            &holder.handle as &dyn AnnounceTransport,
+        )),
+        now_secs(),
+    )
+    .await;
+    assert!(
+        pinned.gained.contains(&capsule),
+        "the pin must move the node's own durable provider records — that is what poisons the diff \
+         every later reconcile is computed against; got {pinned:?}"
+    );
+
+    // -- Subscribe the receiver BEFORE the link exists, so no frame can be missed ----------------
+    let mut inbound = receiver
+        .handle
+        .inbound_receiver()
+        .expect("a started service exposes its inbound receiver");
+
+    // -- Step two: the node runs its peer-presence announcer, and a peer arrives -----------------
+    let announcer = tokio::spawn(run_first_peer_announcer(
+        holder.handle.clone(),
+        Arc::new(StubInventory(inventory)) as Arc<dyn HoldingsInventory>,
+        Arc::clone(&broadcaster),
+    ));
+    holder
+        .handle
+        .connect_to(receiver.dial_addr())
+        .await
+        .expect("the holder dials the receiver over loopback mTLS");
+
+    // -- The assertion the defect cannot satisfy: the RECEIVER got the announcement --------------
+    let holder_id = holder.peer_id_hex();
+    let (sender, decoded) = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let (sender, msg) = inbound.recv().await.expect("inbound channel stays open");
+            if let Some(a) = holdings_announce_payload(&msg) {
+                if a.provider_peer_id == holder_id {
+                    break (sender, a);
+                }
+            }
+        }
+    })
+    .await
+    .expect(
+        "a capsule pinned before the first peer MUST be announced once a peer connects — no frame \
+         arrived, so this holder is invisible to the peer it is connected to",
+    );
+
+    let receiver_id = PeerId::from_hex(&receiver.peer_id_hex()).expect("64-hex peer id");
+    let receiver_dht = Arc::new(DhtService::new(
+        receiver_id,
+        vec![CandidateAddr::direct("::1".to_string(), 9_306)],
+        DhtConfig::default(),
+        Arc::new(UnreachableTransport),
+    ));
+    let ingress = HoldingsIngress::new(receiver.peer_id_hex());
+    let applied = ingress
+        .accept(&receiver_dht, &hex_of(&sender), &decoded, now_secs())
+        .await
+        .expect("the announcement off the real wire is genuinely signed and accepted");
+    assert!(
+        applied.ingested >= 1,
+        "the receiver must INGEST the holder's pinned inventory; got {applied:?}"
+    );
+    let providers = receiver_dht
+        .find_providers(&capsule)
+        .await
+        .expect("a local provider-store hit needs no network");
+    assert!(
+        providers.iter().any(|p| p.provider_peer_id == holder_id),
+        "the peer must be able to DISCOVER the holder of the capsule it pinned before connecting; \
+         got {providers:?}"
+    );
+
+    announcer.abort();
+}
+
+/// PROPERTY: peers dropping to zero and returning re-announces, because that transition is the same
+/// invisibility as the first one — a node whose only peer restarts must not go silently undiscovered.
+///
+/// Asserted on the presence state machine rather than a wire, since the wire property above already
+/// pins the announce itself; what is at stake here is only the EDGE definition. Both directions are
+/// pinned: a rise fires, a further rise while peers are already present does NOT (that would re-flood
+/// the whole inventory on every pool addition), and a fall to zero re-arms it.
+#[test]
+fn every_zero_to_nonzero_peer_transition_re_arms_the_announce() {
+    let mut presence = PoolPresence::default();
+
+    assert!(!presence.observe(0), "an empty pool announces nothing");
+    assert!(presence.observe(1), "the first peer triggers the announce");
+    assert!(
+        !presence.observe(3),
+        "growing an already-peered pool must not re-flood the whole inventory"
+    );
+    assert!(!presence.observe(0), "losing every peer announces nothing");
+    assert!(
+        presence.observe(1),
+        "peers returning after a total loss must re-announce — the node was invisible again"
     );
 }
