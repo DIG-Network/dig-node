@@ -843,19 +843,55 @@ pub trait PeerRpcResponder: Send + Sync {
 struct DhtInventoryAnnouncer {
     node: Arc<crate::Node>,
     dht: Arc<crate::dht::DhtHandle>,
+    /// The real-time opcode-222 flood, when this node can sign one (#1429).
+    holdings: Option<HoldingsFlood>,
 }
 
 #[async_trait::async_trait]
 impl crate::seams::dig_peer::AnnounceHolder for DhtInventoryAnnouncer {
     async fn announce_inventory(&self) {
-        let cached = self.node.cache_list_cached().await;
-        let (announced, withdrawn) = self.dht.refresh_inventory(&cached).await;
+        let delta = reconcile_and_flood(&self.node, &self.dht, self.holdings.as_ref()).await;
         tracing::info!(
-            announced,
-            withdrawn,
+            announced = delta.gained.len(),
+            retracted = delta.lost.len(),
             "capsule warm: announced this node as a holder of the newly cached capsule"
         );
     }
+}
+
+/// The signer plus the pool it floods to — everything needed to emit an opcode-222 announcement.
+#[derive(Clone)]
+struct HoldingsFlood {
+    broadcaster: Arc<crate::seams::dig_peer::holdings::HoldingsBroadcaster>,
+    pool: dig_gossip::GossipHandle,
+}
+
+/// The node's ONE reaction to an inventory change: reconcile the durable DHT provider records, then
+/// flood the matching real-time opcode-222 announcement for exactly the ids that changed.
+///
+/// Both change hooks (the #1576 reshare warm and the generic inventory refresher) route through here,
+/// so the flood is derived from the SAME delta that moved the records — a capsule can never be
+/// announced as gained while its provider record says otherwise, and a retract can never be skipped.
+async fn reconcile_and_flood(
+    node: &Arc<crate::Node>,
+    dht: &Arc<crate::dht::DhtHandle>,
+    holdings: Option<&HoldingsFlood>,
+) -> crate::dht::InventoryDelta {
+    let cached = node.cache_list_cached().await;
+    // Reading the inventory is this shell's job; the reconcile-plus-flood composition itself lives in
+    // `holdings` so it can be tested against a real DhtService without a `Node`.
+    crate::seams::dig_peer::holdings::reconcile_and_announce(
+        dht,
+        &cached,
+        holdings.map(|f| {
+            (
+                f.broadcaster.as_ref(),
+                &f.pool as &dyn crate::seams::dig_peer::holdings::AnnounceTransport,
+            )
+        }),
+        crate::seams::dig_peer::holdings::now_unix_secs(),
+    )
+    .await
 }
 
 /// Serve peer requests over one established, mTLS-authenticated [`dig_nat::mux::PeerSession`] (the
@@ -2208,7 +2244,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     let address_book = Arc::new(crate::address_book::AddressBook::default());
     let mut dial_ranker: Option<Arc<dyn crate::pex::DialRanker>> = None;
 
-    let dht = match bring_up_dht(
+    let (dht, holdings) = match bring_up_dht(
         &node,
         &identity,
         &nat_runtime,
@@ -2218,13 +2254,20 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     )
     .await
     {
-        Ok(dht) => Some(dht),
+        Ok((dht, holdings)) => (Some(dht), holdings),
         Err(e) => {
             tracing::warn!(error = %e, "dig-node DHT bring-up failed; continuing without the DHT");
             status.set_error(format!("dht: {e}"));
-            None
+            (None, None)
         }
     };
+
+    // The flood half of #1429, ready for both inventory-change hooks below: present only when the DHT
+    // is up AND this node can sign an announcement (the DHT records are the durable fallback if not).
+    let holdings_flood = holdings.map(|broadcaster| HoldingsFlood {
+        broadcaster,
+        pool: handle.clone(),
+    });
 
     // 4a. Feed the DHT routing table LIVE from the gossip pool (#1574): bring_up_dht's one-shot
     //     bootstrap runs BEFORE any peer connects, so in a freshly-formed network routing starts empty
@@ -2280,6 +2323,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             Arc::new(DhtInventoryAnnouncer {
                 node: node.clone(),
                 dht: dht.clone(),
+                holdings: holdings_flood.clone(),
             }),
             node.cache_dir_path(),
         );
@@ -2298,16 +2342,17 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     if let Some(dht) = dht.clone() {
         let node_for_hook = node.clone();
         let dht_for_hook = dht.clone();
+        let flood_for_hook = holdings_flood.clone();
         node.set_inventory_refresher(Box::new(move || {
             let node = node_for_hook.clone();
             let dht = dht_for_hook.clone();
+            let flood = flood_for_hook.clone();
             Box::pin(async move {
-                let cached = node.cache_list_cached().await;
-                let (announced, withdrawn) = dht.refresh_inventory(&cached).await;
-                if announced > 0 || withdrawn > 0 {
+                let delta = reconcile_and_flood(&node, &dht, flood.as_ref()).await;
+                if !delta.is_empty() {
                     tracing::debug!(
-                        announced,
-                        withdrawn,
+                        announced = delta.gained.len(),
+                        retracted = delta.lost.len(),
                         "dig-node DHT: refreshed provider records after an inventory change"
                     );
                 }
@@ -2404,7 +2449,13 @@ async fn bring_up_dht(
     network_id: &str,
     pool: &dig_gossip::GossipHandle,
     stun_servers: &[std::net::SocketAddr],
-) -> Result<Arc<crate::dht::DhtHandle>, String> {
+) -> Result<
+    (
+        Arc<crate::dht::DhtHandle>,
+        Option<Arc<crate::seams::dig_peer::holdings::HoldingsBroadcaster>>,
+    ),
+    String,
+> {
     use dig_dht::{CandidateAddr, DhtConfig, DhtService};
 
     // The single IPv6-first STUN server feeds the DHT transport's hole-punch tier (one reflexive-input
@@ -2442,14 +2493,18 @@ async fn bring_up_dht(
     // Assemble the advertised candidate set, IPv6-first via dig_ip::Family (the reflexive leads its
     // family group); see `crate::net::assemble_advertised`. The wildcard bind (`[::]` / `0.0.0.0`)
     // is never a candidate.
-    let local_addresses: Vec<CandidateAddr> = crate::net::advertised_socket_addrs_with_reflexive(
+    // Kept as `SocketAddr`s first: the SAME advertised set feeds BOTH the DHT provider records and
+    // the opcode-222 holdings announcements below, so the two discovery paths can never disagree
+    // about where this node serves.
+    let advertised: Vec<std::net::SocketAddr> = crate::net::advertised_socket_addrs_with_reflexive(
         port,
         crate::net::advertise_loopback_from_env(),
         reflexive,
-    )
-    .into_iter()
-    .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
-    .collect();
+    );
+    let local_addresses: Vec<CandidateAddr> = advertised
+        .iter()
+        .map(|sa| CandidateAddr::direct(sa.ip().to_string(), sa.port()))
+        .collect();
     let service = Arc::new(DhtService::new(
         node_cert.peer_id(),
         local_addresses,
@@ -2486,6 +2541,66 @@ async fn bring_up_dht(
 
     let dht = crate::dht::DhtHandle::new(service, initial_ids);
 
+    // The real-time holdings layer (#1429): flood a signed opcode-222 announcement whenever this
+    // node's inventory changes, and fold every peer's verified announcement into our provider set.
+    //
+    // Signed by the node's OWN NodeCert leaf, because the wire derives `provider_peer_id` from the
+    // signing key's SPKI — announcing under any other key would name an identity no peer can dial.
+    // Advertising the SAME `local_addresses` the DHT records carry keeps the two discovery paths in
+    // agreement about where this node serves.
+    let holdings = match crate::seams::dig_peer::holdings::signer_from_node_cert(node_cert) {
+        Ok(signer) => {
+            let addresses = advertised
+                .iter()
+                .map(|sa| dig_gossip::CandidateAddr {
+                    host: sa.ip().to_string(),
+                    port: sa.port(),
+                })
+                .collect();
+            // Seeded from the wall clock so a restart resumes ABOVE any seq peers already remember
+            // (a from-zero restart would have its announcements dropped as replays until it caught
+            // up). Persisting the counter is #1477's durable-state work.
+            let broadcaster = Arc::new(crate::seams::dig_peer::holdings::HoldingsBroadcaster::new(
+                signer,
+                addresses,
+                crate::seams::dig_peer::holdings::now_unix_secs(),
+            ));
+            match pool.inbound_receiver() {
+                Ok(_) if !crate::seams::dig_peer::holdings::HoldingsIngress::ingest_enabled_from_env() => {
+                    // Operator kill switch: keep ANNOUNCING (so this node stays discoverable in real
+                    // time) but stop applying peers' announcements. Discovery falls back to the
+                    // durable DHT records, which is a degradation, not an outage.
+                    println!(
+                        "dig-node peer network: holdings ingest DISABLED by \
+                         DIG_HOLDINGS_INGEST; still announcing"
+                    );
+                }
+                Ok(inbound) => {
+                    let ingress = Arc::new(crate::seams::dig_peer::holdings::HoldingsIngress::new(
+                        node_cert.peer_id().to_hex(),
+                    ));
+                    let sink = Arc::clone(dht.service());
+                    tokio::spawn(crate::seams::dig_peer::holdings::run_holdings_ingest(
+                        inbound, ingress, sink,
+                    ));
+                    println!("dig-node peer network: holdings announce (opcode 222) up");
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "holdings announce: no inbound receiver; this node still ANNOUNCES but will not \
+                     ingest peers' announcements (DHT find_providers remains the fallback)"
+                ),
+            }
+            Some(broadcaster)
+        }
+        Err(e) => {
+            // Announce-only degradation, never fatal: without a signer this node stays discoverable
+            // through the durable DHT provider records, just not in real time.
+            tracing::warn!(error = %e, "holdings announce disabled: node cert leaf is not signable");
+            None
+        }
+    };
+
     // Spawn the maintenance loop: republish (records never lapse) + refresh buckets + gc, well inside
     // the provider TTL.
     {
@@ -2496,7 +2611,7 @@ async fn bring_up_dht(
         });
     }
 
-    Ok(dht)
+    Ok((dht, holdings))
 }
 
 /// Run the mTLS peer-RPC accept loop over a pre-bound `listener`: accept inbound TLS connections

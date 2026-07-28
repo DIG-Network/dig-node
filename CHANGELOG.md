@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.64.0] - 2026-07-27
+
+### Features
+- **holdings:** Real-time opcode-222 announce/retract + verified rate-limited inbound ingest (#1429)
+- **holdings:** Canonicalize provider identity, bound announcement freshness, keep rejections allocation-free (#1429)
+
+### Tests
+- **holdings:** Pin the provider map's LRU capacity and its eviction victim, the address cap at its placement, and the ingest kill switch (#1429)
+
 ## [0.63.0] - 2026-07-27
 
 ### Bug Fixes

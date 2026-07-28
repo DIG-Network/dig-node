@@ -13,6 +13,7 @@
 pub mod address_book;
 pub mod capsule_fallback;
 pub mod dht;
+pub mod holdings;
 pub mod module_anchor;
 pub mod module_reshare;
 pub mod module_serve;

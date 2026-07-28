@@ -390,24 +390,56 @@ pub fn inventory_diff(
     (to_announce, to_withdraw)
 }
 
+/// What an inventory reconcile changed — the content ids this node started and stopped providing.
+///
+/// Returned (rather than just counted) so the caller can flood the matching real-time opcode-222
+/// [`HoldingsAnnounce`](dig_gossip::HoldingsAnnounce) deltas from the SAME reconcile that moved the
+/// DHT records. One source of truth for "what changed" means the flood can never disagree with the
+/// provider records it is announcing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InventoryDelta {
+    /// Content ids this node now provides and did not before.
+    pub gained: Vec<dig_dht::ContentId>,
+    /// Content ids this node no longer provides.
+    pub lost: Vec<dig_dht::ContentId>,
+}
+
+impl InventoryDelta {
+    /// Whether the reconcile was a no-op (nothing to announce and nothing to retract).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.gained.is_empty() && self.lost.is_empty()
+    }
+}
+
 /// React to an inventory change: `announce_provider` newly-held content ids promptly (don't wait for
-/// the periodic republish tick) and `withdraw_provider` ids the node no longer holds (they then age
-/// out of the DHT via TTL). Returns `(announced, withdrawn)` counts. `previous` is the last-known
-/// content-id set, `current` is derived from the fresh inventory.
+/// the periodic republish tick) and ACTIVELY retract ids the node no longer holds. `previous` is the
+/// last-known content-id set, `current` is derived from the fresh inventory.
+///
+/// Loss uses `retract_own_provider`, NOT the passive `withdraw_provider`: the passive form leaves the
+/// local record in place to lapse via TTL, so for as long as that TTL runs this node keeps answering
+/// `find_providers` with itself for content it can no longer serve — every such answer costs a reader
+/// a wasted dial. The active retract deletes the local record and stops republishing it immediately,
+/// which is the local half of #1423's atomic evict-and-retract. (Copies already PUT at the k closest
+/// peers still age out via TTL, or are removed sooner when the caller floods the signed retract
+/// announce — which is why [`InventoryDelta::lost`] is returned rather than discarded.)
 pub async fn sync_inventory(
     dht: &DhtService,
     previous: &[dig_dht::ContentId],
     cached: &[CachedCapsule],
-) -> (usize, usize) {
+) -> InventoryDelta {
     let current = inventory_content_ids(cached);
     let (to_announce, to_withdraw) = inventory_diff(previous, &current);
     for id in &to_announce {
         let _ = dht.announce_provider(id).await;
     }
     for id in &to_withdraw {
-        dht.withdraw_provider(id).await;
+        dht.retract_own_provider(id).await;
     }
-    (to_announce.len(), to_withdraw.len())
+    InventoryDelta {
+        gained: to_announce,
+        lost: to_withdraw,
+    }
 }
 
 // -- Bootstrap peers from the gossip pool ------------------------------------------------------------
@@ -460,14 +492,25 @@ impl DhtHandle {
     }
 
     /// Re-derive the inventory content-id set from `cached` and reconcile it with the DHT: announce
-    /// new ids, withdraw gone ids (see [`sync_inventory`]). Updates the remembered set. Call whenever
-    /// the node's inventory changes (a capsule cached, a root advanced, a store removed). Returns
-    /// `(announced, withdrawn)`.
-    pub async fn refresh_inventory(&self, cached: &[CachedCapsule]) -> (usize, usize) {
+    /// new ids, actively retract gone ids (see [`sync_inventory`]). Updates the remembered set. Call
+    /// whenever the node's inventory changes (a capsule cached, a root advanced, a store removed).
+    ///
+    /// Returns WHICH ids changed, so the caller can flood the matching real-time opcode-222 announce
+    /// from this same reconcile. This is the node's ONE inventory-reconcile chokepoint: every path
+    /// that gains or loses a capsule (gap-fill, explicit cache, the #1576 reshare warm) goes through
+    /// it, which is what keeps the DHT records and the flood in agreement.
+    pub async fn reconcile_inventory(&self, cached: &[CachedCapsule]) -> InventoryDelta {
         let mut announced = self.announced.lock().await;
-        let (a, w) = sync_inventory(&self.service, &announced, cached).await;
+        let delta = sync_inventory(&self.service, &announced, cached).await;
         *announced = inventory_content_ids(cached);
-        (a, w)
+        delta
+    }
+
+    /// [`Self::reconcile_inventory`] projected to `(announced, retracted)` counts, for callers that
+    /// only log the outcome.
+    pub async fn refresh_inventory(&self, cached: &[CachedCapsule]) -> (usize, usize) {
+        let delta = self.reconcile_inventory(cached).await;
+        (delta.gained.len(), delta.lost.len())
     }
 
     /// Locate the peers holding `content` via the DHT (`find_providers`). The returned
