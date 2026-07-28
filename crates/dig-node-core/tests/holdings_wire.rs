@@ -577,6 +577,57 @@ async fn a_reconcile_floods_exactly_the_deltas_it_moved() {
     );
 }
 
+/// PROPERTY (the DEGRADED bring-up branch): a node that cannot sign still reconciles its durable DHT
+/// provider records — it loses only the real-time flood, never its discoverability.
+///
+/// `holdings: None` is the branch taken by a node whose leaf key cannot produce a P-256 holdings
+/// signer, and the module documents it as "stays discoverable through the durable records alone".
+/// That promise is the whole reason the flood is optional, and it was previously compile-checked only:
+/// the two halves are guarded by ONE `if let (Some(..), false)` condition, so a mistake that makes the
+/// missing signer short-circuit the RECONCILE too would silently make an unsigning node invisible to
+/// `find_providers` — a discovery outage, not a freshness one.
+///
+/// The fixture therefore asserts the SURVIVING half positively (the record is really in the provider
+/// store) rather than only the absent half; a test that checked "nothing was flooded" alone passes
+/// identically whether or not the reconcile ran, which is precisely the defect it must exclude.
+#[tokio::test]
+async fn a_node_that_cannot_sign_still_reconciles_its_records_without_flooding() {
+    let dht = local_dht_handle(9_304);
+    let capsule = ContentId::capsule([0x41u8; 32], [0x42u8; 32]);
+
+    let gained = reconcile_and_announce(&dht, &[cached_capsule(0x41, 0x42)], None, NOW).await;
+
+    assert!(
+        gained.gained.contains(&capsule),
+        "the reconcile must run and report the gain even with no signer; got {gained:?}"
+    );
+    assert_eq!(
+        dht.service()
+            .find_providers(&capsule)
+            .await
+            .expect("local provider-store lookup")
+            .len(),
+        1,
+        "a node that cannot sign an announcement must STILL be discoverable through its durable \
+         provider record — losing the signer costs freshness, never discovery"
+    );
+
+    // And the loss direction, so the shared condition is exercised in both states of `delta`.
+    let lost = reconcile_and_announce(&dht, &[], None, NOW).await;
+    assert!(
+        lost.lost.contains(&capsule),
+        "the retract half must run without a signer too; got {lost:?}"
+    );
+    assert!(
+        dht.service()
+            .find_providers(&capsule)
+            .await
+            .expect("local provider-store lookup")
+            .is_empty(),
+        "an unsigning node must still stop advertising content it no longer holds"
+    );
+}
+
 /// PROPERTY: a reconcile that changes nothing floods nothing, so a steady-state node is silent.
 #[tokio::test]
 async fn an_unchanged_reconcile_floods_nothing() {
