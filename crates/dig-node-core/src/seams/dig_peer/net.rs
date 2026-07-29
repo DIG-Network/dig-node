@@ -463,7 +463,13 @@ mod tests {
     /// straight into the pool.
     #[test]
     fn a_wildcard_or_portless_address_is_not_a_usable_contact() {
-        for junk in ["[::]:0", "0.0.0.0:0", "[::]:9445", "0.0.0.0:9445", "1.2.3.4:0"] {
+        for junk in [
+            "[::]:0",
+            "0.0.0.0:0",
+            "[::]:9445",
+            "0.0.0.0:9445",
+            "1.2.3.4:0",
+        ] {
             let addr: SocketAddr = junk.parse().unwrap();
             assert!(
                 !is_usable_contact(&addr),

@@ -828,6 +828,15 @@ A fail-closed guard is only good UX if it fires at the EARLIEST point the bad co
 
 ## Lane anchor — dig_ecosystem#1668 / #1640 (the range-frame ceiling)
 
+**STATUS: RESOLVED at dig-nat, and the node is now ON the fixed line.** dig-nat 0.13 shipped the
+capped/paged SENDER (fallible `RangeFrame::encode` + the paged prologue) and 0.14 the receiver-side
+`ChunkLensAssembler`; both fail CLOSED, so an over-ceiling frame is a clean boundary error rather than
+a silent mid-read decode failure. The 0.14 line (dig-gossip 0.17, dig-dht 0.8, dig-download 0.12,
+dig-peer 0.7, dig-peer-selector 0.7) landed as the single atomic cascade the note below anticipated,
+so the "this node cannot reach 0.14 yet" paragraph is HISTORY, kept for the lesson it carries about
+duplicate wire crates. `RANGE_WINDOW` remains the node's per-frame SPLIT size and is no longer a
+KNOWN CONSTRAINT.
+
 **One confused quantity made every DIG read above ~48 KiB impossible, network-wide.** `RANGE_WINDOW`
 (3 MiB) bounds how much ONE REQUEST may ask for. `dig_nat::MAX_RANGE_FRAME_PAYLOAD` (32,768 B) bounds
 ONE FRAME. The serve path framed on the former against the latter — 96x over — and because `bytes`

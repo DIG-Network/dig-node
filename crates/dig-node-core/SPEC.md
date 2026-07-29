@@ -862,6 +862,25 @@ node state or reads local resources MUST stay off the list.
 
 - The connected pool is owned by dig-gossip: discover → dial → maintain, with churn events
   (`PeerAdded`/`PeerRemoved`) that feed the selector registry (§7.6) and the PEX pool feeder (§7.7).
+- **`PeerAdded` is REPUBLISHED for an already-added `peer_id`, and no `PeerRemoved` precedes it.**
+  When a fresh verified session supersedes a stale slot for the same identity — typically a dead relay
+  circuit replaced by a direct dial — the pool emits another `PeerAdded` for that `peer_id` at the new
+  address. Every consumer MUST therefore be KEYED-IDEMPOTENT: it MUST treat a repeat `PeerAdded` as an
+  UPSERT of that identity's state (adding the address, preserving learned quality) and MUST NOT assume
+  the first `PeerAdded` for an identity is exclusive, nor that a `PeerRemoved` will arrive between two
+  adds. A consumer that appends per event MUST bound what it accumulates: unbounded per-identity
+  growth is a memory sink driven purely by churn (the node caps its per-peer address list at
+  `dig-dht`'s `MAX_ADDRESSES_PER_RECORD`).
+- **A churn address is a HINT, not a verified destination.** A reported address MUST be rejected before
+  it is recorded as a peer's contact or fetch target when it is not a destination at all — an
+  unspecified/wildcard IP (`::` / `0.0.0.0`) or port `0`. dig-nat reports the wildcard as the remote of
+  an accepted RELAYED circuit when no relay endpoint is configured, and such an address both fails
+  every dial and consumes a scarce dial slot that a reachable address could have used.
+- **The newest session's address leads the pool's per-peer order**, older addresses trailing as
+  fallbacks. That ordering is WITHIN the pool's list only: the dial ladder built from it prefers IPv6
+  over IPv4 first (§5.2), so a freshly-adopted IPv4 address leads the IPv4 group, not the whole ladder.
+  An implementation MUST NOT let one address family's churn evict a peer's only address of the other
+  family — IPv6 is preferred, not exclusive.
 - On every inbound peer/DHT RPC the responder folds the mTLS-verified caller into its routing table —
   the caller identity MUST come from the authenticated transport, never a wire field.
 - A node MAY rotate its network identity (cert → `peer_id`) to reduce long-term linkability;

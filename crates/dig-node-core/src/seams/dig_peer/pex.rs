@@ -679,7 +679,10 @@ impl PexPool for GossipPexPool {
 ///
 /// Split out from the spawned dial task so the decision is unit-testable against a REAL pool, and so
 /// there is exactly ONE place in this module that decides whether an adoption may proceed.
-fn should_adopt_dialed_peer(handle: &dig_gossip::GossipHandle, peer_id: &dig_gossip::PeerId) -> bool {
+fn should_adopt_dialed_peer(
+    handle: &dig_gossip::GossipHandle,
+    peer_id: &dig_gossip::PeerId,
+) -> bool {
     !handle.is_pool_peer(peer_id)
 }
 

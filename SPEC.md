@@ -1856,11 +1856,33 @@ a dig-node release — the installer's pre-rename fallback targets the SEPARATE
 `DIG-Network/dig-companion` repo's own frozen historical releases, not this asset name — so it was
 pure release-noise.
 
-11.3. **Matrix.** `windows-x64` (x86_64-pc-windows-msvc), `linux-x64` (x86_64-unknown-linux-gnu),
-`macos-arm64` (aarch64-apple-darwin), `macos-x64` (x86_64-apple-darwin, cross-compiled on
-macos-14). No linux-arm64 asset is published (the Linux build graph pulls `openssl-sys` via the
-Chia wallet SDK; no consumer requests it — apt.dig.net skips arm64 non-fatally and the installer
-rejects arm64 tokens).
+11.3. **Matrix + the Linux platform floor (HARD RULE).** Five assets are published:
+`windows-x64` (x86_64-pc-windows-msvc), `linux-x64` (x86_64-unknown-linux-gnu), `linux-arm64`
+(aarch64-unknown-linux-gnu), `macos-arm64` (aarch64-apple-darwin), and `macos-x64`
+(x86_64-apple-darwin, cross-compiled on macos-14). The apt `.deb` is published for both `amd64` and
+`arm64`.
+
+**Every published Linux artifact — the raw binaries AND the `.deb` — MUST run on glibc 2.31 or
+newer.** 2.31 is the supported floor, and it is a floor on the whole Linux delivery surface, not a
+per-workflow choice. It clears Ubuntu 20.04+, Debian 11+, Amazon Linux 2023 and RHEL 9.
+
+A glibc-linked binary runs on its BUILD glibc and anything newer, never anything older, so the
+BUILDER IMAGE alone determines this floor. Every job producing a Linux artifact therefore builds
+inside a pinned old-glibc container (`debian:11`) via `.github/actions/setup-linux-build`, which is
+the single place the floor is declared. It is enforced in three ways, all of which MUST hold:
+
+- the action asserts the container's own glibc equals the declared floor, so the image and the
+  number cannot drift apart;
+- `scripts/check-glibc-floor.sh` asserts every produced binary's highest glibc requirement is at or
+  below the floor, and the release job re-runs it against an impossible floor to prove the gate can
+  still fail;
+- `verify-linux-floor` EXECUTES each published binary in `ubuntu:22.04`, `debian:12` and
+  `amazonlinux:2023` containers on both architectures — a link-time claim is not proof that a binary
+  starts.
+
+Raising the floor is a DELIBERATE, coordinated act: the declared value, every calling job's
+`container:` image, this section, and the published docs move together. Both Linux architectures
+build NATIVELY (aarch64 on the arm64 runner), so no vendored-OpenSSL cross-compile is involved.
 
 11.4. **Release hardening.** The release profile keeps `overflow-checks = true` (the read path
 does offset/length arithmetic over untrusted serialized input).

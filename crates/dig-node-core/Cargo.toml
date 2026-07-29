@@ -1,6 +1,12 @@
 [package]
 name = "dig-node-core"
-version = "0.23.0"
+# The engine library's OWN version, independent of the released binary's (`[workspace.package].version`
+# in the root manifest, which only dig-node-service tracks). It moves when this crate's PUBLIC surface
+# moves: 0.24.0 acknowledges that the surface now exposes dig-nat 0.14 / dig-dht 0.8 types, a
+# compatibility-relevant change even though the crate is consumed in-workspace and is not published to
+# crates.io. Holding it at 0.23.0 would have overstated stability to anyone reading the manifest for
+# what the exported types are (dig_ecosystem#1785c).
+version = "0.24.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
