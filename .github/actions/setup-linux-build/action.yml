@@ -51,8 +51,22 @@ runs:
       shell: bash
       run: |
         set -eu
-        actual="$(ldd --version | head -n 1 | grep -oE '[0-9]+\.[0-9]+$')"
+        # NO PIPE. `ldd --version | head -n1` is a SIGPIPE race: `head` closes the pipe after the
+        # first line, `ldd` dies with SIGPIPE, and under `pipefail` the step fails with exit 141
+        # — intermittently, depending on whether ldd had already finished writing. It passed twice
+        # before failing once. Read the output into a variable and slice it with shell expansion.
+        ldd_output="$(ldd --version 2>&1)"
+        IFS= read -r first_line <<<"$ldd_output"
+        # glibc's banner ends with the bare version, e.g. "ldd (Debian GLIBC 2.31-13) 2.31".
+        actual="${first_line##* }"
         declared="${{ steps.floor.outputs.version }}"
+        case "$actual" in
+          [0-9]*.[0-9]*) ;;
+          *)
+            echo "::error::could not parse a glibc version out of: $first_line"
+            exit 1
+            ;;
+        esac
         echo "container glibc: $actual, declared floor: $declared"
         test "$actual" = "$declared" || {
           echo "::error::build container glibc $actual != the declared floor $declared. Update the floor in .github/actions/setup-linux-build/action.yml, every calling job's container: image, SPEC.md §11.3 and the docs TOGETHER."
