@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.66.0] - 2026-07-29
+
+### Chores
+- **deps:** Bump dig-gossip to v0.17.12 (duplicate-connection fixes #1691/#1703/#1762) (#118)
+
 ## [0.65.1] - 2026-07-29
 
 ### Bug Fixes
