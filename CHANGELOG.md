@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.65.1] - 2026-07-29
+
+### Bug Fixes
+- **config:** Type the socket authority so an unbracketed IPv6 host cannot render
+
 ## [0.65.0] - 2026-07-28
 
 ### Bug Fixes
