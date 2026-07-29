@@ -1,0 +1,53 @@
+# Stages the two release binaries under their CANONICAL asset names (SPEC §11.2) and uploads them.
+#
+# WHY this is a composite action rather than an inline step: the binaries are produced by TWO jobs
+# in build-binaries.yml — the Windows/macOS matrix on its host runners, and the Linux matrix inside
+# a pinned old-glibc container (#1736) — and the ONE thing that must never diverge between them is
+# the asset naming every downstream consumer resolves (the dig-installer thin-shim, apt.dig.net's
+# packaging template). Naming lives here, once.
+name: Stage release binaries
+description: Copy the built dig-node + dign binaries to dist/ under their canonical asset names and upload them.
+
+inputs:
+  version:
+    description: "Version string stamped into each artifact filename (e.g. `1.2.3` or `1.2.3-nightly.20260714.abc1234`)."
+    required: true
+  target:
+    description: "Rust target triple the binaries were built for (selects the target/<triple>/release dir)."
+    required: true
+  out-name:
+    description: "Canonical OS/arch asset suffix, e.g. `linux-x64`, `linux-arm64`, `windows-x64.exe`."
+    required: true
+  exe-suffix:
+    description: "Executable suffix of the built binary — `.exe` on Windows, empty elsewhere."
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Stage artifact (dual-named)
+      shell: bash
+      run: |
+        set -euo pipefail
+        VER="${{ inputs.version }}"
+        SUFFIX="${{ inputs.exe-suffix }}"
+        mkdir -p dist
+        # `dig-node` is the service binary; `dign` is its FIRST-CLASS alias (issue #548) — a
+        # separate [[bin]] over the same entrypoint, published under its own stem so the
+        # installer can resolve it via Repo::dign(). Both are required; a missing one is a
+        # release-shaped failure, so fail loudly rather than publishing half the pair.
+        for stem in dig-node dign; do
+          src="target/${{ inputs.target }}/release/${stem}${SUFFIX}"
+          test -f "$src" || { echo "::error::binary not produced: $src"; exit 1; }
+          # out-name already carries the `.exe` on Windows, so it is never appended twice.
+          cp "$src" "dist/${stem}-${VER}-${{ inputs.out-name }}"
+        done
+        ls -la dist
+
+    - name: Upload build artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: dig-node-${{ inputs.out-name }}
+        path: dist/*
+        if-no-files-found: error

@@ -1,0 +1,71 @@
+# Prepares a bare old-glibc container to build the dig-node Linux artifacts, and DECLARES the
+# canonical glibc floor those artifacts must honour.
+#
+# WHY (#1736): a glibc-linked binary runs on its BUILD glibc and anything newer, never anything
+# older — so the builder image, and nothing else, sets the supported-OS floor. dig-node v0.64.0
+# silently began requiring glibc >= 2.38 (breaking Ubuntu 22.04 LTS, Debian 12 and Amazon Linux
+# 2023) purely because GitHub repointed `ubuntu-latest` at Ubuntu 24.04. Every job that produces a
+# shipped Linux artifact — the release binaries AND the apt `.deb` — therefore runs inside a PINNED
+# container and calls this action, so there is one floor rather than one per workflow.
+#
+# The job must declare `container: debian:11`; this action asserts that the container it is running
+# in really provides `glibc-floor`, so the image and the number cannot drift apart.
+#
+# Because this is a LOCAL composite action it can only run after `actions/checkout`, and checkout in
+# a bare container needs `git` + `curl` + CA certificates already present — so each calling job
+# bootstraps exactly those three packages first, then checks out, then calls this action.
+name: Set up an old-glibc Linux build
+description: Install the Rust + C toolchains in the pinned old-glibc container and assert its glibc matches the canonical floor.
+
+outputs:
+  glibc-floor:
+    description: "The canonical minimum glibc version every published dig-node Linux artifact must run on."
+    value: ${{ steps.floor.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Declare the canonical glibc floor
+      id: floor
+      shell: bash
+      # THE single source of truth for the floor. 2.31 (Debian 11) clears every distro #1736
+      # reported broken — Ubuntu 22.04 (2.35), Debian 12 (2.36), Amazon Linux 2023 (2.34) — plus
+      # Ubuntu 20.04 (2.31), Debian 11 (2.31) and RHEL 9 (2.34). Raising it is a DELIBERATE act:
+      # change this value, the `container:` image in every calling job, SPEC.md §11.3 and the
+      # published docs together — never one alone.
+      run: echo "version=2.31" >>"$GITHUB_OUTPUT"
+
+    - name: Install the Rust + C toolchains
+      shell: bash
+      # The container is a bare Debian 11 with neither toolchain. The C toolchain is not optional:
+      # `openssl-sys` builds vendored OpenSSL from source (needs perl + make) and several other
+      # -sys crates in the Chia-wallet-SDK graph want cmake/clang. `binutils` provides the
+      # `readelf` the floor gate reads.
+      run: |
+        set -eux
+        apt-get update -qq
+        apt-get install -y --no-install-recommends \
+          ca-certificates curl git build-essential pkg-config perl make cmake clang binutils
+
+    - name: Verify the container glibc IS the declared floor
+      shell: bash
+      run: |
+        set -eu
+        actual="$(ldd --version | head -n 1 | grep -oE '[0-9]+\.[0-9]+$')"
+        declared="${{ steps.floor.outputs.version }}"
+        echo "container glibc: $actual, declared floor: $declared"
+        test "$actual" = "$declared" || {
+          echo "::error::build container glibc $actual != the declared floor $declared. Update the floor in .github/actions/setup-linux-build/action.yml, every calling job's container: image, SPEC.md §11.3 and the docs TOGETHER."
+          exit 1
+        }
+
+    - name: Install Rust via rustup
+      shell: bash
+      # rustup, not Debian 11's rustc, which is far older than this workspace needs. Only the Rust
+      # toolchain comes from rustup — the glibc it links against is the container's, which is the
+      # entire point of the container.
+      run: |
+        set -eu
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
+        echo "$HOME/.cargo/bin" >>"$GITHUB_PATH"

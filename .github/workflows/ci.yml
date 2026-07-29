@@ -30,6 +30,26 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  # The release path's CI-consumed shell scripts have their own tests, and they gate a real
+  # shipping property (#1736: the glibc floor of every published Linux artifact), so they run on
+  # every PR rather than only when a release is being built — a broken floor gate discovered at
+  # release time is discovered too late.
+  scripts:
+    name: Release-script tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: scripts/tests
+        run: |
+          set -eu
+          for t in scripts/tests/*.test.sh; do
+            echo "::group::$t"
+            bash "$t"
+            echo "::endgroup::"
+          done
+
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest

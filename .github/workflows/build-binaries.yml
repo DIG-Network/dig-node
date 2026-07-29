@@ -21,9 +21,21 @@
 # `dign` is a FIRST-CLASS alias binary (issue #548): a SEPARATE `[[bin]]` target sharing the SAME
 # entrypoint, published alongside `dig-node` under its own stem `dign-<ver>-<os>-<arch>[.exe]`.
 #
-# NO linux-arm64 asset is published: the Linux build graph pulls `openssl-sys` (via the Chia wallet
-# SDK), so an aarch64-Linux cross-compile would also have to cross-compile OpenSSL — fragile, and
-# no consumer requests it (SPEC §11.3).
+# THE LINUX TARGETS BUILD INSIDE A PINNED OLD-GLIBC CONTAINER (`debian:11`, glibc 2.31), in their
+# own `build-linux` job — NOT on the runner image (#1736). A glibc-linked binary runs on the build
+# glibc and anything NEWER, never anything older, so the builder image silently dictates the
+# supported-OS floor. When GitHub moved `ubuntu-latest` to Ubuntu 24.04 the v0.64.0 `linux-x64`
+# binary began requiring glibc >= 2.38 and stopped starting on Ubuntu 22.04 LTS (2.35), Debian 12
+# (2.36) and Amazon Linux 2023 (2.34) — the three most common server distros — with no code change
+# and no signal. Pinning the container makes the floor an explicit, reviewable decision, and
+# `scripts/check-glibc-floor.sh` FAILS the build if a produced binary exceeds it (#1741 covers the
+# arch half of the same problem).
+#
+# `linux-arm64` IS published (#1741): it builds NATIVELY on the free public-repo `ubuntu-24.04-arm`
+# runner, so the vendored `openssl-sys` in the Chia-wallet-SDK graph is compiled by a native
+# toolchain. The old SPEC §11.3 rationale for omitting arm64 was about CROSS-compiling OpenSSL;
+# a native arm64 runner removes that objection entirely. Graviton/Ampere/Pi hosts are exactly the
+# always-on machines a volunteer node runs on.
 #
 # The gate runs fmt + clippy ONLY — a PR's own CI (ci.yml) already ran the full
 # fmt/clippy/test/coverage set (`cargo llvm-cov nextest --workspace`) against the merged tree
@@ -83,6 +95,9 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
 
+  # Windows + macOS build on their HOST runner images. Neither has a glibc floor to defend: the
+  # Windows binary targets the MSVC CRT and macOS pins its floor via the SDK/deployment target, so
+  # only the Linux targets need the pinned-container treatment (`build-linux` below).
   build:
     name: build (${{ matrix.out_name }})
     needs: check
@@ -92,23 +107,17 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: dig-node.exe
+            exe_suffix: ".exe"
             out_name: windows-x64.exe
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            bin: dig-node
-            out_name: linux-x64
           # Both macOS arches build on the fast Apple-silicon macos-14 runner; the Intel binary is
           # CROSS-COMPILED there (host arm64 → target x86_64-apple-darwin). The only C/asm dep in
           # the macOS graph is `ring` (via rustls); `openssl-sys` is cfg-gated to non-Apple targets,
           # so there is no vendored-openssl cross-compile to worry about.
           - os: macos-14 # Apple silicon (arm64)
             target: aarch64-apple-darwin
-            bin: dig-node
             out_name: macos-arm64
           - os: macos-14 # Apple silicon — cross-compiles the Intel binary
             target: x86_64-apple-darwin
-            bin: dig-node
             out_name: macos-x64
     runs-on: ${{ matrix.os }}
     steps:
@@ -136,32 +145,147 @@ jobs:
         # Build BOTH bins — `dign` is the first-class alias (issue #548), published alongside
         # `dig-node` under its own asset stem below.
         run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-node --bin dign
-      - name: Stage artifact (dual-named)
-        id: stage
-        # The caller's `version` is stamped into the filename verbatim: a plain `1.2.3` for a
-        # stable tag, or the synthesized `1.2.3-nightly.YYYYMMDD.<shortsha>` for a nightly.
-        shell: bash
+      # The caller's `version` is stamped into the filename verbatim: a plain `1.2.3` for a stable
+      # tag, or the synthesized `1.2.3-nightly.YYYYMMDD.<shortsha>` for a nightly. Naming lives in
+      # the composite action so this job and `build-linux` can never diverge on it.
+      - uses: ./.github/actions/stage-binaries
+        with:
+          version: ${{ inputs.version }}
+          target: ${{ matrix.target }}
+          out-name: ${{ matrix.out_name }}
+          exe-suffix: ${{ matrix.exe_suffix }}
+
+  # The LINUX targets, built NATIVELY inside a pinned old-glibc container so the supported-OS floor
+  # is a decision rather than a side effect of whatever image `ubuntu-latest` points at this month
+  # (#1736 — see the header). aarch64 builds on the free public-repo arm64 runner (#1741), which
+  # means the vendored `openssl-sys` in the Chia-wallet-SDK graph is never cross-compiled.
+  build-linux:
+    name: build (${{ matrix.out_name }})
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            out_name: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            out_name: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    # Debian 11 = glibc 2.31 = the floor declared by `.github/actions/setup-linux-build`, which
+    # asserts the two agree — so bumping this image without bumping the floor fails the build
+    # instead of silently shipping a higher floor.
+    container: debian:11
+    steps:
+      # Bootstrap only what `actions/checkout` itself needs in a bare container; the full toolchain
+      # (and the floor assertion) comes from the local composite action, which cannot run until the
+      # repository is on disk.
+      - name: Bootstrap the container for checkout
         run: |
-          VER="${{ inputs.version }}"
-          mkdir -p dist
-          SRC="target/${{ matrix.target }}/release/${{ matrix.bin }}"
-          test -f "$SRC" || { echo "binary not produced: $SRC"; exit 1; }
-          # On Windows out_name already ends in .exe; on unix there is no extension. Publish the
-          # binary under the canonical dig-node-* name every consumer resolves (#585 dropped the
-          # duplicate legacy dig-companion-* copy). See the header comment.
-          cp "$SRC" "dist/dig-node-${VER}-${{ matrix.out_name }}"
-          # The `dign` first-class alias (issue #548): a SEPARATE binary that behaves byte-for-byte
-          # like `dig-node`, published under its own `dign-*` stem (same shape as `dig-node-*`) so
-          # the dig-installer resolves it via Repo::dign(). Its filename differs from `dig-node`
-          # only by the `dig-node`->`dign` substring (incl. the `.exe` suffix on Windows).
-          DIGN_BIN="${{ matrix.bin }}"; DIGN_BIN="${DIGN_BIN/dig-node/dign}"
-          DIGN_SRC="target/${{ matrix.target }}/release/${DIGN_BIN}"
-          test -f "$DIGN_SRC" || { echo "dign binary not produced: $DIGN_SRC"; exit 1; }
-          cp "$DIGN_SRC" "dist/dign-${VER}-${{ matrix.out_name }}"
-          ls -la dist
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+          set -eux
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl git
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Trust the checkout (git runs as root in the container)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - id: setup
+        uses: ./.github/actions/setup-linux-build
+      - run: rustc --version && cargo --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          # The glibc floor is part of the cache key: artifacts built against a different glibc must
+          # never be restored into a build that claims a different floor.
+          key: linux-glibc${{ steps.setup.outputs.glibc-floor }}-build-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-glibc${{ steps.setup.outputs.glibc-floor }}-build-${{ matrix.target }}-
+      - name: Build release binaries (dig-node + dign alias)
+        # The triple is the HOST's here (native build, no cross-compilation), but it is passed
+        # explicitly anyway so the output lands in `target/<triple>/release/` — the one path the
+        # shared staging action reads on every platform.
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-node --bin dign
+      - uses: ./.github/actions/stage-binaries
+        with:
+          version: ${{ inputs.version }}
+          target: ${{ matrix.target }}
+          out-name: ${{ matrix.out_name }}
+      - name: Assert the glibc floor of the produced binaries
+        # The gate that makes the floor durable. Both binaries are checked: `dign` is a separate
+        # link, so checking only `dig-node` would leave the alias unguarded.
+        run: |
+          set -eu
+          for stem in dig-node dign; do
+            bin="dist/${stem}-${{ inputs.version }}-${{ matrix.out_name }}"
+            bash scripts/check-glibc-floor.sh "$bin" "${{ steps.setup.outputs.glibc-floor }}"
+            # Prove the gate is not a no-op against a REAL binary, not just against the unit
+            # tests' stub readelf: every ELF references at least the base glibc version
+            # (2.2.5 on x86_64, 2.17 on aarch64), so a floor of 2.0 MUST be rejected. A gate that
+            # cannot fail is a rubber stamp.
+            if bash scripts/check-glibc-floor.sh "$bin" 2.0 >/dev/null 2>&1; then
+              echo "::error::check-glibc-floor.sh accepted an impossible 2.0 floor for $bin — the gate is not working"
+              exit 1
+            fi
+          done
+
+  # PROOF, not inference: start each published Linux binary on the OLDEST distros it claims to
+  # support. `ldd --version` on the builder says what the binary was linked against; only executing
+  # it on the target says it STARTS there. #1736 was found by a binary that died at exec time.
+  #
+  # WHY `--version`: it is the one invocation that touches no config, no network, no filesystem
+  # state and no service manager, so it isolates "does the dynamic loader resolve this binary".
+  verify-linux-floor:
+    name: verify (${{ matrix.out_name }} on ${{ matrix.image }})
+    needs: build-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The three distros #1736 reported broken, each on its own arch's runner so the binary
+          # executes natively rather than under emulation.
+          - runner: ubuntu-latest
+            out_name: linux-x64
+            image: ubuntu:22.04
+          - runner: ubuntu-latest
+            out_name: linux-x64
+            image: debian:12
+          - runner: ubuntu-latest
+            out_name: linux-x64
+            image: amazonlinux:2023
+          - runner: ubuntu-24.04-arm
+            out_name: linux-arm64
+            image: ubuntu:22.04
+          - runner: ubuntu-24.04-arm
+            out_name: linux-arm64
+            image: debian:12
+          - runner: ubuntu-24.04-arm
+            out_name: linux-arm64
+            image: amazonlinux:2023
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
         with:
           name: dig-node-${{ matrix.out_name }}
-          path: dist/*
-          if-no-files-found: error
+          path: dist
+      - name: Run both binaries on ${{ matrix.image }}
+        run: |
+          set -eu
+          chmod +x dist/*
+          for stem in dig-node dign; do
+            bin="${stem}-${{ inputs.version }}-${{ matrix.out_name }}"
+            echo "::group::$bin on ${{ matrix.image }}"
+            # `ldd` FIRST and unconditionally: the dynamic loader names only the FIRST
+            # unsatisfied library, so a partial fix reads as a brand-new regression. Logging the
+            # full dependency set makes the real remaining gap visible in one run.
+            docker run --rm -v "$PWD/dist:/dist:ro" "${{ matrix.image }}" \
+              sh -c "ldd /dist/$bin || true"
+            docker run --rm -v "$PWD/dist:/dist:ro" "${{ matrix.image }}" \
+              /dist/$bin --version
+            echo "::endgroup::"
+          done
