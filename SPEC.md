@@ -2953,7 +2953,13 @@ relayed / isolated network a holder is discovered in the DHT but its advertised 
 addresses the reader cannot dial, so a DHT-only locate yields no REACHABLE source and the read
 dead-ends at the §21 upstream backfill (404) even though the reader is ALREADY CONNECTED to that holder.
 Offering every connected pool peer as a fetch candidate lets the download reach the holder over the
-established connection. A connected-pool holder is NOT gated behind a separate `dig.getAvailability`
+established connection. A pool peer's candidate MUST list its addresses newest-session-first: dig-gossip
+republishes `PoolEvent::PeerAdded` when a freshly authenticated session SUPERSEDES a stale slot for the
+same `peer_id` (newest-wins re-adoption), and that is typically a MOVE — a dead relay circuit replaced by
+a direct dial. The superseded addresses are RETAINED as trailing fallbacks (a still-working older path is
+not discarded) but MUST NOT be dialed first. Re-adoption MUST NOT grow the candidate set: the pool is
+keyed by `peer_id`, so a republished `PeerAdded` upserts one entry — a re-adopted peer is one candidate,
+never two. A connected-pool holder is NOT gated behind a separate `dig.getAvailability`
 confirm probe: the download transport short-circuits the confirm to *available* for any provider whose
 `peer_id` is currently in the connected pool (`PoolConfirmTransport`, #836), so the fetch proceeds
 straight to `dig.fetchRange`. This is required because dig-download's `locate_and_confirm` DROPS any

@@ -652,10 +652,10 @@ impl NodeContent {
         // already self-filtered but otherwise unranked; the selector refines the SOURCE choice at
         // schedule time, not the discovered set. The same RAW `locator` stays on the engine for the
         // redirect-on-miss path (a redirect offers ALL known non-self holders).
-        let config = DownloadConfig {
-            selector: Some(Arc::new(SelectorAdapter::new(selector.clone()))),
-            ..DownloadConfig::default()
-        };
+        // dig-download 0.12 marked `DownloadConfig` `#[non_exhaustive]`, so it is built by mutating a
+        // default rather than by a struct literal — every future field stays a minor bump for us.
+        let mut config = DownloadConfig::default();
+        config.selector = Some(Arc::new(SelectorAdapter::new(selector.clone())));
         // The DOWNLOAD locator (#1590) = a [`PoolProviderLocator`] over the live connected-pool set
         // UNIONed with the raw discovery `locator`. So a fetch's locate step also offers the peers the
         // node is ALREADY CONNECTED to — reaching a holder whose DHT provider record is unreachable on
@@ -828,10 +828,15 @@ impl NodeContent {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match event {
             PoolEvent::PeerAdded { peer_id, addr } => {
+                // The NEWEST session's address leads the candidate's dial order, older ones trailing
+                // as fallbacks (#1771). dig-gossip republishes `PeerAdded` when a fresh verified
+                // session supersedes a stale slot for the same identity (#1691/#1703/#1762), which is
+                // typically a MOVE — a dead relay circuit replaced by a direct dial. Appending would
+                // leave the dead address first and spend a failed dial on it for every later fetch,
+                // and dropping the older ones would discard a still-working fallback.
                 let addrs = pool.entry(peer_id.to_hex()).or_default();
-                if !addrs.contains(addr) {
-                    addrs.push(*addr);
-                }
+                addrs.retain(|known| known != addr);
+                addrs.insert(0, *addr);
             }
             PoolEvent::PeerRemoved { peer_id, .. } => {
                 pool.remove(&peer_id.to_hex());
