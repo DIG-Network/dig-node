@@ -2738,7 +2738,7 @@ fn build_server_tls_config(node: &dig_nat::NodeCert) -> Result<Arc<rustls::Serve
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// An opaque, representative genesis hex for the `snapshot_json` status tests (echoed verbatim
@@ -3162,7 +3162,7 @@ mod tests {
     /// Whether the host has a usable IPv6 loopback stack. Some CI sandboxes disable IPv6 entirely,
     /// in which case a `[::1]` dial cannot be exercised; the two-node test skips rather than reporting
     /// a false failure unrelated to this crate's connect logic (mirrors dig-gossip's CON-002 guard).
-    async fn host_has_ipv6_loopback() -> bool {
+    pub(crate) async fn host_has_ipv6_loopback() -> bool {
         tokio::net::TcpListener::bind("[::1]:0").await.is_ok()
     }
 
@@ -3320,7 +3320,7 @@ mod tests {
 
     /// Build a real, freshly-started `GossipHandle` on the production-shaped dual-stack unspecified
     /// bind (`[::]:0`, §5.2) for the pool-handle tests.
-    async fn fresh_pool_handle(tag: &str, network: [u8; 32]) -> dig_gossip::GossipHandle {
+    pub(crate) async fn fresh_pool_handle(tag: &str, network: [u8; 32]) -> dig_gossip::GossipHandle {
         fresh_pool_handle_on(tag, network, crate::net::dual_stack_listen_addr(0)).await
     }
 
@@ -3331,7 +3331,7 @@ mod tests {
     /// inbound loopback connections into the pool (the native-tls dual-stack accept quirk — the same
     /// family of `[::]`-v6only issue tracked for the extension-offline path), whereas a concrete
     /// loopback bind does, on every platform. Production still binds dual-stack `[::]` (`run_peer_network`).
-    async fn fresh_pool_handle_on(
+    pub(crate) async fn fresh_pool_handle_on(
         tag: &str,
         network: [u8; 32],
         listen_addr: std::net::SocketAddr,
