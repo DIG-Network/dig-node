@@ -177,7 +177,7 @@ dig-nat = "0.14"
 # graph still unifies to ONE of each. The vendored chia-protocol/chia-sdk-client forks it path-patches
 # are re-declared at this SAME rev in the workspace `[patch.crates-io]` (a git dep's own patches do not
 # apply transitively — the #1529 3-rev lockstep: this dep rev + the two patch revs move together).
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "3e352d91fbda830e517c914cf4f6afa6a9a7e121", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "dd29ce8df275d60b3568079f3739bbe55f7bbf17", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. From
 # crates.io: dig-nat 0.7 requires `>=0.4, <0.6` and dig-gossip 0.7.1 requires `>=0.2, <0.5`, so `0.4`
 # sits in both windows and the whole graph resolves to ONE crates.io dig-constants 0.4.x.

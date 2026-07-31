@@ -338,11 +338,22 @@ pub(crate) fn pool_event_to_selector(peer_id: [u8; 32], event: PoolEventKind) ->
     }
 }
 
-/// The 1:1 field map of `dig_gossip::PoolRemovalReason` → the selector's local [`PoolRemovalReason`]
-/// (identical variants; `Banned` makes the peer ineligible until re-added, SPEC §9.4).
+/// Maps `dig_gossip::PoolRemovalReason` → the selector's local [`PoolRemovalReason`]
+/// (`Banned` makes the peer ineligible until re-added, SPEC §9.4).
+///
+/// `Reaped` has no selector counterpart, so it must fold into one of the three the selector knows.
+/// It folds to `Disconnected` rather than `Dead` because a reaped peer's transport was *provably
+/// closed* — a departure, which is what `Disconnected` names — whereas `Dead` names a keepalive
+/// finding a peer unresponsive. What makes the choice safe rather than merely tidy: the selector
+/// distinguishes only `Banned` behaviourally (`engine.rs` matches on it alone to mark a peer
+/// ineligible) and treats `Disconnected`/`Dead` identically, so this fold is observability-only and
+/// cannot change eligibility. Folding it to `Banned` would be the real error — it would make an
+/// honestly-departed peer ineligible and bias the node toward unremembered peers, which is a sybil.
 pub(crate) fn pool_removal_reason(reason: GossipRemovalReason) -> PoolRemovalReason {
     match reason {
-        GossipRemovalReason::Disconnected => PoolRemovalReason::Disconnected,
+        GossipRemovalReason::Disconnected | GossipRemovalReason::Reaped => {
+            PoolRemovalReason::Disconnected
+        }
         GossipRemovalReason::Dead => PoolRemovalReason::Dead,
         GossipRemovalReason::Banned => PoolRemovalReason::Banned,
     }
@@ -415,6 +426,9 @@ pub(crate) enum GossipRemovalReason {
     Dead,
     /// Banned for misbehaviour.
     Banned,
+    /// Swept up by dig-gossip's departed-peer reaper: the transport was provably closed, but the
+    /// slot is keepalive-less so nothing else observed the departure.
+    Reaped,
 }
 
 // -- Selector-driven DIAL ordering (#384) ------------------------------------------------------------
@@ -2649,10 +2663,12 @@ pub(crate) mod tests {
 
     // -- the peer selector (#178): the discovery → select → download → record_outcome loop ----------
 
-    /// The gossip → selector `PoolEvent` map is a byte-identical 1:1 (SPEC §5.4): the peer id is the
-    /// same 32 bytes and the removal reasons map variant-for-variant.
+    /// The gossip → selector `PoolEvent` map preserves identity and removal semantics (SPEC §5.4):
+    /// the peer id is the same 32 bytes, the three reasons the selector shares map
+    /// variant-for-variant, and `Reaped` — which the selector has no variant for — folds to the
+    /// non-punitive `Disconnected`.
     #[test]
-    fn pool_event_map_is_1_to_1() {
+    fn pool_event_map_preserves_identity_and_removal_semantics() {
         let addr: std::net::SocketAddr = "203.0.113.7:9444".parse().unwrap();
         let added = pool_event_to_selector([9u8; 32], PoolEventKind::Added { addr });
         assert_eq!(
@@ -2669,6 +2685,10 @@ pub(crate) mod tests {
             ),
             (GossipRemovalReason::Dead, PoolRemovalReason::Dead),
             (GossipRemovalReason::Banned, PoolRemovalReason::Banned),
+            // `Reaped` has no selector counterpart and folds to `Disconnected`. Pinned here so the
+            // fold is a decision the suite states, not an accident a later edit can quietly change
+            // into `Banned` — which would make an honestly-departed peer ineligible.
+            (GossipRemovalReason::Reaped, PoolRemovalReason::Disconnected),
         ] {
             assert_eq!(pool_removal_reason(g), s);
             assert_eq!(

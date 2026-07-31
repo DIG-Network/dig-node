@@ -54,8 +54,8 @@ overflow-checks = true
 # standalone. `native-tls` is NOT patched: dig-gossip is pulled with
 # `default-features = false, features = ["rustls", "relay"]`, so the OpenSSL/native-tls path is off.
 [patch.crates-io]
-chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "3e352d91fbda830e517c914cf4f6afa6a9a7e121" }
-chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "3e352d91fbda830e517c914cf4f6afa6a9a7e121" }
+chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "dd29ce8df275d60b3568079f3739bbe55f7bbf17" }
+chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "dd29ce8df275d60b3568079f3739bbe55f7bbf17" }
 
 # The dig-nat unification patch is RETIRED (#1280 crates.io cascade): dig-nat 0.7 is on crates.io and
 # the ENTIRE peer stack (dig-gossip 0.7.1, dig-dht 0.2.2, dig-download 0.2.1, dig-peer-selector 0.2.1,
