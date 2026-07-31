@@ -249,6 +249,14 @@ jobs:
       - name: Stage the binary into a root-owned protected directory
         shell: bash
         run: |
+          # The GitHub Linux runner ships /opt group-writable by the `docker` group so the
+          # hosted tool cache can be populated — which the #565 gate correctly refuses as a
+          # privilege-escalation vector. Restore the stock distribution ownership first, so the
+          # step exercises the gate's ACCEPT path rather than the runner's own local weakening.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo chown root:root /opt
+            sudo chmod 0755 /opt
+          fi
           sudo install -d -o root -g wheel -m 0755 /opt/dig/bin 2>/dev/null || sudo install -d -o root -g root -m 0755 /opt/dig/bin
           sudo install -o root -g wheel -m 0755 target/release/dig-node /opt/dig/bin/dig-node 2>/dev/null || sudo install -o root -g root -m 0755 target/release/dig-node /opt/dig/bin/dig-node
           ls -ld /opt /opt/dig /opt/dig/bin /opt/dig/bin/dig-node
