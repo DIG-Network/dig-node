@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.70.0] - 2026-07-31
+
+### Features
+- **service:** Scope-explicit install/uninstall/start/stop (--scope)
+
 ## [0.69.0] - 2026-07-31
 
 ### Features
