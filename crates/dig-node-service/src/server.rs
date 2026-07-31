@@ -494,11 +494,19 @@ fn status_fields(state: &AppState) -> serde_json::Map<String, Value> {
     // is the checkable signal for the difference: an acceptance test polls `peer_tier.attached`
     // until it is true instead of sleeping a guessed interval, and a read taken before then is
     // known to be a gateway measurement rather than assumed to be a P2P one.
-    m.insert(
-        "peer_tier".into(),
-        json!({ "attached": state.node.peer_tier() == PeerTier::Attached }),
-    );
+    m.insert("peer_tier".into(), peer_tier_status(state.node.peer_tier()));
     m
+}
+
+/// The `/health` `peer_tier` object for a given tier — the ONE place the wire spelling of
+/// peer-tier readiness is decided, so both directions are assertable without standing up a peer
+/// network (attachment itself is only settable inside `dig-node-core`).
+///
+/// `attached: true` is the signal SPEC.md §6.1/§7.8 tell every harness to POLL instead of sleeping,
+/// so a field that never reports `true` turns the documented wait into an infinite one with the
+/// same observable signature as the legitimate cold-start window.
+fn peer_tier_status(tier: PeerTier) -> Value {
+    json!({ "attached": tier == PeerTier::Attached })
 }
 
 /// `GET /health` (and `GET /`) — liveness + mode + cache stats + discovery hooks.
@@ -1885,11 +1893,91 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_allowed_origin, is_app_origin, is_local_origin, read_origin_for, APP_ORIGINS_ENV,
-        EXPOSED_DIG_HEADERS,
+        is_allowed_origin, is_app_origin, is_local_origin, peer_tier_status, read_origin_for,
+        served_response, ServeProvenance, StorePath, APP_ORIGINS_ENV, EXPOSED_DIG_HEADERS,
     };
+    use dig_node_core::content_serve::{PeerTier, ServeSource};
     use dig_node_core::download::ReadOrigin;
+    use serde_json::json;
     use std::net::{Ipv4Addr, SocketAddr};
+
+    /// **Regression (#1763):** the `X-Dig-Peer-Tier` wire value for BOTH tiers, asserted on the real
+    /// response builder rather than on the enum alone.
+    ///
+    /// SPEC.md §4.3/§4.6 make this header's value set a cross-repo contract with dig-urn-resolver, so
+    /// the literal is the contract. The only prior HTTP coverage exercised `unattached`, which the
+    /// `dig-node-service` integration suite cannot escape: every test builds state via `build_state`,
+    /// which never attaches an engine, so the `Attached` arm was unreachable there BY CONSTRUCTION and
+    /// spelling it `"unattached"` in core kept the whole workspace green.
+    ///
+    /// **The fixture varies ONE actor.** Both arms build the IDENTICAL served response — same store
+    /// path, same bytes, same `ServeSource::Local` — and differ only in the peer tier, with the
+    /// `unattached` arm kept as the truthful control. Asserting both spellings also kills the
+    /// swap/alias mutants (either arm returning the other's literal, or both returning one constant)
+    /// that a single-direction assertion cannot see.
+    #[test]
+    fn served_response_reports_both_peer_tier_wire_values() {
+        let sp = StorePath {
+            store_id: "ab".repeat(32),
+            root: None,
+            resource: "data.bin".to_string(),
+        };
+        for (tier, expected) in [
+            (PeerTier::Attached, "attached"),
+            (PeerTier::Unattached, "unattached"),
+        ] {
+            let resp = served_response(
+                &sp,
+                "data.bin",
+                b"payload".to_vec(),
+                &"cd".repeat(32),
+                ServeProvenance {
+                    verified: true,
+                    source: ServeSource::Local,
+                    peer_tier: tier,
+                    owner_puzzle_hash: None,
+                    generation: None,
+                },
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("X-Dig-Peer-Tier")
+                    .map(|v| v.to_str().expect("ascii header")),
+                Some(expected),
+                "{tier:?} must serialize as {expected:?} on the wire (#1763)"
+            );
+            // The serving tier is the CONTROL: it is Local in both arms, so a mutant that derives the
+            // peer tier from the serve source cannot satisfy this pair.
+            assert_eq!(
+                resp.headers().get("X-Dig-Source").map(|v| v.to_str().ok()),
+                Some(Some("local")),
+                "{tier:?}: the serve source is the control and must not vary"
+            );
+        }
+    }
+
+    /// **Regression (#1763):** `/health`'s `peer_tier.attached` reports BOTH directions.
+    ///
+    /// The `true` direction is the one that matters asymmetrically: SPEC.md §6.1/§7.8 tell every
+    /// harness to POLL `peer_tier.attached` until it is true instead of sleeping, so a field pinned at
+    /// `false` turns the documented wait into an infinite one with exactly the observable signature of
+    /// the legitimate readiness window (`status: "ok"` + `attached: false`). Only the `false` arm had
+    /// coverage, because `build_state` never attaches an engine and attachment is settable only inside
+    /// `dig-node-core` — hence the assertion sits on the pure mapping that `status_fields` delegates to,
+    /// which is reachable on the CI host with no peer network and no widened production visibility.
+    #[test]
+    fn health_peer_tier_status_reports_both_directions() {
+        assert_eq!(
+            peer_tier_status(PeerTier::Attached),
+            json!({ "attached": true }),
+            "an attached engine must report attached: true — the value harnesses poll for"
+        );
+        assert_eq!(
+            peer_tier_status(PeerTier::Unattached),
+            json!({ "attached": false }),
+            "no engine must report attached: false — the truthful control"
+        );
+    }
 
     #[test]
     fn read_origin_for_classifies_ipv4_mapped_loopback_as_local() {
@@ -1977,6 +2065,13 @@ mod tests {
                 "{required} must be exposed via Access-Control-Expose-Headers"
             );
         }
+        // #1763: the peer-tier readiness header is part of the SAME cross-origin contract — a
+        // browser-side resolver that cannot READ it cannot tell a cold-start gateway serve from a
+        // genuine peer miss, and loses that distinction SILENTLY (the header is still sent).
+        assert!(
+            EXPOSED_DIG_HEADERS.contains(&"x-dig-peer-tier"),
+            "x-dig-peer-tier must be exposed via Access-Control-Expose-Headers (#1763)"
+        );
         // Every entry is a valid lowercase HeaderName (from_static panics otherwise) — this asserts
         // the const stays constructible, the exact shape the CORS layer relies on.
         for h in EXPOSED_DIG_HEADERS {

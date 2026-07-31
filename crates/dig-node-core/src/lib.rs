@@ -6336,6 +6336,19 @@ mod tests {
                 attach_p2p(&node, vec![], content, MissMode::FetchThrough, &td);
             }
 
+            // The node-level accessor `/health` reads (#1763) must flip with attachment too — the
+            // header path and the health path share this one source of truth, so a `peer_tier()`
+            // pinned to either arm is caught here rather than only at whichever surface has coverage.
+            assert_eq!(
+                node.peer_tier(),
+                if attach {
+                    PeerTier::Attached
+                } else {
+                    PeerTier::Unattached
+                },
+                "attach={attach}: Node::peer_tier must track engine attachment"
+            );
+
             let out = rt.block_on(node.serve_content_plaintext(
                 &store.to_hex(),
                 &root.to_hex(),
