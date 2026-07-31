@@ -6209,6 +6209,7 @@ mod tests {
                 root_hex,
                 verified,
                 source,
+                peer_tier,
                 owner_puzzle_hash,
                 generation,
             } => {
@@ -6219,6 +6220,9 @@ mod tests {
                     "the chain-anchored pin is enforced → verified=true"
                 );
                 assert_eq!(source, ServeSource::Local);
+                // No peer network is brought up on this node, so the read skipped Tier 2 (#1763) —
+                // reported honestly even though the bytes came from disk and never needed a peer.
+                assert_eq!(peer_tier, crate::content_serve::PeerTier::Unattached);
                 // The injected resolver (`MockResolver::one`) reports no owner (#486) — the header
                 // must be OMITTED, never guessed.
                 assert_eq!(owner_puzzle_hash, None);
@@ -6291,6 +6295,76 @@ mod tests {
         let latest = node.verification_ledger_snapshot(&store.to_hex(), None);
         assert_eq!(latest.root, root.to_hex());
         assert_eq!(latest.resources.len(), 2);
+    }
+
+    /// **Regression (#1763):** `peer_tier` reports whether the P2P content engine was ATTACHED when
+    /// a read was routed — a fact about the node, independent of which tier ended up serving. Before
+    /// this fix nothing carried it, so a read taken inside the ~30 s cold-start window looked exactly
+    /// like a read taken after attach and any peer-replication conclusion drawn from it was unfounded.
+    ///
+    /// **The fixture varies ONE actor.** Both arms drive the IDENTICAL locally-seeded, chain-anchored
+    /// capsule and both are served from disk (`ServeSource::Local`) — the only difference is whether an
+    /// engine is attached. That is deliberate: the nearest wrong implementation derives the value from
+    /// the SERVE SOURCE (`peer_tier = if source == Rpc { Unattached } else { Attached }`), which is
+    /// indistinguishable from the real thing on a gateway-serve fixture, and which this pair kills from
+    /// both directions — arm 1 is Local-and-Unattached (that impl says Attached) while arm 2 is
+    /// Local-and-Attached, so it cannot be satisfied by any constant either.
+    ///
+    /// The end-to-end cold-start case — a real gateway serve inside the window, reported over HTTP —
+    /// is `dig-node-service`'s `cold_start_gateway_serve_reports_the_peer_tier_as_unattached`.
+    #[test]
+    fn serve_reports_peer_tier_attachment_independently_of_the_serving_tier() {
+        use crate::content_serve::{PeerTier, PlaintextOutcome, ServeSource};
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([23u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>local</h1>".to_vec())];
+        let (root, module) =
+            compile_fixture_module(store, digstore_core::Visibility::Public, true, &files);
+
+        for attach in [false, true] {
+            let (node, td) =
+                test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
+            seed_cached_module(&node.cache_dir, &store.to_hex(), &root.to_hex(), &module);
+            if attach {
+                // An engine with NO providers: the peer tier EXISTS but holds nothing, so the read is
+                // still served from disk. Attachment, not peer availability, is what is under test.
+                let (content, _unrelated_root, _pt) =
+                    anchored_sealed_content(Bytes32([24u8; 32]), "index.html", b"elsewhere");
+                attach_p2p(&node, vec![], content, MissMode::FetchThrough, &td);
+            }
+
+            let out = rt.block_on(node.serve_content_plaintext(
+                &store.to_hex(),
+                &root.to_hex(),
+                "index.html",
+                None,
+                crate::download::ReadOrigin::Local,
+            ));
+            match out {
+                PlaintextOutcome::Served {
+                    source, peer_tier, ..
+                } => {
+                    assert_eq!(
+                        source,
+                        ServeSource::Local,
+                        "attach={attach}: both arms serve from disk — the serving tier is the CONTROL"
+                    );
+                    assert_eq!(
+                        peer_tier,
+                        if attach {
+                            PeerTier::Attached
+                        } else {
+                            PeerTier::Unattached
+                        },
+                        "attach={attach}: peer_tier must track engine attachment, not the serve source"
+                    );
+                }
+                other => panic!("attach={attach}: expected a local Served, got {other:?}"),
+            }
+        }
     }
 
     /// **Proves:** the serve-metadata `X-Dig-Owner-Puzzle-Hash` source (#486) — when the chain-anchored
@@ -6976,9 +7050,21 @@ mod tests {
         ));
         std::env::remove_var("DIG_NODE_PIN");
         match out {
-            PlaintextOutcome::Served { bytes, source, .. } => {
+            PlaintextOutcome::Served {
+                bytes,
+                source,
+                peer_tier,
+                ..
+            } => {
                 assert_eq!(source, ServeSource::Peer, "must serve from the P2P holder");
                 assert_eq!(bytes, plaintext, "the decrypted P2P bytes match the source");
+                // The post-attach half of #1763: a read that genuinely reached a peer reports the
+                // tier as attached, so it is distinguishable from a cold-start read that could not.
+                assert_eq!(
+                    peer_tier,
+                    crate::content_serve::PeerTier::Attached,
+                    "a peer-served read was routed with the engine up"
+                );
             }
             other => panic!("expected a peer Served (no upstream), got {other:?}"),
         }

@@ -1317,6 +1317,21 @@ impl crate::Node {
         self.p2p_content.get()
     }
 
+    /// Whether the peer (Tier-2) content path is consultable RIGHT NOW (#1763).
+    ///
+    /// The peer network attaches ~30 s after the HTTP surface starts answering, so this is
+    /// [`PeerTier::Unattached`](crate::content_serve::PeerTier::Unattached) for the whole
+    /// cold-start window — and permanently on the FFI/in-process path, which brings up no peer
+    /// network. It is reported per read (`X-Dig-Peer-Tier`) and on `GET /health`, which is what
+    /// lets a caller wait for the peer tier deterministically instead of sleeping a guessed
+    /// interval and hoping.
+    pub fn peer_tier(&self) -> crate::content_serve::PeerTier {
+        match self.p2p_content() {
+            Some(_) => crate::content_serve::PeerTier::Attached,
+            None => crate::content_serve::PeerTier::Unattached,
+        }
+    }
+
     /// Decide the #165 miss outcome for `content` at redirect depth `depth`: fetch-through when
     /// configured (falling back to redirect if the fetch fails), else locate + redirect within the
     /// hop budget, else not-found. NEVER a silent 404 while a provider exists.

@@ -24,7 +24,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use dig_node_core::content_serve::{PlaintextOutcome, ServeSource};
+use dig_node_core::content_serve::{PeerTier, PlaintextOutcome, ServeSource};
 use dig_node_core::{cache_cap_bytes, cache_used_bytes, handle_rpc, ContentServer, Node};
 use dig_wallet::sage::events::{SyncEvent, SyncLifecycle, SyncStatus};
 use dig_wallet::sage::rpc::WalletBackend;
@@ -203,12 +203,13 @@ pub fn router(state: AppState) -> Router {
 /// attestation + the Merkle-proof/chunk-length headers on the ciphertext path — without which the
 /// resolver fails closed and drops to the verified rpc tier. Lowercase (header names are
 /// case-insensitive; `HeaderName::from_static` requires lowercase).
-const EXPOSED_DIG_HEADERS: [&str; 10] = [
+const EXPOSED_DIG_HEADERS: [&str; 11] = [
     "x-dig-verified",
     "x-dig-root",
     "x-dig-inclusion-proof",
     "x-dig-chunk-lens",
     "x-dig-source",
+    "x-dig-peer-tier",
     "x-dig-store-id",
     "x-dig-capsule",
     "x-dig-resource-key",
@@ -488,6 +489,15 @@ fn status_fields(state: &AppState) -> serde_json::Map<String, Value> {
     // §21 whole-store sync availability (whether a §21.9 identity is loaded) — the
     // "sync state" a live client wants alongside version/addr (#239).
     m.insert("sync".into(), json!({ "available": state.sync_available }));
+    // Peer-tier readiness (#1763). The HTTP surface answers content reads ~30 s BEFORE the peer
+    // network attaches, so "the node responds" has never implied "the node can reach peers". This
+    // is the checkable signal for the difference: an acceptance test polls `peer_tier.attached`
+    // until it is true instead of sleeping a guessed interval, and a read taken before then is
+    // known to be a gateway measurement rather than assumed to be a P2P one.
+    m.insert(
+        "peer_tier".into(),
+        json!({ "attached": state.node.peer_tier() == PeerTier::Attached }),
+    );
     m
 }
 
@@ -1280,6 +1290,7 @@ async fn serve_resource(
             root_hex,
             verified,
             source,
+            peer_tier,
             owner_puzzle_hash,
             generation,
         } => served_response(
@@ -1287,10 +1298,13 @@ async fn serve_resource(
             &sp.resource,
             bytes,
             &root_hex,
-            verified,
-            source,
-            owner_puzzle_hash.as_deref(),
-            generation,
+            ServeProvenance {
+                verified,
+                source,
+                peer_tier,
+                owner_puzzle_hash: owner_puzzle_hash.as_deref(),
+                generation,
+            },
         ),
         PlaintextOutcome::NotFound { root_hex } => serve_miss(state, &sp, &root_hex, origin).await,
         PlaintextOutcome::InvalidParams { message } => {
@@ -1339,6 +1353,7 @@ async fn serve_miss(
             root_hex,
             verified,
             source,
+            peer_tier,
             owner_puzzle_hash,
             generation,
         } => served_response(
@@ -1346,17 +1361,39 @@ async fn serve_miss(
             "index.html",
             bytes,
             &root_hex,
-            verified,
-            source,
-            owner_puzzle_hash.as_deref(),
-            generation,
+            ServeProvenance {
+                verified,
+                source,
+                peer_tier,
+                owner_puzzle_hash: owner_puzzle_hash.as_deref(),
+                generation,
+            },
         ),
         _ => not_found(),
     }
 }
 
+/// Everything a served response reports ABOUT its bytes rather than the bytes themselves — grouped
+/// so [`served_response`] takes one self-describing argument instead of a positional run of five
+/// that a caller can silently transpose.
+struct ServeProvenance<'a> {
+    /// Whether the bytes were verified against the CHAIN-ANCHORED root (`X-Dig-Verified`).
+    verified: bool,
+    /// Which tier the bytes came from (`X-Dig-Source`).
+    source: ServeSource,
+    /// Whether the peer tier was attached when the read was routed (`X-Dig-Peer-Tier`, #1763) —
+    /// which is what distinguishes "the gateway answered because no peer held this" from "the
+    /// gateway answered because there was no peer tier yet".
+    peer_tier: PeerTier,
+    /// The store's on-chain owner puzzle hash, when resolvable (`X-Dig-Owner-Puzzle-Hash`).
+    owner_puzzle_hash: Option<&'a str>,
+    /// The commit ordinal that last wrote the resource, when known (`X-Dig-Generation`).
+    generation: Option<u64>,
+}
+
 /// Build the `200` response for a served resource: the ecosystem content-type + `nosniff`, the
-/// `X-Dig-Verified`/`X-Dig-Root`/`X-Dig-Source` provenance headers (#292), the serve-metadata HEAD
+/// `X-Dig-Verified`/`X-Dig-Root`/`X-Dig-Source`/`X-Dig-Peer-Tier` provenance headers (#292, #1763),
+/// the serve-metadata HEAD
 /// (#486: `X-Dig-Store-Id`/`X-Dig-Capsule`/`X-Dig-Resource-Key` always, `X-Dig-Owner-Puzzle-Hash`/
 /// `X-Dig-Generation` when resolvable), and — for HTML — the injected store-root
 /// `<base>`/`<meta referrer>` plus the hardened store CSP.
@@ -1367,17 +1404,20 @@ async fn serve_miss(
 ///
 /// `owner_puzzle_hash`/`generation` are OMITTED (not an empty placeholder) when unknowable — see
 /// [`PlaintextOutcome::Served`]'s field docs.
-#[allow(clippy::too_many_arguments)]
 fn served_response(
     sp: &StorePath,
     resource: &str,
     bytes: Vec<u8>,
     root_hex: &str,
-    verified: bool,
-    source: ServeSource,
-    owner_puzzle_hash: Option<&str>,
-    generation: Option<u64>,
+    provenance: ServeProvenance<'_>,
 ) -> Response {
+    let ServeProvenance {
+        verified,
+        source,
+        peer_tier,
+        owner_puzzle_hash,
+        generation,
+    } = provenance;
     let content_type = content_type_for(resource);
     // The MAIN resource actually served: an empty key (a bare store-root request) resolved to the
     // default view `index.html` internally, so the header reports that, never a blank string.
@@ -1393,6 +1433,7 @@ fn served_response(
         .header("X-Dig-Verified", if verified { "true" } else { "false" })
         .header("X-Dig-Root", root_hex)
         .header("X-Dig-Source", source.as_str())
+        .header("X-Dig-Peer-Tier", peer_tier.as_str())
         .header("X-Dig-Store-Id", sp.store_id.as_str())
         .header("X-Dig-Capsule", format!("{}:{}", sp.store_id, root_hex))
         .header("X-Dig-Resource-Key", resource_key);
