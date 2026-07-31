@@ -22,9 +22,11 @@
 //!
 //! Every path here is under a directory an unprivileged user controls, so a naive removal is an
 //! arbitrary-delete primitive: symlink `~/.config` at `/etc` and a root `remove_dir_all` follows it
-//! out of the home directory. Therefore **no component may be a symlink** — checked with `lstat` on
-//! every component below the account root before anything is removed ([`first_symlink_component`]),
-//! the same no-follow discipline [`crate::security`] applies to the install target. Only individual
+//! out of the home directory. Therefore **no intermediate DIRECTORY component may be a symlink** —
+//! checked with `lstat` on every component between the account root and the leaf before anything is
+//! removed ([`first_symlink_component`]), the same no-follow discipline [`crate::security`] applies
+//! to the install target. The leaf itself may be a symlink (systemd's enablement entry always is)
+//! because it is only ever `unlink`ed, which removes the link and never follows it. Only individual
 //! FILES and symlinks are ever unlinked; this module never removes a directory tree.
 
 use std::io;
@@ -95,19 +97,29 @@ pub fn launchd_agent_path(home: &Path, label: &str) -> PathBuf {
         .join(format!("{label}.plist"))
 }
 
-/// The FIRST component of `path` at or below `base` that is a symlink, per the injected `is_symlink`
-/// oracle — or `None` when the whole chain below `base` is symlink-free.
+/// The FIRST DIRECTORY component between `base` and `path` that is a symlink, per the injected
+/// `is_symlink` oracle — or `None` when that chain is symlink-free.
+///
+/// Two components are deliberately NOT judged:
+/// * **The account roots themselves** (`/home`, `/Users`) are system-owned, and on some systems are
+///   legitimately symlinks (`/home → /System/Volumes/Data/home`). Judging them would refuse every
+///   account on such a host — a guard that disables the mechanism it protects.
+/// * **The leaf**, because systemd's enablement entry IS a symlink by design, and refusing it would
+///   leave the unit ENABLED — the exact outcome the sweep exists to prevent. This is safe: the leaf
+///   is only ever passed to `remove_file`, which unlinks the LINK and never follows it. The
+///   arbitrary-delete primitive this guard closes needs an intermediate DIRECTORY to redirect the
+///   walk (symlink `~/.config` at `/etc` and a root removal descends out of the home directory), and
+///   every one of those is still judged.
 ///
 /// The oracle is a parameter for two reasons: it makes the walk testable on any host (creating a real
-/// symlink needs privilege on Windows), and it keeps this function PURE. Only components BELOW `base`
-/// are judged: the account roots themselves (`/home`) are system-owned, and on some systems `/home`
-/// is legitimately a symlink (macOS `/Users`, or a `/home → /System/Volumes/Data/home` style setup).
+/// symlink needs privilege on Windows), and it keeps this function PURE.
 pub fn first_symlink_component<'a>(
     base: &Path,
     path: &'a Path,
     is_symlink: impl Fn(&Path) -> bool,
 ) -> Option<&'a Path> {
     path.ancestors()
+        .skip(1) // the leaf is unlinked, never followed — see the doc comment
         .take_while(|c| c.starts_with(base) && *c != base)
         .find(|c| is_symlink(c))
 }
@@ -195,8 +207,9 @@ pub fn discover(unit_file_name: &str, label: &str) -> Vec<UserScopeRegistration>
 /// Remove ONE discovered registration: stop the running instance (best-effort), drop the enablement
 /// symlinks, then unlink the registration file.
 ///
-/// Refuses outright — without removing anything — if any path component below the account root is a
-/// symlink, because as root that would be an arbitrary-delete primitive rather than a cleanup.
+/// Refuses outright — without removing anything — if any intermediate DIRECTORY component below the
+/// account root is a symlink, because as root a redirected walk would be an arbitrary-delete
+/// primitive rather than a cleanup. The leaf may be a symlink; see [`first_symlink_component`].
 /// `stop` is injected so the OS-specific stop (and the fact that it is best-effort) stays out of the
 /// removal logic, and so the ORDER is testable without a real service manager.
 pub fn remove(
@@ -311,6 +324,37 @@ mod tests {
             first_symlink_component(home, path, |c| c == home || c == Path::new("/home")),
             None,
             "only components strictly BELOW the account root are judged"
+        );
+    }
+
+    /// The LEAF is exempt, and it must be: systemd's enablement entry
+    /// (`default.target.wants/<unit>`) is ALWAYS a symlink — refusing it would make the guard refuse
+    /// the single artifact whose whole purpose is to be removed, leaving the unit ENABLED and the
+    /// migration a no-op (caught live by the `service-smoke` system-scope leg on ubuntu-latest).
+    ///
+    /// Exempting it is safe for the reason the guard exists: `remove_file` unlinks the LINK, it never
+    /// follows it, so a leaf pointed at `/etc/passwd` costs the link and not the target. The
+    /// arbitrary-delete primitive comes from an intermediate DIRECTORY component redirecting the
+    /// walk, and those are still judged — asserted here in the same test so the exemption cannot
+    /// widen unnoticed.
+    #[test]
+    fn the_leaf_may_be_a_symlink_but_an_intermediate_directory_may_not() {
+        let home = Path::new("/home/alice");
+        let wants = Path::new(
+            "/home/alice/.config/systemd/user/default.target.wants/dignetwork-dig-node.service",
+        );
+
+        assert_eq!(
+            first_symlink_component(home, wants, |c| c == wants),
+            None,
+            "the enablement entry IS a symlink by design and must remain removable"
+        );
+
+        let parent = Path::new("/home/alice/.config/systemd/user/default.target.wants");
+        assert_eq!(
+            first_symlink_component(home, wants, |c| c == parent || c == wants),
+            Some(parent),
+            "a redirected directory component is still refused"
         );
     }
 

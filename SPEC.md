@@ -1708,11 +1708,14 @@ Numeric values and symbolic names are a stable contract and MUST NOT be renumber
      `result.user_scope_sweep { removed_accounts, failed_accounts, residual }`. Stopping matters as
      much as unlinking: a still-running user-level node holds the node's port, and the `dig-node
      start` an installer treats as fatal would fail with `EADDRINUSE`.
-     - **Root deleting inside user-owned directories is symlink-refusing.** No component of a
-       removal path BELOW the account root may be a symlink (checked with `lstat`, which does not
-       follow); if one is, that registration is refused and REPORTED rather than removed, because as
-       root the removal would otherwise be an arbitrary-delete primitive. Only individual files and
-       symlinks are ever unlinked — never a directory tree.
+     - **Root deleting inside user-owned directories is symlink-refusing.** No intermediate
+       DIRECTORY component of a removal path below the account root may be a symlink (checked with
+       `lstat`, which does not follow); if one is, that registration is refused and REPORTED rather
+       than removed, because as root a redirected walk would be an arbitrary-delete primitive. The
+       FINAL component MAY be a symlink — systemd's `default.target.wants/` enablement entry always
+       is, and refusing it would leave the unit ENABLED — because it is only ever unlinked, which
+       removes the link and never follows it. Only individual files and symlinks are ever unlinked —
+       never a directory tree.
      - **Stated residual (NOT covered).** A user-scope registration under a home directory outside
        `/home`, `/root` or `/Users`, or under a non-default `XDG_CONFIG_HOME`, is not discoverable
        and is NOT removed; that residual is stated in the install output, and the affected user
