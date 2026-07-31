@@ -1614,7 +1614,7 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
     // `dig-node start` that dig-installer treats as fatal would fail. So when registering at SYSTEM
     // scope, additionally sweep every account's registration on the FILESYSTEM.
     let account_sweep = (scope == ServiceScope::System && host_supports_user_scope())
-        .then(|| sweep_other_accounts_user_scope());
+        .then(sweep_other_accounts_user_scope);
     let (report, migration) = install_at_scope(
         &backend,
         other_backend.as_ref().map(|b| (b, other_scope)),

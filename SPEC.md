@@ -1739,11 +1739,21 @@ Numeric values and symbolic names are a stable contract and MUST NOT be renumber
   positively reporting absence: the classification is by the removal error's KIND, where `NOT_FOUND`
   is the ONLY honest "there was nothing here" signal and anything else (a permission failure on a
   root-owned unit, an unreadable domain, a tool that could not be located in a privileged directory)
-  leaves a registration that may still be present. An unreadable existence probe is likewise
-  indeterminate, and the probe MUST propagate its failure rather than report `false`, so this state
-  is reachable from the real OS backend and not merely from a test double. Only when nothing was
+  leaves a registration that may still be present. Only when nothing was
   removed anywhere AND nothing is unresolved is the result `NOT_FOUND` ("nothing to uninstall"),
   carrying the underlying removal error as context.
+- **The existence probe is THREE-VALUED, and only the OS may say "absent".** The probe answers
+  `present`, `absent`, or `unknown`; it MUST NOT report `absent` for a scope it could not READ. Only
+  a positive OS absence signal — systemd `No files found for <unit>`, launchd `Could not find
+  service` (exit `113`), Windows SCM `1060` (`ERROR_SERVICE_DOES_NOT_EXIST`) — is `absent`. Every
+  other outcome is `unknown` and carries the tool's own message: `systemctl --user` with no
+  reachable bus (its state when run as root), a launchd domain that cannot be bootstrapped from a
+  session with no Aqua domain, a permission failure, a signal-terminated probe, or an OS tool that
+  could not be located in a privileged directory. `unknown` MUST NOT be collapsed into "not
+  registered" anywhere: it makes a swept scope **indeterminate** (above), and where a caller cannot
+  proceed without certainty — the clean-reinstall, and confirming a deletion took effect — it is an
+  ERROR, never a `false` that would create over a registration that may be live. This state is
+  therefore reachable from the real OS backend, not only from a test double.
 - **Native packages register system scope**, consistently with `--scope system`: the `.deb`'s static
   systemd unit is `WantedBy=multi-user.target` running as root, and the macOS `postinstall`
   bootstraps into the `system` launchd domain (§9.7).
