@@ -113,10 +113,16 @@ fn every_service_verb_accepts_the_scope_flag_defaulting_to_auto() {
             help.contains("[default: auto]"),
             "`{verb} --scope` must default to auto so a caller passing no flag is unchanged: {help}"
         );
+        // NOT `help.contains("auto")` etc.: the flag's own doc comment spells all three words in
+        // prose, so that assertion holds even if the ValueEnum lost a variant. Assert clap's
+        // POSSIBLE-VALUES list itself, which is generated from the enum.
         for value in ["auto", "system", "user"] {
+            // clap renders each ValueEnum variant as its own `- <value>: <doc>` bullet under
+            // "Possible values:", so this reads the GENERATED list rather than prose.
             assert!(
-                help.contains(value),
-                "`{verb} --scope` must offer `{value}`: {help}"
+                help.lines()
+                    .any(|l| l.trim_start().starts_with(&format!("- {value}:"))),
+                "`{verb} --scope` must offer `{value}` as a generated possible VALUE: {help}"
             );
         }
     }

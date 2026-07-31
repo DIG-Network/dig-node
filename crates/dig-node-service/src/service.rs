@@ -268,29 +268,41 @@ fn host_scope(choice: ScopeChoice) -> ServiceScope {
 // of them may be located through an attacker-influenced `$PATH`.
 // ---------------------------------------------------------------------------------------------
 
-/// The ONLY directories an OS tool may be executed from.
+/// The unix directories an OS tool may be executed from.
 ///
 /// Privileged, distribution-owned locations only. **`/usr/local/bin` is deliberately absent**: it is
 /// `root:staff 2775` on Debian/Ubuntu (group-writable, and FIRST in sudo's default `secure_path`)
 /// and `<user>:admin 0775` under Intel Homebrew — writable by an unprivileged user, which is the
 /// whole vector. Mirrors the fixed-directory rule `dig-installer`'s SPEC §7.6 already states.
-#[cfg(unix)]
-fn os_tool_dirs() -> Vec<PathBuf> {
+///
+/// Deliberately NOT `#[cfg(unix)]`: a `cfg`-gated list is unfalsifiable on the other platform, so a
+/// user-writable directory could be added to it and every test on a Windows dev box would stay
+/// green. Both platform lists are therefore plain functions, asserted on EVERY host.
+fn unix_os_tool_dirs() -> Vec<PathBuf> {
     ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
         .iter()
         .map(PathBuf::from)
         .collect()
 }
 
-/// Windows: `%SystemRoot%\System32` (+ `%SystemRoot%`), read from the environment ONLY as a location
-/// hint and defaulted to `C:\Windows` — never as a program name. Both are TrustedInstaller/SYSTEM
-/// owned on a stock install.
-#[cfg(windows)]
+/// The Windows directories an OS tool may be executed from: `%SystemRoot%\System32` and
+/// `%SystemRoot%`, both TrustedInstaller/SYSTEM-owned on a stock install. `system_root` is a
+/// PARAMETER (see [`unix_os_tool_dirs`] on why neither list is `cfg`-gated); the environment supplies
+/// it only as a location HINT, never as a program name.
+fn windows_os_tool_dirs(system_root: &std::path::Path) -> Vec<PathBuf> {
+    vec![system_root.join("System32"), system_root.to_path_buf()]
+}
+
+/// This host's privileged tool directories.
 fn os_tool_dirs() -> Vec<PathBuf> {
-    let root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    vec![root.join("System32"), root]
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        windows_os_tool_dirs(&root)
+    } else {
+        unix_os_tool_dirs()
+    }
 }
 
 /// The refusal text when an OS tool is not present in any [`os_tool_dirs`] entry. Named per tool so
@@ -2405,21 +2417,38 @@ mod tests {",
     }
 
     #[test]
-    fn the_os_tool_directory_list_excludes_user_writable_locations() {
-        let dirs = os_tool_dirs();
-        assert!(!dirs.is_empty());
+    fn neither_platform_tool_directory_list_admits_a_user_writable_location() {
+        // BOTH platform lists are asserted on EVERY host: a `cfg`-gated list would let a
+        // user-writable directory be added to the unix set while a Windows dev box stayed green.
+        let unix = unix_os_tool_dirs();
+        let windows = windows_os_tool_dirs(std::path::Path::new(r"C:\Windows"));
+        assert!(!unix.is_empty() && !windows.is_empty());
         for bad in [
+            // Group-writable on Debian/Ubuntu (root:staff 2775), user-owned under Intel Homebrew —
+            // and FIRST in sudo's default secure_path.
             "/usr/local/bin",
             "/usr/local/sbin",
             "/opt/homebrew/bin",
+            "/tmp",
+            // A relative entry resolves against a CWD the caller chooses.
             ".",
+            "",
         ] {
-            assert!(
-                !dirs.iter().any(|d| d == std::path::Path::new(bad)),
-                "{bad} is writable by a non-privileged user on a common install and MUST NOT be a \
-                 privileged tool directory: {dirs:?}"
-            );
+            for (label, dirs) in [("unix", &unix), ("windows", &windows)] {
+                assert!(
+                    !dirs.iter().any(|d| d == std::path::Path::new(bad)),
+                    "{bad:?} is writable by a non-privileged user on a common install and MUST NOT                      be a privileged tool directory ({label}): {dirs:?}"
+                );
+            }
         }
+        // The Windows list stays ANCHORED to the given system root; the unix list is absolute.
+        assert!(windows.iter().all(|d| d.starts_with(r"C:\Windows")));
+        // A POSIX-absolute leading "/" — asserted as a STRING because `Path::is_absolute` answers
+        // for the HOST's rules, and on Windows "/usr/bin" is not absolute (no drive letter), which
+        // would make this assertion host-dependent.
+        assert!(unix
+            .iter()
+            .all(|d| d.to_string_lossy().starts_with('/')));
     }
 
     #[test]
@@ -2727,6 +2756,38 @@ mod tests {",
         );
         let outcome = uninstall_outcome(vec![removal]).expect("a proven removal is a success");
         assert_eq!(outcome.result["removed_scopes"], json!(["user"]));
+    }
+
+    /// The structural gap the review named (#526/B3): every migration test used a mock whose probe
+    /// answers TRUTHFULLY, so the suite proved the ORDER of the sweep but never its VISIBILITY. As
+    /// root the OS probe CANNOT see another account's user-scope registration — systemd has no
+    /// `--user` session for root, and `gui/<uid>` is uid 0's domain — so a probe-gated sweep is a
+    /// silent no-op exactly when it matters. This asserts what the OS-manager sweep does in that
+    /// state (nothing, invisibly), which is WHY the filesystem sweep exists.
+    #[test]
+    fn a_swept_scope_is_invisible_to_the_probe_when_a_registration_does_exist_b3() {
+        // The lying combination: a registration IS present, but the probe (as root) reports false.
+        let backend = MockBackend::new(false);
+        let removal = remove_registration(&backend, ServiceScope::User, RemovalMode::Swept);
+
+        assert!(!removal.found && !removal.removed);
+        assert!(
+            !removal.indeterminate,
+            "the probe answered cleanly — it just answered WRONGLY, which no probe-gated sweep can \
+             detect: {removal:?}"
+        );
+        assert_eq!(
+            backend.calls(),
+            vec!["is_installed"],
+            "nothing was even attempted, and nothing was reported — hence the filesystem sweep"
+        );
+        // So the account-aware mechanism must NOT be probe-gated, and must state its own residual
+        // rather than implying completeness.
+        let note = crate::user_scope::UserScopeSweep::residual_note();
+        assert!(
+            note.contains("XDG_CONFIG_HOME"),
+            "the residual must be stated, not implied: {note}"
+        );
     }
 
     #[test]

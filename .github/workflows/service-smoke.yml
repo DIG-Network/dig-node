@@ -14,6 +14,8 @@ on:
   pull_request:
     paths:
       - "crates/dig-node-service/src/service.rs"
+      - "crates/dig-node-service/src/user_scope.rs"
+      - "crates/dig-node-service/src/security.rs"
       - "crates/dig-node-service/src/config.rs"
       - "crates/dig-node-service/src/hosts.rs"
       - "packaging/**"
@@ -29,13 +31,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # This smoke test installs the freshly-built `target/release/dig-node` from the runner's
-  # user-writable checkout. On Windows that registration is system-level (LocalSystem), which the
-  # §565 privileged-target gate refuses for a user-writable binary dir (a real LPE protection —
-  # see service.rs). This explicit, default-off opt-out permits the controlled test install of an
-  # unreleased build; end users install via the native OS package into a protected admin-owned dir
-  # (never this env). It is a harmless no-op on the Linux/macOS user-level installs.
-  DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET: "1"
+  # NOTE: `DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET` is deliberately NOT set workflow-wide (#526/B5).
+  # Setting it here disabled the §565 privileged-target gate in the ONE job where it would otherwise
+  # fire, so the gate was never actually exercised by CI. It is now scoped to the single step that
+  # genuinely needs it (the Windows system-level install of an unreleased build from the runner's
+  # user-writable checkout), and the `system-scope` job below installs into a real root-owned
+  # directory so it needs no override at all — and asserts the gate REFUSES when that is not so.
 
 jobs:
   smoke:
@@ -82,6 +83,12 @@ jobs:
 
       - name: Install (1st) — fresh registration
         shell: bash
+        # Windows SCM registration is always system-level (LocalSystem), and this installs the
+        # freshly-built binary from the runner's user-writable checkout — the controlled test/dev
+        # case the default-off opt-out exists for. Empty (⇒ gate ENABLED) everywhere else, so the
+        # Linux/macOS legs run with the production gate in force.
+        env:
+          DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET: ${{ runner.os == 'Windows' && '1' || '' }}
         run: |
           "${{ steps.bin.outputs.path }}" install --json | tee install-1.json
           grep -q '"installed":true' install-1.json
@@ -110,6 +117,8 @@ jobs:
 
       - name: Install (2nd) — proves clean-reinstall avoids CreateService 1073
         shell: bash
+        env:
+          DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET: ${{ runner.os == 'Windows' && '1' || '' }}
         run: |
           "${{ steps.bin.outputs.path }}" install --json | tee install-2.json
           grep -q '"installed":true' install-2.json
@@ -167,4 +176,181 @@ jobs:
             uninstall.json
             sc-qc-1.txt
             sc-qc-2.txt
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------------------------------------
+  # #526/B5: REAL evidence for the SYSTEM scope — the path the whole scope feature exists to enable,
+  # and the one the matrix job above cannot reach (it never passes `--scope system` and never runs
+  # elevated on unix, so all three of its legs exercise `auto` => user scope, i.e. the old behaviour).
+  #
+  # This job installs the built binary into a REAL root-owned protected directory (what the DIG
+  # installer does) and registers a genuine boot-started service AS ROOT, with the §565
+  # privileged-target gate FULLY ENABLED — no override anywhere in this job. It then asserts the
+  # three properties that actually make a registration survive a reboot, the negative control that
+  # the gate refuses an unprivileged target, and the #526/B3 upgrade path: an existing RUNNING
+  # user-level node is swept away rather than left fighting for the node's port.
+  # ------------------------------------------------------------------------------------------------
+  system-scope:
+    name: system-scope install/uninstall (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: service-smoke-system
+
+      - name: Build dig-node (release)
+        run: cargo build --release --locked --bin dig-node
+
+      # NEGATIVE CONTROL, and it runs FIRST: with no override, an elevated system-scope install from
+      # the runner's user-writable checkout MUST be refused, and the refusal must name what failed.
+      # Without this, a gate that had quietly stopped firing would look identical to a passing one.
+      - name: Gate refuses a system install from a user-writable path
+        shell: bash
+        run: |
+          set -o pipefail
+          if sudo -E target/release/dig-node install --scope system --json | tee refused.json; then
+            echo "FAIL: a system-scope install from a user-writable checkout was ACCEPTED"
+            exit 1
+          fi
+          grep -q '"ok":false' refused.json
+          grep -q 'PERMISSION_DENIED' refused.json
+          # The message must name the offending path LEVEL or the program file — an operator cannot
+          # act on "somewhere in this path is user-writable".
+          grep -Eq 'the path level|the program file itself' refused.json
+
+      # #526/B7: the override is INERT for a genuinely-root system registration. Same command, with
+      # the env var set — it must STILL be refused. (An inheritable env var must not be able to turn
+      # the gate off for a root boot daemon, and `sudo -E` is exactly how it would arrive.)
+      - name: The insecure override cannot disable the gate for a root system install
+        shell: bash
+        env:
+          DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET: "1"
+        run: |
+          set -o pipefail
+          if sudo -E target/release/dig-node install --scope system --json | tee refused-override.json; then
+            echo "FAIL: the override disabled the gate for a root system registration"
+            exit 1
+          fi
+          grep -q 'PERMISSION_DENIED' refused-override.json
+
+      # The canonical layout: a root-owned protected directory holding a root-owned 0755 binary —
+      # what dig-installer produces (/opt/dig/bin) and what the gate is designed to ACCEPT.
+      - name: Stage the binary into a root-owned protected directory
+        shell: bash
+        run: |
+          sudo install -d -o root -g wheel -m 0755 /opt/dig/bin 2>/dev/null || sudo install -d -o root -g root -m 0755 /opt/dig/bin
+          sudo install -o root -g wheel -m 0755 target/release/dig-node /opt/dig/bin/dig-node 2>/dev/null || sudo install -o root -g root -m 0755 target/release/dig-node /opt/dig/bin/dig-node
+          ls -ld /opt /opt/dig /opt/dig/bin /opt/dig/bin/dig-node
+
+      # #526/B3 — the upgrade population: a RUNNING user-level registration must not survive the
+      # elevated install, or both units stay enabled, the running one keeps the port, and the
+      # `dig-node start` that dig-installer treats as fatal fails with EADDRINUSE.
+      - name: (Linux) pre-existing user-level registration, running
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo loginctl enable-linger "$(whoami)"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          target/release/dig-node install --scope user --json | tee user-install.json
+          grep -q '"scope":"user"' user-install.json
+          target/release/dig-node start --scope user --json || true
+          test -f "$HOME/.config/systemd/user/dignetwork-dig-node.service"
+
+      - name: Install at SYSTEM scope, as root, with the gate enabled
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo -E /opt/dig/bin/dig-node install --scope system --json | tee system-install.json
+          grep -q '"installed":true' system-install.json
+          grep -q '"scope":"system"' system-install.json
+          grep -q '"program":"/opt/dig/bin/dig-node"' system-install.json
+
+      # The three properties that actually make a registration survive a reboot with no login
+      # session. `is-enabled` alone is not enough (it can report "static"/"linked"), and the unit
+      # file alone is not enough (a unit file nothing wants never starts) — so all three.
+      - name: (Linux) assert a real, boot-enabled system unit
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          test -f /etc/systemd/system/dignetwork-dig-node.service
+          test "$(systemctl is-enabled dignetwork-dig-node.service)" = "enabled"
+          test -L /etc/systemd/system/multi-user.target.wants/dignetwork-dig-node.service
+
+      - name: (macOS) assert a real system LaunchDaemon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo test -f /Library/LaunchDaemons/net.dignetwork.dig-node.plist
+          sudo launchctl print system/net.dignetwork.dig-node > launchd-system.txt
+          grep -q 'net.dignetwork.dig-node' launchd-system.txt
+
+      - name: (Linux) assert the user-level registration was swept away
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          # The unit FILE and its enablement symlink are both gone ...
+          test ! -f "$HOME/.config/systemd/user/dignetwork-dig-node.service"
+          test ! -L "$HOME/.config/systemd/user/default.target.wants/dignetwork-dig-node.service"
+          # ... and the user manager no longer knows the unit.
+          ! systemctl --user cat dignetwork-dig-node.service
+          # The sweep is REPORTED, never silent.
+          grep -q '"user_scope_sweep"' system-install.json
+          grep -q "$HOME" system-install.json
+
+      - name: Start the system service + poll for serving
+        shell: bash
+        run: |
+          sudo -E /opt/dig/bin/dig-node start --scope system --json || true
+          ok=0
+          for _ in $(seq 1 20); do
+            if /opt/dig/bin/dig-node status --json | tee system-status.json | grep -q '"serving":true'; then
+              ok=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ok" -eq 1
+
+      - name: Uninstall at SYSTEM scope + assert every trace is gone
+        shell: bash
+        run: |
+          set -o pipefail
+          sudo -E /opt/dig/bin/dig-node uninstall --scope system --json | tee system-uninstall.json
+          grep -q '"installed":false' system-uninstall.json
+          grep -q '"removed_scopes":\["system"\]' system-uninstall.json
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            sudo test ! -f /Library/LaunchDaemons/net.dignetwork.dig-node.plist
+            ! sudo launchctl print system/net.dignetwork.dig-node
+          else
+            test ! -f /etc/systemd/system/dignetwork-dig-node.service
+            test ! -L /etc/systemd/system/multi-user.target.wants/dignetwork-dig-node.service
+            ! systemctl is-enabled dignetwork-dig-node.service
+          fi
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-smoke-system-${{ matrix.os }}
+          path: |
+            refused.json
+            refused-override.json
+            user-install.json
+            system-install.json
+            system-status.json
+            system-uninstall.json
+            launchd-system.txt
           if-no-files-found: ignore
