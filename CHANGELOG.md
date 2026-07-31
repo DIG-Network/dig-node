@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.68.1] - 2026-07-31
+
+### Bug Fixes
+- **holdings:** Refuse a peer-declared address count before reserving on it (#122)
+
 ## [0.68.0] - 2026-07-31
 
 ### Features
