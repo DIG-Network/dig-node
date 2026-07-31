@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.71.0] - 2026-07-31
+
+### Bug Fixes
+- **sync:** Resolve the chain tip when no root is given, and cache the whole capsule (#125)
+
 ## [0.70.0] - 2026-07-31
 
 ### Features
