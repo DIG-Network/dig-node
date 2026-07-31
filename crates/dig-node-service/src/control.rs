@@ -783,6 +783,17 @@ fn config_set_upstream(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             "control.config.setUpstream requires params.upstream (a URL string)",
         );
     };
+    // #526/B2: a control character in a persisted upstream would later be baked verbatim into a
+    // line of a root-owned systemd unit file at install time. `normalize_upstream` maps such a value
+    // to empty (= "use the default"), so silently persisting the result would erase the operator's
+    // setting instead of telling them it was rejected. Refuse it explicitly.
+    if crate::config::contains_control_character(upstream) {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            "control.config.setUpstream: params.upstream must not contain control characters",
+        );
+    }
     let normalized = crate::config::normalize_upstream(upstream);
     match set_upstream_override(&ctx.config_path, &normalized) {
         Ok(()) => control_ok(

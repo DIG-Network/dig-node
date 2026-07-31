@@ -2285,6 +2285,7 @@ dependencies = [
  "digstore-crypto",
  "digstore-stage",
  "futures-util",
+ "libc",
  "reqwest",
  "rustls",
  "serde",

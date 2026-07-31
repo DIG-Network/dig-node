@@ -224,35 +224,119 @@ fn host_supports_user_scope() -> bool {
     !cfg!(windows)
 }
 
-/// Whether this process is root (uid 0). Read via `id -u` rather than adding a `libc` dependency
-/// for one call — the same approach [`launchd_domain_target`] already uses for the uid. Always
-/// `false` off unix, where the answer never reaches a decision: Windows has no user scope, so
+/// Whether this process is root (uid 0), read straight from the kernel via `geteuid()`.
+///
+/// **A syscall, never a spawned `id -u` (#526/B1 — a root LPE).** The privilege level now DECIDES
+/// the service scope on EVERY service verb, so this runs while root under exactly the
+/// `sudo dig-node install --scope system` the docs prescribe. A spawned bare `id` resolves through
+/// `$PATH` — group-writable `/usr/local/bin` leads sudo's default Debian `secure_path`, and macOS
+/// sets no `secure_path` at all — so a planted `id` would execute AS ROOT before any gate ran.
+/// Worse, an `id` printing a non-zero uid would flip the resolved scope to `User`, and a user-scope
+/// target is exempt from the §565 privileged-target gate — one writable `PATH` entry would have
+/// switched that gate OFF. `geteuid()` cannot be intercepted and cannot fail, which also removes
+/// the failure mode this adapter would otherwise need to report.
+///
+/// Always `false` off unix, where the answer never reaches a decision: Windows has no user scope, so
 /// [`resolve_scope`] short-circuits to system and elevation is checked by the SCM gate
 /// ([`is_elevated`]).
 #[cfg(unix)]
 fn host_is_root() -> bool {
-    unix_uid() == Some(0)
+    unix_euid() == 0
 }
 #[cfg(not(unix))]
 fn host_is_root() -> bool {
     false
 }
 
-/// The effective uid via `id -u`, or `None` when it cannot be determined.
+/// The effective uid via `geteuid()`. Infallible by POSIX contract, and spawn-free (see
+/// [`host_is_root`]).
 #[cfg(unix)]
-fn unix_uid() -> Option<u32> {
-    std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u32>().ok())
+fn unix_euid() -> u32 {
+    // SAFETY: `geteuid` takes no arguments, touches no memory, and is documented as always
+    // succeeding — there is no error case and no pointer involved.
+    unsafe { libc::geteuid() }
 }
 
 /// Resolve `choice` against THIS host — the single place the pure [`resolve_scope`] decision meets
 /// the real OS and privilege level.
 fn host_scope(choice: ScopeChoice) -> ServiceScope {
     resolve_scope(choice, host_supports_user_scope(), host_is_root())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Privileged OS-tool spawning (#526/B8): every tool this module runs may now run AS ROOT, so none
+// of them may be located through an attacker-influenced `$PATH`.
+// ---------------------------------------------------------------------------------------------
+
+/// The ONLY directories an OS tool may be executed from.
+///
+/// Privileged, distribution-owned locations only. **`/usr/local/bin` is deliberately absent**: it is
+/// `root:staff 2775` on Debian/Ubuntu (group-writable, and FIRST in sudo's default `secure_path`)
+/// and `<user>:admin 0775` under Intel Homebrew — writable by an unprivileged user, which is the
+/// whole vector. Mirrors the fixed-directory rule `dig-installer`'s SPEC §7.6 already states.
+#[cfg(unix)]
+fn os_tool_dirs() -> Vec<PathBuf> {
+    ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Windows: `%SystemRoot%\System32` (+ `%SystemRoot%`), read from the environment ONLY as a location
+/// hint and defaulted to `C:\Windows` — never as a program name. Both are TrustedInstaller/SYSTEM
+/// owned on a stock install.
+#[cfg(windows)]
+fn os_tool_dirs() -> Vec<PathBuf> {
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    vec![root.join("System32"), root]
+}
+
+/// The refusal text when an OS tool is not present in any [`os_tool_dirs`] entry. Named per tool so
+/// the message says which one, and kept as constants so the same wording is used everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MISSING_TOOL_SC: &str =
+    "dig-node: sc.exe was not found in a privileged system directory; refusing to run it from an unverified location";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const MISSING_TOOL_LAUNCHCTL: &str =
+    "dig-node: launchctl was not found in a privileged system directory; refusing to run it from an unverified location";
+#[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+const MISSING_TOOL_SYSTEMCTL: &str =
+    "dig-node: systemctl was not found in a privileged system directory; refusing to run it from an unverified location";
+
+/// Locate `program` in [`os_tool_dirs`] and build a [`std::process::Command`] for that ABSOLUTE
+/// path, or `None` when it is not present in any of them (fail closed — a tool we cannot locate
+/// safely is not run at all, rather than run from wherever `$PATH` points).
+///
+/// Beyond resolving our OWN spawns, this pins the CHILD's environment, which is what closes the
+/// dependency's half of the same hole: `service-manager` selects its **WinSW** backend whenever a
+/// `winsw.exe` is anywhere on `$PATH` or `%WINSW_PATH%` names an existing file, and then executes
+/// that binary as the (elevated) installer — a planted `winsw.exe` would hand an attacker the whole
+/// service definition. So `PATH` is replaced with the fixed list and `WINSW_PATH` is removed.
+fn os_tool(program: &str) -> Option<std::process::Command> {
+    let dirs = os_tool_dirs();
+    let path = dirs.iter().map(|d| d.join(program)).find(|p| p.is_file())?;
+    let mut cmd = std::process::Command::new(path);
+    let joined = std::env::join_paths(dirs.iter()).ok()?;
+    cmd.env("PATH", joined);
+    cmd.env_remove("WINSW_PATH");
+    Some(cmd)
+}
+
+/// Pin THIS process's `PATH` to [`os_tool_dirs`] and drop `WINSW_PATH`, for the duration of a
+/// privileged service verb.
+///
+/// [`os_tool`] hardens the spawns this module makes; this hardens the ones it does NOT control —
+/// `service-manager` shells out to `systemctl`/`launchctl`/`sc` by BARE NAME, and unix resolves a
+/// bare name with `execvp` against the CALLING process's `PATH` (not a child `PATH` we set). Since
+/// every one of those spawns can now happen as root, the process-wide value is the only place the
+/// lookup can actually be constrained.
+fn harden_process_path_for_privileged_spawns() {
+    if let Ok(joined) = std::env::join_paths(os_tool_dirs().iter()) {
+        std::env::set_var("PATH", joined);
+    }
+    std::env::remove_var("WINSW_PATH");
 }
 
 /// Refuse a system-scope registration that the caller cannot actually make, with a message that
@@ -323,7 +407,8 @@ fn recovery_action_args(service_name: &str) -> Vec<String> {
 #[cfg(windows)]
 fn configure_windows_recovery(service_name: &str) -> io::Result<()> {
     let args = recovery_action_args(service_name);
-    let output = std::process::Command::new("sc.exe")
+    let output = os_tool("sc.exe")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, MISSING_TOOL_SC))?
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -506,14 +591,69 @@ pub fn remove_registration<B: ServiceBackend + ?Sized>(
     match backend.delete() {
         Ok(()) => removal.removed = true,
         Err(e) => {
-            // A failed delete at a scope the probe never saw a registration at is the ordinary
-            // "there was nothing here" case (the OS says so twice) — keep the reason for context,
-            // but only a scope we DID see, or could not read at all, is unresolved.
-            removal.indeterminate = probe.is_err();
+            removal.indeterminate = removal_failure_is_indeterminate(probe.is_err(), e.kind());
             removal.error = Some(e.to_string());
         }
     }
     removal
+}
+
+/// PURE: after a removal FAILED, is the scope's state unknown (⇒ must be reported) rather than
+/// genuinely empty (⇒ "nothing to uninstall")?
+///
+/// Classifying by the delete error's KIND is what keeps a real leftover from being reported as
+/// absence (#526/B4). `NotFound` is the OS positively saying there is nothing registered — the only
+/// honest "empty" signal. Anything else (`PermissionDenied` on a root-owned unit, a busy manager, an
+/// unreadable domain, a tool that could not run) leaves a registration that MAY still be there:
+/// e.g. an ssh session with no Aqua domain false-negatives the launchd probe AND fails `unload`
+/// before the plist is removed — the plist survives and starts at next login, so telling the
+/// operator "nothing was installed" would be a lie. An unreadable probe is likewise unknown.
+fn removal_failure_is_indeterminate(probe_failed: bool, delete_error: io::ErrorKind) -> bool {
+    probe_failed || delete_error != io::ErrorKind::NotFound
+}
+
+/// Sweep EVERY account's user-scope registration off the filesystem, stopping each running instance
+/// first (#526/B3). Best-effort: the returned report is what the caller surfaces.
+///
+/// The per-account stop is what keeps the elevated install viable for the upgrade population: a
+/// still-running user-level node holds the node's port, so the `dig-node start` that dig-installer
+/// treats as a hard error would fail with `EADDRINUSE` on exactly the path this feature enables.
+/// Both stops are best-effort and spawn only through [`os_tool`] (absolute path, pinned `PATH`).
+fn sweep_other_accounts_user_scope() -> crate::user_scope::UserScopeSweep {
+    let unit_file_name = format!(
+        "{}.service",
+        label()
+            .map(|l| l.to_script_name())
+            .unwrap_or_else(|_| "dignetwork-dig-node".to_string())
+    );
+    crate::user_scope::sweep(&unit_file_name, SERVICE_LABEL, |registration| {
+        // launchd: root CAN address another user's GUI domain, given the uid — which is read from
+        // the plist's own owner, never from a spawned name lookup.
+        if let (Some(uid), Some(mut cmd)) = (registration.uid, os_tool("launchctl")) {
+            let _ = cmd
+                .args(["bootout", &format!("gui/{uid}/{SERVICE_LABEL}")])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        // systemd: `--machine=<account>@.host` is how root reaches another account's user manager.
+        // The account name is the home directory's own file name, so no passwd lookup is spawned.
+        if let (Some(account), Some(mut cmd)) = (
+            registration.home.file_name().and_then(|n| n.to_str()),
+            os_tool("systemctl"),
+        ) {
+            let _ = cmd
+                .args([
+                    "--user",
+                    &format!("--machine={account}@.host"),
+                    "stop",
+                    &unit_file_name,
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    })
 }
 
 /// Register at the requested scope, first clearing any registration at the OTHER scope.
@@ -648,6 +788,49 @@ fn wait_for_removal<B: ServiceBackend>(backend: &B) -> io::Result<()> {
              close the Services console and retry)"
         ),
     ))
+}
+
+/// Refuse baked service-environment entries carrying a CONTROL CHARACTER before they are written
+/// into a privileged unit file (#526/B2 — root unit-file injection).
+///
+/// `service-manager`'s systemd backend writes each entry as one raw line —
+/// `Environment="{key}={value}"` — into `/etc/systemd/system/<unit>.service`, with no escaping or
+/// validation. Since this change is what causes that file to be written AS ROOT, a value containing
+/// a line terminator does not merely corrupt the entry: it appends further DIRECTIVES to a root
+/// unit. It is reachable because `config.upstream`/`cache_dir`/`host` derive from environment
+/// variables and from `config.json` under `$HOME` — a file an unprivileged user writes whenever
+/// elevation leaves `HOME` user-writable (`sudo -E`, `su` without `-`, `doas`, a root shell inside a
+/// user session), which is also exactly the shared-cache co-tenancy this module intends.
+///
+/// The guard is stated over the CLASS — any of `\n`, `\r`, `\0` in a key or a value — and NOT over
+/// any particular directive (`ExecStartPre=`, `User=`, …): a guard justified by one attacker action
+/// is bypassed by the next variant. Applied to SYSTEM scope, where the file is root-owned and the
+/// daemon privileged; a user-scope unit is written by, and runs as, the user who already controls
+/// these values, so there is no boundary to cross. PURE, so every arm is unit-tested.
+fn ensure_environment_is_unit_file_safe(
+    environment: &[(String, String)],
+    scope: ServiceScope,
+) -> io::Result<()> {
+    if scope.is_user() {
+        return Ok(());
+    }
+    let offending = |s: &str| s.contains('\n') || s.contains('\r') || s.contains('\0');
+    for (key, value) in environment {
+        if offending(key) || offending(value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "dig-node: refusing to register a system-level (privileged) service whose \
+                     baked environment variable \"{key}\" contains a control character (a \
+                     newline, carriage return or NUL). Each variable is written verbatim as one \
+                     line of a root-owned systemd unit file, so such a value could append \
+                     arbitrary directives that run as root (#526). Fix the value in the \
+                     environment or in config.json and re-run `dig-node install`."
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build the [`InstallPlan`] for `program` from a resolved [`Config`]. PURE (given the program
@@ -791,9 +974,10 @@ fn insecure_service_target_allowed() -> bool {
 /// ([`ALLOW_INSECURE_SERVICE_TARGET_ENV`]); it is default-`false` in production.
 ///
 /// Since #526 this genuinely fires on unix too (a root systemd unit / launchd daemon is as
-/// privileged as a Windows SYSTEM service), so its refusal NAMES the offending directory level: the
-/// gate walks every ancestor, and an operator cannot act on "somewhere in this path is
-/// user-writable". The canonical installer target (`/opt/dig/bin`, root-owned) clears it.
+/// privileged as a Windows SYSTEM service), so its refusal NAMES what failed: the offending
+/// directory LEVEL (the gate walks every ancestor, and an operator cannot act on "somewhere in this
+/// path is user-writable") or the program FILE itself. The canonical installer target
+/// (`/opt/dig/bin/dig-node`, root-owned `0755`) clears both.
 fn ensure_service_target_is_safe(
     program: &std::path::Path,
     scope: ServiceScope,
@@ -804,21 +988,25 @@ fn ensure_service_target_is_safe(
     if scope.is_user() {
         return Ok(());
     }
-    // The program's directory is the surface an attacker would need write access to; a
-    // privileged-owned directory keeps a non-privileged user from replacing the binary in it.
-    let root = program.parent().unwrap_or(program);
-    let Some(offending) = crate::security::first_unprivileged_ancestor(root) else {
+    let dir = program.parent().unwrap_or(program);
+    let refusal = classify_system_target(
+        crate::security::first_unprivileged_ancestor(dir),
+        crate::security::file_is_privileged(program),
+    );
+    let Some(refusal) = refusal else {
         return Ok(());
     };
     // Explicit, default-off test/dev opt-out — a controlled install of an unreleased build from a
-    // build directory (see the env-var doc). Never set on an end-user machine.
+    // build directory (see the env-var doc). Never set on an end-user machine, and INERT for a
+    // genuinely-root system registration (the caller applies that rule — #526/B7).
     if allow_insecure_override {
         eprintln!(
             "dig-node: WARN {ALLOW_INSECURE_SERVICE_TARGET_ENV} is set — registering a \
-             system-level service pointing at \"{}\", a user-writable directory. This is a \
-             privilege-escalation risk (#565) and is intended ONLY for test/dev installs of an \
+             system-level service pointing at \"{}\", which is not privileged-owned ({}). This is \
+             a privilege-escalation risk (#565) and is intended ONLY for test/dev installs of an \
              unreleased build.",
-            program.display()
+            program.display(),
+            refusal.describe(),
         );
         return Ok(());
     }
@@ -826,15 +1014,71 @@ fn ensure_service_target_is_safe(
         io::ErrorKind::PermissionDenied,
         format!(
             "dig-node: refusing to register a system-level (privileged) service pointing at \
-             \"{}\": the path level \"{}\" is writable by a non-privileged user. Registering it \
-             would let any local user replace that binary and gain persistent SYSTEM/root code \
-             execution (a privilege-escalation vector, #565). Install dig-node into a protected, \
-             admin-owned location — via the DIG installer or a native OS package — and re-run \
-             `dig-node install` from there.",
+             \"{}\": {}. Registering it would let a non-privileged local user replace that binary \
+             and gain persistent SYSTEM/root code execution (a privilege-escalation vector, #565). \
+             Install dig-node into a protected, admin-owned location — via the DIG installer or a \
+             native OS package — and re-run `dig-node install` from there.",
             program.display(),
-            offending.display(),
+            refusal.describe(),
         ),
     ))
+}
+
+/// Why a system-scope service target was refused — which of the two independent checks failed, so
+/// the message can name it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetRefusal {
+    /// A DIRECTORY level in the program's chain is not privileged-owned (it names that level).
+    Directory(PathBuf),
+    /// The program FILE itself is not privileged-owned (wrong owner, a group/other write bit, or a
+    /// symlink) — even though its directory chain is fine.
+    ProgramFile,
+}
+
+impl TargetRefusal {
+    /// The operator-facing clause naming the offending thing.
+    fn describe(&self) -> String {
+        match self {
+            TargetRefusal::Directory(level) => format!(
+                "the path level \"{}\" is writable by a non-privileged user",
+                level.display()
+            ),
+            TargetRefusal::ProgramFile => {
+                "the program file itself is not owned by root/SYSTEM, or \
+                 grants write access beyond its owner (a non-privileged user could rewrite it in \
+                 place, which the directory's permissions do not prevent)"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// PURE: given the first unprivileged DIRECTORY level (if any) and whether the program FILE itself
+/// is privileged, decide whether a system-scope registration is refused, and why.
+///
+/// Both checks are required and they are independent (#526/B6): a root-owned directory stops the
+/// entry being unlinked or renamed, while the file's OWN owner/mode is what stops it being rewritten
+/// in place. The directory is reported first because it is the wider problem when both fail.
+fn classify_system_target(
+    unprivileged_dir_level: Option<&std::path::Path>,
+    program_file_privileged: bool,
+) -> Option<TargetRefusal> {
+    match (unprivileged_dir_level, program_file_privileged) {
+        (Some(level), _) => Some(TargetRefusal::Directory(level.to_path_buf())),
+        (None, false) => Some(TargetRefusal::ProgramFile),
+        (None, true) => None,
+    }
+}
+
+/// PURE: is the [`ALLOW_INSECURE_SERVICE_TARGET_ENV`] opt-out actually in force?
+///
+/// It is INERT for a genuinely-root system-scope registration (#526/B7). That combination is a root
+/// BOOT DAEMON on a real machine — the one case where the §565 gate matters most — and the env var
+/// is inheritable: `sudo -E`, a stray export in a root profile, or a CI value leaking into an
+/// operator shell must not be able to switch the gate off for it. The override survives only where
+/// it is genuinely needed: an unelevated/dev context, or Windows-without-root semantics.
+fn insecure_override_is_effective(env_set: bool, scope: ServiceScope, is_root: bool) -> bool {
+    env_set && !(scope == ServiceScope::System && is_root)
 }
 
 /// On Windows, is this process running elevated (Administrator)? Used to fail
@@ -845,12 +1089,17 @@ fn is_elevated() -> bool {
     // Probe by attempting to open the SCM with all-access; only an elevated token
     // can. Shelling to `net session` is the classic check; doing it via `sc` query
     // would not distinguish. Use a lightweight `net session` invocation.
-    std::process::Command::new("net")
-        .arg("session")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+    os_tool("net.exe")
+        .and_then(|mut cmd| {
+            cmd.arg("session")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .ok()
+        })
         .map(|s| s.success())
+        // A `net.exe` we cannot locate in a privileged directory means we cannot establish
+        // elevation — fail CLOSED (report not-elevated) rather than proceed unverified.
         .unwrap_or(false)
 }
 #[cfg(not(windows))]
@@ -923,10 +1172,10 @@ impl SystemServiceBackend {
 
 impl ServiceBackend for SystemServiceBackend {
     fn is_installed(&self) -> io::Result<bool> {
-        Ok(query_installed(
-            &os_native_service_name(&self.label),
-            self.scope,
-        ))
+        // Propagated, NOT swallowed into `false`: a probe that could not run at all is a THIRD
+        // state (unknown), and collapsing it to "not installed" is what makes a failed removal look
+        // like "nothing was installed" (#526/B4).
+        query_installed(&os_native_service_name(&self.label), self.scope)
     }
 
     fn stop(&self) -> io::Result<()> {
@@ -993,29 +1242,29 @@ fn os_native_service_name(label: &ServiceLabel) -> String {
 /// probe that cannot run (tool missing) reports `false` so the clean-reinstall proceeds to create.
 /// Windows SCM has exactly one scope, so `scope` carries no information there.
 #[cfg(windows)]
-fn query_installed(service_name: &str, _scope: ServiceScope) -> bool {
+fn query_installed(service_name: &str, _scope: ServiceScope) -> io::Result<bool> {
     // `sc query <name>` exits 0 when the service exists, 1060 (does-not-exist) otherwise.
-    std::process::Command::new("sc.exe")
+    let status = os_tool("sc.exe")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, MISSING_TOOL_SC))?
         .args(["query", service_name])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .status()?;
+    Ok(status.success())
 }
 
 /// macOS launchd existence probe: `launchctl print <domain>/<label>` exits 0 when the service
 /// is bootstrapped in that scope's domain.
 #[cfg(target_os = "macos")]
-fn query_installed(service_name: &str, scope: ServiceScope) -> bool {
+fn query_installed(service_name: &str, scope: ServiceScope) -> io::Result<bool> {
     let domain = launchd_domain_target(service_name, scope);
-    std::process::Command::new("launchctl")
+    let status = os_tool("launchctl")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, MISSING_TOOL_LAUNCHCTL))?
         .args(["print", &domain])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .status()?;
+    Ok(status.success())
 }
 
 /// Linux systemd existence probe: `systemctl [--user] cat <label>.service` exits 0 when the
@@ -1023,18 +1272,19 @@ fn query_installed(service_name: &str, scope: ServiceScope) -> bool {
 /// per-user manager, its absence the system manager — the two hold DIFFERENT unit files, so the
 /// flag must track the scope being probed or the probe reports on the wrong registration.
 #[cfg(all(unix, not(target_os = "macos")))]
-fn query_installed(service_name: &str, scope: ServiceScope) -> bool {
+fn query_installed(service_name: &str, scope: ServiceScope) -> io::Result<bool> {
     let unit = format!("{service_name}.service");
-    let mut cmd = std::process::Command::new("systemctl");
+    let mut cmd = os_tool("systemctl")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, MISSING_TOOL_SYSTEMCTL))?;
     if scope.is_user() {
         cmd.arg("--user");
     }
-    cmd.args(["cat", &unit])
+    let status = cmd
+        .args(["cat", &unit])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .status()?;
+    Ok(status.success())
 }
 
 /// The launchd domain target `launchctl print` addresses for `scope`: `gui/<uid>/<label>` for a
@@ -1043,7 +1293,7 @@ fn query_installed(service_name: &str, scope: ServiceScope) -> bool {
 #[cfg(target_os = "macos")]
 fn launchd_domain_target(service_name: &str, scope: ServiceScope) -> String {
     if scope.is_user() {
-        format!("gui/{}/{}", unix_uid().unwrap_or(0), service_name)
+        format!("gui/{}/{}", unix_euid(), service_name)
     } else {
         format!("system/{service_name}")
     }
@@ -1055,11 +1305,13 @@ fn launchd_domain_target(service_name: &str, scope: ServiceScope) -> String {
 #[cfg(windows)]
 fn set_windows_display_name(service_name: &str, display_name: &str) {
     let args = display_name_config_args(service_name, display_name);
-    let _ = std::process::Command::new("sc.exe")
-        .args(&args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    if let Some(mut cmd) = os_tool("sc.exe") {
+        let _ = cmd
+            .args(&args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 /// Read back the Windows service's CURRENT display name via `sc qc <name>`, so
@@ -1067,7 +1319,8 @@ fn set_windows_display_name(service_name: &str, display_name: &str) {
 /// took effect rather than trusting its exit code alone.
 #[cfg(windows)]
 fn query_windows_display_name(service_name: &str) -> io::Result<Option<String>> {
-    let output = std::process::Command::new("sc.exe")
+    let output = os_tool("sc.exe")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, MISSING_TOOL_SC))?
         .args(["qc", service_name])
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1104,6 +1357,7 @@ fn ensure_install_host_allowed(config: &Config) -> io::Result<()> {
 /// desktop user while giving an ELEVATED installer the machine-wide, boot-started one it needs on a
 /// headless host. Any registration at the other scope is cleared first ([`install_at_scope`]).
 pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
+    harden_process_path_for_privileged_spawns();
     // #1667: fail fast on a remote bind that lacks the escape hatch, BEFORE any side effect
     // (service registration, state-dir harden), so the refusal leaves nothing behind.
     ensure_install_host_allowed(config)?;
@@ -1126,8 +1380,15 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
     // whose program binary sits in a user-writable directory — a swapped binary would run as
     // SYSTEM/root on the next start. Checked FIRST so a refusal has no side effects (no state-dir
     // harden, no service create). A user-level install runs as the invoking user and is allowed.
-    ensure_service_target_is_safe(&program, scope, insecure_service_target_allowed())?;
+    ensure_service_target_is_safe(
+        &program,
+        scope,
+        insecure_override_is_effective(insecure_service_target_allowed(), scope, host_is_root()),
+    )?;
     let plan = build_plan(config, program.clone());
+    // #526/B2: refuse a control character in the baked environment BEFORE anything is written —
+    // each entry becomes one raw line of a root-owned systemd unit file.
+    ensure_environment_is_unit_file_safe(&plan.environment, scope)?;
 
     // HARDEN the machine-wide state dir NOW, as the INSTALLING (interactive) user, per the
     // #501 contract: owner→SYSTEM, purge foreign ACEs, protected DACL granting SYSTEM +
@@ -1157,6 +1418,14 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
     let other_backend = host_supports_user_scope()
         .then(|| SystemServiceBackend::new(other_scope).ok())
         .flatten();
+    // The OS-manager sweep above can only see the CURRENT account's user scope, and as root it can
+    // see none at all (#526/B3: root has no systemd `--user` session, and `gui/<uid>` is uid 0's
+    // domain). Registering a system service while another account's user-level node keeps running
+    // would leave two enabled units on the same port — and the still-running one holds it, so the
+    // `dig-node start` that dig-installer treats as fatal would fail. So when registering at SYSTEM
+    // scope, additionally sweep every account's registration on the FILESYSTEM.
+    let account_sweep = (scope == ServiceScope::System && host_supports_user_scope())
+        .then(|| sweep_other_accounts_user_scope());
     let (report, migration) = install_at_scope(
         &backend,
         other_backend.as_ref().map(|b| (b, other_scope)),
@@ -1218,6 +1487,29 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
             ));
         }
     }
+    // Report the per-account filesystem sweep truthfully: what was cleared, what was left behind,
+    // and — whenever a system registration was made — the residual this mechanism cannot reach.
+    if let Some(sweep) = &account_sweep {
+        for home in &sweep.removed {
+            summary.push_str(&format!(
+                "
+  note: removed (and stopped) the user-level registration belonging to {}.",
+                home.display()
+            ));
+        }
+        for (home, why) in &sweep.failed {
+            summary.push_str(&format!(
+                "
+  WARN could not remove the user-level registration belonging to {} ({why}); it                  may keep starting a second node on the same port. Have that user run: dig-node                  uninstall --scope user",
+                home.display()
+            ));
+        }
+        summary.push_str(&format!(
+            "
+  note: {}",
+            crate::user_scope::UserScopeSweep::residual_note()
+        ));
+    }
     if let Some(note) = &recovery_note {
         summary.push_str("\n  ");
         summary.push_str(note);
@@ -1246,6 +1538,21 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
     if let Some(verified) = display_name_verified {
         result["display_name_verified"] = json!(verified);
     }
+    if let Some(sweep) = &account_sweep {
+        result["user_scope_sweep"] = json!({
+            "removed_accounts": sweep
+                .removed
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+            "failed_accounts": sweep
+                .failed
+                .iter()
+                .map(|(p, why)| json!({ "account": p.display().to_string(), "error": why }))
+                .collect::<Vec<_>>(),
+            "residual": crate::user_scope::UserScopeSweep::residual_note(),
+        });
+    }
     if let Some(m) = &migration {
         result["migrated_from_scope"] = json!({
             "scope": m.scope.as_str(),
@@ -1266,6 +1573,7 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
 /// ([`uninstall_scopes`]/[`uninstall_outcome`]). Every scope is reported, and anything short of a
 /// complete removal is an error, never a silent success.
 pub fn uninstall(scope: ScopeChoice) -> io::Result<Outcome> {
+    harden_process_path_for_privileged_spawns();
     if cfg!(windows) && !is_elevated() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1354,12 +1662,14 @@ fn start_outcome(result: io::Result<()>) -> io::Result<Outcome> {
 /// default `auto` starts what a default `install` registered). Idempotent: an already-running
 /// service is reported as success (#772), never a hard error.
 pub fn start(scope: ScopeChoice) -> io::Result<Outcome> {
+    harden_process_path_for_privileged_spawns();
     let backend = SystemServiceBackend::new(host_scope(scope))?;
     start_outcome(backend.start())
 }
 
 /// Stop the running service at `scope` (#526).
 pub fn stop(scope: ScopeChoice) -> io::Result<Outcome> {
+    harden_process_path_for_privileged_spawns();
     let backend = SystemServiceBackend::new(host_scope(scope))?;
     backend.stop()?;
     Ok(Outcome::new(
@@ -1697,7 +2007,9 @@ SERVICE_NAME: net.dignetwork.dig-node
         let err = ensure_service_target_is_safe(&program, ServiceScope::System, false)
             .expect_err("a system-level install from a user-writable dir must be refused");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        // The message must name the LPE class + the offending path so an operator can act.
+        // The message must name the LPE class + the offending path so an operator can act. (Which
+        // of the two independent checks fires depends on the host and on whether the suite runs as
+        // root — see the directory-level test — so only the class + path are asserted here.)
         let msg = err.to_string();
         assert!(msg.contains("#565"), "message cites the LPE class: {msg}");
         assert!(
@@ -1802,6 +2114,7 @@ SERVICE_NAME: net.dignetwork.dig-node
         created_plan: RefCell<Option<InstallPlan>>,
         fail_stop: bool,
         fail_delete: bool,
+        fail_delete_not_found: bool,
         fail_probe: bool,
     }
 
@@ -1814,6 +2127,7 @@ SERVICE_NAME: net.dignetwork.dig-node
                 created_plan: RefCell::new(None),
                 fail_stop: false,
                 fail_delete: false,
+                fail_delete_not_found: false,
                 fail_probe: false,
             }
         }
@@ -1836,6 +2150,13 @@ SERVICE_NAME: net.dignetwork.dig-node
         /// case that must never be reported as a silent success).
         fn failing_delete(mut self) -> Self {
             self.fail_delete = true;
+            self
+        }
+        /// A mock whose `delete` fails with `NotFound` — the OS positively reporting that nothing is
+        /// registered, which is the ONLY honest "there was nothing here" signal (#526/B4).
+        fn failing_delete_not_found(mut self) -> Self {
+            self.fail_delete = true;
+            self.fail_delete_not_found = true;
             self
         }
         /// A mock whose existence probe errors — an indeterminate scope, which must be REPORTED,
@@ -1871,10 +2192,17 @@ SERVICE_NAME: net.dignetwork.dig-node
         fn delete(&self) -> io::Result<()> {
             self.record("delete");
             if self.fail_delete {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Failed to connect to bus: Operation not permitted",
-                ));
+                return Err(if self.fail_delete_not_found {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "Unit dignetwork-dig-node.service does not exist",
+                    )
+                } else {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "Failed to connect to bus: Operation not permitted",
+                    )
+                });
             }
             *self.installed.borrow_mut() = false; // synchronous removal
             Ok(())
@@ -2028,6 +2356,76 @@ An instance of the service is already running.",
         let err = backend.create(&plan()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert!(err.to_string().contains("1073"));
+    }
+
+    // -- #526/B1 + B8: nothing privileged is located through $PATH ---------------------------
+
+    /// The B1/B8 root-LPE guard, asserted at the SOURCE level because that is where the property
+    /// lives: every OS tool this module runs may now run as root (the privilege level decides the
+    /// scope on every verb), so NO spawn may name a program that `$PATH` resolves. A behavioural
+    /// test cannot express "and no future spawn either"; this can, and it fails the moment someone
+    /// reintroduces `Command::new("systemctl")`.
+    #[test]
+    fn no_privileged_spawn_names_a_program_that_path_would_resolve_b1_b8() {
+        // Only the PRODUCTION half is scanned: this test's own prose necessarily spells the
+        // forbidden pattern, and matching itself would make it unfalsifiable.
+        let whole = include_str!("service.rs");
+        let src = whole
+            .split_once(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .map(|(production, _)| production)
+            .expect("the test module marks the end of production code");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("Command::new("))
+            // The ONE legitimate site: inside `os_tool`, which passes an absolute PathBuf it
+            // resolved from the fixed privileged directory list.
+            .filter(|(_, line)| !line.contains("Command::new(path)"))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "every OS-tool spawn must go through os_tool() (absolute path from a fixed privileged \
+             directory list). A bare program name is resolved through $PATH, and these run as root \
+             — a planted binary in a user-writable PATH entry (/usr/local/bin is group-writable on \
+             Debian and user-owned under Intel Homebrew, and sudo keeps the user's PATH on macOS) \
+             would execute as root. Offending lines: {offenders:?}"
+        );
+        // The privilege probe itself must be a syscall: an `id -u` spawn was the original defect,
+        // and a fake `id` printing a non-zero uid would ALSO flip the resolved scope to `user`,
+        // switching the §565 privileged-target gate off.
+        assert!(
+            !src.contains("\"id\""),
+            "the effective uid must come from geteuid(), never a spawned `id`"
+        );
+    }
+
+    #[test]
+    fn the_os_tool_directory_list_excludes_user_writable_locations() {
+        let dirs = os_tool_dirs();
+        assert!(!dirs.is_empty());
+        for bad in [
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "/opt/homebrew/bin",
+            ".",
+        ] {
+            assert!(
+                !dirs.iter().any(|d| d == std::path::Path::new(bad)),
+                "{bad} is writable by a non-privileged user on a common install and MUST NOT be a \
+                 privileged tool directory: {dirs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn os_tool_fails_closed_for_a_tool_that_is_not_in_a_privileged_directory() {
+        // A tool we cannot locate safely is NOT run from wherever $PATH points.
+        assert!(os_tool("definitely-not-a-real-os-tool-xyz").is_none());
     }
 
     // -- #526 scope resolution: the decision, host-independently ------------------------------
@@ -2290,7 +2688,9 @@ An instance of the service is already running.",
 
     #[test]
     fn uninstall_errors_when_no_scope_holds_a_registration() {
-        let backend = MockBackend::new(false).failing_delete();
+        // Genuine absence: the probe sees nothing AND the OS itself reports NotFound on removal.
+        // (A removal that fails for any OTHER reason is `indeterminate`, not absence — B4.)
+        let backend = MockBackend::new(false).failing_delete_not_found();
         let removals =
             remove_registrations(&[(&backend, ServiceScope::User, RemovalMode::Requested)]);
         let err = uninstall_outcome(removals).expect_err("nothing to uninstall is an error");
@@ -2344,6 +2744,208 @@ An instance of the service is already running.",
         );
     }
 
+    // -- #526/B2: no control character may reach a root-owned unit file ----------------------
+
+    /// The unit-file injection guard. `service-manager`'s systemd backend writes each baked variable
+    /// as one raw `Environment="K=V"` line into a ROOT-owned unit, unescaped — so a value carrying a
+    /// newline appends directives (`ExecStartPre=` may appear repeatedly and runs as root before
+    /// `ExecStart`). The fixture uses the real reachable carrier, `DIG_RPC_UPSTREAM`, whose value can
+    /// come from a `config.json` under a user-writable `$HOME`.
+    #[test]
+    fn a_control_character_in_a_baked_env_value_is_refused_for_system_scope_b2() {
+        let injected = "https://a.test\nExecStartPre=/tmp/pwn\n";
+        let env = vec![("DIG_RPC_UPSTREAM".to_string(), injected.to_string())];
+
+        let err = ensure_environment_is_unit_file_safe(&env, ServiceScope::System)
+            .expect_err("a newline in a value written into a root unit file must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DIG_RPC_UPSTREAM"),
+            "names the variable: {msg}"
+        );
+        assert!(
+            msg.contains("control character"),
+            "states the guard over the CLASS, not one directive: {msg}"
+        );
+    }
+
+    #[test]
+    fn every_control_character_class_is_refused_in_a_key_or_a_value_b2() {
+        // The guard is over the class: \n (new directive), \r (systemd also splits on CR), \0
+        // (truncation). In the KEY as well as the VALUE — the key is written on the same line.
+        for bad in ["\n", "\r", "\0"] {
+            let in_value = vec![("DIG_NODE_CACHE".to_string(), format!("/tmp{bad}Bad=1"))];
+            assert!(
+                ensure_environment_is_unit_file_safe(&in_value, ServiceScope::System).is_err(),
+                "{bad:?} in a value must be refused"
+            );
+            let in_key = vec![(format!("DIG_NODE_CACHE{bad}Bad"), "/tmp".to_string())];
+            assert!(
+                ensure_environment_is_unit_file_safe(&in_key, ServiceScope::System).is_err(),
+                "{bad:?} in a key must be refused"
+            );
+        }
+        // A clean environment passes — the guard must not reject the ordinary case (otherwise every
+        // install would fail and the tests above would prove nothing about the guard's precision).
+        let clean =
+            build_plan(&Config::default(), PathBuf::from("/opt/dig/bin/dig-node")).environment;
+        assert!(ensure_environment_is_unit_file_safe(&clean, ServiceScope::System).is_ok());
+    }
+
+    #[test]
+    fn user_scope_does_not_apply_the_unit_file_guard_b2() {
+        // A user-scope unit is written by, and runs as, the very user who owns these values — no
+        // privilege boundary is crossed, so the guard would only reject that user's own footgun.
+        let env = vec![("DIG_RPC_UPSTREAM".to_string(), "https://a\nb".to_string())];
+        assert!(ensure_environment_is_unit_file_safe(&env, ServiceScope::User).is_ok());
+    }
+
+    #[test]
+    fn a_control_character_never_survives_upstream_normalisation_b2() {
+        // Source-side rejection, so a poisoned value cannot even PERSIST into config.json and be
+        // baked at some later install.
+        assert!(crate::config::contains_control_character(
+            "https://a\nExecStartPre=/tmp/x"
+        ));
+        assert!(crate::config::normalize_upstream("https://a\nExecStartPre=/tmp/x").is_empty());
+        // The ordinary value is untouched.
+        assert_eq!(
+            crate::config::normalize_upstream("rpc.dig.net"),
+            "https://rpc.dig.net"
+        );
+    }
+
+    // -- #526/B4: a failed removal is never reported as "nothing was installed" ---------------
+
+    #[test]
+    fn a_removal_that_fails_for_any_reason_but_absence_is_indeterminate_b4() {
+        // The classification: only the OS positively saying NotFound means "there was nothing here".
+        assert!(
+            !removal_failure_is_indeterminate(false, io::ErrorKind::NotFound),
+            "a readable probe plus NotFound is genuine absence"
+        );
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(
+                removal_failure_is_indeterminate(false, kind),
+                "{kind:?} leaves a possible registration behind and MUST be unresolved"
+            );
+        }
+        // An unreadable probe is unknown regardless of what the delete then said.
+        assert!(removal_failure_is_indeterminate(
+            true,
+            io::ErrorKind::NotFound
+        ));
+    }
+
+    /// The macOS-from-the-other-side case: an ssh session with no Aqua domain false-negatives the
+    /// probe AND fails `unload` before the plist is removed. Reporting `NotFound` there would tell
+    /// the operator nothing was installed while the agent still starts at next login.
+    #[test]
+    fn a_failed_removal_is_not_reported_as_nothing_to_uninstall_b4() {
+        let backend = MockBackend::new(false).failing_delete(); // probe lies, delete denied
+        let removal = remove_registration(&backend, ServiceScope::User, RemovalMode::Requested);
+        assert!(!removal.found && !removal.removed);
+        assert!(
+            removal.indeterminate,
+            "a PermissionDenied removal leaves the state UNKNOWN: {removal:?}"
+        );
+        let err = uninstall_outcome(vec![removal]).expect_err("must not be a success");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "telling the operator 'nothing to uninstall' would be a lie: {err}"
+        );
+    }
+
+    /// The multi-scope shape of the same defect: one scope removed, another left behind. A
+    /// `removed`-only classification would report plain success.
+    #[test]
+    fn a_leftover_at_one_scope_is_not_masked_by_a_success_at_another_b4() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let user = MockBackend::tagged("user:", &log, true);
+        let system = MockBackend::tagged("system:", &log, false).failing_delete();
+        let removals = remove_registrations(&[
+            (&user, ServiceScope::User, RemovalMode::Requested),
+            (&system, ServiceScope::System, RemovalMode::Requested),
+        ]);
+        assert!(removals[0].removed, "one scope genuinely removed");
+        assert!(removals[1].indeterminate, "the other is unknown");
+        assert!(uninstall_outcome(removals).is_err());
+    }
+
+    #[test]
+    fn the_real_backend_can_report_an_unreadable_probe_b4() {
+        // `is_installed` must PROPAGATE a probe failure rather than swallow it into `false`, or the
+        // `indeterminate` state advertised in SPEC would be unreachable outside the mock. Asserted
+        // through the signature: a swallowing implementation cannot express an Err at all.
+        fn assert_propagates<F: Fn(&str, ServiceScope) -> io::Result<bool>>(_f: F) {}
+        assert_propagates(query_installed);
+    }
+
+    // -- #526/B6 + B7: the file's own owner, and an override that cannot be inherited ---------
+
+    /// Directory permissions stop unlink/rename; they do NOT stop a rewrite of a file whose own mode
+    /// permits it. A root-owned `0755 /opt/dig/bin` holding a uid-1000 `dig-node` would otherwise
+    /// PASS and give that user root at next boot. Table-driven over both independent checks.
+    #[test]
+    fn the_program_file_must_be_privileged_in_its_own_right_b6() {
+        let level = std::path::Path::new("/opt/dig/bin");
+        assert_eq!(classify_system_target(None, true), None, "both checks pass");
+        assert_eq!(
+            classify_system_target(None, false),
+            Some(TargetRefusal::ProgramFile),
+            "a privileged directory chain does NOT excuse a user-writable program file"
+        );
+        assert_eq!(
+            classify_system_target(Some(level), true),
+            Some(TargetRefusal::Directory(level.to_path_buf()))
+        );
+        assert_eq!(
+            classify_system_target(Some(level), false),
+            Some(TargetRefusal::Directory(level.to_path_buf())),
+            "the wider problem is reported first"
+        );
+        // Each refusal must be actionable and distinguishable in the message.
+        assert!(TargetRefusal::ProgramFile
+            .describe()
+            .contains("program file"));
+        assert!(TargetRefusal::Directory(level.to_path_buf())
+            .describe()
+            .contains("/opt/dig/bin"));
+    }
+
+    #[test]
+    fn the_insecure_override_is_inert_for_a_root_system_registration_b7() {
+        // The env var is INHERITABLE (`sudo -E`, a root profile export, a CI value leaking into an
+        // operator shell). It must not be able to switch the §565 gate off for a root boot daemon.
+        assert!(
+            !insecure_override_is_effective(true, ServiceScope::System, true),
+            "a genuinely-root system registration must ignore the override"
+        );
+        // …and must still work where it is legitimately needed.
+        assert!(insecure_override_is_effective(
+            true,
+            ServiceScope::System,
+            false
+        ));
+        assert!(insecure_override_is_effective(
+            true,
+            ServiceScope::User,
+            true
+        ));
+        // Absent env var ⇒ never effective (default-safe).
+        assert!(!insecure_override_is_effective(
+            false,
+            ServiceScope::System,
+            false
+        ));
+    }
+
     // -- #526: the §565 gate now fires on unix system scope, so its refusal must be actionable
 
     #[test]
@@ -2357,17 +2959,26 @@ An instance of the service is already running.",
         let program = nested.join("dig-node");
 
         let err = ensure_service_target_is_safe(&program, ServiceScope::System, false)
-            .expect_err("a system-level install from a user-writable chain must be refused");
+            .expect_err("a system-level install from an unprivileged target must be refused");
         let msg = err.to_string();
-        let offending = crate::security::first_unprivileged_ancestor(&nested)
-            .expect("the temp chain has an unprivileged level");
-        // A bare `contains(offending)` would be VACUOUS: every ancestor is a string PREFIX of the
-        // program path the message already prints, so the assertion would hold even if the level
-        // were never named. Assert the exact naming PHRASE instead.
-        let named = format!("the path level \"{}\"", offending.display());
+
+        // WHICH check fires depends on the host and on whether the suite itself runs as root (a
+        // root-owned temp dir clears the directory chain, leaving the FILE check to refuse), so the
+        // test asserts against the classifier's own verdict for this exact path rather than assuming
+        // one of them — otherwise it would false-RED under `sudo cargo test` and, worse, stop
+        // testing a refusal at all.
+        let expected = classify_system_target(
+            crate::security::first_unprivileged_ancestor(&nested),
+            crate::security::file_is_privileged(&program),
+        )
+        .expect("an unprivileged target must classify as a refusal");
+        // A bare `contains(<some ancestor path>)` would be VACUOUS: every ancestor is a string
+        // PREFIX of the program path the message already prints, so it would hold even if nothing
+        // were named. Assert the exact naming PHRASE the refusal is required to carry.
         assert!(
-            msg.contains(&named),
-            "the refusal must name the offending level as `{named}`: {msg}"
+            msg.contains(&expected.describe()),
+            "the refusal must name what failed ({}): {msg}",
+            expected.describe()
         );
     }
 }

@@ -91,6 +91,10 @@ pub mod tls;
 /// beacon's world-readable status and shells its elevation-gated CLI for channel/pause/resume/
 /// check-now — never a second implementation of the beacon's own trust logic. See [`updater`].
 pub mod updater;
+/// Discovering + removing OTHER ACCOUNTS' user-scope service registrations (#526): as root, the OS
+/// cannot be asked about a per-user systemd unit or a `gui/<uid>` launchd agent, so the cross-scope
+/// sweep reads the filesystem per account, with a strict no-symlink discipline. See [`user_scope`].
+pub mod user_scope;
 pub mod wallet_authz;
 
 /// Windows Service Control Protocol entrypoint — only meaningful on Windows, where

@@ -442,11 +442,26 @@ pub fn host_is_allowed(host_header: Option<&str>) -> bool {
     )
 }
 
+/// Whether `s` carries any character that must never survive into a value this node persists or
+/// bakes into a service unit file: a C0/C1 control character, which includes newline, carriage
+/// return and NUL.
+///
+/// Stated over the CLASS of control characters rather than over the specific line terminators that
+/// make systemd unit-file injection work (#526/B2) — a check justified by one attacker trick is
+/// bypassed by the next variant, and no legitimate URL or filesystem path needs one.
+pub fn contains_control_character(s: &str) -> bool {
+    s.chars().any(char::is_control)
+}
+
 /// Normalise an upstream URL: trim, strip trailing slashes, and default a bare
 /// host to `https://`. Pure so the precedence/normalisation is unit-testable.
 pub fn normalize_upstream(raw: &str) -> String {
     let t = raw.trim().trim_end_matches('/');
-    if t.is_empty() {
+    // A control character can never be part of a URL, and an upstream is baked verbatim into a line
+    // of a privileged systemd unit file at install time (#526/B2), so reject the whole value here at
+    // the SOURCE rather than let it persist and be caught later: an embedded newline would let a
+    // stored config append directives to a root-owned unit. Empty ⇒ "use the default".
+    if t.is_empty() || contains_control_character(t) {
         return String::new();
     }
     if t.starts_with("http://") || t.starts_with("https://") {

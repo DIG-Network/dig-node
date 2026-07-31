@@ -52,6 +52,20 @@ pub fn first_unprivileged_ancestor(dir: &Path) -> Option<&Path> {
     dir.ancestors().find(|c| !component_is_privileged(c))
 }
 
+/// Whether a single FILE clears the SAME trust bar every directory component must
+/// ([`component_is_privileged`]): privileged-owned, no group/other write bit, not a
+/// symlink/reparse point. Fails CLOSED.
+///
+/// Directory permissions and file permissions stop DIFFERENT attacks, which is why both are checked
+/// (#526/B6): a root-owned `0755` directory prevents unlink/rename of the entry, but says nothing
+/// about a binary INSIDE it that is itself owned by uid 1000 (or group/world-writable) — that file
+/// can be rewritten in place, and a root boot daemon would execute the new contents. So the program
+/// a privileged service points at must clear the bar on its own account, not merely by living in a
+/// good directory.
+pub fn file_is_privileged(file: &Path) -> bool {
+    component_is_privileged(file)
+}
+
 /// Whether a SINGLE existing path `component` clears the trust bar: privileged-owned, not
 /// user-writable, and not a symlink/junction/reparse point. Fails CLOSED on any metadata error
 /// (missing, access denied) — an indeterminate component is untrusted. Used for every level by
