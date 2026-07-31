@@ -210,10 +210,10 @@ impl CapsuleStore for Node {
         }
         // Serialize on-demand writes so two fetches of the same capsule don't race.
         let _guard = self.cache_lock.lock().await;
-        // sync_module_from returns true only when the served root == requested
-        // root; either way the module lands under its SERVED root, so we read the
-        // file back to report size + confirm the capsule is now present.
-        let matched = self
+        // The module lands under its SERVED root, which may differ from the requested one if
+        // the remote head advanced mid-sync, so we read the file back to report size + confirm
+        // THIS capsule is now present.
+        let sync = self
             .sync_module_from(&self.upstream, store_id_hex, root_hex)
             .await;
         let path = capsule.module_path(&self.cache_dir);
@@ -230,14 +230,19 @@ impl CapsuleStore for Node {
                 self.refresh_dht_inventory().await;
                 Ok((md.len(), root_hex.to_string()))
             }
-            Err(_) if matched => {
-                // matched but no file: should not happen, surface it.
-                Err("sync reported a match but the module is not cached".to_string())
-            }
-            Err(_) => Err(format!(
-                "could not fetch capsule {store_id_hex}:{root_hex} (no §21 identity, \
-                 not authorized, or served root differs)"
-            )),
+            // No file on disk. The sync's OWN outcome says why — never a list of causes that
+            // were not checked. A guess-list here sent #1886's investigation at authorization
+            // for days while the upstream had been answering a plain HTTP 400.
+            Err(_) => match sync {
+                Ok(served) => Err(format!(
+                    "capsule {store_id_hex}:{root_hex} not cached: the upstream served root {} \
+                     instead (its head moved)",
+                    served.to_hex()
+                )),
+                Err(reason) => Err(format!(
+                    "could not fetch capsule {store_id_hex}:{root_hex}: {reason}"
+                )),
+            },
         }
     }
 
@@ -310,12 +315,16 @@ impl CapsuleStore for Node {
         }
         let root = Bytes32(root_bytes);
         tokio::spawn(async move {
+            // OPERATOR-VISIBLE at the default level, both ways (#1886): landing a capsule is
+            // the moment this node becomes a holder and the content-replication flywheel turns,
+            // and failing to land one is the moment it silently does not. At `debug!` a broken
+            // flywheel looked exactly like a working one from any log a user would run.
             match node.gap_fill_generation(store_id, root).await {
-                Ok(()) => tracing::debug!(
+                Ok(()) => tracing::info!(
                     capsule = %key,
                     "backfill: cached the whole capsule after a resource read from another node"
                 ),
-                Err(e) => tracing::debug!(
+                Err(e) => tracing::warn!(
                     capsule = %key,
                     error = %e,
                     "backfill: whole-capsule pull did not complete (will re-attempt on the next miss)"
