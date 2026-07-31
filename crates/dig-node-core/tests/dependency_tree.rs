@@ -114,7 +114,19 @@ fn the_peer_client_and_pull_engine_are_not_duplicated() {
     // size regression — those calls stop typechecking. Requesting the dig-nat 0.14 line while
     // dig-download 0.11 and dig-gossip 0.16 sit on ^0.13 resolves THREE dig-nat instances, which is
     // what this assertion exists to catch before a manifest edit ships (#1668).
-    for crate_name in ["dig-peer", "dig-download", "dig-nat", "dig-tls", "dig-dht"] {
+    //
+    // `dig-peer-selector` joined the list after the #1674 cascade, where it was the one member left on
+    // the old line and so the sole source of a duplicate dig-nat AND dig-dht. It belongs here on the
+    // same rule as the rest — the node bridges dig-download's `SourceSelector` to it
+    // (`seams/dig_peer/selector_adapter.rs`), so its `dig-dht` candidate types must be the node's.
+    for crate_name in [
+        "dig-peer",
+        "dig-download",
+        "dig-nat",
+        "dig-tls",
+        "dig-dht",
+        "dig-peer-selector",
+    ] {
         let versions = locked_versions(crate_name);
         assert_eq!(
             versions.len(),

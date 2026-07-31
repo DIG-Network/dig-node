@@ -5,8 +5,10 @@ name = "dig-node-core"
 # moves: 0.24.0 acknowledges that the surface now exposes dig-nat 0.14 / dig-dht 0.8 types, a
 # compatibility-relevant change even though the crate is consumed in-workspace and is not published to
 # crates.io. Holding it at 0.23.0 would have overstated stability to anyone reading the manifest for
-# what the exported types are (dig_ecosystem#1785c).
-version = "0.25.1"
+# what the exported types are (dig_ecosystem#1785c). 0.26.0 does the same for the 0.15 line: the
+# exported dig-nat / dig-dht types rotate identity again, and `DhtError` — reachable through this
+# crate's dig-dht re-exports — now carries `SafeText` instead of `String` (dig_ecosystem#1674/#1675).
+version = "0.26.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -147,12 +149,19 @@ getrandom = "0.2"
 # values and passes them INTO dig-download, dig-gossip and dig-peer-selector, so a second dig-nat
 # instance does not merely bloat the tree -- those calls stop typechecking (verified: E0308 `expected
 # dig_nat::relay::RelayStatus, found dig_nat::RelayStatus`). So dig-nat cannot be bumped alone, and
-# dig-gossip/dig-dht/dig-download/dig-peer/dig-peer-selector cannot be bumped past it: the 0.14 line
-# (dig-gossip 0.17, dig-dht 0.8, dig-download 0.12, dig-peer 0.7, dig-peer-selector 0.7) is a single
-# atomic cascade, which #1686 completed by publishing every member. `tests/dependency_tree.rs` asserts
-# the single-instance invariant against the resolved LOCK so a partial cascade cannot quietly
+# dig-gossip/dig-dht/dig-download/dig-peer/dig-peer-selector cannot be bumped past it: the 0.15 line
+# (dig-gossip 0.18, dig-dht 0.9, dig-download 0.13, dig-peer 0.8, dig-peer-selector 0.8) is a single
+# atomic cascade, which #1674/#1675 completed by publishing every member. `tests/dependency_tree.rs`
+# asserts the single-instance invariant against the resolved LOCK so a partial cascade cannot quietly
 # reintroduce the duplicate.
-dig-nat = "0.14"
+#
+# The 0.15 line carries the SafeText peer-text cascade (#1674/#1675): error text of remote origin is
+# held as `dig_nat::SafeText` rather than `String`, so a hostile peer's control characters cannot forge
+# a line in an operator's log. On a partial bump the failure is now LOUDER than the RelayStatus mismatch
+# above -- `SafeText` crosses dig-dht's AND dig-peer's public error surfaces, so two dig-nat versions is
+# an outright compile error on those seams rather than merely two mTLS stacks. See
+# `seams/dig_peer/dht.rs::stage_failed` for this crate's side of the adoption.
+dig-nat = "0.15"
 # dig-gossip is the ONE peer-stack exception: not yet published to crates.io (its publish is guarded
 # pending dig-peer-protocol, #681), so it stays a git dependency PINNED to a release commit — here
 # v0.17.12 (rev 3e352d91).
@@ -177,7 +186,7 @@ dig-nat = "0.14"
 # graph still unifies to ONE of each. The vendored chia-protocol/chia-sdk-client forks it path-patches
 # are re-declared at this SAME rev in the workspace `[patch.crates-io]` (a git dep's own patches do not
 # apply transitively — the #1529 3-rev lockstep: this dep rev + the two patch revs move together).
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "dd29ce8df275d60b3568079f3739bbe55f7bbf17", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "6d458974522cdada1f9b09469d7709e08036a800", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. From
 # crates.io: dig-nat 0.7 requires `>=0.4, <0.6` and dig-gossip 0.7.1 requires `>=0.2, <0.5`, so `0.4`
 # sits in both windows and the whole graph resolves to ONE crates.io dig-constants 0.4.x.
@@ -193,7 +202,7 @@ dig-constants = "0.4"
 # so cargo unifies to ONE dig-dht instance — dig-dht's `PeerId` / `Contact` / `DhtTransport` share the
 # exact types `dig_nat::connect` returns. dig-dht 0.5 deps dig-nat "^0.10" (crates.io), the SAME
 # dig-nat "0.10" this crate pins, so the whole graph shares ONE dig-nat 0.10 instance.
-dig-dht = "0.8"
+dig-dht = "0.9"
 # -- L7 Peer Exchange (PEX, #166) --------------------------------------------------------------------
 # The node<->node peer-sharing protocol: over each established mTLS peer connection, a dedicated PEX
 # logical stream exchanges delta-based first-hand known-peer sets (handshake -> snapshot -> deltas),
@@ -228,7 +237,7 @@ dig-pex = "0.1"
 # `seams/dig_peer/module_anchor.rs` (`ChainAnchoredModuleVerifier`). NOTE the `testkit` feature is
 # deliberately NOT enabled: it is what makes the fail-OPEN `AcceptAnyModuleAnchor` nameable, and this
 # crate's anchor gate is the reshare path's ONLY root of trust.
-dig-download = "0.12"
+dig-download = "0.13"
 # -- The shared peer client (#1283/#1576) -------------------------------------------------------------
 # `DigPeer` — the ONE DIG Network peer client: peer_id-pinned mTLS over the full NAT ladder plus typed
 # RPC. Depended on DIRECTLY (not only transitively through dig-download) because dig-node supplies the
@@ -240,7 +249,7 @@ dig-download = "0.12"
 # module pull's trust boundary — on the fields that drive the whole pull plan. dig-download 0.8.1 is on
 # dig-peer 0.5 too, so exactly ONE dig-rpc-protocol + ONE dig-peer resolve here (asserted by
 # `crates/dig-node-core/tests/dependency_tree.rs`).
-dig-peer = "0.7"
+dig-peer = "0.8"
 # -- Self-optimizing peer selection (#178) ------------------------------------------------------------
 # The decision + learning layer between dig-dht discovery and dig-download execution: it ranks the
 # providers `find_providers` returns (learning throughput/rtt/reliability + a per-class saturation
@@ -257,7 +266,7 @@ dig-peer = "0.7"
 # dig-nat/dig-dht types). The selector mirrors `dig_gossip::PoolEvent` LOCALLY (it does not depend on
 # dig-gossip, which lags as a git dep), so the node maps `dig_gossip::PoolEvent` → the selector's local
 # `PoolEvent` 1:1 (see `download.rs::pool_event_to_selector`).
-dig-peer-selector = "0.7"
+dig-peer-selector = "0.8"
 # The canonical DIG mTLS certificate crate (L00, crates.io). The node's PERSISTENT machine identity
 # is a CA-signed `dig_tls::NodeCert` minted from the node's own BLS identity key and persisted 0600 in
 # the data dir (#908 identity boundary: this is the MACHINE key, never a user key). Replaces the
@@ -307,7 +316,7 @@ rcgen = "0.13"
 #
 # Pinned by the `the_fail_open_anchor_verifier_is_not_reachable_from_a_production_build` test, which
 # fails if `testkit` ever appears on the production entry.
-dig-download = { version = "0.12", features = ["testkit"] }
+dig-download = { version = "0.13", features = ["testkit"] }
 # Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
 # serve-observability tests (#1595) assert what an operator would actually see in the node log —
 # and that no payload byte or proof ever reaches it.
