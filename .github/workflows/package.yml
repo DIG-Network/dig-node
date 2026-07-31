@@ -16,9 +16,11 @@ on:
       - "packaging/**"
       - "src/**"
       - "crates/**"
+      - "scripts/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/package.yml"
+      - ".github/actions/**"
   push:
     tags:
       - "v*"
@@ -30,18 +32,43 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: "0"
 
 jobs:
-  # ---- Ubuntu .deb ----------------------------------------------------------
+  # ---- Ubuntu/Debian .deb (amd64 + arm64) -----------------------------------
+  #
+  # Built inside the SAME pinned old-glibc container as the release binaries
+  # (`.github/actions/setup-linux-build`, glibc 2.31 — #1736). This .deb is what apt.dig.net serves,
+  # so building it on `ubuntu-latest` made `apt-get install dig-node` produce a binary that would
+  # not start on Ubuntu 22.04 LTS, Debian 12 or Amazon Linux 2023 — the same defect as the raw
+  # binary, on the path most users actually take.
+  #
+  # arm64 is built NATIVELY on the free public-repo arm64 runner (#1741): apt's arm64 index
+  # previously contained no `dig-node` at all, so every Graviton/Ampere/Pi host was unserved.
   deb:
-    name: build .deb (linux-x64)
-    runs-on: ubuntu-latest
+    name: build .deb (linux-${{ matrix.dpkg_arch }})
+    runs-on: ${{ matrix.runner }}
+    container: debian:11
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            dpkg_arch: amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            dpkg_arch: arm64
     steps:
+      - name: Bootstrap the container for checkout
+        run: |
+          set -eux
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ca-certificates curl git
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable
-          rustup default stable
+      - name: Trust the checkout (git runs as root in the container)
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - id: setup
+        uses: ./.github/actions/setup-linux-build
       - uses: actions/cache@v4
         with:
           path: |
@@ -49,8 +76,8 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-          key: ${{ runner.os }}-pkg-deb-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-pkg-deb-
+          key: pkg-deb-glibc${{ steps.setup.outputs.glibc-floor }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: pkg-deb-glibc${{ steps.setup.outputs.glibc-floor }}-${{ matrix.target }}-
       - name: Resolve version
         id: ver
         run: |
@@ -58,16 +85,21 @@ jobs:
             V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
           echo "v=$V" >> "$GITHUB_OUTPUT"
       - name: Build release binary
-        run: cargo build --release --locked --bin dig-node
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-node
+      - name: Assert the packaged binary honours the glibc floor
+        # Gate the .deb's payload, not just the raw release binary: apt is a separate delivery path
+        # and would otherwise be able to regress on its own.
+        run: bash scripts/check-glibc-floor.sh "target/${{ matrix.target }}/release/dig-node" "${{ steps.setup.outputs.glibc-floor }}"
       - name: Build .deb
-        run: bash packaging/linux/build-deb.sh target/release/dig-node "${{ steps.ver.outputs.v }}" amd64 dist
+        run: bash packaging/linux/build-deb.sh "target/${{ matrix.target }}/release/dig-node" "${{ steps.ver.outputs.v }}" "${{ matrix.dpkg_arch }}" dist
       - name: Validate .deb metadata
         run: |
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb
       - uses: actions/upload-artifact@v4
         with:
-          name: dig-node-deb
+          # One artifact per arch — a shared name would make the two matrix legs collide.
+          name: dig-node-deb-${{ matrix.dpkg_arch }}
           path: dist/*.deb
           if-no-files-found: error
 
@@ -175,7 +207,7 @@ jobs:
   # ---- Attach to the GitHub Release (tags only) -----------------------------
   publish:
     name: Attach packages to the release
-    needs: [deb, pkg, msi]
+    needs: [deb, pkg, msi] # `deb` is a matrix; the whole matrix must be green before publishing
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:

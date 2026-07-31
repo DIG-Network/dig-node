@@ -348,6 +348,44 @@ pub(crate) fn pool_removal_reason(reason: GossipRemovalReason) -> PoolRemovalRea
     }
 }
 
+/// The most addresses the connected pool keeps for ONE `peer_id`.
+///
+/// WHY 8 (dig_ecosystem#1782): it is `dig-dht`'s own `MAX_ADDRESSES_PER_RECORD`, the limit every
+/// address list this pool feeds is eventually cut to. Matching it means the pool never holds an
+/// address that could not be published anyway.
+///
+/// WHY a cap at all: `PeerAdded` is republished each time a fresh verified session supersedes a
+/// stale slot for the same identity, and a supersede fires NO `PeerRemoved` — so without a cap the
+/// list grows by one entry per distinct `SocketAddr` ever seen for that peer, forever (measured:
+/// 5000 `PeerAdded` events → 5000 entries). Three independent guards downstream stop a remote peer
+/// from driving that today, which makes this defence-in-depth rather than a live leak; the point of
+/// the cap is that relaxing any ONE of those guards later must not turn this into a remote memory
+/// sink.
+pub(crate) const MAX_POOL_ADDRS_PER_PEER: usize = 8;
+
+/// Cut `addrs` (newest-first) down to at most `limit` entries, evicting the OLDEST address of
+/// whichever address family currently has the most entries.
+///
+/// WHY not a plain `truncate` (dig_ecosystem#1782, secondary): the tail is where the other address
+/// FAMILY ends up. A peer reached over IPv6 that then becomes reachable over IPv4 accumulates fresh
+/// IPv6 sessions; a blind truncate drops the lone IPv4 address off the end, and since the downstream
+/// dial ladder is both IPv6-first and very short, losing it can make an otherwise-reachable peer
+/// unreachable. Evicting from the larger family keeps at least one address of each family for as
+/// long as the cap allows, which is what the IPv6-first/IPv4-FALLBACK rule (§5.2) actually requires:
+/// IPv6 is preferred, not exclusive.
+fn retain_newest_per_family(addrs: &mut Vec<std::net::SocketAddr>, limit: usize) {
+    while addrs.len() > limit {
+        let ipv6_count = addrs.iter().filter(|a| a.is_ipv6()).count();
+        let evict_ipv6 = ipv6_count * 2 >= addrs.len();
+        // Newest-first ordering means the LAST entry of a family is its oldest.
+        let victim = addrs
+            .iter()
+            .rposition(|a| a.is_ipv6() == evict_ipv6)
+            .expect("the majority family has at least one member");
+        addrs.remove(victim);
+    }
+}
+
 /// The kind of a pool churn event, extracted from `dig_gossip::PoolEvent` at the call site so this
 /// module does not depend on dig-gossip's concrete type. The caller (`crate::peer`) destructures the
 /// gossip event into this + the raw 32-byte peer id, keeping the 1:1 map explicit and testable here.
@@ -828,15 +866,29 @@ impl NodeContent {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match event {
             PoolEvent::PeerAdded { peer_id, addr } => {
+                // A wildcard / port-0 address is not a destination (#1784): dig-nat reports `[::]:0`
+                // as the remote of an accepted relayed circuit when no relay endpoint is configured.
+                // SKIP the event outright rather than record-then-filter, so a peer that already has
+                // a working address does not have it displaced from the front of the dial order by
+                // an address nothing can be reached at.
+                if !crate::seams::dig_peer::net::is_usable_contact(addr) {
+                    return;
+                }
                 // The NEWEST session's address leads the candidate's dial order, older ones trailing
                 // as fallbacks (#1771). dig-gossip republishes `PeerAdded` when a fresh verified
                 // session supersedes a stale slot for the same identity (#1691/#1703/#1762), which is
                 // typically a MOVE — a dead relay circuit replaced by a direct dial. Appending would
                 // leave the dead address first and spend a failed dial on it for every later fetch,
                 // and dropping the older ones would discard a still-working fallback.
+                //
+                // Newest-first holds within the POOL's list; the eventual dial order additionally
+                // prefers IPv6 over IPv4 (dig-download's `dial_candidates` sorts by family first,
+                // per the ecosystem IPv6-first rule §5.2), so a freshly-adopted IPv4 address leads
+                // only the IPv4 group, not the whole ladder (#1785d).
                 let addrs = pool.entry(peer_id.to_hex()).or_default();
                 addrs.retain(|known| known != addr);
                 addrs.insert(0, *addr);
+                retain_newest_per_family(addrs, MAX_POOL_ADDRS_PER_PEER);
             }
             PoolEvent::PeerRemoved { peer_id, .. } => {
                 pool.remove(&peer_id.to_hex());
@@ -1516,6 +1568,141 @@ pub(crate) mod tests {
             .expect("anchored content root is 64-hex")
             .0;
         ContentId::resource([1; 32], root_bytes, [3; 32])
+    }
+
+    // -- connected-pool address bookkeeping (#1782 cap, #1784 wildcard guard) --------------------
+
+    /// A `NodeContent` with no real transport — enough to drive `on_pool_event` and read the pool
+    /// back. The download machinery is never exercised, so the mocks can be trivial.
+    fn pool_only_content(dir: &std::path::Path) -> Arc<NodeContent> {
+        NodeContent::new(
+            Arc::new(MockProviderLocator::fixed(vec![])),
+            Arc::new(MockRangeTransport::new(MockContent::even(4, 1))),
+            MissMode::FetchThrough,
+            None,
+            dir,
+        )
+    }
+
+    /// Feed one `PeerAdded` for `peer` at `addr` through the real event path.
+    fn feed_added(content: &NodeContent, peer: [u8; 32], addr: &str) {
+        content.on_pool_event(&pool_event_to_selector(
+            peer,
+            PoolEventKind::Added {
+                addr: addr.parse().expect("test address parses"),
+            },
+        ));
+    }
+
+    /// The addresses the pool currently holds for `peer`, newest first.
+    fn pool_addrs(content: &NodeContent, peer: [u8; 32]) -> Vec<std::net::SocketAddr> {
+        let pool = content.connected_pool();
+        let guard = pool.lock().unwrap();
+        guard.get(&hex::encode(peer)).cloned().unwrap_or_default()
+    }
+
+    /// #1782: a supersede republishes `PeerAdded` and fires NO `PeerRemoved`, so the address list
+    /// must be capped rather than growing once per distinct `SocketAddr` ever seen. 5000 is the
+    /// figure the security gate measured growing unbounded — well past `MAX_ADDRESSES_PER_RECORD`,
+    /// so the cap cannot pass by accident of a small fixture.
+    #[test]
+    fn a_peer_that_supersedes_forever_never_exceeds_the_address_cap() {
+        let td = tempfile::tempdir().unwrap();
+        let content = pool_only_content(td.path());
+        let peer = [0xA1; 32];
+
+        for port in 10_000..15_000u16 {
+            feed_added(&content, peer, &format!("203.0.113.7:{port}"));
+        }
+
+        let addrs = pool_addrs(&content, peer);
+        assert_eq!(
+            addrs.len(),
+            MAX_POOL_ADDRS_PER_PEER,
+            "5000 superseding sessions must leave at most the cap, not 5000 entries"
+        );
+        assert_eq!(
+            addrs[0].port(),
+            14_999,
+            "the newest session still leads the pool's dial order"
+        );
+    }
+
+    /// #1782 secondary: the ONE IPv4 address of a mostly-IPv6 peer must survive continued IPv6
+    /// churn. A plain `truncate` keeps the newest 8 — all IPv6 here — and silently drops the only
+    /// address of the fallback family, which the very short IPv6-first dial ladder downstream then
+    /// cannot recover. The IPv4 address is adopted BEFORE the churn precisely so a
+    /// newest-first-wins implementation cannot pass this by keeping it for recency.
+    #[test]
+    fn ipv6_churn_cannot_evict_a_peers_only_ipv4_address() {
+        let td = tempfile::tempdir().unwrap();
+        let content = pool_only_content(td.path());
+        let peer = [0xB2; 32];
+
+        feed_added(&content, peer, "203.0.113.7:9444");
+        for n in 0..64 {
+            feed_added(&content, peer, &format!("[2001:db8::{n:x}]:9444"));
+        }
+
+        let addrs = pool_addrs(&content, peer);
+        assert_eq!(addrs.len(), MAX_POOL_ADDRS_PER_PEER);
+        assert!(
+            addrs.iter().any(|a| a.is_ipv4()),
+            "the IPv4 fallback must survive IPv6 churn; got {addrs:?}"
+        );
+        assert!(
+            addrs.iter().filter(|a| a.is_ipv6()).count() >= MAX_POOL_ADDRS_PER_PEER - 1,
+            "IPv6 still fills the rest of the list — IPv6 is PREFERRED, not evicted (§5.2)"
+        );
+    }
+
+    /// #1784: `[::]:0` — dig-nat's remote address for an accepted relayed circuit with no configured
+    /// relay endpoint — must never become a peer's contact.
+    ///
+    /// The peer is given a WORKING address first and the assertion is that the working address is
+    /// still there, still FIRST. That is what makes this test see the difference between skipping
+    /// the event and recording-then-filtering: a filter applied when the pool is READ would leave
+    /// the wildcard sitting at the head of the stored list, displacing the reachable address, and
+    /// would still satisfy a bare "the wildcard is not returned" assertion.
+    #[test]
+    fn a_wildcard_relay_address_never_displaces_a_peers_real_address() {
+        let td = tempfile::tempdir().unwrap();
+        let content = pool_only_content(td.path());
+        let peer = [0xC3; 32];
+
+        feed_added(&content, peer, "203.0.113.7:9444");
+        feed_added(&content, peer, "[::]:0");
+
+        let addrs = pool_addrs(&content, peer);
+        assert_eq!(
+            addrs,
+            vec!["203.0.113.7:9444".parse::<std::net::SocketAddr>().unwrap()],
+            "the wildcard is dropped at the event, leaving the real address untouched and leading"
+        );
+    }
+
+    /// #1784, control: a peer whose ONLY reported address is the wildcard is absent from the pool
+    /// entirely — it must not appear as a fetch candidate with an unreachable target. Paired with
+    /// the test above so "absent" cannot be achieved by dropping every peer.
+    #[test]
+    fn a_peer_known_only_by_a_wildcard_address_is_not_a_pool_candidate() {
+        let td = tempfile::tempdir().unwrap();
+        let content = pool_only_content(td.path());
+        let wildcard_only = [0xD4; 32];
+        let reachable = [0xE5; 32];
+
+        feed_added(&content, wildcard_only, "[::]:0");
+        feed_added(&content, reachable, "203.0.113.9:9444");
+
+        assert!(
+            pool_addrs(&content, wildcard_only).is_empty(),
+            "an unreachable-only peer is not a candidate"
+        );
+        assert_eq!(
+            pool_addrs(&content, reachable).len(),
+            1,
+            "a reachable peer in the same pool is unaffected"
+        );
     }
 
     // -- miss-mode resolution --------------------------------------------------------------------

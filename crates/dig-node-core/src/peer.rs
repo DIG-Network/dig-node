@@ -114,18 +114,38 @@ pub fn dht_addr_from_gossip_addr(gossip: std::net::SocketAddr) -> std::net::Sock
     dht_addr
 }
 
+/// A pool-reported gossip address turned into the DHT contact to store for that peer, or `None` when
+/// the result would not be a usable contact.
+///
+/// Composes the two things that must BOTH hold before an address enters the DHT routing table:
+/// [`dht_addr_from_gossip_addr`]'s port shift, and [`crate::net::is_usable_contact`]'s "is this a
+/// destination at all" check (dig_ecosystem#1784 — dig-nat reports `[::]:0` as the remote of an
+/// accepted relayed circuit with no configured relay endpoint, and routing would otherwise store the
+/// wildcard as that peer's contact, so every lookup seeded from it dead-ends).
+///
+/// The check is applied to the MAPPED address, not the raw one: the port shift is what determines the
+/// port actually stored, so a gossip port at or below the offset maps to port 0 — unusable — even
+/// though the input looked fine.
+pub(crate) fn dht_contact_from_pool_addr(
+    gossip: std::net::SocketAddr,
+) -> Option<std::net::SocketAddr> {
+    let dht = dht_addr_from_gossip_addr(gossip);
+    crate::net::is_usable_contact(&dht).then_some(dht)
+}
+
 /// Per-window ciphertext cap for a `dig.fetchRange` frame (bytes) — the node window (3 MiB), the same
 /// cap the HTTP read path (`WINDOW`) uses.
 ///
-/// KNOWN CONSTRAINT (dig_ecosystem#1640): this is chosen without reference to `dig-nat`'s wire framing
-/// cap (`MAX_FRAMED_BODY`, 64 KiB) — a 3 MiB frame plus #1577's per-frame verification metadata
-/// (`root`, the whole `chunk_lens` array, `total_length`, a base64 `inclusion_proof`) cannot actually
-/// be base64-encoded and framed within that limit, so a real peer-to-peer window this large fails to
-/// decode on arrival. The reshare leg's whole-module pull (`seams/dig_peer/module_serve.rs`) rides the
-/// SAME constant and inherits the same defect for any module above a few tens of KB. The fix belongs
-/// at `dig-nat` (publish the real payload ceiling; every framer targets it) — this constant is a
-/// single source of truth for the per-frame split, so lowering it here (once the true ceiling is
-/// known) requires touching only this line, not the streaming loops that consume it.
+/// The framing ceiling this constant used to fight (dig_ecosystem#1640) is RESOLVED at `dig-nat`,
+/// which is where it belonged: 0.13 made `RangeFrame::encode` FALLIBLE and payload-capped at the
+/// sender and added the paged-prologue API (so #1577's per-frame verification metadata — `root`, the
+/// `chunk_lens` array, `total_length`, the base64 `inclusion_proof` — is split across pages instead of
+/// having to fit one frame), and 0.14 added the receiver-side `ChunkLensAssembler` validation. Both
+/// fail CLOSED, so an over-ceiling frame is now a clean error at the boundary rather than a silent
+/// decode failure mid-read.
+///
+/// This value therefore remains the node's per-frame SPLIT size, and stays the single source of truth
+/// for it: the streaming loops that consume it never need to change if it moves.
 pub const RANGE_WINDOW: usize = 3 * 1024 * 1024;
 
 /// Maximum concurrent accepted mTLS peer CONNECTIONS the listener will serve at once (audit #179
@@ -1831,7 +1851,11 @@ fn spawn_dht_routing_feed(dht: Arc<crate::dht::DhtHandle>, handle: dig_gossip::G
     for (peer_id, addr, _outbound) in handle.connected_pool_peers() {
         let mut bytes = [0u8; 32];
         bytes.copy_from_slice(peer_id.as_ref());
-        let dht_addr = dht_addr_from_gossip_addr(addr);
+        // Skip a peer whose pool address is not a destination (#1784) — routing must never seed a
+        // lookup from a wildcard contact.
+        let Some(dht_addr) = dht_contact_from_pool_addr(addr) else {
+            continue;
+        };
         let dht = dht.clone();
         tokio::spawn(async move {
             dht.add_peer(bytes, dht_addr).await;
@@ -1852,8 +1876,11 @@ fn spawn_dht_routing_feed(dht: Arc<crate::dht::DhtHandle>, handle: dig_gossip::G
                     dig_gossip::PoolEvent::PeerAdded { peer_id, addr } => {
                         let mut bytes = [0u8; 32];
                         bytes.copy_from_slice(peer_id.as_ref());
-                        // Map the peer's gossip addr to its DHT addr before seeding routing (GAP 2).
-                        dht.add_peer(bytes, dht_addr_from_gossip_addr(*addr)).await;
+                        // Map the peer's gossip addr to its DHT addr before seeding routing (GAP 2),
+                        // dropping an address that is not a destination (#1784).
+                        if let Some(dht_addr) = dht_contact_from_pool_addr(*addr) {
+                            dht.add_peer(bytes, dht_addr).await;
+                        }
                     }
                     dig_gossip::PoolEvent::PeerRemoved { peer_id, .. } => {
                         let mut bytes = [0u8; 32];
@@ -2537,15 +2564,21 @@ async fn bring_up_dht(
     ));
 
     // Bootstrap from the connected pool (+ relay-introducer peers discovered into it).
+    //
+    // Uses the SAME `dht_contact_from_pool_addr` the live routing feed uses, so all three paths that
+    // publish a pool address into the DHT routing table apply one identical mapping-plus-guard: the
+    // port shift (GAP 2) AND the "is this a destination at all" check (#1784). A pool-sourced address
+    // that is not dialable — a relay-introducer-discovered peer whose circuit dig-nat reports as
+    // `[::]:0` is the case seen in the wild — must never seed a lookup, and bootstrap seeds the very
+    // same table the feed does.
     let pool_peers: Vec<([u8; 32], std::net::SocketAddr)> = pool
         .connected_pool_peers()
         .into_iter()
-        .map(|(peer_id, addr, _outbound)| {
+        .filter_map(|(peer_id, addr, _outbound)| {
             // dig-gossip's PeerId is a chia Bytes32; take its raw 32 bytes for the dig-nat PeerId.
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(peer_id.as_ref());
-            // The pool reports each peer's GOSSIP addr; the DHT must dial its DHT/peer-RPC addr (GAP 2).
-            (bytes, dht_addr_from_gossip_addr(addr))
+            Some((bytes, dht_contact_from_pool_addr(addr)?))
         })
         .collect();
     let bootstrap = crate::dht::bootstrap_peers_from_pool(&pool_peers);
@@ -2738,7 +2771,7 @@ fn build_server_tls_config(node: &dig_nat::NodeCert) -> Result<Arc<rustls::Serve
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// An opaque, representative genesis hex for the `snapshot_json` status tests (echoed verbatim
@@ -3141,6 +3174,40 @@ mod tests {
         assert_eq!(found.len(), 2, "two identities are two candidates");
     }
 
+    /// #1784, DHT-routing half: the routing feed does NOT pass through the connected pool, so it
+    /// needs its own guard. A pool address that is not a destination yields no contact at all.
+    ///
+    /// `[::]:9446` and `203.0.113.7:9446` distinguish the two independent reasons an address can be
+    /// unusable — a wildcard IP, and a port that becomes 0 only AFTER the gossip→DHT shift — and the
+    /// latter is what proves the check runs on the MAPPED address: `203.0.113.7:1` looks perfectly
+    /// dialable until the offset is applied.
+    #[test]
+    fn a_wildcard_or_unshiftable_pool_address_yields_no_dht_contact() {
+        for junk in ["[::]:9446", "0.0.0.0:9446", "203.0.113.7:1", "[::]:0"] {
+            let addr: std::net::SocketAddr = junk.parse().unwrap();
+            assert_eq!(
+                dht_contact_from_pool_addr(addr),
+                None,
+                "{junk} must not become a routing-table contact"
+            );
+        }
+    }
+
+    /// The control for the guard above: a real gossip address still yields the peer's DHT contact,
+    /// with the port SHIFTED — so the guard cannot be satisfied by returning the raw address, and
+    /// cannot be satisfied by rejecting everything.
+    #[test]
+    fn a_real_pool_address_yields_the_shifted_dht_contact() {
+        let gossip: std::net::SocketAddr = "203.0.113.7:9445".parse().unwrap();
+        let contact = dht_contact_from_pool_addr(gossip).expect("a real address is a contact");
+        assert_eq!(contact.ip(), gossip.ip());
+        assert_eq!(
+            contact.port(),
+            9445 - GOSSIP_TO_DHT_PORT_OFFSET,
+            "routing stores the peer's DHT/peer-RPC port, not its gossip port (#1575 GAP 2)"
+        );
+    }
+
     /// A fresh pool has no connected peers, so the per-peer array is empty (the honest "count only"
     /// state before any peer connects). Uses a real `GossipHandle` — the same type the node retains.
     #[tokio::test]
@@ -3162,7 +3229,7 @@ mod tests {
     /// Whether the host has a usable IPv6 loopback stack. Some CI sandboxes disable IPv6 entirely,
     /// in which case a `[::1]` dial cannot be exercised; the two-node test skips rather than reporting
     /// a false failure unrelated to this crate's connect logic (mirrors dig-gossip's CON-002 guard).
-    async fn host_has_ipv6_loopback() -> bool {
+    pub(crate) async fn host_has_ipv6_loopback() -> bool {
         tokio::net::TcpListener::bind("[::1]:0").await.is_ok()
     }
 
@@ -3320,7 +3387,10 @@ mod tests {
 
     /// Build a real, freshly-started `GossipHandle` on the production-shaped dual-stack unspecified
     /// bind (`[::]:0`, §5.2) for the pool-handle tests.
-    async fn fresh_pool_handle(tag: &str, network: [u8; 32]) -> dig_gossip::GossipHandle {
+    pub(crate) async fn fresh_pool_handle(
+        tag: &str,
+        network: [u8; 32],
+    ) -> dig_gossip::GossipHandle {
         fresh_pool_handle_on(tag, network, crate::net::dual_stack_listen_addr(0)).await
     }
 
@@ -3331,7 +3401,7 @@ mod tests {
     /// inbound loopback connections into the pool (the native-tls dual-stack accept quirk — the same
     /// family of `[::]`-v6only issue tracked for the extension-offline path), whereas a concrete
     /// loopback bind does, on every platform. Production still binds dual-stack `[::]` (`run_peer_network`).
-    async fn fresh_pool_handle_on(
+    pub(crate) async fn fresh_pool_handle_on(
         tag: &str,
         network: [u8; 32],
         listen_addr: std::net::SocketAddr,

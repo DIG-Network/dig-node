@@ -82,6 +82,29 @@ pub fn is_advertisable_ipv4(ip: &Ipv4Addr) -> bool {
     !(ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() || ip.is_broadcast())
 }
 
+/// Whether an address REPORTED BY A PEER OR THE POOL is a usable contact — one this node could
+/// actually dial back — and so may be recorded as that peer's `fetchRange` target or DHT contact.
+///
+/// WHY this exists (dig_ecosystem#1784): `dig-nat`'s accept path records `remote_addr` for an
+/// accepted RELAYED circuit, and with no configured relay endpoint that address is the unspecified
+/// wildcard `[::]:0`. It then flows through `PoolEvent::PeerAdded` into the connected pool as the
+/// peer's fetch target AND into the DHT routing table as its contact. A wildcard address is not a
+/// destination — a fetch to it can only fail — and worse, it consumes one of the very few dial
+/// slots downstream, so a peer that IS reachable by another address can be rendered unreachable.
+/// The root cause belongs in dig-nat; this is the node's own guard, applied where such an address
+/// would enter node state.
+///
+/// Rejects exactly two things, both of which mean "not a destination":
+/// - an **unspecified** IP (`::` / `0.0.0.0`) — a bind wildcard, never a peer's location;
+/// - port **0** — the "any port" sentinel, which nothing listens on.
+///
+/// Loopback is deliberately ACCEPTED (unlike [`is_advertisable_ipv6`] / [`is_advertisable_ipv4`],
+/// which decide what to advertise to the wider network): a loopback peer is genuinely dialable, and
+/// single-host multi-node runs depend on it.
+pub fn is_usable_contact(addr: &SocketAddr) -> bool {
+    !addr.ip().is_unspecified() && addr.port() != 0
+}
+
 /// Discover a routable local IPv6 address, if the host has one. Uses the connect-a-UDP-socket trick:
 /// "connecting" a UDP socket to an off-host address forces the OS to select the local address it
 /// would route from, WITHOUT sending any packet. Returns the local IPv6 address only when it is
@@ -432,6 +455,44 @@ pub fn build_node_nat_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The #1784 guard, from both sides. The rejected cases are the exact shapes dig-nat's accept
+    /// path can produce for a relayed circuit with no configured relay endpoint (`[::]:0`), plus the
+    /// two half-broken variants — a wildcard IP with a real port, and a real IP with port 0 —
+    /// because a guard that only recognises the fully-degenerate pair would pass either half
+    /// straight into the pool.
+    #[test]
+    fn a_wildcard_or_portless_address_is_not_a_usable_contact() {
+        for junk in [
+            "[::]:0",
+            "0.0.0.0:0",
+            "[::]:9445",
+            "0.0.0.0:9445",
+            "1.2.3.4:0",
+        ] {
+            let addr: SocketAddr = junk.parse().unwrap();
+            assert!(
+                !is_usable_contact(&addr),
+                "{junk} is not a destination and must never become a peer's contact"
+            );
+        }
+    }
+
+    /// The truthful control: real addresses — including LOOPBACK, which single-host multi-node runs
+    /// depend on — stay usable. Without this the guard could reject everything and still look
+    /// correct against the rejection cases alone.
+    #[test]
+    fn a_real_address_including_loopback_is_a_usable_contact() {
+        for good in [
+            "203.0.113.7:9445",
+            "[2001:db8::7]:9445",
+            "127.0.0.1:9445",
+            "[::1]:9445",
+        ] {
+            let addr: SocketAddr = good.parse().unwrap();
+            assert!(is_usable_contact(&addr), "{good} is dialable");
+        }
+    }
 
     #[test]
     fn dual_stack_listen_addr_is_ipv6_unspecified() {

@@ -626,6 +626,22 @@ impl PexPool for GossipPexPool {
                     .await
                 {
                     Ok(conn) => {
+                        // RE-CHECK pool membership now that the dial has resolved (#1783). The
+                        // `is_pool_peer` check above happened at DECISION time; this dial ran for up
+                        // to CANDIDATE_DIAL_TIMEOUT afterwards, and the identity may have joined the
+                        // pool in between (an intervening PEX offer, the pool's own maintenance, or
+                        // the peer dialing us). Adopting then is not harmless: since dig-gossip
+                        // 0.17.12 a second connection for an identity SUPERSEDES the existing slot
+                        // and tears down the displaced session, which kills any `fetchRange` stream
+                        // in flight over it. Earlier versions merely returned `DuplicateConnection`,
+                        // which is why this was previously safe to ignore.
+                        if !should_adopt_dialed_peer(&handle, &peer_id) {
+                            tracing::debug!(
+                                peer = %peer_id,
+                                "pex candidate joined the pool while the dial was in flight; dropping the redundant connection rather than superseding the live session"
+                            );
+                            return;
+                        }
                         // Adoption dedups + caps; a duplicate/full/banned result is fine (already known).
                         let _ = handle.adopt_nat_connection(conn).await;
                     }
@@ -652,6 +668,24 @@ impl PexPool for GossipPexPool {
     }
 }
 
+/// Whether a PEX candidate whose dial has just SUCCEEDED should still be adopted into the pool.
+///
+/// The answer is "only if the identity is still absent from the pool". The membership check that
+/// authorised the dial happened before it, and a NAT dial can run for `CANDIDATE_DIAL_TIMEOUT`; if
+/// the identity joined the pool in the meantime, adopting a second connection for it SUPERSEDES the
+/// live slot and tears the existing session down (dig-gossip 0.17.12 onward), taking any in-flight
+/// range stream with it. Dropping the redundant connection instead costs nothing — the peer is
+/// already connected, which is the outcome the dial was for.
+///
+/// Split out from the spawned dial task so the decision is unit-testable against a REAL pool, and so
+/// there is exactly ONE place in this module that decides whether an adoption may proceed.
+fn should_adopt_dialed_peer(
+    handle: &dig_gossip::GossipHandle,
+    peer_id: &dig_gossip::PeerId,
+) -> bool {
+    !handle.is_pool_peer(peer_id)
+}
+
 /// Parse a 64-hex `peer_id` into a dig-gossip [`PeerId`](dig_gossip::PeerId) (`Bytes32`), or `None` if
 /// malformed. Pure so it is unit-tested without a handle.
 fn parse_gossip_peer_id(peer_id_hex: &str) -> Option<dig_gossip::PeerId> {
@@ -671,6 +705,57 @@ mod tests {
 
     fn hexid(b: u8) -> String {
         format!("{b:02x}").repeat(32)
+    }
+
+    /// #1783: once a PEX dial has resolved, an identity that is ALREADY in the pool must not be
+    /// adopted — adopting supersedes the live slot and tears its session (and any in-flight range
+    /// stream) down.
+    ///
+    /// Driven against a REAL pool holding a REAL connected peer rather than a stubbed membership
+    /// answer: node A dials node B over the IPv6 loopback, so A's pool genuinely contains B (the
+    /// DIALER's half registers synchronously on every platform, unlike the inbound half). An
+    /// unconnected identity in the SAME pool is the control — without it the test would also pass
+    /// against an implementation that refused every adoption.
+    #[tokio::test]
+    async fn a_candidate_already_in_the_pool_is_not_adopted_after_its_dial_resolves() {
+        if !crate::peer::tests::host_has_ipv6_loopback().await {
+            eprintln!("skipping: host has no usable IPv6 loopback stack");
+            return;
+        }
+        // The gossip mTLS stack needs a process-global rustls provider; install it so this test is
+        // order-independent (production installs it during node bring-up).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let network = [0x7bu8; 32];
+        let node_a = crate::peer::tests::fresh_pool_handle("pex-adopt-a", network).await;
+        let node_b = crate::peer::tests::fresh_pool_handle_on(
+            "pex-adopt-b",
+            network,
+            "[::1]:0".parse().expect("parse [::1]:0"),
+        )
+        .await;
+        let b_port = node_b
+            .__listen_bound_addr_for_tests()
+            .expect("node B bound listen addr")
+            .port();
+
+        let b_peer_hex = crate::peer::connect_peer(&node_a, &format!("[::1]:{b_port}"))
+            .await
+            .expect("node A dials node B over loopback mTLS");
+        let b_peer_id = parse_gossip_peer_id(&b_peer_hex).expect("B's peer id is 64-hex");
+
+        assert!(
+            !should_adopt_dialed_peer(&node_a, &b_peer_id),
+            "B is already in A's pool — adopting a second connection would supersede the live session"
+        );
+
+        // Control: an identity A has never connected to is still adoptable, so the guard is
+        // membership-driven and not a blanket refusal.
+        let stranger = dig_gossip::PeerId::from([0x33u8; 32]);
+        assert!(
+            should_adopt_dialed_peer(&node_a, &stranger),
+            "an unconnected identity's verified dial is exactly what adoption is for"
+        );
     }
 
     /// A capturing [`PexPool`] that records what PEX handed it, so the adapter is tested without a live
