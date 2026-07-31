@@ -431,51 +431,87 @@ pub fn reinstall<B: ServiceBackend>(
 /// What a per-scope removal attempt did — the reporting unit for the cross-scope migration
 /// ([`install_at_scope`]) and for `uninstall` ([`remove_registrations`]).
 ///
-/// `found` and `removed` are deliberately separate: "nothing was registered here" and "something
-/// was registered here and is STILL registered" are different facts, and only the second is a
-/// leftover an operator must know about.
+/// `found` (what the PROBE saw) and `removed` (what the OS deregistration actually did) are
+/// deliberately separate, because **the probe is advisory and the deregistration is authoritative**:
+/// `launchctl print gui/<uid>/<label>` cannot see a per-user agent from a session with no Aqua/GUI
+/// domain (a headless CI runner, an ssh login), so it false-negatives on a service that IS
+/// registered. Only `removed` proves anything; `found` explains, and `indeterminate` admits when
+/// absence was never established.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeRemoval {
     /// The scope this attempt addressed.
     pub scope: ServiceScope,
-    /// A registration was found at this scope (so a removal was attempted).
+    /// The probe SAW a registration at this scope. Advisory only — a `false` here does NOT prove
+    /// absence (see the type doc).
     pub found: bool,
-    /// The registration was successfully deregistered.
+    /// The OS deregistration succeeded. The authoritative signal.
     pub removed: bool,
-    /// Why the scope could not be probed or removed, when it could not be. `None` on success and
-    /// on a clean "nothing registered here".
+    /// Absence was never established: the probe failed (or said nothing was there) AND the removal
+    /// did not succeed either — so whether a registration remains is UNKNOWN, and must not be
+    /// reported as a clean uninstall.
+    pub indeterminate: bool,
+    /// Why the probe or the removal failed, when one did. `None` on success and on a clean
+    /// "nothing registered here".
     pub error: Option<String>,
+}
+
+/// How hard to try at a scope — the distinction that keeps a probe false-negative from turning into
+/// a silent no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalMode {
+    /// The scope the operator NAMED (or `auto` resolved to). Deregistered UNCONDITIONALLY: the OS
+    /// removal call is the authority, so a probe that wrongly reports absence can never turn the
+    /// uninstall into a no-op. (This is also the pre-#526 behaviour of `uninstall`, which always
+    /// called delete outright.)
+    Requested,
+    /// A scope being swept for a stale registration nobody asked about (the other scope during
+    /// `install`, the second scope under `uninstall --scope auto`). PROBE-GATED: nothing is written
+    /// unless a registration is actually seen, so a sweep can never disturb an unrelated scope.
+    Swept,
 }
 
 /// Deregister the service at ONE scope, best-effort, reporting exactly what happened.
 ///
-/// Never returns `Err`: the caller decides which combination of per-scope outcomes is fatal (a
-/// stale other-scope registration is not; a requested scope left behind is). PROBES FIRST, so a
-/// scope holding no registration is never written to — that is what makes sweeping the other scope
-/// safe on every install. A probe that ERRORS is reported, not read as absence (fail closed).
+/// Never returns `Err`: the caller decides which combination of per-scope outcomes is fatal (a stale
+/// swept registration is not; a named scope left behind is). See [`RemovalMode`] for why a
+/// [`RemovalMode::Requested`] scope is removed without trusting the probe.
 pub fn remove_registration<B: ServiceBackend + ?Sized>(
     backend: &B,
     scope: ServiceScope,
+    mode: RemovalMode,
 ) -> ScopeRemoval {
     let mut removal = ScopeRemoval {
         scope,
         found: false,
         removed: false,
+        indeterminate: false,
         error: None,
     };
-    match backend.is_installed() {
-        Ok(false) => return removal,
-        Ok(true) => removal.found = true,
+    let probe = backend.is_installed();
+    match &probe {
+        Ok(found) => removal.found = *found,
         Err(e) => {
-            removal.error = Some(format!("could not determine whether it is registered: {e}"));
-            return removal;
+            removal.error = Some(format!("could not determine whether it is registered: {e}"))
         }
+    }
+    // A sweep touches nothing it did not positively see — an unrelated scope must never be written
+    // to on the strength of a guess. A probe FAILURE leaves the swept scope indeterminate: absence
+    // was not established, and the caller reports that rather than assuming it is clean.
+    if mode == RemovalMode::Swept && !removal.found {
+        removal.indeterminate = probe.is_err();
+        return removal;
     }
     // Best-effort stop first so nothing keeps holding the node's port past the deregistration.
     let _ = backend.stop();
     match backend.delete() {
         Ok(()) => removal.removed = true,
-        Err(e) => removal.error = Some(e.to_string()),
+        Err(e) => {
+            // A failed delete at a scope the probe never saw a registration at is the ordinary
+            // "there was nothing here" case (the OS says so twice) — keep the reason for context,
+            // but only a scope we DID see, or could not read at all, is unresolved.
+            removal.indeterminate = probe.is_err();
+            removal.error = Some(e.to_string());
+        }
     }
     removal
 }
@@ -496,26 +532,31 @@ pub fn install_at_scope<T: ServiceBackend, O: ServiceBackend>(
     other: Option<(&O, ServiceScope)>,
     plan: &InstallPlan,
 ) -> io::Result<(ReinstallReport, Option<ScopeRemoval>)> {
-    let migration = other.map(|(backend, scope)| remove_registration(backend, scope));
+    let migration =
+        other.map(|(backend, scope)| remove_registration(backend, scope, RemovalMode::Swept));
     let report = reinstall(target, plan)?;
     Ok((report, migration))
 }
 
-/// Sweep several scopes, in order, reporting each ([`remove_registration`]).
-pub fn remove_registrations(targets: &[(&dyn ServiceBackend, ServiceScope)]) -> Vec<ScopeRemoval> {
+/// Remove at several scopes, in order, reporting each ([`remove_registration`]).
+pub fn remove_registrations(
+    targets: &[(&dyn ServiceBackend, ServiceScope, RemovalMode)],
+) -> Vec<ScopeRemoval> {
     targets
         .iter()
-        .map(|(backend, scope)| remove_registration(*backend, *scope))
+        .map(|(backend, scope, mode)| remove_registration(*backend, *scope, *mode))
         .collect()
 }
 
 /// Turn per-scope removal results into the `uninstall` [`Outcome`], failing LOUDLY on anything
 /// less than a complete removal.
 ///
-/// * Any scope found-but-not-removed, or any scope whose state could not be determined ⇒ `Err`:
-///   an uninstall that leaves a registration behind (or cannot tell) must never report success —
-///   that is how a "removed" node keeps starting at boot.
-/// * No scope held a registration ⇒ `Err(NotFound)`: there was nothing to uninstall.
+/// * Any scope found-but-not-removed, or left indeterminate ⇒ `Err`: an uninstall that leaves a
+///   registration behind — or cannot tell whether it did — must never report success, which is how
+///   a "removed" node keeps starting at boot.
+/// * Nothing removed anywhere, and nothing unresolved ⇒ `Err(NotFound)`: there was nothing to
+///   uninstall. Any removal error collected along the way is carried as context, since the reason a
+///   delete failed is the best evidence available for "there was nothing here".
 /// * Otherwise ⇒ success, naming every scope removed.
 fn uninstall_outcome(removals: Vec<ScopeRemoval>) -> io::Result<Outcome> {
     let removed: Vec<&'static str> = removals
@@ -525,7 +566,7 @@ fn uninstall_outcome(removals: Vec<ScopeRemoval>) -> io::Result<Outcome> {
         .collect();
     let problems: Vec<String> = removals
         .iter()
-        .filter(|r| r.error.is_some() || (r.found && !r.removed))
+        .filter(|r| r.indeterminate || (r.found && !r.removed))
         .map(|r| {
             let why = r.error.as_deref().unwrap_or("removal did not take effect");
             format!("{} scope: {why}", r.scope.as_str())
@@ -549,18 +590,29 @@ fn uninstall_outcome(removals: Vec<ScopeRemoval>) -> io::Result<Outcome> {
         ));
     }
     if removed.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "dig-node: no service registration for \"{SERVICE_LABEL}\" was found at {} \
-                 scope — nothing to uninstall.",
-                removals
-                    .iter()
-                    .map(|r| r.scope.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" or ")
-            ),
-        ));
+        return Err(io::Error::new(io::ErrorKind::NotFound, {
+            let scopes = removals
+                .iter()
+                .map(|r| r.scope.as_str())
+                .collect::<Vec<_>>()
+                .join(" or ");
+            let reasons = removals
+                .iter()
+                .filter_map(|r| {
+                    r.error
+                        .as_deref()
+                        .map(|e| format!("{} scope: {e}", r.scope.as_str()))
+                })
+                .collect::<Vec<_>>();
+            let mut msg = format!(
+                "dig-node: no service registration for \"{SERVICE_LABEL}\" was found at \
+                     {scopes} scope — nothing to uninstall."
+            );
+            if !reasons.is_empty() {
+                msg.push_str(&format!(" ({})", reasons.join("; ")));
+            }
+            msg
+        }));
     }
     Ok(Outcome::new(
         format!(
@@ -1155,7 +1207,8 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
                 "\n  note: removed a previous {}-scope registration of this service.",
                 m.scope.as_str()
             ));
-        } else if let Some(err) = &m.error {
+        } else if m.found || m.indeterminate {
+            let err = m.error.as_deref().unwrap_or("removal did not take effect");
             summary.push_str(&format!(
                 "\n  WARN a {}-scope registration of this service is still present and could \
                  not be removed ({err}); both may try to serve the same port. Remove it with: \
@@ -1198,6 +1251,7 @@ pub fn install(config: &Config, scope: ScopeChoice) -> io::Result<Outcome> {
             "scope": m.scope.as_str(),
             "found": m.found,
             "removed": m.removed,
+            "indeterminate": m.indeterminate,
             "error": m.error,
         });
     }
@@ -1226,16 +1280,28 @@ pub fn uninstall(scope: ScopeChoice) -> io::Result<Outcome> {
         .into_iter()
         .map(|s| (s, SystemServiceBackend::new(s)))
         .collect();
+    // The FIRST scope is the one the operator named (or `auto` resolved to) and is removed
+    // unconditionally; any further scope is only being swept for a stale registration.
     let removals = backends
         .iter()
-        .map(|(scope, backend)| match backend {
-            Ok(b) => remove_registration(b, *scope),
-            Err(e) => ScopeRemoval {
-                scope: *scope,
-                found: false,
-                removed: false,
-                error: Some(e.to_string()),
-            },
+        .enumerate()
+        .map(|(i, (scope, backend))| {
+            let mode = if i == 0 {
+                RemovalMode::Requested
+            } else {
+                RemovalMode::Swept
+            };
+            match backend {
+                Ok(b) => remove_registration(b, *scope, mode),
+                Err(e) => ScopeRemoval {
+                    scope: *scope,
+                    found: false,
+                    removed: false,
+                    // A scope whose manager cannot even be acquired is UNKNOWN, not clean.
+                    indeterminate: true,
+                    error: Some(e.to_string()),
+                },
+            }
         })
         .collect();
     uninstall_outcome(removals)
@@ -2168,8 +2234,10 @@ An instance of the service is already running.",
         let log = Rc::new(RefCell::new(Vec::new()));
         let system = MockBackend::tagged("system:", &log, true);
         let user = MockBackend::tagged("user:", &log, true);
-        let removals =
-            remove_registrations(&[(&system, ServiceScope::System), (&user, ServiceScope::User)]);
+        let removals = remove_registrations(&[
+            (&system, ServiceScope::System, RemovalMode::Requested),
+            (&user, ServiceScope::User, RemovalMode::Swept),
+        ]);
 
         assert_eq!(removals.len(), 2);
         assert!(
@@ -2189,8 +2257,10 @@ An instance of the service is already running.",
         let log = Rc::new(RefCell::new(Vec::new()));
         let user = MockBackend::tagged("user:", &log, true);
         let system = MockBackend::tagged("system:", &log, true).failing_delete();
-        let removals =
-            remove_registrations(&[(&user, ServiceScope::User), (&system, ServiceScope::System)]);
+        let removals = remove_registrations(&[
+            (&user, ServiceScope::User, RemovalMode::Requested),
+            (&system, ServiceScope::System, RemovalMode::Swept),
+        ]);
 
         assert!(removals[0].removed, "the removable scope IS removed");
         assert!(removals[1].found && !removals[1].removed);
@@ -2204,19 +2274,74 @@ An instance of the service is already running.",
     #[test]
     fn uninstall_reports_an_indeterminate_scope_rather_than_assuming_it_is_clean() {
         // A probe that errors is NOT evidence of absence — fail closed and say so.
-        let backend = MockBackend::new(true).failing_probe();
-        let removals = remove_registrations(&[(&backend, ServiceScope::System)]);
-        assert!(!removals[0].found);
-        assert!(removals[0].error.is_some());
-        assert!(uninstall_outcome(removals).is_err());
+        let backend = MockBackend::new(true).failing_probe().failing_delete();
+        let removals =
+            remove_registrations(&[(&backend, ServiceScope::System, RemovalMode::Requested)]);
+        assert!(!removals[0].found, "the probe reported nothing");
+        assert!(!removals[0].removed, "the removal did not succeed either");
+        assert!(
+            removals[0].indeterminate,
+            "absence was never established, so the scope is UNKNOWN: {removals:?}"
+        );
+        let err = uninstall_outcome(removals)
+            .expect_err("an unresolved scope must not be reported as a clean uninstall");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]
     fn uninstall_errors_when_no_scope_holds_a_registration() {
-        let backend = MockBackend::new(false);
-        let removals = remove_registrations(&[(&backend, ServiceScope::User)]);
+        let backend = MockBackend::new(false).failing_delete();
+        let removals =
+            remove_registrations(&[(&backend, ServiceScope::User, RemovalMode::Requested)]);
         let err = uninstall_outcome(removals).expect_err("nothing to uninstall is an error");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Regression test for the real macOS `service-smoke` failure this change first caused: the
+    /// runner had a user-scope agent registered, but `launchctl print gui/<uid>/<label>` cannot see
+    /// it from a session with no GUI domain, so a probe-GATED uninstall reported
+    /// `no service registration … was found` and exited 6 on a service that WAS registered.
+    ///
+    /// The scope the operator NAMED must therefore be deregistered without trusting the probe — the
+    /// OS removal call is the authority. The mock is built with the lying combination (`installed:
+    /// false` for the probe, but a `delete` that succeeds), which is exactly what a false-negative
+    /// launchd probe looks like from here.
+    #[test]
+    fn a_requested_scope_is_removed_even_when_the_probe_cannot_see_it() {
+        let backend = MockBackend::new(false); // probe says "nothing here" — and is wrong
+        let removal = remove_registration(&backend, ServiceScope::User, RemovalMode::Requested);
+
+        assert!(
+            !removal.found,
+            "the probe false-negatived, as launchd's does"
+        );
+        assert!(
+            removal.removed,
+            "the deregistration must be attempted anyway, and it succeeded: {removal:?}"
+        );
+        assert!(!removal.indeterminate);
+        assert!(
+            backend.calls().contains(&"delete".to_string()),
+            "delete must be called despite the probe: {:?}",
+            backend.calls()
+        );
+        let outcome = uninstall_outcome(vec![removal]).expect("a proven removal is a success");
+        assert_eq!(outcome.result["removed_scopes"], json!(["user"]));
+    }
+
+    #[test]
+    fn a_swept_scope_is_never_written_to_on_a_probe_that_sees_nothing() {
+        // The counterpart: the requested/swept distinction is what keeps the unconditional removal
+        // above from also disturbing a scope nobody asked about. Same mock, opposite mode.
+        let backend = MockBackend::new(false);
+        let removal = remove_registration(&backend, ServiceScope::System, RemovalMode::Swept);
+
+        assert!(!removal.removed && !removal.indeterminate);
+        assert_eq!(
+            backend.calls(),
+            vec!["is_installed"],
+            "a swept scope is probed and then left alone"
+        );
     }
 
     // -- #526: the §565 gate now fires on unix system scope, so its refusal must be actionable

@@ -1695,12 +1695,23 @@ Numeric values and symbolic names are a stable contract and MUST NOT be renumber
   is best-effort (an unprivileged install cannot delete a system unit) and it is REPORTED, never
   silently dropped: `result.migrated_from_scope { scope, found, removed, error }` in `--json`, plus a
   `note`/`WARN` line in the human summary. A failed other-scope removal MUST NOT fail the install.
+- **The existence probe is ADVISORY; the OS deregistration is AUTHORITATIVE.**
+  `launchctl print gui/<uid>/<label>` cannot see a per-user agent from a session with no Aqua/GUI
+  domain (a headless CI runner, an ssh login), so it reports absence for a service that IS
+  registered. Therefore the scope the operator NAMED (or `auto` resolved to) MUST be deregistered
+  **unconditionally**, without gating on the probe — a probe false-negative MUST NEVER turn an
+  uninstall into a silent no-op. A scope merely being SWEPT (the other scope during `install`, the
+  second scope of `uninstall --scope auto`) MUST be probe-gated, so a scope nobody asked about is
+  never written to.
 - **`uninstall` scope sweep.** An explicit `--scope` removes exactly that scope. `--scope auto`
-  sweeps BOTH scopes (requested one first) so an uninstall can never leave the other scope's
+  removes the resolved scope and then sweeps the other, so an uninstall can never leave a
   registration behind still starting the node. Every scope is reported
-  (`result.removed_scopes: ["system", "user"]`), and anything short of a complete removal — a scope
-  found but not removed, or a scope whose state could not be determined — MUST be an error naming
-  the scope, never a silent success. No registration at any swept scope is `NOT_FOUND`.
+  (`result.removed_scopes: ["system", "user"]`). Anything short of a complete removal MUST be an
+  error naming the scope, never a silent success: a scope seen but not removed, or one left
+  **indeterminate** (the probe could not read it AND the removal did not succeed, so a remaining
+  registration is unproven either way). Only when nothing was removed anywhere AND nothing is
+  unresolved is the result `NOT_FOUND` ("nothing to uninstall"), carrying the underlying removal
+  error as context.
 - **Native packages register system scope**, consistently with `--scope system`: the `.deb`'s static
   systemd unit is `WantedBy=multi-user.target` running as root, and the macOS `postinstall`
   bootstraps into the `system` launchd domain (§9.7).
