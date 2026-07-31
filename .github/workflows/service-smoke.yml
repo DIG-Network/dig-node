@@ -38,6 +38,11 @@ env:
   # user-writable checkout), and the `system-scope` job below installs into a real root-owned
   # directory so it needs no override at all — and asserts the gate REFUSES when that is not so.
 
+# Least privilege: these jobs only check out the repo and upload artifacts (which uses the job's own
+# artifact token, not GITHUB_TOKEN). Nothing here writes to the repository.
+permissions:
+  contents: read
+
 jobs:
   smoke:
     name: install/start/reinstall/uninstall (${{ matrix.os }})
