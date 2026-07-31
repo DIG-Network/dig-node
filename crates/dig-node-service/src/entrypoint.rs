@@ -36,7 +36,23 @@ use crate::control_cli::{self, ControlAction};
 use crate::open;
 use crate::pair::{self, PairAction};
 use crate::peers::{self, BanState, PeersAction};
+use crate::service::ScopeChoice;
 use crate::{serve, service, VERSION};
+
+/// The shared `--scope <auto|system|user>` flag carried by every service verb (#526).
+///
+/// Flattened into each verb rather than declared four times, so the flag's spelling, default and
+/// help text can never drift between `install`, `uninstall`, `start` and `stop`. The default is
+/// `auto`, so a caller that passes no flag at all — including a dig-installer release predating
+/// this flag — behaves exactly as it did before.
+#[derive(clap::Args)]
+struct ScopeArg {
+    /// Which OS scope to act on: `system` (machine-wide, starts at boot, needs root/Administrator),
+    /// `user` (per-user, no elevation, starts with your login session), or `auto` — system when
+    /// running elevated, user otherwise. Windows has only system scope.
+    #[arg(long = "scope", value_enum, default_value_t = ScopeChoice::Auto)]
+    choice: ScopeChoice,
+}
 
 #[derive(Parser)]
 #[command(
@@ -68,13 +84,25 @@ enum Command {
     #[command(hide = true)]
     RunService,
     /// Register the node as an auto-starting OS service.
-    Install,
+    Install {
+        #[command(flatten)]
+        scope: ScopeArg,
+    },
     /// Remove the OS service.
-    Uninstall,
+    Uninstall {
+        #[command(flatten)]
+        scope: ScopeArg,
+    },
     /// Start the installed service.
-    Start,
+    Start {
+        #[command(flatten)]
+        scope: ScopeArg,
+    },
     /// Stop the running service.
-    Stop,
+    Stop {
+        #[command(flatten)]
+        scope: ScopeArg,
+    },
     /// Report whether the node is serving (probes /health).
     Status,
     /// Pair a browser controller (the DIG Chrome extension) with this node (#280):
@@ -291,10 +319,10 @@ impl Command {
     fn action(&self) -> &'static str {
         match self {
             Command::Run | Command::RunService => "run",
-            Command::Install => "install",
-            Command::Uninstall => "uninstall",
-            Command::Start => "start",
-            Command::Stop => "stop",
+            Command::Install { .. } => "install",
+            Command::Uninstall { .. } => "uninstall",
+            Command::Start { .. } => "start",
+            Command::Stop { .. } => "stop",
             Command::Status => "status",
             Command::Pair { .. } => "pair",
             Command::Open { .. } => "open",
@@ -377,10 +405,12 @@ pub fn run() -> std::process::ExitCode {
     let exit = match command {
         Command::Run => render_serve(block_on_serve(config), action, json),
         Command::RunService => render_serve(run_service(config), action, json),
-        Command::Install => render(service::install(&config), action, json),
-        Command::Uninstall => render(service::uninstall(), action, json),
-        Command::Start => render(service::start(), action, json),
-        Command::Stop => render(service::stop(), action, json),
+        Command::Install { scope } => {
+            render(service::install(&config, scope.choice), action, json)
+        }
+        Command::Uninstall { scope } => render(service::uninstall(scope.choice), action, json),
+        Command::Start { scope } => render(service::start(scope.choice), action, json),
+        Command::Stop { scope } => render(service::stop(scope.choice), action, json),
         Command::Status => render_status(service::status(&config), action, json),
         Command::Pair { action: pair_cmd } => {
             let pair_action = match pair_cmd {

@@ -40,7 +40,16 @@ use std::path::Path;
 /// component is untrusted. `dir.ancestors()` always yields at least `dir`, so an empty chain can
 /// never vacuously pass.
 pub fn dir_is_privileged(dir: &Path) -> bool {
-    dir.ancestors().all(component_is_privileged)
+    first_unprivileged_ancestor(dir).is_none()
+}
+
+/// The FIRST ancestor component of `dir` (walking leaf → filesystem root) that fails the trust bar,
+/// or `None` when the whole chain is privileged. The diagnostic twin of [`dir_is_privileged`]: the
+/// boolean answers *whether* a path is trustworthy, this answers *which level* is not — so a refusal
+/// can name the offending directory instead of leaving an operator to bisect the chain by hand
+/// (#526: the system-service install gate must be actionable, never a silent downgrade).
+pub fn first_unprivileged_ancestor(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|c| !component_is_privileged(c))
 }
 
 /// Whether a SINGLE existing path `component` clears the trust bar: privileged-owned, not
