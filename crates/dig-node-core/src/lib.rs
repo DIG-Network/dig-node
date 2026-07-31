@@ -627,8 +627,36 @@ pub fn set_cache_cap_bytes(cap: u64) -> std::io::Result<()> {
     })
 }
 
-/// Total bytes currently held in the local cache (modules + response windows).
-pub fn cache_used_bytes() -> u64 {
+/// How the local cache's bytes are split between the two things it holds.
+///
+/// The split exists because the totals looked contradictory without it (#1886): a node can report
+/// megabytes of `used_bytes` while `cache.listCached` returns an EMPTY list, and both are correct
+/// — `listCached` enumerates whole `.dig` capsules, and until one has been synced the bytes on
+/// disk are all per-resource response windows. Reporting the breakdown makes "content cached but
+/// no capsule held" — precisely the broken-flywheel state — readable instead of baffling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheUsage {
+    /// Bytes in whole `.dig` capsules under `<cache>/modules/` — what makes this node a HOLDER
+    /// and what `cache.listCached` enumerates.
+    pub capsule_bytes: u64,
+    /// Bytes in cached per-resource response windows under `<cache>/responses/` — served reads,
+    /// which make this node no one's provider.
+    pub response_bytes: u64,
+    /// Everything else in the cache tree (config-adjacent files, in-progress temporaries).
+    pub other_bytes: u64,
+}
+
+impl CacheUsage {
+    /// Total bytes held, i.e. what [`cache_used_bytes`] reports.
+    pub fn total(&self) -> u64 {
+        self.capsule_bytes
+            .saturating_add(self.response_bytes)
+            .saturating_add(self.other_bytes)
+    }
+}
+
+/// Bytes currently held in the local cache, split by kind. See [`CacheUsage`].
+pub fn cache_usage() -> CacheUsage {
     fn walk(p: &Path, total: &mut u64) {
         if let Ok(rd) = std::fs::read_dir(p) {
             for e in rd.flatten() {
@@ -641,9 +669,24 @@ pub fn cache_used_bytes() -> u64 {
             }
         }
     }
-    let mut total = 0u64;
-    walk(&cache_dir(), &mut total);
-    total
+    let root = cache_dir();
+    let mut usage = CacheUsage::default();
+    walk(&root.join("modules"), &mut usage.capsule_bytes);
+    walk(&root.join("responses"), &mut usage.response_bytes);
+    // Whatever else lives in the tree: total the whole thing, then subtract the two known
+    // subtrees, so a future cache directory is never silently unaccounted for.
+    let mut everything = 0u64;
+    walk(&root, &mut everything);
+    usage.other_bytes = everything
+        .saturating_sub(usage.capsule_bytes)
+        .saturating_sub(usage.response_bytes);
+    usage
+}
+
+/// Total bytes currently held in the local cache (capsules + response windows + the rest).
+/// [`cache_usage`] reports the same total broken down by kind.
+pub fn cache_used_bytes() -> u64 {
+    cache_usage().total()
 }
 
 /// Delete all locally cached DIG content (the settings "clear cache" action).
@@ -3289,12 +3332,10 @@ mod tests {
                 }}))
             }
         };
-        let app = Router::new()
-            .route("/", post(rpc))
-            .route(
-                "/stores/:id/module",
-                get(move || async move { (clone_status, "{\"error\":\"invalid_request\"}") }),
-            );
+        let app = Router::new().route("/", post(rpc)).route(
+            "/stores/:id/module",
+            get(move || async move { (clone_status, "{\"error\":\"invalid_request\"}") }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3316,9 +3357,12 @@ mod tests {
         let root = Bytes32([0x22u8; 32]);
         let window = 4096;
         let capsule: Vec<u8> = (0..window * 2 + 101).map(|i| (i % 251) as u8).collect();
-        let base =
-            spawn_capsule_rpc_upstream(capsule.clone(), window, axum::http::StatusCode::BAD_REQUEST)
-                .await;
+        let base = spawn_capsule_rpc_upstream(
+            capsule.clone(),
+            window,
+            axum::http::StatusCode::BAD_REQUEST,
+        )
+        .await;
 
         // No identity: the chunked path is anonymous, so whole-store sync no longer depends on
         // the node holding a §21 identity key.
@@ -3329,9 +3373,16 @@ mod tests {
             .expect("the chunked dig.getCapsule path syncs the capsule");
 
         assert_eq!(served, root);
-        let cached =
-            std::fs::read(module_path(&node.cache_dir, &store.to_hex(), &root.to_hex())).unwrap();
-        assert_eq!(cached, capsule, "the WHOLE capsule is cached, byte for byte");
+        let cached = std::fs::read(module_path(
+            &node.cache_dir,
+            &store.to_hex(),
+            &root.to_hex(),
+        ))
+        .unwrap();
+        assert_eq!(
+            cached, capsule,
+            "the WHOLE capsule is cached, byte for byte"
+        );
     }
 
     /// **#1886, the diagnosability half.** When both download paths fail, the reported reason
@@ -3370,7 +3421,10 @@ mod tests {
             .expect_err("both paths refused");
 
         assert!(err.contains("418"), "carries the RPC path's status: {err}");
-        assert!(err.contains("400"), "carries the clone path's status: {err}");
+        assert!(
+            err.contains("400"),
+            "carries the clone path's status: {err}"
+        );
         assert!(
             !err.contains("not authorized"),
             "no longer guesses at authorization: {err}"

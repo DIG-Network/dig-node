@@ -61,6 +61,22 @@ pub trait CapsuleStore: Send + Sync {
         root_hex: &str,
     ) -> Result<(u64, String), String>;
 
+    /// Sync a whole store BY STORE ID, with no caller-supplied root: resolve the store's
+    /// CHAIN-ANCHORED tip and cache that generation. Returns `(size_bytes, root_hex)`.
+    ///
+    /// The root comes from the chain, never from the serving upstream (#1886). An upstream
+    /// asked for "latest" would be choosing which generation this node caches, reshares, and
+    /// announces itself as a holder of; the chain is the only authority for a store's tip.
+    ///
+    /// This is the entry point a "sync this store" request needs — until it existed, the only
+    /// way in required the caller to already know a concrete root, so a control-plane trigger
+    /// by store id had nothing to call.
+    ///
+    /// # Errors
+    /// A non-64-hex store id, a store with no confirmed generation on chain, an unreachable
+    /// chain resolver, or the underlying download failure verbatim.
+    async fn sync_whole_store(&self, store_id_hex: &str) -> Result<(u64, String), String>;
+
     /// GAP-FILL one missing generation (SPEC §14.3): pull the whole `.dig` module for
     /// `(store_id, root)` down from other nodes, verify it against the chain-anchored root, land it in
     /// the local cache, and (best-effort) refresh the DHT provider records so peers immediately find
@@ -244,6 +260,18 @@ impl CapsuleStore for Node {
                 )),
             },
         }
+    }
+
+    async fn sync_whole_store(&self, store_id_hex: &str) -> Result<(u64, String), String> {
+        let store_id =
+            crate::dht::hex64(store_id_hex).ok_or_else(|| "store_id must be 64-hex".to_string())?;
+        let root = crate::ChainSource::anchored_root_resolver_arc(self)
+            .anchored_root(&store_id)
+            .await
+            .map_err(|e| format!("could not resolve the chain-anchored root: {e}"))?
+            .ok_or_else(|| "the store has no chain-confirmed generation to sync".to_string())?;
+        self.cache_fetch_and_cache(store_id_hex, &root.to_hex())
+            .await
     }
 
     async fn gap_fill_generation(&self, store_id: [u8; 32], root: Bytes32) -> Result<(), String> {

@@ -814,10 +814,17 @@ fn config_set_upstream(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 }
 
 /// Cache view (cap/used/dir/shared) — reuses the dig-node crate's resolvers.
+///
+/// `capsule_bytes`/`response_bytes` split the same total, so `used_bytes` being large while
+/// `cache.listCached` is EMPTY reads as what it is — response windows without a held capsule —
+/// rather than as the two RPCs contradicting each other (#1886).
 fn cache_get() -> Value {
+    let usage = dig_node_core::cache_usage();
     json!({
         "cap_bytes": dig_node_core::cache_cap_bytes(),
-        "used_bytes": dig_node_core::cache_used_bytes(),
+        "used_bytes": usage.total(),
+        "capsule_bytes": usage.capsule_bytes,
+        "response_bytes": usage.response_bytes,
         "dir": crate::meta::cache_dir().display().to_string(),
         "shared": crate::meta::cache_shared(),
     })
@@ -1075,32 +1082,33 @@ async fn sync_status(ctx: &ControlCtx) -> Value {
         .filter(|s| cached_stores.contains(s))
         .count();
     json!({
-        "available": ctx.sync_available,
-        "method": "section-21-whole-store-sync",
+        // Whole-store sync leads with the ANONYMOUS chunked `dig.getCapsule` download, so it is
+        // available whether or not a §21 identity was loaded (#1886). The identity's presence is
+        // reported separately rather than folded into availability, since it only decides whether
+        // the authenticated §21 clone is available as a second path.
+        "available": true,
+        "method": "chunked-capsule-download-with-section-21-clone-fallback",
+        "identity_loaded": ctx.sync_available,
         "pinned_total": pinned_total,
         "pinned_synced": pinned_synced,
-        // Whole-store-by-store-id sync (without a concrete capsule root) is not
-        // exposed by the pinned dig-node crate revision; per-capsule sync IS (via
-        // control.sync.trigger / hostedStores.pin with a root).
-        "whole_store_trigger_supported": false,
+        // Whole-store-by-store-id IS exposed now: `control.sync.trigger` with a store id and no
+        // root resolves the store's chain-anchored tip and syncs that generation.
+        "whole_store_trigger_supported": true,
     })
 }
 
-/// Trigger a §21 sync for one capsule (storeId + root). Reports NOT_SUPPORTED when
-/// authenticated sync is unavailable (no §21 identity), and INVALID_PARAMS for a bad
-/// capsule ref. The actual fetch proxies to dig-node's `cache_fetch_and_cache`.
+/// Trigger a whole-store sync, either for ONE capsule (`storeId:rootHash` / `store_id` + `root`)
+/// or for a whole store BY STORE ID ALONE, in which case the node resolves the store's
+/// chain-anchored tip and syncs that generation (#1886).
+///
+/// No identity gate: the chunked `dig.getCapsule` download the sync now leads with is anonymous,
+/// so a node holding no §21 identity key syncs perfectly well. Rejecting the request here would
+/// refuse work the node can actually do.
 async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
-    // Accept either `store` = "storeId:rootHash" or explicit store_id + root.
+    // Accept `store` = "storeId[:rootHash]", or explicit store_id [+ root].
     let (store_id, root) = if let Some(s) = params.get("store").and_then(|v| v.as_str()) {
         match parse_store_ref(s) {
-            Ok((sid, Some(r))) => (sid, r),
-            Ok((_, None)) => {
-                return control_error(
-                    id,
-                    ErrorCode::InvalidParams,
-                    "control.sync.trigger needs a capsule root: pass store as storeId:rootHash",
-                )
-            }
+            Ok((sid, root)) => (sid, root),
             Err(e) => return control_error(id, ErrorCode::InvalidParams, e),
         }
     } else {
@@ -1108,32 +1116,39 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             .get("store_id")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let r = params.get("root").and_then(|v| v.as_str()).unwrap_or("");
-        if !is_hex64(sid) || !is_hex64(r) {
+        if !is_hex64(sid) {
             return control_error(
                 id,
                 ErrorCode::InvalidParams,
-                "control.sync.trigger requires store_id + root (each 64-hex), \
-                 or store=storeId:rootHash",
+                "control.sync.trigger requires store_id (64-hex), optionally with a 64-hex root, \
+                 or store=storeId[:rootHash]",
             );
         }
-        (sid.to_lowercase(), r.to_lowercase())
+        match params.get("root").and_then(|v| v.as_str()) {
+            Some(r) if !is_hex64(r) => {
+                return control_error(
+                    id,
+                    ErrorCode::InvalidParams,
+                    "control.sync.trigger root must be 64-hex when given",
+                )
+            }
+            Some(r) => (sid.to_lowercase(), Some(r.to_lowercase())),
+            None => (sid.to_lowercase(), None),
+        }
     };
 
-    if !ctx.sync_available {
-        return control_error(
-            id,
-            ErrorCode::NotSupported,
-            "authenticated §21 whole-store sync is unavailable (no §21 identity loaded)",
-        );
-    }
+    // Rootless: the CHAIN picks the generation, never the serving upstream.
+    let outcome = match &root {
+        Some(root) => ctx.node.cache_fetch_and_cache(&store_id, root).await,
+        None => ctx.node.sync_whole_store(&store_id).await,
+    };
 
-    match ctx.node.cache_fetch_and_cache(&store_id, &root).await {
+    match outcome {
         Ok((size_bytes, served_root)) => control_ok(
             id,
             json!({
                 "store_id": store_id,
-                "root": root,
+                "root": root.clone().unwrap_or_else(|| served_root.clone()),
                 "status": "synced",
                 "size_bytes": size_bytes,
                 "served_root": served_root,
@@ -1142,7 +1157,10 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Err(e) => control_error(
             id,
             ErrorCode::ControlError,
-            format!("§21 sync failed for {store_id}:{root}: {e}"),
+            match &root {
+                Some(root) => format!("whole-store sync failed for {store_id}:{root}: {e}"),
+                None => format!("whole-store sync failed for {store_id}: {e}"),
+            },
         ),
     }
 }

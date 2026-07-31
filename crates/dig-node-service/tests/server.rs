@@ -1075,11 +1075,16 @@ async fn control_sync_status_reports_availability() {
         Some(&token),
     )
     .await;
-    assert!(resp["result"]["available"].is_boolean());
+    // Whole-store sync leads with the ANONYMOUS chunked capsule download, so availability no
+    // longer depends on a §21 identity; the identity's presence is reported on its own field
+    // (#1886). `whole_store_trigger_supported` is now true because a store id alone is enough.
+    assert_eq!(resp["result"]["available"], json!(true));
     assert_eq!(
         resp["result"]["method"],
-        json!("section-21-whole-store-sync")
+        json!("chunked-capsule-download-with-section-21-clone-fallback")
     );
+    assert!(resp["result"]["identity_loaded"].is_boolean());
+    assert_eq!(resp["result"]["whole_store_trigger_supported"], json!(true));
     assert!(resp["result"]["pinned_total"].is_u64());
 }
 

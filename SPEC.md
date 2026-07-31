@@ -1127,21 +1127,21 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.config.get` | — | `addr`, `port`, `upstream`, `upstream_override`, `cache_dir`, `cache_shared`, `config_path`, `sync_available` |
 | `control.config.setUpstream` | `upstream` (URL string; blank clears) | `upstream` (normalized), `requires_restart: true` — persisted, effective on next start (§3.4) |
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
-| `control.cache.get` | — | `cap_bytes`, `used_bytes`, `dir`, `shared` |
+| `control.cache.get` | — | `cap_bytes`, `used_bytes`, `capsule_bytes`, `response_bytes`, `dir`, `shared` |
 | `control.cache.setCap` | `cap_bytes` (number) | `cap_bytes` (floored at 64 MiB) |
 | `control.cache.clear` | — | `cleared: true` |
 | `control.hostedStores.list` | — | `stores[]`: `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` (capsule, root, size_bytes, last_used_unix_ms) — cached stores ∪ pinned stores |
 | `control.hostedStores.pin` | `store` = `storeId[:rootHash]` | `store_id`, `root`, `pinned: true`, `fetch` = `{status: cached\|failed\|skipped, …}` (pre-fetch attempted only with a concrete root AND sync available; a skipped fetch reports `reason`) |
 | `control.hostedStores.unpin` | `store` = `storeId[:rootHash]` | `store_id`, `unpinned` (whether a pin was removed), `evicted_capsules` — MUST evict every cached capsule of the store |
 | `control.hostedStores.status` | `store` = `storeId[:rootHash]` | `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` |
-| `control.sync.status` | — | `available`, `method: "section-21-whole-store-sync"`, `pinned_total`, `pinned_synced`, `whole_store_trigger_supported` (`false` at this pin — per-capsule sync only) |
-| `control.sync.trigger` | `store` = `storeId:rootHash` (root REQUIRED), or `store_id` + `root` | `status: "synced"`, `size_bytes`, `served_root`; `NOT_SUPPORTED` when no §21 identity is loaded |
+| `control.sync.status` | — | `available` (always `true` — the chunked capsule download needs no identity), `method: "chunked-capsule-download-with-section-21-clone-fallback"`, `identity_loaded`, `pinned_total`, `pinned_synced`, `whole_store_trigger_supported` (`true` — a store id alone is enough) |
+| `control.sync.trigger` | `store` = `storeId[:rootHash]`, or `store_id` [+ `root`] — the root is OPTIONAL; without one the node resolves the store's CHAIN-ANCHORED tip and syncs that generation | `status: "synced"`, `root`, `size_bytes`, `served_root` |
 
 ### 7.5. Ownership boundary
 
 Cache and sync operations MUST proxy to the node library
 (`cache_list_cached`/`cache_remove_cached`/`cache_fetch_and_cache`/`clear_cache`/
-`set_cache_cap_bytes`/`cache_cap_bytes`/`cache_used_bytes`); the shell never duplicates read/cache
+`set_cache_cap_bytes`/`cache_cap_bytes`/`cache_used_bytes`/`cache_usage`/`sync_whole_store`); the shell never duplicates read/cache
 logic. The shell owns only the pin registry and the upstream override.
 
 ### 7.6. Pin registry
@@ -2219,6 +2219,37 @@ a root OTHER than the confirmed root MUST be rejected (never cached or served).
 - **Fail-closed.** Gap-fill never pulls against an unconfirmable root (the §14.2 decision gates it).
 - **Verification invariant.** Every served module is verified against the chain-anchored root at SERVE,
   no matter how it arrived — a client read, a §21 whole-store sync, or a proactive/backfill gap-fill.
+
+### 14.3a. Whole-capsule download — two paths, chunked first
+
+Landing a whole `.dig` for `(store_id, root)` is the mechanism BOTH gap-fill triggers and the
+control-plane sync run on. The node MUST attempt these paths in this order:
+
+1. **The chunked `dig.getCapsule` JSON-RPC** (`POST` on the upstream base URL). The node pages the
+   capsule in windows of at most **3 MiB** — the upstream's own per-response ceiling — following the
+   server's `next_offset` until `complete`. This path is ANONYMOUS: it MUST work on a node holding
+   no §21.9 identity.
+2. **The §21.9 authenticated clone** (`GET /stores/{id}/module`), attempted only when an identity is
+   loaded. Retained for §21 hosts exposing no `dig` JSON-RPC.
+
+The chunked path MUST lead, not serve as a fallback: a single-response clone cannot carry a
+production-sized capsule across an HTTPS edge that caps a response body, so for real stores it is
+the only path that completes.
+
+The node MUST send the CONCRETE root it resolved and MUST NOT send `"latest"`. A server-chosen
+generation would be a server choosing which generation this node caches, reshares, and announces
+itself a holder of; the chain is the only authority for a store's tip.
+
+Every window is validated before it is trusted. The node MUST reject a download whose declared
+`total_length` exceeds **4 GiB**, whose `total_length` changes between windows, whose served offset
+differs from the requested one, whose `next_offset` fails to advance, or whose reassembled length
+differs from the declared length. Rejection is required BEFORE the bytes are gathered where the
+declaration alone is disqualifying, so a dishonest upstream cannot drive an unbounded allocation or
+an endless loop.
+
+A failed download MUST be reported with the ACTUAL failure — the upstream's HTTP status, its
+JSON-RPC error code and message, or the specific validation that rejected it. A diagnostic naming
+causes that were not checked is non-conformant.
 
 ### 14.4. Read-path anchored-root pin
 

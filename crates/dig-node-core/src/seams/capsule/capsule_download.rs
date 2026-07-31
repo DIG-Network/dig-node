@@ -283,15 +283,10 @@ mod tests {
         let capsule = deterministic_capsule(window * 3 + 17);
         let (url, calls) = spawn_capsule_rpc(capsule.clone(), window, |_| {}).await;
 
-        let got = download_capsule_via_rpc(
-            &reqwest::Client::new(),
-            &url,
-            STORE,
-            ROOT,
-            window as u64,
-        )
-        .await
-        .expect("download");
+        let got =
+            download_capsule_via_rpc(&reqwest::Client::new(), &url, STORE, ROOT, window as u64)
+                .await
+                .expect("download");
 
         assert_eq!(got, capsule, "reassembled bytes must equal the capsule");
         assert_eq!(*calls.lock().unwrap(), 4, "one request per window");
@@ -347,7 +342,11 @@ mod tests {
 
         let params = seen.lock().unwrap().clone().expect("server saw a request");
         assert_eq!(params["store_id"], json!(STORE));
-        assert_eq!(params["root"], json!(ROOT), "the explicit root, not \"latest\"");
+        assert_eq!(
+            params["root"],
+            json!(ROOT),
+            "the explicit root, not \"latest\""
+        );
     }
 
     /// A stalled upstream must fail, not spin. `next_offset` is rewritten to the offset just
@@ -510,6 +509,43 @@ mod tests {
         .expect_err("a 400 is an error");
 
         assert!(err.contains("400"), "names the status: {err}");
+    }
+
+    /// The property: the usage breakdown DISTINGUISHES held capsules from response windows —
+    /// the state that made `cache.get` and `cache.listCached` look contradictory (#1886).
+    ///
+    /// The fixture writes DIFFERENT byte counts to the two subtrees, and a third file outside
+    /// both, so an implementation that reported the same walk for every field, or folded the
+    /// stray file into a subtree, cannot pass. `capsule_bytes == 0` with a non-zero total is
+    /// exactly the observed broken-flywheel reading, and it must be legible as such.
+    #[test]
+    fn cache_usage_separates_held_capsules_from_response_windows() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let td = tempfile::tempdir().unwrap();
+        let cache = td.path().join("cache");
+        std::env::set_var("DIG_NODE_CACHE", &cache);
+
+        std::fs::create_dir_all(cache.join("modules/aa")).unwrap();
+        std::fs::create_dir_all(cache.join("responses")).unwrap();
+        std::fs::write(cache.join("modules/aa/bb.module"), vec![7u8; 300]).unwrap();
+        std::fs::write(cache.join("responses/win1"), vec![1u8; 50]).unwrap();
+        std::fs::write(cache.join("responses/win2"), vec![1u8; 25]).unwrap();
+        std::fs::write(cache.join("config-adjacent"), vec![0u8; 9]).unwrap();
+
+        let usage = crate::cache_usage();
+        assert_eq!(usage.capsule_bytes, 300, "held capsules");
+        assert_eq!(usage.response_bytes, 75, "response windows");
+        assert_eq!(usage.other_bytes, 9, "neither subtree, still accounted for");
+        assert_eq!(usage.total(), 384);
+        assert_eq!(
+            usage.total(),
+            crate::cache_used_bytes(),
+            "the breakdown sums to the number `used_bytes` has always reported"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
     }
 
     /// The default window is pinned to the GATEWAY's per-response ceiling. If hub.dig.net's

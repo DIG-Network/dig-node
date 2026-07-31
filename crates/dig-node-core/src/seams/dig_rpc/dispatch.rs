@@ -288,9 +288,16 @@ impl RpcDispatch for Node {
                 // `cap_bytes`/`used_bytes` are UNCHANGED — the FFI contract is
                 // additive-only (see SYSTEM.md change-impact + the regression test).
                 let (dir, shared) = resolve_cache_dir();
+                // The breakdown is ADDITIVE beside `used_bytes` (#1886): it is what tells an
+                // operator whether those bytes are held CAPSULES (this node is a holder) or
+                // merely per-resource response windows (it is not) — the difference between a
+                // turning flywheel and a stalled one.
+                let usage = cache_usage();
                 return json!({"jsonrpc":"2.0","id":id,"result":{
             "cap_bytes": cache_cap_bytes(),
-            "used_bytes": cache_used_bytes(),
+            "used_bytes": usage.total(),
+            "capsule_bytes": usage.capsule_bytes,
+            "response_bytes": usage.response_bytes,
             "cache_dir": dir.display().to_string(),
             "shared": shared}});
             }
@@ -461,9 +468,12 @@ impl RpcDispatch for Node {
                 let entry_count = list.len() as u64;
                 let total_bytes: u64 = list.iter().map(|c| c.size_bytes).sum();
                 use std::sync::atomic::Ordering::Relaxed;
+                let usage = cache_usage();
                 return json!({"jsonrpc":"2.0","id":id,"result":{
                 "cap_bytes": cache_cap_bytes(),
-                "used_bytes": cache_used_bytes(),
+                "used_bytes": usage.total(),
+                "capsule_bytes": usage.capsule_bytes,
+                "response_bytes": usage.response_bytes,
                 "entry_count": entry_count,
                 "total_bytes": total_bytes,
                 "evicted_count": CACHE_EVICTED_COUNT.load(Relaxed),
