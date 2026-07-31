@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.69.0] - 2026-07-31
+
+### Features
+- **dht:** Hold peer-derived error text as SafeText, bumping the peer stack to the 0.15 line (#124)
+
 ## [0.68.1] - 2026-07-31
 
 ### Bug Fixes
