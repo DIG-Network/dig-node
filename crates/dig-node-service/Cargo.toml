@@ -160,6 +160,14 @@ dig-constants = "0.4"
 # 1053 ("did not respond in a timely fashion"). The service's hidden `run-service`
 # entrypoint uses this to be a real Windows service. (systemd/launchd exec the
 # foreground process directly, so they need no equivalent.)
+# #526/B1: read the effective uid through `geteuid()` — a syscall, NO process spawn. The privilege
+# level now DECIDES the service scope on every service verb, so the previous `id -u` spawn resolved
+# a BARE program name through `$PATH` while running as root under `sudo` (whose default
+# `secure_path` puts a group-writable `/usr/local/bin` first on Debian, and which macOS does not set
+# at all) — a local privilege-escalation vector on the very command the docs tell operators to run.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 

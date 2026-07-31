@@ -91,3 +91,59 @@ fn version_flag_prints_version() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(env!("CARGO_PKG_VERSION")), "got: {stdout}");
 }
+
+/// #526: `--scope <auto|system|user>` must be present on EVERY service verb, with `auto` as the
+/// documented default. Asserted against the BUILT binary's own help — the only place that proves
+/// the flag is actually wired into the CLI (a lib-level scope test cannot see a verb that forgot to
+/// accept it). Reads help rather than running the verbs, so nothing is registered on the host.
+#[test]
+fn every_service_verb_accepts_the_scope_flag_defaulting_to_auto() {
+    for verb in ["install", "uninstall", "start", "stop"] {
+        let out = bin()
+            .args([verb, "--help"])
+            .output()
+            .unwrap_or_else(|e| panic!("run dig-node {verb} --help: {e}"));
+        assert!(out.status.success(), "`{verb} --help` must succeed");
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            help.contains("--scope"),
+            "`{verb}` must accept --scope: {help}"
+        );
+        assert!(
+            help.contains("[default: auto]"),
+            "`{verb} --scope` must default to auto so a caller passing no flag is unchanged: {help}"
+        );
+        // NOT `help.contains("auto")` etc.: the flag's own doc comment spells all three words in
+        // prose, so that assertion holds even if the ValueEnum lost a variant. Assert clap's
+        // POSSIBLE-VALUES list itself, which is generated from the enum.
+        for value in ["auto", "system", "user"] {
+            // clap renders each ValueEnum variant as its own `- <value>: <doc>` bullet under
+            // "Possible values:", so this reads the GENERATED list rather than prose.
+            assert!(
+                help.lines()
+                    .any(|l| l.trim_start().starts_with(&format!("- {value}:"))),
+                "`{verb} --scope` must offer `{value}` as a generated possible VALUE: {help}"
+            );
+        }
+    }
+}
+
+/// A scope the CLI does not define must be a USAGE error (exit 2), never silently coerced to a
+/// default — a typo'd `--scope sytem` must not quietly install at user scope.
+#[test]
+fn an_unknown_scope_value_is_a_usage_error() {
+    let out = bin()
+        .args(["install", "--scope", "sytem"])
+        .output()
+        .expect("run dig-node install --scope sytem");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "an invalid --scope value must be a clap usage error, not an install"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("sytem"),
+        "the error names the bad value: {stderr}"
+    );
+}

@@ -40,7 +40,30 @@ use std::path::Path;
 /// component is untrusted. `dir.ancestors()` always yields at least `dir`, so an empty chain can
 /// never vacuously pass.
 pub fn dir_is_privileged(dir: &Path) -> bool {
-    dir.ancestors().all(component_is_privileged)
+    first_unprivileged_ancestor(dir).is_none()
+}
+
+/// The FIRST ancestor component of `dir` (walking leaf → filesystem root) that fails the trust bar,
+/// or `None` when the whole chain is privileged. The diagnostic twin of [`dir_is_privileged`]: the
+/// boolean answers *whether* a path is trustworthy, this answers *which level* is not — so a refusal
+/// can name the offending directory instead of leaving an operator to bisect the chain by hand
+/// (#526: the system-service install gate must be actionable, never a silent downgrade).
+pub fn first_unprivileged_ancestor(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|c| !component_is_privileged(c))
+}
+
+/// Whether a single FILE clears the SAME trust bar every directory component must
+/// ([`component_is_privileged`]): privileged-owned, no group/other write bit, not a
+/// symlink/reparse point. Fails CLOSED.
+///
+/// Directory permissions and file permissions stop DIFFERENT attacks, which is why both are checked
+/// (#526/B6): a root-owned `0755` directory prevents unlink/rename of the entry, but says nothing
+/// about a binary INSIDE it that is itself owned by uid 1000 (or group/world-writable) — that file
+/// can be rewritten in place, and a root boot daemon would execute the new contents. So the program
+/// a privileged service points at must clear the bar on its own account, not merely by living in a
+/// good directory.
+pub fn file_is_privileged(file: &Path) -> bool {
+    component_is_privileged(file)
 }
 
 /// Whether a SINGLE existing path `component` clears the trust bar: privileged-owned, not

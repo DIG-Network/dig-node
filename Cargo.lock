@@ -2266,7 +2266,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.69.0"
+version = "0.70.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2285,6 +2285,7 @@ dependencies = [
  "digstore-crypto",
  "digstore-stage",
  "futures-util",
+ "libc",
  "reqwest",
  "rustls",
  "serde",

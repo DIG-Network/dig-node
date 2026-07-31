@@ -1493,7 +1493,8 @@ flood of never-attached `begin`s cannot grow engine state without bound.
 
 `run` (default when no subcommand; serves in the foreground and is the unix-service entrypoint) ·
 `run-service` (hidden; the Windows SCM entrypoint, §9.4; behaves as `run` off Windows) ·
-`install` · `uninstall` · `start` · `stop` · `status` · `pair` (§7.11) · `open` (§8.5) ·
+`install` · `uninstall` · `start` · `stop` (each accepting `--scope <auto|system|user>`, §9.1) ·
+`status` · `pair` (§7.11) · `open` (§8.5) ·
 the **control-parity** subcommands `info` · `config` · `cache` · `stores` · `sync` · `updater` ·
 `subscriptions` (§8.6) · `peers` (§8.7) · `logs` (§11).
 
@@ -1662,10 +1663,133 @@ Numeric values and symbolic names are a stable contract and MUST NOT be renumber
 
 ## 9. OS-service contract
 
-9.1. **Install levels.** Linux (systemd) and macOS (launchd) install at **user level** (no
-root/sudo; runs as the installing user). Windows SCM has no per-user services, so install is
-**system-level only**, and `install`/`uninstall` MUST fail fast with a clear
-`PERMISSION_DENIED` when the console is not elevated (probed up front, not deep inside `sc.exe`).
+9.1. **Service scope (`--scope`, #526).** A registration lives in exactly ONE of two scopes, and
+`install`, `uninstall`, `start` and `stop` all accept `--scope <auto|system|user>`, default `auto`.
+
+| Scope | Where the registration lands | Runs as | Survives a reboot with NO login session | Requires |
+| --- | --- | --- | --- | --- |
+| `system` | systemd system unit (`/etc/systemd/system/dignetwork-dig-node.service`, `WantedBy=multi-user.target`) · launchd daemon (`/Library/LaunchDaemons/net.dignetwork.dig-node.plist`, `system` domain) · Windows SCM service | root / LocalSystem | **YES** — starts at boot | root / Administrator |
+| `user` | systemd user unit (`~/.config/systemd/user/dignetwork-dig-node.service`) · launchd agent (`gui/<uid>` domain) | the installing user | NO — starts with that user's session | nothing |
+
+- **Resolution (normative).** Given the operator's choice, whether the OS HAS a user scope, and
+  whether the process is root, the resolved scope MUST be: `system` whenever the OS has no user
+  scope (Windows SCM) — **including for an explicit `--scope user`, which cannot be honoured
+  there**; otherwise the explicit `--scope system`/`--scope user` **verbatim** (an explicit choice is
+  authoritative and MUST NEVER be silently overridden by the privilege level); otherwise, for
+  `auto`, `system` when running as root and `user` when not.
+- **`auto` is the default**, so a caller that passes no flag — including a dig-installer release
+  predating this flag — gets the historical behaviour: user scope for an unelevated desktop install,
+  and now system scope for an ELEVATED install, which is what makes a headless install survive a
+  reboot. Root has no `systemd --user`/D-Bus session, so a user-scope registration attempted as root
+  cannot succeed at all.
+- **A system scope requested without root MUST be refused** (`PERMISSION_DENIED`) with a message
+  naming the missing privilege and the `--scope user` alternative — never silently downgraded to
+  user scope (a silent downgrade produces a registration that does not survive a reboot, which the
+  operator asked to avoid). On Windows, the equivalent up-front check is elevation itself:
+  `install`/`uninstall` MUST fail fast with a clear `PERMISSION_DENIED` when the console is not
+  elevated (probed up front, not deep inside `sc.exe`).
+- **Cross-scope migration (`install`).** Before registering at the resolved scope, `install` clears
+  this service label at the OTHER scope, so a host upgrading from a previous user-level install does
+  not end up with two registrations both starting a node bound to the same port. TWO mechanisms, with
+  different reach, and the difference is normative because the first one CANNOT work as root:
+  1. **The OS-manager sweep** asks the current process's own service manager about the other scope.
+     It is PROBE-GATED (a scope holding no registration is never written to) and therefore only ever
+     sees the CURRENT account: root has no systemd `--user` session, and `gui/<uid>` is uid 0's
+     domain, so as root this mechanism sees nothing and does nothing. Reported as
+     `result.migrated_from_scope { scope, found, removed, indeterminate, error }`.
+  2. **The per-account FILESYSTEM sweep**, which runs when the resolved scope is `System` on a
+     user-capable OS, because that is the case mechanism 1 cannot cover. It enumerates real
+     registration FILES under the fixed account roots `/home`, `/root` and `/Users` — the systemd
+     user unit `<home>/.config/systemd/user/dignetwork-dig-node.service` together with its
+     `default.target.wants/` enablement symlink, and the launchd agent
+     `<home>/Library/LaunchAgents/net.dignetwork.dig-node.plist` — best-effort STOPS each running
+     instance (`launchctl bootout gui/<uid>/<label>`, `systemctl --user --machine=<account>@.host
+     stop <unit>`), then unlinks them. Reported per account as
+     `result.user_scope_sweep { removed_accounts, failed_accounts, residual }`. Stopping matters as
+     much as unlinking: a still-running user-level node holds the node's port, and the `dig-node
+     start` an installer treats as fatal would fail with `EADDRINUSE`.
+     - **Root deleting inside user-owned directories is symlink-refusing.** No intermediate
+       DIRECTORY component of a removal path below the account root may be a symlink (checked with
+       `lstat`, which does not follow); if one is, that registration is refused and REPORTED rather
+       than removed, because as root a redirected walk would be an arbitrary-delete primitive. The
+       FINAL component MAY be a symlink — systemd's `default.target.wants/` enablement entry always
+       is, and refusing it would leave the unit ENABLED — because it is only ever unlinked, which
+       removes the link and never follows it. Only individual files and symlinks are ever unlinked —
+       never a directory tree.
+     - **Stated residual (NOT covered).** A user-scope registration under a home directory outside
+       `/home`, `/root` or `/Users`, or under a non-default `XDG_CONFIG_HOME`, is not discoverable
+       and is NOT removed; that residual is stated in the install output, and the affected user
+       removes it with `dig-node uninstall --scope user`.
+  Both sweeps are best-effort and a failure in either MUST NOT fail an otherwise-good install — but a
+  registration that was seen and could not be removed MUST be reported as a `WARN` in the human
+  summary and in `--json`, never silently dropped.
+- **The existence probe is ADVISORY; the OS deregistration is AUTHORITATIVE.**
+  `launchctl print gui/<uid>/<label>` cannot see a per-user agent from a session with no Aqua/GUI
+  domain (a headless CI runner, an ssh login), so it reports absence for a service that IS
+  registered. Therefore the scope the operator NAMED (or `auto` resolved to) MUST be deregistered
+  **unconditionally**, without gating on the probe — a probe false-negative MUST NEVER turn an
+  uninstall into a silent no-op. A scope merely being SWEPT (the other scope during `install`, the
+  second scope of `uninstall --scope auto`) MUST be probe-gated, so a scope nobody asked about is
+  never written to.
+- **`uninstall` scope sweep.** An explicit `--scope` removes exactly that scope. `--scope auto`
+  removes the resolved scope and then sweeps the other, so an uninstall does not leave the other
+  scope's registration of the CURRENT account behind (the residual above applies here too: another
+  account's user-scope registration is that user's own `dig-node uninstall --scope user`). Every
+  scope is reported
+  (`result.removed_scopes: ["system", "user"]`). Anything short of a complete removal MUST be an
+  error naming the scope, never a silent success. A scope is **indeterminate** — unknown, and
+  therefore reported as unresolved — when the removal did not succeed AND its failure was not the OS
+  positively reporting absence: the classification is by the removal error's KIND, where `NOT_FOUND`
+  is the ONLY honest "there was nothing here" signal and anything else (a permission failure on a
+  root-owned unit, an unreadable domain, a tool that could not be located in a privileged directory)
+  leaves a registration that may still be present. Only when nothing was
+  removed anywhere AND nothing is unresolved is the result `NOT_FOUND` ("nothing to uninstall"),
+  carrying the underlying removal error as context.
+- **The existence probe is THREE-VALUED, and only the OS may say "absent".** The probe answers
+  `present`, `absent`, or `unknown`; it MUST NOT report `absent` for a scope it could not READ. Only
+  a positive OS absence signal — systemd `No files found for <unit>`, launchd `Could not find
+  service` (exit `113`), Windows SCM `1060` (`ERROR_SERVICE_DOES_NOT_EXIST`) — is `absent`. Every
+  other outcome is `unknown` and carries the tool's own message: `systemctl --user` with no
+  reachable bus (its state when run as root), a launchd domain that cannot be bootstrapped from a
+  session with no Aqua domain, a permission failure, a signal-terminated probe, or an OS tool that
+  could not be located in a privileged directory. `unknown` MUST NOT be collapsed into "not
+  registered" anywhere: it makes a swept scope **indeterminate** (above), and where a caller cannot
+  proceed without certainty — the clean-reinstall, and confirming a deletion took effect — it is an
+  ERROR, never a `false` that would create over a registration that may be live. This state is
+  therefore reachable from the real OS backend, not only from a test double.
+- **Native packages register system scope**, consistently with `--scope system`: the `.deb`'s static
+  systemd unit is `WantedBy=multi-user.target` running as root, and the macOS `postinstall`
+  bootstraps into the `system` launchd domain (§9.7).
+
+9.1a. **Privileged execution hygiene (HARD RULES).** Every service verb now resolves the scope from
+the process's privilege level, so all of the following execute while root during the prescribed
+`sudo dig-node install --scope system`:
+
+- **The effective uid MUST come from `geteuid()`**, never from a spawned `id`. A bare program name is
+  resolved through `$PATH`, and `/usr/local/bin` — group-writable `root:staff 2775` on Debian/Ubuntu
+  and user-owned under Intel Homebrew — leads sudo's default `secure_path`, while macOS sets no
+  `secure_path` at all. A planted `id` would therefore run AS ROOT; and one printing a non-zero uid
+  would additionally resolve the scope to `user`, which is exempt from the privileged-target gate
+  (§9.2c) — one writable `PATH` entry would switch that gate OFF.
+- **Every OS tool MUST be executed from an ABSOLUTE path resolved out of a fixed list of privileged
+  directories** (`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`; `%SystemRoot%\System32` and
+  `%SystemRoot%` on Windows). `/usr/local/bin` MUST NOT appear in that list. A tool that cannot be
+  found in it MUST NOT be run at all (fail closed), and the failure is reported.
+- **The process `PATH` MUST be pinned to that same list, and `WINSW_PATH` removed, for the duration of
+  a service verb.** Unix resolves a bare name with `execvp` against the CALLING process's `PATH`, so
+  this is the only place spawns made by DEPENDENCIES can be constrained — and the service-manager
+  library selects a **WinSW** backend whenever a `winsw.exe` is on `$PATH` or `%WINSW_PATH%` names an
+  existing file, then executes it as the elevated installer, which would hand an attacker the entire
+  service definition.
+- **No baked service-environment key or value may contain a control character** (newline,
+  carriage return or NUL)
+  when the resolved scope is `System`. Each entry is written verbatim as one `Environment="K=V"` line
+  of a root-owned systemd unit file, so a line terminator appends further DIRECTIVES that run as root
+  (`ExecStartPre=` may appear repeatedly and runs before `ExecStart`). The refusal names the offending
+  key and is stated over the CLASS of control characters, not over any particular directive. Such a
+  value is also rejected at its SOURCE (`normalize_upstream`, `control.config.setUpstream`) so it
+  cannot persist in `config.json` and be baked by a later install. User scope is exempt: that unit is
+  written by, and runs as, the user who already controls the values.
 
 9.2. **Recorded environment.** `install` MUST register the absolute path of the currently-running
 executable (never a PATH lookup) and record the resolved config as service environment variables:
@@ -1727,15 +1851,27 @@ registering a system-level service, `install` MUST verify the program's director
 component privileged-owned, non-reparse) and **refuse with `PERMISSION_DENIED`** otherwise, before any
 side effect (no state-dir harden, no service create). This is the SAME spawn-free owner gate the
 self-heal spawn root (§7 #565) and the TLS material root (§4.1a #661) use — one shared check,
-fail-closed on an indeterminate owner. A **user-level** install
-(the Linux/macOS default) runs as the very user who owns the binary, crosses no privilege boundary,
-and is always allowed. The canonical install path (native OS package, §9.7) places the binary in a
-protected admin-owned location (`%ProgramFiles%\DIG Network\dig-node\`, `/usr/…`), so it satisfies
-the gate; a manual `dig-node install` from a user-writable download directory is what the gate
-refuses. A single explicit, **default-off** opt-out — the `DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET`
+fail-closed on an indeterminate owner. The refusal MUST NAME the offending path
+LEVEL (the first ancestor that fails the check), not merely the program path: the check walks the
+whole chain, so a privileged-owned leaf under a user-writable parent is refused, and an operator
+cannot act on a refusal that does not say which level failed. A **user-scope** install runs as the
+very user who owns the binary, crosses no privilege boundary, and is always allowed. The canonical
+install paths (native OS package, §9.7; the dig-installer's root-owned `/opt/dig/bin`) place the
+binary in a protected admin-owned location (`%ProgramFiles%\DIG Network\dig-node\`, `/usr/…`), so
+they satisfy the gate; a manual system-scope `dig-node install` from a user-writable download
+directory is what the gate refuses — and it is refused loudly, never downgraded to user scope. **The program FILE itself MUST also clear the bar** — owned by root/SYSTEM, no group/other write
+bit, not a symlink/reparse point — and not merely sit inside a privileged directory: directory
+permissions prevent unlink/rename of the entry, but a binary whose OWN mode permits it can be
+rewritten in place, and the daemon would execute the new contents at next boot. The two checks are
+independent and both required; the refusal names which one failed.
+
+A single explicit, **default-off** opt-out — the `DIG_NODE_ALLOW_INSECURE_SERVICE_TARGET`
 env var (truthy `1`/`true`/`yes`) — bypasses the gate with a loud warning, intended ONLY for a
 controlled test/dev install of an unreleased build from a build directory (e.g. the `service-smoke`
-CI); it MUST NOT be set on an end-user machine.
+CI); it MUST NOT be set on an end-user machine. **It is INERT when the resolved scope is `System` and
+the process is genuinely root**: that combination is a root boot daemon on a real machine, the env var
+is inheritable (`sudo -E`, an export in a root profile, a CI value leaking into an operator shell),
+and no inherited variable may disable this gate for it.
 
 9.3. **Entrypoint per platform.** The installed service runs `dig-node run-service` on Windows and
 `dig-node run` on systemd/launchd (which exec the foreground process directly).

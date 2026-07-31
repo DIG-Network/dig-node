@@ -64,11 +64,19 @@ dig-node uninstall
   `sc config` + a `sc qc` read-back to confirm it took). Re-running `install` against an
   already-registered service cleanly stops + deregisters + recreates it instead of hitting
   `CreateService` error 1073 ("the specified service already exists").
-- **Linux / macOS:** the service installs at **user level** (systemd `--user` / a launchd GUI agent),
-  so no `sudo` is needed and it runs as you. (systemd user services start at login; enable
-  linger — `loginctl enable-linger $USER` — if you want it running without an active session.)
-  Both back ends restart the service on crash out of the box — systemd's generated unit sets
-  `Restart=on-failure`, launchd's generated plist sets `KeepAlive: true`.
+- **Linux / macOS:** both scopes exist, and `install` picks by privilege — run it plainly and you get a
+  **user-level** service (systemd `--user` / a launchd GUI agent): no `sudo`, runs as you. (systemd
+  user services start at login; enable linger — `loginctl enable-linger $USER` — if you want it
+  running without an active session.) Run it with `sudo` and you get a **system-level** service that
+  starts at boot with no login session — what you want on a headless host, and what the DIG installer
+  and the native `.deb`/`.pkg` register. Both back ends restart the service on crash out of the box —
+  systemd's generated unit sets `Restart=on-failure`, launchd's generated plist sets `KeepAlive: true`.
+- **Choosing explicitly:** `install`, `uninstall`, `start` and `stop` all accept
+  `--scope <auto|system|user>` (default `auto` = the privilege-based choice above). An explicit scope
+  is honoured as given — `--scope system` without root is refused with a clear message rather than
+  quietly becoming a user service that will not survive a reboot. `install` also removes any
+  registration at the *other* scope first, so upgrading a user-level install to a system one never
+  leaves two services fighting over the port; `uninstall` with the default `auto` clears both.
 
 ## Point the extension at it
 
