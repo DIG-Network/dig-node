@@ -405,9 +405,7 @@ pub fn run() -> std::process::ExitCode {
     let exit = match command {
         Command::Run => render_serve(block_on_serve(config), action, json),
         Command::RunService => render_serve(run_service(config), action, json),
-        Command::Install { scope } => {
-            render(service::install(&config, scope.choice), action, json)
-        }
+        Command::Install { scope } => render(service::install(&config, scope.choice), action, json),
         Command::Uninstall { scope } => render(service::uninstall(scope.choice), action, json),
         Command::Start { scope } => render(service::start(scope.choice), action, json),
         Command::Stop { scope } => render(service::stop(scope.choice), action, json),

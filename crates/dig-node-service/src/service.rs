@@ -1707,7 +1707,11 @@ SERVICE_NAME: net.dignetwork.dig-node
         // panic and must report a boolean (false in a clean env). No service is created.
         if let Ok(backend) = SystemServiceBackend::new(ServiceScope::System) {
             let _installed = backend.is_installed().expect("probe never hard-errors");
-            assert_eq!(backend.scope(), ServiceScope::System, "the backend keeps its scope");
+            assert_eq!(
+                backend.scope(),
+                ServiceScope::System,
+                "the backend keeps its scope"
+            );
             assert_eq!(backend.display_name_verified(), None, "no create() ran yet");
         }
     }
@@ -2058,12 +2062,9 @@ An instance of the service is already running.",
         let target = MockBackend::tagged("system:", &log, false);
         let stale_user = MockBackend::tagged("user:", &log, true);
 
-        let (report, migration) = install_at_scope(
-            &target,
-            Some((&stale_user, ServiceScope::User)),
-            &plan(),
-        )
-        .expect("install proceeds after migrating the other scope");
+        let (report, migration) =
+            install_at_scope(&target, Some((&stale_user, ServiceScope::User)), &plan())
+                .expect("install proceeds after migrating the other scope");
 
         assert!(report.created, "the requested scope is registered");
         let migration = migration.expect("a migration was attempted");
@@ -2167,13 +2168,14 @@ An instance of the service is already running.",
         let log = Rc::new(RefCell::new(Vec::new()));
         let system = MockBackend::tagged("system:", &log, true);
         let user = MockBackend::tagged("user:", &log, true);
-        let removals = remove_registrations(&[
-            (&system, ServiceScope::System),
-            (&user, ServiceScope::User),
-        ]);
+        let removals =
+            remove_registrations(&[(&system, ServiceScope::System), (&user, ServiceScope::User)]);
 
         assert_eq!(removals.len(), 2);
-        assert!(removals.iter().all(|r| r.found && r.removed), "{removals:?}");
+        assert!(
+            removals.iter().all(|r| r.found && r.removed),
+            "{removals:?}"
+        );
         let outcome = uninstall_outcome(removals).expect("removing both scopes is a success");
         assert_eq!(outcome.result["registered"], json!(false));
         assert_eq!(outcome.result["removed_scopes"], json!(["system", "user"]));
@@ -2187,10 +2189,8 @@ An instance of the service is already running.",
         let log = Rc::new(RefCell::new(Vec::new()));
         let user = MockBackend::tagged("user:", &log, true);
         let system = MockBackend::tagged("system:", &log, true).failing_delete();
-        let removals = remove_registrations(&[
-            (&user, ServiceScope::User),
-            (&system, ServiceScope::System),
-        ]);
+        let removals =
+            remove_registrations(&[(&user, ServiceScope::User), (&system, ServiceScope::System)]);
 
         assert!(removals[0].removed, "the removable scope IS removed");
         assert!(removals[1].found && !removals[1].removed);

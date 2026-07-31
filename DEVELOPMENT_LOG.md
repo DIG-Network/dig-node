@@ -4,6 +4,29 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## Root has NO systemd `--user` bus, so a user-scope service install is impossible under `sudo` (#526)
+
+`systemctl --user` (and everything `service-manager`'s systemd backend does at `ServiceLevel::User`)
+talks to a **per-login-session D-Bus user manager**. A process running as root under `sudo` inherits
+the invoking user's environment but NOT their session bus, and root's own user manager is normally not
+running, so the call fails with `Failed to connect to bus: Operation not permitted` — surfacing to a
+caller as a bare non-zero exit (the dig-installer observed `exited with 6`). There is no environment
+tweak that makes this work in general: `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` point at the
+*invoking* user's runtime dir, which root may reach but which registers the unit for THAT user's
+session — not a machine-wide service.
+
+Two consequences that generalize beyond this repo:
+
+- **An elevated installer must register SYSTEM scope, not user scope.** A user-scope unit only starts
+  when its user's session/manager starts, so on a headless host it may never come back after a reboot.
+  Only a system unit (`WantedBy=multi-user.target`) starts at boot with no login session — which is why
+  dig-node's own `.deb`/`.pkg` always registered system scope while the CLI's `install` verb did not.
+- **The privilege level, not the platform, decides the default.** A single compile-time "prefer user
+  level" constant cannot express it: the same binary on the same OS must land a user unit for a desktop
+  double-click and a system unit under `sudo`. The scope has to be a RUNTIME value (see `resolve_scope`
+  in `crates/dig-node-service/src/service.rs`) — and, because both scopes can be registered
+  independently, an install at one scope must clear the other or two units race for the node's port.
+
 ## A git-pinned peer-stack dep hides shipped fixes indefinitely — the network looked dead for 11 minors (#1771)
 
 dig-gossip is a **git dependency pinned by rev** (it cannot go to crates.io until dig-peer-protocol
