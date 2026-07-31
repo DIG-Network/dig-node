@@ -450,11 +450,19 @@ pub async fn sync_inventory(
 /// through the SAME pool (dig-gossip discovers introducer peers into the pool), so this one source
 /// covers both "the pool" and "relay-introducer peers" the task calls for.
 ///
+/// A pool entry whose address is not a DESTINATION is dropped (dig_ecosystem#1784). The rule is over
+/// the whole class, not one variant: routing must never seed a lookup from an address nothing can be
+/// dialed at, no matter which pool-sourced path delivered it. Bootstrap seeds the SAME routing table
+/// as the live churn feed (`spawn_dht_routing_feed`) does moments later, so the guard belongs on both
+/// — and it lives HERE, at the single funnel every caller passes through, rather than only at the one
+/// call site known today.
+///
 /// `pool` is the `(peer_id_bytes, addr, _outbound)` triples from
-/// [`dig_gossip::GossipHandle::connected_pool_peers`]. Pure over that list so it is unit-tested
-/// without a live pool.
+/// [`dig_gossip::GossipHandle::connected_pool_peers`], already mapped to each peer's DHT address.
+/// Pure over that list so it is unit-tested without a live pool.
 pub fn bootstrap_peers_from_pool(pool: &[([u8; 32], std::net::SocketAddr)]) -> Vec<BootstrapPeer> {
     pool.iter()
+        .filter(|(_, addr)| crate::seams::dig_peer::net::is_usable_contact(addr))
         .map(|(peer_id, addr)| {
             BootstrapPeer::direct(
                 PeerId::from_bytes(*peer_id),
@@ -958,6 +966,38 @@ mod tests {
     #[test]
     fn bootstrap_peers_from_pool_empty_is_empty() {
         assert!(bootstrap_peers_from_pool(&[]).is_empty());
+    }
+
+    #[test]
+    fn bootstrap_peers_from_pool_drops_every_unusable_contact_and_keeps_the_reachable_one() {
+        // The CLASS this pins (dig_ecosystem#1784): NO contact that is not a destination may seed
+        // the DHT routing table, whichever pool-sourced path delivered it. Bootstrap seeds the SAME
+        // table as the live routing feed moments later, so it needs the SAME guard.
+        //
+        // The fixture varies ONE property at a time against a truthful control, so a guard that
+        // checks only half of "is a destination" still fails:
+        //   - the reachable peer is the control — a guard that drops everything cannot pass;
+        //   - `[::]:0` is the address dig-nat reports for an accepted relayed circuit with no relay
+        //     endpoint configured — the real-world case;
+        //   - `[::]:9444` / `0.0.0.0:9444` have a VALID port, so a port-0-only guard keeps them;
+        //   - `203.0.113.9:0` has a VALID ip, so an unspecified-ip-only guard keeps it.
+        let reachable: std::net::SocketAddr = "203.0.113.1:9444".parse().unwrap();
+        let pool = vec![
+            ([1u8; 32], reachable),
+            ([2u8; 32], "[::]:0".parse().unwrap()),
+            ([3u8; 32], "[::]:9444".parse().unwrap()),
+            ([4u8; 32], "0.0.0.0:9444".parse().unwrap()),
+            ([5u8; 32], "203.0.113.9:0".parse().unwrap()),
+        ];
+
+        let peers = bootstrap_peers_from_pool(&pool);
+
+        // Assert the SURVIVOR by identity, not just the count: a guard that dropped the wrong entry
+        // would still leave exactly one behind.
+        assert_eq!(peers.len(), 1, "only the reachable pool peer may bootstrap");
+        assert_eq!(peers[0].peer_id, PeerId::from_bytes([1u8; 32]));
+        assert_eq!(peers[0].addresses[0].host, reachable.ip().to_string());
+        assert_eq!(peers[0].addresses[0].port, reachable.port());
     }
 
     // -- availability_item_for -----------------------------------------------------------------

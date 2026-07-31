@@ -2564,15 +2564,21 @@ async fn bring_up_dht(
     ));
 
     // Bootstrap from the connected pool (+ relay-introducer peers discovered into it).
+    //
+    // Uses the SAME `dht_contact_from_pool_addr` the live routing feed uses, so all three paths that
+    // publish a pool address into the DHT routing table apply one identical mapping-plus-guard: the
+    // port shift (GAP 2) AND the "is this a destination at all" check (#1784). A pool-sourced address
+    // that is not dialable — a relay-introducer-discovered peer whose circuit dig-nat reports as
+    // `[::]:0` is the case seen in the wild — must never seed a lookup, and bootstrap seeds the very
+    // same table the feed does.
     let pool_peers: Vec<([u8; 32], std::net::SocketAddr)> = pool
         .connected_pool_peers()
         .into_iter()
-        .map(|(peer_id, addr, _outbound)| {
+        .filter_map(|(peer_id, addr, _outbound)| {
             // dig-gossip's PeerId is a chia Bytes32; take its raw 32 bytes for the dig-nat PeerId.
             let mut bytes = [0u8; 32];
             bytes.copy_from_slice(peer_id.as_ref());
-            // The pool reports each peer's GOSSIP addr; the DHT must dial its DHT/peer-RPC addr (GAP 2).
-            (bytes, dht_addr_from_gossip_addr(addr))
+            Some((bytes, dht_contact_from_pool_addr(addr)?))
         })
         .collect();
     let bootstrap = crate::dht::bootstrap_peers_from_pool(&pool_peers);
