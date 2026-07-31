@@ -61,6 +61,22 @@ pub trait CapsuleStore: Send + Sync {
         root_hex: &str,
     ) -> Result<(u64, String), String>;
 
+    /// Sync a whole store BY STORE ID, with no caller-supplied root: resolve the store's
+    /// CHAIN-ANCHORED tip and cache that generation. Returns `(size_bytes, root_hex)`.
+    ///
+    /// The root comes from the chain, never from the serving upstream (#1886). An upstream
+    /// asked for "latest" would be choosing which generation this node caches, reshares, and
+    /// announces itself as a holder of; the chain is the only authority for a store's tip.
+    ///
+    /// This is the entry point a "sync this store" request needs — until it existed, the only
+    /// way in required the caller to already know a concrete root, so a control-plane trigger
+    /// by store id had nothing to call.
+    ///
+    /// # Errors
+    /// A non-64-hex store id, a store with no confirmed generation on chain, an unreachable
+    /// chain resolver, or the underlying download failure verbatim.
+    async fn sync_whole_store(&self, store_id_hex: &str) -> Result<(u64, String), String>;
+
     /// GAP-FILL one missing generation (SPEC §14.3): pull the whole `.dig` module for
     /// `(store_id, root)` down from other nodes, verify it against the chain-anchored root, land it in
     /// the local cache, and (best-effort) refresh the DHT provider records so peers immediately find
@@ -210,10 +226,10 @@ impl CapsuleStore for Node {
         }
         // Serialize on-demand writes so two fetches of the same capsule don't race.
         let _guard = self.cache_lock.lock().await;
-        // sync_module_from returns true only when the served root == requested
-        // root; either way the module lands under its SERVED root, so we read the
-        // file back to report size + confirm the capsule is now present.
-        let matched = self
+        // The module lands under its SERVED root, which may differ from the requested one if
+        // the remote head advanced mid-sync, so we read the file back to report size + confirm
+        // THIS capsule is now present.
+        let sync = self
             .sync_module_from(&self.upstream, store_id_hex, root_hex)
             .await;
         let path = capsule.module_path(&self.cache_dir);
@@ -230,15 +246,32 @@ impl CapsuleStore for Node {
                 self.refresh_dht_inventory().await;
                 Ok((md.len(), root_hex.to_string()))
             }
-            Err(_) if matched => {
-                // matched but no file: should not happen, surface it.
-                Err("sync reported a match but the module is not cached".to_string())
-            }
-            Err(_) => Err(format!(
-                "could not fetch capsule {store_id_hex}:{root_hex} (no §21 identity, \
-                 not authorized, or served root differs)"
-            )),
+            // No file on disk. The sync's OWN outcome says why — never a list of causes that
+            // were not checked. A guess-list here sent #1886's investigation at authorization
+            // for days while the upstream had been answering a plain HTTP 400.
+            Err(_) => match sync {
+                Ok(served) => Err(format!(
+                    "capsule {store_id_hex}:{root_hex} not cached: the upstream served root {} \
+                     instead (its head moved)",
+                    served.to_hex()
+                )),
+                Err(reason) => Err(format!(
+                    "could not fetch capsule {store_id_hex}:{root_hex}: {reason}"
+                )),
+            },
         }
+    }
+
+    async fn sync_whole_store(&self, store_id_hex: &str) -> Result<(u64, String), String> {
+        let store_id =
+            crate::dht::hex64(store_id_hex).ok_or_else(|| "store_id must be 64-hex".to_string())?;
+        let root = crate::ChainSource::anchored_root_resolver_arc(self)
+            .anchored_root(&store_id)
+            .await
+            .map_err(|e| format!("could not resolve the chain-anchored root: {e}"))?
+            .ok_or_else(|| "the store has no chain-confirmed generation to sync".to_string())?;
+        self.cache_fetch_and_cache(store_id_hex, &root.to_hex())
+            .await
     }
 
     async fn gap_fill_generation(&self, store_id: [u8; 32], root: Bytes32) -> Result<(), String> {
@@ -310,12 +343,16 @@ impl CapsuleStore for Node {
         }
         let root = Bytes32(root_bytes);
         tokio::spawn(async move {
+            // OPERATOR-VISIBLE at the default level, both ways (#1886): landing a capsule is
+            // the moment this node becomes a holder and the content-replication flywheel turns,
+            // and failing to land one is the moment it silently does not. At `debug!` a broken
+            // flywheel looked exactly like a working one from any log a user would run.
             match node.gap_fill_generation(store_id, root).await {
-                Ok(()) => tracing::debug!(
+                Ok(()) => tracing::info!(
                     capsule = %key,
                     "backfill: cached the whole capsule after a resource read from another node"
                 ),
-                Err(e) => tracing::debug!(
+                Err(e) => tracing::warn!(
                     capsule = %key,
                     error = %e,
                     "backfill: whole-capsule pull did not complete (will re-attempt on the next miss)"

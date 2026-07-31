@@ -627,8 +627,36 @@ pub fn set_cache_cap_bytes(cap: u64) -> std::io::Result<()> {
     })
 }
 
-/// Total bytes currently held in the local cache (modules + response windows).
-pub fn cache_used_bytes() -> u64 {
+/// How the local cache's bytes are split between the two things it holds.
+///
+/// The split exists because the totals looked contradictory without it (#1886): a node can report
+/// megabytes of `used_bytes` while `cache.listCached` returns an EMPTY list, and both are correct
+/// — `listCached` enumerates whole `.dig` capsules, and until one has been synced the bytes on
+/// disk are all per-resource response windows. Reporting the breakdown makes "content cached but
+/// no capsule held" — precisely the broken-flywheel state — readable instead of baffling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheUsage {
+    /// Bytes in whole `.dig` capsules under `<cache>/modules/` — what makes this node a HOLDER
+    /// and what `cache.listCached` enumerates.
+    pub capsule_bytes: u64,
+    /// Bytes in cached per-resource response windows under `<cache>/responses/` — served reads,
+    /// which make this node no one's provider.
+    pub response_bytes: u64,
+    /// Everything else in the cache tree (config-adjacent files, in-progress temporaries).
+    pub other_bytes: u64,
+}
+
+impl CacheUsage {
+    /// Total bytes held, i.e. what [`cache_used_bytes`] reports.
+    pub fn total(&self) -> u64 {
+        self.capsule_bytes
+            .saturating_add(self.response_bytes)
+            .saturating_add(self.other_bytes)
+    }
+}
+
+/// Bytes currently held in the local cache, split by kind. See [`CacheUsage`].
+pub fn cache_usage() -> CacheUsage {
     fn walk(p: &Path, total: &mut u64) {
         if let Ok(rd) = std::fs::read_dir(p) {
             for e in rd.flatten() {
@@ -641,9 +669,24 @@ pub fn cache_used_bytes() -> u64 {
             }
         }
     }
-    let mut total = 0u64;
-    walk(&cache_dir(), &mut total);
-    total
+    let root = cache_dir();
+    let mut usage = CacheUsage::default();
+    walk(&root.join("modules"), &mut usage.capsule_bytes);
+    walk(&root.join("responses"), &mut usage.response_bytes);
+    // Whatever else lives in the tree: total the whole thing, then subtract the two known
+    // subtrees, so a future cache directory is never silently unaccounted for.
+    let mut everything = 0u64;
+    walk(&root, &mut everything);
+    usage.other_bytes = everything
+        .saturating_sub(usage.capsule_bytes)
+        .saturating_sub(usage.response_bytes);
+    usage
+}
+
+/// Total bytes currently held in the local cache (capsules + response windows + the rest).
+/// [`cache_usage`] reports the same total broken down by kind.
+pub fn cache_used_bytes() -> u64 {
+    cache_usage().total()
 }
 
 /// Delete all locally cached DIG content (the settings "clear cache" action).
@@ -1172,70 +1215,83 @@ impl Node {
         }
     }
 
-    /// Authenticated whole-store sync (§21.9) against the configured upstream §21
-    /// host. Returns `true` when the synced module's served root matches the
-    /// requested root, so the caller can now serve the request locally.
+    /// Whole-store sync against the configured upstream. Returns `true` when the synced
+    /// module's served root matches the requested root, so the caller can now serve the
+    /// request locally. The REASON for a `false` is available from
+    /// [`Node::sync_module_from`] — this thin wrapper exists for the read path, which only
+    /// needs to know whether it may now serve locally.
     async fn sync_module(&self, store_hex: &str, root_hex: &str) -> bool {
         self.sync_module_from(&self.upstream, store_hex, root_hex)
             .await
+            .is_ok_and(|served| served.to_hex() == root_hex)
     }
 
-    /// Core of [`Node::sync_module`], parameterized by the §21 host base URL (tests
-    /// point it at a local mock). It is a no-op (returns `false`) unless an
-    /// identity is configured AND the request is sync-eligible. On success it
-    /// fetches the WHOLE `.dig` module from `GET /stores/{id}/module` — stamping
-    /// the §21.9 `X-Dig-Identity/-Timestamp/-Nonce/-Auth` headers via the loaded
-    /// identity seed — and writes it to `module_path(store, served_root)`, so
-    /// `serve_local` then serves it (and every other resource in the store)
-    /// without further network.
+    /// Core of [`Node::sync_module`], parameterized by the upstream base URL (tests point it
+    /// at a local mock). Downloads the WHOLE `.dig` module for `(store, root)` and writes it
+    /// to `module_path(store, served_root)`, so `serve_local` then serves it — and every
+    /// other resource in the store — without further network. Returns the SERVED root.
     ///
-    /// The synced module is NOT cryptographically trusted here: every response the
-    /// node later serves from it carries its merkle proof, which the browser
-    /// verifies against the chain-anchored root — a tampered module fails THAT
-    /// gate, not this sync. Sync-time verification is therefore a minimal
-    /// non-empty check.
-    async fn sync_module_from(&self, base_url: &str, store_hex: &str, root_hex: &str) -> bool {
-        let Some(seed) = self.identity_seed else {
-            return false;
-        };
+    /// # Two download paths, tried in this order
+    ///
+    /// 1. **The chunked `dig.getCapsule` JSON-RPC.** The public gateway caps a single
+    ///    response at ~6 MB, so a real (~135 MB) capsule can only cross it in windows; this
+    ///    is the gateway's own whole-capsule interface and it needs no identity (#1886).
+    /// 2. **The §21.9 authenticated clone** (`GET /stores/{id}/module`), when an identity is
+    ///    configured. Retained for §21 hosts that expose no `dig` JSON-RPC, and it is the
+    ///    only path that carries the operator's identity.
+    ///
+    /// A capsule too large for path 2 is the COMMON case against the public gateway, which
+    /// is why path 1 leads rather than serving as a fallback.
+    ///
+    /// The synced module is NOT cryptographically trusted here: every response the node
+    /// later serves from it carries its merkle proof, which the client verifies against the
+    /// chain-anchored root — a tampered module fails THAT gate, not this sync. Sync-time
+    /// verification is therefore a minimal non-empty check.
+    ///
+    /// # Errors
+    /// The returned string names what ACTUALLY failed — the upstream's HTTP status, its
+    /// JSON-RPC error, a dishonest length, or a local write failure. It is surfaced to
+    /// operators verbatim, so it must never become a list of causes that were not checked.
+    async fn sync_module_from(
+        &self,
+        base_url: &str,
+        store_hex: &str,
+        root_hex: &str,
+    ) -> Result<Bytes32, String> {
         if !sync_eligible(store_hex, root_hex) {
-            return false;
+            return Err("store id and root must each be 64-hex".to_string());
         }
         let (Ok(store_id), Ok(want_root)) =
             (Bytes32::from_hex(store_hex), Bytes32::from_hex(root_hex))
         else {
-            return false;
+            return Err("store id and root must each be 64-hex".to_string());
         };
 
-        // Reuse the node's reqwest client; attach a fresh §21.9 identity (the
-        // client takes it by value) minted from the in-memory seed.
-        let client = DigClient::with_client(base_url, self.http.clone())
-            .with_identity(identity::identity_from_seed(seed));
-        let verify = |bytes: &[u8], _served: &Bytes32| -> Result<(), String> {
-            if bytes.is_empty() {
-                Err("empty module".into())
-            } else {
-                Ok(())
-            }
-        };
-        let (served_root, bytes) = match client.clone_store(&store_id, verify, None).await {
+        let (served_root, bytes) = match self
+            .download_capsule(base_url, store_hex, root_hex, want_root)
+            .await
+        {
             Ok(v) => v,
-            Err(e) => {
-                // Best-effort: log WHY (e.g. a §21 401/403 = the identity is not
-                // authorized to clone this store) so the silent fallback to the
-                // per-resource proxy is diagnosable, then give up on the sync.
-                eprintln!("dig-node: §21 whole-store sync for {store_hex} skipped: {e}");
-                return false;
+            Err(rpc_error) => {
+                tracing::debug!(
+                    store = %store_hex,
+                    error = %rpc_error,
+                    "whole-store sync: the chunked dig.getCapsule path failed; trying the §21 clone"
+                );
+                self.clone_whole_store(base_url, &store_id, store_hex, &rpc_error)
+                    .await?
             }
         };
-        eprintln!(
-            "dig-node: §21 whole-store sync for {store_hex} ok — served root {} ({} bytes)",
-            served_root.to_hex(),
-            bytes.len()
+
+        tracing::info!(
+            store = %store_hex,
+            served_root = %served_root.to_hex(),
+            bytes = bytes.len(),
+            "whole-store sync downloaded a capsule"
         );
 
         // Cache under the SERVED root (which may differ from want_root if the
-        // remote head advanced between resolve and sync). Best-effort.
+        // remote head advanced between resolve and sync).
         //
         // ATOMIC + CONTENT-ADDRESSED: a module is keyed by capsule
         // (storeId:rootHash) and its bytes are immutable, so two writers (the
@@ -1247,14 +1303,73 @@ impl Node {
         // The SERVED root (not the requested one) keys the write, and both components are re-validated
         // here: `store_hex` came from the caller, and re-parsing costs nothing next to the write it
         // guards (#1599).
-        let Some(served_key) = CapsuleKey::parse(store_hex, &served_root.to_hex()) else {
-            return false;
-        };
+        let served_hex = served_root.to_hex();
+        let served_key = CapsuleKey::parse(store_hex, &served_hex)
+            .ok_or("the upstream served a root that is not 64-hex")?;
         let path = served_key.module_path(&self.cache_dir);
-        if write_atomic(&path, &bytes).is_err() {
-            return false;
-        }
-        served_root == want_root
+        write_atomic(&path, &bytes).map_err(|e| format!("could not write the capsule: {e}"))?;
+        Ok(served_root)
+    }
+
+    /// Path 1: the chunked `dig.getCapsule` download. The served root is the REQUESTED root —
+    /// the RPC pins the generation on the way in, so there is no server-chosen "latest" here.
+    async fn download_capsule(
+        &self,
+        base_url: &str,
+        store_hex: &str,
+        root_hex: &str,
+        want_root: Bytes32,
+    ) -> Result<(Bytes32, Vec<u8>), String> {
+        let bytes = seams::capsule::download_capsule_via_rpc(
+            &self.http,
+            base_url,
+            store_hex,
+            root_hex,
+            seams::capsule::CAPSULE_WINDOW_BYTES,
+        )
+        .await?;
+        Ok((want_root, bytes))
+    }
+
+    /// Path 2: the §21.9 authenticated whole-store clone. `rpc_error` is the reason path 1
+    /// gave up, carried into the failure message so an operator sees BOTH attempts rather
+    /// than only the last one.
+    async fn clone_whole_store(
+        &self,
+        base_url: &str,
+        store_id: &Bytes32,
+        store_hex: &str,
+        rpc_error: &str,
+    ) -> Result<(Bytes32, Vec<u8>), String> {
+        let Some(seed) = self.identity_seed else {
+            return Err(format!(
+                "dig.getCapsule failed ({rpc_error}) and the §21 clone needs an identity key, \
+                 which this node has none"
+            ));
+        };
+        // Reuse the node's reqwest client; attach a fresh §21.9 identity (the
+        // client takes it by value) minted from the in-memory seed.
+        let client = DigClient::with_client(base_url, self.http.clone())
+            .with_identity(identity::identity_from_seed(seed));
+        let verify = |bytes: &[u8], _served: &Bytes32| -> Result<(), String> {
+            if bytes.is_empty() {
+                Err("empty module".into())
+            } else {
+                Ok(())
+            }
+        };
+        client
+            .clone_store(store_id, verify, None)
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    store = %store_hex,
+                    rpc_error = %rpc_error,
+                    clone_error = %e,
+                    "whole-store sync failed on BOTH the dig.getCapsule and §21 clone paths"
+                );
+                format!("dig.getCapsule failed ({rpc_error}); the §21 clone failed ({e})")
+            })
     }
 
     /// Proxy the raw JSON-RPC body to the upstream rpc.dig.net and return its response.
@@ -2834,8 +2949,11 @@ mod tests {
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let (node, _td) = test_node(Some([5u8; 32]));
         let root_hex = "10".repeat(32); // served genesis root
-        let matched = node.sync_module_from(&base, &store_hex, &root_hex).await;
-        assert!(matched, "authed sync to served root 0x10 should match");
+        let served = node
+            .sync_module_from(&base, &store_hex, &root_hex)
+            .await
+            .expect("authed sync succeeds");
+        assert_eq!(served.to_hex(), root_hex, "served root == requested root");
         let cached = std::fs::read(module_path(&node.cache_dir, &store_hex, &root_hex)).unwrap();
         assert_eq!(cached, module, "served module must be cached locally");
     }
@@ -3185,6 +3303,134 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Spawn a mock upstream that speaks the `dig.getCapsule` JSON-RPC on `POST /` and
+    /// REJECTS the §21 `GET /stores/:id/module` clone with `status` — the shape of the real
+    /// gateway, which requires a `root` query on that route and answers 400 without one
+    /// (#1886). `capsule` is streamed in `window`-sized pieces.
+    async fn spawn_capsule_rpc_upstream(
+        capsule: Vec<u8>,
+        window: usize,
+        clone_status: axum::http::StatusCode,
+    ) -> String {
+        use axum::{routing::get, routing::post, Json, Router};
+        use serde_json::Value;
+
+        let rpc = move |Json(body): Json<Value>| {
+            let capsule = capsule.clone();
+            async move {
+                let offset = body["params"]["offset"].as_u64().unwrap_or(0) as usize;
+                let end = (offset + window).min(capsule.len());
+                let chunk = capsule.get(offset..end).unwrap_or(&[]);
+                let complete = end >= capsule.len();
+                Json(json!({"jsonrpc":"2.0","id":1,"result":{
+                    "ciphertext": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    "total_length": capsule.len(),
+                    "offset": offset,
+                    "length": chunk.len(),
+                    "complete": complete,
+                    "next_offset": if complete { Value::Null } else { json!(end) },
+                }}))
+            }
+        };
+        let app = Router::new().route("/", post(rpc)).route(
+            "/stores/:id/module",
+            get(move || async move { (clone_status, "{\"error\":\"invalid_request\"}") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    /// **#1886, the flywheel's first hop.** A capsule LARGER than one JSON-RPC window lands in
+    /// the cache from an upstream whose §21 clone route refuses the request — which is exactly
+    /// the live gateway, where that route both requires a `root` query the client never sends
+    /// and cannot carry a real capsule inside one response.
+    ///
+    /// The fixture spans three windows so a single-response implementation cannot pass, and the
+    /// assertion is on the cached BYTES, so landing a truncated capsule cannot pass either.
+    #[tokio::test]
+    async fn whole_store_sync_lands_a_multi_window_capsule_when_the_clone_route_refuses() {
+        let store = Bytes32([0x21u8; 32]);
+        let root = Bytes32([0x22u8; 32]);
+        let window = 4096;
+        let capsule: Vec<u8> = (0..window * 2 + 101).map(|i| (i % 251) as u8).collect();
+        let base = spawn_capsule_rpc_upstream(
+            capsule.clone(),
+            window,
+            axum::http::StatusCode::BAD_REQUEST,
+        )
+        .await;
+
+        // No identity: the chunked path is anonymous, so whole-store sync no longer depends on
+        // the node holding a §21 identity key.
+        let (node, _td) = test_node(None);
+        let served = node
+            .sync_module_from(&base, &store.to_hex(), &root.to_hex())
+            .await
+            .expect("the chunked dig.getCapsule path syncs the capsule");
+
+        assert_eq!(served, root);
+        let cached = std::fs::read(module_path(
+            &node.cache_dir,
+            &store.to_hex(),
+            &root.to_hex(),
+        ))
+        .unwrap();
+        assert_eq!(
+            cached, capsule,
+            "the WHOLE capsule is cached, byte for byte"
+        );
+    }
+
+    /// **#1886, the diagnosability half.** When both download paths fail, the reported reason
+    /// carries the upstream's ACTUAL status. The message this replaced named three causes it
+    /// had not checked ("no §21 identity, not authorized, or served root differs") and the
+    /// truth was none of them — a plain HTTP 400 — which cost days of investigation aimed at
+    /// authorization.
+    #[tokio::test]
+    async fn a_failed_fetch_reports_the_upstream_status_not_a_list_of_guesses() {
+        use axum::{routing::get, routing::post, Router};
+        // BOTH routes reject, with DIFFERENT statuses, so the message is pinned to the real
+        // status of each attempt rather than to any single hardcoded number.
+        let app = Router::new()
+            .route(
+                "/",
+                post(|| async { (axum::http::StatusCode::IM_A_TEAPOT, "no") }),
+            )
+            .route(
+                "/stores/:id/module",
+                get(|| async { (axum::http::StatusCode::BAD_REQUEST, "no") }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (mut node, _td) = test_node(Some([5u8; 32]));
+        node.upstream = format!("http://{addr}/");
+        let store_hex = Bytes32([0x31u8; 32]).to_hex();
+        let root_hex = Bytes32([0x32u8; 32]).to_hex();
+
+        let err = node
+            .cache_fetch_and_cache(&store_hex, &root_hex)
+            .await
+            .expect_err("both paths refused");
+
+        assert!(err.contains("418"), "carries the RPC path's status: {err}");
+        assert!(
+            err.contains("400"),
+            "carries the clone path's status: {err}"
+        );
+        assert!(
+            !err.contains("not authorized"),
+            "no longer guesses at authorization: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn authed_module_sync_carries_verifiable_identity() {
         let seed = [7u8; 32];
@@ -3194,10 +3440,11 @@ mod tests {
         let url = spawn_mock_module_server(captured.clone(), root, b"MODULE".to_vec()).await;
 
         let (node, _td) = test_node(Some(seed));
-        let matched = node
+        let served = node
             .sync_module_from(&url, &store.to_hex(), &root.to_hex())
-            .await;
-        assert!(matched, "served root == requested root");
+            .await
+            .expect("authed sync succeeds");
+        assert_eq!(served, root, "served root == requested root");
 
         let headers = captured
             .lock()
@@ -3244,10 +3491,11 @@ mod tests {
         let url = spawn_mock_module_server(captured, served, b"DIGMODULE".to_vec()).await;
 
         let (node, _td) = test_node(Some(seed));
-        let matched = node
+        let served = node
             .sync_module_from(&url, &store.to_hex(), &requested.to_hex())
-            .await;
-        assert!(!matched, "served (AA..) != requested (BB..)");
+            .await
+            .expect("the sync itself succeeds — it just landed a different generation");
+        assert_ne!(served, requested, "served (AA..) != requested (BB..)");
 
         // The module is cached under the SERVED root with the served bytes …
         let served_path = module_path(&node.cache_dir, &store.to_hex(), &served.to_hex());
@@ -3492,10 +3740,14 @@ mod tests {
         let root = Bytes32([3u8; 32]);
         // No identity → must short-circuit to false WITHOUT touching the network
         // (the URL is intentionally unroutable; the call returns immediately).
-        let matched = node
+        let failure = node
             .sync_module_from("http://127.0.0.1:1", &store.to_hex(), &root.to_hex())
-            .await;
-        assert!(!matched);
+            .await
+            .expect_err("no identity and an unroutable upstream cannot sync");
+        assert!(
+            failure.contains("identity key"),
+            "names the missing identity: {failure}"
+        );
         assert!(!module_path(&node.cache_dir, &store.to_hex(), &root.to_hex()).exists());
     }
 

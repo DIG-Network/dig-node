@@ -4,6 +4,8 @@
 //! reader/writer stays external (`digstore-core`); this seam is the NODE's cache-management
 //! surface over it.
 
+mod capsule_download;
 mod capsule_store;
 
+pub use capsule_download::{download_capsule_via_rpc, CAPSULE_WINDOW_BYTES, MAX_CAPSULE_BYTES};
 pub use capsule_store::CapsuleStore;
