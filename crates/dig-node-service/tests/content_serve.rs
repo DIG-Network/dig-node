@@ -100,6 +100,15 @@ async fn mock_upstream_all_miss() -> String {
 /// seed a module into), and the env-serialization hold.
 async fn start_server(upstream: &str) -> (SocketAddr, PathBuf, EnvHold) {
     let hold = env_guard().lock_owned().await;
+    let (addr, cache) = spawn_node(upstream).await;
+    (addr, cache, EnvHold(hold))
+}
+
+/// Bring up ONE service node — the body of [`start_server`] WITHOUT taking the env-serialization
+/// lock, so a single test can stand up two nodes (a reader and the gateway it falls back to) inside
+/// one hold. Each node captures its own cache dir at construction, so the process-global
+/// `DIG_NODE_CACHE` may be repointed between calls.
+async fn spawn_node(upstream: &str) -> (SocketAddr, PathBuf) {
     let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let base = std::env::temp_dir().join(format!(
         "dig-node-serve-test-{}-{}",
@@ -131,7 +140,7 @@ async fn start_server(upstream: &str) -> (SocketAddr, PathBuf, EnvHold) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, cache, EnvHold(hold))
+    (addr, cache)
 }
 
 fn store_and_files() -> (Bytes32, Vec<(String, Vec<u8>)>) {
@@ -733,5 +742,79 @@ async fn fallback_serve_labels_a_rerooted_read_from_the_connection() {
     assert!(
         seen.iter().all(|o| *o == ReadOrigin::Peer) && !seen.is_empty(),
         "a non-loopback reader must be Peer on the fallback door too, got {seen:?}"
+    );
+}
+
+/// **Regression (#1763):** during the ~30 s cold-start window BEFORE the peer network attaches, a
+/// content read still succeeds — but it is served by the public gateway, having never consulted the
+/// peer tier at all. Before this fix the response was indistinguishable from a post-attach gateway
+/// serve, so a fresh node (or a test that started promptly) measured the gateway and recorded it as
+/// a P2P result. The read MUST now say, in the response itself, that the peer tier was not attached
+/// when it was routed.
+///
+/// **The fixture is a real cold start, not a mock of one:** `build_state` is the same constructor
+/// the daemon uses and it does NOT attach the P2P content engine (only `spawn_peer_network` does),
+/// so the reader node below is genuinely inside the window. Its Tier-3 fallback is a SECOND real
+/// dig-node serving the capsule over the real `dig.getContent` wire — the gateway's bytes, proof and
+/// chunk lengths are produced by the production serve path, not hand-built.
+#[tokio::test]
+async fn cold_start_gateway_serve_reports_the_peer_tier_as_unattached() {
+    let _hold = EnvHold(env_guard().lock_owned().await);
+    let (store, files) = store_and_files();
+    let (root, module) = compile_public_module(store, &files);
+
+    // The GATEWAY: a node that holds the capsule and answers `dig.getContent` from its own cache.
+    // Its own upstream is unroutable — every byte it returns comes from the module seeded below.
+    let (gw_addr, gw_cache) = spawn_node("http://127.0.0.1:1/").await;
+    seed_module(&gw_cache, &store.to_hex(), &root.to_hex(), &module);
+
+    // The READER: a freshly-started node with an EMPTY cache and no peer network attached — the
+    // cold-start window. Local misses, the peer tier is not there, so the read falls to the gateway.
+    let (addr, _cache) = spawn_node(&format!("http://{gw_addr}")).await;
+
+    let url = format!(
+        "http://{addr}/s/{}:{}/index.html",
+        store.to_hex(),
+        root.to_hex()
+    );
+    let resp = reqwest::Client::new().get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "the read still succeeds — availability is not traded away"
+    );
+    let h = resp.headers();
+    assert_eq!(
+        h.get("x-dig-source").unwrap(),
+        "rpc",
+        "the gateway served these bytes"
+    );
+    assert_eq!(
+        h.get("x-dig-peer-tier")
+            .map(|v| v.to_str().unwrap())
+            .unwrap_or("<header absent>"),
+        "unattached",
+        "the read must declare that the peer tier was never consulted"
+    );
+}
+
+/// **Proves (#1763):** the peer-tier state is ALSO checkable out-of-band, on `GET /health`, so an
+/// acceptance test can poll `peer_tier.attached` until the peer network is up instead of sleeping a
+/// guessed 30 s and hoping. A node that answers `/health` with `status: ok` is live, but liveness has
+/// never implied a usable peer tier — this is the field that separates the two.
+#[tokio::test]
+async fn health_reports_the_peer_tier_as_unattached_before_the_peer_network_starts() {
+    let (addr, _cache, _hold) = start_server("http://127.0.0.1:1/").await;
+    let body: Value = reqwest::get(format!("http://{addr}/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["status"], json!("ok"), "the node is live");
+    assert_eq!(
+        body["peer_tier"]["attached"],
+        json!(false),
+        "a live node with no peer network must say so rather than leaving it unstated"
     );
 }

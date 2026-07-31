@@ -59,6 +59,40 @@ impl ServeSource {
     }
 }
 
+/// Whether the P2P content engine was attached when a read was routed — surfaced verbatim as
+/// `X-Dig-Peer-Tier` (#1763).
+///
+/// The engine attaches ~30 s after the HTTP surface opens, so a node answers content reads before
+/// there is any peer tier to consult. Such a read is still SERVED (refusing content for half a
+/// minute is worse), but it reaches the gateway having skipped Tier 2 entirely. `X-Dig-Source`
+/// alone cannot express that: a gateway serve because the peer tier was DOWN and a gateway serve
+/// because no peer HELD the resource are both `rpc`. This value is the difference, so a caller —
+/// or an acceptance test — can tell whether the peer path was measured or merely absent.
+///
+/// It reports engine ATTACHMENT and nothing else: not peer count, not reachability, not whether a
+/// fetch was attempted, and emphatically not verification (see `X-Dig-Verified`, whose overloaded
+/// name is #1738).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTier {
+    /// The P2P content engine was attached when this read was routed, so Tier 2 was consultable.
+    /// A read that nonetheless came from the gateway genuinely missed on the peer tier.
+    Attached,
+    /// No P2P content engine was attached, so this read SKIPPED Tier 2. Either the node is still
+    /// inside its cold-start window, or it runs on the FFI/in-process path that has no peer
+    /// network at all. Any peer-replication conclusion drawn from this read is unfounded.
+    Unattached,
+}
+
+impl PeerTier {
+    /// The lowercase `X-Dig-Peer-Tier` header value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeerTier::Attached => "attached",
+            PeerTier::Unattached => "unattached",
+        }
+    }
+}
+
 /// The result of a local plaintext content serve. The HTTP layer (`dig-node-service`) maps each
 /// variant to a response: `Served` → 200 with the plaintext + `X-Dig-*` headers; `NotFound` → the
 /// SPA-fallback-vs-404 decision (a route serves the store's `index.html`, an asset misses honestly);
@@ -74,6 +108,13 @@ pub enum PlaintextOutcome {
         root_hex: String,
         verified: bool,
         source: ServeSource,
+        /// Whether the P2P content engine was attached when this read was ROUTED — surfaced as
+        /// `X-Dig-Peer-Tier` (#1763). Independent of `source`: a gateway serve is `Unattached`
+        /// during cold start but `Attached` once the engine is up and simply missed. Captured
+        /// ONCE at request entry and applied uniformly across whichever tier served the bytes
+        /// (see [`with_serve_metadata`]), so it describes the routing decision this read faced
+        /// rather than a later moment.
+        peer_tier: PeerTier,
         /// The store's on-chain OWNER puzzle hash (64-hex) — the future tip recipient, surfaced
         /// as `X-Dig-Owner-Puzzle-Hash` (#486). `None` when the chain-anchored pin did not run
         /// (`DIG_NODE_PIN=off`) or the resolver could not supply it — the header is OMITTED
@@ -385,6 +426,12 @@ impl ContentServer for Node {
             .map(|r| r.to_hex())
             .unwrap_or_else(|| requested_root_hex.to_string());
         let verified = enforced;
+        // Whether Tier 2 even EXISTS for this read (#1763), captured before any tier runs so the
+        // answer describes the routing decision this request faced — not whether the engine
+        // happened to attach while the read was in flight. A read routed with no engine skipped the
+        // peer tier outright, and the response says so rather than letting a gateway serve pass for
+        // a measured P2P result.
+        let peer_tier = self.peer_tier();
         // The store generation this resource came from (#486) — a local-only manifest lookup, no
         // chain call. `None` on a rootless/pin-off request or when the generation is unknowable.
         let generation = if root_hex.is_empty() {
@@ -415,7 +462,7 @@ impl ContentServer for Node {
                     &root_hex,
                     verified,
                 ) {
-                    return with_serve_metadata(served, owner_puzzle_hash, generation);
+                    return with_serve_metadata(served, owner_puzzle_hash, generation, peer_tier);
                 }
                 // else: a decoy / verify or decrypt failure → fall through to peer/RPC.
             }
@@ -441,7 +488,7 @@ impl ContentServer for Node {
             {
                 // A peer served the resource; warm the whole capsule locally for next time (#290).
                 self.maybe_backfill_capsule(store_hex, &root_hex, origin);
-                return with_serve_metadata(peer, owner_puzzle_hash, generation);
+                return with_serve_metadata(peer, owner_puzzle_hash, generation, peer_tier);
             }
         }
 
@@ -478,11 +525,14 @@ impl ContentServer for Node {
                                     root_hex: root_hex.clone(),
                                     verified,
                                     source: ServeSource::Rpc,
+                                    // All three stamped just below by `with_serve_metadata`.
+                                    peer_tier: PeerTier::Unattached,
                                     owner_puzzle_hash: None,
                                     generation: None,
                                 },
                                 owner_puzzle_hash,
                                 generation,
+                                peer_tier,
                             )
                         }
                         // The gateway returned bytes that do not verify against the anchored root — a
@@ -622,7 +672,8 @@ impl Node {
                 verified,
                 source: ServeSource::Local,
                 // Stamped by the caller (`serve_content_plaintext`) via `with_serve_metadata` —
-                // both fields are resolved ONCE per request, not per tier.
+                // every one of these is resolved ONCE per request, not per tier.
+                peer_tier: PeerTier::Unattached,
                 owner_puzzle_hash: None,
                 generation: None,
             }
@@ -712,6 +763,7 @@ impl Node {
                     verified,
                     source: ServeSource::Peer,
                     // Stamped by the caller via `with_serve_metadata` (see `decrypt_local`).
+                    peer_tier: PeerTier::Unattached,
                     owner_puzzle_hash: None,
                     generation: None,
                 })
@@ -804,22 +856,26 @@ impl Node {
     }
 }
 
-/// Stamp the request-scoped serve-metadata (#486) onto a `Served` outcome — the owner puzzle hash
-/// and generation resolved ONCE in [`Node::serve_content_plaintext`], applied uniformly across
-/// whichever tier (local/peer/rpc) actually served the bytes. A no-op on any other variant.
+/// Stamp the request-scoped serve-metadata onto a `Served` outcome — the owner puzzle hash and
+/// generation (#486) plus the peer-tier attachment (#1763), each resolved ONCE in
+/// [`Node::serve_content_plaintext`] and applied uniformly across whichever tier (local/peer/rpc)
+/// actually served the bytes. A no-op on any other variant.
 fn with_serve_metadata(
     mut outcome: PlaintextOutcome,
     owner_puzzle_hash: Option<String>,
     generation: Option<u64>,
+    peer_tier: PeerTier,
 ) -> PlaintextOutcome {
     if let PlaintextOutcome::Served {
         owner_puzzle_hash: o,
         generation: g,
+        peer_tier: p,
         ..
     } = &mut outcome
     {
         *o = owner_puzzle_hash;
         *g = generation;
+        *p = peer_tier;
     }
     outcome
 }

@@ -455,8 +455,8 @@ Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Typ
 node-first path) can READ them — a cross-origin `fetch` can otherwise read only a short safelist, and
 a resolver that cannot see `X-Dig-Verified` fails CLOSED and drops to the verified rpc tier. The
 exposed set is: `X-Dig-Verified`, `X-Dig-Root`, `X-Dig-Inclusion-Proof`, `X-Dig-Chunk-Lens`,
-`X-Dig-Source`, `X-Dig-Store-Id`, `X-Dig-Capsule`, `X-Dig-Resource-Key`, `X-Dig-Owner-Puzzle-Hash`,
-`X-Dig-Generation`. These are read-only provenance metadata, so exposing them broadens only
+`X-Dig-Source`, `X-Dig-Peer-Tier`, `X-Dig-Store-Id`, `X-Dig-Capsule`, `X-Dig-Resource-Key`,
+`X-Dig-Owner-Puzzle-Hash`, `X-Dig-Generation`. These are read-only provenance metadata, so exposing them broadens only
 readability. (Cross-repo contract with dig-urn-resolver — mirrored in `SYSTEM.md`.)
 
 **Private Network Access (PNA, #285).** The server MUST advertise `allow_private_network` on the
@@ -597,6 +597,23 @@ sanctioned content network legs) attached as a response header, never trusted fr
 verified server-side — `false` only when the node-side pin is disabled via `DIG_NODE_PIN=off`),
 `X-Dig-Root: <root>` (the resolved root served against), and `X-Dig-Source: local|peer|rpc` (the tier
 that served the MAIN resource). A consumer's DIG Shields / toolbar reads these.
+
+**Peer-tier attachment (every serve, #1763).** Every served response MUST additionally carry
+`X-Dig-Peer-Tier: attached|unattached`, reporting whether the P2P content engine was attached at the
+moment the read was ROUTED — i.e. whether Tier 2 was consultable at all. The node MUST capture this
+once, before any tier runs, and report the same value regardless of which tier ultimately served the
+bytes; it MUST NOT be derived from `X-Dig-Source`.
+
+The two are independent and both are required, because `X-Dig-Source` alone cannot express the
+difference between a gateway serve that MISSED on the peer tier and a gateway serve that never had
+one. The node serves content from the moment its HTTP surface opens, which is BEFORE the peer network
+attaches (§7.8) — availability is deliberately not traded away for readiness — so reads inside that
+window skip Tier 2 entirely and are answered by the public RPC. `unattached` is the node stating that;
+a caller MUST NOT treat such a read as evidence about peer replication. `unattached` is also the
+permanent value on the in-process/FFI path, which brings up no peer network.
+
+`X-Dig-Peer-Tier` reports engine attachment ONLY: not peer count, not reachability, not whether a
+fetch was attempted, and never verification (that is `X-Dig-Verified`).
 
 **Serve-metadata headers (every serve, #486).** Alongside the provenance set, every served resource
 carries: `X-Dig-Store-Id: <64-hex>` (the storeId serving this resource); `X-Dig-Owner-Puzzle-Hash:
@@ -882,10 +899,17 @@ are asserted by classification only).
 ### 6.1. `GET /health`
 
 Returns `{ status: "ok", service, version, commit, mode: "local-node", addr, upstream, cache:
-{ dir, cap_bytes, used_bytes, shared }, methods: [names…] }`. The fields `status`, `version`,
+{ dir, cap_bytes, used_bytes, shared }, sync: { available }, peer_tier: { attached },
+methods: [names…] }`. The fields `status`, `version`,
 `mode`, `upstream`, `cache` are the stable probe contract (the v0.2 server's health shape);
 additions MUST be additive. `cache.shared` reports whether the effective cache dir is the shared
 canonical one (`true`) or a process-private fallback (`false`), from the read path's resolver.
+
+`peer_tier.attached` (#1763) reports whether the P2P content engine is attached RIGHT NOW — the same
+state a served response reports as `X-Dig-Peer-Tier` (§4.6). `status: "ok"` means the node is live and
+answering; it does NOT imply a usable peer tier, since the HTTP surface opens before the peer network
+attaches (§7.8). A client or harness that needs the peer tier MUST poll `peer_tier.attached` until it
+is `true` rather than waiting a fixed interval.
 
 ### 6.2. `GET /version`
 
@@ -1172,6 +1196,13 @@ SHOULD be set in tests to skip the privileged `:80` dig.local bind. The control 
 token-gated test is read from `<state_dir>/control-token` after startup; a test SHOULD set
 `DIG_NODE_STATE_DIR` to an isolated temp dir (§7.3a) so its token/paired-token state is hermetic
 regardless of any real machine-wide state dir on the host.
+
+**The peer tier is NOT up when `/health` first answers (#1763).** The HTTP surface opens immediately,
+while the peer network attaches seconds later, so a read issued as soon as `/health` responds skips
+Tier 2 and is answered by the public RPC. A harness that intends to exercise the P2P path MUST poll
+`peer_tier.attached` on `/health` (§6.1) until it is `true` — a fixed sleep is neither sufficient nor
+checkable — and MUST confirm `X-Dig-Peer-Tier: attached` on the response it measures (§4.6). A result
+gathered from a response carrying `unattached` is a measurement of the gateway, not of peer replication.
 
 ### 7.9. Cache-method families (open `cache.*` vs gated `control.cache.*`)
 
