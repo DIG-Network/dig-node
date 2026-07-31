@@ -3247,6 +3247,14 @@ connects to, with a restart re-entering the same state. Re-stating the whole inv
 single chokepoint. dig-dht is crypto-free by design, and `ingest_verified_provider` is the sole sanctioned
 bypass of its mTLS self-announce check, so these are the whole of the authentication:
 
+0. **DECODE refuses a frame whose declared counts exceed the protocol maxima, BEFORE reserving for them**
+   (#1723). The wire states its batch size and each `Add`'s address count as `u16`, so both are the
+   sender's to choose; decode MUST check them against `HOLDINGS_MAX_CHANGES` (256) and
+   `MAX_ADDRS_PER_CHANGE` (32) before any allocation is sized from them. This gate is stated separately
+   from gate 1 because it necessarily runs BEFORE it: decode precedes the signature check, so an
+   allocation sized here is one an UNAUTHENTICATED peer commissioned. A ~200-byte frame declaring
+   65,535 addresses would otherwise reserve ~2 MiB, and no later gate can refund it. The general rule
+   this instantiates: **never size an allocation from a number a peer supplied.**
 1. `verify_holdings_announce` passes (batch cap, `SHA-256(provider_spki) == provider_peer_id`, P-256 SPKI,
    valid signature over the `dig:holdings:v1` domain-separated message).
 2. `provider_peer_id` is CANONICALIZED (decoded to 32 bytes, re-encoded lowercase) and every subsequent

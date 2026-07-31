@@ -1929,6 +1929,9 @@ pub(crate) fn map_gossip_pool_event(ev: &dig_gossip::PoolEvent) -> dig_peer_sele
                 dig_gossip::PoolRemovalReason::Banned => {
                     crate::download::GossipRemovalReason::Banned
                 }
+                dig_gossip::PoolRemovalReason::Reaped => {
+                    crate::download::GossipRemovalReason::Reaped
+                }
             };
             crate::download::pool_event_to_selector(
                 bytes,
