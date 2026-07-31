@@ -30,11 +30,13 @@ stub_readelf() {
   echo "$path"
 }
 
-# expect <name> <expected-exit> <readelf-stub> <floor>
+# expect <name> <expected-exit> <readelf-stub> <floor> [VAR=value ...]
+# Trailing `VAR=value` arguments are exported into the gate's environment only for that case.
 expect() {
   local name="$1" want="$2" stub="$3" floor="$4"
+  shift 4
   local out status
-  out="$(READELF_BIN="$stub" bash "$GATE" "$WORK/fake-binary" "$floor" 2>&1)"
+  out="$(READELF_BIN="$stub" env "$@" bash "$GATE" "$WORK/fake-binary" "$floor" 2>&1)"
   status=$?
   if [ "$status" -ne "$want" ]; then
     printf 'FAIL %s: exit %s, want %s\n%s\n' "$name" "$status" "$want" "$out"
@@ -77,10 +79,18 @@ private_tag="$(stub_readelf private-tag \
   '  0010: 0x09691a75 0x00 03 GLIBC_2.17')"
 expect 'GLIBC_PRIVATE is not mistaken for a requirement' 0 "$private_tag" 2.31
 
-# A binary with NO glibc requirement at all (a static/musl build) is accepted rather than
-# crashing on an empty maximum.
+# A binary with NO versioned glibc symbols FAILS CLOSED. This is the musl escape hatch the other
+# two floor gates cannot see: the container assert only measures the CONTAINER's glibc (which a musl
+# TARGET built inside it still satisfies) and `verify-linux-floor` goes green because a musl binary
+# starts everywhere. Returning OK here would let a switch to `*-musl` pass all three gates while
+# silently swapping the DNS resolver the node seeds from (SPEC.md §11.3).
 no_glibc="$(stub_readelf no-glibc '  There is no dynamic section in this file.')"
-expect 'no glibc requirement passes' 0 "$no_glibc" 2.31
+expect 'no versioned glibc symbols fails closed' 3 "$no_glibc" 2.31
+
+# ...unless the caller DECLARES a deliberate no-glibc build. Without this case the fail-closed
+# behaviour above could only be satisfied by a gate that rejects every static binary unconditionally,
+# leaving no way to ship one.
+expect 'a declared no-glibc build is allowed' 0 "$no_glibc" 2.31 ALLOW_NO_GLIBC=1
 
 # A missing floor argument is a MISUSE, not a pass — a gate invoked wrongly must never be
 # silently green, which is how a CI gate rots into a no-op.

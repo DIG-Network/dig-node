@@ -1874,11 +1874,20 @@ the single place the floor is declared. It is enforced in three ways, all of whi
 - the action asserts the container's own glibc equals the declared floor, so the image and the
   number cannot drift apart;
 - `scripts/check-glibc-floor.sh` asserts every produced binary's highest glibc requirement is at or
-  below the floor, and the release job re-runs it against an impossible floor to prove the gate can
-  still fail;
+  below the floor, and additionally FAILS a binary that carries no versioned glibc symbols at all
+  (the musl substitution below); the release job re-runs it against an impossible floor to prove the
+  gate can still fail;
 - `verify-linux-floor` EXECUTES each published binary in `ubuntu:22.04`, `debian:12` and
   `amazonlinux:2023` containers on both architectures — a link-time claim is not proof that a binary
   starts.
+
+**Every Linux artifact MUST be built for a `*-unknown-linux-gnu` target. A `*-unknown-linux-musl`
+target is REJECTED**, and is not an acceptable substitute for the old-glibc container even though it
+would satisfy the floor trivially. musl's built-in resolver is not a drop-in for glibc's: it supports
+no NSS modules, handles a much narrower subset of `resolv.conf`, and historically does not fall back
+to TCP when a UDP answer exceeds 512 bytes — precisely the shape of a DNS-seed record set carrying
+many A/AAAA entries, which the node depends on to find its first peers. Meeting the glibc floor by
+changing the C library therefore changes node behaviour and is a breaking change, not a build detail.
 
 Raising the floor is a DELIBERATE, coordinated act: the declared value, every calling job's
 `container:` image, this section, and the published docs move together. Both Linux architectures

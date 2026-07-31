@@ -9,10 +9,12 @@
 # supported-floor CLAIM in a doc cannot notice that happening; only a gate over the produced
 # artifact can, so the release build runs this against every Linux binary it publishes.
 #
-# Usage: check-glibc-floor.sh <binary> <max-glibc-version>
+# Usage: check-glibc-floor.sh <binary> <max-glibc-version>     [env: ALLOW_NO_GLIBC=1]
 # Exit:  0 = binary's highest glibc requirement is <= <max-glibc-version>
 #        1 = the floor has RISEN (the regression this gate catches)
 #        2 = usage error (never silently green — that is how a gate rots into a no-op)
+#        3 = the binary is not a glibc build at all (a *-musl target), which SPEC.md §11.3 rejects;
+#            set ALLOW_NO_GLIBC=1 to declare a deliberate static build
 set -uo pipefail
 
 # Overridable so the unit tests can feed exact adversarial symbol tables (scripts/tests/).
@@ -39,9 +41,30 @@ fi
 requirements="$("$READELF" -V --dyn-syms --wide "$binary" 2>/dev/null |
   grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -Vu)"
 
+# FAIL CLOSED on a binary with no versioned glibc symbols at all.
+#
+# A `*-unknown-linux-gnu` binary ALWAYS carries them, so their absence means the target is not a gnu
+# target — in practice a musl build. That is the one substitution the other two floor gates cannot
+# see: the container assert only compares the CONTAINER's glibc to the declared number (which a musl
+# target built inside that container still satisfies), and `verify-linux-floor` goes green because a
+# musl binary starts everywhere. Accepting it here would let "just target musl and delete the
+# container" pass every gate while silently swapping the node's DNS resolver (SPEC.md §11.3).
+#
+# `ALLOW_NO_GLIBC=1` is the deliberate opt-out for a genuinely intended static build.
 if [ -z "$requirements" ]; then
-  echo "check-glibc-floor: $binary requires no versioned glibc symbols (static or musl) — OK"
-  exit 0
+  if [ "${ALLOW_NO_GLIBC:-0}" = "1" ]; then
+    echo "check-glibc-floor: $binary has no versioned glibc symbols; ALLOW_NO_GLIBC=1 — OK"
+    exit 0
+  fi
+  cat >&2 <<EOF
+check-glibc-floor: FAIL — $binary requires NO versioned glibc symbols.
+  A -gnu target always links them, so this is not a glibc build (almost always a *-musl target).
+  SPEC.md §11.3 REQUIRES the -gnu target: musl's built-in resolver is not a drop-in for glibc's
+  (no NSS modules, much narrower resolv.conf handling, and historically no TCP fallback for a UDP
+  answer over 512 bytes — the shape of a DNS-seed record set). Build for -gnu, or set
+  ALLOW_NO_GLIBC=1 to declare a deliberate static build.
+EOF
+  exit 3
 fi
 
 # `sort -V` compares each dotted component NUMERICALLY. A lexical sort would rank glibc 2.4 above
