@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.68.0] - 2026-07-31
+
+### Features
+- **content:** Report peer-tier attachment on every serve and on /health (#1763) (#121)
+
 ## [0.67.0] - 2026-07-31
 
 ### Features
