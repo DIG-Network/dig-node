@@ -168,7 +168,7 @@ impl DhtTransport for UnreachableTransport {
         _target: &dig_dht::Contact,
         _request: &DhtRequest,
     ) -> Result<DhtResponse, DhtError> {
-        Err(DhtError::Transport("unreachable in this test".to_string()))
+        Err(DhtError::transport("unreachable in this test"))
     }
 }
 

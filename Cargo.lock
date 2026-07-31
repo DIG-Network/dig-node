@@ -787,7 +787,7 @@ dependencies = [
 [[package]]
 name = "chia-protocol"
 version = "0.26.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=dd29ce8df275d60b3568079f3739bbe55f7bbf17#dd29ce8df275d60b3568079f3739bbe55f7bbf17"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=6d458974522cdada1f9b09469d7709e08036a800#6d458974522cdada1f9b09469d7709e08036a800"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-serde",
@@ -880,7 +880,7 @@ dependencies = [
 [[package]]
 name = "chia-sdk-client"
 version = "0.28.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=dd29ce8df275d60b3568079f3739bbe55f7bbf17#dd29ce8df275d60b3568079f3739bbe55f7bbf17"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=6d458974522cdada1f9b09469d7709e08036a800#6d458974522cdada1f9b09469d7709e08036a800"
 dependencies = [
  "aws-lc-rs",
  "chia-protocol",
@@ -1998,7 +1998,25 @@ checksum = "3e0effb120e4932d05b28e3211d3f7a47dff62aea394a3bed239334ea8ee558a"
 dependencies = [
  "async-trait",
  "dig-ip",
- "dig-nat",
+ "dig-nat 0.14.1",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "dig-dht"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "723c3a5659f6dc47be3640e2da928fd3cb173d5aea3e36caf769d88359000327"
+dependencies = [
+ "async-trait",
+ "dig-ip",
+ "dig-nat 0.15.0",
  "rand 0.8.7",
  "serde",
  "serde_json",
@@ -2010,14 +2028,14 @@ dependencies = [
 
 [[package]]
 name = "dig-download"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d6ef799dea375447c379e76b3c442835cdc9aa9e6b97cfc9ab737a7ef503080"
+checksum = "102cc2d15cb075c3b964c55d86ac918125520ace49d560467ac6b35eab0d91eb"
 dependencies = [
  "async-trait",
  "dig-constants 0.8.0",
- "dig-dht",
- "dig-nat",
+ "dig-dht 0.9.0",
+ "dig-nat 0.15.0",
  "dig-peer",
  "dig-rpc-protocol",
  "futures",
@@ -2031,8 +2049,8 @@ dependencies = [
 
 [[package]]
 name = "dig-gossip"
-version = "0.17.21"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=dd29ce8df275d60b3568079f3739bbe55f7bbf17#dd29ce8df275d60b3568079f3739bbe55f7bbf17"
+version = "0.18.0"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=6d458974522cdada1f9b09469d7709e08036a800#6d458974522cdada1f9b09469d7709e08036a800"
 dependencies = [
  "bincode",
  "chia-protocol",
@@ -2041,7 +2059,7 @@ dependencies = [
  "chia_streamable_macro 0.26.0",
  "dig-constants 0.4.0",
  "dig-ip",
- "dig-nat",
+ "dig-nat 0.15.0",
  "dig-peer-protocol",
  "dig-tls",
  "futures-util",
@@ -2210,6 +2228,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-nat"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90270aea6b4a11c80cc4b6230d87926eb0944a6911307aa3c7425134fd714dbf"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "base64",
+ "dig-constants 0.5.1",
+ "dig-identity 0.4.2",
+ "dig-ip",
+ "dig-tls",
+ "futures",
+ "futures-util",
+ "igd-next",
+ "ring",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "yamux",
+]
+
+[[package]]
 name = "dig-node-core"
 version = "0.25.1"
 dependencies = [
@@ -2223,13 +2271,13 @@ dependencies = [
  "chia-sdk-utils",
  "dig-chainsource-interface",
  "dig-constants 0.4.0",
- "dig-dht",
+ "dig-dht 0.9.0",
  "dig-download",
  "dig-gossip",
  "dig-identity 0.4.0",
  "dig-ip",
  "dig-ipc-protocol",
- "dig-nat",
+ "dig-nat 0.15.0",
  "dig-peer",
  "dig-peer-selector",
  "dig-pex",
@@ -2304,14 +2352,14 @@ dependencies = [
 
 [[package]]
 name = "dig-peer"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6de94e87ca139b5a61a09c6d22c94d825ac9280bd0b1fe91b9ea3daa3451c7a"
+checksum = "dd7fadbaa3a2d83fb49bf1d583ba4cb2e0a00452007cc50010254f2047916467"
 dependencies = [
  "chia-protocol",
  "chia-traits 0.26.0",
  "dig-message",
- "dig-nat",
+ "dig-nat 0.15.0",
  "dig-rpc-protocol",
  "dig-tls",
  "serde",
@@ -2342,8 +2390,8 @@ version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5e08046d2d2f5eb470930df4eeffabacb13f5424922838b895d6d3b7cda00f8"
 dependencies = [
- "dig-dht",
- "dig-nat",
+ "dig-dht 0.8.0",
+ "dig-nat 0.14.1",
  "rand 0.8.7",
  "rand_pcg 0.3.1",
  "serde",
@@ -2774,7 +2822,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2922,7 +2970,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3697,7 +3745,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4025,7 +4073,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4621,7 +4669,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4990,7 +5038,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5639,7 +5687,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6697,7 +6745,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

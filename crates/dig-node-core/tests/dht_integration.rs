@@ -127,7 +127,10 @@ impl DhtTransport for UnreachableTransport {
         peer: &Contact,
         _request: &DhtRequest,
     ) -> Result<DhtResponse, DhtError> {
-        Err(DhtError::transport(format!("unreachable {}", peer.peer_id)))
+        Err(DhtError::transport_from_untrusted(format!(
+            "unreachable {}",
+            peer.peer_id
+        )))
     }
 }
 
@@ -326,7 +329,10 @@ impl DhtTransport for SwarmTransport {
             Some(svc) => Ok(svc
                 .handle_request_from(Some(from.clone()), request.clone())
                 .await),
-            None => Err(DhtError::transport(format!("no route to {}", peer.peer_id))),
+            None => Err(DhtError::transport_from_untrusted(format!(
+                "no route to {}",
+                peer.peer_id
+            ))),
         }
     }
 }

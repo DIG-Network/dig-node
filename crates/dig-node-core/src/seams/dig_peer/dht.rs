@@ -8,8 +8,8 @@
 //! 1. **A [`DhtTransport`] over dig-nat** ([`NatDhtTransport`]): "send this [`DhtRequest`] to that
 //!    peer, give me the [`DhtResponse`]." It dials a peer over dig-nat's NAT-traversal ladder (mTLS,
 //!    peer_id pinned), opens ONE logical stream, writes `request.encode()`, reads `DhtResponse::decode`,
-//!    bounded by an RPC timeout, mapping every failure to [`DhtError::transport`] (which the lookup
-//!    treats as "that peer is unreachable" and moves on).
+//!    bounded by an RPC timeout, mapping every failure to [`DhtError::transport_from_untrusted`]
+//!    (which the lookup treats as "that peer is unreachable" and moves on).
 //! 2. **Bring-up + maintenance** ([`DhtHandle`], [`run_maintenance`]): construct a [`DhtService`] for
 //!    this node (the standalone `run()` path wires it in [`crate::peer`]'s peer-network bring-up),
 //!    bootstrap it from the dig-gossip peer pool + the relay introducer as [`BootstrapPeer`]s
@@ -70,7 +70,14 @@ const DEFAULT_DHT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The DHT RPC therefore "rides" the exact same authenticated transport the content fetch uses — no
 /// separate, unauthenticated DHT channel exists. A dial/stream/parse failure (or a timeout) becomes a
-/// [`DhtError::transport`], which the iterative lookup treats as "that peer is unreachable" and skips.
+/// [`DhtError::transport_from_untrusted`], which the iterative lookup treats as "that peer is
+/// unreachable" and skips.
+///
+/// Every one of those messages goes through the UNTRUSTED door, not [`DhtError::transport`]. Four of
+/// them interpolate a dial/stream/codec error whose text a peer (or a relay on the path) can shape,
+/// and the remaining two interpolate a `peer_id` that also arrived from a remote party. Whether a
+/// given value's `Display` happens to be inert today is a property of another crate that no type
+/// here enforces, so the provenance — not the current rendering — decides the door.
 ///
 /// One connection PER RPC (not pooled) keeps this adapter simple + correct; the DHT's traffic is low
 /// (a handful of small RPCs per lookup, on the maintenance cadence). A pooled dialer is a transparent
@@ -156,6 +163,22 @@ impl NatDhtTransport {
     }
 }
 
+/// Build the [`DhtError`] for an exchange with `peer` that failed at `stage`, naming the stage and
+/// carrying the underlying `cause`.
+///
+/// The four dial/stream/write/read failures share one message shape, so they share one constructor:
+/// a reader learns the provenance rule once here rather than re-deriving it at four call sites, and a
+/// fifth stage added later inherits the rule instead of re-deciding it.
+///
+/// `cause` goes through the UNTRUSTED door. It is a dig-nat dial error, and dig-nat's NAT-traversal
+/// ladder ends at a relay tier whose `MethodError::reason` is text the relay supplied — so a stranger
+/// on the path can shape these bytes. `stage` is a source literal and `peer.peer_id` is a fixed-width
+/// hash, but neutralizing the whole rendered message costs nothing and keeps the guard stated over the
+/// message rather than over one currently-inert component of it.
+fn stage_failed(stage: &'static str, peer: &Contact, cause: impl std::fmt::Display) -> DhtError {
+    DhtError::transport_from_untrusted(format!("{stage} {}: {cause}", peer.peer_id))
+}
+
 #[async_trait]
 impl DhtTransport for NatDhtTransport {
     async fn rpc(
@@ -166,9 +189,9 @@ impl DhtTransport for NatDhtTransport {
     ) -> Result<DhtResponse, DhtError> {
         // `from` is authenticated by the mTLS certificate we present (this node's identity), NOT the
         // wire body — the responder derives our peer_id from the cert, so we do not send it here.
-        let target = self
-            .target_for(peer)
-            .ok_or_else(|| DhtError::transport(format!("unreachable peer {}", peer.peer_id)))?;
+        let target = self.target_for(peer).ok_or_else(|| {
+            DhtError::transport_from_untrusted(format!("unreachable peer {}", peer.peer_id))
+        })?;
 
         // The whole dial+exchange is bounded so a lookup round never stalls on one peer.
         let exchange = async {
@@ -179,22 +202,22 @@ impl DhtTransport for NatDhtTransport {
                 &self.runtime,
             )
             .await
-            .map_err(|e| DhtError::transport(format!("connect {}: {e}", peer.peer_id)))?;
+            .map_err(|e| stage_failed("connect", peer, e))?;
             let mut stream = conn
                 .open_stream()
                 .await
-                .map_err(|e| DhtError::transport(format!("open stream {}: {e}", peer.peer_id)))?;
+                .map_err(|e| stage_failed("open stream", peer, e))?;
             write_dht_request(&mut stream, request)
                 .await
-                .map_err(|e| DhtError::transport(format!("write request {}: {e}", peer.peer_id)))?;
+                .map_err(|e| stage_failed("write request", peer, e))?;
             read_dht_response(&mut stream)
                 .await
-                .map_err(|e| DhtError::transport(format!("read response {}: {e}", peer.peer_id)))
+                .map_err(|e| stage_failed("read response", peer, e))
         };
 
         match tokio::time::timeout(self.rpc_timeout, exchange).await {
             Ok(result) => result,
-            Err(_) => Err(DhtError::transport(format!(
+            Err(_) => Err(DhtError::transport_from_untrusted(format!(
                 "rpc to {} timed out after {:?}",
                 peer.peer_id, self.rpc_timeout
             ))),
@@ -1073,6 +1096,103 @@ mod tests {
         assert!(
             !dht.remove_peer(peer).await,
             "removing an absent peer returns false"
+        );
+    }
+
+    // =================================================================================================
+    // `stage_failed` — peer-shaped cause text cannot reach the rendered error (#1674, #1675)
+    // =================================================================================================
+
+    /// A cause whose `Display` renders text a stranger chose, of the shape dig-nat's relay tier can
+    /// actually produce: a readable diagnosis with log-forging control characters spliced into it.
+    struct HostileCause;
+
+    impl std::fmt::Display for HostileCause {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // \n forges a new log line; \u{202e} (RIGHT-TO-LEFT OVERRIDE) reverses how the rest of the
+            // line renders in a terminal. Both are the classic ways peer text lies to an operator.
+            write!(
+                f,
+                "connection refused\nERROR forged-by-a-peer\u{202e}drowssap"
+            )
+        }
+    }
+
+    fn contact_for_tests() -> Contact {
+        Contact::new(
+            &PeerId::from_bytes([7u8; 32]),
+            vec![CandidateAddr::direct("127.0.0.1", 1)],
+        )
+    }
+
+    /// The `{cause}` half is the peer-shaped half, and it is the half a `peer_id`-only fix would miss:
+    /// `peer_id` is a fixed-width hash that renders as inert hex no matter what a peer sends, so a
+    /// message built by sanitizing only the identifier would render this hostile cause verbatim and
+    /// still look correct. Putting the hostile bytes exclusively in `cause` is what makes this test
+    /// able to fail.
+    #[test]
+    fn a_peer_shaped_cause_cannot_forge_a_line_in_the_rendered_error() {
+        let rendered = stage_failed("connect", &contact_for_tests(), HostileCause).to_string();
+
+        assert!(
+            !rendered.contains('\n'),
+            "a peer's newline must not become a line break: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "a peer's bidi override must not reach the operator: {rendered:?}"
+        );
+        assert!(
+            !rendered.chars().any(|c| c.is_control()),
+            "no control character survives: {rendered:?}"
+        );
+    }
+
+    /// The control: neutralizing must not be satisfied by throwing the diagnosis away. An error that
+    /// says nothing is trivially injection-free, so without this the test above would still pass if
+    /// `stage_failed` dropped the cause entirely — and the operator would lose the reason the RPC died.
+    #[test]
+    fn the_neutralized_error_still_says_what_went_wrong() {
+        let peer = contact_for_tests();
+        let rendered = stage_failed("connect", &peer, HostileCause).to_string();
+
+        assert!(
+            rendered.contains("connect"),
+            "the stage that failed is still named: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&peer.peer_id),
+            "the peer it failed against is still named: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("connection refused"),
+            "the readable part of the cause survives sanitizing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("forged-by-a-peer"),
+            "escaping keeps the text diagnosable rather than deleting it: {rendered:?}"
+        );
+    }
+
+    /// The bound, pinned from BOTH sides. A cap tested only with an over-long cause could be satisfied
+    /// by truncating everything, so the short case proves an ordinary cause is delivered whole.
+    #[test]
+    fn a_flooding_cause_is_bounded_while_an_ordinary_one_is_delivered_whole() {
+        let peer = contact_for_tests();
+
+        let flood = "A".repeat(50_000);
+        let bounded = stage_failed("read response", &peer, flood).to_string();
+        assert!(
+            bounded.chars().count() < 1_000,
+            "a hostile peer cannot flood the log line, got {} chars",
+            bounded.chars().count()
+        );
+
+        let ordinary = "eof before the response frame was complete";
+        let whole = stage_failed("read response", &peer, ordinary).to_string();
+        assert!(
+            whole.contains(ordinary),
+            "an ordinary cause is not truncated: {whole:?}"
         );
     }
 }

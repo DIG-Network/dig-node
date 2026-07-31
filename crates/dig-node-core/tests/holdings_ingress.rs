@@ -186,7 +186,7 @@ fn local_dht_service(port: u16) -> Arc<dig_dht::DhtService> {
             _target: &dig_dht::Contact,
             _request: &dig_dht::DhtRequest,
         ) -> Result<dig_dht::DhtResponse, dig_dht::DhtError> {
-            Err(dig_dht::DhtError::Transport("unreachable".to_string()))
+            Err(dig_dht::DhtError::transport("unreachable"))
         }
     }
     Arc::new(dig_dht::DhtService::new(
