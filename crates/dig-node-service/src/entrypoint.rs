@@ -396,6 +396,12 @@ pub fn run() -> std::process::ExitCode {
     };
 
     let json = cli.json;
+    // For an installed SERVICE run (DIG_NODE_RUN_CONTEXT=service), steer the identity-seed and
+    // cache dirs to the machine-wide state dir BEFORE anything reads them, so a sandboxed
+    // service (systemd ProtectHome, launchd, SCM — all of which blank $HOME) still gets a
+    // persistent identity + cache and actually joins the P2P network (#1928). A no-op for a
+    // plain CLI run. Runs before `Config::from_env` so the resolved cache dir is consistent.
+    crate::state::apply_service_state_env();
     let config = Config::from_env();
     let command = cli.command.unwrap_or(Command::Run);
     let action = command.action();

@@ -259,6 +259,53 @@ pub fn ensure_service_state_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// The identity-seed dir and the `.dig` cache dir this process should use, given a resolved
+/// machine-wide `state_dir`. Both live UNDER the machine dir (`<state>/identity`,
+/// `<state>/cache`), never under `$HOME`. Pure — [`apply_service_state_env`] wires it to the
+/// real [`state_dir`] + process env; kept separate so the placement is unit-testable without
+/// mutating process-global env.
+fn service_state_env_defaults(state_dir: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        // digstore-remote's `identity_dir()` reads DIG_IDENTITY_DIR first (before
+        // `dirs::config_dir()`); dig-node-core's `canonical_cache_dir()` reads DIG_NODE_CACHE
+        // first. So steering both here reaches both readers with no code change in either.
+        ("DIG_IDENTITY_DIR", state_dir.join("identity")),
+        ("DIG_NODE_CACHE", state_dir.join("cache")),
+    ]
+}
+
+/// For an INSTALLED SERVICE run only, default the identity-seed dir and the `.dig` cache dir
+/// to the machine-wide [`state_dir`] when the operator has not pinned them explicitly.
+///
+/// The packaged service managers sandbox `$HOME`: systemd's `ProtectHome=true` blanks `/root`,
+/// launchd/SCM run with no writable home. The historic `$HOME`-relative defaults —
+/// digstore-remote's `identity_dir()` (`$HOME/.config/dig`) and dig-node-core's
+/// `canonical_cache_dir()` (`$HOME/DigNode/cache`) — therefore fail `EROFS`, so the node loads
+/// no identity seed (the peer network refuses to start — no peer_id, no relay reservation,
+/// forever) and falls back to a `/tmp` cache that does not survive a restart (#1928). Pointing
+/// both at `/var/lib/dig-node` (which the sandbox CAN write, and which is already the service's
+/// root-owned `0700` state dir, #501) fixes it outright.
+///
+/// Driven off `DIG_NODE_RUN_CONTEXT=service` (set by systemd, launchd, AND the Windows SCM),
+/// so all three service managers are steered from ONE place rather than each packaging target
+/// re-deriving a path. A no-op for any non-service (operator CLI) run — a bare `dig-node run`
+/// keeps the shared `$HOME` cache so it stays byte-identical to the browser's in-process node
+/// (#96). Never overrides an explicit `DIG_IDENTITY_DIR`/`DIG_NODE_CACHE`.
+///
+/// Call ONCE at the top of the entrypoint, before the node reads either path.
+pub fn apply_service_state_env() {
+    if !running_as_service() {
+        return;
+    }
+    let base = state_dir();
+    for (key, default) in service_state_env_defaults(&base) {
+        let already_set = std::env::var_os(key).is_some_and(|v| !v.is_empty());
+        if !already_set {
+            std::env::set_var(key, default);
+        }
+    }
+}
+
 /// The read-grant principal for a SERVICE harden of `dir`: the interactive install-user's
 /// SID that should retain READ access to the control token.
 ///
@@ -1012,6 +1059,108 @@ mod tests {
             Some(v) => std::env::set_var(RUN_CONTEXT_ENV, v),
             None => std::env::remove_var(RUN_CONTEXT_ENV),
         }
+    }
+
+    // -- #1928: a sandboxed service must NOT default identity/cache under $HOME ----
+
+    #[test]
+    fn service_state_env_defaults_land_under_the_machine_dir_not_home() {
+        // PURE (no env mutation): the identity + cache dirs resolve UNDER the machine state
+        // dir, so neither can land in the $HOME that systemd's ProtectHome=true blanks.
+        let machine = PathBuf::from("/var/lib/dig-node");
+        let defaults = service_state_env_defaults(&machine);
+        assert_eq!(
+            defaults,
+            [
+                ("DIG_IDENTITY_DIR", machine.join("identity")),
+                ("DIG_NODE_CACHE", machine.join("cache")),
+            ]
+        );
+        for (_, path) in &defaults {
+            assert!(
+                path.starts_with(&machine),
+                "{path:?} must live under the machine state dir"
+            );
+            for home in ["/root", "/home/u"] {
+                assert!(
+                    !path.starts_with(home),
+                    "{path:?} must NOT default under $HOME ({home}) — ProtectHome would blank it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apply_service_state_env_service_context_points_outside_home_and_respects_overrides() {
+        // Save every env var this test touches, restore at the end (process-global env).
+        let keys = [
+            RUN_CONTEXT_ENV,
+            STATE_DIR_ENV,
+            "DIG_IDENTITY_DIR",
+            "DIG_NODE_CACHE",
+            "HOME",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let restore = || {
+            for (k, v) in &saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        };
+
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+
+        // 1) A SERVICE run with nothing pinned: both dirs default under the machine state dir,
+        //    NOT under $HOME (the #1928 regression — a .deb node that never joins the network).
+        std::env::set_var("HOME", home.path());
+        std::env::set_var(RUN_CONTEXT_ENV, RUN_CONTEXT_SERVICE);
+        std::env::set_var(STATE_DIR_ENV, state.path()); // deterministic; no real /var/lib write
+        std::env::remove_var("DIG_IDENTITY_DIR");
+        std::env::remove_var("DIG_NODE_CACHE");
+
+        apply_service_state_env();
+
+        let id = PathBuf::from(std::env::var("DIG_IDENTITY_DIR").expect("identity dir set"));
+        let cache = PathBuf::from(std::env::var("DIG_NODE_CACHE").expect("cache dir set"));
+        assert_eq!(id, state.path().join("identity"));
+        assert_eq!(cache, state.path().join("cache"));
+        assert!(
+            !id.starts_with(home.path()),
+            "identity must not land in $HOME"
+        );
+        assert!(
+            !cache.starts_with(home.path()),
+            "cache must not land in $HOME"
+        );
+
+        // 2) An explicit operator value is never overridden.
+        std::env::set_var("DIG_IDENTITY_DIR", "/opt/custom/id");
+        std::env::set_var("DIG_NODE_CACHE", "/opt/custom/cache");
+        apply_service_state_env();
+        assert_eq!(std::env::var("DIG_IDENTITY_DIR").unwrap(), "/opt/custom/id");
+        assert_eq!(
+            std::env::var("DIG_NODE_CACHE").unwrap(),
+            "/opt/custom/cache"
+        );
+
+        // 3) A non-service (CLI) run is a no-op — the shared $HOME cache default is preserved.
+        std::env::remove_var(RUN_CONTEXT_ENV);
+        std::env::remove_var("DIG_IDENTITY_DIR");
+        std::env::remove_var("DIG_NODE_CACHE");
+        apply_service_state_env();
+        assert!(
+            std::env::var_os("DIG_IDENTITY_DIR").is_none(),
+            "CLI: unset ⇒ stays unset"
+        );
+        assert!(
+            std::env::var_os("DIG_NODE_CACHE").is_none(),
+            "CLI: unset ⇒ stays unset"
+        );
+
+        restore();
     }
 
     // -- SID resolution + spoof guard (#501: spoofable grant principal) ----------
