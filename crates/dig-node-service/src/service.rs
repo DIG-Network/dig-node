@@ -3217,6 +3217,109 @@ mod tests {",
             .is_some());
     }
 
+    /// #1888: the absence set is EXHAUSTIVE and the matching rule is case-insensitive SUBSTRING.
+    ///
+    /// `SPEC.md` §9.1 enumerates the signals a reimplementation (dig-relay, dig-installer) must
+    /// treat as positive absence. The test above pins only one phrase per backend, so the four
+    /// phrasings it omits could be dropped from `contains_any` and stay green while the spec still
+    /// promised them. Each fixture below is built to fail against the NEAREST WRONG classifier:
+    ///
+    /// - The phrase is embedded MID-MESSAGE inside the tool's real sentence, so an equality or
+    ///   `starts_with` match answers `Unknown`.
+    /// - The casing is the OS's own (capitalised, and one SHOUTED variant), never the lowercase
+    ///   needle literal, so a case-sensitive `contains` answers `Unknown`.
+    /// - launchd's phrases are paired with a NON-113 exit code, so a classifier that recognises
+    ///   only `code == 113` answers `Unknown` — the phrase alone must be sufficient.
+    #[test]
+    fn every_documented_absence_phrasing_is_recognised_case_insensitively_1888() {
+        // systemd — BOTH phrasings, and no exit-code condition exists for either.
+        for (label, stderr) in [
+            (
+                "systemd: `cat` on a unit with no files",
+                "No files found for dignetwork-dig-node.service.\n",
+            ),
+            (
+                // What systemd says when the unit name resolves to nothing at all.
+                "systemd: unit could not be found",
+                "Unit dignetwork-dig-node.service could not be found.\n",
+            ),
+            (
+                "systemd: shouted, mid-sentence",
+                "Failed: UNIT DIGNETWORK-DIG-NODE.SERVICE COULD NOT BE FOUND on this host\n",
+            ),
+        ] {
+            assert_eq!(
+                classify_systemctl_probe(false, stderr),
+                Registration::Absent,
+                "{label}"
+            );
+        }
+
+        // launchd — all THREE phrasings, each with an exit code that is NOT 113, so recognition
+        // rests on the phrase and not on the code.
+        for (label, stderr) in [
+            (
+                "launchd: service not in the domain",
+                "Could not find service \"net.dignetwork.dig-node\" in domain for gui/501\n",
+            ),
+            (
+                "launchd: no such process",
+                "launchctl print error: No such process\n",
+            ),
+            (
+                "launchd: no such file or directory",
+                "Load failed: 5: No such file or directory\n",
+            ),
+        ] {
+            assert_eq!(
+                classify_launchctl_probe(false, Some(1), stderr),
+                Registration::Absent,
+                "{label}"
+            );
+        }
+        // And the code alone remains sufficient, with stderr that says nothing about absence.
+        assert_eq!(
+            classify_launchctl_probe(false, Some(113), "Bootstrap failed: 5\n"),
+            Registration::Absent,
+            "launchd: exit 113 is itself a positive absence signal"
+        );
+
+        // Windows SCM — `1060` and ONLY `1060`, pinned from BOTH sides so the bound cannot drift
+        // into a range. A stderr phrase must NOT sway it: the SCM's contract is the code.
+        assert_eq!(
+            classify_sc_probe(false, Some(1060)),
+            Registration::Absent,
+            "sc: ERROR_SERVICE_DOES_NOT_EXIST"
+        );
+        for neighbour in [1059, 1061] {
+            assert!(
+                classify_sc_probe(false, Some(neighbour))
+                    .unknown_reason()
+                    .is_some(),
+                "sc: {neighbour} is not ERROR_SERVICE_DOES_NOT_EXIST and must stay Unknown"
+            );
+        }
+
+        // `Present` is decided BEFORE any absence test, on every backend: a successful probe stays
+        // `Present` even when its stderr carries an absence phrase (a warning about another unit).
+        for (label, verdict) in [
+            (
+                "systemd",
+                classify_systemctl_probe(true, "No files found for some-other.service\n"),
+            ),
+            (
+                "launchd",
+                classify_launchctl_probe(true, Some(113), "Could not find service other\n"),
+            ),
+        ] {
+            assert_eq!(
+                verdict,
+                Registration::Present,
+                "{label}: success outranks an absence phrase"
+            );
+        }
+    }
+
     /// The three states must stay distinguishable at every consumer, and uncertainty must never
     /// collapse to "no": `certain()` — the accessor the reinstall and the removal-wait use — turns
     /// `Unknown` into an ERROR, never a `false` that would let a create run over a live service.

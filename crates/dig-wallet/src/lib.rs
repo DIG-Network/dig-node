@@ -4627,11 +4627,17 @@ mod tests {
     }
 
     /// The self origin can LIST the cache (an empty list when nothing is cached). Points
-    /// the cache dir at a throwaway tempdir via LOCALAPPDATA so the test is hermetic.
+    /// the cache dir at a throwaway tempdir so the test is hermetic.
+    ///
+    /// The override MUST be `DIG_NODE_CACHE`, the only variable `canonical_cache_dir` consults
+    /// before falling through to `directories::BaseDirs`. `BaseDirs` reads the OS API rather than
+    /// the environment, so setting `LOCALAPPDATA` alone left this test reading the REAL machine
+    /// cache and asserting it was empty — it failed on any host that had ever cached a capsule.
     #[tokio::test]
     async fn cache_list_self_origin_returns_capsule_list() {
         let _g = ENV_LOCK.lock().await;
         let td = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", td.path().join("cache"));
         std::env::set_var("LOCALAPPDATA", td.path());
         let self_origin = format!("http://127.0.0.1:{}", wallet_port());
         let resp = dig_cache_list(origin_headers(&self_origin)).await;
@@ -4639,6 +4645,7 @@ mod tests {
         let body = body_json(resp).await;
         assert!(body["cached"].is_array(), "list returns a cached array");
         assert_eq!(body["cached"].as_array().unwrap().len(), 0, "empty cache");
+        std::env::remove_var("DIG_NODE_CACHE");
         std::env::remove_var("LOCALAPPDATA");
     }
 
