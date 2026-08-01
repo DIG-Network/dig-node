@@ -1746,14 +1746,41 @@ Numeric values and symbolic names are a stable contract and MUST NOT be renumber
   removed anywhere AND nothing is unresolved is the result `NOT_FOUND` ("nothing to uninstall"),
   carrying the underlying removal error as context.
 - **The existence probe is THREE-VALUED, and only the OS may say "absent".** The probe answers
-  `present`, `absent`, or `unknown`; it MUST NOT report `absent` for a scope it could not READ. Only
-  a positive OS absence signal — systemd `No files found for <unit>`, launchd `Could not find
-  service` (exit `113`), Windows SCM `1060` (`ERROR_SERVICE_DOES_NOT_EXIST`) — is `absent`. Every
-  other outcome is `unknown` and carries the tool's own message: `systemctl --user` with no
+  `present`, `absent`, or `unknown` — there is no fourth outcome — and it MUST NOT report `absent`
+  for a scope it could not READ. The three answers are decided in a fixed order, and the ORDER is
+  normative:
+
+  1. **A probe that SUCCEEDED is `present`**, tested before any absence test. Success outranks the
+     stderr entirely: a probe that exits 0 is `present` even if its stderr carries an absence
+     phrase (a warning about some other unit) or an absence exit code.
+  2. Otherwise, a **positive OS absence signal** (exhaustively enumerated below) is `absent`.
+  3. Otherwise the outcome is **`unknown`, carrying the tool's own message** verbatim.
+
+  The absence signals are EXACTLY these, per backend, and a reimplementation MUST recognise every
+  one of them — the set is closed, and nothing outside it may become `absent`:
+
+  | Backend (probe) | `absent` iff |
+  | --- | --- |
+  | systemd (`systemctl [--user] cat <unit>`) | stderr contains `no files found for` **or** `could not be found`. **No exit-code condition** — systemd's exit codes are not a reliable absence signal, so the phrasing alone decides. |
+  | launchd (`launchctl print <domain>/<label>`) | exit code `113` **or** stderr contains `could not find service`, `no such process`, or `no such file`. The code and the phrases are INDEPENDENTLY sufficient: either one alone is `absent`. |
+  | Windows SCM (`sc query <name>`) | exit code `1060` (`ERROR_SERVICE_DOES_NOT_EXIST`) **only**. No stderr phrasing participates, and no neighbouring code does: `1059`/`1061` are `unknown`, as is `5` (`ERROR_ACCESS_DENIED`). |
+
+  **The stderr match is a CASE-INSENSITIVE SUBSTRING search**, never equality and never a prefix:
+  the phrase above must be found anywhere within a case-folded copy of the tool's stderr, because
+  the OS embeds it mid-sentence and capitalises it its own way (`No files found for
+  dignetwork-dig-node.service.`, `Unit dignetwork-dig-node.service could not be found.`). Matching
+  on equality, on a prefix, or case-sensitively would classify a genuinely-absent service as
+  `unknown`.
+
+  Every other outcome is `unknown` and carries the tool's own message: `systemctl --user` with no
   reachable bus (its state when run as root), a launchd domain that cannot be bootstrapped from a
   session with no Aqua domain, a permission failure, a signal-terminated probe, or an OS tool that
   could not be located in a privileged directory. `unknown` MUST NOT be collapsed into "not
-  registered" anywhere: it makes a swept scope **indeterminate** (above), and where a caller cannot
+  registered" ANYWHERE. Concretely: the "is there something here" accessor is false for `unknown`
+  exactly as it is for `absent` (it answers only "positively present", so no caller can read a
+  `false` as "nothing is registered"), and the accessor that demands certainty — used by the
+  clean-reinstall and the post-delete removal wait — MUST return an ERROR on `unknown` rather than
+  either boolean. It makes a swept scope **indeterminate** (above), and where a caller cannot
   proceed without certainty — the clean-reinstall, and confirming a deletion took effect — it is an
   ERROR, never a `false` that would create over a registration that may be live. This state is
   therefore reachable from the real OS backend, not only from a test double.
