@@ -594,11 +594,16 @@ async fn rpc_verification_failure_is_recorded_and_fails_closed() {
 #[derive(Default)]
 struct RecordingContentServer {
     origins: std::sync::Mutex<Vec<dig_node_core::download::ReadOrigin>>,
+    provenances: std::sync::Mutex<Vec<dig_node_core::download::RequestProvenance>>,
 }
 
 impl RecordingContentServer {
     fn recorded(&self) -> Vec<dig_node_core::download::ReadOrigin> {
         self.origins.lock().unwrap().clone()
+    }
+
+    fn recorded_provenances(&self) -> Vec<dig_node_core::download::RequestProvenance> {
+        self.provenances.lock().unwrap().clone()
     }
 }
 
@@ -611,8 +616,10 @@ impl dig_node_core::ContentServer for RecordingContentServer {
         _resource_key: &str,
         _salt_hex: Option<&str>,
         origin: dig_node_core::download::ReadOrigin,
+        provenance: dig_node_core::download::RequestProvenance,
     ) -> dig_node_core::content_serve::PlaintextOutcome {
         self.origins.lock().unwrap().push(origin);
+        self.provenances.lock().unwrap().push(provenance);
         dig_node_core::content_serve::PlaintextOutcome::NotFound {
             root_hex: String::new(),
         }
@@ -632,13 +639,16 @@ impl dig_node_core::ContentServer for RecordingContentServer {
     }
 }
 
-/// Drive `GET <path>` through the real router from `peer` (a forged connection remote address) and
-/// return every `ReadOrigin` the content server was asked with.
-async fn origins_seen_for(
+/// Drive `GET <path>` through the REAL router from `peer` (a forged connection remote address),
+/// optionally carrying a `Referer` and a `Sec-Fetch-Site` header, and return the recording content
+/// server (the reads it saw) plus the HTTP status. The single low-level seam behind the origin- and
+/// provenance-observing helpers.
+async fn drive_s_get(
     peer: &str,
     path: &str,
     referer: Option<&str>,
-) -> Vec<dig_node_core::download::ReadOrigin> {
+    sec_fetch_site: Option<&str>,
+) -> (Arc<RecordingContentServer>, axum::http::StatusCode) {
     use tower::ServiceExt;
 
     let hold = env_guard().lock_owned().await;
@@ -672,6 +682,9 @@ async fn origins_seen_for(
     if let Some(referer) = referer {
         builder = builder.header(axum::http::header::REFERER, referer);
     }
+    if let Some(sfs) = sec_fetch_site {
+        builder = builder.header("sec-fetch-site", sfs);
+    }
     let mut request = builder.body(axum::body::Body::empty()).unwrap();
     request.extensions_mut().insert(axum::extract::ConnectInfo(
         peer.parse::<SocketAddr>()
@@ -687,8 +700,19 @@ async fn origins_seen_for(
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         "a missing ConnectInfo would be an axum rejection (500), not a defaulted origin"
     );
+    let status = response.status();
     drop(EnvHold(hold));
-    recorder.recorded()
+    (recorder, status)
+}
+
+/// Drive `GET <path>` through the real router from `peer` and return every `ReadOrigin` the content
+/// server was asked with.
+async fn origins_seen_for(
+    peer: &str,
+    path: &str,
+    referer: Option<&str>,
+) -> Vec<dig_node_core::download::ReadOrigin> {
+    drive_s_get(peer, path, referer, None).await.0.recorded()
 }
 
 /// **Proves:** `GET /s/…` labels its read from the CONNECTION — a non-loopback reader is `Peer`
@@ -742,6 +766,77 @@ async fn fallback_serve_labels_a_rerooted_read_from_the_connection() {
     assert!(
         seen.iter().all(|o| *o == ReadOrigin::Peer) && !seen.is_empty(),
         "a non-loopback reader must be Peer on the fallback door too, got {seen:?}"
+    );
+}
+
+// -- `/s/` RequestProvenance derivation (#1654) --------------------------------------------------
+//
+// A loopback address proves the CONNECTION is local, not that the operator authorized the request:
+// a malicious page can drive a cross-site `GET dig.local/s/<capsule>`, and the durable LANDING side
+// effect (cache write → DHT holder) would then be remotely triggerable. `Sec-Fetch-Site: cross-site`
+// is the browser's own report that another origin drove the request; the node threads it to the
+// serve seam so the LANDING legs (but never the READ) can suppress it. These prove the header is
+// carried to the seam exactly; the core `landing_origin` unit test proves the collapse it drives.
+
+/// **Proves:** a loopback `GET /s/…` carrying `Sec-Fetch-Site: cross-site` still SERVES (the read is
+/// frictionless — same status as an ordinary miss) but reaches the serve seam labelled `CrossSite`,
+/// so the landing legs fold to `Peer` and no durable holder side effect fires. A same-site request
+/// and a header-ABSENT request (a CLI/SDK client) both reach the seam as `FirstParty`, so a
+/// legitimate read still lands.
+///
+/// **Catches:** the `Sec-Fetch-Site` header being dropped between the transport and the serve seam,
+/// or absence being mistaken for cross-site (which would silently stop every CLI/SDK read landing).
+#[tokio::test]
+async fn store_serve_labels_provenance_from_sec_fetch_site_without_blocking_the_read() {
+    use dig_node_core::download::RequestProvenance;
+    let store = "31".repeat(32);
+    let path = format!("/s/{store}/app/index.html");
+
+    // Cross-site: the browser reports another origin drove this loopback request.
+    let (cross, cross_status) =
+        drive_s_get("127.0.0.1:51240", &path, None, Some("cross-site")).await;
+    assert!(
+        cross
+            .recorded_provenances()
+            .iter()
+            .all(|p| *p == RequestProvenance::CrossSite)
+            && !cross.recorded_provenances().is_empty(),
+        "a cross-site read must reach the seam as CrossSite, got {:?}",
+        cross.recorded_provenances()
+    );
+
+    // Same-site: a first-party subresource — must land normally.
+    let (same, same_status) = drive_s_get("127.0.0.1:51241", &path, None, Some("same-site")).await;
+    assert!(
+        same.recorded_provenances()
+            .iter()
+            .all(|p| *p == RequestProvenance::FirstParty)
+            && !same.recorded_provenances().is_empty(),
+        "a same-site read must reach the seam as FirstParty, got {:?}",
+        same.recorded_provenances()
+    );
+
+    // Header ABSENT (a CLI/SDK client sends no Sec-Fetch-*): must be FirstParty, never CrossSite.
+    let (absent, absent_status) = drive_s_get("127.0.0.1:51242", &path, None, None).await;
+    assert!(
+        absent
+            .recorded_provenances()
+            .iter()
+            .all(|p| *p == RequestProvenance::FirstParty)
+            && !absent.recorded_provenances().is_empty(),
+        "an absent Sec-Fetch-Site must reach the seam as FirstParty, got {:?}",
+        absent.recorded_provenances()
+    );
+
+    // The READ is never blocked by provenance: all three miss identically (the recorder serves
+    // NotFound → the SPA/404 decision), so a cross-site read is exactly as served as a same-site one.
+    assert_eq!(
+        cross_status, same_status,
+        "a cross-site read must not be blocked — same status as a same-site read"
+    );
+    assert_eq!(
+        same_status, absent_status,
+        "a header-absent read must not be blocked either"
     );
 }
 

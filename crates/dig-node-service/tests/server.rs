@@ -794,6 +794,46 @@ async fn control_method_without_token_is_rejected_with_unauthorized() {
     assert!(resp.get("result").is_none(), "no result on a rejected call");
 }
 
+/// **Proves (#1654):** `cache.fetchAndCache` over the HTTP `POST /` surface is token-gated like
+/// `control.*` — an untokened call is UNAUTHORIZED (-32030) and never reaches the landing dispatch,
+/// while the master control token gets PAST the gate (the response is not the unauthorized error).
+/// The method makes this node a durable DHT holder of the requested capsule, so it is not a public
+/// read; the in-process FFI `cache.*` path (which never reaches this handler) stays open.
+#[tokio::test]
+async fn cache_fetch_and_cache_over_http_requires_the_control_token() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "cache.fetchAndCache",
+        "params": { "store_id": "31".repeat(32) }
+    });
+
+    // Untokened → rejected at the gate before any landing work.
+    let rejected = post_rpc(&addr, body.clone(), None).await;
+    assert_eq!(rejected["error"]["code"], json!(-32030));
+    assert_eq!(rejected["error"]["data"]["code"], json!("UNAUTHORIZED"));
+    assert!(
+        rejected.get("result").is_none(),
+        "no result on a rejected landing call"
+    );
+
+    // With the master control token → PAST the gate (whatever the dispatch then returns, it is not
+    // the landing gate's UNAUTHORIZED).
+    let authorized = post_rpc(&addr, body, Some(&token)).await;
+    let is_unauthorized = authorized
+        .get("error")
+        .and_then(|e| e.get("data"))
+        .and_then(|d| d.get("code"))
+        .is_some_and(|c| c == &json!("UNAUTHORIZED"));
+    assert!(
+        !is_unauthorized,
+        "a control-token call must clear the landing gate, got {authorized:?}"
+    );
+}
+
 #[tokio::test]
 async fn control_method_with_wrong_token_is_rejected() {
     let (upstream, _calls) = start_mock_upstream().await;

@@ -1135,6 +1135,16 @@ that holds a different seam's handle. `dig-node-service`'s `AppState` demonstrat
 `content_server: Arc<dyn ContentServer>` (used by the loopback plaintext serve path, `server::
 serve_resource`/`serve_miss`) — the SAME object, two shapes.
 
+**`ContentServer::serve_content_plaintext` takes TWO landing axes (#1654).** `origin`
+(`ReadOrigin`, §21.7 of the service SPEC) is the transport label derived from the accepting
+connection's remote address; `provenance` (`RequestProvenance`, from the `/s/` request's
+`Sec-Fetch-Site` header via `download::from_sec_fetch_site`) says whether a first-party navigation or a
+cross-site page drove the request. The serve seam collapses them ONCE — `landing_origin(origin,
+provenance)` = `origin` when first-party, else `Peer` — and passes the collapsed origin to the
+landing legs (`maybe_backfill_capsule`, the peer tier's reshare); the READ tiers still use `origin`.
+The bytes are served identically regardless of provenance — only the durable holder side effect is
+gated. Absence of the header is first-party (CLI/SDK clients send none). See the service SPEC §21.8.
+
 **The binary holds no seam logic.** `dig-node-service` wires seam handles + HTTP/control transport; the
 actual dispatch/serve/cache/chain/peer/key logic lives in `dig-node-core`'s seam modules. A second
 competing binary, or seam logic leaking into the service crate, is an architecture violation.

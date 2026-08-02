@@ -3965,3 +3965,52 @@ The peer-tier read (`dig.fetchRange` / `dig.getContent` on the peer wire) and th
 (`GET /s/…`, and the root-absolute reroot that shares its path) are BOTH subject to this rule — the
 serve path reaches the same legs through its P2P tier, so gating one door and not the other leaves the
 property unheld.
+
+### 21.8. Landing has a SECOND axis — request provenance (MUST)
+
+A loopback remote address proves the CONNECTION is local; it does NOT prove the OPERATOR authorized the
+request. A browser running an attacker's page can issue a cross-site `GET dig.local/s/<capsule>`: the
+address is loopback, so §21.7 alone would label the read `Local` and let the attacker's chosen capsule
+LAND (warm + reshare + holder-announce). The read itself is harmless — the bytes are public — but the
+durable holder side effect is a remotely-triggerable amplification.
+
+Landing therefore gates on BOTH axes:
+
+1. **The `/s/` HTTP surface derives a request-provenance label from the `Sec-Fetch-Site` request
+   header**, orthogonal to the §21.7 read-origin label. ONLY an explicit, case-insensitive `cross-site`
+   value is `CrossSite`; `same-origin`, `same-site`, `none`, an unknown value, AND an ABSENT header are
+   all `FirstParty`. Absence MUST map to `FirstParty` — non-browser clients (the CLI, the SDK) send no
+   `Sec-Fetch-*` header, and treating absence as cross-site would silently stop every CLI/SDK read from
+   landing.
+2. **A read lands only when it is BOTH `Local` (§21.7) AND `FirstParty`.** A `CrossSite` request collapses
+   its landing origin to `Peer`: the bytes are served identically, but no warm, reshare, promotion, or
+   announce fires. The READ MUST NEVER be blocked, throttled, or altered by provenance — only the side
+   effect is suppressed.
+3. **The collapse is applied ONCE, at the serve seam**, and the collapsed origin flows to the landing
+   legs; the leaf gates (§21.7) are unchanged. This axis is HTTP-only (`serve_content_plaintext` has no
+   peer-wire callers); the peer tier remains gated by §21.7's read-origin alone.
+
+Honest residuals: a browser predating `Sec-Fetch-Site` (all current major browsers send it) presents no
+header and is treated as first-party; and a same-origin store-to-store request within a shared serving
+origin is first-party by construction. These are accepted — the axis closes the cross-site CSRF door,
+not every conceivable same-origin confusion.
+
+### 21.9. The `cache.fetchAndCache` HTTP surface is token-gated (MUST)
+
+`cache.fetchAndCache` explicitly makes this node fetch, cache, and DHT-announce a capsule of the
+CALLER'S naming — the §21.3 holder side effect on demand. Over the HTTP `POST /` surface a loopback
+address does not prove operator intent (a cross-site page can POST to `dig.local`), so the method MUST
+require the local control token (the `X-Dig-Control-Token` header or `params._control_token`) OR a valid
+paired controller token, exactly like a `control.*` method; an unauthorized call is rejected
+`UNAUTHORIZED` (-32030) before any landing work. The in-process FFI `cache.*` path is the operator's own
+process and MUST stay open — it never traverses this HTTP handler. Reads remain ungated.
+
+### 21.10. Reverse-proxy trust caveat (informative)
+
+The `Local` label trusts the loopback boundary. Behind a loopback-terminating reverse proxy every remote
+client appears to the node as a `Local` connection; `X-Forwarded-For` is explicitly NOT trusted for the
+origin label (a remote client can forge it). An operator who deliberately fronts the node with a proxy
+would need a future explicit trusted-proxy configuration — an allowlist of proxy addresses plus an
+authenticated proxy-supplied client-address header — before any forwarded address could be believed. No
+such configuration exists today; running the node behind an untrusted-header proxy forfeits the origin
+gate.

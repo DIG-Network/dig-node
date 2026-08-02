@@ -947,3 +947,20 @@ from its DHT announce. The fix reuses the #1576 reshare leg's `ChainAnchoredModu
 seam (resolve the chain-anchored root, re-hash, compare) and refuses BEFORE the write, so an
 unverified capsule never lands and is never announced. General lesson: a defense that only runs on one
 of several exit paths is not a defense — verify at every seam that admits an artifact.
+
+**Loopback != operator-authorized; provenance is a SECOND axis over ReadOrigin (#1654).** The read-origin
+gate (#1576) labels a `/s/` read `Local` when the connection is loopback — but a loopback address only
+proves the CONNECTION is local, not that the OPERATOR authorized the request. A browser running an
+attacker's page can issue a cross-site `GET dig.local/s/<capsule>`: loopback ⇒ `Local` ⇒ the attacker's
+chosen capsule LANDS (warm + reshare + DHT holder-announce), a remotely-triggerable amplification of the
+attacker's choosing at the cost of a few bytes. The bytes themselves are harmless (public content); the
+durable holder side effect is the vulnerability. Fix: a second orthogonal axis, `RequestProvenance`,
+derived from the browser's own `Sec-Fetch-Site` header — only an explicit `cross-site` is `CrossSite`;
+absence is `FirstParty` (CLI/SDK send no `Sec-Fetch-*`, and treating absence as cross-site would silently
+stop every CLI/SDK read from landing). Landing fires only when BOTH `Local` AND `FirstParty`; a cross-site
+read collapses its landing origin to `Peer` (`landing_origin(origin, provenance)`), serving the bytes
+identically but effecting nothing. Also token-gated `cache.fetchAndCache` over HTTP (it is an explicit
+"become a holder" call, not a public read); the in-process FFI `cache.*` path stays open. General lesson:
+a transport-derived trust label (loopback) can be a NECESSARY but not SUFFICIENT condition — a CSRF-class
+attacker rides the trusted transport, so a durable side effect needs a second axis the attacker cannot
+forge (here, the browser's own cross-site self-report).
