@@ -1251,6 +1251,11 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             ErrorCode::WalletReadFailed,
             format!("balance read failed: {e}"),
         ),
+        Err(BalanceError::RateLimited) => control_error(
+            id,
+            ErrorCode::WalletRateLimited,
+            "balance read refused: the open coinset-fallback rate limit is exhausted; back off and retry",
+        ),
     }
 }
 

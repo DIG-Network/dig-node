@@ -96,6 +96,11 @@ pub enum BalanceError {
     NotSynced,
     /// An underlying read (DB query or fallback) errored.
     ReadFailed(String),
+    /// The GLOBAL coinset-fallback rate bound (#1957) is exhausted: too many arbitrary-address
+    /// reads have hit the expensive fallback in a short window. Defense-in-depth against an
+    /// open-read amplification/oracle sweep — the caller should back off and retry. The cheap
+    /// local-DB fast path is NEVER subject to this bound.
+    RateLimited,
 }
 
 /// Static wallet identity + config the read surface needs (derived once at bring-up).
@@ -125,6 +130,16 @@ impl Default for WalletConfig {
         }
     }
 }
+
+/// Default burst allowance for the open-balance coinset fallback (#1957): a single caller may
+/// hit the expensive fallback this many times in a burst before the rate bound engages. Sized
+/// generously so no realistic legitimate use (a handful of address lookups) is ever refused —
+/// only a rapid sweep of many arbitrary addresses trips it.
+const DEFAULT_FALLBACK_BURST: f64 = 64.0;
+
+/// Default sustained refill rate (tokens per second) for the open-balance coinset fallback
+/// (#1957): once the burst is spent, fallback reads are admitted at this steady rate.
+const DEFAULT_FALLBACK_REFILL_PER_SEC: f64 = 8.0;
 
 /// The Sage-parity wallet backend.
 #[derive(Clone)]
@@ -177,6 +192,12 @@ pub struct WalletBackend {
     /// publishes to. DISTINCT from [`Self::events`] so tip events never leak into the Sage-parity
     /// `SyncEvent` stream.
     tip_events: Arc<super::tipping::TipEventBus>,
+    /// The GLOBAL rate bound on the EXPENSIVE coinset-fallback leg of `balance_for_address`
+    /// (#1957). `control.wallet.balance` is an open, unauthenticated loopback read; the local-DB
+    /// fast path is cheap + legitimate and stays unbounded, but the externally-dependent coinset
+    /// fallback is a cheap amplification/oracle surface, so its aggregate call rate is capped
+    /// here. Shared across `Clone`s so one bucket governs the whole backend, not per-connection.
+    fallback_rate: Arc<super::rate_limit::TokenBucket>,
 }
 
 /// The connected client's PUBLIC identity for a session (#407). Scoping data only — no key.
@@ -208,7 +229,23 @@ impl WalletBackend {
             sign_lock: Arc::new(tokio::sync::Mutex::new(())),
             tipping: None,
             tip_events: Arc::new(super::tipping::TipEventBus::default()),
+            fallback_rate: Arc::new(super::rate_limit::TokenBucket::new(
+                DEFAULT_FALLBACK_BURST,
+                DEFAULT_FALLBACK_REFILL_PER_SEC,
+            )),
         }
+    }
+
+    /// Override the coinset-fallback rate bound (#1957) — primarily for tests that want a small,
+    /// deterministic pool. `capacity` is the immediate burst allowance; `refill_per_sec` the
+    /// sustained rate (`0.0` = a fixed, non-replenishing pool).
+    #[must_use]
+    pub fn with_fallback_rate_limit(mut self, capacity: f64, refill_per_sec: f64) -> Self {
+        self.fallback_rate = Arc::new(super::rate_limit::TokenBucket::new(
+            capacity,
+            refill_per_sec,
+        ));
+        self
     }
 
     /// Attach the tipping subsystem (#378) — enables the `tip.*` methods. The engine should be
@@ -508,6 +545,13 @@ impl WalletBackend {
                     } else {
                         BalanceError::NoChainSource
                     });
+                }
+                // Defense-in-depth (#1957): the coinset fallback is the ONLY expensive,
+                // externally-dependent leg of this open read. Bound its aggregate call rate so an
+                // unauthenticated loopback caller cannot sweep arbitrary addresses to amplify load
+                // on / oracle the fallback. The cheap DB fast path above is never gated.
+                if !self.fallback_rate.try_acquire() {
+                    return Err(BalanceError::RateLimited);
                 }
                 let phs = [puzzle_hash];
                 // XCH coins sit AT the puzzle hash; CAT coins are HINTED to it.
@@ -3359,6 +3403,94 @@ mod tests {
         // default is now fail-closed, so a live double must say so explicitly).
         fn is_live(&self) -> bool {
             true
+        }
+    }
+
+    // ---- #1957: the coinset-fallback path is abuse-bounded -----------------------------------
+
+    /// A fresh arbitrary address for a sweep — each derived from a distinct seed byte so no two
+    /// reads collapse onto one puzzle hash.
+    fn arbitrary_address(seed: u8) -> String {
+        encode_address(&format!("{seed:02x}").repeat(32), "xch").unwrap()
+    }
+
+    /// A rapid SWEEP of arbitrary addresses that force the coinset fallback trips the global
+    /// rate bound: with a fixed pool of `N` fallback tokens (no refill), the first `N` reads
+    /// succeed and the `(N+1)`th is refused with the distinct [`BalanceError::RateLimited`].
+    /// RED without a limiter: every read would succeed.
+    #[tokio::test]
+    async fn wallet_balance_fallback_is_rate_limited_after_a_burst() {
+        const POOL: usize = 4;
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(POOL as f64, 0.0); // no refill ⇒ deterministic
+
+        for i in 0..POOL {
+            let r = be
+                .balance_for_address(&arbitrary_address(i as u8), BalanceAsset::Xch)
+                .await;
+            assert!(r.is_ok(), "read {i} within the burst is admitted: {r:?}");
+        }
+        assert_eq!(
+            be.balance_for_address(&arbitrary_address(0xEE), BalanceAsset::Xch)
+                .await,
+            Err(BalanceError::RateLimited),
+            "the read past the burst is refused with the rate-limit error"
+        );
+    }
+
+    /// A SINGLE legitimate fallback read is never throttled — the limiter must not trip on one.
+    /// RED if the bound were set below 1 (too aggressive).
+    #[tokio::test]
+    async fn a_single_legitimate_balance_read_is_unaffected() {
+        let arb_ph = "44".repeat(32);
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "c1",
+            &arb_ph,
+            77,
+            Some(10),
+            None,
+        )]));
+        // Even a minimal pool of exactly one token admits the single honest read.
+        let be =
+            WalletBackend::new(db, fb, WalletConfig::default()).with_fallback_rate_limit(1.0, 0.0);
+        let r = be
+            .balance_for_address(&encode_address(&arb_ph, "xch").unwrap(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(r.balance, 77, "the honest read returns its real figure");
+    }
+
+    /// The cheap, legitimate local-DB fast path is NEVER rate-limited: even with a fully
+    /// exhausted (zero-capacity) fallback bucket, a burst of DB-hit reads all succeed, proving
+    /// the gate sits ONLY in front of the fallback, not ahead of the DB fast path. RED if the
+    /// limiter were placed before the routing decision.
+    #[tokio::test]
+    async fn the_local_db_fast_path_is_not_rate_limited() {
+        let db = db_with_owned_derivation(true, Some(10)).await;
+        db.upsert_coins(&[coin_at_ph("confirmed", &owned_ph(), 100, Some(10), None)])
+            .await
+            .unwrap();
+        // A zero-token bucket would refuse ANY fallback call — but the DB path must bypass it.
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(0.0, 0.0);
+        for _ in 0..10 {
+            let r = be
+                .balance_for_address(&owned_address(), BalanceAsset::Xch)
+                .await
+                .expect("the DB fast path is never throttled");
+            assert_eq!(r.balance, 100);
         }
     }
 
