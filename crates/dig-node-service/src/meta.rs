@@ -567,6 +567,12 @@ pub enum ErrorCode {
     /// Distinct from `WALLET_NO_CHAIN_SOURCE` (nothing to ask) and `WALLET_NOT_SYNCED`
     /// (not ready). Node error.
     WalletReadFailed,
+    /// `-32043` — a wallet balance read was refused because the GLOBAL coinset-fallback rate
+    /// bound (#1957) is exhausted: too many arbitrary-address reads have hit the expensive
+    /// fallback in a short window. Defense-in-depth against an open-read amplification/oracle
+    /// sweep; the caller should back off and retry. The cheap local-DB fast path is never gated.
+    /// Node error. (Wallet range `-3204x`.)
+    WalletRateLimited,
 }
 
 impl ErrorCode {
@@ -586,6 +592,7 @@ impl ErrorCode {
             ErrorCode::WalletNoChainSource => -32040,
             ErrorCode::WalletNotSynced => -32041,
             ErrorCode::WalletReadFailed => -32042,
+            ErrorCode::WalletRateLimited => -32043,
         }
     }
 
@@ -606,6 +613,7 @@ impl ErrorCode {
             ErrorCode::WalletNoChainSource => "WALLET_NO_CHAIN_SOURCE",
             ErrorCode::WalletNotSynced => "WALLET_NOT_SYNCED",
             ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
+            ErrorCode::WalletRateLimited => "WALLET_RATE_LIMITED",
         }
     }
 
@@ -626,7 +634,8 @@ impl ErrorCode {
             // The wallet balance read (#1851) is served by the node-custodied wallet backend.
             ErrorCode::WalletNoChainSource
             | ErrorCode::WalletNotSynced
-            | ErrorCode::WalletReadFailed => "node",
+            | ErrorCode::WalletReadFailed
+            | ErrorCode::WalletRateLimited => "node",
             // INVALID_PARAMS is returned by the embedded read path's locally-served
             // read methods (bad store_id / retrieval_key) before any I/O.
             ErrorCode::InvalidParams => "node",
@@ -666,6 +675,9 @@ impl ErrorCode {
                 "A wallet balance read of the wallet's own address is still syncing with no fallback."
             }
             ErrorCode::WalletReadFailed => "A wallet balance read failed at the DB / chain layer.",
+            ErrorCode::WalletRateLimited => {
+                "A wallet balance read was refused: the open coinset-fallback rate bound is exhausted."
+            }
         }
     }
 
@@ -685,6 +697,7 @@ impl ErrorCode {
             ErrorCode::WalletNoChainSource,
             ErrorCode::WalletNotSynced,
             ErrorCode::WalletReadFailed,
+            ErrorCode::WalletRateLimited,
         ]
     }
 }

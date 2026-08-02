@@ -68,6 +68,7 @@ pub mod mint;
 pub mod network;
 pub mod offers;
 pub mod options;
+pub mod rate_limit;
 pub mod routing;
 pub mod rpc;
 pub mod service;
