@@ -9,9 +9,11 @@
 //! `match Method::from_name(..)` dispatch byte-identical). `async_trait`-boxed (matching the
 //! other seam traits) so it stays dyn-compatible for the future `Arc<dyn RpcDispatch>` handle
 //! (W1c). The crate-root `handle_rpc`/`handle_rpc_json` free functions (every external caller's
-//! entry point — `dig-node-service`, `dig-runtime`, the peer-RPC server) now thinly delegate to
-//! [`RpcDispatch::dispatch`] — their signatures are UNCHANGED, so no caller anywhere needed to
-//! change.
+//! entry point — `dig-node-service`, `dig-runtime`, the peer-RPC server) thinly delegate to
+//! [`RpcDispatch::dispatch`]. Each carries the request's `origin` (transport axis) AND its
+//! `provenance` (the `Sec-Fetch-Site` landing axis, #1956) — both threaded EXPLICITLY by every
+//! caller so a transport can never forget to state who is asking or whether a cross-site page drove
+//! the request.
 
 use serde_json::{json, Value};
 
@@ -299,7 +301,12 @@ impl RpcDispatch for Node {
                                 let depth = download::redirect_depth(&params);
                                 if let Some(envelope) = node
                                     .range_miss_envelope(
-                                        &id, &content, depth, offset, length, land_origin,
+                                        &id,
+                                        &content,
+                                        depth,
+                                        offset,
+                                        length,
+                                        land_origin,
                                     )
                                     .await
                                 {
@@ -766,7 +773,14 @@ impl RpcDispatch for Node {
             // capsule page cannot drive landing. Reads are NEVER altered — only the side effect.
             let land_origin = crate::download::landing_origin(origin, provenance);
             if let Some(envelope) = node
-                .content_miss_envelope(&id, &content, depth, offset, pin_hex.as_deref(), land_origin)
+                .content_miss_envelope(
+                    &id,
+                    &content,
+                    depth,
+                    offset,
+                    pin_hex.as_deref(),
+                    land_origin,
+                )
                 .await
             {
                 // This resource is being served FROM ANOTHER NODE (a redirect/fetch-through). In the

@@ -6699,7 +6699,12 @@ mod tests {
         ];
         for req in cases {
             let method = req["method"].as_str().unwrap().to_string();
-            let resp = rt.block_on(handle_rpc(&node, req, crate::download::ReadOrigin::Local, crate::download::RequestProvenance::FirstParty));
+            let resp = rt.block_on(handle_rpc(
+                &node,
+                req,
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
             assert_eq!(
                 resp["error"]["code"],
                 json!(-32601),
@@ -7764,6 +7769,233 @@ mod tests {
         assert!(
             node.capsule_acquisition_gate().claim(key).is_none(),
             "the reshare leg, claiming the SAME gate, must be refused while the backfill holds it",
+        );
+    }
+
+    // -- #1956: the JSON-RPC POST landing legs gate on request PROVENANCE (Sec-Fetch-Site) ----------
+    //
+    // The transport-axis (`ReadOrigin`) tests above prove a PEER-origin miss never lands. These prove
+    // the SECOND axis: a same-origin capsule page that `POST`s `dig.getContent`/`dig.fetchRange` over
+    // the LOOPBACK transport (origin = Local) still cannot drive landing when the browser reports the
+    // request was CROSS-SITE — matching the #1654 `/s/` serve gate. The read is NEVER altered: the
+    // redirect envelope (the served bytes' locator) is returned identically; only the durable holder
+    // side effect (backfill/reshare warm) is withheld. Each mirrors the `origin`-axis control exactly,
+    // varying ONLY the `provenance` argument, so a dropped `land_origin` fold at ANY of the four
+    // landing sites turns one of these RED.
+
+    /// **Proves (#1956):** a CROSS-SITE `dig.fetchRange` POST over the loopback transport still SERVES
+    /// (the miss redirects to the provider — the bytes' locator) but spawns NO background backfill —
+    /// the CSRF door the `origin` axis alone left open on the JSON-RPC path.
+    /// **Catches:** the `land_origin` fold being dropped at the fetchRange landing sites
+    /// (`range_miss_envelope` and/or `maybe_backfill_capsule`) — then a cross-site page drives landing.
+    #[test]
+    fn cross_site_post_fetchrange_serves_but_does_not_land() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::CrossSite,
+        ));
+        // The read STILL serves — a cross-site request is never throttled, only its landing is denied.
+        assert_eq!(
+            resp["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "a cross-site fetchRange must still serve (redirect to the provider): {resp}"
+        );
+
+        let key = format!("{}:{}", store.to_hex(), tip.to_hex());
+        assert!(
+            !node.capsule_acquisition.is_warming(&key),
+            "a cross-site fetchRange POST must NOT spawn a backfill, even over the loopback transport"
+        );
+    }
+
+    /// **Proves (#1956):** a CROSS-SITE `dig.getContent` POST still serves the miss (redirect) but
+    /// spawns NO backfill — the sibling handler, whose miss-envelope leg forwards origin into the
+    /// reshare chain, is gated identically.
+    /// **Catches:** the `land_origin` fold being dropped at the getContent landing sites
+    /// (`content_miss_envelope` and/or `maybe_backfill_capsule`).
+    #[test]
+    fn cross_site_post_getcontent_serves_but_does_not_land() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(3, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::CrossSite,
+        ));
+        assert_eq!(
+            resp["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "a cross-site getContent must still serve (redirect to the provider): {resp}"
+        );
+
+        let key = format!("{}:{}", store.to_hex(), tip.to_hex());
+        assert!(
+            !node.capsule_acquisition.is_warming(&key),
+            "a cross-site getContent POST must NOT spawn a backfill"
+        );
+    }
+
+    /// **The control (#1956):** the identical `dig.getContent` miss at FIRST-PARTY provenance DOES
+    /// spawn a backfill — proving the fold does not simply disable landing, and that a legitimate
+    /// same-site / CLI / SDK read (no `Sec-Fetch-*` header ⇒ FirstParty) still lands (frictionless).
+    #[test]
+    fn first_party_post_getcontent_still_lands() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(3, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(resp["error"]["code"], json!(CONTENT_REDIRECT), "{resp}");
+
+        let key = format!("{}:{}", store.to_hex(), tip.to_hex());
+        assert!(
+            node.capsule_acquisition.is_warming(&key),
+            "a first-party local getContent miss (the control) must still land"
+        );
+    }
+
+    /// **Proves (#1956):** a PEER-transport `dig.getContent` miss is unaffected by the provenance axis —
+    /// `landing_origin(Peer, FirstParty) == Peer`, so it serves but never lands, exactly as before. The
+    /// two axes compose; provenance can only ever tighten landing, never loosen the transport denial.
+    #[test]
+    fn peer_transport_post_getcontent_unaffected() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(3, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+            }}),
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(resp["error"]["code"], json!(CONTENT_REDIRECT), "{resp}");
+
+        let key = format!("{}:{}", store.to_hex(), tip.to_hex());
+        assert!(
+            !node.capsule_acquisition.is_warming(&key),
+            "a peer-transport getContent miss must never land, regardless of provenance"
+        );
+    }
+
+    /// **Proves (#1956):** the SERVED response is byte-identical whether the request is FirstParty or
+    /// CrossSite — provenance touches ONLY the landing side effect, never the read. Two fresh nodes run
+    /// the identical getContent miss under the two provenances; the returned envelopes must be equal.
+    /// **Catches:** provenance ever leaking onto the serve/response path (the frictionless-read trap).
+    #[test]
+    fn read_bytes_identical_regardless_of_provenance() {
+        fn serve_miss(provenance: crate::download::RequestProvenance) -> Value {
+            let rt = pin_test_rt();
+            let (store, tip, rk) = miss_setup();
+            let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+            let node = Arc::new(node);
+            node.set_self_ref(Arc::downgrade(&node));
+            let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+            attach_p2p(
+                &node,
+                vec![dig_download::testkit::mock_provider(3, &cid)],
+                dig_download::testkit::MockContent::even(10, 1),
+                MissMode::Redirect,
+                &td,
+            );
+            rt.block_on(handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                    "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                }}),
+                crate::download::ReadOrigin::Local,
+                provenance,
+            ))
+        }
+
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let first_party = serve_miss(crate::download::RequestProvenance::FirstParty);
+        let cross_site = serve_miss(crate::download::RequestProvenance::CrossSite);
+        assert_eq!(
+            first_party, cross_site,
+            "the served response must be identical across provenance — only landing differs"
         );
     }
 

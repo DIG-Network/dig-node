@@ -3999,19 +3999,32 @@ durable holder side effect is a remotely-triggerable amplification.
 
 Landing therefore gates on BOTH axes:
 
-1. **The `/s/` HTTP surface derives a request-provenance label from the `Sec-Fetch-Site` request
-   header**, orthogonal to the §21.7 read-origin label. ONLY an explicit, case-insensitive `cross-site`
-   value is `CrossSite`; `same-origin`, `same-site`, `none`, an unknown value, AND an ABSENT header are
-   all `FirstParty`. Absence MUST map to `FirstParty` — non-browser clients (the CLI, the SDK) send no
-   `Sec-Fetch-*` header, and treating absence as cross-site would silently stop every CLI/SDK read from
-   landing.
+1. **Every browser-reachable read surface derives a request-provenance label from the `Sec-Fetch-Site`
+   request header**, orthogonal to the §21.7 read-origin label. This covers BOTH the `/s/` plaintext
+   serve surface AND the `POST /` JSON-RPC read methods (`dig.getContent`, `dig.fetchRange`), whose
+   miss-path landing legs (the implicit warm/backfill/reshare fired when the resource is not held
+   locally) would otherwise let a SAME-ORIGIN capsule page `POST dig.getContent` and drive landing —
+   the loopback address labels it `Local`, so §21.7 alone permits it. ONLY an explicit, case-insensitive
+   `cross-site` value is `CrossSite`; `same-origin`, `same-site`, `none`, an unknown value, AND an ABSENT
+   header are all `FirstParty`. Absence MUST map to `FirstParty` — non-browser clients (the CLI, the SDK)
+   send no `Sec-Fetch-*` header, and treating absence as cross-site would silently stop every CLI/SDK
+   read from landing.
 2. **A read lands only when it is BOTH `Local` (§21.7) AND `FirstParty`.** A `CrossSite` request collapses
    its landing origin to `Peer`: the bytes are served identically, but no warm, reshare, promotion, or
    announce fires. The READ MUST NEVER be blocked, throttled, or altered by provenance — only the side
    effect is suppressed.
-3. **The collapse is applied ONCE, at the serve seam**, and the collapsed origin flows to the landing
-   legs; the leaf gates (§21.7) are unchanged. This axis is HTTP-only (`serve_content_plaintext` has no
-   peer-wire callers); the peer tier remains gated by §21.7's read-origin alone.
+3. **The collapse is applied ONCE per landing site via the shared `landing_origin(origin, provenance)`
+   fold**, and the collapsed `land_origin` flows to the landing legs; the leaf gates (§21.7) are
+   unchanged. On the `/s/` path the fold is applied at the serve seam; on the `POST /` JSON-RPC path it
+   is applied at the top of each read handler and the collapsed origin replaces the raw origin at every
+   landing site (`content_miss_envelope`/`range_miss_envelope` → the reshare chain, AND
+   `maybe_backfill_capsule`) — the raw read-origin is used everywhere else. Each transport threads the
+   provenance EXPLICITLY through `handle_rpc`/`dispatch` (a required argument, never inferred): the
+   browser-facing HTTP POST classifies the header, every trusted/non-browser caller (the control
+   surface, the in-process FFI, the peer-RPC server) passes `FirstParty`. This axis applies only to
+   browser-reachable HTTP surfaces; the peer wire remains gated by §21.7's read-origin alone
+   (`landing_origin(Peer, FirstParty) == Peer`, so a peer read still never lands). It complements §21.9's
+   token-gate on the EXPLICIT `cache.fetchAndCache` landing method.
 
 Honest residuals: a browser predating `Sec-Fetch-Site` (all current major browsers send it) presents no
 header and is treated as first-party; and a same-origin store-to-store request within a shared serving
