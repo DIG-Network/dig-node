@@ -1304,6 +1304,25 @@ impl PeerRpcResponder for NodeResponder {
             .await;
         };
 
+        // OUTGOING-BANDWIDTH THROTTLE (#30/#1616): the module-range serve is the whole-capsule pull —
+        // the largest transfer in the system — so it must respect the operator egress cap the same way
+        // `stream_range` does, not only the FCFS `serve_limiter`. Checked ONCE before the first frame,
+        // against the window this stream will actually serve. Over budget with a known alternate holder
+        // → decline with the redirect frame (the puller then sources the window elsewhere, the SAME
+        // `{"error": …}` shape as the not-held answer above); no alternate → serve anyway
+        // (`bandwidth_redirect` returns `None`), never dropping a request only this node can answer.
+        if let Some(content) = crate::download::availability_content_id(&store, Some(&root), None) {
+            let depth = crate::download::redirect_depth(&params);
+            if let Some(obj) = self
+                .node
+                .bandwidth_redirect(&content, window.len() as u64, depth)
+                .await
+            {
+                module_serve::module_range_outcome(conn_key, &store, &root, offset, None);
+                return write_framed(out, &json!({ "error": obj })).await;
+            }
+        }
+
         // One frame per FRAME PAYLOAD, so a large module rides many bounded frames. The puller decodes
         // these with `dig_nat::RangeFrame` (see `module_serve::module_frame`), so they are bound by the
         // SAME ceiling as `dig.fetchRange` frames — framing them on `RANGE_WINDOW` made every module
@@ -4461,6 +4480,118 @@ pub(crate) mod tests {
             "no known alternate holder must NOT redirect, must stream: {frame}"
         );
         assert_eq!(frame["complete"], json!(true));
+        srv.await.unwrap().unwrap();
+    }
+
+    /// Seed a raw `.dig` module on disk at the capsule's `module_path`, the shape
+    /// `stream_module_range` seeks its window out of (mirrors lib.rs's `cache_module`).
+    fn seed_module_on_disk(cache_dir: &std::path::Path, store: &str, root: &str, bytes: &[u8]) {
+        let path = crate::CapsuleKey::parse(store, root)
+            .expect("canonical ids")
+            .module_path(cache_dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+    }
+
+    /// #1616: the whole-capsule (`dig.fetchModuleRange`) serve is the largest transfer in the system,
+    /// yet it used to consult only the FCFS `serve_limiter`, never the #30 egress budget — so an
+    /// operator's configured cap was silently bypassed on exactly the path where it matters most. Over
+    /// the cap with a known alternate holder, the module serve must now DECLINE with the redirect frame
+    /// (same graceful shape as `stream_range`), so the caller sources the window elsewhere.
+    #[tokio::test]
+    async fn stream_module_range_over_cap_with_a_provider_declines_instead_of_streaming() {
+        let (node, td) = crate::test_support::test_node_for_peer_surface();
+        let store = digstore_core::Bytes32([0x51; 32]);
+        let root = digstore_core::Bytes32([0x52; 32]);
+        // A real on-disk module well past the 10-byte cap.
+        seed_module_on_disk(td.path(), &store.to_hex(), &root.to_hex(), &[0xABu8; 5000]);
+
+        let mut node = node;
+        Arc::get_mut(&mut node)
+            .expect("sole owner right after construction")
+            .outgoing_throttle = crate::bandwidth::OutgoingThrottle::new(10);
+        // A holder for this CAPSULE is known via the DHT (capsule-granularity content id).
+        let cid = dig_dht::ContentId::capsule(store.0, root.0);
+        let locator = Arc::new(dig_download::testkit::MockProviderLocator::fixed(vec![
+            dig_download::testkit::mock_provider(6, &cid),
+        ]));
+        let transport = Arc::new(dig_download::testkit::MockRangeTransport::new(
+            dig_download::testkit::MockContent::even(10, 1),
+        ));
+        let pc = crate::download::NodeContent::new(
+            locator,
+            transport,
+            crate::download::MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        node.set_p2p_content(pc);
+
+        let responder: Arc<dyn PeerRpcResponder> = Arc::new(NodeResponder::without_pool(node));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let srv = tokio::spawn(serve_one_stream(server, responder));
+
+        let req = json!({"method":"dig.fetchModuleRange","params":{
+            "store_id": store.to_hex(), "root": root.to_hex(), "offset": 0, "length": 4096}});
+        write_framed(&mut client, &req).await.unwrap();
+        let frame = read_framed(&mut client).await.unwrap().expect("a frame");
+        assert_eq!(
+            frame["error"]["code"],
+            json!(crate::download::CONTENT_REDIRECT),
+            "held on disk but over the egress cap must decline/redirect, not stream: {frame}"
+        );
+        assert_eq!(
+            frame["error"]["data"]["redirect"]["providers"][0]["peer_id"],
+            json!(dig_download::testkit::mock_peer_hex(6))
+        );
+        srv.await.unwrap().unwrap();
+    }
+
+    /// #1616, the graceful fallback: over the cap but NO known alternate holder → serve the module
+    /// window anyway rather than drop a request only this node can answer (mirrors the
+    /// `stream_range_over_cap_with_no_provider_still_streams_the_frame` contract).
+    #[tokio::test]
+    async fn stream_module_range_over_cap_with_no_provider_still_streams() {
+        let (node, td) = crate::test_support::test_node_for_peer_surface();
+        let store = digstore_core::Bytes32([0x53; 32]);
+        let root = digstore_core::Bytes32([0x54; 32]);
+        seed_module_on_disk(td.path(), &store.to_hex(), &root.to_hex(), &[0xCDu8; 5000]);
+
+        let mut node = node;
+        Arc::get_mut(&mut node)
+            .expect("sole owner right after construction")
+            .outgoing_throttle = crate::bandwidth::OutgoingThrottle::new(10);
+        // A P2P engine is attached but the DHT knows of NO holder for this capsule.
+        let locator = Arc::new(dig_download::testkit::MockProviderLocator::fixed(vec![]));
+        let transport = Arc::new(dig_download::testkit::MockRangeTransport::new(
+            dig_download::testkit::MockContent::even(10, 1),
+        ));
+        let pc = crate::download::NodeContent::new(
+            locator,
+            transport,
+            crate::download::MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        node.set_p2p_content(pc);
+
+        let responder: Arc<dyn PeerRpcResponder> = Arc::new(NodeResponder::without_pool(node));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let srv = tokio::spawn(serve_one_stream(server, responder));
+
+        let req = json!({"method":"dig.fetchModuleRange","params":{
+            "store_id": store.to_hex(), "root": root.to_hex(), "offset": 0, "length": 4096}});
+        write_framed(&mut client, &req).await.unwrap();
+        let frame = read_framed(&mut client).await.unwrap().expect("a frame");
+        assert!(
+            frame.get("error").is_none(),
+            "no known alternate holder must NOT redirect, must stream the module window: {frame}"
+        );
+        assert_eq!(
+            frame["offset"],
+            json!(0),
+            "a real module window frame leads"
+        );
         srv.await.unwrap().unwrap();
     }
 
