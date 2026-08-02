@@ -360,6 +360,24 @@ pub struct Node {
 pub(crate) type InventoryRefresher =
     Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
+/// An in-memory [`dig_download::ModuleReader`] over a freshly-synced capsule, so the chain-anchored
+/// verifier can inspect bytes the node holds in RAM (the sync path never stages to disk before the
+/// verify — an unverified capsule must not touch the cache, whose mere presence is an announcement).
+struct InMemoryModule(Vec<u8>);
+
+#[async_trait::async_trait]
+impl dig_download::ModuleReader for InMemoryModule {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, dig_download::DownloadError> {
+        let start = (offset as usize).min(self.0.len());
+        let end = start.saturating_add(len as usize).min(self.0.len());
+        Ok(self.0[start..end].to_vec())
+    }
+}
+
 /// The CANONICAL (shared) cache dir — the one the DIG Browser's in-process
 /// dig-node AND the standalone dig-node/dig-companion both resolve to, so they
 /// share a `.dig` cache by construction (#96). Precedence:
@@ -1249,10 +1267,15 @@ impl Node {
     /// A capsule too large for path 2 is the COMMON case against the public gateway, which
     /// is why path 1 leads rather than serving as a fallback.
     ///
-    /// The synced module is NOT cryptographically trusted here: every response the node
-    /// later serves from it carries its merkle proof, which the client verifies against the
-    /// chain-anchored root — a tampered module fails THAT gate, not this sync. Sync-time
-    /// verification is therefore a minimal non-empty check.
+    /// The synced module is bound to the store's CHAIN-ANCHORED generation before it lands
+    /// ([`verify_synced_capsule_is_chain_anchored`](Self::verify_synced_capsule_is_chain_anchored)).
+    /// Landing a capsule is what makes this node a DISCOVERABLE holder of it (§14.1): the read-side
+    /// serve gate downstream is not enough, because a capsule the node advertises poisons holder
+    /// reputation and multiplies through the reshare flywheel (#1576) whether or not any later read
+    /// verifies it. So this is the SAME chain-anchored check the reshare leg applies at its own seam
+    /// (#1623): resolve the generation root from the chain, re-hash the module, and refuse anything
+    /// that is not the store's confirmed generation — the module never reaches disk, so it is never
+    /// announced.
     ///
     /// # Errors
     /// The returned string names what ACTUALLY failed — the upstream's HTTP status, its
@@ -1295,6 +1318,13 @@ impl Node {
             bytes = bytes.len(),
             "whole-store sync downloaded a capsule"
         );
+
+        // Chain-anchored verify BEFORE the module lands (#1623): landing is announcing (§14.1), so an
+        // unverified capsule that reaches disk turns this node into an advertised holder of content no
+        // chain confirmed. Refuse anything that is not the store's chain-anchored generation — the same
+        // fail-closed gate the reshare leg applies at its own seam.
+        self.verify_synced_capsule_is_chain_anchored(&store_id, &served_root, &bytes)
+            .await?;
 
         // Cache under the SERVED root (which may differ from want_root if the
         // remote head advanced between resolve and sync).
@@ -1376,6 +1406,66 @@ impl Node {
                 );
                 format!("dig.getCapsule failed ({rpc_error}); the §21 clone failed ({e})")
             })
+    }
+
+    /// Prove a freshly-synced capsule is the store's chain-anchored generation, before it lands.
+    ///
+    /// A synced capsule comes from an UPSTREAM the node does not trust, and the act of landing it makes
+    /// this node a discoverable holder (§14.1). So the bytes are bound to the CHAIN here, exactly as the
+    /// #1576 reshare leg binds its own pull (`ChainAnchoredModuleVerifier`): the generation root is
+    /// resolved through the chain — never taken from the serving peer — and the module is re-hashed
+    /// against it. Reusing that one verifier keeps a single verification shape across every seam that
+    /// admits a capsule.
+    ///
+    /// Fail-CLOSED, matching the reshare leg: any failure to ESTABLISH the anchor rejects the sync (the
+    /// caller never writes the module, so it is never announced). The rejections, each an `Err`:
+    /// - the store has no chain-confirmed generation, or the chain read failed;
+    /// - the upstream served a root that is not the chain-anchored generation (a moved/forged head);
+    /// - the bytes do not commit the store + the chain-anchored root.
+    async fn verify_synced_capsule_is_chain_anchored(
+        &self,
+        store_id: &Bytes32,
+        served_root: &Bytes32,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let chain_root = self
+            .anchored_root_resolver
+            .anchored_root(&store_id.0)
+            .await
+            .map_err(|e| format!("could not resolve the chain-anchored root: {e}"))?
+            .ok_or("the store has no chain-confirmed generation to anchor the synced capsule to")?;
+
+        // The served generation must BE the chain's. The verifier re-checks this against the module's
+        // committed root, but naming it here gives an operator the exact reason a moved upstream head is
+        // refused rather than a generic "not anchored".
+        if *served_root != chain_root {
+            return Err(format!(
+                "the upstream served root {} is not the store's chain-anchored root {}",
+                served_root.to_hex(),
+                chain_root.to_hex()
+            ));
+        }
+
+        let verifier = crate::seams::dig_peer::ChainAnchoredModuleVerifier::for_generation(
+            *store_id, chain_root,
+        );
+        let reader = InMemoryModule(bytes.to_vec());
+        match dig_download::ModuleAnchorVerifier::verify_module_anchor(
+            &verifier,
+            &reader,
+            &store_id.to_hex(),
+            &served_root.to_hex(),
+        )
+        .await
+        {
+            dig_download::ModuleAnchor::Anchored => Ok(()),
+            dig_download::ModuleAnchor::NotAnchored => {
+                Err("the synced module is not the store's chain-anchored .dig".to_string())
+            }
+            dig_download::ModuleAnchor::Unavailable(reason) => Err(format!(
+                "could not verify the synced capsule's anchor: {reason}"
+            )),
+        }
     }
 
     /// Proxy the raw JSON-RPC body to the upstream rpc.dig.net and return its response.
@@ -2954,10 +3044,13 @@ mod tests {
     async fn authed_identity_syncs_module_from_authed_remote() {
         // The native §21.9 identity is admitted by an auth-REQUIRED §21 server, the
         // whole module is synced, and it lands in the on-disk cache for local-first.
-        let module = b"compiled-module-bytes".to_vec();
+        let store = Bytes32([1u8; 32]); // the id spawn_authed_remote seeds
+        let root = Bytes32([0x10; 32]); // its served genesis root
+        let module = chain_anchored_module(store.0, root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
-        let (node, _td) = test_node(Some([5u8; 32]));
-        let root_hex = "10".repeat(32); // served genesis root
+        let (node, _td) =
+            test_node_with_resolver(Some([5u8; 32]), MockResolver::one(&store_hex, root));
+        let root_hex = root.to_hex();
         let served = node
             .sync_module_from(&base, &store_hex, &root_hex)
             .await
@@ -2975,11 +3068,11 @@ mod tests {
     /// **Catches:** a gap-fill that doesn't pull, lands the module at the wrong key, or re-pulls.
     #[tokio::test]
     async fn gap_fill_pulls_a_missing_generation_from_a_remote() {
-        let module = b"gap-filled-module-bytes".to_vec();
-        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
-        let store_id: [u8; 32] = Bytes32::from_hex(&store_hex).unwrap().0;
         // The remote's served genesis root.
         let root = Bytes32([0x10; 32]);
+        let module = chain_anchored_module([1u8; 32], root.0);
+        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
+        let store_id: [u8; 32] = Bytes32::from_hex(&store_hex).unwrap().0;
         // A node with a §21 identity whose UPSTREAM is the authed remote (gap-fill pulls via upstream).
         let td = tempfile::tempdir().unwrap();
         let node = Node {
@@ -3024,9 +3117,9 @@ mod tests {
     /// **Catches:** a mis-wired production seam (held-check or gap-filler pointed at the wrong path).
     #[tokio::test]
     async fn chain_watch_tick_gap_fills_a_subscribed_store_end_to_end() {
-        let module = b"watched-store-module".to_vec();
-        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let root = Bytes32([0x10; 32]);
+        let module = chain_anchored_module([1u8; 32], root.0);
+        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let td = tempfile::tempdir().unwrap();
         let node = Arc::new(Node {
             cache_dir: td.path().to_path_buf(),
@@ -3099,9 +3192,9 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let module = b"proactively-pulled-generation".to_vec();
-            let (base, store_hex) = spawn_authed_remote(module.clone()).await;
             let root = Bytes32([0x10; 32]);
+            let module = chain_anchored_module([1u8; 32], root.0);
+            let (base, store_hex) = spawn_authed_remote(module.clone()).await;
             let td = tempfile::tempdir().unwrap();
 
             // The chain-watch loop reads the PROCESS-GLOBAL subscription set + cache dir (via
@@ -3175,9 +3268,9 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let module = b"chain-watch-pulled".to_vec();
-            let (base, store_hex) = spawn_authed_remote(module.clone()).await;
             let root = Bytes32([0x10; 32]);
+            let module = chain_anchored_module([1u8; 32], root.0);
+            let (base, store_hex) = spawn_authed_remote(module.clone()).await;
             let td = tempfile::tempdir().unwrap();
 
             std::env::set_var("DIG_NODE_CACHE", td.path());
@@ -3369,7 +3462,13 @@ mod tests {
         let store = Bytes32([0x21u8; 32]);
         let root = Bytes32([0x22u8; 32]);
         let window = 4096;
-        let capsule: Vec<u8> = (0..window * 2 + 101).map(|i| (i % 251) as u8).collect();
+        // A REAL chain-anchored capsule (so the verify-before-land gate admits it) padded past three
+        // windows by a large filler section, so a single-response implementation still cannot pass.
+        let capsule = chain_anchored_module_with_filler(store.0, root.0, window * 2 + 101);
+        assert!(
+            capsule.len() > window * 2,
+            "the fixture must span >2 windows"
+        );
         let base = spawn_capsule_rpc_upstream(
             capsule.clone(),
             window,
@@ -3379,7 +3478,7 @@ mod tests {
 
         // No identity: the chunked path is anonymous, so whole-store sync no longer depends on
         // the node holding a §21 identity key.
-        let (node, _td) = test_node(None);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root));
         let served = node
             .sync_module_from(&base, &store.to_hex(), &root.to_hex())
             .await
@@ -3449,10 +3548,12 @@ mod tests {
         let seed = [7u8; 32];
         let store = Bytes32([3u8; 32]);
         let root = Bytes32([9u8; 32]);
+        let module = chain_anchored_module(store.0, root.0);
         let captured = Arc::new(std::sync::Mutex::new(None));
-        let url = spawn_mock_module_server(captured.clone(), root, b"MODULE".to_vec()).await;
+        let url = spawn_mock_module_server(captured.clone(), root, module).await;
 
-        let (node, _td) = test_node(Some(seed));
+        let (node, _td) =
+            test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), root));
         let served = node
             .sync_module_from(&url, &store.to_hex(), &root.to_hex())
             .await
@@ -3498,12 +3599,16 @@ mod tests {
     async fn sync_caches_module_under_served_root_and_reports_mismatch() {
         let seed = [1u8; 32];
         let store = Bytes32([2u8; 32]);
-        let served = Bytes32([0xAA; 32]);
+        let served = Bytes32([0xAA; 32]); // the chain-anchored generation the upstream serves
         let requested = Bytes32([0xBB; 32]); // differs from served
+        let module = chain_anchored_module(store.0, served.0);
         let captured = Arc::new(std::sync::Mutex::new(None));
-        let url = spawn_mock_module_server(captured, served, b"DIGMODULE".to_vec()).await;
+        let url = spawn_mock_module_server(captured, served, module.clone()).await;
 
-        let (node, _td) = test_node(Some(seed));
+        // The chain confirms the SERVED root, so the capsule the upstream lands is genuinely anchored —
+        // the served/requested mismatch is orthogonal to chain-anchoring (the upstream's head advanced).
+        let (node, _td) =
+            test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), served));
         let served = node
             .sync_module_from(&url, &store.to_hex(), &requested.to_hex())
             .await
@@ -3512,9 +3617,117 @@ mod tests {
 
         // The module is cached under the SERVED root with the served bytes …
         let served_path = module_path(&node.cache_dir, &store.to_hex(), &served.to_hex());
-        assert_eq!(std::fs::read(&served_path).unwrap(), b"DIGMODULE");
+        assert_eq!(std::fs::read(&served_path).unwrap(), module);
         // … and nothing is cached under the (unmatched) requested root.
         assert!(!module_path(&node.cache_dir, &store.to_hex(), &requested.to_hex()).exists());
+    }
+
+    // -- Chain-anchored verify before announce (#1623) ------------------------------------------
+
+    /// A minimal chain-anchored `.dig` data section committing `(store, root)` — the shape the reshare
+    /// leg's [`ChainAnchoredModuleVerifier`] admits, so a test upstream can serve a capsule that is
+    /// genuinely the store's generation.
+    fn chain_anchored_module(store: [u8; 32], root: [u8; 32]) -> Vec<u8> {
+        use digstore_core::datasection::{encode_blob, SectionId};
+        encode_blob(&[
+            (SectionId::StoreId as u16, store.to_vec()),
+            (SectionId::CurrentRoot as u16, root.to_vec()),
+        ])
+    }
+
+    /// A chain-anchored module (as above) padded past `min_len` bytes with a filler section, for the
+    /// multi-window capsule fixture — the padding lives in an extra section the verifier ignores, so the
+    /// module still commits exactly `(store, root)`.
+    fn chain_anchored_module_with_filler(
+        store: [u8; 32],
+        root: [u8; 32],
+        min_len: usize,
+    ) -> Vec<u8> {
+        use digstore_core::datasection::{encode_blob, SectionId};
+        encode_blob(&[
+            (SectionId::StoreId as u16, store.to_vec()),
+            (SectionId::CurrentRoot as u16, root.to_vec()),
+            (SectionId::Filler as u16, vec![0x5a; min_len]),
+        ])
+    }
+
+    /// Install an inventory-refresher spy that records whether the node announced itself a holder, so a
+    /// test can prove an announce did — or did NOT — happen (§14.1: `refresh_dht_inventory` IS the announce).
+    fn install_announce_spy(node: &Node, announced: Arc<AtomicBool>) {
+        use crate::seams::dig_peer::peer_network::PeerNetwork;
+        node.set_inventory_refresher(Box::new(move || {
+            let announced = announced.clone();
+            Box::pin(async move {
+                announced.store(true, Ordering::SeqCst);
+            })
+        }));
+    }
+
+    /// **Proves (#1623):** a capsule synced from an upstream whose served root is NOT the store's
+    /// chain-anchored generation never makes this node announce itself a holder — the module does not
+    /// land, so `refresh_dht_inventory` is never reached. Without the chain-anchored verify-before-land
+    /// gate the node would advertise unverified content, poisoning holder reputation and multiplying
+    /// unverified copies through the reshare flywheel (#1576).
+    /// **Catches:** landing + announcing a capsule bound only to a peer-served root.
+    #[tokio::test]
+    async fn a_capsule_whose_root_is_not_chain_confirmed_is_never_announced() {
+        let store = Bytes32([1u8; 32]); // the id spawn_authed_remote seeds
+        let served_root = Bytes32([0x10; 32]); // the genesis root it serves at
+        let module = chain_anchored_module(store.0, served_root.0);
+        let (base, store_hex) = spawn_authed_remote(module).await;
+
+        // The chain has NO confirmed generation for this store, so the served root is unverifiable.
+        let (mut node, _td) =
+            test_node_with_resolver(Some([5u8; 32]), MockResolver::always(Ok(None)));
+        node.upstream = base;
+        let announced = Arc::new(AtomicBool::new(false));
+        install_announce_spy(&node, announced.clone());
+
+        let outcome = node
+            .cache_fetch_and_cache(&store_hex, &served_root.to_hex())
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "an unconfirmed capsule must not be fetched-and-cached: {outcome:?}"
+        );
+        assert!(
+            !module_exists(&node.cache_dir, &store_hex, &served_root.to_hex()),
+            "the unverified capsule must not land in the cache"
+        );
+        assert!(
+            !announced.load(Ordering::SeqCst),
+            "the node must NOT announce itself a holder of an unverified capsule"
+        );
+    }
+
+    /// **Proves (#1623):** a capsule whose served root IS the store's chain-anchored generation lands
+    /// and the node announces itself a holder — the verify gate admits genuine content, so the flywheel
+    /// still turns for chain-confirmed capsules (the gate is fail-closed, not fail-shut).
+    #[tokio::test]
+    async fn a_chain_confirmed_capsule_lands_and_is_announced() {
+        let store = Bytes32([1u8; 32]);
+        let root = Bytes32([0x10; 32]);
+        let module = chain_anchored_module(store.0, root.0);
+        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
+
+        let (mut node, _td) =
+            test_node_with_resolver(Some([5u8; 32]), MockResolver::one(&store_hex, root));
+        node.upstream = base;
+        let announced = Arc::new(AtomicBool::new(false));
+        install_announce_spy(&node, announced.clone());
+
+        let (len, _root) = node
+            .cache_fetch_and_cache(&store_hex, &root.to_hex())
+            .await
+            .expect("a chain-confirmed capsule is fetched and cached");
+
+        assert_eq!(len as usize, module.len());
+        assert!(module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
+        assert!(
+            announced.load(Ordering::SeqCst),
+            "a verified holder announces itself to the DHT"
+        );
     }
 
     // -- Anchored-root resolution (dig.getAnchoredRoot) ------------------------
@@ -4402,11 +4615,13 @@ mod tests {
     async fn fetch_and_cache_syncs_a_capsule_on_demand() {
         // cache.fetchAndCache pulls a whole store over the §21 authed sync path and
         // lands it in the cache, reporting the served root + size.
-        let module = b"freshly-fetched-module".to_vec();
+        let root = Bytes32([0x10; 32]); // the served genesis root
+        let module = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
-        let (mut node, _td) = test_node(Some([5u8; 32]));
+        let (mut node, _td) =
+            test_node_with_resolver(Some([5u8; 32]), MockResolver::one(&store_hex, root));
         node.upstream = base; // point the on-demand fetch at the authed remote
-        let root_hex = "10".repeat(32); // the served genesis root
+        let root_hex = root.to_hex();
 
         let resp = handle_rpc(
             &node,
@@ -4456,11 +4671,13 @@ mod tests {
         // fire the DHT inventory refresh exactly once; an already-cached call must
         // NOT re-announce (unchanged inventory).
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let module = b"announce-on-land-module".to_vec();
+        let root = Bytes32([0x10; 32]);
+        let module = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
-        let (mut node, _td) = test_node(Some([7u8; 32]));
+        let (mut node, _td) =
+            test_node_with_resolver(Some([7u8; 32]), MockResolver::one(&store_hex, root));
         node.upstream = base;
-        let root_hex = "10".repeat(32);
+        let root_hex = root.to_hex();
 
         let announces = Arc::new(AtomicUsize::new(0));
         let counter = announces.clone();
@@ -4498,11 +4715,13 @@ mod tests {
         // owns the announce. The previously-explicit refresh at the gap_fill site is
         // removed, so a gap-fill announces EXACTLY once — not twice.
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let module = b"gap-fill-announce-module".to_vec();
+        let root = Bytes32([0x10; 32]);
+        let module = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
-        let (mut node, _td) = test_node(Some([8u8; 32]));
+        let (mut node, _td) =
+            test_node_with_resolver(Some([8u8; 32]), MockResolver::one(&store_hex, root));
         node.upstream = base;
-        let root_hex = "10".repeat(32);
+        let root_hex = root.to_hex();
 
         let announces = Arc::new(AtomicUsize::new(0));
         let counter = announces.clone();

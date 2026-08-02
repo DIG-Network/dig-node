@@ -2310,6 +2310,14 @@ a root OTHER than the confirmed root MUST be rejected (never cached or served).
 - **Fail-closed.** Gap-fill never pulls against an unconfirmable root (the §14.2 decision gates it).
 - **Verification invariant.** Every served module is verified against the chain-anchored root at SERVE,
   no matter how it arrived — a client read, a §21 whole-store sync, or a proactive/backfill gap-fill.
+- **Verify-before-announce invariant.** A synced capsule MUST ALSO pass the chain-anchored verification
+  BEFORE it lands in the cache, because landing a capsule makes this node a DISCOVERABLE holder of it
+  (§14.1) — an announcement, not merely a local copy. The node resolves the store's chain-anchored root,
+  re-hashes the downloaded module against it, and refuses anything that is not the store's confirmed
+  generation, so the module never reaches disk and is never announced. The serve-time gate is not
+  sufficient on its own: a node that advertises a capsule poisons holder reputation and multiplies it
+  through the reshare flywheel whether or not any later read verifies it. This is the SAME chain-anchored
+  check the reshare leg applies at its own seam — one verification shape at every seam that admits a capsule.
 
 ### 14.3a. Whole-capsule download — two paths, chunked first
 
