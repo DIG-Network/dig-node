@@ -78,6 +78,18 @@ pub fn is_control_method(method: &str) -> bool {
     method.starts_with("control.")
 }
 
+/// Is this a control method that is READ-ONLY and safe to answer WITHOUT the control token —
+/// an OPEN read on the loopback read plane? PURE.
+///
+/// `control.wallet.balance` (#1851) is a chain-read of a PUBLIC address (no seed, no signing
+/// key, no custody), so it is exposed like the other reads rather than behind the control-token
+/// gate: a local UI can poll a balance without pairing. It is still routed through the control
+/// dispatcher (so it stays discoverable in [`CONTROL_METHODS`] and gets its CLI verb), but the
+/// server skips the token requirement for it. NO mutation or custody method is ever open here.
+pub fn is_open_control_read(method: &str) -> bool {
+    method == "control.wallet.balance"
+}
+
 /// The canonical set of `control.*` methods the node's control plane RESOLVES — the
 /// union of the methods this shell owns ([`dispatch_control`]) and the ones it delegates
 /// to the embedded node's own control surface (`control.peerStatus` +
@@ -106,6 +118,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.hostedStores.status",
     "control.sync.status",
     "control.sync.trigger",
+    "control.wallet.balance",
     "control.updater.status",
     "control.updater.setChannel",
     "control.updater.pause",
@@ -142,6 +155,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.hostedStores.status",
     "control.sync.status",
     "control.sync.trigger",
+    "control.wallet.balance",
     "control.updater.status",
     "control.updater.setChannel",
     "control.updater.pause",
@@ -661,6 +675,9 @@ pub struct ControlCtx {
     /// `pairing.request`/`pairing.poll` handlers so an operator-approved pairing
     /// becomes pollable by the requesting extension.
     pub pairings: Arc<std::sync::Mutex<crate::pairing::PendingPairings>>,
+    /// The node-custodied wallet backend (#368), for the READ-ONLY `control.wallet.balance`
+    /// chain read (#1851). A public-address balance read only — never a spend/custody path.
+    pub wallet: Arc<dig_wallet::sage::rpc::WalletBackend>,
 }
 
 /// Dispatch a single authorized CONTROL method. The caller has ALREADY enforced the
@@ -710,6 +727,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.hostedStores.status" => hosted_status(ctx, id, params).await,
         "control.sync.status" => control_ok(id, sync_status(ctx).await),
         "control.sync.trigger" => sync_trigger(ctx, id, params).await,
+        "control.wallet.balance" => wallet_balance(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
         // re-implements the beacon's trust/install logic).
@@ -1162,6 +1180,65 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
                 None => format!("whole-store sync failed for {store_id}: {e}"),
             },
         ),
+    }
+}
+
+/// `control.wallet.balance` (#1851) — the READ-ONLY balance of a PUBLIC address, for XCH or
+/// $DIG. An OPEN read (no token gate, [`is_open_control_read`]): it needs only an address, never
+/// a seed or signing key, so it carries zero custody risk. It reuses the wallet backend's B.6
+/// sync-state routing ([`dig_wallet::sage::rpc::WalletBackend::balance_for_address`]).
+///
+/// Params: `{ address (bech32m string), asset ("xch" | "dig") }`. Result:
+/// `{ balance, pending, synced, peak_height }`. A synced empty address is a SUCCESS with a zero
+/// figure; the three read-failure shapes map to DISTINCT catalogued errors (never a fabricated
+/// `0`): `WALLET_NO_CHAIN_SOURCE`, `WALLET_NOT_SYNCED`, `WALLET_READ_FAILED`.
+async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    use dig_wallet::sage::rpc::{BalanceAsset, BalanceError};
+
+    let Some(address) = params.get("address").and_then(|v| v.as_str()) else {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            "control.wallet.balance requires params.address (a bech32m address string)",
+        );
+    };
+    let asset_str = params.get("asset").and_then(|v| v.as_str()).unwrap_or("xch");
+    let Some(asset) = BalanceAsset::from_wire(asset_str) else {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!("control.wallet.balance asset must be \"xch\" or \"dig\", got {asset_str:?}"),
+        );
+    };
+
+    match ctx.wallet.balance_for_address(address, asset).await {
+        Ok(r) => control_ok(
+            id,
+            json!({
+                "balance": r.balance.to_string(),
+                "pending": r.pending.to_string(),
+                "synced": r.synced,
+                "peak_height": r.peak_height,
+            }),
+        ),
+        Err(BalanceError::InvalidAddress) => control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!("control.wallet.balance: {address:?} is not a valid bech32m address"),
+        ),
+        Err(BalanceError::NoChainSource) => control_error(
+            id,
+            ErrorCode::WalletNoChainSource,
+            "no live chain source could answer this balance read",
+        ),
+        Err(BalanceError::NotSynced) => control_error(
+            id,
+            ErrorCode::WalletNotSynced,
+            "the wallet is still syncing and no fallback is available to answer",
+        ),
+        Err(BalanceError::ReadFailed(e)) => {
+            control_error(id, ErrorCode::WalletReadFailed, format!("balance read failed: {e}"))
+        }
     }
 }
 

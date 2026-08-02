@@ -460,6 +460,7 @@ fn control_ctx(state: &AppState) -> ControlCtx {
         started: state.started,
         sync_available: state.sync_available,
         pairings: state.pairings.clone(),
+        wallet: state.wallet.clone(),
     }
 }
 
@@ -767,34 +768,40 @@ async fn rpc(
     // DIG_NODE_ALLOW_REMOTE=1, #1662) is defense-in-depth beneath this gate, not the gate itself.
     // The READ methods below are NOT token-gated.
     if control::is_control_method(&method) {
-        let header_tok = headers
-            .get(control::CONTROL_TOKEN_HEADER)
-            .and_then(|v| v.to_str().ok());
-        let presented = control::presented_token(header_tok, &req);
-        // Authorization is granted by EITHER the master control token OR — for a
-        // NON-administrative control method — a valid PAIRED token (#280). Pairing
-        // administration (list/approve/revoke) requires the MASTER token only, so a
-        // paired controller can neither mint more tokens nor revoke itself.
-        let master_ok = control::is_authorized(&method, presented.as_deref(), &state.control_token);
-        let paired_ok = !control::is_pairing_admin_method(&method)
-            && presented.as_deref().is_some_and(|tok| {
-                pairing::is_paired_token(&pairing::paired_tokens_path(&state.state_dir), tok)
-            });
-        if !(master_ok || paired_ok) {
-            return (
-                StatusCode::OK,
-                Json(control::control_error(
-                    id,
-                    ErrorCode::Unauthorized,
-                    format!(
-                        "control.* requires the local control token (X-Dig-Control-Token \
-                         header or params._control_token, from {}), or a paired controller \
-                         token (see `dig-node pair`). {}",
-                        control::control_token_path().display(),
-                        control::control_token_remedy()
-                    ),
-                )),
-            );
+        // An OPEN control READ (`control.wallet.balance`, #1851) is a public-address chain read
+        // with no custody — served WITHOUT the control token, like the other reads, while still
+        // routing through the control dispatcher below. Every other control method is token-gated.
+        if !control::is_open_control_read(&method) {
+            let header_tok = headers
+                .get(control::CONTROL_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok());
+            let presented = control::presented_token(header_tok, &req);
+            // Authorization is granted by EITHER the master control token OR — for a
+            // NON-administrative control method — a valid PAIRED token (#280). Pairing
+            // administration (list/approve/revoke) requires the MASTER token only, so a
+            // paired controller can neither mint more tokens nor revoke itself.
+            let master_ok =
+                control::is_authorized(&method, presented.as_deref(), &state.control_token);
+            let paired_ok = !control::is_pairing_admin_method(&method)
+                && presented.as_deref().is_some_and(|tok| {
+                    pairing::is_paired_token(&pairing::paired_tokens_path(&state.state_dir), tok)
+                });
+            if !(master_ok || paired_ok) {
+                return (
+                    StatusCode::OK,
+                    Json(control::control_error(
+                        id,
+                        ErrorCode::Unauthorized,
+                        format!(
+                            "control.* requires the local control token (X-Dig-Control-Token \
+                             header or params._control_token, from {}), or a paired controller \
+                             token (see `dig-node pair`). {}",
+                            control::control_token_path().display(),
+                            control::control_token_remedy()
+                        ),
+                    )),
+                );
+            }
         }
         let params = req.get("params").cloned().unwrap_or(json!({}));
         let ctx = control_ctx(&state);
