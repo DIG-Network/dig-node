@@ -247,17 +247,46 @@ pub async fn run_once() {
     tracing::debug!(outcome = ?reconcile, "self-heal: ext-forcelist reconcile");
 }
 
+/// Drive the self-heal cadence: run `pass` once immediately, then once per `tick`, forever.
+///
+/// The pass + tick are injected so the immediate-then-interval ORDER is falsifiable under a paused
+/// clock (#1864) — the detached `tokio::spawn` in [`spawn_driver`] is not itself observable, so the
+/// tested behaviour lives here. `tokio::time::interval` fires its FIRST tick immediately, so the
+/// first `pass` runs at spawn with no wait and every later one is `tick` apart.
+async fn drive<F, Fut>(tick: Duration, mut pass: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut ticker = tokio::time::interval(tick);
+    loop {
+        ticker.tick().await;
+        pass().await;
+    }
+}
+
 /// Spawn the always-on self-heal driver as a detached task: one pass immediately, then a pass every
 /// [`SELF_HEAL_TICK`]. Detached + best-effort — it never blocks or fails the serve path. On an
 /// unprivileged (dev/CLI) run its spawns simply resolve nothing and no-op.
 pub fn spawn_driver() {
-    tokio::spawn(async {
-        let mut ticker = tokio::time::interval(SELF_HEAL_TICK);
-        loop {
-            ticker.tick().await;
-            run_once().await;
-        }
-    });
+    tokio::spawn(drive(SELF_HEAL_TICK, run_once));
+}
+
+/// Spawn the self-heal driver **iff** this is a privileged service run — the single wiring seam the
+/// serve path calls (#1864). The service-gate lives here rather than inline at the call site so it is
+/// a tested unit ([`spawn_driver_if`]) a refactor cannot silently flip to always- or never-spawn. A
+/// dev/CLI run must not attempt the privileged sibling spawns, so it no-ops.
+pub fn spawn_driver_if_service() {
+    spawn_driver_if(crate::state::running_as_service(), spawn_driver);
+}
+
+/// The pure gate behind [`spawn_driver_if_service`]: invoke `spawn` exactly when `is_service`. Split
+/// out so a test asserts the driver spawns on a service run and NOT on a CLI run without launching a
+/// real detached task.
+fn spawn_driver_if(is_service: bool, spawn: impl FnOnce()) {
+    if is_service {
+        spawn();
+    }
 }
 
 #[cfg(test)]
@@ -419,5 +448,73 @@ mod tests {
         })
         .await;
         assert_eq!(outcome, KickOutcome::NotInstalled);
+    }
+
+    // -- #1864: the driver cadence + the service-gate wiring must both be falsifiable -----------
+
+    #[test]
+    fn spawn_driver_if_spawns_the_driver_only_on_a_service_run() {
+        use std::cell::Cell;
+        let spawned = Cell::new(false);
+        // A dev/CLI (non-service) run must NOT spawn the privileged driver.
+        spawn_driver_if(false, || spawned.set(true));
+        assert!(
+            !spawned.get(),
+            "a non-service run must not spawn the self-heal driver"
+        );
+        // A service run MUST spawn it — the wiring the serve path depends on. Flipping the gate to
+        // always- or never-spawn (the silent-unwiring #1864 guards against) fails one of these.
+        spawn_driver_if(true, || spawned.set(true));
+        assert!(
+            spawned.get(),
+            "a service run must spawn the self-heal driver"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn driver_runs_a_pass_immediately_then_once_per_tick() {
+        // A std channel makes each pass observable without depending on tokio's `sync` feature; its
+        // send is non-blocking so it never stalls the runtime. `#[tokio::test(start_paused)]` runs a
+        // single-thread runtime, so `yield_now` cooperatively lets the detached driver run, and time
+        // advances ONLY where we advance it — proving the immediate pass + exactly one pass per tick.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let tick = Duration::from_secs(3600);
+        // Let the driver make progress up to its next timer park.
+        async fn settle() {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let driver = tokio::spawn(async move {
+            drive(tick, move || {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(());
+                }
+            })
+            .await;
+        });
+
+        // interval's first tick is immediate: one pass with NO time advance.
+        settle().await;
+        assert_eq!(rx.try_iter().count(), 1, "one pass immediately on start");
+        // No further pass until a full tick elapses.
+        tokio::time::advance(tick - Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(
+            rx.try_iter().count(),
+            0,
+            "no pass before the interval elapses"
+        );
+        // The tick boundary fires exactly one more pass.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+        assert_eq!(
+            rx.try_iter().count(),
+            1,
+            "one pass per tick after the first"
+        );
+
+        driver.abort();
     }
 }

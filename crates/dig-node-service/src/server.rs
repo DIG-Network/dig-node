@@ -1565,10 +1565,9 @@ where
     // schedule ensure`, opt-out-respecting) and re-apply the extension force-install policy
     // (`dig-installer --set-ext-forcelist-channel`). Gated to a service run — its repairs need
     // elevation, and a dev/CLI run must not attempt privileged sibling spawns. Detached +
-    // best-effort: it never blocks or fails the serve path. See [`crate::self_heal`].
-    if crate::state::running_as_service() {
-        crate::self_heal::spawn_driver();
-    }
+    // best-effort: it never blocks or fails the serve path. The service-gate lives inside the seam
+    // (a tested unit, #1864) so it cannot be silently flipped to always- or never-spawn.
+    crate::self_heal::spawn_driver_if_service();
 
     // Best-effort mTLS `9257` listener (#368, Sage byte-parity, node-class clients, §5.3). Binds
     // loopback only; a bind failure (port in use) is NON-FATAL — the wallet stays reachable over
