@@ -844,8 +844,9 @@ For the current node library (§2.2) the catalogue is:
 - **local**: `dig.getContent`, `dig.getAnchoredRoot`, `dig.getManifest`, `dig.stage`,
   `dig.getCollection`, `dig.listCollectionItems`, the L7 peer surface (`dig.getNetworkInfo`,
   `dig.getPeers`, `dig.announce`, `dig.getAvailability`, `dig.listInventory`, `dig.fetchRange`),
-  and all `cache.*` (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
-  `cache.removeCached`, `cache.fetchAndCache`).
+  all `cache.*` (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
+  `cache.removeCached`, `cache.fetchAndCache`), and the chat subsystem `chat.send` / `chat.poll`
+  (§5.5.2).
 - **passthrough**: `dig.getCapsule` (an alias the node does NOT resolve — local-first callers use
   `dig.getContent`), `dig.getProof`, `dig.listCapsules`.
 - **shell**: `rpc.discover`.
@@ -880,6 +881,52 @@ version per path) as of a given capsule's commit. PUBLIC, unencrypted data; no `
   `RESOURCE_NOT_AVAILABLE_AT_ROOT`/unavailable code `dig.fetchRange` reports on a miss) — distinct
   from the "held but no manifest" case above.
 - Malformed `store_id`/`root` (not 64-hex) → `-32602` before any filesystem access.
+
+#### 5.5.2. Chat subsystem — `chat.send` / `chat.poll` (epic #793)
+
+The node is the directed-message **TRANSPORT** for dig-chat: an application seals its own opaque
+`DIGCHAT1` message body and the node wraps that blob in an e2e-sealed `dig-message` envelope
+addressed to the recipient's `0x0010` BLS identity key, then dig-gossip directed-sends it over
+opcode 220 (`DIG_MESSAGE`). The node NEVER parses the `DIGCHAT1` body — it is carried verbatim in
+`dig_chat_protocol::ChatMessage::envelope` (message type id `0x0000_0200`, dig-message's dig-chat
+band).
+
+**Double seal (NC-1, content-blindness).** Two independent seals stack: the inner `DIGCHAT1` seal
+the app applies, and the outer `dig-message` seal to the recipient's BLS key. A relay or on-path
+peer sees only the outer ciphertext; a peer that terminates the outer seal still faces the inner
+one. The node cannot expose chat plaintext even in principle. A conformance test asserts neither
+the plaintext body nor the plaintext message id appears in the on-wire sealed bytes.
+
+- **`chat.send`** — seal + directed-send. Params `{ recipient_did (64-hex), recipient_pub (base64,
+  the recipient's 48-byte BLS G1 sealing key), peer_id (64-hex, the gossip directed-send target),
+  envelope (base64, the opaque `DIGCHAT1` bytes) }`. Result `{ message_id }` (64-hex, a
+  node-minted `SHA-256(sender_did ‖ counter ‖ envelope)`). Each send stamps a strictly-monotonic
+  per-node anti-replay counter and a 5-minute expiry (dig-message §5.6/§5.6b). Errors: `-32050`
+  (no node identity key), `-32602` (missing/malformed param), `-32051` (no peer network), `-32052`
+  (seal or directed-send failed). The node seals as the node identity DID
+  `SHA-256(node BLS G1 public key)`.
+- **`chat.poll`** — drain the inbound inbox. No params. Result `{ messages: [{ sender_did (64-hex,
+  the verified envelope sender), message_id (64-hex), envelope (base64, the opaque `DIGCHAT1`
+  body) }] }`, in arrival order, leaving the inbox empty. The inbox is bounded (oldest evicted at
+  capacity) so a paired peer cannot grow node memory without bound.
+
+**Inbound path.** A received opcode-220 frame is opened (`dig-message` unseal → BLS-G2 signature
+verify → anti-replay → expiry), routed through the chat `MessageRegistry`, and the decoded
+`ChatMessage` is queued into the inbox. A sender the node cannot resolve to a BLS key is rejected,
+never queued (fail-closed). This describes the inbound handler (`process_inbound_frame`), which is
+implemented and unit-tested; the **live peer-network feed that invokes it is not yet wired** into
+`run_peer_network` (see Deferred), so in the shipped build `chat.poll` returns empty until that
+loop lands.
+
+**Deferred (epic #793):** the **live inbound feed** — the `run_peer_network` loop that drains
+`GossipHandle::inbound_receiver()` into `process_inbound_frame` — is not yet wired (the handler is
+implemented + unit-tested but nothing in production calls it, so `chat.poll` is always empty until
+this lands; it is gated on the sender-key resolver below). The sealing-key directory
+(`resolveSealingKey`) that maps a recipient DID to its attested `0x0010` BLS key + gossip `PeerId`,
+and the inbound sender-key resolver, are NOT in this MVP — the app supplies `recipient_pub` +
+`peer_id` on `chat.send`, and the inbound resolver is caller-supplied. Group chat, onion routing, and receipt UX are out of scope; the five
+chat message types (message, delivery/read receipts, typing, presence) are defined in
+`dig-chat-protocol` but only `ChatMessage` surfaces to `chat.poll`.
 
 ### 5.6. OpenRPC drift guard (conformance test)
 

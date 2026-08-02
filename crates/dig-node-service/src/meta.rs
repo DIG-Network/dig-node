@@ -471,6 +471,28 @@ pub fn methods() -> &'static [MethodInfo] {
                       of control.peers.connect). Idempotent. Params { peer }.",
             requires_auth: true,
         },
+        // -- chat subsystem (epic #793) — the directed-message TRANSPORT. Served LOCALLY by the
+        // node engine (dispatched in seams::dig_rpc BEFORE the Method catalogue). The node seals an
+        // app-supplied opaque DIGCHAT1 envelope to the recipient's 0x0010 key and dig-gossip
+        // directed-sends it; it never parses chat content. -------------------------------------
+        MethodInfo {
+            name: "chat.send",
+            served: "local",
+            summary: "Seal an opaque DIGCHAT1 envelope to a recipient and directed-send it over \
+                      dig-gossip (opcode 220). Params { recipient_did (64-hex), recipient_pub \
+                      (base64 48-byte BLS G1 sealing key), peer_id (64-hex gossip target), \
+                      envelope (base64 opaque DIGCHAT1) }; result { message_id (64-hex) }. \
+                      recipient_pub + peer_id are app-supplied pending the key directory.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            name: "chat.poll",
+            served: "local",
+            summary: "Drain the node's inbound chat inbox. No params; result { messages: \
+                      [{ sender_did (64-hex), message_id (64-hex), envelope (base64 opaque \
+                      DIGCHAT1) }] } in arrival order.",
+            requires_auth: false,
+        },
     ]
 }
 

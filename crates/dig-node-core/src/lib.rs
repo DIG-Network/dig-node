@@ -47,6 +47,7 @@ use tokio::sync::Mutex;
 
 mod capsule_key;
 pub mod chainwatch;
+pub mod chat;
 pub mod download;
 pub mod peer;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
@@ -344,6 +345,11 @@ pub struct Node {
     /// badge + proof-inspection modal. Populated on the existing verify step (never re-verified),
     /// fail-closed unchanged. See [`verification_ledger::VerificationLedger`].
     verification_ledger: verification_ledger::VerificationLedger,
+    /// The chat subsystem state (epic #793): the inbound-message inbox `chat.poll` drains and the
+    /// monotonic anti-replay counter each outbound `chat.send` stamps. The node is the chat TRANSPORT
+    /// only — it seals an app-supplied opaque `DIGCHAT1` envelope and dig-gossip directed-sends it; it
+    /// never parses chat content. See [`chat`].
+    chat: chat::ChatState,
 }
 
 /// A boxed async hook that reconciles the node's DHT provider records with its current cache
@@ -2463,6 +2469,7 @@ impl Node {
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
+            chat: chat::ChatState::new(),
         })
     }
 
@@ -2558,6 +2565,7 @@ pub(crate) mod test_support {
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+            chat: chat::ChatState::new(),
         };
         (Arc::new(node), td)
     }
@@ -2912,6 +2920,7 @@ mod tests {
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+            chat: chat::ChatState::new(),
         };
         (node, td)
     }
@@ -2989,6 +2998,7 @@ mod tests {
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+            chat: chat::ChatState::new(),
         };
 
         // Missing before the pull.
@@ -3034,6 +3044,7 @@ mod tests {
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+            chat: chat::ChatState::new(),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -3120,6 +3131,7 @@ mod tests {
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+                chat: chat::ChatState::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -3188,6 +3200,7 @@ mod tests {
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+                chat: chat::ChatState::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -7636,6 +7649,7 @@ mod tests {
         seed_local_resource(&node, store, tip, rk, 5000);
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            chat: chat::ChatState::new(),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -7682,6 +7696,7 @@ mod tests {
         seed_local_resource(&node, store, tip, rk, 5000);
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            chat: chat::ChatState::new(),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -7727,6 +7742,7 @@ mod tests {
         seed_local_resource(&node, store, tip, rk, 5000);
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            chat: chat::ChatState::new(),
             ..node
         };
 
@@ -7754,6 +7770,7 @@ mod tests {
         seed_local_resource(&node, store, tip, rk, 5000);
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(1_000_000),
+            chat: chat::ChatState::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -7790,6 +7807,7 @@ mod tests {
         seed_local_resource(&node, store, tip, rk, 5000);
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            chat: chat::ChatState::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -7828,6 +7846,7 @@ mod tests {
         seed_local_resource(&node, store, tip, rk, 5000);
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
+            chat: chat::ChatState::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
