@@ -257,6 +257,24 @@ enum ProxyMiss {
 /// unchanged from this module (W1b-1) — a behaviour-preserving trait extraction, not a new
 /// implementation. `async_trait`-boxed (matching [`crate::shared::AnchoredRootResolver`]) so the
 /// trait stays dyn-compatible for the future `Arc<dyn ContentServer>` handle (W1c).
+/// Collapse the two landing axes (#1654) into the single [`ReadOrigin`] the miss-path landing legs
+/// (`maybe_backfill_capsule`, `peer_serve_plaintext`→reshare) gate on. A first-party request keeps
+/// its transport origin (a loopback operator read still lands); a CROSS-SITE request — driven by
+/// another origin's page — folds to [`Peer`] so it serves the bytes but effects no durable holder
+/// side effect. PURE: the ONE place the two axes meet.
+///
+/// [`ReadOrigin`]: crate::download::ReadOrigin
+/// [`Peer`]: crate::download::ReadOrigin::Peer
+fn landing_origin(
+    origin: crate::download::ReadOrigin,
+    provenance: crate::download::RequestProvenance,
+) -> crate::download::ReadOrigin {
+    match provenance {
+        crate::download::RequestProvenance::FirstParty => origin,
+        crate::download::RequestProvenance::CrossSite => crate::download::ReadOrigin::Peer,
+    }
+}
+
 #[async_trait::async_trait]
 pub trait ContentServer: Send + Sync {
     /// Serve a store resource as DECRYPTED plaintext over the trusted loopback surface (#289).
@@ -284,6 +302,12 @@ pub trait ContentServer: Send + Sync {
     /// `spawn_capsule_reshare` behind the peer tier's `fetch_resource`); a `Peer` read is served
     /// but effects nothing, so a stranger can never drive this node into pulling, caching, and
     /// DHT-announcing capsules of the STRANGER'S choosing (#1576).
+    ///
+    /// `provenance` is the SECOND landing axis (#1654): even on a `Local` (loopback) connection, a
+    /// browser-reported `Sec-Fetch-Site: cross-site` marks the request as driven by another origin's
+    /// page (a CSRF vector). The bytes ALWAYS serve regardless of provenance; only the landing side
+    /// effects fold to `Peer` for a cross-site request, so a malicious page cannot make this node
+    /// land + DHT-announce a capsule of its choosing. Non-browser clients send no header ⇒ first-party.
     async fn serve_content_plaintext(
         &self,
         store_hex: &str,
@@ -291,6 +315,7 @@ pub trait ContentServer: Send + Sync {
         resource_key: &str,
         salt_hex: Option<&str>,
         origin: crate::download::ReadOrigin,
+        provenance: crate::download::RequestProvenance,
     ) -> PlaintextOutcome;
 
     /// The store's public file PATHS at `(store, root)` from the embedded `PublicManifest` (id 13),
@@ -322,7 +347,13 @@ impl ContentServer for Node {
         resource_key: &str,
         salt_hex: Option<&str>,
         origin: crate::download::ReadOrigin,
+        provenance: crate::download::RequestProvenance,
     ) -> PlaintextOutcome {
+        // The landing axis (#1654): a cross-site request serves the bytes but must NOT trigger the
+        // network-effecting landing legs (whole-capsule backfill + reshare/DHT-announce), so a
+        // malicious page can never CSRF this node into becoming a holder of a capsule it chose.
+        // The READ tiers still use `origin`; only the LANDING calls below use `land_origin`.
+        let land_origin = landing_origin(origin, provenance);
         let store_id = match Bytes32::from_hex(store_hex.trim()) {
             Ok(b) => b,
             Err(_) => {
@@ -482,12 +513,12 @@ impl ContentServer for Node {
                     pinned_root,
                     salt.as_ref(),
                     verified,
-                    origin,
+                    land_origin,
                 )
                 .await
             {
                 // A peer served the resource; warm the whole capsule locally for next time (#290).
-                self.maybe_backfill_capsule(store_hex, &root_hex, origin);
+                self.maybe_backfill_capsule(store_hex, &root_hex, land_origin);
                 return with_serve_metadata(peer, owner_puzzle_hash, generation, peer_tier);
             }
         }
@@ -498,7 +529,7 @@ impl ContentServer for Node {
                 Ok((ciphertext, proof, chunk_lens)) => {
                     let trusted = pinned_root.unwrap_or(proof.root);
                     // Warm the whole capsule locally so the next read is local-first (#290).
-                    self.maybe_backfill_capsule(store_hex, &root_hex, origin);
+                    self.maybe_backfill_capsule(store_hex, &root_hex, land_origin);
                     return match verify_and_decrypt(
                         &store_id,
                         effective_key,
@@ -559,7 +590,7 @@ impl ContentServer for Node {
                     };
                 }
                 Err(ProxyMiss::NotFound) => {
-                    self.maybe_backfill_capsule(store_hex, &root_hex, origin);
+                    self.maybe_backfill_capsule(store_hex, &root_hex, land_origin);
                     return PlaintextOutcome::NotFound {
                         root_hex: root_hex.clone(),
                     };
@@ -993,5 +1024,43 @@ mod tests {
             out.is_err(),
             "decrypting under the wrong URN key must fail closed"
         );
+    }
+
+    // -- landing_origin: the two-axis collapse (#1654) --------------------------------------------
+
+    use crate::download::{ReadOrigin, RequestProvenance};
+
+    #[test]
+    fn first_party_local_read_still_lands() {
+        // A same-site / header-absent (CLI/SDK) request keeps its Local origin, so a legitimate
+        // operator read still triggers the whole-capsule warm + reshare (the #290 flywheel).
+        assert_eq!(
+            landing_origin(ReadOrigin::Local, RequestProvenance::FirstParty),
+            ReadOrigin::Local,
+            "a first-party local read must keep landing"
+        );
+    }
+
+    #[test]
+    fn cross_site_local_read_does_not_land() {
+        // The CSRF door (#1654): a loopback connection whose browser reports cross-site provenance
+        // folds to Peer, so the bytes serve but no durable holder side effect fires.
+        assert_eq!(
+            landing_origin(ReadOrigin::Local, RequestProvenance::CrossSite),
+            ReadOrigin::Peer,
+            "a cross-site read must NOT land, even on a loopback connection"
+        );
+    }
+
+    #[test]
+    fn a_peer_read_never_lands_regardless_of_provenance() {
+        // A genuine peer-wire read never lands; provenance can only ever tighten, never loosen.
+        for provenance in [RequestProvenance::FirstParty, RequestProvenance::CrossSite] {
+            assert_eq!(
+                landing_origin(ReadOrigin::Peer, provenance),
+                ReadOrigin::Peer,
+                "a peer read must never land"
+            );
+        }
     }
 }
