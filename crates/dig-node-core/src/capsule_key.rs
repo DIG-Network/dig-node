@@ -5,7 +5,7 @@
 //!
 //! A capsule is named by `(store_id, root)`, and on the peer surface BOTH components arrive as raw
 //! bytes chosen by an untrusted caller. The node turns them into a path
-//! (`<cache>/modules/<store>/<root>.module`) and into log records. Both are places where an
+//! (`<cache>/modules/<store>/<root>.dig`) and into log records. Both are places where an
 //! attacker-chosen string is dangerous: `..` segments walk out of the cache, and a `\n` forges a log
 //! record.
 //!
@@ -48,6 +48,78 @@ const CANONICAL_ID_LEN: usize = 64;
 /// parent directory while the pull staged in this one, so abandoned staging accumulated forever.
 pub(crate) const MODULE_STAGING_SUBDIR: &str = "modules";
 
+/// The file extension a freshly-landed capsule is written with (#1896).
+///
+/// Unified with the staging artifact ([`CapsuleKey::staged_module_path`], `.dig`) so ONE capsule has
+/// ONE artifact extension end-to-end — a cached capsule and the `.dig` it was staged from are now the
+/// same shape, not `.module` vs `.dig`.
+pub(crate) const CACHED_MODULE_EXT: &str = "dig";
+
+/// The extension a PRIOR node version wrote a landed capsule with (#1896).
+///
+/// Still READ — reader-tolerance keeps a cache written by an older binary making this node a holder —
+/// and a startup pass ([`migrate_legacy_module_extensions`]) renames it to [`CACHED_MODULE_EXT`], so
+/// the fallback is only ever exercised on a not-yet-migrated cache.
+pub(crate) const LEGACY_MODULE_EXT: &str = "module";
+
+/// Strip the cached-capsule extension — the current `.dig` or the legacy `.module` (#1896) — from a
+/// file name, yielding its `<root_hex>` stem, or `None` if the name is not a cached capsule.
+///
+/// The SINGLE authority on which suffixes name a capsule on disk, so the inventory scan
+/// ([`CapsuleStore::cache_list_cached`](crate::CapsuleStore::cache_list_cached)) and the path builders
+/// can never disagree about what counts as a held capsule.
+pub(crate) fn cached_root_stem(file_name: &str) -> Option<&str> {
+    file_name
+        .strip_suffix(&format!(".{CACHED_MODULE_EXT}"))
+        .or_else(|| file_name.strip_suffix(&format!(".{LEGACY_MODULE_EXT}")))
+}
+
+/// Converge a cache written by a prior binary onto the unified `.dig` artifact (#1896): rename every
+/// legacy `<cache>/modules/<store>/*.module` to `*.dig`.
+///
+/// Idempotent + crash-safe by construction, so it is safe to run unconditionally at every bring-up:
+/// - a name whose `.dig` target ALREADY exists has its redundant `.module` deleted (dedup, never a
+///   failure), because the two are byte-identical content-addressed artifacts;
+/// - a partially-migrated cache is finished by the next run, and reader-tolerance
+///   ([`CapsuleKey::resolve_cached_path`]) serves either suffix in the meantime, so an interrupted
+///   pass never drops a holder.
+///
+/// Best-effort: an unreadable directory or a failed rename is skipped rather than propagated — a
+/// convergence sweep must never abort a node's bring-up.
+pub(crate) fn migrate_legacy_module_extensions(cache_dir: &Path) {
+    let modules_root = cache_dir.join("modules");
+    let Ok(stores) = std::fs::read_dir(&modules_root) else {
+        return; // no cache yet — nothing to converge
+    };
+    for store_entry in stores.flatten() {
+        let store_dir = store_entry.path();
+        if !store_dir.is_dir() {
+            continue;
+        }
+        let Ok(modules) = std::fs::read_dir(&store_dir) else {
+            continue;
+        };
+        for m in modules.flatten() {
+            let legacy = m.path();
+            let is_legacy = legacy
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e == LEGACY_MODULE_EXT);
+            if !is_legacy {
+                continue;
+            }
+            let unified = legacy.with_extension(CACHED_MODULE_EXT);
+            if unified.exists() {
+                // Both artifacts present (a prior interrupted run, or a re-land): the `.dig` is the
+                // canonical one, so the legacy duplicate is redundant — remove it rather than fail.
+                let _ = std::fs::remove_file(&legacy);
+            } else {
+                let _ = std::fs::rename(&legacy, &unified);
+            }
+        }
+    }
+}
+
 /// Is `s` a canonical DIG content id — a 32-byte value written as exactly 64 hex digits?
 ///
 /// The single predicate every guard over a CALLER-SUPPLIED id shares, so "canonical" can never come to
@@ -85,15 +157,43 @@ impl CapsuleKey {
         &self.store
     }
 
-    /// The cached module path for this capsule: `<cache_dir>/modules/<store>/<root>.module`.
+    /// The cached module path for this capsule: `<cache_dir>/modules/<store>/<root>.dig` (#1896).
     ///
     /// The existence of this file is what makes the node a HOLDER of the capsule, so this is also the
-    /// path the availability answer and the reshare promotion agree on.
+    /// path a fresh land WRITES and the shape the availability answer and reshare promotion agree on.
+    /// To READ a capsule (which may still be on disk under the legacy `.module` extension), go through
+    /// [`resolve_cached_path`](Self::resolve_cached_path), not this — this always names the CURRENT
+    /// `.dig` shape.
     pub(crate) fn module_path(&self, cache_dir: &Path) -> PathBuf {
+        self.cached_path_with_ext(cache_dir, CACHED_MODULE_EXT)
+    }
+
+    /// The cached path for this capsule with an explicit extension — the shared join both the current
+    /// `.dig` and the legacy `.module` paths are built from, so the directory layout lives in ONE place.
+    fn cached_path_with_ext(&self, cache_dir: &Path, ext: &str) -> PathBuf {
         cache_dir
             .join("modules")
             .join(&self.store)
-            .join(format!("{}.module", self.root))
+            .join(format!("{}.{ext}", self.root))
+    }
+
+    /// Resolve where this capsule ACTUALLY lives on disk to read it, tolerating a legacy cache (#1896):
+    /// the current `.dig` path if it exists, else the legacy `.module` path a prior binary may have
+    /// written, else the `.dig` path.
+    ///
+    /// Returning the `.dig` path when NEITHER exists is deliberate: a caller about to write, or about
+    /// to report "not held", should see the canonical current shape, never the legacy one. Every read
+    /// site routes through here so no site re-derives the fallback and drifts (#1896).
+    pub(crate) fn resolve_cached_path(&self, cache_dir: &Path) -> PathBuf {
+        let unified = self.module_path(cache_dir);
+        if unified.exists() {
+            return unified;
+        }
+        let legacy = self.cached_path_with_ext(cache_dir, LEGACY_MODULE_EXT);
+        if legacy.exists() {
+            return legacy;
+        }
+        unified
     }
 
     /// The staging path a whole-capsule warm pulls into: `<staging_dir>/modules/<store>-<root>.dig`.
@@ -253,6 +353,92 @@ mod tests {
         assert_eq!(rendered.len(), CANONICAL_ID_LEN * 2 + 1, "bounded length");
         assert_eq!(format!("{key:?}"), format!("CapsuleKey({rendered})"));
     }
-}
 
-// TODO(#1896): unify the cached-capsule artifact on `.dig` (salvage-anchor stub).
+    #[test]
+    fn a_landed_capsule_is_written_with_the_dig_extension() {
+        // #1896: the cache landing is unified onto `.dig` — `module_path` (the WRITE path) names the
+        // `.dig` artifact, never the legacy `.module`.
+        let cache = tempfile::tempdir().expect("tempdir");
+        let key = CapsuleKey::parse(&hex_id(0x11), &hex_id(0x22)).expect("canonical");
+        let path = key.module_path(cache.path());
+        assert_eq!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("dig"),
+            "a landed capsule is a `.dig`, not a `.module`"
+        );
+    }
+
+    #[test]
+    fn resolve_cached_path_prefers_dig_then_falls_back_to_legacy_module() {
+        // #1896 reader-tolerance: read the current `.dig` when present, else the legacy `.module` a
+        // prior binary wrote, else the canonical `.dig` shape (for a not-held / about-to-write caller).
+        let cache = tempfile::tempdir().expect("tempdir");
+        let key = CapsuleKey::parse(&hex_id(0x33), &hex_id(0x44)).expect("canonical");
+        let dig = key.module_path(cache.path());
+        let legacy = key.cached_path_with_ext(cache.path(), LEGACY_MODULE_EXT);
+        std::fs::create_dir_all(dig.parent().unwrap()).unwrap();
+
+        // Neither present → the canonical `.dig` shape.
+        assert_eq!(key.resolve_cached_path(cache.path()), dig);
+
+        // Only legacy present → the legacy path (a cache written by an older version is still served).
+        std::fs::write(&legacy, b"legacy").unwrap();
+        assert_eq!(key.resolve_cached_path(cache.path()), legacy);
+
+        // Both present → the `.dig` wins (the canonical current artifact).
+        std::fs::write(&dig, b"unified").unwrap();
+        assert_eq!(key.resolve_cached_path(cache.path()), dig);
+    }
+
+    #[test]
+    fn cached_root_stem_accepts_either_suffix_and_rejects_others() {
+        let root = hex_id(0x55);
+        assert_eq!(
+            cached_root_stem(&format!("{root}.dig")),
+            Some(root.as_str())
+        );
+        assert_eq!(
+            cached_root_stem(&format!("{root}.module")),
+            Some(root.as_str())
+        );
+        assert_eq!(cached_root_stem(&format!("{root}.tmp")), None);
+        assert_eq!(cached_root_stem(&root), None);
+    }
+
+    #[test]
+    fn startup_migration_renames_module_to_dig_and_is_idempotent() {
+        // #1896 convergence: a startup pass renames legacy `.module` to `.dig`; where both already
+        // exist the redundant `.module` is deleted; nothing is lost; a second run is a no-op.
+        let cache = tempfile::tempdir().expect("tempdir");
+        let store = hex_id(0x66);
+        let store_dir = cache.path().join("modules").join(&store);
+        std::fs::create_dir_all(&store_dir).unwrap();
+
+        let root_legacy = hex_id(0x01);
+        let root_both = hex_id(0x02);
+        std::fs::write(store_dir.join(format!("{root_legacy}.module")), b"a").unwrap();
+        // A capsule already migrated on a prior interrupted run: BOTH suffixes on disk.
+        std::fs::write(store_dir.join(format!("{root_both}.module")), b"b").unwrap();
+        std::fs::write(store_dir.join(format!("{root_both}.dig")), b"b").unwrap();
+
+        migrate_legacy_module_extensions(cache.path());
+
+        assert!(store_dir.join(format!("{root_legacy}.dig")).exists());
+        assert!(!store_dir.join(format!("{root_legacy}.module")).exists());
+        assert!(store_dir.join(format!("{root_both}.dig")).exists());
+        assert!(
+            !store_dir.join(format!("{root_both}.module")).exists(),
+            "the redundant legacy duplicate is removed"
+        );
+
+        // Idempotent: a second run changes nothing.
+        migrate_legacy_module_extensions(cache.path());
+        let names: Vec<_> = std::fs::read_dir(&store_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "only the two `.dig` artifacts remain");
+        assert!(names.iter().all(|n| n.ends_with(".dig")));
+    }
+}

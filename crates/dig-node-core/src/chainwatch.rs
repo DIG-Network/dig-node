@@ -10,7 +10,8 @@
 //!   node never gap-fills against a root the chain could not confirm).
 //!
 //! - **§14.3 generation gap-fill** — when the confirmed tip is a root the node does not hold locally
-//!   (`<cache>/modules/<store>/<root>.module` absent), the node is MISSING that generation. It
+//!   (`<cache>/modules/<store>/<root>.dig` absent, tolerating a legacy `.module`), the node is MISSING
+//!   that generation. It
 //!   actively pulls it down (via the injected [`GapFiller`]), verifying against the chain-anchored
 //!   root exactly as a read would, then refreshes its DHT provider records so peers find it as a new
 //!   holder. This is the *"actively seek other nodes to pull the missing generations"* behavior.
@@ -115,7 +116,7 @@ pub trait GapFiller: Send + Sync {
 /// Whether the node holds the module for `(store_id, root)` locally. A thin seam over
 /// [`crate::module_exists`] so the loop's "is this generation missing?" check is injectable in tests.
 pub trait HeldCheck: Send + Sync {
-    /// `true` iff `<cache>/modules/<store>/<root>.module` is present.
+    /// `true` iff `<cache>/modules/<store>/<root>.dig` (or a legacy `.module`) is present.
     fn is_held(&self, store_id: &[u8; 32], root: &Bytes32) -> bool;
 }
 

@@ -18,7 +18,7 @@
 //! ```text
 //!   <downloads>/modules/<store>-<root>.dig.download.tmp   staging (dig-download FileSink)
 //!   <downloads>/modules/<store>-<root>.dig                verified, NOT yet a holder
-//!   <cache>/modules/<store>/<root>.module                 CACHED  ==  ANNOUNCED AS HOLDER
+//!   <cache>/modules/<store>/<root>.dig                    CACHED  ==  ANNOUNCED AS HOLDER
 //! ```
 //!
 //! The last hop is the one that matters. The node's DHT provider records are derived from its CACHE
@@ -201,7 +201,7 @@ pub struct WarmPaths {
     /// The directory the pull stages into. MUST NOT be inside the cache: a file under the cache path is
     /// already an announcement (see the module docs).
     pub staging_dir: PathBuf,
-    /// The node's cache dir. The final hop writes `<cache>/modules/<store>/<root>.module`.
+    /// The node's cache dir. The final hop writes `<cache>/modules/<store>/<root>.dig`.
     pub cache_dir: PathBuf,
 }
 
@@ -248,7 +248,7 @@ fn promote_into_cache(
     }
     // Write-then-rename INTO the cache, so a reader never observes a partial module at the cache path
     // (whose mere existence is this node's holder claim).
-    let tmp = cached.with_extension("module.warm.tmp");
+    let tmp = cached.with_extension("dig.warm.tmp");
     std::fs::write(&tmp, &bytes).map_err(|_| WarmFailure::CacheWriteFailed)?;
     std::fs::rename(&tmp, cached).map_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -801,7 +801,7 @@ mod tests {
             .join("cache")
             .join("modules")
             .join(&store_hex)
-            .join(format!("{root_hex}.module"));
+            .join(format!("{root_hex}.dig"));
         assert_eq!(
             std::fs::read(&cached_path).expect("module is at the cache path"),
             module,

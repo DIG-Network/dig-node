@@ -564,7 +564,7 @@ pub fn gossip_listen_candidates(gossip_port: u16) -> Vec<std::net::SocketAddr> {
 // -- Local inventory → L7 availability / inventory / range -------------------------------------------
 //
 // The node serves the SAME content over the peer RPC that it serves over §21 / the HTTP read path:
-// the capsules cached on disk (`<cache>/modules/<store>/<root>.module`). `cache_list_cached()` is the
+// the capsules cached on disk (`<cache>/modules/<store>/<root>.dig`). `cache_list_cached()` is the
 // authoritative local inventory, so these pure helpers derive the peer-RPC answers from it.
 
 /// Group a flat list of cached capsules into `store_id → [root, …]` (roots deduped, sorted). Pure so
@@ -2104,6 +2104,11 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     // Install the weak self-reference so a `&self` read handler can spawn an owned-`Arc` background
     // task — the capsule backfill on a read-from-another-node (SPEC §5.6). Weak: no self-keep-alive.
     node.set_self_ref(Arc::downgrade(&node));
+    // Converge a cache written by a prior binary onto the unified `.dig` artifact BEFORE the first
+    // inventory announce below (#1896): rename any legacy `<cache>/modules/<store>/*.module` to `.dig`.
+    // Idempotent + crash-safe, and reader-tolerance serves either suffix meanwhile, so a legacy holder
+    // is never dropped by the upgrade.
+    crate::capsule_key::migrate_legacy_module_extensions(node.cache_dir_path());
     let status = node.peer_status();
     // The EFFECTIVE genesis (from `DIG_NETWORK_GENESIS`, else the canonical mainnet genesis) and the
     // effective network label derived from it — the ONE resolution shared by the gossip config, the

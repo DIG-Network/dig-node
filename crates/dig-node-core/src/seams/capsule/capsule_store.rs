@@ -25,7 +25,7 @@ use crate::{module_exists, CachedCapsule, Node, PeerNetwork};
 #[async_trait::async_trait]
 pub trait CapsuleStore: Send + Sync {
     /// List every cached capsule (`storeId:rootHash`) with its on-disk size and
-    /// last-used time. Walks `<cache>/modules/<storeId_hex>/<root_hex>.module`
+    /// last-used time. Walks `<cache>/modules/<storeId_hex>/<root_hex>.dig`
     /// (the same layout `module_path`/`serve_local`/`sync_module_from` use),
     /// reusing the directory-enumerate pattern from [`cache_used_bytes`](crate::cache_used_bytes) and
     /// [`Node::evict_if_needed`]. `last_used_unix_ms` is the file mtime (the LRU
@@ -135,7 +135,7 @@ impl CapsuleStore for Node {
     async fn cache_list_cached(&self) -> Vec<CachedCapsule> {
         let modules_root = self.cache_dir.join("modules");
         let mut out = Vec::new();
-        // Outer level: one directory per store id (hex). Inner: `<root>.module`.
+        // Outer level: one directory per store id (hex). Inner: `<root>.dig` (or a legacy `<root>.module`).
         let Ok(stores) = std::fs::read_dir(&modules_root) else {
             return out; // no modules cached yet
         };
@@ -151,11 +151,13 @@ impl CapsuleStore for Node {
             };
             for m in modules.flatten() {
                 let path = m.path();
-                // A capsule module is `<root_hex>.module`; skip anything else.
+                // A capsule module is `<root_hex>.dig` (or a legacy `<root_hex>.module` a prior binary
+                // wrote — #1896); either names a held capsule, so stripping BOTH suffixes from one
+                // authority is what keeps a legacy holder discoverable through the upgrade.
                 let Some(root_hex) = path
                     .file_name()
                     .and_then(|f| f.to_str())
-                    .and_then(|f| f.strip_suffix(".module"))
+                    .and_then(crate::capsule_key::cached_root_stem)
                     .map(str::to_string)
                 else {
                     continue;
@@ -189,7 +191,9 @@ impl CapsuleStore for Node {
         let Some(capsule) = crate::CapsuleKey::parse(store_id_hex, root_hex) else {
             return Err("invalid capsule key: store_id and root must each be 64-hex".to_string());
         };
-        let path = capsule.module_path(&self.cache_dir);
+        // Remove whichever artifact is on disk — the current `.dig` or a legacy `.module` (#1896) — so
+        // a removal on a not-yet-migrated cache still clears the holder claim.
+        let path = capsule.resolve_cached_path(&self.cache_dir);
 
         let _guard = self.cache_lock.lock().await;
         if !path.exists() {
@@ -220,8 +224,8 @@ impl CapsuleStore for Node {
         let capsule = crate::CapsuleKey::parse(store_id_hex, root_hex).ok_or_else(|| {
             "invalid capsule key: store_id and root must each be 64-hex".to_string()
         })?;
-        // Already cached → report its size, no network.
-        if let Ok(md) = std::fs::metadata(capsule.module_path(&self.cache_dir)) {
+        // Already cached → report its size, no network (tolerating a legacy `.module`, #1896).
+        if let Ok(md) = std::fs::metadata(capsule.resolve_cached_path(&self.cache_dir)) {
             return Ok((md.len(), root_hex.to_string()));
         }
         // Serialize on-demand writes so two fetches of the same capsule don't race.
@@ -232,7 +236,8 @@ impl CapsuleStore for Node {
         let sync = self
             .sync_module_from(&self.upstream, store_id_hex, root_hex)
             .await;
-        let path = capsule.module_path(&self.cache_dir);
+        // A fresh land is written as `.dig`; resolve tolerates a legacy `.module` already on disk.
+        let path = capsule.resolve_cached_path(&self.cache_dir);
         match std::fs::metadata(&path) {
             Ok(md) => {
                 // A capsule just entered this node's served set at runtime. Landing a capsule MUST make
