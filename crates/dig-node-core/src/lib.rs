@@ -4852,7 +4852,10 @@ mod tests {
         .await["result"]["refetch_count"]
             .as_u64()
             .unwrap();
-        assert_eq!(before, after_failed, "a failed sync must not count as a refetch");
+        assert_eq!(
+            before, after_failed,
+            "a failed sync must not count as a refetch"
+        );
     }
 
     // -- dig.stage (#95 Pass C): in-process capsule staging/compile -------------

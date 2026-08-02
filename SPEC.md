@@ -1323,11 +1323,44 @@ eviction. These additive fields/methods complete that surface; all are `served: 
   shared }`.
 
 - **`cache.stats` — session cache telemetry (new).** Result:
-  `{ cap_bytes, used_bytes, entry_count, total_bytes, evicted_count, evicted_bytes,
-  content_cache: { hits, misses } }`. `entry_count`/`total_bytes` are the count and summed on-disk
-  size of cached capsules; `evicted_count`/`evicted_bytes` are the disk-cache LRU evictions since the
-  node started; `content_cache.hits`/`misses` are the decoded-content (RAM) cache lookups since
-  start. All counters are process-lifetime (reset each start), never persisted.
+  `{ cap_bytes, used_bytes, entry_count, total_bytes, evicted_count, evicted_bytes, refetch_count,
+  content_cache: { hits, misses }, tiers: { tier0_precache, tier1_demand, tier2_bribed } }`.
+  `entry_count`/`total_bytes` are the count and summed on-disk size of cached capsules;
+  `evicted_count`/`evicted_bytes` are the disk-cache LRU evictions since the node started;
+  `content_cache.hits`/`misses` are the decoded-content (RAM) cache lookups since start. All
+  counters are process-lifetime (reset each start), never persisted. See §7.10e for
+  `refetch_count` and `tiers`.
+
+### 7.10e. Cache observability metrics (#1991, epic #1934)
+
+`cache.stats` (§7.10) exposes the metrics a controller (the dig-chrome-extension control panel; the
+relay-globe per-location cached-store count, #1933) needs to observe cache HEALTH, not just its
+current contents. Each field is sourced from a REAL counter or, where the underlying signal does not
+exist yet, an honestly-stubbed placeholder — never a fabricated number.
+
+- **`refetch_count`** — whole-capsule NETWORK lands since process start: bytes actually pulled over
+  the wire and written to disk, as opposed to a RAM decode-cache miss (`content_cache.misses`, which
+  can hit an already-on-disk capsule with no network at all). Bumped once per successful
+  `Node::sync_module_from` write — the single choke-point every landing path (on-demand
+  `cache.fetchAndCache`, chain gap-fill, fetch-side backfill §7.10d(a), reshare warm) funnels
+  through, so it counts every genuine re-download exactly once regardless of which caller triggered
+  it. A failed sync (no upstream reachable, verification rejected) never increments it.
+
+- **`tiers.{tier0_precache,tier1_demand,tier2_bribed}`** — per-`CacheTier` (§7.10a) occupancy, each
+  shaped `{ occupancy, wired }`. `wired: false` means the tier has no live occupancy source yet — its
+  `occupancy` is a fixed `0`, never a guess — and `wired: true` means the figure is real:
+  - **`tier1_demand`** is **`wired: true`** today: `occupancy` is the inbound-demand ledger's
+    (§7.10d) own bounded-LRU entry count — the number of DISTINCT stores currently tagged
+    `Tier1Demand` by real peer/local demand. This needs no cache wiring to be honest; the ledger
+    already tracks exactly this.
+  - **`tier0_precache`** and **`tier2_bribed`** are **`wired: false`**: no tier-0 prefetch loop and
+    no tier-2 bribed-retention mechanism exists yet (later epic-#1934 children), so there is nothing
+    to count. The shape is fixed now (`occupancy`/`wired` fields present) so a controller written
+    against it today needs no change when those children wire a real source — only `wired` flips to
+    `true` and `occupancy` starts moving.
+
+All `cache.stats` counters remain process-lifetime (reset each start, never persisted) and additive
+(§5.1) — an older reader that does not know `refetch_count`/`tiers` still parses the fields it does.
 
 ### 7.10a. Cache relevance + tier model + eviction precedence (#1986, epic #1934)
 
