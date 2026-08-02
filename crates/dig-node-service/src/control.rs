@@ -1183,6 +1183,21 @@ async fn sync_trigger(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     }
 }
 
+/// Maps the wallet backend's [`dig_wallet::sage::rpc::WalletBalanceResult`] (internally `u128`,
+/// to leave headroom for summed intermediate math) onto the wire contract published by
+/// `dig-node-control-interface` 0.3.0 and consumed by dig-app's `BalanceResponse`: `balance`/
+/// `pending` as JSON **numbers** fitting `u64` (a single address's balance can never exceed
+/// `u64::MAX` mojos, ~18.4M XCH), never JSON strings. Saturates rather than panicking on an
+/// implausible overflow, since a clamped-but-alive response beats a crashed RPC call.
+fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
+    json!({
+        "balance": u64::try_from(r.balance).unwrap_or(u64::MAX),
+        "pending": u64::try_from(r.pending).unwrap_or(u64::MAX),
+        "synced": r.synced,
+        "peak_height": r.peak_height,
+    })
+}
+
 /// `control.wallet.balance` (#1851) — the READ-ONLY balance of a PUBLIC address, for XCH or
 /// $DIG. An OPEN read (no token gate, [`is_open_control_read`]): it needs only an address, never
 /// a seed or signing key, so it carries zero custody risk. It reuses the wallet backend's B.6
@@ -1215,15 +1230,7 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     };
 
     match ctx.wallet.balance_for_address(address, asset).await {
-        Ok(r) => control_ok(
-            id,
-            json!({
-                "balance": r.balance.to_string(),
-                "pending": r.pending.to_string(),
-                "synced": r.synced,
-                "peak_height": r.peak_height,
-            }),
-        ),
+        Ok(r) => control_ok(id, balance_wire(&r)),
         Err(BalanceError::InvalidAddress) => control_error(
             id,
             ErrorCode::InvalidParams,
@@ -1725,5 +1732,68 @@ mod tests {
         set_upstream_override(&config_path, "  ").unwrap();
         assert_eq!(read_upstream_override_from(&config_path), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (#1851 leg-2) `control.wallet.balance` MUST emit `balance`/`pending` as JSON **numbers**,
+    /// matching `dig-node-control-interface` 0.3.0's `WalletBalanceResult { balance: u64, .. }`
+    /// and dig-app-core's `BalanceResponse { balance: u64 }`. This is the property under test —
+    /// distinguished from the nearest wrong implementation (`r.balance.to_string()`, which
+    /// produces a `Value::String` that LOOKS identical when printed but fails `u64` deserialize)
+    /// by asserting deserialization into a `u64`-typed mirror struct, not just string-equality
+    /// against the printed JSON.
+    #[test]
+    fn balance_wire_emits_numeric_amounts_matching_app_contract() {
+        use dig_wallet::sage::rpc::WalletBalanceResult;
+
+        #[derive(serde::Deserialize)]
+        struct AppBalance {
+            balance: u64,
+        }
+
+        let r = WalletBalanceResult {
+            balance: 12_345,
+            pending: 6,
+            synced: true,
+            peak_height: Some(42),
+        };
+        let emitted = balance_wire(&r);
+
+        // Golden shape: numeric, not string.
+        assert_eq!(
+            emitted,
+            json!({"balance": 12345u64, "pending": 6u64, "synced": true, "peak_height": 42}),
+        );
+        assert!(
+            emitted["balance"].is_number(),
+            "balance must be a JSON number, not a string"
+        );
+        assert!(
+            emitted["pending"].is_number(),
+            "pending must be a JSON number, not a string"
+        );
+
+        // Load-bearing: dig-app's numeric-typed struct deserializes cleanly from the emitted
+        // value. A `.to_string()`-based emission (`Value::String("12345")`) fails THIS
+        // assertion with a "invalid type: string, expected u64" error.
+        let app: AppBalance =
+            serde_json::from_value(emitted).expect("numeric balance must deserialize into u64");
+        assert_eq!(app.balance, 12_345);
+    }
+
+    /// Saturating-cast guard: a `u128` balance beyond `u64::MAX` clamps rather than panicking,
+    /// so the RPC call stays alive (clamped-but-answered) instead of crashing on an implausible
+    /// overflow.
+    #[test]
+    fn balance_wire_saturates_u128_overflow_to_u64_max() {
+        use dig_wallet::sage::rpc::WalletBalanceResult;
+
+        let r = WalletBalanceResult {
+            balance: u128::from(u64::MAX) + 1,
+            pending: 0,
+            synced: false,
+            peak_height: None,
+        };
+        let emitted = balance_wire(&r);
+        assert_eq!(emitted["balance"], json!(u64::MAX));
     }
 }
