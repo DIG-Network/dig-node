@@ -254,3 +254,5 @@ mod tests {
         assert_eq!(format!("{key:?}"), format!("CapsuleKey({rendered})"));
     }
 }
+
+// TODO(#1896): unify the cached-capsule artifact on `.dig` (salvage-anchor stub).
