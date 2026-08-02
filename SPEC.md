@@ -3305,7 +3305,7 @@ hint above.
 the gate every DHT-discovered holder must pass — dig-download's `locate_and_confirm` DROPS a provider
 whose answer is not *available* BEFORE any `dig.fetchRange` — so at ROOT / RESOURCE granularity the
 answer is DERIVED FROM THE SERVABLE SOURCE: the existence of the very capsule module
-(`<cache>/modules/<store>/<root>.module`) the serve path reads. It MUST NOT be derived from an
+(`<cache>/modules/<store>/<root>.dig`) the serve path reads. It MUST NOT be derived from an
 inventory snapshot that can lag a write, and any cache retained for cost MUST be invalidated on every
 inventory-changing write (pin, §21 sync, on-demand fetch-and-cache, gap-fill, backfill, eviction).
 A snapshot lags in BOTH damaging directions: a capsule that landed after the snapshot was taken (a
@@ -3849,14 +3849,23 @@ production dependency edge.
 ### 21.3. Becoming a holder — promote, then announce (MUST)
 
 This node's DHT provider records are derived from its CACHE INVENTORY (§19), so the moment a module file
-appears at `<cache>/modules/<store>/<root>.module` this node is advertising itself network-wide as an
+appears at `<cache>/modules/<store>/<root>.dig` this node is advertising itself network-wide as an
 authoritative source of that capsule. The promotion ladder is therefore:
 
 ```
 <downloads>/modules/<store>-<root>.dig.download.tmp   staging
 <downloads>/modules/<store>-<root>.dig                verified, NOT yet a holder
-<cache>/modules/<store>/<root>.module                 CACHED == ANNOUNCED AS HOLDER
+<cache>/modules/<store>/<root>.dig                    CACHED == ANNOUNCED AS HOLDER
 ```
+
+The cached artifact and the `.dig` it was staged from now share ONE extension end-to-end (#1896). A
+reader MUST accept a legacy `<root>.module` cache a prior binary wrote — the availability answer, the
+serve path, the held-check, and the inventory scan all treat `.dig` and `.module` as the same held
+capsule — so an in-place upgrade never drops a holder. At bring-up, BEFORE its first inventory announce,
+the node MUST run an idempotent, crash-safe pass that renames each legacy `<root>.module` to `<root>.dig`
+(deleting the redundant `.module` where the `.dig` already exists), converging the cache onto the unified
+artifact; reader-tolerance covers any file a partial run leaves behind. This is a CACHE-FILENAME
+convergence only — it is NOT a change to the immutable `.dig` byte format (§5.1 does not apply).
 
 - **A pull MUST stage OUTSIDE the cache**, so a partial or failed pull is never a candidate for
   announcement — there is no window in which a half-pulled capsule sits at the cache path.

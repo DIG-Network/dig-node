@@ -103,7 +103,8 @@ fn descriptor_memo() -> &'static Mutex<LruCache<(String, String), CachedDescript
 /// Blocking file I/O — call from `spawn_blocking`, like the rest of the module-reading serve path.
 pub fn describe_module(cache_dir: &Path, store_hex: &str, root_hex: &str) -> Option<ModuleInfo> {
     let capsule = CapsuleKey::parse(store_hex, root_hex)?;
-    let path = capsule.module_path(cache_dir);
+    // Reader-tolerance (#1896): describe the current `.dig`, or a legacy `.module` a prior binary wrote.
+    let path = capsule.resolve_cached_path(cache_dir);
     let metadata = std::fs::metadata(&path).ok()?;
     let len = metadata.len();
     if len == 0 {
@@ -175,7 +176,7 @@ pub fn read_module_window(
     // served in 4 MiB windows would otherwise cost a full-file read PER request — ~256 GiB of IO to
     // serve one pull, with up to 512 MiB resident per in-flight request. Only the bytes this request
     // actually asked for are ever pulled off disk.
-    let mut file = std::fs::File::open(capsule.module_path(cache_dir)).ok()?;
+    let mut file = std::fs::File::open(capsule.resolve_cached_path(cache_dir)).ok()?;
     let total = file.metadata().ok()?.len();
     let start = offset.min(total);
     let want = length.min(MAX_MODULE_WINDOW).min(total - start);

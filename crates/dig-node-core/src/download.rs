@@ -1136,7 +1136,7 @@ impl NodeContent {
     /// diverges from the one that was debugged (#836/#1590).
     ///
     /// `cache_dir` is the node's cache root; a promoted module lands at
-    /// `<cache_dir>/modules/<store>/<root>.module`, the path whose existence IS this node's holder claim.
+    /// `<cache_dir>/modules/<store>/<root>.dig`, the path whose existence IS this node's holder claim.
     #[allow(clippy::too_many_arguments)]
     pub fn wire_capsule_reshare(
         self: &Arc<Self>,

@@ -12,7 +12,7 @@
 //!
 //! Native Rust so the compiled-module serve path (BLS, wasmtime) works.
 //!
-//! Cache layout: `<cache_dir>/<store_id_hex>/<root_hex>.module` — the compiled
+//! Cache layout: `<cache_dir>/modules/<store_id_hex>/<root_hex>.dig` — the compiled
 //! module bytes for that store at that root. The browser sends a concrete root
 //! (rootless URNs are resolved to the singleton tip by dig-resolver first), so a
 //! module is keyed by (store_id, root).
@@ -837,7 +837,7 @@ pub fn unsubscribe_store(store_id: &str) -> Result<bool, String> {
 /// node wrote, so "not held" is the honest answer and the only one that requires no path to exist
 /// (#1599).
 pub(crate) fn module_exists(dir: &Path, store_hex: &str, root_hex: &str) -> bool {
-    CapsuleKey::parse(store_hex, root_hex).is_some_and(|key| key.module_path(dir).exists())
+    CapsuleKey::parse(store_hex, root_hex).is_some_and(|key| key.resolve_cached_path(dir).exists())
 }
 
 /// Hard bound on the total bytes [`walk_dir_files`] will read into memory before aborting.
@@ -1067,7 +1067,8 @@ fn serve_local_blocking(
     key: &CapsuleKey,
     retrieval_key: &[u8; 32],
 ) -> Option<ContentResponse> {
-    let path = key.module_path(cache_dir);
+    // Reader-tolerance (#1896): serve the current `.dig`, or a legacy `.module` a prior binary wrote.
+    let path = key.resolve_cached_path(cache_dir);
     let module = std::fs::read(&path).ok()?;
     let store_id = Bytes32::from_hex(key.store()).ok()?;
     // Ephemeral host key: the browser verifies the merkle proof against the chain-anchored root, not
@@ -1097,7 +1098,8 @@ fn read_public_manifest_blocking(
     cache_dir: &Path,
     key: &CapsuleKey,
 ) -> Result<Option<Option<digstore_core::PublicManifest>>, String> {
-    let path = key.module_path(cache_dir);
+    // Reader-tolerance (#1896): a manifest read tolerates a legacy `.module` cache like every serve.
+    let path = key.resolve_cached_path(cache_dir);
     let module = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(_) => return Ok(None),
@@ -2060,7 +2062,7 @@ impl Node {
     // Every cached module is one CAPSULE — the canonical `(store_id, root_hash)`
     // identity (`digstore_core::Capsule`, rendered `storeId:rootHash`). The
     // on-disk cache key IS that capsule: each module lives at
-    // `module_path(store_hex, root_hex)` = `<cache>/modules/<storeId>/<root>.module`,
+    // `module_path(store_hex, root_hex)` = `<cache>/modules/<storeId>/<root>.dig`,
     // so listing/removing/fetching are all keyed by capsule identity.
 
     // -- L7 peer RPC (PHASE-2b, #162) — serving the node's LOCAL inventory ------
@@ -2340,7 +2342,7 @@ fn chunk_count_for(resp: &ContentResponse) -> usize {
 pub struct CachedCapsule {
     /// Store id (lowercase 64-hex) — the directory name under `<cache>/modules/`.
     pub store_id: String,
-    /// Generation root hash (lowercase 64-hex) — the `<root>.module` file stem.
+    /// Generation root hash (lowercase 64-hex) — the `<root>.dig` file stem.
     pub root: String,
     /// On-disk size of the cached module, in bytes.
     pub size_bytes: u64,
@@ -4263,9 +4265,138 @@ mod tests {
         path
     }
 
+    /// Seed a capsule at the LEGACY `<root>.module` path a prior binary wrote (#1896) — the legacy
+    /// corpus the reader-tolerance + startup-migration guarantees are proven against.
+    fn seed_legacy_module(node: &Node, store_hex: &str, root_hex: &str, bytes: &[u8]) -> PathBuf {
+        let path = node
+            .cache_dir
+            .join("modules")
+            .join(store_hex)
+            .join(format!("{root_hex}.module"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn a_landed_capsule_is_written_with_the_dig_extension() {
+        // #1896: a fresh land is a `.dig`, never a `.module`.
+        let (node, _td) = test_node(None);
+        let store = "aa".repeat(32);
+        let root = "11".repeat(32);
+        let path = seed_module(&node, &store, &root, b"landed");
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("dig"));
+        assert!(
+            !node
+                .cache_dir
+                .join("modules")
+                .join(&store)
+                .join(format!("{root}.module"))
+                .exists(),
+            "no legacy `.module` is written for a fresh land"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_list_cached_discovers_a_legacy_dot_module_file() {
+        // HOLDER-CONTINUITY GUARD (#1896): a cache written by a PRIOR binary (`.module`, no `.dig`) must
+        // stay discoverable — listed, held, and thus announced (refresh_dht_inventory derives its
+        // announcement from exactly this list). RED before the dual-suffix scan (which stripped only
+        // `.module`... this seeds the inverse legacy case the new scan must also accept).
+        let (node, _td) = test_node(None);
+        let store = "cc".repeat(32);
+        let root = "33".repeat(32);
+        seed_legacy_module(&node, &store, &root, b"legacy-capsule");
+
+        let cached = node.cache_list_cached().await;
+        assert_eq!(cached.len(), 1, "the legacy capsule is enumerated");
+        assert_eq!(cached[0].store_id, store);
+        assert_eq!(cached[0].root, root);
+        assert!(
+            module_exists(&node.cache_dir, &store, &root),
+            "a legacy `.module` still makes this node a holder"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_list_cached_discovers_a_new_dot_dig_file() {
+        let (node, _td) = test_node(None);
+        let store = "dd".repeat(32);
+        let root = "44".repeat(32);
+        seed_module(&node, &store, &root, b"dig-capsule");
+
+        let cached = node.cache_list_cached().await;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].root, root);
+        assert!(module_exists(&node.cache_dir, &store, &root));
+    }
+
+    #[tokio::test]
+    async fn serve_and_held_check_resolve_a_legacy_dot_module() {
+        // #1896: the SERVE path (serve_local_blocking, via resolve_cached_path) reads a legacy
+        // `.module`, and the held-check agrees — so an upgraded node keeps serving a legacy cache.
+        let (node, _td) = test_node(None);
+        let store = "ee".repeat(32);
+        let root = "55".repeat(32);
+        let key = CapsuleKey::parse(&store, &root).expect("canonical");
+        let bytes = b"the-on-disk-module-bytes";
+        seed_legacy_module(&node, &store, &root, bytes);
+
+        assert!(module_exists(&node.cache_dir, &store, &root));
+        // resolve_cached_path (the read authority) points at the legacy artifact, and reading it yields
+        // the seeded bytes — the guarantee the whole serve path rests on.
+        assert_eq!(
+            std::fs::read(key.resolve_cached_path(&node.cache_dir)).unwrap(),
+            bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn mid_upgrade_partial_rename_loses_no_holder() {
+        // #1896: mid-migration a cache is half `.dig`, half `.module`. The scan must return the FULL set
+        // so a crash between renames never drops a holder.
+        let (node, _td) = test_node(None);
+        let store = "ff".repeat(32);
+        let root_dig = "66".repeat(32);
+        let root_legacy = "77".repeat(32);
+        seed_module(&node, &store, &root_dig, b"new");
+        seed_legacy_module(&node, &store, &root_legacy, b"old");
+
+        let mut roots: Vec<_> = node
+            .cache_list_cached()
+            .await
+            .into_iter()
+            .map(|c| c.root)
+            .collect();
+        roots.sort();
+        let mut expected = vec![root_dig, root_legacy];
+        expected.sort();
+        assert_eq!(roots, expected);
+    }
+
+    #[tokio::test]
+    async fn cache_remove_removes_either_suffix() {
+        // #1896: removal clears the holder claim whether the artifact is `.dig` or a legacy `.module`.
+        let (node, _td) = test_node(None);
+        let store = "ab".repeat(32);
+
+        let root_dig = "88".repeat(32);
+        seed_module(&node, &store, &root_dig, b"new");
+        assert_eq!(node.cache_remove_cached(&store, &root_dig).await, Ok(true));
+        assert!(!module_exists(&node.cache_dir, &store, &root_dig));
+
+        let root_legacy = "99".repeat(32);
+        seed_legacy_module(&node, &store, &root_legacy, b"old");
+        assert_eq!(
+            node.cache_remove_cached(&store, &root_legacy).await,
+            Ok(true)
+        );
+        assert!(!module_exists(&node.cache_dir, &store, &root_legacy));
+    }
+
     #[tokio::test]
     async fn list_cached_reports_capsules_with_size_and_mtime() {
-        // cache.listCached enumerates every cached `.module` as a capsule
+        // cache.listCached enumerates every cached `.dig` (or legacy `.module`) as a capsule
         // (storeId:rootHash) with its on-disk size and last-used time.
         let (node, _td) = test_node(None);
         let store_a = "aa".repeat(32);
