@@ -152,3 +152,73 @@ async fn live_funds_dev_tip_broadcasts_and_confirms() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// End-to-end: a live mainnet wallet balance read on a funded address (#1959). Gated + `#[ignore]`
+/// so it never runs in CI or an ordinary `cargo test`; the operator opts in per the live-funds gate.
+#[tokio::test]
+#[ignore = "reads real mainnet balance — run only with DIG_LIVE_FUNDS_TEST=1 + the funded test wallet (see live_funds_dev_tip_broadcasts_and_confirms)"]
+async fn live_wallet_balance_reads_a_funded_address() {
+    // ── Gate 1: the explicit opt-in env. Without it, this is a no-op skip (belt-and-suspenders
+    // beside `#[ignore]`, so even a `--ignored` sweep on a normal machine can't trigger the read). ──
+    if std::env::var("DIG_LIVE_FUNDS_TEST").as_deref() != Ok("1") {
+        eprintln!(
+            "SKIP live_wallet_balance_reads_a_funded_address: set DIG_LIVE_FUNDS_TEST=1 (and \
+             DIG_TEST_WALLET_MNEMONIC) to run the live mainnet balance read — same gate as \
+             live_funds_dev_tip_broadcasts_and_confirms"
+        );
+        return;
+    }
+
+    // ── Gate 2: the funded test wallet mnemonic, by env (exported from /.test-credentials — NEVER
+    // inlined or logged). Absent-while-gated is a hard, explicit failure. ──
+    let mnemonic = std::env::var("DIG_TEST_WALLET_MNEMONIC").expect(
+        "DIG_LIVE_FUNDS_TEST=1 requires DIG_TEST_WALLET_MNEMONIC (export it from /.test-credentials; \
+         never commit or print it)",
+    );
+    let password = "live-funds-e2e-password";
+
+    // ── Assemble a LIVE wallet (real chia_query broadcaster + confirmer + lineage + fallback). ──
+    let dir = scratch_dir();
+    let svc = WalletService::build_with(
+        &dir,
+        WalletServiceConfig {
+            enable_live_broadcast: true,
+        },
+    )
+    .await;
+
+    // Import + unlock the funded test wallet (persist_and_unlock loads the signer). NEVER logs the
+    // mnemonic.
+    let custody = svc
+        .backend
+        .custody()
+        .expect("live wallet must carry node custody");
+    let wallet = custody
+        .import(&mnemonic, password, None)
+        .expect("import + unlock the funded test wallet");
+    eprintln!(
+        "live e2e balance read: funded test wallet unlocked at {}",
+        wallet.address
+    );
+
+    // ── Read the live mainnet balance for the funded address. ──
+    let result = svc
+        .backend
+        .balance_for_address(&wallet.address, dig_wallet::sage::rpc::BalanceAsset::Xch)
+        .await
+        .expect("balance read must succeed for a funded address on live mainnet");
+
+    // Assert the balance is non-zero and confirmed.
+    eprintln!(
+        "live e2e balance read: confirmed = {} mojos, pending = {} mojos, synced = {}",
+        result.balance, result.pending, result.synced
+    );
+
+    // The funded test address must have a non-zero confirmed balance on mainnet.
+    assert!(
+        result.balance > 0,
+        "the funded test wallet must have confirmed balance on live mainnet"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
