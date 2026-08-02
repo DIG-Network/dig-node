@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.72.0] - 2026-08-02
+
+### Bug Fixes
+- **service:** Anchor identity + cache under the state dir, not $HOME (#127)
+
+### Documentation
+- **spec:** Enumerate every service absence signal exhaustively (#126)
+
 ## [0.71.0] - 2026-07-31
 
 ### Bug Fixes
