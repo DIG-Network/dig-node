@@ -62,6 +62,10 @@ pub struct AppState {
     /// implementation without touching `node` or the service's other seam calls.
     content_server: Arc<dyn ContentServer>,
     upstream: String,
+    /// Whether an unimplemented method is relayed to [`Self::upstream`], and the bring-up probe
+    /// that proves that upstream is not this node itself (#1997). Shared across every request so a
+    /// proven loop takes effect on the very next relay decision.
+    relay: Arc<crate::relay::RelayGuard>,
     http: reqwest::Client,
     /// The loopback `host:port` the server is bound to, surfaced in `/health` and
     /// the well-known document so an agent learns where the node serves.
@@ -399,6 +403,7 @@ pub async fn build_state(config: &Config) -> AppState {
         content_server: node.as_content_server(),
         node,
         upstream: config.upstream.clone(),
+        relay: Arc::new(crate::relay::RelayGuard::new(&config.upstream)),
         http: reqwest::Client::builder()
             .user_agent(concat!("dig-node/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -426,6 +431,28 @@ impl AppState {
     /// backend + its event bus the router dispatches to.
     pub fn wallet_backend(&self) -> Arc<WalletBackend> {
         self.wallet.clone()
+    }
+
+    /// This node's loop-probe request (#1997) — the exact body [`crate::relay`] sends to the
+    /// configured upstream at bring-up.
+    ///
+    /// TEST-CONSTRUCTION ONLY, behind `testkit` so it is genuinely absent from a production build.
+    /// Exposed because the loop breaker's whole value is what happens when this request comes back
+    /// to THIS node, and a test cannot stage that without knowing the id the node generated. The
+    /// alternative — trusting the unit tests and asserting nothing end-to-end — is how a correct
+    /// guard ends up wired to nothing.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn loop_probe_request(&self) -> Value {
+        self.relay.probe_request()
+    }
+
+    /// Whether this node would relay an unimplemented method right now (#1997).
+    ///
+    /// TEST-CONSTRUCTION ONLY, behind `testkit`. Lets a test observe the loop breaker's state
+    /// transition directly rather than inferring it from a downstream side effect.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn would_relay(&self) -> bool {
+        self.relay.should_relay()
     }
 
     /// Repoint the seam-5 content-server handle (#1285 W1c) at another implementation, leaving every
@@ -765,6 +792,38 @@ async fn rpc(
         );
     }
 
+    // A request carrying THIS node's loop-probe id proves the configured upstream leads back here
+    // (#1997), whatever DNS/CDN/gateway sits in between. Recorded before the answer so the very
+    // next relay decision already sees it. The probe is still ANSWERED normally below — it is an
+    // ordinary `dig.health` call, and replying keeps the sender's own bookkeeping honest.
+    if state.relay.is_own_probe(&id) {
+        state.relay.disable_after_loop();
+    }
+
+    // `dig.health` / `dig.methods` are answered by the shell, from the SAME catalogue and status
+    // body `GET /health` uses (#1997). A node states its own liveness and its own method list on
+    // its own authority: needing an upstream to answer either is what made an unconfigured node
+    // unable to describe itself at all.
+    if method == "dig.health" {
+        let mut body = status_fields(&state);
+        body.insert("status".into(), json!("ok"));
+        body.insert("methods".into(), json!(meta::method_names()));
+        return (
+            StatusCode::OK,
+            Json(json!({ "jsonrpc": "2.0", "id": id, "result": Value::Object(body) })),
+        );
+    }
+    if method == "dig.methods" {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "methods": meta::method_names() },
+            })),
+        );
+    }
+
     // PAIRING plane (#280): `pairing.request` / `pairing.poll` are OPEN (no token) —
     // an MV3 extension can't read the control-token file, so it bootstraps a scoped
     // credential here. They are NOT under `control.` (so the gate below leaves them
@@ -929,14 +988,19 @@ async fn rpc(
             ),
         };
 
-    // If dig-node didn't resolve the method, relay it blindly to the upstream.
+    // A method dig-node did not resolve is relayed to the upstream — but ONLY when an operator
+    // configured one and it has not been proven to lead back here (#1997). With no upstream the
+    // node returns dig-node's own `-32601`, which is the truthful answer for a method it genuinely
+    // does not implement, and is what keeps an unrecognised method (and its params) from being
+    // forwarded to a host the operator never chose.
     if resp
         .get("error")
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_i64())
         == Some(METHOD_NOT_FOUND)
+        && state.relay.should_relay()
     {
-        let relayed = proxy(&state.http, &state.upstream, &original)
+        let relayed = proxy(&state.http, state.relay.upstream(), &original)
             .await
             .unwrap_or_else(|e| {
                 rpc_error(
@@ -1651,6 +1715,18 @@ where
     // node keeps installing no P2P content — its in-process trust boundary is unchanged.
     if dig_node_core::peer::peer_network_enabled() {
         dig_node_core::peer::spawn_peer_network(state.node.clone());
+    }
+
+    // Prove the configured upstream is not this node (#1997). Fire-and-forget: the evidence is the
+    // probe ARRIVING BACK at this node's own dispatcher, which the request path notices — nothing
+    // here waits on or inspects a reply. A no-op when no upstream is configured, which is the
+    // default. See [`crate::relay`] for why the marker rides in the JSON-RPC `id`.
+    {
+        let http = state.http.clone();
+        let relay = state.relay.clone();
+        tokio::spawn(async move {
+            crate::relay::probe_upstream_for_loop(&http, &relay).await;
+        });
     }
 
     // Always-on self-heal driver (#584 beacon re-arm + #651 ext-forcelist reconcile): on a
