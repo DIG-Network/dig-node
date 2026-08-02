@@ -170,6 +170,43 @@ pub enum ReadOrigin {
     Peer,
 }
 
+/// Whether an HTTP read is a FIRST-PARTY navigation (the user's own top-level request, a same-site
+/// subresource, or a non-browser client) or a CROSS-SITE subresource driven by some OTHER origin's
+/// page. This is a SECOND axis, ORTHOGONAL to [`ReadOrigin`]: `ReadOrigin` is the TRANSPORT the
+/// request arrived on (loopback/FFI vs the peer wire), while `RequestProvenance` describes WITHIN a
+/// loopback HTTP request whether the browser tells us another site drove it.
+///
+/// It exists because "the peer address is loopback" is NOT "the operator authorized this": a
+/// malicious web page can make a cross-site `GET dig.local/s/<capsule>` and — while the bytes are
+/// harmless to serve — the LANDING side effect (cache write → this node becomes a DHT holder,
+/// SPEC §14.3/§21.3) is a durable, remotely-triggerable amplification. Gating landing on first-party
+/// provenance closes that CSRF door WITHOUT ever throttling the read: the bytes always serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestProvenance {
+    /// A first-party request: the user's own navigation, a same-origin/same-site subresource, a
+    /// direct address-bar hit, OR any non-browser client (CLI/SDK send no `Sec-Fetch-*` header).
+    FirstParty,
+    /// A cross-site subresource: the browser explicitly reported `Sec-Fetch-Site: cross-site`,
+    /// meaning some OTHER origin's page drove this request. The read still serves; landing does not.
+    CrossSite,
+}
+
+/// Classify a request's provenance from its `Sec-Fetch-Site` header value (already extracted from
+/// the header map; `None` when the header is absent).
+///
+/// ONLY an explicit, case-insensitive `cross-site` denies landing. Everything else — `same-origin`,
+/// `same-site`, `none`, an unknown value, AND (critically) an ABSENT header — is [`FirstParty`], so
+/// non-browser clients that never send `Sec-Fetch-*` (the CLI, the SDK) are never mistaken for a
+/// cross-site attacker. Absence must NEVER map to `CrossSite`.
+///
+/// [`FirstParty`]: RequestProvenance::FirstParty
+pub fn from_sec_fetch_site(hdr: Option<&str>) -> RequestProvenance {
+    match hdr.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("cross-site") => RequestProvenance::CrossSite,
+        _ => RequestProvenance::FirstParty,
+    }
+}
+
 // -- The digstore-bound proof verifier -------------------------------------------------------------
 
 /// The REAL [`ProofVerifier`] for dig-download's whole-resource check: decodes the digstore
@@ -3155,6 +3192,59 @@ pub(crate) mod tests {
             peers,
             vec![peer],
             "a recorded bad-descriptor verdict must persist across a restart"
+        );
+    }
+
+    // -- RequestProvenance::from_sec_fetch_site (Sec-Fetch-Site → landing-gate axis) ---------------
+
+    #[test]
+    fn sec_fetch_site_cross_site_is_cross_site() {
+        assert_eq!(
+            from_sec_fetch_site(Some("cross-site")),
+            RequestProvenance::CrossSite,
+            "an explicit cross-site fetch must be classified CrossSite so landing is suppressed"
+        );
+    }
+
+    #[test]
+    fn sec_fetch_site_first_party_values_are_first_party() {
+        for value in ["same-origin", "same-site", "none"] {
+            assert_eq!(
+                from_sec_fetch_site(Some(value)),
+                RequestProvenance::FirstParty,
+                "{value} is a first-party fetch and must land normally"
+            );
+        }
+    }
+
+    #[test]
+    fn sec_fetch_site_absent_is_first_party() {
+        // LOAD-BEARING: non-browser clients (CLI/SDK) send no Sec-Fetch-* header. Absence must map
+        // to FirstParty, never CrossSite — otherwise every CLI/SDK read would stop landing.
+        assert_eq!(
+            from_sec_fetch_site(None),
+            RequestProvenance::FirstParty,
+            "an absent Sec-Fetch-Site header must be treated as first-party"
+        );
+    }
+
+    #[test]
+    fn sec_fetch_site_is_case_insensitive_and_trims() {
+        assert_eq!(
+            from_sec_fetch_site(Some("  Cross-Site ")),
+            RequestProvenance::CrossSite,
+            "the header match must be trimmed + case-insensitive"
+        );
+    }
+
+    #[test]
+    fn sec_fetch_site_unknown_value_is_first_party() {
+        // Only an explicit "cross-site" denies landing; an unrecognized value fails OPEN (serves +
+        // lands) so a future/odd Sec-Fetch-Site value never silently breaks landing.
+        assert_eq!(
+            from_sec_fetch_site(Some("wat")),
+            RequestProvenance::FirstParty,
+            "an unknown Sec-Fetch-Site value must default to first-party"
         );
     }
 }
