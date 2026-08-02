@@ -48,6 +48,7 @@ use tokio::sync::Mutex;
 mod capsule_key;
 pub mod chainwatch;
 pub mod chat;
+pub mod dht_sampling;
 pub mod download;
 pub mod peer;
 pub mod relevance;
