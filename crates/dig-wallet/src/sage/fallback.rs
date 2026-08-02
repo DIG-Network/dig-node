@@ -57,7 +57,7 @@ pub trait ChainFallback: Send + Sync {
     /// "chain says zero" apart from "no chain source to ask" — the difference between a
     /// truthful `0` and an honest error (#1851).
     fn is_live(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -133,6 +133,11 @@ impl CoinsetFallback {
 
 #[async_trait]
 impl ChainFallback for CoinsetFallback {
+    /// A real coinset/peer connection: a genuinely live chain source (#1851).
+    fn is_live(&self) -> bool {
+        true
+    }
+
     async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {
         let phs = Self::query_hashes(phs);
         let records = self
@@ -311,6 +316,12 @@ pub(crate) mod mock {
 
     #[async_trait]
     impl ChainFallback for MockFallback {
+        /// The test double stands in for a genuinely live chain source (unit tests that want
+        /// the "no chain source" path use a dedicated non-live double instead, #1851).
+        fn is_live(&self) -> bool {
+            true
+        }
+
         async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self

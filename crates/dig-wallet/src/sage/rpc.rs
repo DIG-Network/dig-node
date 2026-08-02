@@ -3355,7 +3355,11 @@ mod tests {
         async fn coin_record_by_id(&self, _: &str) -> Result<Option<FallbackCoin>> {
             Err(Error::internal("boom"))
         }
-        // is_live defaults to true.
+        // A live source whose reads fail — proves the READ_FAILED shape (#1851: the trait
+        // default is now fail-closed, so a live double must say so explicitly).
+        fn is_live(&self) -> bool {
+            true
+        }
     }
 
     #[tokio::test]
@@ -4369,6 +4373,10 @@ mod tests {
             }
             async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
                 Ok(None)
+            }
+            // Stands in for the live coinset/peer tier (#1851: the trait default is fail-closed).
+            fn is_live(&self) -> bool {
+                true
             }
         }
 

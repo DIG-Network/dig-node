@@ -280,8 +280,8 @@ fn summarize(method: &str, result: &Value) -> String {
         ),
         "control.wallet.balance" => format!(
             "balance {} · pending {} · {}",
-            result["balance"].as_str().unwrap_or("?"),
-            result["pending"].as_str().unwrap_or("?"),
+            result["balance"].as_u64().unwrap_or(0),
+            result["pending"].as_u64().unwrap_or(0),
             if result["synced"].as_bool().unwrap_or(false) {
                 "synced"
             } else {
@@ -420,6 +420,22 @@ mod tests {
         assert!(s.contains("42s"));
         assert!(s.contains("3 hosted"));
         assert!(s.contains("sync available"));
+    }
+
+    /// REGRESSION (#1851): `control.wallet.balance` emits `balance`/`pending` as JSON NUMBERS
+    /// (not strings). The summary line MUST render the actual numeric values — a prior version
+    /// read them with `.as_str()`, which always misses on a JSON number and silently prints `?`
+    /// for both fields regardless of the real balance.
+    #[test]
+    fn wallet_balance_summary_renders_numeric_fields() {
+        let s = summarize(
+            "control.wallet.balance",
+            &json!({ "balance": 12345, "pending": 6, "synced": true, "peak_height": 42 }),
+        );
+        assert!(s.contains("12345"), "got: {s}");
+        assert!(s.contains('6'), "got: {s}");
+        assert!(!s.contains('?'), "must not fall back to `?`: {s}");
+        assert!(s.contains("synced"), "got: {s}");
     }
 
     #[test]
