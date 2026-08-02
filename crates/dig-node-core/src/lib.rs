@@ -51,6 +51,7 @@ pub mod chat;
 pub mod download;
 pub mod peer;
 pub mod relevance;
+pub mod tier0_selector;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
 /// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep
 /// every existing `crate::net`/`crate::pex`/… reference working unchanged (W1b-0 is a pure
