@@ -13,6 +13,7 @@
 //!    [`ChatMessage::envelope`] carries it verbatim);
 //! 2. the **outer** [`dig_message`] e2e seal to the recipient's BLS identity key, which is what
 //!    dig-gossip actually carries over opcode 220.
+//!
 //! A relay or on-path peer sees only the outer ciphertext; even a peer that terminates the outer seal
 //! would still face the inner `DIGCHAT1` seal. The node is content-blind by construction.
 //!
@@ -227,7 +228,11 @@ pub fn seal_outbound(
         recipient_pub,
         message_type: ID_CHAT_MESSAGE.0,
         shape: InteractionShape::OneShot,
-        correlation_id: message_id,
+        // A one-shot chat message needs no request/response correlation, and correlation_id is a
+        // CLEARTEXT envelope header — so it is left zero rather than carrying the message id, which
+        // would leak that id in plaintext on the wire (NC-1). The message id travels sealed inside the
+        // ChatMessage payload above.
+        correlation_id: Bytes32::from([0u8; 32]),
         stream: None,
         counter,
         timestamp_ms: now,
