@@ -591,6 +591,25 @@ impl StateStore for CapturingStateStore {
         // Keep the captured commitment (do NOT drop it on clear) — clear only the on-disk checkpoint.
         self.inner.clear(key).await
     }
+
+    // Bad-descriptor reputation (#1611) must reach the inner file store, NOT the trait's forgetful
+    // no-op defaults: a holder demoted for serving a lying descriptor stays demoted across a restart,
+    // so a later call/process never re-pays for the same lie. This wrapper only adds commitment
+    // capture — it delegates reputation verbatim.
+    async fn record_bad_descriptor(
+        &self,
+        target_key: &str,
+        peer_id: &str,
+    ) -> Result<(), dig_download::DownloadError> {
+        self.inner.record_bad_descriptor(target_key, peer_id).await
+    }
+
+    async fn bad_descriptor_peers(
+        &self,
+        target_key: &str,
+    ) -> Result<Vec<String>, dig_download::DownloadError> {
+        self.inner.bad_descriptor_peers(target_key).await
+    }
 }
 
 /// A [`RangeTransport`] wrapper that BYPASSES the `getAvailability` confirm probe for a holder the node
@@ -3110,6 +3129,32 @@ pub(crate) mod tests {
         assert!(
             !started,
             "DIG_NODE_BACKFILL_ON_MISS=off must refuse even a Local-origin read"
+        );
+    }
+
+    #[tokio::test]
+    async fn capturing_state_store_persists_bad_descriptor_reputation_across_restart() {
+        // #1629: `CapturingStateStore` wraps `FileStateStore` but must DELEGATE the bad-descriptor
+        // reputation methods, not inherit the trait's forgetful no-op defaults — otherwise a holder
+        // that served a lying descriptor is re-asked from scratch after every restart, paying the
+        // same wasted pull attempts again (#1611). Record a verdict through one wrapper, then read it
+        // back through a FRESH wrapper over the SAME on-disk store (a simulated process restart): the
+        // verdict must survive. Without delegation this returns empty, because the record went to the
+        // no-op default and never reached the file store.
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let target = "a".repeat(64);
+        let peer = "b".repeat(64);
+
+        let before = CapturingStateStore::new(FileStateStore::new(state_dir.clone()));
+        before.record_bad_descriptor(&target, &peer).await.unwrap();
+
+        let after = CapturingStateStore::new(FileStateStore::new(state_dir));
+        let peers = after.bad_descriptor_peers(&target).await.unwrap();
+        assert_eq!(
+            peers,
+            vec![peer],
+            "a recorded bad-descriptor verdict must persist across a restart"
         );
     }
 }
