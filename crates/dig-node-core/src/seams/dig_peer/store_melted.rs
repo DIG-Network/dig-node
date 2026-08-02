@@ -101,7 +101,10 @@ impl TombstoneSet {
     /// Whether `store_id` has already been tombstoned.
     #[must_use]
     pub fn contains(&self, store_id: &[u8; 32]) -> bool {
-        self.inner.lock().expect("tombstone lock").contains(store_id)
+        self.inner
+            .lock()
+            .expect("tombstone lock")
+            .contains(store_id)
     }
 
     /// Compare-and-set: insert `store_id`, returning `true` iff it was NEWLY inserted.
@@ -292,8 +295,16 @@ pub async fn run_melt_tick(
     let mut propagated = 0;
     for store_id in cache.held_store_ids().await {
         if matches!(
-            process_holder_store(chain, cache, broadcaster, tombstone, signer, store_id, melt_height)
-                .await,
+            process_holder_store(
+                chain,
+                cache,
+                broadcaster,
+                tombstone,
+                signer,
+                store_id,
+                melt_height
+            )
+            .await,
             PropagateOutcome::Propagated { .. }
         ) {
             propagated += 1;
@@ -557,9 +568,18 @@ mod tests {
 
         let out = run_inbound(&chain, &cache, &bc, &tomb, store(1)).await;
         assert_eq!(out, PropagateOutcome::NotMelted);
-        assert!(cache.deleted.lock().unwrap().is_empty(), "no delete for a live store");
-        assert!(bc.sent.lock().unwrap().is_empty(), "no rebroadcast for a live store");
-        assert!(!tomb.contains(&store(1)), "a live store is never tombstoned");
+        assert!(
+            cache.deleted.lock().unwrap().is_empty(),
+            "no delete for a live store"
+        );
+        assert!(
+            bc.sent.lock().unwrap().is_empty(),
+            "no rebroadcast for a live store"
+        );
+        assert!(
+            !tomb.contains(&store(1)),
+            "a live store is never tombstoned"
+        );
     }
 
     /// TEST 2 — the TOP risk: an unreachable chain (`Err` → [`MeltStatus::Unknown`]) is FAIL-CLOSED.
@@ -574,8 +594,14 @@ mod tests {
 
         let out = run_inbound(&chain, &cache, &bc, &tomb, store(1)).await;
         assert_eq!(out, PropagateOutcome::NotMelted);
-        assert!(cache.deleted.lock().unwrap().is_empty(), "fail-closed: no delete on chain error");
-        assert!(bc.sent.lock().unwrap().is_empty(), "fail-closed: no rebroadcast on chain error");
+        assert!(
+            cache.deleted.lock().unwrap().is_empty(),
+            "fail-closed: no delete on chain error"
+        );
+        assert!(
+            bc.sent.lock().unwrap().is_empty(),
+            "fail-closed: no rebroadcast on chain error"
+        );
         assert!(!tomb.contains(&store(1)));
     }
 
@@ -590,14 +616,38 @@ mod tests {
         let tomb = TombstoneSet::new();
         let sender = PeerId::from([0x55u8; 32]);
 
-        let out = process_inbound(&chain, &cache, &bc, &tomb, Some(sender), &announce_for(store(1)))
-            .await;
-        assert_eq!(out, PropagateOutcome::Propagated { generations: 3, broadcasts: 1 });
-        assert_eq!(*cache.deleted.lock().unwrap(), vec![store(1)], "deleted the store's generations");
+        let out = process_inbound(
+            &chain,
+            &cache,
+            &bc,
+            &tomb,
+            Some(sender),
+            &announce_for(store(1)),
+        )
+        .await;
+        assert_eq!(
+            out,
+            PropagateOutcome::Propagated {
+                generations: 3,
+                broadcasts: 1
+            }
+        );
+        assert_eq!(
+            *cache.deleted.lock().unwrap(),
+            vec![store(1)],
+            "deleted the store's generations"
+        );
         let sent = bc.sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "rebroadcast EXACTLY once");
-        assert_eq!(sent[0], (store(1), Some(sender)), "rebroadcast excludes the sender");
-        assert!(tomb.contains(&store(1)), "store is tombstoned after the transition");
+        assert_eq!(
+            sent[0],
+            (store(1), Some(sender)),
+            "rebroadcast excludes the sender"
+        );
+        assert!(
+            tomb.contains(&store(1)),
+            "store is tombstoned after the transition"
+        );
     }
 
     /// TEST 4 — a NEVER-HELD store is ignored BEFORE any chain read: `confirm_melt` is never invoked
@@ -611,7 +661,11 @@ mod tests {
 
         let out = run_inbound(&chain, &cache, &bc, &tomb, store(1)).await;
         assert_eq!(out, PropagateOutcome::NotHeld);
-        assert_eq!(chain.calls.load(Ordering::SeqCst), 0, "no chain read for an un-held store");
+        assert_eq!(
+            chain.calls.load(Ordering::SeqCst),
+            0,
+            "no chain read for an un-held store"
+        );
         assert!(bc.sent.lock().unwrap().is_empty());
         assert!(cache.deleted.lock().unwrap().is_empty());
     }
@@ -628,8 +682,15 @@ mod tests {
 
         let out = run_inbound(&chain, &cache, &bc, &tomb, store(1)).await;
         assert_eq!(out, PropagateOutcome::AlreadyTombstoned);
-        assert_eq!(chain.calls.load(Ordering::SeqCst), 0, "no chain read for a re-receipt");
-        assert!(bc.sent.lock().unwrap().is_empty(), "no rebroadcast on re-receipt");
+        assert_eq!(
+            chain.calls.load(Ordering::SeqCst),
+            0,
+            "no chain read for a re-receipt"
+        );
+        assert!(
+            bc.sent.lock().unwrap().is_empty(),
+            "no rebroadcast on re-receipt"
+        );
         assert!(cache.deleted.lock().unwrap().is_empty());
     }
 
@@ -648,7 +709,11 @@ mod tests {
             let out = run_inbound(&chain, &cache, &bc, &tomb, store(n)).await;
             assert_eq!(out, PropagateOutcome::NotHeld);
         }
-        assert_eq!(chain.calls.load(Ordering::SeqCst), 0, "un-held flood → zero chain reads");
+        assert_eq!(
+            chain.calls.load(Ordering::SeqCst),
+            0,
+            "un-held flood → zero chain reads"
+        );
         assert_eq!(
             cache.held_checks.load(Ordering::SeqCst),
             flood as usize,
@@ -678,12 +743,26 @@ mod tests {
             let first = run_inbound(&chain, &cache, &bc, &tomb, store(9)).await;
             let echo = run_inbound(&chain, &cache, &bc, &tomb, store(9)).await;
 
-            assert!(matches!(first, PropagateOutcome::Propagated { .. }), "first melt propagates");
-            assert_eq!(echo, PropagateOutcome::AlreadyTombstoned, "the echo never re-emits");
-            assert_eq!(bc.sent.lock().unwrap().len(), 1, "each node broadcasts at most once");
+            assert!(
+                matches!(first, PropagateOutcome::Propagated { .. }),
+                "first melt propagates"
+            );
+            assert_eq!(
+                echo,
+                PropagateOutcome::AlreadyTombstoned,
+                "the echo never re-emits"
+            );
+            assert_eq!(
+                bc.sent.lock().unwrap().len(),
+                1,
+                "each node broadcasts at most once"
+            );
             total_broadcasts += bc.sent.lock().unwrap().len();
         }
-        assert_eq!(total_broadcasts, holders, "total broadcasts == holder count → quiesces");
+        assert_eq!(
+            total_broadcasts, holders,
+            "total broadcasts == holder count → quiesces"
+        );
     }
 
     /// TEST 8 — piece #4 fail-closed: a HELD store whose lineage is transiently `Err`
@@ -700,10 +779,16 @@ mod tests {
         // Transient chain error → no delete, no broadcast, not tombstoned (retryable next tick).
         let unreachable = ChainSpy::new(MeltStatus::Unknown);
         let propagated = run_melt_tick(&unreachable, &cache, &bc, &tomb, &sig, 500).await;
-        assert_eq!(propagated, 0, "fail-closed: an unreachable chain melts nothing");
+        assert_eq!(
+            propagated, 0,
+            "fail-closed: an unreachable chain melts nothing"
+        );
         assert!(cache.deleted.lock().unwrap().is_empty());
         assert!(bc.sent.lock().unwrap().is_empty());
-        assert!(!tomb.contains(&store(4)), "not tombstoned — the holder retries next tick");
+        assert!(
+            !tomb.contains(&store(4)),
+            "not tombstoned — the holder retries next tick"
+        );
 
         // Now a STABLE confirmed melt → delete + broadcast (with no exclude) exactly once.
         let melted = ChainSpy::new(MeltStatus::Melted);
@@ -712,7 +797,11 @@ mod tests {
         assert_eq!(*cache.deleted.lock().unwrap(), vec![store(4)]);
         let sent = bc.sent.lock().unwrap();
         assert_eq!(sent.len(), 1, "the holder broadcasts its own melt once");
-        assert_eq!(sent[0], (store(4), None), "the holder's own broadcast has no exclude");
+        assert_eq!(
+            sent[0],
+            (store(4), None),
+            "the holder's own broadcast has no exclude"
+        );
     }
 
     // -- Supporting unit tests for the shared core -------------------------------------------------
@@ -720,11 +809,26 @@ mod tests {
     /// PROPERTY: only a held, not-tombstoned, on-chain-CONFIRMED melt authorizes a delete.
     #[test]
     fn only_a_held_confirmed_melt_deletes() {
-        assert_eq!(decide_melt(true, false, MeltStatus::Melted), MeltDecision::DeleteAndPropagate);
-        assert_eq!(decide_melt(true, false, MeltStatus::Live), MeltDecision::Ignore);
-        assert_eq!(decide_melt(true, false, MeltStatus::Unknown), MeltDecision::Ignore);
-        assert_eq!(decide_melt(false, false, MeltStatus::Melted), MeltDecision::Ignore);
-        assert_eq!(decide_melt(true, true, MeltStatus::Melted), MeltDecision::Ignore);
+        assert_eq!(
+            decide_melt(true, false, MeltStatus::Melted),
+            MeltDecision::DeleteAndPropagate
+        );
+        assert_eq!(
+            decide_melt(true, false, MeltStatus::Live),
+            MeltDecision::Ignore
+        );
+        assert_eq!(
+            decide_melt(true, false, MeltStatus::Unknown),
+            MeltDecision::Ignore
+        );
+        assert_eq!(
+            decide_melt(false, false, MeltStatus::Melted),
+            MeltDecision::Ignore
+        );
+        assert_eq!(
+            decide_melt(true, true, MeltStatus::Melted),
+            MeltDecision::Ignore
+        );
     }
 
     /// PROPERTY: the tombstone CAS admits exactly one transition per store.

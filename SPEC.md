@@ -2922,6 +2922,46 @@ against the on-chain current root or fails closed — it NEVER trusts an upstrea
   a NODE-side gate; clients still verify the returned proof against their own trust root regardless, so
   the opt-out only relaxes the node's serve gate for local dev.
 
+### 14.5. Store-melt propagation (receive → on-chain-verify → delete → rebroadcast, #1316)
+
+When a store's CHIP-0035 singleton is MELTED (the store-lifecycle delete), the deletion PROPAGATES
+across the peer network so every holder stops hosting the store's `.dig` content and reclaims disk.
+The wire is dig-gossip opcode **221** (`STORE_MELTED`, a `StoreMeltedAnnounce`: `store_id`,
+advisory `melt_height`, `sender_peer_id`, BLS signature). It is a **public all-peers broadcast**
+(Plumtree flood, Bulk priority), **§5.4-EXEMPT** from recipient-sealing: a store deletion is
+public-by-nature and addressed to everyone, like L2 consensus gossip. It is mTLS-authenticated +
+signed, never recipient-sealed.
+
+**The on-chain melt proof is the SOLE delete authority (NC-9, fail-closed).** A store's melt status is
+resolved by its singleton-lineage walk (the same authority as §14.4): a closed singleton (`Ok(None)`)
+IS a melt; a live tip (`Ok(Some)`) is NOT; an unreachable/errored chain is UNKNOWN. A node MUST NEVER
+delete unless the chain POSITIVELY confirms the melt — a forged/replayed announcement, or a chain the
+node cannot reach, deletes NOTHING. The announcement's signature is attribution/anti-spam ONLY (never
+delete authority), and `melt_height` is an advisory hint the receiver never trusts on its face. The
+melt authority is the lineage walk, NEVER a bare `anchored_root() == Ok(None)`.
+
+- **Holder path (the melting node).** For a store the node HOLDS whose singleton the chain confirms
+  closed, and which is not already tombstoned: delete EVERY held generation (the audited cache-remove
+  path — path-containment guarded, content-cache invalidating, idempotent), broadcast a signed
+  `StoreMeltedAnnounce`, and tombstone the store. Live/Unknown ⇒ no-op (retried next tick).
+- **Receiver path (a peer).** Per inbound opcode-221 frame, in strictly-increasing cost order (so an
+  un-held flood is O(local) per message and can never amplify into chain work): (1) **held-check FIRST**
+  — if the store is not held, drop with NO chain read, NO signature verification, NO rebroadcast; (2)
+  **tombstone check** — a re-receipt drops with no chain read; (3) **NC-9 on-chain verify** — only a
+  confirmed melt proceeds (fail-closed on Live/Unknown); (4) **delete + rebroadcast ONCE** — gated on a
+  compare-and-set into the shared tombstone, so only the holding→deleted transition re-emits (excluding
+  the sender).
+- **Termination.** Each node broadcasts at most once per store (the CAS admits one transition), the
+  tombstone is set-once (never cleared in-run), and dig-gossip's Plumtree seen-set dedups frames
+  network-wide — so the epidemic quiesces after every holder has deleted once.
+- **§5.1 preserved.** Deleting a CACHED `.dig` is safe: the on-chain anchor is permanent and this
+  touches no history/anchor. Melt does not rewrite or break any older `.dig` format.
+
+The receive/holder policy is unit-tested against spy seams (chain / cache / broadcast) with the eight
+adversarial cases: forged-melt-for-live, chain-error-fail-closed, genuine-melt (delete-all +
+rebroadcast-once), never-held (no chain call), already-tombstoned, verify-cost DoS (held-check before
+chain), multi-node convergence-terminates, and holder fail-closed on transient error.
+
 ---
 
 ## 15. FFI — dig-runtime C-ABI (in-process host)

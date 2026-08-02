@@ -30,7 +30,6 @@ pub mod peer_network;
 pub mod pex;
 pub mod ping;
 pub mod pool_locator;
-pub mod store_melted;
 /// Wire-level range-stream conformance tests (#1668): the real serve path over a real loopback mTLS
 /// connection, decoded through the real dig-nat codec. Test-only — there is no production surface here.
 #[cfg(test)]
@@ -40,6 +39,7 @@ pub mod selector_adapter;
 pub mod self_excluding_locator;
 pub mod serve_log;
 pub mod session;
+pub mod store_melted;
 pub mod union_locator;
 
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;
