@@ -913,12 +913,18 @@ the plaintext body nor the plaintext message id appears in the on-wire sealed by
 **Inbound path.** A received opcode-220 frame is opened (`dig-message` unseal → BLS-G2 signature
 verify → anti-replay → expiry), routed through the chat `MessageRegistry`, and the decoded
 `ChatMessage` is queued into the inbox. A sender the node cannot resolve to a BLS key is rejected,
-never queued (fail-closed).
+never queued (fail-closed). This describes the inbound handler (`process_inbound_frame`), which is
+implemented and unit-tested; the **live peer-network feed that invokes it is not yet wired** into
+`run_peer_network` (see Deferred), so in the shipped build `chat.poll` returns empty until that
+loop lands.
 
-**Deferred (epic #793):** the sealing-key directory (`resolveSealingKey`) that maps a recipient
-DID to its attested `0x0010` BLS key + gossip `PeerId`, and the inbound sender-key resolver, are
-NOT in this MVP — the app supplies `recipient_pub` + `peer_id` on `chat.send`, and the inbound
-resolver is caller-supplied. Group chat, onion routing, and receipt UX are out of scope; the five
+**Deferred (epic #793):** the **live inbound feed** — the `run_peer_network` loop that drains
+`GossipHandle::inbound_receiver()` into `process_inbound_frame` — is not yet wired (the handler is
+implemented + unit-tested but nothing in production calls it, so `chat.poll` is always empty until
+this lands; it is gated on the sender-key resolver below). The sealing-key directory
+(`resolveSealingKey`) that maps a recipient DID to its attested `0x0010` BLS key + gossip `PeerId`,
+and the inbound sender-key resolver, are NOT in this MVP — the app supplies `recipient_pub` +
+`peer_id` on `chat.send`, and the inbound resolver is caller-supplied. Group chat, onion routing, and receipt UX are out of scope; the five
 chat message types (message, delivery/read receipts, typing, presence) are defined in
 `dig-chat-protocol` but only `ChatMessage` surfaces to `chat.poll`.
 
