@@ -1476,9 +1476,19 @@ is genuinely wanted here") reached from opposite directions:
   (`RelevanceInputs.local_read_count`, §7.10a) and the tier-based eviction precedence consult for
   peer-demanded stores.
 
+**The ledger is BOUNDED (memory is not remotely amplifiable).** Recording is always-on and fed by a
+remote peer's on-wire store id, and the format check accepts any 64-hex value (not only stores that
+exist), so a peer could otherwise mint permanent entries from the 2^256 keyspace until the node OOMs.
+The ledger MUST therefore be a bounded LRU: at most `MAX_DEMAND_ENTRIES` (default 65_536) distinct
+stores, evicting the least-recently-demanded entry on overflow (a re-demanded store is refreshed and
+survives over colder entries). Worst-case memory is bounded by the cap — on the order of ten-odd MiB
+— REGARDLESS of remote request volume; distinct-id spam churns through the fixed footprint rather
+than growing it.
+
 **What is always on vs. opt-in.** Recording inbound demand (the count + `Tier1Demand` tag) is
-UNCONDITIONAL — it holds no content and pulls nothing, so it carries no amplification risk and always
-runs. The whole-`.dig` PULL on inbound demand is OPT-IN, default OFF, gated by
+UNCONDITIONAL — it moves no content bytes and pulls no capsule, and its memory is bounded by the cap
+above, so it carries no bandwidth/content amplification risk and always runs. The whole-`.dig` PULL on
+inbound demand is OPT-IN, default OFF, gated by
 `DIG_NODE_INBOUND_DEMAND_CACHE` (only an explicit `on`/`1`/`true`/`yes` enables it). A peer-triggered
 pull is an amplification primitive of exactly the shape trigger (a)'s `ReadOrigin::Local` gate exists
 to close; the intended amplification defence is the tier-0/1 selector's XOR-proximity admission (§7.10a
