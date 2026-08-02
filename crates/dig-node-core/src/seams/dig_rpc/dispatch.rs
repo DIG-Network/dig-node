@@ -9,9 +9,11 @@
 //! `match Method::from_name(..)` dispatch byte-identical). `async_trait`-boxed (matching the
 //! other seam traits) so it stays dyn-compatible for the future `Arc<dyn RpcDispatch>` handle
 //! (W1c). The crate-root `handle_rpc`/`handle_rpc_json` free functions (every external caller's
-//! entry point — `dig-node-service`, `dig-runtime`, the peer-RPC server) now thinly delegate to
-//! [`RpcDispatch::dispatch`] — their signatures are UNCHANGED, so no caller anywhere needed to
-//! change.
+//! entry point — `dig-node-service`, `dig-runtime`, the peer-RPC server) thinly delegate to
+//! [`RpcDispatch::dispatch`]. Each carries the request's `origin` (transport axis) AND its
+//! `provenance` (the `Sec-Fetch-Site` landing axis, #1956) — both threaded EXPLICITLY by every
+//! caller so a transport can never forget to state who is asking or whether a cross-site page drove
+//! the request.
 
 use serde_json::{json, Value};
 
@@ -34,12 +36,32 @@ pub trait RpcDispatch: Send + Sync {
     /// dispatch is shared by every transport (loopback HTTP, in-process FFI, AND the peer-RPC
     /// server, #179/#1576): it is the single place the two are told apart, so it is threaded through
     /// EXPLICITLY by each caller rather than inferred here.
-    async fn dispatch(&self, req: Value, origin: crate::download::ReadOrigin) -> Value;
+    ///
+    /// `provenance` is the SECOND, orthogonal axis (#1956): within a loopback HTTP request, whether
+    /// the browser reports another origin's page drove it (`Sec-Fetch-Site: cross-site`). Like
+    /// `origin` it is threaded EXPLICITLY (never inferred) — a required param so every transport must
+    /// state it (fail-safe): a browser-facing POST classifies the header, every trusted/non-browser
+    /// caller passes [`FirstParty`]. It gates ONLY the miss-path landing legs (never the served
+    /// bytes) via [`landing_origin`], exactly as the `/s/` serve path does.
+    ///
+    /// [`FirstParty`]: crate::download::RequestProvenance::FirstParty
+    /// [`landing_origin`]: crate::download::landing_origin
+    async fn dispatch(
+        &self,
+        req: Value,
+        origin: crate::download::ReadOrigin,
+        provenance: crate::download::RequestProvenance,
+    ) -> Value;
 }
 
 #[async_trait::async_trait]
 impl RpcDispatch for Node {
-    async fn dispatch(&self, req: Value, origin: crate::download::ReadOrigin) -> Value {
+    async fn dispatch(
+        &self,
+        req: Value,
+        origin: crate::download::ReadOrigin,
+        provenance: crate::download::RequestProvenance,
+    ) -> Value {
         // `node` alias: the body below is relocated VERBATIM from the pre-#1285-W1b-5
         // `handle_rpc(node: &Node, req: Value)` free function — byte-identical, just bound to
         // `self` here instead of taking `node` as a parameter.
@@ -206,6 +228,12 @@ impl RpcDispatch for Node {
                 // A single range frame of a resource this node holds (the JSON-RPC face of the streamed
                 // peer-transport range fetch; the caller advances `offset` for further windows). The frame
                 // carries the per-range verification metadata on the first window.
+                //
+                // Fold the two landing axes ONCE (#1956): a cross-site-driven POST still serves the
+                // range bytes, but its miss-path landing legs (the miss-envelope→reshare chain AND the
+                // whole-capsule backfill) gate on `land_origin`, so a same-origin capsule page cannot
+                // drive this node into becoming a holder. Reads are NEVER altered — only the side effect.
+                let land_origin = crate::download::landing_origin(origin, provenance);
                 let params = req.get("params").cloned().unwrap_or(json!({}));
                 let store_hex = params.get("store_id").and_then(Value::as_str).unwrap_or("");
                 let root_hex = params.get("root").and_then(Value::as_str).unwrap_or("");
@@ -273,7 +301,12 @@ impl RpcDispatch for Node {
                                 let depth = download::redirect_depth(&params);
                                 if let Some(envelope) = node
                                     .range_miss_envelope(
-                                        &id, &content, depth, offset, length, origin,
+                                        &id,
+                                        &content,
+                                        depth,
+                                        offset,
+                                        length,
+                                        land_origin,
                                     )
                                     .await
                                 {
@@ -281,7 +314,7 @@ impl RpcDispatch for Node {
                                     // next read is local (SPEC §14.3). Deduped + detached; no delay here.
                                     // `origin` is the SAME gate the reshare leg uses: a peer-origin
                                     // miss must never trigger this pull (#1619 follow-up).
-                                    node.maybe_backfill_capsule(store_hex, root_hex, origin);
+                                    node.maybe_backfill_capsule(store_hex, root_hex, land_origin);
                                     return envelope;
                                 }
                             }
@@ -734,8 +767,20 @@ impl RpcDispatch for Node {
         if let Some(content) = download::miss_content_for(store_hex, &root_hex, rk_hex) {
             let depth = download::redirect_depth(&params);
             let pin_hex = pinned_root.map(|r| r.to_hex());
+            // Fold the two landing axes ONCE (#1956): a cross-site-driven `dig.getContent` POST still
+            // serves the bytes, but the miss-path landing legs (the miss-envelope→`fetch_resource`→
+            // reshare chain AND the whole-capsule backfill) gate on `land_origin`, so a same-origin
+            // capsule page cannot drive landing. Reads are NEVER altered — only the side effect.
+            let land_origin = crate::download::landing_origin(origin, provenance);
             if let Some(envelope) = node
-                .content_miss_envelope(&id, &content, depth, offset, pin_hex.as_deref(), origin)
+                .content_miss_envelope(
+                    &id,
+                    &content,
+                    depth,
+                    offset,
+                    pin_hex.as_deref(),
+                    land_origin,
+                )
                 .await
             {
                 // This resource is being served FROM ANOTHER NODE (a redirect/fetch-through). In the
@@ -744,7 +789,7 @@ impl RpcDispatch for Node {
                 // does not delay the current response — it spawns a deduped detached pull and returns.
                 // `origin` is the SAME gate the reshare leg uses: a peer-origin miss must never
                 // trigger this pull (#1619 follow-up).
-                node.maybe_backfill_capsule(store_hex, &root_hex, origin);
+                node.maybe_backfill_capsule(store_hex, &root_hex, land_origin);
                 return envelope;
             }
         }

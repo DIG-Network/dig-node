@@ -257,24 +257,6 @@ enum ProxyMiss {
 /// unchanged from this module (W1b-1) — a behaviour-preserving trait extraction, not a new
 /// implementation. `async_trait`-boxed (matching [`crate::shared::AnchoredRootResolver`]) so the
 /// trait stays dyn-compatible for the future `Arc<dyn ContentServer>` handle (W1c).
-/// Collapse the two landing axes (#1654) into the single [`ReadOrigin`] the miss-path landing legs
-/// (`maybe_backfill_capsule`, `peer_serve_plaintext`→reshare) gate on. A first-party request keeps
-/// its transport origin (a loopback operator read still lands); a CROSS-SITE request — driven by
-/// another origin's page — folds to [`Peer`] so it serves the bytes but effects no durable holder
-/// side effect. PURE: the ONE place the two axes meet.
-///
-/// [`ReadOrigin`]: crate::download::ReadOrigin
-/// [`Peer`]: crate::download::ReadOrigin::Peer
-fn landing_origin(
-    origin: crate::download::ReadOrigin,
-    provenance: crate::download::RequestProvenance,
-) -> crate::download::ReadOrigin {
-    match provenance {
-        crate::download::RequestProvenance::FirstParty => origin,
-        crate::download::RequestProvenance::CrossSite => crate::download::ReadOrigin::Peer,
-    }
-}
-
 #[async_trait::async_trait]
 pub trait ContentServer: Send + Sync {
     /// Serve a store resource as DECRYPTED plaintext over the trusted loopback surface (#289).
@@ -353,7 +335,7 @@ impl ContentServer for Node {
         // network-effecting landing legs (whole-capsule backfill + reshare/DHT-announce), so a
         // malicious page can never CSRF this node into becoming a holder of a capsule it chose.
         // The READ tiers still use `origin`; only the LANDING calls below use `land_origin`.
-        let land_origin = landing_origin(origin, provenance);
+        let land_origin = crate::download::landing_origin(origin, provenance);
         let store_id = match Bytes32::from_hex(store_hex.trim()) {
             Ok(b) => b,
             Err(_) => {
@@ -1028,7 +1010,7 @@ mod tests {
 
     // -- landing_origin: the two-axis collapse (#1654) --------------------------------------------
 
-    use crate::download::{ReadOrigin, RequestProvenance};
+    use crate::download::{landing_origin, ReadOrigin, RequestProvenance};
 
     #[test]
     fn first_party_local_read_still_lands() {

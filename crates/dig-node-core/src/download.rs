@@ -207,6 +207,23 @@ pub fn from_sec_fetch_site(hdr: Option<&str>) -> RequestProvenance {
     }
 }
 
+/// Collapse the two landing axes (#1654/#1956) into the single [`ReadOrigin`] the miss-path landing
+/// legs (`maybe_backfill_capsule`, the miss-envelope→`fetch_resource`→`spawn_capsule_reshare` chain)
+/// gate on. A FIRST-PARTY request keeps its transport origin — a loopback operator read (or a CLI/SDK
+/// read with no `Sec-Fetch-*` header) still lands. A CROSS-SITE request — one the browser reports was
+/// driven by another origin's page — folds to [`Peer`], so it serves the bytes but effects no durable
+/// holder side effect (no cache-write, no DHT announce, no reshare). PURE: the ONE place the two axes
+/// meet, shared by both the `/s/` plaintext serve path (#1654) and the JSON-RPC dispatch landing legs
+/// (#1956), so the two surfaces can never drift.
+///
+/// [`Peer`]: ReadOrigin::Peer
+pub(crate) fn landing_origin(origin: ReadOrigin, provenance: RequestProvenance) -> ReadOrigin {
+    match provenance {
+        RequestProvenance::FirstParty => origin,
+        RequestProvenance::CrossSite => ReadOrigin::Peer,
+    }
+}
+
 // -- The digstore-bound proof verifier -------------------------------------------------------------
 
 /// The REAL [`ProofVerifier`] for dig-download's whole-resource check: decodes the digstore

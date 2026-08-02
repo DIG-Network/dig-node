@@ -688,8 +688,10 @@ fn read_origin_for(peer_addr: &SocketAddr) -> dig_node_core::download::ReadOrigi
     }
 }
 
-/// Classify a `/s/` request's landing PROVENANCE (#1654) from its `Sec-Fetch-Site` header — the
-/// second landing axis over [`read_origin_for`]. A loopback address proves the CONNECTION is local,
+/// Classify a request's landing PROVENANCE (#1654/#1956) from its `Sec-Fetch-Site` header — the
+/// second landing axis over [`read_origin_for`], applied identically to the `/s/` plaintext serve
+/// path AND the `POST /` JSON-RPC path (`dig.getContent`/`dig.fetchRange`). A loopback address proves
+/// the CONNECTION is local,
 /// but not that the operator authorized the request: a malicious web page can drive a cross-site
 /// `GET dig.local/s/<capsule>`, and the durable LANDING side effect (cache write → DHT holder,
 /// SPEC §14.3/§21.3) would then be remotely triggerable. The browser reports the driving origin in
@@ -720,6 +722,11 @@ async fn rpc(
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     let origin = read_origin_for(&peer_addr);
+    // Classify the SECOND landing axis (#1956): the `/s/` serve path (#1654) already gates on
+    // Sec-Fetch-Site so a cross-site page cannot drive capsule landing; the JSON-RPC POST path must
+    // gate identically, or a same-origin capsule page could `POST dig.getContent`/`dig.fetchRange`
+    // and drive this node into becoming a holder. WITHOUT this classification the gate is a no-op.
+    let provenance = provenance_for(&headers);
     if !req.is_object() {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         return (
@@ -908,16 +915,19 @@ async fn rpc(
     // server down on one bad request.
     let node = state.node.clone();
     // `origin` was derived above from the ACCEPTING CONNECTION'S remote address, not assumed.
-    let resp = match tokio::task::spawn(async move { handle_rpc(&node, normalized, origin).await })
+    let resp =
+        match tokio::task::spawn(
+            async move { handle_rpc(&node, normalized, origin, provenance).await },
+        )
         .await
-    {
-        Ok(v) => v,
-        Err(e) => rpc_error(
-            id.clone(),
-            ErrorCode::DispatchFailed,
-            format!("dig-node: dispatch failed: {e}"),
-        ),
-    };
+        {
+            Ok(v) => v,
+            Err(e) => rpc_error(
+                id.clone(),
+                ErrorCode::DispatchFailed,
+                format!("dig-node: dispatch failed: {e}"),
+            ),
+        };
 
     // If dig-node didn't resolve the method, relay it blindly to the upstream.
     if resp
@@ -1975,11 +1985,13 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_allowed_origin, is_app_origin, is_local_origin, peer_tier_status, read_origin_for,
-        served_response, ServeProvenance, StorePath, APP_ORIGINS_ENV, EXPOSED_DIG_HEADERS,
+        is_allowed_origin, is_app_origin, is_local_origin, peer_tier_status, provenance_for,
+        read_origin_for, served_response, ServeProvenance, StorePath, APP_ORIGINS_ENV,
+        EXPOSED_DIG_HEADERS,
     };
+    use axum::http::HeaderMap;
     use dig_node_core::content_serve::{PeerTier, ServeSource};
-    use dig_node_core::download::ReadOrigin;
+    use dig_node_core::download::{ReadOrigin, RequestProvenance};
     use serde_json::json;
     use std::net::{Ipv4Addr, SocketAddr};
 
@@ -2058,6 +2070,37 @@ mod tests {
             peer_tier_status(PeerTier::Unattached),
             json!({ "attached": false }),
             "no engine must report attached: false — the truthful control"
+        );
+    }
+
+    /// **Proves (#1956):** the `POST /` JSON-RPC path derives its landing provenance from the SAME
+    /// `Sec-Fetch-Site` classifier the `/s/` serve path uses — a `cross-site` header denies landing, an
+    /// ABSENT header (a CLI/SDK client, or a same-origin navigation) is first-party so it still lands.
+    /// This is the load-bearing wiring: without `provenance_for` on the POST handler the whole gate is
+    /// a no-op (constant FirstParty). The `rpc` handler passes exactly this value into `handle_rpc`.
+    #[test]
+    fn provenance_is_read_on_the_post_path() {
+        let mut cross = HeaderMap::new();
+        cross.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        assert_eq!(
+            provenance_for(&cross),
+            RequestProvenance::CrossSite,
+            "a cross-site POST must classify as CrossSite so its landing legs are denied"
+        );
+
+        // No Sec-Fetch-Site header (a non-browser client, or a same-origin request) ⇒ first-party.
+        assert_eq!(
+            provenance_for(&HeaderMap::new()),
+            RequestProvenance::FirstParty,
+            "an absent header must be first-party — a CLI/SDK read must never be mistaken for cross-site"
+        );
+
+        let mut same = HeaderMap::new();
+        same.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        assert_eq!(
+            provenance_for(&same),
+            RequestProvenance::FirstParty,
+            "a same-origin POST still lands — only an explicit cross-site value denies landing"
         );
     }
 
