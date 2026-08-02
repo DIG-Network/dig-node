@@ -4323,9 +4323,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_cached_rejects_path_traversal() {
-        // A non-hex store id that tries to escape the cache dir is refused and
-        // never deletes anything outside it.
+    async fn remove_cached_rejects_a_non_canonical_key_at_the_validator() {
+        // A non-hex store id is refused by the 64-hex validator (`CapsuleKey::parse`) BEFORE any path
+        // is built — so it never reaches the containment guard below. This pins the validator gate;
+        // `remove_cached_containment_guard_refuses_a_symlink_escape` pins the guard that follows it.
         let (node, _td) = test_node(None);
         let err = node
             .cache_remove_cached("../../etc", &"33".repeat(32))
@@ -4333,7 +4334,42 @@ mod tests {
             .unwrap_err();
         assert!(
             err.contains("invalid") || err.contains("hex"),
-            "traversal attempt rejected as invalid input, got: {err}"
+            "a non-canonical key is rejected as invalid input, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_cached_containment_guard_refuses_a_symlink_escape() {
+        // The 64-hex validator can only pass keys whose bytes contain no `.`/`/`, so a valid key can
+        // never escape `<cache>/modules` on its own — the canonicalize + `starts_with(cache)` guard is
+        // defense-in-depth against a compromised cache LAYOUT. Exercise it directly: plant a symlink
+        // inside the cache whose target is a real file OUTSIDE the cache, then a well-formed remove
+        // must REFUSE it and leave the outside file intact. Delete the guard and this unlinks the
+        // outside file instead — so the assertions below fail without it (the test pins the guard).
+        let (node, _td) = test_node(None);
+        let store = "aa".repeat(32);
+        let root = "bb".repeat(32);
+
+        // A real file outside the cache dir that must survive the refused remove.
+        let outside = tempfile::tempdir().unwrap();
+        let protected = outside.path().join(format!("{root}.module"));
+        std::fs::write(&protected, b"must-not-be-deleted").unwrap();
+
+        // <cache>/modules/<store> -> <outside>, so <cache>/modules/<store>/<root>.module resolves,
+        // through the symlink, to the protected file above.
+        let modules = node.cache_dir_path().join("modules");
+        std::fs::create_dir_all(&modules).unwrap();
+        std::os::unix::fs::symlink(outside.path(), modules.join(&store)).unwrap();
+
+        let err = node.cache_remove_cached(&store, &root).await.unwrap_err();
+        assert!(
+            err.contains("outside the cache"),
+            "a symlink escape is refused by the containment guard, got: {err}"
+        );
+        assert!(
+            protected.exists(),
+            "the containment guard must leave the out-of-cache file intact"
         );
     }
 
