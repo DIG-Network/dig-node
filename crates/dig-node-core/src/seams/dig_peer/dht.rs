@@ -816,6 +816,68 @@ mod tests {
         assert_eq!(to_withdraw.len(), 2, "store + its capsule both withdrawn");
     }
 
+    // -- sync_inventory (active retract on loss) -----------------------------------------------
+
+    /// **Verifies:** `sync_inventory` on evicted capsules calls `retract_own_provider` (active
+    /// retract), NOT the passive `withdraw_provider`. Active retract deletes the local provider record
+    /// immediately, so a reader's `find_providers` query does NOT see this node as a provider anymore;
+    /// passive withdraw leaves the record until TTL, causing wasted dials to a node that can no longer
+    /// serve (#1962).
+    ///
+    /// **Catches:** accidental revert to `withdraw_provider` in the loss branch.
+    #[tokio::test]
+    async fn evicted_capsule_is_actively_retracted_from_local_providers() {
+        let transport = Arc::new(test_transport("sync-inventory-1962"));
+        let service = Arc::new(DhtService::new(
+            PeerId::from_bytes([0x11; 32]),
+            vec![],
+            dig_dht::DhtConfig::default(),
+            transport,
+        ));
+        let dht = DhtHandle::new(service.clone(), vec![]);
+
+        // Step 1: Announce a capsule by calling reconcile_inventory with it present.
+        let s = "bb".repeat(32);
+        let r = "cc".repeat(32);
+        let cached = [cap(&s, &r)];
+        let delta = dht.reconcile_inventory(&cached).await;
+        assert!(
+            !delta.gained.is_empty(),
+            "capsule announced on first reconcile"
+        );
+        let announced_ids = delta.gained.clone();
+
+        // Step 2: Evict the capsule (empty inventory) and trigger the active-retract branch.
+        let delta_loss = dht.reconcile_inventory(&[]).await;
+        assert_eq!(
+            delta_loss.lost.len(),
+            announced_ids.len(),
+            "all announced ids retracted on eviction"
+        );
+        assert!(
+            announced_ids.iter().all(|id| delta_loss.lost.contains(id)),
+            "the lost set contains exactly the ids we had announced"
+        );
+
+        // Step 3: Verify active retract via find_providers: the local provider record for the
+        // evicted capsule is GONE, not just "waiting for TTL". A passive withdraw would leave it
+        // in the local table. We query find_providers without adding peers to the routing table,
+        // so it can only return local records or those already in the table (none in this case).
+        // The assertion: `find_providers` does not return self (our PeerId) for the evicted id.
+        // If retract_own_provider was used, the local record is deleted and find_providers returns
+        // an empty list. If withdraw_provider was used, the record stays and find_providers returns
+        // self (because the record is still there locally even if we stopped announcing it).
+        for evicted_id in &announced_ids {
+            let providers = service.find_providers(evicted_id).await.unwrap_or_default();
+            assert!(
+                providers.is_empty(),
+                "after active retract, find_providers for {evicted_id:?} does not return self; \
+                 if it does, the code reverted to passive withdraw_provider instead of active \
+                 retract_own_provider"
+            );
+        }
+    }
+
     // -- is_dht_request (inbound classification) -----------------------------------------------
 
     #[test]
