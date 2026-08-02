@@ -68,6 +68,9 @@ digstore-stage = { git = "https://github.com/DIG-Network/digstore.git", rev = "4
 digstore-crypto = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 digstore-compiler = { git = "https://github.com/DIG-Network/digstore.git", rev = "4c34f0be" }
 chia-protocol = "0.26"
+# The `Streamable` to_bytes/from_bytes trait, used to serialize the chat `ChatMessage` payload before
+# the dig-message seal. Same 0.26 as chia-protocol so the byte layout agrees across the workspace.
+chia-traits = "0.26"
 # -- Seam 1: Chia light-client CONFIRMATION/PEAK observability (#1314) --------------------------------
 # `chia-peer` is a subscribing Chia wallet-protocol light client (a thin driver over chia-wallet-sdk
 # 0.30 / chia-protocol 0.26): it tracks the peak + coin/puzzle-hash confirmations for the coins the
@@ -105,6 +108,13 @@ serde_json = "1"
 # method names + the peer allowlist from HERE (never hand-rolled) so the contract
 # cannot drift from the other node implementation or the discovery document (#1075).
 dig-rpc-protocol = "0.6"
+# The directed-message base protocol (epic #793/#796): the e2e seal/open pipeline + the typed envelope
+# the chat subsystem seals into. dig-node is the TRANSPORT — it seals an app-supplied opaque DIGCHAT1
+# envelope to the recipient's 0x0010 BLS identity key and dig-gossip directed-sends the sealed bytes.
+dig-message = "0.5"
+# The chat message-TYPE layer: the five chat payloads on dig-message's dig-chat band + the registry
+# wiring. A crypto-free, content-blind type layer — the DIGCHAT1 seal is carried as opaque bytes.
+dig-chat-protocol = { path = "../dig-chat-protocol", version = "0.1" }
 base64 = "0.22"
 hex = "0.4"
 # The whole-module pull's one content-addressing primitive (#1576): the module descriptor's per-chunk +

@@ -1925,6 +1925,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-chat-protocol"
+version = "0.1.0"
+dependencies = [
+ "chia-protocol",
+ "chia-sha2 0.26.0",
+ "chia-traits 0.26.0",
+ "chia_streamable_macro 0.26.0",
+ "dig-message",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "dig-clvm"
 version = "0.1.1"
 source = "git+https://github.com/DIG-Network/dig-clvm.git?rev=356771034afd54a61d6199bc5960786139e39988#356771034afd54a61d6199bc5960786139e39988"
@@ -2221,7 +2233,9 @@ dependencies = [
  "chia-protocol",
  "chia-query 0.5.1",
  "chia-sdk-utils",
+ "chia-traits 0.26.0",
  "dig-chainsource-interface",
+ "dig-chat-protocol",
  "dig-constants 0.4.0",
  "dig-dht",
  "dig-download",
@@ -2229,6 +2243,7 @@ dependencies = [
  "dig-identity 0.4.0",
  "dig-ip",
  "dig-ipc-protocol",
+ "dig-message",
  "dig-nat",
  "dig-peer",
  "dig-peer-selector",
@@ -2266,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.73.0"
+version = "0.74.0"
 dependencies = [
  "async-trait",
  "axum",

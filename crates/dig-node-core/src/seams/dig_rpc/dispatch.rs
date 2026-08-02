@@ -46,6 +46,20 @@ impl RpcDispatch for Node {
         let node = self;
         let id = req.get("id").cloned().unwrap_or(json!(1));
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+        // Chat subsystem (epic #793). These methods are NOT yet in the shared `dig-rpc-protocol`
+        // Method catalogue (promoting them there is a release-first follow-up), so they are dispatched
+        // here BEFORE the `Method::from_name` match. They are `served: "local"` in the shell's method
+        // catalogue, so the OpenRPC drift guard dispatches them through this path and never sees -32601.
+        match method {
+            "chat.send" => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.chat_send(&params, id).await;
+            }
+            "chat.poll" => return node.chat_poll(id),
+            _ => {}
+        }
+
         use dig_rpc_protocol::Method;
         // Dispatch on the canonical Method enum (dig-rpc-protocol, #1075) instead of
         // string literals, so the served method names cannot drift from the shared
