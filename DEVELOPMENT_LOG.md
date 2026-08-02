@@ -936,3 +936,14 @@ debt existing.
 makes records expire before the holder re-announces. Pinning only the named relation would have left
 the real one unguarded. No single value satisfies both bounds with margin, so closing the zero margin
 is a wire-behaviour decision, not a test fix.
+
+**Landing a capsule IS announcing it — verify at the land seam, not only at serve (#1623).** The
+whole-store sync (`sync_module_from` → `cache_fetch_and_cache`) writes a downloaded module straight to
+`<cache>/modules/<store>/<root>.module`, and the mere existence of that file makes the node a
+discoverable DHT holder (§14.1) — the reshare/flywheel then multiplies the copy across peers. So the
+old rationale "the synced module isn't trusted here; a tampered module fails the SERVE gate, not this
+sync" was wrong: the serve gate never runs for a peer that only learns this node HOLDS the capsule
+from its DHT announce. The fix reuses the #1576 reshare leg's `ChainAnchoredModuleVerifier` at the sync
+seam (resolve the chain-anchored root, re-hash, compare) and refuses BEFORE the write, so an
+unverified capsule never lands and is never announced. General lesson: a defense that only runs on one
+of several exit paths is not a defense — verify at every seam that admits an artifact.
