@@ -86,10 +86,11 @@ impl ProviderLocator for UnionLocator {
                     // ORDER is preserved (dig-dht stays authoritative for ordering).
                     Some(i) => {
                         let existing: &mut ProviderRecord = &mut merged[i];
-                        existing.addresses.extend(record.addresses);
-                        // #1490: re-dedup + re-cap the combined hint set so merging can never let a
-                        // provider's advertised addresses grow past the dial-amplification bound.
-                        sanitize_address_hints(existing);
+                        // #1490: keep the combined hint set deduped + capped (dial-amplification bound).
+                        // #1620: when the cap must drop hints, drop this earlier record's SURPLUS TAIL
+                        // — never the later source's NOVEL hint — so a reachable pool address is not
+                        // silently dropped by an earlier source that already filled the cap with junk.
+                        merge_address_hints(existing, record.addresses);
                     }
                     None => {
                         let mut record = record;
@@ -106,22 +107,57 @@ impl ProviderLocator for UnionLocator {
     }
 }
 
-/// Dedup (order-preserving) and CAP a provider record's advertised addresses at
+/// Order-preserving dedup of a hint list — no cap. `CandidateAddr` is `Eq` but not `Hash`, so this is
+/// O(n²) over a tiny list. The shared primitive behind [`sanitize_address_hints`] (which then caps a
+/// single source) and [`merge_address_hints`] (which merges two, computing novelty first).
+fn dedup_hints(addrs: Vec<dig_dht::CandidateAddr>) -> Vec<dig_dht::CandidateAddr> {
+    let mut out: Vec<dig_dht::CandidateAddr> = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
+}
+
+/// Dedup (order-preserving) and CAP a single provider record's advertised addresses at
 /// [`MAX_ADDRS_PER_PROVIDER`] (#1490). The addresses are untrusted reach-hints — the SPKI pin at
 /// connect is what authenticates the peer — so bounding the set stops dial amplification without
 /// affecting correctness (a real holder is reachable at its most-preferred, IPv6-first hints, which
-/// the cap keeps). Dedup is O(n²) over a tiny list; `CandidateAddr` is `Eq` but not `Hash`.
+/// the cap keeps). Used at INGEST for a first-seen record; a later merge goes through
+/// [`merge_address_hints`].
 fn sanitize_address_hints(record: &mut ProviderRecord) {
+    let deduped = dedup_hints(std::mem::take(&mut record.addresses));
+    record.addresses = deduped.into_iter().take(MAX_ADDRS_PER_PROVIDER).collect();
+}
+
+/// Merge a LATER source's `incoming` hints into `existing` (the first-seen record), keeping the set
+/// deduped and capped at [`MAX_ADDRS_PER_PROVIDER`].
+///
+/// The earlier source keeps its LEAD position (#836: dig-dht/pool ordering is authoritative, and the
+/// dial's `best_address` breaks ties by list order), but when the combined set exceeds the cap the
+/// SURPLUS is dropped from the earlier source's TAIL — never from the later source's NOVEL hints
+/// (#1620). The later source (the live connected pool) carries the connection-verified reachable
+/// address; an earlier source (a stale DHT record) that already filled the cap with unreachable hints
+/// must never silently drop it. So: the earlier HEAD leads, every later novel hint claims a slot (up
+/// to the cap), and only earlier surplus beyond the cap is discarded. When everything fits, the order
+/// is exactly earlier-then-later — unchanged from the pre-#1620 merge.
+fn merge_address_hints(existing: &mut ProviderRecord, incoming: Vec<dig_dht::CandidateAddr>) {
+    let earlier = dedup_hints(std::mem::take(&mut existing.addresses));
+    let novel_later: Vec<dig_dht::CandidateAddr> = dedup_hints(incoming)
+        .into_iter()
+        .filter(|addr| !earlier.contains(addr))
+        .collect();
+
+    // Reserve the cap's slots for the later novel hints first (so a reachable one is never dropped),
+    // then lead with as many of the earlier hints as still fit.
+    let keep_later = novel_later.len().min(MAX_ADDRS_PER_PROVIDER);
+    let room_for_earlier = MAX_ADDRS_PER_PROVIDER - keep_later;
+
     let mut kept: Vec<dig_dht::CandidateAddr> = Vec::with_capacity(MAX_ADDRS_PER_PROVIDER);
-    for addr in record.addresses.drain(..) {
-        if kept.len() >= MAX_ADDRS_PER_PROVIDER {
-            break;
-        }
-        if !kept.contains(&addr) {
-            kept.push(addr);
-        }
-    }
-    record.addresses = kept;
+    kept.extend(earlier.into_iter().take(room_for_earlier));
+    kept.extend(novel_later.into_iter().take(keep_later));
+    existing.addresses = kept;
 }
 
 /// A [`ProviderLocator`] that always finds nothing — the DORMANT PEX / relay-introducer placeholder in
@@ -291,5 +327,62 @@ mod tests {
                 "no duplicate address hint survives ingest"
             );
         }
+    }
+
+    /// #1620: when an EARLIER source already fills the address cap, a LATER source's novel reachable
+    /// hint must still survive the merge — the cap drops the earlier source's SURPLUS TAIL, never the
+    /// later novel hint. (In production the reachable pool source is wired FIRST so this is masked;
+    /// this pins the guarantee order-independently. Before the fix the merge appended the later hint
+    /// then kept the first MAX = the earlier junk, dropping the reachable one.)
+    #[tokio::test]
+    async fn a_later_sources_novel_hint_survives_when_an_earlier_source_fills_the_cap() {
+        use dig_dht::CandidateAddr;
+        let cid = mock_content_id();
+        // Earlier source (queried first) alone fills the cap with MAX distinct (unreachable) hints.
+        let earlier_addrs: Vec<CandidateAddr> = (0..super::MAX_ADDRS_PER_PROVIDER)
+            .map(|i| CandidateAddr::direct(format!("10.9.{i}.9"), 1))
+            .collect();
+        let earlier = ProviderRecord {
+            content_key: cid.to_key().to_hex(),
+            provider_peer_id: mock_peer_hex(1),
+            addresses: earlier_addrs,
+            expires_at: u64::MAX,
+        };
+        // A LATER source names the SAME peer at one ADDITIONAL, reachable address.
+        let later = ProviderRecord {
+            content_key: cid.to_key().to_hex(),
+            provider_peer_id: mock_peer_hex(1),
+            addresses: vec![CandidateAddr::direct("10.0.0.1", 9444)],
+            expires_at: u64::MAX,
+        };
+        let src_a = Arc::new(MockProviderLocator::fixed(vec![earlier]));
+        let src_b = Arc::new(MockProviderLocator::fixed(vec![later]));
+        let union = UnionLocator::new(vec![src_a, src_b]);
+
+        let got = union.find_providers(&cid).await.expect("union ok");
+        assert_eq!(got.len(), 1, "the same peer is one record");
+        let hosts: Vec<(&str, u16)> = got[0]
+            .addresses
+            .iter()
+            .map(|a| (a.host.as_str(), a.port))
+            .collect();
+        assert!(
+            got[0].addresses.len() <= super::MAX_ADDRS_PER_PROVIDER,
+            "still capped at {} (got {})",
+            super::MAX_ADDRS_PER_PROVIDER,
+            got[0].addresses.len()
+        );
+        assert!(
+            hosts.contains(&("10.0.0.1", 9444)),
+            "the later source's novel reachable hint survives even though the earlier source filled \
+             the cap (got {hosts:?})"
+        );
+        // The earlier source's HEAD still leads (best_address tie-break, #836) — only its surplus
+        // tail was displaced to make room for the reachable hint.
+        assert_eq!(
+            hosts.first().copied(),
+            Some(("10.9.0.9", 1)),
+            "the earlier source still leads the merged list"
+        );
     }
 }
