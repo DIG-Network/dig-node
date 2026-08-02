@@ -6853,6 +6853,7 @@ mod tests {
             "index.html",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         match out {
             PlaintextOutcome::Served {
@@ -6890,6 +6891,7 @@ mod tests {
             "assets/app.js",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         assert!(
             matches!(js, PlaintextOutcome::Served { ref bytes, .. } if bytes == b"console.log(1)"),
@@ -6903,6 +6905,7 @@ mod tests {
             "",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         assert!(
             matches!(bare, PlaintextOutcome::Served { ref bytes, .. } if bytes == b"<h1>hi</h1>"),
@@ -7006,6 +7009,7 @@ mod tests {
                 "index.html",
                 None,
                 crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
             ));
             match out {
                 PlaintextOutcome::Served {
@@ -7060,6 +7064,7 @@ mod tests {
             "index.html",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         match out {
             PlaintextOutcome::Served {
@@ -7107,6 +7112,7 @@ mod tests {
             "index.html",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         match out {
             PlaintextOutcome::Served {
@@ -7154,6 +7160,7 @@ mod tests {
             "secret.txt",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         match out {
             PlaintextOutcome::Served { generation, .. } => {
@@ -7197,6 +7204,7 @@ mod tests {
             "index.html",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         match out {
             PlaintextOutcome::Served {
@@ -7240,6 +7248,7 @@ mod tests {
             "index.html",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         assert!(
             matches!(out, PlaintextOutcome::RootError { .. }),
@@ -7711,6 +7720,7 @@ mod tests {
             "index.html",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         std::env::remove_var("DIG_NODE_PIN");
         match out {
@@ -7791,6 +7801,7 @@ mod tests {
                 "index.html",
                 None,
                 origin,
+                crate::download::RequestProvenance::FirstParty,
             ));
             match out {
                 PlaintextOutcome::Served { bytes, source, .. } => {
@@ -7938,6 +7949,7 @@ mod tests {
             "index.html",
             None,
             crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
         ));
         std::env::remove_var("DIG_NODE_PIN");
         match out {

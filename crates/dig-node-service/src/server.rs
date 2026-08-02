@@ -688,6 +688,20 @@ fn read_origin_for(peer_addr: &SocketAddr) -> dig_node_core::download::ReadOrigi
     }
 }
 
+/// Classify a `/s/` request's landing PROVENANCE (#1654) from its `Sec-Fetch-Site` header — the
+/// second landing axis over [`read_origin_for`]. A loopback address proves the CONNECTION is local,
+/// but not that the operator authorized the request: a malicious web page can drive a cross-site
+/// `GET dig.local/s/<capsule>`, and the durable LANDING side effect (cache write → DHT holder,
+/// SPEC §14.3/§21.3) would then be remotely triggerable. The browser reports the driving origin in
+/// `Sec-Fetch-Site`; a `cross-site` value folds landing to `Peer` while the bytes still serve. A
+/// non-browser client (CLI/SDK) sends no header ⇒ first-party. See
+/// [`dig_node_core::download::from_sec_fetch_site`].
+fn provenance_for(headers: &HeaderMap) -> dig_node_core::download::RequestProvenance {
+    dig_node_core::download::from_sec_fetch_site(
+        headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()),
+    )
+}
+
 /// `POST /` — JSON-RPC. Normalises the request params for dig-node, dispatches via
 /// `handle_rpc`, and returns the node's JSON-RPC envelope. A non-object body (e.g.
 /// a batch array, which dig-node does not handle) is rejected in-band so the client
@@ -848,6 +862,40 @@ async fn rpc(
             StatusCode::OK,
             Json(wallet_result_to_jsonrpc(id, status, out)),
         );
+    }
+
+    // LANDING gate (#1654): `cache.fetchAndCache` makes this node fetch + cache + DHT-announce a
+    // capsule of the CALLER'S choosing — a durable holder side effect (SPEC §14.3/§21.3). Over the
+    // HTTP surface a loopback address does not prove the operator authorized the call (a cross-site
+    // page can POST to `dig.local`), so it requires the control token exactly like `control.*`:
+    // the master control token OR a valid paired token. The in-process FFI `cache.*` path stays open
+    // (SYSTEM.md) — it never reaches this HTTP `rpc` handler. Reads remain ungated.
+    if method == "cache.fetchAndCache" {
+        let header_tok = headers
+            .get(control::CONTROL_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let presented = control::presented_token(header_tok, &req);
+        // Direct constant-time compare (NOT `control::is_authorized`, which fails OPEN for any
+        // non-`control.*` method): either the master control token or a valid paired token.
+        let master_ok = presented
+            .as_deref()
+            .is_some_and(|tok| control::ct_eq(tok, &state.control_token));
+        let paired_ok = presented.as_deref().is_some_and(|tok| {
+            pairing::is_paired_token(&pairing::paired_tokens_path(&state.state_dir), tok)
+        });
+        if !(master_ok || paired_ok) {
+            return (
+                StatusCode::OK,
+                Json(rpc_error(
+                    id,
+                    ErrorCode::Unauthorized,
+                    "cache.fetchAndCache requires the local control token (X-Dig-Control-Token \
+                     header or params._control_token) or a paired controller token (see \
+                     `dig-node pair`): it makes this node a durable DHT holder of the requested \
+                     capsule, so it is not a public read",
+                )),
+            );
+        }
     }
 
     // Keep the original request for a possible passthrough relay (the upstream must
@@ -1237,10 +1285,19 @@ async fn ws_wallet_session(mut socket: WebSocket, state: AppState) {
 async fn store_serve(
     State(state): State<AppState>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
     match parse_store_path(&path) {
-        Some(sp) => serve_resource(&state, sp, read_origin_for(&peer_addr)).await,
+        Some(sp) => {
+            serve_resource(
+                &state,
+                sp,
+                read_origin_for(&peer_addr),
+                provenance_for(&headers),
+            )
+            .await
+        }
         None => not_found(),
     }
 }
@@ -1276,7 +1333,15 @@ async fn fallback_serve(
 ) -> Response {
     let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
     match reroot_via_referer(referer, uri.path()) {
-        Some(sp) => serve_resource(&state, sp, read_origin_for(&peer_addr)).await,
+        Some(sp) => {
+            serve_resource(
+                &state,
+                sp,
+                read_origin_for(&peer_addr),
+                provenance_for(&headers),
+            )
+            .await
+        }
         None => not_found(),
     }
 }
@@ -1291,13 +1356,14 @@ async fn serve_resource(
     state: &AppState,
     sp: StorePath,
     origin: dig_node_core::download::ReadOrigin,
+    provenance: dig_node_core::download::RequestProvenance,
 ) -> Response {
     let root = sp.root.as_deref().unwrap_or("");
     // Public stores only for now (salt = None): a private store's secret salt is not yet provisioned
     // to the local serve surface, so such a store fails closed at decrypt (a documented follow-up).
     match state
         .content_server
-        .serve_content_plaintext(&sp.store_id, root, &sp.resource, None, origin)
+        .serve_content_plaintext(&sp.store_id, root, &sp.resource, None, origin, provenance)
         .await
     {
         PlaintextOutcome::Served {
@@ -1321,7 +1387,9 @@ async fn serve_resource(
                 generation,
             },
         ),
-        PlaintextOutcome::NotFound { root_hex } => serve_miss(state, &sp, &root_hex, origin).await,
+        PlaintextOutcome::NotFound { root_hex } => {
+            serve_miss(state, &sp, &root_hex, origin, provenance).await
+        }
         PlaintextOutcome::InvalidParams { message } => {
             error_response(StatusCode::BAD_REQUEST, &message)
         }
@@ -1344,6 +1412,7 @@ async fn serve_miss(
     sp: &StorePath,
     root_hex: &str,
     origin: dig_node_core::download::ReadOrigin,
+    provenance: dig_node_core::download::RequestProvenance,
 ) -> Response {
     if is_static_asset_path(&sp.resource) {
         return not_found();
@@ -1360,7 +1429,14 @@ async fn serve_miss(
     // SPA fallback: the store's default view, served against the SAME resolved root.
     match state
         .content_server
-        .serve_content_plaintext(&sp.store_id, root_hex, "index.html", None, origin)
+        .serve_content_plaintext(
+            &sp.store_id,
+            root_hex,
+            "index.html",
+            None,
+            origin,
+            provenance,
+        )
         .await
     {
         PlaintextOutcome::Served {
