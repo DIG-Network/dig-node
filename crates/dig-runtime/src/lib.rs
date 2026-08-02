@@ -106,11 +106,14 @@ const NODE_UNAVAILABLE_JSONRPC: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"c
 /// wallet-only guard is testable without the process-global runtime.
 fn dispatch_node_rpc(node: Option<&Node>, rt: &tokio::runtime::Runtime, req: &str) -> String {
     match node {
-        // The in-process FFI node engine (the browser BEING the node, #44/#47) — always Local.
+        // The in-process FFI node engine (the browser BEING the node, #44/#47) — always Local, and
+        // the operator's OWN navigation (no cross-site Sec-Fetch context) → FirstParty, so its reads
+        // land as before (#1956).
         Some(node) => rt.block_on(dig_node_core::handle_rpc_json(
             node,
             req,
             dig_node_core::download::ReadOrigin::Local,
+            dig_node_core::download::RequestProvenance::FirstParty,
         )),
         None => NODE_UNAVAILABLE_JSONRPC.to_string(),
     }

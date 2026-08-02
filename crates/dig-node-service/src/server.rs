@@ -720,6 +720,11 @@ async fn rpc(
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     let origin = read_origin_for(&peer_addr);
+    // Classify the SECOND landing axis (#1956): the `/s/` serve path (#1654) already gates on
+    // Sec-Fetch-Site so a cross-site page cannot drive capsule landing; the JSON-RPC POST path must
+    // gate identically, or a same-origin capsule page could `POST dig.getContent`/`dig.fetchRange`
+    // and drive this node into becoming a holder. WITHOUT this classification the gate is a no-op.
+    let provenance = provenance_for(&headers);
     if !req.is_object() {
         let id = req.get("id").cloned().unwrap_or(Value::Null);
         return (
@@ -908,8 +913,10 @@ async fn rpc(
     // server down on one bad request.
     let node = state.node.clone();
     // `origin` was derived above from the ACCEPTING CONNECTION'S remote address, not assumed.
-    let resp = match tokio::task::spawn(async move { handle_rpc(&node, normalized, origin).await })
-        .await
+    let resp = match tokio::task::spawn(
+        async move { handle_rpc(&node, normalized, origin, provenance).await },
+    )
+    .await
     {
         Ok(v) => v,
         Err(e) => rpc_error(

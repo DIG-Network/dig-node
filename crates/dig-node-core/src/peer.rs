@@ -1248,7 +1248,16 @@ impl PeerRpcResponder for NodeResponder {
             return json!({"jsonrpc":"2.0","id":id,"result":{"peers": peers}});
         }
         // This is the peer-RPC server's OWN dispatch — a REMOTE peer's request, always (#179/#1576).
-        crate::handle_rpc(&self.node, req, crate::download::ReadOrigin::Peer).await
+        // Provenance is FirstParty here: `landing_origin(Peer, FirstParty) == Peer`, so a peer-wire
+        // read still never lands (the transport axis already denies it); the Sec-Fetch axis only ever
+        // applies to browser-driven loopback requests, which never arrive here (#1956).
+        crate::handle_rpc(
+            &self.node,
+            req,
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await
     }
 
     async fn handle_availability(&self, items: Value) -> Value {

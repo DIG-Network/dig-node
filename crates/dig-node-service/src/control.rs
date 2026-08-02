@@ -702,7 +702,15 @@ pub async fn dispatch_control(ctx: &ControlCtx, id: Value, method: &str, params:
     // not the bind. (The bind is also loopback-only by default and a non-loopback `DIG_NODE_HOST`
     // is refused unless `DIG_NODE_ALLOW_REMOTE=1` (#1662), but the token gate is what authorizes a
     // control call regardless of where it arrives from.)
-    dig_node_core::handle_rpc(&ctx.node, req, dig_node_core::download::ReadOrigin::Local).await
+    // The control surface is the node's OWN trusted operator (token-gated, no browser / no
+    // Sec-Fetch context) → first-party by definition, so its reads land exactly as before (#1956).
+    dig_node_core::handle_rpc(
+        &ctx.node,
+        req,
+        dig_node_core::download::ReadOrigin::Local,
+        dig_node_core::download::RequestProvenance::FirstParty,
+    )
+    .await
 }
 
 /// Handle a control method OWNED by this shell (guaranteed by [`dispatch_control`] to be a member
