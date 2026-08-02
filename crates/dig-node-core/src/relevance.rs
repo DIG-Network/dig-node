@@ -69,11 +69,13 @@ pub struct RelevanceWeights {
 }
 
 impl Default for RelevanceWeights {
-    /// The `xor` weight (1.0) exceeds the SUM of every other bonus's clamped
-    /// ceiling (0.25 + 0.4 + 0.2 + 0.15 = 1.0 excluding the pin override), so
-    /// proximity is never dominated by the gameable secondary signals; `pinned`
-    /// (2.0) deliberately overrides everything because an explicit pin is a
-    /// direct operator instruction, not a heuristic.
+    /// The `xor` weight (1.0) strictly exceeds the SUM of the
+    /// ATTACKER-GAMEABLE secondaries — scarcity + demand + recency
+    /// (0.25 + 0.4 + 0.2 = 0.85) — so proximity can never be dominated by a
+    /// signal an attacker can manufacture. `pin_adjacent` and `pinned` are
+    /// deliberately excluded from that sum: they are OPERATOR-controlled, not
+    /// attacker-choosable, so `pinned` (2.0) intentionally overrides
+    /// everything as a direct operator instruction rather than a heuristic.
     fn default() -> Self {
         Self {
             xor: 1.0,
@@ -161,7 +163,7 @@ const RECENCY_SCALE: f64 = 1000.0;
 /// below is a bounded ADDITIVE bonus that can nudge, never dominate, this term.
 ///
 /// ## Monotonic proximity map
-/// Proximity is `1 - (hi128 / 2^128)` where `hi128` is the top 128 bits of the
+/// Proximity is `1 - (hi128 / u128::MAX)` where `hi128` is the top 128 bits of the
 /// XOR distance. It is a strictly decreasing function of those high bits, so a
 /// strictly smaller XOR distance (differing anywhere in the top 128 bits) yields
 /// a strictly higher proximity. The low 128 bits are an intentional
@@ -195,7 +197,7 @@ fn xor_proximity(content_id: &[u8; 32], peer_id: &[u8; 32]) -> f64 {
     for i in 0..16 {
         hi = (hi << 8) | u128::from(content_id[i] ^ peer_id[i]);
     }
-    // hi / 2^128 in [0,1); proximity = 1 - that, strictly decreasing in hi.
+    // hi / u128::MAX in [0,1]; proximity = 1 - that, strictly decreasing in hi.
     let distance_fraction = (hi as f64) / (u128::MAX as f64);
     1.0 - distance_fraction
 }

@@ -1376,6 +1376,37 @@ only when `candidate > incumbent + margin` (strict). The margin is an anti-thras
 two near-equal stores would ping-pong in and out of the cache each sweep. At or below the margin the
 incumbent stays.
 
+### 7.10b. Tier-0 knapsack selector (#1988, epic #1934)
+
+The `tier0_selector` module (`crates/dig-node-core/src/tier0_selector.rs`) is a PURE, deterministic
+selector that decides WHICH speculative-precache candidates are worth keeping under a small
+sub-budget, given each candidate's size and a relevance score already computed by §7.10a's
+`relevance`. Like `relevance`, it performs NO I/O and reads NO clock. It does NOT sample the DHT for
+candidates (a later epic-#1934 child) or fetch/evict anything against the live cache — that wiring
+is out of scope here.
+
+**Sub-budget.** Tier-0 speculative precache is bounded to `TIER0_BUDGET_FRACTION` (0.10) of the
+node's WHOLE cache cap (`DIG_NODE_CACHE_CAP`/§7.10 `cache_cap_bytes`), never the whole cap —
+`tier0_budget_bytes(whole_cache_cap_bytes) -> u64` computes this fraction as pure arithmetic over a
+caller-supplied cap (the cap lookup itself is I/O and stays outside this module). Tier-0 is an
+opportunistic bet, and reserving only a slice of the cap keeps it from crowding out real Tier1/Tier2
+retention even before the tier-based eviction precedence (§7.10a) has to bite.
+
+**Selection.** `select_within_budget(candidates: &[Candidate], budget_bytes: u64) -> Vec<usize>`
+returns the indices of the candidates to keep, using GREEDY selection by value-density
+(`relevance / size_bytes`, descending) rather than an exact 0/1 dynamic-programming knapsack — DP is
+`O(n * budget)`, which is disproportionate at a GiB-scale budget; greedy is `O(n log n)` and
+near-optimal (it can only under-fill the last unit of budget by at most one candidate's size). The
+selected set's total size MUST NOT exceed `budget_bytes`. A candidate with `size_bytes == 0` is
+treated as infinitely dense (free to keep) and is always included rather than causing a
+divide-by-zero.
+
+**Displacement hysteresis.** `should_displace_tier0(incumbent, candidate, margin) -> bool` is a
+thin, named wrapper over §7.10a's `should_displace`, reusing its `candidate > incumbent + margin`
+rule so tier-0 re-selection against an existing held set does not thrash a fetch/evict/refetch cycle
+on marginal score differences. The tier-0 selector's own default margin is
+`DEFAULT_HYSTERESIS_MARGIN` (0.05), overridable per call.
+
 ### 7.11. Control-token pairing for browser controllers (#280)
 
 An MV3 browser extension cannot read the `<state_dir>/control-token` file, so it cannot drive

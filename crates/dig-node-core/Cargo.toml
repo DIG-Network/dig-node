@@ -10,7 +10,10 @@ name = "dig-node-core"
 # crate's dig-dht re-exports — now carries `SafeText` instead of `String` (dig_ecosystem#1674/#1675).
 # 0.27.0 adds the pure `relevance` module (CacheTier / relevance() / evict_key / should_displace) —
 # a new, backwards-compatible public export (dig_ecosystem#1986), hence a MINOR bump.
-version = "0.27.0"
+# 0.28.0 adds the pure `tier0_selector` module (Candidate / select_within_budget / tier0_budget_bytes /
+# should_displace_tier0) built on 0.27's relevance module — a new, backwards-compatible public export
+# (dig_ecosystem#1988), hence another MINOR bump.
+version = "0.28.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
