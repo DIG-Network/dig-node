@@ -516,6 +516,14 @@ impl RpcDispatch for Node {
                 let total_bytes: u64 = list.iter().map(|c| c.size_bytes).sum();
                 use std::sync::atomic::Ordering::Relaxed;
                 let usage = cache_usage();
+                // #1991 (epic #1934): per-tier occupancy for the relay-globe cached-store count.
+                // Tier1 is a REAL figure — the inbound-demand ledger's own bounded-LRU size (§7.10d).
+                // Tier0/Tier2 have no live occupancy source yet (no prefetch loop / bribed tier), so
+                // each is reported `wired: false, occupancy: 0` rather than a fabricated number — a
+                // controller can distinguish "empty" from "not measurable yet". They populate once the
+                // remaining epic-#1934 children (tier-0 prefetch loop, tier-2 bribed retention) wire a
+                // real occupancy source; the shape is fixed now so no controller-side change is needed
+                // then.
                 return json!({"jsonrpc":"2.0","id":id,"result":{
                 "cap_bytes": cache_cap_bytes(),
                 "used_bytes": usage.total(),
@@ -525,9 +533,15 @@ impl RpcDispatch for Node {
                 "total_bytes": total_bytes,
                 "evicted_count": CACHE_EVICTED_COUNT.load(Relaxed),
                 "evicted_bytes": CACHE_EVICTED_BYTES.load(Relaxed),
+                "refetch_count": CACHE_REFETCH_COUNT.load(Relaxed),
                 "content_cache": {
                     "hits": CONTENT_CACHE_HITS.load(Relaxed),
                     "misses": CONTENT_CACHE_MISSES.load(Relaxed),
+                },
+                "tiers": {
+                    "tier0_precache": {"occupancy": 0, "wired": false},
+                    "tier1_demand": {"occupancy": node.inbound_demand_entry_count(), "wired": true},
+                    "tier2_bribed": {"occupancy": 0, "wired": false},
                 }}});
             }
             Some(Method::CacheRemoveCached) => {

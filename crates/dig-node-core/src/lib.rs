@@ -202,6 +202,12 @@ static CACHE_EVICTED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static CONTENT_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Decoded-content-cache lookups that MISSED (had to re-decode the module).
 static CONTENT_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Whole-capsule NETWORK lands since process start — a real refetch (bytes pulled over the
+/// wire and written to disk), distinct from a RAM decode-cache miss (#1991, epic #1934). Bumped
+/// once per successful [`Node::sync_module_from`] write, the single choke-point every landing
+/// path (on-demand `cache.fetchAndCache`, chain gap-fill, fetch-side backfill, reshare warm)
+/// funnels through, so it counts every genuine re-download without double-counting or missing a path.
+static CACHE_REFETCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The [`ContentCache`] key: `(store_hex, root_hex, retrieval_key)` identifying one served resource.
 type ContentCacheKey = (String, String, [u8; 32]);
@@ -1363,6 +1369,11 @@ impl Node {
             .ok_or("the upstream served a root that is not 64-hex")?;
         let path = served_key.module_path(&self.cache_dir);
         write_atomic(&path, &bytes).map_err(|e| format!("could not write the capsule: {e}"))?;
+        // #1991 telemetry: this IS the single choke-point every whole-capsule network land funnels
+        // through — on-demand `cache.fetchAndCache`, chain gap-fill, fetch-side backfill, and the
+        // reshare warm all call down to here — so counting here (rather than at any one caller)
+        // captures every genuine refetch without double-counting or missing a path.
+        CACHE_REFETCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(served_root)
     }
 
@@ -2626,6 +2637,15 @@ impl Node {
         store_hex: &str,
     ) -> Option<crate::relevance::CacheTier> {
         self.inbound_demand.tier(store_hex)
+    }
+
+    /// Distinct stores currently held in the inbound-demand ledger — the live `Tier1Demand`
+    /// occupancy figure `cache.stats` (#1991) reports. Real and load-bearing today (unlike
+    /// [`Node::inbound_demand_count`]/[`Node::inbound_demand_tier`] above, which await the
+    /// eviction-precedence consumer): it is the ledger's own bounded-LRU size (§7.10d), so it needs
+    /// no cache wiring to be an honest number.
+    pub(crate) fn inbound_demand_entry_count(&self) -> usize {
+        self.inbound_demand.entry_count()
     }
 
     /// The INBOUND-DEMAND tier-1 cache trigger (#1990): a remote PEER just asked this node to serve a
@@ -4764,6 +4784,75 @@ mod tests {
         assert!(r["evicted_bytes"].as_u64().is_some(), "evicted_bytes");
         assert!(r["content_cache"]["hits"].as_u64().is_some(), "cc hits");
         assert!(r["content_cache"]["misses"].as_u64().is_some(), "cc misses");
+        // #1991: refetch_count is present (process-global, so presence/type only), and the
+        // per-tier occupancy shape is fixed — tier1 is REAL (backed by the inbound-demand
+        // ledger), tier0/tier2 are honestly stubbed `wired: false` until their epic-#1934
+        // occupancy sources land.
+        assert!(r["refetch_count"].as_u64().is_some(), "refetch_count");
+        assert_eq!(r["tiers"]["tier1_demand"]["wired"].as_bool(), Some(true));
+        assert_eq!(r["tiers"]["tier1_demand"]["occupancy"].as_u64(), Some(0));
+        assert_eq!(r["tiers"]["tier0_precache"]["wired"].as_bool(), Some(false));
+        assert_eq!(r["tiers"]["tier0_precache"]["occupancy"].as_u64(), Some(0));
+        assert_eq!(r["tiers"]["tier2_bribed"]["wired"].as_bool(), Some(false));
+        assert_eq!(r["tiers"]["tier2_bribed"]["occupancy"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn cache_stats_tier1_occupancy_reflects_inbound_demand_ledger() {
+        // #1991: tier1_demand.occupancy tracks the inbound-demand ledger's live entry count —
+        // it must rise as distinct stores are demanded, not just report a placeholder zero.
+        let (node, _td) = test_node(None);
+        let store_a = "11".repeat(32);
+        let store_b = "22".repeat(32);
+        let root = "cd".repeat(32);
+        node.note_inbound_demand(&store_a, &root);
+        node.note_inbound_demand(&store_b, &root);
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["tiers"]["tier1_demand"]["occupancy"].as_u64(),
+            Some(2),
+            "two distinct demanded stores → occupancy 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stats_refetch_count_increments_on_a_fresh_network_land() {
+        // #1991: refetch_count must be a REAL counter, not a decoration — it rises exactly when a
+        // capsule lands via a network sync (never on a cache hit for an already-held capsule).
+        let (node, _td) = test_node(None);
+        let before = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await["result"]["refetch_count"]
+            .as_u64()
+            .unwrap();
+
+        let store = "33".repeat(32);
+        let root = "44".repeat(32);
+        node.sync_module_from("http://unreachable.invalid", &store, &root)
+            .await
+            .ok(); // expected to fail (no live upstream) — asserts no spurious bump on failure
+
+        let after_failed = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await["result"]["refetch_count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(before, after_failed, "a failed sync must not count as a refetch");
     }
 
     // -- dig.stage (#95 Pass C): in-process capsule staging/compile -------------
