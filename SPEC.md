@@ -1329,6 +1329,53 @@ eviction. These additive fields/methods complete that surface; all are `served: 
   node started; `content_cache.hits`/`misses` are the decoded-content (RAM) cache lookups since
   start. All counters are process-lifetime (reset each start), never persisted.
 
+### 7.10a. Cache relevance + tier model + eviction precedence (#1986, epic #1934)
+
+The `relevance` module (`crates/dig-node-core/src/relevance.rs`) is the PURE, deterministic scoring
+core the disk cache consults to decide WHAT is worth keeping, WHAT to sacrifice first, and WHEN a
+fresh candidate may displace an incumbent. It performs NO I/O and reads NO clock — time enters only
+as caller-supplied tick counters — so its decisions are reproducible and auditable. This subsection
+specifies the contract; the live wiring into the on-disk LRU (§3.4/§7.10) is delivered by later
+children of epic #1934 and is out of scope here.
+
+**Tiers + eviction precedence.** Every cached entry belongs to a `CacheTier`:
+`Tier0Precache` (speculatively fetched), `Tier1Demand` (fetched for a real local read), or
+`Tier2Bribed` (retained because a backer paid). Cross-tier eviction precedence is fixed by the tier
+ALONE — **tier2 > tier1 > tier0**, i.e. Tier0 is sacrificed first and Tier2 last — so speculative
+precache can never evict content a user or a paying backer asked for. Relevance score orders entries
+only WITHIN a tier, never across tiers. `evict_key(entry) -> (tier_rank, last_access_ticks)` yields
+the eviction sort key: sorting entries by it ASCENDING gives exactly tier0-oldest → tier1-oldest →
+tier2-oldest (LRU within each tier), which is the order the cap MUST evict in. `tier_rank` is
+`Tier0Precache = 0`, `Tier1Demand = 1`, `Tier2Bribed = 2`.
+
+**Relevance score.** `relevance(store: &RelevanceInputs, node: &NodeContext) -> RelevanceValue` is a
+weighted sum:
+`xor·proximity + scarcity·scarcity_term + demand·demand_term + recency·recency_term
++ pin_adjacent·[adjacent] + pinned·[pinned]`.
+
+- **XOR proximity is the PRIMARY, ungameable signal.** Proximity is derived from
+  `content_id XOR peer_id` and MUST be a strictly decreasing function of that distance (closer =
+  higher). The reference map is `1 - (hi128 / 2^128)` over the top 128 bits of the distance. It is
+  ungameable because an attacker cannot choose the victim's `peer_id` and cannot cheaply grind a
+  `content_id` that lands near it (a 256-bit preimage search), so junk cannot be made to look like
+  "this node's responsibility". Every other signal is a bounded ADDITIVE bonus.
+- **Replication scarcity is CLAMPED (load-bearing anti-gaming).** `known_provider_count` is UNTRUSTED
+  and MUST be clamped to `[1, 32]` before use; the resulting term lies in `[0, 1]` (fewer providers →
+  higher) and is scaled by a weight strictly smaller than the XOR weight. A flooded count (→ `u32::MAX`)
+  clamps to the ceiling (scarcity → 0) and a deflated count (0) clamps to the floor (scarcity → 1), so
+  a lie can neither DOMINATE the score nor ZERO it — the XOR + demand terms survive regardless.
+- **Local demand + recency + pin adjacency** are bounded additive bonuses: demand saturates at 16
+  reads, recency decays as `1/(1 + age/1000)` (age in ticks; `None` ⇒ 0), and pin-adjacency adds a
+  fixed small bonus. An explicit pin (`is_pinned`) adds a large bonus that deliberately overrides the
+  heuristics (a pin is a direct operator instruction).
+- **Weight invariant.** The default weights keep the XOR term strictly dominant over the sum of the
+  gameable secondary bonuses, so proximity always leads.
+
+**Displacement hysteresis.** `should_displace(incumbent, candidate, margin) -> bool` returns true
+only when `candidate > incumbent + margin` (strict). The margin is an anti-thrash band: without it,
+two near-equal stores would ping-pong in and out of the cache each sweep. At or below the margin the
+incumbent stays.
+
 ### 7.11. Control-token pairing for browser controllers (#280)
 
 An MV3 browser extension cannot read the `<state_dir>/control-token` file, so it cannot drive
