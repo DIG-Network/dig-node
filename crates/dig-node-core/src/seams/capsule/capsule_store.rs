@@ -19,6 +19,59 @@ use digstore_core::Bytes32;
 
 use crate::{module_exists, CachedCapsule, Node, PeerNetwork};
 
+/// Walk `<modules_root>/<store_id_hex>/<root_hex>.dig` and describe every capsule this node holds.
+///
+/// BLOCKING (`read_dir` plus one `stat` per entry) — drive it from a blocking thread, never from an
+/// async worker: on a network-mounted cache each of those is a round trip. It reads only directory
+/// metadata (name, size, mtime) and never opens a capsule's bytes, so its cost is exactly one `stat`
+/// per held generation.
+fn list_cached_capsules(modules_root: &std::path::Path) -> Vec<CachedCapsule> {
+    let mut out = Vec::new();
+    // Outer level: one directory per store id (hex). Inner: `<root>.dig` (or a legacy `<root>.module`).
+    let Ok(stores) = std::fs::read_dir(modules_root) else {
+        return out; // no modules cached yet
+    };
+    for store_entry in stores.flatten() {
+        if !store_entry.path().is_dir() {
+            continue;
+        }
+        let Some(store_hex) = store_entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(modules) = std::fs::read_dir(store_entry.path()) else {
+            continue;
+        };
+        for m in modules.flatten() {
+            let path = m.path();
+            // A capsule module is `<root_hex>.dig` (or a legacy `<root_hex>.module` a prior binary
+            // wrote — #1896); either names a held capsule, so stripping BOTH suffixes from one
+            // authority is what keeps a legacy holder discoverable through the upgrade.
+            let Some(root_hex) = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .and_then(crate::capsule_key::cached_root_stem)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let Ok(md) = m.metadata() else { continue };
+            let last_used_unix_ms = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            out.push(CachedCapsule {
+                store_id: store_hex.clone(),
+                root: root_hex,
+                size_bytes: md.len(),
+                last_used_unix_ms,
+            });
+        }
+    }
+    out
+}
+
 /// Seam 6 (capsule management) — the node's on-disk `.dig` capsule cache: list/remove/fetch a held
 /// capsule, gap-fill a missing chain-confirmed generation, and the self-reference plumbing that lets
 /// `&self` read handlers spawn an owned background backfill.
@@ -134,51 +187,14 @@ pub trait CapsuleStore: Send + Sync {
 #[async_trait::async_trait]
 impl CapsuleStore for Node {
     async fn cache_list_cached(&self) -> Vec<CachedCapsule> {
+        // Handed to a blocking thread rather than run inline: this is `std::fs` `read_dir` + `stat`
+        // per held capsule, and on a node whose cache is a NETWORK mount (the S3-backed store, #1943)
+        // every one of those is a round trip. Running them on an async worker parks a runtime thread
+        // for the duration, stalling whatever else was scheduled onto it (dig_ecosystem#1974).
         let modules_root = self.cache_dir.join("modules");
-        let mut out = Vec::new();
-        // Outer level: one directory per store id (hex). Inner: `<root>.dig` (or a legacy `<root>.module`).
-        let Ok(stores) = std::fs::read_dir(&modules_root) else {
-            return out; // no modules cached yet
-        };
-        for store_entry in stores.flatten() {
-            if !store_entry.path().is_dir() {
-                continue;
-            }
-            let Some(store_hex) = store_entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            let Ok(modules) = std::fs::read_dir(store_entry.path()) else {
-                continue;
-            };
-            for m in modules.flatten() {
-                let path = m.path();
-                // A capsule module is `<root_hex>.dig` (or a legacy `<root_hex>.module` a prior binary
-                // wrote — #1896); either names a held capsule, so stripping BOTH suffixes from one
-                // authority is what keeps a legacy holder discoverable through the upgrade.
-                let Some(root_hex) = path
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .and_then(crate::capsule_key::cached_root_stem)
-                    .map(str::to_string)
-                else {
-                    continue;
-                };
-                let Ok(md) = m.metadata() else { continue };
-                let last_used_unix_ms = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                out.push(CachedCapsule {
-                    store_id: store_hex.clone(),
-                    root: root_hex,
-                    size_bytes: md.len(),
-                    last_used_unix_ms,
-                });
-            }
-        }
-        out
+        tokio::task::spawn_blocking(move || list_cached_capsules(&modules_root))
+            .await
+            .unwrap_or_default()
     }
 
     async fn cache_remove_cached(

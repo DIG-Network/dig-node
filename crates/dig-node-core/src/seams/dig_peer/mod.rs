@@ -21,6 +21,7 @@ pub mod module_transport;
 pub mod net;
 pub mod peer_network;
 pub mod pex;
+pub mod ping;
 pub mod pool_locator;
 /// Wire-level range-stream conformance tests (#1668): the real serve path over a real loopback mTLS
 /// connection, decoded through the real dig-nat codec. Test-only — there is no production surface here.
