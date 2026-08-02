@@ -1202,7 +1202,10 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             "control.wallet.balance requires params.address (a bech32m address string)",
         );
     };
-    let asset_str = params.get("asset").and_then(|v| v.as_str()).unwrap_or("xch");
+    let asset_str = params
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("xch");
     let Some(asset) = BalanceAsset::from_wire(asset_str) else {
         return control_error(
             id,
@@ -1236,9 +1239,11 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             ErrorCode::WalletNotSynced,
             "the wallet is still syncing and no fallback is available to answer",
         ),
-        Err(BalanceError::ReadFailed(e)) => {
-            control_error(id, ErrorCode::WalletReadFailed, format!("balance read failed: {e}"))
-        }
+        Err(BalanceError::ReadFailed(e)) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("balance read failed: {e}"),
+        ),
     }
 }
 

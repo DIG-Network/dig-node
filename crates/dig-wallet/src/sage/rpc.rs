@@ -460,7 +460,8 @@ impl WalletBackend {
         address: &str,
         asset: BalanceAsset,
     ) -> std::result::Result<WalletBalanceResult, BalanceError> {
-        let puzzle_hash = normalize_ph(&decode_address(address).ok_or(BalanceError::InvalidAddress)?);
+        let puzzle_hash =
+            normalize_ph(&decode_address(address).ok_or(BalanceError::InvalidAddress)?);
         let asset_id = asset.asset_id_hex();
 
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
@@ -3057,8 +3058,8 @@ fn paginate(coins: Vec<CoinRecord>, offset: u32, limit: u32) -> Vec<CoinRecord> 
 
 #[cfg(test)]
 mod tests {
-    use super::super::db::WalletDb;
     use super::super::db::DerivationRow;
+    use super::super::db::WalletDb;
     use super::super::fallback::mock::MockFallback;
     use super::super::fallback::EmptyFallback;
     use super::super::fallback::FallbackCoin;
@@ -3130,7 +3131,13 @@ mod tests {
         db
     }
 
-    fn coin_at_ph(id: &str, ph: &str, amount: u64, created: Option<i64>, spent: Option<i64>) -> CoinRow {
+    fn coin_at_ph(
+        id: &str,
+        ph: &str,
+        amount: u64,
+        created: Option<i64>,
+        spent: Option<i64>,
+    ) -> CoinRow {
         CoinRow {
             coin_id: id.into(),
             parent_coin_info: "pp".into(),
@@ -3145,7 +3152,13 @@ mod tests {
         }
     }
 
-    fn fallback_coin(id: &str, ph: &str, amount: u64, created: Option<u32>, spent: Option<u32>) -> FallbackCoin {
+    fn fallback_coin(
+        id: &str,
+        ph: &str,
+        amount: u64,
+        created: Option<u32>,
+        spent: Option<u32>,
+    ) -> FallbackCoin {
         FallbackCoin {
             coin_id: id.into(),
             parent_coin_info: "pp".into(),
@@ -3217,13 +3230,20 @@ mod tests {
         ])
         .await
         .unwrap();
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
 
         let dig_bal = be
             .balance_for_address(&owned_address(), BalanceAsset::Dig)
             .await
             .unwrap();
-        assert_eq!(dig_bal.balance, 250, "the $DIG CAT coin, by canonical asset id");
+        assert_eq!(
+            dig_bal.balance, 250,
+            "the $DIG CAT coin, by canonical asset id"
+        );
         let xch_bal = be
             .balance_for_address(&owned_address(), BalanceAsset::Xch)
             .await
@@ -3262,7 +3282,11 @@ mod tests {
     #[tokio::test]
     async fn synced_empty_address_is_zero_success_not_error() {
         let db = db_with_owned_derivation(true, None).await;
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default());
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
         let r = be
             .balance_for_address(&owned_address(), BalanceAsset::Xch)
             .await
