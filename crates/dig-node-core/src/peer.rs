@@ -2302,6 +2302,45 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         }
     };
 
+    // RLY-009 (#1935): let the relay ASK this node what its DHT provider store holds, so
+    // relay.dig.net/dht can show the network's CONTENT layer. The relay is not a DHT node and holds
+    // no records; because a Kademlia node stores records for keys near its OWN peer_id, what this
+    // answers describes MANY OTHER peers' content, and the union across connected nodes is a broad
+    // slice of the real DHT.
+    //
+    // Registered only when the DHT is actually up. With no reader the node stays SILENT, which on the
+    // wire is indistinguishable from a pre-RLY-009 node — the correct default for a feature that
+    // publishes what this node knows about the network.
+    //
+    // The answer carries COUNTS, never provider identities: a provider record is a
+    // (peer_id, content_key) pair, and publishing that linkage is what the relay's /map refuses to do.
+    if let Some(dht_handle) = dht.as_ref() {
+        let service = dht_handle.service().clone();
+        relay_status.set_dht_records_provider(move |max_keys| {
+            // The reader is sync but the snapshot is async, so hop onto the runtime. `block_in_place`
+            // keeps this off the reservation socket's own poll: the relay's request must never be able
+            // to stall the connection this node depends on for its reachability.
+            let service = service.clone();
+            let snapshot = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async move { service.provider_snapshot(max_keys).await })
+            });
+            dig_nat::relay::DhtRecordsAnswer {
+                records: snapshot
+                    .entries
+                    .into_iter()
+                    .map(|e| dig_nat::wire::DhtRecordEntry {
+                        content_key: e.content_key,
+                        providers: e.providers,
+                    })
+                    .collect(),
+                total_keys: snapshot.total_keys,
+                truncated: snapshot.truncated,
+            }
+        });
+        tracing::info!("dig-node peer network: RLY-009 DHT-record answers enabled");
+    }
+
     // The flood half of #1429, ready for both inventory-change hooks below: present only when the DHT
     // is up AND this node can sign an announcement (the DHT records are the durable fallback if not).
     let holdings_flood = holdings.map(|broadcaster| HoldingsFlood {

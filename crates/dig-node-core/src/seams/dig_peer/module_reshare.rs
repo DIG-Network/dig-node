@@ -520,6 +520,26 @@ mod tests {
 
     // -- the pre-announce re-check ------------------------------------------------------------------
 
+    /// An in-memory [`dig_download::ModuleReader`] over staged bytes — dig-download 0.15 hands the
+    /// verifier a reader rather than a slice, so the tests supply the same shape the engine does.
+    struct SliceReader(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl dig_download::ModuleReader for SliceReader {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        async fn read_at(
+            &self,
+            offset: u64,
+            len: u64,
+        ) -> Result<Vec<u8>, dig_download::DownloadError> {
+            let start = (offset as usize).min(self.0.len());
+            let end = start.saturating_add(len as usize).min(self.0.len());
+            Ok(self.0[start..end].to_vec())
+        }
+    }
+
     /// **Proves:** a staged artifact that IS the admitted one is promoted into the cache.
     #[test]
     fn promotes_the_artifact_the_gate_admitted() {
@@ -531,12 +551,12 @@ mod tests {
         let verifier =
             ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
         assert_eq!(
-            dig_download::ModuleAnchorVerifier::verify_module_anchor(
+            futures::executor::block_on(dig_download::ModuleAnchorVerifier::verify_module_anchor(
                 &verifier,
-                &module,
+                &SliceReader(module.clone()),
                 &hex32(STORE),
                 &hex32(CHAIN_ROOT)
-            ),
+            )),
             dig_download::ModuleAnchor::Anchored
         );
 
@@ -561,12 +581,12 @@ mod tests {
         let verifier =
             ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
         assert_eq!(
-            dig_download::ModuleAnchorVerifier::verify_module_anchor(
+            futures::executor::block_on(dig_download::ModuleAnchorVerifier::verify_module_anchor(
                 &verifier,
-                &module,
+                &SliceReader(module.clone()),
                 &hex32(STORE),
                 &hex32(CHAIN_ROOT)
-            ),
+            )),
             dig_download::ModuleAnchor::Anchored
         );
 
