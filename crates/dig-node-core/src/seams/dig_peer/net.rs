@@ -62,10 +62,10 @@ pub fn dual_stack_listen_addr(port: u16) -> SocketAddr {
 
 /// Whether an [`Ipv6Addr`] is a *global-unicast* address we can advertise to peers: not loopback, not
 /// unspecified, not link-local (`fe80::/10`), not unique-local (`fc00::/7`, i.e. `fc00::` / `fd00::`),
-/// and not an IPv4-mapped address. Such an address is (best-effort) routable, so it belongs at the
-/// front of the advertised candidate list.
+/// and not an IPv4-mapped OR IPv4-compatible address. Such an address is (best-effort) routable, so it
+/// belongs at the front of the advertised candidate list.
 pub fn is_advertisable_ipv6(ip: &Ipv6Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() || ip.to_ipv4_mapped().is_some() {
+    if ip.is_loopback() || ip.is_unspecified() || ip.to_ipv4().is_some() {
         return false;
     }
     let seg0 = ip.segments()[0];
@@ -542,6 +542,37 @@ mod tests {
                                                                               // A global-unicast address IS advertisable.
         assert!(is_advertisable_ipv6(&"2001:db8::1".parse().unwrap()));
         assert!(is_advertisable_ipv6(&"2606:4700::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn ipv4_compatible_is_not_advertisable() {
+        // IPv4-compatible address (::1.2.3.4 = ::0102:0304) is an IPv4 address in disguise.
+        // It MUST be rejected as non-routable IPv6, just like IPv4-mapped addresses.
+        let compat_addr = Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x0102, 0x0304);
+        assert!(
+            !is_advertisable_ipv6(&compat_addr),
+            "IPv4-compatible address must not be advertisable"
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_is_still_not_advertisable() {
+        // Regression guard: IPv4-mapped addresses (::ffff:a.b.c.d) must continue to be rejected.
+        let mapped_addr: Ipv6Addr = "::ffff:1.2.3.4".parse().unwrap();
+        assert!(
+            !is_advertisable_ipv6(&mapped_addr),
+            "IPv4-mapped address must not be advertisable"
+        );
+    }
+
+    #[test]
+    fn a_real_global_unicast_ipv6_is_advertisable() {
+        // Guard against over-rejecting: genuine global-unicast addresses must remain advertisable.
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        assert!(
+            is_advertisable_ipv6(&global),
+            "global-unicast address must be advertisable"
+        );
     }
 
     #[test]
