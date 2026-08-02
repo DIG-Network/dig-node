@@ -2605,12 +2605,22 @@ impl Node {
 
     /// The recorded inbound-demand count for a store (0 if none) — the peer-request count that feeds
     /// [`RelevanceInputs::local_read_count`](crate::relevance::RelevanceInputs::local_read_count).
+    ///
+    /// This is the relevance-feed reader half of the inbound-demand ledger: the SIGNAL is recorded
+    /// live today (§7.10d), but the live scoring that CONSUMES it lands with the epic-#1934 cache-
+    /// wiring child, so the reader is currently exercised only by this crate's tests. `allow(dead_code)`
+    /// records that the API is deliberately ahead of its live consumer (the same shape as the pure,
+    /// not-yet-wired `relevance`/`tier0_selector` modules), not accidentally unused.
+    #[allow(dead_code)]
     pub(crate) fn inbound_demand_count(&self, store_hex: &str) -> u32 {
         self.inbound_demand.count(store_hex)
     }
 
     /// The tier a store is tagged with by inbound demand, if any — always
-    /// [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand) when present.
+    /// [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand) when present. Like
+    /// [`Node::inbound_demand_count`], the reader is ahead of its live eviction-precedence consumer
+    /// (epic #1934 cache-wiring child) and currently exercised only by tests.
+    #[allow(dead_code)]
     pub(crate) fn inbound_demand_tier(
         &self,
         store_hex: &str,

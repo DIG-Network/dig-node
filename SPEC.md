@@ -1453,6 +1453,46 @@ Vec<PeerObservation>`), reconciling ALL probed regions TOGETHER so the quorum is
 concrete probe (`find_node` toward each point, then a provider-snapshot RPC to the peers found) lands
 with the fetch child (#4); this module defines only the shape it consumes.
 
+### 7.10d. Tier-1 caching triggers — fetch-side backfill AND inbound demand (#1990, epic #1934)
+
+A store earns the `Tier1Demand` tier (§7.10a) — real, non-speculative demand, evicted only after all
+`Tier0Precache` — from EITHER of two independent triggers. Both are the same conclusion ("this content
+is genuinely wanted here") reached from opposite directions:
+
+- **(a) Fetch-side backfill (SPEC §5.6 / §14.3b).** THIS node reads a resource it does not hold, is
+  served it from another node/upstream, and background-pulls the whole `.dig` so its NEXT read is
+  local. This is what THIS node fetched. It is gated `ReadOrigin::Local`: a REMOTE peer's read served
+  through this node MUST NOT trigger it, or a stranger could drive this node into pulling + caching +
+  DHT-announcing content of the peer's choosing (an amplification primitive).
+
+- **(b) Inbound demand (this section).** A remote PEER asks this node to serve a resource from a store
+  (a `dig.fetchRange`/`dig.fetchModuleRange` request over the peer surface). That request is direct
+  evidence this node's keyspace neighbourhood WANTS the content, so the demanded store is recorded in
+  the in-memory INBOUND-DEMAND LEDGER (`crates/dig-node-core/src/inbound_demand.rs`), which tags it
+  `Tier1Demand` and bumps a saturating demand count. The ledger is the FIRST live tier-tagging: the
+  on-disk LRU cache (§3.4/§7.10) keys entries by path and orders them by file mtime alone and carries
+  NO per-entry acquisition tier, so this in-memory, process-lifetime map (never persisted, additive
+  over the `.dig` format and the LRU layout) is the source the relevance demand term
+  (`RelevanceInputs.local_read_count`, §7.10a) and the tier-based eviction precedence consult for
+  peer-demanded stores.
+
+**What is always on vs. opt-in.** Recording inbound demand (the count + `Tier1Demand` tag) is
+UNCONDITIONAL — it holds no content and pulls nothing, so it carries no amplification risk and always
+runs. The whole-`.dig` PULL on inbound demand is OPT-IN, default OFF, gated by
+`DIG_NODE_INBOUND_DEMAND_CACHE` (only an explicit `on`/`1`/`true`/`yes` enables it). A peer-triggered
+pull is an amplification primitive of exactly the shape trigger (a)'s `ReadOrigin::Local` gate exists
+to close; the intended amplification defence is the tier-0/1 selector's XOR-proximity admission (§7.10a
+/ §7.10b) — pull a peer-demanded store only when its `content_id` lands in this node's keyspace
+neighbourhood — which is not yet wired into the live pull. Until it is, the pull stays opt-in so
+enabling the feature never SILENTLY reverses the amplification invariant.
+
+**Shared pull machinery.** When the opt-in pull fires, it reuses the SAME whole-capsule backfill body
+as trigger (a) (`Node::spawn_capsule_backfill`): the `DIG_NODE_BACKFILL_ON_MISS` kill switch + a live
+P2P content engine, an owned self-reference to spawn the detached task, a concrete `(store, root)`, an
+already-held skip, and the ONE shared `(store, root)` single-flight acquisition gate (§21.3 / #1614) —
+so both tier-1 triggers and the reshare warm can never drift in how they pull, dedupe, verify, or
+announce, and an already-held store is never re-pulled.
+
 ### 7.11. Control-token pairing for browser controllers (#280)
 
 An MV3 browser extension cannot read the `<state_dir>/control-token` file, so it cannot drive
