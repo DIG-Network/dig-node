@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.72.2] - 2026-08-02
+
+### Bug Fixes
+- **deps:** Dig-nat 0.15.1 — stop the relay reservation flapping (#131)
+
 ## [0.72.1] - 2026-08-02
 
 ### Testing
