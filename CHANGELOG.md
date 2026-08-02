@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.72.1] - 2026-08-02
+
+### Testing
+- **self-heal:** Make the driver cadence + service-gate wiring falsifiable (#129)
+
 ## [0.72.0] - 2026-08-02
 
 ### Bug Fixes
