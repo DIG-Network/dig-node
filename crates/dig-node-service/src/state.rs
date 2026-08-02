@@ -169,6 +169,88 @@ pub fn running_as_service() -> bool {
         .unwrap_or(false)
 }
 
+/// The env var that overrides where the node's persistent IDENTITY SEED lives (read by
+/// `digstore_remote::identity`). Named here because a service run must ANCHOR it — see
+/// [`service_data_dir_overrides`].
+pub const IDENTITY_DIR_ENV: &str = "DIG_IDENTITY_DIR";
+
+/// The env var that overrides the node's content CACHE dir (read by `dig_node_core`).
+pub const CACHE_DIR_ENV: &str = "DIG_NODE_CACHE";
+
+/// PURE decision core (no I/O): the identity + cache directory overrides a SERVICE run must
+/// adopt, given whether it is a service, the resolved machine `state_dir`, and whether the
+/// operator has already set each override explicitly.
+///
+/// # Why a service needs this at all (dig_ecosystem #1928)
+///
+/// Both the identity seed and the cache default to a location under the user's home
+/// (`dirs::config_dir()`, i.e. `$HOME/.config/dig`, and `$HOME/DigNode/cache`). That is right
+/// for a CLI and WRONG for a system service: the packaged systemd unit runs with
+/// `ProtectHome=true`, which makes `$HOME` unreadable, so seed creation fails `EROFS`, the node
+/// starts with NO identity, and the peer network refuses to come up — a stock `.deb` install
+/// never joins the network at all. The machine state dir the service already resolves and
+/// hardens (#501) is the correct home for both.
+///
+/// Returned as overrides rather than applied here so the decision is testable without touching
+/// the process environment, and so the ONE place that mutates the environment is a single
+/// documented call early in startup.
+///
+/// An override the operator set explicitly is never replaced — their choice outranks ours.
+pub fn service_data_dir_overrides(
+    is_service: bool,
+    state_dir: &Path,
+    identity_dir_set: bool,
+    cache_dir_set: bool,
+) -> Vec<(&'static str, PathBuf)> {
+    if !is_service {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if !identity_dir_set {
+        out.push((IDENTITY_DIR_ENV, state_dir.join("identity")));
+    }
+    if !cache_dir_set {
+        out.push((CACHE_DIR_ENV, state_dir.join("cache")));
+    }
+    out
+}
+
+/// Anchor a SERVICE run's identity + cache under the machine state dir, per
+/// [`service_data_dir_overrides`]. A no-op for a CLI run and for any override the operator has
+/// already set.
+///
+/// MUST be called EARLY in startup, before any thread is spawned: it writes process environment,
+/// which is only sound while the process is still single-threaded.
+pub fn anchor_service_data_dirs() {
+    if !running_as_service() {
+        return;
+    }
+    let dir = state_dir();
+    let overrides = service_data_dir_overrides(
+        true,
+        &dir,
+        env_is_set(IDENTITY_DIR_ENV),
+        env_is_set(CACHE_DIR_ENV),
+    );
+    for (key, value) in overrides {
+        // Create it up front so the first write does not race, and so a failure surfaces here
+        // with a clear path rather than as an opaque error deep in identity creation.
+        if let Err(e) = ensure_dir_restricted(&value) {
+            tracing::warn!(path = %value.display(), error = %e, "could not create service data dir");
+        }
+        std::env::set_var(key, &value);
+    }
+}
+
+/// Whether `key` is set to a non-empty value — an empty override is treated as unset, matching
+/// how the consumers parse it.
+fn env_is_set(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// PURE decision core (no I/O): pick the state dir from the inputs, so the priority is
 /// unit-testable without touching the real filesystem/env.
 ///
@@ -888,6 +970,69 @@ fn windows_grant_best_effort(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- #1928: a service run must not keep its identity + cache under $HOME -----------------
+    //
+    // These assert on the DECISION rather than on a `#[cfg(unix)]` filesystem effect, so the
+    // guard is falsifiable on every host CI runs on — a Unix-only test would leave the whole
+    // rule unexercised on Windows and a mutation would stay green there.
+
+    #[test]
+    fn a_service_run_anchors_both_identity_and_cache_under_the_machine_state_dir() {
+        // The exact failure this prevents: the packaged unit sets ProtectHome=true, so a seed
+        // written under $HOME fails EROFS and the peer network never starts.
+        let overrides =
+            service_data_dir_overrides(true, Path::new("/var/lib/dig-node"), false, false);
+        assert_eq!(
+            overrides,
+            vec![
+                (
+                    IDENTITY_DIR_ENV,
+                    PathBuf::from("/var/lib/dig-node/identity")
+                ),
+                (CACHE_DIR_ENV, PathBuf::from("/var/lib/dig-node/cache")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cli_run_is_left_entirely_alone() {
+        // The CLI legitimately lives under the user's home and shares that identity with the
+        // user's other DIG tools; anchoring it machine-wide would change where an existing
+        // user's key is looked up.
+        assert!(
+            service_data_dir_overrides(false, Path::new("/var/lib/dig-node"), false, false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_operator_set_override_is_never_replaced() {
+        let overrides =
+            service_data_dir_overrides(true, Path::new("/var/lib/dig-node"), true, false);
+        assert_eq!(
+            overrides,
+            vec![(CACHE_DIR_ENV, PathBuf::from("/var/lib/dig-node/cache"))],
+            "only the unset one is filled in"
+        );
+        assert!(
+            service_data_dir_overrides(true, Path::new("/var/lib/dig-node"), true, true).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_anchored_dirs_are_inside_the_state_dir_whatever_it_resolved_to() {
+        // A user-level service that could not create /var/lib falls back to a per-user dir; the
+        // anchor must follow it rather than hardcoding the machine path.
+        let legacy = Path::new("/home/u/.local/share/DigNode");
+        for (_, path) in service_data_dir_overrides(true, legacy, false, false) {
+            assert!(
+                path.starts_with(legacy),
+                "{} must live under the resolved state dir",
+                path.display()
+            );
+        }
+    }
 
     #[test]
     fn override_wins_over_everything() {

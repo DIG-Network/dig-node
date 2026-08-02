@@ -1035,6 +1035,21 @@ NOT depend on `$HOME`/`%LOCALAPPDATA%`/the running user):
 4. Else the LEGACY per-user dir (the parent of `config.json`) — the back-compat fallback that keeps
    a non-service `dig-node run` as a normal user working exactly as before (additive).
 
+**Service data dirs — identity + cache MUST NOT live under `$HOME`.** On a SERVICE run the node MUST
+resolve its persistent identity seed and its content cache UNDER the resolved state dir
+(`<state_dir>/identity`, `<state_dir>/cache`) rather than under the invoking user's home, and MUST do
+so before the identity is first loaded.
+
+Both otherwise default to a home-relative path (`dirs::config_dir()/dig` for the seed, `$HOME/DigNode/
+cache` for the cache), which a system service cannot use: the packaged Linux unit runs with
+`ProtectHome=true`, so `$HOME` is unreadable, seed creation fails with `EROFS`, the node starts with
+NO identity, and the peer network refuses to come up — a stock package install never joins the
+network. The same reasoning binds the macOS launchd daemon and the Windows service, which is why this
+is a property of a SERVICE RUN and not of one packaging target.
+
+An `DIG_IDENTITY_DIR` / `DIG_NODE_CACHE` value the operator set explicitly MUST be preserved; a CLI
+run MUST be left untouched, keeping the user's identity shared with their other DIG tools.
+
 **Creation + ACL — the HARDENING CONTRACT.** The state dir holds the control token that grants FULL
 local control, so its ACL MUST NOT be world/all-users-readable. On Windows this is the HARD case:
 `%PROGRAMDATA%` grants `BUILTIN\Users` "create subfolder", so ANY low-priv user can pre-create

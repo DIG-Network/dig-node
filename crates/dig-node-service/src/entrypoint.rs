@@ -395,6 +395,12 @@ pub fn run() -> std::process::ExitCode {
         Err(e) => e.exit(),
     };
 
+    // A SERVICE run must resolve its identity seed + cache under the machine state dir rather
+    // than under $HOME, which the packaged unit's `ProtectHome=true` makes unreadable (#1928 —
+    // without this a stock install starts with no identity and the peer network never comes up).
+    // Done HERE, before the runtime and any thread exists, because it writes process environment.
+    crate::state::anchor_service_data_dirs();
+
     let json = cli.json;
     let config = Config::from_env();
     let command = cli.command.unwrap_or(Command::Run);
