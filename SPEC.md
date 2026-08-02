@@ -31,7 +31,9 @@ For usage instructions, see `README.md`. For non-normative narrative, see `USER_
   dispatch, local-first content serve/fetch/redirect, chain-anchored-root resolution, chain-watch +
   subscriptions + generation gap-fill, the cache, and the P2P stack (peer serve/dial, DHT
   provider records, PEX, multi-source download). It depends on the P2P crates
-  (`dig-nat`/`dig-gossip`/`dig-dht`/`dig-pex`/`dig-download`/`dig-peer-selector`/`dig-protocol`)
+  (`dig-nat`/`dig-gossip`/`dig-dht`/`dig-pex`/`dig-download`/`dig-peer-selector`) — consumed from
+  crates.io per §3.6, with the single exception of `dig-gossip`, which stays a pinned git
+  dependency until its crates.io publish is unblocked (guarded pending `dig-peer-protocol`, #681) —
   and on digstore's `.dig` store-format LIBRARY crates
   (`digstore-core`/`-crypto`/`-chain`/`-host`/`-remote`/`-stage`) as git dependencies. The
   dependency direction is dig-node-core → store-lib; digstore MUST NOT depend on dig-node-core
