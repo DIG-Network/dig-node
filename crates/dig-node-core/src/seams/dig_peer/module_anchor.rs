@@ -41,7 +41,7 @@ use digstore_core::datasection::{DataView, SectionId};
 use digstore_core::Bytes32;
 use sha2::{Digest, Sha256};
 
-use dig_download::{ModuleAnchor, ModuleAnchorVerifier};
+use dig_download::{ModuleAnchor, ModuleAnchorVerifier, ModuleReader};
 
 /// Why a blob was not admitted, and — crucially — WHOSE fault that is.
 ///
@@ -214,8 +214,40 @@ impl ChainAnchoredModuleVerifier {
     }
 }
 
+#[async_trait::async_trait]
 impl ModuleAnchorVerifier for ChainAnchoredModuleVerifier {
-    fn verify_module_anchor(&self, module: &[u8], store_id: &str, root: &str) -> ModuleAnchor {
+    /// dig-download 0.15 hands the staged module as a borrowed READER rather than a slice, so the
+    /// engine no longer has to hold the whole blob in memory on the caller's behalf.
+    ///
+    /// This verifier still needs every byte: both `extract_data_section_blob` and `DataView::parse`
+    /// parse the whole container, and the admitted digest is over the whole module. So the bytes are
+    /// materialized here — the same working set the old `&[u8]` API forced on the engine, just owned
+    /// on this side of the call now. Verifying from a prefix would mean teaching those parsers to
+    /// stream, which is a real change to the trust core and not something to fold into a dep bump.
+    async fn verify_module_anchor(
+        &self,
+        module: &dyn ModuleReader,
+        store_id: &str,
+        root: &str,
+    ) -> ModuleAnchor {
+        // A read failure is THIS NODE failing to read its own staging area, never evidence against
+        // the holder — so `Unavailable`, never `NotAnchored`. Collapsing the two would durably demote
+        // an honest peer for our local I/O error (see `ModuleAnchor`).
+        let module = match module.read_at(0, module.len()).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let reason = format!("could not read the staged module back: {e}");
+                tracing::warn!(
+                    store = %crate::seams::dig_peer::serve_log::SafeId::new(store_id),
+                    root = %crate::seams::dig_peer::serve_log::SafeId::new(root),
+                    %reason,
+                    "module pull: cannot verify the anchor — local read failure, not holder evidence"
+                );
+                return ModuleAnchor::Unavailable(reason);
+            }
+        };
+        let module = module.as_slice();
+
         let rejection = match self.rejection_reason(module, store_id, root) {
             None => {
                 // Record the digest of exactly what was admitted, so the caller can prove the artifact
@@ -307,7 +339,70 @@ mod tests {
     /// but only the first is evidence against the holder, and a test that cannot tell them apart
     /// cannot notice a local fault being mislabelled as a peer's misbehaviour (see [`Rejection`]).
     fn verdict(module: &[u8], store: &str, root: &str) -> ModuleAnchor {
-        verifier().verify_module_anchor(module, store, root)
+        let reader = SliceReader(module.to_vec());
+        futures::executor::block_on(verifier().verify_module_anchor(&reader, store, root))
+    }
+
+    /// An in-memory [`ModuleReader`] over staged bytes — dig-download 0.15 hands the verifier a
+    /// reader rather than a slice, so the tests supply the same shape the engine does.
+    struct SliceReader(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl ModuleReader for SliceReader {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+        async fn read_at(
+            &self,
+            offset: u64,
+            len: u64,
+        ) -> Result<Vec<u8>, dig_download::DownloadError> {
+            let start = offset as usize;
+            let end = start.saturating_add(len as usize).min(self.0.len());
+            Ok(self.0[start.min(self.0.len())..end].to_vec())
+        }
+    }
+
+    /// A reader whose every read FAILS — the local-fault path. A staging read error is this node
+    /// failing to read its own bytes, so it must be `Unavailable` (no evidence against the holder),
+    /// never `NotAnchored` (a durable demotion for something the peer did not do).
+    struct FailingReader;
+
+    #[async_trait::async_trait]
+    impl ModuleReader for FailingReader {
+        fn len(&self) -> u64 {
+            128
+        }
+        async fn read_at(
+            &self,
+            _offset: u64,
+            _len: u64,
+        ) -> Result<Vec<u8>, dig_download::DownloadError> {
+            Err(dig_download::DownloadError::Sink(
+                "staging read failed".into(),
+            ))
+        }
+    }
+
+    /// **Proves:** a failure to read the staged bytes back is reported as OUR fault, not the
+    /// holder's. Collapsing this into `NotAnchored` would durably demote an honest peer for a local
+    /// I/O error — the distinction the whole `Rejection` split exists to preserve.
+    #[test]
+    fn a_staging_read_failure_is_unavailable_not_notanchored() {
+        let verdict = futures::executor::block_on(verifier().verify_module_anchor(
+            &FailingReader,
+            &hex32(STORE),
+            &hex32(CHAIN_ROOT),
+        ));
+        match verdict {
+            ModuleAnchor::Unavailable(reason) => {
+                assert!(
+                    reason.contains("read"),
+                    "reason should name the read: {reason}"
+                );
+            }
+            other => panic!("a local read failure must be Unavailable, got {other:?}"),
+        }
     }
 
     /// **Proves:** the genuine module — the one whose committed root IS the chain's root — is admitted.
@@ -490,7 +585,11 @@ mod tests {
         let v = verifier();
         assert_eq!(v.admitted_digest(), None, "nothing admitted yet");
         assert_eq!(
-            v.verify_module_anchor(&module, &hex32(STORE), &hex32(CHAIN_ROOT)),
+            futures::executor::block_on(v.verify_module_anchor(
+                &SliceReader(module.clone()),
+                &hex32(STORE),
+                &hex32(CHAIN_ROOT)
+            )),
             ModuleAnchor::Anchored
         );
         assert_eq!(v.admitted_digest(), Some(sha256(&module)));
@@ -503,11 +602,11 @@ mod tests {
     fn a_rejected_blob_never_becomes_the_promotion_reference() {
         let v = verifier();
         assert_eq!(
-            v.verify_module_anchor(
-                &module_committing(STORE, OTHER_ROOT),
+            futures::executor::block_on(v.verify_module_anchor(
+                &SliceReader(module_committing(STORE, OTHER_ROOT)),
                 &hex32(STORE),
                 &hex32(CHAIN_ROOT)
-            ),
+            )),
             ModuleAnchor::NotAnchored
         );
         assert_eq!(
