@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.73.0] - 2026-08-02
+
+### Features
+- **peer:** Answer RLY-009 so relay.dig.net/dht can show the content layer (#136)
+
+### Bug Fixes
+- **peer:** Keep a later source's novel reach-hint when an earlier source fills the cap (#130)- **download:** Persist bad-descriptor reputation through CapturingStateStore (#134)
+
+### Documentation
+- **spec:** Correct the dig-node-core P2P dependency list to match Cargo.toml (#132)
+
+### Testing
+- **cache:** Pin the remove_cached containment guard against a symlink escape (#135)
+
 ## [0.72.2] - 2026-08-02
 
 ### Bug Fixes
