@@ -51,12 +51,12 @@ pub mod chat;
 pub mod download;
 pub mod peer;
 pub mod relevance;
-pub mod tier0_selector;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
 /// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep
 /// every existing `crate::net`/`crate::pex`/… reference working unchanged (W1b-0 is a pure
 /// relocation — no behaviour change, no caller updates required).
 pub mod seams;
+pub mod tier0_selector;
 /// The `CapsuleStore` trait is seam 6's public surface (#1285 W1b-4) — bring it into scope to call
 /// `cache_list_cached`/`cache_remove_cached`/`cache_fetch_and_cache`/`gap_fill_generation`/
 /// `maybe_backfill_capsule`/`set_self_ref`/`arc_self` on a `Node`.
