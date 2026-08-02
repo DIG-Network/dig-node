@@ -1295,6 +1295,9 @@ impl PeerRpcResponder for NodeResponder {
             .and_then(Value::as_u64)
             .unwrap_or(module_serve::MAX_MODULE_WINDOW);
         module_serve::module_range_requested(conn_key, &store, &root, offset, length);
+        // INBOUND DEMAND (#1990): a peer asking us for this module's window is direct evidence this
+        // node's neighbourhood wants the store — tag it Tier1Demand + (opt-in) trigger a tier-1 cache.
+        self.node.note_inbound_demand(&store, &root);
 
         let cache = self.node.cache_dir_path().to_path_buf();
         let (s, r) = (store.clone(), root.clone());
@@ -1408,6 +1411,9 @@ impl PeerRpcResponder for NodeResponder {
         // so "did the holder get it, and what did it answer?" is answerable from the log alone.
         let target = serve_log::ServeTarget::from_range_request(conn_key, &req);
         serve_log::range_requested(&target, offset, length);
+        // INBOUND DEMAND (#1990): a peer's range request for this store is real demand from this
+        // node's neighbourhood — tag it Tier1Demand + (opt-in) trigger a tier-1 whole-capsule cache.
+        self.node.note_inbound_demand(store, root);
 
         // The resource is resolved ONCE for the whole stream, because the prologue's paging state
         // belongs to the stream rather than to any one frame (see `Node::range_source`).

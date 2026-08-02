@@ -312,10 +312,44 @@ impl CapsuleStore for Node {
         // ORIGIN GATE FIRST (checked before the config gate deliberately): a remote peer must never
         // be able to make this node pull, cache, and DHT-announce a capsule of the PEER'S choosing —
         // the exact primitive the #1576 reshare leg's own `ReadOrigin` gate exists to close. This is
-        // the sibling call site that gate had NOT yet reached.
+        // the sibling call site that gate had NOT yet reached. The inbound-demand trigger (#1990)
+        // reaches the SHARED pull body ([`Node::spawn_capsule_backfill`]) through its OWN opt-in gate,
+        // never through this origin-gated fetch-side entry.
         if origin != crate::download::ReadOrigin::Local {
             return;
         }
+        self.spawn_capsule_backfill(store_hex, root_hex);
+    }
+
+    fn set_self_ref(&self, weak: Weak<Node>) {
+        let _ = self.self_ref.set(weak);
+    }
+
+    fn arc_self(&self) -> Option<Arc<Node>> {
+        self.self_ref.get().and_then(Weak::upgrade)
+    }
+}
+
+impl Node {
+    /// The SHARED whole-`.dig` backfill pull body: spawn a detached, single-flighted, chain-anchored
+    /// pull of the `(store_hex, root_hex)` capsule so a subsequent read is served locally. This is the
+    /// ONE source of truth for "warm the whole capsule" — reached by BOTH the fetch-side
+    /// [`CapsuleStore::maybe_backfill_capsule`] (after its `ReadOrigin::Local` gate) and the
+    /// inbound-demand trigger [`Node::note_inbound_demand`] (after its opt-in config gate), so the two
+    /// tier-1 caching triggers can never drift in how they pull, dedupe, verify, or announce.
+    ///
+    /// The CALLER owns the "should we pull at all?" policy (origin gate / opt-in gate); this body owns
+    /// only the mechanics and their own always-required guards:
+    /// - **config + peer-network** — the `DIG_NODE_BACKFILL_ON_MISS` kill switch and the presence of a
+    ///   P2P content engine to pull from (a no-op on the FFI/consumer path, which has neither);
+    /// - **owned self-ref** — an `Arc<Node>` to spawn the detached task (installed by the standalone
+    ///   bring-up; `None` on the FFI path or during teardown);
+    /// - **concrete (store, root)** — a rootless/`"latest"`/malformed key names no capsule and is
+    ///   skipped;
+    /// - **already-held** — a held capsule needs no warm-up;
+    /// - **single-flight** — the SHARED `(store, root)` acquisition gate (#1614) both this leg and the
+    ///   #1576 reshare warm claim, so a burst of reads across either leg starts exactly ONE pull.
+    pub(crate) fn spawn_capsule_backfill(&self, store_hex: &str, root_hex: &str) {
         // Config gate (default on) + only where a peer network / upstream exists to pull from.
         if !crate::download::backfill_on_miss_enabled() || self.p2p_content().is_none() {
             return;
@@ -343,8 +377,8 @@ impl CapsuleStore for Node {
         // reshare warm are two transports for the SAME capsule, so they claim ONE registry. If the
         // other leg (or a prior read on this leg) already claimed this capsule, do nothing — a burst of
         // resource reads for the same not-yet-held store triggers exactly ONE whole-capsule pull across
-        // BOTH legs. The gates ABOVE (origin, config, p2p_content, already-held) all run BEFORE this
-        // claim, so a gated-out read never consumes a concurrency slot (#1576/#1654).
+        // BOTH legs. The gates ABOVE (config, p2p_content, already-held) all run BEFORE this claim, so a
+        // gated-out read never consumes a concurrency slot (#1576/#1654).
         let Some(claim) = self.capsule_acquisition.clone().claim(key.clone()) else {
             return; // an acquisition for this capsule is already in flight on one of the two legs
         };
@@ -369,13 +403,5 @@ impl CapsuleStore for Node {
                 ),
             }
         });
-    }
-
-    fn set_self_ref(&self, weak: Weak<Node>) {
-        let _ = self.self_ref.set(weak);
-    }
-
-    fn arc_self(&self) -> Option<Arc<Node>> {
-        self.self_ref.get().and_then(Weak::upgrade)
     }
 }
