@@ -3319,6 +3319,17 @@ mod tests {
         });
     }
 
+    /// **Proves (#1614):** the §21 backfill leg and the #1576 reshare leg claim against ONE shared
+    /// single-flight gate, so a single read triggers AT MOST ONE whole-capsule acquisition. This stub
+    /// asserts the gate is reachable as `Node::capsule_acquisition`; the full dedup pins follow.
+    #[tokio::test]
+    async fn capsule_acquisition_gate_is_a_single_shared_registry() {
+        let (node, _td) = test_node(Some([5u8; 32]));
+        let key = format!("{}:{}", "ab".repeat(32), "cd".repeat(32));
+        // A fresh node has claimed nothing on the shared gate.
+        assert!(!node.capsule_acquisition.is_warming(&key));
+    }
+
     /// **Proves:** capsule backfill (§14.3) is a safe NO-OP on the FFI/consumer path — a node with no
     /// P2P content engine + no installed self-ref (the browser's in-process node) never spawns a pull
     /// and never records an in-flight entry, so a resource read there is unchanged.
