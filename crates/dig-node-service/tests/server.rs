@@ -168,6 +168,39 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
     (addr, token, EnvHold(hold))
 }
 
+/// Like [`start_companion`] but ALSO returns this node's loop-probe request (#1997) — the exact
+/// body the bring-up probe puts on the wire. A loop-breaker test must be able to stage the probe
+/// COMING BACK, and only the node knows the random id it generated.
+async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
+    let config = dig_node_service::Config {
+        upstream: upstream.to_string(),
+        port: 0,
+        ..dig_node_service::Config::default()
+    };
+    let hold = env_guard().lock_owned().await;
+    let (state, probe) = {
+        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).expect("create test cache dir");
+        std::env::set_var("DIG_NODE_CACHE", &cache);
+        std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        let state = dig_node_service::server::build_state(&config).await;
+        let probe = state.loop_probe_request();
+        (state, probe)
+    };
+    let app =
+        dig_node_service::server::router(state).into_make_service_with_connect_info::<SocketAddr>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, probe, EnvHold(hold))
+}
+
 /// Like [`start_companion_full`] but ALSO returns the served wallet backend (#368/#369) so a WS
 /// push test can drive the backend's event bus directly. Same per-call on-disk isolation + env
 /// lock (the wallet DB + seed live under the same per-test config dir).
@@ -737,6 +770,214 @@ async fn anchored_root_and_passthrough_relay_to_upstream() {
             .any(|c| c["method"] == json!("dig.listCapsules")),
         "passthrough must reach the upstream"
     );
+}
+
+/// **Proves:** with no upstream configured — the default since #1997 — an unimplemented method is
+/// answered locally with `-32601` and the node contacts nobody.
+/// **Catches:** a reinstated default upstream, or a relay branch that runs on an empty upstream and
+/// so posts every unrecognised method (with its params) to whatever an empty URL resolves to.
+#[tokio::test]
+async fn with_no_upstream_an_unimplemented_method_is_answered_locally_and_relayed_nowhere() {
+    let (upstream, calls) = start_mock_upstream().await;
+    // The upstream exists and is reachable, but is NOT configured on this node.
+    let (addr, _hold) = start_companion("").await;
+
+    let resp: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "dig.listCapsules", "params": {}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32601),
+        "an unimplemented method answers method-not-found locally, not an upstream error: {resp}"
+    );
+    assert!(
+        resp.get("result").is_none(),
+        "no fabricated result: {resp}"
+    );
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "an unconfigured upstream must receive nothing; it saw {:?}",
+        calls.lock().unwrap()
+    );
+    let _ = upstream;
+}
+
+/// **Proves:** `dig.health` is answered by this node about itself, with no upstream configured.
+/// **Catches:** the #1997 regression in full — the node behind rpc.dig.net could not state its own
+/// health without asking its own public address, which is what produced the relay loop.
+#[tokio::test]
+async fn dig_health_is_answered_locally_with_no_upstream() {
+    let (_upstream, calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion("").await;
+
+    let resp: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 3, "method": "dig.health", "params": {} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(resp["result"]["status"], json!("ok"), "{resp}");
+    assert!(resp["result"]["version"].is_string(), "{resp}");
+    // The `methods` array is the dig.health contract's capability summary.
+    assert!(
+        resp["result"]["methods"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|v| v == "dig.getContent")),
+        "health carries the method catalogue: {resp}"
+    );
+    assert!(calls.lock().unwrap().is_empty(), "health asks nobody");
+}
+
+/// **Proves:** `dig.methods` self-describes locally and agrees with the catalogue, including the
+/// two methods #1997 moved onto the shell.
+/// **Catches:** adding the catalogue entries without adding the handlers (or vice versa), which
+/// would make the node advertise a method it answers `-32601` for.
+#[tokio::test]
+async fn dig_methods_lists_the_catalogue_locally() {
+    let (_upstream, calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion("").await;
+
+    let resp: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 4, "method": "dig.methods", "params": {} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let names: Vec<String> = resp["result"]["methods"]
+        .as_array()
+        .expect("methods array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    for expected in ["dig.getContent", "dig.health", "dig.methods", "rpc.discover"] {
+        assert!(names.contains(&expected.to_string()), "missing {expected}");
+    }
+    assert!(calls.lock().unwrap().is_empty(), "methods asks nobody");
+}
+
+/// **Proves:** the runtime loop breaker end-to-end — when this node's OWN bring-up probe arrives
+/// back at its dispatcher, passthrough switches off and unimplemented methods answer `-32601`
+/// locally from then on, contacting the upstream no further.
+/// **Catches:** the production outage shape exactly, and the two ways the guard could be wired to
+/// nothing: a dispatcher that never checks the inbound id, and a relay branch that ignores the
+/// disabled flag. A static address comparison cannot see this case at all — in production the
+/// upstream was `https://rpc.dig.net`, self only by DNS.
+#[tokio::test]
+async fn a_returning_loop_probe_disables_passthrough() {
+    let (upstream, calls) = start_mock_upstream().await;
+    let (addr, probe, _hold) = start_companion_probe(&upstream).await;
+
+    // Before: an unimplemented method relays, and the upstream answers it.
+    let before: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "dig.listCapsules", "params": {} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        before["result"]["capsules"],
+        json!(["passthrough-ok"]),
+        "a configured, non-looping upstream still relays: {before}"
+    );
+    let relayed_before = calls.lock().unwrap().len();
+    assert!(relayed_before > 0);
+
+    // The node's own probe comes back to it — the observable proof that the upstream leads here.
+    // This is byte-for-byte what `relay::probe_upstream_for_loop` put on the wire.
+    let echoed: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&probe)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Still answered normally: it is an ordinary dig.health call.
+    assert_eq!(echoed["result"]["status"], json!("ok"), "{echoed}");
+
+    // After: the same unimplemented method is answered locally, and the upstream sees nothing more.
+    let after: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 2, "method": "dig.listCapsules", "params": {} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["error"]["code"],
+        json!(-32601),
+        "a proven loop must stop the relay: {after}"
+    );
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        relayed_before,
+        "no further request may reach a looping upstream"
+    );
+}
+
+/// **Proves:** another node's probe is ordinary traffic and does not switch OUR relay off.
+/// **Catches:** matching the probe on its prefix rather than the full random id — which would let
+/// any caller disable a node's passthrough, and would break the legitimate case of this node being
+/// somebody else's upstream (they probe us; we must keep relaying).
+#[tokio::test]
+async fn another_nodes_loop_probe_does_not_disable_our_relay() {
+    let (upstream, calls) = start_mock_upstream().await;
+    let (addr, _probe, _hold) = start_companion_probe(&upstream).await;
+
+    let foreign = json!({
+        "jsonrpc": "2.0",
+        "id": "dig-node-loop-probe:00112233445566778899aabbccddeeff",
+        "method": "dig.health",
+        "params": {}
+    });
+    let _: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&foreign)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let after: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 5, "method": "dig.listCapsules", "params": {} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["result"]["capsules"],
+        json!(["passthrough-ok"]),
+        "a foreign probe must not disable our passthrough: {after}"
+    );
+    assert!(!calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
