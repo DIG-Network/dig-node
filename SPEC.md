@@ -2313,8 +2313,11 @@ a root OTHER than the confirmed root MUST be rejected (never cached or served).
   *actively seeks other nodes to pull missing generations* rather than only reacting to reads.
   (b) **Backfill-on-miss** — when a read is satisfied from another node or the upstream rather than
   from local disk, the node background-backfills the whole capsule so the NEXT read of that resource is
-  served locally (deduplicated: a backfill already in flight for `store:root` is not started twice).
-  Enabled by default; toggle with the `DIG_NODE_BACKFILL_ON_MISS` environment variable.
+  served locally (deduplicated: a backfill already in flight for `store:root` is not started twice). This
+  dedup spans BOTH whole-capsule transports: the §21 backfill here and the §21.3 P2P reshare warm claim
+  ONE shared single-flight gate keyed `(store, root)`, so a read starts at most one whole-capsule pull no
+  matter which leg wins, and the shared cap bounds concurrent distinct-generation acquisitions across the
+  two legs together. Enabled by default; toggle with the `DIG_NODE_BACKFILL_ON_MISS` environment variable.
 - **Fail-closed.** Gap-fill never pulls against an unconfirmable root (the §14.2 decision gates it).
 - **Verification invariant.** Every served module is verified against the chain-anchored root at SERVE,
   no matter how it arrived — a client read, a §21 whole-store sync, or a proactive/backfill gap-fill.
@@ -3913,9 +3916,17 @@ read's latency is user-facing. Serving a module range is paced by the SAME FCFS 
 `dig.fetchRange` uses (§17) — a whole-capsule pull is the largest thing a node serves, so exempting it
 would leave the biggest transfer as the one path able to starve every other peer.
 
-At most ONE warm per generation runs at a time, so a burst of reads across a capsule's resources cannot
-start N concurrent pulls of the same module. A store-granularity read starts no warm: it does not name
-WHICH generation to pull, and guessing would reshare a capsule nobody asked for.
+A single read triggers AT MOST ONE whole-capsule acquisition for a `(store, root)` generation, regardless
+of tier. Two transports can pull the SAME capsule down — the §21 authenticated whole-store backfill
+(`maybe_backfill_capsule` → `gap_fill_generation`, the peerless-network fallback that acquires from the
+RPC upstream when no peer serves) and the §21.3 P2P reshare warm — and they are two routes to the same
+artifact, so they claim ONE shared single-flight gate keyed `(store, root)`. Whichever leg claims the key
+first runs the pull; the other, and any further read of the same not-yet-held capsule, is refused. A
+burst of reads across a capsule's resources therefore cannot start N concurrent pulls of the same module,
+and the two legs cannot double-pull it between them. The shared gate ALSO bounds how many DISTINCT
+generations may acquire concurrently (a fixed cap across BOTH legs, not each in isolation): claims beyond
+the cap are SKIPPED, not queued — the next read simply tries again. A store-granularity read starts no
+warm: it does not name WHICH generation to pull, and guessing would reshare a capsule nobody asked for.
 
 ### 21.5. Dial path (MUST)
 
@@ -3943,7 +3954,9 @@ A read can trigger background legs that spend this node's bandwidth and disk and
 advertises network-wide: the whole-capsule warm (`maybe_backfill_capsule`, §21.4) and the reshare pull
 plus holder-announce (§21.3). Those legs MUST be reachable only from a read this node's OWN OPERATOR
 made. A read that arrived from the network is SERVED normally and effects NOTHING: it starts no warm, no
-reshare, no promotion, and no announce.
+reshare, no promotion, and no announce. These two legs share ONE single-flight acquisition gate (§21.4),
+so the origin/config/held gates on EACH leg run BEFORE it can claim that gate — a gated-out read never
+consumes a slot, and the two legs dedup against each other rather than each pulling the capsule.
 
 The rule is not optional hardening. Every peer-facing read surface is unauthenticated in the sense that
 matters here — any well-formed self-signed mTLS leaf is accepted (§13), and the plaintext `/s/` surface

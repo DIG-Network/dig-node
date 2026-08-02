@@ -2443,6 +2443,9 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
                 holdings: holdings_flood.clone(),
             }),
             node.cache_dir_path(),
+            // Share the node's ONE acquisition gate (#1614): the reshare warm and the §21 backfill leg
+            // claim the SAME registry, so a read triggers at most one whole-capsule pull across both.
+            node.capsule_acquisition_gate(),
         );
         node.set_p2p_content(content);
         println!(
