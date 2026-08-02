@@ -1022,7 +1022,10 @@ Two layers, both REQUIRED:
 Exactly the `control.` method prefix is gated (`is_control_method`); unknown `control.*` methods
 still pass the auth gate first, then yield `METHOD_NOT_FOUND`. The pairing-administration methods
 (`control.pairing.list`/`approve`/`revoke`, §7.11) require the MASTER token specifically — a paired
-token is NOT accepted for them.
+token is NOT accepted for them. The ONE exception is `control.wallet.balance` (`is_open_control_read`):
+a READ-ONLY chain read of a PUBLIC address with no custody, so it is served WITHOUT a token like the
+other reads — it still routes through `dispatch_control` (so it stays in the control catalog and gets
+its CLI verb) but the server skips the token requirement. No mutation or custody method is ever open.
 
 ### 7.3. The control token
 
@@ -1200,6 +1203,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.hostedStores.status` | `store` = `storeId[:rootHash]` | `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` |
 | `control.sync.status` | — | `available` (always `true` — the chunked capsule download needs no identity), `method: "chunked-capsule-download-with-section-21-clone-fallback"`, `identity_loaded`, `pinned_total`, `pinned_synced`, `whole_store_trigger_supported` (`true` — a store id alone is enough) |
 | `control.sync.trigger` | `store` = `storeId[:rootHash]`, or `store_id` [+ `root`] — the root is OPTIONAL; without one the node resolves the store's CHAIN-ANCHORED tip and syncs that generation | `status: "synced"`, `root`, `size_bytes`, `served_root` |
+| `control.wallet.balance` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"`, default `"xch"`) | `balance` (confirmed, spendable — JSON NUMBER, u64 base units), `pending` (unspent + unconfirmed — JSON NUMBER, u64 base units), `synced` (bool — whether a fully-synced view answered), `peak_height` (the node's chain-view peak, or `null`). Matches `dig-node-control-interface` 0.3.0's `WalletBalanceResult { balance: u64, pending: u64, .. }` and dig-app's `BalanceResponse { balance: u64 }` — a Rust-to-Rust numeric contract, never a decimal string. The wallet backend tracks the base-unit total as `u128` (headroom for summed intermediate math); the wire boundary saturating-casts to `u64` (a single address's balance can never exceed `u64::MAX` mojos, ~18.4M XCH). READ-ONLY chain read of a PUBLIC address (no seed/signing key). Reuses the B.6 sync-state routing: the local DB when the address is the wallet's own and the DB is synced, else the coinset fallback. `$DIG` scopes by the canonical CAT asset id `digstore_chain::dig::DIG_ASSET_ID`. A synced empty address is a SUCCESS `{balance:0, synced:true}`, never an error; the three read-failure shapes are DISTINCT errors `WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED` (§10), never a fabricated `0`. `INVALID_PARAMS` on a missing/malformed `address` or a bad `asset`. |
 
 ### 7.5. Ownership boundary
 
@@ -2046,7 +2050,8 @@ method-not-found cue).
 `privacy_requires_local_node` / `onion_hops_out_of_range`) — the published normative contract on
 docs.dig.net — and MUST NOT be used for control. (`dig-rpc-protocol` is the source of this resolution;
 any client that branched on the old control numbers keys on the symbolic `data.code`, not the
-number.)
+number.) The wallet-read errors occupy `-3204x` (`WALLET_NO_CHAIN_SOURCE` / `WALLET_NOT_SYNCED` /
+`WALLET_READ_FAILED`); `-3205x` is owned by the chat plane (§ chat) and MUST NOT collide.
 
 | Code | Name | Origin | Meaning |
 |---|---|---|---|
@@ -2065,6 +2070,9 @@ number.)
 | -32030 | `UNAUTHORIZED` | shell | `control.*` called without a valid local control token. |
 | -32031 | `NOT_SUPPORTED` | shell | A control operation this build/pin cannot perform (e.g. §21 sync without an identity). |
 | -32032 | `CONTROL_ERROR` | shell | A control operation failed at runtime (distinct from bad input / absent capability). |
+| -32040 | `WALLET_NO_CHAIN_SOURCE` | node | `control.wallet.balance` (§ control catalog) had NO live chain source able to answer an arbitrary (non-wallet) address. Distinct from a truthful `0`. |
+| -32041 | `WALLET_NOT_SYNCED` | node | `control.wallet.balance` of the wallet's OWN address while the local DB is still syncing and no live fallback is attached (nothing can answer yet). |
+| -32042 | `WALLET_READ_FAILED` | node | `control.wallet.balance` failed at the underlying DB / chain-source layer. Distinct from `WALLET_NO_CHAIN_SOURCE` and `WALLET_NOT_SYNCED`. |
 
 Read-path and upstream errors outside this table are relayed verbatim; this catalogue governs what
 the **shell** mints plus the cross-boundary codes a client must be able to branch on.

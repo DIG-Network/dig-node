@@ -792,6 +792,59 @@ impl WalletDb {
             .sum())
     }
 
+    /// The PENDING balance for `asset_id` scoped to `puzzle_hashes`: the sum of coins that
+    /// are unspent AND not yet confirmed on-chain (`spent_height IS NULL AND created_height
+    /// IS NULL` — a coin the wallet has created/received but that has not landed in a block).
+    /// Distinct from [`Self::balance_scoped`], which counts ONLY confirmed unspent coins
+    /// (`created_height IS NOT NULL`). Used by the `control.wallet.balance` read (#1851) to
+    /// report `{ balance, pending }` separately so a caller never conflates in-flight value
+    /// with spendable value.
+    pub async fn pending_scoped(
+        &self,
+        asset_id: Option<&str>,
+        puzzle_hashes: &[String],
+    ) -> sqlx::Result<u128> {
+        if puzzle_hashes.is_empty() {
+            return Ok(0);
+        }
+        let ph = Self::placeholders(puzzle_hashes.len());
+        let (scope_col, asset_clause) = match asset_id {
+            Some(_) => ("hint", "AND asset_id = ?"),
+            None => ("puzzle_hash", "AND asset_id IS NULL"),
+        };
+        let sql = format!(
+            "SELECT * FROM coins WHERE spent_height IS NULL AND created_height IS NULL \
+             AND {scope_col} IN ({ph}) {asset_clause}"
+        );
+        let mut q = sqlx::query(&sql);
+        for p in puzzle_hashes {
+            q = q.bind(p.to_ascii_lowercase());
+        }
+        if let Some(a) = asset_id {
+            q = q.bind(a.to_ascii_lowercase());
+        }
+        let rows = q.fetch_all(&self.pool).await?;
+        Ok(rows
+            .iter()
+            .map(Self::coin_from_row)
+            .filter_map(|c| c.amount.parse::<u128>().ok())
+            .sum())
+    }
+
+    /// Whether `puzzle_hash` belongs to one of the wallet's own HD derivations — the
+    /// `scoped_to_wallet` axis of the B.6 routing gate ([`crate::sage::routing::route`]).
+    /// A derivation match means the local DB is authoritative for this address once synced;
+    /// a non-match is an arbitrary chain address that only the fallback tier can answer
+    /// (#1851). `puzzle_hash` is matched case-insensitively against the stored `hex::encode`
+    /// form.
+    pub async fn derivation_exists(&self, puzzle_hash: &str) -> sqlx::Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM derivations WHERE puzzle_hash = ? LIMIT 1")
+            .bind(puzzle_hash.to_ascii_lowercase())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     /// All coins (any spent state) for `asset_id` scoped to `puzzle_hashes`. Used by
     /// `get_coins`, which applies its own spent/filter modes over the returned set.
     pub async fn coins_scoped(

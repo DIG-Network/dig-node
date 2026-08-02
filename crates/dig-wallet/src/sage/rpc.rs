@@ -33,6 +33,71 @@ use super::types::*;
 use super::{actions, mint, network, offers, options, themes};
 use super::{Error, Result};
 
+/// Which asset a [`WalletBackend::balance_for_address`] read totals (#1851). The wire form
+/// is the lowercase token (`xch` / `dig`); the CAT asset id for `Dig` is sourced from
+/// `digstore_chain::dig::DIG_ASSET_ID` (canonical, never hardcoded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BalanceAsset {
+    /// Native chia (XCH) — no CAT asset id.
+    Xch,
+    /// The $DIG CAT.
+    Dig,
+}
+
+impl BalanceAsset {
+    /// Parse the lowercase wire token. Returns `None` for any other value.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "xch" => Some(Self::Xch),
+            "dig" => Some(Self::Dig),
+            _ => None,
+        }
+    }
+
+    /// The CAT asset id (bare lowercase hex) this asset scopes to, or `None` for native XCH
+    /// — the `asset_id` argument the DB / fallback reads take. Sourced from
+    /// `digstore_chain::dig::DIG_ASSET_ID` so the $DIG TAIL never drifts from the canonical
+    /// definition.
+    fn asset_id_hex(self) -> Option<String> {
+        match self {
+            Self::Xch => None,
+            Self::Dig => Some(hex::encode(digstore_chain::dig::DIG_ASSET_ID)),
+        }
+    }
+}
+
+/// The result of a [`WalletBackend::balance_for_address`] read (#1851): the confirmed +
+/// pending balance for ONE address, plus the sync context so a caller can tell a
+/// fully-synced figure from a still-converging one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WalletBalanceResult {
+    /// Confirmed, spendable balance (unspent, on-chain) in mojos / CAT base units.
+    pub balance: u128,
+    /// Pending balance: unspent coins not yet confirmed on-chain (in-flight value).
+    pub pending: u128,
+    /// Whether the answer reflects a fully-synced view (DB caught up), vs a fallback read
+    /// taken while the local replica is still converging.
+    pub synced: bool,
+    /// The node's best-known chain peak height, when known.
+    pub peak_height: Option<u32>,
+}
+
+/// Why a [`WalletBackend::balance_for_address`] read could not produce a figure (#1851).
+/// Each variant maps to a DISTINCT wire error — never a fabricated `0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BalanceError {
+    /// The address did not decode as a bech32m Chia address.
+    InvalidAddress,
+    /// No live chain source could answer a read that required one (an arbitrary, non-wallet
+    /// address with no live fallback attached).
+    NoChainSource,
+    /// The address is the wallet's own, but the local DB has not finished syncing and no
+    /// live fallback is attached, so nothing can answer yet.
+    NotSynced,
+    /// An underlying read (DB query or fallback) errored.
+    ReadFailed(String),
+}
+
 /// Static wallet identity + config the read surface needs (derived once at bring-up).
 #[derive(Debug, Clone)]
 pub struct WalletConfig {
@@ -371,6 +436,105 @@ impl WalletBackend {
     /// Whether the initial subscription catch-up is complete (the routing gate, B.6).
     async fn synced(&self) -> Result<bool> {
         Ok(self.db.is_synced().await?)
+    }
+
+    /// The confirmed + pending balance held at ONE address, for XCH or $DIG (#1851).
+    ///
+    /// A READ-ONLY chain view — it needs only a public address, never a seed or signing key,
+    /// so it carries zero custody risk and answers the `control.wallet.balance` control read.
+    /// It reuses the EXISTING B.6 routing ([`routing::route`]):
+    ///
+    /// - **Wallet-owned address, DB synced** → the local DB is authoritative:
+    ///   [`db::WalletDb::balance_scoped`] (confirmed) + [`db::WalletDb::pending_scoped`]
+    ///   (unconfirmed), `synced = true`.
+    /// - **Otherwise** → the fallback (coinset) tier answers, `synced` reflecting the real DB
+    ///   sync state. If no LIVE fallback is attached, the read cannot honestly answer, so it
+    ///   returns a DISTINCT error rather than a fabricated `0`: [`BalanceError::NotSynced`]
+    ///   for the wallet's own address (the DB would answer once synced),
+    ///   [`BalanceError::NoChainSource`] for an arbitrary address (only a chain source could).
+    ///
+    /// `peak_height` is sourced from the node's real chain view (the DB sync-state peak),
+    /// never fabricated.
+    pub async fn balance_for_address(
+        &self,
+        address: &str,
+        asset: BalanceAsset,
+    ) -> std::result::Result<WalletBalanceResult, BalanceError> {
+        let puzzle_hash =
+            normalize_ph(&decode_address(address).ok_or(BalanceError::InvalidAddress)?);
+        let asset_id = asset.asset_id_hex();
+
+        let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
+        let db_synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        let peak_height = self
+            .db
+            .sync_state()
+            .await
+            .map_err(|e| read_err(e.into()))?
+            .peak_height;
+        let scoped = self
+            .db
+            .derivation_exists(&puzzle_hash)
+            .await
+            .map_err(|e| read_err(e.into()))?;
+
+        match routing::route(db_synced, scoped) {
+            Source::Db => {
+                let scope = [puzzle_hash];
+                let balance = self
+                    .db
+                    .balance_scoped(asset_id.as_deref(), &scope)
+                    .await
+                    .map_err(|e| read_err(e.into()))?;
+                let pending = self
+                    .db
+                    .pending_scoped(asset_id.as_deref(), &scope)
+                    .await
+                    .map_err(|e| read_err(e.into()))?;
+                Ok(WalletBalanceResult {
+                    balance,
+                    pending,
+                    synced: true,
+                    peak_height,
+                })
+            }
+            Source::Fallback => {
+                // A fallback read must consult the chain; without a live source it cannot
+                // honestly answer. Distinguish "own address, still syncing" from "arbitrary
+                // address, no chain source" so the caller sees WHY (never a fabricated 0).
+                if !self.fallback.is_live() {
+                    return Err(if scoped {
+                        BalanceError::NotSynced
+                    } else {
+                        BalanceError::NoChainSource
+                    });
+                }
+                let phs = [puzzle_hash];
+                // XCH coins sit AT the puzzle hash; CAT coins are HINTED to it.
+                let coins = match asset {
+                    BalanceAsset::Xch => self.fallback.coin_records_by_puzzle_hashes(&phs).await,
+                    BalanceAsset::Dig => self.fallback.coin_records_by_hints(&phs).await,
+                }
+                .map_err(read_err)?;
+                let (mut balance, mut pending) = (0u128, 0u128);
+                for c in &coins {
+                    if c.spent_height.is_some() {
+                        continue;
+                    }
+                    if c.created_height.is_some() {
+                        balance += u128::from(c.amount);
+                    } else {
+                        pending += u128::from(c.amount);
+                    }
+                }
+                Ok(WalletBalanceResult {
+                    balance,
+                    pending,
+                    synced: db_synced,
+                    peak_height,
+                })
+            }
+        }
     }
 
     // ---- session identity scoping (#407) ---------------------------------
@@ -2894,8 +3058,10 @@ fn paginate(coins: Vec<CoinRecord>, offset: u32, limit: u32) -> Vec<CoinRecord> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::db::DerivationRow;
     use super::super::db::WalletDb;
     use super::super::fallback::mock::MockFallback;
+    use super::super::fallback::EmptyFallback;
     use super::super::fallback::FallbackCoin;
     use super::*;
 
@@ -2930,6 +3096,269 @@ mod tests {
             hint: None,
             created_timestamp: None,
             spent_timestamp: None,
+        }
+    }
+
+    // ---- control.wallet.balance: balance_for_address (#1851) -------------------------------
+
+    /// A wallet-owned puzzle hash used across the balance tests, distinct from `test_ph`
+    /// so the two identity axes never coincide by accident.
+    fn owned_ph() -> String {
+        "11".repeat(32)
+    }
+
+    fn owned_address() -> String {
+        encode_address(&owned_ph(), "xch").unwrap()
+    }
+
+    /// A DB with `owned_ph` registered as a real HD derivation (the `scoped_to_wallet` axis),
+    /// its sync flag set, and an optional peak — the fixture for the DB-path reads.
+    async fn db_with_owned_derivation(synced: bool, peak: Option<u32>) -> WalletDb {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_derivation(&DerivationRow {
+            hardened: false,
+            index: 0,
+            public_key: "aa".repeat(48),
+            puzzle_hash: owned_ph(),
+            address: owned_address(),
+        })
+        .await
+        .unwrap();
+        db.set_initial_sync_complete(synced).await.unwrap();
+        if let Some(h) = peak {
+            db.set_peak(h, &"cc".repeat(32)).await.unwrap();
+        }
+        db
+    }
+
+    fn coin_at_ph(
+        id: &str,
+        ph: &str,
+        amount: u64,
+        created: Option<i64>,
+        spent: Option<i64>,
+    ) -> CoinRow {
+        CoinRow {
+            coin_id: id.into(),
+            parent_coin_info: "pp".into(),
+            puzzle_hash: ph.into(),
+            amount: amount.to_string(),
+            created_height: created,
+            spent_height: spent,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    fn fallback_coin(
+        id: &str,
+        ph: &str,
+        amount: u64,
+        created: Option<u32>,
+        spent: Option<u32>,
+    ) -> FallbackCoin {
+        FallbackCoin {
+            coin_id: id.into(),
+            parent_coin_info: "pp".into(),
+            puzzle_hash: ph.into(),
+            amount,
+            created_height: created,
+            spent_height: spent,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    /// Scoped + synced ⇒ the DB path: `balance` counts ONLY confirmed unspent coins (excludes
+    /// the spent coin AND the not-yet-confirmed one), while `pending` reports the coin whose
+    /// `created_height` is NULL. The three coins have distinct states so a placement that
+    /// conflated them (e.g. summing all unspent into `balance`) would change the numbers.
+    #[tokio::test]
+    async fn scoped_synced_reads_db_separating_confirmed_pending_and_spent() {
+        let db = db_with_owned_derivation(true, Some(500)).await;
+        db.upsert_coins(&[
+            coin_at_ph("confirmed", &owned_ph(), 100, Some(10), None),
+            coin_at_ph("spent", &owned_ph(), 50, Some(10), Some(20)),
+            coin_at_ph("pending", &owned_ph(), 7, None, None),
+        ])
+        .await
+        .unwrap();
+        // A live fallback is attached but MUST NOT be consulted on the DB path.
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "ghost",
+            &owned_ph(),
+            9999,
+            Some(1),
+            None,
+        )]));
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+
+        let r = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(r.balance, 100, "confirmed unspent only");
+        assert_eq!(r.pending, 7, "created_height NULL coin");
+        assert!(r.synced);
+        assert_eq!(r.peak_height, Some(500), "peak from the real chain view");
+        assert_eq!(fb.call_count(), 0, "DB path never touches the fallback");
+    }
+
+    /// $DIG is scoped by the canonical CAT asset id (`digstore_chain::dig::DIG_ASSET_ID`): a
+    /// CAT coin hinted to the address with that asset id is counted, while an XCH coin at the
+    /// same address is NOT — proving the asset routing is asset-id-scoped, not address-scoped.
+    #[tokio::test]
+    async fn dig_balance_scopes_by_canonical_cat_asset_id() {
+        let dig = hex::encode(digstore_chain::dig::DIG_ASSET_ID);
+        let db = db_with_owned_derivation(true, None).await;
+        db.upsert_coins(&[
+            CoinRow {
+                coin_id: "cat".into(),
+                parent_coin_info: "pp".into(),
+                puzzle_hash: "cat-inner".into(),
+                amount: "250".into(),
+                created_height: Some(10),
+                spent_height: None,
+                asset_id: Some(dig.clone()),
+                hint: Some(owned_ph()),
+                created_timestamp: None,
+                spent_timestamp: None,
+            },
+            coin_at_ph("xch", &owned_ph(), 100, Some(10), None),
+        ])
+        .await
+        .unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+
+        let dig_bal = be
+            .balance_for_address(&owned_address(), BalanceAsset::Dig)
+            .await
+            .unwrap();
+        assert_eq!(
+            dig_bal.balance, 250,
+            "the $DIG CAT coin, by canonical asset id"
+        );
+        let xch_bal = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(xch_bal.balance, 100, "XCH at the address, not the CAT");
+    }
+
+    /// An arbitrary (non-wallet) address routes to the LIVE fallback, and `synced` reflects the
+    /// DB's real `is_synced()` — asserted BOTH ways (false while syncing, true once caught up)
+    /// so the field cannot be a constant.
+    #[tokio::test]
+    async fn arbitrary_address_uses_fallback_and_synced_tracks_db_state() {
+        let arbitrary = encode_address(&"22".repeat(32), "xch").unwrap();
+        let arb_ph = "22".repeat(32);
+        let coins = vec![
+            fallback_coin("c1", &arb_ph, 42, Some(10), None),
+            fallback_coin("pend", &arb_ph, 5, None, None),
+        ];
+
+        for synced in [false, true] {
+            let db = WalletDb::open_in_memory().await.unwrap();
+            db.set_initial_sync_complete(synced).await.unwrap();
+            let fb = Arc::new(MockFallback::with_coins(coins.clone()));
+            let be = WalletBackend::new(db, fb, WalletConfig::default());
+            let r = be
+                .balance_for_address(&arbitrary, BalanceAsset::Xch)
+                .await
+                .unwrap();
+            assert_eq!(r.balance, 42, "confirmed fallback coin");
+            assert_eq!(r.pending, 5, "unconfirmed fallback coin");
+            assert_eq!(r.synced, synced, "synced mirrors is_synced()");
+        }
+    }
+
+    /// A synced, wallet-owned, EMPTY address is a SUCCESS with a zero figure — never an error.
+    #[tokio::test]
+    async fn synced_empty_address_is_zero_success_not_error() {
+        let db = db_with_owned_derivation(true, None).await;
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+        let r = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(r.balance, 0);
+        assert_eq!(r.pending, 0);
+        assert!(r.synced);
+    }
+
+    /// The four failure shapes are DISTINCT, so each maps to its own wire error (never a `0`):
+    /// invalid address, no chain source (arbitrary addr + no live fallback), not synced (own
+    /// addr + no live fallback), and a read failure (live fallback that errors).
+    #[tokio::test]
+    async fn failure_shapes_are_distinct() {
+        // Invalid address — does not decode as bech32m.
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            Arc::new(EmptyFallback),
+            WalletConfig::default(),
+        );
+        assert_eq!(
+            be.balance_for_address("not-an-address", BalanceAsset::Xch)
+                .await,
+            Err(BalanceError::InvalidAddress)
+        );
+
+        // No chain source: arbitrary address, DB synced, EmptyFallback (not live).
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
+        assert_eq!(
+            be.balance_for_address(&arbitrary, BalanceAsset::Xch).await,
+            Err(BalanceError::NoChainSource)
+        );
+
+        // Not synced: the wallet's OWN address, DB not synced, EmptyFallback (not live).
+        let db = db_with_owned_derivation(false, None).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.balance_for_address(&owned_address(), BalanceAsset::Xch)
+                .await,
+            Err(BalanceError::NotSynced)
+        );
+
+        // Read failed: arbitrary address routes to a LIVE fallback that errors.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
+        assert!(matches!(
+            be.balance_for_address(&arbitrary, BalanceAsset::Xch).await,
+            Err(BalanceError::ReadFailed(_))
+        ));
+    }
+
+    /// A live fallback whose reads always error — for the READ_FAILED shape.
+    struct ErringFallback;
+    #[async_trait::async_trait]
+    impl ChainFallback for ErringFallback {
+        async fn coin_records_by_puzzle_hashes(&self, _: &[String]) -> Result<Vec<FallbackCoin>> {
+            Err(Error::internal("boom"))
+        }
+        async fn coin_records_by_hints(&self, _: &[String]) -> Result<Vec<FallbackCoin>> {
+            Err(Error::internal("boom"))
+        }
+        async fn coin_record_by_id(&self, _: &str) -> Result<Option<FallbackCoin>> {
+            Err(Error::internal("boom"))
+        }
+        // A live source whose reads fail — proves the READ_FAILED shape (#1851: the trait
+        // default is now fail-closed, so a live double must say so explicitly).
+        fn is_live(&self) -> bool {
+            true
         }
     }
 
@@ -3944,6 +4373,10 @@ mod tests {
             }
             async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
                 Ok(None)
+            }
+            // Stands in for the live coinset/peer tier (#1851: the trait default is fail-closed).
+            fn is_live(&self) -> bool {
+                true
             }
         }
 

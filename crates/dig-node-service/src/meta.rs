@@ -555,6 +555,18 @@ pub enum ErrorCode {
     /// `INVALID_PARAMS` (bad input) and `NOT_SUPPORTED` (capability absent). Shell.
     /// (Canonical dig-rpc-types §10 code; `-32022` is RESERVED for onion routing.)
     ControlError,
+    /// `-32040` — a wallet balance read (`control.wallet.balance`, #1851) had NO live chain
+    /// source able to answer an arbitrary (non-wallet) address. Distinct from a truthful `0`:
+    /// the node could not consult the chain, so it reports the read as unanswerable rather than
+    /// fabricating an empty balance. Node error. (Wallet range `-3204x`; chat owns `-3205x`.)
+    WalletNoChainSource,
+    /// `-32041` — a wallet balance read of the wallet's OWN address while the local DB is still
+    /// syncing and no live fallback is attached: nothing can answer yet. Node error.
+    WalletNotSynced,
+    /// `-32042` — a wallet balance read failed at the underlying DB / chain-source layer.
+    /// Distinct from `WALLET_NO_CHAIN_SOURCE` (nothing to ask) and `WALLET_NOT_SYNCED`
+    /// (not ready). Node error.
+    WalletReadFailed,
 }
 
 impl ErrorCode {
@@ -571,6 +583,9 @@ impl ErrorCode {
             ErrorCode::Unauthorized => -32030,
             ErrorCode::NotSupported => -32031,
             ErrorCode::ControlError => -32032,
+            ErrorCode::WalletNoChainSource => -32040,
+            ErrorCode::WalletNotSynced => -32041,
+            ErrorCode::WalletReadFailed => -32042,
         }
     }
 
@@ -588,6 +603,9 @@ impl ErrorCode {
             ErrorCode::Unauthorized => "UNAUTHORIZED",
             ErrorCode::NotSupported => "NOT_SUPPORTED",
             ErrorCode::ControlError => "CONTROL_ERROR",
+            ErrorCode::WalletNoChainSource => "WALLET_NO_CHAIN_SOURCE",
+            ErrorCode::WalletNotSynced => "WALLET_NOT_SYNCED",
+            ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
         }
     }
 
@@ -605,6 +623,10 @@ impl ErrorCode {
             | ErrorCode::ControlError
             | ErrorCode::ParseError => "shell",
             ErrorCode::MethodNotFound => "boundary",
+            // The wallet balance read (#1851) is served by the node-custodied wallet backend.
+            ErrorCode::WalletNoChainSource
+            | ErrorCode::WalletNotSynced
+            | ErrorCode::WalletReadFailed => "node",
             // INVALID_PARAMS is returned by the embedded read path's locally-served
             // read methods (bad store_id / retrieval_key) before any I/O.
             ErrorCode::InvalidParams => "node",
@@ -637,6 +659,13 @@ impl ErrorCode {
                 "The requested control operation is not supported on this node build."
             }
             ErrorCode::ControlError => "A control operation failed at runtime.",
+            ErrorCode::WalletNoChainSource => {
+                "A wallet balance read had no live chain source to answer an arbitrary address."
+            }
+            ErrorCode::WalletNotSynced => {
+                "A wallet balance read of the wallet's own address is still syncing with no fallback."
+            }
+            ErrorCode::WalletReadFailed => "A wallet balance read failed at the DB / chain layer.",
         }
     }
 
@@ -653,6 +682,9 @@ impl ErrorCode {
             ErrorCode::Unauthorized,
             ErrorCode::NotSupported,
             ErrorCode::ControlError,
+            ErrorCode::WalletNoChainSource,
+            ErrorCode::WalletNotSynced,
+            ErrorCode::WalletReadFailed,
         ]
     }
 }

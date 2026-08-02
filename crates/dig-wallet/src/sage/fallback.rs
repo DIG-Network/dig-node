@@ -49,6 +49,16 @@ pub trait ChainFallback: Send + Sync {
     async fn coin_records_by_hints(&self, hints: &[String]) -> Result<Vec<FallbackCoin>>;
     /// A single coin by id (out-of-DB / arbitrary lookup).
     async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>>;
+
+    /// Whether this fallback can actually reach a chain source. `true` for a live tier
+    /// ([`CoinsetFallback`]); `false` for the graceful no-network [`EmptyFallback`], whose
+    /// every read is a silent empty. A read that MUST consult the chain (an arbitrary,
+    /// non-wallet address, or a wallet address whose DB has not synced) uses this to tell
+    /// "chain says zero" apart from "no chain source to ask" — the difference between a
+    /// truthful `0` and an honest error (#1851).
+    fn is_live(&self) -> bool {
+        false
+    }
 }
 
 /// The production fallback: `chia_query::ChiaQuery` (coinset.org + peer point-reads),
@@ -123,6 +133,11 @@ impl CoinsetFallback {
 
 #[async_trait]
 impl ChainFallback for CoinsetFallback {
+    /// A real coinset/peer connection: a genuinely live chain source (#1851).
+    fn is_live(&self) -> bool {
+        true
+    }
+
     async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {
         let phs = Self::query_hashes(phs);
         let records = self
@@ -226,6 +241,10 @@ impl ChainFallback for EmptyFallback {
     async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
         Ok(None)
     }
+    /// No network: not a live chain source (#1851).
+    fn is_live(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +316,12 @@ pub(crate) mod mock {
 
     #[async_trait]
     impl ChainFallback for MockFallback {
+        /// The test double stands in for a genuinely live chain source (unit tests that want
+        /// the "no chain source" path use a dedicated non-live double instead, #1851).
+        fn is_live(&self) -> bool {
+            true
+        }
+
         async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self

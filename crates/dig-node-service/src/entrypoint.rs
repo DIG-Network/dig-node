@@ -142,6 +142,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<SyncCommand>,
     },
+    /// Read a public address's balance (the OPEN `control.wallet.balance` read, #1851).
+    Wallet {
+        #[command(subcommand)]
+        action: WalletCommand,
+    },
     /// Drive the DIG auto-update beacon (the `control.updater.*` surface).
     Updater {
         #[command(subcommand)]
@@ -224,6 +229,19 @@ enum SyncCommand {
     Trigger {
         /// The capsule reference (`storeId:rootHash`).
         store: String,
+    },
+}
+
+/// `dig-node wallet` sub-actions (#1851).
+#[derive(Subcommand)]
+enum WalletCommand {
+    /// Print the balance of a public address (READ-ONLY; needs no seed or pairing).
+    Balance {
+        /// The bech32m address to read (`xch1…`).
+        address: String,
+        /// The asset to total: `xch` (default) or `dig`.
+        #[arg(long, default_value = "xch")]
+        asset: String,
     },
 }
 
@@ -331,6 +349,7 @@ impl Command {
             Command::Cache { .. } => "cache",
             Command::Stores { .. } => "stores",
             Command::Sync { .. } => "sync",
+            Command::Wallet { .. } => "wallet",
             Command::Updater { .. } => "updater",
             Command::Subscriptions { .. } => "subscriptions",
             Command::Peers { .. } => "peers",
@@ -438,6 +457,9 @@ pub fn run() -> std::process::ExitCode {
         Command::Sync { action: cmd } => {
             render(control_cli::run(&config, sync_action(cmd)), action, json)
         }
+        Command::Wallet { action: cmd } => {
+            render(control_cli::run(&config, wallet_action(cmd)), action, json)
+        }
         Command::Updater { action: cmd } => {
             render(control_cli::run(&config, updater_action(cmd)), action, json)
         }
@@ -487,6 +509,15 @@ fn sync_action(cmd: Option<SyncCommand>) -> ControlAction {
     match cmd {
         None | Some(SyncCommand::Status) => ControlAction::SyncStatus,
         Some(SyncCommand::Trigger { store }) => ControlAction::SyncTrigger { store },
+    }
+}
+
+/// Map the `wallet` subcommand to its [`ControlAction`] (#1851).
+fn wallet_action(cmd: WalletCommand) -> ControlAction {
+    match cmd {
+        WalletCommand::Balance { address, asset } => {
+            ControlAction::WalletBalance { address, asset }
+        }
     }
 }
 

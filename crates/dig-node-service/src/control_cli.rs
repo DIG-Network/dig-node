@@ -56,6 +56,8 @@ pub enum ControlAction {
     SyncStatus,
     /// `control.sync.trigger` — trigger a §21 sync for one capsule (`storeId:rootHash`).
     SyncTrigger { store: String },
+    /// `control.wallet.balance` — the READ-ONLY balance of a public address (XCH or $DIG).
+    WalletBalance { address: String, asset: String },
     /// `control.updater.status` — the DIG auto-update beacon's status.
     UpdaterStatus,
     /// `control.updater.setChannel` — set the beacon channel (`nightly` | `stable`).
@@ -91,6 +93,7 @@ impl ControlAction {
             ControlAction::StoresStatus { .. } => "control.hostedStores.status",
             ControlAction::SyncStatus => "control.sync.status",
             ControlAction::SyncTrigger { .. } => "control.sync.trigger",
+            ControlAction::WalletBalance { .. } => "control.wallet.balance",
             ControlAction::UpdaterStatus => "control.updater.status",
             ControlAction::UpdaterSetChannel { .. } => "control.updater.setChannel",
             ControlAction::UpdaterPause { .. } => "control.updater.pause",
@@ -111,6 +114,9 @@ impl ControlAction {
             | ControlAction::StoresUnpin { store }
             | ControlAction::StoresStatus { store }
             | ControlAction::SyncTrigger { store } => json!({ "store": store }),
+            ControlAction::WalletBalance { address, asset } => {
+                json!({ "address": address, "asset": asset })
+            }
             ControlAction::UpdaterSetChannel { channel } => json!({ "channel": channel }),
             ControlAction::UpdaterPause { until: Some(u) } => json!({ "until": u }),
             ControlAction::SubsAdd { store_id } | ControlAction::SubsRemove { store_id } => {
@@ -159,6 +165,11 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         ControlAction::SyncStatus.method(),
         ControlAction::SyncTrigger {
             store: String::new(),
+        }
+        .method(),
+        ControlAction::WalletBalance {
+            address: String::new(),
+            asset: String::new(),
         }
         .method(),
         ControlAction::UpdaterStatus.method(),
@@ -266,6 +277,16 @@ fn summarize(method: &str, result: &Value) -> String {
         "control.unsubscribe" => format!(
             "unsubscribed from {}",
             result["store_id"].as_str().unwrap_or("?"),
+        ),
+        "control.wallet.balance" => format!(
+            "balance {} · pending {} · {}",
+            result["balance"].as_u64().unwrap_or(0),
+            result["pending"].as_u64().unwrap_or(0),
+            if result["synced"].as_bool().unwrap_or(false) {
+                "synced"
+            } else {
+                "syncing"
+            },
         ),
         "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
@@ -399,6 +420,22 @@ mod tests {
         assert!(s.contains("42s"));
         assert!(s.contains("3 hosted"));
         assert!(s.contains("sync available"));
+    }
+
+    /// REGRESSION (#1851): `control.wallet.balance` emits `balance`/`pending` as JSON NUMBERS
+    /// (not strings). The summary line MUST render the actual numeric values — a prior version
+    /// read them with `.as_str()`, which always misses on a JSON number and silently prints `?`
+    /// for both fields regardless of the real balance.
+    #[test]
+    fn wallet_balance_summary_renders_numeric_fields() {
+        let s = summarize(
+            "control.wallet.balance",
+            &json!({ "balance": 12345, "pending": 6, "synced": true, "peak_height": 42 }),
+        );
+        assert!(s.contains("12345"), "got: {s}");
+        assert!(s.contains('6'), "got: {s}");
+        assert!(!s.contains('?'), "must not fall back to `?`: {s}");
+        assert!(s.contains("synced"), "got: {s}");
     }
 
     #[test]
