@@ -1407,6 +1407,52 @@ rule so tier-0 re-selection against an existing held set does not thrash a fetch
 on marginal score differences. The tier-0 selector's own default margin is
 `DEFAULT_HYSTERESIS_MARGIN` (0.05), overridable per call.
 
+### 7.10c. DHT candidate sampling + anti-Sybil quorum reconciliation (#1987, epic #1934)
+
+The `dht_sampling` module (`crates/dig-node-core/src/dht_sampling.rs`) produces the CANDIDATE SET that
+feeds §7.10a's `RelevanceInputs` (each candidate's `content_id` + an untrusted `known_provider_count`).
+It does NOT score candidates (§7.10a) or select/fetch them (§7.10b + the fetch child) — discovery and
+reconciliation ONLY. It splits a PURE reconciliation policy from the network I/O so the
+security-critical logic is unit-tested with no sockets.
+
+**Observation model.** A `PeerObservation { peer_id: [u8;32], holdings: Vec<ObservedCandidate> }` is
+ONE peer's reported provider view — the shape of a dig-dht `DhtService::provider_snapshot` (the RLY-009
+`get_dht_records` view, #1935): each `ObservedCandidate { content_id: [u8;32], provider_count: u32,
+size_hint: Option<u64> }` is that peer's untrusted claim about one content KEY (the 32-byte
+`ContentId::to_key` keyspace point). The DHT provider snapshot carries no size, so `size_hint` is
+optional; the true size is learned at fetch time.
+
+**Random keyspace sampling.** `sample_keyspace_points(rng: &mut impl KeyspaceRng, k) -> Vec<[u8;32]>`
+picks `k` keyspace points to probe. Randomness enters ONLY through the injected `KeyspaceRng`
+(a self-contained non-cryptographic `SplitMix64` seeded from node state — MUST NOT be used for keys or
+nonces), so coverage is deterministic under a seed. Points are reached in production with the dig-dht
+routing primitive `find_node`/`known_closest`, which accepts ANY key — so sampling probes arbitrary
+regions rather than only ids the node already holds, spreading coverage across the whole keyspace.
+`DEFAULT_SAMPLE_POINTS` = 8.
+
+**Anti-Sybil quorum reconciliation.** `reconcile(observations: &[PeerObservation], policy:
+&QuorumPolicy) -> Vec<Candidate>` admits a content key ONLY when at least `policy.min_distinct_peers`
+(`DEFAULT_QUORUM_MIN_PEERS` = 3) DISTINCT peers independently report it. Observations are collapsed per
+peer FIRST — one peer listing a key many times (or across regions) is a SINGLE vote — so a lone
+lying/Sybil peer's unique injections never reach the candidate set. Each admitted key's
+`known_provider_count` is the LOWER MEDIAN of the reporting peers' claimed counts (NEVER the max): a
+single peer inflating its count to `u32::MAX` moves only one tail sample and cannot drag the median
+while honest peers outnumber it; the mirror deflation-to-zero attack fails the same way. `size_hint`
+is the lower median of the supplied sizes, or `None`. Output is sorted by `content_id`. §7.10a's
+`[1, 32]` provider-count clamp remains the final defense on whatever count survives here.
+
+**Residual model (stated, not hidden).** Distinct-peer quorum is a COST MULTIPLIER, not proof of
+honesty: an attacker minting `M` distinct mTLS identities that all corroborate one key still clears the
+bar. That residual is bounded by the surrounding layers — keyspace sampling forces the attacker to
+cover the whole space, the §7.10a XOR proximity primary means a corroborated junk key scores by an id
+the attacker cannot grind toward this node, and the `[1, 32]` clamp caps the surviving count.
+
+**Composition seam.** `sample_candidates(probe: &dyn NeighbourhoodProbe, rng, sample_points, policy)`
+ties sampling + probing + reconciliation over a `NeighbourhoodProbe` seam (`observe_near(point) ->
+Vec<PeerObservation>`), reconciling ALL probed regions TOGETHER so the quorum is whole-round. The
+concrete probe (`find_node` toward each point, then a provider-snapshot RPC to the peers found) lands
+with the fetch child (#4); this module defines only the shape it consumes.
+
 ### 7.11. Control-token pairing for browser controllers (#280)
 
 An MV3 browser extension cannot read the `<state_dir>/control-token` file, so it cannot drive
