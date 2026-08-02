@@ -103,8 +103,9 @@ pub trait CapsuleStore: Send + Sync {
     /// delayed. It is a NO-OP when: backfill is disabled; there is no P2P content engine (the
     /// in-process FFI consumer — it has no upstream/peer network to pull a whole capsule from); the
     /// capsule is already held locally; or a backfill for this exact capsule is already in flight
-    /// (deduped via `Node::backfilling`, so a burst of resource reads for the same not-yet-held store
-    /// triggers ONE whole-`.dig` pull, not one per read). The pull reuses
+    /// (deduped via the shared `capsule_acquisition` gate — one `WarmRegistry` both this §21 backfill
+    /// and the P2P reshare leg claim — so a burst of resource reads for the same not-yet-held store,
+    /// across either acquisition transport, triggers ONE whole-`.dig` pull, not one per read). The pull reuses
     /// [`Self::gap_fill_generation`] — the authenticated §21 whole-store sync, chain-anchored-root
     /// pinned + DHT-announced — so a backfilled capsule is verified exactly like every other cached
     /// generation.
@@ -338,16 +339,20 @@ impl CapsuleStore for Node {
             return;
         }
         let key = format!("{store_hex}:{root_hex}");
-        // Dedup: claim the in-flight slot; if another read already claimed it, do nothing (a burst of
-        // resource reads for the same not-yet-held store triggers ONE whole-capsule pull).
-        {
-            let mut inflight = self.backfilling.lock().unwrap_or_else(|p| p.into_inner());
-            if !inflight.insert(key.clone()) {
-                return; // a backfill for this capsule is already running
-            }
-        }
+        // Single-flight against the SHARED acquisition gate (#1614): this §21 backfill and the #1576
+        // reshare warm are two transports for the SAME capsule, so they claim ONE registry. If the
+        // other leg (or a prior read on this leg) already claimed this capsule, do nothing — a burst of
+        // resource reads for the same not-yet-held store triggers exactly ONE whole-capsule pull across
+        // BOTH legs. The gates ABOVE (origin, config, p2p_content, already-held) all run BEFORE this
+        // claim, so a gated-out read never consumes a concurrency slot (#1576/#1654).
+        let Some(claim) = self.capsule_acquisition.clone().claim(key.clone()) else {
+            return; // an acquisition for this capsule is already in flight on one of the two legs
+        };
         let root = Bytes32(root_bytes);
         tokio::spawn(async move {
+            // The claim guard is MOVED into the task so the single-flight slot is held for the whole
+            // pull and released on completion (or drop, incl. panic), never before the pull spawns.
+            let _claim = claim;
             // OPERATOR-VISIBLE at the default level, both ways (#1886): landing a capsule is
             // the moment this node becomes a holder and the content-replication flywheel turns,
             // and failing to land one is the moment it silently does not. At `debug!` a broken
@@ -363,11 +368,6 @@ impl CapsuleStore for Node {
                     "backfill: whole-capsule pull did not complete (will re-attempt on the next miss)"
                 ),
             }
-            // Release the in-flight slot so a later miss can re-attempt if this one failed.
-            node.backfilling
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&key);
         });
     }
 

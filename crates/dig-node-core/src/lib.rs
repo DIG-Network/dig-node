@@ -314,10 +314,17 @@ pub struct Node {
     /// (the browser is a consumer with no DHT), where an inventory-change refresh is a no-op. Kept off
     /// the `Node` struct's DHT-handle dependency (the node stays FFI-safe) by taking a boxed async hook.
     inventory_refresher: OnceLock<InventoryRefresher>,
-    /// Capsules whose background backfill (§14.3) is currently in flight, keyed `store_hex:root_hex`,
-    /// so a burst of resource reads for the same not-yet-held store spawns ONE whole-`.dig` pull, not
-    /// one per read. An entry is inserted before the pull spawns and removed when it finishes.
-    backfilling: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The ONE single-flight gate every whole-capsule acquisition claims against, keyed
+    /// `store_hex:root_hex` (#1614). A read miss can pull the same `(store, root)` capsule down TWO
+    /// transports — the §21 authenticated whole-store backfill ([`Node::maybe_backfill_capsule`] →
+    /// [`Node::gap_fill_generation`]) and the #1576 P2P reshare warm ([`crate::seams::dig_peer::CapsuleWarmer`]).
+    /// They are two transports for the SAME artifact, so they share this gate: whichever leg claims the
+    /// key first runs the pull, the other refuses, and a burst of resource reads across one not-yet-held
+    /// store starts exactly ONE whole-`.dig` pull. The reshare warmer is wired with a clone of this same
+    /// `Arc` ([`crate::download::NodeContent::wire_capsule_reshare`]), so both legs test-and-set one
+    /// registry. The registry's distinct-generation cap ([`crate::seams::dig_peer::DEFAULT_MAX_CONCURRENT_WARMS`])
+    /// therefore bounds concurrent acquisitions across BOTH legs, not each in isolation.
+    capsule_acquisition: Arc<crate::seams::dig_peer::WarmRegistry>,
     /// A WEAK self-reference, installed by the standalone peer-network bring-up (which holds the
     /// `Arc<Node>`), so a `&self` read handler can spawn a detached background task that needs an owned
     /// `Arc<Node>` — the capsule backfill (§14.3). `Weak` (not `Arc`) so the node's refcount is
@@ -2520,6 +2527,14 @@ fn decode_rk(hex_str: &str) -> Result<[u8; 32], ()> {
 }
 
 impl Node {
+    /// The node's ONE whole-capsule single-flight gate (#1614), shared by the §21 backfill leg
+    /// ([`Node::maybe_backfill_capsule`]) and the #1576 reshare warm. Handed to
+    /// [`crate::download::NodeContent::wire_capsule_reshare`] so both legs claim the same registry and a
+    /// read triggers at most one whole-capsule acquisition.
+    pub(crate) fn capsule_acquisition_gate(&self) -> Arc<crate::seams::dig_peer::WarmRegistry> {
+        self.capsule_acquisition.clone()
+    }
+
     /// Build a node from the environment (cache dir/cap, §21 identity, upstream).
     /// Used by both the standalone bin's [`run`] and the in-process `dig-runtime`.
     pub fn from_env() -> Arc<Node> {
@@ -2556,7 +2571,7 @@ impl Node {
             p2p_content: OnceLock::new(),
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
-            backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -2652,7 +2667,7 @@ pub(crate) mod test_support {
             p2p_content: OnceLock::new(),
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
-            backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -3007,7 +3022,7 @@ mod tests {
             p2p_content: OnceLock::new(),
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
-            backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -3088,7 +3103,7 @@ mod tests {
             p2p_content: OnceLock::new(),
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
-            backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -3134,7 +3149,7 @@ mod tests {
             p2p_content: OnceLock::new(),
             content_cache: std::sync::Mutex::new(ContentCache::default()),
             inventory_refresher: OnceLock::new(),
-            backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+            capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
@@ -3221,7 +3236,7 @@ mod tests {
                 p2p_content: OnceLock::new(),
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
-                backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+                capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
@@ -3290,7 +3305,7 @@ mod tests {
                 p2p_content: OnceLock::new(),
                 content_cache: std::sync::Mutex::new(ContentCache::default()),
                 inventory_refresher: OnceLock::new(),
-                backfilling: std::sync::Mutex::new(std::collections::HashSet::new()),
+                capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
@@ -3344,11 +3359,9 @@ mod tests {
         node.maybe_backfill_capsule(&store_hex, &root_hex, crate::download::ReadOrigin::Local);
         // Nothing pulled, nothing left in-flight.
         assert!(!module_exists(&node.cache_dir, &store_hex, &root_hex));
+        let key = format!("{store_hex}:{root_hex}");
         assert!(
-            node.backfilling
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_empty(),
+            !node.capsule_acquisition.is_warming(&key),
             "no in-flight backfill claimed on the consumer path"
         );
     }
@@ -3365,11 +3378,9 @@ mod tests {
         let root_hex = "cd".repeat(32);
         seed_module(&node, &store_hex, &root_hex, b"already-here");
         node.maybe_backfill_capsule(&store_hex, &root_hex, crate::download::ReadOrigin::Local);
+        let key = format!("{store_hex}:{root_hex}");
         assert!(
-            node.backfilling
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_empty(),
+            !node.capsule_acquisition.is_warming(&key),
             "an already-held capsule claims no in-flight backfill slot"
         );
     }
@@ -7545,11 +7556,7 @@ mod tests {
 
         let key = format!("{}:{}", store.to_hex(), tip.to_hex());
         assert!(
-            !node
-                .backfilling
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains(&key),
+            !node.capsule_acquisition.is_warming(&key),
             "a Peer-origin miss must never spawn a background backfill"
         );
     }
@@ -7589,11 +7596,109 @@ mod tests {
 
         let key = format!("{}:{}", store.to_hex(), tip.to_hex());
         assert!(
-            node.backfilling
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains(&key),
+            node.capsule_acquisition.is_warming(&key),
             "a Local-origin miss (the control) must spawn a background backfill"
+        );
+    }
+
+    /// **Proves (#1614):** the §21 backfill leg and the #1576 reshare leg claim the ONE shared gate, so a
+    /// read triggers AT MOST ONE whole-capsule pull. Here the reshare leg has already won the race and
+    /// holds the capsule's single-flight slot; the §21 backfill for the SAME `(store, root)` must then
+    /// find the slot taken and start NO second pull.
+    /// **Catches:** the pre-#1614 two-registries defect, where `maybe_backfill` used its own
+    /// `Node::backfilling` set — blind to the reshare claim — and fired a redundant whole-`.dig` pull.
+    #[test]
+    fn backfill_defers_to_an_in_flight_reshare_on_the_shared_gate() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        // The reshare leg wins the race first: it claims the capsule on the node's SHARED gate.
+        let key = format!("{}:{}", store.to_hex(), tip.to_hex());
+        let reshare_claim = node
+            .capsule_acquisition_gate()
+            .claim(key.clone())
+            .expect("the reshare leg claims the fresh gate");
+
+        // Now drive the identical Local read: the §21 backfill sees the slot already taken.
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+        ));
+        assert_eq!(resp["error"]["code"], json!(CONTENT_REDIRECT), "{resp}");
+
+        // The only claim on the gate is the reshare leg's: dropping it must free the slot completely,
+        // proving the backfill did NOT add a second, independent claim.
+        drop(reshare_claim);
+        assert!(
+            !node.capsule_acquisition.is_warming(&key),
+            "the §21 backfill must NOT hold its own slot once the reshare claim is released — one pull, \
+             one gate"
+        );
+    }
+
+    /// **Proves (#1614):** once the §21 backfill leg holds the shared gate, the #1576 reshare leg,
+    /// claiming the SAME `Arc<WarmRegistry>` (via [`Node::capsule_acquisition_gate`]), is refused — the
+    /// two legs are wired to ONE registry instance, not two blind ones.
+    /// **Catches:** the reshare warmer being wired with a fresh `WarmRegistry` (the pre-#1614 shape).
+    #[test]
+    fn reshare_defers_to_an_in_flight_backfill_on_the_shared_gate() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+
+        // The §21 backfill leg wins the race first (a Local read claims the shared gate).
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+        ));
+        assert_eq!(resp["error"]["code"], json!(CONTENT_REDIRECT), "{resp}");
+
+        // The reshare leg, claiming the SAME instance, is refused — proof it shares one registry.
+        let key = format!("{}:{}", store.to_hex(), tip.to_hex());
+        assert!(
+            node.capsule_acquisition.is_warming(&key),
+            "the §21 backfill must hold the shared slot",
+        );
+        assert!(
+            node.capsule_acquisition_gate().claim(key).is_none(),
+            "the reshare leg, claiming the SAME gate, must be refused while the backfill holds it",
         );
     }
 

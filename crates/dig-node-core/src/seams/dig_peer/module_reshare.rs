@@ -105,7 +105,7 @@ impl WarmRegistry {
     ///
     /// The claim is released when the returned guard drops — including on panic, so a panicking pull
     /// cannot permanently block a generation from ever being warmed again.
-    fn claim(self: &Arc<Self>, key: String) -> Option<WarmClaim> {
+    pub(crate) fn claim(self: &Arc<Self>, key: String) -> Option<WarmClaim> {
         let mut guard = self
             .in_flight
             .lock()
@@ -138,7 +138,10 @@ impl WarmRegistry {
 }
 
 /// Releases a [`WarmRegistry`] claim on drop.
-struct WarmClaim {
+///
+/// `pub(crate)` so the §21 backfill leg ([`crate::Node::maybe_backfill_capsule`]) can hold a claim on
+/// the SAME shared gate as the reshare warm (#1614) — the guard whose drop frees the single-flight slot.
+pub(crate) struct WarmClaim {
     registry: Arc<WarmRegistry>,
     key: String,
 }
@@ -323,6 +326,13 @@ impl CapsuleWarmer {
             registry,
             config,
         })
+    }
+
+    /// The single-flight [`WarmRegistry`] this warmer claims against. Exposed so a test can prove the
+    /// reshare leg and the §21 backfill leg were wired to the SAME shared gate (#1614).
+    #[cfg(test)]
+    pub(crate) fn registry(&self) -> &Arc<WarmRegistry> {
+        &self.registry
     }
 
     /// Pull the whole capsule for `(store_hex, root_hex)`, cache it, and announce this node as a
@@ -706,6 +716,35 @@ mod tests {
             Arc::new(WarmRegistry::new()),
             dig_download::ModuleDownloadConfig::default(),
         )
+    }
+
+    /// **Proves (#1614):** a warmer stores the EXACT `Arc<WarmRegistry>` it was built with — the property
+    /// [`crate::download::NodeContent::wire_capsule_reshare`] relies on to make the reshare leg claim the
+    /// node's SHARED gate rather than a fresh one. If `CapsuleWarmer::new` ever cloned into a new registry
+    /// instead of keeping the passed `Arc`, the two legs would silently double-pull again.
+    /// **Catches:** the reshare warmer being wired with `Arc::new(WarmRegistry::new())` (the pre-#1614
+    /// shape) instead of the node's `capsule_acquisition` gate.
+    #[test]
+    fn a_warmer_shares_the_exact_registry_arc_it_was_built_with() {
+        let dir = temp_dir("shared-registry");
+        let shared = Arc::new(WarmRegistry::new());
+        let warmer = CapsuleWarmer::new(
+            Arc::new(NoHolders),
+            Arc::new(UnusedTransport),
+            Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::clone(&shared),
+            dig_download::ModuleDownloadConfig::default(),
+        );
+        assert!(
+            Arc::ptr_eq(warmer.registry(), &shared),
+            "the warmer must claim against the SAME registry instance it was wired with, not a fresh one"
+        );
     }
 
     /// **Proves:** a pull that ends in `Err` announces NOTHING and leaves no module at the cache path.

@@ -4,6 +4,27 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## §21 backfill and the #1576 reshare are TWO transports for the same capsule — one gate, not two (#1614)
+
+A read miss can pull the SAME `(store, root)` whole `.dig` down two independent legs, and for a long
+time each had its OWN in-flight set, blind to the other:
+
+- **Leg A — §21 backfill** (`maybe_backfill_capsule` → `gap_fill_generation` → `cache_fetch_and_cache`):
+  the authenticated whole-store sync from the RPC upstream. This is the PEERLESS-network fallback — it
+  can acquire a capsule when NO peer serves it, so it must never be suppressed away.
+- **Leg B — #1576 reshare warm** (`spawn_capsule_reshare` → `CapsuleWarmer::warm`): the P2P pull that
+  makes a reader a discoverable HOLDER. It has NO upstream fallback — with no providers it just refuses.
+
+Because Leg A used `Node::backfilling` (a `HashSet<String>`) and Leg B used a separate `WarmRegistry`,
+a single read fired BOTH — 2× bandwidth/disk/CPU for one artifact. The fix is one shared single-flight
+gate: `Node::capsule_acquisition` is the ONE `Arc<WarmRegistry>`, and the reshare warmer is wired with a
+CLONE of that same Arc (`wire_capsule_reshare(..., node.capsule_acquisition_gate())`), so both legs
+test-and-set one registry keyed `"{store}:{root}"`. The keys were ALREADY byte-identical across the two
+sites (`CapsuleKey::Display` == `maybe_backfill`'s `format!` == `WarmRegistry`'s key), which is what made
+the collapse race-free — one mutex, one key space. Load-bearing ordering: each leg's origin/config/held
+gates run BEFORE it claims the gate, so a gated-out read (a Peer origin, a cross-site read, an already-held
+capsule) never consumes a slot. Keep BOTH legs — dropping Leg A would lose the peerless fallback.
+
 ## Root has NO systemd `--user` bus, so a user-scope service install is impossible under `sudo` (#526)
 
 `systemctl --user` (and everything `service-manager`'s systemd backend does at `ServiceLevel::User`)

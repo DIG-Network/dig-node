@@ -1184,6 +1184,10 @@ impl NodeContent {
         anchor_resolver: Arc<dyn crate::shared::AnchoredRootResolver>,
         announce: Arc<dyn crate::seams::dig_peer::AnnounceHolder>,
         cache_dir: &Path,
+        // The node's SHARED single-flight acquisition gate (#1614). Passed in — NOT freshly created —
+        // so this reshare warm claims the SAME registry the §21 backfill leg does; the two transports
+        // for one capsule then dedup against each other instead of each pulling the whole `.dig`.
+        capsule_acquisition: Arc<crate::seams::dig_peer::WarmRegistry>,
     ) {
         let transport = Arc::new(crate::seams::dig_peer::NatModuleTransport::new(
             node_cert,
@@ -1205,7 +1209,7 @@ impl NodeContent {
                 cache_dir: cache_dir.to_path_buf(),
             },
             announce,
-            Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            capsule_acquisition,
             dig_download::ModuleDownloadConfig::default(),
         ));
     }
