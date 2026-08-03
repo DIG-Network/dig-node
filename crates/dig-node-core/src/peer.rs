@@ -1134,6 +1134,16 @@ pub(crate) fn is_peer_reachable_method(method: &str) -> bool {
     if method == crate::seams::dig_peer::neighbourhood_probe::GET_PROVIDER_SNAPSHOT_METHOD {
         return true;
     }
+    // `dig.resolveCapsule` is the SECOND dig-node-local peer method (epic #1934 flywheel live-wiring,
+    // PR-1). It answers a sampled DHT content-key with the `(store_id, root, size)` PREIMAGE this node
+    // ALREADY HOLDS — a READ that discloses only the preimages of stores this node is already a public
+    // provider for (whose bytes `dig.getAvailability`/`dig.fetchRange` already serve), and mutates no
+    // node state, so it widens no privilege. Local for the same reason as `getProviderSnapshot`: the
+    // shared `dig-rpc-protocol` allowlist is a crates.io pin this repo cannot extend (promoting it is a
+    // tracked cross-repo follow-up).
+    if method == crate::seams::dig_peer::resolve_capsule::RESOLVE_CAPSULE_METHOD {
+        return true;
+    }
     dig_rpc_protocol::Method::from_name(method).is_some_and(|m| m.is_peer_reachable())
 }
 
@@ -1252,6 +1262,19 @@ impl PeerRpcResponder for NodeResponder {
             let params = req.get("params").cloned().unwrap_or(Value::Null);
             let result = crate::seams::dig_peer::neighbourhood_probe::provider_snapshot_result(
                 self.dht.as_ref(),
+                &params,
+            )
+            .await;
+            return json!({"jsonrpc":"2.0","id":id,"result":result});
+        }
+        // dig.resolveCapsule is answered HERE from this node's OWN holdings reverse index
+        // (`cache_list_cached`): for each requested content-key it holds, it returns the
+        // `(store_id, root, size)` PREIMAGE the key hashed from (epic #1934 flywheel live-wiring, PR-1).
+        // A requested key this node does not hold is simply absent — the getAvailability not-held idiom.
+        if method == crate::seams::dig_peer::resolve_capsule::RESOLVE_CAPSULE_METHOD {
+            let params = req.get("params").cloned().unwrap_or(Value::Null);
+            let result = crate::seams::dig_peer::resolve_capsule::resolve_capsule_answer(
+                &self.node,
                 &params,
             )
             .await;
@@ -4184,6 +4207,30 @@ pub(crate) mod tests {
         assert!(
             dig_rpc_protocol::Method::from_name(
                 crate::seams::dig_peer::neighbourhood_probe::GET_PROVIDER_SNAPSHOT_METHOD
+            )
+            .is_none(),
+            "it is a dig-node-local method — the shared crate must not yet know it (promoting it is a \
+             tracked cross-repo follow-up)"
+        );
+    }
+
+    /// **Proves:** `dig.resolveCapsule` is peer-reachable as a DELIBERATE dig-node-LOCAL addition beyond
+    /// the shared `dig-rpc-protocol` allowlist (epic #1934 flywheel live-wiring, PR-1) — the second such
+    /// local method after `getProviderSnapshot`. It is a preimage READ of this node's own public
+    /// holdings (no mutation, no other node's provider identity), so it widens no privilege.
+    /// **Catches:** a silent removal of the local allowlist entry (which would break the tier-0 precache
+    /// resolve), and confirms the shared crate's own set still does NOT carry the method.
+    #[test]
+    fn resolve_capsule_is_a_deliberate_local_peer_method_beyond_the_crate_allowlist() {
+        assert!(
+            is_peer_reachable_method(
+                crate::seams::dig_peer::resolve_capsule::RESOLVE_CAPSULE_METHOD
+            ),
+            "dig.resolveCapsule must be peer-reachable (the tier-0 precache key→preimage resolve)"
+        );
+        assert!(
+            dig_rpc_protocol::Method::from_name(
+                crate::seams::dig_peer::resolve_capsule::RESOLVE_CAPSULE_METHOD
             )
             .is_none(),
             "it is a dig-node-local method — the shared crate must not yet know it (promoting it is a \
