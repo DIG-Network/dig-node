@@ -213,8 +213,12 @@ trait CappedWarm: Send + Sync {
 /// Run the tier-aware, size-capped LRU sweep over `<cache>/modules` so the self-driven precache loop
 /// plateaus at the cache cap instead of growing to disk-exhaustion. A seam over
 /// [`crate::Node::evict_modules_if_needed`] so the fetcher's post-land trigger is tested without a Node.
+///
+/// Shared with the reshare leg (#2053): the [`CapsuleWarmer`](crate::seams::dig_peer::CapsuleWarmer)
+/// runs this SAME sweep after a reshare-warm land, so the tier-0 precache loop and the read-triggered
+/// reshare both bound `<cache>/modules` through one implementation — no second, driftable evictor.
 #[async_trait]
-trait ModulesCacheEvictor: Send + Sync {
+pub(crate) trait ModulesCacheEvictor: Send + Sync {
     async fn evict_if_needed(&self);
 }
 
@@ -368,9 +372,18 @@ impl CappedWarm for WarmerCappedWarm {
 }
 
 /// The production [`ModulesCacheEvictor`] over the node's tier-aware modules-cache sweep — the
-/// standing-occupancy bound that keeps the self-driven precache loop from exhausting disk.
-struct NodeModulesEvictor {
+/// standing-occupancy bound that keeps the self-driven precache loop from exhausting disk. Shared with
+/// the reshare leg (#2053) so both land paths sweep through the one Node implementation.
+pub(crate) struct NodeModulesEvictor {
     node: Arc<crate::Node>,
+}
+
+impl NodeModulesEvictor {
+    /// Wrap a node so its tier-aware modules-cache sweep can be injected as a [`ModulesCacheEvictor`]
+    /// seam (into the tier-0 fetcher AND the reshare warmer).
+    pub(crate) fn new(node: Arc<crate::Node>) -> Self {
+        Self { node }
+    }
 }
 
 #[async_trait]
@@ -378,6 +391,18 @@ impl ModulesCacheEvictor for NodeModulesEvictor {
     async fn evict_if_needed(&self) {
         self.node.evict_modules_if_needed().await;
     }
+}
+
+/// A no-op [`ModulesCacheEvictor`] for tests that build a warmer but do not exercise the sweep — the
+/// warmer's `evictor` seam is mandatory (the compiler forces every land path to wire one), so tests
+/// that only assert the pull/announce behaviour inject this.
+#[cfg(test)]
+pub(crate) struct NoopModulesEvictor;
+
+#[cfg(test)]
+#[async_trait]
+impl ModulesCacheEvictor for NoopModulesEvictor {
+    async fn evict_if_needed(&self) {}
 }
 
 // =================================================================================================

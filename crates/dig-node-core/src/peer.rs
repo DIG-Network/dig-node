@@ -2515,6 +2515,9 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             // Share the node's ONE acquisition gate (#1614): the reshare warm and the §21 backfill leg
             // claim the SAME registry, so a read triggers at most one whole-capsule pull across both.
             node.capsule_acquisition_gate(),
+            // The node's tier-aware modules-cache sweep (#2053): a reshare-warm land bounds
+            // `<cache>/modules` through the SAME evictor the tier-0 precache loop uses.
+            Arc::new(crate::tier0_live::NodeModulesEvictor::new(node.clone())),
         );
         // Anchor the inbound-demand proximity gate (§7.10d, #2014) to this node's own peer_id — the
         // SAME identity the tier-0 loop scores against below — so a peer-driven pull is admitted only

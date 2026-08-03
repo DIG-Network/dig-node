@@ -297,6 +297,11 @@ pub struct CapsuleWarmer {
     registry: Arc<WarmRegistry>,
     /// Tunables for the pull.
     config: dig_download::ModuleDownloadConfig,
+    /// The tier-aware `<cache>/modules` size-cap sweep, run after a SUCCESSFUL reshare-warm land so this
+    /// read-triggered whole-capsule pull cannot grow the modules cache past [`cache_cap_bytes`] (#2053).
+    /// The SAME seam the tier-0 precache loop uses ([`crate::tier0_live::ModulesCacheEvictor`]), so both
+    /// on-demand land paths bound the cache through one implementation rather than two driftable ones.
+    evictor: Arc<dyn crate::tier0_live::ModulesCacheEvictor>,
 }
 
 /// Announces this node's inventory to the DHT — the step that makes a cached capsule DISCOVERABLE.
@@ -313,7 +318,7 @@ pub trait AnnounceHolder: Send + Sync {
 impl CapsuleWarmer {
     /// Assemble a warmer from its injected seams.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         locator: Arc<dyn dig_download::ProviderLocator>,
         transport: Arc<dyn dig_download::ModuleTransport>,
         state_store: Arc<dyn dig_download::StateStore>,
@@ -322,6 +327,7 @@ impl CapsuleWarmer {
         announce: Arc<dyn AnnounceHolder>,
         registry: Arc<WarmRegistry>,
         config: dig_download::ModuleDownloadConfig,
+        evictor: Arc<dyn crate::tier0_live::ModulesCacheEvictor>,
     ) -> Arc<Self> {
         Arc::new(CapsuleWarmer {
             locator,
@@ -332,6 +338,7 @@ impl CapsuleWarmer {
             announce,
             registry,
             config,
+            evictor,
         })
     }
 
@@ -348,8 +355,24 @@ impl CapsuleWarmer {
     /// Callers on the read path use [`spawn_capsule_warm`] instead; this is the awaitable core so the
     /// behaviour is testable without a background task.
     pub async fn warm(self: &Arc<Self>, store_hex: &str, root_hex: &str) -> WarmOutcome {
-        self.warm_with_config(store_hex, root_hex, self.config.clone())
-            .await
+        let outcome = self
+            .warm_with_config(store_hex, root_hex, self.config.clone())
+            .await;
+        // #2053: the tier-aware `<cache>/modules` size-cap sweep, run ONLY after a land that actually
+        // grew the cache (`Held`) — a refusal wrote nothing, so there is nothing new to bound. This
+        // closes the last on-demand land path left unbounded: like the read-path §21 sync (#2041) and
+        // the tier-0 precache loop (#1934), a reshare-warm promotion must ITSELF bound the cache so the
+        // `<cache>/modules` cap holds independent of any background loop's state.
+        //
+        // Lock context (the load-bearing choice): a reshare warm holds NO `cache_lock` — the warmer is a
+        // standalone seam with no Node handle or guard across the land — so this drives the ASYNC
+        // [`crate::Node::evict_modules_if_needed`] (which takes `cache_lock` fresh), NEVER the locked
+        // core. Calling the locked core here would evict without serialization; calling the async
+        // variant while holding the lock would deadlock — neither applies because no lock is held.
+        if matches!(outcome, WarmOutcome::Held { .. }) {
+            self.evictor.evict_if_needed().await;
+        }
+        outcome
     }
 
     /// [`warm`](Self::warm) with a HARD per-pull byte ceiling — the tier-0 eager-precache entry point
@@ -789,6 +812,7 @@ mod tests {
             announce,
             Arc::new(WarmRegistry::new()),
             dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
         )
     }
 
@@ -814,6 +838,7 @@ mod tests {
             Arc::new(AnnounceSpy::default()),
             Arc::clone(&shared),
             dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
         );
         assert!(
             Arc::ptr_eq(warmer.registry(), &shared),
@@ -893,6 +918,7 @@ mod tests {
             Arc::clone(&spy) as Arc<dyn AnnounceHolder>,
             Arc::new(WarmRegistry::new()),
             dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
         );
 
         let outcome = warmer.warm(&store_hex, &root_hex).await;
@@ -934,6 +960,107 @@ mod tests {
             "the download's own .tmp staging file is discarded too"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`ModulesCacheEvictor`](crate::tier0_live::ModulesCacheEvictor) that counts sweeps, so
+    /// "the reshare-warm land triggered exactly one sweep" (and "a refusal triggered none") are
+    /// assertable properties without a Node.
+    #[derive(Default)]
+    struct CountingEvictor {
+        sweeps: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tier0_live::ModulesCacheEvictor for CountingEvictor {
+        async fn evict_if_needed(&self) {
+            self.sweeps.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// **Proves (#2053):** a SUCCESSFUL reshare-warm land runs the tier-aware `<cache>/modules` size-cap
+    /// sweep exactly once — the hook that closes the "every on-demand land path bounds the cache"
+    /// invariant (#1934/#2041) for the reshare leg. Mirrors `a_successful_pull_is_held...`'s harness so
+    /// the sweep is observed on a genuinely-`Held` outcome, not a refusal.
+    ///
+    /// **Non-vacuous:** the companion assertion below drives a `Refused(PullFailed)` warm through the
+    /// SAME wiring and requires ZERO sweeps — so a sweep that fired unconditionally (or never) would
+    /// fail one of the two. Removing the `evict_if_needed` call in `warm()` drops the count to 0 here.
+    #[tokio::test]
+    async fn a_successful_reshare_warm_land_sweeps_the_modules_cache_once() {
+        let dir = temp_dir("reshare-sweep-once");
+        let (store_hex, root_hex) = (hex32(STORE), hex32(CHAIN_ROOT));
+        let module = module_committing(STORE, CHAIN_ROOT);
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        let locator = Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+            dig_download::testkit::mock_providers(1, &content),
+        ));
+        let transport = Arc::new(dig_download::testkit::MockModuleTransport::serving(
+            &store_hex,
+            &root_hex,
+            module.clone(),
+            8,
+        ));
+        let evictor = Arc::new(CountingEvictor::default());
+        let warmer = CapsuleWarmer::new(
+            locator,
+            transport,
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::clone(&evictor) as Arc<dyn crate::tier0_live::ModulesCacheEvictor>,
+        );
+
+        let outcome = warmer.warm(&store_hex, &root_hex).await;
+
+        assert!(
+            matches!(outcome, WarmOutcome::Held { .. }),
+            "the harness must actually land the capsule, or the sweep assertion proves nothing"
+        );
+        assert_eq!(
+            evictor.sweeps.load(Ordering::SeqCst),
+            1,
+            "a successful reshare-warm land must run the modules-cache size-cap sweep exactly once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Proves (#2053):** a REFUSED reshare warm sweeps NOTHING — a pull that wrote no module into the
+    /// cache has nothing to bound, so the sweep is gated on the `Held` outcome, never fired blindly.
+    #[tokio::test]
+    async fn a_refused_reshare_warm_does_not_sweep_the_modules_cache() {
+        let dir = temp_dir("reshare-sweep-none");
+        let evictor = Arc::new(CountingEvictor::default());
+        let warmer = CapsuleWarmer::new(
+            Arc::new(NoHolders),
+            Arc::new(UnusedTransport),
+            Arc::new(dig_download::FileStateStore::new(dir.join("state"))),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::new(AnnounceSpy::default()),
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::clone(&evictor) as Arc<dyn crate::tier0_live::ModulesCacheEvictor>,
+        );
+
+        let outcome = warmer.warm(&hex32(STORE), &hex32(CHAIN_ROOT)).await;
+
+        assert_eq!(outcome, WarmOutcome::Refused(WarmFailure::PullFailed));
+        assert_eq!(
+            evictor.sweeps.load(Ordering::SeqCst),
+            0,
+            "a refused warm landed nothing, so it must not run the modules-cache sweep"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
