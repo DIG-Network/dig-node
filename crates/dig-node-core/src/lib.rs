@@ -114,6 +114,16 @@ pub const NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// "chain is the authority" semantics).
 pub(crate) const ROOT_NOT_ANCHORED: i64 = -32005;
 
+/// The resource is not available at the requested root — this node does not hold it and no other
+/// tier produced it. Catalogued as `RESOURCE_NOT_AVAILABLE_AT_ROOT` (dig-node `SPEC.md` error table)
+/// and already the code the read path returns for content it does not have.
+///
+/// Named here (#1997) because the read path now reaches it in a NEW way: with no upstream configured
+/// — the default — a miss that no peer served ends here rather than at an upstream error. That
+/// distinction is the point. `-32000 "upstream: …"` tells a caller the node's configuration failed;
+/// `-32004` tells them the resource is not available, which is the true and actionable answer.
+pub(crate) const RESOURCE_NOT_AVAILABLE: i64 = -32004;
+
 // -- Canonical control-plane error taxonomy (dig-rpc-types §10, #200) ------------------------------
 //
 // The control-plane errors adopt the CANONICAL numbering + machine codes from the `dig-rpc-types`
@@ -1503,8 +1513,26 @@ impl Node {
         }
     }
 
-    /// Proxy the raw JSON-RPC body to the upstream rpc.dig.net and return its response.
+    /// Whether an upstream is configured at all (#1997). `false` is the DEFAULT, not a fault.
+    ///
+    /// Call this to SKIP an upstream leg rather than to attempt one and report the failure: "no
+    /// upstream" is a statement about this node's configuration, and turning it into a per-request
+    /// error would tell a caller their read failed for a reason that has nothing to do with their
+    /// read. A miss with no upstream is a miss.
+    pub(crate) fn has_upstream(&self) -> bool {
+        !self.upstream.trim().is_empty()
+    }
+
+    /// Proxy the raw JSON-RPC body to the configured upstream and return its response.
+    ///
+    /// Fails immediately when no upstream is configured — the default since #1997. A node with no
+    /// upstream answers from what it holds; it does not forward a caller's request, with that
+    /// caller's params, to a host its operator never chose. Callers on a read path should gate on
+    /// [`Self::has_upstream`] first so the absence becomes a clean miss rather than this error.
     async fn proxy(&self, body: &Value) -> Result<Value, String> {
+        if !self.has_upstream() {
+            return Err("no upstream is configured".to_string());
+        }
         let resp = self
             .http
             .post(&self.upstream)

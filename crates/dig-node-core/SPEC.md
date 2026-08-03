@@ -117,8 +117,10 @@ client) connects over **mTLS**, presenting a client cert derived from its DIG id
 tier including `rpc.dig.net` (dual-mode: an mTLS endpoint for node-class clients plus the plain-HTTPS
 public read tier browsers require). A browser/agent uses the plain-HTTPS public read tier. A client
 MUST NOT hard-code `rpc.dig.net` as the primary endpoint. dig-node itself is the *server* end of this
-ladder; its own upstream fallback for a miss (`DIG_NODE_UPSTREAM`, default `https://rpc.dig.net/`) is
-the node's own client-side use of tier 4.
+ladder. The node has NO default upstream of its own: `DIG_NODE_UPSTREAM` is unset unless an operator
+sets it, and a node resolves a miss over the peer network rather than by falling back to tier 4. The
+§5.3 ladder governs how a CLIENT picks a node; it is not a licence for a node to treat rpc.dig.net as
+its own upstream.
 
 ### 2.3 Method surface
 
@@ -471,7 +473,8 @@ tampered pull can never be served as current.
 ### 5.2 Authenticated whole-store sync (§21)
 
 On a local miss for a concrete `(store, root)`, the node MAY fetch the WHOLE `.dig` module from the
-§21 `GET /stores/{id}/module` endpoint of its upstream (`DIG_NODE_UPSTREAM`, default `rpc.dig.net`),
+§21 `GET /stores/{id}/module` endpoint of its upstream (`DIG_NODE_UPSTREAM`, unset by default — with
+no upstream configured this leg is skipped and the miss is resolved over the peer network),
 cache it, then serve every subsequent resource in that store locally.
 
 - That endpoint is dighub-auth-gated (401 for anonymous clients), so the node carries a native Chia
@@ -1032,7 +1035,7 @@ cache cap is `config.json` > env > default).
 |---|---|---|
 | `DIG_NODE_PORT` | loopback HTTP read-surface port | `9778` |
 | `DIG_PEER_PORT` | mTLS peer-RPC listen port (dual-stack `[::]`) | `9444` |
-| `DIG_NODE_UPSTREAM` | §21 host base for sync + read proxy fallback | `https://rpc.dig.net/` |
+| `DIG_NODE_UPSTREAM` | §21 host base for sync + read proxy fallback (OPTIONAL) | *(unset — no upstream)* |
 | `DIG_NODE_COINSET` | coinset API base for chain reads | `Coinset::mainnet()` (api.coinset.org) |
 | `DIG_NODE_CACHE` | override the shared cache dir | per-OS `DigNode/cache` (§3.4) |
 | `DIG_NODE_CACHE_CAP` | on-disk cache cap (bytes) | `DEFAULT_CACHE_CAP` = 1 GiB (floor 64 MiB) |

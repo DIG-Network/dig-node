@@ -562,7 +562,10 @@ pub fn is_self_upstream(upstream: &str, serving_port: u16) -> bool {
         return false;
     };
 
-    let is_loopback_host = matches!(host.as_str(), "localhost" | "::1")
+    // Every name that reaches THIS process: the loopback family, plus `dig.local`, which the
+    // installer's hosts entry points at the loopback alias 127.0.0.2 (#91).
+    let names_this_host = host == "dig.local"
+        || matches!(host.as_str(), "localhost" | "::1")
         || host
             .parse::<std::net::Ipv4Addr>()
             .is_ok_and(|ip| ip.is_loopback())
@@ -570,13 +573,15 @@ pub fn is_self_upstream(upstream: &str, serving_port: u16) -> bool {
             .parse::<std::net::Ipv6Addr>()
             .is_ok_and(|ip| ip.is_loopback());
 
-    // `dig.local` is this node's own alias (#91) on the privileged port, so it is self regardless
-    // of the ephemeral port the localhost listener uses.
-    if host == "dig.local" && port == DIG_LOCAL_PORT {
-        return true;
-    }
+    // Stated over the CLASS of ports this node listens on, not one member of it. The node binds
+    // FOUR: the configurable localhost port, `dig.local` plaintext :80, and the `https://dig.local`
+    // TLS pair on :443 (127.0.0.2 and [::1], #624). Naming only :80 here left the likeliest
+    // hand-typed self value — `DIG_RPC_UPSTREAM=dig.local`, which `normalize_upstream` turns into
+    // `https://dig.local`, i.e. port 443 — unrefused. A guard justified by one spelling is bypassed
+    // by the next spelling of the same thing.
+    let own_ports = [serving_port, DIG_LOCAL_PORT, DIG_LOCAL_HTTPS_PORT];
 
-    is_loopback_host && port == serving_port
+    names_this_host && own_ports.contains(&port)
 }
 
 /// Resolve the explicit cache dir from a raw `DIG_NODE_CACHE` value: a non-blank
@@ -649,6 +654,17 @@ mod tests {
             "http://127.0.0.1:9778/rpc?x=1",
             "http://dig.local",
             "http://dig.local:80",
+            // The likeliest hand-typed self value of all: a bare host, which normalize_upstream
+            // turns into `https://dig.local` — port 443, the TLS dig.local listener (#624).
+            "dig.local",
+            "https://dig.local",
+            "https://dig.local:443",
+            // The TLS pair's own addresses, both families.
+            "https://127.0.0.2",
+            "https://[::1]",
+            // The plaintext dig.local alias reached by IP rather than by name.
+            "http://127.0.0.2",
+            "http://[::1]:80",
         ] {
             assert!(
                 is_self_upstream(&normalize_upstream(u), 9778),
@@ -668,7 +684,13 @@ mod tests {
             "http://localhost:8080",
             "https://rpc.dig.net",
             "https://some-peer.example:9778",
-            "http://dig.local:9778",
+            // A second node on loopback at a port this one does not bind: a real, supported
+            // development setup. Refusing it would make the guard indistinguishable from a bug.
+            "http://127.0.0.1:19778",
+            "http://[::1]:19778",
+            // A host that merely CONTAINS a self-ish name is not this node.
+            "https://dig.local.example.com",
+            "https://not-dig.local:443",
             "not a url",
             "",
         ] {
