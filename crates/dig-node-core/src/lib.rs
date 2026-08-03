@@ -1230,7 +1230,13 @@ pub(crate) fn content_window_envelope(
     // sides of the contract (openrpc.json: "Emitted on the FIRST window only"; the Lambda gates
     // exactly this one field the same way). It describes how to split the REASSEMBLED resource,
     // which a client cannot act on until it holds every window anyway.
-    if start == 0 {
+    //
+    // A WHOLE-CAPSULE window (`dig.getCapsule`) has no per-resource chunk layout at all, and
+    // passes `Null` to say so. Omit the field there rather than send an explicit null: absent
+    // says "this shape does not apply here", where null invites a caller to read it as "applies,
+    // but empty". This differs from `inclusion_proof` above, where empty-vs-absent distinguishes
+    // two states of the SAME applicable field.
+    if start == 0 && !chunk_lens.is_null() {
         result["chunk_lens"] = chunk_lens;
     }
     result
@@ -9302,9 +9308,13 @@ mod tests {
             Some(module_bytes.len() as u64),
             "the downloader reserves from total_length before it has every window: {first}"
         );
-        // A capsule window carries no per-resource proof or chunk layout; an empty one would
-        // invite a caller to read the absence as a passed check.
-        assert!(first["result"].get("inclusion_proof").is_none(), "{first}");
+        // A capsule window has no per-resource proof, and says so as the EMPTY STRING rather
+        // than by omission — the field is required on every window, and a caller must be able
+        // to tell "no proof for this" from "this server forgot one". Empty is not a passed
+        // check: a puller binds a module to its on-chain root, it does not verify a Merkle path.
+        assert_eq!(first["result"]["inclusion_proof"], json!(""), "{first}");
+        // chunk_lens is genuinely INAPPLICABLE to a whole module (there is no per-resource chunk
+        // layout), so that one IS omitted rather than sent empty.
         assert!(first["result"].get("chunk_lens").is_none(), "{first}");
 
         let mut assembled: Vec<u8> = Vec::new();
