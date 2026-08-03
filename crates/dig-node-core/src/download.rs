@@ -150,6 +150,43 @@ fn resolve_backfill_on_miss(v: Option<&str>) -> bool {
     )
 }
 
+/// Whether the INBOUND-DEMAND whole-capsule cache trigger (#1990) is enabled: when a remote PEER
+/// requests a resource from a store this node does NOT hold, ALSO background-pull the whole `.dig`
+/// so a subsequent request is served locally, tagged
+/// [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand). Resolved from
+/// `DIG_NODE_INBOUND_DEMAND_CACHE`; **default OFF** — only an explicit truthy value
+/// (`on`/`1`/`true`/`yes`, case-insensitive) enables it.
+///
+/// # Why the PULL defaults OFF while the demand SIGNAL is always recorded
+/// Recording inbound demand (the count + [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand)
+/// tag that feeds relevance + eviction precedence) is free of the amplification concern — it holds no
+/// content and pulls nothing. The whole-capsule PULL on peer demand is a DIFFERENT matter: a stranger
+/// naming an arbitrary store could otherwise drive this node into pulling + caching + DHT-announcing
+/// content of the peer's choosing (the exact primitive [`spawn_capsule_reshare`]'s and
+/// [`maybe_backfill_capsule`](crate::seams::capsule::capsule_store::CapsuleStore::maybe_backfill_capsule)'s
+/// `ReadOrigin::Local` gates exist to close). The intended amplification defence is the tier-0/1
+/// selector's XOR-proximity admission (epic #1934 children #1988/#1990-siblings) — pull a
+/// peer-demanded store only when it lands in THIS node's keyspace neighbourhood — which is not yet
+/// wired into the live pull. Until it is, the pull stays opt-in so enabling this feature never
+/// SILENTLY reverses the amplification invariant.
+pub fn inbound_demand_cache_enabled() -> bool {
+    resolve_inbound_demand_cache(
+        std::env::var("DIG_NODE_INBOUND_DEMAND_CACHE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure core of [`inbound_demand_cache_enabled`]: default OFF; only an explicit truthy value
+/// (`on`/`1`/`true`/`yes`, case-insensitive) enables it. Pure so the policy is unit-tested without
+/// touching process-global env.
+fn resolve_inbound_demand_cache(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("on") | Some("1") | Some("true") | Some("yes")
+    )
+}
+
 // -- Where a read request came from — the reshare trigger's ONLY gate ------------------------------
 
 /// Who asked for this read: this node's OWN operator (loopback HTTP / in-process FFI / the
@@ -1850,6 +1887,28 @@ pub(crate) mod tests {
             assert!(
                 !resolve_backfill_on_miss(Some(v)),
                 "DIG_NODE_BACKFILL_ON_MISS={v} → disabled"
+            );
+        }
+    }
+
+    /// **Proves:** inbound-demand caching (#1990) defaults OFF and only an explicit truthy value
+    /// enables it — the mirror-image policy of backfill-on-miss, because a peer-triggered pull must
+    /// never be silently on (amplification safety, see [`inbound_demand_cache_enabled`]).
+    /// **Catches:** a default-on regression that would open the amplification vector, or a parser that
+    /// misreads an absent/falsy value as enabled.
+    #[test]
+    fn inbound_demand_cache_defaults_off_and_opts_in_only_on_truthy() {
+        assert!(!resolve_inbound_demand_cache(None), "unset → OFF (default)");
+        assert!(!resolve_inbound_demand_cache(Some("off")));
+        assert!(!resolve_inbound_demand_cache(Some("0")));
+        assert!(
+            !resolve_inbound_demand_cache(Some("anything")),
+            "unknown → OFF"
+        );
+        for v in ["on", "1", "true", "yes", "ON", "True", " yes "] {
+            assert!(
+                resolve_inbound_demand_cache(Some(v)),
+                "DIG_NODE_INBOUND_DEMAND_CACHE={v} → enabled"
             );
         }
     }

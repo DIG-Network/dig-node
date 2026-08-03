@@ -1362,6 +1362,180 @@ eviction. These additive fields/methods complete that surface; all are `served: 
   node started; `content_cache.hits`/`misses` are the decoded-content (RAM) cache lookups since
   start. All counters are process-lifetime (reset each start), never persisted.
 
+### 7.10a. Cache relevance + tier model + eviction precedence (#1986, epic #1934)
+
+The `relevance` module (`crates/dig-node-core/src/relevance.rs`) is the PURE, deterministic scoring
+core the disk cache consults to decide WHAT is worth keeping, WHAT to sacrifice first, and WHEN a
+fresh candidate may displace an incumbent. It performs NO I/O and reads NO clock — time enters only
+as caller-supplied tick counters — so its decisions are reproducible and auditable. This subsection
+specifies the contract; the live wiring into the on-disk LRU (§3.4/§7.10) is delivered by later
+children of epic #1934 and is out of scope here.
+
+**Tiers + eviction precedence.** Every cached entry belongs to a `CacheTier`:
+`Tier0Precache` (speculatively fetched), `Tier1Demand` (fetched for a real local read), or
+`Tier2Bribed` (retained because a backer paid). Cross-tier eviction precedence is fixed by the tier
+ALONE — **tier2 > tier1 > tier0**, i.e. Tier0 is sacrificed first and Tier2 last — so speculative
+precache can never evict content a user or a paying backer asked for. Relevance score orders entries
+only WITHIN a tier, never across tiers. `evict_key(entry) -> (tier_rank, last_access_ticks)` yields
+the eviction sort key: sorting entries by it ASCENDING gives exactly tier0-oldest → tier1-oldest →
+tier2-oldest (LRU within each tier), which is the order the cap MUST evict in. `tier_rank` is
+`Tier0Precache = 0`, `Tier1Demand = 1`, `Tier2Bribed = 2`.
+
+**Relevance score.** `relevance(store: &RelevanceInputs, node: &NodeContext) -> RelevanceValue` is a
+weighted sum:
+`xor·proximity + scarcity·scarcity_term + demand·demand_term + recency·recency_term
++ pin_adjacent·[adjacent] + pinned·[pinned]`.
+
+- **XOR proximity is the PRIMARY, ungameable signal.** Proximity is derived from
+  `content_id XOR peer_id` and MUST be a strictly decreasing function of that distance (closer =
+  higher). The reference map is `1 - (hi128 / 2^128)` over the top 128 bits of the distance. It is
+  ungameable because an attacker cannot choose the victim's `peer_id` and cannot cheaply grind a
+  `content_id` that lands near it (a 256-bit preimage search), so junk cannot be made to look like
+  "this node's responsibility". Every other signal is a bounded ADDITIVE bonus.
+- **Replication scarcity is CLAMPED (load-bearing anti-gaming).** `known_provider_count` is UNTRUSTED
+  and MUST be clamped to `[1, 32]` before use; the resulting term lies in `[0, 1]` (fewer providers →
+  higher) and is scaled by a weight strictly smaller than the XOR weight. A flooded count (→ `u32::MAX`)
+  clamps to the ceiling (scarcity → 0) and a deflated count (0) clamps to the floor (scarcity → 1), so
+  a lie can neither DOMINATE the score nor ZERO it — the XOR + demand terms survive regardless.
+- **Local demand + recency + pin adjacency** are bounded additive bonuses: demand saturates at 16
+  reads, recency decays as `1/(1 + age/1000)` (age in ticks; `None` ⇒ 0), and pin-adjacency adds a
+  fixed small bonus. An explicit pin (`is_pinned`) adds a large bonus that deliberately overrides the
+  heuristics (a pin is a direct operator instruction).
+- **Weight invariant.** The default weights keep the XOR term strictly dominant over the sum of the
+  gameable secondary bonuses, so proximity always leads.
+
+**Displacement hysteresis.** `should_displace(incumbent, candidate, margin) -> bool` returns true
+only when `candidate > incumbent + margin` (strict). The margin is an anti-thrash band: without it,
+two near-equal stores would ping-pong in and out of the cache each sweep. At or below the margin the
+incumbent stays.
+
+### 7.10b. Tier-0 knapsack selector (#1988, epic #1934)
+
+The `tier0_selector` module (`crates/dig-node-core/src/tier0_selector.rs`) is a PURE, deterministic
+selector that decides WHICH speculative-precache candidates are worth keeping under a small
+sub-budget, given each candidate's size and a relevance score already computed by §7.10a's
+`relevance`. Like `relevance`, it performs NO I/O and reads NO clock. It does NOT sample the DHT for
+candidates (a later epic-#1934 child) or fetch/evict anything against the live cache — that wiring
+is out of scope here.
+
+**Sub-budget.** Tier-0 speculative precache is bounded to `TIER0_BUDGET_FRACTION` (0.10) of the
+node's WHOLE cache cap (`DIG_NODE_CACHE_CAP`/§7.10 `cache_cap_bytes`), never the whole cap —
+`tier0_budget_bytes(whole_cache_cap_bytes) -> u64` computes this fraction as pure arithmetic over a
+caller-supplied cap (the cap lookup itself is I/O and stays outside this module). Tier-0 is an
+opportunistic bet, and reserving only a slice of the cap keeps it from crowding out real Tier1/Tier2
+retention even before the tier-based eviction precedence (§7.10a) has to bite.
+
+**Selection.** `select_within_budget(candidates: &[Candidate], budget_bytes: u64) -> Vec<usize>`
+returns the indices of the candidates to keep, using GREEDY selection by value-density
+(`relevance / size_bytes`, descending) rather than an exact 0/1 dynamic-programming knapsack — DP is
+`O(n * budget)`, which is disproportionate at a GiB-scale budget; greedy is `O(n log n)` and
+near-optimal (it can only under-fill the last unit of budget by at most one candidate's size). The
+selected set's total size MUST NOT exceed `budget_bytes`. A candidate with `size_bytes == 0` is
+treated as infinitely dense (free to keep) and is always included rather than causing a
+divide-by-zero.
+
+**Displacement hysteresis.** `should_displace_tier0(incumbent, candidate, margin) -> bool` is a
+thin, named wrapper over §7.10a's `should_displace`, reusing its `candidate > incumbent + margin`
+rule so tier-0 re-selection against an existing held set does not thrash a fetch/evict/refetch cycle
+on marginal score differences. The tier-0 selector's own default margin is
+`DEFAULT_HYSTERESIS_MARGIN` (0.05), overridable per call.
+
+### 7.10c. DHT candidate sampling + anti-Sybil quorum reconciliation (#1987, epic #1934)
+
+The `dht_sampling` module (`crates/dig-node-core/src/dht_sampling.rs`) produces the CANDIDATE SET that
+feeds §7.10a's `RelevanceInputs` (each candidate's `content_id` + an untrusted `known_provider_count`).
+It does NOT score candidates (§7.10a) or select/fetch them (§7.10b + the fetch child) — discovery and
+reconciliation ONLY. It splits a PURE reconciliation policy from the network I/O so the
+security-critical logic is unit-tested with no sockets.
+
+**Observation model.** A `PeerObservation { peer_id: [u8;32], holdings: Vec<ObservedCandidate> }` is
+ONE peer's reported provider view — the shape of a dig-dht `DhtService::provider_snapshot` (the RLY-009
+`get_dht_records` view, #1935): each `ObservedCandidate { content_id: [u8;32], provider_count: u32,
+size_hint: Option<u64> }` is that peer's untrusted claim about one content KEY (the 32-byte
+`ContentId::to_key` keyspace point). The DHT provider snapshot carries no size, so `size_hint` is
+optional; the true size is learned at fetch time.
+
+**Random keyspace sampling.** `sample_keyspace_points(rng: &mut impl KeyspaceRng, k) -> Vec<[u8;32]>`
+picks `k` keyspace points to probe. Randomness enters ONLY through the injected `KeyspaceRng`
+(a self-contained non-cryptographic `SplitMix64` seeded from node state — MUST NOT be used for keys or
+nonces), so coverage is deterministic under a seed. Points are reached in production with the dig-dht
+routing primitive `find_node`/`known_closest`, which accepts ANY key — so sampling probes arbitrary
+regions rather than only ids the node already holds, spreading coverage across the whole keyspace.
+`DEFAULT_SAMPLE_POINTS` = 8.
+
+**Anti-Sybil quorum reconciliation.** `reconcile(observations: &[PeerObservation], policy:
+&QuorumPolicy) -> Vec<Candidate>` admits a content key ONLY when at least `policy.min_distinct_peers`
+(`DEFAULT_QUORUM_MIN_PEERS` = 3) DISTINCT peers independently report it. Observations are collapsed per
+peer FIRST — one peer listing a key many times (or across regions) is a SINGLE vote — so a lone
+lying/Sybil peer's unique injections never reach the candidate set. Each admitted key's
+`known_provider_count` is the LOWER MEDIAN of the reporting peers' claimed counts (NEVER the max): a
+single peer inflating its count to `u32::MAX` moves only one tail sample and cannot drag the median
+while honest peers outnumber it; the mirror deflation-to-zero attack fails the same way. `size_hint`
+is the lower median of the supplied sizes, or `None`. Output is sorted by `content_id`. §7.10a's
+`[1, 32]` provider-count clamp remains the final defense on whatever count survives here.
+
+**Residual model (stated, not hidden).** Distinct-peer quorum is a COST MULTIPLIER, not proof of
+honesty: an attacker minting `M` distinct mTLS identities that all corroborate one key still clears the
+bar. That residual is bounded by the surrounding layers — keyspace sampling forces the attacker to
+cover the whole space, the §7.10a XOR proximity primary means a corroborated junk key scores by an id
+the attacker cannot grind toward this node, and the `[1, 32]` clamp caps the surviving count.
+
+**Composition seam.** `sample_candidates(probe: &dyn NeighbourhoodProbe, rng, sample_points, policy)`
+ties sampling + probing + reconciliation over a `NeighbourhoodProbe` seam (`observe_near(point) ->
+Vec<PeerObservation>`), reconciling ALL probed regions TOGETHER so the quorum is whole-round. The
+concrete probe (`find_node` toward each point, then a provider-snapshot RPC to the peers found) lands
+with the fetch child (#4); this module defines only the shape it consumes.
+
+### 7.10d. Tier-1 caching triggers — fetch-side backfill AND inbound demand (#1990, epic #1934)
+
+A store earns the `Tier1Demand` tier (§7.10a) — real, non-speculative demand, evicted only after all
+`Tier0Precache` — from EITHER of two independent triggers. Both are the same conclusion ("this content
+is genuinely wanted here") reached from opposite directions:
+
+- **(a) Fetch-side backfill (SPEC §5.6 / §14.3b).** THIS node reads a resource it does not hold, is
+  served it from another node/upstream, and background-pulls the whole `.dig` so its NEXT read is
+  local. This is what THIS node fetched. It is gated `ReadOrigin::Local`: a REMOTE peer's read served
+  through this node MUST NOT trigger it, or a stranger could drive this node into pulling + caching +
+  DHT-announcing content of the peer's choosing (an amplification primitive).
+
+- **(b) Inbound demand (this section).** A remote PEER asks this node to serve a resource from a store
+  (a `dig.fetchRange`/`dig.fetchModuleRange` request over the peer surface). That request is direct
+  evidence this node's keyspace neighbourhood WANTS the content, so the demanded store is recorded in
+  the in-memory INBOUND-DEMAND LEDGER (`crates/dig-node-core/src/inbound_demand.rs`), which tags it
+  `Tier1Demand` and bumps a saturating demand count. The ledger is the FIRST live tier-tagging: the
+  on-disk LRU cache (§3.4/§7.10) keys entries by path and orders them by file mtime alone and carries
+  NO per-entry acquisition tier, so this in-memory, process-lifetime map (never persisted, additive
+  over the `.dig` format and the LRU layout) is the source the relevance demand term
+  (`RelevanceInputs.local_read_count`, §7.10a) and the tier-based eviction precedence consult for
+  peer-demanded stores.
+
+**The ledger is BOUNDED (memory is not remotely amplifiable).** Recording is always-on and fed by a
+remote peer's on-wire store id, and the format check accepts any 64-hex value (not only stores that
+exist), so a peer could otherwise mint permanent entries from the 2^256 keyspace until the node OOMs.
+The ledger MUST therefore be a bounded LRU: at most `MAX_DEMAND_ENTRIES` (default 65_536) distinct
+stores, evicting the least-recently-demanded entry on overflow (a re-demanded store is refreshed and
+survives over colder entries). Worst-case memory is bounded by the cap — on the order of ten-odd MiB
+— REGARDLESS of remote request volume; distinct-id spam churns through the fixed footprint rather
+than growing it.
+
+**What is always on vs. opt-in.** Recording inbound demand (the count + `Tier1Demand` tag) is
+UNCONDITIONAL — it moves no content bytes and pulls no capsule, and its memory is bounded by the cap
+above, so it carries no bandwidth/content amplification risk and always runs. The whole-`.dig` PULL on
+inbound demand is OPT-IN, default OFF, gated by
+`DIG_NODE_INBOUND_DEMAND_CACHE` (only an explicit `on`/`1`/`true`/`yes` enables it). A peer-triggered
+pull is an amplification primitive of exactly the shape trigger (a)'s `ReadOrigin::Local` gate exists
+to close; the intended amplification defence is the tier-0/1 selector's XOR-proximity admission (§7.10a
+/ §7.10b) — pull a peer-demanded store only when its `content_id` lands in this node's keyspace
+neighbourhood — which is not yet wired into the live pull. Until it is, the pull stays opt-in so
+enabling the feature never SILENTLY reverses the amplification invariant.
+
+**Shared pull machinery.** When the opt-in pull fires, it reuses the SAME whole-capsule backfill body
+as trigger (a) (`Node::spawn_capsule_backfill`): the `DIG_NODE_BACKFILL_ON_MISS` kill switch + a live
+P2P content engine, an owned self-reference to spawn the detached task, a concrete `(store, root)`, an
+already-held skip, and the ONE shared `(store, root)` single-flight acquisition gate (§21.3 / #1614) —
+so both tier-1 triggers and the reshare warm can never drift in how they pull, dedupe, verify, or
+announce, and an already-held store is never re-pulled.
+
 ### 7.11. Control-token pairing for browser controllers (#280)
 
 An MV3 browser extension cannot read the `<state_dir>/control-token` file, so it cannot drive

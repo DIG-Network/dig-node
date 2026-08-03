@@ -48,13 +48,17 @@ use tokio::sync::Mutex;
 mod capsule_key;
 pub mod chainwatch;
 pub mod chat;
+pub mod dht_sampling;
 pub mod download;
+pub mod inbound_demand;
 pub mod peer;
+pub mod relevance;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
 /// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep
 /// every existing `crate::net`/`crate::pex`/… reference working unchanged (W1b-0 is a pure
 /// relocation — no behaviour change, no caller updates required).
 pub mod seams;
+pub mod tier0_selector;
 /// The `CapsuleStore` trait is seam 6's public surface (#1285 W1b-4) — bring it into scope to call
 /// `cache_list_cached`/`cache_remove_cached`/`cache_fetch_and_cache`/`gap_fill_generation`/
 /// `maybe_backfill_capsule`/`set_self_ref`/`arc_self` on a `Node`.
@@ -367,6 +371,12 @@ pub struct Node {
     /// only — it seals an app-supplied opaque `DIGCHAT1` envelope and dig-gossip directed-sends it; it
     /// never parses chat content. See [`chat`].
     chat: chat::ChatState,
+    /// The live INBOUND-DEMAND ledger (#1990, epic #1934): the FIRST live tier-tagging. Records which
+    /// stores a remote PEER has asked this node to serve and tags each `Tier1Demand`, so a peer's
+    /// request — direct evidence this node's neighbourhood wants the content — feeds the relevance
+    /// local-demand term and gives the store eviction precedence over speculative `Tier0Precache`.
+    /// In-memory + process-lifetime; additive over the on-disk cache. See [`inbound_demand`].
+    inbound_demand: inbound_demand::InboundDemand,
 }
 
 /// A boxed async hook that reconciles the node's DHT provider records with its current cache
@@ -2610,6 +2620,7 @@ impl Node {
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
         })
     }
 
@@ -2617,6 +2628,58 @@ impl Node {
     /// (`<cache>/downloads`) + `.download.tmp` GC live under (shares the node's writability handling).
     pub fn cache_dir_path(&self) -> &Path {
         &self.cache_dir
+    }
+
+    /// The recorded inbound-demand count for a store (0 if none) — the peer-request count that feeds
+    /// [`RelevanceInputs::local_read_count`](crate::relevance::RelevanceInputs::local_read_count).
+    ///
+    /// This is the relevance-feed reader half of the inbound-demand ledger: the SIGNAL is recorded
+    /// live today (§7.10d), but the live scoring that CONSUMES it lands with the epic-#1934 cache-
+    /// wiring child, so the reader is currently exercised only by this crate's tests. `allow(dead_code)`
+    /// records that the API is deliberately ahead of its live consumer (the same shape as the pure,
+    /// not-yet-wired `relevance`/`tier0_selector` modules), not accidentally unused.
+    #[allow(dead_code)]
+    pub(crate) fn inbound_demand_count(&self, store_hex: &str) -> u32 {
+        self.inbound_demand.count(store_hex)
+    }
+
+    /// The tier a store is tagged with by inbound demand, if any — always
+    /// [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand) when present. Like
+    /// [`Node::inbound_demand_count`], the reader is ahead of its live eviction-precedence consumer
+    /// (epic #1934 cache-wiring child) and currently exercised only by tests.
+    #[allow(dead_code)]
+    pub(crate) fn inbound_demand_tier(
+        &self,
+        store_hex: &str,
+    ) -> Option<crate::relevance::CacheTier> {
+        self.inbound_demand.tier(store_hex)
+    }
+
+    /// The INBOUND-DEMAND tier-1 cache trigger (#1990): a remote PEER just asked this node to serve a
+    /// resource from `(store_hex, root_hex)`. That request is real demand, so:
+    ///
+    /// 1. **Always** record it in the [`inbound_demand`] ledger — tagging the store `Tier1Demand` and
+    ///    bumping its demand count. This is free of the amplification concern (it holds no content and
+    ///    pulls nothing), so it runs unconditionally; it feeds relevance + eviction precedence.
+    /// 2. **Opt-in** (default OFF, `DIG_NODE_INBOUND_DEMAND_CACHE`) trigger a whole-`.dig` backfill of
+    ///    the store — reusing the SAME machinery the fetch-side backfill uses
+    ///    ([`Node::spawn_capsule_backfill`]) — so a subsequent request is served locally. Gated OFF by
+    ///    default because a peer-triggered pull is an amplification primitive until the tier-0/1
+    ///    selector's XOR-proximity admission is live-wired; see
+    ///    [`crate::download::inbound_demand_cache_enabled`].
+    ///
+    /// A non-canonical `store_hex` is ignored (records nothing) — a serve path may hand a placeholder
+    /// or `"latest"`-shaped value, and only a real store id names demand to record.
+    pub(crate) fn note_inbound_demand(&self, store_hex: &str, root_hex: &str) {
+        if !is_canonical_hex_id(store_hex) {
+            return;
+        }
+        self.inbound_demand.record(store_hex);
+        if crate::download::inbound_demand_cache_enabled() {
+            // Tier1Demand is asserted in the ledger above; the on-disk pull reuses the fetch-side
+            // machinery, which lands + announces the capsule exactly as every other cache path does.
+            self.spawn_capsule_backfill(store_hex, root_hex);
+        }
     }
 }
 
@@ -2706,6 +2769,7 @@ pub(crate) mod test_support {
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
         };
         (Arc::new(node), td)
     }
@@ -3061,6 +3125,7 @@ mod tests {
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
         };
         (node, td)
     }
@@ -3142,6 +3207,7 @@ mod tests {
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
         };
 
         // Missing before the pull.
@@ -3188,6 +3254,7 @@ mod tests {
             gossip: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -3275,6 +3342,7 @@ mod tests {
                 gossip: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
                 chat: chat::ChatState::new(),
+                inbound_demand: inbound_demand::InboundDemand::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -3344,6 +3412,7 @@ mod tests {
                 gossip: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
                 chat: chat::ChatState::new(),
+                inbound_demand: inbound_demand::InboundDemand::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -3416,6 +3485,132 @@ mod tests {
             !node.capsule_acquisition.is_warming(&key),
             "an already-held capsule claims no in-flight backfill slot"
         );
+    }
+
+    /// **Proves (#1990):** a peer's inbound request records demand for the store — bumping its count
+    /// and tagging it `Tier1Demand` — so the demand feeds relevance + eviction precedence. This is the
+    /// always-on, amplification-free half of the trigger (it holds no content, pulls nothing).
+    /// **Catches:** a demand record that fails to tag Tier1 or fails to accumulate.
+    #[tokio::test]
+    async fn inbound_demand_records_and_tags_tier1() {
+        let (node, _td) = test_node(None);
+        let store_hex = "ab".repeat(32);
+        let root_hex = "cd".repeat(32);
+        assert_eq!(node.inbound_demand_count(&store_hex), 0, "undemanded → 0");
+        node.note_inbound_demand(&store_hex, &root_hex);
+        node.note_inbound_demand(&store_hex, &root_hex);
+        assert_eq!(node.inbound_demand_count(&store_hex), 2, "two requests → 2");
+        assert_eq!(
+            node.inbound_demand_tier(&store_hex),
+            Some(crate::relevance::CacheTier::Tier1Demand),
+            "inbound demand tags Tier1Demand"
+        );
+    }
+
+    /// **Proves (#1990):** a non-canonical store id (a placeholder / `"latest"`-shaped value a serve
+    /// path may hand in) records NO demand — only a real store id names demand.
+    /// **Catches:** the ledger accumulating junk keys that would skew relevance.
+    #[tokio::test]
+    async fn inbound_demand_ignores_a_noncanonical_store() {
+        let (node, _td) = test_node(None);
+        node.note_inbound_demand("not-a-store", &"cd".repeat(32));
+        assert_eq!(node.inbound_demand_count("not-a-store"), 0);
+    }
+
+    /// **Proves (#1990):** the inbound-demand PULL is OFF by default — a peer's request records demand
+    /// but spawns NO whole-capsule backfill even with a live peer network + provider. This preserves
+    /// the amplification invariant: a stranger cannot drive an uncached pull until an operator opts in.
+    /// **Catches:** a default-on regression that would re-open the peer-triggered amplification vector.
+    #[test]
+    fn inbound_demand_pull_is_off_by_default() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE"); // default OFF
+        let rt = pin_test_rt();
+        let (store, tip, _rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        let (s, r) = (store.to_hex(), tip.to_hex());
+        rt.block_on(async { node.note_inbound_demand(&s, &r) });
+        assert_eq!(node.inbound_demand_count(&s), 1, "demand is still recorded");
+        let key = format!("{s}:{r}");
+        assert!(
+            !node.capsule_acquisition.is_warming(&key),
+            "inbound-demand pull must be OFF by default — no backfill without opt-in"
+        );
+    }
+
+    /// **Proves (#1990):** with the operator opt-in ON, a peer's request for an UNCACHED store spawns
+    /// a tier-1 whole-capsule backfill (the same single-flight machinery the fetch-side leg uses).
+    /// **Catches:** the opt-in gate failing to reach the shared pull body, or the demand trigger not
+    /// caching an uncached store.
+    #[test]
+    fn inbound_demand_opt_in_spawns_a_backfill_for_an_uncached_store() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        std::env::set_var("DIG_NODE_INBOUND_DEMAND_CACHE", "on");
+        let rt = pin_test_rt();
+        let (store, tip, _rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        let (s, r) = (store.to_hex(), tip.to_hex());
+        rt.block_on(async { node.note_inbound_demand(&s, &r) });
+        let key = format!("{s}:{r}");
+        let warming = node.capsule_acquisition.is_warming(&key);
+        std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE");
+        assert!(
+            warming,
+            "an opt-in inbound-demand request for an uncached store must spawn a tier-1 backfill"
+        );
+    }
+
+    /// **Proves (#1990):** even with the opt-in ON, a peer's request for an ALREADY-HELD store spawns
+    /// no redundant pull — demand is recorded, but the shared held-skip guard short-circuits.
+    /// **Catches:** a demand trigger that double-pulls content it already holds.
+    #[test]
+    fn inbound_demand_opt_in_skips_an_already_held_store() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        std::env::set_var("DIG_NODE_INBOUND_DEMAND_CACHE", "on");
+        let rt = pin_test_rt();
+        let (store, tip, _rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let (s, r) = (store.to_hex(), tip.to_hex());
+        seed_module(&node, &s, &r, b"already-here");
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        rt.block_on(async { node.note_inbound_demand(&s, &r) });
+        let key = format!("{s}:{r}");
+        let warming = node.capsule_acquisition.is_warming(&key);
+        std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE");
+        assert_eq!(node.inbound_demand_count(&s), 1, "demand still recorded");
+        assert!(!warming, "an already-held store claims no backfill slot");
     }
 
     #[tokio::test]
@@ -8453,6 +8648,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -8501,6 +8697,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -8548,6 +8745,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
             ..node
         };
 
@@ -8577,6 +8775,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(1_000_000),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -8615,6 +8814,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -8655,6 +8855,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
