@@ -836,6 +836,29 @@ async fn dig_health_is_answered_locally_with_no_upstream() {
         "health carries the method catalogue: {resp}"
     );
     assert!(calls.lock().unwrap().is_empty(), "health asks nobody");
+
+    // `dig.health` is on rpc.dig.net's PUBLIC-read allowlist, so a gateway-fronted node answers this
+    // to the open internet. Operator-identifying detail must not ride along: `cache.dir` is an
+    // absolute path carrying the OS account name on a default install, `addr` describes the host's
+    // internal network layout, and `upstream` names a third party this node talks to.
+    assert!(
+        resp["result"]["cache"]["dir"].is_null(),
+        "the absolute cache path must not reach a public caller: {resp}"
+    );
+    assert!(
+        resp["result"]["addr"].is_null(),
+        "the internal bind address must not reach a public caller: {resp}"
+    );
+    assert!(
+        resp["result"]["upstream"].is_null(),
+        "the configured upstream must not reach a public caller: {resp}"
+    );
+    // …while the fields that make the answer USEFUL survive, so this is redaction and not amputation.
+    assert!(
+        resp["result"]["cache"]["used_bytes"].is_number(),
+        "cache size counters are operational scale, not identity: {resp}"
+    );
+    assert_eq!(resp["result"]["service"], json!("dig-node"), "{resp}");
 }
 
 /// **Proves:** `dig.methods` self-describes locally and agrees with the catalogue, including the

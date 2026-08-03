@@ -495,6 +495,31 @@ fn control_ctx(state: &AppState) -> ControlCtx {
 /// identity, mode, the bound `addr`, `upstream`, cache stats, and §21 sync
 /// availability. Pulled out so the two unauthenticated liveness surfaces can never
 /// silently drift from each other.
+/// Strip operator-identifying detail from a [`status_fields`] body before it leaves the node over a
+/// surface an untrusted caller can reach.
+///
+/// `GET /health` is loopback-only and keeps the full body — an operator inspecting their own node
+/// should see everything. The JSON-RPC surface is different: `dig.health` sits on rpc.dig.net's
+/// PUBLIC-read allowlist, so a gateway-fronted node answers it to the open internet. Three fields do
+/// not belong there:
+///
+/// - `cache.dir` — an absolute path, which on a default install contains the OS account name.
+/// - `addr` — the internal bind address, which describes the host's network layout.
+/// - `upstream` — names a third party this node talks to, and is exactly the value #1997 exists to
+///   keep deliberate rather than ambient.
+///
+/// Liveness does not require any of them: `service`, `version`, `mode`, `sync`, `peer_tier` and the
+/// cache SIZE counters all survive, so the health answer stays useful. `cache.cap_bytes`/`used_bytes`
+/// are kept deliberately — they are operational scale, not identity, and a public read tier
+/// advertising its capacity is intended.
+fn redact_operator_details(body: &mut serde_json::Map<String, Value>) {
+    body.remove("addr");
+    body.remove("upstream");
+    if let Some(Value::Object(cache)) = body.get_mut("cache") {
+        cache.remove("dir");
+    }
+}
+
 fn status_fields(state: &AppState) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
     m.insert("service".into(), json!(meta::SERVICE_NAME));
@@ -806,6 +831,7 @@ async fn rpc(
     // unable to describe itself at all.
     if method == "dig.health" {
         let mut body = status_fields(&state);
+        redact_operator_details(&mut body);
         body.insert("status".into(), json!("ok"));
         body.insert("methods".into(), json!(meta::method_names()));
         return (

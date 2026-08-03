@@ -570,9 +570,19 @@ pub fn is_self_upstream(upstream: &str, serving_port: u16) -> bool {
             .parse::<std::net::Ipv6Addr>()
             .is_ok_and(|ip| ip.is_loopback());
 
-    // `dig.local` is this node's own alias (#91) on the privileged port, so it is self regardless
-    // of the ephemeral port the localhost listener uses.
-    if host == "dig.local" && port == DIG_LOCAL_PORT {
+    // The `dig.local` alias and the DIG_LOCAL_IP it resolves to are this node on BOTH privileged
+    // listeners, not just the plaintext one: `http://dig.local` (DIG_LOCAL_PORT) and
+    // `https://dig.local` (DIG_LOCAL_HTTPS_PORT, #624).
+    //
+    // Checking only DIG_LOCAL_PORT left the likeliest hand-typed self value walking past the guard:
+    // a bare `dig.local` normalises to `https://dig.local` (§3.3 defaults the scheme to https), so
+    // it arrives here as port 443 and matched nothing. State the guard over the CLASS — this alias
+    // on any port it is actually served on — rather than over the one shape first thought of.
+    let is_dig_local_alias = host == DIG_LOCAL_HOST
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip == DIG_LOCAL_IP);
+    if is_dig_local_alias && matches!(port, DIG_LOCAL_PORT | DIG_LOCAL_HTTPS_PORT) {
         return true;
     }
 
@@ -649,6 +659,15 @@ mod tests {
             "http://127.0.0.1:9778/rpc?x=1",
             "http://dig.local",
             "http://dig.local:80",
+            // The HTTPS dig.local listener (#624) is this node too. A BARE `dig.local` is the
+            // likeliest value an operator hand-types, and §3.3 defaults its scheme to https — so it
+            // arrives as port 443. Checking only DIG_LOCAL_PORT let exactly that case through.
+            "dig.local",
+            "https://dig.local",
+            "https://dig.local:443",
+            // …and the loopback IP the alias resolves to, on both privileged listeners.
+            "http://127.0.0.2:80",
+            "https://127.0.0.2:443",
         ] {
             assert!(
                 is_self_upstream(&normalize_upstream(u), 9778),
