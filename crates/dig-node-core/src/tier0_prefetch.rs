@@ -47,7 +47,8 @@
 use async_trait::async_trait;
 
 use crate::dht_sampling::{
-    sample_candidates, Candidate, KeyspaceRng, NeighbourhoodProbe, QuorumPolicy, DEFAULT_SAMPLE_POINTS,
+    sample_candidates, Candidate, KeyspaceRng, NeighbourhoodProbe, QuorumPolicy,
+    DEFAULT_SAMPLE_POINTS,
 };
 use crate::relevance::{relevance, CacheTier, NodeContext, RelevanceInputs};
 use crate::tier0_selector::{
@@ -465,8 +466,7 @@ async fn resolve_candidate_size(
 mod tests {
     use super::*;
     use crate::dht_sampling::{ObservedCandidate, PeerObservation, SplitMix64};
-    use crate::relevance::{CacheEntry, evict_key, RelevanceWeights};
-    use std::collections::HashMap;
+    use crate::relevance::{evict_key, CacheEntry, RelevanceWeights};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -884,7 +884,10 @@ mod tests {
         )
         .await;
         assert_eq!(out.cached, 0);
-        assert_eq!(out.skipped, None, "an empty round is not a skip, just no candidates");
+        assert_eq!(
+            out.skipped, None,
+            "an empty round is not a skip, just no candidates"
+        );
     }
 
     // -- Rate limiting -----------------------------------------------------------------------------
@@ -946,7 +949,10 @@ mod tests {
             0,
         )
         .await;
-        assert!(out.cached <= 2, "at most two fetched under the store rate limit");
+        assert!(
+            out.cached <= 2,
+            "at most two fetched under the store rate limit"
+        );
         assert!(out.rate_limited >= 1, "the third is rate-limited");
     }
 
@@ -995,7 +1001,11 @@ mod tests {
             CacheTier::Tier0Precache,
             "precache is sacrificed before real demand, even when freshest"
         );
-        assert_eq!(entries[2].tier, CacheTier::Tier2Bribed, "paid retention lasts longest");
+        assert_eq!(
+            entries[2].tier,
+            CacheTier::Tier2Bribed,
+            "paid retention lasts longest"
+        );
     }
 
     // -- Full-pipeline happy path ------------------------------------------------------------------

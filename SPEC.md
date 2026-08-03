@@ -1556,6 +1556,63 @@ already-held skip, and the ONE shared `(store, root)` single-flight acquisition 
 so both tier-1 triggers and the reshare warm can never drift in how they pull, dedupe, verify, or
 announce, and an already-held store is never re-pulled.
 
+### 7.10f. Tier-0 eager-precache loop — the governed round (#1989 child 4b, epic #1934)
+
+The `tier0_prefetch` module (`crates/dig-node-core/src/tier0_prefetch.rs`) is the GOVERNED
+orchestration that turns the DHT-sampling flywheel into actually-cached speculative content. It ties
+the pure/seam pieces — §7.10c sampling+reconcile, §7.10a relevance, §7.10b knapsack selection — into
+one self-driven ROUND: `sample_candidates` → size resolution → relevance score → `select_within_budget`
+→ governed fetch (merkle-verify + hard byte-cap + cache tagged `Tier0Precache` + announce). The loop
+is self-driven (it reads NO attacker-supplied trigger), so it is not the amplification vector the
+inbound-demand pull (§7.10d(b)) is; every value an attacker can influence (they populate DHT provider
+snapshots) is nonetheless bounded BEFORE it costs bandwidth or disk. The following governors are
+NORMATIVE:
+
+- **Off-switch, DEFAULT-ON.** `tier0_precache_enabled()` reads `DIG_TIER0_PRECACHE`; the loop is ON
+  unless an explicit falsy value (`0`/`off`/`false`/`no`, case-insensitive) disables it. DEFAULT-ON is
+  the deliberate stance for a self-driven, quorum-corroborated, XOR-relevant, byte-capped pull (unlike
+  the inbound-demand pull, which is default-OFF because it is peer-triggered). `run_round` takes the
+  resolved enablement as an injected `bool` parameter (the caller reads the env once per round), so the
+  round is a pure function of its arguments.
+- **Small-disk no-op (#1927).** `should_run_loop(cache_cap_bytes)` is `false` when the derived tier-0
+  sub-budget (§7.10b `tier0_budget_bytes`, 10% of cache) is below `MIN_USEFUL_TIER0` (64 MiB); the
+  caller checks this ONCE at bring-up and does not spawn the loop, degrading gracefully on a tiny disk.
+- **Backoff-when-serving.** A round yields ENTIRELY (`RoundSkip::Busy`) when the `LoadSignal` reports
+  the node is serving real inbound reads — speculative precache always defers to genuine demand.
+- **Rate limit.** `RoundRateLimiter` is a token bucket on BOTH stores/window AND bytes/window (bytes is
+  the load-bearing limit; bandwidth is the real cost). A fetch proceeds only when both buckets admit it,
+  atomically (a refused byte-take never consumes a store token).
+- **Size resolution — NEVER zero an unknown.** A candidate's size is the reconciled median `size_hint`
+  when present; otherwise an ADMITTED candidate spends at most ONE bounded metadata probe (capped at
+  `MAX_SIZE_PROBES_PER_ROUND` = 32 per round), else it is DROPPED for the round. An unresolved size is
+  never treated as 0 (which would make it maximally dense in the knapsack).
+- **Hard byte-cap at fetch.** Each selected store is fetched under a hard cap of
+  `min(reported_hint, remaining_sub_budget)`; the fetcher enforces the TRUE store size against that cap
+  and ABORTS + discards an over-size store (`DiscardReason::ExceededByteCap`) — the
+  under-report-size-then-bloat defence. The selected total never exceeds the tier-0 sub-budget.
+- **Merkle-verify before cache; never execute.** The fetch reuses the existing verified download path,
+  so content is verified against the confirmed root before it lands and is never opened/executed;
+  verification failure discards (`DiscardReason::VerifyFailed`).
+- **Tier precedence.** Cached stores are tagged `Tier0Precache` and sacrificed FIRST. `effective_tier`
+  is the MAX-across-ledgers rule (§7.10a `CacheTier::rank`): a store this loop precached that a peer
+  later demands is promoted to `Tier1Demand`, so precache can never evict genuinely-demanded content.
+- **Anti-Sybil identity carries forward from §7.10c/4a unchanged** — candidates come ONLY from
+  `sample_candidates`, whose votes are attributed to the probe's mTLS-verified session `peer_id`.
+
+**Size + wiring status (normative gap — the fetch seam's preimage requirement).** `run_round` is
+complete as the governed orchestration over three concrete seams: `SizeProbe`, `Tier0Fetcher`, and
+`LoadSignal`. A candidate carries a DHT `content_id` = `SHA-256(ContentId::canonical_bytes)` (§7.10c) —
+a ONE-WAY key. Every merkle-verified fetch path (`find_providers`/`fetch_resource`/
+`Node::gap_fill_generation`) is addressed by the `ContentId` PREIMAGE `(store_id, root)`, and merkle
+verification itself requires the confirmed `root`. A concrete `Tier0Fetcher` therefore REQUIRES a
+`content_key → (store_id, root)` resolution that the counts-only `dig.getProviderSnapshot` surface
+(§7.10c, §7.4a) deliberately does not carry, and that the node otherwise holds only for stores it
+already knows (subscriptions/chain-watch §7.10c/§14.2). Supplying that resolution — a discovery surface
+that returns verifiable preimages for XOR-near keys, with its privacy trade-off assessed — is a
+prerequisite child of epic #1934 and is out of scope for this module, which is why the concrete
+network seams + the spawn-at-bring-up are gated on it. Until then the governed round + its seams are
+the normative contract, exercised end-to-end against injected seams.
+
 ### 7.11. Control-token pairing for browser controllers (#280)
 
 An MV3 browser extension cannot read the `<state_dir>/control-token` file, so it cannot drive

@@ -764,7 +764,11 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
   a consumer building an anti-Sybil observation MUST attribute it to the `peer_id` of the verified mTLS
   session (`SHA-256(server-cert SPKI DER)`), NEVER to a routing `Contact.peer_id` or any field of this
   payload (the payload carries no identity) — the response is deliberately identity-free so the
-  attribution can only come from the authenticated channel.
+  attribution can only come from the authenticated channel. **Privacy note:** the answer discloses the
+  PRESENCE of each content KEY in this node's provider store (which keys it serves), visible to any
+  mTLS-authenticated peer that calls the method; it discloses no provider identities and no key
+  PREIMAGE (`content_key` is the one-way `SHA-256(ContentId::canonical_bytes)`, so `(store_id, root)`
+  is not recoverable from it).
 - **The four DHT methods** `find_node` / `find_providers` / `add_provider` / `ping` (§7.5), dispatched
   to the content-location DHT, folding the mTLS-verified caller into the routing table.
 - **The four PEX messages** `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` (§7.7).
