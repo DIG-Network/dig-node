@@ -821,7 +821,9 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
   bring-up a standalone node with a DHT and the reshare warmer wired SPAWNS a self-driven precache loop.
   Each round: sample quorum-reconciled candidates from the 4a neighbourhood probe → resolve each
   sampled content-key to a self-verified `VerifiedCapsuleKey` (the two gates above) → score by relevance
-  under this node's context → select within the tier-0 sub-budget → fetch each selected store through
+  under this node's context (`RelevanceInputs.local_read_count` drives this tier-0 CANDIDATE selection
+  and is legitimately `0` for a speculative DHT-sampled candidate this node has never read) → select
+  within the tier-0 sub-budget → fetch each selected store through
   the SHARED `CapsuleWarmer` (byte-capped, chain-anchored, merkle-verified, cached tagged
   `Tier0Precache`, then announced as a holder). The loop is GOVERNED end to end and the following are
   NORMATIVE:

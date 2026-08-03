@@ -2835,36 +2835,9 @@ impl Node {
         &self.cache_dir
     }
 
-    /// The recorded inbound-demand count for a store (0 if none) — the peer-request count that feeds
-    /// [`RelevanceInputs::local_read_count`](crate::relevance::RelevanceInputs::local_read_count).
-    ///
-    /// This is the relevance-feed reader half of the inbound-demand ledger: the SIGNAL is recorded
-    /// live today (§7.10d), but the live scoring that CONSUMES it lands with the epic-#1934 cache-
-    /// wiring child, so the reader is currently exercised only by this crate's tests. `allow(dead_code)`
-    /// records that the API is deliberately ahead of its live consumer (the same shape as the pure,
-    /// not-yet-wired `relevance`/`tier0_selector` modules), not accidentally unused.
-    #[allow(dead_code)]
-    pub(crate) fn inbound_demand_count(&self, store_hex: &str) -> u32 {
-        self.inbound_demand.count(store_hex)
-    }
-
-    /// The tier a store is tagged with by inbound demand, if any — always
-    /// [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand) when present. Like
-    /// [`Node::inbound_demand_count`], the reader is ahead of its live eviction-precedence consumer
-    /// (epic #1934 cache-wiring child) and currently exercised only by tests.
-    #[allow(dead_code)]
-    pub(crate) fn inbound_demand_tier(
-        &self,
-        store_hex: &str,
-    ) -> Option<crate::relevance::CacheTier> {
-        self.inbound_demand.tier(store_hex)
-    }
-
     /// Distinct stores currently held in the inbound-demand ledger — the live `Tier1Demand`
-    /// occupancy figure `cache.stats` (#1991) reports. Real and load-bearing today (unlike
-    /// [`Node::inbound_demand_count`]/[`Node::inbound_demand_tier`] above, which await the
-    /// eviction-precedence consumer): it is the ledger's own bounded-LRU size (§7.10d), so it needs
-    /// no cache wiring to be an honest number.
+    /// occupancy figure `cache.stats` (#1991) reports. It is the ledger's own bounded-LRU size
+    /// (§7.10d), so it needs no cache wiring to be an honest number.
     pub(crate) fn inbound_demand_entry_count(&self) -> usize {
         self.inbound_demand.entry_count()
     }
@@ -3861,12 +3834,12 @@ mod tests {
         let (node, _td) = test_node(None);
         let store_hex = "ab".repeat(32);
         let root_hex = "cd".repeat(32);
-        assert_eq!(node.inbound_demand_count(&store_hex), 0, "undemanded → 0");
+        assert_eq!(node.inbound_demand.count(&store_hex), 0, "undemanded → 0");
         node.note_inbound_demand(&store_hex, &root_hex);
         node.note_inbound_demand(&store_hex, &root_hex);
-        assert_eq!(node.inbound_demand_count(&store_hex), 2, "two requests → 2");
+        assert_eq!(node.inbound_demand.count(&store_hex), 2, "two requests → 2");
         assert_eq!(
-            node.inbound_demand_tier(&store_hex),
+            node.inbound_demand.tier(&store_hex),
             Some(crate::relevance::CacheTier::Tier1Demand),
             "inbound demand tags Tier1Demand"
         );
@@ -3879,7 +3852,7 @@ mod tests {
     async fn inbound_demand_ignores_a_noncanonical_store() {
         let (node, _td) = test_node(None);
         node.note_inbound_demand("not-a-store", &"cd".repeat(32));
-        assert_eq!(node.inbound_demand_count("not-a-store"), 0);
+        assert_eq!(node.inbound_demand.count("not-a-store"), 0);
     }
 
     /// **Proves (#2013, #1990):** an inbound-DEMANDED module survives a size-cap eviction sweep that
@@ -3893,8 +3866,10 @@ mod tests {
     /// pass because tier beats mtime.
     /// **Catches:** a regression that stops stamping the demand tier into the cache entry, or sorts
     /// eviction by recency alone.
-    #[tokio::test]
-    async fn inbound_demanded_module_survives_tier0_eviction_sweep() {
+    #[test]
+    fn inbound_demanded_module_survives_tier0_eviction_sweep() {
+        // A plain `#[test]` (not `#[tokio::test]`) so `ENV_GUARD` — a std `Mutex` guarding the
+        // process-global `DIG_NODE_CACHE`/cap config — is never held across an `.await`.
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         let (node, _td) = test_node(None);
 
@@ -3922,7 +3897,7 @@ mod tests {
         filetime::set_file_mtime(&path_a, filetime::FileTime::from_unix_time(1_000, 0)).unwrap();
         filetime::set_file_mtime(&path_b, filetime::FileTime::from_unix_time(2_000, 0)).unwrap();
 
-        node.evict_modules_if_needed().await;
+        pin_test_rt().block_on(node.evict_modules_if_needed());
 
         assert!(
             path_a.exists(),
@@ -3960,7 +3935,7 @@ mod tests {
         );
         let (s, r) = (store.to_hex(), tip.to_hex());
         rt.block_on(async { node.note_inbound_demand(&s, &r) });
-        assert_eq!(node.inbound_demand_count(&s), 1, "demand is still recorded");
+        assert_eq!(node.inbound_demand.count(&s), 1, "demand is still recorded");
         let key = format!("{s}:{r}");
         assert!(
             !node.capsule_acquisition.is_warming(&key),
@@ -4033,7 +4008,7 @@ mod tests {
         let key = format!("{s}:{r}");
         let warming = node.capsule_acquisition.is_warming(&key);
         std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE");
-        assert_eq!(node.inbound_demand_count(&s), 1, "demand still recorded");
+        assert_eq!(node.inbound_demand.count(&s), 1, "demand still recorded");
         assert!(!warming, "an already-held store claims no backfill slot");
     }
 
@@ -4083,7 +4058,7 @@ mod tests {
         );
         rt.block_on(async { far_node.note_inbound_demand(&s, &r) });
         assert_eq!(
-            far_node.inbound_demand_count(&s),
+            far_node.inbound_demand.count(&s),
             1,
             "demand is still recorded regardless of proximity"
         );

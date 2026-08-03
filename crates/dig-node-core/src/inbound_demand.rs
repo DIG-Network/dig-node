@@ -9,16 +9,16 @@
 //!    This is what THIS node fetched — gated `ReadOrigin::Local` to stay amplification-safe.
 //! 2. **Inbound demand (this module, #1990).** A remote PEER asks US for a resource from a store —
 //!    direct evidence this node's neighbourhood WANTS that content. A peer's request is the demand
-//!    signal, so the demanded store is tagged `Tier1Demand`, its demand count feeds
-//!    [`relevance`](crate::relevance::relevance)'s local-demand term, and the tier gives it eviction
-//!    precedence over speculative `Tier0Precache`.
+//!    signal, so the demanded store is tagged `Tier1Demand` (via
+//!    [`Node::module_tier`](crate::Node)), which gives it eviction precedence over speculative
+//!    `Tier0Precache` — the KEEP mechanism the modules-cache sweep consults (#2013).
 //!
 //! # Why this ledger exists
 //! The on-disk LRU cache (see [`crate`] `DIG_NODE_CACHE_CAP`) keys entries by path and orders them by
 //! file mtime alone — it carries NO per-entry acquisition tier. This ledger is the FIRST live
 //! tier-tagging: a small, additive, in-memory map that records WHICH stores a peer has demanded and
 //! at what tier, WITHOUT touching the `.dig` format or the on-disk cache layout. It is the source the
-//! relevance demand term + the tier-based eviction precedence consult for peer-demanded stores.
+//! tier-based eviction precedence consults for peer-demanded stores.
 //! Process-lifetime (never persisted) — like the other §7.9 runtime counters, it resets each start.
 //!
 //! # Bounded against remote memory-exhaustion (load-bearing)
