@@ -265,11 +265,38 @@ pub fn full_nat_config(
     per_method_timeout: Duration,
     stun_server: Option<SocketAddr>,
 ) -> dig_nat::NatConfig {
+    nat_config_builder(per_method_timeout, stun_server).build()
+}
+
+/// [`full_nat_config`] narrowed to ONE tier of the ladder — the config the `control.peers.ping`
+/// diagnostic dials each rung with (dig_ecosystem#1985).
+///
+/// It shares [`full_nat_config`]'s builder rather than assembling its own, so the ping cannot drift
+/// into a parallel prober whose timeouts or STUN wiring differ from what the node really dials with.
+/// The ONLY difference is `enabled_methods`: restricting the ladder to a single rung is what turns
+/// "did we connect?" into "which tier connected?", since dig-nat otherwise walks the rungs itself and
+/// reports only the winner.
+pub fn single_tier_nat_config(
+    per_method_timeout: Duration,
+    stun_server: Option<SocketAddr>,
+    tier: dig_nat::TraversalKind,
+) -> dig_nat::NatConfig {
+    nat_config_builder(per_method_timeout, stun_server)
+        .enabled_methods(vec![tier])
+        .build()
+}
+
+/// The ONE builder both node NAT configs are made from, so a change to the shared dial parameters
+/// (the per-tier bound, the STUN wiring) cannot land on one and miss the other.
+fn nat_config_builder(
+    per_method_timeout: Duration,
+    stun_server: Option<SocketAddr>,
+) -> dig_nat::NatConfigBuilder {
     let mut builder = dig_nat::NatConfig::builder().per_method_timeout(per_method_timeout);
     if let Some(stun) = stun_server {
         builder = builder.stun_server(stun);
     }
-    builder.build()
+    builder
 }
 
 /// Extract the host from a relay endpoint URL so the node can derive the co-located STUN server

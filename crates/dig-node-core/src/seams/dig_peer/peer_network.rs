@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use crate::peer::PeerStatus;
+use crate::seams::dig_peer::ping::PeerPingContext;
 use crate::InventoryRefresher;
 use crate::Node;
 
@@ -40,6 +41,16 @@ pub trait PeerNetwork: Send + Sync {
     /// and before bring-up — callers degrade honestly (empty peer list; "no peer network" on connect).
     fn gossip_handle(&self) -> Option<&dig_gossip::GossipHandle>;
 
+    /// Retain the inputs `control.peers.ping` runs the connection ladder with (dig_ecosystem#1985) —
+    /// this node's mTLS identity, the shared NAT runtime, the network id, the STUN server. Installed
+    /// once by the standalone peer-network bring-up as soon as the NAT runtime exists; the FFI path
+    /// never does. Idempotent — a second install is ignored.
+    fn set_peer_ping_context(&self, ctx: Arc<PeerPingContext>);
+
+    /// The ping context, if the peer network is running. `None` on the FFI path and before bring-up,
+    /// where the ping verb answers "no peer network" instead of dialing with invented inputs.
+    fn peer_ping_context(&self) -> Option<&Arc<PeerPingContext>>;
+
     /// Refresh the node's DHT provider records against its current inventory, if a peer network is
     /// running (SPEC §14.1). A no-op on the FFI path (no hook installed) or before bring-up.
     async fn refresh_dht_inventory(&self);
@@ -61,6 +72,14 @@ impl PeerNetwork for Node {
 
     fn gossip_handle(&self) -> Option<&dig_gossip::GossipHandle> {
         self.gossip.get()
+    }
+
+    fn set_peer_ping_context(&self, ctx: Arc<PeerPingContext>) {
+        let _ = self.peer_ping.set(ctx);
+    }
+
+    fn peer_ping_context(&self) -> Option<&Arc<PeerPingContext>> {
+        self.peer_ping.get()
     }
 
     async fn refresh_dht_inventory(&self) {

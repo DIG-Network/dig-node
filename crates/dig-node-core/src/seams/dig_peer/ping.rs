@@ -19,9 +19,9 @@
 //!
 //! **It is read-only.** Each tier is a bare `dig-nat` dial that is dropped as soon as it is graded:
 //! it joins no pool, announces nothing, writes nothing, and leaves no relay reservation behind — a
-//! diagnostic that mutates network state is not a diagnostic. It reuses the SAME
-//! [`crate::net::full_nat_config`] every other node dial is built from, narrowed to one tier at a
-//! time, so what it reports is what the real dialer does rather than a parallel prober that could
+//! diagnostic that mutates network state is not a diagnostic. It dials from the SAME config builder
+//! [`crate::net::full_nat_config`] uses ([`crate::net::single_tier_nat_config`]), narrowed to one tier
+//! at a time, so what it reports is what the real dialer does rather than a parallel prober that could
 //! drift away from it.
 
 use std::net::SocketAddr;
@@ -215,7 +215,11 @@ pub struct DialedPeer {
 #[async_trait]
 pub trait TierDialer: Send + Sync {
     /// Dial `target` with ONLY `tier` enabled. `Err` carries dig-nat's failure text verbatim.
-    async fn dial_tier(&self, tier: TraversalKind, target: &PeerTarget) -> Result<DialedPeer, String>;
+    async fn dial_tier(
+        &self,
+        tier: TraversalKind,
+        target: &PeerTarget,
+    ) -> Result<DialedPeer, String>;
 }
 
 /// Run every tier of the ladder against `target` and report each one.
@@ -270,6 +274,7 @@ pub struct PeerPingContext {
     network_id: String,
     stun_server: Option<SocketAddr>,
     per_tier_timeout: Duration,
+    gate: PingGate,
 }
 
 impl PeerPingContext {
@@ -286,6 +291,7 @@ impl PeerPingContext {
             network_id: network_id.into(),
             stun_server,
             per_tier_timeout,
+            gate: PingGate::default(),
         }
     }
 
@@ -300,10 +306,135 @@ impl PeerPingContext {
     }
 }
 
+// -- Anti-amplification gate -------------------------------------------------------------------
+//
+// A ping takes a caller-supplied address and makes this node dial it. That is a request-forgery
+// shape: unbounded, it would turn the node's control surface into a dialer anyone local could point
+// at a third party (#1985). The gate lives HERE, on the context every ping must go through, rather
+// than in the control shell — so a second caller (the CLI, the app, a future `dign` verb) cannot
+// reach the dialer without it.
+
+/// How many ladder runs this node will START inside [`PING_RATE_WINDOW`].
+///
+/// A ladder is a slow operation, so the START rate is what needs bounding: a target that refuses
+/// every tier instantly would otherwise let a caller loop dials as fast as the OS can refuse them.
+pub const MAX_PINGS_PER_WINDOW: u32 = 6;
+
+/// The fixed window [`MAX_PINGS_PER_WINDOW`] is counted over.
+pub const PING_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Why a ping was refused BEFORE any dial was made — distinct from a ladder that ran and found
+/// nothing, which is a diagnostic answer and reported as one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingRefused {
+    /// A ladder is already running on this node. Single-flight is the hard load bound: however many
+    /// callers ask, this surface never has more than one ladder's worth of dials outstanding.
+    InFlight,
+    /// The start-rate bound is exhausted; `retry_after` is when the current window closes.
+    RateLimited { retry_after: Duration },
+}
+
+impl PingRefused {
+    /// A one-line reason for the caller, naming the bound rather than just refusing.
+    pub fn summary(&self) -> String {
+        match self {
+            PingRefused::InFlight => {
+                "a peer ping is already running on this node; only one runs at a time".to_string()
+            }
+            PingRefused::RateLimited { retry_after } => format!(
+                "peer-ping rate limit reached ({MAX_PINGS_PER_WINDOW} per {}s); retry in {}s",
+                PING_RATE_WINDOW.as_secs(),
+                retry_after.as_secs() + 1
+            ),
+        }
+    }
+}
+
+/// Single-flight plus a fixed-window start bound on ladder runs.
+#[derive(Debug, Default)]
+struct PingGate {
+    running: std::sync::atomic::AtomicBool,
+    window: std::sync::Mutex<StartWindow>,
+}
+
+/// The fixed counting window: how many ladders started since `opened_at`. `None` means no window is
+/// open yet, so the first start opens one.
+#[derive(Debug, Default)]
+struct StartWindow {
+    opened_at: Option<std::time::Instant>,
+    starts: u32,
+}
+
+/// Holds the single-flight claim for the duration of one ladder; releases it on drop, so an early
+/// return or a panic mid-ladder cannot wedge the surface closed for the rest of the process.
+struct PingLease<'a> {
+    gate: &'a PingGate,
+}
+
+impl Drop for PingLease<'_> {
+    fn drop(&mut self) {
+        self.gate
+            .running
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl PingGate {
+    /// Claim the right to run ONE ladder, or say why not.
+    ///
+    /// The rate window is charged only AFTER the single-flight claim succeeds, so a caller that is
+    /// merely too eager (a second concurrent request) does not also burn its window budget.
+    fn try_enter(&self, now: std::time::Instant) -> Result<PingLease<'_>, PingRefused> {
+        use std::sync::atomic::Ordering;
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(PingRefused::InFlight);
+        }
+        let lease = PingLease { gate: self };
+        // A poisoned lock (a panic while held) must not wedge the diagnostic shut; the guard's
+        // accounting is fully re-derived from `now` below.
+        let mut window = self
+            .window
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match admit(&mut window, now) {
+            Ok(()) => {
+                drop(window);
+                Ok(lease)
+            }
+            // `lease` drops here, releasing the single-flight claim the refusal never used.
+            Err(retry_after) => Err(PingRefused::RateLimited { retry_after }),
+        }
+    }
+}
+
+/// Charge one start against the fixed window, opening a fresh window when the old one has elapsed.
+/// `Err(retry_after)` is how long until the current window closes. PURE (given `window` + `now`).
+fn admit(window: &mut StartWindow, now: std::time::Instant) -> Result<(), Duration> {
+    let opened_at = match window.opened_at {
+        // The window has elapsed (or none was ever opened): start counting again from now.
+        Some(opened) if now.duration_since(opened) < PING_RATE_WINDOW => opened,
+        _ => {
+            window.opened_at = Some(now);
+            window.starts = 0;
+            now
+        }
+    };
+    if window.starts >= MAX_PINGS_PER_WINDOW {
+        return Err(PING_RATE_WINDOW.saturating_sub(now.duration_since(opened_at)));
+    }
+    window.starts += 1;
+    Ok(())
+}
+
 /// The production [`TierDialer`]: one tier of the REAL `dig-nat` ladder per attempt.
 ///
-/// It builds [`crate::net::full_nat_config`] — the one shared config constructor SPEC §19.1 requires
-/// every dial site to use — and narrows `enabled_methods` to the single tier under test. So each
+/// It dials via [`crate::net::single_tier_nat_config`], which shares its builder with
+/// [`crate::net::full_nat_config`] — the one config constructor SPEC §19.1 requires every node dial
+/// site to use — differing ONLY in narrowing `enabled_methods` to the single tier under test. So each
 /// attempt is the genuine dialer restricted to one rung, not a reimplementation that could disagree
 /// with what the node actually does when it connects to a peer.
 pub struct NatTierDialer<'a> {
@@ -323,22 +454,16 @@ impl TierDialer for NatTierDialer<'_> {
         tier: TraversalKind,
         target: &PeerTarget,
     ) -> Result<DialedPeer, String> {
-        let config = dig_nat::NatConfig::builder()
-            .per_method_timeout(self.ctx.per_tier_timeout)
-            .enabled_methods(vec![tier]);
-        let config = match self.ctx.stun_server {
-            Some(stun) => config.stun_server(stun).build(),
-            None => config.build(),
-        };
+        let config = crate::net::single_tier_nat_config(
+            self.ctx.per_tier_timeout,
+            self.ctx.stun_server,
+            tier,
+        );
 
-        let conn = dig_nat::connect_with_runtime(
-            target,
-            &self.ctx.identity,
-            &config,
-            &self.ctx.runtime,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let conn =
+            dig_nat::connect_with_runtime(target, &self.ctx.identity, &config, &self.ctx.runtime)
+                .await
+                .map_err(|e| e.to_string())?;
 
         let dialed = DialedPeer {
             observed_peer_id: conn.peer_id.to_hex(),
@@ -420,6 +545,21 @@ pub fn resolve_target(
     TargetResolution::Unparseable
 }
 
+/// The node's view of who is where, as [`resolve_target`] wants it: `(peer_id_hex, addr)` for every
+/// peer in the live connected pool.
+///
+/// This is the ONLY source a ping resolves a bare address against. The connected pool is the set of
+/// identities this node has already authenticated over mTLS, so an address it names has a `peer_id`
+/// the certificate actually proved — never a guess, and never an attacker-supplied claim about who
+/// lives at an address.
+pub fn known_peers(handle: &dig_gossip::GossipHandle) -> Vec<(String, SocketAddr)> {
+    handle
+        .connected_pool_peers()
+        .into_iter()
+        .map(|(peer_id, addr, _outbound)| (hex::encode(peer_id), addr))
+        .collect()
+}
+
 /// Whether `s` is a canonical 64-hex `peer_id`.
 fn is_peer_id(s: &str) -> bool {
     s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
@@ -496,53 +636,63 @@ fn tier_json(report: &TierReport) -> Value {
 /// Run a full ping: resolve `peer`, walk the ladder, grade it, and return the report JSON.
 ///
 /// `known` is `(peer_id_hex, addr)` for every peer this node can currently name. A resolution
-/// failure is reported as a result with an `error` severity, never as a transport error: "I could
-/// not work out what to dial" is a diagnostic answer, and the caller asked a diagnostic question.
+/// failure is reported as an `Ok` result with an `error` severity, never as a refusal: "I could not
+/// work out what to dial" is a diagnostic answer, and the caller asked a diagnostic question. `Err`
+/// is reserved for a ping that was never allowed to dial at all ([`PingRefused`]).
+///
+/// Resolution runs BEFORE the gate is claimed, so an unparseable argument costs no rate budget and
+/// cannot lock out a caller who then types a real one.
 pub async fn ping_peer(
     ctx: &PeerPingContext,
     peer: &str,
     explicit_peer_id: Option<&str>,
     known: &[(String, SocketAddr)],
     deadline: Duration,
-) -> Value {
-    let (peer_id, addrs) = match resolve_target(peer, explicit_peer_id, known) {
-        TargetResolution::Resolved { peer_id, addrs } => (peer_id, addrs),
-        TargetResolution::NoKnownAddress { peer_id } => {
-            return unresolved_json(
+) -> Result<Value, PingRefused> {
+    let (peer_id, addrs) =
+        match resolve_target(peer, explicit_peer_id, known) {
+            TargetResolution::Resolved { peer_id, addrs } => (peer_id, addrs),
+            TargetResolution::NoKnownAddress { peer_id } => return Ok(unresolved_json(
                 peer,
                 Some(&peer_id),
                 "this node knows no address for that peer_id — dial it by address, or wait for \
                  discovery to fold it into the connected pool",
-            )
-        }
-        TargetResolution::IdentityRequired { addr } => {
-            return unresolved_json(
-                peer,
-                None,
-                &format!(
+            )),
+            TargetResolution::IdentityRequired { addr } => {
+                return Ok(unresolved_json(
+                    peer,
+                    None,
+                    &format!(
                     "no peer_id is known for {addr}; supply peer_id so the mTLS certificate can be \
                      verified — an identity-less dial could only report whether a port is open, \
                      which is not a peer connection"
                 ),
-            )
-        }
-        TargetResolution::Unparseable => {
-            return unresolved_json(
-                peer,
-                None,
-                "not a dialable address (host:port, IPv6 in brackets) nor a 64-hex peer_id",
-            )
-        }
-    };
+                ))
+            }
+            TargetResolution::Unparseable => {
+                return Ok(unresolved_json(
+                    peer,
+                    None,
+                    "not a dialable address (host:port, IPv6 in brackets) nor a 64-hex peer_id",
+                ))
+            }
+        };
 
     let Some(target) = peer_target(&peer_id, &addrs, ctx.network_id()) else {
-        return unresolved_json(peer, Some(&peer_id), "peer_id is not valid 64-hex");
+        return Ok(unresolved_json(
+            peer,
+            Some(&peer_id),
+            "peer_id is not valid 64-hex",
+        ));
     };
+
+    // Held for the whole ladder; released on drop however this returns.
+    let _lease = ctx.gate.try_enter(std::time::Instant::now())?;
 
     let dialer = NatTierDialer::new(ctx);
     let tiers = run_ladder(&dialer, &target, deadline).await;
     let verdict = verdict(Some(&peer_id), &tiers);
-    report_json(peer, Some(&peer_id), &tiers, &verdict)
+    Ok(report_json(peer, Some(&peer_id), &tiers, &verdict))
 }
 
 /// The result shape for a ping that never got as far as dialing.
@@ -661,7 +811,11 @@ mod tests {
             connected(TraversalKind::Relayed, PEER_A, "10.0.0.5:9444"),
         ];
         let v = verdict(Some(PEER_A), &tiers);
-        assert_ne!(v.severity(), "error", "a NAT'd peer is normal, not an error");
+        assert_ne!(
+            v.severity(),
+            "error",
+            "a NAT'd peer is normal, not an error"
+        );
         let summary = v.summary().to_lowercase();
         assert!(
             summary.contains("normal") && summary.contains("nat"),
@@ -965,7 +1119,11 @@ mod tests {
             per_tier: Duration::from_secs(5),
         };
         let reports = run_ladder(&dialer, &test_target(), Duration::from_secs(11)).await;
-        assert_eq!(reports.len(), ladder_tiers().len(), "every rung is accounted for");
+        assert_eq!(
+            reports.len(),
+            ladder_tiers().len(),
+            "every rung is accounted for"
+        );
         let skipped = reports
             .iter()
             .filter(|r| matches!(r.outcome, TierOutcome::Skipped { .. }))
@@ -974,5 +1132,109 @@ mod tests {
             skipped > 0,
             "an 11s deadline over 5s-per-tier attempts must skip the tail, got {reports:#?}"
         );
+    }
+
+    // -- The anti-amplification gate (#1985: "it must not become an amplifier") ------------------
+
+    /// **Proves:** only ONE ladder runs at a time. Single-flight is the hard load bound: however
+    /// many callers ask at once, the node never has more than one ladder's worth of dials out.
+    ///
+    /// **Catches:** removing the `compare_exchange` claim, which would let N concurrent control
+    /// calls turn the node into an N-way dialer pointed at a caller-chosen address.
+    #[test]
+    fn only_one_ladder_may_run_at_a_time() {
+        let gate = PingGate::default();
+        let now = std::time::Instant::now();
+        let first = gate.try_enter(now).expect("the first ladder is admitted");
+        assert_eq!(
+            gate.try_enter(now).err(),
+            Some(PingRefused::InFlight),
+            "a second concurrent ladder is refused while the first holds the claim"
+        );
+        drop(first);
+        assert!(
+            gate.try_enter(now).is_ok(),
+            "the claim is released on drop, so the next caller gets in"
+        );
+    }
+
+    /// **Proves:** a refused-because-in-flight call does NOT spend rate budget.
+    ///
+    /// **Catches:** charging the window before the single-flight claim, which would let a caller
+    /// exhaust the whole minute's budget with concurrent calls that never dialed anything.
+    #[test]
+    fn a_concurrent_refusal_costs_no_rate_budget() {
+        let gate = PingGate::default();
+        let now = std::time::Instant::now();
+        let held = gate.try_enter(now).expect("first admitted");
+        for _ in 0..50 {
+            assert_eq!(gate.try_enter(now).err(), Some(PingRefused::InFlight));
+        }
+        drop(held);
+        // One start has been charged so far; the remaining budget must be untouched by the 50
+        // concurrent refusals above.
+        for i in 1..MAX_PINGS_PER_WINDOW {
+            assert!(
+                gate.try_enter(now).is_ok(),
+                "start {i} must still be within the window budget"
+            );
+        }
+    }
+
+    /// **Proves:** the START rate is bounded — after [`MAX_PINGS_PER_WINDOW`] ladders the gate
+    /// refuses and names when to retry.
+    ///
+    /// **Catches:** an unbounded loop of instantly-refusing dials (every tier `ECONNREFUSED`
+    /// returns in microseconds, so single-flight alone would not bound the dial rate).
+    #[test]
+    fn the_start_rate_is_bounded_within_the_window() {
+        let gate = PingGate::default();
+        let start = std::time::Instant::now();
+        for i in 0..MAX_PINGS_PER_WINDOW {
+            assert!(gate.try_enter(start).is_ok(), "start {i} is within budget");
+        }
+        match gate.try_enter(start + Duration::from_secs(1)).err() {
+            Some(PingRefused::RateLimited { retry_after }) => assert!(
+                retry_after <= PING_RATE_WINDOW && retry_after > Duration::ZERO,
+                "retry_after must name a real wait inside the window, got {retry_after:?}"
+            ),
+            other => panic!(
+                "the {}th start must be rate-limited, got {other:?}",
+                MAX_PINGS_PER_WINDOW + 1
+            ),
+        }
+    }
+
+    /// **Proves:** the budget replenishes — a caller that waits out the window is admitted again.
+    ///
+    /// **Catches:** a window that never reopens, which would make the diagnostic a one-shot per
+    /// process and push operators back to hand-probing ports.
+    #[test]
+    fn the_window_reopens_once_it_has_elapsed() {
+        let gate = PingGate::default();
+        let start = std::time::Instant::now();
+        for _ in 0..MAX_PINGS_PER_WINDOW {
+            gate.try_enter(start).expect("within budget");
+        }
+        assert!(gate.try_enter(start).is_err(), "budget spent");
+        assert!(
+            gate.try_enter(start + PING_RATE_WINDOW).is_ok(),
+            "a fresh window admits again"
+        );
+    }
+
+    /// **Proves:** the refusal explains itself — which bound was hit, and what to do about it.
+    ///
+    /// **Catches:** a bare "rate limited" with no numbers, which sends the operator to the source
+    /// to find out how long to wait.
+    #[test]
+    fn a_refusal_names_the_bound_it_hit() {
+        assert!(PingRefused::InFlight.summary().contains("already running"));
+        let limited = PingRefused::RateLimited {
+            retry_after: Duration::from_secs(12),
+        }
+        .summary();
+        assert!(limited.contains(&MAX_PINGS_PER_WINDOW.to_string()));
+        assert!(limited.contains("13s"), "rounds the wait up: {limited}");
     }
 }

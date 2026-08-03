@@ -2370,6 +2370,22 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         relayed_dialer,
     ));
 
+    // Hand the CONTROL surface everything `control.peers.ping` needs to walk the connection ladder
+    // against one peer (dig_ecosystem#1985). It is installed HERE, the moment the NAT runtime exists,
+    // rather than assembled on demand: a diagnostic that built its own dialer inputs could disagree
+    // with the ones the node really dials with, and then it would be measuring a different ladder
+    // than the one operators are asking about. The relayed rung in particular only works because this
+    // is the SAME runtime that holds the live relay reservation.
+    node.set_peer_ping_context(Arc::new(
+        crate::seams::dig_peer::ping::PeerPingContext::new(
+            identity.clone(),
+            nat_runtime.clone(),
+            network_id_str.clone(),
+            stun_server,
+            crate::dht::default_rpc_timeout(),
+        ),
+    ));
+
     // The durable, IPv6-first peer address book (#381): every PEX-learned + otherwise-learned candidate
     // accumulates here (incl. relay-only hints) instead of being dial-and-dropped, seeding future dials.
     // The selector-driven dial ranker (#384) is wired below once the content engine (the shared

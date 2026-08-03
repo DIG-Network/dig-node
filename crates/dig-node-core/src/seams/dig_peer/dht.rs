@@ -433,7 +433,7 @@ pub async fn announce_inventory_ids(
             async move {
                 let _ = dht.announce_provider(id).await;
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % stride == 0 && n != total {
+                if n.is_multiple_of(stride) && n != total {
                     println!(
                         "dig-node peer network: DHT announced {n} of {total} content id(s) ({:.0}s elapsed)",
                         started.elapsed().as_secs_f64()
@@ -466,10 +466,21 @@ pub async fn announce_inventory(dht: &DhtService, cached: &[CachedCapsule]) -> u
 ///
 /// Call it AFTER the live pool→routing feed is installed, so each announce runs against a routing
 /// table that is filling rather than the empty one bootstrap leaves behind.
+///
+/// The body is wrapped in [`catch_iteration`](crate::shared::catch_iteration) for the same reason
+/// #2067 wraps the long-lived loops: a panic inside a detached `tokio::spawn` is swallowed with the
+/// dropped `JoinHandle` and logs NOTHING, so this node would silently never publish its inventory for
+/// the rest of the process — the exact class of invisible failure moving the announce off the
+/// bring-up path was meant to end. The guarded future carries only owned `Arc` handles whose locks are
+/// taken and released inside each awaited call, never held across the catch boundary, so asserting its
+/// unwind-safety is sound.
 pub fn spawn_initial_inventory_announce(handle: Arc<DhtHandle>) {
     tokio::spawn(async move {
-        let ids = handle.announced_ids().await;
-        announce_inventory_ids(handle.service(), &ids, INITIAL_ANNOUNCE_CONCURRENCY).await;
+        let _ = crate::shared::catch_iteration("initial_inventory_announce", async move {
+            let ids = handle.announced_ids().await;
+            announce_inventory_ids(handle.service(), &ids, INITIAL_ANNOUNCE_CONCURRENCY).await;
+        })
+        .await;
     });
 }
 
@@ -854,7 +865,11 @@ mod tests {
     async fn the_initial_inventory_announce_runs_concurrently_not_one_id_at_a_time() {
         let service = slow_service(Duration::from_secs(5), 3).await;
         let ids = inventory_ids(34); // 34 stores x 1 capsule each = 68 content ids, as on rpc.dig.net
-        assert_eq!(ids.len(), 68, "34 single-capsule stores announce 68 content ids");
+        assert_eq!(
+            ids.len(),
+            68,
+            "34 single-capsule stores announce 68 content ids"
+        );
 
         // Calibrate: what does ONE announce cost against this transport?
         let t0 = tokio::time::Instant::now();

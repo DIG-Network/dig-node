@@ -64,6 +64,9 @@ pub mod meta;
 pub mod open;
 pub mod pair;
 pub mod pairing;
+/// `control.peers.ping` (dig_ecosystem#1985): the connection-ladder diagnostic — dial one peer a
+/// tier at a time and report WHICH tier reached it. See [`peer_ping`].
+pub mod peer_ping;
 /// `dig-node peers` (#559): view + manage the node's peer connections from the CLI — parity with
 /// the extension's peer surface, driven over the token-gated `control.*` client. See [`peers`].
 pub mod peers;

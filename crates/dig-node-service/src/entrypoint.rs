@@ -294,6 +294,16 @@ enum PeersCommand {
         /// The peer address or peer_id to dial.
         peer: String,
     },
+    /// Test each tier of the connection ladder against a peer and report which one works.
+    Ping {
+        /// The peer to test: a 64-hex peer_id, or a dialable address (`host:port`, IPv6 bracketed).
+        peer: String,
+        /// Pin the peer_id the presented certificate must derive. Required when testing an address
+        /// this node does not already know an identity for — an identity-less dial could only say
+        /// whether a port is open, which is not a peer connection.
+        #[arg(long)]
+        peer_id: Option<String>,
+    },
     /// Drop a connected peer.
     Disconnect {
         /// The peer address or peer_id to drop.
@@ -549,6 +559,7 @@ fn peers_action(cmd: Option<PeersCommand>) -> std::io::Result<PeersAction> {
     Ok(match cmd {
         None | Some(PeersCommand::List) => PeersAction::List,
         Some(PeersCommand::Connect { peer }) => PeersAction::Connect { peer },
+        Some(PeersCommand::Ping { peer, peer_id }) => PeersAction::Ping { peer, peer_id },
         Some(PeersCommand::Disconnect { peer }) => PeersAction::Disconnect { peer },
         Some(PeersCommand::Ban { peer, state }) => {
             let state = BanState::parse(&state)
