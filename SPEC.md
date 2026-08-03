@@ -1361,6 +1361,7 @@ or whether the certificate binds the identity asked for.
     { "tier": "direct", "result": "connected", "remote_addr": "[2001:db8::1]:9444",
       "family": "ipv6", "observed_peer_id": "<64-hex>", "elapsed_ms": 41 },
     { "tier": "hole-punch", "result": "failed", "reason": "<dig-nat's own text>", "elapsed_ms": 5000 },
+    { "tier": "upnp", "result": "unavailable", "reason": "<the local precondition that is missing>" },
     { "tier": "relayed", "result": "skipped", "reason": "overall deadline of 45s reached first" }
   ]
 }
@@ -1375,6 +1376,13 @@ visible as the §5.2 finding it is.
 - **Report the LADDER, not the winner.** Every rung MUST appear. A rung the deadline pre-empted is
   reported `skipped` with a reason, never dropped. Probing MUST NOT stop at the first success:
   "relayed succeeded" is only actionable next to "direct failed, and why".
+- **"Not configured here" is NOT "failed there".** A tier the node cannot compose at all — UPnP with
+  no local port mapping, NAT-PMP/PCP with no IPv4 gateway, hole-punch with no reflexive address or
+  coordinator, relayed with no reservation — MUST be reported `unavailable`, with a reason naming the
+  missing LOCAL precondition, and MUST NOT carry an `elapsed_ms` (nothing was dialed). On an ordinary
+  node several rungs compose to nothing, so reporting them as failures would blame the peer for this
+  node's configuration and show a healthy result as several red rows. `unavailable` never changes the
+  verdict, which is decided only by what CONNECTED.
 - **Identity outranks reachability.** When `peer_id` is known or pinned, a rung that connects to a
   certificate deriving a DIFFERENT `peer_id` MUST grade `identity-mismatch` / `severity: "error"`,
   regardless of how well it connected. An explicit `peer_id` param always wins over what the node

@@ -131,6 +131,8 @@ fn format_rung(rung: &Value) -> String {
             "{tier:<11} failed     {}",
             rung["reason"].as_str().unwrap_or("(no reason)")
         ),
+        // `unavailable` and `skipped` both mean "nothing was dialed", so neither claims a duration;
+        // the reason carries whether the gap is this node's configuration or the run's deadline.
         other => format!(
             "{tier:<11} {other:<10} {}",
             rung["reason"].as_str().unwrap_or("")

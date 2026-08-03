@@ -74,6 +74,14 @@ pub enum TierOutcome {
     },
     /// The tier was attempted and did not connect. `reason` is dig-nat's own failure text.
     Failed { reason: String, elapsed_ms: u64 },
+    /// The tier is not composable on THIS node, so nothing was dialed — a missing LOCAL
+    /// precondition, not a statement about the peer.
+    ///
+    /// Distinct from [`Failed`](Self::Failed) on purpose. Most nodes have no IGD gateway, no IPv4
+    /// gateway, or no hole-punch coordinator, so those rungs cannot be composed at all; rendering
+    /// them as failures would put four red rows in front of a user whose peer is perfectly
+    /// reachable, and #1985 exists precisely so the output does not read as breakage.
+    Unavailable { reason: String },
     /// The tier was not attempted at all (the overall deadline elapsed first).
     Skipped { reason: String },
 }
@@ -207,6 +215,15 @@ pub struct DialedPeer {
     pub remote_addr: SocketAddr,
 }
 
+/// Why a single-tier dial produced no connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TierFailure {
+    /// The tier ran and did not reach the peer; the string is dig-nat's own failure text.
+    Failed(String),
+    /// The tier could not be composed on this node at all, so nothing was dialed.
+    Unavailable(String),
+}
+
 /// Attempt exactly ONE tier of the ladder.
 ///
 /// The seam exists so [`run_ladder`]'s grading is testable without a network; the production
@@ -214,12 +231,12 @@ pub struct DialedPeer {
 /// every other node dial goes through.
 #[async_trait]
 pub trait TierDialer: Send + Sync {
-    /// Dial `target` with ONLY `tier` enabled. `Err` carries dig-nat's failure text verbatim.
+    /// Dial `target` with ONLY `tier` enabled.
     async fn dial_tier(
         &self,
         tier: TraversalKind,
         target: &PeerTarget,
-    ) -> Result<DialedPeer, String>;
+    ) -> Result<DialedPeer, TierFailure>;
 }
 
 /// Run every tier of the ladder against `target` and report each one.
@@ -251,10 +268,13 @@ pub async fn run_ladder(
                 observed_peer_id: peer.observed_peer_id,
                 elapsed_ms: tier_started.elapsed().as_millis() as u64,
             },
-            Err(reason) => TierOutcome::Failed {
+            Err(TierFailure::Failed(reason)) => TierOutcome::Failed {
                 reason,
                 elapsed_ms: tier_started.elapsed().as_millis() as u64,
             },
+            // No elapsed time is reported: nothing was dialed, so a duration would imply an attempt
+            // that never happened.
+            Err(TierFailure::Unavailable(reason)) => TierOutcome::Unavailable { reason },
         };
         reports.push(TierReport { tier, outcome });
     }
@@ -458,7 +478,7 @@ impl TierDialer for NatTierDialer<'_> {
         &self,
         tier: TraversalKind,
         target: &PeerTarget,
-    ) -> Result<DialedPeer, String> {
+    ) -> Result<DialedPeer, TierFailure> {
         let config = crate::net::single_tier_nat_config(
             self.ctx.per_tier_timeout,
             self.ctx.stun_server,
@@ -468,7 +488,7 @@ impl TierDialer for NatTierDialer<'_> {
         let conn =
             dig_nat::connect_with_runtime(target, &self.ctx.identity, &config, &self.ctx.runtime)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| classify_dial_error(tier, e))?;
 
         let dialed = DialedPeer {
             observed_peer_id: conn.peer_id.to_hex(),
@@ -478,6 +498,25 @@ impl TierDialer for NatTierDialer<'_> {
         // behind — no pooled session, no held relay circuit (#1985).
         drop(conn);
         Ok(dialed)
+    }
+}
+
+/// Separate "this node cannot even compose that tier" from "that tier ran and did not reach the peer".
+///
+/// dig-nat composes a tier only when its LOCAL preconditions exist — UPnP needs a local port, NAT-PMP
+/// and PCP need an IPv4 gateway, hole-punch needs a STUN-discovered reflexive address plus a relay
+/// coordinator, relayed needs a held reservation — and returns `NoMethodsEnabled` when the single tier
+/// under test composes to nothing. Reporting that as a failure would put four red rows in front of a
+/// user whose peer is perfectly reachable and blame the peer for this node's own configuration.
+fn classify_dial_error(tier: TraversalKind, error: dig_nat::NatError) -> TierFailure {
+    match error {
+        dig_nat::NatError::NoMethodsEnabled => TierFailure::Unavailable(format!(
+            "the {} tier is not configured on this node, so nothing was dialed \
+             (it needs a local port mapping, an IPv4 gateway, a reflexive address, or a relay \
+             reservation, depending on the tier) — this says nothing about the peer",
+            tier_name(tier)
+        )),
+        other => TierFailure::Failed(other.to_string()),
     }
 }
 
@@ -629,6 +668,11 @@ fn tier_json(report: &TierReport) -> Value {
             "result": "failed",
             "reason": reason,
             "elapsed_ms": elapsed_ms,
+        }),
+        TierOutcome::Unavailable { reason } => json!({
+            "tier": tier_name(report.tier),
+            "result": "unavailable",
+            "reason": reason,
         }),
         TierOutcome::Skipped { reason } => json!({
             "tier": tier_name(report.tier),
@@ -1053,9 +1097,27 @@ mod tests {
     /// A dialer that answers from a scripted per-tier table.
     struct ScriptedDialer {
         connect_on: Vec<TraversalKind>,
+        /// Tiers this node cannot compose at all — dialed nothing, so they must not read as failures.
+        unconfigured: Vec<TraversalKind>,
         peer_id: String,
         /// How long each attempt "takes", so the deadline path is exercisable.
         per_tier: Duration,
+    }
+
+    impl ScriptedDialer {
+        /// A dialer that connects on `connect_on` and reports every other tier as a real failure.
+        fn connecting_on(
+            connect_on: Vec<TraversalKind>,
+            peer_id: &str,
+            per_tier: Duration,
+        ) -> Self {
+            ScriptedDialer {
+                connect_on,
+                unconfigured: Vec::new(),
+                peer_id: peer_id.to_string(),
+                per_tier,
+            }
+        }
     }
 
     #[async_trait]
@@ -1064,7 +1126,14 @@ mod tests {
             &self,
             tier: TraversalKind,
             _target: &PeerTarget,
-        ) -> Result<DialedPeer, String> {
+        ) -> Result<DialedPeer, TierFailure> {
+            if self.unconfigured.contains(&tier) {
+                // No sleep: an uncomposable tier dials nothing, so it costs no time.
+                return Err(TierFailure::Unavailable(format!(
+                    "{} is not configured on this node",
+                    tier_name(tier)
+                )));
+            }
             tokio::time::sleep(self.per_tier).await;
             if self.connect_on.contains(&tier) {
                 Ok(DialedPeer {
@@ -1072,7 +1141,10 @@ mod tests {
                     remote_addr: addr("[2001:db8::1]:9444"),
                 })
             } else {
-                Err(format!("{} unavailable", tier_name(tier)))
+                Err(TierFailure::Failed(format!(
+                    "{} could not reach the peer",
+                    tier_name(tier)
+                )))
             }
         }
     }
@@ -1092,11 +1164,11 @@ mod tests {
     /// answer "was it relayed when direct would have worked?", the question #1929 needed.
     #[tokio::test(start_paused = true)]
     async fn every_tier_is_probed_even_after_one_succeeds() {
-        let dialer = ScriptedDialer {
-            connect_on: vec![TraversalKind::Direct, TraversalKind::Relayed],
-            peer_id: PEER_A.to_string(),
-            per_tier: Duration::from_millis(10),
-        };
+        let dialer = ScriptedDialer::connecting_on(
+            vec![TraversalKind::Direct, TraversalKind::Relayed],
+            PEER_A,
+            Duration::from_millis(10),
+        );
         let reports = run_ladder(&dialer, &test_target(), Duration::from_secs(60)).await;
         assert_eq!(
             reports.len(),
@@ -1118,11 +1190,7 @@ mod tests {
     /// to hang the caller.
     #[tokio::test(start_paused = true)]
     async fn the_run_is_bounded_and_says_which_tiers_it_skipped() {
-        let dialer = ScriptedDialer {
-            connect_on: vec![],
-            peer_id: PEER_A.to_string(),
-            per_tier: Duration::from_secs(5),
-        };
+        let dialer = ScriptedDialer::connecting_on(vec![], PEER_A, Duration::from_secs(5));
         let reports = run_ladder(&dialer, &test_target(), Duration::from_secs(11)).await;
         assert_eq!(
             reports.len(),
@@ -1136,6 +1204,83 @@ mod tests {
         assert!(
             skipped > 0,
             "an 11s deadline over 5s-per-tier attempts must skip the tail, got {reports:#?}"
+        );
+    }
+
+    /// **Proves:** a tier this node cannot COMPOSE reads as `unavailable`, not `failed`, and says
+    /// the missing precondition is local rather than blaming the peer.
+    ///
+    /// **Catches:** collapsing "not configured here" into "tried and failed there". dig-nat composes
+    /// UPnP only with a local port, NAT-PMP/PCP only with an IPv4 gateway, hole-punch only with a
+    /// reflexive address + coordinator — so on an ordinary node four rungs compose to nothing. Marking
+    /// them failed puts four red rows in front of a user whose peer is perfectly reachable, which is
+    /// the "reads as the network is broken" outcome #1985 explicitly forbids.
+    #[tokio::test(start_paused = true)]
+    async fn a_tier_this_node_cannot_compose_reads_as_unavailable_not_failed() {
+        let dialer = ScriptedDialer {
+            connect_on: vec![TraversalKind::Relayed],
+            unconfigured: vec![
+                TraversalKind::Upnp,
+                TraversalKind::NatPmp,
+                TraversalKind::Pcp,
+            ],
+            peer_id: PEER_A.to_string(),
+            per_tier: Duration::from_millis(10),
+        };
+        let reports = run_ladder(&dialer, &test_target(), Duration::from_secs(60)).await;
+
+        for tier in [
+            TraversalKind::Upnp,
+            TraversalKind::NatPmp,
+            TraversalKind::Pcp,
+        ] {
+            let row = reports
+                .iter()
+                .find(|r| r.tier == tier)
+                .unwrap_or_else(|| panic!("{} must be reported", tier_name(tier)));
+            match &row.outcome {
+                TierOutcome::Unavailable { reason } => assert!(
+                    reason.contains("this node"),
+                    "the reason must place the gap on this node, got {reason:?}"
+                ),
+                other => panic!(
+                    "{} composes to nothing here, so it must be unavailable, got {other:?}",
+                    tier_name(tier)
+                ),
+            }
+        }
+        // Direct genuinely ran and did not reach the peer — that IS a failure, and must stay one.
+        let direct = reports
+            .iter()
+            .find(|r| r.tier == TraversalKind::Direct)
+            .expect("direct is reported");
+        assert!(
+            matches!(direct.outcome, TierOutcome::Failed { .. }),
+            "an attempted-and-refused tier stays a failure, got {:?}",
+            direct.outcome
+        );
+        // The reading is still driven by what CONNECTED, so an unconfigured rung never downgrades it.
+        assert_eq!(verdict(Some(PEER_A), &reports), PingVerdict::RelayedOnly);
+    }
+
+    /// **Proves:** an `unavailable` rung serialises with its own `result` token and no `elapsed_ms`.
+    ///
+    /// **Catches:** emitting a duration for a rung that dialed nothing, which would imply an attempt
+    /// that never happened, and a consumer branching on `result` seeing `failed` for both shapes.
+    #[test]
+    fn an_unavailable_rung_serialises_distinctly_and_claims_no_elapsed_time() {
+        let row = TierReport {
+            tier: TraversalKind::Upnp,
+            outcome: TierOutcome::Unavailable {
+                reason: "not configured on this node".into(),
+            },
+        };
+        let j = tier_json(&row);
+        assert_eq!(j["result"], json!("unavailable"));
+        assert_eq!(j["tier"], json!("upnp"));
+        assert!(
+            j.get("elapsed_ms").is_none(),
+            "nothing was dialed, so no duration is claimed: {j}"
         );
     }
 

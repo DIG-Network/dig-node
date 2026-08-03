@@ -16,10 +16,12 @@
 //!    ([`bootstrap_peers_from_pool`]), then run the periodic maintenance loop (`republish` /
 //!    `refresh_buckets` / `gc`) so provider records never lapse and the routing table stays fresh.
 //! 3. **Inventory publishing** (the emphasized requirement): the node continuously keeps its provider
-//!    records current — [`announce_inventory`] on startup for every held capsule (at store AND
-//!    root/capsule granularity), [`sync_inventory`] on inventory change (announce new content,
-//!    withdraw removed content), `republish()` before TTL via the maintenance loop, and a best-effort
-//!    `withdraw_provider` sweep on graceful shutdown.
+//!    records current — [`spawn_initial_inventory_announce`] once at startup for every held capsule
+//!    (at store AND root/capsule granularity), in the BACKGROUND and only after the pool→routing feed
+//!    is live, because awaiting it on the bring-up path left the peer-RPC listener unbound for 12m40s
+//!    on a content-heavy node (dig_ecosystem#1974); [`sync_inventory`] on inventory change (announce
+//!    new content, withdraw removed content), `republish()` before TTL via the maintenance loop, and
+//!    a best-effort `withdraw_provider` sweep on graceful shutdown.
 //!
 //! ## Serving the inbound DHT RPC
 //!
@@ -448,12 +450,6 @@ pub async fn announce_inventory_ids(
         started.elapsed().as_secs_f64()
     );
     total
-}
-
-/// [`announce_inventory_ids`] over the content ids derived from `cached`, at the default concurrency.
-pub async fn announce_inventory(dht: &DhtService, cached: &[CachedCapsule]) -> usize {
-    let ids = inventory_content_ids(cached);
-    announce_inventory_ids(dht, &ids, INITIAL_ANNOUNCE_CONCURRENCY).await
 }
 
 /// Announce the node's initial inventory into the DHT in the BACKGROUND.
