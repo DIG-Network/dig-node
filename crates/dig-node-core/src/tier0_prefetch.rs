@@ -339,6 +339,7 @@ pub const MAX_SIZE_PROBES_PER_ROUND: usize = 32;
 /// rounds. Returns the round tally (including a `skipped` reason when the whole round short-circuits).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_round<R: KeyspaceRng>(
+    enabled: bool,
     probe: &dyn NeighbourhoodProbe,
     size_probe: &dyn SizeProbe,
     fetcher: &dyn Tier0Fetcher,
@@ -350,7 +351,12 @@ pub async fn run_round<R: KeyspaceRng>(
     now_tick: u64,
 ) -> RoundOutcome {
     // -- Whole-round governors, cheapest first: nothing is sampled or fetched if any trips. ----------
-    if !tier0_precache_enabled() {
+    // `enabled` is the off-switch, read by the CALLER from [`tier0_precache_enabled`] once per round
+    // and injected here — so `run_round` is a pure function of its arguments (no process-global env
+    // read in the hot path), which keeps rounds deterministic + unit-testable without env mutation
+    // (the #1991 parallel-runner env race). The caller threads `tier0_precache_enabled()` in on every
+    // round, so flipping the env still flips the round.
+    if !enabled {
         return RoundOutcome::skipped(RoundSkip::Disabled);
     }
     if load.is_busy() {
@@ -583,13 +589,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_disabled_loop_fetches_nothing() {
-        std::env::set_var(TIER0_PRECACHE_ENV, "0");
+        // `enabled = false` is the injected off-switch — no process-global env mutation, so this test
+        // cannot race the default-ON rounds under the parallel runner (#1991).
         let fetcher = ScriptedFetcher {
             true_size: 10,
             verify_ok: true,
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            false,
             &QuorumProbe {
                 keys: vec![([0x10; 32], Some(1000))],
             },
@@ -606,7 +614,6 @@ mod tests {
             0,
         )
         .await;
-        std::env::remove_var(TIER0_PRECACHE_ENV);
         assert_eq!(out.skipped, Some(RoundSkip::Disabled));
         assert!(fetcher.seen.lock().unwrap().is_empty(), "off = no fetches");
     }
@@ -629,6 +636,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &QuorumProbe {
                 keys: vec![([0x10; 32], Some(1000))],
             },
@@ -659,6 +667,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &QuorumProbe {
                 keys: vec![([0x10; 32], Some(1000))],
             },
@@ -697,6 +706,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &QuorumProbe {
                 keys: vec![([0x10; 32], None)],
             },
@@ -728,6 +738,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &QuorumProbe {
                 keys: vec![([0x10; 32], None)],
             },
@@ -763,6 +774,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &QuorumProbe { keys },
             &FixedSizeProbe {
                 size: None,
@@ -795,6 +807,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &QuorumProbe {
                 keys: vec![([0x10; 32], Some(100))],
             },
@@ -826,6 +839,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &QuorumProbe {
                 keys: vec![([0x10; 32], Some(1000))],
             },
@@ -854,6 +868,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &EmptyProbe,
             &FixedSizeProbe {
                 size: Some(1000),
@@ -916,6 +931,7 @@ mod tests {
         };
         let mut rate = RoundRateLimiter::new(2, u64::MAX / 2, 100); // 2 stores/window
         let out = run_round(
+            true,
             &QuorumProbe { keys },
             &FixedSizeProbe {
                 size: None,
@@ -992,6 +1008,7 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         };
         let out = run_round(
+            true,
             &QuorumProbe {
                 keys: vec![([0x10; 32], Some(4096))],
             },
