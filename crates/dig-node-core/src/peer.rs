@@ -611,7 +611,7 @@ pub fn list_inventory(
 
 /// One `dig.getAvailability` answer for a single queried item against the local inventory. Granularity
 /// is inferred from which fields the item carries (spec §9):
-/// - `store_id` only → *has_store* (`roots` = the roots held, newest-first — here mtime-desc).
+/// - `store_id` only → *has_store* (`roots` = the roots held, in a CANONICAL root-hex order).
 /// - `store_id` + `root` → *has_root* (does this node hold that capsule; `total_length`/`chunk_count`
 ///   are filled by [`Node`] from the served module — this pure helper reports presence only).
 /// - `store_id` + `root` + `retrieval_key` → *has_resource* (presence at capsule granularity; the
@@ -644,16 +644,25 @@ pub fn availability_presence(
     _retrieval_key: Option<&str>,
     capsule_servable: bool,
 ) -> Value {
-    // Roots held for the store, newest-first (by last-used mtime desc, matching the on-disk recency).
-    let mut store_caps: Vec<&CachedCapsule> =
-        cached.iter().filter(|c| c.store_id == store_id).collect();
-    store_caps.sort_by_key(|c| std::cmp::Reverse(c.last_used_unix_ms));
+    // Roots held for the store, in a CANONICAL order (by root hex, ascending) — NEVER by an
+    // access-time field (#2022). The peer surface is permissionless (the mTLS verifier accepts any
+    // self-signed leaf), so ANY ordering derived from `last_used_unix_ms` would leak this operator's
+    // read behaviour to an arbitrary peer: it would disclose a total order over the operator's
+    // interests plus approximate read times, and it would INVERT the tier-0 cover-caching privacy
+    // design (never-read cover content sorts last, so genuinely-read entries surface first — adding
+    // cover would make real reads MORE conspicuous). A canonical order carries no such signal: the
+    // response is a set, presented deterministically.
+    let mut roots_held: Vec<String> = cached
+        .iter()
+        .filter(|c| c.store_id == store_id)
+        .map(|c| c.root.clone())
+        .collect();
+    roots_held.sort_unstable();
 
     match root {
         None => {
-            // STORE granularity: available iff any root is held; report the held roots newest-first.
-            let roots: Vec<String> = store_caps.iter().map(|c| c.root.clone()).collect();
-            json!({ "available": !roots.is_empty(), "roots": roots })
+            // STORE granularity: available iff any root is held; report the held roots canonically.
+            json!({ "available": !roots_held.is_empty(), "roots": roots_held })
         }
         Some(_want_root) => {
             // ROOT / RESOURCE granularity: available iff this exact capsule is SERVABLE right now —
@@ -3796,21 +3805,42 @@ pub(crate) mod tests {
         assert_eq!(stores["stores"].as_array().unwrap().len(), 2, "capped to 2");
     }
 
+    /// **Proves (#2022):** the store-granularity `roots` list is ordered CANONICALLY (by root hex),
+    /// NEVER by `last_used_unix_ms`. The response order must NOT vary with access recency, so the
+    /// permissionless peer surface leaks no read-recency ranking of the operator's interests.
+    /// **Catches:** any reintroduction of an access-time sort — the two cases below have IDENTICAL
+    /// roots but INVERTED `last_used` stamps, and both must yield the same canonical order.
     #[test]
-    fn availability_store_granularity_reports_held_roots_newest_first() {
+    fn availability_store_granularity_orders_roots_canonically_not_by_access_time() {
         let store = "aa".repeat(32);
-        let cached = vec![
-            cap(&store, &"11".repeat(32), 10, 100), // older
-            cap(&store, &"22".repeat(32), 10, 300), // newest
-            cap(&store, &"33".repeat(32), 10, 200),
+        let expected = vec![
+            json!("11".repeat(32)),
+            json!("22".repeat(32)),
+            json!("33".repeat(32)),
         ];
-        let a = availability_presence(&cached, &store, None, None, false);
-        assert_eq!(a["available"], true);
-        let roots = a["roots"].as_array().unwrap();
-        // Newest-first by mtime: 22.. (300), 33.. (200), 11.. (100).
-        assert_eq!(roots[0], json!("22".repeat(32)));
-        assert_eq!(roots[1], json!("33".repeat(32)));
-        assert_eq!(roots[2], json!("11".repeat(32)));
+
+        // last_used stamps ascending with root hex.
+        let cached_a = vec![
+            cap(&store, &"11".repeat(32), 10, 100),
+            cap(&store, &"22".repeat(32), 10, 200),
+            cap(&store, &"33".repeat(32), 10, 300),
+        ];
+        // last_used stamps INVERTED vs root hex — a recency sort would flip the order.
+        let cached_b = vec![
+            cap(&store, &"11".repeat(32), 10, 300),
+            cap(&store, &"22".repeat(32), 10, 200),
+            cap(&store, &"33".repeat(32), 10, 100),
+        ];
+
+        for cached in [cached_a, cached_b] {
+            let a = availability_presence(&cached, &store, None, None, false);
+            assert_eq!(a["available"], true);
+            assert_eq!(
+                a["roots"].as_array().unwrap(),
+                &expected,
+                "roots must be canonically ordered regardless of last_used_unix_ms"
+            );
+        }
     }
 
     #[test]

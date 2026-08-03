@@ -4372,6 +4372,59 @@ mod tests {
         );
     }
 
+    /// **Proves (#2022):** `dig.listInventory` with `store_id` omitted — the whole-inventory
+    /// enumeration ("a free map of everything this node holds") — is REFUSED over the permissionless
+    /// peer surface (`ReadOrigin::Peer`) with -32601, yet still answered from the loopback/control
+    /// path (`ReadOrigin::Local`), and the per-store form stays peer-reachable.
+    /// **Catches:** a regression that lets an arbitrary peer enumerate the operator's full holdings,
+    /// or one that breaks the operator's own consent-surface enumeration / the honest per-store query.
+    #[tokio::test]
+    async fn list_inventory_whole_enumeration_is_loopback_only() {
+        let (node, _td) = test_node(None);
+        let (store, root) = (id_hex(0x11), id_hex(0x22));
+        cache_module(&node, &store, &root, b"held bytes");
+
+        let whole_inventory =
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listInventory","params":{}});
+
+        // A remote peer MUST NOT be able to enumerate the whole inventory.
+        let peer = handle_rpc(
+            &node,
+            whole_inventory.clone(),
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(
+            peer["error"]["code"],
+            json!(-32601),
+            "whole-inventory enumeration must be refused on the peer surface"
+        );
+        assert!(peer.get("result").is_none());
+
+        // The operator's own node (loopback) still sees what it advertises (#1934/#2006 consent).
+        let local = handle_rpc(
+            &node,
+            whole_inventory,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(local["result"]["stores"], json!([store]));
+
+        // The per-store query — the ONLY inventory question an honest peer needs — still works.
+        let per_store = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.listInventory",
+                   "params":{"store_id":store}}),
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(per_store["result"]["store_id"], json!(store));
+        assert_eq!(per_store["result"]["roots"], json!([root]));
+    }
+
     /// **Proves:** the request/response form of `dig.fetchModuleRange` returns the EXACT requested
     /// window in the same frame shape the streaming peer form emits, so an agent can read a module by
     /// advancing `offset` without implementing the frame protocol (§6.2).

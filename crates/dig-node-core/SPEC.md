@@ -747,11 +747,20 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
 - **`dig.getAvailability`** — batch answer for queried `items` (store / root / resource granularity),
   positionally aligned with the request; per item `{ available: bool, roots?: [64hex] (store
   granularity), total_length?: u64, chunk_count?: u64, complete?: bool (root/resource granularity) }`.
+  The store-granularity `roots` list is ordered **canonically (by root hex, ascending)** and MUST NOT
+  derive its order (or length or field values) from any access-time / recency field: the peer surface
+  is permissionless, so a recency ordering would leak the operator's read behaviour (a total order over
+  interests + approximate read times). The response is a set, presented deterministically.
   The `items` count is CAPPED at **512** (items past the cap are not answered; the result array is
   aligned to the answered prefix) and the local inventory is snapshotted ONCE per batch, so an
   N-item batch does one directory walk, not N (audit #179).
 - **`dig.listInventory`** — the node's held capsules (`{ store_id?, limit? }` → stores, or the roots
   for a given store). Best-effort discovery; `dig.getAvailability` is the authoritative per-item check.
+  The **whole-inventory enumeration** (`store_id` omitted → the `stores` list) is **loopback/control-only**:
+  the permissionless peer surface (any self-signed leaf) is refused with `-32601`, because a full map of
+  everything a node holds answers no question an honest peer needs (a downloader queries a specific
+  `store_id`). The per-store form (`store_id` present → that store's roots) remains peer-reachable, and
+  the operator's own loopback/FFI/control path answers both forms (the consent-surface precondition).
 - **`dig.fetchRange`** — one range frame of a served resource/capsule (the caller streams by requesting
   successive ranges). Frame: `{ offset, length, bytes: base64, complete }`; the first frame (offset 0)
   additionally carries `total_length`, `chunk_lens`, `chunk_index`, `inclusion_proof`, `root`. Errors

@@ -3670,7 +3670,9 @@ reported available, an evicted one IMMEDIATELY is not, and a capsule genuinely n
 reported not available (the answer is never weakened to an unconditional *available* — the merkle
 verify remains the integrity gate downstream, but availability MUST NOT lie in either direction).
 STORE granularity (`root` absent) still enumerates the held `roots` from the inventory walk, which a
-single-path existence check cannot answer. Because this method is peer-reachable (§7.4), the
+single-path existence check cannot answer; that `roots` list is ordered CANONICALLY (by root hex),
+NEVER by an access-time/recency field, so the permissionless peer surface leaks no read-recency
+ranking of the operator's interests. Because this method is peer-reachable (§7.4), the
 per-request cost is bounded: one path existence check per queried item, and the whole-cache directory
 walk is performed AT MOST once per batch and ONLY when some item asks at store granularity. Every
 caller-supplied `store_id`/`root` is validated canonical 64-hex before any path is built from it (the
