@@ -8855,17 +8855,23 @@ mod tests {
 
     #[test]
     fn passthrough_alias_methods_are_method_not_found_on_the_node() {
-        // The node resolves dig.getContent locally but does NOT resolve the passthrough
-        // aliases dig.getCapsule / dig.listCapsules — it returns the catalogued -32601
-        // (method not found), which is the shell's cue to relay the ORIGINAL request
-        // verbatim to the upstream (SPEC §5.4/§5.5). This pins that classification at
-        // the dispatch level so a future read-path change that starts resolving one of
-        // them locally (and would therefore need its catalogue entry flipped to
-        // served=local) is caught here, mirroring the dig.getProof guard.
+        // What the node still does NOT resolve locally returns the catalogued -32601, which
+        // is the shell's cue to relay the ORIGINAL request verbatim to an upstream when one
+        // is configured (SPEC §5.4/§5.5). This pins that classification at the dispatch
+        // level, so a read-path change that starts resolving one of them locally — and would
+        // therefore need its catalogue entry in dig-node-service's meta.rs flipped to
+        // served=local — is caught here rather than shipping a catalogue that lies.
         //
-        // dig.getManifest is EXCLUDED from this list as of #176 Phase C: it moved from
-        // passthrough to served=local (see the dig_get_manifest_* tests below and the
-        // updated catalogue in dig-node-service's meta.rs).
+        // The list shrinks as methods move to served=local; each departure is deliberate:
+        //   * dig.getManifest       — #176 Phase C
+        //   * dig.getProof, dig.getMetadata, dig.getPublicManifest,
+        //     dig.getCapsule/dig.getModule — #2071 (rpc.dig.net is an ordinary node with no
+        //     upstream, so "relay it" resolved to -32601 for every client that called them)
+        //
+        // What REMAINS here, and why each is honestly unserved rather than merely unwritten:
+        //   * dig.listCapsules   — needs a chain generation walk this node does not do
+        //   * dig.getProofStatus — polls an execution-proof JOB; this node runs none, and
+        //                          inventing a status would be the fabrication #126 forbids
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN");
         let rt = pin_test_rt();
@@ -8873,11 +8879,11 @@ mod tests {
         let store_id = Bytes32([1u8; 32]).to_hex();
         // Representative params per method; the node must still report method-not-found.
         let cases = [
-            json!({"jsonrpc":"2.0","id":1,"method":"dig.getCapsule","params":{
-                "store_id": store_id, "retrieval_key": any_rk_hex(),
-            }}),
-            json!({"jsonrpc":"2.0","id":2,"method":"dig.listCapsules","params":{
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listCapsules","params":{
                 "store_id": store_id,
+            }}),
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getProofStatus","params":{
+                "store_id": store_id, "proof_id": "any",
             }}),
         ];
         for req in cases {
