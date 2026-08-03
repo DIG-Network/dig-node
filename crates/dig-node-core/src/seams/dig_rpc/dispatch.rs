@@ -216,6 +216,23 @@ impl RpcDispatch for Node {
                         return rpc_err(&id, -32602, "store_id must be 64-hex");
                     }
                 }
+                // WHOLE-INVENTORY enumeration (`store_id` omitted) is LOOPBACK/CONTROL-ONLY (#2022).
+                // The mTLS peer surface is permissionless — the verifier accepts any self-signed leaf,
+                // so an "authenticated" peer is merely "some peer_id", never an authorized admin
+                // (see peer::is_peer_reachable_method). Handing an arbitrary peer "a free map of
+                // everything this node holds" answers a question no honest peer needs: a downloader
+                // asks `dig.getAvailability` for the SPECIFIC store/root it wants to fetch. The
+                // operator's OWN node must still be able to see what it advertises (the #1934/#2006
+                // consent surface precondition), so the `None` form stays reachable — but ONLY from
+                // the loopback/FFI/control path (`ReadOrigin::Local`), never over the peer wire.
+                if store_id.is_none() && origin == crate::download::ReadOrigin::Peer {
+                    return rpc_err(
+                        &id,
+                        -32601,
+                        "dig.listInventory whole-inventory enumeration (store_id omitted) is \
+                         loopback-only; a peer must query a specific store_id",
+                    );
+                }
                 let limit = params
                     .get("limit")
                     .and_then(Value::as_u64)
