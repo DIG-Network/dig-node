@@ -807,6 +807,34 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
   `ChainAnchoredModuleVerifier` (a coinset lineage walk) — attaches at the fetch/cache path BEFORE any
   precached content is cached or announced, so an honest-but-stale root that passes the recompute is
   still never cached unanchored.
+
+  **Tier-0 eager-precache LIVE-WIRE (epic #1934, the flywheel — MANDATORY governance).** At peer-network
+  bring-up a standalone node with a DHT and the reshare warmer wired SPAWNS a self-driven precache loop.
+  Each round: sample quorum-reconciled candidates from the 4a neighbourhood probe → resolve each
+  sampled content-key to a self-verified `VerifiedCapsuleKey` (the two gates above) → score by relevance
+  under this node's context → select within the tier-0 sub-budget → fetch each selected store through
+  the SHARED `CapsuleWarmer` (byte-capped, chain-anchored, merkle-verified, cached tagged
+  `Tier0Precache`, then announced as a holder). The loop is GOVERNED end to end and the following are
+  NORMATIVE:
+  - **Chain-anchor gate (GATE 2) before any cache.** No fetch acts on a bare `VerifiedCapsuleKey`: the
+    resolved `(store_id, root)` MUST pass `AnchoredRootResolver::verify_pinned_root` (the root is the
+    store's live on-chain tip) — enforced explicitly before the pull AND again inside the warmer's
+    `ChainAnchoredModuleVerifier`. A real-but-melted/stale/never-anchored root is dropped, never cached.
+  - **Hard byte-cap.** The resolve answer's `size_bytes` is an UNTRUSTED hint, never an allocation size
+    or admission gate. Each fetch's ceiling is `min(reported_hint, remaining_tier0_sub_budget)`, and the
+    warmer lowers the pull's `max_module_size` to it, so an adversarial huge `size_bytes` can neither
+    over-allocate nor bypass the budget — the true store size governs.
+  - **Off-switch, DEFAULT-ON.** `DIG_TIER0_PRECACHE` falsy disables the loop; the flag is read PER ROUND
+    so it takes effect live.
+  - **Small-disk no-op.** A node whose tier-0 sub-budget is below the useful floor (64 MiB) never spawns
+    the loop.
+  - **Backoff-when-serving.** A round yields entirely while the node is serving real inbound demand
+    (the load signal), so speculative precache never competes with real reads.
+  - **One rate limiter across all rounds.** A single token-bucket limiter (stores/window AND
+    bytes/window) is threaded across every round — the bandwidth ceiling spans rounds, never resets
+    per round.
+  Observability: `cache.stats` reports `tiers.tier0_precache.wired = true` once the loop is spawned, and
+  `tiers.tier0_precache.occupancy` as the loop's landed-store counter.
 - **The four DHT methods** `find_node` / `find_providers` / `add_provider` / `ping` (§7.5), dispatched
   to the content-location DHT, folding the mTLS-verified caller into the routing table.
 - **The four PEX messages** `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` (§7.7).

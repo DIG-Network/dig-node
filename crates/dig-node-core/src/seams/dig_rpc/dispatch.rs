@@ -518,12 +518,10 @@ impl RpcDispatch for Node {
                 let usage = cache_usage();
                 // #1991 (epic #1934): per-tier occupancy for the relay-globe cached-store count.
                 // Tier1 is a REAL figure — the inbound-demand ledger's own bounded-LRU size (§7.10d).
-                // Tier0/Tier2 have no live occupancy source yet (no prefetch loop / bribed tier), so
-                // each is reported `wired: false, occupancy: 0` rather than a fabricated number — a
-                // controller can distinguish "empty" from "not measurable yet". They populate once the
-                // remaining epic-#1934 children (tier-0 prefetch loop, tier-2 bribed retention) wire a
-                // real occupancy source; the shape is fixed now so no controller-side change is needed
-                // then.
+                // Tier0 is now LIVE (§7.10e/f, #1934 PR-3): `wired` flips true once the eager-precache
+                // loop is spawned at bring-up, and `occupancy` is that loop's land counter. Tier2
+                // (bribed retention) has no live source yet, so it stays `wired: false, occupancy: 0` —
+                // a controller distinguishes "empty" from "not measurable yet". The shape is fixed.
                 //
                 // Hand-built JSON (not the typed `dig_rpc_protocol::CacheStats`): that published crate
                 // (0.6.0) predates `refetch_count`/`tiers` and gains them release-first in a follow-up
@@ -543,7 +541,10 @@ impl RpcDispatch for Node {
                     "misses": CONTENT_CACHE_MISSES.load(Relaxed),
                 },
                 "tiers": {
-                    "tier0_precache": {"occupancy": 0, "wired": false},
+                    "tier0_precache": {
+                        "occupancy": crate::tier0_live::tier0_occupancy(),
+                        "wired": crate::tier0_live::tier0_wired(),
+                    },
                     "tier1_demand": {"occupancy": node.inbound_demand_entry_count(), "wired": true},
                     "tier2_bribed": {"occupancy": 0, "wired": false},
                 }}});

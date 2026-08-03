@@ -2749,6 +2749,9 @@ impl Node {
         if !is_canonical_hex_id(store_hex) {
             return;
         }
+        // Mark real inbound activity so the tier-0 eager-precache loop (#1934) yields to demand: a
+        // speculative precache round backs off entirely while the node is serving real reads.
+        crate::tier0_live::mark_inbound_activity();
         self.inbound_demand.record(store_hex);
         if crate::download::inbound_demand_cache_enabled() {
             // Tier1Demand is asserted in the ledger above; the on-disk pull reuses the fetch-side
@@ -4904,13 +4907,19 @@ mod tests {
         assert!(r["content_cache"]["misses"].as_u64().is_some(), "cc misses");
         // #1991: refetch_count is present (process-global, so presence/type only), and the
         // per-tier occupancy shape is fixed — tier1 is REAL (backed by the inbound-demand
-        // ledger), tier0/tier2 are honestly stubbed `wired: false` until their epic-#1934
-        // occupancy sources land.
+        // ledger); tier0 is now LIVE (#1934 PR-3) and its `wired`/`occupancy` are process-global
+        // (another test may spawn the loop), so only presence/type is asserted; tier2 stays stubbed.
         assert!(r["refetch_count"].as_u64().is_some(), "refetch_count");
         assert_eq!(r["tiers"]["tier1_demand"]["wired"].as_bool(), Some(true));
         assert_eq!(r["tiers"]["tier1_demand"]["occupancy"].as_u64(), Some(0));
-        assert_eq!(r["tiers"]["tier0_precache"]["wired"].as_bool(), Some(false));
-        assert_eq!(r["tiers"]["tier0_precache"]["occupancy"].as_u64(), Some(0));
+        assert!(
+            r["tiers"]["tier0_precache"]["wired"].as_bool().is_some(),
+            "tier0 wired is a bool"
+        );
+        assert!(
+            r["tiers"]["tier0_precache"]["occupancy"].as_u64().is_some(),
+            "tier0 occupancy is a u64"
+        );
         assert_eq!(r["tiers"]["tier2_bribed"]["wired"].as_bool(), Some(false));
         assert_eq!(r["tiers"]["tier2_bribed"]["occupancy"].as_u64(), Some(0));
     }

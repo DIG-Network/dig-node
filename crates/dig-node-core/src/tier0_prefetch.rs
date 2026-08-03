@@ -956,6 +956,68 @@ mod tests {
         assert!(out.rate_limited >= 1, "the third is rate-limited");
     }
 
+    #[tokio::test]
+    async fn one_rate_limiter_bounds_a_burst_across_rounds() {
+        // The LIVE-WIRE invariant (#1934, PR-3): the loop threads ONE RoundRateLimiter across ALL
+        // rounds. A fresh limiter per round would reset the budget every round and defeat the ceiling.
+        // Here TWO rounds share one limiter admitting only two stores per window — so the SECOND round
+        // is starved even though its own budget + candidates would fit, proving the ceiling spans rounds.
+        let keys = vec![
+            ([0x01; 32], Some(1000)),
+            ([0x02; 32], Some(1000)),
+            ([0x03; 32], Some(1000)),
+        ];
+        let fetcher = ScriptedFetcher {
+            true_size: 1000,
+            verify_ok: true,
+            seen: Mutex::new(Vec::new()),
+        };
+        // Two stores per window, a window far longer than the two ticks these rounds advance — so no
+        // meaningful refill happens between them.
+        let mut rate = RoundRateLimiter::new(2, u64::MAX / 2, 100_000);
+        let first = run_round(
+            true,
+            &QuorumProbe { keys: keys.clone() },
+            &FixedSizeProbe {
+                size: None,
+                calls: AtomicUsize::new(0),
+            },
+            &fetcher,
+            &Idle,
+            &mut SplitMix64::new(3),
+            &node(),
+            BIG_CAP,
+            &mut rate,
+            1,
+        )
+        .await;
+        let second = run_round(
+            true,
+            &QuorumProbe { keys },
+            &FixedSizeProbe {
+                size: None,
+                calls: AtomicUsize::new(0),
+            },
+            &fetcher,
+            &Idle,
+            &mut SplitMix64::new(3),
+            &node(),
+            BIG_CAP,
+            &mut rate,
+            2,
+        )
+        .await;
+        assert!(
+            first.cached + second.cached <= 2,
+            "one shared limiter must bound the two-round burst to the window budget, got {}",
+            first.cached + second.cached
+        );
+        assert!(
+            second.rate_limited >= 1,
+            "the second round is rate-limited by the budget the first round already spent"
+        );
+    }
+
     // -- Tier tagging + precedence -----------------------------------------------------------------
 
     #[test]
