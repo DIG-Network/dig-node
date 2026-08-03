@@ -718,7 +718,7 @@ mod tests {
     /// against an implementation that refused every adoption.
     #[tokio::test]
     async fn a_candidate_already_in_the_pool_is_not_adopted_after_its_dial_resolves() {
-        if !crate::peer::tests::host_has_ipv6_loopback().await {
+        if !crate::peer::tests::is_ipv6_loopback_available().await {
             eprintln!("skipping: host has no usable IPv6 loopback stack");
             return;
         }

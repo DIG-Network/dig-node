@@ -506,10 +506,20 @@ mod tests {
     }
 
     /// The dual-stack listener binds `[::]:0` and, on a host with dual-stack support, accepts an IPv4
-    /// loopback client on the SAME socket — proving `IPV6_V6ONLY` was cleared. Skips gracefully on the
-    /// rare host without dual-stack support (a real socket-option bug fails the connect, not this).
+    /// loopback client on the SAME socket — proving `IPV6_V6ONLY` was cleared. Skips gracefully on a
+    /// host with no IPv6 stack at all (the `[::]:0` bind itself fails with `EAFNOSUPPORT`, not merely a
+    /// refused option) and on the rarer host with IPv6 but no dual-stack support (a real socket-option
+    /// bug fails the connect, not this) — on any host where dual-stack DOES work (every CI runner),
+    /// this still runs + asserts the full proof, unweakened.
     #[tokio::test]
     async fn dual_stack_bind_accepts_an_ipv4_loopback_client() {
+        if !crate::peer::tests::is_ipv6_loopback_available().await {
+            eprintln!(
+                "skipping dual_stack_bind_accepts_an_ipv4_loopback_client: no IPv6 stack in this \
+                 environment"
+            );
+            return;
+        }
         let listener =
             bind_tcp_dual_stack(dual_stack_listen_addr(0)).expect("dual-stack bind must succeed");
         let port = listener.local_addr().unwrap().port();
