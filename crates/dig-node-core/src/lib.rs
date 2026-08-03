@@ -407,8 +407,9 @@ pub struct Node {
     chat: chat::ChatState,
     /// The live INBOUND-DEMAND ledger (#1990, epic #1934): the FIRST live tier-tagging. Records which
     /// stores a remote PEER has asked this node to serve and tags each `Tier1Demand`, so a peer's
-    /// request — direct evidence this node's neighbourhood wants the content — feeds the relevance
-    /// local-demand term and gives the store eviction precedence over speculative `Tier0Precache`.
+    /// request — direct evidence this node's neighbourhood wants the content — assigns the
+    /// `Tier1Demand` tier (via [`Node::module_tier`]) that gives the store eviction precedence over
+    /// speculative `Tier0Precache`.
     /// In-memory + process-lifetime; additive over the on-disk cache. See [`inbound_demand`].
     inbound_demand: inbound_demand::InboundDemand,
     /// This node's own 32-byte `peer_id` (= its DHT node id — both are the SHA-256 SPKI value, one
@@ -3826,8 +3827,8 @@ mod tests {
     }
 
     /// **Proves (#1990):** a peer's inbound request records demand for the store — bumping its count
-    /// and tagging it `Tier1Demand` — so the demand feeds relevance + eviction precedence. This is the
-    /// always-on, amplification-free half of the trigger (it holds no content, pulls nothing).
+    /// and tagging it `Tier1Demand` — so the demand assigns the tier that gives eviction precedence.
+    /// This is the always-on, amplification-free half of the trigger (it holds no content, pulls nothing).
     /// **Catches:** a demand record that fails to tag Tier1 or fails to accumulate.
     #[tokio::test]
     async fn inbound_demand_records_and_tags_tier1() {
