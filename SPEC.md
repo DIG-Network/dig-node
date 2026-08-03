@@ -903,6 +903,79 @@ method + error **discovery** catalogue with intentionally permissive schemas.
 Every non-`control.*` method MUST have `requires_auth: false`; every `control.*` method MUST have
 `served: "control"` and `requires_auth: true`.
 
+#### 5.5.0. `dig.getContent` — the window envelope (#2071)
+
+A `dig.getContent` result is ONE window of a resource's ciphertext, and a client reassembles the
+windows itself. The envelope MUST therefore describe both the WHOLE resource and THIS window:
+
+| field | on | meaning |
+|---|---|---|
+| `ciphertext` | every window | base64 of this window's ciphertext bytes |
+| `total_length` | every window | the FULL resource's ciphertext length in bytes |
+| `offset` | every window | this window's start offset within the resource |
+| `length` | every window | this window's byte length |
+| `complete` | every window | whether this window ends the resource |
+| `next_offset` | every window | the next window's offset, or **`null`** on the last one |
+| `root` | every window | the generation root the window was served against |
+| `inclusion_proof` | every window | base64 whole-resource Merkle inclusion proof |
+| `chunk_lens` | first window (`offset == 0`) | per-chunk ciphertext lengths of the WHOLE resource |
+| `source` | node profile | `"local"` or `"remote"` — where this node served it from |
+
+This table is normative and MUST agree field-for-field with `ChunkObject` in docs.dig.net's
+`static/openrpc.json`, which is the ecosystem-wide publication of the same contract. All of
+`ciphertext`, `total_length`, `offset`, `length`, `complete`, `next_offset`, `inclusion_proof` and
+`root` are REQUIRED there; a node that omits any of them is non-conforming even when the bytes it
+serves are correct.
+
+`total_length` MUST be present on EVERY window, not only the last: a client allocates its
+reassembly buffer from it before it has seen the last window. `next_offset` MUST be present on
+every window as an explicit `null` when complete, so a client ending its loop on
+`next_offset == null` can distinguish "the resource is complete" from "this server omitted the
+field". Both requirements are load-bearing rather than cosmetic — omitting them took every
+`*.on.dig.net` subdomain dark while this node returned correct ciphertext and a correct,
+verifying inclusion proof, and reported no error anywhere (#2071).
+
+`inclusion_proof` MUST ride EVERY window, and MUST always be PRESENT — as the empty string when
+the served resource carries no proof, never as an absent key. It describes the whole resource, so a
+client that resumes, or begins its stream at a non-zero offset, has no other source for it; sending
+it only on window 0 leaves every later window of a multi-window resource unverifiable, which is
+#2071's failure mode relocated to large resources rather than fixed. Present-and-empty is a fact a
+client can act on; absent is one it must guess at.
+
+The proof verifies the resource, NOT the window: verification requires
+`proof.leaf == SHA-256(the whole reassembled ciphertext)`, so a client cannot check a window in
+isolation and MUST hold the complete resource before verifying. Every window carries the proof so
+that whichever window a client happens to receive first can supply it — not so that windows can be
+verified independently.
+
+`chunk_lens` is the ONE field that rides the first window only. It describes how to split the
+REASSEMBLED resource, which a client cannot act on until it holds every window; a client that
+begins mid-resource therefore cannot decrypt a multi-chunk resource and MUST fetch window 0.
+
+**Window size.** A window is at most **3 MiB** of ciphertext. This node currently IGNORES the
+`length` request parameter and always serves a full window (or the remainder), where
+`openrpc.json` documents `length` as a requested size clamped to the server maximum; a client MUST
+therefore size its stride from the `length` it is GIVEN, never from the one it asked for. The
+3 MiB figure is presently defined independently in three places — `WINDOW`
+(`crates/dig-node-core/src/lib.rs`), `RPC_MAX_CHUNK` (hub.dig.net's retrieval Lambda) and
+`RPC_CHUNK` (on.dig.net's resolver service worker) — and a client stride LARGER than the server
+window produces gapped buffers. Consolidating it into `dig-constants` is tracked in DIG-Network/dig_ecosystem#2076; until
+then any change to it MUST be made in all three.
+
+**One builder, with one honest exception.** The locally-held read and the peer fetch-through MUST
+both emit this envelope from the single shared builder (`content_window_envelope`) — a second
+implementation of a shared wire shape is what produced #2071. The response-window cache is the
+exception: it replays a previously-proxied UPSTREAM `result` verbatim, so a window cached from a
+non-conforming upstream is re-served with whatever fields that upstream sent. The cache preserves
+provenance rather than rewriting it; conformance there is the upstream's obligation.
+
+Because a replayed window is indistinguishable on the wire from a freshly built one (it is stamped
+`source: "local"` like any other local serve), the response-cache key MUST carry an envelope SCHEMA
+version, and that version MUST be bumped whenever this envelope's shape changes. Without it an
+upgraded node would keep serving windows captured under the OLD shape until they aged out of the
+LRU — so "the fix is deployed" would not imply "the fix is what clients receive". Bumping the
+version strands every prior entry by construction; no eviction pass or migration is required.
+
 #### 5.5.1. `dig.getManifest` (#176 Phase C)
 
 Resolves the store's normalized **PUBLIC MANIFEST** — the `.dig` format's data-section id 13

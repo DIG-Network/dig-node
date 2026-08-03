@@ -1039,8 +1039,22 @@ fn walk_dir_files_bounded(
     Ok(out)
 }
 
+/// The `dig.getContent` envelope SCHEMA version, carried in every response-cache key.
+///
+/// A cached window is replayed to the client VERBATIM (`serve_cached_response`) and stamped
+/// `source: "local"`, so it is indistinguishable on the wire from a freshly built one. Without a
+/// version in the key, a node with a warm cache would keep serving windows captured under an older
+/// envelope after being upgraded — which for #2071 means a node could be "fixed" and still answer
+/// pre-fix windows missing `total_length`, with nothing anywhere reporting it. Bump this whenever
+/// [`content_window_envelope`]'s shape changes; every prior entry becomes unreachable and ages out
+/// of the LRU naturally, so no migration or eviction pass is needed.
+///
+/// v2 = the #2071 envelope (`total_length`/`offset`/`length`, explicit `next_offset`, the proof on
+/// every window). v1 was the unversioned key, whose entries this constant strands by construction.
+const RESPONSE_ENVELOPE_SCHEMA: u32 = 2;
+
 /// Filesystem-safe filename for one cached proxy-response window, keyed by
-/// (store, root, retrieval_key, offset). All inputs are hex (or empty), so the
+/// (envelope schema, store, root, retrieval_key, offset). All inputs are hex (or empty), so the
 /// only sanitizing needed is to reject anything non-hex defensively and bound
 /// the length — a key collision would only mean a cache miss, never corruption,
 /// because the browser merkle-verifies every response.
@@ -1053,7 +1067,8 @@ fn response_key(store: &str, root: &str, rk: &str, offset: usize) -> String {
         }
     }
     format!(
-        "{}_{}_{}_{}.json",
+        "v{}_{}_{}_{}_{}.json",
+        RESPONSE_ENVELOPE_SCHEMA,
         hexish(store),
         hexish(root),
         hexish(rk),
@@ -1135,30 +1150,93 @@ fn content_window_len(total: usize, offset: usize) -> usize {
     end - start
 }
 
-/// Build the JSON-RPC `result` object for one window of a decoded ContentResponse.
-fn build_result(resp: &ContentResponse, offset: usize) -> Value {
-    let total = resp.ciphertext.len();
+/// Build the `dig.getContent` result envelope for ONE window of a resource's ciphertext.
+///
+/// The SINGLE producer of this wire shape. Both the locally-held read path
+/// ([`build_result`]) and the fetch-through path
+/// ([`FetchedResource::content_result`](crate::download::FetchedResource::content_result))
+/// go through here, so the two can never drift — a second implementation of a shared shape is
+/// precisely what produced #2071.
+///
+/// Every window states the resource's FULL `total_length` alongside this window's own `offset`
+/// and `length`, because a client allocates its reassembly buffer from `total_length` before it
+/// has seen the last window. Omitting them is not cosmetic: it took every `*.on.dig.net`
+/// subdomain dark (#2071). The resolver read `undefined >>> 0 === 0`, allocated a zero-length
+/// buffer, dropped the ciphertext into it, and then failed its own `sum(chunk_lens) ==
+/// buffer.len()` check and answered its own `404` — while this node returned real ciphertext and
+/// a real, verifying inclusion proof the entire time. Nothing anywhere reported an error.
+///
+/// `next_offset` is ALWAYS present: the byte offset of the next window, or an explicit `null` on
+/// the last one. A client that ends its loop on `next_offset == null` must be able to tell "the
+/// resource is complete" apart from "this server omitted the field".
+///
+/// `inclusion_proof` is ALWAYS present, on EVERY window — a `ChunkObject.required` field
+/// ("Sent on every window for getContent/getManifest", docs.dig.net openrpc.json), emitted as the
+/// empty string when the source carries no proof, exactly as the retired Lambda did
+/// (`unwrap_or_default()`). Present-and-empty is a fact a client can act on; absent is a shape it
+/// has to guess at.
+///
+/// `chunk_lens` is the ONE field that rides the FIRST window only (`offset == 0`), which openrpc
+/// and the Lambda both state: it describes how to split the REASSEMBLED resource, which a client
+/// cannot act on until it holds every window. It is taken pre-rendered because the two callers
+/// hold different integer widths for it, and widening either one would be a wire change.
+pub(crate) fn content_window_envelope(
+    ciphertext: &[u8],
+    offset: usize,
+    root_hex: String,
+    inclusion_proof_b64: Option<String>,
+    chunk_lens: Value,
+) -> Value {
+    let total = ciphertext.len();
     let start = offset.min(total);
     let end = (start + WINDOW).min(total);
-    let window = &resp.ciphertext[start..end];
+    let window = &ciphertext[start..end];
     let complete = end >= total;
 
     let mut result = json!({
         "ciphertext": base64::engine::general_purpose::STANDARD.encode(window),
-        "root": resp.roothash.to_hex(),
+        "total_length": total,
+        "offset": start,
+        "length": window.len(),
+        "root": root_hex,
         "complete": complete,
+        "next_offset": if complete { Value::Null } else { json!(end) },
     });
-    if !complete {
-        result["next_offset"] = json!(end);
-    }
-    // The proof + chunk_lens are sent on the FIRST window only (the client keeps
-    // the first non-empty proof). Match rpc.dig.net / the digstore client.
+    // `inclusion_proof` rides EVERY window, not just the first. It is a `ChunkObject.required`
+    // field ("Sent on every window for getContent/getManifest", docs.dig.net openrpc.json) and the
+    // retired Lambda emitted it unconditionally. Gating it on `start == 0` would leave windows
+    // 1..N of any resource over one window carrying no way to verify — the SAME silent,
+    // error-free failure this whole change exists to remove, just moved to large resources, where
+    // a small-resource test could never see it. A client that begins mid-resource (a resumed or
+    // ranged read) would never receive a proof at all.
+    //
+    // It is emitted even when the source has NONE, as the empty string, matching the Lambda's
+    // `unwrap_or_default()` and openrpc's `["string","null"]`-and-required typing. The no-proof
+    // case is reachable rather than theoretical: a fetch-through serve of a capsule that carried
+    // no per-resource commitment has `inclusion_proof: None`. Omitting the key there would ship
+    // exactly the state this crate's own SPEC §5.5.0 calls non-conforming, and would leave a
+    // client unable to distinguish "this resource has no proof" from "this server forgot to send
+    // one" — the same absent-vs-empty ambiguity `next_offset` is explicit about above.
+    result["inclusion_proof"] = json!(inclusion_proof_b64.unwrap_or_default());
+    // `chunk_lens` DOES ride the first window only, and that asymmetry is deliberate on both
+    // sides of the contract (openrpc.json: "Emitted on the FIRST window only"; the Lambda gates
+    // exactly this one field the same way). It describes how to split the REASSEMBLED resource,
+    // which a client cannot act on until it holds every window anyway.
     if start == 0 {
-        result["inclusion_proof"] =
-            json!(base64::engine::general_purpose::STANDARD.encode(resp.merkle_proof.to_bytes()));
-        result["chunk_lens"] = json!(resp.chunk_lens);
+        result["chunk_lens"] = chunk_lens;
     }
     result
+}
+
+/// Build the JSON-RPC `result` object for one window of a decoded ContentResponse.
+fn build_result(resp: &ContentResponse, offset: usize) -> Value {
+    content_window_envelope(
+        &resp.ciphertext,
+        offset,
+        resp.roothash.to_hex(),
+        Some(base64::engine::general_purpose::STANDARD.encode(resp.merkle_proof.to_bytes())),
+        json!(resp.chunk_lens),
+    )
 }
 
 /// Decode a locally cached module into a [`ContentResponse`] (whole-module `fs::read` + wasmtime
@@ -3183,13 +3261,22 @@ mod tests {
     #[test]
     fn response_key_is_stable_and_safe() {
         let k = response_key("aa", "bb", "cc", 0);
-        assert_eq!(k, "aa_bb_cc_0.json");
+        assert_eq!(k, "v2_aa_bb_cc_0.json");
         // Different offset → different file (so windows don't collide).
         assert_ne!(k, response_key("aa", "bb", "cc", 100));
         // Non-hex input is neutralized (no path traversal in the filename).
         let bad = response_key("../../etc", "bb", "cc", 0);
         assert!(!bad.contains('/'));
         assert!(!bad.contains(".."));
+        // #2071: the key carries the envelope SCHEMA version, so an upgraded node cannot
+        // replay windows captured under the OLD shape. A replayed window is stamped
+        // `source: "local"` and is indistinguishable on the wire from a freshly built one,
+        // so without this a node could be "fixed" and still serve pre-fix envelopes until
+        // they aged out of the LRU.
+        assert!(
+            k.starts_with(&format!("v{RESPONSE_ENVELOPE_SCHEMA}_")),
+            "the envelope schema version leads the key: {k}"
+        );
     }
 
     #[test]
@@ -7988,6 +8075,294 @@ mod tests {
             assert!(
                 result.get(forbidden).is_none(),
                 "dig.getContent must not carry a (mock) `{forbidden}` field: {result}"
+            );
+        }
+    }
+
+    // -- #2071: the getContent envelope a client reassembles from ------------------
+    //
+    // Every `*.on.dig.net` subdomain went dark because these fields were absent. The
+    // resolver sizes its reassembly buffer from `total_length` BEFORE it has seen
+    // every window; `undefined >>> 0` is `0`, so it copied the ciphertext into a
+    // zero-length buffer, then failed its own chunk-length sanity check and answered
+    // its own 404. Nothing on the wire was an error — `dig.getContent` returned real
+    // ciphertext and a real, verifying proof the entire time.
+
+    /// A single-window (complete) resource still states its full length, this
+    /// window's placement, and an EXPLICIT `next_offset: null`.
+    #[test]
+    fn content_window_envelope_states_total_length_offset_and_length() {
+        let ciphertext = vec![7u8; 15962];
+        let result = content_window_envelope(
+            &ciphertext,
+            0,
+            Bytes32([0x42; 32]).to_hex(),
+            Some("cHJvb2Y=".into()),
+            json!([15962u32]),
+        );
+
+        assert_eq!(
+            result["total_length"],
+            json!(15962),
+            "the FULL resource length must be on every window — a client sizes its \
+             reassembly buffer from it before it has seen the last window: {result}"
+        );
+        assert_eq!(result["offset"], json!(0), "window placement: {result}");
+        assert_eq!(result["length"], json!(15962), "window size: {result}");
+        assert_eq!(result["complete"], json!(true));
+        assert!(
+            result.get("next_offset").is_some_and(Value::is_null),
+            "the last window carries an EXPLICIT null next_offset, so a client can tell \
+             \"done\" apart from \"this server omitted the field\": {result}"
+        );
+    }
+
+    /// A resource larger than one window reports the NEXT window's offset, and each
+    /// window's own `offset`/`length` — never the whole resource's.
+    #[test]
+    fn content_window_envelope_places_each_window_of_a_multi_window_resource() {
+        let ciphertext = vec![3u8; WINDOW + 500];
+
+        let first = content_window_envelope(&ciphertext, 0, String::new(), None, json!([]));
+        assert_eq!(first["total_length"], json!(WINDOW + 500));
+        assert_eq!(first["offset"], json!(0));
+        assert_eq!(
+            first["length"],
+            json!(WINDOW),
+            "clamped to one window: {first}"
+        );
+        assert_eq!(first["complete"], json!(false));
+        assert_eq!(first["next_offset"], json!(WINDOW));
+
+        let last = content_window_envelope(&ciphertext, WINDOW, String::new(), None, json!([]));
+        assert_eq!(last["total_length"], json!(WINDOW + 500));
+        assert_eq!(last["offset"], json!(WINDOW));
+        assert_eq!(last["length"], json!(500));
+        assert_eq!(last["complete"], json!(true));
+        assert!(last.get("next_offset").is_some_and(Value::is_null));
+    }
+
+    /// EVERY window carries the inclusion proof; only `chunk_lens` rides the first.
+    ///
+    /// `inclusion_proof` is a `ChunkObject.required` field ("Sent on every window",
+    /// docs.dig.net openrpc.json) and the retired Lambda emitted it unconditionally.
+    /// Gating it on the first window would leave windows 1..N of any resource over
+    /// 3 MiB unverifiable — the same silent, error-free failure #2071 is about, just
+    /// relocated to large resources where a small-resource test cannot see it.
+    /// `chia-offer.on.dig.net` is 15962 bytes, one window, which is exactly why.
+    #[test]
+    fn every_window_carries_the_inclusion_proof_but_only_the_first_carries_chunk_lens() {
+        // THREE windows, so a MIDDLE one exists. A two-window resource has only a first and
+        // a last, which leaves `start == 0 || complete` indistinguishable from the correct
+        // unconditional emit — that exact mutation survived the full 670-test suite.
+        let ciphertext = vec![3u8; 2 * WINDOW + 500];
+        let proof = "cHJvb2Y=";
+
+        for (label, offset) in [("first", 0), ("middle", WINDOW), ("last", 2 * WINDOW)] {
+            let window = content_window_envelope(
+                &ciphertext,
+                offset,
+                Bytes32([0x42; 32]).to_hex(),
+                Some(proof.into()),
+                json!([WINDOW, WINDOW, 500]),
+            );
+            assert_eq!(
+                window["inclusion_proof"],
+                json!(proof),
+                "the {label} window must carry the proof — a client that begins mid-resource \
+                 has no other source for it: {window}"
+            );
+            assert_eq!(
+                window["root"],
+                json!(Bytes32([0x42; 32]).to_hex()),
+                "every window names the generation it was served against: {window}"
+            );
+        }
+
+        // chunk_lens is the ONE field that legitimately rides the first window only: it
+        // describes how to split the REASSEMBLED resource, which a client cannot act on
+        // until it holds every window. openrpc.json and the Lambda agree on this asymmetry.
+        for (label, offset) in [("middle", WINDOW), ("last", 2 * WINDOW)] {
+            let window = content_window_envelope(
+                &ciphertext,
+                offset,
+                String::new(),
+                Some(proof.into()),
+                json!([7]),
+            );
+            assert!(
+                window.get("chunk_lens").is_none(),
+                "the {label} window must NOT repeat chunk_lens: {window}"
+            );
+        }
+        let first = content_window_envelope(
+            &ciphertext,
+            0,
+            String::new(),
+            Some(proof.into()),
+            json!([7]),
+        );
+        assert_eq!(first["chunk_lens"], json!([7]), "{first}");
+    }
+
+    /// A source with NO proof still sends the key, as `""` — never omits it.
+    ///
+    /// `ChunkObject` types `inclusion_proof` as `["string","null"]` and REQUIRED, and the
+    /// retired Lambda emitted it unconditionally via `unwrap_or_default()`. The no-proof
+    /// case is reachable, not theoretical: a fetch-through serve of a capsule carrying no
+    /// per-resource commitment has `inclusion_proof: None`. Omitting the key there would
+    /// ship the state SPEC §5.5.0 calls non-conforming, and would leave a client unable to
+    /// tell "this resource has no proof" from "this server forgot to send one".
+    #[test]
+    fn a_window_with_no_proof_sends_an_empty_string_rather_than_omitting_the_key() {
+        let ciphertext = vec![1u8; 64];
+        let window = content_window_envelope(&ciphertext, 0, String::new(), None, json!([64]));
+        assert_eq!(
+            window["inclusion_proof"],
+            json!(""),
+            "present-and-empty is a fact a client can act on; absent is one it must guess at: {window}"
+        );
+
+        // The reachable producer of that state: a fetch-through serve with no commitment.
+        let fetched = crate::download::FetchedResource {
+            bytes: ciphertext,
+            total_length: 64,
+            chunk_lens: vec![64],
+            root: Some(Bytes32([0x42; 32]).to_hex()),
+            inclusion_proof: None,
+        }
+        .content_result(0);
+        assert_eq!(
+            fetched["inclusion_proof"],
+            json!(""),
+            "a fetch-through window with no commitment is still conforming: {fetched}"
+        );
+    }
+
+    /// The exact arithmetic the on.dig.net service worker performs (#2071) — the contract
+    /// that actually matters: buffer sized from `total_length`, each window written at its
+    /// own `offset`, `chunk_lens` kept from window 0, then `sum(chunk_lens) == buf.len()`
+    /// or the read is discarded and the worker answers its own 404.
+    ///
+    /// Driven over a MULTI-window resource. The single-window form of this test was the
+    /// only end-to-end check of the shape the resolver consumes, and it ran in exactly the
+    /// shape — 15962 bytes, one window, no loop — that could not surface a windows-1..N
+    /// defect. `chia-offer.on.dig.net` is that size, which is why the live site could not
+    /// have surfaced one either.
+    #[test]
+    fn a_client_can_reassemble_a_multi_window_resource_from_the_envelope_alone() {
+        use digstore_core::wire::ContentResponse;
+        let root = Bytes32([0x42; 32]);
+        let payload: Vec<u8> = (0..2 * WINDOW + 500).map(|i| (i % 251) as u8).collect();
+        let resp = ContentResponse {
+            ciphertext: payload.clone(),
+            merkle_proof: digstore_core::merkle::MerkleProof {
+                leaf: root,
+                path: Vec::new(),
+                root,
+            },
+            roothash: root,
+            chunk_lens: vec![WINDOW as u32, WINDOW as u32, 500],
+        };
+
+        // Verbatim the resolver's loop (on.dig.net assets/sw.js fetchVerifiedPost): window 0
+        // alone establishes total_length + chunk_lens + the proof, then every later window is
+        // placed by its own reported offset.
+        let first = build_result(&resp, 0);
+        let total = first["total_length"].as_u64().unwrap_or(0) as usize;
+        let mut buf = vec![0u8; total];
+        let chunk_lens: Vec<u64> = first["chunk_lens"]
+            .as_array()
+            .expect("window 0 carries chunk_lens")
+            .iter()
+            .filter_map(Value::as_u64)
+            .collect();
+        let proof = first["inclusion_proof"].as_str().unwrap_or("").to_string();
+
+        let mut window = first;
+        let mut windows_seen = 0;
+        loop {
+            windows_seen += 1;
+            let at = window["offset"].as_u64().unwrap_or(0) as usize;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(window["ciphertext"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(
+                window["length"].as_u64(),
+                Some(bytes.len() as u64),
+                "declared length matches the bytes served: {window}"
+            );
+            assert_eq!(
+                window["inclusion_proof"].as_str(),
+                Some(proof.as_str()),
+                "every window repeats the whole-resource proof: {window}"
+            );
+            buf[at..at + bytes.len()].copy_from_slice(&bytes);
+            match window["next_offset"].as_u64() {
+                Some(next) => window = build_result(&resp, next as usize),
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            windows_seen, 3,
+            "the resource genuinely spans three windows"
+        );
+        let lens_sum: u64 = chunk_lens.iter().sum();
+        assert_eq!(
+            lens_sum as usize,
+            buf.len(),
+            "sum(chunk_lens) must equal the reassembled buffer, or the client discards \
+             the read as corrupt and serves its own 404 (#2071)"
+        );
+        assert_eq!(buf, payload, "the reassembled bytes are the resource");
+    }
+
+    /// The fetch-through path serves the SAME envelope as the local path — a
+    /// second implementation of this shape is what produced #2071 in the first place.
+    #[test]
+    fn fetch_through_and_local_paths_agree_on_the_get_content_envelope() {
+        use digstore_core::wire::ContentResponse;
+        let root = Bytes32([0x42; 32]);
+        let ciphertext = vec![5u8; 4096];
+        let proof_b64 = "cHJvb2Y=";
+
+        let local = build_result(
+            &ContentResponse {
+                ciphertext: ciphertext.clone(),
+                merkle_proof: digstore_core::merkle::MerkleProof {
+                    leaf: root,
+                    path: Vec::new(),
+                    root,
+                },
+                roothash: root,
+                chunk_lens: vec![4096],
+            },
+            0,
+        );
+        let fetched = crate::download::FetchedResource {
+            bytes: ciphertext,
+            total_length: 4096,
+            chunk_lens: vec![4096],
+            root: Some(root.to_hex()),
+            inclusion_proof: Some(proof_b64.into()),
+        }
+        .content_result(0);
+
+        for field in [
+            "total_length",
+            "offset",
+            "length",
+            "complete",
+            "next_offset",
+            "root",
+            "ciphertext",
+            "chunk_lens",
+        ] {
+            assert_eq!(
+                local[field], fetched[field],
+                "field `{field}` differs between the local and fetch-through envelopes\n\
+                 local:   {local}\nfetched: {fetched}"
             );
         }
     }
