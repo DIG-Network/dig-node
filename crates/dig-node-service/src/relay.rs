@@ -148,6 +148,76 @@ mod tests {
         assert_eq!(g.upstream(), "");
     }
 
+    /// **Proves:** [`probe_upstream_for_loop`] actually SENDS the probe — the right method, to the
+    /// configured upstream, carrying this guard's own single-use id — and sends nothing at all when
+    /// no upstream is configured.
+    ///
+    /// **Catches:** the function having zero coverage. Detection (what happens when a probe comes
+    /// BACK) was well tested; emission was tested nowhere, so deleting the send entirely left the
+    /// suite green and the §3.4.1 runtime check wired to nothing. That is the failure mode where a
+    /// correct guard ships disconnected.
+    ///
+    /// **Not covered here:** WHERE the caller spawns this. The probe must be fired after the node's
+    /// own listeners are bound, since the evidence is the request arriving back at this node's
+    /// dispatcher and `probe_upstream_for_loop` swallows transport errors by design. That ordering
+    /// lives in `server::serve_with_shutdown`, which the integration harness does not drive (it
+    /// builds a router and calls `axum::serve` directly), so it is verified by inspection rather
+    /// than by this test. Stated plainly instead of implied to be covered.
+    #[tokio::test]
+    async fn the_probe_is_actually_sent_to_the_configured_upstream() {
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::post(move |axum::Json(req): axum::Json<Value>| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(req);
+                    axum::Json(json!({ "jsonrpc": "2.0", "id": 1, "result": {} }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let http = reqwest::Client::new();
+
+        // No upstream: nothing is sent. A probe to nowhere would be a pointless outbound request
+        // from every default node on the network.
+        probe_upstream_for_loop(&http, &RelayGuard::new("")).await;
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "an unconfigured node probes nobody"
+        );
+
+        let guard = RelayGuard::new(&format!("http://{addr}"));
+        probe_upstream_for_loop(&http, &guard).await;
+
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "exactly one probe: {calls:?}");
+        assert_eq!(calls[0]["method"], json!(PROBE_METHOD), "{calls:?}");
+        assert_eq!(
+            calls[0]["id"],
+            guard.probe_request()["id"],
+            "the marker must ride in the JSON-RPC id — an intermediary that forwards bodies can \
+             drop unknown headers, which is exactly what the rpc.dig.net gateway does: {calls:?}"
+        );
+        let id = calls[0]["id"].as_str().unwrap_or_default();
+        assert!(id.starts_with(PROBE_ID_PREFIX), "{calls:?}");
+        assert_eq!(
+            id.trim_start_matches(PROBE_ID_PREFIX).len(),
+            32,
+            "single-use 16-byte random suffix; a predictable id would let any caller forge the \
+             marker and switch a node's passthrough off: {calls:?}"
+        );
+    }
+
     #[test]
     fn a_configured_upstream_relays_until_a_loop_is_proven() {
         let g = RelayGuard::new("http://127.0.0.1:9999");

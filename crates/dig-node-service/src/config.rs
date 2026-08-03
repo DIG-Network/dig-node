@@ -562,31 +562,43 @@ pub fn is_self_upstream(upstream: &str, serving_port: u16) -> bool {
         return false;
     };
 
-    let is_loopback_host = matches!(host.as_str(), "localhost" | "::1")
-        || host
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| ip.is_loopback())
-        || host
-            .parse::<std::net::Ipv6Addr>()
-            .is_ok_and(|ip| ip.is_loopback());
-
-    // The `dig.local` alias and the DIG_LOCAL_IP it resolves to are this node on BOTH privileged
-    // listeners, not just the plaintext one: `http://dig.local` (DIG_LOCAL_PORT) and
-    // `https://dig.local` (DIG_LOCAL_HTTPS_PORT, #624).
+    // Derived from the sockets this process ACTUALLY binds, rather than from a hand-listed set of
+    // self-looking shapes. An enumeration of shapes is bypassed by the next shape of the same thing
+    // — the first version of this check listed `dig.local` on port 80 only, and a bare `dig.local`
+    // (which §3.3 normalises to `https://`, i.e. port 443) walked straight past it.
     //
-    // Checking only DIG_LOCAL_PORT left the likeliest hand-typed self value walking past the guard:
-    // a bare `dig.local` normalises to `https://dig.local` (§3.3 defaults the scheme to https), so
-    // it arrives here as port 443 and matched nothing. State the guard over the CLASS — this alias
-    // on any port it is actually served on — rather than over the one shape first thought of.
-    let is_dig_local_alias = host == DIG_LOCAL_HOST
-        || host
-            .parse::<std::net::Ipv4Addr>()
-            .is_ok_and(|ip| ip == DIG_LOCAL_IP);
-    if is_dig_local_alias && matches!(port, DIG_LOCAL_PORT | DIG_LOCAL_HTTPS_PORT) {
-        return true;
+    // Keep in step with [`Config::bind_addr`], [`Config::bind_addr_v6`], [`Config::dig_local_addr`],
+    // [`Config::dig_local_https_addr`] and [`Config::dig_local_https_addr_v6`]. Note the HTTPS
+    // dig.local surface is bound on BOTH families (§5.2 IPv6-first), so `[::1]:443` is this node too
+    // — omitting it was the residual hole after the first fix.
+    //
+    // The `dig_local` listeners are listed unconditionally even though they are best-effort and can
+    // be disabled: refusing an upstream we might not actually be serving costs a disabled
+    // passthrough, while accepting one we ARE serving costs a relay loop. Fail closed.
+    // The PRIVILEGED ports this node serves besides its ordinary one: `http://dig.local`
+    // (DIG_LOCAL_PORT) and `https://dig.local` (DIG_LOCAL_HTTPS_PORT, #624). The HTTPS surface is
+    // bound on BOTH families (§5.2 IPv6-first), so `[::1]:443` is this node too — omitting it was
+    // the residual hole after the first fix. Keep in step with [`Config::dig_local_addr`],
+    // [`Config::dig_local_https_addr`] and [`Config::dig_local_https_addr_v6`].
+    let is_privileged_self_port = matches!(port, DIG_LOCAL_PORT | DIG_LOCAL_HTTPS_PORT);
+
+    // `dig.local` is a hosts-file alias for DIG_LOCAL_IP, which is bound ONLY on the privileged
+    // listeners — never on the ordinary serving port. So `dig.local:<serving_port>` genuinely is
+    // some other node, and must stay accepted.
+    if host == DIG_LOCAL_HOST {
+        return is_privileged_self_port;
     }
 
-    is_loopback_host && port == serving_port
+    // Any other loopback name or literal. The serving port is included because DIG_NODE_HOST may
+    // override the bind to ANY loopback address, so `127.0.0.2:<serving_port>` can be this node.
+    //
+    // The privileged ports are folded in unconditionally even though those binds are best-effort
+    // and can be disabled: refusing an upstream we might not be serving costs a disabled
+    // passthrough, whereas accepting one we ARE serving costs a relay loop. Fail closed.
+    let is_loopback_host =
+        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+
+    is_loopback_host && (port == serving_port || is_privileged_self_port)
 }
 
 /// Resolve the explicit cache dir from a raw `DIG_NODE_CACHE` value: a non-blank
@@ -668,6 +680,13 @@ mod tests {
             // …and the loopback IP the alias resolves to, on both privileged listeners.
             "http://127.0.0.2:80",
             "https://127.0.0.2:443",
+            // The HTTPS surface is bound on BOTH families (§5.2 IPv6-first), so the v6 loopback on
+            // 443 is this node too. Matching only the v4 alias left this hole open.
+            "https://[::1]:443",
+            "https://localhost:443",
+            // The v6 loopback on the ordinary serving port, addressed by name and by literal.
+            "http://[::1]:9778",
+            "http://localhost:9778",
         ] {
             assert!(
                 is_self_upstream(&normalize_upstream(u), 9778),

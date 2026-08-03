@@ -1743,18 +1743,6 @@ where
         dig_node_core::peer::spawn_peer_network(state.node.clone());
     }
 
-    // Prove the configured upstream is not this node (#1997). Fire-and-forget: the evidence is the
-    // probe ARRIVING BACK at this node's own dispatcher, which the request path notices — nothing
-    // here waits on or inspects a reply. A no-op when no upstream is configured, which is the
-    // default. See [`crate::relay`] for why the marker rides in the JSON-RPC `id`.
-    {
-        let http = state.http.clone();
-        let relay = state.relay.clone();
-        tokio::spawn(async move {
-            crate::relay::probe_upstream_for_loop(&http, &relay).await;
-        });
-    }
-
     // Always-on self-heal driver (#584 beacon re-arm + #651 ext-forcelist reconcile): on a
     // privileged SERVICE run, periodically re-arm a drifted auto-update schedule (`dig-updater
     // schedule ensure`, opt-out-respecting) and re-apply the extension force-install policy
@@ -1790,6 +1778,11 @@ where
              (non-fatal). The wallet is still served on the loopback HTTP surface + /ws"
         ),
     }
+
+    // Captured before `state` moves into the router. The probe itself is spawned further down, once
+    // every listener is bound — see the comment there for why the ordering is load-bearing.
+    let probe_http = state.http.clone();
+    let probe_relay = state.relay.clone();
 
     let app = router(state);
 
@@ -1875,6 +1868,22 @@ where
     // bare-dig.local listeners: a bind failure logs and is non-fatal; the plaintext surface above
     // keeps serving. Runs as spawned tasks driven to graceful stop by the shared shutdown signal.
     bring_up_local_https(&config, &app, &shutdown_notify);
+
+    // Prove the configured upstream is not this node (#1997). Fire-and-forget: the evidence is the
+    // probe ARRIVING BACK at this node's own dispatcher, which the request path notices — nothing
+    // here waits on or inspects a reply. A no-op when no upstream is configured, which is the default.
+    // See [`crate::relay`] for why the marker rides in the JSON-RPC `id` rather than a header.
+    //
+    // Spawned HERE, after every listener is bound, and deliberately not at the top of bring-up. The
+    // probe's whole mechanism is that the request comes BACK to this node's own dispatcher, so a
+    // probe fired before the sockets exist can only be refused — and `probe_upstream_for_loop`
+    // ignores transport errors by design, so that refusal is silent and no evidence is ever
+    // recorded. On the loopback shapes the round trip is microseconds, so it would lose that race
+    // essentially every time; on the CDN shape it would merely usually win it. A guard whose
+    // correctness depends on winning a race is not a guard.
+    tokio::spawn(async move {
+        crate::relay::probe_upstream_for_loop(&probe_http, &probe_relay).await;
+    });
 
     // `into_make_service_with_connect_info::<SocketAddr>()` — NOT the plain `app` — is what makes
     // `ConnectInfo<SocketAddr>` extractable in `rpc()` at all: a bare `axum::serve(listener, router)`
