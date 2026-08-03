@@ -1616,12 +1616,19 @@ neighbourhood — its XOR proximity to the node's own `peer_id` clears
 `relevance::INBOUND_DEMAND_MIN_PROXIMITY` (the keyspace midpoint, `0.5`: the content id is closer to
 this node's `peer_id` than a uniformly-random point, i.e. shares the top keyspace bit). This is the
 same `xor_proximity` primitive and the same reference `peer_id` the tier-0 precache selector (§7.10a /
-§7.10b) scores against, so both paths share ONE neighbourhood definition. It is ungameable in the ways
-that matter: an attacker cannot move this node's `peer_id`, and because the pull is chain-anchored
-(§7.10d(a) verifies against the CHIP-0035 anchored root) the demanded key cannot name arbitrary junk —
-grinding a store key toward our `peer_id` costs real on-chain mints, not cheap hashing. The gate FAILS
-CLOSED: a node with no known self-identity (the FFI/consumer path) or a non-canonical `(store, root)`
-admits no pull. The read itself is still served normally — the gate governs only the demand-driven
+§7.10b) scores against, so both paths share ONE neighbourhood definition. What the gate binds — and
+what it does NOT: an attacker cannot move this node's `peer_id`, so the gate confines peer-steerable
+demand-caching to keys NEAR this node's own identity — never an arbitrary far-keyspace target. It does
+NOT make naming a near key cost an on-chain mint: a peer may name any `(store, root)` whose key falls
+near our `peer_id` and, on an opted-in node, drive a CHEAP DHT provider-lookup for it (a key that names
+no real store simply finds no providers and the pull fails there — the low cost is "no providers", not
+a per-key mint). The on-chain-mint + merkle cost binds a LATER step — actually becoming a cached
+HOLDER: a pulled module is bound to its `root` by merkle verification and is never SERVED as current
+unless `root` equals the chain-anchored tip (the serve-time read-path pin, §7.10d(a) / §14.4). So the
+worst a near-key attacker extracts from an opted-in node is a bounded, single-flighted, byte-capped
+pull of REAL near-neighbourhood content of a possibly-old generation — never caching of fabricated,
+junk, or out-of-neighbourhood content. The gate FAILS CLOSED: a node with no known self-identity (the
+FFI/consumer path) or a non-canonical `(store, root)` admits no pull. The read itself is still served normally — the gate governs only the demand-driven
 CACHE. The DEFAULT stays OFF; flipping it on (and any tightening of the midpoint bar toward a
 routing-aware k-closest test, which depends on live network size) is a separate deliberate pass.
 
