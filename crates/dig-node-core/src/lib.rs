@@ -4188,6 +4188,106 @@ mod tests {
         std::env::remove_var("DIG_NODE_CACHE");
     }
 
+    /// **Proves (#2053):** the `<cache>/modules` size-cap bound holds on the RESHARE-WARM land — the
+    /// read-triggered whole-capsule pull that makes this node a holder ([`CapsuleWarmer::warm`]). A real
+    /// warm that lands past the cap must ITSELF run the tier-aware sweep (through the SAME
+    /// [`Node::evict_modules_if_needed`] the tier-0 loop #1934 and the read-path sync #2041 use), so the
+    /// last on-demand land path is no longer unbounded — "every on-demand land path sweeps" becomes
+    /// literally true.
+    ///
+    /// The just-promoted reshare-warm module is UNTAGGED, so `module_tier` returns the protected
+    /// `Tier1Demand` default (§ the #2015 fail-safe) — it is NOT marked `Tier0Precache`. So the sweep
+    /// correctly sacrifices the pre-existing tier-0 victim B FIRST and the reshare-warm module A
+    /// survives: a reshare-warm module is treated as its real (demand) tier, never wrongly sacrificed.
+    ///
+    /// **Non-vacuous:** B (oversized, `Tier0Precache`) is the ONLY thing over the cap, and nothing but
+    /// the warm's OWN sweep runs — no tier-0 loop, no read-path sync. Delete the `evict_if_needed` call
+    /// in `CapsuleWarmer::warm` and B survives (unbounded growth); its eviction can only be explained by
+    /// the reshare-warm land now sweeping at its own site.
+    /// A no-op [`AnnounceHolder`](crate::seams::dig_peer::AnnounceHolder): the reshare warm announces on
+    /// a successful land, but this test asserts the SWEEP, not the announce, so the DHT hop is stubbed.
+    struct SilentAnnounce;
+
+    #[async_trait::async_trait]
+    impl crate::seams::dig_peer::AnnounceHolder for SilentAnnounce {
+        async fn announce_inventory(&self) {}
+    }
+
+    #[test]
+    fn reshare_warm_land_bounds_modules_cache_evicting_the_tier0_victim() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+        set_cache_cap_bytes(100_000).unwrap();
+
+        // Store A: landed by a real reshare warm (chain-anchored, verified, promoted). Store B: a
+        // PRE-EXISTING tier-0 precache module, oversized so the cache is over the cap the instant A lands.
+        let store_a = [0x5au8; 32];
+        let root = [0x5bu8; 32];
+        let store_a_hex = hex::encode(store_a);
+        let root_hex = hex::encode(root);
+        let store_b = "b5".repeat(32);
+        let module = chain_anchored_module(store_a, root);
+        assert!(
+            (module.len() as u64) < 100_000,
+            "the warmed capsule must fit UNDER the cap so ONLY the tier-0 module is the eviction victim"
+        );
+
+        // A real Node — its cache_dir IS the warmer's cache_dir, so the promoted capsule lands exactly
+        // where the node's sweep scans. The evictor is the production `NodeModulesEvictor` over it.
+        let (node, _td) = test_node(None);
+        let node = Arc::new(node);
+
+        let path_b = module_path(&node.cache_dir, &store_b, &root_hex);
+        std::fs::create_dir_all(path_b.parent().unwrap()).unwrap();
+        std::fs::write(&path_b, vec![0u8; 200_000]).unwrap();
+        crate::tier0_live::mark_tier0_land(&store_b);
+
+        let content = dig_download::module_content_id(&store_a_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        let warmer = crate::seams::dig_peer::CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                &store_a_hex,
+                &root_hex,
+                module.clone(),
+                8,
+            )),
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            MockResolver::one(&store_a_hex, Bytes32(root)),
+            crate::seams::dig_peer::WarmPaths {
+                staging_dir: cfg.path().join("warm-staging"),
+                cache_dir: node.cache_dir.clone(),
+            },
+            Arc::new(SilentAnnounce),
+            Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NodeModulesEvictor::new(node.clone())),
+        );
+
+        let outcome = pin_test_rt().block_on(warmer.warm(&store_a_hex, &root_hex));
+        assert!(
+            matches!(outcome, crate::seams::dig_peer::WarmOutcome::Held { .. }),
+            "the reshare warm must actually land the capsule, or the eviction assertion proves nothing"
+        );
+
+        let path_a = module_path(&node.cache_dir, &store_a_hex, &root_hex);
+        assert!(
+            path_a.exists(),
+            "the just-warmed reshare module survives its own sweep — it is Tier1Demand, not tier-0"
+        );
+        assert!(
+            !path_b.exists(),
+            "the pre-existing tier-0 module is evicted by the reshare-warm land's OWN sweep — the bound \
+             holds with NO tier-0 loop and no read-path sync"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
     /// **Proves (#2015):** a legacy cache entry with NO `.tier` sidecar defaults FAIL-SAFE. `module_tier`
     /// returns the protected `Tier1Demand`, and a sweep handles the untagged module without error.
     /// **Catches:** a regression that treats a missing tag as `Tier0Precache` (wrongly sacrificial) or

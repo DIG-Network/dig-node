@@ -1236,7 +1236,7 @@ impl NodeContent {
     /// `cache_dir` is the node's cache root; a promoted module lands at
     /// `<cache_dir>/modules/<store>/<root>.dig`, the path whose existence IS this node's holder claim.
     #[allow(clippy::too_many_arguments)]
-    pub fn wire_capsule_reshare(
+    pub(crate) fn wire_capsule_reshare(
         self: &Arc<Self>,
         node_cert: Arc<dig_nat::NodeCert>,
         nat_config: dig_nat::NatConfig,
@@ -1249,6 +1249,10 @@ impl NodeContent {
         // so this reshare warm claims the SAME registry the §21 backfill leg does; the two transports
         // for one capsule then dedup against each other instead of each pulling the whole `.dig`.
         capsule_acquisition: Arc<crate::seams::dig_peer::WarmRegistry>,
+        // The node's tier-aware modules-cache sweep (#2053), run after a SUCCESSFUL reshare-warm land so
+        // this read-triggered whole-capsule pull bounds `<cache>/modules` — the SAME seam the tier-0
+        // precache loop uses, so both on-demand land paths plateau at one cap through one implementation.
+        modules_evictor: Arc<dyn crate::tier0_live::ModulesCacheEvictor>,
     ) {
         let transport = Arc::new(crate::seams::dig_peer::NatModuleTransport::new(
             node_cert,
@@ -1272,6 +1276,7 @@ impl NodeContent {
             announce,
             capsule_acquisition,
             dig_download::ModuleDownloadConfig::default(),
+            modules_evictor,
         ));
     }
 
@@ -3142,6 +3147,7 @@ pub(crate) mod tests {
             Arc::new(UnreachedAnnounce),
             Arc::clone(&registry),
             dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
         );
         pc.set_capsule_warmer(warmer);
         let content = ContentId::resource([0xaa; 32], [0xbb; 32], [0xcc; 32]);
