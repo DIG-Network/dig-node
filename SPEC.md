@@ -1650,11 +1650,14 @@ a ONE-WAY key. Every merkle-verified fetch path (`find_providers`/`fetch_resourc
 verification itself requires the confirmed `root`. A concrete `Tier0Fetcher` therefore REQUIRES a
 `content_key → (store_id, root)` resolution that the counts-only `dig.getProviderSnapshot` surface
 (§7.10c, §7.4a) deliberately does not carry, and that the node otherwise holds only for stores it
-already knows (subscriptions/chain-watch §7.10c/§14.2). Supplying that resolution — a discovery surface
-that returns verifiable preimages for XOR-near keys, with its privacy trade-off assessed — is a
-prerequisite child of epic #1934 and is out of scope for this module, which is why the concrete
-network seams + the spawn-at-bring-up are gated on it. Until then the governed round + its seams are
-the normative contract, exercised end-to-end against injected seams.
+already knows (subscriptions/chain-watch §7.10c/§14.2). That resolution is supplied by the
+`dig.resolveCapsule` peer RPC (dig-node-core `SPEC.md` §7.4): a HOLDER answers a one-way `content_key`
+with the verifiable `(store_id, root, size_bytes)` preimage it recomputes from its own holdings
+(`ContentId::capsule(store, root).to_key()` equals the requested key), disclosing only the preimages of
+capsules it already publicly provides. The SERVER half of that resolve is child PR-1 of the flywheel
+live-wiring; the client resolver and the `Tier0Fetcher`/spawn wiring that consume it are the following
+children (PR-2/PR-3). Until those land the governed round + its seams are the normative contract,
+exercised end-to-end against injected seams.
 
 ### 7.11. Control-token pairing for browser controllers (#280)
 

@@ -27,6 +27,7 @@ pub mod pool_locator;
 /// connection, decoded through the real dig-nat codec. Test-only — there is no production surface here.
 #[cfg(test)]
 mod range_stream_wire;
+pub mod resolve_capsule;
 pub mod selector_adapter;
 pub mod self_excluding_locator;
 pub mod serve_log;
