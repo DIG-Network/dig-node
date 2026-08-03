@@ -790,6 +790,23 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
   so that surface stays strictly counts-only while this one trades preimages of this node's own public
   holdings for keys a caller already sampled. A dig-node-LOCAL peer method (like `getProviderSnapshot`,
   allowlisted explicitly in `is_peer_reachable_method`).
+
+  **Client-side self-verification (`CapsuleKeyResolver`, the anti-forgery invariant — MANDATORY).**
+  The node that CALLS `dig.resolveCapsule` MUST NOT trust the answer. Nothing on the wire binds a
+  returned `(store_id, root)` to the requested key, so a malicious provider can answer any sampled key
+  `H` with an arbitrary preimage. The client therefore, for every returned entry, RECOMPUTES
+  `ContentId::capsule(store_id, root).to_key()` LOCALLY and admits the pair ONLY when it byte-equals a
+  key it actually requested; a returned entry whose `content_key` was not requested, whose `store_id`/
+  `root` is non-canonical, or whose recompute mismatches is DROPPED (never fetched). Because `to_key`
+  is collision-resistant SHA-256 over the frozen domain-separated encoding, a forged preimage that
+  hashes to an `H` the provider does not hold is computationally unrepresentable — the recompute is the
+  load-bearing gate. The verified pair is surfaced ONLY as an opaque `VerifiedCapsuleKey` whose sole
+  constructor is the recompute, so a downstream fetch path is structurally incapable of acting on an
+  unverified preimage. The comparison is over raw 32-byte values, never hex text. This `to_key`
+  recompute is the FIRST of two gates; the SECOND — chain-anchoring the `root` via
+  `ChainAnchoredModuleVerifier` (a coinset lineage walk) — attaches at the fetch/cache path BEFORE any
+  precached content is cached or announced, so an honest-but-stale root that passes the recompute is
+  still never cached unanchored.
 - **The four DHT methods** `find_node` / `find_providers` / `add_provider` / `ping` (§7.5), dispatched
   to the content-location DHT, folding the mTLS-verified caller into the routing table.
 - **The four PEX messages** `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` (§7.7).

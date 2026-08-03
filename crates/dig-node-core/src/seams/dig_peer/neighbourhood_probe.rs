@@ -265,7 +265,7 @@ impl ProviderSnapshotClient for MtlsProviderSnapshotClient {
 /// Relay markers (empty host) and hostnames are skipped rather than DNS-resolved: the probe must never
 /// block the async runtime on a name lookup, and a keyspace probe deals in the IP-literal candidates a
 /// DHT contact carries.
-fn direct_socket_addrs(addresses: &[dig_dht::CandidateAddr]) -> Vec<SocketAddr> {
+pub(crate) fn direct_socket_addrs(addresses: &[dig_dht::CandidateAddr]) -> Vec<SocketAddr> {
     addresses
         .iter()
         .filter_map(|a| {
