@@ -1000,6 +1000,35 @@ async fn rpc(
         }
     }
 
+    // CHAT gate (F1, #1946): `chat.send` seals + BLS-signs a directed message as this node's OWN
+    // 0x0010 identity, and `chat.poll` DRAINS the inbound inbox — both wield node-owned crypto/state,
+    // so they require the control token exactly like `control.*` mutations. A loopback address alone
+    // does not prove the paired chat app (any local process can POST here), so an unauthorized caller
+    // is rejected BEFORE the seal/send or inbox drain runs. Authorization is the master control token
+    // OR a valid paired token (#280). The same gate binds the WS transport ([`ws_dispatch`]).
+    if is_gated_chat_method(&method) {
+        let header_tok = headers
+            .get(control::CONTROL_TOKEN_HEADER)
+            .and_then(|v| v.to_str().ok());
+        let presented = control::presented_token(header_tok, &req);
+        let paired_path = pairing::paired_tokens_path(&state.state_dir);
+        let authorized = chat_call_authorized(presented.as_deref(), &state.control_token, |tok| {
+            pairing::is_paired_token(&paired_path, tok)
+        });
+        if !authorized {
+            return (
+                StatusCode::OK,
+                Json(rpc_error(
+                    id,
+                    ErrorCode::Unauthorized,
+                    "chat.send/chat.poll require the local control token (X-Dig-Control-Token \
+                     header or params._control_token) or a paired controller token (see \
+                     `dig-node pair`): they wield the node's own signing identity and inbox",
+                )),
+            );
+        }
+    }
+
     // Keep the original request for a possible passthrough relay (the upstream must
     // see exactly what the client sent, not the dig-node-normalised form).
     let original = req.clone();
@@ -1101,6 +1130,34 @@ fn presented_wallet_token(headers: &HeaderMap, body: &str) -> Option<String> {
             .and_then(|t| t.as_str())
             .map(String::from)
     })
+}
+
+/// The chat RPC methods gated behind the control token (F1, #1946). `chat.send` makes the node seal +
+/// BLS-sign a directed message as its OWN `0x0010` identity — it wields the node's cryptographic
+/// identity like a `control.*` mutation — and `chat.poll` DRAINS (deletes) the inbound inbox, which an
+/// unauthorized local process could otherwise use to steal/delete another app's queued ciphertext.
+/// A loopback address alone does not prove the paired chat app (any local process can reach the RPC
+/// plane), so both require the control token. PURE.
+fn is_gated_chat_method(method: &str) -> bool {
+    matches!(method, "chat.send" | "chat.poll")
+}
+
+/// Whether `token` authorizes a gated chat call (F1, #1946): the master control token (constant-time)
+/// OR a valid paired controller token — the same master-or-paired policy that gates `control.*` and
+/// the wallet surface. Fails CLOSED on an empty master (the in-memory CSPRNG-failure sentinel) so a
+/// blank token can never match a blank master. PURE — the paired-store lookup is injected for testing.
+fn chat_call_authorized(
+    token: Option<&str>,
+    master: &str,
+    is_paired: impl Fn(&str) -> bool,
+) -> bool {
+    if master.is_empty() {
+        return false;
+    }
+    match token {
+        Some(tok) => control::ct_eq(tok, master) || is_paired(tok),
+        None => false,
+    }
 }
 
 /// Whether a wallet-surface caller presenting `token` is authorized for `method` (§7.12): reads are
@@ -1229,6 +1286,22 @@ async fn ws_dispatch(
             pairing::poll(&state.pairings, id.clone(), &params)
         };
         return ws_from_jsonrpc(id, env);
+    }
+    // CHAT gate (F1, #1946): bind the same control-token requirement as the HTTP path on this
+    // transport, so a chat method wired to `/ws` can never bypass the gate (the #2032 lesson — the WS
+    // path needs its own check, not just HTTP). Master control token OR a valid paired token.
+    if is_gated_chat_method(method) {
+        let paired_path = pairing::paired_tokens_path(&state.state_dir);
+        let authorized = chat_call_authorized(token, &state.control_token, |tok| {
+            pairing::is_paired_token(&paired_path, tok)
+        });
+        if !authorized {
+            return ws_err(
+                id,
+                ErrorCode::Unauthorized,
+                "chat.send/chat.poll require the local control token or a paired controller token",
+            );
+        }
     }
     if wallet_authz::requires_authorization(method) && !wallet_call_authorized(state, method, token)
     {
@@ -2110,9 +2183,9 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_allowed_origin, is_app_origin, is_local_origin, peer_tier_status, provenance_for,
-        read_origin_for, served_response, ws_token, ServeProvenance, StorePath, APP_ORIGINS_ENV,
-        EXPOSED_DIG_HEADERS,
+        chat_call_authorized, is_allowed_origin, is_app_origin, is_gated_chat_method,
+        is_local_origin, peer_tier_status, provenance_for, read_origin_for, served_response,
+        ws_token, ServeProvenance, StorePath, APP_ORIGINS_ENV, EXPOSED_DIG_HEADERS,
     };
     use axum::http::HeaderMap;
     use dig_node_core::content_serve::{PeerTier, ServeSource};
@@ -2141,6 +2214,47 @@ mod tests {
     /// have driven `control.*`/`wallet.*`. `ws_token` now yields `None` for a blank/absent
     /// token, so the gate sees no credential and denies (the empty-`expected` guard in
     /// `is_authorized`/`wallet_authz::authorize` is the transport-independent primary close).
+    /// F1 (#1946): the chat control-token predicate. `chat.send` (seal + BLS-sign as the node's own
+    /// 0x0010 identity) and `chat.poll` (drain the inbound inbox) are the ONLY gated chat methods; a
+    /// caller is authorized only with the master control token or a valid paired token, fail-closed on
+    /// an empty master (the CSPRNG-failure sentinel) so a blank token never matches a blank master.
+    #[test]
+    fn chat_gate_classifies_and_authorizes_like_a_control_mutation() {
+        const MASTER: &str = "master-token-value";
+        const PAIRED: &str = "paired-token-value";
+        let is_paired = |t: &str| t == PAIRED;
+
+        // Only chat.send + chat.poll are gated chat methods.
+        assert!(is_gated_chat_method("chat.send"));
+        assert!(is_gated_chat_method("chat.poll"));
+        assert!(!is_gated_chat_method("chat.status"));
+        assert!(!is_gated_chat_method("dig.getContent"));
+
+        // No token / a wrong token → denied; the master or a paired token → allowed.
+        assert!(!chat_call_authorized(None, MASTER, is_paired), "no token");
+        assert!(
+            !chat_call_authorized(Some("nope"), MASTER, is_paired),
+            "wrong token"
+        );
+        assert!(
+            chat_call_authorized(Some(MASTER), MASTER, is_paired),
+            "master"
+        );
+        assert!(
+            chat_call_authorized(Some(PAIRED), MASTER, is_paired),
+            "paired"
+        );
+
+        // Fail closed on an empty master: no token — not even a blank one — is ever authorized.
+        assert!(
+            !chat_call_authorized(Some(""), "", is_paired),
+            "blank vs blank"
+        );
+        assert!(!chat_call_authorized(Some("anything"), "", is_paired));
+        assert!(!chat_call_authorized(Some(PAIRED), "", is_paired));
+        assert!(!chat_call_authorized(None, "", is_paired));
+    }
+
     #[test]
     fn ws_token_treats_a_blank_token_as_absent() {
         assert_eq!(ws_token(&json!({ "token": "" })), None);

@@ -952,6 +952,16 @@ the plaintext body nor the plaintext message id appears in the on-wire sealed by
   body) }] }`, in arrival order, leaving the inbox empty. The inbox is bounded (oldest evicted at
   capacity) so a paired peer cannot grow node memory without bound.
 
+**Authorization (F1, #1946).** BOTH `chat.send` and `chat.poll` are **control-token gated** on every
+transport (HTTP `POST /` and the `/ws` request plane), exactly like a `control.*` mutation: the caller
+MUST present the master control token (§7.3) OR a valid paired controller token (§7a). A loopback
+address does not authorize them — any local process can reach the RPC plane — because `chat.send`
+wields the node's OWN `0x0010` signing identity to seal + BLS-sign an arbitrary directed message, and
+`chat.poll` DRAINS (deletes) the inbound inbox, which an unauthorized process could otherwise use to
+steal or delete another app's queued ciphertext. An unauthorized call is rejected with `-32030`
+`UNAUTHORIZED` BEFORE any seal/send or inbox drain runs (the fail-closed empty-token rule of §7.2
+applies — a blank/absent token is never a credential on either transport).
+
 **Inbound path.** A received opcode-220 frame is opened (`dig-message` unseal → BLS-G2 signature
 verify → anti-replay → expiry), routed through the chat `MessageRegistry`, and the decoded
 `ChatMessage` is queued into the inbox. A sender the node cannot resolve to a BLS key is rejected,

@@ -1283,6 +1283,55 @@ async fn cache_fetch_and_cache_over_http_requires_the_control_token() {
     );
 }
 
+/// **Proves (F1, #1946):** `chat.send` and `chat.poll` over the HTTP `POST /` surface are token-gated
+/// like `control.*` — an untokened call is UNAUTHORIZED (-32030) and never reaches the chat dispatch,
+/// so the node NEVER seals + BLS-signs a message as its own 0x0010 identity (`chat.send`) and NEVER
+/// drains the inbound inbox (`chat.poll`) for an unauthorized local caller. The master control token
+/// gets PAST the gate (whatever the dispatch returns next, it is not the gate's UNAUTHORIZED).
+#[tokio::test]
+async fn chat_methods_over_http_require_the_control_token() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
+
+    for method in ["chat.send", "chat.poll"] {
+        let body = json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
+
+        // Untokened → rejected at the gate BEFORE any seal/send or inbox drain runs.
+        let rejected = post_rpc(&addr, body.clone(), None).await;
+        assert_eq!(rejected["error"]["code"], json!(-32030), "{method}: -32030");
+        assert_eq!(
+            rejected["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method}: UNAUTHORIZED"
+        );
+        assert!(
+            rejected.get("result").is_none(),
+            "{method}: no result — no seal/send, no inbox drain on a rejected call"
+        );
+
+        // Wrong token → same rejection (the side effect still never runs).
+        let wrong = post_rpc(&addr, body.clone(), Some("the-wrong-token")).await;
+        assert_eq!(
+            wrong["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method}: wrong token rejected"
+        );
+
+        // With the master control token → PAST the gate (whatever the dispatch then returns, it is
+        // not the gate's UNAUTHORIZED).
+        let authorized = post_rpc(&addr, body, Some(&token)).await;
+        let is_unauthorized = authorized
+            .get("error")
+            .and_then(|e| e.get("data"))
+            .and_then(|d| d.get("code"))
+            .is_some_and(|c| c == &json!("UNAUTHORIZED"));
+        assert!(
+            !is_unauthorized,
+            "{method}: a control-token call must clear the chat gate, got {authorized:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn control_method_with_wrong_token_is_rejected() {
     let (upstream, _calls) = start_mock_upstream().await;
