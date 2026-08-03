@@ -524,6 +524,10 @@ impl RpcDispatch for Node {
                 // remaining epic-#1934 children (tier-0 prefetch loop, tier-2 bribed retention) wire a
                 // real occupancy source; the shape is fixed now so no controller-side change is needed
                 // then.
+                //
+                // Hand-built JSON (not the typed `dig_rpc_protocol::CacheStats`): that published crate
+                // (0.6.0) predates `refetch_count`/`tiers` and gains them release-first in a follow-up
+                // (dig_ecosystem#2024) — out of scope for this dig-node-only change.
                 return json!({"jsonrpc":"2.0","id":id,"result":{
                 "cap_bytes": cache_cap_bytes(),
                 "used_bytes": usage.total(),

@@ -1340,11 +1340,13 @@ exist yet, an honestly-stubbed placeholder — never a fabricated number.
 
 - **`refetch_count`** — whole-capsule NETWORK lands since process start: bytes actually pulled over
   the wire and written to disk, as opposed to a RAM decode-cache miss (`content_cache.misses`, which
-  can hit an already-on-disk capsule with no network at all). Bumped once per successful
-  `Node::sync_module_from` write — the single choke-point every landing path (on-demand
-  `cache.fetchAndCache`, chain gap-fill, fetch-side backfill §7.10d(a), reshare warm) funnels
-  through, so it counts every genuine re-download exactly once regardless of which caller triggered
-  it. A failed sync (no upstream reachable, verification rejected) never increments it.
+  can hit an already-on-disk capsule with no network at all). There are exactly TWO landing write
+  paths in the crate, and each bumps this counter once at its own successful write, together
+  covering every genuine re-download with no overlap: `Node::sync_module_from` — the choke-point
+  every ON-DEMAND path (`cache.fetchAndCache`, chain gap-fill, fetch-side backfill §7.10d(a))
+  funnels through — and `module_reshare::promote_into_cache`, the reshare-warm land, which is a
+  SEPARATE write-then-rename that never calls `sync_module_from`. A failed sync/promotion (no
+  upstream reachable, verification rejected, a tampered/mismatched artifact) never increments it.
 
 - **`tiers.{tier0_precache,tier1_demand,tier2_bribed}`** — per-`CacheTier` (§7.10a) occupancy, each
   shaped `{ occupancy, wired }`. `wired: false` means the tier has no live occupancy source yet — its

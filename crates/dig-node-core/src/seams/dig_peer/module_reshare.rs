@@ -257,6 +257,13 @@ fn promote_into_cache(
         let _ = std::fs::remove_file(&tmp);
         WarmFailure::CacheWriteFailed
     })?;
+    // #1991 telemetry: this is the reshare-warm capsule land — a whole-capsule NETWORK pull that
+    // just wrote into the cache, exactly the same kind of event `Node::sync_module_from` counts for
+    // the on-demand/gap-fill/fetch-side-backfill paths. This promotion is a SEPARATE write-then-rename
+    // (never routes through `sync_module_from`), so it needs its own increment to make `refetch_count`
+    // complete over every landing path; the two sites are mutually exclusive, so a land is never
+    // double-counted.
+    crate::CACHE_REFETCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(bytes.len() as u64)
 }
 
@@ -576,6 +583,36 @@ mod tests {
             Ok(module.len() as u64)
         );
         assert_eq!(std::fs::read(&cached).unwrap(), module);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Proves:** a successful promotion bumps the #1991 `CACHE_REFETCH_COUNT` telemetry counter —
+    /// the reshare-warm land counts toward `refetch_count` exactly like `sync_module_from`'s land does,
+    /// since this is the SEPARATE write-then-rename path that never routes through it.
+    #[test]
+    fn promoting_an_admitted_artifact_bumps_the_refetch_counter() {
+        let dir = temp_dir("promote-refetch-counter");
+        let module = module_committing(STORE, CHAIN_ROOT);
+        let staged = dir.join("staged.dig");
+        std::fs::write(&staged, &module).unwrap();
+        let verifier =
+            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
+        futures::executor::block_on(dig_download::ModuleAnchorVerifier::verify_module_anchor(
+            &verifier,
+            &SliceReader(module.clone()),
+            &hex32(STORE),
+            &hex32(CHAIN_ROOT),
+        ));
+
+        let before = crate::CACHE_REFETCH_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        let cached = dir.join("cached.module");
+        assert!(promote_into_cache(&staged, &cached, &verifier).is_ok());
+        let after = crate::CACHE_REFETCH_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after,
+            before + 1,
+            "a successful promotion counts as one refetch"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

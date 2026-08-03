@@ -202,11 +202,15 @@ static CACHE_EVICTED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static CONTENT_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Decoded-content-cache lookups that MISSED (had to re-decode the module).
 static CONTENT_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Whole-capsule NETWORK lands since process start — a real refetch (bytes pulled over the
-/// wire and written to disk), distinct from a RAM decode-cache miss (#1991, epic #1934). Bumped
-/// once per successful [`Node::sync_module_from`] write, the single choke-point every landing
-/// path (on-demand `cache.fetchAndCache`, chain gap-fill, fetch-side backfill, reshare warm)
-/// funnels through, so it counts every genuine re-download without double-counting or missing a path.
+/// Whole-capsule NETWORK lands since process start — a real refetch (bytes pulled over the wire
+/// and written to disk), distinct from a RAM decode-cache miss (#1991, epic #1934). There are
+/// exactly TWO landing write paths in this crate, and each bumps this counter at its own
+/// successful write so together they cover every genuine re-download with no overlap:
+/// [`Node::sync_module_from`] (on-demand `cache.fetchAndCache`, chain gap-fill, fetch-side
+/// backfill — all funnel through this one function) and
+/// [`seams::dig_peer::module_reshare::promote_into_cache`] (the reshare-warm land, a SEPARATE
+/// write-then-rename that never calls `sync_module_from`). A failed sync/promotion never
+/// increments it.
 static CACHE_REFETCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The [`ContentCache`] key: `(store_hex, root_hex, retrieval_key)` identifying one served resource.
@@ -1369,10 +1373,11 @@ impl Node {
             .ok_or("the upstream served a root that is not 64-hex")?;
         let path = served_key.module_path(&self.cache_dir);
         write_atomic(&path, &bytes).map_err(|e| format!("could not write the capsule: {e}"))?;
-        // #1991 telemetry: this IS the single choke-point every whole-capsule network land funnels
-        // through — on-demand `cache.fetchAndCache`, chain gap-fill, fetch-side backfill, and the
-        // reshare warm all call down to here — so counting here (rather than at any one caller)
-        // captures every genuine refetch without double-counting or missing a path.
+        // #1991 telemetry: this is the choke-point every ON-DEMAND landing path funnels through —
+        // `cache.fetchAndCache`, chain gap-fill, and fetch-side backfill all call down to here — so
+        // counting here (rather than at any one caller) captures all three without double-counting.
+        // The reshare-warm land is a SEPARATE write path (`module_reshare::promote_into_cache`,
+        // never calls this function) and counts itself at its own successful write.
         CACHE_REFETCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(served_root)
     }
@@ -2863,6 +2868,13 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    /// Serializes tests that assert an EXACT delta on [`CACHE_REFETCH_COUNT`] (#1991) against each
+    /// other. The counter is process-global — real, load-bearing state, not test scaffolding — so an
+    /// exact `before`/`after` assertion is only deterministic if no OTHER refetch-counting test's land
+    /// can land its own capsule inside this test's read window. Held only by the tests that make that
+    /// exact-delta claim; everything else keeps running fully in parallel.
+    static REFETCH_COUNT_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     /// The cached-module path for a capsule named by hex ids, for fixtures that seed or inspect the
     /// cache directly.
@@ -4823,9 +4835,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_stats_refetch_count_increments_on_a_fresh_network_land() {
-        // #1991: refetch_count must be a REAL counter, not a decoration — it rises exactly when a
-        // capsule lands via a network sync (never on a cache hit for an already-held capsule).
+    async fn cache_stats_refetch_count_does_not_bump_on_a_failed_sync() {
+        // #1991: refetch_count must be a REAL counter, not a decoration — a sync that never reaches an
+        // upstream must never be miscounted as a network land. Held for the whole before/after window
+        // (see REFETCH_COUNT_TEST_LOCK) so no OTHER test's real land can land inside it.
+        let _guard = REFETCH_COUNT_TEST_LOCK.lock().await;
         let (node, _td) = test_node(None);
         let before = handle_rpc(
             &node,
@@ -4855,6 +4869,88 @@ mod tests {
         assert_eq!(
             before, after_failed,
             "a failed sync must not count as a refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stats_refetch_count_increments_on_a_successful_network_land() {
+        // #1991: the positive case — a REAL whole-capsule land against a live mock upstream must bump
+        // `refetch_count` by exactly one. Reuses the `gap_fill_pulls_a_missing_generation_from_a_remote`
+        // mock-remote pattern: `gap_fill_generation` → `cache_fetch_and_cache` → `sync_module_from`,
+        // the choke-point this counter is placed at.
+        // `spawn_authed_remote` always seeds store [1u8; 32] served at root [0x10; 32]
+        // (its own backend, isolated per test on an ephemeral port) — matched here exactly as
+        // `gap_fill_pulls_a_missing_generation_from_a_remote` does.
+        // Held for the whole before/after window (see REFETCH_COUNT_TEST_LOCK) so no OTHER test's
+        // real land can land inside it.
+        let _guard = REFETCH_COUNT_TEST_LOCK.lock().await;
+        let root = Bytes32([0x10; 32]);
+        let module = chain_anchored_module([1u8; 32], root.0);
+        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
+        let store_id: [u8; 32] = Bytes32::from_hex(&store_hex).unwrap().0;
+        let td = tempfile::tempdir().unwrap();
+        let node = Node {
+            cache_dir: td.path().to_path_buf(),
+            http: reqwest::Client::new(),
+            upstream: base,
+            cache_lock: Mutex::new(()),
+            identity_seed: Some([5u8; 32]),
+            anchored_root_resolver: MockResolver::one(&store_hex, root),
+            peer_status: peer::PeerStatus::new(),
+            p2p_content: OnceLock::new(),
+            content_cache: std::sync::Mutex::new(ContentCache::default()),
+            inventory_refresher: OnceLock::new(),
+            capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            verification_ledger: verification_ledger::VerificationLedger::new(),
+            self_ref: OnceLock::new(),
+            gossip: OnceLock::new(),
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+            chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
+        };
+
+        let before = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await["result"]["refetch_count"]
+            .as_u64()
+            .unwrap();
+
+        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+
+        let after = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await["result"]["refetch_count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "one real network land → refetch_count + 1"
+        );
+
+        // A second gap-fill of the SAME (already-held) generation is a no-op — it must NOT
+        // double-count, since no network land occurred.
+        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        let after_repeat = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await["result"]["refetch_count"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            after_repeat, after,
+            "an already-held generation is an idempotent no-op, not a second refetch"
         );
     }
 
