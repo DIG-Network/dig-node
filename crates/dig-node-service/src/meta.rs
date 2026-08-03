@@ -525,6 +525,31 @@ pub fn method_names() -> Vec<&'static str> {
     methods().iter().map(|m| m.name).collect()
 }
 
+/// The method names safe to disclose to an ANONYMOUS caller — everything except the CONTROL plane.
+///
+/// `method_names` above is the full catalogue and is correct for the loopback-only surfaces
+/// (`GET /health`, `/.well-known/dig-node.json`). This filtered view exists for `dig.health` and
+/// `dig.methods`, which are on rpc.dig.net's public-read allowlist and therefore answer strangers
+/// on the internet.
+///
+/// The distinction is not hypothetical. `rpc.discover` is deliberately EXCLUDED from that gateway
+/// allowlist, and `rpc.dig.net`'s `tier.rs` gives the reason verbatim: it *"self-describes the
+/// whole surface including control; the gateway serves its own filtered discovery instead"*.
+/// Publishing the unfiltered catalogue through an ALLOWLISTED method hands out exactly what
+/// excluding `rpc.discover` was meant to withhold — it re-opens the hole through a different door.
+///
+/// Control methods are token-gated and loopback-bound, so enumerating them buys a remote caller no
+/// access. It buys reconnaissance: 26 admin method names, including the wallet, pin-registry,
+/// updater-channel and pairing-administration surfaces, naming what to attack if the token or the
+/// bind is ever weakened. A public self-describe should answer "what can I call", not "what exists".
+pub fn public_method_names() -> Vec<&'static str> {
+    methods()
+        .iter()
+        .filter(|m| m.served != "control")
+        .map(|m| m.name)
+        .collect()
+}
+
 /// The catalogued, stable error codes the node emits on the JSON-RPC/wire boundary.
 ///
 /// Each variant carries a numeric JSON-RPC `code` AND a stable UPPER_SNAKE symbolic

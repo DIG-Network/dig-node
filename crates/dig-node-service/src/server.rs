@@ -564,7 +564,7 @@ fn public_health() -> Value {
     json!({
         "status": "ok",
         "version": VERSION,
-        "methods": meta::method_names(),
+        "methods": meta::public_method_names(),
     })
 }
 
@@ -855,7 +855,7 @@ async fn rpc(
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": { "methods": meta::method_names() },
+                "result": { "methods": meta::public_method_names() },
             })),
         );
     }
