@@ -47,8 +47,8 @@ For usage instructions, see `README.md`. For non-normative narrative, see `USER_
 
 - HTTP transport (axum): listeners, CORS, Host-header allowlist (§4);
 - request **normalization** (param-name aliasing only, §5.3);
-- the **blind-passthrough relay** to the upstream DIG RPC for methods the node does not
-  resolve (§5.4);
+- the **opt-in passthrough relay** to a configured upstream DIG RPC for methods the node does not
+  resolve — OFF by default, and never to itself (§5.4);
 - the **discovery surface** (`/health`, `/version`, `/openrpc.json`,
   `/.well-known/dig-node.json`, `rpc.discover`) (§6);
 - the **control plane** (`control.*`) with its local-token authorization (§7) — the operator
@@ -172,7 +172,7 @@ ARE `DIG_NODE_*`, full stop.
 | `DIG_NODE_PORT` | localhost-listener bind port | `9778` | Parsed as `u16`; `0`, unparsable, or unset → default. |
 | `DIG_NODE_HOST` | EXPLICIT localhost-listener bind IP override | *(unset)* | Parsed as `IpAddr`; unparsable/blank/unset ⇒ unset (§4.1's dual-stack default — see below), NOT a hardcoded `127.0.0.1` default. Setting it REPLACES the dual-stack default with exactly that one address (#288). A NON-loopback value is REFUSED at startup unless `DIG_NODE_ALLOW_REMOTE` is truthy (§3.2.1, #1662). |
 | `DIG_NODE_ALLOW_REMOTE` | permit a non-loopback `DIG_NODE_HOST` bind | `false` | Truthy = `1`/`true`/`yes`/`on`; anything else (unset/blank/falsy/unrecognized) ⇒ the security-safe default **false**. When false, a non-loopback `DIG_NODE_HOST` is a fatal configuration error at startup (§3.2.1). Loopback overrides and the no-override default never require it. |
-| `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | `https://rpc.dig.net` | Normalized (§3.3); highest precedence (§3.4). |
+| `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | *(unset — NO default upstream)* | Normalized (§3.3); highest precedence (§3.4). Unset ⇒ passthrough is OFF and an unimplemented method answers a local `-32601` (§5.4). A value naming THIS node is REFUSED (§3.4.1). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
 | `DIG_NODE_DIGLOCAL` | toggle for the bare `dig.local` listeners (`http://dig.local` on `127.0.0.2:80` AND, when a dig-cert leaf is present, `https://dig.local` on `127.0.0.2:443` — §4.1a) | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
 
@@ -217,7 +217,7 @@ does not own them (except `DIG_NODE_UPSTREAM`, which the shell SETS — see belo
 | `DIG_NODE_COINSET` | override the coinset API base used for chain-anchored-root resolution | `https://api.coinset.org` (mainnet) | Blank/unset ⇒ mainnet default. Used for tests / alternate endpoints. |
 | `DIG_NODE_PIN` | read-path anchored-root pin enforcement (§14.4) | `on` (ENFORCED, fail-closed) | ONLY `off`/`0`/`false` disable the node-side pin (a named offline/local-dev escape hatch); any other value or unset ENFORCES. Clients still verify proofs against their own trust root regardless. |
 | `DIG_NODE_WATCH_INTERVAL` | chain-watch poll interval, in seconds (§14.2) | `30` | Parsed as `u64`; `0`/unparsable/unset ⇒ default `30`; floored at `1` s so a mis-set value cannot flood coinset. |
-| `DIG_NODE_UPSTREAM` | **INTERNAL** — the effective upstream the node library reads | `https://rpc.dig.net/` | NOT a user knob. The shell resolves the upstream (§3.4) and writes this via `Config::apply_to_env()` (§3.5); the shell's public knob is `DIG_RPC_UPSTREAM`. |
+| `DIG_NODE_UPSTREAM` | **INTERNAL** — the effective upstream the node library reads | *(unset — NO default upstream)* | NOT a user knob. The shell resolves the upstream (§3.4) and writes this via `Config::apply_to_env()` (§3.5); the shell's public knob is `DIG_RPC_UPSTREAM`. Empty ⇒ the library makes no upstream request at all. |
 | `DIG_WALLET_WC_PROJECT_ID` | initial/default WalletConnect projectId for the wallet host (§16) | *(unset ⇒ none)* | A persisted `wc_project_id` in `config.json` wins over this; a blank persisted value falls through to this env. Blank ⇒ treated as unset. |
 | `DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC` | outgoing-bandwidth throttle cap, in bytes/second (§17) | `0` (UNLIMITED — opt-in) | Parsed as `u64`; `0`, unparsable, or unset ⇒ unlimited (the throttle is a no-op until an operator configures a cap). Resolved ONCE at node construction. |
 
@@ -276,7 +276,27 @@ The effective upstream is resolved in this order (first non-empty wins):
    setting;
 2. the persisted `upstream_override` key in `config.json` (written by
    `control.config.setUpstream`, §7.5);
-3. the default `https://rpc.dig.net`.
+3. **no upstream.** There is NO default upstream (#1997). A node that has not been given one
+   does not have one, and MUST NOT relay to any host it was not configured with.
+
+### 3.4.1. A node MUST NOT be its own upstream
+
+A resolved upstream that names THIS node MUST be refused and treated as no upstream. Two
+independent checks are required, because neither covers the other's case:
+
+1. **Static (offline, at config resolution).** An upstream whose host is a loopback address or
+   `localhost` on this node's serving port, or `dig.local` on its privileged port, MUST be refused.
+2. **Runtime loop detection.** A public name may resolve back to this node through DNS, a CDN, or a
+   gateway — invisible to any address comparison. At bring-up a node with a configured upstream MUST
+   send it one ordinary `dig.health` request carrying a single-use random JSON-RPC `id`. If a request
+   bearing THAT id subsequently arrives at this node's own dispatcher, the upstream demonstrably
+   leads here and passthrough MUST be disabled for the life of the process.
+
+The marker MUST travel in the JSON-RPC `id`, not an HTTP header: an intermediary that forwards
+JSON-RPC bodies while dropping unknown headers (the rpc.dig.net gateway does exactly this) would
+otherwise defeat the detection. A node MUST match only its OWN full probe id — matching the prefix
+would let any caller disable a node's passthrough, and would misfire whenever this node is
+legitimately somebody else's upstream.
 
 ### 3.5. Shared `.dig` cache
 
@@ -817,14 +837,25 @@ A `"latest"` or non-64-hex `root` is passed through untouched: the read path tre
 and proxies, which is correct for this shell (it performs no chain resolution of "latest").
 Requests for all other methods MUST pass through byte-unchanged.
 
-### 5.4. Blind-passthrough relay
+### 5.4. Passthrough relay — opt-in, and never to itself
 
-When the read path answers `-32601`, the shell MUST POST the client's ORIGINAL request verbatim
-(JSON body) to the configured upstream and return the upstream's parsed JSON envelope unmodified.
-The shell is a transparent proxy for these methods: it MUST NOT rewrite params, results, or
-upstream error codes. If the upstream is unreachable or returns non-JSON, the shell mints
+**There is no default upstream (§3.4).** When the read path answers `-32601` and NO upstream is
+configured, the shell MUST return that `-32601` to the caller. That is the truthful answer for a
+method the node does not implement, and it is what keeps an unrecognised method — and its params,
+which can name stores and carry retrieval keys — from being forwarded to a host the operator never
+chose. The shell MUST NOT substitute a well-known host for an absent one.
+
+When an upstream IS configured and has not been proven to loop (§3.4.1), the shell MUST POST the
+client's ORIGINAL request verbatim (JSON body) to it and return the upstream's parsed JSON envelope
+unmodified. The shell is a transparent proxy for these methods: it MUST NOT rewrite params, results,
+or upstream error codes. If the upstream is unreachable or returns non-JSON, the shell mints
 `UPSTREAM_ERROR` (`-32010`). The relay client identifies itself with the User-Agent
 `dig-node/<version>`.
+
+Passthrough is NOT the node's content-miss path. A read for content this node does not hold is
+resolved over the peer network — DHT provider lookup, then redirect or fetch-through per
+`DIG_NODE_ON_MISS` — not by relaying to a well-known node. The two are independent, and removing the
+default upstream does not remove the miss path.
 
 ### 5.5. Method catalogue
 
@@ -835,7 +866,7 @@ MUST NOT re-declare method names. Each entry carries a `served` class and `requi
 | `served` | Meaning |
 |---|---|
 | `local` | Resolved by the node library (`handle_rpc`). |
-| `passthrough` | Read path returns `-32601`; relayed verbatim to the upstream. |
+| `passthrough` | Read path returns `-32601`; relayed verbatim to the upstream WHEN one is configured (§5.4), else returned to the caller as `-32601`. |
 | `shell` | Answered by this service itself (`rpc.discover`). |
 | `control` | The gated control plane (§7); always `requires_auth: true`. |
 
@@ -849,7 +880,9 @@ For the current node library (§2.2) the catalogue is:
   (§5.5.2).
 - **passthrough**: `dig.getCapsule` (an alias the node does NOT resolve — local-first callers use
   `dig.getContent`), `dig.getProof`, `dig.listCapsules`.
-- **shell**: `rpc.discover`.
+- **shell**: `rpc.discover`, `dig.health`, `dig.methods`. A node MUST answer its own liveness and
+  its own method list on its own authority — neither may depend on an upstream being configured
+  (#1997).
 - **control**: the operator `control.*` methods of §7.4, plus the node-owned control methods the
   shell delegates to the node (`control.peerStatus`, `control.peers.connect`, `control.subscribe`,
   `control.unsubscribe`, `control.listSubscriptions`).

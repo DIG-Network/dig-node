@@ -799,10 +799,7 @@ async fn with_no_upstream_an_unimplemented_method_is_answered_locally_and_relaye
         json!(-32601),
         "an unimplemented method answers method-not-found locally, not an upstream error: {resp}"
     );
-    assert!(
-        resp.get("result").is_none(),
-        "no fabricated result: {resp}"
-    );
+    assert!(resp.get("result").is_none(), "no fabricated result: {resp}");
     assert!(
         calls.lock().unwrap().is_empty(),
         "an unconfigured upstream must receive nothing; it saw {:?}",
@@ -866,7 +863,12 @@ async fn dig_methods_lists_the_catalogue_locally() {
         .iter()
         .map(|v| v.as_str().unwrap_or_default().to_string())
         .collect();
-    for expected in ["dig.getContent", "dig.health", "dig.methods", "rpc.discover"] {
+    for expected in [
+        "dig.getContent",
+        "dig.health",
+        "dig.methods",
+        "rpc.discover",
+    ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
     assert!(calls.lock().unwrap().is_empty(), "methods asks nobody");

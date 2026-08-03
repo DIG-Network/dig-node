@@ -159,7 +159,7 @@ service's environment so the service serves identically):
 |---|---|---|
 | `DIG_NODE_PORT` | `9778` | Port the node listens on (`127.0.0.1`). Uncommon high port (dig-wallet `9777` sibling) to avoid `80`/`8080` collisions. |
 | `DIG_NODE_HOST` | *(unset)* | EXPLICIT bind-address override. Unset (the default) binds BOTH loopback families — `127.0.0.1` and `[::1]` (#288, see [Addressing](#addressing--httpdiglocal-no-port--httplocalhostport-91-288)); setting it REPLACES that dual bind with exactly the one address given. |
-| `DIG_RPC_UPSTREAM` | `https://rpc.dig.net` | Upstream DIG RPC the embedded node proxies ciphertext/proof requests to on a local cache miss, and relays unhandled methods to. |
+| `DIG_RPC_UPSTREAM` | *(unset — no upstream)* | OPTIONAL upstream DIG RPC to relay unhandled methods to. **There is no default**: unset, an unimplemented method answers `-32601` locally rather than being forwarded to a host you did not choose, and a value naming this node is refused. Content misses go over the peer network, not here. |
 | `DIG_NODE_CACHE` | `%LOCALAPPDATA%\DigNode\cache` / `$HOME/DigNode/cache` | On-disk cache dir for synced `.dig` modules (owned by `dig-node`). **Leave it unset to share one cache with the DIG Browser** — see below. |
 | `DIG_NODE_CACHE_CAP` | `1 GiB` | Cache size cap (floored at 64 MiB), LRU-evicted. Also settable via the `cache.setCapBytes` RPC. |
 | `DIG_NODE_DIGLOCAL` | `1` (on) | Whether to ALSO open the bare-`http://dig.local` listener (`127.0.0.2:80`) beside `localhost:<port>`. Auto-attempt with graceful fallback (see [Addressing](#addressing--httpdiglocal-no-port--httplocalhostport-91-288)). Set to `0`/`false` to skip the attempt. |
@@ -203,7 +203,8 @@ in-process node expose:
 | `cache.listCached` / `cache.removeCached` / `cache.fetchAndCache` | Cached-capsule manager (`storeId:rootHash`). Over HTTP, `cache.fetchAndCache` is **local-token gated** (like `control.*`): it makes this node a durable DHT holder of the requested capsule, so it is not a public read. The in-process FFI `cache.*` path stays open. |
 | `rpc.discover` | **Method discovery** — returns this node's OpenRPC document (the standard OpenRPC discovery method), so a client can introspect every method + error over the wire with no out-of-band knowledge. |
 | `control.*` | **CONTROL / admin surface** (loopback-only + **local-token gated** — see below). Manage the node: hosted/pinned stores, cache, §21 sync, config. Read methods above stay open; only `control.*` requires the token. |
-| `dig.getProof`, `dig.listCapsules`, *anything else* | **Blind passthrough** — relayed verbatim to the upstream, so the node stays a correct transparent proxy for methods it doesn't resolve locally. |
+| `dig.health`, `dig.methods` | **Served locally by the shell** — this node's own liveness + method list, answered on its own authority with no upstream. |
+| `dig.getProof`, `dig.listCapsules`, *anything else* | **`-32601` locally**, or relayed verbatim to an upstream if you configured one (`DIG_RPC_UPSTREAM`). No upstream is configured by default. |
 
 ## Control / admin surface (`control.*`) — manage the node
 
@@ -349,9 +350,9 @@ never the reverse — digstore is only ever an RPC client of a node.
   depends only on `digstore-host` / `-core` / `-remote` / `-chain`. No special build step is needed.
 - All TLS is `rustls` (no system OpenSSL), so the binary is genuinely self-contained.
 - The node adds only the **shell** around that node: the HTTP server, CORS, `/health`, request
-  normalisation, a **blind-passthrough fallback** (`dig-node` answers only `dig.getContent` /
-  `dig.getAnchoredRoot` / `cache.*` and returns "method not found" for the rest; the node
-  relays those to the upstream), and the OS-service install/management.
+  normalisation, discovery (`rpc.discover`, `dig.health`, `dig.methods`), an **opt-in passthrough**
+  for methods the node does not resolve (off unless `DIG_RPC_UPSTREAM` is set), and the OS-service
+  install/management.
 
 ## Build from source
 

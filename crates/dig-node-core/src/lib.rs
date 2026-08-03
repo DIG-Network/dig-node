@@ -152,7 +152,17 @@ fn control_err(id: &Value, code: i64, message: &str) -> Value {
     }})
 }
 
-const RPC_FALLBACK: &str = "https://rpc.dig.net/";
+/// The upstream a node uses when `DIG_NODE_UPSTREAM` is unset: **none** (#1997).
+///
+/// This used to be `https://rpc.dig.net/`, which made every node — including the DIG Browser's
+/// in-process one — fall back to a single well-known host for any read it could not satisfy and any
+/// method it did not implement. rpc.dig.net is an ordinary node with a well-known address, not a
+/// structural dependency of every other node, and the node running *behind* that address inherited
+/// the default and relayed to itself.
+///
+/// With no upstream, a miss is a miss and an unimplemented method is `-32601` — both truthful. An
+/// operator who wants an upstream sets `DIG_NODE_UPSTREAM` (or the shell's `DIG_RPC_UPSTREAM`).
+const RPC_FALLBACK: &str = "";
 /// Per-window ciphertext cap (bytes) when paging the JSON-RPC response.
 const WINDOW: usize = 3 * 1024 * 1024;
 /// Default LRU cap for the on-disk module cache.
@@ -1296,6 +1306,16 @@ impl Node {
         store_hex: &str,
         root_hex: &str,
     ) -> Result<Bytes32, String> {
+        // No upstream configured is the DEFAULT (#1997), not an error condition — say so plainly
+        // and make no request. Checked here, at the one place both sync callers funnel through, so
+        // neither can grow a path that posts to an empty URL.
+        if base_url.trim().is_empty() {
+            return Err(
+                "no upstream is configured, so this capsule cannot be synced from one; set \
+                 DIG_NODE_UPSTREAM (or the service's DIG_RPC_UPSTREAM) to a node that serves it"
+                    .to_string(),
+            );
+        }
         if !sync_eligible(store_hex, root_hex) {
             return Err("store id and root must each be 64-hex".to_string());
         }
@@ -1477,8 +1497,15 @@ impl Node {
         }
     }
 
-    /// Proxy the raw JSON-RPC body to the upstream rpc.dig.net and return its response.
+    /// Proxy the raw JSON-RPC body to the configured upstream and return its response.
+    ///
+    /// Fails immediately when no upstream is configured — the default since #1997. A node with no
+    /// upstream answers from what it holds; it does not forward a caller's request, with that
+    /// caller's params, to a host its operator never chose.
     async fn proxy(&self, body: &Value) -> Result<Value, String> {
+        if self.upstream.trim().is_empty() {
+            return Err("no upstream is configured".to_string());
+        }
         let resp = self
             .http
             .post(&self.upstream)
