@@ -935,17 +935,22 @@ field". Both requirements are load-bearing rather than cosmetic — omitting the
 `*.on.dig.net` subdomain dark while this node returned correct ciphertext and a correct,
 verifying inclusion proof, and reported no error anywhere (#2071).
 
-`inclusion_proof` MUST ride EVERY window. It describes the whole resource, but a client may verify
-per window, may resume, and may begin its stream at a non-zero offset — none of which can obtain
-the proof from anywhere else. Sending it only on window 0 leaves every window of a resource larger
-than one window unverifiable, which is #2071's failure mode relocated to large resources rather
-than fixed.
+`inclusion_proof` MUST ride EVERY window, and MUST always be PRESENT — as the empty string when
+the served resource carries no proof, never as an absent key. It describes the whole resource, so a
+client that resumes, or begins its stream at a non-zero offset, has no other source for it; sending
+it only on window 0 leaves every later window of a multi-window resource unverifiable, which is
+#2071's failure mode relocated to large resources rather than fixed. Present-and-empty is a fact a
+client can act on; absent is one it must guess at.
+
+The proof verifies the resource, NOT the window: verification requires
+`proof.leaf == SHA-256(the whole reassembled ciphertext)`, so a client cannot check a window in
+isolation and MUST hold the complete resource before verifying. Every window carries the proof so
+that whichever window a client happens to receive first can supply it — not so that windows can be
+verified independently.
 
 `chunk_lens` is the ONE field that rides the first window only. It describes how to split the
 REASSEMBLED resource, which a client cannot act on until it holds every window; a client that
-begins mid-resource therefore cannot decrypt a multi-chunk resource and MUST fetch window 0. A
-whole-capsule read (`dig.getCapsule`) has no per-resource chunk layout and OMITS the field
-entirely rather than sending `null`.
+begins mid-resource therefore cannot decrypt a multi-chunk resource and MUST fetch window 0.
 
 **Window size.** A window is at most **3 MiB** of ciphertext. This node currently IGNORES the
 `length` request parameter and always serves a full window (or the remainder), where
@@ -963,6 +968,13 @@ implementation of a shared wire shape is what produced #2071. The response-windo
 exception: it replays a previously-proxied UPSTREAM `result` verbatim, so a window cached from a
 non-conforming upstream is re-served with whatever fields that upstream sent. The cache preserves
 provenance rather than rewriting it; conformance there is the upstream's obligation.
+
+Because a replayed window is indistinguishable on the wire from a freshly built one (it is stamped
+`source: "local"` like any other local serve), the response-cache key MUST carry an envelope SCHEMA
+version, and that version MUST be bumped whenever this envelope's shape changes. Without it an
+upgraded node would keep serving windows captured under the OLD shape until they aged out of the
+LRU — so "the fix is deployed" would not imply "the fix is what clients receive". Bumping the
+version strands every prior entry by construction; no eviction pass or migration is required.
 
 #### 5.5.1. `dig.getManifest` (#176 Phase C)
 
