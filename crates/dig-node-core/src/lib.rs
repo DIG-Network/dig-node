@@ -1300,6 +1300,74 @@ fn read_public_manifest_blocking(
         .map_err(|e| format!("malformed public manifest section: {e:?}"))
 }
 
+/// Load + decode the embedded publisher [`MetadataManifest`](digstore_core::MetadataManifest)
+/// (data-section id 6) from a locally cached compiled module — the `dig.getMetadata` read (#2071).
+///
+/// A free function taking only the cache dir + capsule key, so it moves into a `spawn_blocking`
+/// closure with no `Node` borrow (audit #179), mirroring [`read_public_manifest_blocking`]. Like
+/// that read and unlike [`serve_local_blocking`], it does NOT instantiate the module in wasmtime:
+/// the publisher metadata is PUBLIC, unencrypted data sitting directly in the module's data
+/// section, so extracting it is a pure binary-format parse.
+///
+/// Returns:
+/// - `Ok(Some(Some(manifest)))` — the module is held and carries a metadata section.
+/// - `Ok(Some(None))` — held, but no metadata section (store-format §5.1: an optional section's
+///   absence is normal and backwards-compatible, never an error).
+/// - `Ok(None)` — this node does not hold the capsule at all.
+/// - `Err(_)` — the on-disk module's data section is corrupt/malformed.
+fn read_metadata_manifest_blocking(
+    cache_dir: &Path,
+    key: &CapsuleKey,
+) -> Result<Option<Option<digstore_core::MetadataManifest>>, String> {
+    // Reader-tolerance (#1896): tolerate a legacy `.module` cache, like every other read.
+    let path = key.resolve_cached_path(cache_dir);
+    let module = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let blob = digstore_compiler::extract_data_section_blob(&module)
+        .map_err(|e| format!("malformed module data section: {e}"))?;
+    let view = digstore_core::datasection::DataView::parse(&blob)
+        .map_err(|e| format!("malformed module data section: {e:?}"))?;
+    let Some(body) = view.section(digstore_core::datasection::SectionId::Metadata) else {
+        return Ok(Some(None));
+    };
+    let mut decoder = digstore_core::codec::Decoder::new(body);
+    digstore_core::MetadataManifest::decode(&mut decoder)
+        .map(|m| Some(Some(m)))
+        .map_err(|e| format!("malformed metadata section: {e:?}"))
+}
+
+/// Render a decoded [`MetadataManifest`](digstore_core::MetadataManifest) as the dighub `Manifest`
+/// JSON clients consume — the 14 publisher fields, byte-identical to what the retired
+/// `dighub-retrieval` Lambda emitted for `dig.getMetadata`.
+///
+/// Written out field by field rather than derived from the codec struct so the WIRE shape is
+/// stable regardless of the struct's internals: a field added to `MetadataManifest` upstream must
+/// be a deliberate wire change here, not an accidental one.
+fn metadata_manifest_to_json(m: &digstore_core::MetadataManifest) -> Value {
+    json!({
+        "schema_version": m.schema_version,
+        "name": m.name,
+        "version": m.version,
+        "description": m.description,
+        "authors": m.authors.iter().map(|a| json!({
+            "name": a.name, "handle": a.handle, "contact": a.contact,
+        })).collect::<Vec<_>>(),
+        "license": m.license,
+        "homepage": m.homepage,
+        "repository": m.repository,
+        "keywords": m.keywords,
+        "categories": m.categories,
+        "icon": m.icon,
+        "content_type": m.content_type,
+        "links": m.links.iter().map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect::<serde_json::Map<_, _>>(),
+        "custom": m.custom.iter().map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<serde_json::Map<_, _>>(),
+    })
+}
+
 impl Node {
     /// The async, MEMOIZED content-serve path used by every async caller (getContent windows,
     /// fetchRange frames, resource-granularity availability). On a hit in the bounded in-memory
@@ -2075,6 +2143,368 @@ impl Node {
                 &id,
                 -32000,
                 &format!("manifest read task failed: {join_err}"),
+            ),
+        }
+    }
+
+    /// Resolve the CAPSULE ROOT a capsule-scoped read should answer at (#2071).
+    ///
+    /// `params.root` may be a concrete 64-hex root, or absent / empty / the `"latest"` sentinel,
+    /// which every DIG client uses to mean "whatever the chain currently says". The sentinel is
+    /// resolved HERE, against the chain, rather than being pushed onto the caller: a client that
+    /// had to know the root before it could ask for the manifest would have to walk the singleton
+    /// itself, which is exactly the work a node exists to do.
+    ///
+    /// The chain is the authority in both directions: an explicitly requested root MUST equal the
+    /// anchored tip, or the read fails closed with [`ROOT_NOT_ANCHORED`] rather than quietly
+    /// serving a superseded generation. This is the same anti-rollback pin `dig.getContent`
+    /// applies (§14.4, #127); a capsule-scoped read is no less trust-bearing for carrying no
+    /// ciphertext.
+    ///
+    /// Returns the resolved root hex, or a ready-to-return JSON-RPC error.
+    async fn resolve_capsule_root(&self, params: &Value, id: &Value) -> Result<String, Value> {
+        let Ok(store_id) = parse_store_id_arg(params) else {
+            return Err(rpc_err(
+                id,
+                -32602,
+                "params.store_id must be a 32-byte (64-hex) launcher id",
+            ));
+        };
+        let requested = params
+            .get("root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("latest"))
+            .map(str::to_string);
+
+        // Pin disabled (`DIG_NODE_PIN=off` — the offline/local-dev escape hatch the content read
+        // honours identically): answer at the requested root as-is. A ROOTLESS request still
+        // cannot be answered, because with the chain out of the loop nothing else knows which
+        // generation was meant — guessing one would be the rollback this pin exists to prevent.
+        if !pin_enforced() {
+            return requested.ok_or_else(|| {
+                rpc_err(
+                    id,
+                    -32602,
+                    "params.root is required while the anchored-root pin is disabled",
+                )
+            });
+        }
+
+        let anchored = self
+            .anchored_root_resolver
+            .anchored_root(&store_id.into())
+            .await;
+
+        match (requested, anchored) {
+            (Some(req), Ok(Some(tip))) if req.eq_ignore_ascii_case(&tip.to_hex()) => {
+                Ok(tip.to_hex())
+            }
+            (Some(req), Ok(Some(tip))) => Err(rpc_err(
+                id,
+                ROOT_NOT_ANCHORED,
+                &format!(
+                    "requested root {req} does not match the store's on-chain root {} \
+                     (chain is the authority)",
+                    tip.to_hex()
+                ),
+            )),
+            // A requested root the chain cannot confirm falls back to the BOUNDED verify (one
+            // launcher-hint query, no lineage walk) — the same #747/#841 tolerance the content
+            // read applies, so a single unparseable intermediate generation cannot deny a read
+            // of a root that IS anchored. Still fail-closed.
+            (Some(req), _) => match Bytes32::from_hex(&req) {
+                Ok(root) => match self
+                    .anchored_root_resolver
+                    .verify_pinned_root(&store_id.into(), root)
+                    .await
+                {
+                    Ok(()) => Ok(root.to_hex()),
+                    Err(msg) => Err(rpc_err(id, ROOT_NOT_ANCHORED, &msg)),
+                },
+                Err(_) => Err(rpc_err(
+                    id,
+                    -32602,
+                    "params.root must be 64-hex or \"latest\"",
+                )),
+            },
+            (None, Ok(Some(tip))) => Ok(tip.to_hex()),
+            (None, Ok(None)) => Err(rpc_err(
+                id,
+                ROOT_NOT_ANCHORED,
+                "the store has no confirmed on-chain generation",
+            )),
+            (None, Err(e)) => Err(rpc_err(
+                id,
+                ROOT_NOT_ANCHORED,
+                &format!("could not read the store's on-chain root: {e}"),
+            )),
+        }
+    }
+
+    /// `dig.getProof` (#2071) — the trust-bearing half of a read: the resource's Merkle inclusion
+    /// proof and the chain-anchored generation root it verifies against, without the ciphertext.
+    ///
+    /// A client that already holds a resource's bytes — from its own cache, a peer, or an earlier
+    /// window — uses this to (re)establish that those bytes belong to the store's current on-chain
+    /// generation.
+    ///
+    /// **The proof is obtained by running the ordinary `dig.getContent` read and discarding the
+    /// ciphertext**, not by deriving a proof separately. That is deliberate: it guarantees the
+    /// same mandatory anchored-root pin (§14.4), the same local-first → peer → upstream ladder,
+    /// and therefore that the proof returned here is provably the proof a content read of the same
+    /// resource would have verified against. A second derivation could pin a different generation
+    /// and no client could tell. The proof itself is computed by the module's own guest wasm
+    /// inside `serve_blind` — a real inclusion proof over the resource ciphertext, never a
+    /// node-side reconstruction.
+    ///
+    /// - Proof available → `{ inclusion_proof, root, chunk_lens, program_hash, execution_proof,
+    ///   execution_proof_status }`.
+    /// - No proof obtainable — this node does not hold the resource, no peer served it, or the
+    ///   read answered with a redirect rather than bytes → **the underlying read's error,
+    ///   verbatim**. NEVER a proof-shaped result carrying an empty proof: a client handed one
+    ///   would treat unverified bytes as verified, which is strictly worse than an error
+    ///   (#126/#134).
+    ///
+    /// No execution attestation is ever fabricated. This node holds no RISC0 receipt, and
+    /// `execution_proof_status: "unavailable"` states that rather than implying one was checked
+    /// and passed.
+    async fn get_proof(
+        &self,
+        req: &Value,
+        id: Value,
+        origin: crate::download::ReadOrigin,
+        provenance: crate::download::RequestProvenance,
+    ) -> Value {
+        // The proof and chunk layout describe the WHOLE resource and ride window 0, so ask for
+        // exactly that window whatever offset the caller happened to send.
+        let mut read = req.clone();
+        read["method"] = json!(dig_rpc_protocol::Method::GetContent.name());
+        if let Some(params) = read.get_mut("params").and_then(Value::as_object_mut) {
+            params.insert("offset".into(), json!(0));
+        }
+        let answer = handle_rpc(self, read, origin, provenance).await;
+
+        let Some(result) = answer.get("result").and_then(Value::as_object) else {
+            // An error or a redirect envelope passes through unchanged (re-tagged with this
+            // request's id) so the caller learns WHY no proof exists — a redirect names the peers
+            // that can produce one — instead of receiving a blank that looks like a proof.
+            let mut passthrough = answer;
+            passthrough["id"] = id;
+            return passthrough;
+        };
+
+        let proof = result
+            .get("inclusion_proof")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if proof.is_empty() {
+            return rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "no inclusion proof is available for this resource at the anchored root",
+            );
+        }
+
+        // The compiled module's own content address, the SAME value `dig.getModuleInfo` reports —
+        // present only when this node holds the module, because it is a fact about a local
+        // artifact rather than about the proof. `null` when the bytes came from elsewhere.
+        let program_hash = match (
+            result.get("root").and_then(Value::as_str),
+            parse_store_id_arg(req.get("params").unwrap_or(&Value::Null)),
+        ) {
+            (Some(root_hex), Ok(store_id)) => {
+                let (cache_dir, store_hex, root_hex) = (
+                    self.cache_dir.clone(),
+                    store_id.to_string(),
+                    root_hex.to_string(),
+                );
+                tokio::task::spawn_blocking(move || {
+                    crate::seams::dig_peer::module_serve::describe_module(
+                        &cache_dir, &store_hex, &root_hex,
+                    )
+                    .map(|info| info.module_hash)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
+
+        json!({"jsonrpc":"2.0","id":id,"result":{
+            "inclusion_proof": proof,
+            "root": result.get("root").cloned().unwrap_or(Value::Null),
+            "chunk_lens": result.get("chunk_lens").cloned().unwrap_or(Value::Null),
+            "program_hash": program_hash,
+            // NEVER fabricated (#126/#134). A real, verified execution attestation is gated on the
+            // RISC0 toolchain and is honestly absent here.
+            "execution_proof": Value::Null,
+            "execution_proof_status": "unavailable",
+        }})
+    }
+
+    /// `dig.getPublicManifest` (#2071) — a store's normalized PUBLIC MANIFEST, in the enveloped
+    /// shape the hub client and the rpc.dig.net read tier expect: `{ manifest, root }`.
+    ///
+    /// The manifest content is identical to [`dig.getManifest`](Self::get_manifest) — the same
+    /// data-section id 13, rendered by the same [`PublicManifest::to_json`] every DIG reader uses.
+    /// The two differ only in their envelope and their root handling, and both must exist because
+    /// clients in the wild call both: `dig.getManifest` takes a REQUIRED concrete `root` and
+    /// returns the manifest bare, while this takes an OPTIONAL `root` (defaulting to the chain
+    /// tip) and wraps it, echoing the root it resolved so the caller learns which generation it
+    /// just read.
+    ///
+    /// - Params: `{ store_id, root? }` — `root` absent or `"latest"` resolves the anchored tip.
+    /// - Held with a manifest → `{ manifest: { schema_version, entries: [...] }, root }`.
+    /// - Held with NO manifest section (an older `.dig`, or a PRIVATE store whose paths must stay
+    ///   opaque) → `{ manifest: null, root }` — never an error. Store-format §5.1: an optional
+    ///   section's absence is a normal, backwards-compatible outcome.
+    /// - Not held at this root → `-32004`. A corrupt data section → `-32000`.
+    async fn get_public_manifest(&self, params: &Value, id: Value) -> Value {
+        let root_hex = match self.resolve_capsule_root(params, &id).await {
+            Ok(root) => root,
+            Err(e) => return e,
+        };
+        let store_hex = params.get("store_id").and_then(Value::as_str).unwrap_or("");
+        let Some(capsule) = CapsuleKey::parse(store_hex, &root_hex) else {
+            return rpc_err(&id, -32602, "params.store_id must be 64-hex");
+        };
+        let cache_dir = self.cache_dir.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            read_public_manifest_blocking(&cache_dir, &capsule)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(Some(Some(pm)))) => {
+                let manifest = serde_json::from_str::<Value>(&pm.to_json()).unwrap_or_else(
+                    |_| json!({"schema_version": pm.schema_version, "entries": []}),
+                );
+                json!({"jsonrpc":"2.0","id":id,"result":{"manifest": manifest, "root": root_hex}})
+            }
+            Ok(Ok(Some(None))) => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"manifest": Value::Null, "root": root_hex}})
+            }
+            Ok(Ok(None)) => rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "capsule not held locally at the requested root",
+            ),
+            Ok(Err(msg)) => rpc_err(&id, -32000, &msg),
+            Err(join_err) => rpc_err(
+                &id,
+                -32000,
+                &format!("manifest read task failed: {join_err}"),
+            ),
+        }
+    }
+
+    /// `dig.getMetadata` (#2071) — the publisher's plaintext METADATA manifest for a capsule:
+    /// `{ manifest, program_hash, root }`.
+    ///
+    /// This is the dighub `Manifest` a publisher embeds at commit time (name, version, authors,
+    /// license, links, …) — data-section id 6. It is PUBLIC and unencrypted by construction, so
+    /// reading it is a pure binary-format parse with no `serve_blind` decrypt and no retrieval
+    /// key, exactly like the public manifest read beside it.
+    ///
+    /// - Params: `{ store_id, root? }` — `root` absent or `"latest"` resolves the anchored tip.
+    /// - Held with metadata → `{ manifest: { schema_version, name, version, description, authors,
+    ///   license, homepage, repository, keywords, categories, icon, content_type, links, custom },
+    ///   program_hash, root }`.
+    /// - Held with NO metadata section → `{ manifest: null, program_hash, root }` — never an
+    ///   error, for the same store-format §5.1 reason as the public manifest.
+    /// - Not held at this root → `-32004`. A corrupt data section → `-32000`.
+    async fn get_metadata(&self, params: &Value, id: Value) -> Value {
+        let root_hex = match self.resolve_capsule_root(params, &id).await {
+            Ok(root) => root,
+            Err(e) => return e,
+        };
+        let store_hex = params.get("store_id").and_then(Value::as_str).unwrap_or("");
+        let Some(capsule) = CapsuleKey::parse(store_hex, &root_hex) else {
+            return rpc_err(&id, -32602, "params.store_id must be 64-hex");
+        };
+        let cache_dir = self.cache_dir.clone();
+        let (describe_dir, describe_store, describe_root) =
+            (cache_dir.clone(), store_hex.to_string(), root_hex.clone());
+        let outcome = tokio::task::spawn_blocking(move || {
+            let manifest = read_metadata_manifest_blocking(&cache_dir, &capsule)?;
+            let program_hash = crate::seams::dig_peer::module_serve::describe_module(
+                &describe_dir,
+                &describe_store,
+                &describe_root,
+            )
+            .map(|info| info.module_hash);
+            Ok::<_, String>((manifest, program_hash))
+        })
+        .await;
+        match outcome {
+            Ok(Ok((Some(manifest), program_hash))) => json!({"jsonrpc":"2.0","id":id,"result":{
+                "manifest": manifest.map(|m| metadata_manifest_to_json(&m)).unwrap_or(Value::Null),
+                "program_hash": program_hash,
+                "root": root_hex,
+            }}),
+            Ok(Ok((None, _))) => rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "capsule not held locally at the requested root",
+            ),
+            Ok(Err(msg)) => rpc_err(&id, -32000, &msg),
+            Err(join_err) => rpc_err(
+                &id,
+                -32000,
+                &format!("metadata read task failed: {join_err}"),
+            ),
+        }
+    }
+
+    /// `dig.getCapsule` / `dig.getModule` (#2071) — one window of a whole `.dig` module this node
+    /// holds, in the SAME streaming envelope `dig.getContent` uses.
+    ///
+    /// The envelope's byte field is named `ciphertext` for the per-resource reads that share it;
+    /// for a whole capsule it carries the raw `.dig` module bytes, which are already the
+    /// encrypted-at-rest artifact. That naming is a wire contract, not a description — this node's
+    /// own capsule downloader (`seams::capsule::capsule_download`) has always CONSUMED exactly
+    /// this shape from an upstream, and could not serve it. Now both halves exist here.
+    ///
+    /// No `inclusion_proof` rides a capsule window: a module blob is verified by binding it to its
+    /// on-chain root, which is what the puller's own anchor gate does, not by a per-resource
+    /// Merkle path. Omitting the field is the honest answer; emitting an empty one would invite a
+    /// caller to treat the absence as a passed check.
+    ///
+    /// - Params: `{ store_id, root?, offset? }` — `root` absent or `"latest"` resolves the tip.
+    /// - Not held at this root → `-32004`.
+    async fn get_capsule(&self, params: &Value, id: Value) -> Value {
+        let root_hex = match self.resolve_capsule_root(params, &id).await {
+            Ok(root) => root,
+            Err(e) => return e,
+        };
+        let store_hex = params
+            .get("store_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let cache_dir = self.cache_dir.clone();
+        let (read_root, echo_root) = (root_hex.clone(), root_hex);
+        let module = tokio::task::spawn_blocking(move || {
+            let capsule = CapsuleKey::parse(&store_hex, &read_root)?;
+            std::fs::read(capsule.resolve_cached_path(&cache_dir)).ok()
+        })
+        .await;
+        match module {
+            Ok(Some(bytes)) if !bytes.is_empty() => {
+                let result = content_window_envelope(&bytes, offset, echo_root, None, Value::Null);
+                json!({"jsonrpc":"2.0","id":id,"result": result})
+            }
+            Ok(_) => rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "capsule not held locally at the requested root",
+            ),
+            Err(join_err) => rpc_err(
+                &id,
+                -32000,
+                &format!("capsule read task failed: {join_err}"),
             ),
         }
     }
@@ -8045,10 +8475,19 @@ mod tests {
     // On `dig.getContent` the trust-bearing fields are REAL — the guest-computed
     // merkle inclusion proof + the chain-anchored root (#127) — and there is no
     // execution attestation on the wire to fake: `ContentResponse`/`build_result`
-    // carry no execution-proof field, and the node does not implement
-    // `dig.getProof` (it returns -32601 rather than a fabricated mock receipt). A
-    // real, verified execution attestation is gated on the RISC0 toolchain
-    // (SECURITY.md residual #3) and is honestly absent here, never faked.
+    // carry no execution-proof field. A real, verified execution attestation is
+    // gated on the RISC0 toolchain (SECURITY.md residual #3) and is honestly
+    // absent, never faked.
+    //
+    // #2071 changed HOW that honesty is kept for `dig.getProof`, not whether. The
+    // method used to answer -32601, and the guard below asserted exactly that. But
+    // "never fabricate a proof" was always the invariant; "never implement the
+    // method" was only the cheapest way to hold it, and it cost every client the
+    // ability to re-verify bytes it already held. The node now serves a REAL proof
+    // — the guest-computed one, obtained by running the ordinary content read and
+    // discarding the ciphertext, so it is provably the proof that read would have
+    // verified against — and still fabricates no execution attestation. The guard
+    // is rewritten to assert the invariant directly rather than its old proxy.
 
     #[test]
     fn get_content_result_carries_real_inclusion_proof_and_no_execution_proof() {
@@ -8384,11 +8823,13 @@ mod tests {
     }
 
     #[test]
-    fn get_proof_is_not_served_as_a_verified_proof_by_the_node() {
-        // dig-node does not implement dig.getProof — it returns the catalogued
-        // -32601 (method not found) rather than fabricating a mock execution
-        // proof. (The standalone node has no upstream here, so the dispatch's own
-        // method-not-found is observed directly.)
+    fn get_proof_errors_rather_than_fabricating_a_proof_it_cannot_produce() {
+        // The invariant #126 actually protects: when this node cannot produce a
+        // proof — here it holds nothing, has no peer and no upstream — it says so.
+        // It MUST NOT answer with a proof-shaped result carrying an empty
+        // inclusion_proof, because a client handed that would treat unverified
+        // bytes as verified and no error would appear anywhere. An error is the
+        // honest answer; a blank that looks like a proof is worse than -32601.
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN");
         let rt = pin_test_rt();
@@ -8402,10 +8843,9 @@ mod tests {
             crate::download::ReadOrigin::Local,
             crate::download::RequestProvenance::FirstParty,
         ));
-        assert_eq!(
-            resp["error"]["code"],
-            json!(-32601),
-            "dig.getProof must be method-not-found on the node, never a fabricated proof: {resp}"
+        assert!(
+            resp.get("error").is_some(),
+            "an unobtainable proof is an ERROR, never a blank proof: {resp}"
         );
         assert!(
             resp.get("result").is_none(),
@@ -8642,6 +9082,298 @@ mod tests {
         )
         .await;
         assert_eq!(bad_root["error"]["code"], json!(-32602), "{bad_root}");
+    }
+
+    // -- #2071: the read methods the node stopped serving at the rpc.dig.net cutover ----
+    //
+    // These were "passthrough aliases" — relayed to an upstream, and therefore -32601 on
+    // any node without one. rpc.dig.net is meant to be an ordinary node, so it has none,
+    // and every client calling them got method-not-found from a node that held the bytes.
+
+    /// A held capsule yields a REAL inclusion proof — the guest-computed one, rooted at
+    /// the chain-anchored root — and no fabricated execution attestation.
+    #[tokio::test]
+    async fn dig_get_proof_returns_the_guest_computed_proof_at_the_anchored_root() {
+        let store_id = Bytes32([11u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>proof</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+        let rk = crate::content_serve::derive_retrieval_key(&store_id, "index.html");
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getProof","params":{
+                "store_id": store_id.to_hex(), "retrieval_key": rk.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let result = &resp["result"];
+        assert!(resp.get("error").is_none(), "{resp}");
+
+        // The proof is the SAME one a dig.getContent read carries, and it VERIFIES against
+        // the chain-anchored root — the whole point of implementing this rather than stubbing
+        // it. Decoded and checked here, not merely asserted non-empty.
+        let proof_b64 = result["inclusion_proof"].as_str().expect("a proof: {resp}");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(proof_b64)
+            .expect("the proof is base64");
+        let mut dec = digstore_core::codec::Decoder::new(&raw);
+        let proof = digstore_core::merkle::MerkleProof::decode(&mut dec)
+            .expect("the proof decodes as a MerkleProof");
+        assert!(
+            proof.verify(),
+            "the merkle path resolves to its declared root"
+        );
+        assert_eq!(
+            proof.root.to_hex(),
+            root.to_hex(),
+            "the proof is rooted at the CHAIN-anchored root, not some other generation"
+        );
+        assert_eq!(result["root"].as_str(), Some(root.to_hex().as_str()));
+
+        // No execution attestation is fabricated (#126/#134) — absent is reported as absent.
+        assert_eq!(result["execution_proof"], Value::Null, "{resp}");
+        assert_eq!(
+            result["execution_proof_status"],
+            json!("unavailable"),
+            "an absent RISC0 receipt must never be reported as a passed check: {resp}"
+        );
+        // No ciphertext rides a proof response — this is the trust half only.
+        assert!(result.get("ciphertext").is_none(), "{resp}");
+    }
+
+    /// The enveloped public manifest the hub client and the rpc.dig.net read tier call.
+    #[tokio::test]
+    async fn dig_get_public_manifest_wraps_the_manifest_and_echoes_the_resolved_root() {
+        let store_id = Bytes32([12u8; 32]);
+        let files = vec![
+            ("index.html".to_string(), b"<h1>hi</h1>".to_vec()),
+            ("assets/app.js".to_string(), b"console.log(1)".to_vec()),
+        ];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        // No `root` param: the "latest" case every client uses. The node resolves the tip
+        // itself rather than making the caller walk the singleton.
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getPublicManifest","params":{
+                "store_id": store_id.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(
+            resp["result"]["root"].as_str(),
+            Some(root.to_hex().as_str()),
+            "the resolved root is echoed so the caller knows which generation it read: {resp}"
+        );
+        let entries = resp["result"]["manifest"]["entries"]
+            .as_array()
+            .expect("an entries array: {resp}");
+        let paths: Vec<&str> = entries.iter().filter_map(|e| e["path"].as_str()).collect();
+        assert!(
+            paths.contains(&"index.html") && paths.contains(&"assets/app.js"),
+            "every public path is listed: {paths:?}"
+        );
+    }
+
+    /// A capsule with no metadata section is `manifest: null` — an absence, not an error
+    /// (store-format §5.1) — and a capsule this node does not hold is -32004.
+    #[tokio::test]
+    async fn dig_get_metadata_reports_absence_as_null_and_a_miss_as_unavailable() {
+        let store_id = Bytes32([13u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>meta</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        let held = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getMetadata","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(
+            held.get("error").is_none(),
+            "a held capsule with an EMPTY publisher manifest is a success, not an error: {held}"
+        );
+        assert_eq!(
+            held["result"]["root"].as_str(),
+            Some(root.to_hex().as_str())
+        );
+        assert!(
+            held["result"]["program_hash"].is_string(),
+            "a locally held module reports its content address: {held}"
+        );
+
+        // A root this node holds nothing at — distinct from "held but no section".
+        let absent_root = Bytes32([0xAB; 32]);
+        let (miss_node, _td2) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), absent_root));
+        let miss = handle_rpc(
+            &miss_node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getMetadata","params":{
+                "store_id": store_id.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(
+            miss["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "{miss}"
+        );
+    }
+
+    /// `dig.getCapsule` serves the whole `.dig` in the SAME envelope this node's own
+    /// capsule downloader consumes — the two halves of that contract now agree.
+    #[tokio::test]
+    async fn dig_get_capsule_serves_the_module_in_the_downloaders_own_envelope() {
+        let store_id = Bytes32([14u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>capsule</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        // Drive the loop the real downloader drives: reserve from the FIRST window's
+        // total_length, then follow next_offset until complete. A compiled `.dig` carries the
+        // guest wasm, so it spans several windows — this exercises the multi-window path the
+        // capsule download actually takes, not a one-shot.
+        let window_at = |offset: u64| {
+            handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getCapsule","params":{
+                    "store_id": store_id.to_hex(), "root": root.to_hex(), "offset": offset,
+                }}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            )
+        };
+
+        let first = window_at(0).await;
+        assert!(first.get("error").is_none(), "{first}");
+        assert_eq!(
+            first["result"]["total_length"].as_u64(),
+            Some(module_bytes.len() as u64),
+            "the downloader reserves from total_length before it has every window: {first}"
+        );
+        // A capsule window carries no per-resource proof or chunk layout; an empty one would
+        // invite a caller to read the absence as a passed check.
+        assert!(first["result"].get("inclusion_proof").is_none(), "{first}");
+        assert!(first["result"].get("chunk_lens").is_none(), "{first}");
+
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let resp = window_at(offset).await;
+            let result = &resp["result"];
+            assert_eq!(
+                result["offset"].as_u64(),
+                Some(offset),
+                "a window must be served at the offset requested: {resp}"
+            );
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(result["ciphertext"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(
+                result["length"].as_u64(),
+                Some(bytes.len() as u64),
+                "declared length matches the bytes served: {resp}"
+            );
+            assembled.extend_from_slice(&bytes);
+            if result["complete"] == json!(true) {
+                assert!(
+                    result.get("next_offset").is_some_and(Value::is_null),
+                    "the last window ends the loop with an explicit null: {resp}"
+                );
+                break;
+            }
+            let next = result["next_offset"]
+                .as_u64()
+                .expect("an incomplete window advances");
+            assert!(next > offset, "forward progress is mandatory: {resp}");
+            offset = next;
+        }
+        assert_eq!(
+            assembled, module_bytes,
+            "the reassembled bytes ARE the module"
+        );
+
+        // `dig.getModule` is the historical alias and must answer identically.
+        let alias = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getModule","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(alias, first, "dig.getModule is an alias of dig.getCapsule");
+    }
+
+    /// A superseded root is refused rather than served — the anti-rollback pin (#127)
+    /// applies to capsule-scoped reads too, not only to `dig.getContent`.
+    #[tokio::test]
+    async fn capsule_scoped_reads_refuse_a_root_the_chain_does_not_confirm() {
+        let store_id = Bytes32([15u8; 32]);
+        let tip = Bytes32([0xEE; 32]);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), tip));
+        for method in ["dig.getPublicManifest", "dig.getMetadata", "dig.getCapsule"] {
+            let resp = handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{
+                    "store_id": store_id.to_hex(), "root": Bytes32([0x11; 32]).to_hex(),
+                }}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            )
+            .await;
+            assert_eq!(
+                resp["error"]["code"],
+                json!(ROOT_NOT_ANCHORED),
+                "{method} must refuse a root the chain does not confirm: {resp}"
+            );
+        }
     }
 
     // -- LOCAL PLAINTEXT CONTENT-SERVE (#289/#290) — serve_content_plaintext + manifest_paths --------

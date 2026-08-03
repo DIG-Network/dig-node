@@ -76,15 +76,51 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
-            // RELAYED, not served locally: the embedded read path's handle_rpc
-            // resolves ONLY dig.getContent (not this alias), so a dig.getCapsule
-            // request returns -32601 from the node and the dig-node shell relays it
-            // to the upstream. A caller wanting a local-first read uses
-            // dig.getContent with {store_id, root, retrieval_key}.
+            // #2071: served LOCALLY now (was a passthrough alias, which meant -32601 on any node
+            // without an upstream). One window of a whole `.dig` module this node holds, in the
+            // same streaming envelope dig.getContent uses — the shape this node's own capsule
+            // downloader has always consumed from an upstream and could not serve.
             name: "dig.getCapsule",
-            served: "passthrough",
-            summary: "Capsule read (storeId:rootHash) — relayed verbatim to the upstream \
-                      (the local node serves dig.getContent; use that for local-first).",
+            served: "local",
+            summary: "One window of a held capsule's whole `.dig` module: { ciphertext (base64 \
+                      module bytes), total_length, offset, length, complete, next_offset, root }. \
+                      Params { store_id, root?, offset? } (`root` absent/\"latest\" resolves the \
+                      chain-anchored tip). No inclusion_proof: a module blob is bound to its \
+                      on-chain root, not to a per-resource Merkle path. -32004 when not held.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            // #2071: the historical alias of dig.getCapsule, served identically.
+            name: "dig.getModule",
+            served: "local",
+            summary: "Alias of dig.getCapsule — identical params and result.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            // #2071: served LOCALLY now. The publisher's plaintext metadata manifest
+            // (data-section id 6) for a capsule — PUBLIC, unencrypted, no retrieval_key.
+            name: "dig.getMetadata",
+            served: "local",
+            summary: "A capsule's publisher metadata manifest: { manifest: { schema_version, \
+                      name, version, description, authors, license, homepage, repository, \
+                      keywords, categories, icon, content_type, links, custom } | null, \
+                      program_hash, root }. Params { store_id, root? } (`root` absent/\"latest\" \
+                      resolves the chain-anchored tip). `manifest: null` when the module carries \
+                      no metadata section; -32004 when the capsule isn't held locally.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            // #2071: served LOCALLY now. The enveloped form of dig.getManifest that the hub
+            // client and the rpc.dig.net read tier call — same data-section id 13 content, an
+            // optional root, and the resolved root echoed back.
+            name: "dig.getPublicManifest",
+            served: "local",
+            summary: "A capsule's normalized public manifest, enveloped: { manifest: \
+                      { schema_version, entries: [{ path, latest_root, generation_index, \
+                      sha256_latest, version_count }] } | null, root }. Params \
+                      { store_id, root? } (`root` absent/\"latest\" resolves the chain-anchored \
+                      tip). `manifest: null` when the module carries no manifest section \
+                      (older/private `.dig`); -32004 when the capsule isn't held locally.",
             requires_auth: false,
         },
         MethodInfo {
@@ -192,9 +228,18 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
+            // #2071: served LOCALLY now (was a passthrough alias). The trust half of a read,
+            // obtained by running the ordinary getContent read and discarding the ciphertext, so
+            // the proof is provably the one a content read would have verified against. No
+            // execution attestation is ever fabricated (#126/#134).
             name: "dig.getProof",
-            served: "passthrough",
-            summary: "Inclusion proof for a resource — relayed verbatim to the upstream.",
+            served: "local",
+            summary: "A resource's Merkle inclusion proof + the chain-anchored root it verifies \
+                      against, without the ciphertext: { inclusion_proof, root, chunk_lens, \
+                      program_hash, execution_proof: null, execution_proof_status: \
+                      \"unavailable\" }. Params { store_id, retrieval_key, root? }. When no \
+                      verifying proof can be produced the underlying read's error is returned \
+                      verbatim — never a proof-shaped result with an empty proof.",
             requires_auth: false,
         },
         MethodInfo {
