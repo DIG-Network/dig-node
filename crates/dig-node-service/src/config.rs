@@ -50,8 +50,30 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 /// with this service byte-for-byte with no copy to drift.
 pub const DEFAULT_PORT: u16 = dig_constants::DIG_NODE_PORT;
 
-/// Default upstream DIG RPC the embedded node proxies to on a local cache miss.
-pub const DEFAULT_UPSTREAM: &str = "https://rpc.dig.net";
+/// The default upstream DIG RPC: **none** (#1997).
+///
+/// A dig-node ships with NO upstream. A method this node does not implement answers a local
+/// `-32601 METHOD_NOT_FOUND`, which is the truthful answer; passthrough is opt-in, via
+/// `DIG_RPC_UPSTREAM` or the persisted `control.config.setUpstream` override.
+///
+/// # Why this is empty, and must stay empty
+///
+/// It used to be `https://rpc.dig.net`. That single default gave every node in the ecosystem three
+/// properties nobody chose:
+///
+/// 1. **A structurally special node.** `rpc.dig.net` became load-bearing for every other node's
+///    unrecognised methods, rather than an ordinary node that merely has a well-known address.
+/// 2. **A silent off-box data flow.** An unrecognised method — *including its params* — was
+///    forwarded to a third-party host the operator never configured. A method name is not
+///    always harmless: it is caller-controlled, and its params can carry store ids and
+///    retrieval keys describing what someone is reading.
+/// 3. **A self-referential loop on the well-known node itself.** `rpc.dig.net`'s own node
+///    inherited the default and so relayed to *itself* through its public address, turning one
+///    unimplemented method into an unbounded request cycle (#1997 — the outage this fixed).
+///
+/// Pointing this at any other host re-creates all three with a different name. The default is the
+/// absence of an upstream, not a better choice of one.
+pub const DEFAULT_UPSTREAM: &str = "";
 
 /// The loopback IP the bare-`http://dig.local` listener binds to (#91). The
 /// dig-installer writes a hosts entry `127.0.0.2  dig.local`, so binding this IP on
@@ -175,6 +197,22 @@ impl Config {
             .or_else(|| crate::control::read_upstream_override().map(|s| normalize_upstream(&s)))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_UPSTREAM.to_string());
+
+        // Refuse an upstream that is THIS node (#1997). Dropping it back to "no upstream" is the
+        // safe resolution: relaying to ourselves can only ever loop, so declining to relay loses
+        // nothing a working configuration would have provided.
+        let upstream = if is_self_upstream(&upstream, port) {
+            tracing::error!(
+                %upstream,
+                port,
+                "refusing an upstream that names this node — a node cannot be its own upstream; \
+                 passthrough is disabled. Set DIG_RPC_UPSTREAM to a DIFFERENT node, or leave it \
+                 unset to answer unimplemented methods locally."
+            );
+            String::new()
+        } else {
+            upstream
+        };
 
         // DIG_NODE_CACHE is read with the read path's OWN env var name (not a
         // service-specific alias) so a value the operator sets reaches the node
@@ -471,6 +509,81 @@ pub fn normalize_upstream(raw: &str) -> String {
     }
 }
 
+/// Split a normalised upstream into `(host, port)`, defaulting the port from the scheme.
+///
+/// Pure, and deliberately tolerant: anything it cannot parse yields `None`, which the caller
+/// treats as "not provably self" rather than as an error. The self-reference check this feeds is a
+/// safety net over an operator's value, not a URL validator.
+fn upstream_host_port(upstream: &str) -> Option<(String, u16)> {
+    let (scheme_port, rest) = if let Some(r) = upstream.strip_prefix("https://") {
+        (443u16, r)
+    } else {
+        (80u16, upstream.strip_prefix("http://")?)
+    };
+    // Drop any path/query so `http://127.0.0.1:9778/rpc` compares as `127.0.0.1:9778`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Strip userinfo, which is part of the authority but not the host.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+
+    // An IPv6 literal is bracketed, and its colons must not be read as a port separator.
+    if let Some(after_bracket) = authority.strip_prefix('[') {
+        let (host, tail) = after_bracket.split_once(']')?;
+        let port = match tail.strip_prefix(':') {
+            Some(p) => p.parse().ok()?,
+            None => scheme_port,
+        };
+        return Some((host.to_ascii_lowercase(), port));
+    }
+
+    match authority.rsplit_once(':') {
+        Some((host, p)) => Some((host.to_ascii_lowercase(), p.parse().ok()?)),
+        None => Some((authority.to_ascii_lowercase(), scheme_port)),
+    }
+}
+
+/// Whether `upstream` names THIS node — a node configured to relay to itself (#1997).
+///
+/// PURE, no DNS, no I/O: it recognises only the shapes that are self-evidently this process — a
+/// loopback host on the port this node serves, or the `dig.local` alias on its privileged port.
+/// Both are exactly what an operator produces by copying the node's own address into the upstream
+/// slot.
+///
+/// # What this deliberately does NOT catch
+///
+/// A *public* name that resolves back to this host — `https://rpc.dig.net` configured on the box
+/// that answers `rpc.dig.net` — is invisible here, because deciding it needs DNS plus knowledge of
+/// which public names terminate at this process, and a resolver answer is neither stable nor
+/// trustworthy enough to gate startup on. That case is caught at runtime instead, by the
+/// relay-loop probe in [`crate::server`], which detects the loop by observing a request come back
+/// rather than by predicting that it will. The two are complementary and neither replaces the
+/// other: this one is instant and offline, that one is topology-aware.
+pub fn is_self_upstream(upstream: &str, serving_port: u16) -> bool {
+    let Some((host, port)) = upstream_host_port(upstream) else {
+        return false;
+    };
+
+    // Every name that reaches THIS process: the loopback family, plus `dig.local`, which the
+    // installer's hosts entry points at the loopback alias 127.0.0.2 (#91).
+    let names_this_host = host == "dig.local"
+        || matches!(host.as_str(), "localhost" | "::1")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_loopback());
+
+    // Stated over the CLASS of ports this node listens on, not one member of it. The node binds
+    // FOUR: the configurable localhost port, `dig.local` plaintext :80, and the `https://dig.local`
+    // TLS pair on :443 (127.0.0.2 and [::1], #624). Naming only :80 here left the likeliest
+    // hand-typed self value — `DIG_RPC_UPSTREAM=dig.local`, which `normalize_upstream` turns into
+    // `https://dig.local`, i.e. port 443 — unrefused. A guard justified by one spelling is bypassed
+    // by the next spelling of the same thing.
+    let own_ports = [serving_port, DIG_LOCAL_PORT, DIG_LOCAL_HTTPS_PORT];
+
+    names_this_host && own_ports.contains(&port)
+}
+
 /// Resolve the explicit cache dir from a raw `DIG_NODE_CACHE` value: a non-blank
 /// value is honoured (trimmed); a missing or blank/whitespace value is `None`,
 /// meaning "use dig-node's shared canonical default". PURE so the
@@ -513,6 +626,88 @@ mod tests {
             normalize_upstream("http://127.0.0.1:9000"),
             "http://127.0.0.1:9000"
         );
+    }
+
+    /// **Proves:** a dig-node ships with NO upstream, so an unimplemented method is answered
+    /// locally instead of being forwarded to a third party (#1997).
+    /// **Catches:** anyone reinstating a well-known host here, which is the exact change that
+    /// made `rpc.dig.net` structurally special and then made it relay to itself.
+    #[test]
+    fn there_is_no_default_upstream() {
+        assert_eq!(DEFAULT_UPSTREAM, "");
+        assert_eq!(Config::default().upstream, "");
+    }
+
+    /// **Proves:** every self-evidently-self shape is recognised — the node's own port on each
+    /// loopback spelling, and the `dig.local` alias.
+    /// **Catches:** a parser that reads `[::1]:9778`'s host as `[` or splits an IPv6 literal on
+    /// its own colons, which would let the most likely hand-typed self value through.
+    #[test]
+    fn an_upstream_naming_this_node_is_self() {
+        for u in [
+            "http://127.0.0.1:9778",
+            "http://localhost:9778",
+            "http://[::1]:9778",
+            "https://127.0.0.1:9778",
+            "http://127.0.0.2:9778",
+            "http://127.0.0.1:9778/",
+            "http://127.0.0.1:9778/rpc?x=1",
+            "http://dig.local",
+            "http://dig.local:80",
+            // The likeliest hand-typed self value of all: a bare host, which normalize_upstream
+            // turns into `https://dig.local` — port 443, the TLS dig.local listener (#624).
+            "dig.local",
+            "https://dig.local",
+            "https://dig.local:443",
+            // The TLS pair's own addresses, both families.
+            "https://127.0.0.2",
+            "https://[::1]",
+            // The plaintext dig.local alias reached by IP rather than by name.
+            "http://127.0.0.2",
+            "http://[::1]:80",
+        ] {
+            assert!(
+                is_self_upstream(&normalize_upstream(u), 9778),
+                "{u} names this node"
+            );
+        }
+    }
+
+    /// **Proves:** the check stays narrow — a different node on loopback, a different port, and
+    /// any remote host are all legitimate upstreams.
+    /// **Catches:** an over-broad rule that disables passthrough for the developer running two
+    /// nodes side by side, which would make the safety net indistinguishable from a bug.
+    #[test]
+    fn an_upstream_naming_another_node_is_not_self() {
+        for u in [
+            "http://127.0.0.1:9999",
+            "http://localhost:8080",
+            "https://rpc.dig.net",
+            "https://some-peer.example:9778",
+            // A second node on loopback at a port this one does not bind: a real, supported
+            // development setup. Refusing it would make the guard indistinguishable from a bug.
+            "http://127.0.0.1:19778",
+            "http://[::1]:19778",
+            // A host that merely CONTAINS a self-ish name is not this node.
+            "https://dig.local.example.com",
+            "https://not-dig.local:443",
+            "not a url",
+            "",
+        ] {
+            assert!(
+                !is_self_upstream(&normalize_upstream(u), 9778),
+                "{u} does not name this node"
+            );
+        }
+    }
+
+    /// **Proves:** the serving port is what decides it, so a node on a non-default port is
+    /// protected too.
+    /// **Catches:** hardcoding 9778 in the check instead of reading the resolved port.
+    #[test]
+    fn self_detection_follows_the_serving_port() {
+        assert!(is_self_upstream("http://127.0.0.1:1234", 1234));
+        assert!(!is_self_upstream("http://127.0.0.1:1234", 9778));
     }
 
     #[test]

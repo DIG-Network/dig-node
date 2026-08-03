@@ -67,6 +67,9 @@ pub mod pairing;
 /// `dig-node peers` (#559): view + manage the node's peer connections from the CLI — parity with
 /// the extension's peer surface, driven over the token-gated `control.*` client. See [`peers`].
 pub mod peers;
+/// The passthrough relay guard (#1997): whether this node relays an unimplemented method to an
+/// upstream, and the bring-up probe that proves an upstream is not this node itself. See [`relay`].
+pub mod relay;
 pub mod rpc;
 /// Shared OS-owner trust gate ([`security::dir_is_privileged`]): is a directory owned by a
 /// privileged principal (SYSTEM/Administrators or root) and not user-writable? Used by the self-heal

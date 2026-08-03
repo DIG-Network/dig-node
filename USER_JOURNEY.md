@@ -90,8 +90,9 @@ When a `chia://` resource is requested:
    retrieval_key, offset, length}`).
 2. `dig-node` answers **local-first**: if the capsule (`storeId:rootHash`) is in the local cache it
    serves the **blind ciphertext + Merkle inclusion proof + chunk lengths** straight from disk.
-3. On a cache miss it **blind-fetches** ciphertext + proof from the upstream DIG RPC
-   (`DIG_RPC_UPSTREAM`, default `https://rpc.dig.net`), caches the window, and returns it.
+3. On a cache miss it resolves the content over the **peer network** — a DHT provider lookup, then
+   a redirect to a holder or a fetch-through (`DIG_NODE_ON_MISS`) — caches the window, and returns
+   it. It does NOT fall back to a well-known node: there is no default upstream.
 4. The **client verifies the Merkle proof and decrypts** the content (the read-crypto lives in the
    extension/browser — the local node mirrors the ciphertext contract, it never returns plaintext;
    the "blind host" property is preserved for remote hosts, while the *local* node legitimately
@@ -100,9 +101,9 @@ When a `chia://` resource is requested:
 `dig.getAnchoredRoot` resolves a store's chain-anchored tip root; `dig.getManifest` reads a held
 capsule's embedded normalized public manifest (the store's complete public file surface — `null`
 when the module carries no manifest section, never an error); `cache.*` methods configure and
-inspect the on-disk cache; everything else (`dig.getProof`, `dig.listCapsules`, …) is
-**blind-passthrough** relayed verbatim to the upstream, so the node stays a correct transparent
-proxy.
+inspect the on-disk cache; `dig.health` / `dig.methods` are answered by the shell itself; everything
+else (`dig.getProof`, `dig.listCapsules`, …) answers `-32601` locally, or is relayed verbatim to an
+upstream if the operator configured one (there is no default).
 
 ### 5. The local cache
 
@@ -180,7 +181,7 @@ every subcommand (machine output to stdout, prose to stderr).
 |---|---|
 | **dig-installer → dig-node** | Installer downloads the pinned `dig-node` binary and runs `dig-node install`; the resolved plan/version is the install contract. |
 | **dig-chrome-extension ↔ dig-node** | The extension's *server host* points at `localhost:9778`; it sends `dig.getContent` and **verifies + decrypts** the returned ciphertext locally (read-crypto is the same `dig_client` WASM the hub uses). |
-| **dig-node → rpc.dig.net (upstream)** | On a cache miss / unhandled method, `dig-node` blind-fetches ciphertext + proof and relays passthrough methods over the same JSON-RPC read contract. |
+| **dig-node → an upstream (OPTIONAL)** | Only when an operator sets `DIG_RPC_UPSTREAM`. There is no default upstream and `rpc.dig.net` is not one: it is an ordinary node with a well-known address. A node refuses an upstream that names itself. |
 | **dig-node ↔ digstore (`dig-node` crate)** | The read path **is** digstore's `dig_node::handle_rpc`, pinned to a digstore release tag — the same node the native DIG Browser runs in-process. One read path, one cache contract across the ecosystem. |
 | **dig-node ↔ DIG Browser (native)** | Same wire contract and cache semantics; `dig-node` is the standalone-service form for users who run the extension in a normal browser rather than the native fork. |
 | **DIG Browser "My Node" controller → dig-node** | The browser drives the `control.*` admin surface over loopback, reading the control token from `<config_dir>/control-token` and sending it as `X-Dig-Control-Token`. The contract (methods/params/results, `x-requires-auth`, error codes) is discoverable via `/openrpc.json` / `rpc.discover`. |

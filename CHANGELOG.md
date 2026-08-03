@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.82.0] - 2026-08-03
+
+### Features
+- **dig-node:** Peer provider-snapshot mTLS RPC + concrete NeighbourhoodProbe (#157)
+
+### Bug Fixes
+- **rpc:** Remove the default upstream so no node relays to a well-known third party (#156)
+
 ## [0.80.0] - 2026-08-03
 
 ### Features
