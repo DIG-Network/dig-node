@@ -251,10 +251,14 @@ impl CapsuleStore for Node {
                 // FFI path (no refresher installed).
                 self.refresh_dht_inventory().await;
                 // A capsule just grew `<cache>/modules`. Run the tier-aware size-cap sweep so every
-                // land path (gap-fill, §21 backfill, this RPC) keeps whole-capsule storage bounded at
-                // the cache cap — not only the tier-0 precache loop (#1934 disk-exhaustion fix). The
-                // `_guard` above already holds `cache_lock`, so call the LOCKED core directly (the
-                // `_if_needed` wrapper re-takes `cache_lock` and would deadlock).
+                // ON-DEMAND land path keeps whole-capsule storage bounded at the cache cap — not only
+                // the tier-0 precache loop (#1934 disk-exhaustion fix). This site bounds the paths that
+                // funnel through here (`cache.fetchAndCache`, chain gap-fill, fetch-side backfill); the
+                // read-path §21 whole-store sync lands via `Node::sync_module` and sweeps at ITS OWN
+                // call site (`sync_module_and_bound`, #2041) — so with this change every on-demand land
+                // path sweeps, and the bound holds independent of the tier-0 loop's state. The `_guard`
+                // above already holds `cache_lock`, so call the LOCKED core directly (the `_if_needed`
+                // wrapper re-takes `cache_lock` and would deadlock).
                 self.evict_modules_locked();
                 Ok((md.len(), root_hex.to_string()))
             }

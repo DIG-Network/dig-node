@@ -765,7 +765,7 @@ impl RpcDispatch for Node {
             //     falls through to the per-resource proxy below. `sync_module` returns
             //     true only when the SERVED root == the requested (= pinned) root, so a
             //     synced module is keyed by the anchored root before we serve it.
-            if node.sync_module(store_hex, &root_hex).await {
+            if node.sync_module_and_bound(store_hex, &root_hex).await {
                 // The sync just wrote/replaced the on-disk module; drop any stale decoded entry so the
                 // cache reflects the newly-synced module rather than a prior decode.
                 node.invalidate_content_cache(store_hex, &root_hex);
