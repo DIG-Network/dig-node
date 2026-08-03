@@ -8079,7 +8079,11 @@ mod tests {
         let first = content_window_envelope(&ciphertext, 0, String::new(), None, json!([]));
         assert_eq!(first["total_length"], json!(WINDOW + 500));
         assert_eq!(first["offset"], json!(0));
-        assert_eq!(first["length"], json!(WINDOW), "clamped to one window: {first}");
+        assert_eq!(
+            first["length"],
+            json!(WINDOW),
+            "clamped to one window: {first}"
+        );
         assert_eq!(first["complete"], json!(false));
         assert_eq!(first["next_offset"], json!(WINDOW));
 
@@ -8131,7 +8135,10 @@ mod tests {
             "sum(chunk_lens) must equal the reassembled buffer, or the client discards \
              the read as corrupt and serves its own 404 (#2071): {result}"
         );
-        assert_eq!(buf, resp.ciphertext, "the reassembled bytes are the resource");
+        assert_eq!(
+            buf, resp.ciphertext,
+            "the reassembled bytes are the resource"
+        );
     }
 
     /// The fetch-through path serves the SAME envelope as the local path — a
