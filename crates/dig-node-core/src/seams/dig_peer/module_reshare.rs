@@ -604,14 +604,18 @@ mod tests {
             &hex32(CHAIN_ROOT),
         ));
 
+        // `>=` rather than exact `==`: `CACHE_REFETCH_COUNT` is a PROCESS-GLOBAL atomic shared with
+        // every other test in the crate's `cargo test`/`cargo llvm-cov` process, including several
+        // that land real capsules concurrently — a concurrent land can only make the delta BIGGER,
+        // never smaller, so `>= before + 1` is the strongest claim that stays deterministic under
+        // full-suite parallelism while still proving THIS promotion contributed at least one bump.
         let before = crate::CACHE_REFETCH_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         let cached = dir.join("cached.module");
         assert!(promote_into_cache(&staged, &cached, &verifier).is_ok());
         let after = crate::CACHE_REFETCH_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            after,
-            before + 1,
-            "a successful promotion counts as one refetch"
+        assert!(
+            after > before,
+            "a successful promotion counts as at least one refetch (before={before}, after={after})"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
