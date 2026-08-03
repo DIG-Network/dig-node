@@ -6382,15 +6382,24 @@ mod tests {
             .unwrap();
         let (node, _td) = test_node(None);
         // A real, freshly-started gossip pool on a concrete loopback bind (no discovery, no peers).
+        // Prefer the IPv6 loopback (§5.2 IPv6-first); fall back to IPv4 on a host where IPv6 is
+        // unavailable entirely — this test asserts the `peerStatus` pool-posture surface, not
+        // dual-stack transport itself, so either family satisfies it fully.
         let handle = rt.block_on(async {
             let dir = tempfile::tempdir().expect("gossip dir");
+            let listen_addr: std::net::SocketAddr =
+                if peer::tests::is_ipv6_loopback_available().await {
+                    "[::1]:0".parse().unwrap()
+                } else {
+                    "127.0.0.1:0".parse().unwrap()
+                };
             let cfg = dig_gossip::GossipConfig {
                 network_id: chia_protocol::Bytes32::new([0x33u8; 32]),
                 cert_path: dir.path().join("node.cert").display().to_string(),
                 key_path: dir.path().join("node.key").display().to_string(),
                 peers_file_path: dir.path().join("peers.json"),
                 peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
-                listen_addr: "[::1]:0".parse().unwrap(),
+                listen_addr,
                 ..Default::default()
             };
             dig_gossip::GossipService::new(cfg)

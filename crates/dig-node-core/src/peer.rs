@@ -3138,8 +3138,11 @@ pub(crate) mod tests {
     // does; both must succeed (on the old shared-9444 build the second bind fails on Linux).
     #[tokio::test]
     async fn gossip_pool_and_peer_rpc_bind_together_on_distinct_ports() {
-        // The mTLS peer-RPC listener on an OS-assigned ephemeral port.
-        let peer_rpc = crate::net::bind_tcp_dual_stack(crate::net::dual_stack_listen_addr(0))
+        // The mTLS peer-RPC listener on an OS-assigned ephemeral port (dual-stack `[::]:0` where this
+        // host's kernel supports IPv6 at all, else the IPv4 loopback fallback — this test proves two
+        // DISTINCT ports bind without clashing, not dual-stack transport itself).
+        let bind_addr = fresh_pool_listen_addr().await;
+        let peer_rpc = crate::net::bind_tcp_dual_stack(bind_addr)
             .expect("peer-RPC dual-stack bind must succeed");
         let peer_port = peer_rpc.local_addr().unwrap().port();
 
@@ -3152,7 +3155,7 @@ pub(crate) mod tests {
             key_path: dir.join("node.key").display().to_string(),
             peers_file_path: dir.join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
-            listen_addr: crate::net::dual_stack_listen_addr(0),
+            listen_addr: fresh_pool_listen_addr().await,
             ..Default::default()
         };
         let service = dig_gossip::GossipService::new(cfg).expect("gossip config");
@@ -3177,7 +3180,7 @@ pub(crate) mod tests {
             key_path: dir.join("node.key").display().to_string(),
             peers_file_path: dir.join("peers.json"),
             peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
-            listen_addr: crate::net::dual_stack_listen_addr(0),
+            listen_addr: fresh_pool_listen_addr().await,
             ..Default::default()
         };
         let handle = dig_gossip::GossipService::new(cfg)
@@ -3412,11 +3415,29 @@ pub(crate) mod tests {
         assert!(err.contains("dialable address"), "got: {err}");
     }
 
-    /// Whether the host has a usable IPv6 loopback stack. Some CI sandboxes disable IPv6 entirely,
-    /// in which case a `[::1]` dial cannot be exercised; the two-node test skips rather than reporting
-    /// a false failure unrelated to this crate's connect logic (mirrors dig-gossip's CON-002 guard).
-    pub(crate) async fn host_has_ipv6_loopback() -> bool {
+    /// Whether the host has a usable IPv6 loopback stack. Some sandboxes disable IPv6 entirely at the
+    /// kernel level (`[::1]:0` fails with `EAFNOSUPPORT`, not merely a refused bind), in which case no
+    /// `[::1]` dial or `[::]` listen can be exercised; callers that specifically assert dual-stack/IPv6
+    /// behaviour skip cleanly rather than reporting a false failure unrelated to this crate's logic
+    /// (mirrors dig-gossip's CON-002 guard). On any host where IPv6 loopback DOES work — every CI
+    /// runner — this returns `true` and every caller runs its full assertion, unweakened.
+    pub(crate) async fn is_ipv6_loopback_available() -> bool {
         tokio::net::TcpListener::bind("[::1]:0").await.is_ok()
+    }
+
+    /// The listen address the pool-handle test fixtures bind: the production-shaped dual-stack
+    /// unspecified address (`[::]:0`, §5.2 IPv6-first) on a host with a working IPv6 stack, falling
+    /// back to an IPv4 loopback bind (`127.0.0.1:0`) on a host where IPv6 is unavailable entirely.
+    /// These fixtures back tests that assert pool/connect/disconnect semantics, not dual-stack
+    /// transport itself, so a real bound listener on either family satisfies them fully — no skip
+    /// needed here (dual-stack transport itself is proven separately, where it IS the point: see
+    /// `crate::net::tests::dual_stack_bind_accepts_an_ipv4_loopback_client`).
+    async fn fresh_pool_listen_addr() -> std::net::SocketAddr {
+        if is_ipv6_loopback_available().await {
+            crate::net::dual_stack_listen_addr(0)
+        } else {
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+        }
     }
 
     /// Read a pooled peer's transport `via` from the per-peer JSON, or `None` if that `peer_id` is
@@ -3464,7 +3485,7 @@ pub(crate) mod tests {
     /// link.
     #[tokio::test]
     async fn two_nodes_connect_over_loopback_and_each_sees_the_other() {
-        if !host_has_ipv6_loopback().await {
+        if !is_ipv6_loopback_available().await {
             eprintln!("skipping: host has no usable IPv6 loopback stack");
             return;
         }
@@ -3577,7 +3598,7 @@ pub(crate) mod tests {
         tag: &str,
         network: [u8; 32],
     ) -> dig_gossip::GossipHandle {
-        fresh_pool_handle_on(tag, network, crate::net::dual_stack_listen_addr(0)).await
+        fresh_pool_handle_on(tag, network, fresh_pool_listen_addr().await).await
     }
 
     /// Build a freshly-started `GossipHandle` bound on an explicit `listen_addr`.
