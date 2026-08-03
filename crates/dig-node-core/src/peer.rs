@@ -1124,6 +1124,16 @@ where
 /// to a remote peer — they stay reachable only from the loopback admin / in-process FFI
 /// dispatch ([`crate::handle_rpc`]). See audit #179 (CRITICAL auth-bypass).
 pub(crate) fn is_peer_reachable_method(method: &str) -> bool {
+    // `dig.getProviderSnapshot` is a dig-node-LOCAL peer method (the anti-Sybil neighbourhood
+    // provider-snapshot RPC, epic #1934 child 4a). It is not in the shared `dig-rpc-protocol`
+    // allowlist because that crate is a crates.io pin this repo cannot extend; promoting it into the
+    // canonical allowlist is a tracked cross-repo follow-up. Until then it is allowlisted HERE,
+    // deliberately: it is a READ that exposes only AGGREGATE COUNTS (never provider identities) — the
+    // same privacy stance as the RLY-009 relay DHT-records view — and mutates no node state, so it
+    // widens no privilege beyond the existing discovery methods.
+    if method == crate::seams::dig_peer::neighbourhood_probe::GET_PROVIDER_SNAPSHOT_METHOD {
+        return true;
+    }
     dig_rpc_protocol::Method::from_name(method).is_some_and(|m| m.is_peer_reachable())
 }
 
@@ -1233,6 +1243,19 @@ impl PeerRpcResponder for NodeResponder {
         if !is_peer_reachable_method(method) {
             return json!({"jsonrpc":"2.0","id":id,
                 "error":{"code":-32601,"message":"method not found"}});
+        }
+        // dig.getProviderSnapshot is answered HERE, from this node's LIVE DHT provider store, for the
+        // same reason as dig.getPeers below: the base handle_rpc (the FFI-safe Node) holds no DHT
+        // handle, so only the NodeResponder can answer it. The result is COUNTS-ONLY (no provider
+        // identities) — the anti-Sybil per-peer observation the neighbourhood probe consumes (#1934).
+        if method == crate::seams::dig_peer::neighbourhood_probe::GET_PROVIDER_SNAPSHOT_METHOD {
+            let params = req.get("params").cloned().unwrap_or(Value::Null);
+            let result = crate::seams::dig_peer::neighbourhood_probe::provider_snapshot_result(
+                self.dht.as_ref(),
+                &params,
+            )
+            .await;
+            return json!({"jsonrpc":"2.0","id":id,"result":result});
         }
         // dig.getPeers is answered from the LIVE pool here (the base handle_rpc can't — it has no pool
         // handle). Everything else routes through the shared dispatch so the peer surface == the agent
@@ -4141,6 +4164,31 @@ pub(crate) mod tests {
         for m in expected {
             assert!(is_peer_reachable_method(m), "{m} must be peer-reachable");
         }
+    }
+
+    /// **Proves:** `dig.getProviderSnapshot` is peer-reachable as the ONE deliberate dig-node-LOCAL
+    /// addition beyond the shared `dig-rpc-protocol` allowlist (epic #1934 child 4a) — it is not (yet)
+    /// in that crate's set, so the wrapper allowlists it explicitly, and this test records that as an
+    /// intentional decision rather than an accident. It is a counts-only READ (no provider identities,
+    /// no mutation), so it widens no privilege beyond the existing discovery methods.
+    /// **Catches:** a silent removal of the local allowlist entry (which would break the neighbourhood
+    /// probe), and confirms the crate's own set still does NOT carry the method.
+    #[test]
+    fn get_provider_snapshot_is_the_one_local_peer_method_beyond_the_crate_allowlist() {
+        assert!(
+            is_peer_reachable_method(
+                crate::seams::dig_peer::neighbourhood_probe::GET_PROVIDER_SNAPSHOT_METHOD
+            ),
+            "dig.getProviderSnapshot must be peer-reachable (the neighbourhood-probe RPC)"
+        );
+        assert!(
+            dig_rpc_protocol::Method::from_name(
+                crate::seams::dig_peer::neighbourhood_probe::GET_PROVIDER_SNAPSHOT_METHOD
+            )
+            .is_none(),
+            "it is a dig-node-local method — the shared crate must not yet know it (promoting it is a \
+             tracked cross-repo follow-up)"
+        );
     }
 
     /// A→B peer RPC over REAL mTLS against the REAL node dispatch (#929): node B serves its
