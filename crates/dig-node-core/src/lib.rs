@@ -411,6 +411,14 @@ pub struct Node {
     /// local-demand term and gives the store eviction precedence over speculative `Tier0Precache`.
     /// In-memory + process-lifetime; additive over the on-disk cache. See [`inbound_demand`].
     inbound_demand: inbound_demand::InboundDemand,
+    /// This node's own 32-byte `peer_id` (= its DHT node id — both are the SHA-256 SPKI value, one
+    /// keyspace), the XOR-distance REFERENCE point the inbound-demand pull's proximity admission scores
+    /// against (§7.10d, #2014). Installed ONCE by the standalone peer-network bring-up
+    /// ([`peer::spawn_peer_network`]) via [`Node::set_node_peer_id`], the same source the tier-0 loop
+    /// takes its `NodeContext.peer_id` from — so the two paths share ONE reference identity. NEVER set
+    /// on the FFI/consumer path (no peer network, no inbound peer demand), where the gate reads `None`
+    /// and fails CLOSED (no peer-driven pull without a known identity to anchor the neighbourhood to).
+    node_peer_id: OnceLock<[u8; 32]>,
 }
 
 /// A boxed async hook that reconciles the node's DHT provider records with its current cache
@@ -2817,6 +2825,7 @@ impl Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
         })
     }
 
@@ -2883,11 +2892,48 @@ impl Node {
         // speculative precache round backs off entirely while the node is serving real reads.
         crate::tier0_live::mark_inbound_activity();
         self.inbound_demand.record(store_hex);
-        if crate::download::inbound_demand_cache_enabled() {
+        // The pull is gated TWICE: the operator opt-in (default OFF) AND the XOR-proximity admission
+        // below. Both must pass — the proximity gate binds even when the flag is on, so enabling the
+        // feature never lets a peer drive caching of content OUTSIDE this node's keyspace neighbourhood.
+        if crate::download::inbound_demand_cache_enabled()
+            && self.inbound_demand_pull_admitted(store_hex, root_hex)
+        {
             // Tier1Demand is asserted in the ledger above; the on-disk pull reuses the fetch-side
             // machinery, which lands + announces the capsule exactly as every other cache path does.
             self.spawn_capsule_backfill(store_hex, root_hex);
         }
+    }
+
+    /// The ANTI-AMPLIFICATION admission for the inbound-demand pull (§7.10d, #2014): may a remote
+    /// peer's request drive this node to fetch + cache + DHT-announce the `(store_hex, root_hex)`
+    /// capsule? Only when the capsule's keyspace key lies within THIS node's neighbourhood — near our
+    /// own `peer_id` in XOR distance — so a peer can steer caching only toward content this node is
+    /// naturally responsible for, NEVER an arbitrary attacker-chosen capsule (it cannot move our
+    /// `peer_id`, and landing a chain-anchored store's key near it costs real on-chain mints).
+    ///
+    /// Fails CLOSED: an unknown self-identity (`None` on the FFI/consumer path) or a
+    /// non-canonical/malformed `(store, root)` denies the pull. The neighbourhood test itself is
+    /// [`crate::relevance::in_keyspace_neighbourhood`], anchored to the SAME `xor_proximity` primary +
+    /// reference `peer_id` the tier-0 precache selector scores against.
+    fn inbound_demand_pull_admitted(&self, store_hex: &str, root_hex: &str) -> bool {
+        let Some(peer_id) = self.node_peer_id.get() else {
+            return false; // no known self-identity → no anchor for "our neighbourhood" → no pull
+        };
+        let (Some(store_id), Some(root)) =
+            (crate::dht::hex64(store_hex), crate::dht::hex64(root_hex))
+        else {
+            return false; // a rootless/`"latest"`/malformed key names no concrete capsule to place
+        };
+        let capsule_key = dig_dht::ContentId::capsule(store_id, root).to_key();
+        crate::relevance::in_keyspace_neighbourhood(capsule_key.as_bytes(), peer_id)
+    }
+
+    /// Install this node's own `peer_id` — the XOR-distance reference the inbound-demand proximity gate
+    /// anchors on (see [`Node::node_peer_id`]). Called ONCE by the peer-network bring-up with the same
+    /// `peer_id` the tier-0 loop uses. A second call is ignored (`OnceLock`), so the reference identity
+    /// is stable for the node's life.
+    pub(crate) fn set_node_peer_id(&self, peer_id: [u8; 32]) {
+        let _ = self.node_peer_id.set(peer_id);
     }
 }
 
@@ -2979,6 +3025,7 @@ pub(crate) mod test_support {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
         };
         (Arc::new(node), td)
     }
@@ -3435,6 +3482,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
         };
         (node, td)
     }
@@ -3518,6 +3566,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
         };
 
         // Missing before the pull.
@@ -3566,6 +3615,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
         });
 
         // Build the loop's deps from the PRODUCTION seams, with a fixed one-store subscription set.
@@ -3655,6 +3705,7 @@ mod tests {
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
                 chat: chat::ChatState::new(),
                 inbound_demand: inbound_demand::InboundDemand::new(),
+                node_peer_id: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -3726,6 +3777,7 @@ mod tests {
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
                 chat: chat::ChatState::new(),
                 inbound_demand: inbound_demand::InboundDemand::new(),
+                node_peer_id: OnceLock::new(),
             });
 
             assert!(!module_exists(&node.cache_dir, &store_hex, &root.to_hex()));
@@ -3876,6 +3928,10 @@ mod tests {
         let (node, td) = test_node(None);
         let node = Arc::new(node);
         node.set_self_ref(Arc::downgrade(&node));
+        // Anchor this node IN the demanded capsule's keyspace neighbourhood so the proximity gate
+        // (#2014) admits the pull — this test exercises the opt-in reaching the shared pull body, not
+        // the proximity denial (which has its own test below).
+        node.set_node_peer_id(capsule_neighbourhood_peer_id(store.0, tip.0));
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
         attach_p2p(
             &node,
@@ -3908,6 +3964,7 @@ mod tests {
         let (node, td) = test_node(None);
         let node = Arc::new(node);
         node.set_self_ref(Arc::downgrade(&node));
+        node.set_node_peer_id(capsule_neighbourhood_peer_id(store.0, tip.0));
         let (s, r) = (store.to_hex(), tip.to_hex());
         seed_module(&node, &s, &r, b"already-here");
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
@@ -3924,6 +3981,113 @@ mod tests {
         std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE");
         assert_eq!(node.inbound_demand_count(&s), 1, "demand still recorded");
         assert!(!warming, "an already-held store claims no backfill slot");
+    }
+
+    /// A `peer_id` that lands the `(store, root)` capsule INSIDE this node's keyspace neighbourhood:
+    /// the capsule's DHT key verbatim (XOR distance 0 → proximity 1.0), so the #2014 proximity gate
+    /// admits it. Its bitwise complement ([`capsule_far_peer_id`]) lands it in the FAR half.
+    fn capsule_neighbourhood_peer_id(store_id: [u8; 32], root: [u8; 32]) -> [u8; 32] {
+        *dig_dht::ContentId::capsule(store_id, root)
+            .to_key()
+            .as_bytes()
+    }
+
+    /// A `peer_id` FAR from the `(store, root)` capsule key — the complement of the key, so its top
+    /// bit differs and XOR proximity is 0 (well below the midpoint bar). See #2014.
+    fn capsule_far_peer_id(store_id: [u8; 32], root: [u8; 32]) -> [u8; 32] {
+        capsule_neighbourhood_peer_id(store_id, root).map(|b| !b)
+    }
+
+    /// **Proves (#2014):** with the opt-in ON, the inbound-demand pull is admitted ONLY when the
+    /// demanded capsule lies in THIS node's keyspace neighbourhood. A node whose `peer_id` is NEAR the
+    /// capsule key spawns the tier-1 backfill; a node whose `peer_id` is FAR does NOT — the read is
+    /// still served, but a stranger cannot drive caching of content outside the node's neighbourhood.
+    /// **Catches:** the amplification primitive re-opening (a far/attacker-chosen capsule driving a
+    /// peer-triggered pull) if the proximity gate is dropped or inverted.
+    #[test]
+    fn inbound_demand_pull_gated_on_keyspace_proximity() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        std::env::set_var("DIG_NODE_INBOUND_DEMAND_CACHE", "on");
+        let rt = pin_test_rt();
+        let (store, tip, _rk) = miss_setup();
+        let (s, r) = (store.to_hex(), tip.to_hex());
+        let key = format!("{s}:{r}");
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+
+        // A node whose peer_id anchors it FAR from the capsule key — the pull is DENIED.
+        let (far_node, far_td) = test_node(None);
+        let far_node = Arc::new(far_node);
+        far_node.set_self_ref(Arc::downgrade(&far_node));
+        far_node.set_node_peer_id(capsule_far_peer_id(store.0, tip.0));
+        attach_p2p(
+            &far_node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &far_td,
+        );
+        rt.block_on(async { far_node.note_inbound_demand(&s, &r) });
+        assert_eq!(
+            far_node.inbound_demand_count(&s),
+            1,
+            "demand is still recorded regardless of proximity"
+        );
+        assert!(
+            !far_node.capsule_acquisition.is_warming(&key),
+            "a capsule OUTSIDE this node's neighbourhood must not drive a peer-triggered pull"
+        );
+
+        // A node whose peer_id anchors it NEAR the capsule key — the same request is ADMITTED.
+        let (near_node, near_td) = test_node(None);
+        let near_node = Arc::new(near_node);
+        near_node.set_self_ref(Arc::downgrade(&near_node));
+        near_node.set_node_peer_id(capsule_neighbourhood_peer_id(store.0, tip.0));
+        attach_p2p(
+            &near_node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &near_td,
+        );
+        rt.block_on(async { near_node.note_inbound_demand(&s, &r) });
+        std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE");
+        assert!(
+            near_node.capsule_acquisition.is_warming(&key),
+            "a capsule INSIDE this node's neighbourhood is admitted for the tier-1 pull"
+        );
+    }
+
+    /// **Proves (#2014):** the proximity gate fails CLOSED when this node has no known self-identity
+    /// (the FFI/consumer path never calls `set_node_peer_id`): even with the opt-in ON and a NEAR-by
+    /// store, an unset `node_peer_id` admits NO pull — there is no anchor to define "our neighbourhood".
+    /// **Catches:** a gate that treats a missing identity as "admit".
+    #[test]
+    fn inbound_demand_pull_denied_without_a_known_self_identity() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        std::env::set_var("DIG_NODE_INBOUND_DEMAND_CACHE", "on");
+        let rt = pin_test_rt();
+        let (store, tip, _rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        // Deliberately DO NOT set_node_peer_id — the consumer path has no peer identity.
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        let (s, r) = (store.to_hex(), tip.to_hex());
+        rt.block_on(async { node.note_inbound_demand(&s, &r) });
+        std::env::remove_var("DIG_NODE_INBOUND_DEMAND_CACHE");
+        assert!(
+            !node.capsule_acquisition.is_warming(&format!("{s}:{r}")),
+            "no known self-identity → no anchor → the pull fails closed"
+        );
     }
 
     #[tokio::test]
@@ -5268,6 +5432,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
         };
 
         let before = handle_rpc(
@@ -9164,6 +9329,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
             ..node
         };
         // A holder for this EXACT content is known via the DHT.
@@ -9213,6 +9379,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
             ..node
         };
         // A P2P engine is attached but the DHT knows of NO holder for this content — the graceful
@@ -9261,6 +9428,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
             ..node
         };
 
@@ -9291,6 +9459,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(1_000_000),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -9330,6 +9499,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);
@@ -9371,6 +9541,7 @@ mod tests {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
+            node_peer_id: OnceLock::new(),
             ..node
         };
         let cid = ContentId::resource(store.0, tip.0, rk);

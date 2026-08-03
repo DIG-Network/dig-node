@@ -190,9 +190,47 @@ pub fn relevance(store: &RelevanceInputs, node: &NodeContext) -> RelevanceValue 
     RelevanceValue(score)
 }
 
+/// The minimum [`xor_proximity`] a PEER-DRIVEN (inbound-demand) cache pull must clear before this
+/// node will fetch + cache + DHT-announce the demanded capsule (§7.10d, issue #2014).
+///
+/// **`0.5` = the keyspace midpoint.** A uniformly-random content id lands with proximity uniform in
+/// `[0, 1]` (median `0.5`), so this admits EXACTLY the half of the keyspace closer to this node's
+/// `peer_id` than a random point — equivalently, the content id shares the top keyspace bit with the
+/// `peer_id`. It is the parameter-free "this node is, more likely than not, responsible for this
+/// content" boundary, anchored to the SAME `xor_proximity` primary the tier-0 precache selector scores
+/// against (there is no fixed proximity cutoff to reuse verbatim — that selector is a relevance/size
+/// knapsack — so [`in_keyspace_neighbourhood`] derives the minimal admit/deny boolean from the same
+/// primary + the same reference `peer_id`, keeping ONE coherent neighbourhood definition).
+///
+/// ## Why this is ungameable in the ways that matter
+/// The reference point is THIS node's `peer_id`, which an attacker cannot move, so they cannot
+/// manufacture "you are responsible for this" for an arbitrary target. Landing a capsule key near our
+/// `peer_id` requires grinding `SHA-256(0x02 ‖ store_id ‖ root)` toward a fixed target — and because
+/// the inbound-demand pull is chain-anchored (the backfill merkle-verifies against the CHIP-0035
+/// anchored root), that key cannot name arbitrary junk: each grind candidate is a REAL on-chain store,
+/// so grinding is bounded by on-chain mint cost, not cheap hashing.
+///
+/// ## Tightness
+/// The midpoint is the CONSERVATIVE floor: it can only ADMIT content genuinely closer to us than
+/// random, and it never rejects legitimate demand (Kademlia routes near-key requests to near-key
+/// nodes, so real inbound demand at this node already sits well inside the neighbourhood). Tightening
+/// the bar further (a larger shared-prefix / a routing-table-aware k-closest test) depends on the live
+/// network size and belongs to the SEPARATE pass that flips this feature's default ON — the gate stays
+/// a one-constant change here.
+pub(crate) const INBOUND_DEMAND_MIN_PROXIMITY: f64 = 0.5;
+
+/// Whether `content_id` lies within THIS node's keyspace neighbourhood — the admission predicate the
+/// inbound-demand cache pull gates on (§7.10d, issue #2014). `true` iff the XOR proximity of
+/// `content_id` to `peer_id` clears [`INBOUND_DEMAND_MIN_PROXIMITY`]. See that constant for why the
+/// bar is the coherent, ungameable "content this node is responsible for" boundary.
+#[must_use]
+pub(crate) fn in_keyspace_neighbourhood(content_id: &[u8; 32], peer_id: &[u8; 32]) -> bool {
+    xor_proximity(content_id, peer_id) >= INBOUND_DEMAND_MIN_PROXIMITY
+}
+
 /// Map XOR distance to a proximity in `[0, 1]`, strictly decreasing in the top
 /// 128 bits of `content_id XOR peer_id` (closer = higher). See [`relevance`].
-fn xor_proximity(content_id: &[u8; 32], peer_id: &[u8; 32]) -> f64 {
+pub(crate) fn xor_proximity(content_id: &[u8; 32], peer_id: &[u8; 32]) -> f64 {
     let mut hi = 0u128;
     for i in 0..16 {
         hi = (hi << 8) | u128::from(content_id[i] ^ peer_id[i]);
@@ -314,6 +352,27 @@ mod tests {
             near.get(),
             far.get()
         );
+    }
+
+    #[test]
+    fn keyspace_neighbourhood_admits_the_near_half_and_denies_the_far_half() {
+        let me = id(0x00);
+        // Shares the top bit with peer_id (top bit 0) → inside the near half.
+        let mut near = id(0x00);
+        near[31] = 0xFF; // differs only in the low byte → clearly proximity >= 0.5
+        assert!(
+            in_keyspace_neighbourhood(&near, &me),
+            "near half is admitted"
+        );
+        // Top bits differ (0xFF) → deep in the far half, proximity well below 0.5.
+        let mut far = id(0x00);
+        far[0] = 0xFF;
+        assert!(
+            !in_keyspace_neighbourhood(&far, &me),
+            "the far half of the keyspace is denied"
+        );
+        // Identical id → proximity 1.0 → admitted.
+        assert!(in_keyspace_neighbourhood(&me, &me));
     }
 
     #[test]
