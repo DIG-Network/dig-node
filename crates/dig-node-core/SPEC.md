@@ -336,6 +336,12 @@ but the stored artifact and the served wire stay ciphertext + proof.
   set. When the cache exceeds the cap, the node evicts by **LRU** (oldest mtime first) until the total
   fits; a read touches the file mtime for recency. Capsule modules are the durable inventory (§6) and
   are removed explicitly via `cache.removeCached` / `cache.clear`, not silently evicted mid-serve.
+- **Whole-capsule (`<cache>/modules`) bound.** The on-disk capsule store is separately bounded by a
+  TIER-AWARE size-cap sweep: `Tier0Precache` (self-driven precache) modules are sacrificed before
+  `Tier1Demand`/pinned modules, oldest-first within a tier, until the total fits the cap. The sweep runs
+  after EVERY on-demand land — `cache.fetchAndCache`, chain gap-fill, fetch-side backfill, AND the
+  read-path §21 whole-store sync — so the bound holds independent of whether the tier-0 precache loop is
+  running.
 - Concurrent cache/config mutation is serialized by an in-process mutex AND the cross-process flock.
 
 ### 3.5 Integrity invariant
