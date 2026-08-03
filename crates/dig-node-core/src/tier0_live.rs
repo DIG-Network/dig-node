@@ -110,7 +110,7 @@ fn tier0_land_ledger() -> &'static Mutex<HashSet<String>> {
 }
 
 /// Record that the tier-0 loop landed `store_hex`, so the eviction sweep sacrifices it before demand.
-fn mark_tier0_land(store_hex: &str) {
+pub(crate) fn mark_tier0_land(store_hex: &str) {
     tier0_land_ledger()
         .lock()
         .unwrap_or_else(|p| p.into_inner())

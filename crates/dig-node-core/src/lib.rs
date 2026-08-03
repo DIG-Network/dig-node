@@ -3882,6 +3882,60 @@ mod tests {
         assert_eq!(node.inbound_demand_count("not-a-store"), 0);
     }
 
+    /// **Proves (#2013, #1990):** an inbound-DEMANDED module survives a size-cap eviction sweep that
+    /// sacrifices an OLDER-by-mtime tier-0 precache module — through the LIVE
+    /// `module_tier` → `evict_modules_locked` → `plan_module_eviction` path, not just the pure
+    /// `evict_key` unit test. Tier precedence (`Tier0Precache` before `Tier1Demand`) OVERRIDES recency.
+    ///
+    /// **Non-vacuous:** the demanded store A is made the OLDER file and the tier-0 store B the NEWER
+    /// one, so if `module_tier` were ignored (both defaulting to `Tier1Demand`, pure LRU-by-mtime) the
+    /// sweep would evict A and keep B — the exact OPPOSITE of what is asserted. The assertion can only
+    /// pass because tier beats mtime.
+    /// **Catches:** a regression that stops stamping the demand tier into the cache entry, or sorts
+    /// eviction by recency alone.
+    #[tokio::test]
+    async fn inbound_demanded_module_survives_tier0_eviction_sweep() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let (node, _td) = test_node(None);
+
+        // Isolate the config the cap is read from, then pin a tiny cap: two ~1 KiB modules exceed it,
+        // so the sweep must evict exactly one.
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+        set_cache_cap_bytes(1_500).unwrap();
+
+        // Store A: inbound-demanded → tagged `Tier1Demand`. Store B: a tier-0 precache land.
+        let store_a = "ab".repeat(32);
+        let store_b = "ba".repeat(32);
+        let root = "cd".repeat(32);
+        node.note_inbound_demand(&store_a, &root);
+        crate::tier0_live::mark_tier0_land(&store_b);
+
+        let path_a = module_path(&node.cache_dir, &store_a, &root);
+        let path_b = module_path(&node.cache_dir, &store_b, &root);
+        for p in [&path_a, &path_b] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; 1_024]).unwrap();
+        }
+        // A is OLDER, B is NEWER — pure LRU-by-mtime would sacrifice A, so keeping A proves tier wins.
+        filetime::set_file_mtime(&path_a, filetime::FileTime::from_unix_time(1_000, 0)).unwrap();
+        filetime::set_file_mtime(&path_b, filetime::FileTime::from_unix_time(2_000, 0)).unwrap();
+
+        node.evict_modules_if_needed().await;
+
+        assert!(
+            path_a.exists(),
+            "the inbound-DEMANDED (Tier1) module must survive though it is the older file"
+        );
+        assert!(
+            !path_b.exists(),
+            "the tier-0 precache module must be evicted first despite being the newer file"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
     /// **Proves (#1990):** the inbound-demand PULL is OFF by default — a peer's request records demand
     /// but spawns NO whole-capsule backfill even with a live peer network + provider. This preserves
     /// the amplification invariant: a stranger cannot drive an uncached pull until an operator opts in.
