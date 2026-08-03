@@ -2507,6 +2507,48 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             // claim the SAME registry, so a read triggers at most one whole-capsule pull across both.
             node.capsule_acquisition_gate(),
         );
+        // 4b-iii. TIER-0 EAGER-PRECACHE (#1934, PR-3) — SPAWN the self-driven precache loop so a fleet
+        //         node with an empty cache autonomously fills its tier-0 budget from the DHT, becomes a
+        //         discoverable provider, and yields to tier-1 under real demand. Wired ONLY when the DHT
+        //         is up (it is the sampling + provider source) AND the reshare warmer is installed (the
+        //         precache reuses that ONE warmer for chain-anchored, byte-capped, merkle-verified pulls
+        //         — never a second fetch/verify path). The chain-anchor gate + hard byte-cap are enforced
+        //         inside the loop's fetcher; the small-disk no-op is checked once inside the spawn.
+        if let Some(warmer) = content.capsule_warmer().cloned() {
+            let probe: Arc<dyn crate::dht_sampling::NeighbourhoodProbe> = Arc::new(
+                crate::seams::dig_peer::neighbourhood_probe::DhtNeighbourhoodProbe::new(
+                    dht.service().clone(),
+                    crate::seams::dig_peer::neighbourhood_probe::MtlsProviderSnapshotClient::new(
+                        identity.clone(),
+                        crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server),
+                        network_id_str.clone(),
+                    ),
+                ),
+            );
+            let spawned = crate::tier0_live::spawn_tier0_precache(
+                crate::tier0_live::Tier0Runtime::production(
+                    node.clone(),
+                    dht.service().clone(),
+                    probe,
+                    warmer,
+                    crate::ChainSource::anchored_root_resolver_arc(node.as_ref()),
+                    identity.clone(),
+                    crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server),
+                    &network_id_str,
+                    *identity.peer_id().as_bytes(),
+                    crate::cache_cap_bytes(),
+                ),
+            );
+            println!(
+                "dig-node peer network: tier-0 eager-precache loop {}",
+                if spawned {
+                    "up"
+                } else {
+                    "skipped (small-disk)"
+                }
+            );
+        }
+
         node.set_p2p_content(content);
         println!(
             "dig-node peer network: P2P content engine up (selector-driven, miss mode: {:?})",

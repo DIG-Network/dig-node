@@ -1217,6 +1217,13 @@ impl NodeContent {
         let _ = self.capsule_warmer.set(warmer);
     }
 
+    /// The installed capsule warmer (the reshare leg), if the composition root wired one. The tier-0
+    /// eager-precache loop (#1934, PR-3) reuses this ONE warmer for its chain-anchored, byte-capped
+    /// pulls so precache and reshare can never drift in how they verify, cache, or announce.
+    pub fn capsule_warmer(&self) -> Option<&Arc<crate::seams::dig_peer::CapsuleWarmer>> {
+        self.capsule_warmer.get()
+    }
+
     /// Build + install the reshare leg from the pieces only the composition root has (#1576): this
     /// node's mTLS identity + shared NAT runtime, the CHAIN's root resolver, and the announce hook.
     ///

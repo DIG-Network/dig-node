@@ -348,6 +348,39 @@ impl CapsuleWarmer {
     /// Callers on the read path use [`spawn_capsule_warm`] instead; this is the awaitable core so the
     /// behaviour is testable without a background task.
     pub async fn warm(self: &Arc<Self>, store_hex: &str, root_hex: &str) -> WarmOutcome {
+        self.warm_with_config(store_hex, root_hex, self.config.clone())
+            .await
+    }
+
+    /// [`warm`](Self::warm) with a HARD per-pull byte ceiling — the tier-0 eager-precache entry point
+    /// (epic #1934, PR-3). `max_bytes` lowers the pull's [`ModuleDownloadConfig::max_module_size`] so a
+    /// store whose descriptor declares (or whose true assembled size reaches) more than the caller's
+    /// remaining tier-0 sub-budget is REFUSED before it is allocated, chunked, or cached — the
+    /// provider-reported `size_bytes` hint is never trusted as an allocation size, only this true ceiling
+    /// governs. The chain-anchor gate, merkle verification, promote-recheck, and announce are identical
+    /// to [`warm`](Self::warm); only the size ceiling tightens.
+    pub async fn warm_capped(
+        self: &Arc<Self>,
+        store_hex: &str,
+        root_hex: &str,
+        max_bytes: u64,
+    ) -> WarmOutcome {
+        let mut config = self.config.clone();
+        // The ceiling is the TIGHTER of the node-wide default and the caller's per-pull budget, so a
+        // tier-0 round can never pull more than its remaining sub-budget even if the node default is
+        // larger.
+        config.max_module_size = config.max_module_size.min(max_bytes);
+        self.warm_with_config(store_hex, root_hex, config).await
+    }
+
+    /// The awaitable core of [`warm`](Self::warm) / [`warm_capped`](Self::warm_capped), parameterized by
+    /// the pull `config` so the byte ceiling can vary per call while every trust step stays identical.
+    async fn warm_with_config(
+        self: &Arc<Self>,
+        store_hex: &str,
+        root_hex: &str,
+        config: dig_download::ModuleDownloadConfig,
+    ) -> WarmOutcome {
         // Already a holder → nothing to pull, nothing to announce again. Checked BEFORE claiming a
         // registry slot: a burst of reads across an already-cached capsule should cost one stat call
         // each, never a wasted concurrency slot another generation could have used.
@@ -391,7 +424,7 @@ impl CapsuleWarmer {
             Arc::clone(&self.transport),
             Arc::new(verifier.clone()),
             Arc::clone(&self.state_store),
-            self.config.clone(),
+            config,
         );
 
         let pulled = downloader.download(store_hex, root_hex, &sink).await;
