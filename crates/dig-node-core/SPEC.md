@@ -668,8 +668,23 @@ unless `DIG_PEER_NETWORK` is `off`/`0`/`false`; the in-process FFI host never do
    autonomous sync;
 3. bring up the dig-gossip connected pool + relay introducer registration (relay via `DIG_RELAY_URL`,
    default `wss://relay.dig.net:443`), and a background task that refreshes pool status (~10 s);
-4. bring up the dig-dht content-location DHT (bootstrap from the gossip pool), and announce the held
-   inventory (§6.2);
+4. bring up the dig-dht content-location DHT (bootstrap from the gossip pool) and RECORD the held
+   inventory's content ids on the DHT handle (§6.2);
+4a. install the pool→DHT routing feed, then START THE INVENTORY ANNOUNCE IN THE BACKGROUND. The
+   announce MUST NOT be awaited on the bring-up path and MUST NOT run before the routing feed
+   exists:
+   - Each `announce_provider` is an iterative Kademlia lookup plus a PUT at the `k` closest peers,
+     with every RPC bounded by `DhtConfig::rpc_timeout`. Against the sparse routing table a
+     just-booted node has, those RPCs time out rather than resolve, so an announce costs roughly
+     its whole timeout budget and the cost is linear in how much content the node holds.
+   - Awaiting it therefore held the peer-RPC listener (step 7) unbound for as long as the announce
+     took — 12m40s on a node holding 44 capsules — during which the node was undialable and
+     answered no DHT query while holding a relay reservation that advertised it as up.
+   - Announces run with bounded concurrency (`INITIAL_ANNOUNCE_CONCURRENCY`) so bring-up cost is
+     sub-linear in inventory size, and MUST log the start, periodic progress, and completion: a
+     multi-minute silence is indistinguishable from a hang.
+   The recorded ids are authoritative from step 4 regardless of whether the announce has finished,
+   so a `reconcile_inventory` during the announce diffs against the truth.
 5. wire the multi-source content engine (`NodeContent`) to the DHT + the selector (fed by pool churn),
    and install the DHT inventory-refresh hook (so a gap-filled generation is announced immediately,
    §6.2);

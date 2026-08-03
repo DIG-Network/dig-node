@@ -1339,6 +1339,66 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.sync.status` | — | `available` (always `true` — the chunked capsule download needs no identity), `method: "chunked-capsule-download-with-section-21-clone-fallback"`, `identity_loaded`, `pinned_total`, `pinned_synced`, `whole_store_trigger_supported` (`true` — a store id alone is enough) |
 | `control.sync.trigger` | `store` = `storeId[:rootHash]`, or `store_id` [+ `root`] — the root is OPTIONAL; without one the node resolves the store's CHAIN-ANCHORED tip and syncs that generation | `status: "synced"`, `root`, `size_bytes`, `served_root` |
 | `control.wallet.balance` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"`, default `"xch"`) | `balance` (confirmed, spendable — JSON NUMBER, u64 base units), `pending` (unspent + unconfirmed — JSON NUMBER, u64 base units), `synced` (bool — whether a fully-synced view answered), `peak_height` (the node's chain-view peak, or `null`). Matches `dig-node-control-interface` 0.3.0's `WalletBalanceResult { balance: u64, pending: u64, .. }` and dig-app's `BalanceResponse { balance: u64 }` — a Rust-to-Rust numeric contract, never a decimal string. The wallet backend tracks the base-unit total as `u128` (headroom for summed intermediate math); the wire boundary saturating-casts to `u64` (a single address's balance can never exceed `u64::MAX` mojos, ~18.4M XCH). READ-ONLY chain read of a PUBLIC address (no seed/signing key). Reuses the B.6 sync-state routing: the local DB when the address is the wallet's own and the DB is synced, else the coinset fallback. This is an OPEN read (`is_open_control_read`, no token); the cheap local-DB fast path is unbounded, but the EXPENSIVE coinset-fallback leg is subject to a GLOBAL token-bucket rate bound (defense-in-depth against an open-read amplification/oracle sweep — #1957): a burst of arbitrary-address fallback reads beyond the bound is refused with `WALLET_RATE_LIMITED` (§10), while any single honest read (DB fast path or one fallback) always succeeds. `$DIG` scopes by the canonical CAT asset id `digstore_chain::dig::DIG_ASSET_ID`. A synced empty address is a SUCCESS `{balance:0, synced:true}`, never an error; the read-failure shapes are DISTINCT errors `WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED` (§10), never a fabricated `0`. `INVALID_PARAMS` on a missing/malformed `address` or a bad `asset`. |
+| `control.peers.ping` | `peer` (a 64-hex `peer_id`, or a dialable `host:port` with IPv6 bracketed), `peer_id` (OPTIONAL 64-hex — pins the identity the presented certificate MUST derive) | The connection-ladder report — see §7.4a. `INVALID_PARAMS` on a missing/blank `peer`; `CONTROL_ERROR` when no peer network is running; `PEER_PING_REFUSED` (§10) when the anti-amplification gate refuses before dialing. |
+
+### 7.4a. `control.peers.ping` — the connection-ladder diagnostic
+
+Given a peer, the node MUST attempt EVERY rung of the §19.1 traversal ladder against it and report
+each one, then grade the run. It answers "is this peer reachable, and HOW?" — the question a raw TCP
+port probe cannot answer, since an open port says nothing about whether the mTLS handshake succeeds
+or whether the certificate binds the identity asked for.
+
+**Result shape.**
+
+```json
+{
+  "peer": "<the argument as given>",
+  "expected_peer_id": "<64-hex>|null",
+  "verdict": "direct" | "relayed-only" | "unreachable" | "identity-mismatch" | "unresolved",
+  "severity": "ok" | "warn" | "error",
+  "summary": "<one line of plain language>",
+  "ladder": [
+    { "tier": "direct", "result": "connected", "remote_addr": "[2001:db8::1]:9444",
+      "family": "ipv6", "observed_peer_id": "<64-hex>", "elapsed_ms": 41 },
+    { "tier": "hole-punch", "result": "failed", "reason": "<dig-nat's own text>", "elapsed_ms": 5000 },
+    { "tier": "relayed", "result": "skipped", "reason": "overall deadline of 45s reached first" }
+  ]
+}
+```
+
+`tier` is one of `direct` / `upnp` / `nat-pmp` / `pcp` / `hole-punch` / `relayed`, in §19.1 rank
+order with the relay LAST. `family` distinguishes `ipv6` from `ipv4`, so an IPv4-only success is
+visible as the §5.2 finding it is.
+
+**Normative requirements.**
+
+- **Report the LADDER, not the winner.** Every rung MUST appear. A rung the deadline pre-empted is
+  reported `skipped` with a reason, never dropped. Probing MUST NOT stop at the first success:
+  "relayed succeeded" is only actionable next to "direct failed, and why".
+- **Identity outranks reachability.** When `peer_id` is known or pinned, a rung that connects to a
+  certificate deriving a DIFFERENT `peer_id` MUST grade `identity-mismatch` / `severity: "error"`,
+  regardless of how well it connected. An explicit `peer_id` param always wins over what the node
+  believes is at that address.
+- **A relay-only success is `warn`, never `error`.** Most peers are behind NAT and are relay-
+  reachable only; that is the normal shape of the network, and grading it as failure would report a
+  healthy network as broken.
+- **No anonymous dial.** dig-nat pins the expected `peer_id` in its TLS verifier, so an address the
+  node cannot name an identity for MUST be answered `verdict: "unresolved"` explaining that `peer_id`
+  is required — NEVER downgraded to a bare TCP probe, which would give exactly the "an open port
+  means connected" answer this method exists to replace. Identities are resolved ONLY from the
+  connected pool (mTLS-authenticated) or the caller's explicit pin.
+- **Read-only.** Each rung's connection MUST be dropped as soon as it is graded: no pooled session,
+  no announcement, no retained relay reservation.
+- **Bounded.** Each rung is bounded by the node's per-tier dial timeout and the run by an overall
+  deadline (45s), so a black-holed address cannot hang the caller.
+- **Not an amplifier.** The method makes the node dial a caller-supplied address, so it MUST be
+  bounded: at most ONE ladder runs at a time, and at most 6 runs START per 60s. A refusal is
+  `PEER_PING_REFUSED` (§10) and MUST NOT be reported as a ladder result — nothing was dialed. A
+  refusal for concurrency MUST NOT consume rate budget, and an unresolvable argument MUST NOT
+  consume it either.
+- **One implementation.** The rungs MUST be dialed through the same NAT config builder every other
+  node dial uses, narrowed only by `enabled_methods`, so the diagnostic cannot drift into a parallel
+  prober that disagrees with what the node really does.
 
 ### 7.5. Ownership boundary
 
@@ -2067,6 +2127,12 @@ reachable from a CLI verb, so a new node control method cannot ship without a CL
   longer) connected succeeds as a no-op. A malformed `peer_id` or no running peer network returns a
   deterministic control error. CONTROL-plane — loopback admin / in-process dispatch only, NEVER over
   the mTLS peer surface.
+- `peers ping <peer> [--peer-id <64hex>]` → `control.peers.ping` — test EVERY rung of the connection
+  ladder against a peer and report which one reached it (§7.4a). `peer` is a 64-hex `peer_id` or a
+  dialable address; `--peer-id` pins the identity the certificate must derive, which is required for
+  an address the node cannot already name an identity for. The human output leads with an
+  `[OK]`/`[WARN]`/`[FAIL]` marker matching the graded severity, then one line per rung; `--json`
+  emits the §7.4a result verbatim. Read-only and bounded — see §7.4a for the full contract.
 - `peers ban <peer> --state <ban|blacklist|none>` → `control.peers.setBan`; `peers pool-config
   --max-connections <n>` → `control.peers.setPoolConfig` remain a **known node-side gap**: until the
   node ships those RPCs those verbs surface the node's METHOD_NOT_FOUND. The CLI verbs exist now so the
@@ -2495,7 +2561,7 @@ docs.dig.net — and MUST NOT be used for control. (`dig-rpc-protocol` is the so
 any client that branched on the old control numbers keys on the symbolic `data.code`, not the
 number.) The wallet-read errors occupy `-3204x` (`WALLET_NO_CHAIN_SOURCE` / `WALLET_NOT_SYNCED` /
 `WALLET_READ_FAILED` / `WALLET_RATE_LIMITED`); `-3205x` is owned by the chat plane (§ chat) and MUST
-NOT collide.
+NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
 
 | Code | Name | Origin | Meaning |
 |---|---|---|---|
@@ -2518,6 +2584,7 @@ NOT collide.
 | -32041 | `WALLET_NOT_SYNCED` | node | `control.wallet.balance` of the wallet's OWN address while the local DB is still syncing and no live fallback is attached (nothing can answer yet). |
 | -32042 | `WALLET_READ_FAILED` | node | `control.wallet.balance` failed at the underlying DB / chain-source layer. Distinct from `WALLET_NO_CHAIN_SOURCE` and `WALLET_NOT_SYNCED`. |
 | -32043 | `WALLET_RATE_LIMITED` | node | `control.wallet.balance` refused: the GLOBAL coinset-fallback rate bound is exhausted (too many arbitrary-address reads hit the expensive fallback in a short window). Defense-in-depth against an open-read amplification/oracle sweep; back off and retry. The cheap local-DB fast path is never gated. |
+| -32060 | `PEER_PING_REFUSED` | node | `control.peers.ping` (§7.4a) refused BEFORE dialing: a ladder is already running on this node (single-flight), or the start-rate bound for the window is exhausted. Anti-amplification — the method makes this node dial a caller-supplied address. Distinct from a ladder that ran and reached nothing, which is a RESULT (`verdict: "unreachable"`), not an error. |
 
 Read-path and upstream errors outside this table are relayed verbatim; this catalogue governs what
 the **shell** mints plus the cross-boundary codes a client must be able to branch on.
