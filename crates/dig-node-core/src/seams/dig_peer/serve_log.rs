@@ -32,8 +32,9 @@
 //! request that served nothing. That destroys the exact property this module exists to provide.
 //!
 //! So no `&str` id ever reaches a `tracing` macro here. Ids are logged through [`SafeId`], which emits
-//! the value only when it is a canonical 64-hex content id and a short fixed sentinel otherwise — a
-//! form that is bounded and control-character-free by construction, not by remembering to escape.
+//! the value only when it is a canonical 64-hex content id, and otherwise a short fixed sentinel plus a
+//! bounded, non-injectable shape hint (`len=… charset=…`, dig-node#107) — a form that is bounded and
+//! control-character-free by construction, not by remembering to escape.
 //!
 //! ## Why the wrappers live in the STRUCT, not at the log site
 //!
@@ -55,13 +56,87 @@ const NON_CANONICAL: &str = "<non-canonical>";
 /// Emitted in place of an id the request did not carry at all (a store-granularity query, say).
 const ABSENT: &str = "<absent>";
 
+/// The charset class of a rejected id — a CLOSED enum, so the tag put in the log is one of a fixed few
+/// literals no peer can influence. It answers "was this nearly-right hex, or garbage?" without echoing
+/// a single byte the peer chose.
+enum Charset {
+    /// Every character is an ASCII hex digit (`[0-9a-fA-F]`) — a plausible-but-wrong-length content id.
+    Hex,
+    /// A `0x`/`0X` prefix over an otherwise all-hex body — hex a caller mistakenly prefixed.
+    HexPrefix,
+    /// Anything else — contains at least one byte outside the hex alphabet.
+    NonHex,
+}
+
+impl Charset {
+    /// The stable, greppable tag rendered into the log — a source literal, never peer input.
+    fn tag(&self) -> &'static str {
+        match self {
+            Charset::Hex => "hex",
+            Charset::HexPrefix => "hex+prefix",
+            Charset::NonHex => "non-hex",
+        }
+    }
+
+    /// Classify a raw id by alphabet alone. Checks all-hex first (the common near-miss), then the
+    /// `0x`-prefixed-hex shape, then falls through to `non-hex`. Reads not one byte into the output.
+    fn of(raw: &str) -> Self {
+        if !raw.is_empty() && raw.chars().all(|c| c.is_ascii_hexdigit()) {
+            Charset::Hex
+        } else if let Some(body) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+            if !body.is_empty() && body.chars().all(|c| c.is_ascii_hexdigit()) {
+                Charset::HexPrefix
+            } else {
+                Charset::NonHex
+            }
+        } else {
+            Charset::NonHex
+        }
+    }
+}
+
+/// A bounded, NON-INJECTABLE description of a rejected id's SHAPE — its length and charset class.
+///
+/// The [`NON_CANONICAL`] sentinel proves an id was refused but erases the difference between a
+/// nearly-right id (a 63-hex typo, a `0x`-prefixed key) and pure garbage — signal a diagnosis wants
+/// (dig-node#107). This hint restores it WITHOUT restoring the attack the sentinel removes (#1603): its
+/// `Display` emits only a bounded integer length (`len=<N>`) and one tag from the closed [`Charset`]
+/// enum (`charset=<class>`), both DERIVED from the raw value and containing none of its bytes. No byte,
+/// substring, or transform a peer chose can reach the log through it, so the amplification/forgery
+/// properties of the sentinel are preserved by construction.
+struct IdShapeHint {
+    /// The raw id's length in characters — an integer, so it carries no attacker-chosen bytes.
+    len: usize,
+    /// Which alphabet class the raw id fell into.
+    charset: Charset,
+}
+
+impl IdShapeHint {
+    /// Describe a raw id's shape. Total and side-effect-free: reads length + alphabet, echoes neither
+    /// the value nor any part of it.
+    fn of(raw: &str) -> Self {
+        IdShapeHint {
+            len: raw.chars().count(),
+            charset: Charset::of(raw),
+        }
+    }
+}
+
+impl fmt::Display for IdShapeHint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "len={} charset={}", self.len, self.charset.tag())
+    }
+}
+
 /// A peer-supplied identifier in a form that is SAFE to put in a log record.
 ///
 /// `Display` renders the id verbatim only if it is a canonical 64-hex content id
 /// ([`crate::is_canonical_hex_id`]) — the only shape that can name real content, and the shape a
-/// diagnosis actually needs to read. Anything else renders as a fixed sentinel, so an id can neither
-/// bloat a line nor inject one. A non-canonical id loses no diagnostic value: it could never have named
-/// held content, and the accompanying outcome/reason already says why the request failed.
+/// diagnosis actually needs to read. Anything else renders as the fixed [`NON_CANONICAL`] sentinel
+/// FOLLOWED BY a bounded [`IdShapeHint`] (`len=… charset=…`), so an id can neither bloat a line nor
+/// inject one while a NEARLY-right id (a 63-hex typo, a `0x`-prefixed key) still leaves debug signal
+/// (dig-node#107). The hint is derived from the raw value but echoes none of its bytes, so the
+/// sentinel's amplification/forgery guarantees hold unchanged.
 pub(crate) struct SafeId<'a>(&'a str);
 
 impl<'a> SafeId<'a> {
@@ -77,7 +152,9 @@ impl fmt::Display for SafeId<'_> {
         match self.0 {
             "" => f.write_str(ABSENT),
             id if crate::is_canonical_hex_id(id) => f.write_str(id),
-            _ => f.write_str(NON_CANONICAL),
+            // Sentinel + shape hint: the hint's bytes are all source literals + an integer, so this
+            // stays as unforgeable and bounded as the bare sentinel (dig-node#107 / #1603).
+            raw => write!(f, "{NON_CANONICAL} {}", IdShapeHint::of(raw)),
         }
     }
 }
@@ -399,9 +476,10 @@ mod tests {
     }
 
     #[test]
-    fn a_non_canonical_id_renders_as_a_fixed_sentinel_never_verbatim() {
-        // The two peer-reachable abuses of a verbatim id, in one predicate: a newline that would end the
-        // record and forge another, and bulk that would amplify the log. Both cost a fixed string.
+    fn a_non_canonical_id_renders_as_the_sentinel_plus_a_shape_hint_never_verbatim() {
+        // The two peer-reachable abuses of a verbatim id: a newline that would end the record and forge
+        // another, and bulk that would amplify the log. Both must cost a bounded, injection-free string —
+        // the sentinel, followed only by a length integer + a fixed charset tag (dig-node#107).
         for hostile in [
             "aa\n  INFO peer serve: dig.fetchRange served outcome=served proof_attached=true",
             &"z".repeat(64 * 1024),
@@ -410,8 +488,100 @@ mod tests {
             &format!("{}!", "aa".repeat(32)), // 65 chars: right alphabet, wrong length
         ] {
             let rendered = SafeId::new(hostile).to_string();
-            assert_eq!(rendered, NON_CANONICAL, "{hostile:?} must not be echoed");
+            assert!(
+                rendered.starts_with(NON_CANONICAL),
+                "{hostile:?} must be sentinelled, got {rendered:?}"
+            );
+            // The hint's charset tag can appear, but no raw byte of the input may — check the parts a
+            // peer chose (the injection payload, the path) never leak through.
+            assert!(
+                !rendered.contains("INFO peer serve") && !rendered.contains("etc/passwd"),
+                "{hostile:?} leaked bytes into {rendered:?}"
+            );
         }
+    }
+
+    #[test]
+    fn shape_hint_reports_length_and_charset_from_the_alphabet() {
+        // A 63-hex near-miss: right alphabet, one short of canonical — the case #107 wants to see.
+        assert_eq!(
+            IdShapeHint::of(&"a".repeat(63)).to_string(),
+            "len=63 charset=hex"
+        );
+        // A 0x-prefixed key: the prefix is recognized so the operator knows it was hex-with-a-prefix.
+        assert_eq!(
+            IdShapeHint::of("0xABCDEF").to_string(),
+            "len=8 charset=hex+prefix"
+        );
+        assert_eq!(
+            IdShapeHint::of("0Xabc").to_string(),
+            "len=5 charset=hex+prefix"
+        );
+        // Any non-hex byte falls to non-hex; length is the raw character count.
+        assert_eq!(
+            IdShapeHint::of("not-a-root").to_string(),
+            "len=10 charset=non-hex"
+        );
+        // A bare `0x` has no hex body, so it is non-hex, not a prefix.
+        assert_eq!(IdShapeHint::of("0x").to_string(), "len=2 charset=non-hex");
+    }
+
+    /// **Proves:** the shape hint is NON-INJECTABLE — it echoes only a length integer and a fixed
+    /// charset tag, never a byte the peer chose (dig-node#107 / #1603).
+    ///
+    /// **Catches:** any regression that folds part of the raw id (a substring, a transform) into the
+    /// hint. The payload carries a newline, control chars, a fake forged record, a path, and non-ASCII;
+    /// the emitted hint must contain NONE of them — only `len=<digits>` + one enum tag.
+    #[test]
+    fn shape_hint_echoes_no_byte_of_a_hostile_id() {
+        let hostile =
+            "aa\r\n  INFO peer serve: served peer_id=deadbeef\u{202e}../../etc/passwd\t\0";
+        let rendered = IdShapeHint::of(hostile).to_string();
+
+        // Structurally, the whole output is `len=<digits> charset=<tag>` — nothing else can be present.
+        let expected_len = hostile.chars().count();
+        assert_eq!(rendered, format!("len={expected_len} charset=non-hex"));
+
+        // And explicitly: not one attacker-chosen fragment survives into the log line.
+        assert!(!rendered.chars().any(char::is_control), "no control bytes");
+        for leaked in [
+            "INFO peer serve",
+            "peer_id=",
+            "deadbeef",
+            "etc/passwd",
+            "\u{202e}",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "hint leaked {leaked:?}: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_serve_log_reject_paths_emit_the_shape_hint() {
+        // fetchRange: the reject path renders ids through ServeTarget's SafeId fields.
+        let req = json!({"store_id": "not-hex-store", "root": "0xdead", "retrieval_key": "zz"});
+        let target = ServeTarget::from_range_request("also-not-hex", &req);
+        let (peer, store, root, rk) = rendered(&target);
+        for (field, tag) in [
+            (peer, "charset=non-hex"),
+            (store, "charset=non-hex"),
+            (root, "charset=hex+prefix"),
+            (rk, "charset=non-hex"),
+        ] {
+            assert!(
+                field.starts_with(NON_CANONICAL) && field.contains("len=") && field.contains(tag),
+                "fetchRange field lost its hint: {field:?}"
+            );
+        }
+
+        // getAvailability: the same SafeId renders the queried ids, so a rejected key carries the hint.
+        let rendered_root = SafeId::new("0xdead").to_string();
+        assert_eq!(
+            rendered_root,
+            format!("{NON_CANONICAL} len=6 charset=hex+prefix")
+        );
     }
 
     #[test]
