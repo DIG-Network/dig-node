@@ -128,8 +128,21 @@ pub fn request(pending: &Mutex<PendingPairings>, id: Value, params: &Value) -> V
         .take(MAX_CLIENT_NAME)
         .collect();
 
-    let pairing_id = crate::control::random_hex(16); // 32-hex
-    let code = crate::control::random_pairing_code();
+    // Fail CLOSED: the pairing id + code gate the consent step, so if the OS CSPRNG is
+    // unavailable refuse the request rather than mint guessable pairing material (§7.3).
+    let (pairing_id, code) = match (
+        crate::control::random_hex(16), // 32-hex
+        crate::control::random_pairing_code(),
+    ) {
+        (Ok(pairing_id), Ok(code)) => (pairing_id, code),
+        _ => {
+            return control_error(
+                id,
+                ErrorCode::ControlError,
+                "the OS CSPRNG is unavailable; refusing to start pairing",
+            )
+        }
+    };
     let created = now_ms();
     let expires = created + PAIRING_TTL_MS;
 
@@ -260,9 +273,23 @@ pub fn approve(
             Some(p) => p.client_name.clone(),
         };
 
-    let token = crate::control::random_hex(32); // 64-hex, like the master token
+    // Fail CLOSED: a paired token is authorization material, so if the OS CSPRNG is
+    // unavailable refuse to issue one rather than mint a guessable token (§7.3).
+    let (token, record_id) = match (
+        crate::control::random_hex(32),
+        crate::control::random_hex(8),
+    ) {
+        (Ok(token), Ok(id)) => (token, id), // 64-hex token + 16-hex short id for revoke
+        _ => {
+            return control_error(
+                id,
+                ErrorCode::ControlError,
+                "the OS CSPRNG is unavailable; refusing to mint a paired token",
+            )
+        }
+    };
     let record = PairedToken {
-        id: crate::control::random_hex(8), // 16-hex short id for revoke
+        id: record_id,
         token: token.clone(),
         client_name: client_name.clone(),
         created_ms: now,

@@ -65,7 +65,15 @@ impl RelayGuard {
     pub fn new(upstream: &str) -> Self {
         Self {
             upstream: upstream.to_string(),
-            probe_id: format!("{PROBE_ID_PREFIX}{}", crate::control::random_hex(16)),
+            // The loop-probe id rides the same OS CSPRNG (#156, for free). It is NOT
+            // authorization material — a predictable probe can only cause a false
+            // self-loop match, which fail-SAFELY disables relaying — so unlike the token
+            // path this constructor stays infallible: on the (practically impossible) OS
+            // CSPRNG failure the probe id is empty rather than propagating an error.
+            probe_id: format!(
+                "{PROBE_ID_PREFIX}{}",
+                crate::control::random_hex(16).unwrap_or_default()
+            ),
             relaying: AtomicBool::new(!upstream.is_empty()),
         }
     }
