@@ -848,10 +848,23 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
     RATE, not standing disk use. `<cache>/modules` is therefore bounded by a tier-aware size-cap LRU
     keyed to `cache_cap_bytes()`: after each capsule land the node runs a sweep that, under pressure,
     evicts `Tier0Precache` modules FIRST, then `Tier1Demand`/pin modules, oldest-first within a tier
-    (`effective_tier` + `evict_key`). A module's tier is the MAX across the inbound-demand ledger and
-    the tier-0 land ledger; a module in NEITHER defaults to `Tier1Demand` (protected). So the
-    self-driven loop PLATEAUS at the cache cap by evicting its OWN older precache lands, and a
-    demand-promoted or pinned capsule is never sacrificed while precache lands remain (tier integrity).
+    (`effective_tier` + `evict_key`). A module's tier is the MAX across THREE sources: the in-memory
+    inbound-demand ledger, the in-memory tier-0 land ledger, and a PERSISTED per-store on-disk tag; a
+    module none of them names defaults to `Tier1Demand` (protected). So the self-driven loop PLATEAUS at
+    the cache cap by evicting its OWN older precache lands, and a demand-promoted or pinned capsule is
+    never sacrificed while precache lands remain (tier integrity).
+  - **Tier persistence across restart (the on-disk tag).** Both in-memory ledgers are process-lifetime,
+    so without persistence every cached module would read back as the `Tier1Demand` default after a
+    restart — losing the tier-0-sacrifice-first order until content is re-precached. The tier is
+    therefore persisted as a tiny per-store sidecar `<cache>/modules/<store>/.tier` (token `tier0`/
+    `tier1`/`tier2`), written ATOMICALLY (temp + rename) whenever a store is landed (the post-land sweep
+    re-stamps every scanned store) or inbound-demanded (guarded on the store already being cached, so a
+    demand event never creates an orphan tag). `module_tier` folds the tag in as the third MAX source, so
+    tier-aware precedence is restored the instant the node comes back up. The sidecar is fail-SAFE: a
+    missing tag (a legacy pre-persistence cache) or a malformed/unreadable one reads as absent and folds
+    into the protected `Tier1Demand` default — a corrupt tag can never make genuinely-demanded content
+    wrongly sacrificial, and reading one never panics. It is SEPARATE metadata, NOT part of the
+    `.dig` format (§5.1): an older reader ignores the extra file entirely.
   Observability: `cache.stats` reports `tiers.tier0_precache.wired = true` once the loop is spawned, and
   `tiers.tier0_precache.occupancy` as the loop's landed-store counter.
 - **The four DHT methods** `find_node` / `find_providers` / `add_provider` / `ping` (§7.5), dispatched

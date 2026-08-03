@@ -53,6 +53,7 @@ pub mod chat;
 pub mod dht_sampling;
 pub mod download;
 pub mod inbound_demand;
+mod module_tier_tag;
 pub mod peer;
 pub mod relevance;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
@@ -668,7 +669,7 @@ fn update_config_locked(mutate: impl FnOnce(&mut Value)) -> std::io::Result<()> 
 /// contents or the fully-written new ones. Used for content-addressed module
 /// bytes (immutable per capsule, so concurrent writers converge) and for the
 /// config read-modify-write.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;
     // Unique temp name in the same dir so `rename` stays within one filesystem
@@ -1345,16 +1346,25 @@ impl Node {
 
     /// The effective [`CacheTier`](crate::relevance::CacheTier) of a cached MODULE for eviction.
     ///
-    /// MAX across the ledgers that hold an opinion (`effective_tier`): a store the inbound-demand ledger
-    /// tags `Tier1Demand` is protected; a store ONLY in the tier-0 precache ledger is `Tier0Precache`
-    /// (sacrificed first); a store in NEITHER (a hosted pin / subscription gap-fill) defaults to
-    /// `Tier1Demand` — fail-SAFE, so the tier-0 sweep can never evict genuinely-demanded content it
-    /// simply has not labelled. A precached store later demanded is promoted (max) to `Tier1Demand`.
+    /// MAX across the THREE sources that hold an opinion (`effective_tier`): the in-memory inbound-demand
+    /// ledger (a store it tags `Tier1Demand` is protected), the in-memory tier-0 precache ledger (a store
+    /// ONLY there is `Tier0Precache`, sacrificed first), and the PERSISTED on-disk tag
+    /// ([`crate::module_tier_tag`]). A store none of them names (a hosted pin / subscription gap-fill, or
+    /// a legacy cache with no sidecar) defaults to `Tier1Demand` — fail-SAFE, so the tier-0 sweep can
+    /// never evict genuinely-demanded content it simply has not labelled. A precached store later
+    /// demanded is promoted (max) to `Tier1Demand`.
+    ///
+    /// The persisted tag is what makes precedence survive a RESTART (#2015): both in-memory ledgers are
+    /// process-lifetime, so on a fresh node they are empty and this MAX would collapse to the
+    /// `Tier1Demand` default for every on-disk module — losing the tier-0-sacrifice-first order until
+    /// content is re-precached. Folding the on-disk tag in as a third source restores that order the
+    /// moment the node comes back up.
     fn module_tier(&self, store_hex: &str) -> crate::relevance::CacheTier {
         let demand = self.inbound_demand.tier(store_hex);
         let precache = crate::tier0_live::is_tier0_precache(store_hex)
             .then_some(crate::relevance::CacheTier::Tier0Precache);
-        crate::tier0_prefetch::effective_tier(demand.into_iter().chain(precache))
+        let persisted = crate::module_tier_tag::read_tier_tag(&self.cache_dir, store_hex);
+        crate::tier0_prefetch::effective_tier(demand.into_iter().chain(precache).chain(persisted))
             .unwrap_or(crate::relevance::CacheTier::Tier1Demand)
     }
 
@@ -1387,11 +1397,24 @@ impl Node {
                 continue;
             };
             let tier = self.module_tier(&store_hex);
+            // Persist the just-computed tier so tier-aware precedence survives a restart (#2015): a
+            // sweep runs after every land, so this keeps the on-disk tag tracking the in-memory tier.
+            crate::module_tier_tag::write_tier_tag(&self.cache_dir, &store_hex, tier);
             let Ok(modules) = std::fs::read_dir(store_entry.path()) else {
                 continue;
             };
             for m in modules.flatten() {
                 let path = m.path();
+                // Only real capsules are eviction candidates — skip the `.tier` sidecar (and any
+                // stray `.tmp-*` write-atomic scratch file), which carry no capsule extension.
+                let is_capsule = m
+                    .file_name()
+                    .to_str()
+                    .and_then(crate::capsule_key::cached_root_stem)
+                    .is_some();
+                if !is_capsule {
+                    continue;
+                }
                 let Ok(md) = m.metadata() else { continue };
                 if !md.is_file() {
                     continue;
@@ -2866,6 +2889,14 @@ impl Node {
         // speculative precache round backs off entirely while the node is serving real reads.
         crate::tier0_live::mark_inbound_activity();
         self.inbound_demand.record(store_hex);
+        // Persist the (now at-least-`Tier1Demand`) tier so the demand tag outlives a restart (#2015).
+        // Guarded on the store already being cached, so recording demand for a not-yet-held store does
+        // not leave an orphan sidecar with no module beside it.
+        crate::module_tier_tag::write_tier_tag_if_cached(
+            &self.cache_dir,
+            store_hex,
+            self.module_tier(store_hex),
+        );
         // The pull is gated TWICE: the operator opt-in (default OFF) AND the XOR-proximity admission
         // below. Both must pass — the proximity gate binds even when the flag is on, so enabling the
         // feature never lets a peer drive caching of content OUTSIDE this node's keyspace neighbourhood.
@@ -3907,6 +3938,109 @@ mod tests {
         assert!(
             !path_b.exists(),
             "the tier-0 precache module must be evicted first despite being the newer file"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// **Proves (#2015):** tier-aware eviction precedence SURVIVES a restart. A persisted on-disk tier
+    /// tag alone — with BOTH in-memory ledgers empty (a fresh `Node`, exactly as after a restart) —
+    /// drives the sweep to sacrifice the `Tier0Precache` module and keep the `Tier1Demand` one.
+    ///
+    /// **Non-vacuous:** the persisted-Tier0 store B is made the OLDER file and the persisted-Tier1 store
+    /// A the NEWER one, so pure mtime-LRU (the pre-persistence behaviour, both defaulting to
+    /// `Tier1Demand`) would evict B's-older... — precisely, with no tag both would be `Tier1Demand` and
+    /// the sweep would evict the OLDER file B and could keep A regardless; to force a genuine
+    /// discriminator we make the sacrificial one (B) the NEWER file so that ONLY the persisted tier can
+    /// explain evicting it. Under pure mtime the newer B would survive and the older A be evicted — the
+    /// OPPOSITE of what is asserted, so the assertion can only pass because the persisted tag is read.
+    /// **Catches:** a regression where `module_tier` stops consulting the on-disk tag, collapsing
+    /// post-restart eviction back to tier-blind mtime-LRU.
+    #[test]
+    fn persisted_tier_tag_drives_eviction_precedence_after_restart() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let (node, _td) = test_node(None);
+
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+        set_cache_cap_bytes(1_500).unwrap();
+
+        // Store A: persisted Tier1Demand (protected). Store B: persisted Tier0Precache (sacrificial).
+        // NOTHING is recorded in the in-memory ledgers — the node is fresh, simulating a restart where
+        // only the on-disk tags remain.
+        let store_a = "a1".repeat(32);
+        let store_b = "b2".repeat(32);
+        let root = "cd".repeat(32);
+        let path_a = module_path(&node.cache_dir, &store_a, &root);
+        let path_b = module_path(&node.cache_dir, &store_b, &root);
+        for p in [&path_a, &path_b] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; 1_024]).unwrap();
+        }
+        crate::module_tier_tag::write_tier_tag(
+            &node.cache_dir,
+            &store_a,
+            crate::relevance::CacheTier::Tier1Demand,
+        );
+        crate::module_tier_tag::write_tier_tag(
+            &node.cache_dir,
+            &store_b,
+            crate::relevance::CacheTier::Tier0Precache,
+        );
+        // Confirm the ledgers really are empty — the tag is the ONLY tier signal in play.
+        assert_eq!(node.inbound_demand.count(&store_a), 0);
+        assert!(!crate::tier0_live::is_tier0_precache(&store_b));
+
+        // Make the SACRIFICIAL (Tier0) module the NEWER file: pure mtime-LRU would keep it, so evicting
+        // it can only be explained by the persisted tier.
+        filetime::set_file_mtime(&path_a, filetime::FileTime::from_unix_time(1_000, 0)).unwrap();
+        filetime::set_file_mtime(&path_b, filetime::FileTime::from_unix_time(2_000, 0)).unwrap();
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+
+        assert!(
+            path_a.exists(),
+            "the persisted-Tier1 module must survive across restart"
+        );
+        assert!(
+            !path_b.exists(),
+            "the persisted-Tier0 module must be evicted first even though it is the newer file"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// **Proves (#2015):** a legacy cache entry with NO `.tier` sidecar defaults FAIL-SAFE. `module_tier`
+    /// returns the protected `Tier1Demand`, and a sweep handles the untagged module without error.
+    /// **Catches:** a regression that treats a missing tag as `Tier0Precache` (wrongly sacrificial) or
+    /// panics on the absent sidecar.
+    #[test]
+    fn a_legacy_untagged_module_defaults_fail_safe() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let (node, _td) = test_node(None);
+
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+        set_cache_cap_bytes(10_000).unwrap(); // roomy — nothing is evicted, we assert the default + no panic
+
+        let store = "77".repeat(32);
+        let root = "cd".repeat(32);
+        let path = module_path(&node.cache_dir, &store, &root);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![0u8; 1_024]).unwrap();
+
+        assert_eq!(
+            node.module_tier(&store),
+            crate::relevance::CacheTier::Tier1Demand,
+            "an untagged legacy module is the PROTECTED tier, never sacrificial tier-0"
+        );
+        // The sweep must not error or drop the untagged module (cap is roomy).
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+        assert!(
+            path.exists(),
+            "the untagged module survives a no-pressure sweep"
         );
 
         std::env::remove_var("DIG_NODE_CACHE");
@@ -9642,4 +9776,3 @@ mod tests {
         }
     }
 }
-
