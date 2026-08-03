@@ -7,8 +7,10 @@
 //! ciphertext + merkle proof + chunk_lens), and only on a cache miss is it
 //! proxied to rpc.dig.net. The browser points its dig handler at this node, so
 //! once a store is cached locally every resource in it is served without leaving
-//! the machine. Cached store modules are evicted with an LRU size cap (default
-//! 1 GiB).
+//! the machine. Cached store modules under `<cache>/modules` are bounded by a
+//! TIER-AWARE size-cap LRU (default 1 GiB, [`cache_cap_bytes`]): under disk
+//! pressure the self-driven `Tier0Precache` lands are evicted FIRST, so
+//! demand-driven / pinned capsules survive a precache sweep ([`Node::evict_modules_if_needed`]).
 //!
 //! Native Rust so the compiled-module serve path (BLS, wasmtime) works.
 //!
@@ -1081,6 +1083,38 @@ fn plan_eviction(entries: &[(PathBuf, std::time::SystemTime, u64)], cap: u64) ->
     victims
 }
 
+/// Decide which cached `.dig` MODULES to evict so `<cache>/modules` fits under `cap`, TIER-AWARE.
+///
+/// Unlike [`plan_eviction`] (pure LRU over response windows), whole-capsule modules carry a
+/// [`CacheTier`](crate::relevance::CacheTier): the self-driven tier-0 precache loop (#1934) must be the
+/// SACRIFICIAL tier, so under disk pressure a `Tier0Precache` module is evicted BEFORE a
+/// `Tier1Demand`/pin module — [`evict_key`](crate::relevance::evict_key) gives exactly that order
+/// (tier ascending, then oldest-first within a tier). A demand read that promoted a store to Tier1 thus
+/// survives a tier-0 sweep; a purely-precached store is reclaimed first. Returns the `(path, store_hex)`
+/// victims, oldest-lowest-tier first, stopping as soon as the remaining total is at/under `cap`.
+fn plan_module_eviction(
+    entries: &[(PathBuf, String, crate::relevance::CacheEntry, u64)],
+    cap: u64,
+) -> Vec<(PathBuf, String)> {
+    let total: u64 = entries.iter().map(|(_, _, _, sz)| *sz).sum();
+    if total <= cap {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&(PathBuf, String, crate::relevance::CacheEntry, u64)> =
+        entries.iter().collect();
+    sorted.sort_by_key(|(_, _, entry, _)| crate::relevance::evict_key(entry));
+    let mut running = total;
+    let mut victims = Vec::new();
+    for (path, store_hex, _, sz) in sorted {
+        if running <= cap {
+            break;
+        }
+        victims.push((path.clone(), store_hex.clone()));
+        running = running.saturating_sub(*sz);
+    }
+    victims
+}
+
 /// The number of raw ciphertext bytes the WINDOW-based `dig.getContent` window at `offset` serves
 /// for a resource of `total` bytes — the same slicing [`build_result`] performs, exposed standalone
 /// so the outgoing-bandwidth throttle (#30) can decide BEFORE building the result whether serving it
@@ -1296,6 +1330,102 @@ impl Node {
                 // #279 telemetry: record the LRU eviction (count + reclaimed bytes).
                 CACHE_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 CACHE_EVICTED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The effective [`CacheTier`](crate::relevance::CacheTier) of a cached MODULE for eviction.
+    ///
+    /// MAX across the ledgers that hold an opinion (`effective_tier`): a store the inbound-demand ledger
+    /// tags `Tier1Demand` is protected; a store ONLY in the tier-0 precache ledger is `Tier0Precache`
+    /// (sacrificed first); a store in NEITHER (a hosted pin / subscription gap-fill) defaults to
+    /// `Tier1Demand` — fail-SAFE, so the tier-0 sweep can never evict genuinely-demanded content it
+    /// simply has not labelled. A precached store later demanded is promoted (max) to `Tier1Demand`.
+    fn module_tier(&self, store_hex: &str) -> crate::relevance::CacheTier {
+        let demand = self.inbound_demand.tier(store_hex);
+        let precache = crate::tier0_live::is_tier0_precache(store_hex)
+            .then_some(crate::relevance::CacheTier::Tier0Precache);
+        crate::tier0_prefetch::effective_tier(demand.into_iter().chain(precache))
+            .unwrap_or(crate::relevance::CacheTier::Tier1Demand)
+    }
+
+    /// TIER-AWARE size-cap LRU eviction over `<cache>/modules` — the STANDING-OCCUPANCY bound that keeps
+    /// the self-driven tier-0 precache loop (#1934) from growing whole-capsule storage to disk
+    /// exhaustion. Run after a capsule lands so the modules cache plateaus at [`cache_cap_bytes`]:
+    /// `Tier0Precache` modules are sacrificed before `Tier1Demand`/pin modules, oldest-first within a
+    /// tier ([`plan_module_eviction`]). Best-effort + idempotent — nothing to evict is a cheap scan.
+    pub(crate) async fn evict_modules_if_needed(&self) {
+        // Serialize against this process's other cache writers, exactly like `evict_if_needed`.
+        let _guard = self.cache_lock.lock().await;
+        self.evict_modules_locked();
+    }
+
+    /// The scan→plan→delete core of [`Node::evict_modules_if_needed`], held under the cross-process
+    /// advisory lock so two DIG processes sharing the cache cannot double-evict or race a torn scan.
+    fn evict_modules_locked(&self) {
+        let _xproc = acquire_cache_lock();
+        let cap = cache_cap_bytes();
+        let modules_root = self.cache_dir.join("modules");
+        let mut entries = Vec::new();
+        let Ok(stores) = std::fs::read_dir(&modules_root) else {
+            return; // no modules cached yet — nothing to bound
+        };
+        for store_entry in stores.flatten() {
+            if !store_entry.path().is_dir() {
+                continue;
+            }
+            let Some(store_hex) = store_entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let tier = self.module_tier(&store_hex);
+            let Ok(modules) = std::fs::read_dir(store_entry.path()) else {
+                continue;
+            };
+            for m in modules.flatten() {
+                let path = m.path();
+                let Ok(md) = m.metadata() else { continue };
+                if !md.is_file() {
+                    continue;
+                }
+                // mtime-as-ticks: seconds since the epoch, so oldest = smallest = evicted first (LRU
+                // within a tier). `touch` on serve refreshes it, matching the response cache's recency.
+                let last_access_ticks = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                entries.push((
+                    path,
+                    store_hex.clone(),
+                    crate::relevance::CacheEntry {
+                        tier,
+                        last_access_ticks,
+                    },
+                    md.len(),
+                ));
+            }
+        }
+        for (victim, store_hex) in plan_module_eviction(&entries, cap) {
+            let size = entries
+                .iter()
+                .find(|(p, _, _, _)| *p == victim)
+                .map(|(_, _, _, s)| *s)
+                .unwrap_or(0);
+            if std::fs::remove_file(&victim).is_ok() {
+                CACHE_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                CACHE_EVICTED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+                // Drop any decoded content for the evicted generation so a removed module is never
+                // still served from the in-memory content cache (audit #179).
+                if let Some(root_hex) = victim
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .and_then(crate::capsule_key::cached_root_stem)
+                {
+                    self.invalidate_content_cache(&store_hex, root_hex);
+                }
+                // Forget the tier-0 tag so the ledger cannot grow unbounded across precache→evict churn.
+                crate::tier0_live::forget_tier0_land(&store_hex);
             }
         }
     }
@@ -3035,6 +3165,75 @@ mod tests {
             (PathBuf::from("new"), new, 200),
         ];
         assert_eq!(plan_eviction(&entries, 250), vec![PathBuf::from("old")]);
+    }
+
+    // -- Tier-aware modules-cache eviction (#1934 disk-exhaustion bound) --------
+
+    /// A module entry for the tier-aware planner: `(path, store_hex, tier, mtime-ticks, size)`.
+    fn module_entry(
+        name: &str,
+        tier: crate::relevance::CacheTier,
+        ticks: u64,
+        size: u64,
+    ) -> (PathBuf, String, crate::relevance::CacheEntry, u64) {
+        (
+            PathBuf::from(name),
+            name.to_string(),
+            crate::relevance::CacheEntry {
+                tier,
+                last_access_ticks: ticks,
+            },
+            size,
+        )
+    }
+
+    #[test]
+    fn a_tier0_land_past_cap_evicts_an_older_tier0_and_stays_under_cap() {
+        use crate::relevance::CacheTier;
+        // Three tier-0 precache modules of 100 each, cap 250: the loop just landed the newest, so the
+        // OLDEST tier-0 is evicted and the modules total plateaus at ≤ cap (the standing-occupancy bound
+        // — the direct regression for the disk-exhaustion finding).
+        let entries = vec![
+            module_entry("newest", CacheTier::Tier0Precache, 3, 100),
+            module_entry("oldest", CacheTier::Tier0Precache, 1, 100),
+            module_entry("middle", CacheTier::Tier0Precache, 2, 100),
+        ];
+        let victims = plan_module_eviction(&entries, 250);
+        assert_eq!(
+            victims,
+            vec![(PathBuf::from("oldest"), "oldest".to_string())],
+            "the oldest tier-0 land is evicted first; the modules cache stays at cap"
+        );
+        // Post-eviction the remaining two (200) are under the 250 cap.
+        let remaining: u64 = 300 - 100;
+        assert!(
+            remaining <= 250,
+            "modules cache is bounded at cap after eviction"
+        );
+    }
+
+    #[test]
+    fn a_demand_promoted_entry_survives_while_tier0_entries_remain() {
+        use crate::relevance::CacheTier;
+        // A tier-1 (demand-promoted) module sits alongside tier-0 precache lands, all 100, cap 150.
+        // The tier-0 entries MUST be sacrificed first — the demand content survives (tier integrity).
+        let entries = vec![
+            // The demand entry is the OLDEST by mtime — proving tier precedence beats LRU: a Tier1
+            // module older than a Tier0 module is still protected.
+            module_entry("demand", CacheTier::Tier1Demand, 1, 100),
+            module_entry("precache_a", CacheTier::Tier0Precache, 2, 100),
+            module_entry("precache_b", CacheTier::Tier0Precache, 3, 100),
+        ];
+        let victims = plan_module_eviction(&entries, 150);
+        let victim_names: Vec<String> = victims.into_iter().map(|(_, s)| s).collect();
+        assert!(
+            !victim_names.contains(&"demand".to_string()),
+            "a demand-promoted (tier-1) module must NOT be evicted while tier-0 entries remain"
+        );
+        assert!(
+            victim_names.contains(&"precache_a".to_string()),
+            "tier-0 precache is the sacrificial tier, evicted first"
+        );
     }
 
     // -- Authenticated whole-store sync (§21.9) --------------------------------

@@ -833,6 +833,14 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
   - **One rate limiter across all rounds.** A single token-bucket limiter (stores/window AND
     bytes/window) is threaded across every round — the bandwidth ceiling spans rounds, never resets
     per round.
+  - **Standing-occupancy cap with TIER-AWARE eviction (the disk bound).** The rate limiter bounds the
+    RATE, not standing disk use. `<cache>/modules` is therefore bounded by a tier-aware size-cap LRU
+    keyed to `cache_cap_bytes()`: after each capsule land the node runs a sweep that, under pressure,
+    evicts `Tier0Precache` modules FIRST, then `Tier1Demand`/pin modules, oldest-first within a tier
+    (`effective_tier` + `evict_key`). A module's tier is the MAX across the inbound-demand ledger and
+    the tier-0 land ledger; a module in NEITHER defaults to `Tier1Demand` (protected). So the
+    self-driven loop PLATEAUS at the cache cap by evicting its OWN older precache lands, and a
+    demand-promoted or pinned capsule is never sacrificed while precache lands remain (tier integrity).
   Observability: `cache.stats` reports `tiers.tier0_precache.wired = true` once the loop is spawned, and
   `tiers.tier0_precache.occupancy` as the loop's landed-store counter.
 - **The four DHT methods** `find_node` / `find_providers` / `add_provider` / `ping` (§7.5), dispatched

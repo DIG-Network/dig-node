@@ -2527,6 +2527,7 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             );
             let spawned = crate::tier0_live::spawn_tier0_precache(
                 crate::tier0_live::Tier0Runtime::production(
+                    node.clone(),
                     dht.service().clone(),
                     probe,
                     warmer,

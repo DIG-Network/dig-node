@@ -40,8 +40,9 @@
 //! ALL rounds (a fresh limiter per round would defeat the ceiling), and yields entirely to real inbound
 //! demand via [`LoadSignal`].
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -93,6 +94,45 @@ fn now_ms() -> u64 {
 /// inbound-demand path ([`crate::Node::note_inbound_demand`]) so tier-0 yields to real load (#1934).
 pub(crate) fn mark_inbound_activity() {
     INBOUND_ACTIVITY_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+/// The ledger of store ids THIS process's tier-0 loop has landed in `<cache>/modules` — the tier tag
+/// the modules-cache eviction sweep reads so a purely-precached store is the SACRIFICIAL tier (evicted
+/// before demand-driven content, [`crate::Node::evict_modules_if_needed`]).
+///
+/// In-memory + process-scoped by design: a store landed by tier-0 is `Tier0Precache` while this process
+/// runs (so the loop plateaus at cap by evicting its OWN older lands first); after a restart an
+/// unlabeled on-disk module is treated as demand content (protected) and bounded only by plain LRU — a
+/// fail-SAFE default that can never wrongly evict genuinely-demanded content.
+fn tier0_land_ledger() -> &'static Mutex<HashSet<String>> {
+    static LEDGER: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LEDGER.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Record that the tier-0 loop landed `store_hex`, so the eviction sweep sacrifices it before demand.
+fn mark_tier0_land(store_hex: &str) {
+    tier0_land_ledger()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(store_hex.to_string());
+}
+
+/// Whether `store_hex` is a tier-0 precache land of THIS process (the eviction sweep's tier input).
+#[must_use]
+pub(crate) fn is_tier0_precache(store_hex: &str) -> bool {
+    tier0_land_ledger()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(store_hex)
+}
+
+/// Drop `store_hex` from the tier-0 ledger — called when the eviction sweep removes its last module, so
+/// the ledger cannot grow without bound as stores are precached then evicted.
+pub(crate) fn forget_tier0_land(store_hex: &str) {
+    tier0_land_ledger()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(store_hex);
 }
 
 /// Whether the tier-0 precache loop is wired live this process (`cache.stats` §7.10e/f).
@@ -170,6 +210,14 @@ trait CappedWarm: Send + Sync {
     async fn warm(&self, store_id: [u8; 32], root: [u8; 32], max_bytes: u64) -> WarmVerdict;
 }
 
+/// Run the tier-aware, size-capped LRU sweep over `<cache>/modules` so the self-driven precache loop
+/// plateaus at the cache cap instead of growing to disk-exhaustion. A seam over
+/// [`crate::Node::evict_modules_if_needed`] so the fetcher's post-land trigger is tested without a Node.
+#[async_trait]
+trait ModulesCacheEvictor: Send + Sync {
+    async fn evict_if_needed(&self);
+}
+
 // =================================================================================================
 // The concrete SizeProbe + Tier0Fetcher (composed from the seams above)
 // =================================================================================================
@@ -199,6 +247,7 @@ struct NodeTier0Fetcher {
     lookup: Arc<dyn PreimageLookup>,
     gate: Arc<dyn ChainAnchorGate>,
     warm: Arc<dyn CappedWarm>,
+    evictor: Arc<dyn ModulesCacheEvictor>,
 }
 
 #[async_trait]
@@ -224,7 +273,12 @@ impl Tier0Fetcher for NodeTier0Fetcher {
             .await
         {
             WarmVerdict::Cached(bytes) => {
+                // Tag the land so the modules-cache sweep treats it as the sacrificial tier, then run
+                // the tier-aware size-cap eviction so the self-driven loop PLATEAUS at the cache cap
+                // instead of growing `<cache>/modules` to disk-exhaustion.
+                mark_tier0_land(&hex::encode(preimage.store_id));
                 TIER0_LANDED.fetch_add(1, Ordering::Relaxed);
+                self.evictor.evict_if_needed().await;
                 FetchOutcome::Cached(bytes)
             }
             WarmVerdict::OverCap => FetchOutcome::Discarded(DiscardReason::ExceededByteCap),
@@ -313,6 +367,19 @@ impl CappedWarm for WarmerCappedWarm {
     }
 }
 
+/// The production [`ModulesCacheEvictor`] over the node's tier-aware modules-cache sweep — the
+/// standing-occupancy bound that keeps the self-driven precache loop from exhausting disk.
+struct NodeModulesEvictor {
+    node: Arc<crate::Node>,
+}
+
+#[async_trait]
+impl ModulesCacheEvictor for NodeModulesEvictor {
+    async fn evict_if_needed(&self) {
+        self.node.evict_modules_if_needed().await;
+    }
+}
+
 // =================================================================================================
 // The bring-up spawn
 // =================================================================================================
@@ -346,6 +413,7 @@ pub struct Tier0Runtime {
 impl Tier0Runtime {
     /// Assemble the PRODUCTION tier-0 runtime from the node's live peer stack (#1934, PR-3).
     ///
+    /// - `node` runs the tier-aware modules-cache eviction sweep after each land (the disk bound);
     /// - `dht` locates providers + is the sampling source (the 4a probe routes through it);
     /// - `warmer` is the node's ONE reshare warmer, reused for chain-anchored byte-capped pulls;
     /// - `anchor_resolver` is the CHAIN — the only root of trust for GATE 2;
@@ -353,6 +421,7 @@ impl Tier0Runtime {
     #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn production(
+        node: Arc<crate::Node>,
         dht: Arc<dig_dht::DhtService>,
         probe: Arc<dyn NeighbourhoodProbe>,
         warmer: Arc<CapsuleWarmer>,
@@ -378,6 +447,7 @@ impl Tier0Runtime {
                 resolver: anchor_resolver,
             }),
             warm: Arc::new(WarmerCappedWarm { warmer }),
+            evictor: Arc::new(NodeModulesEvictor { node }),
         });
         Self {
             probe,
@@ -496,11 +566,30 @@ mod tests {
         }
     }
 
+    /// An evictor spy that counts how many times the post-land sweep was triggered.
+    struct SpyEvictor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl SpyEvictor {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+    #[async_trait]
+    impl ModulesCacheEvictor for SpyEvictor {
+        async fn evict_if_needed(&self) {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn fetcher(lookup: Option<Preimage>, anchored: bool, warm: Arc<SpyWarm>) -> NodeTier0Fetcher {
         NodeTier0Fetcher {
             lookup: Arc::new(FixedLookup(lookup)),
             gate: Arc::new(FixedGate(anchored)),
             warm,
+            evictor: SpyEvictor::new(),
         }
     }
 
@@ -537,7 +626,13 @@ mod tests {
             verdict: WarmVerdict::Cached(4096),
             seen: Mutex::new(Vec::new()),
         });
-        let f = fetcher(Some(preimage()), true, warm.clone());
+        let evictor = SpyEvictor::new();
+        let f = NodeTier0Fetcher {
+            lookup: Arc::new(FixedLookup(Some(preimage()))),
+            gate: Arc::new(FixedGate(true)),
+            warm: warm.clone(),
+            evictor: evictor.clone(),
+        };
 
         let outcome = f.fetch_and_cache([0x01; 32], 8192).await;
 
@@ -548,6 +643,16 @@ mod tests {
         assert!(
             tier0_occupancy() > before,
             "a successful land increments the tier-0 occupancy counter"
+        );
+        assert_eq!(
+            evictor.calls.load(Ordering::Relaxed),
+            1,
+            "the tier-aware modules-cache sweep runs after a land (the disk bound)"
+        );
+        // The landed store is now tagged tier-0 (the sacrificial tier) for the eviction sweep.
+        assert!(
+            is_tier0_precache(&hex::encode(preimage().store_id)),
+            "a tier-0 land is tagged Tier0Precache for eviction"
         );
     }
 
