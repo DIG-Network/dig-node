@@ -877,6 +877,14 @@ impl PoolPresence {
 ///
 /// Best-effort by construction: a failed subscribe logs and returns, leaving the durable DHT provider
 /// records as the discovery path (a freshness degradation, never an outage).
+///
+/// A panic inside a single re-state is CONTAINED via [`catch_iteration`](crate::shared::catch_iteration)
+/// so it cannot unwind out of the spawned task and silently stop this node from ever re-announcing its
+/// holdings to newly-arriving peers for the rest of the process (#2068). The guarded iteration carries
+/// only the borrowed `pool`/`inventory`/`broadcaster` handles (whose own locks are taken + released
+/// INSIDE each awaited call, never held across the catch boundary — the broadcaster's `seq` is an
+/// atomic, not a guard), so asserting its unwind-safety is sound; the next pool event simply re-reads
+/// the connected count and re-arms.
 pub async fn run_first_peer_announcer(
     pool: dig_gossip::GossipHandle,
     inventory: Arc<dyn HoldingsInventory>,
@@ -908,7 +916,13 @@ pub async fn run_first_peer_announcer(
             // reconstructed count permanently wrong.
             Ok(_) => {
                 if announce_if_rising(pool.connected_pool_peers().len()) {
-                    restate_holdings(&pool, inventory.as_ref(), broadcaster.as_ref()).await;
+                    // A panic mid-re-state is contained so the announcer survives to react to the next
+                    // pool event (#2068); `None` just means this re-state panicked and was skipped.
+                    let _ = crate::shared::catch_iteration(
+                        "first_peer_announce",
+                        restate_holdings(&pool, inventory.as_ref(), broadcaster.as_ref()),
+                    )
+                    .await;
                 }
             }
             // Lagged: the count is re-read anyway, so a missed event costs nothing but a re-check.
@@ -919,14 +933,19 @@ pub async fn run_first_peer_announcer(
 }
 
 /// Flood the node's whole current inventory to the pool, logging what it re-stated.
+///
+/// Takes the network as a `&dyn AnnounceTransport` rather than a concrete `GossipHandle` so a re-state
+/// — the exact iteration [`run_first_peer_announcer`]'s loop guards against panic-death (#2068) — is
+/// drivable against a mock transport with no live pool, which is how its per-iteration panic guard is
+/// proven (see the tests below).
 async fn restate_holdings(
-    pool: &dig_gossip::GossipHandle,
+    transport: &dyn AnnounceTransport,
     inventory: &dyn HoldingsInventory,
     broadcaster: &HoldingsBroadcaster,
 ) {
     let cached = inventory.current().await;
     let held = cached.len();
-    let frames = announce_all_holdings(broadcaster, pool, &cached, now_unix_secs()).await;
+    let frames = announce_all_holdings(broadcaster, transport, &cached, now_unix_secs()).await;
     tracing::info!(
         held,
         frames,
@@ -940,6 +959,14 @@ async fn restate_holdings(
 /// broadcast channel is tolerated: a missed announcement costs freshness, never correctness, because
 /// the DHT's own republish/TTL cycle is the backstop. This loop performs NO egress — it is the reason
 /// an inbound announcement cannot be amplified into outbound work.
+///
+/// A panic while applying a single frame is CONTAINED via
+/// [`catch_iteration`](crate::shared::catch_iteration) so it cannot unwind out of the spawned task and
+/// silently stop this node from ingesting ANY further peer holdings announcements for the rest of the
+/// process (#2068). `recv().await` stays at the top of the loop, so a persistently-panicking source
+/// cannot hot-spin — the loop still blocks on the next inbound frame between attempts. The guarded
+/// iteration holds no lock across the catch boundary (the ingress's `state` is a tokio `Mutex` taken +
+/// released INSIDE `accept`, never held by the loop), so asserting its unwind-safety is sound.
 pub async fn run_holdings_ingest(
     mut inbound: tokio::sync::broadcast::Receiver<(dig_gossip::PeerId, dig_gossip::Message)>,
     ingress: Arc<HoldingsIngress>,
@@ -960,32 +987,58 @@ pub async fn run_holdings_ingest(
         let Some(announce) = dig_gossip::holdings_announce_payload(&msg) else {
             continue; // not an opcode-222 frame (or an undecodable one)
         };
-        // `provider_peer_id` is a `u16`-length-prefixed WIRE string: up to 65,535 bytes of arbitrary
-        // UTF-8, newlines and terminal escapes included. Normalising it here means no peer-supplied
-        // text can reach a log line, forge one, or drive a terminal escape. Logging at `debug` bounds
-        // the VOLUME an attacker can cause; it does nothing about CONTENT, so content is handled by
-        // never emitting the raw field at all.
-        let canonical_provider =
-            dig_dht::PeerId::from_hex(&announce.provider_peer_id).map(|p| p.to_hex());
-        let now = now_unix_secs();
-        match ingress
-            .accept(&sink, &hex::encode(sender.to_bytes()), &announce, now)
-            .await
-        {
-            Ok(applied) => tracing::debug!(
-                // Present whenever `accept` succeeded — it canonicalizes the same value.
-                provider = canonical_provider.as_deref().unwrap_or("<unverified>"),
-                ingested = applied.ingested,
-                removed = applied.removed,
-                "dig-node holdings: applied a verified announcement"
+        // A panic mid-apply is contained so the ingest loop survives to consume the next frame (#2068);
+        // `None` just means this one frame's application panicked and was skipped.
+        let _ = crate::shared::catch_iteration(
+            "holdings_ingest",
+            apply_inbound_announcement(
+                &ingress,
+                &sink,
+                &hex::encode(sender.to_bytes()),
+                &announce,
+                now_unix_secs(),
             ),
-            Err(reason) => tracing::debug!(
-                // `None` exactly when the id was not canonical hex, which is itself the diagnosis.
-                provider = canonical_provider.as_deref().unwrap_or("<malformed>"),
-                ?reason,
-                "dig-node holdings: rejected an announcement"
-            ),
-        }
+        )
+        .await;
+    }
+}
+
+/// Verify, bound, apply and log ONE decoded inbound announcement — the awaited per-frame body of
+/// [`run_holdings_ingest`], split out so the iteration its loop guards against panic-death (#2068) is a
+/// standalone, testable unit. The loop wraps this in
+/// [`catch_iteration`](crate::shared::catch_iteration); its panic-injection test drives this directly
+/// against a [`HoldingsSink`] that panics mid-ingest — no live `DhtService` required.
+///
+/// Takes the sink as `&dyn HoldingsSink` (the same seam [`HoldingsIngress::accept`] consumes) precisely
+/// so that injection is possible.
+async fn apply_inbound_announcement(
+    ingress: &HoldingsIngress,
+    sink: &dyn HoldingsSink,
+    sender_hex: &str,
+    announce: &HoldingsAnnounce,
+    now: u64,
+) {
+    // `provider_peer_id` is a `u16`-length-prefixed WIRE string: up to 65,535 bytes of arbitrary
+    // UTF-8, newlines and terminal escapes included. Normalising it here means no peer-supplied
+    // text can reach a log line, forge one, or drive a terminal escape. Logging at `debug` bounds
+    // the VOLUME an attacker can cause; it does nothing about CONTENT, so content is handled by
+    // never emitting the raw field at all.
+    let canonical_provider =
+        dig_dht::PeerId::from_hex(&announce.provider_peer_id).map(|p| p.to_hex());
+    match ingress.accept(sink, sender_hex, announce, now).await {
+        Ok(applied) => tracing::debug!(
+            // Present whenever `accept` succeeded — it canonicalizes the same value.
+            provider = canonical_provider.as_deref().unwrap_or("<unverified>"),
+            ingested = applied.ingested,
+            removed = applied.removed,
+            "dig-node holdings: applied a verified announcement"
+        ),
+        Err(reason) => tracing::debug!(
+            // `None` exactly when the id was not canonical hex, which is itself the diagnosis.
+            provider = canonical_provider.as_deref().unwrap_or("<malformed>"),
+            ?reason,
+            "dig-node holdings: rejected an announcement"
+        ),
     }
 }
 
@@ -1082,5 +1135,122 @@ mod tests {
                 "{on:?} must leave the ingress enabled — the switch fails OPEN"
             );
         }
+    }
+
+    // -- The per-iteration panic guards on the two holdings background loops (#2068) ----------------
+
+    /// A real §5.2 P-256 leaf identity + its `peer_id_hex`, so a test announcement is signed by a
+    /// genuine identity that `verify_holdings_announce` accepts (mirrors the integration `TestPeer`).
+    fn test_signer() -> (EcdsaHoldingsSigner, String) {
+        let kp = rcgen::KeyPair::generate().expect("generate P-256 leaf key pair");
+        let spki = kp.public_key_der();
+        let rng = ring::rand::SystemRandom::new();
+        let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            &kp.serialize_der(),
+            &rng,
+        )
+        .expect("the generated key pair is a valid P-256 PKCS#8");
+        let peer_id_hex = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&spki));
+        (EcdsaHoldingsSigner::new(key_pair, spki), peer_id_hex)
+    }
+
+    /// A holdings inventory whose read PANICS — the cheapest seam that makes a real [`restate_holdings`]
+    /// unwind, so the first-peer announcer's per-iteration guard can be proven to contain it.
+    struct PanickingInventory;
+    #[async_trait::async_trait]
+    impl HoldingsInventory for PanickingInventory {
+        async fn current(&self) -> Vec<crate::CachedCapsule> {
+            panic!("injected holdings-inventory panic");
+        }
+    }
+
+    /// A no-op announce transport: the panic test never reaches it (the inventory read panics first);
+    /// it exists only to satisfy [`restate_holdings`]'s signature.
+    struct NoopTransport;
+    #[async_trait::async_trait]
+    impl AnnounceTransport for NoopTransport {
+        async fn flood(&self, _announce: &HoldingsAnnounce) -> usize {
+            0
+        }
+    }
+
+    /// **Proves:** a panic inside a single re-state is CONTAINED by [`run_first_peer_announcer`]'s
+    /// [`catch_iteration`](crate::shared::catch_iteration) guard (#2068), so it never unwinds out of the
+    /// spawned task and permanently stops this node re-announcing its holdings to arriving peers.
+    ///
+    /// NON-VACUOUS: remove the `catch_unwind` in `catch_iteration` (or `.await` `restate_holdings`
+    /// directly here) and this test unwinds/aborts instead of returning `None` — proving the guard, not
+    /// the harness, contains the panic.
+    #[tokio::test]
+    async fn a_panicking_re_state_is_caught_and_does_not_propagate() {
+        let (signer, _peer_id) = test_signer();
+        let broadcaster = HoldingsBroadcaster::new(signer, Vec::new(), 0);
+
+        let contained = crate::shared::catch_iteration(
+            "first_peer_announce",
+            restate_holdings(&NoopTransport, &PanickingInventory, &broadcaster),
+        )
+        .await;
+
+        assert_eq!(
+            contained, None,
+            "a panicking re-state must be contained as None, never propagated out of the loop"
+        );
+    }
+
+    /// A holdings sink whose ingest PANICS — makes a real [`apply_inbound_announcement`] unwind at the
+    /// exact point the ingest loop applies a verified announcement, so its per-frame guard is provable.
+    struct PanickingSink;
+    #[async_trait::async_trait]
+    impl HoldingsSink for PanickingSink {
+        async fn ingest(&self, _record: ProviderRecord) -> bool {
+            panic!("injected holdings-sink ingest panic");
+        }
+        async fn remove(&self, _content_key: &str, _provider_peer_id: &str) -> bool {
+            false
+        }
+    }
+
+    /// **Proves:** a panic while applying a single inbound frame is CONTAINED by
+    /// [`run_holdings_ingest`]'s [`catch_iteration`](crate::shared::catch_iteration) guard (#2068), so it
+    /// never unwinds out of the spawned task and permanently stops this node ingesting any further peer
+    /// holdings announcements. The announcement is genuinely signed and passes every `accept` gate, so
+    /// the panic is raised by the REAL apply path reaching the sink — not by the harness.
+    ///
+    /// NON-VACUOUS: remove the `catch_unwind` in `catch_iteration` and this test unwinds/aborts instead
+    /// of returning `None`.
+    #[tokio::test]
+    async fn a_panicking_frame_application_is_caught_and_does_not_propagate() {
+        let (signer, provider_id) = test_signer();
+        let now = now_unix_secs();
+        // One valid `Add`, so `accept` passes verification, freshness, replay and both rate buckets and
+        // reaches the sink's ingest (where the injected panic fires).
+        let add = HoldingsDelta::Add {
+            content_key: [7u8; 32],
+            addresses: vec![GossipAddr {
+                host: "::1".to_string(),
+                port: 9_257,
+            }],
+            expires_at: now + ADVERTISED_TTL_SECS,
+        };
+        let announce = HoldingsAnnounce::new_signed(&signer, 1, now, vec![add])
+            .expect("the fixture batch is within HOLDINGS_MAX_CHANGES");
+        // A self id that is NOT the provider, so the self-attribution gate lets the frame through.
+        let self_id = "00".repeat(32);
+        assert_ne!(provider_id, self_id, "the provider must not be this node");
+        let ingress = HoldingsIngress::with_limits(self_id, IngressLimits::default());
+        let sender_hex = "ab".repeat(32);
+
+        let contained = crate::shared::catch_iteration(
+            "holdings_ingest",
+            apply_inbound_announcement(&ingress, &PanickingSink, &sender_hex, &announce, now),
+        )
+        .await;
+
+        assert_eq!(
+            contained, None,
+            "a panicking frame application must be contained as None, never propagated out of the loop"
+        );
     }
 }
