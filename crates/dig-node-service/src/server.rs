@@ -1248,6 +1248,19 @@ async fn ws_dispatch(
     }
 }
 
+/// The authorization token carried on a WS `request` frame, or `None`. A BLANK token is
+/// treated as absent — matching the HTTP path ([`control::presented_token`]) — so a
+/// `{"token":""}` frame never reaches the gate as `Some("")`. Defense in depth beneath the
+/// empty-`expected` guard in [`control::is_authorized`]/[`wallet_authz::authorize`]: a blank
+/// token must never be a credential, especially in the fail-closed empty-token state. PURE.
+fn ws_token(frame: &Value) -> Option<&str> {
+    frame
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+}
+
 /// Parse one client text frame and, if it is a `request`, dispatch it to a response frame. Non-request
 /// frames (client-side keepalives, unknown types) are ignored (`None`).
 async fn ws_handle_text(state: &AppState, txt: &str) -> Option<Value> {
@@ -1262,7 +1275,7 @@ async fn ws_handle_text(state: &AppState, txt: &str) -> Option<Value> {
         return Some(ws_err(id, ErrorCode::InvalidRequest, "missing method"));
     }
     let params = v.get("params").cloned().unwrap_or_else(|| json!({}));
-    let token = v.get("token").and_then(|t| t.as_str());
+    let token = ws_token(&v);
     Some(ws_dispatch(state, id, method, params, token).await)
 }
 
@@ -2098,13 +2111,13 @@ async fn shutdown_signal() {
 mod tests {
     use super::{
         is_allowed_origin, is_app_origin, is_local_origin, peer_tier_status, provenance_for,
-        read_origin_for, served_response, ServeProvenance, StorePath, APP_ORIGINS_ENV,
+        read_origin_for, served_response, ws_token, ServeProvenance, StorePath, APP_ORIGINS_ENV,
         EXPOSED_DIG_HEADERS,
     };
     use axum::http::HeaderMap;
     use dig_node_core::content_serve::{PeerTier, ServeSource};
     use dig_node_core::download::{ReadOrigin, RequestProvenance};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::net::{Ipv4Addr, SocketAddr};
 
     /// **Regression (#1763):** the `X-Dig-Peer-Tier` wire value for BOTH tiers, asserted on the real
@@ -2121,6 +2134,25 @@ mod tests {
     /// `unattached` arm kept as the truthful control. Asserting both spellings also kills the
     /// swap/alias mutants (either arm returning the other's literal, or both returning one constant)
     /// that a single-direction assertion cannot see.
+    /// Fail-closed regression: the WS transport treats a BLANK `token` as ABSENT, exactly
+    /// like the HTTP `presented_token` path. Before this, `{"token":""}` reached the gate
+    /// as `Some("")`; combined with the empty in-memory control token after a CSPRNG
+    /// failure and `ct_eq("", "")` being `true`, a cross-origin page reaching `ws://` could
+    /// have driven `control.*`/`wallet.*`. `ws_token` now yields `None` for a blank/absent
+    /// token, so the gate sees no credential and denies (the empty-`expected` guard in
+    /// `is_authorized`/`wallet_authz::authorize` is the transport-independent primary close).
+    #[test]
+    fn ws_token_treats_a_blank_token_as_absent() {
+        assert_eq!(ws_token(&json!({ "token": "" })), None);
+        assert_eq!(ws_token(&json!({ "token": "   " })), None);
+        assert_eq!(ws_token(&json!({})), None);
+        assert_eq!(ws_token(&json!({ "token": Value::Null })), None);
+        assert_eq!(ws_token(&json!({ "token": 123 })), None);
+        // A real token is preserved verbatim (trimmed), so authorization still works.
+        assert_eq!(ws_token(&json!({ "token": "deadbeef" })), Some("deadbeef"));
+        assert_eq!(ws_token(&json!({ "token": "  tok  " })), Some("tok"));
+    }
+
     #[test]
     fn served_response_reports_both_peer_tier_wire_values() {
         let sp = StorePath {

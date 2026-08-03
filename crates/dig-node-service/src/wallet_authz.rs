@@ -139,6 +139,14 @@ pub fn authorize(
     if !requires_authorization(method) {
         return true;
     }
+    // Fail CLOSED on an unusable master token (empty in-memory fallback after a CSPRNG
+    // mint / persist failure — see `control::is_authorized`). `ct_eq("", "")` is `true`,
+    // so without this guard a blank presented token would match a blank master and seize
+    // wallet custody/spend. A node with no usable token authorizes NOTHING; a paired
+    // token cannot rescue authorization here — the master token gates the paired store.
+    if master.is_empty() {
+        return false;
+    }
     match presented {
         Some(tok) => ct_eq(tok, master) || is_paired(tok),
         None => false,
@@ -307,5 +315,20 @@ mod tests {
     fn a_read_is_authorized_without_a_token() {
         assert!(authorize("get_coins", None, MASTER, is_paired));
         assert!(authorize("dig.getContent", None, MASTER, is_paired));
+    }
+
+    /// Fail-closed regression: an EMPTY master token (the CSPRNG-failure in-memory
+    /// sentinel) authorizes NO gated wallet method — not even a blank presented token,
+    /// which `ct_eq("", "")` would otherwise accept, seizing custody/spend. A paired
+    /// token cannot rescue it either (the master gates the paired store).
+    #[test]
+    fn empty_master_token_authorizes_no_gated_method() {
+        assert!(!authorize("send_xch", Some(""), "", is_paired));
+        assert!(!authorize("send_xch", Some("anything"), "", is_paired));
+        assert!(!authorize("send_xch", Some(PAIRED), "", is_paired));
+        assert!(!authorize("send_xch", None, "", is_paired));
+        // Reads stay open regardless (no token needed), and a healthy master still works.
+        assert!(authorize("get_coins", None, "", is_paired));
+        assert!(authorize("send_xch", Some(MASTER), MASTER, is_paired));
     }
 }

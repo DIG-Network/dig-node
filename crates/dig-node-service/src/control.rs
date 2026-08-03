@@ -441,6 +441,15 @@ pub fn is_authorized(method: &str, presented: Option<&str>, expected: &str) -> b
     if !is_control_method(method) {
         return true;
     }
+    // Fail CLOSED on an unusable configured token. When the daemon could not mint a
+    // token (the OS CSPRNG failed) or persist one, it falls back to an EMPTY in-memory
+    // token (server.rs `resolve_state_dir_and_token`) — a node with no usable token
+    // authorizes NOTHING. Guard BEFORE `ct_eq`, because `ct_eq("", "")` is `true`, so a
+    // caller presenting a blank token would otherwise be accepted against a blank
+    // expected — exactly the "guessable token" the empty sentinel must never be (§7.3).
+    if expected.is_empty() {
+        return false;
+    }
     match presented {
         Some(tok) => ct_eq(tok, expected),
         None => false,
@@ -1340,6 +1349,20 @@ mod tests {
 
     #[test]
     fn control_method_with_correct_token_is_allowed() {
+        assert!(is_authorized("control.status", Some("secret"), "secret"));
+    }
+
+    /// Fail-closed regression: when the configured token is the EMPTY fail-closed
+    /// sentinel (CSPRNG mint/persist failure → empty in-memory token), NO presented
+    /// token authorizes a `control.*` method — not even a blank one, which `ct_eq`
+    /// would otherwise match against a blank expected. The empty sentinel is never a
+    /// usable credential (§7.3).
+    #[test]
+    fn empty_expected_token_authorizes_nothing() {
+        assert!(!is_authorized("control.status", Some(""), ""));
+        assert!(!is_authorized("control.status", Some("anything"), ""));
+        assert!(!is_authorized("control.status", None, ""));
+        // A healthy 64-hex token still authorizes its exact match (no regression).
         assert!(is_authorized("control.status", Some("secret"), "secret"));
     }
 

@@ -1108,6 +1108,12 @@ its CLI verb) but the server skips the token requirement. No mutation or custody
   unavailable), the daemon MUST fall back to an in-memory token that no controller can read — the
   control plane fails **closed**; the read plane is unaffected. It MUST NEVER emit a guessable
   token in place of a CSPRNG-drawn one.
+- **The authorization gate MUST NEVER accept an empty or absent token, on ANY transport.** A blank
+  presentation is treated as absent (HTTP header/`params._control_token` AND the WS frame `token`
+  field alike), and a node whose configured token is the empty fail-closed sentinel authorizes
+  NOTHING — the empty string is never a valid credential (a constant-time comparison of two empty
+  strings would otherwise match). This holds identically for the master control token and the paired
+  controller tokens; a node with no usable token gates every `control.*`/custody call closed.
 - Randomness source: the operating-system CSPRNG on EVERY platform (`getrandom` — `getrandom(2)`/
   `/dev/urandom` on Unix, `BCryptGenRandom` on Windows). There is NO software (non-CSPRNG) fallback:
   when the OS CSPRNG is unavailable the daemon fails closed (above) rather than derive a token from
