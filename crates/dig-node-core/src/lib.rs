@@ -202,6 +202,16 @@ static CACHE_EVICTED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 static CONTENT_CACHE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Decoded-content-cache lookups that MISSED (had to re-decode the module).
 static CONTENT_CACHE_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Whole-capsule NETWORK lands since process start — a real refetch (bytes pulled over the wire
+/// and written to disk), distinct from a RAM decode-cache miss (#1991, epic #1934). There are
+/// exactly TWO landing write paths in this crate, and each bumps this counter at its own
+/// successful write so together they cover every genuine re-download with no overlap:
+/// [`Node::sync_module_from`] (on-demand `cache.fetchAndCache`, chain gap-fill, fetch-side
+/// backfill — all funnel through this one function) and
+/// [`seams::dig_peer::module_reshare::promote_into_cache`] (the reshare-warm land, a SEPARATE
+/// write-then-rename that never calls `sync_module_from`). A failed sync/promotion never
+/// increments it.
+static CACHE_REFETCH_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The [`ContentCache`] key: `(store_hex, root_hex, retrieval_key)` identifying one served resource.
 type ContentCacheKey = (String, String, [u8; 32]);
@@ -1363,6 +1373,12 @@ impl Node {
             .ok_or("the upstream served a root that is not 64-hex")?;
         let path = served_key.module_path(&self.cache_dir);
         write_atomic(&path, &bytes).map_err(|e| format!("could not write the capsule: {e}"))?;
+        // #1991 telemetry: this is the choke-point every ON-DEMAND landing path funnels through —
+        // `cache.fetchAndCache`, chain gap-fill, and fetch-side backfill all call down to here — so
+        // counting here (rather than at any one caller) captures all three without double-counting.
+        // The reshare-warm land is a SEPARATE write path (`module_reshare::promote_into_cache`,
+        // never calls this function) and counts itself at its own successful write.
+        CACHE_REFETCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(served_root)
     }
 
@@ -2626,6 +2642,15 @@ impl Node {
         store_hex: &str,
     ) -> Option<crate::relevance::CacheTier> {
         self.inbound_demand.tier(store_hex)
+    }
+
+    /// Distinct stores currently held in the inbound-demand ledger — the live `Tier1Demand`
+    /// occupancy figure `cache.stats` (#1991) reports. Real and load-bearing today (unlike
+    /// [`Node::inbound_demand_count`]/[`Node::inbound_demand_tier`] above, which await the
+    /// eviction-precedence consumer): it is the ledger's own bounded-LRU size (§7.10d), so it needs
+    /// no cache wiring to be an honest number.
+    pub(crate) fn inbound_demand_entry_count(&self) -> usize {
+        self.inbound_demand.entry_count()
     }
 
     /// The INBOUND-DEMAND tier-1 cache trigger (#1990): a remote PEER just asked this node to serve a
@@ -4764,6 +4789,148 @@ mod tests {
         assert!(r["evicted_bytes"].as_u64().is_some(), "evicted_bytes");
         assert!(r["content_cache"]["hits"].as_u64().is_some(), "cc hits");
         assert!(r["content_cache"]["misses"].as_u64().is_some(), "cc misses");
+        // #1991: refetch_count is present (process-global, so presence/type only), and the
+        // per-tier occupancy shape is fixed — tier1 is REAL (backed by the inbound-demand
+        // ledger), tier0/tier2 are honestly stubbed `wired: false` until their epic-#1934
+        // occupancy sources land.
+        assert!(r["refetch_count"].as_u64().is_some(), "refetch_count");
+        assert_eq!(r["tiers"]["tier1_demand"]["wired"].as_bool(), Some(true));
+        assert_eq!(r["tiers"]["tier1_demand"]["occupancy"].as_u64(), Some(0));
+        assert_eq!(r["tiers"]["tier0_precache"]["wired"].as_bool(), Some(false));
+        assert_eq!(r["tiers"]["tier0_precache"]["occupancy"].as_u64(), Some(0));
+        assert_eq!(r["tiers"]["tier2_bribed"]["wired"].as_bool(), Some(false));
+        assert_eq!(r["tiers"]["tier2_bribed"]["occupancy"].as_u64(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn cache_stats_tier1_occupancy_reflects_inbound_demand_ledger() {
+        // #1991: tier1_demand.occupancy tracks the inbound-demand ledger's live entry count —
+        // it must rise as distinct stores are demanded, not just report a placeholder zero.
+        let (node, _td) = test_node(None);
+        let store_a = "11".repeat(32);
+        let store_b = "22".repeat(32);
+        let root = "cd".repeat(32);
+        node.note_inbound_demand(&store_a, &root);
+        node.note_inbound_demand(&store_b, &root);
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["tiers"]["tier1_demand"]["occupancy"].as_u64(),
+            Some(2),
+            "two distinct demanded stores → occupancy 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stats_refetch_count_does_not_bump_on_a_failed_sync() {
+        // #1991: refetch_count must be a REAL counter, not a decoration — a sync that never reaches an
+        // upstream must never be miscounted as a network land.
+        //
+        // `refetch_count` is a PROCESS-GLOBAL atomic, and `cargo test`/`cargo llvm-cov` run every test
+        // in this crate's suite in parallel on the same process — including ~8 other pre-existing
+        // tests that land real capsules (gap-fill, backfill, reshare-warm), any of which can bump the
+        // counter between this test's OWN before/after reads. So this test proves the invariant
+        // directly at its root cause instead of through the shared counter: `write_atomic` (the only
+        // thing that could have bumped the counter) is never reached on a failed sync, so the module
+        // simply never lands on disk. That is deterministic regardless of what any other test does to
+        // the global counter.
+        let (node, _td) = test_node(None);
+        let store = "33".repeat(32);
+        let root = "44".repeat(32);
+        let result = node
+            .sync_module_from("http://unreachable.invalid", &store, &root)
+            .await;
+        assert!(result.is_err(), "no upstream reachable → the sync fails");
+        assert!(
+            !module_path(&node.cache_dir, &store, &root).exists(),
+            "a failed sync must never write the module — the only thing that could bump refetch_count"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_stats_refetch_count_increments_on_a_successful_network_land() {
+        // #1991: the positive case — a REAL whole-capsule land against a live mock upstream must bump
+        // `refetch_count` by AT LEAST one. Reuses the `gap_fill_pulls_a_missing_generation_from_a_remote`
+        // mock-remote pattern: `gap_fill_generation` → `cache_fetch_and_cache` → `sync_module_from`,
+        // the choke-point this counter is placed at.
+        //
+        // `>=` rather than exact `==`: `refetch_count` is a PROCESS-GLOBAL atomic shared with ~8 other
+        // pre-existing tests that land real capsules, any of which may run concurrently in the same
+        // `cargo test`/`cargo llvm-cov` process and bump it between this test's reads. A concurrent
+        // land can only make the delta BIGGER, never smaller, so `>= before + 1` is the strongest claim
+        // that stays deterministic under full-suite parallelism — this test's OWN land is guaranteed to
+        // contribute at least one, which is exactly what it exists to prove.
+        //
+        // `spawn_authed_remote` always seeds store [1u8; 32] served at root [0x10; 32]
+        // (its own backend, isolated per test on an ephemeral port) — matched here exactly as
+        // `gap_fill_pulls_a_missing_generation_from_a_remote` does.
+        let root = Bytes32([0x10; 32]);
+        let module = chain_anchored_module([1u8; 32], root.0);
+        let (base, store_hex) = spawn_authed_remote(module.clone()).await;
+        let store_id: [u8; 32] = Bytes32::from_hex(&store_hex).unwrap().0;
+        let td = tempfile::tempdir().unwrap();
+        let node = Node {
+            cache_dir: td.path().to_path_buf(),
+            http: reqwest::Client::new(),
+            upstream: base,
+            cache_lock: Mutex::new(()),
+            identity_seed: Some([5u8; 32]),
+            anchored_root_resolver: MockResolver::one(&store_hex, root),
+            peer_status: peer::PeerStatus::new(),
+            p2p_content: OnceLock::new(),
+            content_cache: std::sync::Mutex::new(ContentCache::default()),
+            inventory_refresher: OnceLock::new(),
+            capsule_acquisition: Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            verification_ledger: verification_ledger::VerificationLedger::new(),
+            self_ref: OnceLock::new(),
+            gossip: OnceLock::new(),
+            outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
+            chat: chat::ChatState::new(),
+            inbound_demand: inbound_demand::InboundDemand::new(),
+        };
+
+        let before = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await["result"]["refetch_count"]
+            .as_u64()
+            .unwrap();
+
+        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+
+        let after = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"cache.stats"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await["result"]["refetch_count"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            after > before,
+            "one real network land → refetch_count rose by at least 1 (before={before}, after={after})"
+        );
+
+        // A second gap-fill of the SAME (already-held) generation is a no-op — it must NOT perform
+        // another network land. Proved directly (not via the shared counter, for the same reason as
+        // above): the cached bytes are exactly the original module, unchanged by the repeat call.
+        assert_eq!(node.gap_fill_generation(store_id, root).await, Ok(()));
+        let cached =
+            std::fs::read(module_path(&node.cache_dir, &store_hex, &root.to_hex())).unwrap();
+        assert_eq!(
+            cached, module,
+            "an already-held generation is an idempotent no-op — no second land"
+        );
     }
 
     // -- dig.stage (#95 Pass C): in-process capsule staging/compile -------------

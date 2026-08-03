@@ -182,8 +182,9 @@ impl InboundDemand {
             .map(|e| e.record.tier)
     }
 
-    /// The number of live entries — exposed for the boundedness regression test.
-    #[cfg(test)]
+    /// The number of live entries — the ledger's own bounded-LRU size. Backs both the
+    /// boundedness regression test AND the live `tier1_demand.occupancy` figure `cache.stats`
+    /// reports (#1991, epic #1934).
     #[must_use]
     pub fn entry_count(&self) -> usize {
         self.inner
