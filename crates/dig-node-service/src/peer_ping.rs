@@ -131,6 +131,14 @@ fn format_rung(rung: &Value) -> String {
             "{tier:<11} failed     {}",
             rung["reason"].as_str().unwrap_or("(no reason)")
         ),
+        // The WRONG-PEER row. It reads as a failure to dig-nat (the mTLS pin refuses the handshake),
+        // so it must be called out by name here or an impersonation renders as an ordinary dead rung.
+        "identity-mismatch" => format!(
+            "{tier:<11} WRONG PEER answered as {}",
+            rung["observed_peer_id"]
+                .as_str()
+                .unwrap_or("an undisclosed identity"),
+        ),
         // `unavailable` and `skipped` both mean "nothing was dialed", so neither claims a duration;
         // the reason carries whether the gap is this node's configuration or the run's deadline.
         other => format!(
@@ -194,6 +202,27 @@ mod tests {
         assert!(
             out.contains("ipv6"),
             "the winning address family is visible: {out}"
+        );
+    }
+
+    /// **Proves:** the WRONG-PEER rung is called out by name and names who answered.
+    ///
+    /// **Catches:** rendering it through the generic fallback arm, which would print
+    /// `direct  identity-mismatch` with the answering id nowhere in sight — the one fact an operator
+    /// needs when a peer is being impersonated or an address-book entry has gone stale.
+    #[test]
+    fn a_wrong_peer_rung_is_called_out_by_name() {
+        let out = format_report(&json!({
+            "peer": "p", "severity": "error", "summary": "WRONG PEER: ...",
+            "ladder": [
+                {"tier": "direct", "result": "identity-mismatch",
+                 "observed_peer_id": "beef", "reason": "peer_id mismatch", "elapsed_ms": 9},
+            ],
+        }));
+        assert!(out.contains("WRONG PEER"), "{out}");
+        assert!(
+            out.contains("beef"),
+            "the answering identity is visible: {out}"
         );
     }
 

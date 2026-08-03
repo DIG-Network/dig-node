@@ -1368,8 +1368,10 @@ or whether the certificate binds the identity asked for.
 ```
 
 `tier` is one of `direct` / `upnp` / `nat-pmp` / `pcp` / `hole-punch` / `relayed`, in §19.1 rank
-order with the relay LAST. `family` distinguishes `ipv6` from `ipv4`, so an IPv4-only success is
-visible as the §5.2 finding it is.
+order with the relay LAST. A rung's `result` is one of `connected` / `failed` / `identity-mismatch` /
+`unavailable` / `skipped`; only `connected`, `failed` and `identity-mismatch` carry `elapsed_ms`,
+since the other two dialed nothing. `family` distinguishes `ipv6` from `ipv4`, so an IPv4-only
+success is visible as the §5.2 finding it is.
 
 **Normative requirements.**
 
@@ -1383,10 +1385,16 @@ visible as the §5.2 finding it is.
   node several rungs compose to nothing, so reporting them as failures would blame the peer for this
   node's configuration and show a healthy result as several red rows. `unavailable` never changes the
   verdict, which is decided only by what CONNECTED.
-- **Identity outranks reachability.** When `peer_id` is known or pinned, a rung that connects to a
-  certificate deriving a DIFFERENT `peer_id` MUST grade `identity-mismatch` / `severity: "error"`,
-  regardless of how well it connected. An explicit `peer_id` param always wins over what the node
-  believes is at that address.
+- **Identity outranks reachability — including over UNreachability.** When `peer_id` is known or
+  pinned, a rung that reaches a certificate deriving a DIFFERENT `peer_id` MUST grade
+  `identity-mismatch` / `severity: "error"`. Note the mechanism, because it inverts the naive
+  expectation: dig-tls pins the expected id inside its certificate verifier, so a mismatch ABORTS the
+  handshake and no connection is ever produced. The mismatch therefore arrives as a dial FAILURE, and
+  an implementation that only inspects successful connections will report an impersonation — or a
+  stale address-book entry — as `unreachable`, which is the reading a user would act on backwards. A
+  rung MUST report `result: "identity-mismatch"` with the answering `observed_peer_id` where the
+  handshake error discloses it; the classification MUST NOT depend on recovering that id. An explicit
+  `peer_id` param always wins over what the node believes is at that address.
 - **A relay-only success is `warn`, never `error`.** Most peers are behind NAT and are relay-
   reachable only; that is the normal shape of the network, and grading it as failure would report a
   healthy network as broken.
@@ -1395,8 +1403,18 @@ visible as the §5.2 finding it is.
   is required — NEVER downgraded to a bare TCP probe, which would give exactly the "an open port
   means connected" answer this method exists to replace. Identities are resolved ONLY from the
   connected pool (mTLS-authenticated) or the caller's explicit pin.
-- **Read-only.** Each rung's connection MUST be dropped as soon as it is graded: no pooled session,
-  no announcement, no retained relay reservation.
+- **Read-only on the DIG network.** Each rung's connection MUST be dropped as soon as it is graded:
+  no pooled session, no announcement, no retained relay reservation, no stored state. One documented
+  exception, because it is a real side effect: the UPnP rung is a PORT-MAPPING method, so composing it
+  calls `add_port_mapping` and leaves a ~2h mapping on the operator's OWN router, once per ping. That
+  is this node's NAT device rather than network state, and the ordinary dial ladder does the same on
+  every peer dial — but it MUST NOT be described as "writes nothing".
+- **Authorization: the control token, master OR paired.** `control.peers.ping` is a `control.*` method
+  and is NEVER peer-reachable (absent from `dig_rpc_protocol::Method`, so the mTLS peer wire answers
+  `-32601`) and never on the public-read allowlist. It is NOT a pairing-admin method, so a PAIRED
+  controller token may drive it as well as the master token — deliberate, since a paired local UI
+  (dig-app) is the intended consumer of the diagnostic and the method is read-shaped. Target
+  restriction is a separate, tracked concern shared with `control.peers.connect`.
 - **Bounded.** Each rung is bounded by the node's per-tier dial timeout (5s) and the run by an
   overall deadline (45s), so a black-holed address cannot hang the caller. A consumer MUST allow for
   the full deadline: this is the one control method that can legitimately take tens of seconds, and

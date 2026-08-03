@@ -17,9 +17,15 @@
 //! deliberately grades it `warn`, never `error`. The finding worth surfacing is narrower: a peer
 //! that ADVERTISES a routable address and still cannot be reached directly.
 //!
-//! **It is read-only.** Each tier is a bare `dig-nat` dial that is dropped as soon as it is graded:
-//! it joins no pool, announces nothing, writes nothing, and leaves no relay reservation behind — a
-//! diagnostic that mutates network state is not a diagnostic. It dials from the SAME config builder
+//! **It is read-only on the DIG network.** Each tier is a bare `dig-nat` dial that is dropped as soon
+//! as it is graded: it joins no pool, announces nothing, stores nothing, and leaves no relay
+//! reservation behind — a diagnostic that mutates network state is not a diagnostic.
+//!
+//! One caveat, because a future reader will lean on the sentence above: the UPnP rung is a
+//! PORT-MAPPING method, so composing it calls `add_port_mapping(local_port, 7200)` and leaves a real
+//! two-hour mapping on the operator's own router, once per ping. That is the node's OWN NAT device,
+//! not network state, and the ordinary dial ladder does exactly the same thing on every peer dial —
+//! but "writes nothing" would be too strong a claim to leave unqualified. It dials from the SAME config builder
 //! [`crate::net::full_nat_config`] uses ([`crate::net::single_tier_nat_config`]), narrowed to one tier
 //! at a time, so what it reports is what the real dialer does rather than a parallel prober that could
 //! drift away from it.
@@ -48,6 +54,11 @@ pub fn ladder_tiers() -> Vec<TraversalKind> {
     tiers
 }
 
+/// Stands in for the answering identity when the mTLS pin refused the certificate and the handshake
+/// error did not carry the id in a form this node could recover. The verdict is still
+/// `identity-mismatch` — knowing WHO answered is a detail; knowing it was the wrong peer is not.
+pub const UNDISCLOSED_IDENTITY: &str = "unknown (not recoverable from the handshake error)";
+
 /// The wire token for a tier — stable, lower-case, and part of the control-method contract.
 pub fn tier_name(tier: TraversalKind) -> &'static str {
     match tier {
@@ -74,6 +85,23 @@ pub enum TierOutcome {
     },
     /// The tier was attempted and did not connect. `reason` is dig-nat's own failure text.
     Failed { reason: String, elapsed_ms: u64 },
+    /// The transport reached a peer, and the certificate it presented derives a DIFFERENT `peer_id`
+    /// than the one asked for, so the mTLS pin refused the handshake.
+    ///
+    /// This is the WRONG-PEER outcome, and it is a distinct rung result rather than a failure
+    /// because the two mean opposite things operationally: "nothing answered" versus "something
+    /// answered and it was not who you asked for". dig-tls pins the expected `peer_id` inside its
+    /// certificate verifier, so no `PeerConnection` is ever produced for a mismatch — the truth
+    /// arrives only as a handshake error, and folding it into [`Failed`](Self::Failed) would render
+    /// an impersonation, or a stale address-book entry, as a dead peer.
+    ///
+    /// `observed` is the identity that actually answered when it could be recovered from the
+    /// handshake error; the classification never depends on recovering it.
+    IdentityMismatch {
+        observed: Option<String>,
+        reason: String,
+        elapsed_ms: u64,
+    },
     /// The tier is not composable on THIS node, so nothing was dialed — a missing LOCAL
     /// precondition, not a statement about the peer.
     ///
@@ -126,10 +154,12 @@ pub enum PingVerdict {
     RelayedOnly,
     /// No tier reached the peer.
     Unreachable,
-    /// A tier connected, but the certificate derives a DIFFERENT `peer_id` than the one asked for.
+    /// A tier reached a peer whose certificate derives a DIFFERENT `peer_id` than the one asked for.
     ///
-    /// This outranks every other reading, including a successful direct connection: reaching the
-    /// right address and the wrong identity is a failure that must be loud, never a pass.
+    /// This outranks every other reading: reaching the right address and the wrong identity is a
+    /// failure that must be loud, never a pass — and, since the mTLS pin refuses the handshake,
+    /// never an `Unreachable` either. An impersonation and a stale address-book entry both land
+    /// here, and reporting them as a dead peer would hide exactly the thing worth knowing.
     IdentityMismatch { expected: String, observed: String },
 }
 
@@ -138,10 +168,26 @@ pub enum PingVerdict {
 /// `expected_peer_id` is the identity the caller asked for, when it asked by `peer_id`; a ping by
 /// bare address has none to check against and reports whichever identity answered.
 pub fn verdict(expected_peer_id: Option<&str>, tiers: &[TierReport]) -> PingVerdict {
-    // Identity first, and before any success is reported: a connection to the wrong peer is the one
-    // outcome that must never be graded on how nicely it connected.
+    // Identity first, and before any success or failure is reported: reaching the wrong peer is the
+    // one outcome that must never be graded on how nicely it connected — or, since the mTLS pin
+    // refuses the handshake, on the fact that it did not connect at all.
     if let Some(expected) = expected_peer_id {
         for report in tiers {
+            // The production shape: dig-tls pinned the id, refused the certificate, and the tier
+            // reports WHO answered instead of merely that nothing did.
+            if let TierOutcome::IdentityMismatch { observed, .. } = &report.outcome {
+                return PingVerdict::IdentityMismatch {
+                    expected: expected.to_ascii_lowercase(),
+                    observed: observed
+                        .as_deref()
+                        .map(str::to_ascii_lowercase)
+                        .unwrap_or_else(|| UNDISCLOSED_IDENTITY.to_string()),
+                };
+            }
+            // Defence in depth over the DIALER CLASS, not a path `NatTierDialer` can take: any
+            // dialer that DOES return a connection must still not have its wrong identity graded as
+            // a success. `NatTierDialer` cannot reach this — dig-tls refuses the handshake first —
+            // so this guards a future in-crate dialer that does not pin, never today's.
             if let Some(observed) = report.outcome.observed_peer_id() {
                 if !observed.eq_ignore_ascii_case(expected) {
                     return PingVerdict::IdentityMismatch {
@@ -222,6 +268,11 @@ pub enum TierFailure {
     Failed(String),
     /// The tier could not be composed on this node at all, so nothing was dialed.
     Unavailable(String),
+    /// The tier reached a peer presenting the WRONG identity, so the mTLS pin refused it.
+    IdentityMismatch {
+        observed: Option<String>,
+        detail: String,
+    },
 }
 
 /// Attempt exactly ONE tier of the ladder.
@@ -244,7 +295,7 @@ pub trait TierDialer: Send + Sync {
 /// Every tier is attempted even after one succeeds — the point of the diagnostic is the whole
 /// ladder, since "connected" hides whether the direct path was available. Attempts stop only at
 /// `deadline`, after which the remaining tiers are reported as skipped rather than silently dropped.
-pub async fn run_ladder(
+pub(crate) async fn run_ladder(
     dialer: &dyn TierDialer,
     target: &PeerTarget,
     deadline: Duration,
@@ -272,6 +323,13 @@ pub async fn run_ladder(
                 reason,
                 elapsed_ms: tier_started.elapsed().as_millis() as u64,
             },
+            Err(TierFailure::IdentityMismatch { observed, detail }) => {
+                TierOutcome::IdentityMismatch {
+                    observed,
+                    reason: detail,
+                    elapsed_ms: tier_started.elapsed().as_millis() as u64,
+                }
+            }
             // No elapsed time is reported: nothing was dialed, so a duration would imply an attempt
             // that never happened.
             Err(TierFailure::Unavailable(reason)) => TierOutcome::Unavailable { reason },
@@ -462,12 +520,12 @@ fn admit(window: &mut StartWindow, now: std::time::Instant) -> Result<(), Durati
 /// site to use — differing ONLY in narrowing `enabled_methods` to the single tier under test. So each
 /// attempt is the genuine dialer restricted to one rung, not a reimplementation that could disagree
 /// with what the node actually does when it connects to a peer.
-pub struct NatTierDialer<'a> {
+pub(crate) struct NatTierDialer<'a> {
     ctx: &'a PeerPingContext,
 }
 
 impl<'a> NatTierDialer<'a> {
-    pub fn new(ctx: &'a PeerPingContext) -> Self {
+    pub(crate) fn new(ctx: &'a PeerPingContext) -> Self {
         NatTierDialer { ctx }
     }
 }
@@ -509,7 +567,23 @@ impl TierDialer for NatTierDialer<'_> {
 /// under test composes to nothing. Reporting that as a failure would put four red rows in front of a
 /// user whose peer is perfectly reachable and blame the peer for this node's own configuration.
 fn classify_dial_error(tier: TraversalKind, error: dig_nat::NatError) -> TierFailure {
+    // The WRONG-PEER case arrives only as a handshake error, never as a connection: dig-tls pins the
+    // expected id inside its certificate verifier (`pin_and_bind`), so a mismatched certificate
+    // aborts the handshake and no `PeerConnection` is produced. Left unclassified, an impersonation
+    // — or a stale address-book entry — would be reported as an unreachable peer, which is the
+    // opposite of what #1985 asks the diagnostic to surface.
+    let text = error.to_string();
+    if let Some(observed) = identity_mismatch_in(&text) {
+        return TierFailure::IdentityMismatch {
+            observed,
+            detail: text,
+        };
+    }
     match error {
+        dig_nat::NatError::PeerIdentityMismatch { actual, .. } => TierFailure::IdentityMismatch {
+            observed: Some(actual),
+            detail: text,
+        },
         dig_nat::NatError::NoMethodsEnabled => TierFailure::Unavailable(format!(
             "the {} tier is not configured on this node, so nothing was dialed \
              (it needs a local port mapping, an IPv4 gateway, a reflexive address, or a relay \
@@ -518,6 +592,37 @@ fn classify_dial_error(tier: TraversalKind, error: dig_nat::NatError) -> TierFai
         )),
         other => TierFailure::Failed(other.to_string()),
     }
+}
+
+/// The marker dig-tls's certificate verifier puts in the handshake error when the presented
+/// certificate derives a different `peer_id` than the pin.
+///
+/// dig-tls emits `peer_id mismatch: expected {expected}, got {derived}` from `pin_and_bind`, dig-nat
+/// wraps it as `mtls handshake: {msg}`, and `NatError::AllMethodsFailed` renders the whole vector.
+/// There is no typed path: the mismatch never becomes a `NatError::PeerIdentityMismatch` on this
+/// route, and the identity dig-tls captured is not exposed on the failure — so the marker is the
+/// only signal, and `identity_mismatch_pin_matches_the_real_dig_tls_message` fails loudly if a
+/// dig-tls/dig-nat bump changes the wording rather than letting the diagnostic silently regress.
+const TLS_IDENTITY_MISMATCH_MARKER: &str = "peer_id mismatch:";
+
+/// The identity that answered, when a handshake error carries the mismatch marker.
+///
+/// `Some(None)` means "it WAS a mismatch, but the answering id could not be recovered" — the
+/// classification deliberately does not depend on the parse, so a wording change downgrades the
+/// detail, never the verdict. `None` means the error was not a mismatch at all.
+fn identity_mismatch_in(text: &str) -> Option<Option<String>> {
+    let rest = text.split_once(TLS_IDENTITY_MISMATCH_MARKER)?.1;
+    // `expected <hex>, got <hex>` — take the token after `got `, trimmed of the punctuation the
+    // surrounding error layers wrap it in.
+    let observed = rest.split_once("got ").and_then(|(_, tail)| {
+        let token: String = tail
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        (token.len() == 64).then_some(token)
+    });
+    Some(observed)
 }
 
 /// How a ping resolved the `peer` argument into something dialable.
@@ -666,6 +771,17 @@ fn tier_json(report: &TierReport) -> Value {
         TierOutcome::Failed { reason, elapsed_ms } => json!({
             "tier": tier_name(report.tier),
             "result": "failed",
+            "reason": reason,
+            "elapsed_ms": elapsed_ms,
+        }),
+        TierOutcome::IdentityMismatch {
+            observed,
+            reason,
+            elapsed_ms,
+        } => json!({
+            "tier": tier_name(report.tier),
+            "result": "identity-mismatch",
+            "observed_peer_id": observed,
             "reason": reason,
             "elapsed_ms": elapsed_ms,
         }),
@@ -872,18 +988,25 @@ mod tests {
         );
     }
 
-    /// **Proves:** connecting to a reachable address that presents the WRONG identity is a loud
-    /// failure — and outranks the fact that the connection itself succeeded directly.
+    /// **Proves:** a rung that reached the WRONG identity grades `identity-mismatch`, not
+    /// `unreachable` — the shape the REAL dialer produces, since dig-tls pins the id in its verifier
+    /// and so refuses the handshake instead of returning a connection.
     ///
-    /// **Catches:** grading on reachability before identity, which would report "direct, ok" for a
-    /// dial that reached an entirely different node than the one asked for.
+    /// **Catches:** treating a refused-for-wrong-identity handshake as "nothing answered", which
+    /// renders an impersonation or a stale address-book entry as a dead peer. That is the reading a
+    /// user would act on backwards. (`classify_dial_error` is what produces this outcome from a real
+    /// handshake error; `identity_mismatch_pin_matches_the_real_dig_tls_message` pins that mapping,
+    /// and `tests/peer_ping_identity.rs` proves it end to end over a real mTLS handshake.)
     #[test]
-    fn a_wrong_peer_id_on_a_reachable_address_is_an_error_not_a_success() {
-        let tiers = vec![connected(
-            TraversalKind::Direct,
-            PEER_B,
-            "[2001:db8::1]:9444",
-        )];
+    fn a_rung_that_reached_the_wrong_identity_grades_as_a_mismatch_not_unreachable() {
+        let tiers = vec![TierReport {
+            tier: TraversalKind::Direct,
+            outcome: TierOutcome::IdentityMismatch {
+                observed: Some(PEER_B.to_string()),
+                reason: "mtls handshake: peer_id mismatch".to_string(),
+                elapsed_ms: 7,
+            },
+        }];
         let v = verdict(Some(PEER_A), &tiers);
         assert_eq!(
             v,
@@ -891,9 +1014,82 @@ mod tests {
                 expected: PEER_A.to_string(),
                 observed: PEER_B.to_string(),
             },
-            "identity is checked before reachability is graded"
+            "a refused-for-identity handshake must not be graded as unreachable"
         );
         assert_eq!(v.severity(), "error");
+    }
+
+    /// **Proves:** the verdict is still `identity-mismatch` when the answering id could NOT be
+    /// recovered from the handshake error.
+    ///
+    /// **Catches:** making the WRONG-PEER classification depend on parsing an id out of an error
+    /// string — a dig-tls wording change would then silently downgrade an impersonation to
+    /// `unreachable` instead of merely losing the detail.
+    #[test]
+    fn an_unrecoverable_identity_still_grades_as_a_mismatch() {
+        let tiers = vec![TierReport {
+            tier: TraversalKind::Direct,
+            outcome: TierOutcome::IdentityMismatch {
+                observed: None,
+                reason: "mtls handshake: peer_id mismatch: <unparseable>".to_string(),
+                elapsed_ms: 7,
+            },
+        }];
+        match verdict(Some(PEER_A), &tiers) {
+            PingVerdict::IdentityMismatch { observed, .. } => {
+                assert_eq!(observed, UNDISCLOSED_IDENTITY)
+            }
+            other => panic!("must still be a mismatch, got {other:?}"),
+        }
+    }
+
+    /// **Proves:** `classify_dial_error` recognises the message dig-tls ACTUALLY emits and recovers
+    /// the answering identity from it.
+    ///
+    /// **Catches (the coupling that makes the feature work):** a dig-tls or dig-nat bump that changes
+    /// the wording. There is no typed path for this failure — the mismatch never becomes
+    /// `NatError::PeerIdentityMismatch` on the dial route, and dig-tls's captured id is not exposed
+    /// on the error — so this string IS the contract. The literal below is copied from dig-tls
+    /// `src/verify.rs` `pin_and_bind`, wrapped exactly as dig-nat's `classify_tls_error` wraps it.
+    #[test]
+    fn identity_mismatch_pin_matches_the_real_dig_tls_message() {
+        let expected = "aa".repeat(32);
+        let derived = "bb".repeat(32);
+        // dig-tls: `peer_id mismatch: expected {expected}, got {derived}`
+        // dig-nat: `mtls handshake: {msg}`, aggregated into AllMethodsFailed.
+        let real = dig_nat::NatError::AllMethodsFailed(vec![dig_nat::MethodError::failed(
+            TraversalKind::Direct,
+            format!("mtls handshake: peer_id mismatch: expected {expected}, got {derived}"),
+        )]);
+        match classify_dial_error(TraversalKind::Direct, real) {
+            TierFailure::IdentityMismatch { observed, detail } => {
+                assert_eq!(
+                    observed,
+                    Some(derived.clone()),
+                    "the answering identity is recovered from dig-tls's message"
+                );
+                assert!(detail.contains("peer_id mismatch"), "{detail}");
+            }
+            other => panic!(
+                "the real dig-tls mismatch message must classify as a mismatch, got {other:?}"
+            ),
+        }
+    }
+
+    /// **Proves:** an ordinary dial failure is NOT mistaken for an identity mismatch.
+    ///
+    /// **Catches:** a marker match loose enough to swallow every failure, which would report a
+    /// genuinely unreachable peer as an impersonation — the same confusion, inverted.
+    #[test]
+    fn an_ordinary_dial_failure_is_not_read_as_an_identity_mismatch() {
+        let refused = dig_nat::NatError::AllMethodsFailed(vec![dig_nat::MethodError::failed(
+            TraversalKind::Direct,
+            "tcp connect [2001:db8::1]:9444: connection refused".to_string(),
+        )]);
+        assert!(matches!(
+            classify_dial_error(TraversalKind::Direct, refused),
+            TierFailure::Failed(_)
+        ));
     }
 
     /// **Proves:** a ping by bare ADDRESS (no expected identity) reports whoever answered instead of
