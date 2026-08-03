@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.84.0] - 2026-08-03
+
+### Features
+- **dig-node:** Tier-0 eager-precache loop — governed orchestration + seams (#158)
+
+### Bug Fixes
+- **rpc:** Do not enumerate the control plane to anonymous callers (#159)
+
 ## [0.82.0] - 2026-08-03
 
 ### Features
