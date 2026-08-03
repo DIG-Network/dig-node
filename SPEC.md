@@ -1389,8 +1389,10 @@ visible as the §5.2 finding it is.
   connected pool (mTLS-authenticated) or the caller's explicit pin.
 - **Read-only.** Each rung's connection MUST be dropped as soon as it is graded: no pooled session,
   no announcement, no retained relay reservation.
-- **Bounded.** Each rung is bounded by the node's per-tier dial timeout and the run by an overall
-  deadline (45s), so a black-holed address cannot hang the caller.
+- **Bounded.** Each rung is bounded by the node's per-tier dial timeout (5s) and the run by an
+  overall deadline (45s), so a black-holed address cannot hang the caller. A consumer MUST allow for
+  the full deadline: this is the one control method that can legitimately take tens of seconds, and
+  a client timeout below it would report a healthy ladder as a transport failure.
 - **Not an amplifier.** The method makes the node dial a caller-supplied address, so it MUST be
   bounded: at most ONE ladder runs at a time, and at most 6 runs START per 60s. A refusal is
   `PEER_PING_REFUSED` (§10) and MUST NOT be reported as a ladder result — nothing was dialed. A

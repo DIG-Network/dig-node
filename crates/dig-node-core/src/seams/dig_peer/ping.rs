@@ -384,6 +384,11 @@ impl PingGate {
     ///
     /// The rate window is charged only AFTER the single-flight claim succeeds, so a caller that is
     /// merely too eager (a second concurrent request) does not also burn its window budget.
+    ///
+    /// `now` is a `std::time::Instant` — WALL time, deliberately not `tokio::time::Instant` like the
+    /// ladder's own deadline. A rate bound measured on a pausable clock would hand out unlimited
+    /// budget wherever that clock is paused. Taking it as a parameter is also what makes the window
+    /// arithmetic testable without sleeping.
     fn try_enter(&self, now: std::time::Instant) -> Result<PingLease<'_>, PingRefused> {
         use std::sync::atomic::Ordering;
         if self
