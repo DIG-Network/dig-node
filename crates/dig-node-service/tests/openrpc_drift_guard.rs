@@ -71,7 +71,13 @@ async fn dispatch_error_code(node: &Node, method: &str) -> Option<i64> {
 /// answered by this service's own server/control plane, not dispatched to the read
 /// path). Excluded from the live-dispatch sync check; covered by `meta.rs` units.
 fn is_shell_only(name: &str) -> bool {
-    name == "rpc.discover" || name.starts_with("control.")
+    // Derived from the CATALOGUE, not a hand-listed set. The hand-listed version named only
+    // `rpc.discover` + `control.*`, so a newly-added `served: "shell"` method (#1997 added two)
+    // matched neither this predicate nor the `local`/`passthrough` filters below and was skipped
+    // in silence — the classification guard had a hole exactly where new entries land.
+    meta::methods()
+        .iter()
+        .any(|m| m.name == name && (m.served == "shell" || m.served == "control"))
 }
 
 #[tokio::test(flavor = "multi_thread")]

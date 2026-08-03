@@ -61,7 +61,10 @@ pub struct AppState {
     /// concrete `Node`, and W2-W5 can later repoint this ONE handle at a different concrete
     /// implementation without touching `node` or the service's other seam calls.
     content_server: Arc<dyn ContentServer>,
-    upstream: String,
+    /// The resolved upstream, and whether an unimplemented method is relayed to it, and the bring-up probe
+    /// that proves that upstream is not this node itself (#1997). Shared across every request so a
+    /// proven loop takes effect on the very next relay decision.
+    relay: Arc<crate::relay::RelayGuard>,
     http: reqwest::Client,
     /// The loopback `host:port` the server is bound to, surfaced in `/health` and
     /// the well-known document so an agent learns where the node serves.
@@ -398,7 +401,7 @@ pub async fn build_state(config: &Config) -> AppState {
     AppState {
         content_server: node.as_content_server(),
         node,
-        upstream: config.upstream.clone(),
+        relay: Arc::new(crate::relay::RelayGuard::new(&config.upstream)),
         http: reqwest::Client::builder()
             .user_agent(concat!("dig-node/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -426,6 +429,39 @@ impl AppState {
     /// backend + its event bus the router dispatches to.
     pub fn wallet_backend(&self) -> Arc<WalletBackend> {
         self.wallet.clone()
+    }
+
+    /// This node's loop-probe request (#1997) — the exact body [`crate::relay`] sends to the
+    /// configured upstream at bring-up.
+    ///
+    /// TEST-CONSTRUCTION ONLY, behind `testkit` so it is genuinely absent from a production build.
+    /// Exposed because the loop breaker's whole value is what happens when this request comes back
+    /// to THIS node, and a test cannot stage that without knowing the id the node generated. The
+    /// alternative — trusting the unit tests and asserting nothing end-to-end — is how a correct
+    /// guard ends up wired to nothing.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn loop_probe_request(&self) -> Value {
+        self.relay.probe_request()
+    }
+
+    /// Whether this node would relay an unimplemented method right now (#1997).
+    ///
+    /// TEST-CONSTRUCTION ONLY, behind `testkit`. Lets a test observe the loop breaker's state
+    /// transition directly rather than inferring it from a downstream side effect.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn would_relay(&self) -> bool {
+        self.relay.should_relay()
+    }
+
+    /// Whether the ENGINE would still make an outbound upstream call (#1997).
+    ///
+    /// TEST-CONSTRUCTION ONLY, behind `testkit`. Distinct from [`Self::would_relay`] on purpose:
+    /// that reports the shell's method-passthrough guard, this reports `dig-node-core`, which owns
+    /// the two CONTENT legs. The security audit found the loop latch wired to the first and not the
+    /// second, so a test must be able to tell them apart rather than infer one from the other.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn engine_would_use_upstream(&self) -> bool {
+        self.node.has_upstream()
     }
 
     /// Repoint the seam-5 content-server handle (#1285 W1c) at another implementation, leaving every
@@ -456,7 +492,7 @@ fn control_ctx(state: &AppState) -> ControlCtx {
         config_path: state.config_path.clone(),
         state_dir: state.state_dir.clone(),
         addr: state.addr.clone(),
-        upstream: state.upstream.clone(),
+        upstream: state.relay.upstream().to_string(),
         started: state.started,
         sync_available: state.sync_available,
         pairings: state.pairings.clone(),
@@ -475,7 +511,7 @@ fn status_fields(state: &AppState) -> serde_json::Map<String, Value> {
     m.insert("commit".into(), json!(meta::GIT_SHA));
     m.insert("mode".into(), json!("local-node"));
     m.insert("addr".into(), json!(state.addr));
-    m.insert("upstream".into(), json!(state.upstream));
+    m.insert("upstream".into(), json!(state.relay.upstream()));
     m.insert(
         "cache".into(),
         json!({
@@ -508,6 +544,28 @@ fn status_fields(state: &AppState) -> serde_json::Map<String, Value> {
 /// same observable signature as the legitimate cold-start window.
 fn peer_tier_status(tier: PeerTier) -> Value {
     json!({ "attached": tier == PeerTier::Attached })
+}
+
+/// The `dig.health` result — the PUBLIC liveness body (#1997).
+///
+/// Deliberately a small, hand-picked set rather than [`status_fields`], and the difference matters:
+/// `GET /health` is reachable only over loopback, whereas `dig.health` is on the rpc.dig.net
+/// public-read allowlist, so **this body is readable anonymously from the internet**. Serving the
+/// operational body there would newly publish the node's absolute cache path (which contains the OS
+/// account name), its configured upstream (which can name internal infrastructure), its bound
+/// address, and its exact commit — none of which a content reader needs, and each of which helps
+/// someone targeting the host.
+///
+/// What remains is what the `dig_rpc_protocol::types::Health` contract is actually for: is this node
+/// alive, what version is it, and what does it serve. The operational detail stays on the
+/// loopback-only `GET /health` and the token-gated `control.status`, which is where it was before
+/// this method existed.
+fn public_health() -> Value {
+    json!({
+        "status": "ok",
+        "version": VERSION,
+        "methods": meta::method_names(),
+    })
 }
 
 /// `GET /health` (and `GET /`) — liveness + mode + cache stats + discovery hooks.
@@ -650,7 +708,7 @@ async fn openrpc() -> impl IntoResponse {
 async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
     Json(meta::well_known_document(
         &state.addr,
-        &state.upstream,
+        state.relay.upstream(),
         cache_cap_bytes(),
         cache_used_bytes(),
     ))
@@ -761,6 +819,43 @@ async fn rpc(
                 "jsonrpc": "2.0",
                 "id": id,
                 "result": meta::openrpc_document(),
+            })),
+        );
+    }
+
+    // A request carrying THIS node's loop-probe id proves the configured upstream leads back here
+    // (#1997), whatever DNS/CDN/gateway sits in between. Recorded before the answer so the very
+    // next relay decision already sees it. The probe is still ANSWERED normally below — it is an
+    // ordinary `dig.health` call, and replying keeps the sender's own bookkeeping honest.
+    if state.relay.is_own_probe(&id) {
+        state.relay.disable_after_loop();
+        // ALSO latch the engine (#1997). The guard above stops the shell's method-passthrough
+        // relay, which is only ONE of the three legs that reach an upstream; the other two carry
+        // content (`dig.getContent`'s miss proxy and the `/s/*` Tier 3 fetch) and live inside
+        // dig-node-core, gated on `Node::has_upstream`. Latching only the shell would leave a node
+        // that has DETECTED and LOGGED a loop still recursing on any anonymous `dig.getContent`
+        // for content it does not hold — the original outage, on the more expensive path, behind a
+        // log line claiming the loop was closed.
+        state.node.disable_upstream_after_loop();
+    }
+
+    // `dig.health` / `dig.methods` are answered by the shell, from the SAME catalogue and status
+    // body `GET /health` uses (#1997). A node states its own liveness and its own method list on
+    // its own authority: needing an upstream to answer either is what made an unconfigured node
+    // unable to describe itself at all.
+    if method == "dig.health" {
+        return (
+            StatusCode::OK,
+            Json(json!({ "jsonrpc": "2.0", "id": id, "result": public_health() })),
+        );
+    }
+    if method == "dig.methods" {
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "methods": meta::method_names() },
             })),
         );
     }
@@ -929,14 +1024,19 @@ async fn rpc(
             ),
         };
 
-    // If dig-node didn't resolve the method, relay it blindly to the upstream.
+    // A method dig-node did not resolve is relayed to the upstream — but ONLY when an operator
+    // configured one and it has not been proven to lead back here (#1997). With no upstream the
+    // node returns dig-node's own `-32601`, which is the truthful answer for a method it genuinely
+    // does not implement, and is what keeps an unrecognised method (and its params) from being
+    // forwarded to a host the operator never chose.
     if resp
         .get("error")
         .and_then(|e| e.get("code"))
         .and_then(|c| c.as_i64())
         == Some(METHOD_NOT_FOUND)
+        && state.relay.should_relay()
     {
-        let relayed = proxy(&state.http, &state.upstream, &original)
+        let relayed = proxy(&state.http, state.relay.upstream(), &original)
             .await
             .unwrap_or_else(|e| {
                 rpc_error(
@@ -1651,6 +1751,18 @@ where
     // node keeps installing no P2P content — its in-process trust boundary is unchanged.
     if dig_node_core::peer::peer_network_enabled() {
         dig_node_core::peer::spawn_peer_network(state.node.clone());
+    }
+
+    // Prove the configured upstream is not this node (#1997). Fire-and-forget: the evidence is the
+    // probe ARRIVING BACK at this node's own dispatcher, which the request path notices — nothing
+    // here waits on or inspects a reply. A no-op when no upstream is configured, which is the
+    // default. See [`crate::relay`] for why the marker rides in the JSON-RPC `id`.
+    {
+        let http = state.http.clone();
+        let relay = state.relay.clone();
+        tokio::spawn(async move {
+            crate::relay::probe_upstream_for_loop(&http, &relay).await;
+        });
     }
 
     // Always-on self-heal driver (#584 beacon re-arm + #651 ext-forcelist reconcile): on a

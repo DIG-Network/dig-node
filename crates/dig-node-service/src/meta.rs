@@ -143,6 +143,29 @@ pub fn methods() -> &'static [MethodInfo] {
             summary: "Return this node's OpenRPC document (method/error discovery).",
             requires_auth: false,
         },
+        MethodInfo {
+            // #1997: served by the SHELL, from the same body `GET /health` returns. Previously a
+            // passthrough alias, which meant a node with no upstream could not state its own
+            // liveness — and the node behind rpc.dig.net asked ITSELF, via its public address, for
+            // its own health. A node's own status is never a question for a third party.
+            name: "dig.health",
+            served: "shell",
+            summary: "This node's liveness + capability summary: { status, version, methods }. \
+                      Answered locally, with no upstream. Deliberately NARROWER than `GET /health`: \
+                      this method is reachable ANONYMOUSLY through the public read tier, so the \
+                      operational fields (cache dir, bound addr, upstream, commit) stay on the \
+                      loopback-only `GET /health` and the token-gated `control.status`.",
+            requires_auth: false,
+        },
+        MethodInfo {
+            // #1997: served by the SHELL from the catalogue below — the agent self-describe
+            // (§6.2) that must not depend on an upstream being configured.
+            name: "dig.methods",
+            served: "shell",
+            summary: "The method names this node implements: { methods: [...] }. Answered locally \
+                      with no upstream.",
+            requires_auth: false,
+        },
         // -- pairing bootstrap (#280) — OPEN (no token; an MV3 extension can't read the
         // control-token file). The scoped token is minted only after LOCAL operator
         // approval via the gated control.pairing.approve. --------------------------------

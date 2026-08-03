@@ -812,14 +812,26 @@ impl RpcDispatch for Node {
             }
         }
 
-        // 3. MISS: proxy to rpc.dig.net, then cache the result window (LRU-capped)
-        //    so the next load of this resource is served locally. (rpc.dig.net is the
-        //    remote DIG network, not a local server — the in-process node IS local.)
+        // 3. MISS: proxy to the CONFIGURED upstream, then cache the result window (LRU-capped)
+        //    so the next load of this resource is served locally.
+        //
+        //    There is NO upstream by default (#1997). Without one this leg does not run at all and
+        //    the miss is reported as `-32004` — the catalogued "not available at this root" answer
+        //    the read path already uses for content it does not hold. Reporting a configuration
+        //    error instead would blame the operator's setup for a resource that no node offered.
         //
         //    The upstream request is pinned to the anchored root (rewriting/forcing
         //    `params.root`), and the upstream-returned root is re-checked against the
         //    pin — so even on the proxy path the node never serves a generation the
         //    chain did not confirm.
+        if !node.has_upstream() {
+            return err(
+                &id,
+                RESOURCE_NOT_AVAILABLE,
+                "resource not available: this node does not hold it and no peer served it"
+                    .to_string(),
+            );
+        }
         let upstream_req = pinned_root
             .map(|pin| pin_request_root(&req, &pin.to_hex()))
             .unwrap_or_else(|| req.clone());

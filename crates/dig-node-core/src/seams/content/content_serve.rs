@@ -44,7 +44,8 @@ pub enum ServeSource {
     Local,
     /// Fetched from a peer over the P2P content engine (multi-source, dig-download).
     Peer,
-    /// Fetched from the public RPC gateway (rpc.dig.net), the final fallback.
+    /// Fetched from a configured upstream RPC, the final fallback. OPTIONAL: no upstream is
+    /// configured by default (#1997), in which case this tier does not exist for that node.
     Rpc,
 }
 
@@ -265,7 +266,8 @@ pub trait ContentServer: Send + Sync {
     /// 1. **Local** — a synced+verified `.dig` module on disk (no network). The DEFAULT once a store
     ///    is cached; every subsequent read is local (#290).
     /// 2. **Peer** — the P2P content engine (dig-download multi-source), when one is attached.
-    /// 3. **Rpc** — the public gateway (rpc.dig.net), the final fallback.
+    /// 3. **Rpc** — a configured upstream, the final fallback. Absent by default (#1997): with no
+    ///    upstream the ladder ends at Peer, and an unheld resource is a clean miss.
     ///
     /// The store's chain-anchored root is resolved FIRST and every serve is pinned to it (#127,
     /// fail-closed): a stale locally-cached generation whose root is not the on-chain tip is not served
@@ -505,8 +507,14 @@ impl ContentServer for Node {
             }
         }
 
-        // -- Tier 3: PUBLIC RPC (rpc.dig.net), the final fallback --------------------------------
-        if !root_hex.is_empty() {
+        // -- Tier 3: an OPTIONAL configured upstream, the final fallback -------------------------
+        //
+        // Skipped entirely when no upstream is configured, which is the DEFAULT since #1997 (there is
+        // no well-known fallback host any more). Skipping rather than attempting-and-failing is what
+        // keeps the outcome honest: a resource no peer holds is a MISS (`NotFound`, which drives the
+        // caller's SPA/404 decision), not an `Unreadable` server error blaming this node's upstream
+        // configuration for a resource that simply is not available.
+        if !root_hex.is_empty() && self.has_upstream() {
             match self.proxy_full_content(store_hex, &root_hex, &rk_hex).await {
                 Ok((ciphertext, proof, chunk_lens)) => {
                     let trusted = pinned_root.unwrap_or(proof.root);
