@@ -982,6 +982,100 @@ async fn another_nodes_loop_probe_does_not_disable_our_relay() {
     assert!(!calls.lock().unwrap().is_empty());
 }
 
+/// **Proves:** every method the catalogue classifies `served: "shell"` really HAS a shell handler —
+/// none of them answers `-32601`.
+/// **Catches:** the hole the `openrpc_drift_guard` leaves open. That guard only cross-checks `local`
+/// and `passthrough` against the core read path; a `shell` entry could be advertised in
+/// `rpc.discover`, `/health.methods` and `/.well-known/dig-node.json` with nothing implementing it,
+/// and stay green. The shell is the only place that can answer this, so the assertion lives here
+/// where the real router is running.
+#[tokio::test]
+async fn every_shell_classified_method_has_a_shell_handler() {
+    let (addr, _hold) = start_companion("").await;
+
+    let shell_methods: Vec<&str> = dig_node_service::meta::methods()
+        .iter()
+        .filter(|m| m.served == "shell")
+        .map(|m| m.name)
+        .collect();
+    assert!(
+        shell_methods.len() >= 4,
+        "expected at least rpc.discover + dig.health + dig.methods + a pairing method, got {shell_methods:?}"
+    );
+
+    for name in shell_methods {
+        let resp: Value = client()
+            .post(format!("http://{addr}/"))
+            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": name, "params": {} }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        // A shell method may legitimately reject EMPTY params (-32602) — pairing.request does.
+        // What it may never do is claim the method does not exist.
+        assert_ne!(
+            resp["error"]["code"],
+            json!(-32601),
+            "catalogue marks {name} served=shell, but the shell returned method-not-found: {resp}"
+        );
+    }
+}
+
+/// **Proves:** the public `dig.health` body carries liveness only — never the node's cache path,
+/// bound address, configured upstream, or commit.
+/// **Catches:** a future re-widening of this result to `status_fields()`. `dig.health` is on
+/// rpc.dig.net's public-read allowlist, so anything here is readable ANONYMOUSLY from the internet;
+/// the absolute cache path alone discloses the OS account name. The operational body stays on the
+/// loopback-only `GET /health`.
+#[tokio::test]
+async fn public_dig_health_does_not_leak_operational_detail() {
+    let (addr, _hold) = start_companion("").await;
+
+    let resp: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": "dig.health", "params": {} }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let result = resp["result"].as_object().expect("health result object");
+    assert_eq!(result["status"], json!("ok"));
+    assert!(result["version"].is_string());
+    assert!(result["methods"].is_array());
+    for leaked in [
+        "cache",
+        "addr",
+        "upstream",
+        "commit",
+        "mode",
+        "sync",
+        "peer_tier",
+    ] {
+        assert!(
+            !result.contains_key(leaked),
+            "public dig.health must not expose `{leaked}`: {resp}"
+        );
+    }
+    // The loopback-only GET /health keeps the operational detail.
+    let local: Value = client()
+        .get(format!("http://{addr}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        local["cache"]["dir"].is_string(),
+        "GET /health keeps the operational body: {local}"
+    );
+}
+
 #[tokio::test]
 async fn non_object_body_returns_jsonrpc_error_not_transport_error() {
     let (upstream, _calls) = start_mock_upstream().await;

@@ -61,8 +61,7 @@ pub struct AppState {
     /// concrete `Node`, and W2-W5 can later repoint this ONE handle at a different concrete
     /// implementation without touching `node` or the service's other seam calls.
     content_server: Arc<dyn ContentServer>,
-    upstream: String,
-    /// Whether an unimplemented method is relayed to [`Self::upstream`], and the bring-up probe
+    /// The resolved upstream, and whether an unimplemented method is relayed to it, and the bring-up probe
     /// that proves that upstream is not this node itself (#1997). Shared across every request so a
     /// proven loop takes effect on the very next relay decision.
     relay: Arc<crate::relay::RelayGuard>,
@@ -402,7 +401,6 @@ pub async fn build_state(config: &Config) -> AppState {
     AppState {
         content_server: node.as_content_server(),
         node,
-        upstream: config.upstream.clone(),
         relay: Arc::new(crate::relay::RelayGuard::new(&config.upstream)),
         http: reqwest::Client::builder()
             .user_agent(concat!("dig-node/", env!("CARGO_PKG_VERSION")))
@@ -483,7 +481,7 @@ fn control_ctx(state: &AppState) -> ControlCtx {
         config_path: state.config_path.clone(),
         state_dir: state.state_dir.clone(),
         addr: state.addr.clone(),
-        upstream: state.upstream.clone(),
+        upstream: state.relay.upstream().to_string(),
         started: state.started,
         sync_available: state.sync_available,
         pairings: state.pairings.clone(),
@@ -502,7 +500,7 @@ fn status_fields(state: &AppState) -> serde_json::Map<String, Value> {
     m.insert("commit".into(), json!(meta::GIT_SHA));
     m.insert("mode".into(), json!("local-node"));
     m.insert("addr".into(), json!(state.addr));
-    m.insert("upstream".into(), json!(state.upstream));
+    m.insert("upstream".into(), json!(state.relay.upstream()));
     m.insert(
         "cache".into(),
         json!({
@@ -535,6 +533,28 @@ fn status_fields(state: &AppState) -> serde_json::Map<String, Value> {
 /// same observable signature as the legitimate cold-start window.
 fn peer_tier_status(tier: PeerTier) -> Value {
     json!({ "attached": tier == PeerTier::Attached })
+}
+
+/// The `dig.health` result — the PUBLIC liveness body (#1997).
+///
+/// Deliberately a small, hand-picked set rather than [`status_fields`], and the difference matters:
+/// `GET /health` is reachable only over loopback, whereas `dig.health` is on the rpc.dig.net
+/// public-read allowlist, so **this body is readable anonymously from the internet**. Serving the
+/// operational body there would newly publish the node's absolute cache path (which contains the OS
+/// account name), its configured upstream (which can name internal infrastructure), its bound
+/// address, and its exact commit — none of which a content reader needs, and each of which helps
+/// someone targeting the host.
+///
+/// What remains is what the `dig_rpc_protocol::types::Health` contract is actually for: is this node
+/// alive, what version is it, and what does it serve. The operational detail stays on the
+/// loopback-only `GET /health` and the token-gated `control.status`, which is where it was before
+/// this method existed.
+fn public_health() -> Value {
+    json!({
+        "status": "ok",
+        "version": VERSION,
+        "methods": meta::method_names(),
+    })
 }
 
 /// `GET /health` (and `GET /`) — liveness + mode + cache stats + discovery hooks.
@@ -677,7 +697,7 @@ async fn openrpc() -> impl IntoResponse {
 async fn well_known(State(state): State<AppState>) -> impl IntoResponse {
     Json(meta::well_known_document(
         &state.addr,
-        &state.upstream,
+        state.relay.upstream(),
         cache_cap_bytes(),
         cache_used_bytes(),
     ))
@@ -805,12 +825,9 @@ async fn rpc(
     // its own authority: needing an upstream to answer either is what made an unconfigured node
     // unable to describe itself at all.
     if method == "dig.health" {
-        let mut body = status_fields(&state);
-        body.insert("status".into(), json!("ok"));
-        body.insert("methods".into(), json!(meta::method_names()));
         return (
             StatusCode::OK,
-            Json(json!({ "jsonrpc": "2.0", "id": id, "result": Value::Object(body) })),
+            Json(json!({ "jsonrpc": "2.0", "id": id, "result": public_health() })),
         );
     }
     if method == "dig.methods" {

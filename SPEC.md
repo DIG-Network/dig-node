@@ -588,8 +588,9 @@ surface is never reachable off-machine.
    valid pinned root stays readable; both paths are fail-closed and enforce that the pinned root is
    the current on-chain generation. A ROOTLESS request resolves the tip via the walk and serves
    against it (surfaced as `X-Dig-Root` + `X-Dig-Verified: true`);
-3. fetches the resource's ciphertext + inclusion proof + chunk lengths LOCAL-FIRST, then peer, then the
-   public RPC (§4.6 cache order below);
+3. fetches the resource's ciphertext + inclusion proof + chunk lengths LOCAL-FIRST, then peer, then a
+   CONFIGURED upstream if the operator set one (§4.6 cache order below; there is no upstream by
+   default — §3.4 — so the ladder normally ends at peer and an unheld resource is a clean miss);
 4. verifies `resource_leaf(ciphertext) == proof.leaf`, `proof.verify()`, and `proof.root ==
    chain_anchored_root`, THEN AES-256-GCM-SIV-decrypts each chunk under the per-URN key — the SAME
    `digstore-core` read-crypto every DIG client uses. A tampered chunk, decoy, or non-anchored root
@@ -630,7 +631,8 @@ The two are independent and both are required, because `X-Dig-Source` alone cann
 difference between a gateway serve that MISSED on the peer tier and a gateway serve that never had
 one. The node serves content from the moment its HTTP surface opens, which is BEFORE the peer network
 attaches (§7.8) — availability is deliberately not traded away for readiness — so reads inside that
-window skip Tier 2 entirely and are answered by the public RPC. `unattached` is the node stating that;
+window skip Tier 2 entirely and fall to a configured upstream, or — with none, the default — MISS.
+`unattached` is the node stating that;
 a caller MUST NOT treat such a read as evidence about peer replication. `unattached` is also the
 permanent value on the in-process/FFI path, which brings up no peer network.
 
@@ -657,7 +659,7 @@ separate HEAD code path).
 
 **Local-first store cache (#290).** Resolution order per `(store, root)`:
 1. a synced+verified `.dig` module on disk → serve LOCAL, no network (the DEFAULT once cached);
-2. not held → serve the immediate resource from a peer / the public RPC AND trigger a single-flight
+2. not held → serve the immediate resource from a peer (or a CONFIGURED upstream, if any) AND trigger a single-flight
    background whole-`.dig` sync-down (the deduped `maybe_backfill_capsule` → chain-anchored-root-pinned
    whole-store pull) into the reserved LRU cache dir, so the NEXT read is local. LRU eviction (§7.10)
    applies; an evicted-then-re-requested capsule re-syncs. Freshness is inherent to the anchored-root
@@ -1300,7 +1302,8 @@ regardless of any real machine-wide state dir on the host.
 
 **The peer tier is NOT up when `/health` first answers (#1763).** The HTTP surface opens immediately,
 while the peer network attaches seconds later, so a read issued as soon as `/health` responds skips
-Tier 2 and is answered by the public RPC. A harness that intends to exercise the P2P path MUST poll
+Tier 2 — reaching a configured upstream, or MISSING outright when none is configured (the default).
+A harness that intends to exercise the P2P path MUST poll
 `peer_tier.attached` on `/health` (§6.1) until it is `true` — a fixed sleep is neither sufficient nor
 checkable — and MUST confirm `X-Dig-Peer-Tier: attached` on the response it measures (§4.6). A result
 gathered from a response carrying `unattached` is a measurement of the gateway, not of peer replication.
