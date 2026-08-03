@@ -1181,10 +1181,25 @@ pub(crate) fn content_window_envelope(
         "complete": complete,
         "next_offset": if complete { Value::Null } else { json!(end) },
     });
-    if start == 0 {
-        if let Some(proof) = inclusion_proof_b64 {
-            result["inclusion_proof"] = json!(proof);
-        }
+    // `inclusion_proof` rides EVERY window, not just the first. It is a `ChunkObject.required`
+    // field ("Sent on every window for getContent/getManifest", docs.dig.net openrpc.json) and the
+    // retired Lambda emitted it unconditionally. Gating it on `start == 0` would leave windows
+    // 1..N of any resource over one window carrying no way to verify — the SAME silent,
+    // error-free failure this whole change exists to remove, just moved to large resources, where
+    // a small-resource test could never see it. A client that begins mid-resource (a resumed or
+    // ranged read) would never receive a proof at all.
+    if let Some(proof) = inclusion_proof_b64 {
+        result["inclusion_proof"] = json!(proof);
+    }
+    // `chunk_lens` DOES ride the first window only, and that asymmetry is deliberate on both
+    // sides of the contract (openrpc.json: "Emitted on the FIRST window only"; the Lambda gates
+    // exactly this one field the same way). It describes how to split the REASSEMBLED resource,
+    // which a client cannot act on until it holds every window anyway.
+    //
+    // A whole-capsule window has no per-resource chunk layout: omit the field rather than send an
+    // explicit null, because absent says "this shape does not apply here" where null invites a
+    // caller to read it as "applies, but empty".
+    if start == 0 && !chunk_lens.is_null() {
         result["chunk_lens"] = chunk_lens;
     }
     result
@@ -8093,6 +8108,61 @@ mod tests {
         assert_eq!(last["length"], json!(500));
         assert_eq!(last["complete"], json!(true));
         assert!(last.get("next_offset").is_some_and(Value::is_null));
+    }
+
+    /// EVERY window carries the inclusion proof; only `chunk_lens` rides the first.
+    ///
+    /// `inclusion_proof` is a `ChunkObject.required` field ("Sent on every window",
+    /// docs.dig.net openrpc.json) and the retired Lambda emitted it unconditionally.
+    /// Gating it on the first window would leave windows 1..N of any resource over
+    /// 3 MiB unverifiable — the same silent, error-free failure #2071 is about, just
+    /// relocated to large resources where a small-resource test cannot see it.
+    /// `chia-offer.on.dig.net` is 15962 bytes, one window, which is exactly why.
+    #[test]
+    fn every_window_carries_the_inclusion_proof_but_only_the_first_carries_chunk_lens() {
+        let ciphertext = vec![3u8; WINDOW + 500];
+        let proof = "cHJvb2Y=";
+
+        for (label, offset) in [("first", 0), ("last", WINDOW)] {
+            let window = content_window_envelope(
+                &ciphertext,
+                offset,
+                Bytes32([0x42; 32]).to_hex(),
+                Some(proof.into()),
+                json!([WINDOW, 500]),
+            );
+            assert_eq!(
+                window["inclusion_proof"],
+                json!(proof),
+                "the {label} window must carry the proof — a client that begins mid-resource, \
+                 or verifies per window, has no other source for it: {window}"
+            );
+            assert_eq!(
+                window["root"],
+                json!(Bytes32([0x42; 32]).to_hex()),
+                "every window names the generation it was served against: {window}"
+            );
+        }
+
+        // chunk_lens is the ONE field that legitimately rides the first window only: it
+        // describes how to split the REASSEMBLED resource, which a client cannot act on
+        // until it holds every window. openrpc.json and the Lambda agree on this asymmetry.
+        let first = content_window_envelope(
+            &ciphertext,
+            0,
+            String::new(),
+            Some(proof.into()),
+            json!([7]),
+        );
+        let last = content_window_envelope(
+            &ciphertext,
+            WINDOW,
+            String::new(),
+            Some(proof.into()),
+            json!([7]),
+        );
+        assert_eq!(first["chunk_lens"], json!([7]), "{first}");
+        assert!(last.get("chunk_lens").is_none(), "{last}");
     }
 
     /// The exact arithmetic the on.dig.net service worker performs (#2071). It is the

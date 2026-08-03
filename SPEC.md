@@ -917,9 +917,15 @@ windows itself. The envelope MUST therefore describe both the WHOLE resource and
 | `complete` | every window | whether this window ends the resource |
 | `next_offset` | every window | the next window's offset, or **`null`** on the last one |
 | `root` | every window | the generation root the window was served against |
-| `inclusion_proof` | first window (`offset == 0`) | base64 whole-resource Merkle inclusion proof |
+| `inclusion_proof` | every window | base64 whole-resource Merkle inclusion proof |
 | `chunk_lens` | first window (`offset == 0`) | per-chunk ciphertext lengths of the WHOLE resource |
 | `source` | node profile | `"local"` or `"remote"` — where this node served it from |
+
+This table is normative and MUST agree field-for-field with `ChunkObject` in docs.dig.net's
+`static/openrpc.json`, which is the ecosystem-wide publication of the same contract. All of
+`ciphertext`, `total_length`, `offset`, `length`, `complete`, `next_offset`, `inclusion_proof` and
+`root` are REQUIRED there; a node that omits any of them is non-conforming even when the bytes it
+serves are correct.
 
 `total_length` MUST be present on EVERY window, not only the last: a client allocates its
 reassembly buffer from it before it has seen the last window. `next_offset` MUST be present on
@@ -929,14 +935,34 @@ field". Both requirements are load-bearing rather than cosmetic — omitting the
 `*.on.dig.net` subdomain dark while this node returned correct ciphertext and a correct,
 verifying inclusion proof, and reported no error anywhere (#2071).
 
-`inclusion_proof` and `chunk_lens` describe the whole resource rather than the window, so they
-ride the FIRST window only; a client keeps the first non-empty proof. A client that begins its
-stream at a non-zero offset therefore never receives them and cannot decrypt a multi-chunk
-resource — window 0 MUST be fetched.
+`inclusion_proof` MUST ride EVERY window. It describes the whole resource, but a client may verify
+per window, may resume, and may begin its stream at a non-zero offset — none of which can obtain
+the proof from anywhere else. Sending it only on window 0 leaves every window of a resource larger
+than one window unverifiable, which is #2071's failure mode relocated to large resources rather
+than fixed.
 
-Every path that serves this envelope — the locally-held read, the response-window cache, and the
-peer fetch-through — MUST emit the identical shape, from one shared builder. A second
-implementation of this shape is what produced #2071.
+`chunk_lens` is the ONE field that rides the first window only. It describes how to split the
+REASSEMBLED resource, which a client cannot act on until it holds every window; a client that
+begins mid-resource therefore cannot decrypt a multi-chunk resource and MUST fetch window 0. A
+whole-capsule read (`dig.getCapsule`) has no per-resource chunk layout and OMITS the field
+entirely rather than sending `null`.
+
+**Window size.** A window is at most **3 MiB** of ciphertext. This node currently IGNORES the
+`length` request parameter and always serves a full window (or the remainder), where
+`openrpc.json` documents `length` as a requested size clamped to the server maximum; a client MUST
+therefore size its stride from the `length` it is GIVEN, never from the one it asked for. The
+3 MiB figure is presently defined independently in three places — `WINDOW`
+(`crates/dig-node-core/src/lib.rs`), `RPC_MAX_CHUNK` (hub.dig.net's retrieval Lambda) and
+`RPC_CHUNK` (on.dig.net's resolver service worker) — and a client stride LARGER than the server
+window produces gapped buffers. Consolidating it into `dig-constants` is tracked in DIG-Network/dig_ecosystem#2076; until
+then any change to it MUST be made in all three.
+
+**One builder, with one honest exception.** The locally-held read and the peer fetch-through MUST
+both emit this envelope from the single shared builder (`content_window_envelope`) — a second
+implementation of a shared wire shape is what produced #2071. The response-window cache is the
+exception: it replays a previously-proxied UPSTREAM `result` verbatim, so a window cached from a
+non-conforming upstream is re-served with whatever fields that upstream sent. The cache preserves
+provenance rather than rewriting it; conformance there is the upstream's obligation.
 
 #### 5.5.1. `dig.getManifest` (#176 Phase C)
 
