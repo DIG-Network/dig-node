@@ -373,31 +373,19 @@ impl FetchedResource {
         Ok(frame)
     }
 
-    /// Build one `dig.getContent` result window over the fetched bytes — the same shape as the
-    /// node's `build_result` over a served [`ContentResponse`](digstore_core::wire::ContentResponse)
-    /// (ciphertext window + `root` + `complete`/`next_offset`, proof + `chunk_lens` on the first
-    /// window only), so a fetch-through serve is indistinguishable in shape from a local one.
+    /// Build one `dig.getContent` result window over the fetched bytes.
+    ///
+    /// Delegates to the SHARED [`content_window_envelope`](crate::content_window_envelope) the
+    /// locally-held path uses, so a fetch-through serve is byte-shape-identical to a local one
+    /// and the two cannot drift apart (#2071).
     pub fn content_result(&self, offset: usize) -> Value {
-        let total = self.bytes.len();
-        let start = offset.min(total);
-        let end = (start + crate::WINDOW).min(total);
-        let window = &self.bytes[start..end];
-        let complete = end >= total;
-        let mut result = json!({
-            "ciphertext": base64::engine::general_purpose::STANDARD.encode(window),
-            "root": self.root.clone().unwrap_or_default(),
-            "complete": complete,
-        });
-        if !complete {
-            result["next_offset"] = json!(end);
-        }
-        if start == 0 {
-            if let Some(proof) = &self.inclusion_proof {
-                result["inclusion_proof"] = json!(proof);
-            }
-            result["chunk_lens"] = json!(self.chunk_lens);
-        }
-        result
+        crate::content_window_envelope(
+            &self.bytes,
+            offset,
+            self.root.clone().unwrap_or_default(),
+            self.inclusion_proof.clone(),
+            json!(self.chunk_lens),
+        )
     }
 }
 
@@ -2084,7 +2072,13 @@ pub(crate) mod tests {
         assert_eq!(result["root"], json!(content.root));
         assert_eq!(result["chunk_lens"], json!(content.chunk_lens));
         assert_eq!(result["inclusion_proof"], json!(content.inclusion_proof));
-        assert!(result.get("next_offset").is_none());
+        // #2071: a complete window carries an EXPLICIT null, not an absent field, so a client
+        // ending its loop on `next_offset == null` can tell "done" from "field omitted".
+        assert!(result.get("next_offset").is_some_and(Value::is_null));
+        // #2071: the fields a client sizes its reassembly buffer from.
+        assert_eq!(result["total_length"], json!(content.bytes.len()));
+        assert_eq!(result["offset"], json!(0));
+        assert_eq!(result["length"], json!(content.bytes.len()));
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(result["ciphertext"].as_str().unwrap())
             .unwrap();

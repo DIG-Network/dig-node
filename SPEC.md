@@ -903,6 +903,41 @@ method + error **discovery** catalogue with intentionally permissive schemas.
 Every non-`control.*` method MUST have `requires_auth: false`; every `control.*` method MUST have
 `served: "control"` and `requires_auth: true`.
 
+#### 5.5.0. `dig.getContent` — the window envelope (#2071)
+
+A `dig.getContent` result is ONE window of a resource's ciphertext, and a client reassembles the
+windows itself. The envelope MUST therefore describe both the WHOLE resource and THIS window:
+
+| field | on | meaning |
+|---|---|---|
+| `ciphertext` | every window | base64 of this window's ciphertext bytes |
+| `total_length` | every window | the FULL resource's ciphertext length in bytes |
+| `offset` | every window | this window's start offset within the resource |
+| `length` | every window | this window's byte length |
+| `complete` | every window | whether this window ends the resource |
+| `next_offset` | every window | the next window's offset, or **`null`** on the last one |
+| `root` | every window | the generation root the window was served against |
+| `inclusion_proof` | first window (`offset == 0`) | base64 whole-resource Merkle inclusion proof |
+| `chunk_lens` | first window (`offset == 0`) | per-chunk ciphertext lengths of the WHOLE resource |
+| `source` | node profile | `"local"` or `"remote"` — where this node served it from |
+
+`total_length` MUST be present on EVERY window, not only the last: a client allocates its
+reassembly buffer from it before it has seen the last window. `next_offset` MUST be present on
+every window as an explicit `null` when complete, so a client ending its loop on
+`next_offset == null` can distinguish "the resource is complete" from "this server omitted the
+field". Both requirements are load-bearing rather than cosmetic — omitting them took every
+`*.on.dig.net` subdomain dark while this node returned correct ciphertext and a correct,
+verifying inclusion proof, and reported no error anywhere (#2071).
+
+`inclusion_proof` and `chunk_lens` describe the whole resource rather than the window, so they
+ride the FIRST window only; a client keeps the first non-empty proof. A client that begins its
+stream at a non-zero offset therefore never receives them and cannot decrypt a multi-chunk
+resource — window 0 MUST be fetched.
+
+Every path that serves this envelope — the locally-held read, the response-window cache, and the
+peer fetch-through — MUST emit the identical shape, from one shared builder. A second
+implementation of this shape is what produced #2071.
+
 #### 5.5.1. `dig.getManifest` (#176 Phase C)
 
 Resolves the store's normalized **PUBLIC MANIFEST** — the `.dig` format's data-section id 13

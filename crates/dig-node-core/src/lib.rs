@@ -1135,30 +1135,70 @@ fn content_window_len(total: usize, offset: usize) -> usize {
     end - start
 }
 
-/// Build the JSON-RPC `result` object for one window of a decoded ContentResponse.
-fn build_result(resp: &ContentResponse, offset: usize) -> Value {
-    let total = resp.ciphertext.len();
+/// Build the `dig.getContent` result envelope for ONE window of a resource's ciphertext.
+///
+/// The SINGLE producer of this wire shape. Both the locally-held read path
+/// ([`build_result`]) and the fetch-through path
+/// ([`FetchedResource::content_result`](crate::download::FetchedResource::content_result))
+/// go through here, so the two can never drift — a second implementation of a shared shape is
+/// precisely what produced #2071.
+///
+/// Every window states the resource's FULL `total_length` alongside this window's own `offset`
+/// and `length`, because a client allocates its reassembly buffer from `total_length` before it
+/// has seen the last window. Omitting them is not cosmetic: it took every `*.on.dig.net`
+/// subdomain dark (#2071). The resolver read `undefined >>> 0 === 0`, allocated a zero-length
+/// buffer, dropped the ciphertext into it, and then failed its own `sum(chunk_lens) ==
+/// buffer.len()` check and answered its own `404` — while this node returned real ciphertext and
+/// a real, verifying inclusion proof the entire time. Nothing anywhere reported an error.
+///
+/// `next_offset` is ALWAYS present: the byte offset of the next window, or an explicit `null` on
+/// the last one. A client that ends its loop on `next_offset == null` must be able to tell "the
+/// resource is complete" apart from "this server omitted the field".
+///
+/// `inclusion_proof` and `chunk_lens` describe the WHOLE resource rather than this window, so
+/// they ride the first window only (`offset == 0`); the client keeps the first non-empty proof.
+/// `chunk_lens` is taken pre-rendered because the two callers hold different integer widths for
+/// it, and widening either one would be a wire change.
+pub(crate) fn content_window_envelope(
+    ciphertext: &[u8],
+    offset: usize,
+    root_hex: String,
+    inclusion_proof_b64: Option<String>,
+    chunk_lens: Value,
+) -> Value {
+    let total = ciphertext.len();
     let start = offset.min(total);
     let end = (start + WINDOW).min(total);
-    let window = &resp.ciphertext[start..end];
+    let window = &ciphertext[start..end];
     let complete = end >= total;
 
     let mut result = json!({
         "ciphertext": base64::engine::general_purpose::STANDARD.encode(window),
-        "root": resp.roothash.to_hex(),
+        "total_length": total,
+        "offset": start,
+        "length": window.len(),
+        "root": root_hex,
         "complete": complete,
+        "next_offset": if complete { Value::Null } else { json!(end) },
     });
-    if !complete {
-        result["next_offset"] = json!(end);
-    }
-    // The proof + chunk_lens are sent on the FIRST window only (the client keeps
-    // the first non-empty proof). Match rpc.dig.net / the digstore client.
     if start == 0 {
-        result["inclusion_proof"] =
-            json!(base64::engine::general_purpose::STANDARD.encode(resp.merkle_proof.to_bytes()));
-        result["chunk_lens"] = json!(resp.chunk_lens);
+        if let Some(proof) = inclusion_proof_b64 {
+            result["inclusion_proof"] = json!(proof);
+        }
+        result["chunk_lens"] = chunk_lens;
     }
     result
+}
+
+/// Build the JSON-RPC `result` object for one window of a decoded ContentResponse.
+fn build_result(resp: &ContentResponse, offset: usize) -> Value {
+    content_window_envelope(
+        &resp.ciphertext,
+        offset,
+        resp.roothash.to_hex(),
+        Some(base64::engine::general_purpose::STANDARD.encode(resp.merkle_proof.to_bytes())),
+        json!(resp.chunk_lens),
+    )
 }
 
 /// Decode a locally cached module into a [`ContentResponse`] (whole-module `fs::read` + wasmtime
@@ -7988,6 +8028,157 @@ mod tests {
             assert!(
                 result.get(forbidden).is_none(),
                 "dig.getContent must not carry a (mock) `{forbidden}` field: {result}"
+            );
+        }
+    }
+
+    // -- #2071: the getContent envelope a client reassembles from ------------------
+    //
+    // Every `*.on.dig.net` subdomain went dark because these fields were absent. The
+    // resolver sizes its reassembly buffer from `total_length` BEFORE it has seen
+    // every window; `undefined >>> 0` is `0`, so it copied the ciphertext into a
+    // zero-length buffer, then failed its own chunk-length sanity check and answered
+    // its own 404. Nothing on the wire was an error — `dig.getContent` returned real
+    // ciphertext and a real, verifying proof the entire time.
+
+    /// A single-window (complete) resource still states its full length, this
+    /// window's placement, and an EXPLICIT `next_offset: null`.
+    #[test]
+    fn content_window_envelope_states_total_length_offset_and_length() {
+        let ciphertext = vec![7u8; 15962];
+        let result = content_window_envelope(
+            &ciphertext,
+            0,
+            Bytes32([0x42; 32]).to_hex(),
+            Some("cHJvb2Y=".into()),
+            json!([15962u32]),
+        );
+
+        assert_eq!(
+            result["total_length"],
+            json!(15962),
+            "the FULL resource length must be on every window — a client sizes its \
+             reassembly buffer from it before it has seen the last window: {result}"
+        );
+        assert_eq!(result["offset"], json!(0), "window placement: {result}");
+        assert_eq!(result["length"], json!(15962), "window size: {result}");
+        assert_eq!(result["complete"], json!(true));
+        assert!(
+            result.get("next_offset").is_some_and(Value::is_null),
+            "the last window carries an EXPLICIT null next_offset, so a client can tell \
+             \"done\" apart from \"this server omitted the field\": {result}"
+        );
+    }
+
+    /// A resource larger than one window reports the NEXT window's offset, and each
+    /// window's own `offset`/`length` — never the whole resource's.
+    #[test]
+    fn content_window_envelope_places_each_window_of_a_multi_window_resource() {
+        let ciphertext = vec![3u8; WINDOW + 500];
+
+        let first = content_window_envelope(&ciphertext, 0, String::new(), None, json!([]));
+        assert_eq!(first["total_length"], json!(WINDOW + 500));
+        assert_eq!(first["offset"], json!(0));
+        assert_eq!(first["length"], json!(WINDOW), "clamped to one window: {first}");
+        assert_eq!(first["complete"], json!(false));
+        assert_eq!(first["next_offset"], json!(WINDOW));
+
+        let last = content_window_envelope(&ciphertext, WINDOW, String::new(), None, json!([]));
+        assert_eq!(last["total_length"], json!(WINDOW + 500));
+        assert_eq!(last["offset"], json!(WINDOW));
+        assert_eq!(last["length"], json!(500));
+        assert_eq!(last["complete"], json!(true));
+        assert!(last.get("next_offset").is_some_and(Value::is_null));
+    }
+
+    /// The exact arithmetic the on.dig.net service worker performs (#2071). It is the
+    /// contract that actually matters: buffer sized from `total_length`, window written
+    /// at `offset`, then `sum(chunk_lens) == buffer.len()` or the read is discarded.
+    #[test]
+    fn a_client_can_reassemble_a_resource_from_the_get_content_envelope_alone() {
+        use digstore_core::wire::ContentResponse;
+        let root = Bytes32([0x42; 32]);
+        let resp = ContentResponse {
+            ciphertext: vec![9u8; 15962],
+            merkle_proof: digstore_core::merkle::MerkleProof {
+                leaf: root,
+                path: Vec::new(),
+                root,
+            },
+            roothash: root,
+            chunk_lens: vec![15962],
+        };
+        let result = build_result(&resp, 0);
+
+        // Verbatim the resolver's reassembly (on.dig.net assets/sw.js fetchVerifiedPost).
+        let total = result["total_length"].as_u64().unwrap_or(0) as usize;
+        let at = result["offset"].as_u64().unwrap_or(0) as usize;
+        let window = base64::engine::general_purpose::STANDARD
+            .decode(result["ciphertext"].as_str().unwrap())
+            .unwrap();
+        let mut buf = vec![0u8; total];
+        buf[at..at + window.len()].copy_from_slice(&window);
+
+        let lens_sum: u64 = result["chunk_lens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_u64)
+            .sum();
+        assert_eq!(
+            lens_sum as usize,
+            buf.len(),
+            "sum(chunk_lens) must equal the reassembled buffer, or the client discards \
+             the read as corrupt and serves its own 404 (#2071): {result}"
+        );
+        assert_eq!(buf, resp.ciphertext, "the reassembled bytes are the resource");
+    }
+
+    /// The fetch-through path serves the SAME envelope as the local path — a
+    /// second implementation of this shape is what produced #2071 in the first place.
+    #[test]
+    fn fetch_through_and_local_paths_agree_on_the_get_content_envelope() {
+        use digstore_core::wire::ContentResponse;
+        let root = Bytes32([0x42; 32]);
+        let ciphertext = vec![5u8; 4096];
+        let proof_b64 = "cHJvb2Y=";
+
+        let local = build_result(
+            &ContentResponse {
+                ciphertext: ciphertext.clone(),
+                merkle_proof: digstore_core::merkle::MerkleProof {
+                    leaf: root,
+                    path: Vec::new(),
+                    root,
+                },
+                roothash: root,
+                chunk_lens: vec![4096],
+            },
+            0,
+        );
+        let fetched = crate::download::FetchedResource {
+            bytes: ciphertext,
+            total_length: 4096,
+            chunk_lens: vec![4096],
+            root: Some(root.to_hex()),
+            inclusion_proof: Some(proof_b64.into()),
+        }
+        .content_result(0);
+
+        for field in [
+            "total_length",
+            "offset",
+            "length",
+            "complete",
+            "next_offset",
+            "root",
+            "ciphertext",
+            "chunk_lens",
+        ] {
+            assert_eq!(
+                local[field], fetched[field],
+                "field `{field}` differs between the local and fetch-through envelopes\n\
+                 local:   {local}\nfetched: {fetched}"
             );
         }
     }
