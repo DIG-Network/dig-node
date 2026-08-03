@@ -2516,6 +2516,12 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
             // claim the SAME registry, so a read triggers at most one whole-capsule pull across both.
             node.capsule_acquisition_gate(),
         );
+        // Anchor the inbound-demand proximity gate (§7.10d, #2014) to this node's own peer_id — the
+        // SAME identity the tier-0 loop scores against below — so a peer-driven pull is admitted only
+        // for content in this node's keyspace neighbourhood. Set unconditionally (inbound demand runs
+        // even when tier-0 is skipped on a small disk).
+        node.set_node_peer_id(*identity.peer_id().as_bytes());
+
         // 4b-iii. TIER-0 EAGER-PRECACHE (#1934, PR-3) — SPAWN the self-driven precache loop so a fleet
         //         node with an empty cache autonomously fills its tier-0 budget from the DHT, becomes a
         //         discoverable provider, and yields to tier-1 under real demand. Wired ONLY when the DHT

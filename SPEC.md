@@ -1597,10 +1597,23 @@ above, so it carries no bandwidth/content amplification risk and always runs. Th
 inbound demand is OPT-IN, default OFF, gated by
 `DIG_NODE_INBOUND_DEMAND_CACHE` (only an explicit `on`/`1`/`true`/`yes` enables it). A peer-triggered
 pull is an amplification primitive of exactly the shape trigger (a)'s `ReadOrigin::Local` gate exists
-to close; the intended amplification defence is the tier-0/1 selector's XOR-proximity admission (§7.10a
-/ §7.10b) — pull a peer-demanded store only when its `content_id` lands in this node's keyspace
-neighbourhood — which is not yet wired into the live pull. Until it is, the pull stays opt-in so
-enabling the feature never SILENTLY reverses the amplification invariant.
+to close.
+
+**XOR-proximity admission on the pull (ENFORCED, #2014).** The opt-in pull is gated a SECOND time by a
+keyspace-proximity admission that binds even when the flag is on: the pull fires ONLY when the demanded
+capsule's DHT key (`ContentId::capsule(store_id, root).to_key()`) lies in THIS node's keyspace
+neighbourhood — its XOR proximity to the node's own `peer_id` clears
+`relevance::INBOUND_DEMAND_MIN_PROXIMITY` (the keyspace midpoint, `0.5`: the content id is closer to
+this node's `peer_id` than a uniformly-random point, i.e. shares the top keyspace bit). This is the
+same `xor_proximity` primitive and the same reference `peer_id` the tier-0 precache selector (§7.10a /
+§7.10b) scores against, so both paths share ONE neighbourhood definition. It is ungameable in the ways
+that matter: an attacker cannot move this node's `peer_id`, and because the pull is chain-anchored
+(§7.10d(a) verifies against the CHIP-0035 anchored root) the demanded key cannot name arbitrary junk —
+grinding a store key toward our `peer_id` costs real on-chain mints, not cheap hashing. The gate FAILS
+CLOSED: a node with no known self-identity (the FFI/consumer path) or a non-canonical `(store, root)`
+admits no pull. The read itself is still served normally — the gate governs only the demand-driven
+CACHE. The DEFAULT stays OFF; flipping it on (and any tightening of the midpoint bar toward a
+routing-aware k-closest test, which depends on live network size) is a separate deliberate pass.
 
 **Shared pull machinery.** When the opt-in pull fires, it reuses the SAME whole-capsule backfill body
 as trigger (a) (`Node::spawn_capsule_backfill`): the `DIG_NODE_BACKFILL_ON_MISS` kill switch + a live
