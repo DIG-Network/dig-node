@@ -2932,13 +2932,78 @@ advisory `melt_height`, `sender_peer_id`, BLS signature). It is a **public all-p
 public-by-nature and addressed to everyone, like L2 consensus gossip. It is mTLS-authenticated +
 signed, never recipient-sealed.
 
-**The on-chain melt proof is the SOLE delete authority (NC-9, fail-closed).** A store's melt status is
-resolved by its singleton-lineage walk (the same authority as §14.4): a closed singleton (`Ok(None)`)
-IS a melt; a live tip (`Ok(Some)`) is NOT; an unreachable/errored chain is UNKNOWN. A node MUST NEVER
-delete unless the chain POSITIVELY confirms the melt — a forged/replayed announcement, or a chain the
-node cannot reach, deletes NOTHING. The announcement's signature is attribution/anti-spam ONLY (never
-delete authority), and `melt_height` is an advisory hint the receiver never trusts on its face. The
-melt authority is the lineage walk, NEVER a bare `anchored_root() == Ok(None)`.
+**The on-chain melt proof is the SOLE delete authority (NC-9, fail-closed).** A node MUST NEVER delete
+unless the chain POSITIVELY confirms the melt — a forged/replayed announcement, or a chain the node
+cannot reach, deletes NOTHING. The announcement's signature is attribution/anti-spam ONLY (never delete
+authority), and `melt_height` is an advisory hint the receiver never trusts on its face.
+
+A store is confirmed MELTED only by walking its singleton lineage along real COIN PARENTAGE:
+
+1. **Identity + minted.** The launcher coin whose `coin_id == store_id` MUST exist and be SPENT.
+   `coin_id == store_id` is a 256-bit hash preimage an attacker cannot grind, so it pins the walk to
+   the real store — never to a look-alike singleton that merely *curries* `launcher_id == store_id`,
+   which IS forgeable. `spent` proves the store was ever minted (the launcher is spent exactly once,
+   to create the eve singleton). An UNSPENT launcher is `Live`: not minted yet is the opposite of
+   melted. This fact discriminates nothing on its own — it holds for every minted store — it anchors
+   the walk's starting point.
+2. **Walk forward by parentage.** At each hop, read the children of the current coin, DISCARD any
+   returned coin whose `parent_coin_info` is not the current coin (the soundness argument is that
+   parentage is fixed by which coin was actually spent — taking the server's word for membership of a
+   "children of X" page would hand that argument back to whatever answered), and follow the
+   single ODD-amount child (the singleton, whose amount is invariant across generations). An UNSPENT
+   successor is `Live`. A spent coin with NO successor is `Melted` — the lineage terminated.
+
+A coin's `parent_coin_info` is fixed by which coin was actually spent to create it, so **placing a
+coin anywhere in this walk requires spending a generation of the store, which requires the owner's
+authority.** The walk is unwritable by anyone but the owner.
+
+Everything else is `Unknown` (fail-closed): any chain read that errors or times out — including
+MID-WALK, which MUST NOT read as "the lineage ended here" — more than one odd child (ambiguous; never
+guess which continues the lineage), an absent launcher coin, and exceeding the hop ceiling.
+
+**Only a COMPLETELY EMPTY children page may conclude a melt, and never at hop 0.** Both halves are
+load-bearing:
+
+- *Hop 0.* A minted launcher always created the eve singleton, so an empty first hop means the answer
+  is untrustworthy — a non-datastore launcher, or a chain-read implementation that does not implement
+  the parent-ids query.
+- *Completeness.* The children query honours a server-side limit, and truncation surfaces SPENT
+  records first. Measured on coinset against the sibling hint query: no limit returns 349 records of
+  which 243 are unspent, while `limit=5` returns 5 records of which **zero** are unspent. A truncated
+  page that kept an even change coin but dropped the odd successor would read exactly like a
+  terminated lineage. Requiring the page to be *entirely* empty is what asserts COMPLETENESS instead
+  of trusting a page — truncation cannot turn a non-empty result set into an empty one short of a
+  zero limit, which is never sent. Children present with no singleton among them is `Unknown`.
+
+Two cheaper signals MUST NOT be used, both having shipped and been found unsound:
+
+- **`anchored_root() == Ok(None)`** means *no confirmed generation* (fail-closed) everywhere else in
+  the node, and is produced for a store that is **not minted yet**. A genuine melt does not even
+  produce it — the lineage walk errors for a tip spent without a datastore child.
+- **The `store_id` hint index.** A hint is an unauthenticated `CREATE_COIN` memo over an arbitrary
+  32-byte value, so ANY party can place a record under ANY store's hint for the price of a dust coin.
+  Measured against mainnet: of the 53 DataLayer stores, **30 live stores have a completely EMPTY
+  `store_id` hint index** — their generations are not hinted to `store_id` at all — so for each of
+  them one planted spent coin would make the index non-empty and entirely spent, indistinguishable
+  from a terminated lineage. `get_coin_records_by_hint` is also truncatable, and truncation surfaces
+  spent records first: the exact order that manufactures a false melt. The hint index MUST NOT carry
+  a delete decision.
+
+**Operator kill switch.** Store-melt propagation MUST be disableable at runtime via
+`DIG_NODE_STORE_MELT` (default ON; only an explicit `off`/`0`/`false`/`no` disables it), matching the
+shape of `DIG_NODE_BACKFILL_ON_MISS`. This is the node's only path that irreversibly deletes content
+in response to chain state, and it propagates, so a fault is correlated across holders rather than
+isolated; an operator MUST be able to stop the deleting without downgrading the node. Disabling is
+lossless — melted stores simply keep costing disk, and nothing else depends on melt propagation
+having run.
+
+**Conformance to real chain state (measured, not derived).** Across all 53 DataLayer launcher coins
+on mainnet this rule yields 51 `Live` (deepest lineage 599 generations; 29 stores have their tip one
+hop from the launcher) and 1 `Melted` — the one genuinely terminated store, which ends at hop 1. No
+lineage produced an ambiguous fork. Because the walk costs one chain read per generation and the
+receive path runs per inbound announcement, verdicts are memoised for a short TTL so a flood of
+announcements for one held store cannot multiply into repeated walks; a stale verdict can only DELAY
+a real melt, never cause a delete.
 
 - **Holder path (the melting node).** For a store the node HOLDS whose singleton the chain confirms
   closed, and which is not already tombstoned: delete EVERY held generation (the audited cache-remove
@@ -2960,7 +3025,14 @@ melt authority is the lineage walk, NEVER a bare `anchored_root() == Ok(None)`.
 The receive/holder policy is unit-tested against spy seams (chain / cache / broadcast) with the eight
 adversarial cases: forged-melt-for-live, chain-error-fail-closed, genuine-melt (delete-all +
 rebroadcast-once), never-held (no chain call), already-tombstoned, verify-cost DoS (held-check before
-chain), multi-node convergence-terminates, and holder fail-closed on transient error.
+chain), multi-node convergence-terminates, and holder fail-closed on transient error. The chain-fact →
+verdict mapping is separately tested against the real chain-read trait with a crafted lineage, whose
+mock PANICS if either hint query is touched: a terminated lineage is the ONLY shape that yields
+`Melted`; an unspent tip at 1/2/7/60 hops, an unspent launcher, an absent launcher, an empty hop 0, an
+even-amount child, an ambiguous two-odd-child fork, a transport failure on the launcher read OR
+mid-walk, and an endless lineage all resolve to `Live` or `Unknown`. The composition that broke the
+previous design — an empty hint index plus one planted spent coin — is covered explicitly and asserts
+`Live`.
 
 ---
 

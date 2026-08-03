@@ -37,13 +37,15 @@
 //! for stores this node does not hold to O(1)-ish local work per message: an attacker cannot make a
 //! cheap inbound frame cost a chain round-trip or a signature verification for content we never held.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dig_gossip::{store_melted_payload, Bytes32, PeerId, StoreMeltedAnnounce};
 use dig_tls::bls::SecretKey;
+use digstore_chain::coinset::ChainReads;
 
-use crate::{AnchoredRootResolver, CapsuleStore, KeyManager};
+use crate::{CapsuleStore, KeyManager};
 
 /// Whether a store's singleton is closed (melted), still live, or currently unknowable.
 ///
@@ -51,11 +53,13 @@ use crate::{AnchoredRootResolver, CapsuleStore, KeyManager};
 /// announcement's contents or signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeltStatus {
-    /// The singleton lineage resolved to a closed store (`Ok(None)`) — the store IS melted.
+    /// The store was minted and its singleton lineage has TERMINATED — the store IS melted. The only
+    /// verdict that authorizes a delete.
     Melted,
-    /// The singleton is still live (`Ok(Some(tip))`) — NEVER delete.
+    /// The lineage is intact, or has not started (a not-yet-minted store) — NEVER delete.
     Live,
-    /// The chain was unreachable/errored (`Err`) — NEVER delete (fail-closed).
+    /// The chain could not settle the question — unreachable, errored, or an answer that cannot
+    /// distinguish "terminated" from "never indexed". NEVER delete (fail-closed).
     Unknown,
 }
 
@@ -101,10 +105,7 @@ impl TombstoneSet {
     /// Whether `store_id` has already been tombstoned.
     #[must_use]
     pub fn contains(&self, store_id: &[u8; 32]) -> bool {
-        self.inner
-            .lock()
-            .expect("tombstone lock")
-            .contains(store_id)
+        self.locked().contains(store_id)
     }
 
     /// Compare-and-set: insert `store_id`, returning `true` iff it was NEWLY inserted.
@@ -112,7 +113,20 @@ impl TombstoneSet {
     /// The single-broadcast guarantee rides on this: only the transition that returns `true` may
     /// propagate the melt, so a re-receipt (which returns `false`) never re-emits.
     pub fn insert(&self, store_id: [u8; 32]) -> bool {
-        self.inner.lock().expect("tombstone lock").insert(store_id)
+        self.locked().insert(store_id)
+    }
+
+    /// The guarded set, recovering from poisoning rather than propagating a panic.
+    ///
+    /// The only code that ever holds this guard is a `HashSet` `contains`/`insert`, so a poisoned
+    /// lock cannot mean a half-applied mutation — it only means some OTHER iteration panicked while
+    /// this loop's guard happened to be held. Recovering keeps a panic in one melt from permanently
+    /// disabling melt propagation for the process's lifetime; `expect`ing here would turn a single
+    /// contained panic into a subsystem that panics on every subsequent frame forever.
+    fn locked(&self) -> std::sync::MutexGuard<'_, HashSet<[u8; 32]>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -122,9 +136,8 @@ impl TombstoneSet {
 
 /// The on-chain melt authority (NC-9). The ONLY thing that may authorize a delete.
 ///
-/// Production maps the node's [`AnchoredRootResolver`] singleton-lineage walk to a [`MeltStatus`]; a
-/// closed singleton (`Ok(None)`) is a melt, a live tip (`Ok(Some)`) is not, and an error is
-/// fail-closed [`MeltStatus::Unknown`].
+/// Production is [`CoinsetMeltChain`], which resolves the verdict through
+/// [`confirm_melt_via_chain`]. A trait so the policy above it is spy-testable.
 #[async_trait::async_trait]
 pub trait MeltChain: Send + Sync {
     /// Resolve the on-chain melt status of `store_id`. MUST fail closed: any error/timeout is
@@ -317,19 +330,255 @@ pub async fn run_melt_tick(
 // Production seams — the live chain resolver, the node cache, and the gossip pool.
 // ---------------------------------------------------------------------------------------------
 
-/// Map the node's anchored-root resolver to a [`MeltChain`]. A closed singleton (`Ok(None)`) is a
-/// melt; a live tip (`Ok(Some)`) is not; an error is fail-closed [`MeltStatus::Unknown`].
+/// The ceiling on the lineage walk. A store deeper than this resolves [`MeltStatus::Unknown`]
+/// (fail-closed) rather than costing unbounded chain reads.
 ///
-/// LOAD-BEARING: this is only ever consulted for a store the node HOLDS. A held store was on-chain
-/// confirmed when it was cached, so `Ok(None)` genuinely means "melted", never "never launched".
-#[async_trait::async_trait]
-impl MeltChain for Arc<dyn AnchoredRootResolver> {
-    async fn confirm_melt(&self, store_id: &[u8; 32]) -> MeltStatus {
-        match self.anchored_root(store_id).await {
-            Ok(None) => MeltStatus::Melted,
-            Ok(Some(_live_tip)) => MeltStatus::Live,
-            Err(_unreachable) => MeltStatus::Unknown,
+/// Sized from measurement, not guesswork: across all 53 DataLayer launcher coins on mainnet the
+/// deepest live lineage is **599** generations, and 29 of the 53 have their tip one hop from the
+/// launcher (mean depth ~7). 10_000 leaves two orders of magnitude of headroom while keeping the
+/// walk bounded.
+const MAX_LINEAGE_HOPS: usize = 10_000;
+
+/// The deepest live DataLayer lineage measured on mainnet (all 53 launcher coins surveyed).
+const DEEPEST_MEASURED_MAINNET_LINEAGE: usize = 599;
+
+/// The ceiling MUST clear real mainnet depth by an order of magnitude, or a perfectly healthy store
+/// silently resolves [`MeltStatus::Unknown`] forever. Enforced at COMPILE time rather than by a test:
+/// a runtime `assert!` over two constants is folded away and proves nothing, and a test asserting
+/// against `MAX_LINEAGE_HOPS` itself puts the same symbol on both sides so it moves with the value.
+/// This fails the BUILD if the ceiling is ever cut below the measured floor.
+const _: () = assert!(MAX_LINEAGE_HOPS >= DEEPEST_MEASURED_MAINNET_LINEAGE * 10);
+
+/// Resolve `store_id`'s on-chain melt status by walking the singleton lineage along real COIN
+/// PARENTAGE, starting from the launcher coin.
+///
+/// # Why parentage, and nothing else
+///
+/// Two cheaper-looking signals were tried and BOTH were unsound. They are recorded here because the
+/// same shortcuts will look attractive again:
+///
+/// - **`anchored_root() == Ok(None)`.** That value is the node's fail-closed sentinel for *no
+///   confirmed generation* everywhere else ([`crate::AnchoredRootResolver`], `chainwatch`), and
+///   [`CoinsetResolver`](crate::CoinsetResolver) produces it for `"launcher coin is unspent (store
+///   not minted yet)"` — a store whose lineage has not STARTED. Deleting on it erases live data. A
+///   real melt does not even produce it: the walk returns an error for a tip spent without a
+///   datastore child.
+/// - **The `store_id` hint index.** A hint is an unauthenticated `CREATE_COIN` memo over an
+///   arbitrary 32-byte value (#1473), so ANY party can put a record under any store's hint for the
+///   price of a dust coin. Measurement settles it: of the 53 DataLayer stores on mainnet, **30 live
+///   stores have a completely EMPTY `store_id` hint index** — their generations are not hinted to
+///   `store_id` at all. For every one of those, a single planted spent coin would have made the
+///   index non-empty and entirely spent, which is indistinguishable from a terminated lineage. The
+///   hint index cannot carry a delete decision. `get_coin_records_by_hint` is also truncatable, and
+///   truncation surfaces spent records first — the exact order that manufactures a false melt.
+///
+/// Coin parentage has neither weakness. A coin's `parent_coin_info` is fixed by which coin was
+/// actually spent to create it, so **to place a coin anywhere in this walk an attacker must spend a
+/// generation of the store — which needs the owner's authority.** The walk is unwritable by anyone
+/// but the store's owner, and it never consults a hint.
+///
+/// # The verdict
+///
+/// 1. **Identity + minted.** The launcher coin whose `coin_id == store_id` must exist and be SPENT.
+///    `coin_id == store_id` is a 256-bit hash preimage that cannot be ground, so this pins the walk
+///    to the real store rather than to a singleton that merely *curries* `launcher_id == store_id`
+///    (forgeable, #1473). An UNSPENT launcher is [`MeltStatus::Live`] — not minted yet is the
+///    opposite of melted. On its own this fact discriminates nothing (it holds for every minted
+///    store); it exists to anchor the walk's starting point.
+/// 2. **Walk forward.** At each hop, take the children of the current coin and follow the single
+///    ODD-amount child — the singleton, whose amount is invariant across generations. Reaching an
+///    UNSPENT successor is [`MeltStatus::Live`]. Reaching a spent coin with NO successor is
+///    [`MeltStatus::Melted`]: the lineage terminated.
+///
+/// Everything else fails closed to [`MeltStatus::Unknown`]: any transport error, more than one odd
+/// child (ambiguous — never observed across 53 mainnet stores, but it must not guess), and
+/// exceeding [`MAX_LINEAGE_HOPS`].
+///
+/// **Only a COMPLETELY EMPTY children page may conclude a melt, and never at hop 0.** Two distinct
+/// hazards make this precise wording load-bearing:
+///
+/// - *Hop 0.* A minted store's launcher was spent precisely to create the eve singleton, so it
+///   always has a child. Zero children at the first hop means the answer is untrustworthy — a
+///   non-datastore launcher, or a [`ChainReads`] implementation whose `coin_records_by_parent_ids`
+///   is the trait's empty DEFAULT. The one genuinely melted store on mainnet terminates at hop 1.
+/// - *Truncation.* The children query honours a server-side limit, and the sibling hint query was
+///   measured truncating 349 records (243 unspent) down to a page of 5 with **zero** unspent —
+///   truncation surfaces spent records first, exactly the order that manufactures a false verdict.
+///   A page that kept an even change coin but dropped the odd successor would otherwise look like a
+///   terminated lineage. Requiring the page to be *entirely* empty is what asserts completeness
+///   rather than trusting a page: truncation cannot turn a non-empty result set into an empty one
+///   short of a zero limit, which is never sent. Children present but no singleton among them is
+///   [`MeltStatus::Unknown`].
+///
+/// The residual assumption is that the coin index cannot report a coin as SPENT while omitting the
+/// children created by that same spend — both come from processing the same block. Walking all 53
+/// mainnet stores exercised ~380 spent-coin→child steps with no such inconsistency.
+pub async fn confirm_melt_via_chain(chain: &dyn ChainReads, store_id: &[u8; 32]) -> MeltStatus {
+    let launcher_id = chia_protocol::Bytes32::new(*store_id);
+
+    // FACT 1 — the launcher coin `coin_id == store_id` exists and is SPENT.
+    let launcher = match chain.coin_record(launcher_id).await {
+        Ok(Some(record)) => record,
+        // Nothing was ever minted under this id, so nothing can have melted. For a store we hold
+        // content for that is an anomaly, never an authorization — fail closed.
+        Ok(None) | Err(_) => return MeltStatus::Unknown,
+    };
+    if !launcher.spent {
+        return MeltStatus::Live;
+    }
+
+    // FACT 2 — follow real parentage from the launcher to the end of the lineage.
+    let mut current = launcher_id;
+    for hop in 0..MAX_LINEAGE_HOPS {
+        let children = match chain.coin_records_by_parent_ids(&[current], true).await {
+            Ok(children) => children,
+            Err(_unreachable) => return MeltStatus::Unknown,
+        };
+        // Re-check parentage locally rather than trusting that a "children of X" response contains
+        // only children of X. The whole soundness argument is that a coin's `parent_coin_info` is
+        // fixed by which coin was actually spent to create it; taking the server's word for which
+        // coins those are would hand that argument back to whatever answered the query.
+        let mut successors = children
+            .iter()
+            .filter(|child| child.coin.parent_coin_info == current)
+            .filter(|child| child.coin.amount % 2 == 1);
+        let Some(next) = successors.next() else {
+            // Nothing here continues the lineage. Only ONE shape of that is a melt.
+            return if hop == 0 {
+                // A minted launcher always created the eve singleton. No successor at the first
+                // hop means the answer is untrustworthy, not that the store is gone.
+                MeltStatus::Unknown
+            } else if children.is_empty() {
+                // The spend created NOTHING — the lineage terminated.
+                MeltStatus::Melted
+            } else {
+                // Children exist but none is a singleton. This is where a TRUNCATED page lands: the
+                // query honours a server-side limit, and a page that dropped the odd successor
+                // while keeping an even change coin is indistinguishable from a real melt. Only a
+                // COMPLETELY EMPTY page may authorize a delete — truncation cannot manufacture that
+                // from a non-empty result set (it would take a limit of zero, which is never sent).
+                MeltStatus::Unknown
+            };
+        };
+        if successors.next().is_some() {
+            return MeltStatus::Unknown; // ambiguous lineage — never guess which one continues it
         }
+        if !next.spent {
+            return MeltStatus::Live;
+        }
+        current = next.coin.coin_id();
+    }
+    MeltStatus::Unknown
+}
+
+/// A short-lived memo of recent [`MeltStatus`] verdicts, keyed by store.
+///
+/// The walk costs one chain read per generation, and the receive path runs it per inbound
+/// announcement for a held store — so without this, a peer could flood announcements for one held
+/// store and multiply each cheap frame into a full lineage walk (up to ~600 reads for the deepest
+/// store on mainnet). The cache bounds that to one walk per store per [`ttl`](Self::new).
+///
+/// Caching cannot cause a wrongful delete: a stale `Melted` is impossible to act on twice (the
+/// tombstone admits one transition), and a stale `Live`/`Unknown` only DELAYS a real melt by at most
+/// the TTL, which the holder watch re-checks on its next tick.
+pub struct MeltVerdictCache {
+    entries: Mutex<HashMap<[u8; 32], (MeltStatus, Instant)>>,
+    ttl: Duration,
+}
+
+impl MeltVerdictCache {
+    /// A cache whose entries expire after `ttl`.
+    #[must_use]
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// The remembered verdict for `store_id`, if one was recorded within the TTL.
+    fn get(&self, store_id: &[u8; 32], now: Instant) -> Option<MeltStatus> {
+        let entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        entries
+            .get(store_id)
+            .filter(|(_, at)| now.duration_since(*at) < self.ttl)
+            .map(|(status, _)| *status)
+    }
+
+    /// Remember `status` for `store_id` as of `now`.
+    fn put(&self, store_id: [u8; 32], status: MeltStatus, now: Instant) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(store_id, (status, now));
+    }
+}
+
+/// How long a melt verdict is reused before the lineage is walked again.
+const MELT_VERDICT_TTL: Duration = Duration::from_secs(300);
+
+/// Whether store-melt propagation runs at all. Resolved from `DIG_NODE_STORE_MELT`; **default ON** —
+/// only an explicit `off`/`0`/`false`/`no` disables it.
+///
+/// This is the operator's kill switch, and it exists because of what this subsystem does rather than
+/// because anything is known to be wrong with it. It is the only path in the node that DELETES
+/// content in response to chain state, the deletion is irreversible, and it propagates — so a fault
+/// here is correlated across every holder rather than isolated to one node. Its decision function
+/// has already been found unsound twice in review (an `Ok(None)` sentinel read as a melt, then an
+/// attacker-writable hint index read as a terminated lineage), and both times the fix arrived before
+/// release only because someone measured. An operator who suspects a third needs a way to stop the
+/// deleting without downgrading the whole node.
+///
+/// Turning it off is safe and lossless: the node simply keeps content whose store has been melted,
+/// which costs disk. Nothing else in the node depends on melt propagation having run. The strictly
+/// less destructive background-pull leg already carries the same control
+/// (`DIG_NODE_BACKFILL_ON_MISS`); this follows its shape exactly.
+pub fn store_melt_enabled() -> bool {
+    resolve_store_melt_enabled(std::env::var("DIG_NODE_STORE_MELT").ok().as_deref())
+}
+
+/// Pure core of [`store_melt_enabled`], so the policy is unit-tested without touching process-global
+/// env. Default ON; only an explicit falsy value disables it.
+fn resolve_store_melt_enabled(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("off") | Some("0") | Some("false") | Some("no")
+    )
+}
+
+/// The production [`MeltChain`] — [`confirm_melt_via_chain`] over the live coinset view, using the
+/// same client (and the same `DIG_NODE_COINSET` override) as every other chain read in the node,
+/// behind a short-TTL verdict cache so a flood of announcements cannot multiply into lineage walks.
+pub struct CoinsetMeltChain {
+    cache: MeltVerdictCache,
+}
+
+impl Default for CoinsetMeltChain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CoinsetMeltChain {
+    /// The production melt chain, with the standard verdict TTL.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cache: MeltVerdictCache::new(MELT_VERDICT_TTL),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MeltChain for CoinsetMeltChain {
+    async fn confirm_melt(&self, store_id: &[u8; 32]) -> MeltStatus {
+        if let Some(remembered) = self.cache.get(store_id, Instant::now()) {
+            return remembered;
+        }
+        let status =
+            confirm_melt_via_chain(&crate::seams::chia_peer::resolution_coinset(), store_id).await;
+        self.cache.put(*store_id, status, Instant::now());
+        status
     }
 }
 
@@ -345,10 +594,17 @@ impl MeltCache for Arc<crate::Node> {
     }
 
     async fn delete_all_generations(&self, store_id: &[u8; 32]) -> usize {
-        let store_hex = hex::encode(store_id);
         let mut removed = 0;
         for capsule in self.cache_list_cached().await {
-            if capsule.store_id == store_hex
+            // Match on the PARSED 32 bytes, never on the hex TEXT. A capsule id is canonical-hex but
+            // NOT canonical-case — `CapsuleKey::parse` admits and preserves mixed case, so the
+            // directory name can be `Ab..cD` while `hex::encode` here would produce lowercase. A
+            // textual compare therefore matches nothing for such a store while `held_store_ids`
+            // (which decodes, and so is case-insensitive) still reports it held: the node would
+            // tombstone the store, announce a melt of `generations: 0`, and go on serving the
+            // content it just told the network it had deleted. Decoding both sides keeps the
+            // held-check and the delete looking at the same identity.
+            if parse_hex32(&capsule.store_id).as_ref() == Some(store_id)
                 && self
                     .cache_remove_cached(&capsule.store_id, &capsule.root)
                     .await
@@ -385,6 +641,13 @@ fn parse_hex32(hex_str: &str) -> Option<[u8; 32]> {
 /// [`run_holdings_ingest`](super::holdings::run_holdings_ingest): non-221 frames are ignored, a lagged
 /// broadcast channel is tolerated (a missed melt is re-heard from any peer that still holds + hears
 /// it), and the loop performs egress ONLY on a confirmed melt it holds (the rebroadcast-once).
+///
+/// A panic while applying a single frame is CONTAINED via
+/// [`catch_iteration`](crate::shared::catch_iteration) so it cannot unwind out of the spawned task and
+/// silently stop this node from ever ingesting another melt (#2067/#2068). `recv().await` stays at the
+/// top of the loop, so a persistently-panicking source blocks on the next frame rather than
+/// hot-spinning. A caught panic ABANDONS that frame — fail-closed, since every delete is gated behind
+/// the on-chain check that the abandoned iteration never completed.
 pub async fn run_store_melted_ingest(
     mut inbound: tokio::sync::broadcast::Receiver<(PeerId, dig_gossip::Message)>,
     chain: Arc<dyn MeltChain>,
@@ -407,27 +670,47 @@ pub async fn run_store_melted_ingest(
         let Some(announce) = store_melted_payload(&msg) else {
             continue; // not an opcode-221 frame (or an undecodable one)
         };
-        let outcome = process_inbound(
-            &*chain,
-            &*cache,
-            &*broadcaster,
-            &tombstone,
-            Some(sender),
-            &announce,
+        // The guarded body holds no lock across the catch boundary: the tombstone's std `Mutex` is
+        // taken and released inside each `TombstoneSet` call, never held across an await.
+        let _ = crate::shared::catch_iteration(
+            "store_melted_ingest",
+            apply_inbound_melt(&chain, &cache, &broadcaster, &tombstone, sender, &announce),
         )
         .await;
-        if let PropagateOutcome::Propagated {
+    }
+}
+
+/// Apply ONE decoded inbound announcement — the awaited per-frame body of
+/// [`run_store_melted_ingest`], split out so the iteration the loop guards against panic-death is a
+/// standalone, testable unit.
+async fn apply_inbound_melt(
+    chain: &Arc<dyn MeltChain>,
+    cache: &Arc<dyn MeltCache>,
+    broadcaster: &Arc<dyn MeltBroadcast>,
+    tombstone: &TombstoneSet,
+    sender: PeerId,
+    announce: &StoreMeltedAnnounce,
+) {
+    let outcome = process_inbound(
+        &**chain,
+        &**cache,
+        &**broadcaster,
+        tombstone,
+        Some(sender),
+        announce,
+    )
+    .await;
+    if let PropagateOutcome::Propagated {
+        generations,
+        broadcasts,
+    } = outcome
+    {
+        tracing::info!(
+            store = %announce.store_id.to_string(),
             generations,
             broadcasts,
-        } = outcome
-        {
-            tracing::info!(
-                store = %announce.store_id.to_string(),
-                generations,
-                broadcasts,
-                "store-melt: on-chain-confirmed melt — deleted held content and rebroadcast once"
-            );
-        }
+            "store-melt: on-chain-confirmed melt — deleted held content and rebroadcast once"
+        );
     }
 }
 
@@ -605,7 +888,7 @@ mod tests {
         assert!(!tomb.contains(&store(1)));
     }
 
-    /// TEST 3 — a GENUINE melt (held + `Ok(None)` → [`MeltStatus::Melted`]) deletes ALL held
+    /// TEST 3 — a GENUINE melt (held + a chain-confirmed [`MeltStatus::Melted`]) deletes ALL held
     /// generations, tombstones the store, and rebroadcasts EXACTLY once (excluding the sender).
     /// Catches: no-delete, delete-without-rebroadcast, or rebroadcast-twice.
     #[tokio::test]
@@ -838,5 +1121,747 @@ mod tests {
         assert!(tomb.insert(store(7)), "first insert is the transition");
         assert!(tomb.contains(&store(7)));
         assert!(!tomb.insert(store(7)), "re-insert never re-admits");
+    }
+
+    // -- The PRODUCTION melt signal: `confirm_melt_via_chain` over a real `ChainReads` ------------
+    //
+    // The eight cases above drive a scripted `ChainSpy`, so they prove the POLICY but say nothing
+    // about the chain-fact -> `MeltStatus` mapping — the link that has now shipped unsound TWICE
+    // (`anchored_root() == Ok(None)` read as a melt; then an attacker-writable hint index read as a
+    // terminated lineage). These drive the REAL `ChainReads` trait with a crafted lineage.
+
+    use chia_protocol::{Bytes32 as ChiaBytes32, Coin, CoinSpend, SpendBundle};
+    use digstore_chain::coinset::{CoinInfo, CoinRecord};
+    use digstore_chain::error::{ChainError, Result as ChainResult};
+
+    /// How the mock answers one read: a value, or a transport failure.
+    enum Answer<T> {
+        Ok(T),
+        Unreachable,
+    }
+
+    /// Whether a crafted lineage ends in a melt or carries a live tip.
+    enum Lineage {
+        Terminated,
+        LiveTip,
+    }
+
+    /// A chain holding ONE crafted singleton lineage, addressed by coin parentage.
+    ///
+    /// Only the two reads the gate performs are modelled; every other `ChainReads` method panics, so
+    /// the gate cannot silently grow a chain dependency this test cannot see. In particular BOTH
+    /// hint queries panic — the gate must never consult an attacker-writable index again.
+    struct MockChain {
+        launcher: Answer<Option<CoinInfo>>,
+        /// parent coin id -> that coin's children.
+        children: HashMap<[u8; 32], Vec<CoinRecord>>,
+        /// A parent id whose children query fails, modelling a mid-walk outage.
+        unreachable_at: Option<[u8; 32]>,
+        /// When set, EVERY coin has one spent odd child, so the lineage never ends. Only the hop
+        /// ceiling can stop a walk over this chain.
+        endless: bool,
+        parent_queries: AtomicUsize,
+    }
+
+    /// A coin record with an explicit parent + amount, so a real parentage chain can be built.
+    fn coin_rec(parent: [u8; 32], amount: u64, spent: bool) -> CoinRecord {
+        CoinInfo {
+            coin: Coin::new(
+                ChiaBytes32::new(parent),
+                ChiaBytes32::new([0xC0; 32]),
+                amount,
+            ),
+            spent,
+            confirmed_block_index: 10,
+            spent_block_index: if spent { 11 } else { 0 },
+            timestamp: 0,
+            coinbase: false,
+        }
+    }
+
+    fn id_of(rec: &CoinRecord) -> [u8; 32] {
+        rec.coin.coin_id().into()
+    }
+
+    impl MockChain {
+        /// A launcher record (its own parentage is irrelevant; only `spent` is read).
+        fn launcher_coin(spent: bool) -> CoinInfo {
+            coin_rec([0xAA; 32], 1, spent)
+        }
+
+        /// A minted store (launcher spent) whose lineage runs `generations` singleton hops.
+        ///
+        /// `Lineage::Terminated` models a melt: the last generation is spent and created no
+        /// successor. `Lineage::LiveTip` models a live store: the last generation is unspent.
+        fn minted(store_id: [u8; 32], generations: usize, tip: Lineage) -> Self {
+            let mut children: HashMap<[u8; 32], Vec<CoinRecord>> = HashMap::new();
+            let mut parent = store_id;
+            for gen in 0..generations {
+                let last = gen + 1 == generations;
+                let spent = !(last && matches!(tip, Lineage::LiveTip));
+                let rec = coin_rec(parent, 1, spent);
+                let id = id_of(&rec);
+                children.insert(parent, vec![rec]);
+                parent = id;
+            }
+            // The final coin has no recorded children: for `Terminated` that IS the melt; for
+            // `LiveTip` the walk stops at the unspent coin before ever asking.
+            children.entry(parent).or_default();
+            Self {
+                launcher: Answer::Ok(Some(Self::launcher_coin(true))),
+                children,
+                unreachable_at: None,
+                endless: false,
+                parent_queries: AtomicUsize::new(0),
+            }
+        }
+
+        /// A minted store whose lineage NEVER ends: every coin has one spent odd successor.
+        fn endless_lineage() -> Self {
+            let mut chain = Self::minted(store(0), 1, Lineage::LiveTip);
+            chain.endless = true;
+            chain
+        }
+
+        fn with_launcher(mut self, launcher: Answer<Option<CoinInfo>>) -> Self {
+            self.launcher = launcher;
+            self
+        }
+
+        /// The coin the walk is standing on after `hop` steps (0 = the launcher itself).
+        fn coin_at_hop(&self, store_id: [u8; 32], hop: usize) -> [u8; 32] {
+            let mut parent = store_id;
+            for _ in 0..hop {
+                parent = id_of(&self.children[&parent][0]);
+            }
+            parent
+        }
+
+        /// Replace the children at the `hop`th step with coins CORRECTLY parented to that coin,
+        /// given as `(amount, spent)`. Taking amounts rather than whole records is deliberate: a
+        /// hand-built record is easy to parent to the wrong coin, which would make a test pass via
+        /// the parentage filter while appearing to exercise something else.
+        fn with_children_at_hop(
+            mut self,
+            store_id: [u8; 32],
+            hop: usize,
+            kids: Vec<(u64, bool)>,
+        ) -> Self {
+            let parent = self.coin_at_hop(store_id, hop);
+            self.children.insert(
+                parent,
+                kids.into_iter()
+                    .map(|(amount, spent)| coin_rec(parent, amount, spent))
+                    .collect(),
+            );
+            self
+        }
+
+        /// Replace the children at the `hop`th step with coins parented to SOMETHING ELSE — coins the
+        /// query returned but that are not actually children of the walked coin.
+        fn with_foreign_children_at_hop(
+            mut self,
+            store_id: [u8; 32],
+            hop: usize,
+            kids: Vec<CoinRecord>,
+        ) -> Self {
+            let parent = self.coin_at_hop(store_id, hop);
+            self.children.insert(parent, kids);
+            self
+        }
+
+        fn unreachable_children(mut self, parent: [u8; 32]) -> Self {
+            self.unreachable_at = Some(parent);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChainReads for MockChain {
+        async fn coin_record(&self, _name: ChiaBytes32) -> ChainResult<Option<CoinInfo>> {
+            match &self.launcher {
+                Answer::Ok(rec) => Ok(rec.clone()),
+                Answer::Unreachable => Err(ChainError::Chain("coinset unreachable".into())),
+            }
+        }
+
+        async fn coin_records_by_parent_ids(
+            &self,
+            parent_ids: &[ChiaBytes32],
+            include_spent: bool,
+        ) -> ChainResult<Vec<CoinRecord>> {
+            assert!(
+                include_spent,
+                "the walk must see SPENT generations or it cannot follow the lineage at all"
+            );
+            assert_eq!(parent_ids.len(), 1, "the walk follows one coin at a time");
+            self.parent_queries.fetch_add(1, Ordering::SeqCst);
+            let parent: [u8; 32] = parent_ids[0].into();
+            if self.unreachable_at == Some(parent) {
+                return Err(ChainError::Chain("coinset unreachable".into()));
+            }
+            if self.endless {
+                // Every coin bears one spent odd successor, whose id differs from its parent's, so
+                // the walk always has somewhere to go and only the hop ceiling can end it.
+                return Ok(vec![coin_rec(parent, 1, true)]);
+            }
+            Ok(self.children.get(&parent).cloned().unwrap_or_default())
+        }
+
+        async fn coin_records_by_hint(
+            &self,
+            _hint: ChiaBytes32,
+            _include_spent: bool,
+        ) -> ChainResult<Vec<CoinRecord>> {
+            unreachable!("the melt gate must NEVER consult the attacker-writable hint index")
+        }
+        async fn unspent_coins_by_hint(&self, _hint: ChiaBytes32) -> ChainResult<Vec<Coin>> {
+            unreachable!("the melt gate must NEVER consult the attacker-writable hint index")
+        }
+        async fn unspent_coins(&self, _ph: ChiaBytes32) -> ChainResult<Vec<Coin>> {
+            unimplemented!("the melt gate must not read coins by puzzle hash")
+        }
+        async fn coin_records_by_puzzle_hash(
+            &self,
+            _ph: ChiaBytes32,
+            _include_spent: bool,
+        ) -> ChainResult<Vec<CoinRecord>> {
+            unimplemented!("the melt gate must not read coin records by puzzle hash")
+        }
+        async fn coin_spend(
+            &self,
+            _coin_id: ChiaBytes32,
+            _spent_height: u32,
+        ) -> ChainResult<Option<CoinSpend>> {
+            unimplemented!("the melt gate must not parse spends (#747-immunity)")
+        }
+        async fn peak_height(&self) -> ChainResult<u32> {
+            unimplemented!("the melt gate must not read the peak")
+        }
+        async fn push(&self, _bundle: SpendBundle) -> ChainResult<()> {
+            unimplemented!("the melt gate is read-only")
+        }
+        async fn estimate_fee(&self, _bundle: &SpendBundle, _target: u64) -> ChainResult<u64> {
+            unimplemented!("the melt gate is read-only")
+        }
+    }
+
+    /// CHAIN-1 — a GENUINE melt: the launcher is spent and the lineage runs to a spent generation
+    /// with no successor. Mirrors the ONE terminated store on mainnet (`cee3e2b0…`), which ends at
+    /// hop 1. This is the only shape that authorizes a delete.
+    #[tokio::test]
+    async fn a_lineage_that_terminates_is_melted() {
+        let chain = MockChain::minted(store(1), 2, Lineage::Terminated);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Melted
+        );
+    }
+
+    /// CHAIN-2 — a LIVE store: the walk reaches an UNSPENT successor. Covers the shape 52 of the 53
+    /// mainnet stores have, including the 29 whose tip is one hop from the launcher.
+    ///
+    /// The deep case is **599** — the deepest live lineage measured on mainnet — not a token 60. A
+    /// floor below the real maximum would let the ceiling be cut to a value that cannot resolve a
+    /// store that actually exists while the suite stayed green.
+    #[tokio::test]
+    async fn a_lineage_with_an_unspent_tip_is_live() {
+        for generations in [1usize, 2, 7, 599] {
+            let chain = MockChain::minted(store(1), generations, Lineage::LiveTip);
+            assert_eq!(
+                confirm_melt_via_chain(&chain, &store(1)).await,
+                MeltStatus::Live,
+                "an unspent tip {generations} hops down is a live store"
+            );
+        }
+    }
+
+    /// CHAIN-3 — the hint index is not merely unused, it is UNREACHABLE. 30 of 53 live mainnet
+    /// stores have an EMPTY `store_id` hint index, so one planted spent coin under that hint made
+    /// the previous gate see "non-empty, all spent" and delete a LIVE store for the price of dust.
+    /// The mock panics if either hint query is called, so any gate that reads hints fails outright.
+    #[tokio::test]
+    async fn the_gate_never_consults_a_hint_index() {
+        let chain = MockChain::minted(store(1), 1, Lineage::LiveTip);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Live
+        );
+    }
+
+    /// CHAIN-4 — the composition the gate called out as untested and lethal: an honest store with an
+    /// EMPTY hint index PLUS one planted spent coin. Under parentage that is simply a live store —
+    /// the planted coin is not a child of any generation, because creating one would require
+    /// spending a generation, which needs the owner's key. Asserts `Live`, and that the verdict cost
+    /// exactly ONE parentage read rather than being influenced by the plant.
+    #[tokio::test]
+    async fn empty_hint_index_plus_a_planted_spent_coin_is_still_live() {
+        let store_id = store(0x42);
+        // The honest lineage: launcher -> one unspent tip. Nothing is hinted anywhere.
+        let mut chain = MockChain::minted(store_id, 1, Lineage::LiveTip);
+        // The attacker's coin: spent, amount 1, but parented to a coin THEY own — not to any
+        // generation of this store. It is therefore invisible to the walk.
+        chain
+            .children
+            .insert([0xEE; 32], vec![coin_rec([0xEE; 32], 1, true)]);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store_id).await,
+            MeltStatus::Live,
+            "an empty hint index plus a planted spent coin must NOT read as a terminated lineage"
+        );
+        assert_eq!(chain.parent_queries.load(Ordering::SeqCst), 1);
+    }
+
+    /// CHAIN-5 — an UNSPENT launcher means "not minted yet", NOT melted, and the walk never starts.
+    /// This is the regression from the first unsound cut, which deleted on exactly this state.
+    #[tokio::test]
+    async fn unspent_launcher_is_not_minted_never_melted() {
+        let chain = MockChain::minted(store(1), 2, Lineage::Terminated)
+            .with_launcher(Answer::Ok(Some(MockChain::launcher_coin(false))));
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Live
+        );
+        assert_eq!(
+            chain.parent_queries.load(Ordering::SeqCst),
+            0,
+            "the launcher fact settles it; the lineage is never walked"
+        );
+    }
+
+    /// CHAIN-6 — hop-0 emptiness is NOT a melt. A minted launcher always created the eve singleton,
+    /// so no children at the first hop means the answer is untrustworthy — a non-datastore launcher,
+    /// or a `ChainReads` whose `coin_records_by_parent_ids` is the trait's empty DEFAULT impl. That
+    /// default would otherwise turn every store into an instant `Melted`.
+    #[tokio::test]
+    async fn no_children_at_the_launcher_is_unknown_not_melted() {
+        let chain = MockChain::minted(store(1), 1, Lineage::LiveTip).with_children_at_hop(
+            store(1),
+            0,
+            vec![],
+        );
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Unknown,
+            "an empty first hop must never authorize an irreversible delete"
+        );
+    }
+
+    /// CHAIN-7 — an EVEN-amount child is not a singleton successor, but neither is it evidence of a
+    /// melt. This is where a TRUNCATED page lands: `coin_records_by_parent_ids` honours a
+    /// server-side limit, and a page that kept an even change coin while dropping the odd successor
+    /// is indistinguishable from a terminated lineage. Only a COMPLETELY EMPTY page may delete, so
+    /// this must be `Unknown`.
+    ///
+    /// The sibling hint query was measured truncating 349 records (243 unspent) to a page of 5 with
+    /// zero unspent — spent records first — so this hazard is real, not theoretical.
+    #[tokio::test]
+    async fn a_page_with_children_but_no_singleton_is_unknown_not_melted() {
+        let store_id = store(3);
+        let chain = MockChain::minted(store_id, 2, Lineage::Terminated).with_children_at_hop(
+            store_id,
+            1,
+            vec![(2, false)],
+        );
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store_id).await,
+            MeltStatus::Unknown,
+            "a non-empty page without a singleton may be a truncated page — never delete on it"
+        );
+    }
+
+    /// CHAIN-15 — a coin the query returned that is NOT actually parented to the walked coin is
+    /// ignored. The soundness argument is that `parent_coin_info` is fixed by which coin was spent to
+    /// create it; taking the server's word for membership of a "children of X" page would hand that
+    /// argument straight back to whatever answered the query. A page of foreign coins is `Unknown`
+    /// (non-empty, no successor) — never a melt.
+    #[tokio::test]
+    async fn a_child_not_parented_to_the_walked_coin_is_ignored() {
+        let store_id = store(7);
+        let chain = MockChain::minted(store_id, 2, Lineage::Terminated)
+            // Spent, odd, superficially a perfect successor — but parented elsewhere.
+            .with_foreign_children_at_hop(store_id, 1, vec![coin_rec([0xF0; 32], 1, true)]);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store_id).await,
+            MeltStatus::Unknown,
+            "a foreign coin must never be walked as if it continued the lineage"
+        );
+    }
+
+    /// CHAIN-16 — a foreign coin sitting BESIDE the genuine successor must not divert the walk: the
+    /// real child is still followed and the lineage still resolves `Live`. With CHAIN-15 this pins
+    /// the parentage filter in both directions — exclude impostors without discarding the true
+    /// successor (a filter that dropped everything would make CHAIN-15 pass for the wrong reason).
+    #[tokio::test]
+    async fn a_foreign_coin_beside_the_real_successor_does_not_divert_the_walk() {
+        let store_id = store(8);
+        let mut chain = MockChain::minted(store_id, 2, Lineage::LiveTip);
+        let real = chain.children[&store_id][0].clone();
+        chain
+            .children
+            .insert(store_id, vec![coin_rec([0xF0; 32], 1, true), real]);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store_id).await,
+            MeltStatus::Live,
+            "the genuine successor must still be followed past an impostor"
+        );
+    }
+
+    /// CHAIN-13 — the planted-coin composition in its DANGEROUS form. CHAIN-4 covers a planted coin
+    /// beside a lineage we can fully resolve as live; this covers one beside a lineage we CANNOT
+    /// resolve (the chain fails mid-walk). The verdict must be `Unknown` — the planted coin must
+    /// never supply the evidence the honest lineage failed to.
+    #[tokio::test]
+    async fn a_planted_coin_beside_an_unresolvable_lineage_is_unknown() {
+        let store_id = store(0x43);
+        let mut chain =
+            MockChain::minted(store_id, 3, Lineage::LiveTip).unreachable_children(store_id);
+        // The attacker's spent coin, parented to a coin they own — never to a generation of S.
+        chain
+            .children
+            .insert([0xEE; 32], vec![coin_rec([0xEE; 32], 1, true)]);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store_id).await,
+            MeltStatus::Unknown,
+            "an unresolvable lineage plus a planted coin must resolve Unknown, never Melted"
+        );
+    }
+
+    /// CHAIN-8 — two odd children is ambiguous and must never be resolved by guessing which one
+    /// continues the lineage. Fail closed.
+    #[tokio::test]
+    async fn an_ambiguous_fork_is_unknown() {
+        let store_id = store(4);
+        // Both are genuinely parented to the walked coin, so the fork is real rather than an
+        // artefact of the parentage filter dropping one of them.
+        let chain = MockChain::minted(store_id, 2, Lineage::Terminated).with_children_at_hop(
+            store_id,
+            1,
+            vec![(1, true), (3, true)],
+        );
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store_id).await,
+            MeltStatus::Unknown
+        );
+    }
+
+    /// CHAIN-9 — a transport failure on the launcher read is fail-closed; the walk never starts.
+    #[tokio::test]
+    async fn unreachable_chain_on_the_launcher_read_is_unknown() {
+        let chain =
+            MockChain::minted(store(1), 2, Lineage::Terminated).with_launcher(Answer::Unreachable);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Unknown
+        );
+        assert_eq!(chain.parent_queries.load(Ordering::SeqCst), 0);
+    }
+
+    /// CHAIN-10 — a transport failure MID-WALK is fail-closed. An outage part-way down the lineage
+    /// must not read as "the lineage ended here"; that collapse is how a transient coinset failure
+    /// would become a correlated, network-wide deletion.
+    #[tokio::test]
+    async fn unreachable_chain_mid_walk_is_unknown() {
+        let store_id = store(5);
+        let chain = MockChain::minted(store_id, 3, Lineage::LiveTip).unreachable_children(store_id);
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store_id).await,
+            MeltStatus::Unknown
+        );
+    }
+
+    /// CHAIN-11 — an absent launcher coin: nothing was minted under this identity, so nothing can
+    /// have melted.
+    #[tokio::test]
+    async fn absent_launcher_coin_is_unknown() {
+        let chain =
+            MockChain::minted(store(1), 2, Lineage::Terminated).with_launcher(Answer::Ok(None));
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(1)).await,
+            MeltStatus::Unknown
+        );
+        assert_eq!(chain.parent_queries.load(Ordering::SeqCst), 0);
+    }
+
+    /// CHAIN-12 — the walk is BOUNDED against a lineage that never ends, and exhausting the ceiling
+    /// is `Unknown`, never a melt.
+    ///
+    /// Asserts a LITERAL, not `MAX_LINEAGE_HOPS`. Comparing the observed read count against the same
+    /// constant the code uses puts the symbol on both sides, so the assertion moves with the value:
+    /// cutting the ceiling to 100 kept this green while silently making the walk unable to resolve
+    /// the 599-generation store that exists on mainnet. Only a literal pins the number in force.
+    #[tokio::test]
+    async fn an_endless_lineage_fails_closed_at_exactly_ten_thousand_hops() {
+        let chain = MockChain::endless_lineage();
+        assert_eq!(
+            confirm_melt_via_chain(&chain, &store(0)).await,
+            MeltStatus::Unknown,
+            "exhausting the hop ceiling must fail closed, never conclude a melt"
+        );
+        assert_eq!(
+            chain.parent_queries.load(Ordering::SeqCst),
+            10_000,
+            "the ceiling in force must be exactly 10_000 hops"
+        );
+    }
+
+    /// CACHE-1 — a repeated verdict for the same store is served from memory, so a flood of
+    /// announcements for one held store cannot multiply into repeated lineage walks.
+    #[test]
+    fn the_verdict_cache_serves_a_repeat_within_its_ttl() {
+        let cache = MeltVerdictCache::new(Duration::from_secs(300));
+        let now = Instant::now();
+        assert_eq!(cache.get(&store(1), now), None, "cold cache has no verdict");
+        cache.put(store(1), MeltStatus::Live, now);
+        assert_eq!(cache.get(&store(1), now), Some(MeltStatus::Live));
+    }
+
+    /// CACHE-2 — an expired verdict is NOT served, so a real melt is delayed by at most the TTL.
+    #[test]
+    fn the_verdict_cache_expires() {
+        let ttl = Duration::from_secs(300);
+        let cache = MeltVerdictCache::new(ttl);
+        let now = Instant::now();
+        cache.put(store(1), MeltStatus::Live, now);
+        let later = now + ttl + Duration::from_secs(1);
+        assert_eq!(
+            cache.get(&store(1), later),
+            None,
+            "an expired verdict must force a fresh walk"
+        );
+    }
+
+    // -- The REAL `MeltCache`: the only code here that actually unlinks files ---------------------
+    //
+    // Every case above drives `CacheSpy`, so none of them touch `MeltCache for Arc<Node>` — the impl
+    // that does the deleting. Inverting its match (`==` -> `!=`, i.e. delete every OTHER store) left
+    // the whole suite green. These drive the real impl against a real cache directory.
+
+    /// Write a cached capsule at `<cache>/modules/<store_hex>/<root_hex>.dig`, verbatim — `store_hex`
+    /// is used exactly as given so a MIXED-CASE directory can be modelled.
+    fn write_cached_capsule(cache_dir: &std::path::Path, store_hex: &str, root_hex: &str) {
+        let dir = cache_dir.join("modules").join(store_hex);
+        std::fs::create_dir_all(&dir).expect("create store dir");
+        std::fs::write(dir.join(format!("{root_hex}.dig")), b"capsule").expect("write capsule");
+    }
+
+    /// REAL-1 — the real `MeltCache` deletes the named store's generations and NOTHING else.
+    ///
+    /// Catches an inverted match: with `==` flipped to `!=` the node would unlink every OTHER store
+    /// in the cache and leave the melted one in place, which no `CacheSpy` test can see.
+    #[tokio::test]
+    async fn the_real_cache_deletes_only_the_named_store() {
+        let (node, td) = crate::test_support::test_node_for_peer_surface();
+        let target = "aa".repeat(32);
+        let bystander = "bb".repeat(32);
+        write_cached_capsule(td.path(), &target, &"11".repeat(32));
+        write_cached_capsule(td.path(), &target, &"22".repeat(32));
+        write_cached_capsule(td.path(), &bystander, &"33".repeat(32));
+
+        let target_id = parse_hex32(&target).expect("64-hex");
+        let cache: &dyn MeltCache = &node;
+
+        assert!(
+            cache.held_store_ids().await.contains(&target_id),
+            "precondition: the store is held"
+        );
+        assert_eq!(
+            cache.delete_all_generations(&target_id).await,
+            2,
+            "both generations of the target are unlinked"
+        );
+        let held_after = cache.held_store_ids().await;
+        assert!(!held_after.contains(&target_id), "the target is gone");
+        assert!(
+            held_after.contains(&parse_hex32(&bystander).expect("64-hex")),
+            "a bystander store MUST survive — an inverted match would delete it instead"
+        );
+    }
+
+    /// REAL-2 — a MIXED-CASE store directory is deleted, not silently skipped.
+    ///
+    /// `CapsuleKey::parse` admits and preserves mixed case (`is_canonical_hex_id` accepts any ASCII
+    /// hex digit, with its own test asserting `Ab..cD` parses), so a mixed-case cache directory is
+    /// reachable. `held_store_ids` DECODES the hex and so is case-insensitive; a delete that compared
+    /// the hex TEXT against `hex::encode` (always lowercase) matched nothing. The node would then
+    /// tombstone the store, broadcast a melt of `generations: 0`, and keep serving the content it had
+    /// just announced as deleted — a melt reported but not performed.
+    #[tokio::test]
+    async fn the_real_cache_deletes_a_mixed_case_store_directory() {
+        let (node, td) = crate::test_support::test_node_for_peer_surface();
+        let mixed = format!("{}{}", "Ab".repeat(16), "cD".repeat(16));
+        write_cached_capsule(td.path(), &mixed, &"44".repeat(32));
+
+        let store_id = parse_hex32(&mixed).expect("mixed-case hex still decodes");
+        let cache: &dyn MeltCache = &node;
+
+        assert!(
+            cache.held_store_ids().await.contains(&store_id),
+            "the held-check decodes, so it already sees a mixed-case store"
+        );
+        assert_eq!(
+            cache.delete_all_generations(&store_id).await,
+            1,
+            "the delete must match the same identity the held-check matched, not the hex casing"
+        );
+        assert!(
+            !cache.held_store_ids().await.contains(&store_id),
+            "the store is really gone from disk"
+        );
+    }
+
+    /// REAL-3 — deleting a store this node does not hold unlinks nothing and reports zero.
+    #[tokio::test]
+    async fn the_real_cache_deletes_nothing_for_an_unheld_store() {
+        let (node, td) = crate::test_support::test_node_for_peer_surface();
+        write_cached_capsule(td.path(), &"cc".repeat(32), &"55".repeat(32));
+        let cache: &dyn MeltCache = &node;
+
+        assert_eq!(cache.delete_all_generations(&store(0x7E)).await, 0);
+        assert_eq!(
+            cache.held_store_ids().await.len(),
+            1,
+            "the unrelated store is untouched"
+        );
+    }
+
+    /// CAS-1 — the tombstone CAS admits exactly ONE winner under REAL concurrency.
+    ///
+    /// `convergence_terminates_at_holder_count` drives receipts sequentially, so gate 2 catches the
+    /// echo and the CAS is never actually under test — dropping the CAS entirely left that test
+    /// green. Concurrency is real here (the ingest task and the holder tick share one `TombstoneSet`),
+    /// and the consequence of losing the CAS is a double broadcast. This races many threads on one
+    /// store and asserts a single winner.
+    #[test]
+    fn the_tombstone_cas_admits_one_winner_under_contention() {
+        let tomb = TombstoneSet::new();
+        let winners = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let tomb = tomb.clone();
+                let winners = Arc::clone(&winners);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait(); // maximise the overlap on the insert
+                    if tomb.insert(store(0x9C)) {
+                        winners.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread");
+        }
+
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one racer may take the holding->deleted transition, or the melt double-broadcasts"
+        );
+    }
+
+    /// KILL-1 — the operator kill switch defaults ON and is turned off ONLY by an explicit falsy
+    /// value, matching `DIG_NODE_BACKFILL_ON_MISS` exactly. Tested through the pure core so it never
+    /// touches process-global env.
+    #[test]
+    fn the_kill_switch_defaults_on_and_honours_explicit_off() {
+        assert!(resolve_store_melt_enabled(None), "absent means ON");
+        assert!(
+            resolve_store_melt_enabled(Some("")),
+            "empty is not a disable"
+        );
+        for on in ["on", "1", "true", "yes", "anything-else"] {
+            assert!(
+                resolve_store_melt_enabled(Some(on)),
+                "{on} must leave melt ON"
+            );
+        }
+        for off in ["off", "0", "false", "no", "OFF", " Off ", "FALSE"] {
+            assert!(
+                !resolve_store_melt_enabled(Some(off)),
+                "{off} must disable melt propagation"
+            );
+        }
+    }
+
+    /// CAS-2 — the tombstone CAS in `process_inbound` (gate 4) admits ONE transition when two
+    /// receipts genuinely race past gate 2.
+    ///
+    /// `convergence_terminates_at_holder_count` drives receipts SEQUENTIALLY, so gate 2 always
+    /// catches the echo and gate 4 is never under test — deleting the CAS entirely left that test
+    /// green while the doc above it claimed concurrency protection. The race is real: the ingest task
+    /// and the holder watch share one `TombstoneSet`.
+    ///
+    /// The race is made DETERMINISTIC rather than hoped for: the chain spy holds both callers at a
+    /// barrier inside `confirm_melt`, so both are guaranteed to have passed gate 2 (the
+    /// `contains` check) before either reaches gate 4. Without the CAS both would then delete and
+    /// broadcast; with it, exactly one does.
+    struct BarrierChainSpy {
+        gate: tokio::sync::Barrier,
+    }
+    #[async_trait::async_trait]
+    impl MeltChain for BarrierChainSpy {
+        async fn confirm_melt(&self, _store_id: &[u8; 32]) -> MeltStatus {
+            self.gate.wait().await;
+            MeltStatus::Melted
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_receipts_broadcast_exactly_once() {
+        let chain = Arc::new(BarrierChainSpy {
+            gate: tokio::sync::Barrier::new(2),
+        });
+        let cache = Arc::new(CacheSpy::holding(&[store(1)], 3));
+        let bc = Arc::new(BroadcastSpy::default());
+        let tomb = TombstoneSet::new();
+        let announce = announce_for(store(1));
+
+        let one = {
+            let (chain, cache, bc, tomb, announce) = (
+                Arc::clone(&chain),
+                Arc::clone(&cache),
+                Arc::clone(&bc),
+                tomb.clone(),
+                announce.clone(),
+            );
+            tokio::spawn(async move {
+                process_inbound(&*chain, &*cache, &*bc, &tomb, None, &announce).await
+            })
+        };
+        let two = {
+            let (chain, cache, bc, tomb, announce) = (
+                Arc::clone(&chain),
+                Arc::clone(&cache),
+                Arc::clone(&bc),
+                tomb.clone(),
+                announce.clone(),
+            );
+            tokio::spawn(async move {
+                process_inbound(&*chain, &*cache, &*bc, &tomb, None, &announce).await
+            })
+        };
+        let outcomes = [one.await.expect("task"), two.await.expect("task")];
+
+        let propagated = outcomes
+            .iter()
+            .filter(|o| matches!(o, PropagateOutcome::Propagated { .. }))
+            .count();
+        assert_eq!(
+            propagated, 1,
+            "exactly one racing receipt may take the holding->deleted transition"
+        );
+        assert_eq!(
+            bc.sent.lock().unwrap().len(),
+            1,
+            "a lost CAS means the melt is broadcast twice from one node"
+        );
+        assert_eq!(
+            cache.deleted.lock().unwrap().len(),
+            1,
+            "and the delete is attempted twice"
+        );
     }
 }
