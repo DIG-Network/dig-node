@@ -551,32 +551,24 @@ pub fn spawn_tier0_precache(runtime: Tier0Runtime) -> bool {
 /// Drive one tier-0 round to completion, CATCHING a panic so the precache loop survives it (#2044).
 ///
 /// A panic inside [`run_round`] would otherwise unwind out of the spawned task and stop precache for
-/// the rest of the process (the node stays up, but the flywheel dies silently until restart). We wrap
-/// the round future in [`catch_unwind`](std::panic::catch_unwind's async cousin) and turn a caught
-/// panic into `None` + a bounded WARNING, so the caller simply skips to the next tick.
+/// the rest of the process (the node stays up, but the flywheel dies silently until restart). This
+/// delegates to the shared [`catch_iteration`](crate::shared::catch_iteration) combinator (#2067) —
+/// the ONE place the unwind machinery lives — turning a caught panic into `None` + a bounded WARNING
+/// so the caller simply skips to the next tick.
 ///
-/// [`AssertUnwindSafe`] is sound here: `run_round`'s only `&mut` state — the `SplitMix64` rng and the
-/// [`RoundRateLimiter`] — are plain value types holding no lock and no across-await guard, so a panic
-/// mid-round leaves them in a valid (if partially advanced) state that the next round uses safely.
+/// [`AssertUnwindSafe`](std::panic::AssertUnwindSafe) (inside the combinator) is sound here:
+/// `run_round`'s only `&mut` state — the `SplitMix64` rng and the [`RoundRateLimiter`] — are plain
+/// value types holding no lock and no across-await guard, so a panic mid-round leaves them in a valid
+/// (if partially advanced) state that the next round uses safely.
 ///
-/// Returns `Some(outcome)` on a completed round (the catch is fully transparent on the happy path) and
-/// `None` when the round panicked and was contained.
-async fn run_round_catching<F>(round: F, tick: u64) -> Option<RoundOutcome>
+/// `tick` is unused for the log (the combinator logs a stable loop name) but kept in the signature so
+/// the loop site reads self-documentingly; returns `Some(outcome)` on a completed round and `None`
+/// when the round panicked and was contained.
+async fn run_round_catching<F>(round: F, _tick: u64) -> Option<RoundOutcome>
 where
     F: std::future::Future<Output = RoundOutcome>,
 {
-    use futures::FutureExt;
-    match std::panic::AssertUnwindSafe(round).catch_unwind().await {
-        Ok(outcome) => Some(outcome),
-        Err(_payload) => {
-            // Fixed-shape message only — never the panic payload (log-hygiene, #1603).
-            tracing::warn!(
-                tick,
-                "tier-0 precache round panicked; continuing to next round"
-            );
-            None
-        }
-    }
+    crate::shared::catch_iteration("tier0_precache", round).await
 }
 
 #[cfg(test)]

@@ -421,11 +421,17 @@ async fn write_pex<W: AsyncWrite + Unpin>(w: &mut W, msg: &PexMessage) -> std::i
 
 /// Drive [`PexEngineHandle::tick`] forever at [`TICK_PERIOD`] (~1/s), so due `pex_delta`s flow on each
 /// link (SPEC §6.1). Spawn it once per node; it never returns.
+///
+/// A panic inside a single tick is CONTAINED via [`catch_iteration`](crate::shared::catch_iteration)
+/// so it cannot unwind out of the spawned task and silently stop PEX delta flow for the rest of the
+/// process (#2067). The loop carries only the `engine` handle (its own locks are taken + released
+/// INSIDE `tick`, never held across the catch boundary), so asserting the tick's unwind-safety is
+/// sound; the next tick simply resumes the schedule.
 pub async fn run_tick_loop(engine: PexEngineHandle) {
     let mut ticker = tokio::time::interval(TICK_PERIOD);
     loop {
         ticker.tick().await;
-        engine.tick(now_ms()).await;
+        let _ = crate::shared::catch_iteration("pex_tick", engine.tick(now_ms())).await;
     }
 }
 

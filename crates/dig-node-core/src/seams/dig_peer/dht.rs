@@ -603,16 +603,24 @@ pub async fn run_maintenance(handle: Arc<DhtHandle>, interval: Duration) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let dht = &handle.service;
-        let republished = dht.republish().await;
-        let refreshed = dht.refresh_buckets().await;
-        let collected = dht.gc().await;
-        tracing::debug!(
-            republished,
-            refreshed,
-            collected,
-            "dig-node DHT maintenance tick"
-        );
+        // A panic inside a single maintenance tick is CONTAINED (#2067) so it cannot unwind out of the
+        // spawned task and silently stop republish/refresh/gc — letting the node's provider records
+        // lapse — for the rest of the process. The tick carries only the `handle` (its service's own
+        // locks are taken + released inside each awaited call, never across the catch boundary), so
+        // asserting its unwind-safety is sound; the next tick resumes the schedule.
+        let _ = crate::shared::catch_iteration("dht_maintenance", async {
+            let dht = &handle.service;
+            let republished = dht.republish().await;
+            let refreshed = dht.refresh_buckets().await;
+            let collected = dht.gc().await;
+            tracing::debug!(
+                republished,
+                refreshed,
+                collected,
+                "dig-node DHT maintenance tick"
+            );
+        })
+        .await;
     }
 }
 
