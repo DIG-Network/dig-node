@@ -58,6 +58,7 @@ pub mod relevance;
 /// every existing `crate::net`/`crate::pex`/… reference working unchanged (W1b-0 is a pure
 /// relocation — no behaviour change, no caller updates required).
 pub mod seams;
+pub mod tier0_live;
 pub mod tier0_prefetch;
 pub mod tier0_selector;
 /// The `CapsuleStore` trait is seam 6's public surface (#1285 W1b-4) — bring it into scope to call
