@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.79.0] - 2026-08-03
+
+### Features
+- Dig-node chat subsystem — chat message types + chat.* RPC over dig-message/dig-gossip (#133)- **node:** Control.wallet.balance read (#1851)- **dig-node:** Pure relevance() + tier model + eviction precedence (#150)- **dig-node:** Tier-0 knapsack selector + sub-budget + hysteresis (#152)- **dig-node:** DHT candidate sampling + anti-Sybil quorum reconciliation (#153)- **dig-node:** Tier-1 inbound-demand cache trigger (#154)
+
+### Bug Fixes
+- **peer:** Enforce the #30 egress budget on the module-range serve path (#137)- **sync:** Bind a synced capsule to its chain-anchored root before it lands (#138)- **cache:** Unify the cached-capsule artifact on .dig (#139)- **cache:** Gate capsule landing on request provenance, not loopback (#141)- **cache:** Collapse the double whole-capsule pull into one shared single-flight gate (#142)- **wallet:** Rate-bound the open control.wallet.balance coinset fallback (#143)- **net:** Reject IPv4-compatible addresses in is_advertisable_ipv6 (#144)- **rpc:** Gate JSON-RPC dispatch landing legs on request provenance (#147)
+
+### Testing
+- **dht:** Guard sync_inventory loss branch uses active retract_own_provider (#145)- **wallet:** Add #[ignore]d live-mainnet integration test for control.wallet.balance (#146)
+
 ## [0.73.0] - 2026-08-02
 
 ### Features
