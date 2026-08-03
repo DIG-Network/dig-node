@@ -56,7 +56,7 @@ use crate::seams::dig_peer::{CapsuleWarmer, WarmFailure, WarmOutcome};
 use crate::shared::AnchoredRootResolver;
 use crate::tier0_prefetch::{
     run_round, should_run_loop, tier0_precache_enabled, DiscardReason, FetchOutcome, LoadSignal,
-    RoundRateLimiter, SizeProbe, Tier0Fetcher,
+    RoundOutcome, RoundRateLimiter, SizeProbe, Tier0Fetcher,
 };
 
 // =================================================================================================
@@ -517,7 +517,7 @@ pub fn spawn_tier0_precache(runtime: Tier0Runtime) -> bool {
             ticker.tick().await;
             tick += 1;
             // `tier0_precache_enabled()` is read HERE, every round, so flipping the env flips the round.
-            let outcome = run_round(
+            let round = run_round(
                 tier0_precache_enabled(),
                 &*runtime.probe,
                 &*runtime.size_probe,
@@ -528,8 +528,13 @@ pub fn spawn_tier0_precache(runtime: Tier0Runtime) -> bool {
                 runtime.cache_cap_bytes,
                 &mut rate,
                 tick,
-            )
-            .await;
+            );
+            // A panic inside a single round must NOT unwind out of this spawned task and silently
+            // stop precache for the process's lifetime (#2044). Catch it, warn, and keep looping —
+            // the next tick starts a fresh round with the (valid, plain-value) rng/rate carried over.
+            let Some(outcome) = run_round_catching(round, tick).await else {
+                continue;
+            };
             if outcome.cached > 0 {
                 tracing::debug!(
                     cached = outcome.cached,
@@ -541,6 +546,37 @@ pub fn spawn_tier0_precache(runtime: Tier0Runtime) -> bool {
         }
     });
     true
+}
+
+/// Drive one tier-0 round to completion, CATCHING a panic so the precache loop survives it (#2044).
+///
+/// A panic inside [`run_round`] would otherwise unwind out of the spawned task and stop precache for
+/// the rest of the process (the node stays up, but the flywheel dies silently until restart). We wrap
+/// the round future in [`catch_unwind`](std::panic::catch_unwind's async cousin) and turn a caught
+/// panic into `None` + a bounded WARNING, so the caller simply skips to the next tick.
+///
+/// [`AssertUnwindSafe`] is sound here: `run_round`'s only `&mut` state — the `SplitMix64` rng and the
+/// [`RoundRateLimiter`] — are plain value types holding no lock and no across-await guard, so a panic
+/// mid-round leaves them in a valid (if partially advanced) state that the next round uses safely.
+///
+/// Returns `Some(outcome)` on a completed round (the catch is fully transparent on the happy path) and
+/// `None` when the round panicked and was contained.
+async fn run_round_catching<F>(round: F, tick: u64) -> Option<RoundOutcome>
+where
+    F: std::future::Future<Output = RoundOutcome>,
+{
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(round).catch_unwind().await {
+        Ok(outcome) => Some(outcome),
+        Err(_payload) => {
+            // Fixed-shape message only — never the panic payload (log-hygiene, #1603).
+            tracing::warn!(
+                tick,
+                "tier-0 precache round panicked; continuing to next round"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -814,6 +850,91 @@ mod tests {
         assert!(
             !spawn_tier0_precache(tiny_runtime(tiny)),
             "a small-disk node must not spawn the tier-0 loop"
+        );
+    }
+
+    // -- The round panic guard (#2044) --------------------------------------------------------------
+
+    /// A neighbourhood probe that PANICS the moment a round consults it — the cheapest seam that makes
+    /// a real [`run_round`] unwind. Used to prove the loop's guard contains the panic.
+    struct PanickingProbe;
+    #[async_trait]
+    impl NeighbourhoodProbe for PanickingProbe {
+        async fn observe_near(
+            &self,
+            _point: [u8; 32],
+        ) -> Vec<crate::dht_sampling::PeerObservation> {
+            panic!("injected tier-0 probe panic");
+        }
+    }
+
+    struct Idle;
+    impl LoadSignal for Idle {
+        fn is_busy(&self) -> bool {
+            false
+        }
+    }
+
+    /// A cap whose 10% tier-0 slice clears the useful floor, so a round actually samples (and thus
+    /// reaches the panicking probe) rather than short-circuiting on small-disk.
+    fn running_cap() -> u64 {
+        10 * 1024 * 1024 * 1024
+    }
+
+    fn generous_rate() -> RoundRateLimiter {
+        RoundRateLimiter::new(1_000_000, u64::MAX / 2, 1)
+    }
+
+    #[tokio::test]
+    async fn a_panicking_round_is_caught_and_does_not_propagate() {
+        // NON-VACUOUS: remove the `catch_unwind` in `run_round_catching` and this test unwinds/aborts
+        // instead of returning — proving the guard, not the harness, contains the panic.
+        let probe = PanickingProbe;
+        let size = Tier0SizeProbe {
+            lookup: Arc::new(FixedLookup(None)),
+        };
+        let warm = Arc::new(SpyWarm {
+            verdict: WarmVerdict::Unavailable,
+            seen: Mutex::new(Vec::new()),
+        });
+        let f = fetcher(None, false, warm);
+        let load = Idle;
+        let mut rng = SplitMix64::new(1);
+        let mut rate = generous_rate();
+        let node = NodeContext {
+            peer_id: [0; 32],
+            weights: RelevanceWeights::default(),
+        };
+
+        let round = run_round(
+            true,
+            &probe,
+            &size,
+            &f,
+            &load,
+            &mut rng,
+            &node,
+            running_cap(),
+            &mut rate,
+            1,
+        );
+
+        assert_eq!(
+            run_round_catching(round, 1).await,
+            None,
+            "a panicking round must be contained as None, never propagated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_panicking_round_returns_its_outcome_unchanged() {
+        // The catch is fully transparent on the happy path: a completed round's outcome passes through.
+        let expected = RoundOutcome::default();
+        let outcome = run_round_catching(async { expected }, 7).await;
+        assert_eq!(
+            outcome,
+            Some(expected),
+            "a completed round's outcome must pass through the guard unchanged"
         );
     }
 }
