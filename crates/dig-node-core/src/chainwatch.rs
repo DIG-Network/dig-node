@@ -195,6 +195,12 @@ pub async fn run_tick(deps: &WatchDeps) -> TickSummary {
 
 /// Run the chain-watch loop until cancelled (spawned + aborted by the peer-network bring-up). On each
 /// tick it runs [`run_tick`]; between ticks it sleeps `interval`. Never returns on its own.
+///
+/// A panic inside a single tick is CONTAINED via [`catch_iteration`](crate::shared::catch_iteration)
+/// so it cannot unwind out of the spawned task and silently stop chain-watch + gap-fill for the rest
+/// of the process (#2067). `run_tick` carries only the borrowed [`WatchDeps`] (plain `Arc` seams,
+/// no lock held across the catch boundary), so asserting its unwind-safety is sound; the next tick
+/// simply re-snapshots the subscription set and continues.
 pub async fn run_loop(deps: WatchDeps, interval: Duration) {
     let mut ticker = tokio::time::interval(interval);
     // Fire the first tick immediately (a node that just started should reconcile promptly), then on
@@ -202,7 +208,10 @@ pub async fn run_loop(deps: WatchDeps, interval: Duration) {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
-        let summary = run_tick(&deps).await;
+        let Some(summary) = crate::shared::catch_iteration("chain_watch", run_tick(&deps)).await
+        else {
+            continue; // this tick panicked and was contained; reconcile again next interval
+        };
         if summary.attempted > 0 {
             tracing::debug!(
                 checked = summary.checked,
@@ -530,6 +539,50 @@ mod tests {
             (t2.checked, t2.filled),
             (1, 1),
             "tick 1: new subscription filled"
+        );
+    }
+
+    // -- The per-tick panic guard (#2067) -----------------------------------------------------------
+
+    /// A resolver that PANICS the moment a tick consults it — the cheapest seam that makes a real
+    /// [`run_tick`] unwind. Used to prove the loop's per-tick guard contains the panic.
+    struct PanickingResolver;
+    #[async_trait::async_trait]
+    impl AnchoredRootResolver for PanickingResolver {
+        async fn anchored_root(&self, _store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
+            panic!("injected chain-watch resolver panic");
+        }
+    }
+
+    /// **Proves:** a panic inside a single chain-watch tick is CONTAINED by the loop's
+    /// [`catch_iteration`](crate::shared::catch_iteration) guard (#2067), so it never unwinds out of
+    /// the spawned task and silently kills chain-watch + gap-fill for the process's lifetime.
+    ///
+    /// NON-VACUOUS: remove the `catch_unwind` in `catch_iteration` (or unwrap `run_tick` directly here)
+    /// and this test unwinds/aborts instead of returning `None` — proving the guard, not the harness,
+    /// contains the panic. A happy tick still passes through as `Some`
+    /// ([`tick_gap_fills_only_missing_confirmed_generations`] covers the transparent path).
+    #[tokio::test]
+    async fn a_panicking_tick_is_caught_and_does_not_propagate() {
+        let deps = WatchDeps {
+            subscriptions: Arc::new(|| {
+                let mut s = SubscriptionSet::new();
+                s.add(&hex::encode(store(1))).unwrap();
+                s
+            }),
+            resolver: Arc::new(PanickingResolver),
+            held: Arc::new(MockHeld(vec![])),
+            filler: Arc::new(RecordingFiller {
+                calls: Mutex::new(Vec::new()),
+                fail: false,
+            }),
+        };
+
+        let contained = crate::shared::catch_iteration("chain_watch", run_tick(&deps)).await;
+
+        assert_eq!(
+            contained, None,
+            "a panicking tick must be contained as None, never propagated out of the loop"
         );
     }
 }

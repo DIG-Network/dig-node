@@ -14,11 +14,16 @@
 //! - [`identity`] — the node's persistent mTLS machine identity ([`load_or_generate_node_cert`])
 //!   and the one-time TLS crypto-provider install ([`install_crypto_provider`]), needed by both
 //!   the peer-network transport and any seam that dials/serves mTLS (e.g. DHT bootstrap tests).
+//! - [`panic_guard`] — the [`catch_iteration`](panic_guard::catch_iteration) combinator every
+//!   long-lived background loop wraps its per-iteration body in, so a single iteration's panic can
+//!   never silently kill a whole subsystem for the process's lifetime (#2067).
 
 pub mod chain_view;
 pub mod content;
 pub mod identity;
+pub mod panic_guard;
 
 pub use chain_view::{AnchoredRootResolver, AnchoredStoreState};
 pub use content::ContentResponse;
 pub use identity::{install_crypto_provider, load_or_generate_node_cert};
+pub(crate) use panic_guard::catch_iteration;
