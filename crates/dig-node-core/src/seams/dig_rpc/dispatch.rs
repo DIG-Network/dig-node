@@ -828,7 +828,7 @@ impl RpcDispatch for Node {
             return err(
                 &id,
                 RESOURCE_NOT_AVAILABLE,
-                "resource not available: this node does not hold it and no peer served it (no \n                 upstream is configured)"
+                "resource not available: this node does not hold it and no peer served it"
                     .to_string(),
             );
         }

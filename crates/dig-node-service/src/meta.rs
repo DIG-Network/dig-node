@@ -150,9 +150,11 @@ pub fn methods() -> &'static [MethodInfo] {
             // its own health. A node's own status is never a question for a third party.
             name: "dig.health",
             served: "shell",
-            summary: "This node's liveness + capability summary: { status, version, commit, mode, \
-                      addr, upstream, cache, sync, peer_tier, methods }. The JSON-RPC form of \
-                      `GET /health`, answered locally with no upstream.",
+            summary: "This node's liveness + capability summary: { status, version, methods }. \
+                      Answered locally, with no upstream. Deliberately NARROWER than `GET /health`: \
+                      this method is reachable ANONYMOUSLY through the public read tier, so the \
+                      operational fields (cache dir, bound addr, upstream, commit) stay on the \
+                      loopback-only `GET /health` and the token-gated `control.status`.",
             requires_auth: false,
         },
         MethodInfo {

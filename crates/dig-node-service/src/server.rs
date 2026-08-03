@@ -453,6 +453,17 @@ impl AppState {
         self.relay.should_relay()
     }
 
+    /// Whether the ENGINE would still make an outbound upstream call (#1997).
+    ///
+    /// TEST-CONSTRUCTION ONLY, behind `testkit`. Distinct from [`Self::would_relay`] on purpose:
+    /// that reports the shell's method-passthrough guard, this reports `dig-node-core`, which owns
+    /// the two CONTENT legs. The security audit found the loop latch wired to the first and not the
+    /// second, so a test must be able to tell them apart rather than infer one from the other.
+    #[cfg(any(test, feature = "testkit"))]
+    pub fn engine_would_use_upstream(&self) -> bool {
+        self.node.has_upstream()
+    }
+
     /// Repoint the seam-5 content-server handle (#1285 W1c) at another implementation, leaving every
     /// other field of the built state intact.
     ///
@@ -818,6 +829,14 @@ async fn rpc(
     // ordinary `dig.health` call, and replying keeps the sender's own bookkeeping honest.
     if state.relay.is_own_probe(&id) {
         state.relay.disable_after_loop();
+        // ALSO latch the engine (#1997). The guard above stops the shell's method-passthrough
+        // relay, which is only ONE of the three legs that reach an upstream; the other two carry
+        // content (`dig.getContent`'s miss proxy and the `/s/*` Tier 3 fetch) and live inside
+        // dig-node-core, gated on `Node::has_upstream`. Latching only the shell would leave a node
+        // that has DETECTED and LOGGED a loop still recursing on any anonymous `dig.getContent`
+        // for content it does not hold — the original outage, on the more expensive path, behind a
+        // log line claiming the loop was closed.
+        state.node.disable_upstream_after_loop();
     }
 
     // `dig.health` / `dig.methods` are answered by the shell, from the SAME catalogue and status

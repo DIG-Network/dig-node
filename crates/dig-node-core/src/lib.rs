@@ -166,7 +166,14 @@ fn control_err(id: &Value, code: i64, message: &str) -> Value {
     }})
 }
 
-const RPC_FALLBACK: &str = "https://rpc.dig.net/";
+/// The upstream a node uses when `DIG_NODE_UPSTREAM` is unset: **none** (#1997).
+///
+/// This was `https://rpc.dig.net/`, which made every embedder of this crate — including the DIG
+/// Browser's in-process node, which calls [`Node::from_env`] directly and never goes through the
+/// service shell — fall back to one well-known host for any read it could not satisfy. That is the
+/// structurally-special-node property the ticket removed, and leaving it here would have kept it
+/// alive for every consumer that is not the `dig-node` binary.
+const RPC_FALLBACK: &str = "";
 /// Per-window ciphertext cap (bytes) when paging the JSON-RPC response.
 const WINDOW: usize = 3 * 1024 * 1024;
 /// Default LRU cap for the on-disk module cache.
@@ -294,12 +301,25 @@ impl ContentCache {
 pub struct Node {
     cache_dir: PathBuf,
     http: reqwest::Client,
-    /// Upstream rpc.dig.net base URL for the JSON-RPC proxy and the §21 module
-    /// sync. Defaults to [`RPC_FALLBACK`]; overridden by `DIG_NODE_UPSTREAM` (a
-    /// node-specific name, distinct from the browser's own `DIG_RPC_ENDPOINT`
-    /// which points the browser AT this node — reusing that name would make the
-    /// node proxy to itself).
+    /// Upstream base URL for the JSON-RPC proxy and the §21 module sync. EMPTY by default
+    /// (#1997) — there is no well-known fallback; set by `DIG_NODE_UPSTREAM` (a node-specific
+    /// name, distinct from the browser's own `DIG_RPC_ENDPOINT`, which points the browser AT this
+    /// node — reusing that name would make the node proxy to itself).
     upstream: String,
+    /// Cleared for good once the upstream is PROVEN to route back to this node (#1997).
+    ///
+    /// Separate from `upstream` being empty, because the two are different facts: "no upstream was
+    /// configured" and "the configured upstream turned out to be us". Both must stop an outbound
+    /// call, so [`Node::has_upstream`] requires both.
+    ///
+    /// This exists because the loop latch previously lived ONLY in the service shell's
+    /// `RelayGuard`, which gates the method-passthrough relay — one of THREE legs that reach an
+    /// upstream. The other two carry content (`dig.getContent`'s miss proxy and the `/s/*` Tier 3
+    /// whole-content fetch) and live here in the engine, where they consulted `upstream` directly.
+    /// A node that had detected and announced a loop would therefore still recurse on any
+    /// anonymous `dig.getContent` for content it does not hold — the original outage, on the more
+    /// expensive path, behind a log line claiming it was closed.
+    upstream_looped_back: std::sync::atomic::AtomicBool,
     /// Serialize cache mutation (eviction) so concurrent requests don't race.
     cache_lock: Mutex<()>,
     /// The persistent §21.9 identity SEED, loaded once at startup. `Some` enables
@@ -1519,8 +1539,26 @@ impl Node {
     /// upstream" is a statement about this node's configuration, and turning it into a per-request
     /// error would tell a caller their read failed for a reason that has nothing to do with their
     /// read. A miss with no upstream is a miss.
-    pub(crate) fn has_upstream(&self) -> bool {
+    pub fn has_upstream(&self) -> bool {
         !self.upstream.trim().is_empty()
+            && !self
+                .upstream_looped_back
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record that this node's upstream has been PROVEN to route back to itself, and stop every
+    /// outbound upstream call for the life of the process (#1997).
+    ///
+    /// Called by the host shell when its bring-up loop probe comes back to its own dispatcher. It
+    /// must reach the engine, not just the shell: the shell's guard covers the method-passthrough
+    /// relay, while the two legs that carry CONTENT — the `dig.getContent` miss proxy and the
+    /// `/s/*` Tier 3 fetch — are here, and those are the expensive ones to leave looping.
+    ///
+    /// Never reset: an upstream cannot stop pointing at us without a configuration change, and a
+    /// configuration change restarts the node.
+    pub fn disable_upstream_after_loop(&self) {
+        self.upstream_looped_back
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Proxy the raw JSON-RPC body to the configured upstream and return its response.
@@ -2620,10 +2658,19 @@ impl Node {
             cache_dir: dir,
             http: reqwest::Client::builder()
                 .user_agent("dig-node/0.1")
+                // An upstream call must not be able to hold a connection open indefinitely
+                // (#1997). Without this, a misconfigured or hostile upstream — including one that
+                // loops back here — keeps every level of the chain alive for as long as the far
+                // end will hold it, turning one request into unbounded in-flight work. A ceiling
+                // is not a substitute for the loop latch above; it bounds what any single
+                // outbound call can cost while the latch removes the cause.
+                .timeout(std::time::Duration::from_secs(120))
+                .connect_timeout(std::time::Duration::from_secs(15))
                 .build()
                 .expect("http client"),
             upstream: std::env::var("DIG_NODE_UPSTREAM")
                 .unwrap_or_else(|_| RPC_FALLBACK.to_string()),
+            upstream_looped_back: std::sync::atomic::AtomicBool::new(false),
             cache_lock: Mutex::new(()),
             identity_seed,
             anchored_root_resolver: default_anchored_resolver(),
@@ -2782,6 +2829,7 @@ pub(crate) mod test_support {
             cache_dir: td.path().to_path_buf(),
             http: reqwest::Client::new(),
             upstream: "http://127.0.0.1:1/".to_string(),
+            upstream_looped_back: std::sync::atomic::AtomicBool::new(false),
             cache_lock: Mutex::new(()),
             identity_seed: None,
             anchored_root_resolver: default_anchored_resolver(),
@@ -3120,6 +3168,36 @@ mod tests {
     /// store, so any `dig.getContent` test that does not explicitly inject a tip
     /// fails closed under the pin — make the pin policy explicit per test via
     /// [`test_node_with_resolver`] or by disabling the pin (`DIG_NODE_PIN=off`).
+    /// **Proves:** `has_upstream` requires BOTH a configured upstream and no proven loop, and the
+    /// latch is one-way.
+    /// **Catches:** a `has_upstream` that reads only the string — which is exactly the shape the
+    /// security audit found, where the shell latched a detected loop but the engine's two content
+    /// legs kept using the upstream anyway.
+    #[test]
+    fn a_proven_loop_stops_the_engine_using_its_upstream() {
+        let (mut node, _td) = test_node(None);
+
+        node.upstream = String::new();
+        assert!(!node.has_upstream(), "no upstream configured");
+
+        node.upstream = "http://127.0.0.1:9999".to_string();
+        assert!(node.has_upstream(), "a configured upstream is usable");
+
+        node.disable_upstream_after_loop();
+        assert!(
+            !node.has_upstream(),
+            "a PROVEN loop must stop the engine using the upstream, not just the shell"
+        );
+
+        // One-way: the latch is not cleared by reconfiguring, because an upstream cannot stop
+        // pointing at us without a restart.
+        node.upstream = "http://127.0.0.1:8888".to_string();
+        assert!(
+            !node.has_upstream(),
+            "the latch is not reset by a new value"
+        );
+    }
+
     fn test_node(identity_seed: Option<[u8; 32]>) -> (Node, tempfile::TempDir) {
         test_node_with_resolver(identity_seed, MockResolver::always(Ok(None)))
     }
@@ -3138,6 +3216,7 @@ mod tests {
             // hermetically (no live rpc.dig.net). Tests needing a real upstream set
             // `node.upstream` explicitly (e.g. fetch_and_cache_*).
             upstream: "http://127.0.0.1:1/".to_string(),
+            upstream_looped_back: std::sync::atomic::AtomicBool::new(false),
             cache_lock: Mutex::new(()),
             identity_seed,
             anchored_root_resolver,
@@ -3220,6 +3299,7 @@ mod tests {
             cache_dir: td.path().to_path_buf(),
             http: reqwest::Client::new(),
             upstream: base,
+            upstream_looped_back: std::sync::atomic::AtomicBool::new(false),
             cache_lock: Mutex::new(()),
             identity_seed: Some([5u8; 32]),
             anchored_root_resolver: MockResolver::one(&store_hex, root),
@@ -3267,6 +3347,7 @@ mod tests {
             cache_dir: td.path().to_path_buf(),
             http: reqwest::Client::new(),
             upstream: base,
+            upstream_looped_back: std::sync::atomic::AtomicBool::new(false),
             cache_lock: Mutex::new(()),
             identity_seed: Some([5u8; 32]),
             anchored_root_resolver: MockResolver::one(&store_hex, root),
@@ -3355,6 +3436,7 @@ mod tests {
                 cache_dir: td.path().to_path_buf(),
                 http: reqwest::Client::new(),
                 upstream: base,
+                upstream_looped_back: std::sync::atomic::AtomicBool::new(false),
                 cache_lock: Mutex::new(()),
                 identity_seed: Some([5u8; 32]),
                 anchored_root_resolver: MockResolver::one(&store_hex, root),
@@ -3425,6 +3507,7 @@ mod tests {
                 cache_dir: td.path().to_path_buf(),
                 http: reqwest::Client::new(),
                 upstream: base,
+                upstream_looped_back: std::sync::atomic::AtomicBool::new(false),
                 cache_lock: Mutex::new(()),
                 identity_seed: Some([5u8; 32]),
                 anchored_root_resolver: MockResolver::one(&store_hex, root),
@@ -4907,6 +4990,7 @@ mod tests {
             cache_dir: td.path().to_path_buf(),
             http: reqwest::Client::new(),
             upstream: base,
+            upstream_looped_back: std::sync::atomic::AtomicBool::new(false),
             cache_lock: Mutex::new(()),
             identity_seed: Some([5u8; 32]),
             anchored_root_resolver: MockResolver::one(&store_hex, root),

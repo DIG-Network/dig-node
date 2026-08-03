@@ -201,6 +201,45 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     (addr, probe, EnvHold(hold))
 }
 
+/// Like [`start_companion_probe`] but ALSO returns the built [`AppState`], so a test can observe
+/// the shell's and the ENGINE's relay decisions directly instead of inferring them from a response.
+async fn start_companion_probe_state(
+    upstream: &str,
+) -> (
+    SocketAddr,
+    Value,
+    dig_node_service::server::AppState,
+    EnvHold,
+) {
+    let config = dig_node_service::Config {
+        upstream: upstream.to_string(),
+        port: 0,
+        ..dig_node_service::Config::default()
+    };
+    let hold = env_guard().lock_owned().await;
+    let (state, probe) = {
+        let unique = TEST_DIR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("dig-node-test-{}-{}", std::process::id(), unique));
+        let cache = base.join("cache");
+        std::fs::create_dir_all(&cache).expect("create test cache dir");
+        std::env::set_var("DIG_NODE_CACHE", &cache);
+        std::env::set_var("DIG_NODE_CACHE_CAP", "67108864");
+        std::env::set_var("DIG_NODE_STATE_DIR", &base);
+        let state = dig_node_service::server::build_state(&config).await;
+        let probe = state.loop_probe_request();
+        (state, probe)
+    };
+    let app = dig_node_service::server::router(state.clone())
+        .into_make_service_with_connect_info::<SocketAddr>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, probe, state, EnvHold(hold))
+}
+
 /// Like [`start_companion_full`] but ALSO returns the served wallet backend (#368/#369) so a WS
 /// push test can drive the backend's event bus directly. Same per-call on-disk isolation + env
 /// lock (the wallet DB + seed live under the same per-test config dir).
@@ -940,6 +979,54 @@ async fn a_returning_loop_probe_disables_passthrough() {
     );
 }
 
+/// **Proves:** a proven loop latches the ENGINE's upstream, not only the shell's passthrough guard.
+/// **Catches:** the exact defect the security audit found on the first cut of this fix. The latch
+/// lived only in `RelayGuard`, which gates ONE of three legs that reach an upstream; the two that
+/// carry content (`dig.getContent`'s miss proxy and the `/s/*` Tier 3 fetch) read
+/// `Node::has_upstream()` — a separate value the guard never touched. A node that had detected,
+/// latched and LOGGED a loop would still recurse on any anonymous `dig.getContent` for content it
+/// does not hold: the original outage on the more expensive path, behind a log line claiming it was
+/// closed.
+///
+/// Asserted on the engine's own state rather than by driving a content read, deliberately. A read
+/// for a fabricated `(store, root)` never reaches the proxy leg — it fails earlier, at
+/// chain-anchored-root resolution — so a test written that way passes whether or not the latch is
+/// wired, which is how the first version of this test came to prove nothing.
+#[tokio::test]
+async fn a_proven_loop_latches_the_engine_not_just_the_shell() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, probe, state, _hold) = start_companion_probe_state(&upstream).await;
+
+    assert!(
+        state.would_relay(),
+        "precondition: the shell relays with a configured upstream"
+    );
+    assert!(
+        state.engine_would_use_upstream(),
+        "precondition: the engine would use the configured upstream"
+    );
+
+    // The node's own probe comes back to it — the upstream demonstrably leads here.
+    let _: Value = client()
+        .post(format!("http://{addr}/"))
+        .json(&probe)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(
+        !state.would_relay(),
+        "the shell's passthrough must latch off"
+    );
+    assert!(
+        !state.engine_would_use_upstream(),
+        "the ENGINE must latch off too — otherwise dig.getContent still recurses"
+    );
+}
+
 /// **Proves:** another node's probe is ordinary traffic and does not switch OUR relay off.
 /// **Catches:** matching the probe on its prefix rather than the full random id — which would let
 /// any caller disable a node's passthrough, and would break the legitimate case of this node being
@@ -1047,20 +1134,17 @@ async fn public_dig_health_does_not_leak_operational_detail() {
     assert_eq!(result["status"], json!("ok"));
     assert!(result["version"].is_string());
     assert!(result["methods"].is_array());
-    for leaked in [
-        "cache",
-        "addr",
-        "upstream",
-        "commit",
-        "mode",
-        "sync",
-        "peer_tier",
-    ] {
-        assert!(
-            !result.contains_key(leaked),
-            "public dig.health must not expose `{leaked}`: {resp}"
-        );
-    }
+    // An EXACT key set, not a deny-list of today's operational fields. A deny-list silently admits
+    // the NEXT field somebody adds to the public body — `state_dir`, `identity`, `peers` — which is
+    // the same class of leak this test exists to stop. Adding a key here must be a deliberate act
+    // asserting that it is safe to publish to anonymous internet callers.
+    let mut keys: Vec<&str> = result.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["methods", "status", "version"],
+        "public dig.health exposes an unexpected field: {resp}"
+    );
     // The loopback-only GET /health keeps the operational detail.
     let local: Value = client()
         .get(format!("http://{addr}/health"))
