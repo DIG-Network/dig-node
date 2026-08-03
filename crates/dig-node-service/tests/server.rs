@@ -910,6 +910,11 @@ async fn dig_methods_lists_the_catalogue_locally() {
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
+    // dig.methods is on the same public allowlist as dig.health, so it carries the same duty.
+    assert!(
+        !names.iter().any(|n| n.starts_with("control.")),
+        "dig.methods must not enumerate the control plane to anonymous callers: {names:?}"
+    );
     assert!(calls.lock().unwrap().is_empty(), "methods asks nobody");
 }
 
@@ -1144,6 +1149,29 @@ async fn public_dig_health_does_not_leak_operational_detail() {
         keys,
         ["methods", "status", "version"],
         "public dig.health exposes an unexpected field: {resp}"
+    );
+
+    // The METHOD LIST is part of the disclosure, not just the field set. `rpc.discover` is kept off
+    // rpc.dig.net's public allowlist precisely because it "self-describes the whole surface
+    // including control"; publishing that same catalogue through an ALLOWLISTED method would
+    // re-open the hole through a different door.
+    let methods: Vec<&str> = result["methods"]
+        .as_array()
+        .expect("methods array")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        methods.contains(&"dig.getContent"),
+        "the public list must still describe what a caller CAN call: {methods:?}"
+    );
+    let control: Vec<&&str> = methods
+        .iter()
+        .filter(|m| m.starts_with("control."))
+        .collect();
+    assert!(
+        control.is_empty(),
+        "public dig.health must not enumerate the control plane to anonymous callers: {control:?}"
     );
     // The loopback-only GET /health keeps the operational detail.
     let local: Value = client()
