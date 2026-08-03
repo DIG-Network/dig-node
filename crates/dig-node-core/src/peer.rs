@@ -1274,8 +1274,7 @@ impl PeerRpcResponder for NodeResponder {
         if method == crate::seams::dig_peer::resolve_capsule::RESOLVE_CAPSULE_METHOD {
             let params = req.get("params").cloned().unwrap_or(Value::Null);
             let result = crate::seams::dig_peer::resolve_capsule::resolve_capsule_answer(
-                &self.node,
-                &params,
+                &self.node, &params,
             )
             .await;
             return json!({"jsonrpc":"2.0","id":id,"result":result});

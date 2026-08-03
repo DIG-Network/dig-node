@@ -772,6 +772,24 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
   mTLS-authenticated peer that calls the method; it discloses no provider identities and no key
   PREIMAGE (`content_key` is the one-way `SHA-256(ContentId::canonical_bytes)`, so `(store_id, root)`
   is not recoverable from it).
+- **`dig.resolveCapsule`** — the tier-0 precache key→PREIMAGE resolve (epic #1934 flywheel
+  live-wiring). Answers, PURELY from this node's OWN holdings reverse index
+  (`CapsuleStore::cache_list_cached`), what `(store_id, root, size)` a requested one-way content-key
+  maps to. Params `{ content_keys: [64hex, …] }`; result `{ resolved: [{ content_key: 64hex, store_id:
+  64hex, root: 64hex, size_bytes: u64 }] }`. For each held capsule the node recomputes
+  `ContentId::capsule(store, root).to_key()` and includes it ONLY if that computed key is in the
+  requested set — so a resolved record is PROOF this node genuinely holds a capsule hashing to the key
+  (a caller cannot make the node claim a preimage it does not hold). A requested key this node does NOT
+  hold is simply ABSENT from `resolved` (never an error — the `dig.getAvailability` not-held idiom).
+  `content_keys` is CLAMPED to **128** (frame-ceiling-derived: one resolved record ≈ 300 B, so 128
+  records fit safely under the 64 KiB control-frame ceiling); a malformed (non-64-hex) requested key
+  can never equal a computed key and is dropped (never a panic). **Privacy contract:** the node
+  discloses ONLY the preimages of capsules it ALREADY announces as a public provider (whose bytes
+  `dig.getAvailability`/`dig.fetchRange` already serve to anyone) — no NEW privacy surface, and never
+  another node's provider identity. Kept a SEPARATE method from `dig.getProviderSnapshot` deliberately,
+  so that surface stays strictly counts-only while this one trades preimages of this node's own public
+  holdings for keys a caller already sampled. A dig-node-LOCAL peer method (like `getProviderSnapshot`,
+  allowlisted explicitly in `is_peer_reachable_method`).
 - **The four DHT methods** `find_node` / `find_providers` / `add_provider` / `ping` (§7.5), dispatched
   to the content-location DHT, folding the mTLS-verified caller into the routing table.
 - **The four PEX messages** `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` (§7.7).
@@ -789,12 +807,14 @@ a JSON-RPC frame arrives over the peer surface, and MUST answer every other meth
 
 **Peer-reachable (allowlisted):** `dig.getContent`, `dig.getAvailability`, `dig.listInventory`,
 `dig.fetchRange`, `dig.getNetworkInfo`, `dig.getPeers`, `dig.announce`, `dig.getAnchoredRoot`,
-`dig.getCollection`, `dig.listCollectionItems`, `dig.getProviderSnapshot` (plus the DHT + PEX frame
-families above, which are classified by shape, not the `method` field). `dig.getProviderSnapshot` is a
-dig-node-LOCAL peer method not yet in the shared `dig-rpc-protocol` allowlist (that crate is a pinned
-dependency this repo cannot extend); it is therefore allowlisted explicitly in `is_peer_reachable_method`,
-a deliberate decision recorded as a counts-only read that mutates no state. Promoting it into the shared
-allowlist crate is a tracked cross-repo follow-up.
+`dig.getCollection`, `dig.listCollectionItems`, `dig.getProviderSnapshot`, `dig.resolveCapsule` (plus
+the DHT + PEX frame families above, which are classified by shape, not the `method` field).
+`dig.getProviderSnapshot` and `dig.resolveCapsule` are dig-node-LOCAL peer methods not yet in the shared
+`dig-rpc-protocol` allowlist (that crate is a pinned dependency this repo cannot extend); they are
+therefore allowlisted explicitly in `is_peer_reachable_method`, each a deliberate decision recorded as a
+read that mutates no state (`getProviderSnapshot` counts-only; `resolveCapsule` discloses only the
+preimages of this node's already-public holdings). Promoting them into the shared allowlist crate is a
+tracked cross-repo follow-up.
 
 **NOT peer-reachable (loopback / in-process ONLY, answered `-32601` on the peer surface):** every
 `cache.*` method (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,

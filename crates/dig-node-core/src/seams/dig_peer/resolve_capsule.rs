@@ -198,13 +198,20 @@ mod tests {
         let key = content_key_for(store, root);
         let inventory = vec![held(store, root, 4_096)];
 
-        let resolved = resolve_capsule_result(&inventory, &[key.clone()]);
+        let resolved = resolve_capsule_result(&inventory, std::slice::from_ref(&key));
 
-        assert_eq!(resolved.len(), 1, "the held key resolves to exactly one record");
+        assert_eq!(
+            resolved.len(),
+            1,
+            "the held key resolves to exactly one record"
+        );
         assert_eq!(resolved[0].content_key, key);
         assert_eq!(resolved[0].store_id, hex::encode(store));
         assert_eq!(resolved[0].root, hex::encode(root));
-        assert_eq!(resolved[0].size_bytes, 4_096, "the on-disk size is reported");
+        assert_eq!(
+            resolved[0].size_bytes, 4_096,
+            "the on-disk size is reported"
+        );
     }
 
     #[test]
@@ -216,7 +223,10 @@ mod tests {
 
         let resolved = resolve_capsule_result(&inventory, &[unheld_key]);
 
-        assert!(resolved.is_empty(), "a key this node does not hold is absent");
+        assert!(
+            resolved.is_empty(),
+            "a key this node does not hold is absent"
+        );
     }
 
     #[test]
@@ -228,11 +238,15 @@ mod tests {
         let inventory = vec![held(a.0, a.1, 1), held(b.0, b.1, 2)];
         let key_b = content_key_for(b.0, b.1);
 
-        let resolved = resolve_capsule_result(&inventory, &[key_b.clone()]);
+        let resolved = resolve_capsule_result(&inventory, std::slice::from_ref(&key_b));
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].content_key, key_b);
-        assert_eq!(resolved[0].store_id, hex::encode(b.0), "the RIGHT preimage is returned");
+        assert_eq!(
+            resolved[0].store_id,
+            hex::encode(b.0),
+            "the RIGHT preimage is returned"
+        );
         assert_eq!(resolved[0].size_bytes, 2);
     }
 
@@ -246,14 +260,18 @@ mod tests {
 
         let requested = vec![
             "not-hex".to_string(),
-            "z".repeat(64),                 // right length, wrong alphabet
-            good[..63].to_string(),         // wrong length
+            "z".repeat(64),                       // right length, wrong alphabet
+            good[..63].to_string(),               // wrong length
             format!("{}\ninjected", &good[..54]), // control chars
-            good.clone(),                   // the one genuine key
+            good.clone(),                         // the one genuine key
         ];
         let resolved = resolve_capsule_result(&inventory, &requested);
 
-        assert_eq!(resolved.len(), 1, "only the genuine key resolves; malformed keys are dropped");
+        assert_eq!(
+            resolved.len(),
+            1,
+            "only the genuine key resolves; malformed keys are dropped"
+        );
         assert_eq!(resolved[0].content_key, good);
     }
 
@@ -267,7 +285,11 @@ mod tests {
 
         let resolved = resolve_capsule_result(&inventory, &[key_upper]);
 
-        assert_eq!(resolved.len(), 1, "an uppercase request matches the lowercase computed key");
+        assert_eq!(
+            resolved.len(),
+            1,
+            "an uppercase request matches the lowercase computed key"
+        );
     }
 
     #[test]
@@ -286,7 +308,7 @@ mod tests {
             held(store, root, 5),
         ];
 
-        let resolved = resolve_capsule_result(&inventory, &[good.clone()]);
+        let resolved = resolve_capsule_result(&inventory, std::slice::from_ref(&good));
 
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].content_key, good);
@@ -313,7 +335,11 @@ mod tests {
     #[test]
     fn an_under_cap_request_passes_through_whole_and_absent_field_is_empty() {
         let params = json!({ "content_keys": [ "aa".repeat(32), "bb".repeat(32) ] });
-        assert_eq!(requested_keys_from_params(&params).len(), 2, "under-cap is kept whole");
+        assert_eq!(
+            requested_keys_from_params(&params).len(),
+            2,
+            "under-cap is kept whole"
+        );
 
         // A request with no `content_keys` field is supported — it simply resolves nothing.
         assert!(requested_keys_from_params(&json!({})).is_empty());
@@ -384,7 +410,8 @@ mod tests {
 
         let server_dir = tempfile::tempdir().expect("server cert dir");
         let server_identity =
-            load_or_generate_node_cert(server_dir.path(), &seed("resolve-holder")).expect("holder id");
+            load_or_generate_node_cert(server_dir.path(), &seed("resolve-holder"))
+                .expect("holder id");
         let server_peer_id = server_identity.peer_id();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -392,12 +419,17 @@ mod tests {
             .expect("loopback listener");
         let addr = listener.local_addr().expect("addr");
         let responder: Arc<dyn PeerRpcResponder> = Arc::new(NodeResponder::without_pool(node));
-        let _server = tokio::spawn(serve_peer_rpc_listener(listener, server_identity, responder));
+        let _server = tokio::spawn(serve_peer_rpc_listener(
+            listener,
+            server_identity,
+            responder,
+        ));
 
         // The client dials the real server and calls dig.resolveCapsule for the sampled key over mTLS.
         let client_dir = tempfile::tempdir().expect("client cert dir");
         let client_identity =
-            load_or_generate_node_cert(client_dir.path(), &seed("resolve-reader")).expect("reader id");
+            load_or_generate_node_cert(client_dir.path(), &seed("resolve-reader"))
+                .expect("reader id");
         let config = dig_nat::NatConfig::builder()
             .enabled_methods(vec![dig_nat::TraversalKind::Direct])
             .per_method_timeout(Duration::from_secs(10))
@@ -430,7 +462,11 @@ mod tests {
         let resolved = response["result"]["resolved"]
             .as_array()
             .expect("resolved is an array");
-        assert_eq!(resolved.len(), 1, "only the held key resolves; the absent key is absent");
+        assert_eq!(
+            resolved.len(),
+            1,
+            "only the held key resolves; the absent key is absent"
+        );
         assert_eq!(resolved[0]["content_key"], expected_key);
         assert_eq!(resolved[0]["store_id"], hex::encode(store));
         assert_eq!(resolved[0]["root"], hex::encode(root));
