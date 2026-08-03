@@ -202,13 +202,21 @@ pub fn relevance(store: &RelevanceInputs, node: &NodeContext) -> RelevanceValue 
 /// knapsack — so [`in_keyspace_neighbourhood`] derives the minimal admit/deny boolean from the same
 /// primary + the same reference `peer_id`, keeping ONE coherent neighbourhood definition).
 ///
-/// ## Why this is ungameable in the ways that matter
-/// The reference point is THIS node's `peer_id`, which an attacker cannot move, so they cannot
-/// manufacture "you are responsible for this" for an arbitrary target. Landing a capsule key near our
-/// `peer_id` requires grinding `SHA-256(0x02 ‖ store_id ‖ root)` toward a fixed target — and because
-/// the inbound-demand pull is chain-anchored (the backfill merkle-verifies against the CHIP-0035
-/// anchored root), that key cannot name arbitrary junk: each grind candidate is a REAL on-chain store,
-/// so grinding is bounded by on-chain mint cost, not cheap hashing.
+/// ## What this gate binds — and what it does NOT
+/// The reference point is THIS node's `peer_id`, which an attacker cannot move. So the property this
+/// gate ENFORCES is: a peer can steer this node's demand-driven caching only toward keys that land
+/// NEAR our own identity — never toward an arbitrary attacker-chosen target far in the keyspace.
+///
+/// It does NOT make naming a near key cost an on-chain mint. A peer may name ANY `(store, root)` whose
+/// key falls near our `peer_id` and, on an opted-in node, make us attempt a DHT provider-lookup for it;
+/// that lookup is CHEAP, and a non-existent store simply finds no providers and the pull fails there —
+/// the low cost is "no providers", not a per-key mint. The on-chain-mint + merkle cost binds a LATER
+/// step: actually BECOMING A CACHED HOLDER of a specific capsule. A pulled module is bound to its `root`
+/// by merkle verification, and is never served as current unless that root equals the chain-anchored
+/// tip (the serve-time read-path pin). Combined with the default-OFF gate on the pull, the byte-cap,
+/// and the per-key single-flight, the worst a near-key attacker can extract from an opted-in node is a
+/// bounded pull of REAL near-neighbourhood content — never caching of fabricated, junk, or
+/// out-of-neighbourhood content.
 ///
 /// ## Tightness
 /// The midpoint is the CONSERVATIVE floor: it can only ADMIT content genuinely closer to us than

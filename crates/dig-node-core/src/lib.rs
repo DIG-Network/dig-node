@@ -2942,9 +2942,14 @@ impl Node {
     /// The ANTI-AMPLIFICATION admission for the inbound-demand pull (§7.10d, #2014): may a remote
     /// peer's request drive this node to fetch + cache + DHT-announce the `(store_hex, root_hex)`
     /// capsule? Only when the capsule's keyspace key lies within THIS node's neighbourhood — near our
-    /// own `peer_id` in XOR distance — so a peer can steer caching only toward content this node is
-    /// naturally responsible for, NEVER an arbitrary attacker-chosen capsule (it cannot move our
-    /// `peer_id`, and landing a chain-anchored store's key near it costs real on-chain mints).
+    /// own `peer_id` in XOR distance — so a peer can steer caching only toward keys near content this
+    /// node is naturally responsible for, NEVER toward an arbitrary far-keyspace target (an attacker
+    /// cannot move our `peer_id`). This gate binds WHERE a peer can steer caching; it does not make
+    /// naming a near key costly — a near key that names no real store just finds no DHT providers and
+    /// the pull fails cheaply there. Actually becoming a cached HOLDER binds later: the pull is
+    /// merkle-verified against `root` and is never served as current unless `root` equals the
+    /// chain-anchored tip (the serve-time read-path pin), so the worst outcome on an opted-in node is a
+    /// bounded pull of REAL near-neighbourhood content, never fabricated or out-of-neighbourhood junk.
     ///
     /// Fails CLOSED: an unknown self-identity (`None` on the FFI/consumer path) or a
     /// non-canonical/malformed `(store, root)` denies the pull. The neighbourhood test itself is

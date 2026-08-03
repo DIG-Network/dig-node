@@ -78,7 +78,7 @@ pub trait CapsuleStore: Send + Sync {
     async fn sync_whole_store(&self, store_id_hex: &str) -> Result<(u64, String), String>;
 
     /// GAP-FILL one missing generation (SPEC §14.3): pull the whole `.dig` module for
-    /// `(store_id, root)` down from other nodes, verify it against the chain-anchored root, land it in
+    /// `(store_id, root)` down from other nodes, merkle-verify it against `root`, land it in
     /// the local cache, and (best-effort) refresh the DHT provider records so peers immediately find
     /// this node as a NEW holder of the just-synced capsule (§14.1). Idempotent — an already-held
     /// generation is a cheap success with no network.
@@ -90,8 +90,19 @@ pub trait CapsuleStore: Send + Sync {
     /// tampered or wrong-generation pull can never be served — the same guarantee whether the module
     /// arrived via a client read, a §21 sync, or this proactive gap-fill.
     ///
-    /// `root` is passed as [`Bytes32`] (the chain-anchored tip the watcher resolved), so gap-fill
-    /// always targets a chain-confirmed generation — never a caller-chosen root.
+    /// ## The `root` argument — normally chain-anchored, with ONE sanctioned exception
+    /// `root` is NORMALLY the chain-anchored tip a caller already resolved (the chain watcher, the §21
+    /// sync, the fetch-side backfill), so gap-fill targets a chain-confirmed generation. The ONE
+    /// sanctioned exception is the INBOUND-DEMAND pull (§7.10d(b), [`Node::note_inbound_demand`]), which
+    /// passes a PEER-supplied `(store, root)` deliberately — demand-caching's whole purpose is to warm
+    /// the specifically-requested capsule, so it MUST NOT be re-routed through the anchored-root
+    /// resolver. A caller-chosen root is safe here because the anchor binds at two DOWNSTREAM points
+    /// regardless of who chose it: the pulled module is bound to `root` by merkle verification, and it
+    /// is never SERVED as current unless `root` equals the chain-anchored tip (the serve-time read-path
+    /// pin, §14.4). So the worst a caller-chosen root can do is cache REAL near-neighbourhood content of
+    /// a possibly-OLD generation (#1623) — never fabricated, junk, or out-of-neighbourhood content. The
+    /// inbound-demand path additionally confines the caller to this node's keyspace neighbourhood (the
+    /// XOR-proximity admission, §7.10d) before it ever passes a peer-supplied root in.
     async fn gap_fill_generation(&self, store_id: [u8; 32], root: Bytes32) -> Result<(), String>;
 
     /// Background CAPSULE BACKFILL (SPEC §5.6): when a resource read for `(store_hex, root_hex)` is
