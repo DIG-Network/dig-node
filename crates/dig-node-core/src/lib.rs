@@ -1483,6 +1483,13 @@ impl Node {
     /// `cache.fetchAndCache` traffic (#2041). Sweeping right after the land makes the bound hold
     /// independent of any background loop's state.
     ///
+    /// The sweep runs after EVERY sync ATTEMPT, not only when the caller may serve locally. A sync
+    /// whose served root differs from the requested one (the upstream's head advanced) returns `false`
+    /// yet STILL lands a whole (chain-anchored) capsule under the served root ([`Node::sync_module_from`]),
+    /// so gating the sweep on the `true` return would let repeated head-advance lands grow the cache
+    /// unbounded. The sweep is a bounded, idempotent best-effort dir-scan, so the extra scan on the
+    /// `false`/`Err` path (where nothing landed) is cheap and finds nothing to evict.
+    ///
     /// The read-path call site holds NO `cache_lock`, so this uses the async
     /// [`Node::evict_modules_if_needed`] (which takes `cache_lock` fresh) — NOT the locked core, which
     /// assumes the lock is already held (as `cache_fetch_and_cache` calls it, holding the lock). The
@@ -1492,9 +1499,7 @@ impl Node {
     /// now serve locally.
     async fn sync_module_and_bound(&self, store_hex: &str, root_hex: &str) -> bool {
         let may_serve_locally = self.sync_module(store_hex, root_hex).await;
-        if may_serve_locally {
-            self.evict_modules_if_needed().await;
-        }
+        self.evict_modules_if_needed().await;
         may_serve_locally
     }
 
@@ -4101,6 +4106,78 @@ mod tests {
             !path_b.exists(),
             "the pre-existing tier-0 module is evicted by the read-path land's OWN sweep — the bound \
              holds with NO tier-0 loop and no cache.fetchAndCache"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// **Proves (#2041, the served≠requested residual):** a read-path §21 sync whose SERVED root differs
+    /// from the requested one (the upstream's head advanced) still lands a chain-anchored capsule under
+    /// the served root and `sync_module` returns `false` — yet the modules-cache bound MUST still hold,
+    /// because that land grew the cache. The sweep runs after every sync ATTEMPT, so the oversized
+    /// pre-existing tier-0 module is evicted even on the `false` return.
+    ///
+    /// **Non-vacuous:** `sync_module` returns `false` here (served AA.. != requested BB..), so a sweep
+    /// gated on the `true` return — the pre-fix shape — would NOT run and the tier-0 module B would
+    /// survive (unbounded growth). The eviction of B can only be explained by the now-unconditional sweep.
+    /// **Catches:** a regression that re-gates the read-path sweep on the `sync_module` bool.
+    #[test]
+    fn read_path_sync_land_under_served_root_bounds_cache_even_when_served_ne_requested() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+        set_cache_cap_bytes(100_000).unwrap();
+
+        // The upstream serves the SERVED generation (chain-anchored via the resolver); the read requests
+        // a DIFFERENT root, so the capsule lands under `served` and `sync_module` returns false.
+        let seed = [1u8; 32];
+        let store = Bytes32([0x3au8; 32]);
+        let served = Bytes32([0xAAu8; 32]);
+        let requested = Bytes32([0xBBu8; 32]);
+        let store_b = "cc".repeat(32);
+        let module = chain_anchored_module(store.0, served.0);
+        assert!(
+            (module.len() as u64) < 100_000,
+            "the synced capsule must fit UNDER the cap so ONLY the tier-0 module is the eviction victim"
+        );
+
+        let (mut node, _td) =
+            test_node_with_resolver(Some(seed), MockResolver::one(&store.to_hex(), served));
+
+        let path_b = module_path(&node.cache_dir, &store_b, &served.to_hex());
+        std::fs::create_dir_all(path_b.parent().unwrap()).unwrap();
+        std::fs::write(&path_b, vec![0u8; 200_000]).unwrap();
+        crate::tier0_live::mark_tier0_land(&store_b);
+
+        pin_test_rt().block_on(async {
+            // The §21 clone path serves the served root via its ETag; no `dig.getCapsule` route exists on
+            // this mock, so path 1 fails and the clone path (which carries the served/requested mismatch)
+            // is taken.
+            let captured = Arc::new(std::sync::Mutex::new(None));
+            let url = spawn_mock_module_server(captured, served, module.clone()).await;
+            node.upstream = url;
+            // The read-path land attempt: served != requested, so `sync_module` returns false — but a
+            // whole capsule DID land under the served root, so the sweep must still fire.
+            assert!(
+                !node
+                    .sync_module_and_bound(&store.to_hex(), &requested.to_hex())
+                    .await,
+                "served (AA..) != requested (BB..), so the caller may NOT serve locally"
+            );
+        });
+
+        // The capsule landed under the SERVED root …
+        let served_path = module_path(&node.cache_dir, &store.to_hex(), &served.to_hex());
+        assert!(
+            served_path.exists(),
+            "the chain-anchored capsule landed under the served root"
+        );
+        // … and the sweep — which ran despite the `false` return — evicted the oversized tier-0 module.
+        assert!(
+            !path_b.exists(),
+            "the pre-existing tier-0 module is evicted by the land's sweep even on a served≠requested \
+             (false) sync — the bound holds regardless of the return value"
         );
 
         std::env::remove_var("DIG_NODE_CACHE");
