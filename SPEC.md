@@ -1484,9 +1484,27 @@ the attacker cannot grind toward this node, and the `[1, 32]` clamp caps the sur
 
 **Composition seam.** `sample_candidates(probe: &dyn NeighbourhoodProbe, rng, sample_points, policy)`
 ties sampling + probing + reconciliation over a `NeighbourhoodProbe` seam (`observe_near(point) ->
-Vec<PeerObservation>`), reconciling ALL probed regions TOGETHER so the quorum is whole-round. The
-concrete probe (`find_node` toward each point, then a provider-snapshot RPC to the peers found) lands
-with the fetch child (#4); this module defines only the shape it consumes.
+Vec<PeerObservation>`), reconciling ALL probed regions TOGETHER so the quorum is whole-round.
+
+**Concrete probe (`neighbourhood_probe` module, #1989 child 4a).** `DhtNeighbourhoodProbe` implements
+`observe_near`: it routes toward `point` with dig-dht `find_node`, then for each returned `Contact`
+opens/uses an mTLS peer connection and calls the `dig.getProviderSnapshot` peer RPC (§7.4 in
+dig-node-core `SPEC.md`), turning each RESPONDING peer into ONE `PeerObservation`. Two properties are
+normative and security-critical:
+
+- **Identity comes from the verified session, never the wire.** A `PeerObservation.peer_id` is the
+  anti-Sybil VOTE identity, so it is set from `SHA-256(verified mTLS server-cert SPKI DER)` of that
+  session — NEVER from `Contact.peer_id` and NEVER from any field of the snapshot payload (the
+  `DhtRecordsAnswer` is deliberately identity-free). A peer lying about its id in its `Contact` either
+  fails the pinned handshake (contributing nothing) or is attributed to the cert it actually presented.
+  An unreachable/silent/erroring peer yields NOTHING (never an error), matching the seam contract.
+- **Volume caps before reconcile.** Each peer's holdings are truncated at `MAX_HOLDINGS_PER_PEER` (=
+  the server's 512-key cap) and the whole round's observation volume at `MAX_OBS_PER_ROUND` (4 096),
+  so neither a single verbose peer nor a Sybil cluster can exhaust memory in `reconcile`.
+
+The server half — answering `dig.getProviderSnapshot` from this node's local provider store, counts
+only, `max_keys` clamped — is specified in dig-node-core `SPEC.md` §7.4/§7.4a. The prefetch loop that
+DRIVES the probe (selection, fetch, cache writes) is child 4b, not this module.
 
 ### 7.10d. Tier-1 caching triggers — fetch-side backfill AND inbound demand (#1990, epic #1934)
 

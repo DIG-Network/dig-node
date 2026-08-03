@@ -18,6 +18,7 @@ pub mod module_anchor;
 pub mod module_reshare;
 pub mod module_serve;
 pub mod module_transport;
+pub mod neighbourhood_probe;
 pub mod net;
 pub mod peer_network;
 pub mod pex;

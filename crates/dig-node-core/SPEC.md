@@ -753,6 +753,18 @@ classified by its fields: `method` present → JSON-RPC; `length` present (no `m
   successive ranges). Frame: `{ offset, length, bytes: base64, complete }`; the first frame (offset 0)
   additionally carries `total_length`, `chunk_lens`, `chunk_index`, `inclusion_proof`, `root`. Errors
   `-32004` (not held), `-32007` (bad range), `-32008` (redirect on miss when holders located).
+- **`dig.getProviderSnapshot`** — a bounded, AGGREGATED view of this node's DHT provider store for
+  anti-Sybil neighbourhood sampling (epic #1934). Params `{ max_keys?: u64 }`; result reuses the
+  RLY-009 `DhtRecordsAnswer` wire shape VERBATIM: `{ records: [{ content_key: 64hex, providers: u64
+  }], total_keys: u64, truncated: bool }`. The answer carries provider COUNTS ONLY — never provider
+  identities (the same privacy stance as the relay RLY-009 view, so it links no `(peer_id,
+  content_key)` pair). `max_keys` is CLAMPED to **512** (an over-cap or absent request is bounded, not
+  honoured unboundedly), a bound derived from the 64 KiB control-frame ceiling so a full answer always
+  fits one frame. A node with no DHT wired answers an empty snapshot. **Normative identity contract:**
+  a consumer building an anti-Sybil observation MUST attribute it to the `peer_id` of the verified mTLS
+  session (`SHA-256(server-cert SPKI DER)`), NEVER to a routing `Contact.peer_id` or any field of this
+  payload (the payload carries no identity) — the response is deliberately identity-free so the
+  attribution can only come from the authenticated channel.
 - **The four DHT methods** `find_node` / `find_providers` / `add_provider` / `ping` (§7.5), dispatched
   to the content-location DHT, folding the mTLS-verified caller into the routing table.
 - **The four PEX messages** `pex_handshake` / `pex_snapshot` / `pex_delta` / `pex_error` (§7.7).
@@ -770,8 +782,12 @@ a JSON-RPC frame arrives over the peer surface, and MUST answer every other meth
 
 **Peer-reachable (allowlisted):** `dig.getContent`, `dig.getAvailability`, `dig.listInventory`,
 `dig.fetchRange`, `dig.getNetworkInfo`, `dig.getPeers`, `dig.announce`, `dig.getAnchoredRoot`,
-`dig.getCollection`, `dig.listCollectionItems` (plus the DHT + PEX frame families above, which are
-classified by shape, not the `method` field).
+`dig.getCollection`, `dig.listCollectionItems`, `dig.getProviderSnapshot` (plus the DHT + PEX frame
+families above, which are classified by shape, not the `method` field). `dig.getProviderSnapshot` is a
+dig-node-LOCAL peer method not yet in the shared `dig-rpc-protocol` allowlist (that crate is a pinned
+dependency this repo cannot extend); it is therefore allowlisted explicitly in `is_peer_reachable_method`,
+a deliberate decision recorded as a counts-only read that mutates no state. Promoting it into the shared
+allowlist crate is a tracked cross-repo follow-up.
 
 **NOT peer-reachable (loopback / in-process ONLY, answered `-32601` on the peer surface):** every
 `cache.*` method (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
