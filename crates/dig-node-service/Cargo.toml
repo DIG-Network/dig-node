@@ -66,6 +66,13 @@ testkit = []
 # around it, and produces the `dig-node` binary (distinct name from the engine lib).
 dig-node-core = { path = "../dig-node-core" }
 
+# The OS CSPRNG for all authorization material — the control token, pairing ids/tokens
+# (§7), and the relay loop-probe id (`control::fill_random`). Wraps `getrandom(2)` /
+# `/dev/urandom` on Unix and `BCryptGenRandom` on Windows, one code path on every
+# platform, so a token is NEVER minted from a software (non-CSPRNG) fallback. Pinned to
+# the 0.2 line already resolved in the lock (no new major pulled in).
+getrandom = "0.2"
+
 # The canonical node<->node JSON-RPC contract crate — the shell's discovery catalogue
 # (meta.rs) drift-guards its node-surface method names against this single source of
 # truth so the published OpenRPC can never describe a method set that diverges from

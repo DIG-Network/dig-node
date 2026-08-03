@@ -35,8 +35,14 @@
 //! random web page (which cannot read a local file) is rejected even though it can
 //! reach loopback, while the legitimate local controller (which can) is allowed.
 //!
-//! The token is generated at RUNTIME and never committed; constant-time comparison
-//! avoids a timing oracle.
+//! The token is generated at RUNTIME from the OS CSPRNG (`getrandom` — `getrandom(2)`/
+//! `/dev/urandom` on Unix, `BCryptGenRandom` on Windows, one path on every platform;
+//! see [`fill_random`]) and never committed; constant-time comparison avoids a timing
+//! oracle. There is NO software (non-CSPRNG) fallback: if the OS CSPRNG is unavailable
+//! the node fails CLOSED — it refuses to mint a token (and the pairing methods refuse to
+//! mint pairing material) rather than emit a guessable credential. So the token's
+//! secrecy rests on the OS CSPRNG, NOT on an attacker's ability to estimate mint
+//! time/PID/ASLR entropy.
 //!
 //! # What's proxied vs. owned
 //!
@@ -321,7 +327,7 @@ pub fn load_or_create_token_at(path: &Path) -> std::io::Result<String> {
             let _ = std::fs::remove_file(path);
         }
     }
-    let token = generate_token();
+    let token = generate_token()?;
     if let Some(dir) = path.parent() {
         // Create the state dir with a RESTRICTIVE ACL (not the world-readable default of
         // a machine-wide `%PROGRAMDATA%`) — see [`crate::state::ensure_dir_restricted`].
@@ -342,76 +348,52 @@ pub(crate) fn restrict_permissions(path: &Path) {
     crate::state::restrict_file(path);
 }
 
-/// Generate a fresh 64-hex control token from 32 bytes of OS randomness.
-fn generate_token() -> String {
+/// Generate a fresh 64-hex control token from 32 bytes of OS-CSPRNG randomness.
+/// Fails closed (propagates) if the OS CSPRNG is unavailable — the caller must refuse
+/// to mint a token rather than fall back to a guessable one (see [`fill_random`]).
+fn generate_token() -> std::io::Result<String> {
     random_hex(32)
 }
 
-/// `n_bytes` of OS randomness rendered as lowercase hex. Used for the control token
-/// (32 bytes → 64-hex) and the pairing ids/tokens (#280). Same randomness source as
-/// [`generate_token`].
-pub(crate) fn random_hex(n_bytes: usize) -> String {
+/// `n_bytes` of OS-CSPRNG randomness rendered as lowercase hex. Used for the control
+/// token (32 bytes → 64-hex) and the pairing ids/tokens (#280) — all authorization
+/// material. Same CSPRNG source as [`generate_token`]; returns `Err` (never a weak
+/// value) when the OS CSPRNG is unavailable so every caller can fail CLOSED.
+pub(crate) fn random_hex(n_bytes: usize) -> std::io::Result<String> {
     let mut buf = vec![0u8; n_bytes];
-    fill_random(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    fill_random(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// A short numeric pairing code (6 digits, zero-padded) for the compare-codes
 /// consent step (#280) — the human confirms the extension's code matches the CLI's
-/// before approving. Uniformly random over `000000..=999999` from OS randomness.
-pub(crate) fn random_pairing_code() -> String {
+/// before approving. Uniformly random over `000000..=999999` from the OS CSPRNG;
+/// fails closed (propagates) when the CSPRNG is unavailable.
+pub(crate) fn random_pairing_code() -> std::io::Result<String> {
     let mut buf = [0u8; 4];
-    fill_random(&mut buf);
+    fill_random(&mut buf)?;
     let n = u32::from_le_bytes(buf) % 1_000_000;
-    format!("{n:06}")
+    Ok(format!("{n:06}"))
 }
 
-/// Fill `buf` with cryptographically-random bytes from the OS, without adding a
-/// crypto dependency: read `/dev/urandom` on Unix, `BCryptGenRandom` is not wired
-/// so on Windows we fall back to a strong, non-deterministic mix (PID + high-res
-/// time + address-space entropy hashed) — adequate for a loopback capability token
-/// whose real protection is the file's same-host-readable property + loopback bind.
-/// Unix uses the kernel CSPRNG directly.
-fn fill_random(buf: &mut [u8]) {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            if f.read_exact(buf).is_ok() {
-                return;
-            }
-        }
-    }
-    // Fallback (Windows, or a Unix box without /dev/urandom): mix several
-    // non-deterministic sources through a splitmix64 stream. Not a CSPRNG, but the
-    // token's security model is "readable only by a same-host process", not
-    // secrecy from a network attacker; combined with the default loopback-only binding
-    // (a non-loopback DIG_NODE_HOST is refused unless DIG_NODE_ALLOW_REMOTE=1, #1662) this
-    // is sufficient, and it never blocks the build on a platform crypto crate.
-    let mut seed = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let pid = std::process::id() as u64;
-        let stack_addr = (&seed_anchor() as *const u8) as u64;
-        nanos ^ pid.rotate_left(17) ^ stack_addr.rotate_left(33)
-    };
-    for slot in buf.iter_mut() {
-        // splitmix64
-        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = seed;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        *slot = (z & 0xff) as u8;
-    }
-}
-
-/// A tiny stack byte whose address contributes ASLR entropy to the fallback seed.
-#[inline(never)]
-fn seed_anchor() -> u8 {
-    0
+/// Fill `buf` with cryptographically-secure random bytes from the operating-system
+/// CSPRNG on EVERY platform. `getrandom` wraps `getrandom(2)`/`/dev/urandom` on Unix
+/// and `BCryptGenRandom` on Windows, so there is ONE code path everywhere.
+///
+/// There is deliberately NO software fallback. A weak (seed-derived) generator that is
+/// exercised only when the OS source is missing is a guard nobody tests, and any
+/// authorization token it minted would rest on estimating time/PID/ASLR entropy — a
+/// full compromise of the control plane if guessed. Instead, when the OS CSPRNG is
+/// unavailable this returns the error so the caller fails CLOSED: it refuses to mint a
+/// usable token rather than emit a guessable one (§7.3; the token-mint path routes the
+/// error to `resolve_state_dir_and_token`'s ephemeral in-memory fallback, and the
+/// pairing methods return a control error — either way, no weak credential is issued).
+fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
+    getrandom::getrandom(buf).map_err(|e| {
+        std::io::Error::other(format!(
+            "OS CSPRNG unavailable, refusing to mint authorization material: {e}"
+        ))
+    })
 }
 
 /// Constant-time string equality, so token verification can't be probed via a
@@ -1407,11 +1389,61 @@ mod tests {
 
     #[test]
     fn generate_token_is_64_hex_and_unique() {
-        let a = generate_token();
-        let b = generate_token();
+        let a = generate_token().expect("OS CSPRNG available in tests");
+        let b = generate_token().expect("OS CSPRNG available in tests");
         assert_eq!(a.len(), 64);
         assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "two generated tokens must differ");
+    }
+
+    /// The control token must NOT be reproducible from a fixed process context. Before
+    /// the CSPRNG fix, `fill_random` fell back on Windows/`/dev/urandom`-less hosts to a
+    /// splitmix64 stream seeded purely from `nanos ^ pid ^ stack_addr` — an attacker who
+    /// estimated the mint time/PID/ASLR could reconstruct the whole control-plane token.
+    /// That deterministic seed path is now gone: every byte comes from the OS CSPRNG.
+    ///
+    /// HONEST LIMIT: this test cannot validate randomness QUALITY (no unit test can —
+    /// that needs statistical/known-answer suites the OS CSPRNG already carries). It only
+    /// asserts the seed-determinism escape hatch is gone: within one process (fixed PID,
+    /// near-fixed time) many draws are all distinct, which the old seeded stream — a pure
+    /// function of that fixed context per call site — could not guarantee across calls
+    /// the way an independent CSPRNG draw does.
+    #[test]
+    fn random_hex_is_not_reproducible_from_fixed_process_context() {
+        let draws: std::collections::HashSet<String> = (0..64)
+            .map(|_| random_hex(32).expect("OS CSPRNG available in tests"))
+            .collect();
+        assert_eq!(
+            draws.len(),
+            64,
+            "64 tokens drawn in one process (fixed pid/time) must all differ — no \
+             deterministic seed path remains"
+        );
+    }
+
+    /// Fail CLOSED: when the token cannot be minted, `load_or_create_token_at`
+    /// propagates the error (it does not silently emit a weak token). This drives the
+    /// `resolve_state_dir_and_token` ephemeral in-memory fallback (server.rs) so the
+    /// control plane is unauthorizable rather than guessable. We simulate the mint
+    /// failure via an unwritable state dir (the OS CSPRNG itself cannot be un-provisioned
+    /// in-process); the propagate-on-failure contract this exercises is the SAME `?` path
+    /// a `getrandom` error takes out of `generate_token`.
+    #[test]
+    fn token_mint_fails_closed_when_it_cannot_be_persisted() {
+        // A path whose parent is a FILE, so `ensure_dir_restricted` / write cannot
+        // create the token → `generate_token()?` / `write` returns Err, never a token.
+        let file = std::env::temp_dir().join(format!(
+            "dig-node-failclosed-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&file, b"not a dir").unwrap();
+        let bogus = file.join("sub").join(CONTROL_TOKEN_FILE);
+        assert!(
+            load_or_create_token_at(&bogus).is_err(),
+            "must fail closed (propagate), never return a usable token when it cannot mint+persist"
+        );
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

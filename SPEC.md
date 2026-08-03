@@ -1078,9 +1078,9 @@ its CLI verb) but the server skips the token requirement. No mutation or custody
   identities, so the CLI would never see the token the service wrote (and would mint a phantom the
   daemon never trusts). Resolving a machine-wide dir independently of the running user makes the
   daemon and the CLI read the SAME token.
-- Value: 32 bytes of OS randomness rendered as 64 lowercase hex characters. Generated at first
-  run; subsequent runs (and other same-host processes/users) read the same value. The token MUST
-  never be committed or logged.
+- Value: 32 bytes drawn from the operating-system CSPRNG rendered as 64 lowercase hex characters.
+  Generated at first run; subsequent runs (and other same-host processes/users) read the same
+  value. The token MUST never be committed or logged.
 - Presentation, either of (header preferred): the `X-Dig-Control-Token` request header, or the
   `params._control_token` field. Blank presentations are treated as absent.
 - **The daemon MAY create the token (write); an operator CLI MUST NOT mint one.** The CLI
@@ -1104,12 +1104,16 @@ its CLI verb) but the server skips the token requirement. No mutation or custody
   mode `0600` (owner-only); a group/other-readable or foreign-uid token is untrusted. This is layered
   BENEATH the §7.3a state-dir hardening (which already purges a squatter-owned dir on a service run)
   as defense-in-depth: it also guards the non-hardened dev path and any harden gap.
-- If the token cannot be persisted (unwritable state dir), the daemon MUST fall back to an
-  in-memory token that no controller can read — the control plane fails **closed**; the read plane
-  is unaffected.
-- Randomness source: the kernel CSPRNG (`/dev/urandom`) on Unix; elsewhere a non-deterministic
-  mixed fallback. The security model is *possession of a same-host-readable file*, layered on the
-  loopback bind — not secrecy from a network attacker.
+- If the token cannot be persisted (unwritable state dir) OR cannot be minted (the OS CSPRNG is
+  unavailable), the daemon MUST fall back to an in-memory token that no controller can read — the
+  control plane fails **closed**; the read plane is unaffected. It MUST NEVER emit a guessable
+  token in place of a CSPRNG-drawn one.
+- Randomness source: the operating-system CSPRNG on EVERY platform (`getrandom` — `getrandom(2)`/
+  `/dev/urandom` on Unix, `BCryptGenRandom` on Windows). There is NO software (non-CSPRNG) fallback:
+  when the OS CSPRNG is unavailable the daemon fails closed (above) rather than derive a token from
+  time/PID/ASLR entropy. The same CSPRNG source mints the pairing ids/tokens (§7.11) and, layered on
+  loopback bind + same-host-readable-file possession, is the token's secrecy guarantee — not an
+  attacker's inability to estimate mint time/PID/ASLR.
 
 ### 7.3a. The daemon state dir — location, ACL, threat model (#501)
 
