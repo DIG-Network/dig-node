@@ -66,6 +66,36 @@ fn triggers_block(workflow: &str) -> String {
     lines.join("\n")
 }
 
+/// Extract ONE job's block from a workflow: the lines from `  <name>:` (inclusive) up to the next
+/// sibling job key at the same two-space indent. Scoping an assertion to a single job is what makes
+/// it load-bearing — a string found anywhere in a 360-line workflow proves nothing about where it
+/// sits, and "the packages exist somewhere" is exactly the coincidence these guards must not pin.
+fn job_block(workflow: &str, name: &str) -> String {
+    let header = format!("  {name}:");
+    let mut lines: Vec<&str> = Vec::new();
+    for line in workflow.lines() {
+        if lines.is_empty() {
+            if line == header {
+                lines.push(line);
+            }
+            continue;
+        }
+        let is_sibling_job = line.starts_with("  ")
+            && !line.starts_with("   ")
+            && !line.trim_start().starts_with('#')
+            && line.trim_end().ends_with(':');
+        if is_sibling_job {
+            break;
+        }
+        lines.push(line);
+    }
+    assert!(
+        !lines.is_empty(),
+        "workflow declares no `{name}:` job — expected it at two-space indent under `jobs:`"
+    );
+    lines.join("\n")
+}
+
 #[test]
 fn tagger_no_longer_triggers_on_push_to_main() {
     let on = triggers_block(&nightly_release());
@@ -235,5 +265,115 @@ fn reusable_build_workflow_is_workflow_call_and_shared() {
     assert!(
         release.contains("./.github/workflows/build-binaries.yml"),
         "release.yml (stable) must build via the shared build-binaries.yml (never a hand-rolled matrix)"
+    );
+}
+
+// ─────────────────── the nightly channel's NATIVE PACKAGES (dig_ecosystem#618) ───────────────────
+//
+// The beacon does not install dig-node from a raw binary — it hands a NATIVE PACKAGE to
+// `msiexec`/`installer`/`dpkg` (dig-updater's `InstallMethod`). dig-updater's feedsign therefore
+// resolves each component's assets by their native-package file names, and a nightly release that
+// ships only bare binaries makes the whole nightly CHANNEL non-installable: feedsign fails closed
+// with `no matching release assets`, reddening the signed feed for every channel it builds.
+//
+// These guards pin the wiring that fixes it, in the two places it can silently rot: `package.yml`
+// must stay CALLABLE (and keep its own triggers), and the nightly channel must actually call it and
+// wait for it before publishing.
+
+/// The native-package builder — the .deb/.pkg/.msi definitions shared by the stable tag path and
+/// the nightly channel.
+fn package_workflow() -> String {
+    workflow("package.yml")
+}
+
+#[test]
+fn package_workflow_is_reusable_and_keeps_its_own_triggers() {
+    let pkg = package_workflow();
+    let on = triggers_block(&pkg);
+    assert!(
+        on.contains("workflow_call:"),
+        "package.yml must be callable (`on: workflow_call`) so the nightly channel builds the \
+         native packages from the SAME definitions as the stable tag path, never a copy. \
+         `on:` block:\n{on}"
+    );
+    assert!(
+        on.contains("version:"),
+        "the `workflow_call` interface must take a `version` input — the nightly version is \
+         synthesized at build time and exists in no version file. `on:` block:\n{on}"
+    );
+    // Making package.yml callable must not cost it its own triggers: the PR trigger is what
+    // catches a broken package definition on the PR, and the `v*` tag trigger is what attaches
+    // packages to a STABLE release.
+    assert!(
+        on.contains("pull_request:"),
+        "package.yml must keep its `pull_request:` trigger — a broken package definition has to \
+         fail on the PR, not on release night. `on:` block:\n{on}"
+    );
+    assert!(
+        on.contains("\"v*\""),
+        "package.yml must keep its `push: tags: v*` trigger — that is how the STABLE release gets \
+         its native packages. `on:` block:\n{on}"
+    );
+}
+
+#[test]
+fn nightly_channel_builds_the_native_packages_from_the_shared_definitions() {
+    let wf = nightly_release();
+    assert!(
+        wf.contains("./.github/workflows/package.yml"),
+        "the nightly channel must build its native packages via the shared package.yml (never a \
+         hand-rolled copy of the .deb/.pkg/.msi definitions)"
+    );
+    assert!(
+        wf.contains("needs.nightly-meta.outputs.version"),
+        "the native-package build must be stamped with the SAME synthesized nightly version as \
+         the binaries (`nightly-meta.outputs.version`), or feedsign resolves two different \
+         versions from one release"
+    );
+}
+
+#[test]
+fn nightly_publish_waits_for_the_packages_before_collecting_assets() {
+    let wf = nightly_release();
+    let publish = job_block(&wf, "nightly-publish");
+    assert!(
+        publish.contains("nightly-packages"),
+        "`nightly-publish` must `needs:` the packages job. It collects assets with a blanket \
+         `download-artifact` over the whole run, so WITHOUT that edge it can publish before the \
+         packages exist — the nightly release would come out binaries-only exactly as it does \
+         today, with every guard still green. `nightly-publish` job:\n{publish}"
+    );
+}
+
+#[test]
+fn nightly_publish_uploads_the_three_assets_feedsign_resolves() {
+    let wf = nightly_release();
+    let publish = job_block(&wf, "nightly-publish");
+    // feedsign's `asset_name_parts` matches on these EXACT tails: `{prefix}_{version}_amd64.deb`,
+    // `{prefix}-{version}-macos.pkg`, `{prefix}-{version}-windows-x64.msi`. Naming them in the
+    // flatten step makes the collection explicit rather than an incidental consequence of a
+    // blanket `find -type f`, so dropping one is a visible edit.
+    for glob in ["_amd64.deb", "-macos.pkg", ".msi"] {
+        assert!(
+            publish.contains(glob),
+            "`nightly-publish` must explicitly collect `*{glob}` — that is one of the three asset \
+             names dig-updater's feedsign resolves for a native-package component. \
+             `nightly-publish` job:\n{publish}"
+        );
+    }
+}
+
+/// The nightly `.deb` is amd64-ONLY by deliberate scope: feedsign's platform set has exactly one
+/// Linux entry (`linux/x64`), so an arm64 nightly `.deb` would be built every night and resolved by
+/// nobody. This guard is what keeps that a decision rather than a regression.
+#[test]
+fn nightly_deb_is_amd64_only() {
+    let wf = nightly_release();
+    let packages = job_block(&wf, "nightly-packages");
+    assert!(
+        packages.contains("amd64") && !packages.contains("arm64"),
+        "the nightly packages job must request the amd64 `.deb` only — feedsign resolves a single \
+         `linux/x64` Linux artifact, so a nightly arm64 build is pure CI cost. \
+         `nightly-packages` job:\n{packages}"
     );
 }
