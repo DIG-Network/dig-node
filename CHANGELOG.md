@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.93.9] - 2026-08-04
+
+### Features
+- **dig-node:** Dig.resolveCapsule peer RPC + holdings reverse-index (#160)- **dig-node:** Self-verifying CapsuleKeyResolver anti-forgery gate (#161)- **dig-node:** Live-wire tier-0 precache with chain-anchored fetch + tiered cache eviction (#162)- **dig-node:** Live eviction test for inbound-demand tier + remove dead demand wrappers (#166)- **dig-node:** Persist cache tier tag so eviction precedence survives restart (#167)
+
+### Bug Fixes
+- **dig-node:** Mint control + pairing tokens from an OS CSPRNG, fail closed (#163)- **dig-node:** Canonical getAvailability order + gate whole listInventory off peer tier (#164)- **dig-node:** Gate inbound-demand pull on XOR-proximity admission (anti-amplification) (#165)- **dig-node:** Gate chat.send + chat.poll behind the control token (#168)- **dig-node:** Sweep modules-cache after every read-path §21 sync attempt (#170)- **dig-node:** Sweep modules-cache after reshare-warm promote_into_cache land (#172)- **dig-node:** Keep the tier-0 precache loop alive across a round panic (#173)- **dig-node:** Guard long-lived background loops against silent panic-death (#174)- **dig-node:** Guard remaining inline background loops against panic-death (#175)- **dig-node:** Add bounded non-injectable shape hint for rejected peer ids (#176)- **dig-node:** Restore the getContent envelope fields the resolver needs (#177)
+
+### Documentation
+- **dig-node:** Correct inbound-demand proximity + gap_fill anchor contract wording (#171)
+
+### Testing
+- **dig-node:** Make port-bind + dual-stack tests loopback-tolerant (#169)
+
 ## [0.84.0] - 2026-08-03
 
 ### Features
