@@ -184,21 +184,46 @@ pub fn read_module_window(
     let mut window = vec![0u8; want as usize];
     file.read_exact(&mut window).ok()?;
     #[cfg(test)]
-    module_bytes_read().fetch_add(window.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    record_module_bytes_read(root_hex, window.len() as u64);
     Some(window)
 }
 
-/// Test-only counter of bytes pulled off disk by [`read_module_window`].
+/// Test-only tally of bytes pulled off disk by [`read_module_window`], keyed by ROOT.
 ///
-/// A serve's CORRECTNESS test cannot see the defect that matters here: whether the response was
-/// built from a windowed read or from slurping the whole module, both produce byte-identical
-/// output. The only observable difference is how much was read, so that is what the guard asserts.
-/// A revert to `fs::read` leaves this counter at zero while every correctness assertion still
-/// passes — which is exactly how a whole-file read reached an anonymous endpoint.
+/// A serve's CORRECTNESS test cannot see the defect that matters here: a windowed read and a
+/// whole-module slurp produce byte-identical output, so the only observable difference is how much
+/// was read. A revert to `fs::read` leaves this tally at zero while every correctness assertion
+/// still passes — which is exactly how a whole-file read reached an anonymous endpoint.
+///
+/// Keyed by root rather than a single global counter because the test harness runs tests in
+/// PARALLEL and the read happens on a `spawn_blocking` thread, so neither a bare global nor a
+/// thread-local can attribute a read to the test that caused it. A per-root tally can: each test
+/// reads its own fixture's root. (A global counter here passed in isolation and failed in the full
+/// suite — the guard would have been flaky rather than wrong, which is worse.)
 #[cfg(test)]
-pub(crate) fn module_bytes_read() -> &'static std::sync::atomic::AtomicU64 {
-    static READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    &READ
+pub(crate) fn module_bytes_read(root_hex: &str) -> u64 {
+    module_read_tally()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(root_hex)
+        .copied()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn record_module_bytes_read(root_hex: &str, bytes: u64) {
+    *module_read_tally()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entry(root_hex.to_string())
+        .or_insert(0) += bytes;
+}
+
+#[cfg(test)]
+fn module_read_tally() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static TALLY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    TALLY.get_or_init(Default::default)
 }
 
 /// One `RangeFrame`-shaped response frame for a module window, in the SAME wire shape

@@ -9069,7 +9069,6 @@ mod tests {
     /// ~200-byte unauthenticated request pull 128 MiB off a `--cache`-less S3 mount.
     #[tokio::test]
     async fn dig_get_capsule_reads_only_the_requested_window_off_disk() {
-        use std::sync::atomic::Ordering;
         let store_id = Bytes32([21u8; 32]);
         let files = vec![("index.html".to_string(), b"<h1>bounded</h1>".to_vec())];
         let (root, module_bytes) =
@@ -9088,8 +9087,7 @@ mod tests {
             &module_bytes,
         );
 
-        let before =
-            crate::seams::dig_peer::module_serve::module_bytes_read().load(Ordering::Relaxed);
+        let before = crate::seams::dig_peer::module_serve::module_bytes_read(&root.to_hex());
         let resp = handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":1,"method":"dig.getCapsule","params":{
@@ -9099,9 +9097,7 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         )
         .await;
-        let read = crate::seams::dig_peer::module_serve::module_bytes_read()
-            .load(Ordering::Relaxed)
-            - before;
+        let read = crate::seams::dig_peer::module_serve::module_bytes_read(&root.to_hex()) - before;
 
         assert!(resp.get("error").is_none(), "{resp}");
         assert!(
@@ -9124,8 +9120,7 @@ mod tests {
 
         // A far-past-EOF offset is the cheapest possible request: an empty window, and it must
         // not have read the module to discover that.
-        let before =
-            crate::seams::dig_peer::module_serve::module_bytes_read().load(Ordering::Relaxed);
+        let before = crate::seams::dig_peer::module_serve::module_bytes_read(&root.to_hex());
         let past = handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":2,"method":"dig.getCapsule","params":{
@@ -9136,9 +9131,8 @@ mod tests {
             crate::download::RequestProvenance::FirstParty,
         )
         .await;
-        let read_past = crate::seams::dig_peer::module_serve::module_bytes_read()
-            .load(Ordering::Relaxed)
-            - before;
+        let read_past =
+            crate::seams::dig_peer::module_serve::module_bytes_read(&root.to_hex()) - before;
         assert_eq!(past["result"]["length"].as_u64(), Some(0), "{past}");
         assert_eq!(
             read_past, 0,
