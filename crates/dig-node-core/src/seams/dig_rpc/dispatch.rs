@@ -890,3 +890,4 @@ impl RpcDispatch for Node {
         }
     }
 }
+// WIP: cache.pushCapsule (#1476) - stub
