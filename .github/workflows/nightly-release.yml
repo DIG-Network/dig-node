@@ -259,11 +259,33 @@ jobs:
       version: ${{ needs.nightly-meta.outputs.version }}
       ref: ${{ needs.nightly-meta.outputs.sha }}
 
-  # 3) publish: attach the built binaries to a dated + rolling PRE-release, then prune old
-  #    nightlies. Uses RELEASE_TOKEN for git tag + gh release operations (same identity as stable).
+  # 2b) packages: the NATIVE install packages, from the same shared definitions the stable tag path
+  #     uses (dig_ecosystem#618). Raw binaries alone make the nightly channel non-installable: the
+  #     beacon installs dig-node by handing a native package to msiexec/installer/dpkg, and
+  #     dig-updater's feedsign therefore resolves dig-node's assets by their native-package file
+  #     names — so a binaries-only nightly failed its feed build with `no matching release assets`,
+  #     reddening the signed feed for every channel. Stamped with the SAME synthesized version and
+  #     built from the SAME commit as the binaries, so one release never mixes two trees.
+  #
+  #     amd64 `.deb` only: feedsign's platform set has exactly one Linux entry (`linux/x64`), so a
+  #     nightly arm64 `.deb` would be built every night and resolved by nobody. apt.dig.net's arm64
+  #     index is fed by the STABLE tag path, which keeps both legs.
+  nightly-packages:
+    name: Nightly — native packages
+    needs: nightly-meta
+    if: needs.nightly-meta.outputs.token_present == 'true'
+    uses: ./.github/workflows/package.yml
+    with:
+      version: ${{ needs.nightly-meta.outputs.version }}
+      ref: ${{ needs.nightly-meta.outputs.sha }}
+      deb_arches: '[{"runner":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","dpkg_arch":"amd64"}]'
+
+  # 3) publish: attach the built binaries + native packages to a dated + rolling PRE-release, then
+  #    prune old nightlies. Uses RELEASE_TOKEN for git tag + gh release operations (same identity as
+  #    stable).
   nightly-publish:
     name: Nightly — publish + prune
-    needs: [nightly-meta, nightly-build]
+    needs: [nightly-meta, nightly-build, nightly-packages]
     if: needs.nightly-meta.outputs.token_present == 'true'
     runs-on: ubuntu-latest
     env:
@@ -287,10 +309,31 @@ jobs:
           path: artifacts
 
       - name: Flatten artifacts
+        shell: bash
+        env:
+          VERSION: ${{ needs.nightly-meta.outputs.version }}
         run: |
+          set -euo pipefail
           mkdir -p release
           find artifacts -type f -exec cp {} release/ \;
           ls -la release
+          # Fail CLOSED on a missing native package (dig_ecosystem#618). These three file names are
+          # exactly what dig-updater's feedsign resolves for a native-package component — it strips a
+          # fixed head/tail off the asset NAME to recover a rolling nightly's version, so a name that
+          # is absent or misspelt is indistinguishable from "there is no nightly". Asserting them
+          # here turns that into a red publish rather than a published-but-unusable release, which is
+          # how the channel stayed broken for weeks: every job was green.
+          missing=0
+          for asset in \
+            "dig-node_${VERSION}_amd64.deb" \
+            "dig-node-${VERSION}-macos.pkg" \
+            "dig-node-${VERSION}-windows-x64.msi"; do
+            if [ ! -f "release/$asset" ]; then
+              echo "::error::nightly is missing the native package '$asset' — dig-updater's feedsign resolves dig-node by these exact asset names, so publishing without it would leave the nightly channel non-installable."
+              missing=$((missing + 1))
+            fi
+          done
+          [ "$missing" -eq 0 ]
 
       - name: Move nightly tags (dated + rolling) to this build
         shell: bash
