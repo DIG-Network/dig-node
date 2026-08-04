@@ -1300,60 +1300,119 @@ fn serve_local_blocking(
     Some(resp)
 }
 
-/// How many capsules' extracted DIGS blobs to keep. Each blob is the module's METADATA sections,
-/// not its content — kilobytes, not the 128 MiB module it came from — so 256 entries is small.
-const DATA_SECTION_MEMO_CAP: usize = 256;
-
-/// The process-wide DIGS-blob memo, keyed by `(store_hex, root_hex)`, LRU-evicted at
-/// [`DATA_SECTION_MEMO_CAP`].
+/// How many capsules' DECODED manifests to keep.
 ///
-/// Extracting a data section costs a WHOLE-MODULE read (the DIGS blob shares a wasm data section
-/// with the content chunk pool, so the parse cannot skip past it). `dig.getManifest` is on the
-/// ANONYMOUS public-read allowlist, so without this every ~200-byte unauthenticated request would
-/// re-read a 128 MiB capsule off a `--cache`-less Mountpoint-S3 mount. `(len, mtime)` is a sound
-/// fingerprint for the same reason `descriptor_memo` uses it: a cached module is a brand-new file
-/// written by write-then-rename, never edited in place, so any change invalidates the entry.
+/// An entry is two decoded manifests — a path list and ~14 publisher fields — so it is genuinely
+/// kilobytes and an ENTRY cap is a sound bound. That is only true because the entry holds decoded
+/// values: the DIGS blob they come from is padded to `FIXED_BLOB_LEN` (128 MiB) and contains the
+/// content chunk pool, so a blob cache with this same cap would retain up to 32 GiB. Anything
+/// added to [`CachedManifests`] must stay small, or this cap has to become a BYTE budget like
+/// [`CONTENT_CACHE_MAX_BYTES`].
+const MANIFEST_MEMO_CAP: usize = 256;
+
+/// The process-wide DECODED-manifest memo, keyed by `(store_hex, capsule)`, LRU-evicted at
+/// [`MANIFEST_MEMO_CAP`].
+///
+/// Decoding a capsule's manifests costs a WHOLE-MODULE read: the DIGS blob shares a wasm data
+/// section with the content chunk pool, so the parse cannot skip past it. `dig.getManifest`,
+/// `dig.getPublicManifest` and `dig.getMetadata` are all on the ANONYMOUS public-read allowlist,
+/// so without this every ~200-byte unauthenticated request would re-read a 128 MiB capsule off a
+/// `--cache`-less Mountpoint-S3 mount.
+///
+/// `(len, mtime)` is a sound fingerprint for the same reason `descriptor_memo` uses it: a cached
+/// module is a brand-new file written by write-then-rename, never edited in place, so any change
+/// invalidates the entry.
 #[allow(clippy::type_complexity)]
-fn data_section_memo(
-) -> &'static std::sync::Mutex<lru::LruCache<(String, String), CachedDataSection>> {
-    static MEMO: OnceLock<std::sync::Mutex<lru::LruCache<(String, String), CachedDataSection>>> =
+fn manifest_memo(
+) -> &'static std::sync::Mutex<lru::LruCache<(String, String), Arc<CachedManifests>>> {
+    static MEMO: OnceLock<std::sync::Mutex<lru::LruCache<(String, String), Arc<CachedManifests>>>> =
         OnceLock::new();
     MEMO.get_or_init(|| {
         std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(DATA_SECTION_MEMO_CAP).expect("256 is nonzero"),
+            std::num::NonZeroUsize::new(MANIFEST_MEMO_CAP).expect("256 is nonzero"),
         ))
     })
 }
 
-/// A memoized DIGS blob plus the file fingerprint it was extracted from.
-#[derive(Clone)]
-struct CachedDataSection {
-    len: u64,
-    modified: Option<std::time::SystemTime>,
-    blob: Arc<Vec<u8>>,
+/// Serializes COLD manifest extractions across the whole process.
+///
+/// Two jobs, both load-bearing on a 2 GiB host. It coalesces duplicate work — a second request for
+/// the same capsule waits, then finds the memo populated instead of repeating the read. And it
+/// bounds TRANSIENT memory: one extraction peaks at roughly three ~128 MiB buffers (the module,
+/// plus the two copies `extract_data_section_blob` makes internally), so allowing N concurrently
+/// would let N unauthenticated requests multiply that with no cap at all. Serialized, the peak is
+/// one extraction's worth however many callers arrive.
+///
+/// Held only around the cold path; a memo hit never touches it.
+fn manifest_extract_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-/// Extract a held capsule's DIGS data-section blob, memoized.
+/// A capsule's decoded manifests plus the file fingerprint they came from.
+///
+/// `None` on either field means the section is genuinely ABSENT from the module (an older `.dig`,
+/// or a private store) — store-format §5.1 treats that as normal, so it is a cacheable answer
+/// rather than a miss to retry.
+#[derive(Clone, Default)]
+struct CachedManifests {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    public: Option<digstore_core::PublicManifest>,
+    metadata: Option<digstore_core::MetadataManifest>,
+}
+
+/// Test-only: the bytes this memo RETAINS for a capsule, or `None` if it holds nothing for it.
+///
+/// Residency is invisible to every functional assertion — a memo that pins the whole 128 MiB DIGS
+/// blob returns byte-identical manifests to one that pins two decoded structs. Only a size check
+/// can tell them apart, and the blob-caching version of this memo would have exhausted a 2 GiB
+/// host at ~16 capsules while passing every other test in this file.
+#[cfg(test)]
+fn memoized_manifest_bytes(key: &CapsuleKey) -> Option<usize> {
+    let memo_key = (key.store().to_string(), format!("{key}"));
+    let entry = manifest_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&memo_key)
+        .cloned()?;
+    // Rendered size is a fair proxy for what the entry holds: both manifests are plain owned
+    // data, so a blob hiding in the entry would show up here as megabytes.
+    let public = entry
+        .public
+        .as_ref()
+        .map(|p| p.to_json().len())
+        .unwrap_or(0);
+    let metadata = entry
+        .metadata
+        .as_ref()
+        .map(|m| metadata_manifest_to_json(m).to_string().len())
+        .unwrap_or(0);
+    Some(public + metadata)
+}
+
+/// Decode a held capsule's manifests, memoized and single-flighted.
 ///
 /// The single whole-module reader behind `dig.getManifest` / `dig.getPublicManifest` /
-/// `dig.getMetadata` — all three of which are ANONYMOUSLY reachable through the rpc.dig.net
+/// `dig.getMetadata`, all three of which are ANONYMOUSLY reachable through the rpc.dig.net
 /// public-read tier.
 ///
-/// **Why a memo rather than a seek.** The peer-tier module serve bounds itself by seeking to the
-/// requested window (`read_module_window`), but that works because a capsule window is a raw byte
-/// range. A data-section extraction is not: the DIGS blob lives in the same wasm data section as
-/// the content chunk pool, so locating it means walking the module and the bytes must be present.
-/// The read is therefore whole-file by construction, and the defence is to make it happen ONCE per
-/// capsule instead of once per request — which is what removes the amplification a rate-limit rule
-/// cannot see (a ~200-byte request triggering a 128 MiB read).
+/// **What is cached is the DECODED manifests, never the blob they came from.** A seek cannot bound
+/// this read the way `read_module_window` bounds a capsule window: the DIGS blob lives in the same
+/// wasm data section as the content chunk pool, so the parse needs the bytes present. The defence
+/// is therefore to do that read ONCE per capsule and retain only the small result — which removes
+/// the amplification a rate-limit rule cannot see, without turning it into a retention leak. The
+/// blob is padded to `FIXED_BLOB_LEN` (128 MiB) and is ~99% content, so caching IT would pin
+/// 128 MiB per capsule for the life of the process: ~16 capsules would exhaust a 2 GiB host, and
+/// `cache.listCached` hands an attacker the exact capsule list to walk.
 ///
 /// Reader-tolerance (#1896): tolerates a legacy `.module` cache like every other serve path.
 ///
 /// `Ok(None)` = not held. `Err` = held but the data section is malformed.
-fn data_section_blob_blocking(
+fn cached_manifests_blocking(
     cache_dir: &Path,
     key: &CapsuleKey,
-) -> Result<Option<Arc<Vec<u8>>>, String> {
+) -> Result<Option<Arc<CachedManifests>>, String> {
     let path = key.resolve_cached_path(cache_dir);
     let Ok(meta) = std::fs::metadata(&path) else {
         return Ok(None);
@@ -1361,38 +1420,67 @@ fn data_section_blob_blocking(
     let (len, modified) = (meta.len(), meta.modified().ok());
     let memo_key = (key.store().to_string(), format!("{key}"));
 
-    if let Some(hit) = data_section_memo()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&memo_key)
-    {
-        if hit.len == len && hit.modified == modified {
-            return Ok(Some(hit.blob.clone()));
-        }
+    let fresh_hit = |k: &(String, String)| -> Option<Arc<CachedManifests>> {
+        manifest_memo()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(k)
+            .filter(|hit| hit.len == len && hit.modified == modified)
+            .cloned()
+    };
+
+    if let Some(hit) = fresh_hit(&memo_key) {
+        return Ok(Some(hit));
     }
 
-    let module = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
+    // COLD. Serialize from here: whoever waited re-checks the memo first and usually finds the
+    // work already done, so N concurrent requests for one capsule cost one read, not N.
+    let _extracting = manifest_extract_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hit) = fresh_hit(&memo_key) {
+        return Ok(Some(hit));
+    }
+
+    let decoded = {
+        let module = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        let blob = digstore_compiler::extract_data_section_blob(&module)
+            .map_err(|e| format!("malformed module data section: {e}"))?;
+        // The module buffer is dead the moment the blob exists; drop it before decoding so the
+        // two are never both live.
+        drop(module);
+
+        let public = digstore_core::datasection::read_public_manifest(&blob)
+            .map_err(|e| format!("malformed public manifest section: {e:?}"))?;
+        let view = digstore_core::datasection::DataView::parse(&blob)
+            .map_err(|e| format!("malformed module data section: {e:?}"))?;
+        let metadata = match view.section(digstore_core::datasection::SectionId::Metadata) {
+            Some(body) => {
+                let mut decoder = digstore_core::codec::Decoder::new(body);
+                Some(
+                    digstore_core::MetadataManifest::decode(&mut decoder)
+                        .map_err(|e| format!("malformed metadata section: {e:?}"))?,
+                )
+            }
+            None => None,
+        };
+        // `blob` (128 MiB) goes out of scope HERE, before anything is retained.
+        Arc::new(CachedManifests {
+            len,
+            modified,
+            public,
+            metadata,
+        })
     };
-    let blob = Arc::new(
-        digstore_compiler::extract_data_section_blob(&module)
-            .map_err(|e| format!("malformed module data section: {e}"))?,
-    );
-    // Drop the module before caching so the 128 MiB buffer is not live alongside the insert.
-    drop(module);
-    data_section_memo()
+
+    manifest_memo()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .put(
-            memo_key,
-            CachedDataSection {
-                len,
-                modified,
-                blob: blob.clone(),
-            },
-        );
-    Ok(Some(blob))
+        .put(memo_key, decoded.clone());
+    Ok(Some(decoded))
 }
 
 /// Load + decode the embedded [`PublicManifest`](digstore_core::PublicManifest) (data-section
@@ -1400,8 +1488,8 @@ fn data_section_blob_blocking(
 ///
 /// The manifest is PUBLIC, unencrypted data sitting in the module's wasm data section, so — unlike
 /// [`serve_local_blocking`] — this does NOT instantiate the module in wasmtime; it is a pure
-/// binary-format parse. The whole-module read that parse requires is memoized per capsule by
-/// [`data_section_blob_blocking`], because this read is ANONYMOUSLY reachable.
+/// binary-format parse. The whole-module read that parse requires is memoized and single-flighted
+/// per capsule by [`cached_manifests_blocking`], because this read is ANONYMOUSLY reachable.
 ///
 /// Returns:
 /// - `Ok(Some(Some(manifest)))` — the module is held and carries a `PublicManifest` section.
@@ -1413,22 +1501,14 @@ fn read_public_manifest_blocking(
     cache_dir: &Path,
     key: &CapsuleKey,
 ) -> Result<Option<Option<digstore_core::PublicManifest>>, String> {
-    let Some(blob) = data_section_blob_blocking(cache_dir, key)? else {
-        return Ok(None);
-    };
-    digstore_core::datasection::read_public_manifest(&blob)
-        .map(Some)
-        .map_err(|e| format!("malformed public manifest section: {e:?}"))
+    Ok(cached_manifests_blocking(cache_dir, key)?.map(|m| m.public.clone()))
 }
 
 /// Load + decode the embedded publisher [`MetadataManifest`](digstore_core::MetadataManifest)
 /// (data-section id 6) from a locally cached compiled module — the `dig.getMetadata` read (#2071).
 ///
-/// A free function taking only the cache dir + capsule key, so it moves into a `spawn_blocking`
-/// closure with no `Node` borrow (audit #179), mirroring [`read_public_manifest_blocking`]. Like
-/// that read and unlike [`serve_local_blocking`], it does NOT instantiate the module in wasmtime:
-/// the publisher metadata is PUBLIC, unencrypted data sitting directly in the module's data
-/// section, so extracting it is a pure binary-format parse.
+/// Shares [`cached_manifests_blocking`] with [`read_public_manifest_blocking`], so one whole-module
+/// read answers both methods rather than each paying its own.
 ///
 /// Returns:
 /// - `Ok(Some(Some(manifest)))` — the module is held and carries a metadata section.
@@ -1440,18 +1520,7 @@ fn read_metadata_manifest_blocking(
     cache_dir: &Path,
     key: &CapsuleKey,
 ) -> Result<Option<Option<digstore_core::MetadataManifest>>, String> {
-    let Some(blob) = data_section_blob_blocking(cache_dir, key)? else {
-        return Ok(None);
-    };
-    let view = digstore_core::datasection::DataView::parse(&blob)
-        .map_err(|e| format!("malformed module data section: {e:?}"))?;
-    let Some(body) = view.section(digstore_core::datasection::SectionId::Metadata) else {
-        return Ok(Some(None));
-    };
-    let mut decoder = digstore_core::codec::Decoder::new(body);
-    digstore_core::MetadataManifest::decode(&mut decoder)
-        .map(|m| Some(Some(m)))
-        .map_err(|e| format!("malformed metadata section: {e:?}"))
+    Ok(cached_manifests_blocking(cache_dir, key)?.map(|m| m.metadata.clone()))
 }
 
 /// Render a decoded [`MetadataManifest`](digstore_core::MetadataManifest) as the dighub `Manifest`
@@ -9058,6 +9127,62 @@ mod tests {
         let through = proof_from_content_answer(failed, json!(7));
         assert_eq!(through["error"]["code"], json!(-32004), "{through}");
         assert_eq!(through["id"], json!(7), "re-tagged with this request's id");
+    }
+
+    /// The manifest memo retains KILOBYTES per capsule, not the 128 MiB blob they came from.
+    ///
+    /// This is a residency assertion, and it exists because residency is invisible to every
+    /// functional test here: caching the DIGS blob returns byte-identical manifests. But that blob
+    /// is padded to `FIXED_BLOB_LEN` (128 MiB) and is ~99% content chunk pool, so a 256-ENTRY cap
+    /// over blobs bounds at ~32 GiB. On the 2 GiB host this runs on, ~16 anonymous requests for
+    /// distinct capsules would exhaust it — and `cache.listCached` hands out the exact capsule
+    /// list, so the attacker does not even have to guess. An entry cap is only sound because what
+    /// is retained is small; this test is what keeps that true.
+    #[tokio::test]
+    async fn the_manifest_memo_retains_kilobytes_not_the_capsule_it_decoded() {
+        let store_id = Bytes32([31u8; 32]);
+        let files = vec![
+            ("index.html".to_string(), b"<h1>residency</h1>".to_vec()),
+            ("assets/app.js".to_string(), b"console.log(1)".to_vec()),
+        ];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+        let capsule = CapsuleKey::parse(&store_id.to_hex(), &root.to_hex()).unwrap();
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getPublicManifest","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "{resp}");
+
+        let retained = memoized_manifest_bytes(&capsule).expect("the read populated the memo");
+        // Generous ceiling — the point is orders of magnitude, not a byte count. A blob entry
+        // would be ~128 MiB here; the real figure for this fixture is a few hundred bytes.
+        const CEILING: usize = 1024 * 1024;
+        assert!(
+            retained < CEILING,
+            "the memo retains {retained} bytes for one capsule; an ENTRY cap of \
+             {MANIFEST_MEMO_CAP} is only a sound bound while entries stay small. The module this \
+             was decoded from is {} bytes.",
+            module_bytes.len()
+        );
+        assert!(
+            retained > 0,
+            "the entry must actually carry the decoded manifest, not an empty placeholder"
+        );
     }
 
     /// `dig.getCapsule` reads only the requested WINDOW off disk, never the whole module.
