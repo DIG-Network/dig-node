@@ -183,7 +183,22 @@ pub fn read_module_window(
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut window = vec![0u8; want as usize];
     file.read_exact(&mut window).ok()?;
+    #[cfg(test)]
+    module_bytes_read().fetch_add(window.len() as u64, std::sync::atomic::Ordering::Relaxed);
     Some(window)
+}
+
+/// Test-only counter of bytes pulled off disk by [`read_module_window`].
+///
+/// A serve's CORRECTNESS test cannot see the defect that matters here: whether the response was
+/// built from a windowed read or from slurping the whole module, both produce byte-identical
+/// output. The only observable difference is how much was read, so that is what the guard asserts.
+/// A revert to `fs::read` leaves this counter at zero while every correctness assertion still
+/// passes — which is exactly how a whole-file read reached an anonymous endpoint.
+#[cfg(test)]
+pub(crate) fn module_bytes_read() -> &'static std::sync::atomic::AtomicU64 {
+    static READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    &READ
 }
 
 /// One `RangeFrame`-shaped response frame for a module window, in the SAME wire shape
