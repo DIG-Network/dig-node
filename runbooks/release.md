@@ -79,6 +79,23 @@ Actions → **Nightly + stable release** → **Run workflow** → `channel: nigh
   Expect three names. Fewer means dig-updater's `Feed` workflow will fail that channel with
   `no matching release assets` — the failure mode dig_ecosystem#618 fixed.
 
+## Gotcha — moving a Windows host from `nightly` back to `stable`
+
+A nightly `.msi` carries `ProductVersion = X.Y.<days since 2020-01-01>` (MSI accepts no prerelease
+suffix; the full version lives in the file name). The day count sits above every real patch number,
+so a nightly `0.96.2407` outranks every stable `0.96.z`. Consequences to expect, neither of which is
+a bug in the beacon:
+
+- **`msiexec` aborts installing a stable `0.96.z` over a nightly**, with "A newer version of DIG
+  NETWORK: NODE is already installed." The beacon cannot pre-empt it — anti-rollback state is per
+  channel. **Uninstall the nightly package first** (Add/Remove Programs, or
+  `msiexec /x` with the nightly's ProductCode), then let the stable install proceed. A stable release
+  in a HIGHER `major.minor` installs normally.
+- **Two nightly builds on one UTC day share a ProductVersion** (a `force` re-cut, or a manual
+  `channel: nightly` dispatch on a day the cron already ran). That is handled:
+  `AllowSameVersionUpgrades="yes"` makes the second upgrade in place instead of installing as a
+  second product. Do not remove that attribute — see SPEC §11.5c.
+
 ## Workflows
 
 | File | Trigger | Role |

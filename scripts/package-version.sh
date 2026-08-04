@@ -23,11 +23,19 @@
 #     anything else — so `0.93.9-nightly.20260804.603187a` cannot be handed to WiX unchanged.
 #
 # For a nightly the mapping is `X.Y.<days since 2020-01-01>`. The date lands in the BUILD field, not
-# a fourth field, because Windows Installer compares only major.minor.build: a fourth field is
-# parsed and then ignored, so two nightlies of the same base version would compare EQUAL, and the
-# `MajorUpgrade` in packaging/windows/dig-node.wxs would neither upgrade nor downgrade — the second
-# night's package would install SIDE BY SIDE. In the build field the date is monotonic per night and
-# always above any real patch number, so each nightly cleanly upgrades the last.
+# a fourth field, because Windows Installer compares only major.minor.build: a fourth field is parsed
+# and then ignored, so the date would stop being comparison-significant at all.
+#
+# This mapping is day-granular, and deliberately so: its INPUT carries a date and a commit sha and
+# nothing else, and 16 bits of build field cannot hold a finer monotonic counter over any useful
+# epoch (minute resolution exhausts the field in 45 days; a sha-derived tiebreak is not ordered,
+# which would make a later build compare LOWER — far worse). Two builds on one UTC day therefore map
+# to the SAME ProductVersion, which is reachable via the `force` re-cut and via a manual
+# `channel: nightly` dispatch on a day the cron already ran. The required upgrade invariant is
+# consequently held JOINTLY with packaging/windows/dig-node.wxs, whose
+# `MajorUpgrade/@AllowSameVersionUpgrades="yes"` makes an equal version upgrade in place rather than
+# install as a second product. Neither half is sufficient alone — see SPEC §11.5c, asserted by
+# scripts/tests/package-version.test.sh.
 #
 # Usage: package-version.sh <version>
 # Emits (stdout, `key=value` lines suitable for appending to $GITHUB_OUTPUT):
