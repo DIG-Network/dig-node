@@ -131,6 +131,14 @@ pub fn methods() -> &'static [MethodInfo] {
             requires_auth: false,
         },
         MethodInfo {
+            // #1476: the publish→seed push. Local-only by default; the HTTP surface adds a control-token
+            // landing gate (server.rs) and, under DIG_NODE_PUSH_OPEN, a §21.9 authorized-writer check.
+            name: "cache.pushCapsule",
+            served: "local",
+            summary: "Push a freshly-committed capsule's bytes to seed this node as a holder.",
+            requires_auth: false,
+        },
+        MethodInfo {
             name: "cache.stats",
             served: "local",
             summary: "Cache telemetry: { cap_bytes, used_bytes, entry_count, total_bytes, \

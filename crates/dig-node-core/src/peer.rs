@@ -1153,6 +1153,14 @@ pub(crate) fn is_peer_reachable_method(method: &str) -> bool {
     if method == crate::seams::dig_peer::resolve_capsule::RESOLVE_CAPSULE_METHOD {
         return true;
     }
+    // `cache.pushCapsule` is the publish→seed mutator (#1476). It is LOCAL-ONLY by default — like every
+    // other `cache.*` method it must NOT be forwarded to a self-signed peer (audit #179). The operator
+    // OPENS it to the peer surface with `DIG_NODE_PUSH_OPEN=true`; even then the handler still requires a
+    // §21.9 authorized-writer signature for the target store, so "reachable" never means "unauthenticated
+    // mutation" (see `seams::capsule::push_capsule`). Read live so the toggle needs no restart.
+    if method == crate::seams::capsule::PUSH_CAPSULE_METHOD {
+        return crate::seams::capsule::push_open_enabled();
+    }
     dig_rpc_protocol::Method::from_name(method).is_some_and(|m| m.is_peer_reachable())
 }
 
