@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.94.0] - 2026-08-04
+
+### Bug Fixes
+- **node:** Make peer bring-up honest and add a peer-ping ladder (#149)
+
 ## [0.93.9] - 2026-08-04
 
 ### Features
