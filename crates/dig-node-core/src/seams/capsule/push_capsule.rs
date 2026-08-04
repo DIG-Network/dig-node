@@ -152,7 +152,12 @@ impl Node {
         let signature = match params.get("signature").and_then(Value::as_str) {
             Some(s) => match Bytes96::from_hex(s) {
                 Ok(sig) => Some(sig),
-                Err(_) => return err(-32602, "params.signature must be 192-hex (a 96-byte BLS signature)"),
+                Err(_) => {
+                    return err(
+                        -32602,
+                        "params.signature must be 192-hex (a 96-byte BLS signature)",
+                    )
+                }
             },
             None => None,
         };
@@ -202,7 +207,10 @@ impl Node {
             // Strict forward progress: the only accepted offset is exactly where the buffer stands, so
             // a gap can never leave a hole and an overlap can never silently rewrite earlier bytes.
             if offset != pending.buf.len() as u64 {
-                return err(-32602, "offset does not continue the push where it left off");
+                return err(
+                    -32602,
+                    "offset does not continue the push where it left off",
+                );
             }
             if offset + data.len() as u64 > pending.total_length {
                 table.remove(&map_key);
@@ -232,7 +240,8 @@ impl Node {
         // locality. This is the leg that turns "internally consistent bytes" into "the store's owner
         // said so"; see the module docs for why integrity alone is not authorization.
         if require_auth {
-            let sig = signature.expect("require_auth implies a signature was supplied (checked above)");
+            let sig =
+                signature.expect("require_auth implies a signature was supplied (checked above)");
             if let Err(reason) = verify_push_authority(&bytes, store_id, root, &sig) {
                 return err(-32001, &reason);
             }
@@ -263,7 +272,11 @@ impl Node {
 /// the root is the WRITER-ATTESTED requested root, not a chain-resolved one — for a push, AUTHORITY
 /// (the §21.9 writer signature, `verify_push_authority`) is the trust anchor, and this gate provides
 /// only integrity: the bytes are self-consistently the capsule they claim to be.
-async fn verify_capsule_integrity(bytes: &[u8], store_id: Bytes32, root: Bytes32) -> Result<(), String> {
+async fn verify_capsule_integrity(
+    bytes: &[u8],
+    store_id: Bytes32,
+    root: Bytes32,
+) -> Result<(), String> {
     use dig_download::{ModuleAnchor, ModuleAnchorVerifier};
     let verifier = ChainAnchoredModuleVerifier::for_generation(store_id, root);
     let reader = InMemoryModule(bytes.to_vec());
@@ -397,7 +410,8 @@ mod tests {
         if let Some(sig) = signature {
             params["signature"] = json!(sig);
         }
-        node.push_capsule(&params, json!(1), origin, provenance).await
+        node.push_capsule(&params, json!(1), origin, provenance)
+            .await
     }
 
     /// (a) A loopback push lands the capsule — it appears on disk at `module_path` and in the cached
@@ -423,7 +437,9 @@ mod tests {
         );
         let listed = crate::seams::capsule::CapsuleStore::cache_list_cached(node).await;
         assert!(
-            listed.iter().any(|c| c.store_id == store_hex && c.root == root_hex),
+            listed
+                .iter()
+                .any(|c| c.store_id == store_hex && c.root == root_hex),
             "the pushed capsule must appear in cache_list_cached"
         );
         assert_eq!(
@@ -451,7 +467,11 @@ mod tests {
         assert_eq!(r1["result"]["complete"], json!(true));
         let r2 = push_one_shot(node, &store_hex, &root_hex, &module, None, local()).await;
         assert_eq!(r2["result"]["complete"], json!(true));
-        assert_eq!(r2["result"]["already_cached"], json!(true), "second push is a no-op");
+        assert_eq!(
+            r2["result"]["already_cached"],
+            json!(true),
+            "second push is a no-op"
+        );
         assert_eq!(
             announces.load(Ordering::SeqCst),
             1,
@@ -486,13 +506,31 @@ mod tests {
                 "offset": offset,
                 "total_length": total,
             });
-            last = node.push_capsule(&params, json!(1), ReadOrigin::Local, RequestProvenance::FirstParty).await;
-            offset = last["result"]["next_offset"].as_u64().map(|n| n as usize).unwrap_or(total);
+            last = node
+                .push_capsule(
+                    &params,
+                    json!(1),
+                    ReadOrigin::Local,
+                    RequestProvenance::FirstParty,
+                )
+                .await;
+            offset = last["result"]["next_offset"]
+                .as_u64()
+                .map(|n| n as usize)
+                .unwrap_or(total);
             if offset < total {
-                assert_eq!(last["result"]["complete"], json!(false), "mid-stream not complete");
+                assert_eq!(
+                    last["result"]["complete"],
+                    json!(false),
+                    "mid-stream not complete"
+                );
             }
         }
-        assert_eq!(last["result"]["complete"], json!(true), "final window completes: {last}");
+        assert_eq!(
+            last["result"]["complete"],
+            json!(true),
+            "final window completes: {last}"
+        );
         assert!(crate::module_exists(&node.cache_dir, &store_hex, &root_hex));
         assert!(offset >= total, "reassembly needed ≥2 windows");
         assert_eq!(announces.load(Ordering::SeqCst), 1);
@@ -501,9 +539,24 @@ mod tests {
         let wrong_root = [0x67; 32];
         let wrong_root_hex = hex::encode(wrong_root);
         let mismatched = push_module(store, [0x99; 32], &pk, 0); // commits neither the requested root
-        let resp = push_one_shot(node, &store_hex, &wrong_root_hex, &mismatched, None, local()).await;
-        assert!(resp.get("error").is_some(), "root-mismatch must be rejected: {resp}");
-        assert!(!crate::module_exists(&node.cache_dir, &store_hex, &wrong_root_hex));
+        let resp = push_one_shot(
+            node,
+            &store_hex,
+            &wrong_root_hex,
+            &mismatched,
+            None,
+            local(),
+        )
+        .await;
+        assert!(
+            resp.get("error").is_some(),
+            "root-mismatch must be rejected: {resp}"
+        );
+        assert!(!crate::module_exists(
+            &node.cache_dir,
+            &store_hex,
+            &wrong_root_hex
+        ));
     }
 
     /// (c) With `DIG_NODE_PUSH_OPEN` unset, `cache.pushCapsule` is not peer-reachable — the peer
@@ -529,7 +582,10 @@ mod tests {
         std::env::set_var(PUSH_OPEN_ENV, "true");
         let reachable = crate::peer::is_peer_reachable_method(PUSH_CAPSULE_METHOD);
         std::env::remove_var(PUSH_OPEN_ENV);
-        assert!(reachable, "DIG_NODE_PUSH_OPEN=true must admit cache.pushCapsule to the peer surface");
+        assert!(
+            reachable,
+            "DIG_NODE_PUSH_OPEN=true must admit cache.pushCapsule to the peer surface"
+        );
     }
 
     /// (d) On the peer/authority path a push signed by a NON-authorized writer is rejected, and one
@@ -552,16 +608,46 @@ mod tests {
 
         // No signature at all on the peer surface → rejected before any buffering.
         let none = push_one_shot(node, &store_hex, &root_hex, &module, None, peer()).await;
-        assert!(none.get("error").is_some(), "a peer push with no signature must be rejected: {none}");
+        assert!(
+            none.get("error").is_some(),
+            "a peer push with no signature must be rejected: {none}"
+        );
 
         // Wrong writer → rejected, nothing lands.
-        let wrong = push_one_shot(node, &store_hex, &root_hex, &module, Some(&bad_sig.to_hex()), peer()).await;
-        assert!(wrong.get("error").is_some(), "a non-authorized signature must be rejected: {wrong}");
-        assert!(!crate::module_exists(&node.cache_dir, &store_hex, &root_hex));
+        let wrong = push_one_shot(
+            node,
+            &store_hex,
+            &root_hex,
+            &module,
+            Some(&bad_sig.to_hex()),
+            peer(),
+        )
+        .await;
+        assert!(
+            wrong.get("error").is_some(),
+            "a non-authorized signature must be rejected: {wrong}"
+        );
+        assert!(!crate::module_exists(
+            &node.cache_dir,
+            &store_hex,
+            &root_hex
+        ));
 
         // Authorized writer → lands.
-        let ok = push_one_shot(node, &store_hex, &root_hex, &module, Some(&good_sig.to_hex()), peer()).await;
-        assert_eq!(ok["result"]["complete"], json!(true), "the authorized writer's push must land: {ok}");
+        let ok = push_one_shot(
+            node,
+            &store_hex,
+            &root_hex,
+            &module,
+            Some(&good_sig.to_hex()),
+            peer(),
+        )
+        .await;
+        assert_eq!(
+            ok["result"]["complete"],
+            json!(true),
+            "the authorized writer's push must land: {ok}"
+        );
         assert!(crate::module_exists(&node.cache_dir, &store_hex, &root_hex));
     }
 }

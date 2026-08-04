@@ -966,13 +966,14 @@ async fn rpc(
         );
     }
 
-    // LANDING gate (#1654): `cache.fetchAndCache` makes this node fetch + cache + DHT-announce a
-    // capsule of the CALLER'S choosing — a durable holder side effect (SPEC §14.3/§21.3). Over the
-    // HTTP surface a loopback address does not prove the operator authorized the call (a cross-site
-    // page can POST to `dig.local`), so it requires the control token exactly like `control.*`:
-    // the master control token OR a valid paired token. The in-process FFI `cache.*` path stays open
-    // (SYSTEM.md) — it never reaches this HTTP `rpc` handler. Reads remain ungated.
-    if method == "cache.fetchAndCache" {
+    // LANDING gate (#1654/#1476): `cache.fetchAndCache` (fetch + cache + DHT-announce a capsule of the
+    // CALLER'S choosing) and `cache.pushCapsule` (accept + cache + DHT-announce capsule BYTES the caller
+    // supplies) both make this node a durable holder — the same holder side effect (SPEC §14.3/§21.3).
+    // Over the HTTP surface a loopback address does not prove the operator authorized the call (a
+    // cross-site page can POST to `dig.local`), so each requires the control token exactly like
+    // `control.*`: the master control token OR a valid paired token. The in-process FFI `cache.*` path
+    // stays open (SYSTEM.md) — it never reaches this HTTP `rpc` handler. Reads remain ungated.
+    if method == "cache.fetchAndCache" || method == "cache.pushCapsule" {
         let header_tok = headers
             .get(control::CONTROL_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok());
@@ -991,10 +992,10 @@ async fn rpc(
                 Json(rpc_error(
                     id,
                     ErrorCode::Unauthorized,
-                    "cache.fetchAndCache requires the local control token (X-Dig-Control-Token \
-                     header or params._control_token) or a paired controller token (see \
-                     `dig-node pair`): it makes this node a durable DHT holder of the requested \
-                     capsule, so it is not a public read",
+                    "cache.fetchAndCache / cache.pushCapsule require the local control token \
+                     (X-Dig-Control-Token header or params._control_token) or a paired controller \
+                     token (see `dig-node pair`): each makes this node a durable DHT holder of the \
+                     requested capsule, so it is not a public read",
                 )),
             );
         }

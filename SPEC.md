@@ -882,8 +882,8 @@ For the current node library (§2.2) the catalogue is:
   `dig.getCollection`, `dig.listCollectionItems`, the L7 peer surface (`dig.getNetworkInfo`,
   `dig.getPeers`, `dig.announce`, `dig.getAvailability`, `dig.listInventory`, `dig.fetchRange`),
   all `cache.*` (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
-  `cache.removeCached`, `cache.fetchAndCache`), and the chat subsystem `chat.send` / `chat.poll`
-  (§5.5.2).
+  `cache.removeCached`, `cache.fetchAndCache`, `cache.pushCapsule` — §5.5.3), and the chat subsystem
+  `chat.send` / `chat.poll` (§5.5.2).
 - **passthrough**: `dig.getCapsule` (an alias the node does NOT resolve — local-first callers use
   `dig.getContent`), `dig.getProof`, `dig.listCapsules`.
 - **shell**: `rpc.discover`, `dig.health`, `dig.methods`. A node MUST answer its own liveness and
@@ -1052,6 +1052,54 @@ and the inbound sender-key resolver, are NOT in this MVP — the app supplies `r
 `peer_id` on `chat.send`, and the inbound resolver is caller-supplied. Group chat, onion routing, and receipt UX are out of scope; the five
 chat message types (message, delivery/read receipts, typing, presence) are defined in
 `dig-chat-protocol` but only `ChatMessage` surfaces to `chat.poll`.
+
+#### 5.5.3. `cache.pushCapsule` — the publish→seed push (#1476)
+
+The seed leg of the content-replication flywheel: the store owner hands a FRESHLY-COMMITTED `.dig`
+capsule straight to their own node so the node becomes a discoverable DHT holder the instant the
+content is published, instead of waiting to be asked for it first. It is the reverse of
+`dig.getCapsule` (§5.5 passthrough / the retrieval service's chunked download): the bytes are PUSHED
+in windows the node reassembles, then verified and landed through the ONE shared land site every
+other cache path uses (so a seeded capsule is discoverable byte-for-byte identically to a pulled one,
+and lands + announces exactly once — SPEC §14.1/§14.3).
+
+**Chunked wire.** A capsule exceeds the ~6 MB inline JSON-RPC ceiling, so it is pushed in ≤3 MiB
+base64 windows (mirroring `dig.getCapsule`'s `CAPSULE_WINDOW_BYTES`). Params:
+`{ store_id (64-hex), root (64-hex), data (base64, this window's bytes), offset? (u64, default 0),
+total_length? (u64, default = this window's decoded length ⇒ single-shot), signature? (192-hex, a
+96-byte BLS signature — required only in open mode, below) }`. Pushes are STRICTLY forward: the only
+accepted `offset` is exactly the assembled length so far (no gaps, no overlaps); `total_length` is a
+commitment fixed on the first window and constant after; and `total_length` may not exceed the
+whole-capsule ceiling (`MAX_CAPSULE_BYTES`, 4 GiB). Result mirrors the chunk-ack shape:
+`{ offset, complete (bool), next_offset (u64 | null), size_bytes }`, plus `served_root` on completion
+and `already_cached: true` for an idempotent re-push. The client repeats with `offset = next_offset`
+until `complete: true`.
+
+**Verification, on the completing window (before landing).** (1) INTEGRITY: the reassembled bytes
+MUST be a genuine `.dig` module committing exactly the requested `(store_id, root)` — checked with the
+same digstore-bound verifier every other land runs. (2) IDEMPOTENCE: a capsule already held is a
+no-op that neither re-writes nor re-announces (no double-announce). Only on a fresh, verified land
+does the node write `<cache>/modules/<store>/<root>.dig` and announce itself a DHT holder.
+
+**Trust posture — local-only by default (SECURITY-CRITICAL).** `cache.pushCapsule` is a MUTATOR with
+a durable holder side effect. It is **absent from the peer allowlist**, so an inbound mTLS peer is
+answered `-32601` before dispatch (audit #179), exactly like every `cache.*`/`control.*` method. Over
+the loopback HTTP surface it carries the SAME control-token landing gate as `cache.fetchAndCache`
+(master control token or a paired controller token — §7): a loopback address alone does not prove the
+operator authorized it. The in-process FFI path is trusted-by-locality and ungated.
+
+**Open mode — `DIG_NODE_PUSH_OPEN` (default `false`).** Setting `DIG_NODE_PUSH_OPEN=true` admits
+`cache.pushCapsule` to the peer/mTLS surface. Locality no longer implies authority there, so an
+OPENED push MUST additionally prove the caller is the store's **§21.6/§21.9 authorized writer** for
+the target store: the pushed module commits a publisher public key whose `SHA-256` DERIVES `store_id`
+(`store_id = sha256(publisher_pubkey)`, the DIG store-identity derivation), AND the request carries a
+BLS signature over `SHA-256(root || store_id)` that verifies under that key. The merkle-integrity
+check gives INTEGRITY, never AUTHORITY — without the writer check an opened node would be an
+unauthenticated cache-poison + DHT-announce-amplification surface (the #179/#1576 class). A push that
+arrives on the peer surface with no signature, a signature under a key that does not derive
+`store_id`, or a signature the store key does not verify is rejected (`-32001`) before landing.
+`DIG_NODE_PUSH_OPEN` is dig-node-LOCAL (only dig-node reads it; deliberately NOT a `dig-constants`
+value).
 
 ### 5.6. OpenRPC drift guard (conformance test)
 
