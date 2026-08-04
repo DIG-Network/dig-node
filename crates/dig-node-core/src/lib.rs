@@ -1300,18 +1300,79 @@ fn serve_local_blocking(
     Some(resp)
 }
 
-/// How many capsules' DECODED manifests to keep.
+/// TOTAL bytes the decoded-manifest memo may retain, across every capsule.
 ///
-/// An entry is two decoded manifests — a path list and ~14 publisher fields — so it is genuinely
-/// kilobytes and an ENTRY cap is a sound bound. That is only true because the entry holds decoded
-/// values: the DIGS blob they come from is padded to `FIXED_BLOB_LEN` (128 MiB) and contains the
-/// content chunk pool, so a blob cache with this same cap would retain up to 32 GiB. Anything
-/// added to [`CachedManifests`] must stay small, or this cap has to become a BYTE budget like
-/// [`CONTENT_CACHE_MAX_BYTES`].
-const MANIFEST_MEMO_CAP: usize = 256;
+/// A BYTE budget, not an entry count, because nothing about an entry is bounded: a
+/// `PublicManifest` is one row per public path and a `MetadataManifest`'s `authors`/`keywords`/
+/// `categories`/`links`/`custom` are all publisher-supplied and open-ended. Measured, a manifest
+/// row retains ~117 B and costs ~224 B of the 128 MiB blob budget, so a single chain-anchorable
+/// capsule can carry ~600k paths ≈ 115 MB in ONE entry — an entry cap of 256 would then bound at
+/// ~29.6 GB, and ~14 ordinary large stores would exhaust the 2 GiB gateway with no adversary at
+/// all, just anonymous `dig.getManifest` calls.
+///
+/// This is the same shape as [`CONTENT_CACHE_MAX_BYTES`] and for the same reason. The lesson that
+/// produced it: `descriptor_memo`'s entry cap is sound ONLY because `MAX_DESCRIPTOR_CHUNKS`
+/// structurally caps each of ITS entries. Copying the cap without the per-entry bound is what made
+/// two earlier versions of this memo unbounded.
+const MANIFEST_MEMO_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// The process-wide DECODED-manifest memo, keyed by `(store_hex, capsule)`, LRU-evicted at
-/// [`MANIFEST_MEMO_CAP`].
+/// The largest single entry worth retaining.
+///
+/// Above this a capsule is simply not memoized: it is re-decoded per request instead, which costs
+/// a bounded, SERIALIZED whole-module read (see [`manifest_extract_lock`]) rather than permanent
+/// residency. Trading amplification back for a pathological store is the right way round — a
+/// transient read is survivable, retention is not.
+const MANIFEST_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// A byte-budgeted LRU of decoded manifests.
+///
+/// `lru::LruCache` bounds entries; this bounds BYTES, using each entry's own
+/// [`CachedManifests::retained_bytes`].
+struct ManifestMemo {
+    entries: lru::LruCache<(String, String), Arc<CachedManifests>>,
+    /// Running sum of `retained_bytes()` over everything currently held.
+    bytes: usize,
+}
+
+impl ManifestMemo {
+    fn get_fresh(
+        &mut self,
+        key: &(String, String),
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+    ) -> Option<Arc<CachedManifests>> {
+        self.entries
+            .get(key)
+            .filter(|hit| hit.len == len && hit.modified == modified)
+            .cloned()
+    }
+
+    /// Insert, then evict least-recently-used entries until the total is within budget.
+    ///
+    /// An entry over [`MANIFEST_ENTRY_MAX_BYTES`] is dropped rather than stored, so one huge
+    /// capsule can neither occupy the budget nor evict everything else to fit.
+    fn insert(&mut self, key: (String, String), value: Arc<CachedManifests>) {
+        let size = value.retained_bytes();
+        if size > MANIFEST_ENTRY_MAX_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.put(key, value) {
+            self.bytes = self.bytes.saturating_sub(previous.retained_bytes());
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        while self.bytes > MANIFEST_MEMO_MAX_BYTES {
+            match self.entries.pop_lru() {
+                Some((_, evicted)) => {
+                    self.bytes = self.bytes.saturating_sub(evicted.retained_bytes());
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// The process-wide DECODED-manifest memo, keyed by `(cache_dir, capsule)`, bounded in BYTES by
+/// [`MANIFEST_MEMO_MAX_BYTES`].
 ///
 /// Decoding a capsule's manifests costs a WHOLE-MODULE read: the DIGS blob shares a wasm data
 /// section with the content chunk pool, so the parse cannot skip past it. `dig.getManifest`,
@@ -1321,16 +1382,17 @@ const MANIFEST_MEMO_CAP: usize = 256;
 ///
 /// `(len, mtime)` is a sound fingerprint for the same reason `descriptor_memo` uses it: a cached
 /// module is a brand-new file written by write-then-rename, never edited in place, so any change
-/// invalidates the entry.
-#[allow(clippy::type_complexity)]
-fn manifest_memo(
-) -> &'static std::sync::Mutex<lru::LruCache<(String, String), Arc<CachedManifests>>> {
-    static MEMO: OnceLock<std::sync::Mutex<lru::LruCache<(String, String), Arc<CachedManifests>>>> =
-        OnceLock::new();
+/// invalidates the entry. The cache dir is part of the KEY because this memo is process-wide while
+/// cache dirs are not — two nodes in one process (tests, the browser host) must not share entries.
+///
+/// The entry cap here is a backstop only; [`MANIFEST_MEMO_MAX_BYTES`] is the real bound.
+fn manifest_memo() -> &'static std::sync::Mutex<ManifestMemo> {
+    static MEMO: OnceLock<std::sync::Mutex<ManifestMemo>> = OnceLock::new();
     MEMO.get_or_init(|| {
-        std::sync::Mutex::new(lru::LruCache::new(
-            std::num::NonZeroUsize::new(MANIFEST_MEMO_CAP).expect("256 is nonzero"),
-        ))
+        std::sync::Mutex::new(ManifestMemo {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
+        })
     })
 }
 
@@ -1362,33 +1424,134 @@ struct CachedManifests {
     metadata: Option<digstore_core::MetadataManifest>,
 }
 
+impl CachedManifests {
+    /// Approximate heap bytes this entry retains — the input to the memo's byte budget.
+    ///
+    /// **Every field is destructured, deliberately.** A field added to this struct will not
+    /// COMPILE until it is named here (`error[E0027]: pattern does not mention field`), which is
+    /// the whole point: the previous version summed two ENUMERATED fields, so a
+    /// `blob: Arc<Vec<u8>>` added beside them was invisible to it — the accounting reported
+    /// kilobytes while the entry pinned 128 MiB, and every test passed. Do not replace this with
+    /// a `self.public…` style sum; the exhaustiveness IS the mechanism.
+    ///
+    /// What it does NOT stop, stated plainly so nobody trusts it further than it goes: writing
+    /// `new_field: _` in the pattern silences the compiler without adding the cost. The guard
+    /// forces a DECISION about every new field; it cannot force the right one. Anything holding
+    /// bytes must be added to the sum, not to the ignore list.
+    ///
+    /// Approximate is fine — it drives an eviction budget, not an allocator. It must never be an
+    /// UNDER-count of the unbounded parts (the path list and the publisher collections), which is
+    /// what it measures directly.
+    fn retained_bytes(&self) -> usize {
+        let CachedManifests {
+            len,
+            modified,
+            public,
+            metadata,
+        } = self;
+        let _ = (len, modified); // Copy scalars, no heap.
+
+        let public_bytes = public.as_ref().map_or(0, |m| {
+            // One row per PUBLIC PATH — unbounded, publisher-controlled, and the dominant term.
+            m.entries
+                .iter()
+                .map(|e| e.path.len() + std::mem::size_of_val(e))
+                .sum::<usize>()
+        });
+
+        let metadata_bytes = metadata.as_ref().map_or(0, |m| {
+            let strings = m.name.len()
+                + opt_len(&m.version)
+                + opt_len(&m.description)
+                + opt_len(&m.license)
+                + opt_len(&m.homepage)
+                + opt_len(&m.repository)
+                + opt_len(&m.icon)
+                + opt_len(&m.content_type);
+            // Every one of these is publisher-supplied and open-ended, despite the field COUNT
+            // being fixed at 14. A fixed field count is not a size bound.
+            let authors: usize = m
+                .authors
+                .iter()
+                .map(|a| a.name.len() + opt_len(&a.handle) + opt_len(&a.contact))
+                .sum();
+            let lists: usize = m
+                .keywords
+                .iter()
+                .chain(m.categories.iter())
+                .map(String::len)
+                .sum();
+            let links: usize = m.links.iter().map(|(k, v)| k.len() + v.len()).sum();
+            let custom: usize = m
+                .custom
+                .iter()
+                .map(|(k, v)| k.len() + json_retained_bytes(v))
+                .sum();
+            strings + authors + lists + links + custom
+        });
+
+        std::mem::size_of::<Self>() + public_bytes + metadata_bytes
+    }
+}
+
+fn opt_len(s: &Option<String>) -> usize {
+    s.as_ref().map_or(0, String::len)
+}
+
+/// Approximate heap bytes a decoded JSON value retains.
+///
+/// `MetadataManifest::custom` is `BTreeMap<String, Value>` holding arbitrary publisher JSON, so it
+/// is recursive and unbounded and must be walked rather than assumed small.
+fn json_retained_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) => std::mem::size_of::<Value>(),
+        Value::String(s) => std::mem::size_of::<Value>() + s.len(),
+        Value::Array(items) => {
+            std::mem::size_of::<Value>() + items.iter().map(json_retained_bytes).sum::<usize>()
+        }
+        Value::Object(map) => {
+            std::mem::size_of::<Value>()
+                + map
+                    .iter()
+                    .map(|(k, v)| k.len() + json_retained_bytes(v))
+                    .sum::<usize>()
+        }
+    }
+}
+
 /// Test-only: the bytes this memo RETAINS for a capsule, or `None` if it holds nothing for it.
 ///
-/// Residency is invisible to every functional assertion — a memo that pins the whole 128 MiB DIGS
-/// blob returns byte-identical manifests to one that pins two decoded structs. Only a size check
-/// can tell them apart, and the blob-caching version of this memo would have exhausted a 2 GiB
-/// host at ~16 capsules while passing every other test in this file.
+/// Reads the SAME [`CachedManifests::retained_bytes`] the eviction budget runs on, rather than
+/// re-deriving a size from a list of fields. That is the fix for the previous version: it summed
+/// two enumerated fields, so a field added beside them was invisible, and the "falsification" only
+/// appeared to work because the metric was edited in the same breath as the mutation it was
+/// supposed to catch independently. Sharing the production accounting means a probe cannot be
+/// taught about a regression the budget itself would miss — if this can see it, so can eviction.
 #[cfg(test)]
-fn memoized_manifest_bytes(key: &CapsuleKey) -> Option<usize> {
-    let memo_key = (key.store().to_string(), format!("{key}"));
-    let entry = manifest_memo()
+fn memoized_manifest_bytes(cache_dir: &Path, key: &CapsuleKey) -> Option<usize> {
+    manifest_memo()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&memo_key)
-        .cloned()?;
-    // Rendered size is a fair proxy for what the entry holds: both manifests are plain owned
-    // data, so a blob hiding in the entry would show up here as megabytes.
-    let public = entry
-        .public
-        .as_ref()
-        .map(|p| p.to_json().len())
-        .unwrap_or(0);
-    let metadata = entry
-        .metadata
-        .as_ref()
-        .map(|m| metadata_manifest_to_json(m).to_string().len())
-        .unwrap_or(0);
-    Some(public + metadata)
+        .entries
+        .get(&manifest_memo_key(cache_dir, key))
+        .map(|entry| entry.retained_bytes())
+}
+
+/// Test-only: total bytes the memo is holding across every capsule.
+#[cfg(test)]
+fn manifest_memo_total_bytes() -> usize {
+    manifest_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .bytes
+}
+
+/// The memo key for a capsule.
+///
+/// Includes the CACHE DIR: the memo is process-wide but cache dirs are not, so two nodes in one
+/// process (the test harness, the browser host) must not collide on `(store, root)` alone.
+fn manifest_memo_key(cache_dir: &Path, key: &CapsuleKey) -> (String, String) {
+    (cache_dir.to_string_lossy().into_owned(), format!("{key}"))
 }
 
 /// Decode a held capsule's manifests, memoized and single-flighted.
@@ -1418,15 +1581,13 @@ fn cached_manifests_blocking(
         return Ok(None);
     };
     let (len, modified) = (meta.len(), meta.modified().ok());
-    let memo_key = (key.store().to_string(), format!("{key}"));
+    let memo_key = manifest_memo_key(cache_dir, key);
 
     let fresh_hit = |k: &(String, String)| -> Option<Arc<CachedManifests>> {
         manifest_memo()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(k)
-            .filter(|hit| hit.len == len && hit.modified == modified)
-            .cloned()
+            .get_fresh(k, len, modified)
     };
 
     if let Some(hit) = fresh_hit(&memo_key) {
@@ -1476,10 +1637,13 @@ fn cached_manifests_blocking(
         })
     };
 
+    // Byte-budgeted insert: an entry over MANIFEST_ENTRY_MAX_BYTES is not retained at all, and the
+    // total is evicted back under MANIFEST_MEMO_MAX_BYTES. The caller still gets `decoded` either
+    // way — declining to memoize costs a re-decode next time, never a wrong answer.
     manifest_memo()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .put(memo_key, decoded.clone());
+        .insert(memo_key, decoded.clone());
     Ok(Some(decoded))
 }
 
@@ -2597,7 +2761,7 @@ impl Node {
     /// license, links, …) — data-section id 6. It is PUBLIC and unencrypted by construction, so
     /// reading it is a pure binary-format parse with no `serve_blind` decrypt and no retrieval
     /// key, exactly like the public manifest read beside it. The extraction is memoized per
-    /// capsule ([`data_section_blob_blocking`]) because this method is ANONYMOUSLY reachable.
+    /// capsule ([`cached_manifests_blocking`]) because this method is ANONYMOUSLY reachable.
     ///
     /// No `program_hash`: it would cost a second whole-module read plus a SHA-256 of every chunk
     /// for a field nothing consumes. `dig.getModuleInfo` already serves a module's content address.
@@ -9131,15 +9295,13 @@ mod tests {
 
     /// The manifest memo retains KILOBYTES per capsule, not the 128 MiB blob they came from.
     ///
-    /// This is a residency assertion, and it exists because residency is invisible to every
-    /// functional test here: caching the DIGS blob returns byte-identical manifests. But that blob
-    /// is padded to `FIXED_BLOB_LEN` (128 MiB) and is ~99% content chunk pool, so a 256-ENTRY cap
-    /// over blobs bounds at ~32 GiB. On the 2 GiB host this runs on, ~16 anonymous requests for
-    /// distinct capsules would exhaust it — and `cache.listCached` hands out the exact capsule
-    /// list, so the attacker does not even have to guess. An entry cap is only sound because what
-    /// is retained is small; this test is what keeps that true.
+    /// Residency is invisible to every functional test here — caching the DIGS blob returns
+    /// byte-identical manifests — so it has to be measured. The measurement reads the SAME
+    /// `retained_bytes()` the eviction budget runs on, which is what makes it a real probe: an
+    /// earlier version summed two enumerated fields, so a field added beside them was invisible,
+    /// and the "falsification" only worked because the metric got edited alongside the mutation.
     #[tokio::test]
-    async fn the_manifest_memo_retains_kilobytes_not_the_capsule_it_decoded() {
+    async fn the_manifest_memo_retains_the_manifest_not_the_capsule_it_decoded() {
         let store_id = Bytes32([31u8; 32]);
         let files = vec![
             ("index.html".to_string(), b"<h1>residency</h1>".to_vec()),
@@ -9168,20 +9330,139 @@ mod tests {
         .await;
         assert!(resp.get("error").is_none(), "{resp}");
 
-        let retained = memoized_manifest_bytes(&capsule).expect("the read populated the memo");
-        // Generous ceiling — the point is orders of magnitude, not a byte count. A blob entry
-        // would be ~128 MiB here; the real figure for this fixture is a few hundred bytes.
-        const CEILING: usize = 1024 * 1024;
+        let retained = memoized_manifest_bytes(&node.cache_dir, &capsule)
+            .expect("the read populated the memo");
+        // Orders of magnitude, not a byte count: a blob entry would be ~128 MiB here.
         assert!(
-            retained < CEILING,
-            "the memo retains {retained} bytes for one capsule; an ENTRY cap of \
-             {MANIFEST_MEMO_CAP} is only a sound bound while entries stay small. The module this \
-             was decoded from is {} bytes.",
+            retained < 64 * 1024,
+            "the memo retains {retained} bytes for a 2-file capsule decoded from a {} byte \
+             module — it is holding something other than the manifests",
             module_bytes.len()
         );
         assert!(
             retained > 0,
             "the entry must actually carry the decoded manifest, not an empty placeholder"
+        );
+        // The PROCESS-WIDE total is the thing that actually OOMs a host, so assert on it too and
+        // not only on this one entry. Every other test in this suite has been decoding manifests
+        // into the same global memo, so this covers their residency as well as ours.
+        let total = manifest_memo_total_bytes();
+        assert!(
+            total <= MANIFEST_MEMO_MAX_BYTES,
+            "the process-wide memo holds {total} bytes, over its {MANIFEST_MEMO_MAX_BYTES} budget"
+        );
+        assert!(
+            total >= retained,
+            "the running total ({total}) must include this entry ({retained}) — a total that \
+             does not track inserts cannot drive eviction"
+        );
+    }
+
+    /// `retained_bytes()` tracks the UNBOUNDED part of an entry — the public path list.
+    ///
+    /// This is the assertion that makes the byte budget meaningful. An entry is not a fixed size:
+    /// `PublicManifest` is one row per public path, so a store with 600k paths retains ~115 MB in
+    /// a SINGLE entry. If the accounting did not scale with path count, a byte budget would be as
+    /// hollow as the entry cap it replaced — it would evict on a number that never grew.
+    ///
+    /// Built by hand rather than through `stage_and_compile` because the point is the accounting
+    /// function, and compiling a 600k-path fixture would dominate the suite runtime.
+    #[test]
+    fn retained_bytes_scales_with_the_manifest_it_holds() {
+        use digstore_core::public_manifest::{PublicManifest, PublicManifestEntry};
+
+        let manifest_of = |paths: usize| -> CachedManifests {
+            let entries = (0..paths)
+                .map(|i| PublicManifestEntry {
+                    path: format!("assets/generated/file-{i:08}.js"),
+                    latest_root: Bytes32([7u8; 32]),
+                    generation_index: 0,
+                    sha256_latest: Bytes32([8u8; 32]),
+                    version_count: 1,
+                })
+                .collect();
+            CachedManifests {
+                len: 1,
+                modified: None,
+                public: Some(PublicManifest {
+                    schema_version: 1,
+                    entries,
+                }),
+                metadata: None,
+            }
+        };
+
+        let small = manifest_of(10).retained_bytes();
+        let large = manifest_of(10_000).retained_bytes();
+        assert!(
+            large > small * 100,
+            "accounting must scale with path count (10 paths: {small} B, 10k paths: {large} B) — \
+             a budget that does not grow with the unbounded field cannot bound anything"
+        );
+
+        // And the budget must actually refuse an entry that large rather than store it.
+        assert!(
+            manifest_of(200_000).retained_bytes() > MANIFEST_ENTRY_MAX_BYTES,
+            "a 200k-path manifest must exceed the per-entry ceiling, or the ceiling is too high \
+             to stop the ~600k-path capsule a 128 MiB blob budget permits"
+        );
+    }
+
+    /// The memo evicts on BYTES, so many large entries cannot accumulate past the budget.
+    #[test]
+    fn the_manifest_memo_evicts_to_stay_within_its_byte_budget() {
+        use digstore_core::public_manifest::{PublicManifest, PublicManifestEntry};
+
+        let mut memo = ManifestMemo {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
+        };
+        let entry = |paths: usize| {
+            Arc::new(CachedManifests {
+                len: 1,
+                modified: None,
+                public: Some(PublicManifest {
+                    schema_version: 1,
+                    entries: (0..paths)
+                        .map(|i| PublicManifestEntry {
+                            path: format!("p/{i:06}"),
+                            latest_root: Bytes32([7u8; 32]),
+                            generation_index: 0,
+                            sha256_latest: Bytes32([8u8; 32]),
+                            version_count: 1,
+                        })
+                        .collect(),
+                }),
+                metadata: None,
+            })
+        };
+
+        // Insert far more than the budget can hold.
+        let one = entry(20_000);
+        let per_entry = one.retained_bytes();
+        let needed = (MANIFEST_MEMO_MAX_BYTES / per_entry) + 20;
+        for i in 0..needed {
+            memo.insert((format!("dir{i}"), format!("cap{i}")), entry(20_000));
+        }
+
+        assert!(
+            memo.bytes <= MANIFEST_MEMO_MAX_BYTES,
+            "memo holds {} bytes, over the {MANIFEST_MEMO_MAX_BYTES} budget after {needed} inserts",
+            memo.bytes
+        );
+        assert!(
+            memo.entries.len() < needed,
+            "eviction must have happened — {} of {needed} entries retained",
+            memo.entries.len()
+        );
+
+        // An entry over the per-entry ceiling is refused outright, not stored and then evicted.
+        let before = memo.entries.len();
+        memo.insert(("huge".into(), "huge".into()), entry(400_000));
+        assert_eq!(
+            memo.entries.len(),
+            before,
+            "an oversized entry must be declined, never stored"
         );
     }
 
