@@ -1411,143 +1411,55 @@ fn manifest_extract_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
-/// A capsule's decoded manifests plus the file fingerprint they came from.
+/// A capsule's manifests, RENDERED, plus the file fingerprint they came from.
+///
+/// **Rendered JSON, not decoded trees, and that is the security property.** Four consecutive
+/// attempts to size a decoded `MetadataManifest` by hand undercounted it: by ~190,000x on the flat
+/// collections, then ~20x on nested `custom` JSON, and separately on `Vec` capacity-vs-length and
+/// B-tree fill factor. Hand-written structural estimation over a recursive, attacker-shaped type
+/// has unboundedly many places to be wrong and the compiler checks none of them. A byte buffer has
+/// exactly one number, and it is not an estimate.
+///
+/// It is also LESS work on the hot path: all three read methods serialize to JSON anyway, so
+/// caching the output removes a per-request render AND the per-request deep clone of the tree.
 ///
 /// `None` on either field means the section is genuinely ABSENT from the module (an older `.dig`,
-/// or a private store) — store-format §5.1 treats that as normal, so it is a cacheable answer
-/// rather than a miss to retry.
+/// or a private store) - store-format section 5.1 treats that as normal, so it is a cacheable
+/// answer rather than a miss to retry.
 #[derive(Clone, Default)]
 struct CachedManifests {
     len: u64,
     modified: Option<std::time::SystemTime>,
-    public: Option<digstore_core::PublicManifest>,
-    metadata: Option<digstore_core::MetadataManifest>,
+    /// `PublicManifest::to_json()` output, byte-identical to what every DIG reader consumes.
+    public_json: Option<Arc<str>>,
+    /// `metadata_manifest_to_json()` output.
+    metadata_json: Option<Arc<str>>,
 }
 
 impl CachedManifests {
-    /// Approximate heap bytes this entry retains — the input to the memo's byte budget.
+    /// Bytes this entry retains - the input to the memo's byte budget.
     ///
-    /// **Every field is destructured, deliberately.** A field added to this struct will not
-    /// COMPILE until it is named here (`error[E0027]: pattern does not mention field`), which is
-    /// the whole point: the previous version summed two ENUMERATED fields, so a
-    /// `blob: Arc<Vec<u8>>` added beside them was invisible to it — the accounting reported
-    /// kilobytes while the entry pinned 128 MiB, and every test passed. Do not replace this with
-    /// a `self.public…` style sum; the exhaustiveness IS the mechanism.
+    /// EXACT, not an estimate: the entry holds two byte buffers and their lengths are their cost.
+    /// There is no per-element overhead to forget, no capacity-vs-length gap, no container fill
+    /// factor and no recursion - the four things that defeated the previous approach in four
+    /// successive rounds.
     ///
-    /// **The destructure guards ONE axis, and it is not the dangerous one.** It catches a NEW
-    /// FIELD appearing. It cannot catch an EXISTING field whose CONTENTS go unmeasured — and that
-    /// is what actually happened: `authors`/`keywords`/`categories` were summed by string content
-    /// only, charging nothing for the `Author` (72 B) or `String` (24 B) each element occupies, so
-    /// a million empty authors accounted as 0 bytes while pinning 72 MB. The compiler had nothing
-    /// to say; every field WAS named. Writing `new_field: _` defeats it the same way.
-    ///
-    /// So the rule this function is held to is not "name every field", it is: **for every field,
-    /// charge the per-element cost BEFORE the content cost.** Anything unbounded in LENGTH must be
-    /// summed per element with `size_of_val`/`size_of`, never by content alone. A test that leaves
-    /// a collection empty — or `None` — proves nothing about it.
-    ///
-    /// Approximate is fine — it drives an eviction budget, not an allocator. It must never be an
-    /// UNDER-count of the unbounded parts (the path list and the publisher collections), which is
-    /// what it measures directly.
+    /// Every field is still destructured so a new field cannot be added without a decision here
+    /// (`error[E0027]`). That guard was never sufficient alone - it watches for new FIELDS, not for
+    /// unmeasured CONTENTS - but with fields that are just byte buffers there is no longer a
+    /// contents axis to get wrong. Keep it that way: anything added here should be a buffer or a
+    /// scalar, never a decoded tree.
     fn retained_bytes(&self) -> usize {
         let CachedManifests {
             len,
             modified,
-            public,
-            metadata,
+            public_json,
+            metadata_json,
         } = self;
         let _ = (len, modified); // Copy scalars, no heap.
-
-        let public_bytes = public.as_ref().map_or(0, |m| {
-            // One row per PUBLIC PATH — unbounded, publisher-controlled, and the dominant term.
-            m.entries
-                .iter()
-                .map(|e| e.path.len() + std::mem::size_of_val(e))
-                .sum::<usize>()
-        });
-
-        let metadata_bytes = metadata.as_ref().map_or(0, |m| {
-            // The eight scalar-ish fields: bounded in COUNT, so only their contents vary.
-            let strings = m.name.len()
-                + opt_len(&m.version)
-                + opt_len(&m.description)
-                + opt_len(&m.license)
-                + opt_len(&m.homepage)
-                + opt_len(&m.repository)
-                + opt_len(&m.icon)
-                + opt_len(&m.content_type);
-
-            // The five COLLECTIONS. Each is publisher-supplied and length-unbounded, and each
-            // element costs its container slot BEFORE it costs a single content byte — an empty
-            // `Author` is 6 bytes of blob and 72 bytes resident, an empty keyword 4 and 24. Sizing
-            // these by content alone is not an approximation, it is a blind spot: a million empty
-            // authors accounted as 0 while pinning 72 MB. `public` above has always got this right
-            // (`size_of_val(e)` per row); these did not, three lines apart, and the budget was
-            // defeated ~190,000x as a result.
-            let authors: usize = m
-                .authors
-                .iter()
-                .map(|a| {
-                    std::mem::size_of_val(a)
-                        + a.name.len()
-                        + opt_len(&a.handle)
-                        + opt_len(&a.contact)
-                })
-                .sum();
-            let lists: usize = m
-                .keywords
-                .iter()
-                .chain(m.categories.iter())
-                .map(|s| std::mem::size_of::<String>() + s.len())
-                .sum();
-            let links: usize = m
-                .links
-                .iter()
-                .map(|(k, v)| BTREE_ENTRY_OVERHEAD + k.len() + v.len())
-                .sum();
-            let custom: usize = m
-                .custom
-                .iter()
-                .map(|(k, v)| BTREE_ENTRY_OVERHEAD + k.len() + json_retained_bytes(v))
-                .sum();
-            strings + authors + lists + links + custom
-        });
-
-        std::mem::size_of::<Self>() + public_bytes + metadata_bytes
-    }
-}
-
-/// Per-entry overhead charged for a `BTreeMap` slot, on top of the key and value contents.
-///
-/// A `BTreeMap` stores keys and values in node arrays with per-node bookkeeping, so an entry costs
-/// its `String`/`Value` headers plus a share of the node. Deliberately rounded UP: this feeds an
-/// eviction budget, and an under-count is the failure mode that matters — it lets an attacker
-/// retain memory the accounting cannot see. Over-counting only evicts a little early.
-const BTREE_ENTRY_OVERHEAD: usize =
-    std::mem::size_of::<String>() + std::mem::size_of::<Value>() + 16;
-
-fn opt_len(s: &Option<String>) -> usize {
-    s.as_ref().map_or(0, String::len)
-}
-
-/// Approximate heap bytes a decoded JSON value retains.
-///
-/// `MetadataManifest::custom` is `BTreeMap<String, Value>` holding arbitrary publisher JSON, so it
-/// is recursive and unbounded and must be walked rather than assumed small.
-fn json_retained_bytes(v: &Value) -> usize {
-    match v {
-        Value::Null | Value::Bool(_) | Value::Number(_) => std::mem::size_of::<Value>(),
-        Value::String(s) => std::mem::size_of::<Value>() + s.len(),
-        Value::Array(items) => {
-            std::mem::size_of::<Value>() + items.iter().map(json_retained_bytes).sum::<usize>()
-        }
-        Value::Object(map) => {
-            std::mem::size_of::<Value>()
-                + map
-                    .iter()
-                    .map(|(k, v)| k.len() + json_retained_bytes(v))
-                    .sum::<usize>()
-        }
+        std::mem::size_of::<Self>()
+            + public_json.as_ref().map_or(0, |s| s.len())
+            + metadata_json.as_ref().map_or(0, |s| s.len())
     }
 }
 
@@ -1646,26 +1558,33 @@ fn cached_manifests_blocking(
         // two are never both live.
         drop(module);
 
-        let public = digstore_core::datasection::read_public_manifest(&blob)
-            .map_err(|e| format!("malformed public manifest section: {e:?}"))?;
+        // Decode, RENDER, and drop the trees. Only the rendered bytes are retained, so the decoded
+        // `MetadataManifest` — the recursive, attacker-shaped value whose size defeated four
+        // rounds of hand-written accounting — is transient and never sized.
+        let public_json = digstore_core::datasection::read_public_manifest(&blob)
+            .map_err(|e| format!("malformed public manifest section: {e:?}"))?
+            .map(|pm| Arc::from(pm.to_json().as_str()));
+
         let view = digstore_core::datasection::DataView::parse(&blob)
             .map_err(|e| format!("malformed module data section: {e:?}"))?;
-        let metadata = match view.section(digstore_core::datasection::SectionId::Metadata) {
+        let metadata_json = match view.section(digstore_core::datasection::SectionId::Metadata) {
             Some(body) => {
                 let mut decoder = digstore_core::codec::Decoder::new(body);
-                Some(
-                    digstore_core::MetadataManifest::decode(&mut decoder)
-                        .map_err(|e| format!("malformed metadata section: {e:?}"))?,
-                )
+                let decoded = digstore_core::MetadataManifest::decode(&mut decoder)
+                    .map_err(|e| format!("malformed metadata section: {e:?}"))?;
+                Some(Arc::from(
+                    metadata_manifest_to_json(&decoded).to_string().as_str(),
+                ))
             }
             None => None,
         };
-        // `blob` (128 MiB) goes out of scope HERE, before anything is retained.
+        // `blob` (128 MiB) and both decoded trees go out of scope HERE, before anything is
+        // retained. What survives is two `Arc<str>` whose lengths ARE their cost.
         Arc::new(CachedManifests {
             len,
             modified,
-            public,
-            metadata,
+            public_json,
+            metadata_json,
         })
     };
 
@@ -1687,36 +1606,44 @@ fn cached_manifests_blocking(
 /// binary-format parse. The whole-module read that parse requires is memoized and single-flighted
 /// per capsule by [`cached_manifests_blocking`], because this read is ANONYMOUSLY reachable.
 ///
-/// Returns:
-/// - `Ok(Some(Some(manifest)))` — the module is held and carries a `PublicManifest` section.
+/// Returns the RENDERED manifest JSON, parsed back to a [`Value`] for the response envelope:
+/// - `Ok(Some(Some(json)))` — the module is held and carries a `PublicManifest` section.
 /// - `Ok(Some(None))` — the module is held but carries NO `PublicManifest` section (an older
 ///   `.dig`, or a private store whose paths must stay opaque — store-format §5.1, additive).
 /// - `Ok(None)` — this node does not hold the requested capsule at all (a cache miss).
 /// - `Err(_)` — the on-disk module's data section is corrupt/malformed.
-fn read_public_manifest_blocking(
+///
+/// The parse happens per request while the RENDER is cached, which is strictly less work than
+/// before: these call sites already did `from_str(&pm.to_json())` on every call, so the render is
+/// removed and nothing is added. The transient parse is bounded by the entry ceiling; the decoded
+/// tree is never retained.
+fn read_public_manifest_json(
     cache_dir: &Path,
     key: &CapsuleKey,
-) -> Result<Option<Option<digstore_core::PublicManifest>>, String> {
-    Ok(cached_manifests_blocking(cache_dir, key)?.map(|m| m.public.clone()))
+) -> Result<Option<Option<Value>>, String> {
+    Ok(cached_manifests_blocking(cache_dir, key)?
+        .map(|m| m.public_json.as_ref().map(|s| parse_cached_json(s))))
 }
 
-/// Load + decode the embedded publisher [`MetadataManifest`](digstore_core::MetadataManifest)
-/// (data-section id 6) from a locally cached compiled module — the `dig.getMetadata` read (#2071).
+/// The rendered publisher metadata (data-section id 6) — the `dig.getMetadata` read (#2071).
 ///
-/// Shares [`cached_manifests_blocking`] with [`read_public_manifest_blocking`], so one whole-module
-/// read answers both methods rather than each paying its own.
-///
-/// Returns:
-/// - `Ok(Some(Some(manifest)))` — the module is held and carries a metadata section.
-/// - `Ok(Some(None))` — held, but no metadata section (store-format §5.1: an optional section's
-///   absence is normal and backwards-compatible, never an error).
-/// - `Ok(None)` — this node does not hold the capsule at all.
-/// - `Err(_)` — the on-disk module's data section is corrupt/malformed.
-fn read_metadata_manifest_blocking(
+/// Shares [`cached_manifests_blocking`] with [`read_public_manifest_json`], so one whole-module
+/// read answers both methods rather than each paying its own. Same `Some/None` semantics.
+fn read_metadata_manifest_json(
     cache_dir: &Path,
     key: &CapsuleKey,
-) -> Result<Option<Option<digstore_core::MetadataManifest>>, String> {
-    Ok(cached_manifests_blocking(cache_dir, key)?.map(|m| m.metadata.clone()))
+) -> Result<Option<Option<Value>>, String> {
+    Ok(cached_manifests_blocking(cache_dir, key)?
+        .map(|m| m.metadata_json.as_ref().map(|s| parse_cached_json(s))))
+}
+
+/// Parse JSON this node rendered itself moments ago.
+///
+/// Infallible in practice — the input is our own `to_json()` output — but a parse failure must not
+/// panic a serve path, so it degrades to `null` rather than unwrapping. A caller sees "no manifest"
+/// instead of a dead connection.
+fn parse_cached_json(rendered: &str) -> Value {
+    serde_json::from_str(rendered).unwrap_or(Value::Null)
 }
 
 /// Render a decoded [`MetadataManifest`](digstore_core::MetadataManifest) as the dighub `Manifest`
@@ -2546,21 +2473,14 @@ impl Node {
             );
         };
         let cache_dir = self.cache_dir.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            read_public_manifest_blocking(&cache_dir, &capsule)
-        })
-        .await;
+        let outcome =
+            tokio::task::spawn_blocking(move || read_public_manifest_json(&cache_dir, &capsule))
+                .await;
         match outcome {
-            // Module held, PublicManifest section present.
-            Ok(Ok(Some(Some(pm)))) => {
-                // Reuse `PublicManifest::to_json` (the SAME renderer digstore's CLI/wasm
-                // readers use) so the shape is byte-for-byte identical across the ecosystem,
-                // then parse it back into a `Value` for the JSON-RPC `result` field.
-                let value = serde_json::from_str::<Value>(&pm.to_json()).unwrap_or_else(
-                    |_| json!({"schema_version": pm.schema_version, "entries": []}),
-                );
-                json!({"jsonrpc":"2.0","id":id,"result": value})
-            }
+            // Module held, PublicManifest section present. The cached bytes are
+            // `PublicManifest::to_json` output — the SAME renderer digstore's CLI/wasm readers
+            // use — so the shape stays byte-for-byte identical across the ecosystem.
+            Ok(Ok(Some(Some(value)))) => json!({"jsonrpc":"2.0","id":id,"result": value}),
             // Module held, no PublicManifest section — tolerate absence, never an error.
             Ok(Ok(Some(None))) => json!({"jsonrpc":"2.0","id":id,"result": Value::Null}),
             // This node does not hold the requested capsule at all.
@@ -2758,15 +2678,11 @@ impl Node {
             return rpc_err(&id, -32602, "params.store_id must be 64-hex");
         };
         let cache_dir = self.cache_dir.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            read_public_manifest_blocking(&cache_dir, &capsule)
-        })
-        .await;
+        let outcome =
+            tokio::task::spawn_blocking(move || read_public_manifest_json(&cache_dir, &capsule))
+                .await;
         match outcome {
-            Ok(Ok(Some(Some(pm)))) => {
-                let manifest = serde_json::from_str::<Value>(&pm.to_json()).unwrap_or_else(
-                    |_| json!({"schema_version": pm.schema_version, "entries": []}),
-                );
+            Ok(Ok(Some(Some(manifest)))) => {
                 json!({"jsonrpc":"2.0","id":id,"result":{"manifest": manifest, "root": root_hex}})
             }
             Ok(Ok(Some(None))) => {
@@ -2815,13 +2731,12 @@ impl Node {
             return rpc_err(&id, -32602, "params.store_id must be 64-hex");
         };
         let cache_dir = self.cache_dir.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            read_metadata_manifest_blocking(&cache_dir, &capsule)
-        })
-        .await;
+        let outcome =
+            tokio::task::spawn_blocking(move || read_metadata_manifest_json(&cache_dir, &capsule))
+                .await;
         match outcome {
             Ok(Ok(Some(manifest))) => json!({"jsonrpc":"2.0","id":id,"result":{
-                "manifest": manifest.map(|m| metadata_manifest_to_json(&m)).unwrap_or(Value::Null),
+                "manifest": manifest.unwrap_or(Value::Null),
                 "root": root_hex,
             }}),
             Ok(Ok(None)) => rpc_err(
@@ -9390,200 +9305,126 @@ mod tests {
         );
     }
 
-    /// `retained_bytes()` tracks the UNBOUNDED part of an entry — the public path list.
+    /// `retained_bytes()` is the LENGTH of what is retained, for every shape of input.
     ///
-    /// This is the assertion that makes the byte budget meaningful. An entry is not a fixed size:
-    /// `PublicManifest` is one row per public path, so a store with 600k paths retains ~115 MB in
-    /// a SINGLE entry. If the accounting did not scale with path count, a byte budget would be as
-    /// hollow as the entry cap it replaced — it would evict on a number that never grew.
+    /// The entry holds rendered JSON, so this is exact rather than estimated — which is the whole
+    /// reason for byte-caching. Four rounds of hand-written structural sizing undercounted a
+    /// decoded `MetadataManifest`: ~190,000x on the flat collections, ~20x on nested `custom`
+    /// JSON, and again on `Vec` capacity-vs-length and B-tree fill factor. Each fix addressed the
+    /// row that had just been found and left the rows nobody had thought of yet.
     ///
-    /// Built by hand rather than through `stage_and_compile` because the point is the accounting
-    /// function, and compiling a 600k-path fixture would dominate the suite runtime.
+    /// The cases below are the exact shapes that defeated the previous approach. None of them can
+    /// defeat this one, and the test is written to make that visible rather than to re-derive a
+    /// size: every assertion is `retained_bytes() == the rendered length`.
     #[test]
-    fn retained_bytes_scales_with_the_manifest_it_holds() {
-        use digstore_core::public_manifest::{PublicManifest, PublicManifestEntry};
-
-        let manifest_of = |paths: usize| -> CachedManifests {
-            let entries = (0..paths)
-                .map(|i| PublicManifestEntry {
-                    path: format!("assets/generated/file-{i:08}.js"),
-                    latest_root: Bytes32([7u8; 32]),
-                    generation_index: 0,
-                    sha256_latest: Bytes32([8u8; 32]),
-                    version_count: 1,
-                })
-                .collect();
-            CachedManifests {
-                len: 1,
-                modified: None,
-                public: Some(PublicManifest {
-                    schema_version: 1,
-                    entries,
-                }),
-                metadata: None,
-            }
+    fn retained_bytes_equals_the_rendered_length_for_every_shape() {
+        let overhead = std::mem::size_of::<CachedManifests>();
+        let entry_of = |public: Option<&str>, metadata: Option<&str>| CachedManifests {
+            len: 1,
+            modified: None,
+            public_json: public.map(Arc::from),
+            metadata_json: metadata.map(Arc::from),
         };
 
-        let small = manifest_of(10).retained_bytes();
-        let large = manifest_of(10_000).retained_bytes();
-        assert!(
-            large > small * 100,
-            "accounting must scale with path count (10 paths: {small} B, 10k paths: {large} B) — \
-             a budget that does not grow with the unbounded field cannot bound anything"
+        // Empty: nothing but the struct itself.
+        assert_eq!(entry_of(None, None).retained_bytes(), overhead);
+
+        // The shapes that broke every previous round, as the JSON they actually render to.
+        // Deeply NESTED custom JSON — round 4's fixtures used `Value::Null` and so never
+        // exercised nesting at all, which is precisely why that hole survived.
+        let nested = format!(
+            r#"{{"custom":{{"a":{}}}}}"#,
+            (0..64).fold("1".to_string(), |acc, _| format!(r#"{{"n":[{acc}]}}"#))
+        );
+        // A million empty authors — the shape that accounted as ZERO under content-only sizing.
+        let empty_authors = format!(
+            r#"{{"authors":[{}]}}"#,
+            vec![r#"{"name":""}"#; 5_000].join(",")
+        );
+        // A long flat path list.
+        let many_paths = format!(
+            r#"{{"entries":[{}]}}"#,
+            vec![r#"{"path":"a"}"#; 5_000].join(",")
         );
 
-        // And the budget must actually refuse an entry that large rather than store it.
-        assert!(
-            manifest_of(200_000).retained_bytes() > MANIFEST_ENTRY_MAX_BYTES,
-            "a 200k-path manifest must exceed the per-entry ceiling, or the ceiling is too high \
-             to stop the ~600k-path capsule a 128 MiB blob budget permits"
-        );
+        for (label, rendered) in [
+            ("nested custom", nested.as_str()),
+            ("empty authors", empty_authors.as_str()),
+            ("many paths", many_paths.as_str()),
+        ] {
+            let as_metadata = entry_of(None, Some(rendered)).retained_bytes();
+            let as_public = entry_of(Some(rendered), None).retained_bytes();
+            assert_eq!(
+                as_metadata,
+                overhead + rendered.len(),
+                "{label}: retained bytes must BE the buffer length, not an estimate of it"
+            );
+            assert_eq!(
+                as_public, as_metadata,
+                "{label}: which field holds the bytes cannot change what they cost"
+            );
+        }
+
+        // And both together sum, so one field cannot mask the other.
+        let both = entry_of(Some(&many_paths), Some(&nested)).retained_bytes();
+        assert_eq!(both, overhead + many_paths.len() + nested.len());
     }
 
-    /// `retained_bytes()` charges the METADATA collections per ELEMENT, not by content.
+    /// A large capsule is REFUSED memoization rather than retained.
     ///
-    /// Every element of `authors`/`keywords`/`categories`/`links`/`custom` occupies its container
-    /// slot before it holds a single content byte — an empty `Author` is 72 B resident for 6 B of
-    /// blob, an empty keyword 24 B for 4 B. Summing content alone made a million empty authors
-    /// account as ZERO while pinning 72 MB, which defeated the byte budget by ~190,000x.
-    ///
-    /// **This fixture populates the collections and leaves the strings EMPTY**, deliberately: the
-    /// previous version of the scaling test set `metadata: None`, so it exercised only the one
-    /// field that was already correct and could never have caught this. A test whose fixture does
-    /// not contain the thing being measured proves nothing about it.
+    /// The ceiling has to bite on real input, not just on a number: this renders a manifest big
+    /// enough to exceed it and asserts the memo declines it.
     #[test]
-    fn retained_bytes_charges_metadata_collections_per_element_not_by_content() {
-        use digstore_core::manifest::{Author, MetadataManifest};
-
-        let with_collections = |n: usize| -> CachedManifests {
-            CachedManifests {
-                len: 1,
-                modified: None,
-                public: None,
-                metadata: Some(MetadataManifest {
-                    schema_version: 1,
-                    name: String::new(),
-                    version: None,
-                    description: None,
-                    // EMPTY strings throughout — all cost is the container slots.
-                    authors: (0..n)
-                        .map(|_| Author {
-                            name: String::new(),
-                            handle: None,
-                            contact: None,
-                        })
-                        .collect(),
-                    license: None,
-                    homepage: None,
-                    repository: None,
-                    keywords: (0..n).map(|_| String::new()).collect(),
-                    categories: (0..n).map(|_| String::new()).collect(),
-                    icon: None,
-                    content_type: None,
-                    links: Default::default(),
-                    custom: Default::default(),
-                }),
-            }
+    fn an_oversized_rendered_manifest_exceeds_the_per_entry_ceiling() {
+        let rendered = "x".repeat(MANIFEST_ENTRY_MAX_BYTES + 1);
+        let entry = CachedManifests {
+            len: 1,
+            modified: None,
+            public_json: Some(Arc::from(rendered.as_str())),
+            metadata_json: None,
         };
-
-        let empty = with_collections(0).retained_bytes();
-        let n = 10_000;
-        let populated = with_collections(n).retained_bytes();
-        let charged = populated - empty;
-
-        // Floor derived from the types, not from a magic number: each author occupies an `Author`
-        // and each keyword/category a `String`, whatever their contents.
-        let floor = n * (std::mem::size_of::<Author>() + 2 * std::mem::size_of::<String>());
         assert!(
-            charged >= floor,
-            "{n} empty authors + {n} empty keywords + {n} empty categories accounted as \
-             {charged} B, below the {floor} B their container slots alone occupy. Content-only \
-             sizing reports ~0 here while the process pins tens of MB."
+            entry.retained_bytes() > MANIFEST_ENTRY_MAX_BYTES,
+            "the ceiling must be measured against the actual retained length"
         );
 
-        // The per-entry ceiling must actually stop a capsule built this way. ~6 MiB of empty
-        // authors is ~75 MB resident; the ceiling has to refuse it.
-        assert!(
-            with_collections(200_000).retained_bytes() > MANIFEST_ENTRY_MAX_BYTES,
-            "200k empty authors/keywords must exceed the per-entry ceiling — this is the shape \
-             that costs ~6 MiB of blob budget and ~75 MB of resident memory"
-        );
-    }
-
-    /// The BTreeMap fields are charged per entry too — `links` and `custom` are unbounded.
-    #[test]
-    fn retained_bytes_charges_the_metadata_maps_per_entry() {
-        use digstore_core::manifest::MetadataManifest;
-
-        let with_maps = |n: usize| -> CachedManifests {
-            let blank = MetadataManifest {
-                schema_version: 1,
-                name: String::new(),
-                version: None,
-                description: None,
-                authors: Vec::new(),
-                license: None,
-                homepage: None,
-                repository: None,
-                keywords: Vec::new(),
-                categories: Vec::new(),
-                icon: None,
-                content_type: None,
-                links: (0..n).map(|i| (format!("{i}"), String::new())).collect(),
-                custom: (0..n).map(|i| (format!("{i}"), Value::Null)).collect(),
-            };
-            CachedManifests {
-                len: 1,
-                modified: None,
-                public: None,
-                metadata: Some(blank),
-            }
+        let mut memo = ManifestMemo {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
         };
-
-        let n = 10_000;
-        let charged = with_maps(n).retained_bytes() - with_maps(0).retained_bytes();
-        assert!(
-            charged >= n * 2 * BTREE_ENTRY_OVERHEAD,
-            "{n} links + {n} custom entries accounted as {charged} B — a map slot costs more \
-             than its key and value contents, and both maps are publisher-controlled"
+        memo.insert(("d".into(), "c".into()), Arc::new(entry));
+        assert_eq!(
+            memo.entries.len(),
+            0,
+            "an oversized entry must be declined, never stored then evicted"
+        );
+        assert_eq!(
+            memo.bytes, 0,
+            "and it must not be counted against the budget"
         );
     }
 
     /// The memo evicts on BYTES, so many large entries cannot accumulate past the budget.
     #[test]
     fn the_manifest_memo_evicts_to_stay_within_its_byte_budget() {
-        use digstore_core::public_manifest::{PublicManifest, PublicManifestEntry};
-
         let mut memo = ManifestMemo {
             entries: lru::LruCache::unbounded(),
             bytes: 0,
         };
-        let entry = |paths: usize| {
+        let entry = |bytes: usize| {
             Arc::new(CachedManifests {
                 len: 1,
                 modified: None,
-                public: Some(PublicManifest {
-                    schema_version: 1,
-                    entries: (0..paths)
-                        .map(|i| PublicManifestEntry {
-                            path: format!("p/{i:06}"),
-                            latest_root: Bytes32([7u8; 32]),
-                            generation_index: 0,
-                            sha256_latest: Bytes32([8u8; 32]),
-                            version_count: 1,
-                        })
-                        .collect(),
-                }),
-                metadata: None,
+                public_json: Some(Arc::from("m".repeat(bytes).as_str())),
+                metadata_json: None,
             })
         };
 
         // Insert far more than the budget can hold.
-        let one = entry(20_000);
-        let per_entry = one.retained_bytes();
+        let per_entry = entry(512 * 1024).retained_bytes();
         let needed = (MANIFEST_MEMO_MAX_BYTES / per_entry) + 20;
         for i in 0..needed {
-            memo.insert((format!("dir{i}"), format!("cap{i}")), entry(20_000));
+            memo.insert((format!("dir{i}"), format!("cap{i}")), entry(512 * 1024));
         }
 
         assert!(
@@ -9599,7 +9440,10 @@ mod tests {
 
         // An entry over the per-entry ceiling is refused outright, not stored and then evicted.
         let before = memo.entries.len();
-        memo.insert(("huge".into(), "huge".into()), entry(400_000));
+        memo.insert(
+            ("huge".into(), "huge".into()),
+            entry(MANIFEST_ENTRY_MAX_BYTES + 1),
+        );
         assert_eq!(
             memo.entries.len(),
             before,
