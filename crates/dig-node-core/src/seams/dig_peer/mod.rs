@@ -39,6 +39,7 @@ pub mod selector_adapter;
 pub mod self_excluding_locator;
 pub mod serve_log;
 pub mod session;
+pub mod store_melted;
 pub mod union_locator;
 
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;

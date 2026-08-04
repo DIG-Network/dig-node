@@ -2877,6 +2877,86 @@ async fn bring_up_dht(
         }
     };
 
+    // Store-melt propagation (#1316, custody-critical): a SECOND inbound receiver drives the
+    // receive → on-chain-verify → delete → rebroadcast-once handler (piece #3), and a holder watch
+    // loop deletes + announces THIS node's own on-chain-melted stores (piece #4). Both share ONE
+    // tombstone, so each store is propagated at most once and the epidemic quiesces. Every delete is
+    // fail-closed on the chain (NC-9): a forged/replayed announcement or an unreachable chain deletes
+    // nothing (see `store_melted`).
+    //
+    // Both loops are behind ONE operator kill switch (`DIG_NODE_STORE_MELT`, default ON). This is the
+    // node's only path that irreversibly deletes content in response to chain state, and it
+    // propagates — so an operator who suspects a fault needs to stop the deleting without downgrading
+    // the node. Off means melted stores keep costing disk; nothing else depends on this having run.
+    if !crate::seams::dig_peer::store_melted::store_melt_enabled() {
+        println!(
+            "dig-node peer network: store-melt propagation DISABLED (DIG_NODE_STORE_MELT) — this \
+             node will not delete or relay melted stores"
+        );
+    } else {
+        use crate::seams::dig_peer::store_melted as melt;
+        let tombstone = melt::TombstoneSet::new();
+        let chain: Arc<dyn melt::MeltChain> = Arc::new(melt::CoinsetMeltChain::new());
+        let cache: Arc<dyn melt::MeltCache> = Arc::new(Arc::clone(node));
+        let broadcaster: Arc<dyn melt::MeltBroadcast> = Arc::new(pool.clone());
+        match pool.inbound_receiver() {
+            Ok(inbound) => {
+                tokio::spawn(melt::run_store_melted_ingest(
+                    inbound,
+                    Arc::clone(&chain),
+                    Arc::clone(&cache),
+                    Arc::clone(&broadcaster),
+                    tombstone.clone(),
+                ));
+                println!("dig-node peer network: store-melt propagation (opcode 221) up");
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "store-melt ingest: no inbound receiver; this node still deletes + announces its OWN \
+                 melted stores, but will not relay peers' melts"
+            ),
+        }
+        // The holder watch: periodically re-check every held store's singleton and, on a stable
+        // on-chain melt, delete + announce once. Signs with the node's identity; a node that cannot
+        // sign still deletes on the receive path, it just cannot originate a melt announcement.
+        match melt::signer_from_node(node) {
+            Some(signer) => {
+                let interval = crate::chainwatch::watch_interval_from_env();
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        ticker.tick().await;
+                        // A panic inside one tick is CONTAINED (#2067) so the watch survives to the
+                        // next tick instead of silently dying for the process's lifetime. `tick()`
+                        // stays outside the guard, so a persistently-panicking tick paces on the
+                        // interval rather than hot-spinning. Abandoning a tick is fail-closed: the
+                        // store is not tombstoned, so the next tick re-evaluates it from scratch.
+                        //
+                        // `melt_height` is an advisory hint only (receivers verify on-chain, never
+                        // trust it); 0 is a safe placeholder until a peak observer feeds a real height.
+                        let _ = crate::shared::catch_iteration(
+                            "store_melt_holder_watch",
+                            melt::run_melt_tick(
+                                &*chain,
+                                &*cache,
+                                &*broadcaster,
+                                &tombstone,
+                                &signer,
+                                0,
+                            ),
+                        )
+                        .await;
+                    }
+                });
+                println!("dig-node peer network: store-melt holder watch up");
+            }
+            None => tracing::warn!(
+                "store-melt holder watch disabled: no signable node identity (receive path still deletes)"
+            ),
+        }
+    }
+
     // Spawn the maintenance loop: republish (records never lapse) + refresh buckets + gc, well inside
     // the provider TTL.
     {
