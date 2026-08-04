@@ -10,6 +10,8 @@
 //!     relay reservation, and (when a newer node fills them) the per-peer list — addresses
 //!     shown IPv6-FIRST per the ecosystem §5.2 address-family policy.
 //!   * `dig-node peers connect <peer>` — dial a peer by address or peer_id.
+//!   * `dig-node peers ping <peer> [--peer-id <64hex>]` — test EVERY tier of the connection ladder
+//!     against a peer and report which one reached it (dig_ecosystem#1985; see [`crate::peer_ping`]).
 //!   * `dig-node peers disconnect <peer>` — drop a connected peer.
 //!   * `dig-node peers ban <peer> --state <ban|blacklist|none>` — block / soft-block / clear a peer.
 //!   * `dig-node peers pool-config --max-connections <n>` — set the peer-pool connection cap.
@@ -71,6 +73,13 @@ pub enum PeersAction {
     List,
     /// Dial a peer by address or peer_id.
     Connect { peer: String },
+    /// Test EVERY tier of the connection ladder against a peer and report which one reached it.
+    Ping {
+        peer: String,
+        /// Pin the identity the peer's certificate must derive. Wins over what this node believes
+        /// is at that address, so a wrong-identity answer is reported rather than silently repaired.
+        peer_id: Option<String>,
+    },
     /// Drop a connected peer.
     Disconnect { peer: String },
     /// Block / soft-block / clear a peer.
@@ -90,6 +99,17 @@ pub fn run(config: &Config, action: PeersAction) -> std::io::Result<Outcome> {
             let result = call_control(config, "control.peers.connect", json!({ "peer": peer }))?;
             Ok(Outcome::new(
                 format!("dig-node: dialing peer {peer}"),
+                result,
+            ))
+        }
+        PeersAction::Ping { peer, peer_id } => {
+            let mut params = json!({ "peer": peer });
+            if let Some(id) = peer_id {
+                params["peer_id"] = json!(id);
+            }
+            let result = call_control(config, "control.peers.ping", params)?;
+            Ok(Outcome::new(
+                crate::peer_ping::format_report(&result),
                 result,
             ))
         }

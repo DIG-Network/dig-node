@@ -16,10 +16,12 @@
 //!    ([`bootstrap_peers_from_pool`]), then run the periodic maintenance loop (`republish` /
 //!    `refresh_buckets` / `gc`) so provider records never lapse and the routing table stays fresh.
 //! 3. **Inventory publishing** (the emphasized requirement): the node continuously keeps its provider
-//!    records current — [`announce_inventory`] on startup for every held capsule (at store AND
-//!    root/capsule granularity), [`sync_inventory`] on inventory change (announce new content,
-//!    withdraw removed content), `republish()` before TTL via the maintenance loop, and a best-effort
-//!    `withdraw_provider` sweep on graceful shutdown.
+//!    records current — [`spawn_initial_inventory_announce`] once at startup for every held capsule
+//!    (at store AND root/capsule granularity), in the BACKGROUND and only after the pool→routing feed
+//!    is live, because awaiting it on the bring-up path left the peer-RPC listener unbound for 12m40s
+//!    on a content-heavy node (dig_ecosystem#1974); [`sync_inventory`] on inventory change (announce
+//!    new content, withdraw removed content), `republish()` before TTL via the maintenance loop, and
+//!    a best-effort `withdraw_provider` sweep on graceful shutdown.
 //!
 //! ## Serving the inbound DHT RPC
 //!
@@ -377,16 +379,105 @@ pub fn inventory_content_ids(cached: &[CachedCapsule]) -> Vec<dig_dht::ContentId
     out
 }
 
+/// How many inventory announcements the node keeps in flight at once.
+///
+/// Each `announce_provider` is a full Kademlia round trip — an iterative lookup followed by a PUT at
+/// the `k` closest peers — and every RPC inside it is bounded by `DhtConfig::rpc_timeout` (5s). Against
+/// the sparse routing table a just-booted node has, those RPCs time out rather than resolve, so an
+/// announce costs roughly its whole timeout budget. Announcing one id at a time therefore costs
+/// `inventory x timeout`: a node holding 44 capsules (68 content ids) spent **12m40s** there, and the
+/// cost grows without bound as holdings do (dig_ecosystem#1974).
+///
+/// 8 makes the wall-clock sub-linear in inventory size while bounding the dial burst a restart puts on
+/// the network — each in-flight announce already fans out to several peers of its own.
+pub const INITIAL_ANNOUNCE_CONCURRENCY: usize = 8;
+
+/// How many completed announces to log a progress line for, so a large inventory emits ~10 lines
+/// rather than one per id. Never zero (the caller takes `n % stride`).
+fn announce_progress_stride(total: usize) -> usize {
+    total.div_ceil(10).max(1)
+}
+
 /// Announce EVERY content id for the node's current inventory into the DHT (`announce_provider` per
-/// id). Called on startup once the DHT is bootstrapped, so peers can immediately find the content this
-/// node holds. Returns the number of content ids announced. Best-effort: a PUT that reaches no peers
-/// (empty routing table) still stores the record locally + is retried by `republish`.
-pub async fn announce_inventory(dht: &DhtService, cached: &[CachedCapsule]) -> usize {
-    let ids = inventory_content_ids(cached);
-    for id in &ids {
-        let _ = dht.announce_provider(id).await;
+/// id), up to `concurrency` at a time, logging progress as it goes. Returns the number of content ids
+/// announced. Best-effort: a PUT that reaches no peers (empty routing table) still stores the record
+/// locally + is retried by `republish`.
+///
+/// The announces run CONCURRENTLY because each one is dominated by network wait, not by local work —
+/// see [`INITIAL_ANNOUNCE_CONCURRENCY`] for what the sequential version cost. The progress logging is
+/// not cosmetic: this is a multi-minute operation on a content-heavy node, and a silent one is
+/// indistinguishable from a hung bring-up — it was read as a crash twice (dig_ecosystem#1974).
+pub async fn announce_inventory_ids(
+    dht: &DhtService,
+    ids: &[dig_dht::ContentId],
+    concurrency: usize,
+) -> usize {
+    use futures::stream::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let total = ids.len();
+    if total == 0 {
+        return 0;
     }
-    ids.len()
+    let stride = announce_progress_stride(total);
+    // `tokio::time::Instant` so the reported elapsed tracks the same clock the RPC timeouts do.
+    let started = tokio::time::Instant::now();
+    let done = AtomicUsize::new(0);
+
+    println!(
+        "dig-node peer network: DHT announcing {total} content id(s) for local inventory \
+         ({concurrency} at a time)"
+    );
+
+    futures::stream::iter(ids.iter())
+        .for_each_concurrent(concurrency.max(1), |id| {
+            let done = &done;
+            async move {
+                let _ = dht.announce_provider(id).await;
+                let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_multiple_of(stride) && n != total {
+                    println!(
+                        "dig-node peer network: DHT announced {n} of {total} content id(s) ({:.0}s elapsed)",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        })
+        .await;
+
+    println!(
+        "dig-node peer network: DHT announced {total} content id(s) for local inventory in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    total
+}
+
+/// Announce the node's initial inventory into the DHT in the BACKGROUND.
+///
+/// The ids are already recorded on `handle` by bring-up, so every later reconcile diffs against the
+/// truth whether or not this task has finished; what runs here is only the network publishing. It is
+/// deliberately NOT awaited on the bring-up path: doing so left the mTLS peer-RPC listener unbound —
+/// the node undialable and undiscoverable, while holding a relay reservation that advertised it as up
+/// — for 12m40s on a node holding 44 capsules (dig_ecosystem#1974).
+///
+/// Call it AFTER the live pool→routing feed is installed, so each announce runs against a routing
+/// table that is filling rather than the empty one bootstrap leaves behind.
+///
+/// The body is wrapped in [`catch_iteration`](crate::shared::catch_iteration) for the same reason
+/// #2067 wraps the long-lived loops: a panic inside a detached `tokio::spawn` is swallowed with the
+/// dropped `JoinHandle` and logs NOTHING, so this node would silently never publish its inventory for
+/// the rest of the process — the exact class of invisible failure moving the announce off the
+/// bring-up path was meant to end. The guarded future carries only owned `Arc` handles whose locks are
+/// taken and released inside each awaited call, never held across the catch boundary, so asserting its
+/// unwind-safety is sound.
+pub fn spawn_initial_inventory_announce(handle: Arc<DhtHandle>) {
+    tokio::spawn(async move {
+        let _ = crate::shared::catch_iteration("initial_inventory_announce", async move {
+            let ids = handle.announced_ids().await;
+            announce_inventory_ids(handle.service(), &ids, INITIAL_ANNOUNCE_CONCURRENCY).await;
+        })
+        .await;
+    });
 }
 
 /// The diff between a previous and a current inventory content-id set: `(to_announce, to_withdraw)`.
@@ -520,6 +611,16 @@ impl DhtHandle {
     /// The underlying service (for the inbound-RPC serving path + diagnostics).
     pub fn service(&self) -> &Arc<DhtService> {
         &self.service
+    }
+
+    /// A snapshot of the content ids this node currently intends to provide.
+    ///
+    /// Recorded at bring-up from the on-disk inventory and kept current by
+    /// [`reconcile_inventory`](Self::reconcile_inventory). Read by
+    /// [`spawn_initial_inventory_announce`] so the background announce publishes exactly the set the
+    /// handle already considers announced — the two can never disagree about what this node holds.
+    pub async fn announced_ids(&self) -> Vec<dig_dht::ContentId> {
+        self.announced.lock().await.clone()
     }
 
     /// Re-derive the inventory content-id set from `cached` and reconcile it with the DHT: announce
@@ -686,6 +787,143 @@ mod tests {
         )
     }
     use dig_dht::ContentId;
+
+    /// A transport whose every RPC sleeps for `delay` and then reports the peer unreachable.
+    ///
+    /// This is the shape of the real bring-up announce: against an almost-empty routing table every
+    /// PUT grinds to the per-RPC timeout rather than resolving, so an announce's cost is entirely
+    /// network wait. It makes the wall-clock of [`announce_inventory_ids`] a pure function of how
+    /// many announces are allowed in flight, which is exactly what the concurrency test measures.
+    struct SlowTransport {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl DhtTransport for SlowTransport {
+        async fn rpc(
+            &self,
+            _from: &Contact,
+            _peer: &Contact,
+            _request: &DhtRequest,
+        ) -> Result<DhtResponse, DhtError> {
+            tokio::time::sleep(self.delay).await;
+            Err(DhtError::Timeout)
+        }
+    }
+
+    /// A `DhtService` over [`SlowTransport`], with `seeds` contacts already in its routing table so
+    /// `announce_provider` actually reaches the transport (with an empty table it short-circuits).
+    async fn slow_service(delay: Duration, seeds: usize) -> Arc<DhtService> {
+        let service = Arc::new(DhtService::new(
+            PeerId::from_bytes([0x77; 32]),
+            vec![CandidateAddr::direct("::1", 9444)],
+            dig_dht::DhtConfig::default(),
+            Arc::new(SlowTransport { delay }),
+        ));
+        for i in 0..seeds {
+            service
+                .add_peer(
+                    &PeerId::from_bytes([i as u8 + 1; 32]),
+                    vec![CandidateAddr::direct("::1", 9500 + i as u16)],
+                )
+                .await;
+        }
+        service
+    }
+
+    /// `total` capsules spread one-per-store, as the inventory content-id list the bring-up announces.
+    fn inventory_ids(capsules: usize) -> Vec<ContentId> {
+        let cached: Vec<CachedCapsule> = (0..capsules)
+            .map(|i| {
+                cap(
+                    &format!("{:064x}", i + 1),
+                    &format!("{:064x}", 0xF000 + i + 1),
+                )
+            })
+            .collect();
+        inventory_content_ids(&cached)
+    }
+
+    /// **Proves:** the initial inventory announce runs its per-id Kademlia round trips CONCURRENTLY,
+    /// so bring-up cost is sub-linear in how much content the node holds.
+    ///
+    /// **Catches:** the dig_ecosystem#1974 defect — `announce_inventory` was a bare
+    /// `for id in &ids { dht.announce_provider(id).await }`, so a node holding 44 capsules (68 content
+    /// ids) paid 68 sequential lookup-plus-PUT round trips at the 5s per-RPC timeout and took 12m40s.
+    /// A revert to the sequential loop makes the measured elapsed equal the full sequential cost and
+    /// fails the bound below.
+    ///
+    /// The bound is SELF-CALIBRATING: it times one real `announce_provider` against this same
+    /// transport rather than hardcoding a duration, so it cannot rot when dig-dht changes how many
+    /// RPCs an announce performs. Time is PAUSED, so the measurement is the deterministic virtual
+    /// clock, not a wall-clock race that could flake on a loaded CI box.
+    #[tokio::test(start_paused = true)]
+    async fn the_initial_inventory_announce_runs_concurrently_not_one_id_at_a_time() {
+        let service = slow_service(Duration::from_secs(5), 3).await;
+        let ids = inventory_ids(34); // 34 stores x 1 capsule each = 68 content ids, as on rpc.dig.net
+        assert_eq!(
+            ids.len(),
+            68,
+            "34 single-capsule stores announce 68 content ids"
+        );
+
+        // Calibrate: what does ONE announce cost against this transport?
+        let t0 = tokio::time::Instant::now();
+        let _ = service.announce_provider(&ids[0]).await;
+        let one = t0.elapsed();
+        assert!(
+            one >= Duration::from_secs(5),
+            "the calibration announce must actually reach the slow transport, took {one:?}"
+        );
+
+        let concurrency = 8;
+        let t1 = tokio::time::Instant::now();
+        let announced = announce_inventory_ids(&service, &ids, concurrency).await;
+        let all = t1.elapsed();
+
+        assert_eq!(announced, ids.len(), "every content id is announced");
+
+        // The sequential implementation costs `ids.len() * one`. With 8 in flight the whole set must
+        // land in well under a quarter of that; a generous margin keeps the assertion about
+        // concurrency rather than about an exact scheduling shape.
+        let sequential = one * ids.len() as u32;
+        assert!(
+            all < sequential / 4,
+            "announcing {} ids with {concurrency} in flight took {all:?}, which is not meaningfully \
+             faster than the {sequential:?} a one-at-a-time loop would cost (#1974)",
+            ids.len(),
+        );
+    }
+
+    /// **Proves:** an empty inventory announces nothing and does no network work — the state every
+    /// fresh node boots in.
+    ///
+    /// **Catches:** a progress-logging or concurrency rewrite that divides by a zero total, or that
+    /// emits bring-up noise on a node with no content to announce.
+    #[tokio::test]
+    async fn an_empty_inventory_announces_nothing() {
+        let service = slow_service(Duration::from_secs(5), 3).await;
+        assert_eq!(announce_inventory_ids(&service, &[], 8).await, 0);
+    }
+
+    /// **Proves:** the progress stride emits at most ~10 lines no matter how much content is held, and
+    /// never zero (which would panic the `n % stride` modulo).
+    ///
+    /// **Catches:** a stride of 0 on a small inventory, and per-id log spam on a large one — the
+    /// tier-0 eager cache (#1934) deliberately grows holdings, so this must stay bounded.
+    #[test]
+    fn announce_progress_is_bounded_regardless_of_inventory_size() {
+        assert_eq!(announce_progress_stride(0), 1, "stride is never zero");
+        assert_eq!(announce_progress_stride(1), 1);
+        assert_eq!(announce_progress_stride(68), 7);
+        for total in [1usize, 9, 68, 1_000, 250_000] {
+            let lines = total / announce_progress_stride(total);
+            assert!(
+                lines <= 10,
+                "{total} ids would emit {lines} progress lines; the cap is ~10"
+            );
+        }
+    }
 
     fn cap(store: &str, root: &str) -> CachedCapsule {
         CachedCapsule {

@@ -133,6 +133,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.pairing.list",
     "control.pairing.approve",
     "control.pairing.revoke",
+    "control.peers.ping",
     // Delegated to the embedded node's own control surface.
     "control.peerStatus",
     "control.peers.connect",
@@ -170,6 +171,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.pairing.list",
     "control.pairing.approve",
     "control.pairing.revoke",
+    "control.peers.ping",
 ];
 
 /// The control methods [`dispatch_control`] DELEGATES to the embedded node's own control surface
@@ -742,6 +744,9 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
             crate::pairing::approve(&ctx.pairings, &ctx.state_dir, id, params)
         }
         "control.pairing.revoke" => crate::pairing::revoke(&ctx.state_dir, id, params),
+        // The connection-ladder diagnostic (dig_ecosystem#1985) — shell-owned so it needs no
+        // `dig-rpc-protocol` release; see `crate::peer_ping` for why.
+        "control.peers.ping" => crate::peer_ping::ping(ctx, id, params).await,
         // Unreachable: `dispatch_control` only routes here for `OWNED_CONTROL_METHODS` members.
         // Reaching this arm means the routing const and these arms have drifted.
         _ => unreachable!(

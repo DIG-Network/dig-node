@@ -21,8 +21,8 @@ use dig_dht::{
     DhtService, DhtTransport, PeerId, ProviderRecord,
 };
 use dig_node_core::dht::{
-    announce_inventory, bootstrap_peers_from_pool, caller_contact, inventory_content_ids,
-    NatDhtTransport,
+    announce_inventory_ids, bootstrap_peers_from_pool, caller_contact, inventory_content_ids,
+    NatDhtTransport, INITIAL_ANNOUNCE_CONCURRENCY,
 };
 use dig_node_core::peer::{
     install_crypto_provider, load_or_generate_node_cert, serve_peer_rpc_listener, PeerRpcResponder,
@@ -381,8 +381,10 @@ async fn announce_then_another_node_finds_the_provider_via_the_dht() {
 
 #[tokio::test]
 async fn startup_announce_publishes_every_held_capsule() {
-    // announce_inventory over a bootstrapped node publishes store + capsule for each held capsule, and
-    // a peer's find_providers then locates this node for that content.
+    // The STARTUP announce -- the exact pair bring-up runs (inventory_content_ids feeding
+    // announce_inventory_ids at the shipped concurrency, dig_ecosystem#1974) -- publishes store +
+    // capsule for each held capsule over a bootstrapped node, and a peer's find_providers then
+    // locates this node for that content.
     let swarm = Swarm::new();
     let holder = node(&swarm, 3);
     let finder = node(&swarm, 4);
@@ -399,7 +401,8 @@ async fn startup_announce_publishes_every_held_capsule() {
         size_bytes: 10,
         last_used_unix_ms: 1,
     }];
-    let n = announce_inventory(&holder, &cached).await;
+    let ids = inventory_content_ids(&cached);
+    let n = announce_inventory_ids(&holder, &ids, INITIAL_ANNOUNCE_CONCURRENCY).await;
     assert_eq!(n, 2, "store + capsule announced for one held capsule");
 
     // The finder locates the holder at BOTH granularities.

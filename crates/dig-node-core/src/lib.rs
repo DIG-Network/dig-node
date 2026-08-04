@@ -388,6 +388,14 @@ pub struct Node {
     /// on the in-process FFI path (the browser is a pure consumer with no pool), where the connect verb
     /// reports "no peer network" and the peer list is empty.
     gossip: OnceLock<dig_gossip::GossipHandle>,
+    /// Everything `control.peers.ping` needs to run the REAL connection ladder against one peer
+    /// (dig_ecosystem#1985): this node's mTLS identity, the shared `NatRuntime` carrying the live relay
+    /// reservation, the network id, and the STUN server. Retained by the standalone peer-network
+    /// bring-up ([`peer::run_peer_network`]) via [`Node::set_peer_ping_context`] the moment the NAT
+    /// runtime exists, so the diagnostic dials with EXACTLY the inputs the node's own dials use and can
+    /// never drift into a parallel prober. NEVER set on the FFI path (no NAT runtime there), where the
+    /// ping verb reports "no peer network" rather than guessing.
+    peer_ping: OnceLock<Arc<crate::seams::dig_peer::ping::PeerPingContext>>,
     /// The outgoing-bandwidth throttle (dig_ecosystem issue #30): tracks bytes served this second
     /// against a configurable cap (`DIG_NODE_MAX_OUTGOING_BYTES_PER_SEC`, unlimited by default) so
     /// the serve path can redirect an over-budget request to a known alternate holder instead of
@@ -2954,6 +2962,7 @@ impl Node {
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
+            peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
@@ -3140,6 +3149,7 @@ pub(crate) mod test_support {
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
+            peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
@@ -3606,6 +3616,7 @@ mod tests {
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
+            peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
@@ -3690,6 +3701,7 @@ mod tests {
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
+            peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
@@ -3739,6 +3751,7 @@ mod tests {
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
+            peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),
@@ -3829,6 +3842,7 @@ mod tests {
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
+                peer_ping: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
                 chat: chat::ChatState::new(),
                 inbound_demand: inbound_demand::InboundDemand::new(),
@@ -3901,6 +3915,7 @@ mod tests {
                 verification_ledger: verification_ledger::VerificationLedger::new(),
                 self_ref: OnceLock::new(),
                 gossip: OnceLock::new(),
+                peer_ping: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
                 chat: chat::ChatState::new(),
                 inbound_demand: inbound_demand::InboundDemand::new(),
@@ -5957,6 +5972,7 @@ mod tests {
             verification_ledger: verification_ledger::VerificationLedger::new(),
             self_ref: OnceLock::new(),
             gossip: OnceLock::new(),
+            peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
             inbound_demand: inbound_demand::InboundDemand::new(),

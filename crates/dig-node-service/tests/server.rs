@@ -1283,6 +1283,73 @@ async fn cache_fetch_and_cache_over_http_requires_the_control_token() {
     );
 }
 
+/// **Proves (dig_ecosystem#1985):** `control.peers.ping` is REACHABLE over the real HTTP control
+/// surface — token-gated, registered, and routed to its own handler.
+///
+/// **Catches** the failure this ticket's first pass actually had: the ladder engine existed and
+/// nothing could call it. Each assertion below rules out a distinct way that can silently recur:
+/// * untokened → `UNAUTHORIZED`, so the dialer is never reachable without the control token;
+/// * tokened → NOT `METHOD_NOT_FOUND`, so the method is registered in the dispatcher (an engine
+///   with no route answers -32601 and looks identical to a missing feature);
+/// * a missing `peer` → `INVALID_PARAMS` from THIS handler, which is only reachable if
+///   `dispatch_owned` routed here rather than hitting its `unreachable!()` arm or delegating to the
+///   node. A method listed in `OWNED_CONTROL_METHODS` with a typo'd `match` arm compiles fine and
+///   fails only at runtime — this is what notices;
+/// * a well-formed ping on a node with NO peer network → a deterministic `CONTROL_ERROR` saying so,
+///   never a hang, a panic, or an invented ladder. The FFI/test node has no NAT runtime, so this is
+///   the honest-degradation path every consumer hits before bring-up completes.
+#[tokio::test]
+async fn control_peers_ping_is_reachable_token_gated_and_degrades_honestly() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
+
+    let ping = |params: Value| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "control.peers.ping",
+            "params": params,
+        })
+    };
+
+    // Untokened: the gate refuses before the dialer is reached.
+    let rejected = post_rpc(&addr, ping(json!({ "peer": "[::1]:9444" })), None).await;
+    assert_eq!(rejected["error"]["data"]["code"], json!("UNAUTHORIZED"));
+
+    // Tokened: resolved by this node, never the "no such method" answer an unwired engine gives.
+    let missing_peer = post_rpc(&addr, ping(json!({})), Some(&token)).await;
+    assert_ne!(
+        missing_peer["error"]["data"]["code"],
+        json!("METHOD_NOT_FOUND"),
+        "control.peers.ping must be registered, got {missing_peer:?}"
+    );
+    // INVALID_PARAMS can only come from this handler's own `peer` check, so reaching it proves the
+    // dispatcher routed here.
+    assert_eq!(
+        missing_peer["error"]["data"]["code"],
+        json!("INVALID_PARAMS"),
+        "a missing params.peer must be this handler's own rejection, got {missing_peer:?}"
+    );
+
+    // A well-formed ping on a node with no peer network: honest, deterministic, and not a ladder.
+    let no_network = post_rpc(&addr, ping(json!({ "peer": "[::1]:9444" })), Some(&token)).await;
+    assert_eq!(
+        no_network["error"]["data"]["code"],
+        json!("CONTROL_ERROR"),
+        "no peer network must be a control error, got {no_network:?}"
+    );
+    assert!(
+        no_network["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no peer network")),
+        "the message must name the missing precondition, got {no_network:?}"
+    );
+    assert!(
+        no_network.get("result").is_none(),
+        "no ladder result is invented when nothing could be dialed"
+    );
+}
+
 /// **Proves (F1, #1946):** `chat.send` and `chat.poll` over the HTTP `POST /` surface are token-gated
 /// like `control.*` — an untokened call is UNAUTHORIZED (-32030) and never reaches the chat dispatch,
 /// so the node NEVER seals + BLS-signs a message as its own 0x0010 identity (`chat.send`) and NEVER

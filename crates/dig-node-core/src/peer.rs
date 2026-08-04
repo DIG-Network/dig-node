@@ -2370,6 +2370,22 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
         relayed_dialer,
     ));
 
+    // Hand the CONTROL surface everything `control.peers.ping` needs to walk the connection ladder
+    // against one peer (dig_ecosystem#1985). It is installed HERE, the moment the NAT runtime exists,
+    // rather than assembled on demand: a diagnostic that built its own dialer inputs could disagree
+    // with the ones the node really dials with, and then it would be measuring a different ladder
+    // than the one operators are asking about. The relayed rung in particular only works because this
+    // is the SAME runtime that holds the live relay reservation.
+    node.set_peer_ping_context(Arc::new(
+        crate::seams::dig_peer::ping::PeerPingContext::new(
+            identity.clone(),
+            nat_runtime.clone(),
+            network_id_str.clone(),
+            stun_server,
+            crate::dht::default_rpc_timeout(),
+        ),
+    ));
+
     // The durable, IPv6-first peer address book (#381): every PEX-learned + otherwise-learned candidate
     // accumulates here (incl. relay-only hints) instead of being dial-and-dropped, seeding future dials.
     // The selector-driven dial ranker (#384) is wired below once the content engine (the shared
@@ -2460,7 +2476,13 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     //     and find_providers finds nobody. This forwards every PoolEvent (add → insert, remove →
     //     evict) into routing so cross-node discovery works as the pool fills.
     if let Some(dht) = dht.clone() {
-        spawn_dht_routing_feed(dht, handle.clone());
+        spawn_dht_routing_feed(dht.clone(), handle.clone());
+        // 4a-ii. Publish this node's local inventory into the DHT — in the BACKGROUND, and only now
+        //        that routing is being fed from the live pool (#1974). Two reasons for this position:
+        //        bring-up must not wait on it (the listener bind is still ahead of us), and every
+        //        announce run before the feed exists queries the empty table bootstrap left behind,
+        //        so it times out instead of reaching the peers that would store the record.
+        crate::dht::spawn_initial_inventory_announce(dht);
     }
 
     // 4b. Bring up the P2P CONTENT engine (#164/#165) over the live DHT + this node's mTLS identity: the
@@ -2777,12 +2799,20 @@ async fn bring_up_dht(
         tracing::debug!(error = %e, "DHT bootstrap found no peers yet; records republish once the pool fills");
     }
 
-    // Announce the node's CURRENT inventory so peers can immediately find the content it holds.
+    // Derive the node's CURRENT inventory and the content ids it provides, and record them on the
+    // handle so every later reconcile diffs against the truth from the first moment.
+    //
+    // The ANNOUNCE itself — one Kademlia lookup + PUT per id, each RPC bounded by the DHT timeout —
+    // is deliberately NOT run here. Awaiting it on the bring-up path is what left the mTLS peer-RPC
+    // listener (bound near the end of `run_peer_network`) unbound for 12m40s on a node holding 44
+    // capsules: undialable and undiscoverable, yet holding a relay reservation that advertised it as
+    // up, and logging nothing for the whole window (dig_ecosystem#1974). The caller starts it in the
+    // background via `spawn_initial_inventory_announce` once the pool→routing feed is live.
     let cached = node.cache_list_cached().await;
-    let announced = crate::dht::announce_inventory(&service, &cached).await;
     let initial_ids = crate::dht::inventory_content_ids(&cached);
     println!(
-        "dig-node peer network: DHT up — announced {announced} content id(s) for local inventory"
+        "dig-node peer network: DHT up — {} content id(s) to announce for local inventory",
+        initial_ids.len()
     );
 
     let dht = crate::dht::DhtHandle::new(service, initial_ids);

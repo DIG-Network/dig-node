@@ -494,6 +494,18 @@ pub fn methods() -> &'static [MethodInfo] {
                       of control.peers.connect). Idempotent. Params { peer }.",
             requires_auth: true,
         },
+        MethodInfo {
+            name: "control.peers.ping",
+            served: "control",
+            summary: "Connection-ladder diagnostic: dial one peer a tier at a time (direct, \
+                      UPnP, NAT-PMP, PCP, hole-punch, relayed) and report EVERY rung plus a \
+                      graded verdict, so a relay-only success reads as the yellow finding it \
+                      is. Read-only: it joins no pool, announces nothing, and leaves no \
+                      reservation. Bounded (per-tier + overall deadline) and rate-limited. \
+                      Params { peer (64-hex peer_id or host:port), peer_id? (pin the identity \
+                      the certificate must derive) }.",
+            requires_auth: true,
+        },
         // -- chat subsystem (epic #793) — the directed-message TRANSPORT. Served LOCALLY by the
         // node engine (dispatched in seams::dig_rpc BEFORE the Method catalogue). The node seals an
         // app-supplied opaque DIGCHAT1 envelope to the recipient's 0x0010 key and dig-gossip
@@ -621,6 +633,13 @@ pub enum ErrorCode {
     /// sweep; the caller should back off and retry. The cheap local-DB fast path is never gated.
     /// Node error. (Wallet range `-3204x`.)
     WalletRateLimited,
+    /// `-32060` — a `control.peers.ping` (dig_ecosystem#1985) was refused BEFORE any dial: either a
+    /// ladder is already running (single-flight) or the start-rate bound for the window is spent.
+    /// Distinct from a ladder that ran and reached nothing, which is a RESULT (`verdict:
+    /// "unreachable"`), not an error. The ping takes a caller-supplied address and makes this node
+    /// dial it, so it is bounded as an anti-amplification measure; the caller should back off and
+    /// retry. Node error. (Peer range `-3206x`.)
+    PeerPingRefused,
 }
 
 impl ErrorCode {
@@ -641,6 +660,7 @@ impl ErrorCode {
             ErrorCode::WalletNotSynced => -32041,
             ErrorCode::WalletReadFailed => -32042,
             ErrorCode::WalletRateLimited => -32043,
+            ErrorCode::PeerPingRefused => -32060,
         }
     }
 
@@ -662,6 +682,7 @@ impl ErrorCode {
             ErrorCode::WalletNotSynced => "WALLET_NOT_SYNCED",
             ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
             ErrorCode::WalletRateLimited => "WALLET_RATE_LIMITED",
+            ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
         }
     }
 
@@ -683,7 +704,9 @@ impl ErrorCode {
             ErrorCode::WalletNoChainSource
             | ErrorCode::WalletNotSynced
             | ErrorCode::WalletReadFailed
-            | ErrorCode::WalletRateLimited => "node",
+            | ErrorCode::WalletRateLimited
+            // The peer ping is run BY the node's own peer network, so the refusal is the node's.
+            | ErrorCode::PeerPingRefused => "node",
             // INVALID_PARAMS is returned by the embedded read path's locally-served
             // read methods (bad store_id / retrieval_key) before any I/O.
             ErrorCode::InvalidParams => "node",
@@ -726,6 +749,10 @@ impl ErrorCode {
             ErrorCode::WalletRateLimited => {
                 "A wallet balance read was refused: the open coinset-fallback rate bound is exhausted."
             }
+            ErrorCode::PeerPingRefused => {
+                "A peer ping was refused before dialing: a ladder is already running on this node, \
+                 or the start-rate bound is exhausted."
+            }
         }
     }
 
@@ -746,6 +773,7 @@ impl ErrorCode {
             ErrorCode::WalletNotSynced,
             ErrorCode::WalletReadFailed,
             ErrorCode::WalletRateLimited,
+            ErrorCode::PeerPingRefused,
         ]
     }
 }
