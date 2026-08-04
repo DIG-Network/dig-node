@@ -1300,20 +1300,6 @@ fn serve_local_blocking(
     Some(resp)
 }
 
-/// Load + decode the embedded [`PublicManifest`](digstore_core::PublicManifest) (data-section
-/// id 13, #176 Phase C) from a locally cached compiled module. A free function (not a `Node`
-/// method) so it moves into a `spawn_blocking` closure with only the cache dir + request keys,
-/// mirroring [`serve_local_blocking`] (audit #179). Unlike `serve_local_blocking` this does NOT
-/// instantiate the module in wasmtime: the manifest is PUBLIC, unencrypted data embedded
-/// directly in the module's wasm data section, so extracting it is a pure binary-format parse
-/// ([`digstore_compiler::extract_data_section_blob`]) with no `serve_blind` decrypt.
-///
-/// Returns:
-/// - `Ok(Some(Some(manifest)))` — the module is held and carries a `PublicManifest` section.
-/// - `Ok(Some(None))` — the module is held but carries NO `PublicManifest` section (an older
-///   `.dig`, or a private store whose paths must stay opaque — store-format §5.1, additive).
-/// - `Ok(None)` — this node does not hold the requested capsule at all (a cache miss).
-/// - `Err(_)` — the on-disk module's data section is corrupt/malformed.
 /// How many capsules' extracted DIGS blobs to keep. Each blob is the module's METADATA sections,
 /// not its content — kilobytes, not the 128 MiB module it came from — so 256 entries is small.
 const DATA_SECTION_MEMO_CAP: usize = 256;
@@ -1409,6 +1395,20 @@ fn data_section_blob_blocking(
     Ok(Some(blob))
 }
 
+/// Load + decode the embedded [`PublicManifest`](digstore_core::PublicManifest) (data-section
+/// id 13, #176 Phase C) from a locally cached compiled module.
+///
+/// The manifest is PUBLIC, unencrypted data sitting in the module's wasm data section, so — unlike
+/// [`serve_local_blocking`] — this does NOT instantiate the module in wasmtime; it is a pure
+/// binary-format parse. The whole-module read that parse requires is memoized per capsule by
+/// [`data_section_blob_blocking`], because this read is ANONYMOUSLY reachable.
+///
+/// Returns:
+/// - `Ok(Some(Some(manifest)))` — the module is held and carries a `PublicManifest` section.
+/// - `Ok(Some(None))` — the module is held but carries NO `PublicManifest` section (an older
+///   `.dig`, or a private store whose paths must stay opaque — store-format §5.1, additive).
+/// - `Ok(None)` — this node does not hold the requested capsule at all (a cache miss).
+/// - `Err(_)` — the on-disk module's data section is corrupt/malformed.
 fn read_public_manifest_blocking(
     cache_dir: &Path,
     key: &CapsuleKey,
