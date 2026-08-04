@@ -1461,6 +1461,57 @@ fn read_metadata_manifest_blocking(
 /// Written out field by field rather than derived from the codec struct so the WIRE shape is
 /// stable regardless of the struct's internals: a field added to `MetadataManifest` upstream must
 /// be a deliberate wire change here, not an accidental one.
+/// Reduce a `dig.getContent` answer to `dig.getProof`'s trust-bearing half.
+///
+/// A pure function over the inner read's answer, deliberately separate from
+/// [`Node::get_proof`], because the anti-fabrication rule below is the whole point of the method
+/// and must be reachable by a test WITHOUT standing up a node that can serve. A guard that only
+/// runs after a successful inner read is not exercised by any test that makes the read fail — the
+/// mutation `if proof.is_empty()` → `if false` survived the entire suite for exactly that reason.
+///
+/// - Inner read failed (an error, or a redirect envelope) → passed through verbatim, re-tagged
+///   with this request's id, so the caller learns WHY no proof exists rather than getting a blank.
+/// - Inner read succeeded but carries NO proof → `RESOURCE_UNAVAILABLE`. **Never** a proof-shaped
+///   result with an empty `inclusion_proof`: a client handed one would treat unverified bytes as
+///   verified, and nothing anywhere would report an error (#126/#134). This case is reachable —
+///   a fetch-through serve of a capsule with no per-resource commitment produces exactly it.
+/// - Inner read succeeded with a proof → the proof, its root, and the chunk layout.
+///
+/// No `program_hash`: it would be the module's content address, and obtaining it costs a
+/// whole-module read plus a SHA-256 of every chunk — real work a ~200-byte ANONYMOUS request would
+/// trigger, for a field nothing consumes and which says nothing about the proof.
+/// `dig.getModuleInfo` already serves that value, memoized, on the peer tier.
+///
+/// No execution attestation is ever fabricated: `execution_proof: null` with
+/// `execution_proof_status: "unavailable"` states the absence rather than implying a passed check.
+fn proof_from_content_answer(answer: Value, id: Value) -> Value {
+    let Some(result) = answer.get("result").and_then(Value::as_object) else {
+        let mut passthrough = answer;
+        passthrough["id"] = id;
+        return passthrough;
+    };
+
+    let proof = result
+        .get("inclusion_proof")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if proof.is_empty() {
+        return rpc_err(
+            &id,
+            download::RESOURCE_UNAVAILABLE,
+            "no inclusion proof is available for this resource at the anchored root",
+        );
+    }
+
+    json!({"jsonrpc":"2.0","id":id,"result":{
+        "inclusion_proof": proof,
+        "root": result.get("root").cloned().unwrap_or(Value::Null),
+        "chunk_lens": result.get("chunk_lens").cloned().unwrap_or(Value::Null),
+        "execution_proof": Value::Null,
+        "execution_proof_status": "unavailable",
+    }})
+}
+
 fn metadata_manifest_to_json(m: &digstore_core::MetadataManifest) -> Value {
     json!({
         "schema_version": m.schema_version,
@@ -2412,43 +2463,7 @@ impl Node {
         if let Some(params) = read.get_mut("params").and_then(Value::as_object_mut) {
             params.insert("offset".into(), json!(0));
         }
-        let answer = handle_rpc(self, read, origin, provenance).await;
-
-        let Some(result) = answer.get("result").and_then(Value::as_object) else {
-            // An error or a redirect envelope passes through unchanged (re-tagged with this
-            // request's id) so the caller learns WHY no proof exists — a redirect names the peers
-            // that can produce one — instead of receiving a blank that looks like a proof.
-            let mut passthrough = answer;
-            passthrough["id"] = id;
-            return passthrough;
-        };
-
-        let proof = result
-            .get("inclusion_proof")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if proof.is_empty() {
-            return rpc_err(
-                &id,
-                download::RESOURCE_UNAVAILABLE,
-                "no inclusion proof is available for this resource at the anchored root",
-            );
-        }
-
-        // NO `program_hash`. It would be the module's content address, and obtaining it costs a
-        // WHOLE-MODULE read plus a SHA-256 of every chunk (`describe_module`) — real work that a
-        // ~200-byte ANONYMOUS request would trigger, for a field nothing consumes and which says
-        // nothing about the proof. `dig.getModuleInfo` already serves exactly that value, is
-        // memoized, and is peer-tier; a caller who wants a module's identity asks there.
-        json!({"jsonrpc":"2.0","id":id,"result":{
-            "inclusion_proof": proof,
-            "root": result.get("root").cloned().unwrap_or(Value::Null),
-            "chunk_lens": result.get("chunk_lens").cloned().unwrap_or(Value::Null),
-            // NEVER fabricated (#126/#134). A real, verified execution attestation is gated on the
-            // RISC0 toolchain and is honestly absent here.
-            "execution_proof": Value::Null,
-            "execution_proof_status": "unavailable",
-        }})
+        proof_from_content_answer(handle_rpc(self, read, origin, provenance).await, id)
     }
 
     /// `dig.getPublicManifest` (#2071) — a store's normalized PUBLIC MANIFEST, in the enveloped
@@ -2535,9 +2550,10 @@ impl Node {
             return rpc_err(&id, -32602, "params.store_id must be 64-hex");
         };
         let cache_dir = self.cache_dir.clone();
-        let outcome =
-            tokio::task::spawn_blocking(move || read_metadata_manifest_blocking(&cache_dir, &capsule))
-                .await;
+        let outcome = tokio::task::spawn_blocking(move || {
+            read_metadata_manifest_blocking(&cache_dir, &capsule)
+        })
+        .await;
         match outcome {
             Ok(Ok(Some(manifest))) => json!({"jsonrpc":"2.0","id":id,"result":{
                 "manifest": manifest.map(|m| metadata_manifest_to_json(&m)).unwrap_or(Value::Null),
@@ -8985,6 +9001,149 @@ mod tests {
         assert!(
             resp.get("result").is_none(),
             "no proof result is fabricated: {resp}"
+        );
+    }
+
+    /// The guard the test above CANNOT reach: a SUCCESSFUL inner read that carries no proof.
+    ///
+    /// That path matters because it is the only one where a blank could be dressed up as a
+    /// result — the failing-read test returns early at the passthrough branch, one level above
+    /// the guard. Mutating `if proof.is_empty()` to `if false` left the whole 676-test suite
+    /// green for exactly that reason. This drives the reduction directly, so the guard is the
+    /// thing under test rather than something the test happens to step over.
+    #[test]
+    fn a_successful_read_with_no_proof_is_an_error_not_a_blank_proof() {
+        // A well-formed getContent success whose proof is EMPTY — the shape a fetch-through
+        // serve of a capsule with no per-resource commitment produces.
+        let no_proof = json!({"jsonrpc":"2.0","id":1,"result":{
+            "ciphertext": "AQID",
+            "total_length": 3, "offset": 0, "length": 3,
+            "complete": true, "next_offset": Value::Null,
+            "root": Bytes32([0x42; 32]).to_hex(),
+            "inclusion_proof": "",
+            "chunk_lens": [3],
+        }});
+        let out = proof_from_content_answer(no_proof, json!(7));
+        assert_eq!(
+            out["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "a successful read carrying no proof must ERROR — a client handed a proof-shaped \
+             blank would treat unverified bytes as verified and nothing would report it: {out}"
+        );
+        assert!(out.get("result").is_none(), "{out}");
+
+        // Same answer WITH a proof still succeeds, so the guard is not simply refusing everything.
+        let with_proof = json!({"jsonrpc":"2.0","id":1,"result":{
+            "ciphertext": "AQID",
+            "root": Bytes32([0x42; 32]).to_hex(),
+            "inclusion_proof": "cHJvb2Y=",
+            "chunk_lens": [3],
+        }});
+        let ok = proof_from_content_answer(with_proof, json!(7));
+        assert_eq!(ok["result"]["inclusion_proof"], json!("cHJvb2Y="), "{ok}");
+        assert_eq!(ok["result"]["execution_proof"], Value::Null, "{ok}");
+        assert_eq!(
+            ok["result"]["execution_proof_status"],
+            json!("unavailable"),
+            "an absent RISC0 receipt is never reported as a passed check: {ok}"
+        );
+        assert!(
+            ok["result"].get("program_hash").is_none(),
+            "no whole-module read is paid for on an anonymous proof request: {ok}"
+        );
+
+        // An inner ERROR passes through, re-tagged, so the caller learns why.
+        let failed = json!({"jsonrpc":"2.0","id":1,
+            "error":{"code": -32004, "message":"resource not available"}});
+        let through = proof_from_content_answer(failed, json!(7));
+        assert_eq!(through["error"]["code"], json!(-32004), "{through}");
+        assert_eq!(through["id"], json!(7), "re-tagged with this request's id");
+    }
+
+    /// `dig.getCapsule` reads only the requested WINDOW off disk, never the whole module.
+    ///
+    /// Asserted in BYTES READ, not bytes returned. Both implementations return byte-identical
+    /// responses, so no correctness assertion can tell them apart — the amplification is the
+    /// entire defect, and it is invisible to every test that only checks output. This method is
+    /// on the ANONYMOUS public-read allowlist, so a whole-module read per window would let one
+    /// ~200-byte unauthenticated request pull 128 MiB off a `--cache`-less S3 mount.
+    #[tokio::test]
+    async fn dig_get_capsule_reads_only_the_requested_window_off_disk() {
+        use std::sync::atomic::Ordering;
+        let store_id = Bytes32([21u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>bounded</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        // The fixture carries the guest wasm, so it spans several 3 MiB windows.
+        assert!(
+            module_bytes.len() > WINDOW,
+            "this guard is meaningless on a module that fits in one window"
+        );
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        let before =
+            crate::seams::dig_peer::module_serve::module_bytes_read().load(Ordering::Relaxed);
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getCapsule","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(), "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let read = crate::seams::dig_peer::module_serve::module_bytes_read()
+            .load(Ordering::Relaxed)
+            - before;
+
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert!(
+            read > 0,
+            "the window must come from the SEEKING reader — zero bytes counted means the serve \
+             reverted to slurping the whole module through a path this guard cannot see"
+        );
+        assert!(
+            read <= WINDOW as u64,
+            "one request read {read} bytes for a {WINDOW}-byte window of a {} byte module — a \
+             ~200-byte anonymous request must not cost a whole-module read",
+            module_bytes.len()
+        );
+        // …and it still reports the FULL length, taken from metadata rather than a buffer.
+        assert_eq!(
+            resp["result"]["total_length"].as_u64(),
+            Some(module_bytes.len() as u64),
+            "{resp}"
+        );
+
+        // A far-past-EOF offset is the cheapest possible request: an empty window, and it must
+        // not have read the module to discover that.
+        let before =
+            crate::seams::dig_peer::module_serve::module_bytes_read().load(Ordering::Relaxed);
+        let past = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getCapsule","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+                "offset": module_bytes.len() as u64 + 1,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let read_past = crate::seams::dig_peer::module_serve::module_bytes_read()
+            .load(Ordering::Relaxed)
+            - before;
+        assert_eq!(past["result"]["length"].as_u64(), Some(0), "{past}");
+        assert_eq!(
+            read_past, 0,
+            "an offset past EOF returns ~250 bytes; it must READ ~0 too, or the response size \
+             and the work done diverge by ~675,000:1 and no rate limit can see the cost"
         );
     }
 
