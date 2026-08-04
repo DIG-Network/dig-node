@@ -2712,6 +2712,77 @@ older dated pre-releases AND their tags together (`gh release delete --cleanup-t
 tags/releases and the rolling `nightly` are NEVER pruned. Neither `nightly-*` nor `nightly` matches
 `release.yml`'s `v*` trigger, so the nightly channel never fires the stable build.
 
+11.5a. **Both channels publish the NATIVE INSTALL PACKAGES (HARD RULE).** A release — stable OR
+nightly — MUST carry the three native packages, not raw binaries alone. The beacon installs dig-node
+by handing a native package to `msiexec`/`installer`/`dpkg`, and dig-updater's feed resolves
+dig-node's artifacts by their native-package file NAMES, so a package-less release is one the update
+system cannot resolve at all: it fails closed and no host on that channel can install or update.
+Every release MUST therefore publish, under exactly these names (`<ver>` = the release's version,
+which for a nightly is the synthesized `X.Y.Z-nightly.YYYYMMDD.<shortsha>`):
+
+- `dig-node_<ver>_amd64.deb`
+- `dig-node-<ver>-macos.pkg`
+- `dig-node-<ver>-windows-x64.msi`
+
+The nightly publish step MUST verify all three are present and FAIL rather than publish an
+incomplete release. The packages are built by `.github/workflows/package.yml`
+(`on: workflow_call`, inputs `version`, `deb_arches`, `ref` — all optional, so its `pull_request`
+and `v*` tag triggers are unaffected), which both channels call, so the definitions cannot diverge.
+The nightly `.deb` is **amd64 only** — the feed resolves a single Linux platform; the stable tag path
+keeps both `amd64` and `arm64` because apt.dig.net serves both (§11.3).
+
+11.5b. **The version is validated at ONE boundary, and the MSI version is derived.** Every package
+build passes its version through `scripts/package-version.sh` before it reaches a dpkg control file,
+`pkgbuild --version`, or the WiX `-d Version=` argument — all of which end up inside a package that
+runs with elevated privilege. The script accepts, by whitelist, ONLY `X.Y.Z` or
+`X.Y.Z-nightly.YYYYMMDD.<shortsha>`, and rejects everything else with a non-zero exit; it MUST also
+reject a component exceeding Windows Installer's field limits (major/minor > 255, patch > 65535).
+
+It emits two values, which differ on purpose:
+
+- **`file_version`** — the version VERBATIM. The package file name MUST carry it unchanged, because
+  the rolling `nightly` tag names no version and the feed recovers it from the asset name alone.
+- **`msi_product_version`** — a numeric `major.minor.build`, since Windows Installer accepts no
+  prerelease suffix. For a nightly this is `X.Y.<days since 2020-01-01>`. The date MUST occupy the
+  BUILD field rather than a fourth field: Windows Installer compares only `major.minor.build`, so a
+  fourth field is parsed and then ignored — the date would stop being comparison-significant at all.
+
+The version whitelist also means a prerelease-shaped STABLE tag (`v1.0.0-rc.1`) is REJECTED rather
+than packaged. That is intended: §2.4 of the ecosystem contract admits only `X.Y.Z` stable versions,
+and an `-rc` MSI would carry the same ProductVersion hazards as a nightly with none of the handling.
+
+11.5c. **The MSI upgrade invariant (HARD RULE).** For any two distinct nightly builds, the later one
+MUST NOT compare LOWER than the earlier, and any pair that compares EQUAL MUST be made safe by an
+explicit same-version-upgrade policy. The beacon installs with a bare `msiexec /i <pkg> /qn
+/norestart`, so a violation of either half is a broken host: a LOWER comparison aborts on
+`DowngradeErrorMessage`, and an EQUAL comparison falls outside `MajorUpgrade`'s `[0.0.0,
+ProductVersion)` detect range — matching neither the upgrade nor the downgrade case, so the build
+installs as a SECOND product under a fresh auto `ProductCode`, leaving two entries that both own the
+`net.dignetwork.dig-node` service.
+
+The mapping alone CANNOT satisfy this. The synthesized nightly version carries a DATE and a commit
+sha and nothing else, so the ProductVersion is day-granular by construction, and 16 bits of build
+field cannot hold a finer monotonic counter over any useful epoch (minute resolution exhausts the
+field in 45 days; a sha-derived tiebreak is not ordered, which would produce the far worse LOWER
+case). Two builds on one UTC day are reachable on supported paths — the `force` re-cut, and a manual
+`channel: nightly` dispatch on a day the cron already ran.
+
+The invariant is therefore held JOINTLY, and both halves are required:
+
+- **the mapping** never decreases across builds (the day count is monotonic, and a base-version bump
+  raises `major`/`minor` first);
+- **`packaging/windows/dig-node.wxs`** sets `MajorUpgrade/@AllowSameVersionUpgrades="yes"`, so an
+  equal version upgrades in place. This also repairs the same hazard for a stable re-install of an
+  unchanged `vX.Y.Z`. WiX raises ICE61 for this by design; the warning IS the decision.
+
+**Known consequence — a nightly Windows host cannot install a stable release of the same
+`major.minor`.** Because the nightly build field is a day count, it sits above every real patch
+number, so `0.96.<days>` outranks every stable `0.96.z`: `msiexec` aborts on
+`DowngradeErrorMessage`, and the beacon cannot detect this because anti-rollback state is kept per
+channel. This is not a regression — no nightly `.msi` existed before — but it is newly reachable. A
+host switched from `nightly` back to `stable` on Windows requires an uninstall of the nightly
+package before the stable one installs, until the version scheme distinguishes channels.
+
 11.6. **Reusable build.** The cross-OS build lives once in `.github/workflows/build-binaries.yml`
 (`on: workflow_call`, inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel
 call it, so the two paths can never diverge on HOW a binary is produced — including the canonical

@@ -10,6 +10,13 @@ name: Native install packages
 #   * push tag v* → build all three AND attach them to the GitHub Release. The Ubuntu .deb is a
 #     release ASSET (apt.dig.net's deploy ingests upstream GitHub release .debs to build the signed
 #     apt repo — no push needed; the .deb name + control metadata are apt-correct + stable).
+#   * workflow_call → build the packages at a CALLER-SUPPLIED version and leave them as run
+#     artifacts for the caller to publish. This is how the NIGHTLY channel gets native packages
+#     (dig_ecosystem#618): the beacon installs dig-node by handing a native package to
+#     msiexec/installer/dpkg, so a nightly release of bare binaries is one dig-updater's feedsign
+#     cannot resolve at all — it fails closed with `no matching release assets` and reddens the
+#     signed feed. Calling this workflow keeps the nightly packages built from these SAME
+#     definitions rather than a copy that would drift.
 on:
   pull_request:
     paths:
@@ -24,7 +31,40 @@ on:
   push:
     tags:
       - "v*"
+  # The dispatch inputs mirror the `workflow_call` ones below, so a maintainer can rebuild the
+  # packages at an ARBITRARY version without publishing anything (the publish job is tag-gated).
+  # That is the only way to exercise a nightly-shaped version — `X.Y.Z-nightly.…`, which WiX rejects
+  # as a ProductVersion — outside a real release night.
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the packages (blank = the tag name, else Cargo.toml)."
+        type: string
+        required: false
+  workflow_call:
+    inputs:
+      version:
+        description: >-
+          The version to stamp into the packages. Omitted (the PR / `v*` tag paths) means "resolve
+          it as before" — from the tag name, else Cargo.toml. Supplied by the nightly channel,
+          whose synthesized `X.Y.Z-nightly.YYYYMMDD.<sha>` version exists in no version file.
+        type: string
+        required: false
+      deb_arches:
+        description: >-
+          A JSON array of `.deb` matrix legs (`runner`/`target`/`dpkg_arch`). Omitted means both
+          amd64 and arm64 — the stable default, since apt.dig.net serves both. The nightly channel
+          narrows it to amd64: dig-updater's feedsign resolves exactly one Linux platform
+          (`linux/x64`), so a nightly arm64 `.deb` would be built every night and resolved by nobody.
+        type: string
+        required: false
+      ref:
+        description: >-
+          The git ref to check out. Omitted means the ref that triggered the run. The nightly
+          channel pins the exact commit its binaries were built from, so the packages and the
+          binaries in one release can never come from two different trees.
+        type: string
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,13 +89,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            dpkg_arch: amd64
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            dpkg_arch: arm64
+        # The legs are data so a caller can narrow them (see the `deb_arches` input). An omitted
+        # input is null on every non-`workflow_call` trigger, so the literal below is the single
+        # source of truth for the default (amd64 + arm64) that the PR and `v*` tag paths use.
+        include: >-
+          ${{ fromJSON(inputs.deb_arches || '[
+            {"runner":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","dpkg_arch":"amd64"},
+            {"runner":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","dpkg_arch":"arm64"}
+          ]') }}
     steps:
       - name: Bootstrap the container for checkout
         run: |
@@ -65,6 +106,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          # Omitted on the PR / tag paths (the triggering ref); pinned by a caller so the packages
+          # and that caller's binaries can only ever come from ONE commit.
+          ref: ${{ inputs.ref }}
       - name: Trust the checkout (git runs as root in the container)
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - id: setup
@@ -78,12 +122,25 @@ jobs:
             target
           key: pkg-deb-glibc${{ steps.setup.outputs.glibc-floor }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: pkg-deb-glibc${{ steps.setup.outputs.glibc-floor }}-${{ matrix.target }}-
-      - name: Resolve version
+      - name: Resolve + validate the package version
         id: ver
+        shell: bash
+        # The caller's version wins; otherwise resolve it exactly as before (the tag name, else
+        # Cargo.toml). It arrives through the ENVIRONMENT, never interpolated into this script, and
+        # scripts/package-version.sh then whitelist-validates it: the version ends up in a dpkg
+        # control file, a `pkgbuild --version` argument and the MSI ProductVersion, on packages that
+        # run ELEVATED — so it is checked once, here, rather than escaped at three call sites. The
+        # script also emits the NUMERIC ProductVersion the MSI needs, which a nightly version is not.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
-            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
-          echo "v=$V" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          V="${INPUT_VERSION:-}"
+          if [ -z "$V" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
+              V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
+          fi
+          bash scripts/package-version.sh "$V" >> "$GITHUB_OUTPUT"
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin dig-node
       - name: Assert the packaged binary honours the glibc floor
@@ -91,7 +148,11 @@ jobs:
         # and would otherwise be able to regress on its own.
         run: bash scripts/check-glibc-floor.sh "target/${{ matrix.target }}/release/dig-node" "${{ steps.setup.outputs.glibc-floor }}"
       - name: Build .deb
-        run: bash packaging/linux/build-deb.sh "target/${{ matrix.target }}/release/dig-node" "${{ steps.ver.outputs.v }}" "${{ matrix.dpkg_arch }}" dist
+        # The version reaches the dpkg CONTROL file, so it arrives through the environment rather
+        # than being interpolated into the command line (it is whitelist-validated upstream too).
+        env:
+          FILE_VERSION: ${{ steps.ver.outputs.file_version }}
+        run: bash packaging/linux/build-deb.sh "target/${{ matrix.target }}/release/dig-node" "$FILE_VERSION" "${{ matrix.dpkg_arch }}" dist
       - name: Validate .deb metadata
         run: |
           dpkg-deb --info dist/*.deb
@@ -111,6 +172,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          # Omitted on the PR / tag paths (the triggering ref); pinned by a caller so the packages
+          # and that caller's binaries can only ever come from ONE commit.
+          ref: ${{ inputs.ref }}
       - name: Install Rust + targets
         run: |
           rustup toolchain install stable
@@ -125,12 +189,25 @@ jobs:
             target
           key: ${{ runner.os }}-pkg-mac-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-pkg-mac-
-      - name: Resolve version
+      - name: Resolve + validate the package version
         id: ver
+        shell: bash
+        # The caller's version wins; otherwise resolve it exactly as before (the tag name, else
+        # Cargo.toml). It arrives through the ENVIRONMENT, never interpolated into this script, and
+        # scripts/package-version.sh then whitelist-validates it: the version ends up in a dpkg
+        # control file, a `pkgbuild --version` argument and the MSI ProductVersion, on packages that
+        # run ELEVATED — so it is checked once, here, rather than escaped at three call sites. The
+        # script also emits the NUMERIC ProductVersion the MSI needs, which a nightly version is not.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
-            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
-          echo "v=$V" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          V="${INPUT_VERSION:-}"
+          if [ -z "$V" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
+              V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
+          fi
+          bash scripts/package-version.sh "$V" >> "$GITHUB_OUTPUT"
       - name: Build both arches + lipo a universal binary
         run: |
           cargo build --release --locked --target aarch64-apple-darwin --bin dig-node
@@ -141,7 +218,10 @@ jobs:
             target/x86_64-apple-darwin/release/dig-node
           lipo -info dist/dig-node
       - name: Build .pkg
-        run: bash packaging/macos/build-pkg.sh dist/dig-node "${{ steps.ver.outputs.v }}" dist
+        # As for the .deb: the version reaches `pkgbuild --version` through the environment.
+        env:
+          FILE_VERSION: ${{ steps.ver.outputs.file_version }}
+        run: bash packaging/macos/build-pkg.sh dist/dig-node "$FILE_VERSION" dist
       - uses: actions/upload-artifact@v4
         with:
           name: dig-node-pkg
@@ -156,6 +236,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          # Omitted on the PR / tag paths (the triggering ref); pinned by a caller so the packages
+          # and that caller's binaries can only ever come from ONE commit.
+          ref: ${{ inputs.ref }}
       - name: Install Rust
         shell: bash
         run: |
@@ -170,13 +253,25 @@ jobs:
             target
           key: ${{ runner.os }}-pkg-msi-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-pkg-msi-
-      - name: Resolve version
+      - name: Resolve + validate the package version
         id: ver
         shell: bash
+        # The caller's version wins; otherwise resolve it exactly as before (the tag name, else
+        # Cargo.toml). It arrives through the ENVIRONMENT, never interpolated into this script, and
+        # scripts/package-version.sh then whitelist-validates it: the version ends up in a dpkg
+        # control file, a `pkgbuild --version` argument and the MSI ProductVersion, on packages that
+        # run ELEVATED — so it is checked once, here, rather than escaped at three call sites. The
+        # script also emits the NUMERIC ProductVersion the MSI needs, which a nightly version is not.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
-            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
-          echo "v=$V" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          V="${INPUT_VERSION:-}"
+          if [ -z "$V" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then V="${GITHUB_REF_NAME#v}"; else
+              V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"; fi
+          fi
+          bash scripts/package-version.sh "$V" >> "$GITHUB_OUTPUT"
       - name: Build release binary
         run: cargo build --release --locked --bin dig-node
       - name: Install WiX
@@ -190,14 +285,24 @@ jobs:
           wix extension add -g WixToolset.Util.wixext/5.0.2
       - name: Build .msi
         shell: bash
+        # Two DIFFERENT versions, deliberately (dig_ecosystem#618):
+        #   * ProductVersion must be numeric `major.minor.build` — WiX rejects a semver prerelease
+        #     outright — so it gets the mapped numeric form;
+        #   * the FILE NAME keeps the full version, because dig-updater's feedsign recovers a rolling
+        #     nightly's version from the asset file name and nothing else.
+        # Both arrive through the environment so neither can extend this command line.
+        env:
+          FILE_VERSION: ${{ steps.ver.outputs.file_version }}
+          MSI_PRODUCT_VERSION: ${{ steps.ver.outputs.msi_product_version }}
         run: |
+          set -euo pipefail
           mkdir -p dist
           wix build packaging/windows/dig-node.wxs \
             -ext WixToolset.Util.wixext \
             -arch x64 \
-            -d Version="${{ steps.ver.outputs.v }}" \
+            -d Version="$MSI_PRODUCT_VERSION" \
             -d BinDir="target/release" \
-            -o "dist/dig-node-${{ steps.ver.outputs.v }}-windows-x64.msi"
+            -o "dist/dig-node-${FILE_VERSION}-windows-x64.msi"
       - uses: actions/upload-artifact@v4
         with:
           name: dig-node-msi
@@ -208,6 +313,9 @@ jobs:
   publish:
     name: Attach packages to the release
     needs: [deb, pkg, msi] # `deb` is a matrix; the whole matrix must be green before publishing
+    # Tag runs ONLY. A `workflow_call` run (the nightly channel) leaves the packages as run
+    # artifacts and lets its own publish job attach them to the rolling pre-release, so this job is
+    # correctly skipped there: `github.ref_type` is the CALLER's ref type, which is `branch`.
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:

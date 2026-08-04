@@ -13,6 +13,12 @@ How this repo's `dig-node` binary (+ the `dign` alias) is built and released. Th
   `dig-node-*` name, plus the `dign-*` alias.
 - **Nightly**: built every night from `main` HEAD as a **pre-release** under a dated tag
   `nightly-YYYYMMDD` + a rolling `nightly` tag. `prerelease: true`, never `latest`. Keeps 14.
+- **BOTH channels also publish the three native install packages** — `dig-node_<ver>_amd64.deb`,
+  `dig-node-<ver>-macos.pkg`, `dig-node-<ver>-windows-x64.msi`. These are what the beacon actually
+  installs (it hands a native package to `msiexec`/`installer`/`dpkg`) and what dig-updater's feed
+  resolves dig-node by, so a release without them is a release nobody on that channel can install —
+  the nightly publish step fails rather than shipping an incomplete set. The nightly `.deb` is
+  amd64-only; the stable one also ships arm64 for apt.dig.net (SPEC §11.5a).
 
 ## Prerequisites / credentials
 
@@ -63,6 +69,32 @@ Actions → **Nightly + stable release** → **Run workflow** → `channel: nigh
   `dign-*`), `prerelease: false`, marked latest. Watch: `gh run watch <id>`.
 - **Nightly:** `gh release view nightly --repo DIG-Network/dig-node` (rolling) or
   `gh release view nightly-YYYYMMDD` — `prerelease: true`.
+- **The native packages, on EITHER channel** — the single check that tells you the update system can
+  actually resolve the release:
+
+  ```bash
+  gh release view nightly --repo DIG-Network/dig-node --json assets --jq '[.assets[].name | select(endswith(".deb") or endswith(".pkg") or endswith(".msi"))]'
+  ```
+
+  Expect three names. Fewer means dig-updater's `Feed` workflow will fail that channel with
+  `no matching release assets` — the failure mode dig_ecosystem#618 fixed.
+
+## Gotcha — moving a Windows host from `nightly` back to `stable`
+
+A nightly `.msi` carries `ProductVersion = X.Y.<days since 2020-01-01>` (MSI accepts no prerelease
+suffix; the full version lives in the file name). The day count sits above every real patch number,
+so a nightly `0.96.2407` outranks every stable `0.96.z`. Consequences to expect, neither of which is
+a bug in the beacon:
+
+- **`msiexec` aborts installing a stable `0.96.z` over a nightly**, with "A newer version of DIG
+  NETWORK: NODE is already installed." The beacon cannot pre-empt it — anti-rollback state is per
+  channel. **Uninstall the nightly package first** (Add/Remove Programs, or
+  `msiexec /x` with the nightly's ProductCode), then let the stable install proceed. A stable release
+  in a HIGHER `major.minor` installs normally.
+- **Two nightly builds on one UTC day share a ProductVersion** (a `force` re-cut, or a manual
+  `channel: nightly` dispatch on a day the cron already ran). That is handled:
+  `AllowSameVersionUpgrades="yes"` makes the second upgrade in place instead of installing as a
+  second product. Do not remove that attribute — see SPEC §11.5c.
 
 ## Workflows
 
@@ -71,6 +103,7 @@ Actions → **Nightly + stable release** → **Run workflow** → `channel: nigh
 | `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (changelog + tag) + nightly (build + pre-release + prune). |
 | `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag. |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build, dual-named + `dign` (both channels call it). |
+| `package.yml` | PR + `push: tags: v*` + `workflow_call` | Builds the `.deb`/`.pkg`/`.msi`. Attaches them itself on a `v*` tag; on a `workflow_call` (the nightly channel) it leaves them as run artifacts for the caller to publish. |
 | `ci.yml` | PR + push to main | fmt/clippy + `cargo llvm-cov nextest --workspace` (pre-merge). NOTE: `ubuntu-latest` only — Windows/macOS build breaks are first caught by the nightly channel, not PR CI (SPEC §11 / follow-up). |
 
 ## Local build (dev)
