@@ -1434,10 +1434,17 @@ impl CachedManifests {
     /// kilobytes while the entry pinned 128 MiB, and every test passed. Do not replace this with
     /// a `self.public…` style sum; the exhaustiveness IS the mechanism.
     ///
-    /// What it does NOT stop, stated plainly so nobody trusts it further than it goes: writing
-    /// `new_field: _` in the pattern silences the compiler without adding the cost. The guard
-    /// forces a DECISION about every new field; it cannot force the right one. Anything holding
-    /// bytes must be added to the sum, not to the ignore list.
+    /// **The destructure guards ONE axis, and it is not the dangerous one.** It catches a NEW
+    /// FIELD appearing. It cannot catch an EXISTING field whose CONTENTS go unmeasured — and that
+    /// is what actually happened: `authors`/`keywords`/`categories` were summed by string content
+    /// only, charging nothing for the `Author` (72 B) or `String` (24 B) each element occupies, so
+    /// a million empty authors accounted as 0 bytes while pinning 72 MB. The compiler had nothing
+    /// to say; every field WAS named. Writing `new_field: _` defeats it the same way.
+    ///
+    /// So the rule this function is held to is not "name every field", it is: **for every field,
+    /// charge the per-element cost BEFORE the content cost.** Anything unbounded in LENGTH must be
+    /// summed per element with `size_of_val`/`size_of`, never by content alone. A test that leaves
+    /// a collection empty — or `None` — proves nothing about it.
     ///
     /// Approximate is fine — it drives an eviction budget, not an allocator. It must never be an
     /// UNDER-count of the unbounded parts (the path list and the publisher collections), which is
@@ -1460,6 +1467,7 @@ impl CachedManifests {
         });
 
         let metadata_bytes = metadata.as_ref().map_or(0, |m| {
+            // The eight scalar-ish fields: bounded in COUNT, so only their contents vary.
             let strings = m.name.len()
                 + opt_len(&m.version)
                 + opt_len(&m.description)
@@ -1468,24 +1476,39 @@ impl CachedManifests {
                 + opt_len(&m.repository)
                 + opt_len(&m.icon)
                 + opt_len(&m.content_type);
-            // Every one of these is publisher-supplied and open-ended, despite the field COUNT
-            // being fixed at 14. A fixed field count is not a size bound.
+
+            // The five COLLECTIONS. Each is publisher-supplied and length-unbounded, and each
+            // element costs its container slot BEFORE it costs a single content byte — an empty
+            // `Author` is 6 bytes of blob and 72 bytes resident, an empty keyword 4 and 24. Sizing
+            // these by content alone is not an approximation, it is a blind spot: a million empty
+            // authors accounted as 0 while pinning 72 MB. `public` above has always got this right
+            // (`size_of_val(e)` per row); these did not, three lines apart, and the budget was
+            // defeated ~190,000x as a result.
             let authors: usize = m
                 .authors
                 .iter()
-                .map(|a| a.name.len() + opt_len(&a.handle) + opt_len(&a.contact))
+                .map(|a| {
+                    std::mem::size_of_val(a)
+                        + a.name.len()
+                        + opt_len(&a.handle)
+                        + opt_len(&a.contact)
+                })
                 .sum();
             let lists: usize = m
                 .keywords
                 .iter()
                 .chain(m.categories.iter())
-                .map(String::len)
+                .map(|s| std::mem::size_of::<String>() + s.len())
                 .sum();
-            let links: usize = m.links.iter().map(|(k, v)| k.len() + v.len()).sum();
+            let links: usize = m
+                .links
+                .iter()
+                .map(|(k, v)| BTREE_ENTRY_OVERHEAD + k.len() + v.len())
+                .sum();
             let custom: usize = m
                 .custom
                 .iter()
-                .map(|(k, v)| k.len() + json_retained_bytes(v))
+                .map(|(k, v)| BTREE_ENTRY_OVERHEAD + k.len() + json_retained_bytes(v))
                 .sum();
             strings + authors + lists + links + custom
         });
@@ -1493,6 +1516,15 @@ impl CachedManifests {
         std::mem::size_of::<Self>() + public_bytes + metadata_bytes
     }
 }
+
+/// Per-entry overhead charged for a `BTreeMap` slot, on top of the key and value contents.
+///
+/// A `BTreeMap` stores keys and values in node arrays with per-node bookkeeping, so an entry costs
+/// its `String`/`Value` headers plus a share of the node. Deliberately rounded UP: this feeds an
+/// eviction budget, and an under-count is the failure mode that matters — it lets an attacker
+/// retain memory the accounting cannot see. Over-counting only evicts a little early.
+const BTREE_ENTRY_OVERHEAD: usize =
+    std::mem::size_of::<String>() + std::mem::size_of::<Value>() + 16;
 
 fn opt_len(s: &Option<String>) -> usize {
     s.as_ref().map_or(0, String::len)
@@ -9405,6 +9437,115 @@ mod tests {
             manifest_of(200_000).retained_bytes() > MANIFEST_ENTRY_MAX_BYTES,
             "a 200k-path manifest must exceed the per-entry ceiling, or the ceiling is too high \
              to stop the ~600k-path capsule a 128 MiB blob budget permits"
+        );
+    }
+
+    /// `retained_bytes()` charges the METADATA collections per ELEMENT, not by content.
+    ///
+    /// Every element of `authors`/`keywords`/`categories`/`links`/`custom` occupies its container
+    /// slot before it holds a single content byte — an empty `Author` is 72 B resident for 6 B of
+    /// blob, an empty keyword 24 B for 4 B. Summing content alone made a million empty authors
+    /// account as ZERO while pinning 72 MB, which defeated the byte budget by ~190,000x.
+    ///
+    /// **This fixture populates the collections and leaves the strings EMPTY**, deliberately: the
+    /// previous version of the scaling test set `metadata: None`, so it exercised only the one
+    /// field that was already correct and could never have caught this. A test whose fixture does
+    /// not contain the thing being measured proves nothing about it.
+    #[test]
+    fn retained_bytes_charges_metadata_collections_per_element_not_by_content() {
+        use digstore_core::manifest::{Author, MetadataManifest};
+
+        let with_collections = |n: usize| -> CachedManifests {
+            CachedManifests {
+                len: 1,
+                modified: None,
+                public: None,
+                metadata: Some(MetadataManifest {
+                    schema_version: 1,
+                    name: String::new(),
+                    version: None,
+                    description: None,
+                    // EMPTY strings throughout — all cost is the container slots.
+                    authors: (0..n)
+                        .map(|_| Author {
+                            name: String::new(),
+                            handle: None,
+                            contact: None,
+                        })
+                        .collect(),
+                    license: None,
+                    homepage: None,
+                    repository: None,
+                    keywords: (0..n).map(|_| String::new()).collect(),
+                    categories: (0..n).map(|_| String::new()).collect(),
+                    icon: None,
+                    content_type: None,
+                    links: Default::default(),
+                    custom: Default::default(),
+                }),
+            }
+        };
+
+        let empty = with_collections(0).retained_bytes();
+        let n = 10_000;
+        let populated = with_collections(n).retained_bytes();
+        let charged = populated - empty;
+
+        // Floor derived from the types, not from a magic number: each author occupies an `Author`
+        // and each keyword/category a `String`, whatever their contents.
+        let floor = n * (std::mem::size_of::<Author>() + 2 * std::mem::size_of::<String>());
+        assert!(
+            charged >= floor,
+            "{n} empty authors + {n} empty keywords + {n} empty categories accounted as \
+             {charged} B, below the {floor} B their container slots alone occupy. Content-only \
+             sizing reports ~0 here while the process pins tens of MB."
+        );
+
+        // The per-entry ceiling must actually stop a capsule built this way. ~6 MiB of empty
+        // authors is ~75 MB resident; the ceiling has to refuse it.
+        assert!(
+            with_collections(200_000).retained_bytes() > MANIFEST_ENTRY_MAX_BYTES,
+            "200k empty authors/keywords must exceed the per-entry ceiling — this is the shape \
+             that costs ~6 MiB of blob budget and ~75 MB of resident memory"
+        );
+    }
+
+    /// The BTreeMap fields are charged per entry too — `links` and `custom` are unbounded.
+    #[test]
+    fn retained_bytes_charges_the_metadata_maps_per_entry() {
+        use digstore_core::manifest::MetadataManifest;
+
+        let with_maps = |n: usize| -> CachedManifests {
+            let blank = MetadataManifest {
+                schema_version: 1,
+                name: String::new(),
+                version: None,
+                description: None,
+                authors: Vec::new(),
+                license: None,
+                homepage: None,
+                repository: None,
+                keywords: Vec::new(),
+                categories: Vec::new(),
+                icon: None,
+                content_type: None,
+                links: (0..n).map(|i| (format!("{i}"), String::new())).collect(),
+                custom: (0..n).map(|i| (format!("{i}"), Value::Null)).collect(),
+            };
+            CachedManifests {
+                len: 1,
+                modified: None,
+                public: None,
+                metadata: Some(blank),
+            }
+        };
+
+        let n = 10_000;
+        let charged = with_maps(n).retained_bytes() - with_maps(0).retained_bytes();
+        assert!(
+            charged >= n * 2 * BTREE_ENTRY_OVERHEAD,
+            "{n} links + {n} custom entries accounted as {charged} B — a map slot costs more \
+             than its key and value contents, and both maps are publisher-controlled"
         );
     }
 
