@@ -878,14 +878,18 @@ MUST NOT re-declare method names. Each entry carries a `served` class and `requi
 
 For the current node library (§2.2) the catalogue is:
 
-- **local**: `dig.getContent`, `dig.getAnchoredRoot`, `dig.getManifest`, `dig.stage`,
+- **local**: `dig.getContent`, `dig.getAnchoredRoot`, `dig.getManifest`, `dig.getPublicManifest`,
+  `dig.getMetadata`, `dig.getProof`, `dig.getCapsule` / `dig.getModule`, `dig.stage`,
   `dig.getCollection`, `dig.listCollectionItems`, the L7 peer surface (`dig.getNetworkInfo`,
   `dig.getPeers`, `dig.announce`, `dig.getAvailability`, `dig.listInventory`, `dig.fetchRange`),
   all `cache.*` (`cache.getConfig`, `cache.setCapBytes`, `cache.clear`, `cache.listCached`,
   `cache.removeCached`, `cache.fetchAndCache`, `cache.pushCapsule` — §5.5.3), and the chat subsystem
   `chat.send` / `chat.poll` (§5.5.2).
-- **passthrough**: `dig.getCapsule` (an alias the node does NOT resolve — local-first callers use
-  `dig.getContent`), `dig.getProof`, `dig.listCapsules`.
+- **passthrough**: `dig.listCapsules` (needs a chain generation walk this node does not perform)
+  and `dig.getProofStatus` (polls an execution-proof JOB this node does not run — inventing a
+  status would be the fabrication the anti-fabrication rule forbids: an absent attestation is
+  reported as absent, never as a passed check). Both are honestly unserved rather than merely
+  unwritten; a node with no upstream answers `-32601` for them, which is correct.
 - **shell**: `rpc.discover`, `dig.health`, `dig.methods`. A node MUST answer its own liveness and
   its own method list on its own authority — neither may depend on an upstream being configured
   (#1997). `dig.health`'s PUBLIC result is liveness only (`status`, `version`, `methods`); the

@@ -2566,10 +2566,12 @@ impl Node {
     /// own capsule downloader (`seams::capsule::capsule_download`) has always CONSUMED exactly
     /// this shape from an upstream, and could not serve it. Now both halves exist here.
     ///
-    /// No `inclusion_proof` rides a capsule window: a module blob is verified by binding it to its
-    /// on-chain root, which is what the puller's own anchor gate does, not by a per-resource
-    /// Merkle path. Omitting the field is the honest answer; emitting an empty one would invite a
-    /// caller to treat the absence as a passed check.
+    /// `inclusion_proof` is present but EMPTY (`""`). A whole module has no per-resource Merkle
+    /// path — it is verified by binding the assembled blob to its on-chain root, which is what the
+    /// puller's own anchor gate does. The field is still sent because `ChunkObject` requires it on
+    /// every window, and an empty string states "there is no proof for this shape" where an absent
+    /// key would leave a caller unable to tell that from a server that forgot one. Empty is NOT a
+    /// passed check, and no caller should read it as one.
     ///
     /// - Params: `{ store_id, root?, offset? }` — `root` absent or `"latest"` resolves the tip.
     /// - Not held at this root → `-32004`.

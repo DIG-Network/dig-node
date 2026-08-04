@@ -85,8 +85,10 @@ pub fn methods() -> &'static [MethodInfo] {
             summary: "One window of a held capsule's whole `.dig` module: { ciphertext (base64 \
                       module bytes), total_length, offset, length, complete, next_offset, root }. \
                       Params { store_id, root?, offset? } (`root` absent/\"latest\" resolves the \
-                      chain-anchored tip). No inclusion_proof: a module blob is bound to its \
-                      on-chain root, not to a per-resource Merkle path. -32004 when not held.",
+                      chain-anchored tip). `inclusion_proof` is present but EMPTY: a module blob \
+                      is bound to its on-chain root, not to a per-resource Merkle path, and empty \
+                      is not a passed check. Only the requested window is read off disk. -32004 \
+                      when not held.",
             requires_auth: false,
         },
         MethodInfo {
@@ -104,7 +106,7 @@ pub fn methods() -> &'static [MethodInfo] {
             summary: "A capsule's publisher metadata manifest: { manifest: { schema_version, \
                       name, version, description, authors, license, homepage, repository, \
                       keywords, categories, icon, content_type, links, custom } | null, \
-                      program_hash, root }. Params { store_id, root? } (`root` absent/\"latest\" \
+                      root }. Params { store_id, root? } (`root` absent/\"latest\" \
                       resolves the chain-anchored tip). `manifest: null` when the module carries \
                       no metadata section; -32004 when the capsule isn't held locally.",
             requires_auth: false,
@@ -236,7 +238,7 @@ pub fn methods() -> &'static [MethodInfo] {
             served: "local",
             summary: "A resource's Merkle inclusion proof + the chain-anchored root it verifies \
                       against, without the ciphertext: { inclusion_proof, root, chunk_lens, \
-                      program_hash, execution_proof: null, execution_proof_status: \
+                      execution_proof: null, execution_proof_status: \
                       \"unavailable\" }. Params { store_id, retrieval_key, root? }. When no \
                       verifying proof can be produced the underlying read's error is returned \
                       verbatim — never a proof-shaped result with an empty proof.",
