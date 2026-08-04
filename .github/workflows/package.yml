@@ -31,7 +31,16 @@ on:
   push:
     tags:
       - "v*"
+  # The dispatch inputs mirror the `workflow_call` ones below, so a maintainer can rebuild the
+  # packages at an ARBITRARY version without publishing anything (the publish job is tag-gated).
+  # That is the only way to exercise a nightly-shaped version — `X.Y.Z-nightly.…`, which WiX rejects
+  # as a ProductVersion — outside a real release night.
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to stamp into the packages (blank = the tag name, else Cargo.toml)."
+        type: string
+        required: false
   workflow_call:
     inputs:
       version:
