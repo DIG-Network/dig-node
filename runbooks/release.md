@@ -13,6 +13,12 @@ How this repo's `dig-node` binary (+ the `dign` alias) is built and released. Th
   `dig-node-*` name, plus the `dign-*` alias.
 - **Nightly**: built every night from `main` HEAD as a **pre-release** under a dated tag
   `nightly-YYYYMMDD` + a rolling `nightly` tag. `prerelease: true`, never `latest`. Keeps 14.
+- **BOTH channels also publish the three native install packages** — `dig-node_<ver>_amd64.deb`,
+  `dig-node-<ver>-macos.pkg`, `dig-node-<ver>-windows-x64.msi`. These are what the beacon actually
+  installs (it hands a native package to `msiexec`/`installer`/`dpkg`) and what dig-updater's feed
+  resolves dig-node by, so a release without them is a release nobody on that channel can install —
+  the nightly publish step fails rather than shipping an incomplete set. The nightly `.deb` is
+  amd64-only; the stable one also ships arm64 for apt.dig.net (SPEC §11.5a).
 
 ## Prerequisites / credentials
 
@@ -63,6 +69,15 @@ Actions → **Nightly + stable release** → **Run workflow** → `channel: nigh
   `dign-*`), `prerelease: false`, marked latest. Watch: `gh run watch <id>`.
 - **Nightly:** `gh release view nightly --repo DIG-Network/dig-node` (rolling) or
   `gh release view nightly-YYYYMMDD` — `prerelease: true`.
+- **The native packages, on EITHER channel** — the single check that tells you the update system can
+  actually resolve the release:
+
+  ```bash
+  gh release view nightly --repo DIG-Network/dig-node --json assets --jq '[.assets[].name | select(endswith(".deb") or endswith(".pkg") or endswith(".msi"))]'
+  ```
+
+  Expect three names. Fewer means dig-updater's `Feed` workflow will fail that channel with
+  `no matching release assets` — the failure mode dig_ecosystem#618 fixed.
 
 ## Workflows
 
@@ -71,6 +86,7 @@ Actions → **Nightly + stable release** → **Run workflow** → `channel: nigh
 | `nightly-release.yml` | midnight-UTC cron + `workflow_dispatch` | Orchestrator: stable (changelog + tag) + nightly (build + pre-release + prune). |
 | `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag. |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build, dual-named + `dign` (both channels call it). |
+| `package.yml` | PR + `push: tags: v*` + `workflow_call` | Builds the `.deb`/`.pkg`/`.msi`. Attaches them itself on a `v*` tag; on a `workflow_call` (the nightly channel) it leaves them as run artifacts for the caller to publish. |
 | `ci.yml` | PR + push to main | fmt/clippy + `cargo llvm-cov nextest --workspace` (pre-merge). NOTE: `ubuntu-latest` only — Windows/macOS build breaks are first caught by the nightly channel, not PR CI (SPEC §11 / follow-up). |
 
 ## Local build (dev)

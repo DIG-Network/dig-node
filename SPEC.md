@@ -2712,6 +2712,44 @@ older dated pre-releases AND their tags together (`gh release delete --cleanup-t
 tags/releases and the rolling `nightly` are NEVER pruned. Neither `nightly-*` nor `nightly` matches
 `release.yml`'s `v*` trigger, so the nightly channel never fires the stable build.
 
+11.5a. **Both channels publish the NATIVE INSTALL PACKAGES (HARD RULE).** A release — stable OR
+nightly — MUST carry the three native packages, not raw binaries alone. The beacon installs dig-node
+by handing a native package to `msiexec`/`installer`/`dpkg`, and dig-updater's feed resolves
+dig-node's artifacts by their native-package file NAMES, so a package-less release is one the update
+system cannot resolve at all: it fails closed and no host on that channel can install or update.
+Every release MUST therefore publish, under exactly these names (`<ver>` = the release's version,
+which for a nightly is the synthesized `X.Y.Z-nightly.YYYYMMDD.<shortsha>`):
+
+- `dig-node_<ver>_amd64.deb`
+- `dig-node-<ver>-macos.pkg`
+- `dig-node-<ver>-windows-x64.msi`
+
+The nightly publish step MUST verify all three are present and FAIL rather than publish an
+incomplete release. The packages are built by `.github/workflows/package.yml`
+(`on: workflow_call`, inputs `version`, `deb_arches`, `ref` — all optional, so its `pull_request`
+and `v*` tag triggers are unaffected), which both channels call, so the definitions cannot diverge.
+The nightly `.deb` is **amd64 only** — the feed resolves a single Linux platform; the stable tag path
+keeps both `amd64` and `arm64` because apt.dig.net serves both (§11.3).
+
+11.5b. **The version is validated at ONE boundary, and the MSI version is derived.** Every package
+build passes its version through `scripts/package-version.sh` before it reaches a dpkg control file,
+`pkgbuild --version`, or the WiX `-d Version=` argument — all of which end up inside a package that
+runs with elevated privilege. The script accepts, by whitelist, ONLY `X.Y.Z` or
+`X.Y.Z-nightly.YYYYMMDD.<shortsha>`, and rejects everything else with a non-zero exit; it MUST also
+reject a component exceeding Windows Installer's field limits (major/minor > 255, patch > 65535).
+
+It emits two values, which differ on purpose:
+
+- **`file_version`** — the version VERBATIM. The package file name MUST carry it unchanged, because
+  the rolling `nightly` tag names no version and the feed recovers it from the asset name alone.
+- **`msi_product_version`** — a numeric `major.minor.build`, since Windows Installer accepts no
+  prerelease suffix. For a nightly this is `X.Y.<days since 2020-01-01>`. The date MUST occupy the
+  BUILD field rather than a fourth field: Windows Installer compares only `major.minor.build`, so a
+  fourth field is ignored, two nightlies of one base version would compare EQUAL, and the package's
+  `MajorUpgrade` would neither upgrade nor downgrade — the newer nightly would install side by side.
+  In the build field the value is monotonic per night and above any real patch number, so each
+  nightly cleanly upgrades the last.
+
 11.6. **Reusable build.** The cross-OS build lives once in `.github/workflows/build-binaries.yml`
 (`on: workflow_call`, inputs `version` + `ref`). Both `release.yml` (stable) and the nightly channel
 call it, so the two paths can never diverge on HOW a binary is produced — including the canonical
