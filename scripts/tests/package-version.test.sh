@@ -75,29 +75,118 @@ ok 'nightly' \
   '0.93.9-nightly.20260804.603187a' \
   "0.93.${DAYS_20260804}"
 
-# The build field must be COMPARISON-SIGNIFICANT, not a cosmetic 4th field: Windows Installer
-# compares only major.minor.build, and the beacon installs with a bare `msiexec /i /qn`. Two
-# nightlies whose ProductVersion compares EQUAL are not detected by MajorUpgrade at all, so the
-# second one installs side-by-side instead of upgrading. Distinguishing this from the nearest wrong
-# implementation (`X.Y.Z.<days>`, which is well-formed and keeps the patch, but which MSI ignores)
-# needs TWO different nights of the SAME base version, compared as MSI compares them.
-printf '\n== consecutive nights of the same base version differ in a field MSI compares ==\n'
-night_a="$(bash "$MAP" '0.93.9-nightly.20260804.603187a' | sed -n 's/^msi_product_version=//p')"
-night_b="$(bash "$MAP" '0.93.9-nightly.20260805.deadbee' | sed -n 's/^msi_product_version=//p')"
-compared() { printf '%s\n' "$1" | cut -d. -f1-3; }
-if [ "$(compared "$night_a")" = "$(compared "$night_b")" ]; then
-  printf 'FAIL two nights compare EQUAL to msiexec (%s vs %s) — the second nightly would install \n' \
-    "$night_a" "$night_b"
-  printf '     side-by-side rather than upgrade. Put the date in major.minor.build.\n'
-  failures=$((failures + 1))
-else
-  printf 'ok   nights are distinguishable to msiexec (%s < %s)\n' "$night_a" "$night_b"
+# ── The invariant every distinct nightly BUILD must satisfy ───────────────────────────────────────
+#
+# The property the beacon needs is not "two hand-picked dates differ" — it is a statement about the
+# whole CLASS of nightly builds:
+#
+#   For any two distinct nightly builds, the later one MUST NOT compare LOWER than the earlier, and
+#   any pair that compares EQUAL must be made safe by an explicit same-version-upgrade policy.
+#
+# Both halves matter, because Windows Installer compares only major.minor.build and the beacon
+# installs with a bare `msiexec /i /qn`:
+#
+#   * compares LOWER  → msiexec aborts on DowngradeErrorMessage and the host is stuck;
+#   * compares EQUAL  → MajorUpgrade's range is [0.0.0, ProductVersion), so the build matches neither
+#     the upgrade nor the downgrade case and installs as a SECOND product, two entries both owning
+#     the `net.dignetwork.dig-node` service.
+#
+# The mapping alone CANNOT eliminate the EQUAL case: the synthesized nightly version carries a DATE
+# and a commit sha and nothing else, so it is day-granular by construction, and 16 bits of build
+# field cannot hold a finer monotonic counter over any useful epoch (minute resolution exhausts the
+# field in 45 days; a sha-derived tiebreak is not ordered, which would produce the far worse LOWER
+# case). Same-day builds are reachable — the `force` re-cut, and a manual `channel: nightly` dispatch
+# on a day the cron already ran. So the invariant is held JOINTLY by the mapping (never decreasing)
+# and by packaging/windows/dig-node.wxs (equal versions upgrade in place), and this asserts both
+# together — asserting either alone passes over the defect.
+printf '\n== no distinct nightly build ever compares LOWER, and EQUAL pairs are policy-safe ==\n'
+
+WXS="$HERE/../../packaging/windows/dig-node.wxs"
+
+# Only the fields Windows Installer actually compares. Taking `cut -f1-3` is the point: an
+# implementation that hides the date in an ignored 4th field is invisible here, exactly as it is to
+# msiexec.
+msi_compared() { bash "$MAP" "$1" | sed -n 's/^msi_product_version=//p' | cut -d. -f1-3; }
+
+# Distinct builds in BUILD ORDER, spanning the cases that break a date mapping: the same UTC day
+# with a different commit, consecutive days, a month rollover, a year rollover, and a base-version
+# bump. Every adjacent pair is checked, so this covers the class rather than one lucky comparison.
+nightly_builds=(
+  '0.93.9-nightly.20260804.603187a'   # the cron run
+  '0.93.9-nightly.20260804.deadbee'   # SAME UTC DAY, different commit — a force re-cut or a dispatch
+  '0.93.9-nightly.20260805.f00ba12'   # the next night
+  '0.93.9-nightly.20260831.aaaaaaa'   # end of month
+  '0.93.9-nightly.20260901.bbbbbbb'   # month rollover
+  '0.93.9-nightly.20261231.ccccccc'   # end of year
+  '0.94.0-nightly.20270101.ddddddd'   # year rollover + a base-version bump
+)
+
+saw_equal_pair=0
+for i in $(seq 1 $((${#nightly_builds[@]} - 1))); do
+  earlier="${nightly_builds[$((i - 1))]}"
+  later="${nightly_builds[$i]}"
+  a="$(msi_compared "$earlier")"
+  b="$(msi_compared "$later")"
+  # Compare as msiexec does — field by field, numerically.
+  order="$(awk -v a="$a" -v b="$b" 'BEGIN {
+    split(a, x, "."); split(b, y, ".");
+    for (i = 1; i <= 3; i++) {
+      if ((y[i] + 0) > (x[i] + 0)) { print "greater"; exit }
+      if ((y[i] + 0) < (x[i] + 0)) { print "lower"; exit }
+    }
+    print "equal";
+  }')"
+  case "$order" in
+    greater)
+      printf 'ok   %s -> %s upgrades (%s < %s)\n' "$earlier" "$later" "$a" "$b"
+      ;;
+    equal)
+      saw_equal_pair=1
+      printf 'note %s -> %s compares EQUAL (%s) — requires the same-version-upgrade policy\n' \
+        "$earlier" "$later" "$a"
+      ;;
+    lower)
+      printf 'FAIL %s -> %s compares LOWER to msiexec (%s > %s) — msiexec would abort on\n' \
+        "$earlier" "$later" "$a" "$b"
+      printf '     DowngradeErrorMessage and the host could never take another nightly.\n'
+      failures=$((failures + 1))
+      ;;
+  esac
+done
+
+# The EQUAL case is only safe because the package declares it safe. If a future mapping DOES
+# distinguish every build, `saw_equal_pair` is 0 and this requirement lifts on its own — which is
+# what makes this an assertion about the invariant rather than about today's implementation.
+if [ "$saw_equal_pair" -eq 1 ]; then
+  if grep -q 'AllowSameVersionUpgrades="yes"' "$WXS"; then
+    printf 'ok   equal-versioned builds upgrade in place (AllowSameVersionUpgrades="yes")\n'
+  else
+    printf 'FAIL the mapping produces EQUAL ProductVersions for distinct nightly builds, but\n'
+    printf '     packaging/windows/dig-node.wxs does not set AllowSameVersionUpgrades="yes" — so the\n'
+    printf '     second build of a UTC day installs as a SECOND product and its ServiceInstall of\n'
+    printf '     net.dignetwork.dig-node fails or clobbers the one already registered.\n'
+    failures=$((failures + 1))
+  fi
 fi
-if [ "$night_b" != "0.93.${DAYS_20260805}" ]; then
-  printf 'FAIL later night: %s, want 0.93.%s\n' "$night_b" "$DAYS_20260805"
+
+# The 4th-field implementation is still caught: it makes EVERY pair above compare equal, including
+# ones a whole year apart, so the date stops being comparison-significant at all.
+printf '\n== the date occupies a field msiexec compares (not an ignored 4th) ==\n'
+first="$(msi_compared '0.93.9-nightly.20260804.603187a')"
+last="$(msi_compared '0.93.9-nightly.20261231.ccccccc')"
+if [ "$first" = "$last" ]; then
+  printf 'FAIL builds five months apart compare EQUAL (%s) — the date is in a field msiexec\n' "$first"
+  printf '     ignores. Windows Installer reads only major.minor.build.\n'
   failures=$((failures + 1))
 else
-  printf 'ok   a later night sorts ABOVE the earlier one\n'
+  printf 'ok   the date moves a compared field (%s < %s)\n' "$first" "$last"
+fi
+if [ "$(msi_compared '0.93.9-nightly.20260805.deadbee')" != "0.93.${DAYS_20260805}" ]; then
+  printf 'FAIL 20260805 maps to %s, want 0.93.%s\n' \
+    "$(msi_compared '0.93.9-nightly.20260805.deadbee')" "$DAYS_20260805"
+  failures=$((failures + 1))
+else
+  printf 'ok   the build field is the day count from 2020-01-01\n'
 fi
 
 printf '\n== the MSI field limits are pinned from BOTH sides ==\n'

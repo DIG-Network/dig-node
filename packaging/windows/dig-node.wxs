@@ -34,8 +34,29 @@
       Scope="perMachine"
       Compressed="yes">
 
-    <!-- Clean in-place upgrades; block downgrades with a clear message. -->
-    <MajorUpgrade DowngradeErrorMessage="A newer version of DIG NETWORK: NODE is already installed." />
+    <!-- Clean in-place upgrades; block downgrades with a clear message.
+
+         AllowSameVersionUpgrades is REQUIRED, not a preference (dig_ecosystem#618). Windows
+         Installer compares only major.minor.build, and a NIGHTLY ProductVersion is `X.Y.<days since
+         2020-01-01>` — day granularity, because the synthesized nightly version carries a DATE and a
+         commit sha and nothing else, and 16 bits of build field cannot hold a finer counter over a
+         useful epoch (minute resolution would exhaust the field in 45 days). Two nightly builds on
+         one UTC day therefore compare EQUAL, which is reachable on supported paths: the `force`
+         re-cut, and a manual `channel: nightly` dispatch on a day the cron already ran.
+
+         Without this attribute MajorUpgrade's detect range is [0.0.0, ProductVersion), so an
+         equal-versioned build matches NEITHER the upgrade nor the downgrade case. With no explicit
+         ProductCode below, the second build gets a fresh auto ProductCode and installs as a SECOND
+         product — two Add/Remove entries both owning the `net.dignetwork.dig-node` service, whose
+         ServiceInstall then fails or clobbers the one already registered. Treating an equal version
+         as an upgrade is the correct semantics for a day-stamped version, and it also repairs the
+         same hazard for a stable re-install of an unchanged vX.Y.Z. (WiX raises ICE61 for this by
+         design; the warning IS this decision.)
+         The invariant this preserves is stated in SPEC §11.5b and asserted by
+         scripts/tests/package-version.test.sh. -->
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of DIG NETWORK: NODE is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- The single install feature. -->
