@@ -271,22 +271,12 @@ impl CapsuleStore for Node {
                 // A capsule just entered this node's served set at runtime. Landing a capsule MUST make
                 // this node a DISCOVERABLE holder — the reshare/flywheel invariant (#1423/#1425): every
                 // path that lands a capsule (a hosted pin, the read-side backfill-cache, gap-fill, the
-                // CacheFetchAndCache RPC) flows through here, so announcing ONCE at this single site
-                // makes them all discoverable. We only reach this point on a FRESH land (an
-                // already-cached capsule returned at the top before any network), so the announce fires
-                // exactly once per newly-held capsule — no double-announce. Best-effort + a no-op on the
-                // FFI path (no refresher installed).
-                self.refresh_dht_inventory().await;
-                // A capsule just grew `<cache>/modules`. Run the tier-aware size-cap sweep so every
-                // ON-DEMAND land path keeps whole-capsule storage bounded at the cache cap — not only
-                // the tier-0 precache loop (#1934 disk-exhaustion fix). This site bounds the paths that
-                // funnel through here (`cache.fetchAndCache`, chain gap-fill, fetch-side backfill); the
-                // read-path §21 whole-store sync lands via `Node::sync_module` and sweeps at ITS OWN
-                // call site (`sync_module_and_bound`, #2041) — so with this change every on-demand land
-                // path sweeps, and the bound holds independent of the tier-0 loop's state. The `_guard`
-                // above already holds `cache_lock`, so call the LOCKED core directly (the `_if_needed`
-                // wrapper re-takes `cache_lock` and would deadlock).
-                self.evict_modules_locked();
+                // CacheFetchAndCache RPC, and now the cache.pushCapsule seed-push #1476) shares the ONE
+                // post-land tail below, so announcing there makes them all discoverable identically. We
+                // only reach this point on a FRESH land (an already-cached capsule returned at the top
+                // before any network), so the announce fires exactly once per newly-held capsule — no
+                // double-announce. The `_guard` above already holds `cache_lock`.
+                self.announce_and_bound_after_land().await;
                 Ok((md.len(), root_hex.to_string()))
             }
             // No file on disk. The sync's OWN outcome says why — never a list of causes that
@@ -368,6 +358,49 @@ impl CapsuleStore for Node {
 }
 
 impl Node {
+    /// The ONE land+announce+bound site for a fully-materialized capsule (#1476).
+    ///
+    /// Writes `bytes` to the capsule's canonical `<cache>/modules/<store>/<root>.dig` path
+    /// (content-addressed, atomic temp-write + rename via [`write_atomic`](crate::write_atomic)),
+    /// then — ONLY on a FRESH land — runs the shared post-land tail
+    /// ([`announce_and_bound_after_land`](Self::announce_and_bound_after_land)): announce this node a
+    /// DHT holder (§14.1 / #1423 flywheel) and sweep the size cap. Both the pull-land
+    /// ([`CapsuleStore::cache_fetch_and_cache`]) and the push-land (`cache.pushCapsule`, #1476) share
+    /// this tail, so a seeded capsule is discoverable byte-for-byte identically to a pulled one.
+    ///
+    /// IDEMPOTENT (#1476 D4/f): a capsule already on disk is a no-op — it neither re-writes the bytes
+    /// nor fires a SECOND `HoldingsAnnounce`. Re-pushing a held capsule therefore never double-announces.
+    /// Returns `(size_bytes, fresh)`, where `fresh` is `false` for the already-held no-op.
+    ///
+    /// The caller MUST hold `cache_lock` so a concurrent pull-land of the same capsule cannot race the
+    /// write (matching `cache_fetch_and_cache`, which lands under the same lock).
+    pub(crate) async fn land_capsule_bytes(
+        &self,
+        key: &crate::CapsuleKey,
+        bytes: &[u8],
+    ) -> Result<(u64, bool), String> {
+        let path = key.module_path(&self.cache_dir);
+        if let Ok(md) = std::fs::metadata(&path) {
+            // Already a holder — do not re-write, do not re-announce (no double-announce).
+            return Ok((md.len(), false));
+        }
+        crate::write_atomic(&path, bytes)
+            .map_err(|e| format!("could not write the capsule: {e}"))?;
+        self.announce_and_bound_after_land().await;
+        Ok((bytes.len() as u64, true))
+    }
+
+    /// The shared post-land tail every ON-DEMAND land path runs (#1476, extracted from
+    /// `cache_fetch_and_cache`): announce this node a discoverable DHT holder (§14.1 / #1423 — a no-op
+    /// on the FFI path with no refresher installed), then run the tier-aware size-cap sweep so
+    /// whole-capsule storage stays bounded at the cache cap (#1934). The caller already holds
+    /// `cache_lock`, so this calls the LOCKED eviction core directly (the `_if_needed` wrapper re-takes
+    /// `cache_lock` and would deadlock).
+    async fn announce_and_bound_after_land(&self) {
+        self.refresh_dht_inventory().await;
+        self.evict_modules_locked();
+    }
+
     /// The SHARED whole-`.dig` backfill pull body: spawn a detached, single-flighted, chain-anchored
     /// pull of the `(store_hex, root_hex)` capsule so a subsequent read is served locally. This is the
     /// ONE source of truth for "warm the whole capsule" — reached by BOTH the fetch-side

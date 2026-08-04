@@ -79,6 +79,17 @@ impl RpcDispatch for Node {
                 return node.chat_send(&params, id).await;
             }
             "chat.poll" => return node.chat_poll(id),
+            // cache.pushCapsule (#1476): the publish→seed flywheel front — the store owner hands a
+            // freshly-committed capsule to their own node so it becomes a discoverable holder
+            // immediately. A dig-node-LOCAL mutator (not a `dig-rpc-protocol` Method): local-only by
+            // default, and — when `DIG_NODE_PUSH_OPEN=true` admits it to peers — gated inside the
+            // handler by a §21.9 authorized-writer signature. Threads `origin`/`provenance` so the
+            // handler can tell a trusted loopback push from an opened peer push. See
+            // `seams::capsule::push_capsule`.
+            m if m == crate::seams::capsule::PUSH_CAPSULE_METHOD => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.push_capsule(&params, id, origin, provenance).await;
+            }
             _ => {}
         }
 
@@ -890,4 +901,3 @@ impl RpcDispatch for Node {
         }
     }
 }
-// WIP: cache.pushCapsule (#1476) - stub
