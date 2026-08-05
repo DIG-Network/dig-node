@@ -1198,7 +1198,32 @@ pub(crate) fn content_window_envelope(
     let total = ciphertext.len();
     let start = offset.min(total);
     let end = (start + WINDOW).min(total);
-    let window = &ciphertext[start..end];
+    windowed_envelope(
+        &ciphertext[start..end],
+        start,
+        total,
+        root_hex,
+        inclusion_proof_b64,
+        chunk_lens,
+    )
+}
+
+/// The same envelope over a window that has ALREADY been read, plus the resource's total length.
+///
+/// [`content_window_envelope`] takes the whole resource and slices it, which is correct when the
+/// caller legitimately holds all of it (a decrypted `ContentResponse`). A caller that reads only
+/// the window off disk — as any serve of a large blob must — has no whole buffer to slice, and
+/// must not create one just to build a response. This is the primitive; that one is the
+/// convenience wrapper over it.
+pub(crate) fn windowed_envelope(
+    window: &[u8],
+    start: usize,
+    total: usize,
+    root_hex: String,
+    inclusion_proof_b64: Option<String>,
+    chunk_lens: Value,
+) -> Value {
+    let end = start.saturating_add(window.len());
     let complete = end >= total;
 
     let mut result = json!({
@@ -1230,7 +1255,13 @@ pub(crate) fn content_window_envelope(
     // sides of the contract (openrpc.json: "Emitted on the FIRST window only"; the Lambda gates
     // exactly this one field the same way). It describes how to split the REASSEMBLED resource,
     // which a client cannot act on until it holds every window anyway.
-    if start == 0 {
+    //
+    // A WHOLE-CAPSULE window (`dig.getCapsule`) has no per-resource chunk layout at all, and
+    // passes `Null` to say so. Omit the field there rather than send an explicit null: absent
+    // says "this shape does not apply here", where null invites a caller to read it as "applies,
+    // but empty". This differs from `inclusion_proof` above, where empty-vs-absent distinguishes
+    // two states of the SAME applicable field.
+    if start == 0 && !chunk_lens.is_null() {
         result["chunk_lens"] = chunk_lens;
     }
     result
@@ -1269,35 +1300,441 @@ fn serve_local_blocking(
     Some(resp)
 }
 
-/// Load + decode the embedded [`PublicManifest`](digstore_core::PublicManifest) (data-section
-/// id 13, #176 Phase C) from a locally cached compiled module. A free function (not a `Node`
-/// method) so it moves into a `spawn_blocking` closure with only the cache dir + request keys,
-/// mirroring [`serve_local_blocking`] (audit #179). Unlike `serve_local_blocking` this does NOT
-/// instantiate the module in wasmtime: the manifest is PUBLIC, unencrypted data embedded
-/// directly in the module's wasm data section, so extracting it is a pure binary-format parse
-/// ([`digstore_compiler::extract_data_section_blob`]) with no `serve_blind` decrypt.
+/// TOTAL bytes the decoded-manifest memo may retain, across every capsule.
 ///
-/// Returns:
-/// - `Ok(Some(Some(manifest)))` — the module is held and carries a `PublicManifest` section.
+/// A BYTE budget, not an entry count, because nothing about an entry is bounded: a
+/// `PublicManifest` is one row per public path and a `MetadataManifest`'s `authors`/`keywords`/
+/// `categories`/`links`/`custom` are all publisher-supplied and open-ended. Measured, a manifest
+/// row retains ~117 B and costs ~224 B of the 128 MiB blob budget, so a single chain-anchorable
+/// capsule can carry ~600k paths ≈ 115 MB in ONE entry — an entry cap of 256 would then bound at
+/// ~29.6 GB, and ~14 ordinary large stores would exhaust the 2 GiB gateway with no adversary at
+/// all, just anonymous `dig.getManifest` calls.
+///
+/// This is the same shape as [`CONTENT_CACHE_MAX_BYTES`] and for the same reason. The lesson that
+/// produced it: `descriptor_memo`'s entry cap is sound ONLY because `MAX_DESCRIPTOR_CHUNKS`
+/// structurally caps each of ITS entries. Copying the cap without the per-entry bound is what made
+/// two earlier versions of this memo unbounded.
+const MANIFEST_MEMO_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// The largest single entry worth retaining.
+///
+/// Above this a capsule is simply not memoized: it is re-decoded per request instead, which costs
+/// a bounded, SERIALIZED whole-module read (see [`manifest_extract_lock`]) rather than permanent
+/// residency. Trading amplification back for a pathological store is the right way round — a
+/// transient read is survivable, retention is not.
+const MANIFEST_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// A byte-budgeted LRU of decoded manifests.
+///
+/// `lru::LruCache` bounds entries; this bounds BYTES, using each entry's own
+/// [`CachedManifests::retained_bytes`].
+struct ManifestMemo {
+    entries: lru::LruCache<(String, String), Arc<CachedManifests>>,
+    /// Running sum of `retained_bytes()` over everything currently held.
+    bytes: usize,
+}
+
+impl ManifestMemo {
+    fn get_fresh(
+        &mut self,
+        key: &(String, String),
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+    ) -> Option<Arc<CachedManifests>> {
+        self.entries
+            .get(key)
+            .filter(|hit| hit.len == len && hit.modified == modified)
+            .cloned()
+    }
+
+    /// Insert, then evict least-recently-used entries until the total is within budget.
+    ///
+    /// An entry over [`MANIFEST_ENTRY_MAX_BYTES`] is dropped rather than stored, so one huge
+    /// capsule can neither occupy the budget nor evict everything else to fit.
+    fn insert(&mut self, key: (String, String), value: Arc<CachedManifests>) {
+        let size = value.retained_bytes();
+        if size > MANIFEST_ENTRY_MAX_BYTES {
+            return;
+        }
+        if let Some(previous) = self.entries.put(key, value) {
+            self.bytes = self.bytes.saturating_sub(previous.retained_bytes());
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        while self.bytes > MANIFEST_MEMO_MAX_BYTES {
+            match self.entries.pop_lru() {
+                Some((_, evicted)) => {
+                    self.bytes = self.bytes.saturating_sub(evicted.retained_bytes());
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// The process-wide DECODED-manifest memo, keyed by `(cache_dir, capsule)`, bounded in BYTES by
+/// [`MANIFEST_MEMO_MAX_BYTES`].
+///
+/// Decoding a capsule's manifests costs a WHOLE-MODULE read: the DIGS blob shares a wasm data
+/// section with the content chunk pool, so the parse cannot skip past it. `dig.getManifest`,
+/// `dig.getPublicManifest` and `dig.getMetadata` are all on the ANONYMOUS public-read allowlist,
+/// so without this every ~200-byte unauthenticated request would re-read a 128 MiB capsule off a
+/// `--cache`-less Mountpoint-S3 mount.
+///
+/// `(len, mtime)` is a sound fingerprint for the same reason `descriptor_memo` uses it: a cached
+/// module is a brand-new file written by write-then-rename, never edited in place, so any change
+/// invalidates the entry. The cache dir is part of the KEY because this memo is process-wide while
+/// cache dirs are not — two nodes in one process (tests, the browser host) must not share entries.
+///
+/// The entry cap here is a backstop only; [`MANIFEST_MEMO_MAX_BYTES`] is the real bound.
+fn manifest_memo() -> &'static std::sync::Mutex<ManifestMemo> {
+    static MEMO: OnceLock<std::sync::Mutex<ManifestMemo>> = OnceLock::new();
+    MEMO.get_or_init(|| {
+        std::sync::Mutex::new(ManifestMemo {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
+        })
+    })
+}
+
+/// Serializes COLD manifest extractions across the whole process.
+///
+/// Two jobs, both load-bearing on a 2 GiB host. It coalesces duplicate work — a second request for
+/// the same capsule waits, then finds the memo populated instead of repeating the read. And it
+/// bounds TRANSIENT memory: one extraction peaks at roughly three ~128 MiB buffers (the module,
+/// plus the two copies `extract_data_section_blob` makes internally), so allowing N concurrently
+/// would let N unauthenticated requests multiply that with no cap at all. Serialized, the peak is
+/// one extraction's worth however many callers arrive.
+///
+/// Held only around the cold path; a memo hit never touches it.
+fn manifest_extract_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// A capsule's manifests, RENDERED, plus the file fingerprint they came from.
+///
+/// **Rendered JSON, not decoded trees, and that is the security property.** Four consecutive
+/// attempts to size a decoded `MetadataManifest` by hand undercounted it: by ~190,000x on the flat
+/// collections, then ~20x on nested `custom` JSON, and separately on `Vec` capacity-vs-length and
+/// B-tree fill factor. Hand-written structural estimation over a recursive, attacker-shaped type
+/// has unboundedly many places to be wrong and the compiler checks none of them. A byte buffer has
+/// exactly one number, and it is not an estimate.
+///
+/// It is also LESS work on the hot path: all three read methods serialize to JSON anyway, so
+/// caching the output removes a per-request render AND the per-request deep clone of the tree.
+///
+/// `None` on either field means the section is genuinely ABSENT from the module (an older `.dig`,
+/// or a private store) - store-format section 5.1 treats that as normal, so it is a cacheable
+/// answer rather than a miss to retry.
+#[derive(Clone, Default)]
+struct CachedManifests {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    /// `PublicManifest::to_json()` output, byte-identical to what every DIG reader consumes.
+    public_json: Option<Arc<str>>,
+    /// `metadata_manifest_to_json()` output.
+    metadata_json: Option<Arc<str>>,
+}
+
+impl CachedManifests {
+    /// Bytes this entry retains - the input to the memo's byte budget.
+    ///
+    /// EXACT, not an estimate: the entry holds two byte buffers and their lengths are their cost.
+    /// There is no per-element overhead to forget, no capacity-vs-length gap, no container fill
+    /// factor and no recursion - the four things that defeated the previous approach in four
+    /// successive rounds.
+    ///
+    /// Every field is still destructured so a new field cannot be added without a decision here
+    /// (`error[E0027]`). That guard was never sufficient alone - it watches for new FIELDS, not for
+    /// unmeasured CONTENTS - but with fields that are just byte buffers there is no longer a
+    /// contents axis to get wrong. Keep it that way: anything added here should be a buffer or a
+    /// scalar, never a decoded tree.
+    ///
+    /// NOT counted, stated so it is not rediscovered as a finding: the per-ENTRY container
+    /// overhead - three `Arc` headers, the LRU node, and the key strings - is a fixed ~200 bytes
+    /// that this returns nothing for. It cannot matter here, because every module is padded to
+    /// `FIXED_BLOB_LEN` so the number of distinct capsules a node can hold is bounded by disk long
+    /// before entry overhead is material. It WOULD matter if the budget were ever driven by a
+    /// large population of tiny entries.
+    fn retained_bytes(&self) -> usize {
+        let CachedManifests {
+            len,
+            modified,
+            public_json,
+            metadata_json,
+        } = self;
+        let _ = (len, modified); // Copy scalars, no heap.
+        std::mem::size_of::<Self>()
+            + public_json.as_ref().map_or(0, |s| s.len())
+            + metadata_json.as_ref().map_or(0, |s| s.len())
+    }
+}
+
+/// Test-only: the bytes this memo RETAINS for a capsule, or `None` if it holds nothing for it.
+///
+/// Reads the SAME [`CachedManifests::retained_bytes`] the eviction budget runs on, rather than
+/// re-deriving a size from a list of fields. That is the fix for the previous version: it summed
+/// two enumerated fields, so a field added beside them was invisible, and the "falsification" only
+/// appeared to work because the metric was edited in the same breath as the mutation it was
+/// supposed to catch independently. Sharing the production accounting means a probe cannot be
+/// taught about a regression the budget itself would miss — if this can see it, so can eviction.
+#[cfg(test)]
+fn memoized_manifest_bytes(cache_dir: &Path, key: &CapsuleKey) -> Option<usize> {
+    manifest_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .entries
+        .get(&manifest_memo_key(cache_dir, key))
+        .map(|entry| entry.retained_bytes())
+}
+
+/// Test-only: total bytes the memo is holding across every capsule.
+#[cfg(test)]
+fn manifest_memo_total_bytes() -> usize {
+    manifest_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .bytes
+}
+
+/// The memo key for a capsule.
+///
+/// Includes the CACHE DIR: the memo is process-wide but cache dirs are not, so two nodes in one
+/// process (the test harness, the browser host) must not collide on `(store, root)` alone.
+fn manifest_memo_key(cache_dir: &Path, key: &CapsuleKey) -> (String, String) {
+    (cache_dir.to_string_lossy().into_owned(), format!("{key}"))
+}
+
+/// Decode a held capsule's manifests, memoized and single-flighted.
+///
+/// The single whole-module reader behind `dig.getManifest` / `dig.getPublicManifest` /
+/// `dig.getMetadata`, all three of which are ANONYMOUSLY reachable through the rpc.dig.net
+/// public-read tier.
+///
+/// **What is cached is the DECODED manifests, never the blob they came from.** A seek cannot bound
+/// this read the way `read_module_window` bounds a capsule window: the DIGS blob lives in the same
+/// wasm data section as the content chunk pool, so the parse needs the bytes present. The defence
+/// is therefore to do that read ONCE per capsule and retain only the small result — which removes
+/// the amplification a rate-limit rule cannot see, without turning it into a retention leak. The
+/// blob is padded to `FIXED_BLOB_LEN` (128 MiB) and is ~99% content, so caching IT would pin
+/// 128 MiB per capsule for the life of the process: ~16 capsules would exhaust a 2 GiB host, and
+/// `cache.listCached` hands an attacker the exact capsule list to walk.
+///
+/// Reader-tolerance (#1896): tolerates a legacy `.module` cache like every other serve path.
+///
+/// `Ok(None)` = not held. `Err` = held but the data section is malformed.
+fn cached_manifests_blocking(
+    cache_dir: &Path,
+    key: &CapsuleKey,
+) -> Result<Option<Arc<CachedManifests>>, String> {
+    let path = key.resolve_cached_path(cache_dir);
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return Ok(None);
+    };
+    let (len, modified) = (meta.len(), meta.modified().ok());
+    let memo_key = manifest_memo_key(cache_dir, key);
+
+    let fresh_hit = |k: &(String, String)| -> Option<Arc<CachedManifests>> {
+        manifest_memo()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_fresh(k, len, modified)
+    };
+
+    if let Some(hit) = fresh_hit(&memo_key) {
+        return Ok(Some(hit));
+    }
+
+    // COLD. Serialize from here: whoever waited re-checks the memo first and usually finds the
+    // work already done, so N concurrent requests for one capsule cost one read, not N.
+    let _extracting = manifest_extract_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hit) = fresh_hit(&memo_key) {
+        return Ok(Some(hit));
+    }
+
+    let decoded = {
+        let module = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(None),
+        };
+        let blob = digstore_compiler::extract_data_section_blob(&module)
+            .map_err(|e| format!("malformed module data section: {e}"))?;
+        // The module buffer is dead the moment the blob exists; drop it before decoding so the
+        // two are never both live.
+        drop(module);
+
+        // Decode, RENDER, and drop the trees. Only the rendered bytes are retained, so the decoded
+        // `MetadataManifest` — the recursive, attacker-shaped value whose size defeated four
+        // rounds of hand-written accounting — is transient and never sized.
+        let public_json = digstore_core::datasection::read_public_manifest(&blob)
+            .map_err(|e| format!("malformed public manifest section: {e:?}"))?
+            .map(|pm| Arc::from(pm.to_json().as_str()));
+
+        let view = digstore_core::datasection::DataView::parse(&blob)
+            .map_err(|e| format!("malformed module data section: {e:?}"))?;
+        let metadata_json = match view.section(digstore_core::datasection::SectionId::Metadata) {
+            Some(body) => {
+                let mut decoder = digstore_core::codec::Decoder::new(body);
+                let decoded = digstore_core::MetadataManifest::decode(&mut decoder)
+                    .map_err(|e| format!("malformed metadata section: {e:?}"))?;
+                Some(Arc::from(
+                    metadata_manifest_to_json(&decoded).to_string().as_str(),
+                ))
+            }
+            None => None,
+        };
+        // `blob` (128 MiB) and both decoded trees go out of scope HERE, before anything is
+        // retained. What survives is two `Arc<str>` whose lengths ARE their cost.
+        Arc::new(CachedManifests {
+            len,
+            modified,
+            public_json,
+            metadata_json,
+        })
+    };
+
+    // Byte-budgeted insert: an entry over MANIFEST_ENTRY_MAX_BYTES is not retained at all, and the
+    // total is evicted back under MANIFEST_MEMO_MAX_BYTES. The caller still gets `decoded` either
+    // way — declining to memoize costs a re-decode next time, never a wrong answer.
+    manifest_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(memo_key, decoded.clone());
+    Ok(Some(decoded))
+}
+
+/// Load + decode the embedded [`PublicManifest`](digstore_core::PublicManifest) (data-section
+/// id 13, #176 Phase C) from a locally cached compiled module.
+///
+/// The manifest is PUBLIC, unencrypted data sitting in the module's wasm data section, so — unlike
+/// [`serve_local_blocking`] — this does NOT instantiate the module in wasmtime; it is a pure
+/// binary-format parse. The whole-module read that parse requires is memoized and single-flighted
+/// per capsule by [`cached_manifests_blocking`], because this read is ANONYMOUSLY reachable.
+///
+/// Returns the RENDERED manifest JSON, parsed back to a [`Value`] for the response envelope:
+/// - `Ok(Some(Some(json)))` — the module is held and carries a `PublicManifest` section.
 /// - `Ok(Some(None))` — the module is held but carries NO `PublicManifest` section (an older
 ///   `.dig`, or a private store whose paths must stay opaque — store-format §5.1, additive).
 /// - `Ok(None)` — this node does not hold the requested capsule at all (a cache miss).
 /// - `Err(_)` — the on-disk module's data section is corrupt/malformed.
-fn read_public_manifest_blocking(
+///
+/// The parse happens per request while the RENDER is cached, which is strictly less work than
+/// before: these call sites already did `from_str(&pm.to_json())` on every call, so the render is
+/// removed and nothing is added. The transient parse is bounded by the entry ceiling; the decoded
+/// tree is never retained.
+fn read_public_manifest_json(
     cache_dir: &Path,
     key: &CapsuleKey,
-) -> Result<Option<Option<digstore_core::PublicManifest>>, String> {
-    // Reader-tolerance (#1896): a manifest read tolerates a legacy `.module` cache like every serve.
-    let path = key.resolve_cached_path(cache_dir);
-    let module = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => return Ok(None),
+) -> Result<Option<Option<Value>>, String> {
+    Ok(cached_manifests_blocking(cache_dir, key)?
+        .map(|m| m.public_json.as_ref().map(|s| parse_cached_json(s))))
+}
+
+/// The rendered publisher metadata (data-section id 6) — the `dig.getMetadata` read (#2071).
+///
+/// Shares [`cached_manifests_blocking`] with [`read_public_manifest_json`], so one whole-module
+/// read answers both methods rather than each paying its own. Same `Some/None` semantics.
+fn read_metadata_manifest_json(
+    cache_dir: &Path,
+    key: &CapsuleKey,
+) -> Result<Option<Option<Value>>, String> {
+    Ok(cached_manifests_blocking(cache_dir, key)?
+        .map(|m| m.metadata_json.as_ref().map(|s| parse_cached_json(s))))
+}
+
+/// Parse JSON this node rendered itself moments ago.
+///
+/// Infallible in practice — the input is our own `to_json()` output — but a parse failure must not
+/// panic a serve path, so it degrades to `null` rather than unwrapping. A caller sees "no manifest"
+/// instead of a dead connection.
+fn parse_cached_json(rendered: &str) -> Value {
+    serde_json::from_str(rendered).unwrap_or(Value::Null)
+}
+
+/// Reduce a `dig.getContent` answer to `dig.getProof`'s trust-bearing half.
+///
+/// A pure function over the inner read's answer, deliberately separate from
+/// [`Node::get_proof`], because the anti-fabrication rule below is the whole point of the method
+/// and must be reachable by a test WITHOUT standing up a node that can serve. A guard that only
+/// runs after a successful inner read is not exercised by any test that makes the read fail — the
+/// mutation `if proof.is_empty()` → `if false` survived the entire suite for exactly that reason.
+///
+/// - Inner read failed (an error, or a redirect envelope) → passed through verbatim, re-tagged
+///   with this request's id, so the caller learns WHY no proof exists rather than getting a blank.
+/// - Inner read succeeded but carries NO proof → `RESOURCE_UNAVAILABLE`. **Never** a proof-shaped
+///   result with an empty `inclusion_proof`: a client handed one would treat unverified bytes as
+///   verified, and nothing anywhere would report an error (#126/#134). This case is reachable —
+///   a fetch-through serve of a capsule with no per-resource commitment produces exactly it.
+/// - Inner read succeeded with a proof → the proof, its root, and the chunk layout.
+///
+/// No `program_hash`: it would be the module's content address, and obtaining it costs a
+/// whole-module read plus a SHA-256 of every chunk — real work a ~200-byte ANONYMOUS request would
+/// trigger, for a field nothing consumes and which says nothing about the proof.
+/// `dig.getModuleInfo` already serves that value, memoized, on the peer tier.
+///
+/// No execution attestation is ever fabricated: `execution_proof: null` with
+/// `execution_proof_status: "unavailable"` states the absence rather than implying a passed check.
+fn proof_from_content_answer(answer: Value, id: Value) -> Value {
+    let Some(result) = answer.get("result").and_then(Value::as_object) else {
+        let mut passthrough = answer;
+        passthrough["id"] = id;
+        return passthrough;
     };
-    let blob = digstore_compiler::extract_data_section_blob(&module)
-        .map_err(|e| format!("malformed module data section: {e}"))?;
-    digstore_core::datasection::read_public_manifest(&blob)
-        .map(Some)
-        .map_err(|e| format!("malformed public manifest section: {e:?}"))
+
+    let proof = result
+        .get("inclusion_proof")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if proof.is_empty() {
+        return rpc_err(
+            &id,
+            download::RESOURCE_UNAVAILABLE,
+            "no inclusion proof is available for this resource at the anchored root",
+        );
+    }
+
+    json!({"jsonrpc":"2.0","id":id,"result":{
+        "inclusion_proof": proof,
+        "root": result.get("root").cloned().unwrap_or(Value::Null),
+        "chunk_lens": result.get("chunk_lens").cloned().unwrap_or(Value::Null),
+        "execution_proof": Value::Null,
+        "execution_proof_status": "unavailable",
+    }})
+}
+
+/// Render a decoded [`MetadataManifest`](digstore_core::MetadataManifest) as the dighub `Manifest`
+/// JSON clients consume — the 14 publisher fields, byte-identical to what the retired
+/// `dighub-retrieval` Lambda emitted for `dig.getMetadata`.
+///
+/// Written out field by field rather than derived from the codec struct so the WIRE shape is
+/// stable regardless of the struct's internals: a field added to `MetadataManifest` upstream must
+/// be a deliberate wire change here, not an accidental one.
+///
+/// Its OUTPUT is what the memo retains (#2071) — the entry holds these bytes, never the decoded
+/// tree — so a change here changes what `retained_bytes()` measures as well as what clients see.
+fn metadata_manifest_to_json(m: &digstore_core::MetadataManifest) -> Value {
+    json!({
+        "schema_version": m.schema_version,
+        "name": m.name,
+        "version": m.version,
+        "description": m.description,
+        "authors": m.authors.iter().map(|a| json!({
+            "name": a.name, "handle": a.handle, "contact": a.contact,
+        })).collect::<Vec<_>>(),
+        "license": m.license,
+        "homepage": m.homepage,
+        "repository": m.repository,
+        "keywords": m.keywords,
+        "categories": m.categories,
+        "icon": m.icon,
+        "content_type": m.content_type,
+        "links": m.links.iter().map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect::<serde_json::Map<_, _>>(),
+        "custom": m.custom.iter().map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<serde_json::Map<_, _>>(),
+    })
 }
 
 impl Node {
@@ -2046,21 +2483,14 @@ impl Node {
             );
         };
         let cache_dir = self.cache_dir.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            read_public_manifest_blocking(&cache_dir, &capsule)
-        })
-        .await;
+        let outcome =
+            tokio::task::spawn_blocking(move || read_public_manifest_json(&cache_dir, &capsule))
+                .await;
         match outcome {
-            // Module held, PublicManifest section present.
-            Ok(Ok(Some(Some(pm)))) => {
-                // Reuse `PublicManifest::to_json` (the SAME renderer digstore's CLI/wasm
-                // readers use) so the shape is byte-for-byte identical across the ecosystem,
-                // then parse it back into a `Value` for the JSON-RPC `result` field.
-                let value = serde_json::from_str::<Value>(&pm.to_json()).unwrap_or_else(
-                    |_| json!({"schema_version": pm.schema_version, "entries": []}),
-                );
-                json!({"jsonrpc":"2.0","id":id,"result": value})
-            }
+            // Module held, PublicManifest section present. The cached bytes are
+            // `PublicManifest::to_json` output — the SAME renderer digstore's CLI/wasm readers
+            // use — so the shape stays byte-for-byte identical across the ecosystem.
+            Ok(Ok(Some(Some(value)))) => json!({"jsonrpc":"2.0","id":id,"result": value}),
             // Module held, no PublicManifest section — tolerate absence, never an error.
             Ok(Ok(Some(None))) => json!({"jsonrpc":"2.0","id":id,"result": Value::Null}),
             // This node does not hold the requested capsule at all.
@@ -2075,6 +2505,347 @@ impl Node {
                 &id,
                 -32000,
                 &format!("manifest read task failed: {join_err}"),
+            ),
+        }
+    }
+
+    /// Resolve the CAPSULE ROOT a capsule-scoped read should answer at (#2071).
+    ///
+    /// `params.root` may be a concrete 64-hex root, or absent / empty / the `"latest"` sentinel,
+    /// which every DIG client uses to mean "whatever the chain currently says". The sentinel is
+    /// resolved HERE, against the chain, rather than being pushed onto the caller: a client that
+    /// had to know the root before it could ask for the manifest would have to walk the singleton
+    /// itself, which is exactly the work a node exists to do.
+    ///
+    /// The chain is the authority in both directions: an explicitly requested root MUST equal the
+    /// anchored tip, or the read fails closed with [`ROOT_NOT_ANCHORED`] rather than quietly
+    /// serving a superseded generation. This is the same anti-rollback pin `dig.getContent`
+    /// applies (§14.4, #127); a capsule-scoped read is no less trust-bearing for carrying no
+    /// ciphertext.
+    ///
+    /// Returns the resolved root hex, or a ready-to-return JSON-RPC error.
+    async fn resolve_capsule_root(&self, params: &Value, id: &Value) -> Result<String, Value> {
+        let Ok(store_id) = parse_store_id_arg(params) else {
+            return Err(rpc_err(
+                id,
+                -32602,
+                "params.store_id must be a 32-byte (64-hex) launcher id",
+            ));
+        };
+        // Parse the requested root into a `Bytes32` HERE, before anything can render it.
+        //
+        // Everything downstream then holds a TYPE that can only ever print as 64 lowercase hex, so
+        // no arm can echo caller-controlled text into a message even by accident. `decide_pin` has
+        // always been structurally immune this way (it takes `Option<Bytes32>` and renders
+        // `to_hex()`); doing the parse late here dropped that guarantee, and a late `from_hex`
+        // check in one arm does not restore it for the arms that run first.
+        let requested: Option<Bytes32> = match params
+            .get("root")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("latest"))
+        {
+            None => None,
+            Some(raw) => match Bytes32::from_hex(raw) {
+                Ok(root) => Some(root),
+                // The rejected value is NOT quoted back — the caller knows what it sent.
+                Err(_) => {
+                    return Err(rpc_err(
+                        id,
+                        -32602,
+                        "params.root must be 64-hex or \"latest\"",
+                    ))
+                }
+            },
+        };
+
+        // Pin disabled (`DIG_NODE_PIN=off` — the offline/local-dev escape hatch the content read
+        // honours identically): answer at the requested root as-is. A ROOTLESS request still
+        // cannot be answered, because with the chain out of the loop nothing else knows which
+        // generation was meant — guessing one would be the rollback this pin exists to prevent.
+        if !pin_enforced() {
+            return requested.map(|root| root.to_hex()).ok_or_else(|| {
+                rpc_err(
+                    id,
+                    -32602,
+                    "params.root is required while the anchored-root pin is disabled",
+                )
+            });
+        }
+
+        let anchored = self
+            .anchored_root_resolver
+            .anchored_root(&store_id.into())
+            .await;
+
+        match (requested, anchored) {
+            (Some(req), Ok(Some(tip))) if req == tip => Ok(tip.to_hex()),
+            // Both roots render via `to_hex()` on a `Bytes32` — neither can be arbitrary text.
+            (Some(req), Ok(Some(tip))) => Err(rpc_err(
+                id,
+                ROOT_NOT_ANCHORED,
+                &format!(
+                    "requested root {} does not match the store's on-chain root {} \
+                     (chain is the authority)",
+                    req.to_hex(),
+                    tip.to_hex()
+                ),
+            )),
+            // A requested root the chain cannot confirm falls back to the BOUNDED verify (one
+            // launcher-hint query, no lineage walk) — the same #747/#841 tolerance the content
+            // read applies, so a single unparseable intermediate generation cannot deny a read
+            // of a root that IS anchored. Still fail-closed.
+            (Some(req), _) => match self
+                .anchored_root_resolver
+                .verify_pinned_root(&store_id.into(), req)
+                .await
+            {
+                Ok(()) => Ok(req.to_hex()),
+                Err(msg) => Err(rpc_err(id, ROOT_NOT_ANCHORED, &msg)),
+            },
+            (None, Ok(Some(tip))) => Ok(tip.to_hex()),
+            (None, Ok(None)) => Err(rpc_err(
+                id,
+                ROOT_NOT_ANCHORED,
+                "the store has no confirmed on-chain generation",
+            )),
+            (None, Err(e)) => Err(rpc_err(
+                id,
+                ROOT_NOT_ANCHORED,
+                &format!("could not read the store's on-chain root: {e}"),
+            )),
+        }
+    }
+
+    /// `dig.getProof` (#2071) — the trust-bearing half of a read: the resource's Merkle inclusion
+    /// proof and the chain-anchored generation root it verifies against, without the ciphertext.
+    ///
+    /// A client that already holds a resource's bytes — from its own cache, a peer, or an earlier
+    /// window — uses this to (re)establish that those bytes belong to the store's current on-chain
+    /// generation.
+    ///
+    /// **The proof is obtained by running the ordinary `dig.getContent` read and discarding the
+    /// ciphertext**, not by deriving a proof separately. That is deliberate: it guarantees the
+    /// same mandatory anchored-root pin (§14.4), the same local-first → peer → upstream ladder,
+    /// and therefore that the proof returned here is provably the proof a content read of the same
+    /// resource would have verified against. A second derivation could pin a different generation
+    /// and no client could tell. The proof itself is computed by the module's own guest wasm
+    /// inside `serve_blind` — a real inclusion proof over the resource ciphertext, never a
+    /// node-side reconstruction.
+    ///
+    /// - Proof available → `{ inclusion_proof, root, chunk_lens, execution_proof,
+    ///   execution_proof_status }`.
+    /// - No proof obtainable — this node does not hold the resource, no peer served it, or the
+    ///   read answered with a redirect rather than bytes → **the underlying read's error,
+    ///   verbatim**. NEVER a proof-shaped result carrying an empty proof: a client handed one
+    ///   would treat unverified bytes as verified, which is strictly worse than an error
+    ///   (#126/#134).
+    ///
+    /// No execution attestation is ever fabricated. This node holds no RISC0 receipt, and
+    /// `execution_proof_status: "unavailable"` states that rather than implying one was checked
+    /// and passed.
+    async fn get_proof(
+        &self,
+        req: &Value,
+        id: Value,
+        origin: crate::download::ReadOrigin,
+        provenance: crate::download::RequestProvenance,
+    ) -> Value {
+        // The proof and chunk layout describe the WHOLE resource and ride window 0, so ask for
+        // exactly that window whatever offset the caller happened to send.
+        let mut read = req.clone();
+        read["method"] = json!(dig_rpc_protocol::Method::GetContent.name());
+        if let Some(params) = read.get_mut("params").and_then(Value::as_object_mut) {
+            params.insert("offset".into(), json!(0));
+        }
+        proof_from_content_answer(handle_rpc(self, read, origin, provenance).await, id)
+    }
+
+    /// `dig.getPublicManifest` (#2071) — a store's normalized PUBLIC MANIFEST, in the enveloped
+    /// shape the hub client and the rpc.dig.net read tier expect: `{ manifest, root }`.
+    ///
+    /// The manifest content is identical to [`dig.getManifest`](Self::get_manifest) — the same
+    /// data-section id 13, rendered by the same [`PublicManifest::to_json`] every DIG reader uses.
+    /// The two differ only in their envelope and their root handling, and both must exist because
+    /// clients in the wild call both: `dig.getManifest` takes a REQUIRED concrete `root` and
+    /// returns the manifest bare, while this takes an OPTIONAL `root` (defaulting to the chain
+    /// tip) and wraps it, echoing the root it resolved so the caller learns which generation it
+    /// just read.
+    ///
+    /// - Params: `{ store_id, root? }` — `root` absent or `"latest"` resolves the anchored tip.
+    /// - Held with a manifest → `{ manifest: { schema_version, entries: [...] }, root }`.
+    /// - Held with NO manifest section (an older `.dig`, or a PRIVATE store whose paths must stay
+    ///   opaque) → `{ manifest: null, root }` — never an error. Store-format §5.1: an optional
+    ///   section's absence is a normal, backwards-compatible outcome.
+    /// - Not held at this root → `-32004`. A corrupt data section → `-32000`.
+    async fn get_public_manifest(&self, params: &Value, id: Value) -> Value {
+        let root_hex = match self.resolve_capsule_root(params, &id).await {
+            Ok(root) => root,
+            Err(e) => return e,
+        };
+        let store_hex = params.get("store_id").and_then(Value::as_str).unwrap_or("");
+        let Some(capsule) = CapsuleKey::parse(store_hex, &root_hex) else {
+            return rpc_err(&id, -32602, "params.store_id must be 64-hex");
+        };
+        let cache_dir = self.cache_dir.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || read_public_manifest_json(&cache_dir, &capsule))
+                .await;
+        match outcome {
+            Ok(Ok(Some(Some(manifest)))) => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"manifest": manifest, "root": root_hex}})
+            }
+            Ok(Ok(Some(None))) => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"manifest": Value::Null, "root": root_hex}})
+            }
+            Ok(Ok(None)) => rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "capsule not held locally at the requested root",
+            ),
+            Ok(Err(msg)) => rpc_err(&id, -32000, &msg),
+            Err(join_err) => rpc_err(
+                &id,
+                -32000,
+                &format!("manifest read task failed: {join_err}"),
+            ),
+        }
+    }
+
+    /// `dig.getMetadata` (#2071) — the publisher's plaintext METADATA manifest for a capsule:
+    /// `{ manifest, root }`.
+    ///
+    /// This is the dighub `Manifest` a publisher embeds at commit time (name, version, authors,
+    /// license, links, …) — data-section id 6. It is PUBLIC and unencrypted by construction, so
+    /// reading it is a pure binary-format parse with no `serve_blind` decrypt and no retrieval
+    /// key, exactly like the public manifest read beside it. The extraction is memoized per
+    /// capsule ([`cached_manifests_blocking`]) because this method is ANONYMOUSLY reachable.
+    ///
+    /// No `program_hash`: it would cost a second whole-module read plus a SHA-256 of every chunk
+    /// for a field nothing consumes. `dig.getModuleInfo` already serves a module's content address.
+    ///
+    /// - Params: `{ store_id, root? }` — `root` absent or `"latest"` resolves the anchored tip.
+    /// - Held with metadata → `{ manifest: { schema_version, name, version, description, authors,
+    ///   license, homepage, repository, keywords, categories, icon, content_type, links, custom },
+    ///   root }`.
+    /// - Held with NO metadata section → `{ manifest: null, root }` — never an error, for the same
+    ///   store-format §5.1 reason as the public manifest.
+    /// - Not held at this root → `-32004`. A corrupt data section → `-32000`.
+    async fn get_metadata(&self, params: &Value, id: Value) -> Value {
+        let root_hex = match self.resolve_capsule_root(params, &id).await {
+            Ok(root) => root,
+            Err(e) => return e,
+        };
+        let store_hex = params.get("store_id").and_then(Value::as_str).unwrap_or("");
+        let Some(capsule) = CapsuleKey::parse(store_hex, &root_hex) else {
+            return rpc_err(&id, -32602, "params.store_id must be 64-hex");
+        };
+        let cache_dir = self.cache_dir.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || read_metadata_manifest_json(&cache_dir, &capsule))
+                .await;
+        match outcome {
+            Ok(Ok(Some(manifest))) => json!({"jsonrpc":"2.0","id":id,"result":{
+                "manifest": manifest.unwrap_or(Value::Null),
+                "root": root_hex,
+            }}),
+            Ok(Ok(None)) => rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "capsule not held locally at the requested root",
+            ),
+            Ok(Err(msg)) => rpc_err(&id, -32000, &msg),
+            Err(join_err) => rpc_err(
+                &id,
+                -32000,
+                &format!("metadata read task failed: {join_err}"),
+            ),
+        }
+    }
+
+    /// `dig.getCapsule` / `dig.getModule` (#2071) — one window of a whole `.dig` module this node
+    /// holds, in the SAME streaming envelope `dig.getContent` uses.
+    ///
+    /// The envelope's byte field is named `ciphertext` for the per-resource reads that share it;
+    /// for a whole capsule it carries the raw `.dig` module bytes, which are already the
+    /// encrypted-at-rest artifact. That naming is a wire contract, not a description — this node's
+    /// own capsule downloader (`seams::capsule::capsule_download`) has always CONSUMED exactly
+    /// this shape from an upstream, and could not serve it. Now both halves exist here.
+    ///
+    /// `inclusion_proof` is present but EMPTY (`""`). A whole module has no per-resource Merkle
+    /// path — it is verified by binding the assembled blob to its on-chain root, which is what the
+    /// puller's own anchor gate does. The field is still sent because `ChunkObject` requires it on
+    /// every window, and an empty string states "there is no proof for this shape" where an absent
+    /// key would leave a caller unable to tell that from a server that forgot one. Empty is NOT a
+    /// passed check, and no caller should read it as one.
+    ///
+    /// - Params: `{ store_id, root?, offset? }` — `root` absent or `"latest"` resolves the tip.
+    /// - Not held at this root → `-32004`.
+    ///
+    /// **Only the requested window is read off disk.** This method is on the ANONYMOUS public-read
+    /// allowlist, and `fs::read`-ing the whole module per call would let one ~200-byte unauthenticated
+    /// POST — `offset` past EOF returns an EMPTY window, so ~250 bytes back — cost a full read of a
+    /// 128 MiB capsule off a `--cache`-less Mountpoint-S3 mount. That is a ~675,000:1 amplification
+    /// invisible to a request-rate WAF rule, and a handful of concurrent ones would exhaust a
+    /// 2 GiB host. The documented client loop alone would need 43 full reads (~5.4 GiB of S3 GET)
+    /// to deliver one 128.7 MiB capsule. The peer-tier twin `dig.fetchModuleRange` already seeks
+    /// rather than slurps (#1615/G1) — this is the SAME guard on the more exposed surface, via the
+    /// same helper.
+    async fn get_capsule(&self, params: &Value, id: Value) -> Value {
+        let root_hex = match self.resolve_capsule_root(params, &id).await {
+            Ok(root) => root,
+            Err(e) => return e,
+        };
+        let store_hex = params
+            .get("store_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let cache_dir = self.cache_dir.clone();
+        let (read_root, echo_root) = (root_hex.clone(), root_hex);
+        let read = tokio::task::spawn_blocking(move || {
+            let capsule = CapsuleKey::parse(&store_hex, &read_root)?;
+            // `total_length` comes from the file's METADATA, not from a buffer — the whole point is
+            // that no buffer of the whole module ever exists.
+            let total = std::fs::metadata(capsule.resolve_cached_path(&cache_dir))
+                .ok()?
+                .len();
+            if total == 0 {
+                return None;
+            }
+            let window = crate::seams::dig_peer::module_serve::read_module_window(
+                &cache_dir,
+                &store_hex,
+                &read_root,
+                offset,
+                WINDOW as u64,
+            )?;
+            Some((window, total))
+        })
+        .await;
+        match read {
+            Ok(Some((window, total))) => {
+                let start = offset.min(total);
+                let result = windowed_envelope(
+                    &window,
+                    start as usize,
+                    total as usize,
+                    echo_root,
+                    None,
+                    Value::Null,
+                );
+                json!({"jsonrpc":"2.0","id":id,"result": result})
+            }
+            Ok(None) => rpc_err(
+                &id,
+                download::RESOURCE_UNAVAILABLE,
+                "capsule not held locally at the requested root",
+            ),
+            Err(join_err) => rpc_err(
+                &id,
+                -32000,
+                &format!("capsule read task failed: {join_err}"),
             ),
         }
     }
@@ -8045,10 +8816,19 @@ mod tests {
     // On `dig.getContent` the trust-bearing fields are REAL — the guest-computed
     // merkle inclusion proof + the chain-anchored root (#127) — and there is no
     // execution attestation on the wire to fake: `ContentResponse`/`build_result`
-    // carry no execution-proof field, and the node does not implement
-    // `dig.getProof` (it returns -32601 rather than a fabricated mock receipt). A
-    // real, verified execution attestation is gated on the RISC0 toolchain
-    // (SECURITY.md residual #3) and is honestly absent here, never faked.
+    // carry no execution-proof field. A real, verified execution attestation is
+    // gated on the RISC0 toolchain (SECURITY.md residual #3) and is honestly
+    // absent, never faked.
+    //
+    // #2071 changed HOW that honesty is kept for `dig.getProof`, not whether. The
+    // method used to answer -32601, and the guard below asserted exactly that. But
+    // "never fabricate a proof" was always the invariant; "never implement the
+    // method" was only the cheapest way to hold it, and it cost every client the
+    // ability to re-verify bytes it already held. The node now serves a REAL proof
+    // — the guest-computed one, obtained by running the ordinary content read and
+    // discarding the ciphertext, so it is provably the proof that read would have
+    // verified against — and still fabricates no execution attestation. The guard
+    // is rewritten to assert the invariant directly rather than its old proxy.
 
     #[test]
     fn get_content_result_carries_real_inclusion_proof_and_no_execution_proof() {
@@ -8384,11 +9164,13 @@ mod tests {
     }
 
     #[test]
-    fn get_proof_is_not_served_as_a_verified_proof_by_the_node() {
-        // dig-node does not implement dig.getProof — it returns the catalogued
-        // -32601 (method not found) rather than fabricating a mock execution
-        // proof. (The standalone node has no upstream here, so the dispatch's own
-        // method-not-found is observed directly.)
+    fn get_proof_errors_rather_than_fabricating_a_proof_it_cannot_produce() {
+        // The invariant #126 actually protects: when this node cannot produce a
+        // proof — here it holds nothing, has no peer and no upstream — it says so.
+        // It MUST NOT answer with a proof-shaped result carrying an empty
+        // inclusion_proof, because a client handed that would treat unverified
+        // bytes as verified and no error would appear anywhere. An error is the
+        // honest answer; a blank that looks like a proof is worse than -32601.
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN");
         let rt = pin_test_rt();
@@ -8402,10 +9184,9 @@ mod tests {
             crate::download::ReadOrigin::Local,
             crate::download::RequestProvenance::FirstParty,
         ));
-        assert_eq!(
-            resp["error"]["code"],
-            json!(-32601),
-            "dig.getProof must be method-not-found on the node, never a fabricated proof: {resp}"
+        assert!(
+            resp.get("error").is_some(),
+            "an unobtainable proof is an ERROR, never a blank proof: {resp}"
         );
         assert!(
             resp.get("result").is_none(),
@@ -8413,19 +9194,373 @@ mod tests {
         );
     }
 
+    /// The guard the test above CANNOT reach: a SUCCESSFUL inner read that carries no proof.
+    ///
+    /// That path matters because it is the only one where a blank could be dressed up as a
+    /// result — the failing-read test returns early at the passthrough branch, one level above
+    /// the guard. Mutating `if proof.is_empty()` to `if false` left the whole 676-test suite
+    /// green for exactly that reason. This drives the reduction directly, so the guard is the
+    /// thing under test rather than something the test happens to step over.
+    #[test]
+    fn a_successful_read_with_no_proof_is_an_error_not_a_blank_proof() {
+        // A well-formed getContent success whose proof is EMPTY — the shape a fetch-through
+        // serve of a capsule with no per-resource commitment produces.
+        let no_proof = json!({"jsonrpc":"2.0","id":1,"result":{
+            "ciphertext": "AQID",
+            "total_length": 3, "offset": 0, "length": 3,
+            "complete": true, "next_offset": Value::Null,
+            "root": Bytes32([0x42; 32]).to_hex(),
+            "inclusion_proof": "",
+            "chunk_lens": [3],
+        }});
+        let out = proof_from_content_answer(no_proof, json!(7));
+        assert_eq!(
+            out["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "a successful read carrying no proof must ERROR — a client handed a proof-shaped \
+             blank would treat unverified bytes as verified and nothing would report it: {out}"
+        );
+        assert!(out.get("result").is_none(), "{out}");
+
+        // Same answer WITH a proof still succeeds, so the guard is not simply refusing everything.
+        let with_proof = json!({"jsonrpc":"2.0","id":1,"result":{
+            "ciphertext": "AQID",
+            "root": Bytes32([0x42; 32]).to_hex(),
+            "inclusion_proof": "cHJvb2Y=",
+            "chunk_lens": [3],
+        }});
+        let ok = proof_from_content_answer(with_proof, json!(7));
+        assert_eq!(ok["result"]["inclusion_proof"], json!("cHJvb2Y="), "{ok}");
+        assert_eq!(ok["result"]["execution_proof"], Value::Null, "{ok}");
+        assert_eq!(
+            ok["result"]["execution_proof_status"],
+            json!("unavailable"),
+            "an absent RISC0 receipt is never reported as a passed check: {ok}"
+        );
+        assert!(
+            ok["result"].get("program_hash").is_none(),
+            "no whole-module read is paid for on an anonymous proof request: {ok}"
+        );
+
+        // An inner ERROR passes through, re-tagged, so the caller learns why.
+        let failed = json!({"jsonrpc":"2.0","id":1,
+            "error":{"code": -32004, "message":"resource not available"}});
+        let through = proof_from_content_answer(failed, json!(7));
+        assert_eq!(through["error"]["code"], json!(-32004), "{through}");
+        assert_eq!(through["id"], json!(7), "re-tagged with this request's id");
+    }
+
+    /// The manifest memo retains KILOBYTES per capsule, not the 128 MiB blob they came from.
+    ///
+    /// Residency is invisible to every functional test here — caching the DIGS blob returns
+    /// byte-identical manifests — so it has to be measured. The measurement reads the SAME
+    /// `retained_bytes()` the eviction budget runs on, which is what makes it a real probe: an
+    /// earlier version summed two enumerated fields, so a field added beside them was invisible,
+    /// and the "falsification" only worked because the metric got edited alongside the mutation.
+    #[tokio::test]
+    async fn the_manifest_memo_retains_the_manifest_not_the_capsule_it_decoded() {
+        let store_id = Bytes32([31u8; 32]);
+        let files = vec![
+            ("index.html".to_string(), b"<h1>residency</h1>".to_vec()),
+            ("assets/app.js".to_string(), b"console.log(1)".to_vec()),
+        ];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+        let capsule = CapsuleKey::parse(&store_id.to_hex(), &root.to_hex()).unwrap();
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getPublicManifest","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "{resp}");
+
+        let retained = memoized_manifest_bytes(&node.cache_dir, &capsule)
+            .expect("the read populated the memo");
+        // Orders of magnitude, not a byte count: a blob entry would be ~128 MiB here.
+        assert!(
+            retained < 64 * 1024,
+            "the memo retains {retained} bytes for a 2-file capsule decoded from a {} byte \
+             module — it is holding something other than the manifests",
+            module_bytes.len()
+        );
+        assert!(
+            retained > 0,
+            "the entry must actually carry the decoded manifest, not an empty placeholder"
+        );
+        // The PROCESS-WIDE total is the thing that actually OOMs a host, so assert on it too and
+        // not only on this one entry. Every other test in this suite has been decoding manifests
+        // into the same global memo, so this covers their residency as well as ours.
+        let total = manifest_memo_total_bytes();
+        assert!(
+            total <= MANIFEST_MEMO_MAX_BYTES,
+            "the process-wide memo holds {total} bytes, over its {MANIFEST_MEMO_MAX_BYTES} budget"
+        );
+        assert!(
+            total >= retained,
+            "the running total ({total}) must include this entry ({retained}) — a total that \
+             does not track inserts cannot drive eviction"
+        );
+    }
+
+    /// `retained_bytes()` is the LENGTH of what is retained, for every shape of input.
+    ///
+    /// The entry holds rendered JSON, so this is exact rather than estimated — which is the whole
+    /// reason for byte-caching. Four rounds of hand-written structural sizing undercounted a
+    /// decoded `MetadataManifest`: ~190,000x on the flat collections, ~20x on nested `custom`
+    /// JSON, and again on `Vec` capacity-vs-length and B-tree fill factor. Each fix addressed the
+    /// row that had just been found and left the rows nobody had thought of yet.
+    ///
+    /// The cases below are the exact shapes that defeated the previous approach. None of them can
+    /// defeat this one, and the test is written to make that visible rather than to re-derive a
+    /// size: every assertion is `retained_bytes() == the rendered length`.
+    #[test]
+    fn retained_bytes_equals_the_rendered_length_for_every_shape() {
+        let overhead = std::mem::size_of::<CachedManifests>();
+        let entry_of = |public: Option<&str>, metadata: Option<&str>| CachedManifests {
+            len: 1,
+            modified: None,
+            public_json: public.map(Arc::from),
+            metadata_json: metadata.map(Arc::from),
+        };
+
+        // Empty: nothing but the struct itself.
+        assert_eq!(entry_of(None, None).retained_bytes(), overhead);
+
+        // The shapes that broke every previous round, as the JSON they actually render to.
+        // Deeply NESTED custom JSON — round 4's fixtures used `Value::Null` and so never
+        // exercised nesting at all, which is precisely why that hole survived.
+        let nested = format!(
+            r#"{{"custom":{{"a":{}}}}}"#,
+            (0..64).fold("1".to_string(), |acc, _| format!(r#"{{"n":[{acc}]}}"#))
+        );
+        // A million empty authors — the shape that accounted as ZERO under content-only sizing.
+        let empty_authors = format!(
+            r#"{{"authors":[{}]}}"#,
+            vec![r#"{"name":""}"#; 5_000].join(",")
+        );
+        // A long flat path list.
+        let many_paths = format!(
+            r#"{{"entries":[{}]}}"#,
+            vec![r#"{"path":"a"}"#; 5_000].join(",")
+        );
+
+        for (label, rendered) in [
+            ("nested custom", nested.as_str()),
+            ("empty authors", empty_authors.as_str()),
+            ("many paths", many_paths.as_str()),
+        ] {
+            let as_metadata = entry_of(None, Some(rendered)).retained_bytes();
+            let as_public = entry_of(Some(rendered), None).retained_bytes();
+            assert_eq!(
+                as_metadata,
+                overhead + rendered.len(),
+                "{label}: retained bytes must BE the buffer length, not an estimate of it"
+            );
+            assert_eq!(
+                as_public, as_metadata,
+                "{label}: which field holds the bytes cannot change what they cost"
+            );
+        }
+
+        // And both together sum, so one field cannot mask the other.
+        let both = entry_of(Some(&many_paths), Some(&nested)).retained_bytes();
+        assert_eq!(both, overhead + many_paths.len() + nested.len());
+    }
+
+    /// A large capsule is REFUSED memoization rather than retained.
+    ///
+    /// The ceiling has to bite on real input, not just on a number: this renders a manifest big
+    /// enough to exceed it and asserts the memo declines it.
+    #[test]
+    fn an_oversized_rendered_manifest_exceeds_the_per_entry_ceiling() {
+        let rendered = "x".repeat(MANIFEST_ENTRY_MAX_BYTES + 1);
+        let entry = CachedManifests {
+            len: 1,
+            modified: None,
+            public_json: Some(Arc::from(rendered.as_str())),
+            metadata_json: None,
+        };
+        assert!(
+            entry.retained_bytes() > MANIFEST_ENTRY_MAX_BYTES,
+            "the ceiling must be measured against the actual retained length"
+        );
+
+        let mut memo = ManifestMemo {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
+        };
+        memo.insert(("d".into(), "c".into()), Arc::new(entry));
+        assert_eq!(
+            memo.entries.len(),
+            0,
+            "an oversized entry must be declined, never stored then evicted"
+        );
+        assert_eq!(
+            memo.bytes, 0,
+            "and it must not be counted against the budget"
+        );
+    }
+
+    /// The memo evicts on BYTES, so many large entries cannot accumulate past the budget.
+    #[test]
+    fn the_manifest_memo_evicts_to_stay_within_its_byte_budget() {
+        let mut memo = ManifestMemo {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
+        };
+        let entry = |bytes: usize| {
+            Arc::new(CachedManifests {
+                len: 1,
+                modified: None,
+                public_json: Some(Arc::from("m".repeat(bytes).as_str())),
+                metadata_json: None,
+            })
+        };
+
+        // Insert far more than the budget can hold.
+        let per_entry = entry(512 * 1024).retained_bytes();
+        let needed = (MANIFEST_MEMO_MAX_BYTES / per_entry) + 20;
+        for i in 0..needed {
+            memo.insert((format!("dir{i}"), format!("cap{i}")), entry(512 * 1024));
+        }
+
+        assert!(
+            memo.bytes <= MANIFEST_MEMO_MAX_BYTES,
+            "memo holds {} bytes, over the {MANIFEST_MEMO_MAX_BYTES} budget after {needed} inserts",
+            memo.bytes
+        );
+        assert!(
+            memo.entries.len() < needed,
+            "eviction must have happened — {} of {needed} entries retained",
+            memo.entries.len()
+        );
+
+        // An entry over the per-entry ceiling is refused outright, not stored and then evicted.
+        let before = memo.entries.len();
+        memo.insert(
+            ("huge".into(), "huge".into()),
+            entry(MANIFEST_ENTRY_MAX_BYTES + 1),
+        );
+        assert_eq!(
+            memo.entries.len(),
+            before,
+            "an oversized entry must be declined, never stored"
+        );
+    }
+
+    /// `dig.getCapsule` reads only the requested WINDOW off disk, never the whole module.
+    ///
+    /// Asserted in BYTES READ, not bytes returned. Both implementations return byte-identical
+    /// responses, so no correctness assertion can tell them apart — the amplification is the
+    /// entire defect, and it is invisible to every test that only checks output. This method is
+    /// on the ANONYMOUS public-read allowlist, so a whole-module read per window would let one
+    /// ~200-byte unauthenticated request pull 128 MiB off a `--cache`-less S3 mount.
+    #[tokio::test]
+    async fn dig_get_capsule_reads_only_the_requested_window_off_disk() {
+        let store_id = Bytes32([21u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>bounded</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        // The fixture carries the guest wasm, so it spans several 3 MiB windows.
+        assert!(
+            module_bytes.len() > WINDOW,
+            "this guard is meaningless on a module that fits in one window"
+        );
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        let before = crate::seams::dig_peer::module_serve::module_bytes_read(&root.to_hex());
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getCapsule","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(), "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let read = crate::seams::dig_peer::module_serve::module_bytes_read(&root.to_hex()) - before;
+
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert!(
+            read > 0,
+            "the window must come from the SEEKING reader — zero bytes counted means the serve \
+             reverted to slurping the whole module through a path this guard cannot see"
+        );
+        assert!(
+            read <= WINDOW as u64,
+            "one request read {read} bytes for a {WINDOW}-byte window of a {} byte module — a \
+             ~200-byte anonymous request must not cost a whole-module read",
+            module_bytes.len()
+        );
+        // …and it still reports the FULL length, taken from metadata rather than a buffer.
+        assert_eq!(
+            resp["result"]["total_length"].as_u64(),
+            Some(module_bytes.len() as u64),
+            "{resp}"
+        );
+
+        // A far-past-EOF offset is the cheapest possible request: an empty window, and it must
+        // not have read the module to discover that.
+        let before = crate::seams::dig_peer::module_serve::module_bytes_read(&root.to_hex());
+        let past = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getCapsule","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+                "offset": module_bytes.len() as u64 + 1,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let read_past =
+            crate::seams::dig_peer::module_serve::module_bytes_read(&root.to_hex()) - before;
+        assert_eq!(past["result"]["length"].as_u64(), Some(0), "{past}");
+        assert_eq!(
+            read_past, 0,
+            "an offset past EOF returns ~250 bytes; it must READ ~0 too, or the response size \
+             and the work done diverge by ~675,000:1 and no rate limit can see the cost"
+        );
+    }
+
     #[test]
     fn passthrough_alias_methods_are_method_not_found_on_the_node() {
-        // The node resolves dig.getContent locally but does NOT resolve the passthrough
-        // aliases dig.getCapsule / dig.listCapsules — it returns the catalogued -32601
-        // (method not found), which is the shell's cue to relay the ORIGINAL request
-        // verbatim to the upstream (SPEC §5.4/§5.5). This pins that classification at
-        // the dispatch level so a future read-path change that starts resolving one of
-        // them locally (and would therefore need its catalogue entry flipped to
-        // served=local) is caught here, mirroring the dig.getProof guard.
+        // What the node still does NOT resolve locally returns the catalogued -32601, which
+        // is the shell's cue to relay the ORIGINAL request verbatim to an upstream when one
+        // is configured (SPEC §5.4/§5.5). This pins that classification at the dispatch
+        // level, so a read-path change that starts resolving one of them locally — and would
+        // therefore need its catalogue entry in dig-node-service's meta.rs flipped to
+        // served=local — is caught here rather than shipping a catalogue that lies.
         //
-        // dig.getManifest is EXCLUDED from this list as of #176 Phase C: it moved from
-        // passthrough to served=local (see the dig_get_manifest_* tests below and the
-        // updated catalogue in dig-node-service's meta.rs).
+        // The list shrinks as methods move to served=local; each departure is deliberate:
+        //   * dig.getManifest       — #176 Phase C
+        //   * dig.getProof, dig.getMetadata, dig.getPublicManifest,
+        //     dig.getCapsule/dig.getModule — #2071 (rpc.dig.net is an ordinary node with no
+        //     upstream, so "relay it" resolved to -32601 for every client that called them)
+        //
+        // What REMAINS here, and why each is honestly unserved rather than merely unwritten:
+        //   * dig.listCapsules   — needs a chain generation walk this node does not do
+        //   * dig.getProofStatus — polls an execution-proof JOB; this node runs none, and
+        //                          inventing a status would be the fabrication #126 forbids
         let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         std::env::remove_var("DIG_NODE_PIN");
         let rt = pin_test_rt();
@@ -8433,11 +9568,11 @@ mod tests {
         let store_id = Bytes32([1u8; 32]).to_hex();
         // Representative params per method; the node must still report method-not-found.
         let cases = [
-            json!({"jsonrpc":"2.0","id":1,"method":"dig.getCapsule","params":{
-                "store_id": store_id, "retrieval_key": any_rk_hex(),
-            }}),
-            json!({"jsonrpc":"2.0","id":2,"method":"dig.listCapsules","params":{
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.listCapsules","params":{
                 "store_id": store_id,
+            }}),
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getProofStatus","params":{
+                "store_id": store_id, "proof_id": "any",
             }}),
         ];
         for req in cases {
@@ -8642,6 +9777,305 @@ mod tests {
         )
         .await;
         assert_eq!(bad_root["error"]["code"], json!(-32602), "{bad_root}");
+    }
+
+    // -- #2071: the read methods the node stopped serving at the rpc.dig.net cutover ----
+    //
+    // These were "passthrough aliases" — relayed to an upstream, and therefore -32601 on
+    // any node without one. rpc.dig.net is meant to be an ordinary node, so it has none,
+    // and every client calling them got method-not-found from a node that held the bytes.
+
+    /// A held capsule yields a REAL inclusion proof — the guest-computed one, rooted at
+    /// the chain-anchored root — and no fabricated execution attestation.
+    #[tokio::test]
+    async fn dig_get_proof_returns_the_guest_computed_proof_at_the_anchored_root() {
+        let store_id = Bytes32([11u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>proof</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+        let rk = crate::content_serve::derive_retrieval_key(&store_id, "index.html");
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getProof","params":{
+                "store_id": store_id.to_hex(), "retrieval_key": rk.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let result = &resp["result"];
+        assert!(resp.get("error").is_none(), "{resp}");
+
+        // The proof is the SAME one a dig.getContent read carries, and it VERIFIES against
+        // the chain-anchored root — the whole point of implementing this rather than stubbing
+        // it. Decoded and checked here, not merely asserted non-empty.
+        let proof_b64 = result["inclusion_proof"].as_str().expect("a proof: {resp}");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(proof_b64)
+            .expect("the proof is base64");
+        let mut dec = digstore_core::codec::Decoder::new(&raw);
+        let proof = digstore_core::merkle::MerkleProof::decode(&mut dec)
+            .expect("the proof decodes as a MerkleProof");
+        assert!(
+            proof.verify(),
+            "the merkle path resolves to its declared root"
+        );
+        assert_eq!(
+            proof.root.to_hex(),
+            root.to_hex(),
+            "the proof is rooted at the CHAIN-anchored root, not some other generation"
+        );
+        assert_eq!(result["root"].as_str(), Some(root.to_hex().as_str()));
+
+        // No execution attestation is fabricated (#126/#134) — absent is reported as absent.
+        assert_eq!(result["execution_proof"], Value::Null, "{resp}");
+        assert_eq!(
+            result["execution_proof_status"],
+            json!("unavailable"),
+            "an absent RISC0 receipt must never be reported as a passed check: {resp}"
+        );
+        // No ciphertext rides a proof response — this is the trust half only.
+        assert!(result.get("ciphertext").is_none(), "{resp}");
+    }
+
+    /// The enveloped public manifest the hub client and the rpc.dig.net read tier call.
+    #[tokio::test]
+    async fn dig_get_public_manifest_wraps_the_manifest_and_echoes_the_resolved_root() {
+        let store_id = Bytes32([12u8; 32]);
+        let files = vec![
+            ("index.html".to_string(), b"<h1>hi</h1>".to_vec()),
+            ("assets/app.js".to_string(), b"console.log(1)".to_vec()),
+        ];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        // No `root` param: the "latest" case every client uses. The node resolves the tip
+        // itself rather than making the caller walk the singleton.
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getPublicManifest","params":{
+                "store_id": store_id.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(
+            resp["result"]["root"].as_str(),
+            Some(root.to_hex().as_str()),
+            "the resolved root is echoed so the caller knows which generation it read: {resp}"
+        );
+        let entries = resp["result"]["manifest"]["entries"]
+            .as_array()
+            .expect("an entries array: {resp}");
+        let paths: Vec<&str> = entries.iter().filter_map(|e| e["path"].as_str()).collect();
+        assert!(
+            paths.contains(&"index.html") && paths.contains(&"assets/app.js"),
+            "every public path is listed: {paths:?}"
+        );
+    }
+
+    /// A capsule with no metadata section is `manifest: null` — an absence, not an error
+    /// (store-format §5.1) — and a capsule this node does not hold is -32004.
+    #[tokio::test]
+    async fn dig_get_metadata_reports_absence_as_null_and_a_miss_as_unavailable() {
+        let store_id = Bytes32([13u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>meta</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        let held = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getMetadata","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(
+            held.get("error").is_none(),
+            "a held capsule with an EMPTY publisher manifest is a success, not an error: {held}"
+        );
+        assert_eq!(
+            held["result"]["root"].as_str(),
+            Some(root.to_hex().as_str())
+        );
+        // No `program_hash`: obtaining it costs a whole-module read plus a SHA-256 of every
+        // chunk, which an ANONYMOUS request must not be able to trigger for an incidental field.
+        // `dig.getModuleInfo` serves a module's content address.
+        assert!(
+            held["result"].get("program_hash").is_none(),
+            "getMetadata must not pay for a content address nothing asked for: {held}"
+        );
+
+        // A root this node holds nothing at — distinct from "held but no section".
+        let absent_root = Bytes32([0xAB; 32]);
+        let (miss_node, _td2) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), absent_root));
+        let miss = handle_rpc(
+            &miss_node,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.getMetadata","params":{
+                "store_id": store_id.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(
+            miss["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "{miss}"
+        );
+    }
+
+    /// `dig.getCapsule` serves the whole `.dig` in the SAME envelope this node's own
+    /// capsule downloader consumes — the two halves of that contract now agree.
+    #[tokio::test]
+    async fn dig_get_capsule_serves_the_module_in_the_downloaders_own_envelope() {
+        let store_id = Bytes32([14u8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>capsule</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        // Drive the loop the real downloader drives: reserve from the FIRST window's
+        // total_length, then follow next_offset until complete. A compiled `.dig` carries the
+        // guest wasm, so it spans several windows — this exercises the multi-window path the
+        // capsule download actually takes, not a one-shot.
+        let window_at = |offset: u64| {
+            handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getCapsule","params":{
+                    "store_id": store_id.to_hex(), "root": root.to_hex(), "offset": offset,
+                }}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            )
+        };
+
+        let first = window_at(0).await;
+        assert!(first.get("error").is_none(), "{first}");
+        assert_eq!(
+            first["result"]["total_length"].as_u64(),
+            Some(module_bytes.len() as u64),
+            "the downloader reserves from total_length before it has every window: {first}"
+        );
+        // A capsule window has no per-resource proof, and says so as the EMPTY STRING rather
+        // than by omission — the field is required on every window, and a caller must be able
+        // to tell "no proof for this" from "this server forgot one". Empty is not a passed
+        // check: a puller binds a module to its on-chain root, it does not verify a Merkle path.
+        assert_eq!(first["result"]["inclusion_proof"], json!(""), "{first}");
+        // chunk_lens is genuinely INAPPLICABLE to a whole module (there is no per-resource chunk
+        // layout), so that one IS omitted rather than sent empty.
+        assert!(first["result"].get("chunk_lens").is_none(), "{first}");
+
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let resp = window_at(offset).await;
+            let result = &resp["result"];
+            assert_eq!(
+                result["offset"].as_u64(),
+                Some(offset),
+                "a window must be served at the offset requested: {resp}"
+            );
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(result["ciphertext"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(
+                result["length"].as_u64(),
+                Some(bytes.len() as u64),
+                "declared length matches the bytes served: {resp}"
+            );
+            assembled.extend_from_slice(&bytes);
+            if result["complete"] == json!(true) {
+                assert!(
+                    result.get("next_offset").is_some_and(Value::is_null),
+                    "the last window ends the loop with an explicit null: {resp}"
+                );
+                break;
+            }
+            let next = result["next_offset"]
+                .as_u64()
+                .expect("an incomplete window advances");
+            assert!(next > offset, "forward progress is mandatory: {resp}");
+            offset = next;
+        }
+        assert_eq!(
+            assembled, module_bytes,
+            "the reassembled bytes ARE the module"
+        );
+
+        // `dig.getModule` is the historical alias and must answer identically.
+        let alias = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getModule","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert_eq!(alias, first, "dig.getModule is an alias of dig.getCapsule");
+    }
+
+    /// A superseded root is refused rather than served — the anti-rollback pin (#127)
+    /// applies to capsule-scoped reads too, not only to `dig.getContent`.
+    #[tokio::test]
+    async fn capsule_scoped_reads_refuse_a_root_the_chain_does_not_confirm() {
+        let store_id = Bytes32([15u8; 32]);
+        let tip = Bytes32([0xEE; 32]);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), tip));
+        for method in ["dig.getPublicManifest", "dig.getMetadata", "dig.getCapsule"] {
+            let resp = handle_rpc(
+                &node,
+                json!({"jsonrpc":"2.0","id":1,"method":method,"params":{
+                    "store_id": store_id.to_hex(), "root": Bytes32([0x11; 32]).to_hex(),
+                }}),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            )
+            .await;
+            assert_eq!(
+                resp["error"]["code"],
+                json!(ROOT_NOT_ANCHORED),
+                "{method} must refuse a root the chain does not confirm: {resp}"
+            );
+        }
     }
 
     // -- LOCAL PLAINTEXT CONTENT-SERVE (#289/#290) — serve_content_plaintext + manifest_paths --------

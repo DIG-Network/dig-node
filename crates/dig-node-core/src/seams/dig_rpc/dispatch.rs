@@ -90,6 +90,24 @@ impl RpcDispatch for Node {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
                 return node.push_capsule(&params, id, origin, provenance).await;
             }
+            // `dig.getPublicManifest` is NOT yet a `dig_rpc_protocol::Method` variant, so — like
+            // the chat methods above — it is dispatched here, before the enum match. Promoting it
+            // into the shared catalogue is a release-first follow-up on that crate (#2071); until
+            // then a node that did not serve it here would answer `-32601` for a method the
+            // rpc.dig.net read tier already allowlists and the hub client already calls.
+            //
+            // SECURITY, and the reason this placement is safe: being absent from the `Method`
+            // catalogue ALSO makes it un-peer-reachable, because `is_peer_reachable_method` ends in
+            // `Method::from_name(m).is_some_and(..)` — an unknown name is filtered out before the
+            // peer surface ever reaches this dispatch. So this arm serves the loopback / in-process
+            // / gateway surface only, and a permissionless peer cannot call it. Promoting the
+            // method into `dig-rpc-protocol` later MUST therefore make a deliberate decision about
+            // `is_peer_reachable()` rather than inherit one: it would otherwise silently widen a
+            // public read from the gateway surface to the whole peer network.
+            "dig.getPublicManifest" => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.get_public_manifest(&params, id).await;
+            }
             _ => {}
         }
 
@@ -120,6 +138,27 @@ impl RpcDispatch for Node {
             // module this node HOLDS — total size, whole-blob content id, and the per-chunk hashes a
             // puller attributes each range against. It describes only local content, so it is a read of
             // this node's own cache, never a chain or network call.
+            // dig.getProof (#2071): a read's trust half — the inclusion proof + the chain-anchored
+            // root it verifies against, no ciphertext. Served by running the ORDINARY getContent
+            // read and discarding the bytes, so the proof is provably the one a content read would
+            // have verified against (see `Node::get_proof`). Previously a passthrough alias, which
+            // meant `-32601` on any node without an upstream.
+            Some(Method::GetProof) => {
+                return node.get_proof(&req, id, origin, provenance).await;
+            }
+            // dig.getMetadata (#2071): the publisher's plaintext metadata manifest (data-section
+            // id 6) for a capsule. PUBLIC, unencrypted — no retrieval_key, no decrypt.
+            Some(Method::GetMetadata) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.get_metadata(&params, id).await;
+            }
+            // dig.getCapsule / dig.getModule (#2071): one window of a whole `.dig` module this
+            // node holds, in the same streaming envelope getContent uses. This node's own capsule
+            // downloader has always consumed this shape from an upstream; now it can serve it too.
+            Some(Method::GetCapsule) | Some(Method::GetModule) => {
+                let params = req.get("params").cloned().unwrap_or(json!({}));
+                return node.get_capsule(&params, id).await;
+            }
             Some(Method::GetModuleInfo) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
                 return node.get_module_info(&params, id).await;
@@ -621,11 +660,11 @@ impl RpcDispatch for Node {
                 };
             }
             // dig.getContent is the canonical local read — the default branch, handled by the
-            // block below the match. Everything the crate catalogues but this core engine does
-            // not serve locally (the shell's passthrough aliases: getCapsule / getModule /
-            // getMetadata / getProof / getProofStatus / listCapsules / health / methods /
-            // rpc.discover) AND any unknown method fall through to method-not-found — exactly
-            // the pre-adoption behaviour (the shell relays those to the upstream on a -32601).
+            // block below the match. What remains unserved here (`dig.getProofStatus`, which polls
+            // an execution-proof JOB this node has none of, and `dig.listCapsules`, which needs a
+            // chain generation walk — both tracked on #2071), plus the shell-answered discovery
+            // methods (health / methods / rpc.discover) and any unknown method, fall through to
+            // method-not-found; the shell relays those to an upstream when one is configured.
             Some(Method::GetContent) => {}
             _ => {
                 return json!({"jsonrpc":"2.0","id":id,

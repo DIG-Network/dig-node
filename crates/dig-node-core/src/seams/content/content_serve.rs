@@ -603,12 +603,22 @@ impl ContentServer for Node {
         let cache_dir = self.cache_dir.clone();
         let capsule = crate::CapsuleKey::parse(store_hex, root_hex)?;
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::read_public_manifest_blocking(&cache_dir, &capsule)
+            crate::read_public_manifest_json(&cache_dir, &capsule)
         })
         .await
         .ok()?;
+        // The memo retains RENDERED manifest JSON (#2071), so read the paths out of that rather
+        // than a decoded tree. Field names are `PublicManifest::to_json`'s, the same shape
+        // `dig.getManifest` puts on the wire.
         match outcome {
-            Ok(Some(Some(pm))) => Some(pm.entries.into_iter().map(|e| e.path).collect()),
+            Ok(Some(Some(manifest))) => Some(
+                manifest
+                    .get("entries")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|e| e.get("path")?.as_str().map(str::to_string))
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -623,16 +633,17 @@ impl ContentServer for Node {
         let capsule = crate::CapsuleKey::parse(store_hex, root_hex)?;
         let key = resource_key.to_string();
         let outcome = tokio::task::spawn_blocking(move || {
-            crate::read_public_manifest_blocking(&cache_dir, &capsule)
+            crate::read_public_manifest_json(&cache_dir, &capsule)
         })
         .await
         .ok()?;
         match outcome {
-            Ok(Some(Some(pm))) => pm
-                .entries
-                .into_iter()
-                .find(|e| e.path == key)
-                .map(|e| e.generation_index),
+            Ok(Some(Some(manifest))) => manifest
+                .get("entries")?
+                .as_array()?
+                .iter()
+                .find(|e| e.get("path").and_then(Value::as_str) == Some(key.as_str()))
+                .and_then(|e| e.get("generation_index")?.as_u64()),
             _ => None,
         }
     }

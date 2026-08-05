@@ -26,8 +26,13 @@ use crate::meta::ErrorCode;
 /// drives request normalisation and keeps the routing intent documented and tested.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Route {
-    /// `dig.getContent` / `dig.getCapsule` — verified content retrieval (returns
-    /// ciphertext + proof + chunk_lens). The only methods whose params we shape.
+    /// `dig.getContent` / `dig.getCapsule` / `dig.getModule` — verified content retrieval
+    /// (returns ciphertext + proof + chunk_lens). The only methods whose params we shape.
+    ///
+    /// `dig.getModule` is here because the catalogue advertises it as an ALIAS of
+    /// `dig.getCapsule` with identical params and result. Routing only the latter made that claim
+    /// false through the shell: `storeId` was normalised to `store_id` for one and not the other,
+    /// so the alias answered `-32602` on input its twin accepted (#2071).
     Content,
     /// `dig.getProof` — inclusion proof for a resource.
     Proof,
@@ -44,7 +49,7 @@ pub enum Route {
 /// Classify a JSON-RPC method. PURE.
 pub fn route_method(method: &str) -> Route {
     match method {
-        "dig.getContent" | "dig.getCapsule" => Route::Content,
+        "dig.getContent" | "dig.getCapsule" | "dig.getModule" => Route::Content,
         "dig.getProof" => Route::Proof,
         "dig.getAnchoredRoot" => Route::AnchoredRoot,
         m if m.starts_with("cache.") => Route::Cache,
@@ -131,6 +136,26 @@ mod tests {
     fn routes_content_methods() {
         assert_eq!(route_method("dig.getContent"), Route::Content);
         assert_eq!(route_method("dig.getCapsule"), Route::Content);
+    }
+
+    /// An ALIAS must route identically to what it aliases, or it is not an alias.
+    ///
+    /// The catalogue advertises `dig.getModule` as "identical params and result" to
+    /// `dig.getCapsule`. Routing is where that claim is kept or broken: `Route::Content` is what
+    /// normalises `storeId` → `store_id`, so routing one and not the other made the alias reject
+    /// input its twin accepted, with `-32602`, while every functional test passed because the
+    /// fixtures all used snake_case already (#2071).
+    ///
+    /// Asserted as EQUALITY against `dig.getCapsule` rather than against `Route::Content`, so the
+    /// two cannot drift apart again even if the route they share is renamed or re-tiered.
+    #[test]
+    fn get_module_routes_identically_to_the_capsule_read_it_aliases() {
+        assert_eq!(
+            route_method("dig.getModule"),
+            route_method("dig.getCapsule"),
+            "dig.getModule is advertised as an alias of dig.getCapsule; a different route means \
+             different param normalisation, so the advertised claim would be false"
+        );
     }
 
     #[test]

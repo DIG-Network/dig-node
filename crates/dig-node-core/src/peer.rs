@@ -4349,6 +4349,15 @@ pub(crate) mod tests {
             "cache.getConfig",
             "control.peerStatus",
             "dig.stage",
+            // #2071: dispatched by NAME (not yet a `dig_rpc_protocol::Method` variant), which is
+            // precisely WHAT keeps it off this surface — `is_peer_reachable_method` ends in
+            // `Method::from_name(..).is_some_and(..)`, so an uncatalogued name is filtered before
+            // the peer transport reaches dispatch. It serves loopback / in-process / gateway only.
+            // Promoting it into the shared crate must therefore be a DELIBERATE
+            // `is_peer_reachable()` decision; inheriting one would silently widen a gateway-only
+            // public read to the whole permissionless peer network. This assertion is what fails
+            // if that promotion happens without the decision.
+            "dig.getPublicManifest",
             "totally.unknown",
             "",
         ] {
