@@ -911,6 +911,15 @@ impl NodeContent {
         self.miss_rate_limiter.reconfigure(capacity, refill_per_sec);
     }
 
+    /// Admit one miss → DHT `find_providers` lookup for `requestor` against its per-requestor budget,
+    /// or refuse it (`false`) when that requestor's bucket is exhausted (dig_ecosystem#2007). The
+    /// `getAvailability` enrichment path lives in a different module ([`crate::Node`]) than the
+    /// bucket's owning struct, so it admits through this accessor rather than the private field the
+    /// single-item legs' [`Self::miss_outcome`] reaches directly.
+    pub(crate) fn allow_miss_lookup(&self, requestor: &crate::rate_limit::RequestorId) -> bool {
+        self.miss_rate_limiter.check(requestor)
+    }
+
     /// The PRODUCTION constructor — wire the engine from the live DHT + the node's mTLS identity,
     /// exactly as dig-download's implementers' note prescribes. Discovery is a [`UnionLocator`] (#1443)
     /// over the live [`DhtProviderLocator`] plus DORMANT PEX + relay-introducer placeholders, so a
@@ -3107,7 +3116,7 @@ pub(crate) mod tests {
             json!({"jsonrpc":"2.0","id":id,"result":{}})
         }
 
-        async fn handle_availability(&self, items: Value) -> Value {
+        async fn handle_availability(&self, items: Value, _conn_key: &str) -> Value {
             let n = items.as_array().map(|a| a.len()).unwrap_or(0);
             let answers: Vec<Value> = (0..n).map(|_| json!({"available": true})).collect();
             json!({"items": answers})

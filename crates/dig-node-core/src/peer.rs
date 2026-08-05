@@ -807,7 +807,13 @@ pub trait PeerRpcResponder: Send + Sync {
 
     /// Answer a `dig.getAvailability` batch (the typed dig-nat control call). `items` is the raw
     /// AvailabilityItem array; returns the `{ "items": [AvailabilityAnswer, …] }` response value.
-    async fn handle_availability(&self, items: Value) -> Value;
+    ///
+    /// `conn_key` is the authenticated caller's mTLS `peer_id` (64-hex; empty for a caller-less/test
+    /// session) — threaded so the not-held → DHT `find_providers` enrichment on this path is bounded
+    /// by the SAME per-requestor miss-lookup budget as the single-item legs (dig_ecosystem#2007). A
+    /// batch is the LARGEST amplification vector (up to `MAX_AVAILABILITY_ITEMS` lookups per request),
+    /// so it must key by the ASKING peer, never one shared peer bucket every peer could exhaust.
+    async fn handle_availability(&self, items: Value, conn_key: &str) -> Value;
 
     /// Stream a `dig.fetchRange` response for `req` (the RangeRequest value) by writing framed
     /// [`dig_nat::mux::RangeFrame`]-shaped frames to `out`. Implementations write the first frame with
@@ -1109,8 +1115,14 @@ where
             write_framed(&mut stream, &resp).await
         }
         PeerRequestKind::Availability => {
+            // The authenticated caller peer_id keys the not-held → DHT `find_providers` enrichment's
+            // per-requestor miss-lookup budget (dig_ecosystem#2007); empty on a caller-less/test session.
+            let conn_key = caller
+                .as_ref()
+                .map(|c| c.peer_id.clone())
+                .unwrap_or_default();
             let items = req.get("items").cloned().unwrap_or_else(|| json!([]));
-            let resp = responder.handle_availability(items).await;
+            let resp = responder.handle_availability(items, &conn_key).await;
             write_framed(&mut stream, &resp).await
         }
         PeerRequestKind::Range => {
@@ -1334,9 +1346,12 @@ impl PeerRpcResponder for NodeResponder {
         .await
     }
 
-    async fn handle_availability(&self, items: Value) -> Value {
+    async fn handle_availability(&self, items: Value, conn_key: &str) -> Value {
         let items = items.as_array().cloned().unwrap_or_default();
-        self.node.availability_batch(&items).await
+        // The verified mTLS peer_id (`conn_key`) keys the per-requestor miss-lookup budget, identical
+        // to the range-stream miss on this same peer surface (dig_ecosystem#2007).
+        let requestor = crate::rate_limit::RequestorId::Peer(conn_key.to_string());
+        self.node.availability_batch(&items, &requestor).await
     }
 
     /// Serve a window of a locally-held whole `.dig` module (#1576, the reshare leg).
@@ -4224,7 +4239,7 @@ pub(crate) mod tests {
             let method = req.get("method").and_then(Value::as_str).unwrap_or("");
             json!({"jsonrpc":"2.0","id":id,"result":{"echo_method": method}})
         }
-        async fn handle_availability(&self, items: Value) -> Value {
+        async fn handle_availability(&self, items: Value, _conn_key: &str) -> Value {
             let n = items.as_array().map(|a| a.len()).unwrap_or(0);
             let answers: Vec<Value> = (0..n).map(|_| json!({"available": true})).collect();
             json!({"items": answers})
@@ -5337,7 +5352,9 @@ pub(crate) mod tests {
         });
 
         let logs = capture_logs(async {
-            let answer = node.availability_answer(&held, &[]).await;
+            let answer = node
+                .availability_answer(&held, &[], &crate::rate_limit::RequestorId::Local)
+                .await;
             assert_eq!(answer["available"], json!(false));
         })
         .await;
@@ -5361,7 +5378,8 @@ pub(crate) mod tests {
         });
 
         let logs = capture_logs(async {
-            node.availability_answer(&bogus, &[]).await;
+            node.availability_answer(&bogus, &[], &crate::rate_limit::RequestorId::Local)
+                .await;
         })
         .await;
 
@@ -5463,7 +5481,8 @@ pub(crate) mod tests {
         });
 
         let logs = capture_logs(async {
-            node.availability_answer(&item, &[]).await;
+            node.availability_answer(&item, &[], &crate::rate_limit::RequestorId::Local)
+                .await;
         })
         .await;
 

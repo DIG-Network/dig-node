@@ -1,13 +1,16 @@
 //! Per-requestor rate limiting for the miss → DHT-lookup path (dig_ecosystem#2007).
 //!
-//! When a content RPC (`dig.getContent` / `dig.fetchRange` / the peer range stream /
-//! `dig.getAvailability`) asks for content this node does NOT hold, the miss handler
-//! ([`crate::Node::miss_outcome`]) runs a DHT `find_providers` lookup (and, on `proxy`, a
-//! full multi-source fetch). Both are network-amplifying: a caller who cannot name any
-//! concrete content it wants can still spend this node's DHT bandwidth by naming arbitrary
-//! `(store, root, retrieval_key)` triples. This gate bounds that spend PER REQUESTOR, so one
-//! abusive caller cannot drive the aggregate lookup rate while a well-behaved caller is
-//! untouched.
+//! When a content RPC (`dig.getContent` / `dig.fetchRange` / the peer range stream) asks for content
+//! this node does NOT hold, the miss handler ([`crate::Node::miss_outcome`]) runs a DHT
+//! `find_providers` lookup (and, on `proxy`, a full multi-source fetch). The `dig.getAvailability`
+//! batch's not-held → holder-hint enrichment ([`crate::Node::availability_answer`]) runs the SAME
+//! `find_providers` lookup per not-held item, admitting through the SAME per-requestor budget (via
+//! [`crate::download::NodeContent::allow_miss_lookup`], ONE token per not-held item — a batch is the
+//! largest amplification vector, up to `MAX_AVAILABILITY_ITEMS` lookups per request). All are
+//! network-amplifying: a caller who cannot name any concrete content it wants can still spend this
+//! node's DHT bandwidth by naming arbitrary `(store, root, retrieval_key)` triples. This gate bounds
+//! that spend PER REQUESTOR, so one abusive caller cannot drive the aggregate lookup rate while a
+//! well-behaved caller is untouched.
 //!
 //! # The primitive
 //!

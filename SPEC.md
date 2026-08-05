@@ -2681,9 +2681,12 @@ the **shell** mints plus the cross-boundary codes a client must be able to branc
 
 The content miss handler (`crate::Node::miss_outcome`, feeding `content_miss_envelope` /
 `range_miss_envelope` / the peer range-stream miss) runs a DHT `find_providers` lookup — and, on an
-explicit `proxy`, a full multi-source fetch — on behalf of the CALLER. Both spend this node's
-network bandwidth, so a caller who cannot name any content it actually wants could otherwise amplify
-this node by naming arbitrary `(store_id, root, retrieval_key)` triples. Three bounds govern the path:
+explicit `proxy`, a full multi-source fetch — on behalf of the CALLER. The `dig.getAvailability`
+batch's not-held → holder-hint enrichment (`Node::availability_answer`) runs the SAME
+`find_providers` lookup per not-held item. Both spend this node's network bandwidth, so a caller who
+cannot name any content it actually wants could otherwise amplify this node by naming arbitrary
+`(store_id, root, retrieval_key)` triples — and a `getAvailability` batch is the LARGEST such vector,
+naming up to `MAX_AVAILABILITY_ITEMS` (= 512) content ids in one request. Three bounds govern the path:
 
 10.4.1. **Per-requestor rate limit.** A token-bucket limiter (default burst
 `DEFAULT_MISS_LOOKUP_BURST` = 16, refill `DEFAULT_MISS_LOOKUP_REFILL_PER_SEC` = 4/s) sits in FRONT of
@@ -2694,6 +2697,15 @@ for the trusted operator loopback. An over-budget requestor's miss is refused wi
 tracked-requestor table is bounded (`MAX_TRACKED_REQUESTORS`), evicting only idle (full) buckets so
 eviction can never weaken a live bound. The oracle bound is enforced upstream: a caller that cannot
 name a concrete 64-hex `ContentId` (`miss_content_for` returns `None`) triggers no lookup at all.
+
+The SAME budget bounds the `dig.getAvailability` enrichment, spent **one token per not-held item**
+that would trigger a lookup (NOT one token per batch — a single per-batch check would still admit 512
+lookups for one token and re-open the hole). When the requestor's bucket is exhausted, the remaining
+items answer not-available WITHOUT a lookup — the redirect/`providers` hint is best-effort enrichment,
+so dropping it leaves the availability answer itself (held vs not-held from local inventory)
+unchanged. So the number of `find_providers` lookups a single requestor can cause via
+`getAvailability` — across ANY batch size and ANY call rate — is bounded by its per-requestor token
+budget, identical to the single-item legs.
 
 10.4.2. **Candidate cap.** A redirect names at most `MAX_REDIRECT_PROVIDERS` (= dig-dht's
 `MAX_ADDRESSES_PER_RECORD`) holders (§10 `-32008`); `find_providers` already caps the addresses per

@@ -3240,7 +3240,12 @@ impl Node {
     /// either direction (a capsule landing after the snapshot is immediately available; an evicted
     /// one immediately is not). One `stat` per item is also strictly cheaper than the walk on this
     /// peer-facing path.
-    async fn availability_answer(&self, item: &Value, cached: &[CachedCapsule]) -> Value {
+    async fn availability_answer(
+        &self,
+        item: &Value,
+        cached: &[CachedCapsule],
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Value {
         let store = item.get("store_id").and_then(Value::as_str).unwrap_or("");
         let root = item.get("root").and_then(Value::as_str);
         let rk = item.get("retrieval_key").and_then(Value::as_str);
@@ -3293,13 +3298,29 @@ impl Node {
         // against a holder instead of dead-ending — the availability-shaped counterpart to the
         // getContent/fetchRange redirect. No engine / no provider → the plain not-available answer
         // stands (the field is simply absent). Self is excluded by `find_providers`.
+        //
+        // The `find_providers` lookup is a DHT-amplifying operation, so it is bounded by the SAME
+        // per-requestor miss-lookup budget as the single-item legs (dig_ecosystem#2007): ONE token per
+        // not-held item that would trigger a lookup — NOT one per batch, or a 512-item batch would fire
+        // 512 lookups for a single token and re-open the amplification hole. When the requestor's bucket
+        // is exhausted, the remaining items answer not-available WITHOUT a lookup — the redirect hint is
+        // best-effort enrichment, so dropping it leaves the availability answer itself (held vs not-held
+        // from local inventory) unchanged. The token is spent only once `availability_content_id`
+        // confirms a lookup would actually run, so a non-canonical item never consumes budget.
+        // NOTE: the proxy leg elsewhere still draws from this same cheap budget — a tracked non-gating
+        // security follow-up (dig_ecosystem#2007 Realizations), no behaviour change here.
         if answer["available"].as_bool() != Some(true) {
             if let Some(pc) = self.p2p_content() {
                 if let Some(content) = download::availability_content_id(store, root, rk) {
-                    let providers = pc.find_providers(&content).await;
-                    if !providers.is_empty() {
-                        if let Some(obj) = answer.as_object_mut() {
-                            obj.insert("providers".into(), download::providers_json(&providers));
+                    if pc.allow_miss_lookup(requestor) {
+                        let providers = pc.find_providers(&content).await;
+                        if !providers.is_empty() {
+                            if let Some(obj) = answer.as_object_mut() {
+                                obj.insert(
+                                    "providers".into(),
+                                    download::providers_json(&providers),
+                                );
+                            }
                         }
                     }
                 }
@@ -3321,7 +3342,16 @@ impl Node {
     ///
     /// The batch is CAPPED at [`MAX_AVAILABILITY_ITEMS`] — the item count is caller-controlled — with
     /// the excess simply not answered (the result array is aligned to the answered prefix).
-    pub async fn availability_batch(&self, items: &[Value]) -> Value {
+    ///
+    /// `requestor` keys the per-item not-held → DHT `find_providers` enrichment against its
+    /// per-requestor miss-lookup budget (dig_ecosystem#2007), so a large batch of not-held items from
+    /// one caller cannot amplify into an unbounded lookup rate — the item cap bounds the RESPONSE, the
+    /// budget bounds the outbound LOOKUP work.
+    pub async fn availability_batch(
+        &self,
+        items: &[Value],
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Value {
         let capped = &items[..items.len().min(MAX_AVAILABILITY_ITEMS)];
         // At most one directory walk for the whole batch, and none at all unless some item asks at
         // STORE granularity (the only answer that needs the held-roots enumeration).
@@ -3335,7 +3365,7 @@ impl Node {
         };
         let mut answers = Vec::with_capacity(capped.len());
         for item in capped {
-            answers.push(self.availability_answer(item, &cached).await);
+            answers.push(self.availability_answer(item, &cached, requestor).await);
         }
         json!({ "items": answers })
     }
@@ -8058,7 +8088,9 @@ mod tests {
             json!({ "store_id": store_b.to_hex(), "root": root_b.to_hex() }),
             json!({ "store_id": "cc".repeat(32), "root": "dd".repeat(32) }), // a miss
         ];
-        let resp = node.availability_batch(&items).await;
+        let resp = node
+            .availability_batch(&items, &crate::rate_limit::RequestorId::Local)
+            .await;
         let arr = resp["items"].as_array().expect("items array");
         assert_eq!(arr.len(), 3, "positionally aligned with the request");
         assert_eq!(arr[0]["available"], true, "store A root held");
@@ -8073,7 +8105,9 @@ mod tests {
         let items: Vec<Value> = (0..(MAX_AVAILABILITY_ITEMS + 1))
             .map(|_| json!({ "store_id": "ee".repeat(32) }))
             .collect();
-        let resp = node.availability_batch(&items).await;
+        let resp = node
+            .availability_batch(&items, &crate::rate_limit::RequestorId::Local)
+            .await;
         assert_eq!(
             resp["items"].as_array().unwrap().len(),
             MAX_AVAILABILITY_ITEMS,
@@ -8272,7 +8306,13 @@ mod tests {
             "root": root.to_hex(),
             "retrieval_key": hex::encode(rk),
         });
-        let answer = node.availability_answer(&item, &stale_snapshot).await;
+        let answer = node
+            .availability_answer(
+                &item,
+                &stale_snapshot,
+                &crate::rate_limit::RequestorId::Local,
+            )
+            .await;
         assert_eq!(
             answer["available"], true,
             "a servable capsule must be reported available even if the snapshot predates it"
@@ -8302,7 +8342,13 @@ mod tests {
         );
 
         let item = json!({ "store_id": store.to_hex(), "root": root.to_hex() });
-        let answer = node.availability_answer(&item, &stale_snapshot).await;
+        let answer = node
+            .availability_answer(
+                &item,
+                &stale_snapshot,
+                &crate::rate_limit::RequestorId::Local,
+            )
+            .await;
         assert_eq!(
             answer["available"], false,
             "an evicted capsule must not be reported available"
@@ -8320,7 +8366,10 @@ mod tests {
         let never_held = json!({ "store_id": "ab".repeat(32), "root": "cd".repeat(32) });
 
         let resp = node
-            .availability_batch(&[item.clone(), never_held.clone()])
+            .availability_batch(
+                &[item.clone(), never_held.clone()],
+                &crate::rate_limit::RequestorId::Local,
+            )
             .await;
         assert_eq!(resp["items"][0]["available"], true, "landed → available");
         assert_eq!(
@@ -8331,7 +8380,9 @@ mod tests {
         node.cache_remove_cached(&store.to_hex(), &root.to_hex())
             .await
             .unwrap();
-        let resp = node.availability_batch(&[item]).await;
+        let resp = node
+            .availability_batch(&[item], &crate::rate_limit::RequestorId::Local)
+            .await;
         assert_eq!(
             resp["items"][0]["available"], false,
             "evicted → no longer available"
@@ -8357,11 +8408,14 @@ mod tests {
         let traversal_via_store = json!({ "store_id": "..", "root": "secret" });
         let traversal_via_root = json!({ "store_id": ".", "root": "../secret" });
         let resp = node
-            .availability_batch(&[
-                traversal_via_store,
-                traversal_via_root,
-                json!({ "store_id": "zz".repeat(32) }),
-            ])
+            .availability_batch(
+                &[
+                    traversal_via_store,
+                    traversal_via_root,
+                    json!({ "store_id": "zz".repeat(32) }),
+                ],
+                &crate::rate_limit::RequestorId::Local,
+            )
             .await;
         assert_eq!(
             resp["items"][0]["available"], false,
@@ -8377,7 +8431,10 @@ mod tests {
         );
         // The genuine capsule still answers correctly beside the rejected keys.
         let ok = node
-            .availability_batch(&[json!({ "store_id": store.to_hex(), "root": root.to_hex() })])
+            .availability_batch(
+                &[json!({ "store_id": store.to_hex(), "root": root.to_hex() })],
+                &crate::rate_limit::RequestorId::Local,
+            )
             .await;
         assert_eq!(ok["items"][0]["available"], true);
     }
@@ -8396,7 +8453,9 @@ mod tests {
         let root = seed_served_capsule(&node, &store, &[("index.html", b"hi")]);
 
         let null_root = json!({ "store_id": store.to_hex(), "root": Value::Null });
-        let resp = node.availability_batch(&[null_root]).await;
+        let resp = node
+            .availability_batch(&[null_root], &crate::rate_limit::RequestorId::Local)
+            .await;
         assert_eq!(
             resp["items"][0]["available"], true,
             "a null root asks store granularity, not a specific (missing) root"
@@ -8408,7 +8467,9 @@ mod tests {
         );
 
         let numeric_root = json!({ "store_id": store.to_hex(), "root": 1 });
-        let resp = node.availability_batch(&[numeric_root]).await;
+        let resp = node
+            .availability_batch(&[numeric_root], &crate::rate_limit::RequestorId::Local)
+            .await;
         assert_eq!(
             resp["items"][0]["available"], true,
             "a non-string root is likewise store granularity, not a servable-root miss"
@@ -11409,6 +11470,109 @@ mod tests {
             other["error"]["code"],
             json!(CONTENT_REDIRECT),
             "a different requestor is unaffected by the abuser's exhausted bucket: {other}"
+        );
+    }
+
+    /// dig_ecosystem#2007 Unit B: the `dig.getAvailability` batch's not-held → DHT `find_providers`
+    /// enrichment is bounded by the SAME per-requestor miss-lookup budget as the single-item legs,
+    /// spent ONE TOKEN PER NOT-HELD ITEM — so a large batch cannot amplify a single token into an
+    /// unbounded lookup rate. This is the LARGEST amplification vector on the miss path (up to
+    /// `MAX_AVAILABILITY_ITEMS` lookups per request), and it was completely ungoverned before this fix.
+    ///
+    /// Fixture design (the DEV_LOG #1586/#1590 rules): a batch of FOUR distinct not-held items against a
+    /// pinned no-refill pool of exactly TWO. The per-item semantics are pinned from BOTH sides —
+    /// items 0 and 1 (within budget) are enriched with `providers`, items 2 and 3 (over budget) are
+    /// NOT — and a truthful CONTROL peer sends the identical batch and still gets ITS first two
+    /// enriched, proving the budget is keyed per requestor, not shared. This is LOAD-BEARING against the
+    /// two nearest wrong implementations: removing the per-item `check` entirely, OR moving it to
+    /// once-per-batch, would enrich ALL FOUR of the abuser's items and RED the `providers.is_none()`
+    /// assertions on items 2 and 3. The availability ANSWER itself (`available=false`, from local
+    /// inventory) is unchanged for every item — only the best-effort redirect hint is dropped.
+    #[test]
+    fn get_availability_enrichment_is_rate_limited_per_item_per_requestor() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let (node, td) = test_node(None);
+        // A DHT holder exists for any queried content (the mock locator answers a fixed provider set),
+        // so a not-held item WOULD be enriched — unless the per-requestor budget refuses the lookup.
+        let cid = ContentId::resource([0x21; 32], [0x22; 32], [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(7, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        // Pin a small, deterministic per-requestor pool of exactly 2 (no refill), smaller than the batch.
+        node.p2p_content()
+            .expect("engine attached")
+            .set_miss_rate_limit(2.0, 0.0);
+
+        // FOUR distinct, not-held, store-granularity items — each names a valid content id, so each
+        // WOULD trigger a `find_providers` lookup absent the budget. The node holds none of them.
+        let batch: Vec<Value> = ["a1", "b2", "c3", "d4"]
+            .iter()
+            .map(|p| json!({ "store_id": p.repeat(32) }))
+            .collect();
+
+        let abuser = crate::rate_limit::RequestorId::Peer("aaaa".to_string());
+        let control = crate::rate_limit::RequestorId::Peer("bbbb".to_string());
+
+        let abuser_resp = rt.block_on(node.availability_batch(&batch, &abuser));
+        let items = abuser_resp["items"].as_array().expect("four answers");
+        assert_eq!(items.len(), 4, "one answer per item");
+        // The ANSWER itself is unchanged for every item — none is held.
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(
+                item["available"],
+                json!(false),
+                "item {i} is not held regardless of enrichment: {item}"
+            );
+        }
+        // Items 0 and 1 spent the two-token budget and ARE enriched with a redirect hint.
+        assert!(
+            items[0].get("providers").is_some(),
+            "item 0 within budget is enriched: {}",
+            items[0]
+        );
+        assert!(
+            items[1].get("providers").is_some(),
+            "item 1 within budget is enriched: {}",
+            items[1]
+        );
+        // Items 2 and 3 are OVER budget: the lookup is refused, so NO `providers` hint. This is the
+        // per-item assertion a once-per-batch (or no-check) implementation cannot satisfy.
+        assert!(
+            items[2].get("providers").is_none(),
+            "item 2 over budget must NOT trigger a lookup (per-item bound): {}",
+            items[2]
+        );
+        assert!(
+            items[3].get("providers").is_none(),
+            "item 3 over budget must NOT trigger a lookup (per-item bound): {}",
+            items[3]
+        );
+
+        // A DIFFERENT requestor draws from its OWN bucket: its first two items are still enriched,
+        // proving the budget is keyed per requestor and the abuser never starved the control.
+        let control_resp = rt.block_on(node.availability_batch(&batch, &control));
+        let control_items = control_resp["items"].as_array().expect("four answers");
+        assert!(
+            control_items[0].get("providers").is_some(),
+            "control item 0 unaffected by the abuser's exhausted bucket: {}",
+            control_items[0]
+        );
+        assert!(
+            control_items[1].get("providers").is_some(),
+            "control item 1 unaffected by the abuser's exhausted bucket: {}",
+            control_items[1]
+        );
+        assert!(
+            control_items[2].get("providers").is_none(),
+            "control item 2 refused by its OWN bucket, not the abuser's: {}",
+            control_items[2]
         );
     }
 

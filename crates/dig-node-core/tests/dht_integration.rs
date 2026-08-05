@@ -61,7 +61,7 @@ impl PeerRpcResponder for DhtServingResponder {
         let id = req.get("id").cloned().unwrap_or(json!(1));
         json!({"jsonrpc":"2.0","id":id,"result":{}})
     }
-    async fn handle_availability(&self, _items: Value) -> Value {
+    async fn handle_availability(&self, _items: Value, _conn_key: &str) -> Value {
         json!({"items": []})
     }
     async fn stream_range(

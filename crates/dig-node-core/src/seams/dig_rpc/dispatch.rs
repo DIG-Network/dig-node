@@ -257,7 +257,10 @@ impl RpcDispatch for Node {
                         )
                     }
                 };
-                return json!({"jsonrpc":"2.0","id":id,"result": node.availability_batch(&items).await});
+                // Thread the in-scope `requestor` so the not-held → DHT enrichment on this JSON leg is
+                // bounded by the SAME per-requestor miss-lookup budget as the single-item legs
+                // (dig_ecosystem#2007) — a batch is the largest amplification vector on this path.
+                return json!({"jsonrpc":"2.0","id":id,"result": node.availability_batch(&items, &requestor).await});
             }
             Some(Method::ListInventory) => {
                 // Enumerate what this node serves: its stores, or the roots it holds for a given store.
