@@ -41,12 +41,12 @@ struct TestResponder;
 
 #[async_trait::async_trait]
 impl PeerRpcResponder for TestResponder {
-    async fn handle_json_rpc(&self, req: Value) -> Value {
+    async fn handle_json_rpc(&self, req: Value, _conn_key: &str) -> Value {
         let id = req.get("id").cloned().unwrap_or(json!(1));
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         json!({"jsonrpc":"2.0","id":id,"result":{"served_method": method, "peers": []}})
     }
-    async fn handle_availability(&self, items: Value) -> Value {
+    async fn handle_availability(&self, items: Value, _conn_key: &str) -> Value {
         let n = items.as_array().map(|a| a.len()).unwrap_or(0);
         let answers: Vec<Value> = (0..n)
             .map(|_| json!({"available": true, "total_length": 1024, "chunk_count": 1}))

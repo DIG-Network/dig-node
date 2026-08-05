@@ -51,6 +51,7 @@ pub trait RpcDispatch: Send + Sync {
         req: Value,
         origin: crate::download::ReadOrigin,
         provenance: crate::download::RequestProvenance,
+        requestor: crate::rate_limit::RequestorId,
     ) -> Value;
 }
 
@@ -61,6 +62,7 @@ impl RpcDispatch for Node {
         req: Value,
         origin: crate::download::ReadOrigin,
         provenance: crate::download::RequestProvenance,
+        requestor: crate::rate_limit::RequestorId,
     ) -> Value {
         // `node` alias: the body below is relocated VERBATIM from the pre-#1285-W1b-5
         // `handle_rpc(node: &Node, req: Value)` free function — byte-identical, just bound to
@@ -255,7 +257,10 @@ impl RpcDispatch for Node {
                         )
                     }
                 };
-                return json!({"jsonrpc":"2.0","id":id,"result": node.availability_batch(&items).await});
+                // Thread the in-scope `requestor` so the not-held → DHT enrichment on this JSON leg is
+                // bounded by the SAME per-requestor miss-lookup budget as the single-item legs
+                // (dig_ecosystem#2007) — a batch is the largest amplification vector on this path.
+                return json!({"jsonrpc":"2.0","id":id,"result": node.availability_batch(&items, &requestor).await});
             }
             Some(Method::ListInventory) => {
                 // Enumerate what this node serves: its stores, or the roots it holds for a given store.
@@ -366,6 +371,7 @@ impl RpcDispatch for Node {
                                 download::miss_content_for(store_hex, root_hex, rk_hex)
                             {
                                 let depth = download::redirect_depth(&params);
+                                let proxy = download::proxy_requested(&params);
                                 if let Some(envelope) = node
                                     .range_miss_envelope(
                                         &id,
@@ -373,7 +379,9 @@ impl RpcDispatch for Node {
                                         depth,
                                         offset,
                                         length,
+                                        proxy,
                                         land_origin,
+                                        &requestor,
                                     )
                                     .await
                                 {
@@ -852,6 +860,7 @@ impl RpcDispatch for Node {
         //     provider falls through to the upstream proxy below (byte-identical to before).
         if let Some(content) = download::miss_content_for(store_hex, &root_hex, rk_hex) {
             let depth = download::redirect_depth(&params);
+            let proxy = download::proxy_requested(&params);
             let pin_hex = pinned_root.map(|r| r.to_hex());
             // Fold the two landing axes ONCE (#1956): a cross-site-driven `dig.getContent` POST still
             // serves the bytes, but the miss-path landing legs (the miss-envelope→`fetch_resource`→
@@ -865,7 +874,9 @@ impl RpcDispatch for Node {
                     depth,
                     offset,
                     pin_hex.as_deref(),
+                    proxy,
                     land_origin,
+                    &requestor,
                 )
                 .await
             {

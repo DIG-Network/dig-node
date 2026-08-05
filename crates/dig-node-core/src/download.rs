@@ -64,6 +64,21 @@ use crate::seams::dig_peer::{
 /// re-requests against a holder. Catalogued in docs.dig.net (L7 peer-network spec + error catalog).
 pub const CONTENT_REDIRECT: i64 = -32008;
 
+/// JSON-RPC error code: the miss → DHT-lookup path is being driven too fast BY THIS REQUESTOR
+/// (dig_ecosystem#2007). Returned instead of a redirect/fetch when the per-requestor
+/// [`MissRateLimiter`](crate::rate_limit::MissRateLimiter) bucket is exhausted, so an abusive caller
+/// backs off while a different caller is unaffected. An old client sees a plain JSON-RPC error (it
+/// never silently succeeds). Catalogued in docs.dig.net (L7 error catalog).
+pub const CONTENT_MISS_RATE_LIMITED: i64 = -32009;
+
+/// The hard cap on how many holder candidates a single [`CONTENT_REDIRECT`] names
+/// (dig_ecosystem#2007). A redirect NAMES candidates; this node does NOT dial/probe them
+/// (reachability is the requestor's job via its own #1985 ladder), so a large candidate list is pure
+/// wire cost + a wider disclosure of who holds the content for no benefit — the requestor only needs
+/// a few to try. Set to `dig-dht`'s own [`MAX_ADDRESSES_PER_RECORD`](dig_dht::MAX_ADDRESSES_PER_RECORD)
+/// so the candidate bound matches the per-record address bound the same records already carry.
+pub const MAX_REDIRECT_PROVIDERS: usize = dig_dht::MAX_ADDRESSES_PER_RECORD;
+
 /// The redirect hop bound (#165): a request that has already been redirected this many times is
 /// answered with the plain not-found instead of another redirect, so a set of nodes can never
 /// bounce a caller in a loop. The caller echoes the served `redirect_depth` on its re-request.
@@ -613,6 +628,13 @@ pub struct NodeContent {
     /// uses. `None` until then, and permanently `None` on the FFI/base path — a read behaves identically
     /// with or without the reshare leg.
     capsule_warmer: std::sync::OnceLock<Arc<crate::seams::dig_peer::CapsuleWarmer>>,
+    /// Per-requestor rate limiter in FRONT of the miss → DHT-lookup path (dig_ecosystem#2007). A
+    /// content miss runs `find_providers` (and, on `proxy`, a full multi-source fetch), both of which
+    /// spend this node's DHT/network bandwidth on behalf of the CALLER — an amplification surface a
+    /// caller can drive by naming arbitrary `(store, root, retrieval_key)` triples. This bounds that
+    /// spend per requestor, so one abusive caller cannot drive the aggregate lookup rate while an
+    /// honest caller is untouched. See [`crate::rate_limit`].
+    miss_rate_limiter: crate::rate_limit::MissRateLimiter,
 }
 
 /// A [`StateStore`] wrapper over a [`FileStateStore`] that SNAPSHOTS every saved [`DownloadState`]
@@ -876,7 +898,26 @@ impl NodeContent {
             fetch_lock: tokio::sync::Mutex::new(()),
             connected_pool,
             capsule_warmer: std::sync::OnceLock::new(),
+            miss_rate_limiter: crate::rate_limit::MissRateLimiter::with_defaults(),
         })
+    }
+
+    /// Reconfigure the miss-path rate limiter's per-requestor bound. Used by the enforcement tests to
+    /// pin a small, deterministic (no-refill) per-requestor pool so the "(N+1)th miss is refused"
+    /// bound is exercised without waiting on wall-clock refill. Production keeps the [`Self::new`]
+    /// default; this only tightens the bound for a test, never loosens it at runtime.
+    #[cfg(test)]
+    pub(crate) fn set_miss_rate_limit(&self, capacity: f64, refill_per_sec: f64) {
+        self.miss_rate_limiter.reconfigure(capacity, refill_per_sec);
+    }
+
+    /// Admit one miss → DHT `find_providers` lookup for `requestor` against its per-requestor budget,
+    /// or refuse it (`false`) when that requestor's bucket is exhausted (dig_ecosystem#2007). The
+    /// `getAvailability` enrichment path lives in a different module ([`crate::Node`]) than the
+    /// bucket's owning struct, so it admits through this accessor rather than the private field the
+    /// single-item legs' [`Self::miss_outcome`] reaches directly.
+    pub(crate) fn allow_miss_lookup(&self, requestor: &crate::rate_limit::RequestorId) -> bool {
+        self.miss_rate_limiter.check(requestor)
     }
 
     /// The PRODUCTION constructor — wire the engine from the live DHT + the node's mTLS identity,
@@ -1431,6 +1472,10 @@ pub(crate) enum MissOutcome {
     },
     /// No engine / no providers / hop budget exhausted: the caller's own not-found stands.
     NotFound,
+    /// The per-requestor miss-lookup budget is exhausted (dig_ecosystem#2007): refuse the lookup with
+    /// a [`CONTENT_MISS_RATE_LIMITED`] error so this requestor backs off. A DIFFERENT requestor draws
+    /// from its own bucket and is unaffected.
+    RateLimited,
 }
 
 impl crate::Node {
@@ -1460,30 +1505,53 @@ impl crate::Node {
         }
     }
 
-    /// Decide the #165 miss outcome for `content` at redirect depth `depth`: fetch-through when
-    /// configured (falling back to redirect if the fetch fails), else locate + redirect within the
-    /// hop budget, else not-found. NEVER a silent 404 while a provider exists.
+    /// Decide the #165 miss outcome for `content` at redirect depth `depth`. Order:
+    /// 1. **Rate-limit** the miss → DHT-lookup path PER REQUESTOR (dig_ecosystem#2007): an
+    ///    over-budget `requestor` is refused with [`MissOutcome::RateLimited`] BEFORE any DHT lookup
+    ///    or fetch, so an abusive caller cannot amplify this node's network spend; a different
+    ///    requestor draws from its own bucket and is unaffected.
+    /// 2. **Proxy fetch-through** (`proxy == true`, opt-in per request — NOT automatic): pull the
+    ///    resource from the holders via the identical chain-anchored merkle-verified fetch path and
+    ///    serve the bytes directly. This is the explicit fallback for a requestor that cannot itself
+    ///    reach the holders (NAT asymmetry). The `origin != Local` reshare refusal stays intact — the
+    ///    proxy serves bytes but this middle node does NOT become a holder (the amplification
+    ///    boundary). The env-configured [`MissMode::FetchThrough`] still applies for the operator's
+    ///    own reads.
+    /// 3. **Redirect** (default): locate the holders (bounded lookup) and name a capped candidate set
+    ///    so the requestor re-requests against a holder over its OWN reachability ladder.
+    /// 4. else **not-found** — NEVER a silent 404 while a provider exists.
     pub(crate) async fn miss_outcome(
         &self,
         content: &ContentId,
         depth: u64,
+        proxy: bool,
         origin: ReadOrigin,
+        requestor: &crate::rate_limit::RequestorId,
     ) -> MissOutcome {
-        // No P2P content engine (the in-process FFI path) → the caller's own not-found stands.
+        // No P2P content engine (the in-process FFI path) → the caller's own not-found stands. Checked
+        // BEFORE the rate limiter: with no engine there is no lookup to amplify, so no token is spent.
         let Some(pc) = self.p2p_content() else {
             return MissOutcome::NotFound;
         };
 
-        // Fetch-through (opt-in): pull the resource from the holders via dig-download, serve it
-        // directly. On any failure, fall through to the redirect so a provider-held resource is never
+        // (1) Per-requestor rate limit, in front of BOTH the DHT lookup and the proxy fetch — the two
+        // network-amplifying legs. An exhausted bucket refuses THIS requestor's lookup; a different
+        // requestor is untouched.
+        if !pc.miss_rate_limiter.check(requestor) {
+            return MissOutcome::RateLimited;
+        }
+
+        // (2) Fetch-through: either the operator's env-configured default (`MissMode::FetchThrough`)
+        // or an explicit per-request `proxy` fallback for a requestor that cannot reach the holders
+        // itself. On any failure, fall through to the redirect so a provider-held resource is never
         // silently 404'd.
-        if pc.miss_mode() == MissMode::FetchThrough {
+        if proxy || pc.miss_mode() == MissMode::FetchThrough {
             if let Ok(fetched) = pc.fetch_resource(content, origin).await {
                 return MissOutcome::Fetched(fetched);
             }
         }
 
-        // Redirect (default): locate the holders and name them so the caller re-requests there.
+        // (3) Redirect (default): locate the holders and name them so the caller re-requests there.
         // BOUND the hops — a request already redirected [`REDIRECT_HOP_CAP`] times is answered with
         // the plain not-found instead of another redirect, so nodes can never bounce a caller in a
         // loop. (The check is here, not on the providers, so an exhausted budget short-circuits the
@@ -1505,6 +1573,7 @@ impl crate::Node {
     /// Shape the miss outcome for a `dig.fetchRange` JSON-RPC call: `Some(envelope)` when the P2P
     /// layer can answer (a fetched frame or a redirect), `None` to fall back to the caller's own
     /// not-found.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn range_miss_envelope(
         &self,
         id: &Value,
@@ -1512,9 +1581,14 @@ impl crate::Node {
         depth: u64,
         offset: usize,
         length: usize,
+        proxy: bool,
         origin: ReadOrigin,
+        requestor: &crate::rate_limit::RequestorId,
     ) -> Option<Value> {
-        match self.miss_outcome(content, depth, origin).await {
+        match self
+            .miss_outcome(content, depth, proxy, origin, requestor)
+            .await
+        {
             MissOutcome::Fetched(f) => Some(match f.range_frame(offset, length) {
                 Ok(frame) => json!({"jsonrpc":"2.0","id":id,"result":frame}),
                 Err((code, message)) => crate::rpc_err(id, code, &message),
@@ -1524,6 +1598,11 @@ impl crate::Node {
                 next_depth,
             } => Some(json!({"jsonrpc":"2.0","id":id,
                 "error": redirect_error_object(content, &providers, next_depth)})),
+            MissOutcome::RateLimited => Some(crate::rpc_err(
+                id,
+                CONTENT_MISS_RATE_LIMITED,
+                MISS_RATE_LIMITED_MESSAGE,
+            )),
             MissOutcome::NotFound => None,
         }
     }
@@ -1532,6 +1611,7 @@ impl crate::Node {
     /// answer, `None` to fall back to the caller's own response. A fetched-through resource is
     /// served ONLY when its committed root matches the pinned chain-anchored root (`pinned_root_hex`
     /// — #127: peers are never the root authority); on a mismatch the fallback stands.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn content_miss_envelope(
         &self,
         id: &Value,
@@ -1539,9 +1619,14 @@ impl crate::Node {
         depth: u64,
         offset: usize,
         pinned_root_hex: Option<&str>,
+        proxy: bool,
         origin: ReadOrigin,
+        requestor: &crate::rate_limit::RequestorId,
     ) -> Option<Value> {
-        match self.miss_outcome(content, depth, origin).await {
+        match self
+            .miss_outcome(content, depth, proxy, origin, requestor)
+            .await
+        {
             MissOutcome::Fetched(f) => {
                 let root_ok = match pinned_root_hex {
                     Some(pin) => f.root.as_deref() == Some(pin),
@@ -1562,12 +1647,22 @@ impl crate::Node {
                 next_depth,
             } => Some(json!({"jsonrpc":"2.0","id":id,
                 "error": redirect_error_object(content, &providers, next_depth)})),
+            MissOutcome::RateLimited => Some(crate::rpc_err(
+                id,
+                CONTENT_MISS_RATE_LIMITED,
+                MISS_RATE_LIMITED_MESSAGE,
+            )),
             MissOutcome::NotFound => None,
         }
     }
 }
 
 // -- Redirect shaping (pure) --------------------------------------------------------------------------
+
+/// The human message on a [`CONTENT_MISS_RATE_LIMITED`] error — the miss-lookup budget for this
+/// requestor is spent; retry after backing off.
+pub(crate) const MISS_RATE_LIMITED_MESSAGE: &str =
+    "miss lookup rate limit exceeded for this requestor; back off and retry";
 
 /// The redirect depth a request has already consumed: `params.redirect_depth` (default 0). The
 /// caller echoes the depth a redirect served it, so the budget is monotone across hops.
@@ -1576,6 +1671,18 @@ pub(crate) fn redirect_depth(params: &Value) -> u64 {
         .get("redirect_depth")
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+/// Whether the request opts into the bounded PROXY fallback (dig_ecosystem#2007): `params.proxy ==
+/// true` asks this node to fetch the resource from the holders (over the identical chain-anchored
+/// merkle-verified path) and serve the bytes back, instead of redirecting — the explicit escape hatch
+/// for a requestor that cannot reach the holders itself (NAT asymmetry). Default `false`: automatic
+/// fetch-on-miss stays OFF; the caller must ask.
+pub(crate) fn proxy_requested(params: &Value) -> bool {
+    params
+        .get("proxy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Build the [`CONTENT_REDIRECT`] JSON-RPC error OBJECT (the `error` member): the catalogued code,
@@ -1592,7 +1699,12 @@ pub(crate) fn redirect_error_object(
         "message": "content not held by this node; re-request against a provider in data.redirect",
         "data": { "redirect": {
             "content": content_id_json(content),
-            "providers": providers.iter().map(provider_json).collect::<Vec<Value>>(),
+            // Cap the candidate set (dig_ecosystem#2007): a redirect NAMES holders (the requestor
+            // dials them over its own reachability ladder), so a few candidates suffice and a large
+            // list is pure wire cost + a wider holder disclosure. `find_providers` already caps
+            // addresses-per-record; this caps records-per-redirect.
+            "providers": providers.iter().take(MAX_REDIRECT_PROVIDERS)
+                .map(provider_json).collect::<Vec<Value>>(),
             "redirect_depth": next_depth,
             "max_redirects": REDIRECT_HOP_CAP,
         }}
@@ -1605,9 +1717,17 @@ fn provider_json(p: &ProviderRecord) -> Value {
     json!({ "peer_id": p.provider_peer_id, "addresses": p.addresses })
 }
 
-/// The `providers` array for an enriched `dig.getAvailability` miss answer.
+/// The `providers` array for an enriched `dig.getAvailability` miss answer — capped at
+/// [`MAX_REDIRECT_PROVIDERS`] (dig_ecosystem#2007), the same candidate bound the `-32008` redirect
+/// applies, so the availability hint never discloses more holders than a redirect would.
 pub(crate) fn providers_json(providers: &[ProviderRecord]) -> Value {
-    Value::Array(providers.iter().map(provider_json).collect())
+    Value::Array(
+        providers
+            .iter()
+            .take(MAX_REDIRECT_PROVIDERS)
+            .map(provider_json)
+            .collect(),
+    )
 }
 
 /// Render a [`ContentId`] as the `data.redirect.content` object (`store_id` [+ `root`
@@ -1938,6 +2058,58 @@ pub(crate) mod tests {
         assert_eq!(r["content"]["store_id"], json!("01".repeat(32)));
         assert_eq!(r["content"]["root"], json!("02".repeat(32)));
         assert_eq!(r["content"]["retrieval_key"], json!("03".repeat(32)));
+    }
+
+    /// dig_ecosystem#2007 Unit A: the redirect candidate set is CAPPED at [`MAX_REDIRECT_PROVIDERS`].
+    ///
+    /// Fixture design — pin the bound from BOTH sides: build `MAX_REDIRECT_PROVIDERS + 1` DISTINCT
+    /// holders (so the input genuinely exceeds the cap; an at-or-under fixture could not tell a real
+    /// cap from an absent one), assert the output is truncated to exactly the cap, AND that a set of
+    /// exactly the cap size is passed through untouched (the at-bound case must still fit).
+    #[test]
+    fn redirect_error_object_caps_the_candidate_set() {
+        let cid = ContentId::resource([1; 32], [2; 32], [3; 32]);
+        let over: Vec<ProviderRecord> = (0..=MAX_REDIRECT_PROVIDERS as u8)
+            .map(|i| mock_provider(i, &cid))
+            .collect();
+        assert!(
+            over.len() > MAX_REDIRECT_PROVIDERS,
+            "fixture must exceed the cap"
+        );
+        let err = redirect_error_object(&cid, &over, 1);
+        let names = err["data"]["redirect"]["providers"].as_array().unwrap();
+        assert_eq!(
+            names.len(),
+            MAX_REDIRECT_PROVIDERS,
+            "an over-cap candidate list is truncated to MAX_REDIRECT_PROVIDERS"
+        );
+
+        // At-bound: exactly the cap passes through in full.
+        let at: Vec<ProviderRecord> = (0..MAX_REDIRECT_PROVIDERS as u8)
+            .map(|i| mock_provider(i, &cid))
+            .collect();
+        let err = redirect_error_object(&cid, &at, 1);
+        assert_eq!(
+            err["data"]["redirect"]["providers"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_REDIRECT_PROVIDERS,
+            "an at-bound candidate list is not truncated"
+        );
+    }
+
+    /// dig_ecosystem#2007 Unit B: `proxy_requested` reads `params.proxy` and defaults OFF (automatic
+    /// fetch-on-miss stays off — the caller must ask).
+    #[test]
+    fn proxy_requested_reads_the_flag_and_defaults_off() {
+        assert!(proxy_requested(&json!({"proxy": true})));
+        assert!(!proxy_requested(&json!({"proxy": false})));
+        assert!(!proxy_requested(&json!({})), "absent → off (opt-in)");
+        assert!(
+            !proxy_requested(&json!({"proxy": "true"})),
+            "non-bool → off"
+        );
     }
 
     #[test]
@@ -2939,12 +3111,12 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl crate::peer::PeerRpcResponder for RecordingHolder {
-        async fn handle_json_rpc(&self, req: Value) -> Value {
+        async fn handle_json_rpc(&self, req: Value, _conn_key: &str) -> Value {
             let id = req.get("id").cloned().unwrap_or(json!(1));
             json!({"jsonrpc":"2.0","id":id,"result":{}})
         }
 
-        async fn handle_availability(&self, items: Value) -> Value {
+        async fn handle_availability(&self, items: Value, _conn_key: &str) -> Value {
             let n = items.as_array().map(|a| a.len()).unwrap_or(0);
             let answers: Vec<Value> = (0..n).map(|_| json!({"available": true})).collect();
             json!({"items": answers})

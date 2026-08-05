@@ -29,10 +29,10 @@ struct SilentResponder;
 
 #[async_trait]
 impl PeerRpcResponder for SilentResponder {
-    async fn handle_json_rpc(&self, _req: Value) -> Value {
+    async fn handle_json_rpc(&self, _req: Value, _conn_key: &str) -> Value {
         json!({ "jsonrpc": "2.0", "id": 1, "result": {} })
     }
-    async fn handle_availability(&self, _items: Value) -> Value {
+    async fn handle_availability(&self, _items: Value, _conn_key: &str) -> Value {
         json!({ "items": [] })
     }
     async fn stream_range(
