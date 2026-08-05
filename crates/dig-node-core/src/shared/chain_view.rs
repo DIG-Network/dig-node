@@ -79,6 +79,39 @@ pub trait AnchoredRootResolver: Send + Sync {
             }
         }
     }
+
+    /// Fail-closed check that `root` is a GENUINE root in `store_id`'s authenticated on-chain
+    /// singleton lineage — the current tip OR any prior committed generation.
+    ///
+    /// This is the load-bearing gate the generation-resolution serve path (#2088) uses to
+    /// chain-authenticate a `serve_root` BEFORE honouring a redirect to an OLDER capsule named by
+    /// the tip's `PublicManifest` (§13). The manifest is an ADDITIVE section that is NOT committed
+    /// into the chain-anchored `current_root` and NOT checked by the capsule anchor gate (#2203),
+    /// so a malicious holder can serve a genuine tip capsule carrying a FORGED §13 whose
+    /// `latest_root` points at attacker content. Cross-checking that `latest_root` against the real
+    /// lineage rejects the forgery and restores the chain-root-in-the-authenticity-path property
+    /// (closing the #127 anti-rollback hole the redirect would otherwise re-open).
+    ///
+    /// Production [`CoinsetResolver`](crate::CoinsetResolver) overrides this with the full lineage
+    /// walk (`sync_datastore_with_history`) + a membership test. The default impl accepts ONLY the
+    /// current tip (via [`anchored_root`](Self::anchored_root) equality) — a redirect to any
+    /// non-tip root fails closed unless the resolver can positively place it in the lineage.
+    ///
+    /// `Ok(())` = `root` is an authenticated lineage root (the redirect is safe to honour). Any
+    /// `Err` — `root` not in the lineage, no confirmed generation, or an unreachable chain — means
+    /// the caller MUST NOT redirect the serve to `root` (fail closed, §5.3 / NC-9 anti-rollback).
+    async fn verify_lineage_root(&self, store_id: &[u8; 32], root: Bytes32) -> Result<(), String> {
+        match self.anchored_root(store_id).await? {
+            Some(tip) if tip == root => Ok(()),
+            Some(_) => Err(format!(
+                "root {} is not in the store's authenticated on-chain lineage (chain is the authority)",
+                root.to_hex()
+            )),
+            None => {
+                Err("store has no confirmed on-chain generation (chain is the authority)".into())
+            }
+        }
+    }
 }
 
 /// The store's on-chain DataStore singleton state, as resolved by walking its lineage to the

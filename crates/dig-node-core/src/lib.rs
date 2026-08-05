@@ -4270,6 +4270,13 @@ mod tests {
         /// test can model #747: the walk (`anchored_root`) errors ("missing child") while the bounded
         /// verify still succeeds — exactly what `CoinsetResolver` does on chain.
         verify_outcome: Option<Result<(), String>>,
+        /// The store's AUTHENTICATED on-chain lineage — every genuine committed root (#2088). `None`
+        /// ⇒ the trait's DEFAULT tip-only [`verify_lineage_root`](AnchoredRootResolver::verify_lineage_root)
+        /// (only the current tip authenticates), which is what every non-redirect test relies on.
+        /// `Some(roots)` models a MULTI-generation store: a generation-resolution redirect to an
+        /// OLDER root is honoured only when that root is in this set — the exact boundary the forged
+        /// §13 exploit crosses (an out-of-lineage `latest_root` is refused).
+        lineage: Option<Vec<Bytes32>>,
     }
 
     impl MockResolver {
@@ -4281,6 +4288,26 @@ mod tests {
                 outcomes,
                 owner: None,
                 verify_outcome: None,
+                lineage: None,
+            })
+        }
+
+        /// One store resolving to `tip`, with an explicit AUTHENTICATED lineage (#2088): a
+        /// generation-resolution redirect to an older root is honoured ONLY when that root is in
+        /// `lineage`. Models a multi-generation store on-chain so the legit older-generation read
+        /// passes the new lineage cross-check, while an out-of-lineage (forged §13) root is refused.
+        fn one_with_lineage(
+            store_hex: &str,
+            tip: Bytes32,
+            lineage: Vec<Bytes32>,
+        ) -> Arc<dyn AnchoredRootResolver> {
+            let mut outcomes = std::collections::HashMap::new();
+            outcomes.insert(store_hex.to_string(), Ok(Some(tip)));
+            Arc::new(MockResolver {
+                outcomes,
+                owner: None,
+                verify_outcome: None,
+                lineage: Some(lineage),
             })
         }
         /// A resolver whose full-lineage walk (`anchored_root`) yields `walk` but whose BOUNDED
@@ -4296,6 +4323,7 @@ mod tests {
                 outcomes,
                 owner: None,
                 verify_outcome: Some(verify),
+                lineage: None,
             })
         }
         /// Like [`one`](Self::one) but ALSO reports `owner` from `anchored_state` (#486): the
@@ -4312,6 +4340,7 @@ mod tests {
                 outcomes,
                 owner: Some(owner),
                 verify_outcome: None,
+                lineage: None,
             })
         }
         /// A resolver whose every lookup is `outcome` (e.g. chain-unreachable).
@@ -4324,6 +4353,7 @@ mod tests {
                 },
                 owner: None,
                 verify_outcome: None,
+                lineage: None,
             })
         }
     }
@@ -4366,6 +4396,25 @@ mod tests {
                 None => match self.anchored_root(store_id).await? {
                     Some(tip) if tip == pinned_root => Ok(()),
                     Some(_) | None => Err("pinned root is not the current on-chain root".into()),
+                },
+            }
+        }
+
+        async fn verify_lineage_root(
+            &self,
+            store_id: &[u8; 32],
+            root: Bytes32,
+        ) -> Result<(), String> {
+            match &self.lineage {
+                // An explicit authenticated lineage (#2088): the root must be one of the store's
+                // genuine committed generations. An out-of-lineage (forged §13) root is refused.
+                Some(roots) if roots.contains(&root) => Ok(()),
+                Some(_) => Err("root is not in the store's on-chain lineage".into()),
+                // No explicit lineage ⇒ mirror the trait's DEFAULT tip-only rule (only the current
+                // tip authenticates), so a non-redirect test keeps its existing semantics.
+                None => match self.anchored_root(store_id).await? {
+                    Some(tip) if tip == root => Ok(()),
+                    Some(_) | None => Err("root is not in the store's on-chain lineage".into()),
                 },
             }
         }
@@ -10584,8 +10633,14 @@ mod tests {
         let ((root0, module0), (root1, module1)) =
             compile_two_generation_module(store, &gen0_files, &gen1_files);
         assert_ne!(root0, root1, "the two generations must have distinct roots");
-        // Seed BOTH capsules on disk; the injected resolver reports gen1 (root1) as the on-chain tip.
-        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root1));
+        // Seed BOTH capsules on disk; the resolver reports gen1 (root1) as the on-chain tip AND
+        // authenticates BOTH roots as genuine committed generations of the store's lineage — so the
+        // #2088 redirect to the older gen0 capsule passes the new lineage cross-check (a GENUINE
+        // multi-generation store, distinct from the forged-§13 case below).
+        let (node, _td) = test_node_with_resolver(
+            None,
+            MockResolver::one_with_lineage(&store.to_hex(), root1, vec![root0, root1]),
+        );
         seed_cached_module(&node.cache_dir, &store.to_hex(), &root0.to_hex(), &module0);
         seed_cached_module(&node.cache_dir, &store.to_hex(), &root1.to_hex(), &module1);
 
@@ -10678,6 +10733,66 @@ mod tests {
             other => {
                 panic!("expected ROOT_NOT_ANCHORED for a superseded client root, got {other:?}")
             }
+        }
+    }
+
+    /// **Proves (#2088 / #127 anti-rollback — the load-bearing lineage gate):** a genuine tip capsule
+    /// whose §13 `PublicManifest` points a path at a `latest_root` that is NOT in the store's
+    /// authenticated on-chain lineage is REFUSED — the node must NEVER serve the attacker-named bytes.
+    ///
+    /// This reproduces the loop-security exploit: `PublicManifest` (§13) is an ADDITIVE section NOT
+    /// committed into `current_root` and NOT checked by the capsule anchor gate (#2203), so a
+    /// malicious holder can serve a genuine, anchor-passing tip capsule carrying a FORGED §13 whose
+    /// `latest_root`/`sha256_latest` point at a fabricated capsule of attacker content. Here the tip
+    /// (root1) is the ONLY authenticated on-chain generation; the older `root0` capsule (holding the
+    /// attacker bytes for `asset.js`) is an out-of-lineage fabrication the tip manifest redirects to.
+    /// Without the lineage cross-check the redirect would serve `ATTACKER` stamped `verified`; with it
+    /// the serve stays pinned to the tip (which does not hold `asset.js`) and folds to a clean miss.
+    #[test]
+    fn serve_content_plaintext_refuses_a_forged_manifest_redirect_to_an_out_of_lineage_root_2088() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([44u8; 32]);
+        // The fabricated "gen0" capsule holds asset.js = ATTACKER bytes; the genuine tip (gen1)
+        // touches only index.html, so its §13 manifest redirects asset.js at the gen0 (root0) capsule.
+        let gen0_files = vec![
+            ("index.html".to_string(), b"<h1>A</h1>".to_vec()),
+            ("asset.js".to_string(), b"ATTACKER".to_vec()),
+        ];
+        let gen1_files = vec![("index.html".to_string(), b"<h1>A-prime</h1>".to_vec())];
+        let ((root0, module0), (root1, module1)) =
+            compile_two_generation_module(store, &gen0_files, &gen1_files);
+        assert_ne!(root0, root1, "the two generations must have distinct roots");
+        // THE FORGE: the resolver authenticates ONLY the tip (root1) as the store's on-chain lineage.
+        // `root0` — the capsule the tip's non-anchored §13 redirects asset.js to — is NOT in the
+        // lineage, exactly the attacker-fabricated root the gate must reject.
+        let (node, _td) = test_node_with_resolver(
+            None,
+            MockResolver::one_with_lineage(&store.to_hex(), root1, vec![root1]),
+        );
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root0.to_hex(), &module0);
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root1.to_hex(), &module1);
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            "", // rootless → resolve the tip, then attempt per-path generation resolution
+            "asset.js",
+            None,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        // MUST fail closed: never the attacker bytes. The tip does not hold asset.js, so the read
+        // folds to a decoy / miss (any non-Served outcome, or a Served that is NOT the attacker bytes).
+        if let PlaintextOutcome::Served { bytes, .. } = &out {
+            assert_ne!(
+                bytes.as_slice(),
+                b"ATTACKER",
+                "a forged §13 redirect to an out-of-lineage root MUST NOT serve the attacker bytes"
+            );
+            panic!("expected a fail-closed miss for the forged redirect, got Served: {out:?}");
         }
     }
 

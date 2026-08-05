@@ -509,8 +509,27 @@ impl ContentServer for Node {
                 // resolved concrete root. Redirect only when the file's latest generation is elsewhere.
                 let tip = pinned_root.or_else(|| Bytes32::from_hex(&root_hex).ok());
                 if Some(entry.latest_root) != tip {
-                    serve_root = Some(entry.latest_root);
-                    serve_root_hex = entry.latest_root.to_hex();
+                    // SECURITY (#2088 / #127 anti-rollback): `latest_root` is read from the tip's
+                    // §13 `PublicManifest` — an ADDITIVE section NOT committed into the chain-anchored
+                    // `current_root` and NOT checked by the capsule anchor gate (#2203). A malicious
+                    // holder can therefore serve a genuine tip capsule carrying a FORGED §13 whose
+                    // `latest_root`/`sha256_latest` point at attacker content. Before honouring the
+                    // redirect, cross-check `latest_root` against the store's AUTHENTICATED on-chain
+                    // lineage (the same singleton walk the pin above uses). Only a genuine historical
+                    // root may be served from — then `proof.root == serve_root` binds the served bytes
+                    // to real committed data of that authenticated generation. If the root is NOT in
+                    // the lineage (fabricated, or the chain can't confirm it), FAIL CLOSED: leave the
+                    // serve pinned to the tip, where an older-generation file folds to the constant-time
+                    // decoy / a clean miss — never the attacker-named bytes.
+                    if self
+                        .anchored_root_resolver
+                        .verify_lineage_root(&store_id.0, entry.latest_root)
+                        .await
+                        .is_ok()
+                    {
+                        serve_root = Some(entry.latest_root);
+                        serve_root_hex = entry.latest_root.to_hex();
+                    }
                 }
             }
         }
