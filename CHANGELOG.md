@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.98.0] - 2026-08-05
+
+### Features
+- **cache:** Cache.pushCapsule — publisher seeds their own node on commit (#181)- **dig-node:** Serve getProof/getMetadata/getPublicManifest/getCapsule locally (#179)
+
 ## [0.96.1] - 2026-08-04
 
 ### CI
