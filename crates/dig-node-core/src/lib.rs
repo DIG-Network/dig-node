@@ -55,6 +55,7 @@ pub mod download;
 pub mod inbound_demand;
 mod module_tier_tag;
 pub mod peer;
+pub mod rate_limit;
 pub mod relevance;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
 /// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep
@@ -3647,7 +3648,27 @@ pub async fn handle_rpc(
     origin: crate::download::ReadOrigin,
     provenance: crate::download::RequestProvenance,
 ) -> Value {
-    RpcDispatch::dispatch(node, req, origin, provenance).await
+    // Callers with no finer requestor identity (the operator loopback/FFI path, tests) key the
+    // miss-path rate limiter by the coarse transport origin. The peer-RPC server threads the
+    // mTLS-verified `peer_id` instead via [`handle_rpc_as`].
+    let requestor = crate::rate_limit::RequestorId::from_origin(origin);
+    handle_rpc_as(node, req, origin, provenance, requestor).await
+}
+
+/// [`handle_rpc`] with an EXPLICIT [`RequestorId`](crate::rate_limit::RequestorId) for the miss-path
+/// per-requestor rate limiter (dig_ecosystem#2007). The real remote transports call this with the
+/// caller's true identity — the peer-RPC server passes its mTLS-verified `peer_id`
+/// (`RequestorId::Peer`), an anonymous HTTP gateway passes the connection IP
+/// (`RequestorId::Anonymous`) — so one abusive caller's exhausted miss-lookup bucket never refuses a
+/// different caller.
+pub async fn handle_rpc_as(
+    node: &Node,
+    req: Value,
+    origin: crate::download::ReadOrigin,
+    provenance: crate::download::RequestProvenance,
+    requestor: crate::rate_limit::RequestorId,
+) -> Value {
+    RpcDispatch::dispatch(node, req, origin, provenance, requestor).await
 }
 
 /// Return a clone of the JSON-RPC `req` with `params.root` forced to `root_hex`
@@ -11239,6 +11260,202 @@ mod tests {
             "fetch-through serves the holder's bytes"
         );
         assert_eq!(frame["root"], json!(content.root));
+    }
+
+    /// dig_ecosystem#2007 Unit B: an explicit `proxy: true` fetches-through even when the engine's
+    /// miss mode is the DEFAULT `Redirect` — the per-request escape hatch for a requestor that cannot
+    /// reach the holders itself.
+    ///
+    /// Fixture design — a TWO-STATE control so the flag is load-bearing (reverting the `proxy` routing
+    /// must flip an assertion, not merely coincide): the SAME holders + SAME `Redirect`-mode engine
+    /// answer a plain miss with a `-32008` REDIRECT (proving the fixture redirects by default), and a
+    /// `proxy: true` miss with the SERVED bytes. If `proxy` were ignored, the second call would
+    /// redirect too and the byte assertion would fail.
+    #[test]
+    fn proxy_flag_routes_a_redirect_mode_miss_through_fetch_through() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS"); // engine mode is Redirect (below), not env fetch
+        let rt = pin_test_rt();
+        let (node, td) = test_node(None);
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        attach_p2p(
+            &node,
+            vec![
+                dig_download::testkit::mock_provider(1, &cid),
+                dig_download::testkit::mock_provider(2, &cid),
+            ],
+            content.clone(),
+            MissMode::Redirect,
+            &td,
+        );
+        let (store_hex, tip_hex, rk_hex) = match &cid {
+            ContentId::Resource {
+                store_id,
+                root,
+                retrieval_key,
+            } => (
+                hex::encode(store_id),
+                hex::encode(root),
+                hex::encode(retrieval_key),
+            ),
+            _ => unreachable!("resource id"),
+        };
+        let req = |proxy: bool| {
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store_hex, "root": tip_hex, "retrieval_key": rk_hex,
+                "length": 4096, "offset": 0, "proxy": proxy,
+            }})
+        };
+
+        // CONTROL: no proxy → the Redirect-mode engine redirects (never serves the bytes).
+        let redirected = rt.block_on(handle_rpc(
+            &node,
+            req(false),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert_eq!(
+            redirected["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "without proxy a Redirect-mode miss redirects: {redirected}"
+        );
+
+        // proxy:true → fetch-through serves the holder's real, merkle-verified bytes.
+        let served = rt.block_on(handle_rpc(
+            &node,
+            req(true),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        assert!(
+            served.get("result").is_some(),
+            "proxy:true fetches-through and serves a frame: {served}"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(served["result"]["bytes"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(bytes, content.bytes, "proxy serves the holder's bytes");
+    }
+
+    /// dig_ecosystem#2007 Unit A: the miss → DHT-lookup path is rate-limited PER REQUESTOR — an
+    /// over-budget requestor's miss is refused, a DIFFERENT requestor is unaffected.
+    ///
+    /// Fixture design — TWO distinct peers, an honest CONTROL kept truthful (the DEV_LOG "vary ONE
+    /// actor, keep a truthful control" rule): a single-actor test (or a shared/global bucket) would
+    /// false-green a bound that is actually shared. The bound is pinned from BOTH sides — exactly the
+    /// budget (2) is admitted, the (N+1)th refused — and the control peer proves the KEY isolation,
+    /// not merely that a bucket empties. A small no-refill pool is pinned so the "(N+1)th refused" is
+    /// deterministic and not a wall-clock race.
+    #[test]
+    fn miss_lookup_rate_limit_is_enforced_per_requestor() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (node, td) = test_node(None);
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(3, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        // Pin a small, deterministic per-requestor pool of exactly 2 (no refill).
+        node.p2p_content()
+            .expect("engine attached")
+            .set_miss_rate_limit(2.0, 0.0);
+
+        let req = || {
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }})
+        };
+        let abuser = || crate::rate_limit::RequestorId::Peer("aaaa".to_string());
+        let control = || crate::rate_limit::RequestorId::Peer("bbbb".to_string());
+        let call = |requestor| {
+            rt.block_on(handle_rpc_as(
+                &node,
+                req(),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+                requestor,
+            ))
+        };
+
+        // Exactly the budget (2) is admitted — each a redirect.
+        for i in 0..2 {
+            let resp = call(abuser());
+            assert_eq!(
+                resp["error"]["code"],
+                json!(CONTENT_REDIRECT),
+                "abuser miss {i} within budget must redirect: {resp}"
+            );
+        }
+        // The (N+1)th is refused with the rate-limit error.
+        let refused = call(abuser());
+        assert_eq!(
+            refused["error"]["code"],
+            json!(crate::download::CONTENT_MISS_RATE_LIMITED),
+            "the over-budget miss is rate-limited: {refused}"
+        );
+        // A DIFFERENT requestor draws from its OWN bucket and is unaffected.
+        let other = call(control());
+        assert_eq!(
+            other["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "a different requestor is unaffected by the abuser's exhausted bucket: {other}"
+        );
+    }
+
+    /// dig_ecosystem#2007 Unit C: an UNCONFIGURED node (no upstream) answers a miss with a `-32008`
+    /// redirect and NEVER falls through to an upstream HTTP proxy — passthrough is gone (#1997). A
+    /// client that ignores `data.redirect` still sees a well-formed JSON-RPC ERROR object (never a
+    /// silent empty success), so an old client degrades safely.
+    #[test]
+    fn unconfigured_node_redirects_a_miss_with_no_upstream_and_degrades_safely() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        std::env::remove_var("DIG_RPC_UPSTREAM"); // no upstream — DEFAULT_UPSTREAM == ""
+        let rt = pin_test_rt();
+        let (store, tip, rk) = miss_setup();
+        let (mut node, td) = test_node(None);
+        // An UNCONFIGURED node has no upstream (#1997, DEFAULT_UPSTREAM == ""): a miss can ONLY
+        // redirect — there is no upstream HTTP leg to fall through to.
+        node.upstream = String::new();
+        assert!(!node.has_upstream(), "an unconfigured node has no upstream");
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(4, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        // A `proxy` field an old redirect-unaware client would never send is tolerated on the request.
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.fetchRange","params":{
+                "store_id": store.to_hex(), "root": tip.to_hex(), "retrieval_key": rk,
+                "length": 4096, "offset": 0,
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        // A redirect, and a WELL-FORMED JSON-RPC error object (jsonrpc + id + error.code) — an old
+        // client that ignores `data.redirect` still sees an error, never a silent empty success.
+        assert_eq!(resp["jsonrpc"], json!("2.0"));
+        assert_eq!(resp["id"], json!(1));
+        assert_eq!(
+            resp["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "miss redirects with no upstream proxy fallthrough: {resp}"
+        );
     }
 
     /// Build an anchored, SEALED single-chunk resource for `(store, resource_key)` the loopback serve

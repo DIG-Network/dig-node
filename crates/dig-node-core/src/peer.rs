@@ -798,7 +798,12 @@ fn gossip_identity_paths(node_cert_dir: &std::path::Path) -> (String, String) {
 pub trait PeerRpcResponder: Send + Sync {
     /// Answer a JSON-RPC 2.0 request (`dig.getPeers` / `dig.getNetworkInfo` / `dig.announce` /
     /// `dig.getAvailability` / `dig.listInventory`, etc.). Returns the JSON-RPC response value.
-    async fn handle_json_rpc(&self, req: Value) -> Value;
+    ///
+    /// `conn_key` is the authenticated caller's mTLS `peer_id` (64-hex; empty for a caller-less/test
+    /// session) — threaded so the miss → DHT-lookup path's per-requestor rate limiter
+    /// (dig_ecosystem#2007) keys a `dig.getContent`/`dig.fetchRange` JSON miss by the ASKING peer,
+    /// not one shared peer bucket every peer could exhaust for the others.
+    async fn handle_json_rpc(&self, req: Value, conn_key: &str) -> Value;
 
     /// Answer a `dig.getAvailability` batch (the typed dig-nat control call). `items` is the raw
     /// AvailabilityItem array; returns the `{ "items": [AvailabilityAnswer, …] }` response value.
@@ -1094,7 +1099,13 @@ where
                 .await
         }
         PeerRequestKind::JsonRpc => {
-            let resp = responder.handle_json_rpc(req).await;
+            // The authenticated caller peer_id keys the miss-path per-requestor rate limiter
+            // (dig_ecosystem#2007); empty on a caller-less/test session.
+            let conn_key = caller
+                .as_ref()
+                .map(|c| c.peer_id.clone())
+                .unwrap_or_default();
+            let resp = responder.handle_json_rpc(req, &conn_key).await;
             write_framed(&mut stream, &resp).await
         }
         PeerRequestKind::Availability => {
@@ -1258,7 +1269,7 @@ impl NodeResponder {
 
 #[async_trait::async_trait]
 impl PeerRpcResponder for NodeResponder {
-    async fn handle_json_rpc(&self, req: Value) -> Value {
+    async fn handle_json_rpc(&self, req: Value, conn_key: &str) -> Value {
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         let id = req.get("id").cloned().unwrap_or(json!(1));
         // PEER-SURFACE ALLOWLIST (audit #179 CRITICAL). The mTLS verifier accepts any self-signed
@@ -1313,11 +1324,12 @@ impl PeerRpcResponder for NodeResponder {
         // Provenance is FirstParty here: `landing_origin(Peer, FirstParty) == Peer`, so a peer-wire
         // read still never lands (the transport axis already denies it); the Sec-Fetch axis only ever
         // applies to browser-driven loopback requests, which never arrive here (#1956).
-        crate::handle_rpc(
+        crate::handle_rpc_as(
             &self.node,
             req,
             crate::download::ReadOrigin::Peer,
             crate::download::RequestProvenance::FirstParty,
+            crate::rate_limit::RequestorId::Peer(conn_key.to_string()),
         )
         .await
     }
@@ -1491,10 +1503,21 @@ impl PeerRpcResponder for NodeResponder {
                 if code == crate::download::RESOURCE_UNAVAILABLE {
                     if let Some(content) = crate::download::range_content_id(&req) {
                         let depth = crate::download::redirect_depth(&req);
-                        // A remote peer's own fetchRange stream miss (#179/#1576) — never local.
+                        let proxy = crate::download::proxy_requested(&req);
+                        // A remote peer's own fetchRange stream miss (#179/#1576) — never local. The
+                        // per-requestor miss-lookup rate limit (dig_ecosystem#2007) is keyed by this
+                        // peer's mTLS-verified `peer_id` (`conn_key`), so one peer's burst cannot
+                        // amplify this node's DHT lookups at another peer's expense.
+                        let requestor = crate::rate_limit::RequestorId::Peer(conn_key.to_string());
                         match self
                             .node
-                            .miss_outcome(&content, depth, crate::download::ReadOrigin::Peer)
+                            .miss_outcome(
+                                &content,
+                                depth,
+                                proxy,
+                                crate::download::ReadOrigin::Peer,
+                                &requestor,
+                            )
                             .await
                         {
                             crate::download::MissOutcome::Fetched(f) => {
@@ -1537,6 +1560,24 @@ impl PeerRpcResponder for NodeResponder {
                                 );
                                 let errf = json!({"error": crate::download::redirect_error_object(
                                     &content, &providers, next_depth)});
+                                return write_framed(out, &errf).await;
+                            }
+                            crate::download::MissOutcome::RateLimited => {
+                                // This peer is driving the miss→lookup path too fast: refuse with a
+                                // rate-limit error frame (dig_ecosystem#2007) so it backs off. A
+                                // DIFFERENT peer draws from its own bucket and is unaffected.
+                                serve_log::range_outcome(
+                                    &target,
+                                    offset,
+                                    &serve_log::RangeOutcome::from_error(
+                                        crate::download::CONTENT_MISS_RATE_LIMITED,
+                                        crate::download::MISS_RATE_LIMITED_MESSAGE.to_string(),
+                                    ),
+                                );
+                                let errf = json!({"error": {
+                                    "code": crate::download::CONTENT_MISS_RATE_LIMITED,
+                                    "message": crate::download::MISS_RATE_LIMITED_MESSAGE,
+                                }});
                                 return write_framed(out, &errf).await;
                             }
                             crate::download::MissOutcome::NotFound => {}
@@ -4178,7 +4219,7 @@ pub(crate) mod tests {
 
     #[async_trait::async_trait]
     impl PeerRpcResponder for StubResponder {
-        async fn handle_json_rpc(&self, req: Value) -> Value {
+        async fn handle_json_rpc(&self, req: Value, _conn_key: &str) -> Value {
             let id = req.get("id").cloned().unwrap_or(json!(1));
             let method = req.get("method").and_then(Value::as_str).unwrap_or("");
             json!({"jsonrpc":"2.0","id":id,"result":{"echo_method": method}})
@@ -4671,7 +4712,7 @@ pub(crate) mod tests {
             "dig.stage",
         ] {
             let req = json!({"jsonrpc":"2.0","id":1,"method":m,"params":{}});
-            let resp = responder.handle_json_rpc(req).await;
+            let resp = responder.handle_json_rpc(req, "").await;
             assert_eq!(
                 resp["error"]["code"],
                 json!(-32601),
@@ -4684,7 +4725,10 @@ pub(crate) mod tests {
         }
         // A legitimate peer read method is still dispatched (no -32601).
         let ok = responder
-            .handle_json_rpc(json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"}))
+            .handle_json_rpc(
+                json!({"jsonrpc":"2.0","id":1,"method":"dig.getNetworkInfo"}),
+                "",
+            )
             .await;
         assert!(
             ok.get("result").is_some(),
@@ -4692,7 +4736,7 @@ pub(crate) mod tests {
         );
         // getPeers is answered from the (empty) pool view, not -32601.
         let peers = responder
-            .handle_json_rpc(json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}))
+            .handle_json_rpc(json!({"jsonrpc":"2.0","id":1,"method":"dig.getPeers"}), "")
             .await;
         assert!(peers["result"]["peers"].is_array());
     }

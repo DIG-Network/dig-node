@@ -2659,7 +2659,8 @@ NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
 | -32000 | `DISPATCH_FAILED` | shell | The shell failed to dispatch the request to the read path. |
 | -32004 | `RESOURCE_NOT_AVAILABLE_AT_ROOT` | upstream | Genuine content miss at the requested root (relayed); distinct from transport failure. Also minted directly by the node library for a LOCAL miss at this same root — `dig.fetchRange` ("resource not held") and `dig.getManifest` ("capsule not held locally") — never a fabricated result. |
 | -32005 | `ROOT_NOT_ANCHORED` | node | The node's mandatory read-path anchored-root pin (§14.4) fails closed: the requested root does not match the chain-anchored tip, the store has no confirmed on-chain generation, the chain is unreachable, or a rootless request cannot be resolved under enforcement. Minted by the node library on `dig.getContent`. |
-| -32008 | `CONTENT_REDIRECT` | node | The node does not (or, under §17's throttle, will not right now) serve the requested content itself, but the DHT located peer(s) that hold it — `error.data.redirect` names them (`content`, `providers[].peer_id`/`addresses`, `redirect_depth`, `max_redirects`) so the caller re-requests there. Minted on a content miss (`dig.getContent`/`dig.fetchRange`/the peer range-stream) and on outgoing-bandwidth saturation (§17), bounded by the same redirect-hop cap either way. |
+| -32008 | `CONTENT_REDIRECT` | node | The node does not (or, under §17's throttle, will not right now) serve the requested content itself, but the DHT located peer(s) that hold it — `error.data.redirect` names them (`content`, `providers[].peer_id`/`addresses`, `redirect_depth`, `max_redirects`) so the caller re-requests there. The candidate set is CAPPED at `MAX_REDIRECT_PROVIDERS` (= dig-dht's `MAX_ADDRESSES_PER_RECORD`): a redirect NAMES holders (the requestor dials them over its own §5.2 reachability ladder — this node does NOT dial/probe them), so a few candidates suffice and probing-on-miss would itself be an amplification vector. Minted on a content miss (`dig.getContent`/`dig.fetchRange`/the peer range-stream) and on outgoing-bandwidth saturation (§17), bounded by the same redirect-hop cap either way. |
+| -32009 | `CONTENT_MISS_RATE_LIMITED` | node | The requested content is not held, and the miss → DHT-lookup path is being driven too fast BY THIS REQUESTOR (§10.4). Minted instead of a redirect/fetch when the per-requestor token-bucket budget is exhausted, so an abusive caller backs off while a DIFFERENT requestor (its own bucket) is unaffected. A well-formed JSON-RPC error, never a silent empty success. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
@@ -2675,6 +2676,44 @@ NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
 
 Read-path and upstream errors outside this table are relayed verbatim; this catalogue governs what
 the **shell** mints plus the cross-boundary codes a client must be able to branch on.
+
+### 10.4. Miss-path amplification bounds and the explicit proxy fallback (dig_ecosystem#2007)
+
+The content miss handler (`crate::Node::miss_outcome`, feeding `content_miss_envelope` /
+`range_miss_envelope` / the peer range-stream miss) runs a DHT `find_providers` lookup — and, on an
+explicit `proxy`, a full multi-source fetch — on behalf of the CALLER. Both spend this node's
+network bandwidth, so a caller who cannot name any content it actually wants could otherwise amplify
+this node by naming arbitrary `(store_id, root, retrieval_key)` triples. Three bounds govern the path:
+
+10.4.1. **Per-requestor rate limit.** A token-bucket limiter (default burst
+`DEFAULT_MISS_LOOKUP_BURST` = 16, refill `DEFAULT_MISS_LOOKUP_REFILL_PER_SEC` = 4/s) sits in FRONT of
+both the DHT lookup and the proxy fetch, keyed by REQUESTOR identity — the mTLS-verified `peer_id`
+for a peer-origin request, the connection IP for an anonymous/gateway HTTP request, one shared bucket
+for the trusted operator loopback. An over-budget requestor's miss is refused with `-32009`
+`CONTENT_MISS_RATE_LIMITED`; a DIFFERENT requestor draws from its own bucket and is unaffected. The
+tracked-requestor table is bounded (`MAX_TRACKED_REQUESTORS`), evicting only idle (full) buckets so
+eviction can never weaken a live bound. The oracle bound is enforced upstream: a caller that cannot
+name a concrete 64-hex `ContentId` (`miss_content_for` returns `None`) triggers no lookup at all.
+
+10.4.2. **Candidate cap.** A redirect names at most `MAX_REDIRECT_PROVIDERS` (= dig-dht's
+`MAX_ADDRESSES_PER_RECORD`) holders (§10 `-32008`); `find_providers` already caps the addresses per
+record. This node NAMES holders but never dials/probes them — reachability is the requestor's job via
+its own §5.2 ladder (NAT asymmetry: "peers I can reach" ≠ "peers the requestor can reach", and
+probing-on-miss would itself be the amplification vector).
+
+10.4.3. **Explicit proxy fallback (`params.proxy`, default OFF).** A requestor that cannot itself
+reach any named holder (NAT asymmetry) MAY set `proxy: true` on `dig.getContent`/`dig.fetchRange`.
+Under the §10.4.1 budget, the node then fetches the resource over the identical chain-anchored,
+merkle-verified fetch path and serves the bytes back, instead of redirecting. Automatic
+fetch-on-miss stays OFF — the caller must ask. The proxy serves bytes but the middle node does NOT
+become a holder (a remote/`Peer`-origin read never triggers reshare/backfill — the reshare
+amplification boundary, §14.3/§19), so proxying cannot be used to plant attacker-chosen inventory.
+
+10.4.4. **Privacy.** A miss discloses the requested `(store_id, root, retrieval_key)` to the middle
+node (it must, to locate holders). The `proxy` path additionally discloses to the serving holder that
+the requestor wanted that resource — the SAME disclosure a direct read from that holder would make.
+No NEW party learns the request beyond those the direct read would already involve (cross-ref
+dig_ecosystem#2006/#1934 on read-path metadata exposure).
 
 ---
 

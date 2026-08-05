@@ -985,3 +985,30 @@ identically but effecting nothing. Also token-gated `cache.fetchAndCache` over H
 a transport-derived trust label (loopback) can be a NECESSARY but not SUFFICIENT condition — a CSRF-class
 attacker rides the trusted transport, so a durable side effect needs a second axis the attacker cannot
 forge (here, the browser's own cross-site self-report).
+
+## The miss→DHT-lookup path is a per-requestor amplification surface; key the bound by identity, not origin (#2007)
+
+A content miss (`Node::miss_outcome`) runs a DHT `find_providers` lookup — and, on an explicit
+`proxy`, a whole multi-source fetch — ON BEHALF OF THE CALLER. Both spend THIS node's network
+bandwidth, so a caller that names arbitrary `(store,root,rk)` triples it does not actually want is an
+amplification/oracle vector even though it holds and pulls nothing itself. The bound that matters is
+PER REQUESTOR: a single global bucket would let one abuser refuse every other caller's misses (a
+denial surface), so the limiter (`crate::rate_limit::MissRateLimiter`) keys by the mTLS-verified
+`peer_id` for a peer, the connection IP for an anonymous/gateway HTTP caller, and one shared bucket
+for the trusted operator loopback. The subtle wiring cost: the peer JSON `dig.getContent` miss loses
+the caller `peer_id` before it reaches the shared `dispatch`, so the identity must be threaded
+EXPLICITLY (`handle_json_rpc(req, conn_key)` → `handle_rpc_as(..., RequestorId::Peer(conn_key))`) —
+inferring it from `ReadOrigin` alone collapses all peers onto ONE bucket. The tracked-requestor table
+is bounded and evicts ONLY full (idle) buckets, because dropping a full bucket recreates it
+identically and so can never weaken a live limit — evicting a partially-drained bucket WOULD.
+
+Two design boundaries worth keeping: (1) a redirect NAMES holders but this node never dials/probes
+them — probing-on-miss is itself the amplification vector, and reachability is the requestor's job via
+its own ladder (NAT asymmetry: "peers I can reach" ≠ "peers the requestor can reach"), so the
+candidate set is merely capped (`MAX_REDIRECT_PROVIDERS` = dig-dht `MAX_ADDRESSES_PER_RECORD`). (2)
+the explicit `proxy:true` fallback reuses the EXISTING `FetchThrough` branch + the identical
+chain-anchored merkle-verified `fetch_resource`, and keeps the `origin != Local` reshare refusal
+intact — the proxy serves bytes but the middle node does NOT become a holder, so it cannot be used to
+plant attacker-chosen inventory. `TokenBucket` here is a byte-identical MIRROR of dig-wallet's #1957
+primitive (dig-node-core must not depend on dig-wallet); consolidating both into a lower shared crate
+is the remaining follow-up.

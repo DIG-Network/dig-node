@@ -25,7 +25,7 @@ use axum::{
     Json, Router,
 };
 use dig_node_core::content_serve::{PeerTier, PlaintextOutcome, ServeSource};
-use dig_node_core::{cache_cap_bytes, cache_used_bytes, handle_rpc, ContentServer, Node};
+use dig_node_core::{cache_cap_bytes, cache_used_bytes, ContentServer, Node};
 use dig_wallet::sage::events::{SyncEvent, SyncLifecycle, SyncStatus};
 use dig_wallet::sage::rpc::WalletBackend;
 use dig_wallet::sage::service::WalletService;
@@ -746,6 +746,19 @@ fn read_origin_for(peer_addr: &SocketAddr) -> dig_node_core::download::ReadOrigi
     }
 }
 
+/// The [`RequestorId`](dig_node_core::rate_limit::RequestorId) that keys the miss-path per-requestor
+/// rate limiter (dig_ecosystem#2007) for an HTTP JSON-RPC caller: the operator's own loopback reads
+/// share the trusted [`Local`](dig_node_core::rate_limit::RequestorId::Local) bucket; a non-loopback
+/// caller (an anonymous/gateway client with no node identity) is keyed by its connection IP, so one
+/// abusive source's exhausted miss-lookup budget never refuses a different source.
+fn requestor_for(peer_addr: &SocketAddr) -> dig_node_core::rate_limit::RequestorId {
+    if crate::config::is_loopback_addr(&peer_addr.ip()) {
+        dig_node_core::rate_limit::RequestorId::Local
+    } else {
+        dig_node_core::rate_limit::RequestorId::Anonymous(peer_addr.ip().to_string())
+    }
+}
+
 /// Classify a request's landing PROVENANCE (#1654/#1956) from its `Sec-Fetch-Site` header — the
 /// second landing axis over [`read_origin_for`], applied identically to the `/s/` plaintext serve
 /// path AND the `POST /` JSON-RPC path (`dig.getContent`/`dig.fetchRange`). A loopback address proves
@@ -780,6 +793,7 @@ async fn rpc(
     Json(req): Json<Value>,
 ) -> impl IntoResponse {
     let origin = read_origin_for(&peer_addr);
+    let requestor = requestor_for(&peer_addr);
     // Classify the SECOND landing axis (#1956): the `/s/` serve path (#1654) already gates on
     // Sec-Fetch-Site so a cross-site page cannot drive capsule landing; the JSON-RPC POST path must
     // gate identically, or a same-origin capsule page could `POST dig.getContent`/`dig.fetchRange`
@@ -1040,19 +1054,18 @@ async fn rpc(
     // server down on one bad request.
     let node = state.node.clone();
     // `origin` was derived above from the ACCEPTING CONNECTION'S remote address, not assumed.
-    let resp =
-        match tokio::task::spawn(
-            async move { handle_rpc(&node, normalized, origin, provenance).await },
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => rpc_error(
-                id.clone(),
-                ErrorCode::DispatchFailed,
-                format!("dig-node: dispatch failed: {e}"),
-            ),
-        };
+    let resp = match tokio::task::spawn(async move {
+        dig_node_core::handle_rpc_as(&node, normalized, origin, provenance, requestor).await
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => rpc_error(
+            id.clone(),
+            ErrorCode::DispatchFailed,
+            format!("dig-node: dispatch failed: {e}"),
+        ),
+    };
 
     // A method dig-node did not resolve is relayed to the upstream — but ONLY when an operator
     // configured one and it has not been proven to lead back here (#1997). With no upstream the
