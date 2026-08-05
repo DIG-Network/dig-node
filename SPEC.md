@@ -3103,6 +3103,36 @@ against the on-chain current root or fails closed — it NEVER trusts an upstrea
   a NODE-side gate; clients still verify the returned proof against their own trust root regardless, so
   the opt-out only relaxes the node's serve gate for local dev.
 
+### 14.4a. Per-path generation resolution (#2088) — the redirect MUST be chain-authenticated
+
+A resource UNCHANGED since an earlier commit lives in an OLDER capsule whose own root ≠ the tip;
+serving it at the tip (where its ciphertext is absent) folds to the constant-time decoy and reads as
+a miss. So after the tip pin (§14.4) the serve consults the TIP capsule's §13 `PublicManifest`, which
+records per public path the `latest_root` of the generation that actually holds the file plus its
+`sha256_latest` leaf, and MAY redirect the serve to that older `serve_root` — reporting the resolved
+generation as `X-Dig-Generation`.
+
+**The redirect is honoured ONLY when `serve_root` is chain-authenticated (fail-closed, #127
+anti-rollback).** The `PublicManifest` (§13) is an ADDITIVE `.dig` section that is NOT committed into
+the chain-anchored `current_root` and NOT checked by the capsule anchor gate, so a malicious holder
+can serve a genuine, anchor-passing tip capsule carrying a FORGED §13 whose `latest_root`/`sha256_latest`
+point at attacker content. Before redirecting to an older `serve_root`, the node MUST verify that
+`serve_root` is a GENUINE root in the store's authenticated on-chain singleton lineage — the SAME
+lineage authority the §14.4 pin walks (`sync_datastore_with_history` membership). If the root is NOT
+in the lineage (fabricated, or the chain cannot confirm it) the node MUST NOT serve from it: the serve
+stays pinned to the tip, where the older-generation file folds to the decoy / a clean miss. Only a
+lineage-authenticated `serve_root` makes the served proof's `proof.root == serve_root` bind the bytes
+to real committed data of that authenticated generation.
+
+- `serve_root` is NEVER client-derivable: a superseded root named in the REQUEST still fails
+  `-32005` (§14.4) — only the node's own trusted tip manifest, cross-checked against the lineage, may
+  redirect the read.
+- `expected_leaf` (= the manifest's `sha256_latest`) is still enforced fail-closed on every tier as a
+  defense-in-depth routing guard (it prevents serving the wrong genuine file for a path), but it is NOT
+  the authenticity binding — the lineage cross-check on `serve_root` is.
+- No manifest / no entry (legacy `.dig`, private store, or a key outside the public surface) ⇒ serve at
+  the tip with no leaf binding, byte-identical to the pre-#2088 behaviour.
+
 ### 14.5. Store-melt propagation (receive → on-chain-verify → delete → rebroadcast, #1316)
 
 When a store's CHIP-0035 singleton is MELTED (the store-lifecycle delete), the deletion PROPAGATES

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use digstore_chain::coinset::Coinset;
-use digstore_chain::singleton::{sync_datastore, verify_pinned_root};
+use digstore_chain::singleton::{sync_datastore, sync_datastore_with_history, verify_pinned_root};
 use digstore_core::Bytes32;
 
 use crate::shared::chain_view::{AnchoredRootResolver, AnchoredStoreState};
@@ -82,6 +82,37 @@ impl AnchoredRootResolver for CoinsetResolver {
         verify_pinned_root(&resolution_coinset(), launcher, pinned)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    /// Fail-closed lineage-membership check (#2088): walk the store's DataStore singleton lineage
+    /// on coinset.org, collecting EVERY committed root (`sync_datastore_with_history`), and confirm
+    /// `root` is one of them. This is the same authenticated walk the tip pin uses, extended to
+    /// yield the full ordered capsule history so a generation-resolution redirect to an older
+    /// `serve_root` is honoured ONLY when that root is a genuine on-chain generation of THIS store —
+    /// never an attacker-fabricated root smuggled in via the tip's non-anchored §13 manifest. Any
+    /// `Err` (root not in the lineage, store not minted, or the chain unreachable) means "do not
+    /// redirect the serve to `root`".
+    async fn verify_lineage_root(&self, store_id: &[u8; 32], root: Bytes32) -> Result<(), String> {
+        let launcher = chia_protocol::Bytes32::new(*store_id);
+        match sync_datastore_with_history(&resolution_coinset(), launcher).await {
+            Ok((_store, history)) => {
+                if history
+                    .history
+                    .iter()
+                    .any(|capsule| capsule.root_hash == root)
+                {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "root {} is not in the store's on-chain lineage (chain is the authority)",
+                        root.to_hex()
+                    ))
+                }
+            }
+            // Cannot positively place the root in the lineage (not minted / lineage broken /
+            // chain unreachable) ⇒ fail closed: the redirect MUST NOT be honoured.
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 

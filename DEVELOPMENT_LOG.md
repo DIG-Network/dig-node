@@ -4,6 +4,24 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## PublicManifest (§13) is NOT committed into the current_root — older-gen reads bind via `sha256_latest` (#2088)
+
+A >1-generation store was unreadable for every file NOT in its latest commit: the serve pinned every
+read to the chain-anchored TIP root, but a file unchanged since an earlier commit lives in an OLDER
+capsule (its own root ≠ tip), so the tip fetch folded to a decoy and the file read as a 404 for every
+generation but the latest. The fix reads the tip capsule's embedded `PublicManifest` (§13) to resolve,
+per path, the `latest_root` that actually holds the file (`serve_root`) and its `sha256_latest` leaf,
+then serves from `serve_root` while requiring `proof.leaf == sha256_latest`.
+
+Sharp edge — WHY the leaf binding is load-bearing and NOT a new trust boundary: the PublicManifest
+section is NOT committed into `current_root` (it is additive `.dig` data, `pipeline.rs:83`), and an
+older capsule's own root is NOT chain-anchored (attacker-choosable in isolation — the #127 pin would
+refuse it from a client). So a proof that merely folds to the older root proves nothing. The read path
+binds older-generation bytes to the tip via `sha256_latest`, which is read FROM the tip capsule the
+chain vouches for — extending the EXISTING tip-capsule trust, not opening a new boundary. A
+client-supplied superseded root still fails `-32005` (anti-rollback preserved); only the node's own
+trusted tip manifest may redirect a read to an older capsule.
+
 ## §21 backfill and the #1576 reshare are TWO transports for the same capsule — one gate, not two (#1614)
 
 A read miss can pull the SAME `(store, root)` whole `.dig` down two independent legs, and for a long
