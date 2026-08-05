@@ -418,6 +418,33 @@ window, upstream proxy). A compromised upstream/host can never choose which gene
 module with no on-chain anchor is rejected, never silently downgraded to a no-op. This is uniform with
 the CLI `clone`/`pull` pin ("chain is the authority", fail closed).
 
+**Anti-rollback invariant (client-supplied roots).** A superseded root named in the REQUEST is ALWAYS
+refused with `-32005`: only the current on-chain tip (or a rootless request that resolves to it) is
+served. Nothing a client sends may cause an older generation to be served — the chain is the sole
+authority for which generation is current.
+
+### 4.2.1 Per-path generation resolution (#2088)
+
+The anchored root is the store's TIP, but a store has many generations and a file UNCHANGED since an
+earlier commit lives in that earlier capsule, not the tip. After the pin resolves the tip, the node
+reads the tip capsule's embedded `PublicManifest` (§13) and, for the requested path, resolves:
+
+- **`serve_root`** — the `latest_root` the tip manifest records for that path: the tip itself when the
+  path was last written at the tip, else the OLDER capsule that actually holds the bytes. The tiers
+  (local, peer, upstream) fetch + verify against `serve_root`, so the older capsule's ciphertext is
+  found and served instead of folding to a decoy at the tip (the file is no longer a 404 for every
+  generation but the latest).
+- **`expected_leaf`** — the tip manifest's `sha256_latest` for that path. The served resource's Merkle
+  proof folds to `serve_root` (the older capsule's OWN root, which is NOT chain-anchored and is
+  attacker-choosable in isolation), so the proof alone proves nothing; the node ADDITIONALLY requires
+  `proof.leaf == expected_leaf`. Because `sha256_latest` is read from the chain-anchored TIP capsule —
+  never from the request or the older capsule — this binds the older-generation bytes back to the tip.
+
+This is a read-path refinement that redirects reads to older capsules SOLELY via the node's own trusted
+tip manifest — it does NOT relax the anti-rollback invariant above: a client-supplied superseded root
+still fails `-32005`. A capsule carrying no `PublicManifest` (legacy `.dig` / private store) or a key
+outside the public surface serves at the tip with no leaf binding, byte-identical to the pre-#2088 path.
+
 **Store identity is anchored on the unforgeable launcher coin, never the curried `launcher_id`.** The
 bounded pinned-root check (`digstore_chain::singleton::verify_pinned_root`) discovers the candidate
 unspent tip with one attacker-controllable `unspent_coins_by_hint(store_id)` query, but it NEVER trusts

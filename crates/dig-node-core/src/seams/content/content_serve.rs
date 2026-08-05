@@ -198,17 +198,32 @@ fn decode_proof_b64(proof_b64: &str) -> Option<MerkleProof> {
 /// `dig-client-wasm::decryptResource`. `resource_key` is the EFFECTIVE key (with the `index.html`
 /// default already applied). `chunk_lens` are the per-chunk CIPHERTEXT byte lengths (empty ⇒ a single
 /// chunk). Returns the decrypted plaintext, or an error string describing the fail-closed reason.
+///
+/// `trusted_root` is the root the proof must fold to — the store's chain-anchored TIP for a resource
+/// last written at the tip, OR the older generation's OWN root when the resource is served from an
+/// earlier capsule (#2088). An older capsule's root is NOT chain-anchored (the #127 pin would refuse
+/// it from a client), so serving older-generation bytes REQUIRES the second binding:
+///
+/// `expected_leaf` is the tip-anchored leaf: when `Some`, the proof's leaf MUST equal the
+/// `sha256_latest` the CHAIN-ANCHORED TIP manifest (§13) recorded for this path. This is what ties
+/// older-generation bytes back to the tip — the older capsule's root is attacker-choosable in
+/// isolation, so folding a proof to it proves nothing on its own; only `sha256_latest`, sourced from
+/// the tip capsule, authenticates that the served leaf is the one the tip vouches for. `None`
+/// (no tip manifest / legacy `.dig`) ⇒ no leaf binding, byte-identical to the pre-#2088 behaviour.
+#[allow(clippy::too_many_arguments)]
 fn verify_and_decrypt(
     store_id: &Bytes32,
     resource_key: &str,
     ciphertext: &[u8],
     proof: &MerkleProof,
     trusted_root: &Bytes32,
+    expected_leaf: Option<Bytes32>,
     salt: Option<&[u8; 32]>,
     chunk_lens: &[u32],
 ) -> Result<Vec<u8>, String> {
     // 1) Integrity gate: the served bytes are the proof's leaf, the path folds to its root, and that
-    //    root is the trusted (chain-anchored) root. Any failure = a tampered/decoy/wrong-store serve.
+    //    root is the trusted (chain-anchored tip, or the older generation's own) root. Any failure =
+    //    a tampered/decoy/wrong-store serve.
     if resource_leaf(ciphertext) != proof.leaf {
         return Err("inclusion proof leaf does not match the served ciphertext".into());
     }
@@ -217,6 +232,17 @@ fn verify_and_decrypt(
     }
     if &proof.root != trusted_root {
         return Err("served root is not the store's chain-anchored root".into());
+    }
+    // 1b) Tip binding (#2088): when the serve root is an OLDER generation (whose own root is not
+    //     chain-anchored), the leaf MUST match the `sha256_latest` the chain-anchored TIP manifest
+    //     recorded for this path. Without this an attacker who could name any older root could fold a
+    //     proof to a capsule of their choosing; sha256_latest — sourced from the tip — closes that.
+    if let Some(expected) = expected_leaf {
+        if proof.leaf != expected {
+            return Err(
+                "served leaf does not match the chain-anchored tip manifest's sha256_latest".into(),
+            );
+        }
     }
     // 2) Confidentiality: derive the per-URN key (mixing the private-store salt when present), split
     //    the plain-concatenated chunk ciphertexts, and open each.
@@ -447,14 +473,47 @@ impl ContentServer for Node {
         // peer tier outright, and the response says so rather than letting a gateway serve pass for
         // a measured P2P result.
         let peer_tier = self.peer_tier();
-        // The store generation this resource came from (#486) — a local-only manifest lookup, no
-        // chain call. `None` on a rootless/pin-off request or when the generation is unknowable.
-        let generation = if root_hex.is_empty() {
-            None
-        } else {
-            self.resource_generation(store_hex, &root_hex, effective_key)
+        // -- Generation resolution (#2088) -------------------------------------------------------
+        // The pin above resolved the store's chain-anchored TIP. A resource UNCHANGED since an
+        // earlier commit lives in an OLDER capsule whose own root ≠ tip; serving it at the tip (where
+        // its ciphertext is absent) folds to a decoy and fails closed — the file reads as a 404 for
+        // every generation but the latest (#2088). The tip's embedded `PublicManifest` (§13) records,
+        // per public path, the `latest_root` of the generation that actually holds the file plus its
+        // `sha256_latest` leaf, so resolve BOTH:
+        //   - `serve_root`     — the capsule the tiers fetch + verify against (the tip, or the older
+        //     generation's own root when the file predates the tip).
+        //   - `expected_leaf`  — the tip-anchored `sha256_latest` every tier's `verify_and_decrypt`
+        //     must match. This is the SECURITY link: an older capsule's root is not chain-anchored
+        //     (attacker-choosable in isolation), so the leaf — sourced from the chain-anchored tip
+        //     manifest, NEVER the request or the older capsule — is what binds the served bytes back
+        //     to the tip. The client-supplied-root pin (#127, above) is UNTOUCHED: a superseded root
+        //     named in the REQUEST still fails `-32005`; only the node's own trusted tip manifest may
+        //     redirect the read to an older capsule.
+        // No manifest / no entry (legacy `.dig`, private store, or a key outside the public surface)
+        // ⇒ serve at the tip with no leaf binding, byte-identical to the pre-#2088 behaviour (the
+        // tip's constant-time decoy still classifies a genuine miss as a clean 404/SPA fallback).
+        // `X-Dig-Generation` (#486) reports the generation that actually holds the file, which may be
+        // BELOW the tip's ordinal.
+        let mut serve_root = pinned_root;
+        let mut serve_root_hex = root_hex.clone();
+        let mut expected_leaf: Option<Bytes32> = None;
+        let mut generation: Option<u64> = None;
+        if !root_hex.is_empty() {
+            if let Some(entry) = self
+                .resource_manifest_entry(store_hex, &root_hex, effective_key)
                 .await
-        };
+            {
+                generation = Some(entry.generation_index);
+                expected_leaf = Some(entry.sha256_latest);
+                // The tip (bytes) whose manifest we just read — `pinned_root` under the pin, else the
+                // resolved concrete root. Redirect only when the file's latest generation is elsewhere.
+                let tip = pinned_root.or_else(|| Bytes32::from_hex(&root_hex).ok());
+                if Some(entry.latest_root) != tip {
+                    serve_root = Some(entry.latest_root);
+                    serve_root_hex = entry.latest_root.to_hex();
+                }
+            }
+        }
 
         let retrieval_key = derive_retrieval_key(&store_id, effective_key).0;
         let rk_hex = hex::encode(retrieval_key);
@@ -463,16 +522,17 @@ impl ContentServer for Node {
         // A cached module returns a DECOY (constant-time, to hide key existence) for a key it does not
         // hold, whose proof does not fold to the anchored root. So a verify/decrypt failure here means
         // "not genuinely held locally" — treat it as a MISS and fall through, NOT a hard error.
-        if !root_hex.is_empty() {
+        if !serve_root_hex.is_empty() {
             if let Some(resp) = self
-                .serve_local_cached(store_hex, &root_hex, &retrieval_key)
+                .serve_local_cached(store_hex, &serve_root_hex, &retrieval_key)
                 .await
             {
                 if let Some(served) = self.decrypt_local(
                     &store_id,
                     effective_key,
                     &resp,
-                    pinned_root,
+                    serve_root,
+                    expected_leaf,
                     salt.as_ref(),
                     &root_hex,
                     verified,
@@ -486,23 +546,26 @@ impl ContentServer for Node {
         // -- Tier 2: PEER (P2P content engine, when attached) ------------------------------------
         // Best-effort: any failure falls through to the public-RPC tier so a resource is never
         // dead-ended while the gateway can still serve it. Only a concrete root has a content id.
-        if !root_hex.is_empty() {
+        if !serve_root_hex.is_empty() {
             if let Some(peer) = self
                 .peer_serve_plaintext(
                     store_hex,
-                    &root_hex,
+                    &serve_root_hex,
                     &rk_hex,
                     &store_id,
                     effective_key,
-                    pinned_root,
+                    serve_root,
+                    expected_leaf,
                     salt.as_ref(),
                     verified,
                     land_origin,
+                    &root_hex,
                 )
                 .await
             {
-                // A peer served the resource; warm the whole capsule locally for next time (#290).
-                self.maybe_backfill_capsule(store_hex, &root_hex, land_origin);
+                // A peer served the resource; warm the (older-gen) capsule that holds it locally for
+                // next time (#290) — `serve_root_hex`, the capsule the bytes actually live in.
+                self.maybe_backfill_capsule(store_hex, &serve_root_hex, land_origin);
                 return with_serve_metadata(peer, owner_puzzle_hash, generation, peer_tier);
             }
         }
@@ -514,18 +577,22 @@ impl ContentServer for Node {
         // keeps the outcome honest: a resource no peer holds is a MISS (`NotFound`, which drives the
         // caller's SPA/404 decision), not an `Unreadable` server error blaming this node's upstream
         // configuration for a resource that simply is not available.
-        if !root_hex.is_empty() && self.has_upstream() {
-            match self.proxy_full_content(store_hex, &root_hex, &rk_hex).await {
+        if !serve_root_hex.is_empty() && self.has_upstream() {
+            match self
+                .proxy_full_content(store_hex, &serve_root_hex, &rk_hex)
+                .await
+            {
                 Ok((ciphertext, proof, chunk_lens)) => {
-                    let trusted = pinned_root.unwrap_or(proof.root);
-                    // Warm the whole capsule locally so the next read is local-first (#290).
-                    self.maybe_backfill_capsule(store_hex, &root_hex, land_origin);
+                    let trusted = serve_root.unwrap_or(proof.root);
+                    // Warm the (older-gen) capsule that holds the bytes locally for next time (#290).
+                    self.maybe_backfill_capsule(store_hex, &serve_root_hex, land_origin);
                     return match verify_and_decrypt(
                         &store_id,
                         effective_key,
                         &ciphertext,
                         &proof,
                         &trusted,
+                        expected_leaf,
                         salt.as_ref(),
                         &chunk_lens,
                     ) {
@@ -580,7 +647,7 @@ impl ContentServer for Node {
                     };
                 }
                 Err(ProxyMiss::NotFound) => {
-                    self.maybe_backfill_capsule(store_hex, &root_hex, land_origin);
+                    self.maybe_backfill_capsule(store_hex, &serve_root_hex, land_origin);
                     return PlaintextOutcome::NotFound {
                         root_hex: root_hex.clone(),
                     };
@@ -629,23 +696,62 @@ impl ContentServer for Node {
         root_hex: &str,
         resource_key: &str,
     ) -> Option<u64> {
+        self.resource_manifest_entry(store_hex, root_hex, resource_key)
+            .await
+            .map(|e| e.generation_index)
+    }
+}
+
+/// The chain-anchored facts a store's TIP `PublicManifest` (§13) records for ONE resource key — the
+/// inputs the generation-resolution read (#2088) binds against. A projection of
+/// [`digstore_core::PublicManifestEntry`] narrowed to the three fields the serve path needs.
+#[derive(Debug, Clone)]
+struct ManifestEntry {
+    /// The root (capsule) hash of the generation that holds this path's LATEST version — where the
+    /// bytes actually live, which may be an OLDER capsule than the tip.
+    latest_root: Bytes32,
+    /// The 0-based commit ordinal that last wrote this path (surfaced as `X-Dig-Generation`).
+    generation_index: u64,
+    /// SHA-256 of that latest version's ciphertext leaf — the tip-anchored value the served proof's
+    /// leaf must match, the link that binds older-generation bytes back to the chain-anchored tip.
+    sha256_latest: Bytes32,
+}
+
+impl Node {
+    /// Resolve the TIP manifest entry for `(store, tip_root, resource_key)` — a local-only binary
+    /// parse of the tip capsule's `PublicManifest` (§13), no wasmtime, no chain call (mirrors
+    /// [`ContentServer::resource_generation`]). `None` when this node does not hold the tip capsule,
+    /// it carries no manifest (legacy `.dig` / private store), or the manifest lists no entry for
+    /// this exact key. The single manifest read behind both generation resolution and the
+    /// `X-Dig-Generation` header (#2088/#486).
+    async fn resource_manifest_entry(
+        &self,
+        store_hex: &str,
+        tip_root_hex: &str,
+        resource_key: &str,
+    ) -> Option<ManifestEntry> {
         let cache_dir = self.cache_dir.clone();
-        let capsule = crate::CapsuleKey::parse(store_hex, root_hex)?;
+        let capsule = crate::CapsuleKey::parse(store_hex, tip_root_hex)?;
         let key = resource_key.to_string();
         let outcome = tokio::task::spawn_blocking(move || {
             crate::read_public_manifest_json(&cache_dir, &capsule)
         })
         .await
         .ok()?;
-        match outcome {
-            Ok(Some(Some(manifest))) => manifest
-                .get("entries")?
-                .as_array()?
-                .iter()
-                .find(|e| e.get("path").and_then(Value::as_str) == Some(key.as_str()))
-                .and_then(|e| e.get("generation_index")?.as_u64()),
-            _ => None,
-        }
+        let manifest = match outcome {
+            Ok(Some(Some(manifest))) => manifest,
+            _ => return None,
+        };
+        let entry = manifest
+            .get("entries")?
+            .as_array()?
+            .iter()
+            .find(|e| e.get("path").and_then(Value::as_str) == Some(key.as_str()))?;
+        Some(ManifestEntry {
+            latest_root: Bytes32::from_hex(entry.get("latest_root")?.as_str()?).ok()?,
+            generation_index: entry.get("generation_index")?.as_u64()?,
+            sha256_latest: Bytes32::from_hex(entry.get("sha256_latest")?.as_str()?).ok()?,
+        })
     }
 }
 
@@ -662,25 +768,29 @@ impl Node {
         store_id: &Bytes32,
         effective_key: &str,
         resp: &ContentResponse,
-        pinned_root: Option<Bytes32>,
+        serve_root: Option<Bytes32>,
+        expected_leaf: Option<Bytes32>,
         salt: Option<&[u8; 32]>,
         root_hex: &str,
         verified: bool,
     ) -> Option<PlaintextOutcome> {
-        // A cached module whose served generation is not the anchored tip is not the resource at this
-        // root — fall through rather than serve a stale generation as current (#127).
-        if let Some(pin) = pinned_root {
-            if resp.roothash != pin {
+        // The cached module must be the capsule we resolved to serve from — the chain-anchored tip,
+        // or the older generation the tip manifest says holds this file (#2088). A module whose root
+        // is neither is a stale generation, not the resource at this serve root — fall through rather
+        // than serve it as current (#127, extended to per-path generation resolution).
+        if let Some(sr) = serve_root {
+            if resp.roothash != sr {
                 return None;
             }
         }
-        let trusted = pinned_root.unwrap_or(resp.roothash);
+        let trusted = serve_root.unwrap_or(resp.roothash);
         verify_and_decrypt(
             store_id,
             effective_key,
             &resp.ciphertext,
             &resp.merkle_proof,
             &trusted,
+            expected_leaf,
             salt,
             &resp.chunk_lens,
         )
@@ -723,10 +833,12 @@ impl Node {
         rk_hex: &str,
         store_id: &Bytes32,
         effective_key: &str,
-        pinned_root: Option<Bytes32>,
+        serve_root: Option<Bytes32>,
+        expected_leaf: Option<Bytes32>,
         salt: Option<&[u8; 32]>,
         verified: bool,
         origin: crate::download::ReadOrigin,
+        display_root_hex: &str,
     ) -> Option<PlaintextOutcome> {
         // Tier-2 observability (#836): this path emitted zero tracing, so a live-but-failing peer
         // fetch was indistinguishable from "engine never attached". Log each decision point.
@@ -762,13 +874,14 @@ impl Node {
         );
         let proof = decode_proof_b64(fetched.inclusion_proof.as_deref()?)?;
         let chunk_lens: Vec<u32> = fetched.chunk_lens.iter().map(|l| *l as u32).collect();
-        let trusted = pinned_root.unwrap_or(proof.root);
+        let trusted = serve_root.unwrap_or(proof.root);
         match verify_and_decrypt(
             store_id,
             effective_key,
             &fetched.bytes,
             &proof,
             &trusted,
+            expected_leaf,
             salt,
             &chunk_lens,
         ) {
@@ -791,7 +904,10 @@ impl Node {
                 );
                 Some(PlaintextOutcome::Served {
                     bytes,
-                    root_hex: root_hex.to_string(),
+                    // Report the store's chain-anchored TIP as `X-Dig-Root` even when the bytes came
+                    // from an older capsule (#2088) — the content is anchored to the tip via the
+                    // manifest's `sha256_latest`; `X-Dig-Generation` states which generation held it.
+                    root_hex: display_root_hex.to_string(),
                     verified,
                     source: ServeSource::Peer,
                     // Stamped by the caller via `with_serve_metadata` (see `decrypt_local`).
@@ -970,7 +1086,16 @@ mod tests {
         let store = test_store();
         let plaintext = b"<h1>hello dig</h1>";
         let (ciphertext, proof, root) = seal_public(&store, "index.html", plaintext);
-        let out = verify_and_decrypt(&store, "index.html", &ciphertext, &proof, &root, None, &[]);
+        let out = verify_and_decrypt(
+            &store,
+            "index.html",
+            &ciphertext,
+            &proof,
+            &root,
+            None,
+            None,
+            &[],
+        );
         assert_eq!(out.as_deref(), Ok(plaintext.as_slice()));
     }
 
@@ -981,7 +1106,16 @@ mod tests {
         // Flip a byte: the proof leaf (SHA-256 of the ciphertext) no longer matches → reject BEFORE
         // any decrypt attempt.
         ciphertext[0] ^= 0xff;
-        let out = verify_and_decrypt(&store, "index.html", &ciphertext, &proof, &root, None, &[]);
+        let out = verify_and_decrypt(
+            &store,
+            "index.html",
+            &ciphertext,
+            &proof,
+            &root,
+            None,
+            None,
+            &[],
+        );
         assert!(out.is_err(), "a tampered chunk must fail closed");
     }
 
@@ -997,6 +1131,7 @@ mod tests {
             &ciphertext,
             &proof,
             &wrong_root,
+            None,
             None,
             &[],
         );
@@ -1019,11 +1154,69 @@ mod tests {
             &proof,
             &root,
             None,
+            None,
             &[],
         );
         assert!(
             out.is_err(),
             "decrypting under the wrong URN key must fail closed"
+        );
+    }
+
+    #[test]
+    fn verify_and_decrypt_serves_older_gen_root_when_leaf_matches() {
+        // #2088 (the enabling half): a resource served from an OLDER generation folds its proof to
+        // that generation's OWN root (not the tip). With `trusted_root = the older root` AND
+        // `expected_leaf = Some(the tip manifest's sha256_latest)` — which for the genuine bytes IS
+        // the proof leaf — the serve succeeds. This is the path that fixes the unreadable older file.
+        let store = test_store();
+        let plaintext = b"console.log(1)";
+        let (ciphertext, proof, older_root) = seal_public(&store, "assets/app.js", plaintext);
+        // The tip manifest's sha256_latest for this path == the older generation's committed leaf.
+        let tip_leaf = proof.leaf;
+        let out = verify_and_decrypt(
+            &store,
+            "assets/app.js",
+            &ciphertext,
+            &proof,
+            &older_root,
+            Some(tip_leaf),
+            None,
+            &[],
+        );
+        assert_eq!(
+            out.as_deref(),
+            Ok(plaintext.as_slice()),
+            "older-gen bytes whose leaf matches the tip manifest must serve"
+        );
+    }
+
+    #[test]
+    fn verify_and_decrypt_rejects_leaf_mismatch_against_tip_manifest() {
+        // #2088 (the SECURITY half): an older capsule's root is attacker-choosable in isolation, so
+        // a proof that folds to it proves nothing on its own. When the served leaf does NOT match the
+        // chain-anchored tip manifest's `sha256_latest`, the serve MUST fail closed — otherwise a
+        // party who could name any older root could substitute a capsule of their choosing.
+        let store = test_store();
+        // Genuine, internally-consistent bytes+proof (integrity gate + root check both pass)…
+        let (ciphertext, proof, older_root) =
+            seal_public(&store, "assets/app.js", b"attacker bytes");
+        // …but the tip manifest committed a DIFFERENT leaf for this path.
+        let tip_leaf = Bytes32([0xAB; 32]);
+        assert_ne!(proof.leaf, tip_leaf, "the mismatch under test must be real");
+        let out = verify_and_decrypt(
+            &store,
+            "assets/app.js",
+            &ciphertext,
+            &proof,
+            &older_root,
+            Some(tip_leaf),
+            None,
+            &[],
+        );
+        assert!(
+            out.is_err(),
+            "a leaf that does not match the tip manifest's sha256_latest must fail closed"
         );
     }
 

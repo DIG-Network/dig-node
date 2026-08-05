@@ -9716,6 +9716,52 @@ mod tests {
         (compiled.root, bytes)
     }
 
+    /// Build a TWO-generation public store sharing ONE data dir (#2088): gen0 holds `gen0_files`
+    /// (next_id 0), gen1 touches ONLY `gen1_files` (next_id 1). Because both generations persist into
+    /// the SAME `generations/` dir, gen1's `build_public_manifest` walk sees BOTH — so the gen1 (TIP)
+    /// capsule's `PublicManifest` points each unchanged path at its OLDER `latest_root`, exactly the
+    /// shape the generation-resolution serve must handle. Returns
+    /// `((root0, module0), (root1_tip, module1_tip))`.
+    fn compile_two_generation_module(
+        store_id: Bytes32,
+        gen0_files: &[(String, Vec<u8>)],
+        gen1_files: &[(String, Vec<u8>)],
+    ) -> ((Bytes32, Vec<u8>), (Bytes32, Vec<u8>)) {
+        let data_dir = tempfile::tempdir().unwrap();
+        let secret = digstore_crypto::bls::SecretKey::from_seed(&[42u8; 32]);
+        let pubkey = secret.public_key().to_bytes();
+        let opts = || digstore_stage::FinalizeOptions {
+            data_dir: data_dir.path().to_path_buf(),
+            trusted_keys: vec![digstore_core::TrustedHostKey {
+                public_key: pubkey.0,
+                label: "test-fixture".to_string(),
+            }],
+            store_pubkey: pubkey,
+            metadata: digstore_stage::empty_manifest(),
+            chain_state: None,
+            auth: digstore_stage::no_auth(),
+            include_public_manifest: true,
+        };
+        let compile = |files: &[(String, Vec<u8>)], next_id: u64| {
+            let compiled = digstore_stage::stage_and_compile(
+                files,
+                store_id,
+                &digstore_core::Visibility::Public,
+                digstore_core::MAX_STORE_BYTES,
+                false,
+                next_id,
+                0,
+                &opts(),
+            )
+            .expect("stage + compile a generation");
+            let bytes = std::fs::read(&compiled.module_path).expect("read compiled module bytes");
+            (compiled.root, bytes)
+        };
+        let gen0 = compile(gen0_files, 0);
+        let gen1 = compile(gen1_files, 1);
+        (gen0, gen1)
+    }
+
     /// Write `module_bytes` into the node's canonical on-disk cache location for
     /// `(store_hex, root_hex)`, so `dig.getManifest` (and any other local-cache-hit
     /// method) finds it via [`module_path`].
@@ -10513,6 +10559,125 @@ mod tests {
                 );
             }
             other => panic!("expected a local Served, got {other:?}"),
+        }
+    }
+
+    /// **Proves (#2088, the bug):** a file UNCHANGED since gen0 is served with its REAL plaintext when
+    /// the store's tip is gen1, reporting `X-Dig-Generation = 0` — NOT a 404 and NOT a decoy. Before
+    /// the fix the serve pinned every read to the tip (where the older ciphertext is absent), so the
+    /// unchanged file folded to a decoy and read as a miss for every generation but the latest.
+    /// **Also proves:** the file CHANGED in gen1 serves gen1's bytes at generation 1.
+    #[test]
+    fn serve_content_plaintext_resolves_reads_to_the_generation_that_holds_the_file_2088() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([42u8; 32]);
+        let gen0_files = vec![
+            ("index.html".to_string(), b"<h1>A</h1>".to_vec()),
+            ("asset.js".to_string(), b"BBB".to_vec()),
+        ];
+        // gen1 touches ONLY index.html; asset.js is untouched → stays in the gen0 capsule.
+        let gen1_files = vec![("index.html".to_string(), b"<h1>A-prime</h1>".to_vec())];
+        let ((root0, module0), (root1, module1)) =
+            compile_two_generation_module(store, &gen0_files, &gen1_files);
+        assert_ne!(root0, root1, "the two generations must have distinct roots");
+        // Seed BOTH capsules on disk; the injected resolver reports gen1 (root1) as the on-chain tip.
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root1));
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root0.to_hex(), &module0);
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root1.to_hex(), &module1);
+
+        // THE BUG: asset.js, unchanged since gen0, must serve its real bytes at generation 0.
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            "", // rootless → resolve to the tip, then per-path generation resolution
+            "asset.js",
+            None,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        match out {
+            PlaintextOutcome::Served {
+                bytes, generation, ..
+            } => {
+                assert_eq!(
+                    bytes, b"BBB",
+                    "the older-generation file must serve its real plaintext"
+                );
+                assert_eq!(
+                    generation,
+                    Some(0),
+                    "asset.js was last written in gen0 → X-Dig-Generation: 0"
+                );
+            }
+            other => panic!("expected asset.js served from gen0, got {other:?}"),
+        }
+
+        // The CHANGED file serves gen1's bytes at generation 1.
+        let idx = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            "",
+            "index.html",
+            None,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        match idx {
+            PlaintextOutcome::Served {
+                bytes, generation, ..
+            } => {
+                assert_eq!(
+                    bytes, b"<h1>A-prime</h1>",
+                    "the changed file serves gen1's bytes"
+                );
+                assert_eq!(generation, Some(1), "index.html was rewritten in gen1");
+            }
+            other => panic!("expected index.html served from gen1, got {other:?}"),
+        }
+    }
+
+    /// **Proves (#2088, anti-rollback preserved — MUST):** a client that explicitly supplies a
+    /// SUPERSEDED root (gen0, no longer the tip) is STILL refused with `-32005 ROOT_NOT_ANCHORED`.
+    /// The generation-resolution fix redirects reads to older capsules ONLY via the node's own
+    /// trusted tip manifest — NEVER by honouring an older root named in the request (that would
+    /// re-open the #127 pin).
+    #[test]
+    fn serve_content_plaintext_still_refuses_a_client_supplied_superseded_root_2088() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([43u8; 32]);
+        let gen0_files = vec![("index.html".to_string(), b"<h1>A</h1>".to_vec())];
+        let gen1_files = vec![("index.html".to_string(), b"<h1>A-prime</h1>".to_vec())];
+        let ((root0, module0), (root1, module1)) =
+            compile_two_generation_module(store, &gen0_files, &gen1_files);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), root1));
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root0.to_hex(), &module0);
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root1.to_hex(), &module1);
+
+        // The client pins the SUPERSEDED gen0 root explicitly → still fail-closed, chain is authority.
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &root0.to_hex(),
+            "index.html",
+            None,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        match out {
+            PlaintextOutcome::RootError { code, .. } => {
+                assert_eq!(
+                    code, ROOT_NOT_ANCHORED,
+                    "a client-supplied superseded root must still fail -32005"
+                );
+            }
+            other => {
+                panic!("expected ROOT_NOT_ANCHORED for a superseded client root, got {other:?}")
+            }
         }
     }
 
