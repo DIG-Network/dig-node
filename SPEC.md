@@ -832,8 +832,15 @@ For each request, in order:
 
 ### 5.3. Request normalization
 
-Applied ONLY to content/proof methods (`dig.getContent`, `dig.getCapsule`, `dig.getProof`) and
-only when the canonical field is absent — an explicit value MUST never be overwritten:
+Applied ONLY to content/proof methods (`dig.getContent`, `dig.getCapsule`, `dig.getModule`,
+`dig.getProof`) and only when the canonical field is absent — an explicit value MUST never be
+overwritten:
+
+`dig.getModule` is in that list because it is advertised as an ALIAS of `dig.getCapsule`: an alias
+that normalizes differently is not an alias, and would reject `storeId` input its twin accepts.
+The capsule-scoped reads added in §5.5.0's family (`dig.getMetadata`, `dig.getPublicManifest`) take
+the same `{store_id, root}` shape but are NOT yet normalized — tracked in
+DIG-Network/dig_ecosystem#2107, along with the `root`/`"latest"` resolution this section predates.
 
 - `storeId` → `store_id`;
 - `resource_key` / `resourceKey` → `retrieval_key`.
@@ -1062,7 +1069,7 @@ chat message types (message, delivery/read receipts, typing, presence) are defin
 The seed leg of the content-replication flywheel: the store owner hands a FRESHLY-COMMITTED `.dig`
 capsule straight to their own node so the node becomes a discoverable DHT holder the instant the
 content is published, instead of waiting to be asked for it first. It is the reverse of
-`dig.getCapsule` (§5.5 passthrough / the retrieval service's chunked download): the bytes are PUSHED
+`dig.getCapsule` (§5.5 served LOCALLY — one bounded window per request): the bytes are PUSHED
 in windows the node reassembles, then verified and landed through the ONE shared land site every
 other cache path uses (so a seeded capsule is discoverable byte-for-byte identically to a pulled one,
 and lands + announces exactly once — SPEC §14.1/§14.3).

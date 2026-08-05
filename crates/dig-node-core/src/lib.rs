@@ -1449,6 +1449,13 @@ impl CachedManifests {
     /// unmeasured CONTENTS - but with fields that are just byte buffers there is no longer a
     /// contents axis to get wrong. Keep it that way: anything added here should be a buffer or a
     /// scalar, never a decoded tree.
+    ///
+    /// NOT counted, stated so it is not rediscovered as a finding: the per-ENTRY container
+    /// overhead - three `Arc` headers, the LRU node, and the key strings - is a fixed ~200 bytes
+    /// that this returns nothing for. It cannot matter here, because every module is padded to
+    /// `FIXED_BLOB_LEN` so the number of distinct capsules a node can hold is bounded by disk long
+    /// before entry overhead is material. It WOULD matter if the budget were ever driven by a
+    /// large population of tiny entries.
     fn retained_bytes(&self) -> usize {
         let CachedManifests {
             len,
@@ -1646,13 +1653,6 @@ fn parse_cached_json(rendered: &str) -> Value {
     serde_json::from_str(rendered).unwrap_or(Value::Null)
 }
 
-/// Render a decoded [`MetadataManifest`](digstore_core::MetadataManifest) as the dighub `Manifest`
-/// JSON clients consume — the 14 publisher fields, byte-identical to what the retired
-/// `dighub-retrieval` Lambda emitted for `dig.getMetadata`.
-///
-/// Written out field by field rather than derived from the codec struct so the WIRE shape is
-/// stable regardless of the struct's internals: a field added to `MetadataManifest` upstream must
-/// be a deliberate wire change here, not an accidental one.
 /// Reduce a `dig.getContent` answer to `dig.getProof`'s trust-bearing half.
 ///
 /// A pure function over the inner read's answer, deliberately separate from
@@ -1704,6 +1704,16 @@ fn proof_from_content_answer(answer: Value, id: Value) -> Value {
     }})
 }
 
+/// Render a decoded [`MetadataManifest`](digstore_core::MetadataManifest) as the dighub `Manifest`
+/// JSON clients consume — the 14 publisher fields, byte-identical to what the retired
+/// `dighub-retrieval` Lambda emitted for `dig.getMetadata`.
+///
+/// Written out field by field rather than derived from the codec struct so the WIRE shape is
+/// stable regardless of the struct's internals: a field added to `MetadataManifest` upstream must
+/// be a deliberate wire change here, not an accidental one.
+///
+/// Its OUTPUT is what the memo retains (#2071) — the entry holds these bytes, never the decoded
+/// tree — so a change here changes what `retained_bytes()` measures as well as what clients see.
 fn metadata_manifest_to_json(m: &digstore_core::MetadataManifest) -> Value {
     json!({
         "schema_version": m.schema_version,
