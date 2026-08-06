@@ -111,6 +111,57 @@ chain vouches for — extending the EXISTING tip-capsule trust, not opening a ne
 client-supplied superseded root still fails `-32005` (anti-rollback preserved); only the node's own
 trusted tip manifest may redirect a read to an older capsule.
 
+## §13 lineage cross-check is NOT enough — serve TIP-AUTHORITATIVE to close the Case-A downgrade (#2211)
+
+The #2088 leaf binding + the #184 lineage cross-check together bind a redirected serve to *a genuine
+lineage generation*, but NOT to the path's *canonical/maximal* one — because `latest_root` is read
+from the §13 `PublicManifest`, which is additive and NOT committed into the chain-anchored
+`current_root`. A malicious holder can serve a genuine, anchor-passing TIP capsule whose §13 is forged
+to redirect a path at a genuine-but-SUPERSEDED prior generation (a real lineage root, so the cross-
+check honours it) — a downgrade bounded to owner-committed content.
+
+Case A (a path whose CURRENT bytes the tip's own `current_root` commits) is closed at the serve tier:
+serve TIP-FIRST with NO §13 leaf binding — bind purely by `proof.root == tip` (the pre-#2088 path) —
+and consult the §13 redirect + `expected_leaf` ONLY on a genuine tip MISS (the tip capsule folds the
+older-generation file to its constant-time decoy). A tip-committed path is served from the chain-
+anchored tip, so a forged redirect is never reached; a legitimately-older-generation file misses at
+the tip and falls through to the (still §13-driven, still lineage-authenticated) redirect exactly as
+#2088 intends. Sharp edge: `current_root = MerkleTree::from_leaves(merkle_leaves)` commits ONLY the
+tip generation's own leaves (digstore `data_section.rs`), which is WHY a tip-committed path is present
+at the tip and an unchanged-since-older-gen path is absent — the whole tip-first split rests on it.
+
+Case B (a path whose current version genuinely lives in an OLDER generation than a forged §13 names)
+stays OPEN on #2211, blocked on the per-path current-state commitment the tip must anchor (digstore
+#2203). `expected_leaf` proves the served bytes are *a* genuine lineage generation, not that it is the
+path's canonical current one.
+
+## The tip-authoritative Case-A closure rests on an ENFORCED premise, not an assumed one (#2211)
+
+The Case-A closure above assumes "a tip serve MISS for a path means the path is legitimately absent
+from the tip generation → consult the §13 redirect". That premise holds ONLY if the tip capsule
+genuinely HOLDS every leaf its `current_root` commits. It is NOT free: the capsule anchor gate
+(`module_anchor.rs`, `ChainAnchoredModuleVerifier`) compares only the 32-byte `CurrentRoot` HEADER
+against the chain — it NEVER recomputes the tree from `MerkleNodes`. So a single malicious holder can
+craft a tip `.dig` whose `CurrentRoot` header still equals the genuine chain tip (a lie) while its
+data is tampered so a tip-committed path no longer folds to it; the honest node admits + caches it,
+the tip serve MISSES that path, and the forged §13 drives the redirect → the rollback the Case-A fix
+was supposed to prevent. (Proven: with the redirect gate disabled the read serves `V1-OLD`.)
+
+Fix: before trusting a §13 redirect to move a read OFF the tip, re-derive the tip capsule and require
+its data to fold to its committed tip — `digstore_compiler::verify_module_root` recomputes the merkle
+root from the capsule's own `MerkleNodes` and checks it equals the committed `CurrentRoot`, plus that
+root must equal the chain-anchored tip. A tampered tip fails this → the redirect is refused → clean
+miss, never a downgrade. Placed at the §13-trust boundary (not the anchor gate) so it covers a tip
+capsule however it entered the cache, and costs a whole-module read only on the redirect-candidate path.
+
+Sharp edge — the two-pass serve must DEFER a tip-pass upstream error. Reordering the serve to tip-first
+then §13-redirect meant a Tier-3 upstream ERROR in the tip pass returned `Some(Unreadable)` and
+short-circuited before the redirect pass — regressing #2088 (a legitimately-older-generation file
+dead-ended as `Unreadable` whenever an upstream was configured). A non-Served tip outcome (decoy miss
+OR upstream error) must NOT be treated as definitive while a §13 redirect candidate remains: hold it,
+try the redirect, and only surface the tip pass's own `Unreadable`/`NotFound` if the redirect also
+misses.
+
 ## §21 backfill and the #1576 reshare are TWO transports for the same capsule — one gate, not two (#1614)
 
 A read miss can pull the SAME `(store, root)` whole `.dig` down two independent legs, and for a long
