@@ -66,8 +66,10 @@ impl RequestorId {
 
     /// The stable map key for this requestor. Distinct requestors MUST map to distinct keys (that is
     /// the whole point — one abuser's exhausted bucket must never refuse a different requestor), and
-    /// the same requestor MUST map to the same key across calls.
-    fn key(&self) -> String {
+    /// the same requestor MUST map to the same key across calls. Shared with the `cache.pushCapsule`
+    /// pending-reassembly bound (dig_ecosystem#2149), which keys its per-requestor cap on this SAME
+    /// non-spoofable transport identity so one peer cannot pin unbounded reassembly state.
+    pub(crate) fn key(&self) -> String {
         match self {
             RequestorId::Local => "local".to_string(),
             RequestorId::Peer(id) => format!("peer:{id}"),

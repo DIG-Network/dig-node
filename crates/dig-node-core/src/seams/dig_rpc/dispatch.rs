@@ -153,7 +153,11 @@ impl RpcDispatch for Node {
             // `seams::capsule::push_capsule`.
             m if m == crate::seams::capsule::PUSH_CAPSULE_METHOD => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
-                return node.push_capsule(&params, id, origin, provenance).await;
+                // `requestor` is the non-spoofable transport identity (loopback operator / verified
+                // peer_id); the handler keys its pending-reassembly DoS bound on it (#2149).
+                return node
+                    .push_capsule(&params, id, origin, provenance, requestor)
+                    .await;
             }
             // `dig.getPublicManifest` is NOT yet a `dig_rpc_protocol::Method` variant, so — like
             // the chat methods above — it is dispatched here, before the enum match. Promoting it
