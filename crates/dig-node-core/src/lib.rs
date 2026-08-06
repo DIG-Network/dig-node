@@ -12749,6 +12749,107 @@ mod tests {
         assert_eq!(bytes, content.bytes, "proxy serves the holder's bytes");
     }
 
+    /// dig_ecosystem#2189: the expensive PROXY fetch-through leg is bounded by its OWN, tighter
+    /// per-requestor allowance — INDEPENDENT of the cheap miss-lookup budget. Proxy-spam therefore
+    /// cannot exhaust this node's egress under the lookup budget: once the proxy allowance is spent,
+    /// further `proxy:true` misses DEGRADE to the normal redirect (fail-closed, never an unbounded
+    /// fetch) even while the lookup budget still has ample tokens — and the cheap-lookup path is
+    /// unchanged.
+    ///
+    /// Fixture design — the two budgets are pinned DELIBERATELY LOPSIDED (lookup 100 / proxy 1, both
+    /// no-refill) so the assertion is load-bearing: it is precisely the SEPARATION that is under test.
+    /// A regression that drew the proxy fetch from the shared lookup budget would serve the SECOND
+    /// proxy call too (100 lookup tokens available) and RED the "second proxy is redirected" assertion;
+    /// the interleaved lookup-only calls prove the lookup budget is genuinely untouched by proxy spend.
+    #[test]
+    fn proxy_fetch_is_bounded_by_its_own_allowance_independent_of_lookups() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        std::env::remove_var("DIG_NODE_ON_MISS");
+        let rt = pin_test_rt();
+        let content = anchored_mock_content(30, 3);
+        let cid = anchored_cid_for(&content);
+        let (store_hex, tip_hex, rk_hex) = match &cid {
+            ContentId::Resource {
+                store_id,
+                root,
+                retrieval_key,
+            } => (
+                hex::encode(store_id),
+                hex::encode(root),
+                hex::encode(retrieval_key),
+            ),
+            _ => unreachable!("resource id"),
+        };
+        // Anchor the content's root on-chain (hermetic pin resolution) so the request resolves past the
+        // #127 pin into the miss path, independent of test-ordering env state.
+        let anchored_root = Bytes32::from_hex(&tip_hex).expect("64-hex root");
+        let (node, td) =
+            test_node_with_resolver(None, MockResolver::one(&store_hex, anchored_root));
+        attach_p2p(
+            &node,
+            vec![
+                dig_download::testkit::mock_provider(1, &cid),
+                dig_download::testkit::mock_provider(2, &cid),
+            ],
+            content.clone(),
+            MissMode::Redirect,
+            &td,
+        );
+        // A GENEROUS cheap-lookup budget, a TINY (exactly 1, no-refill) proxy allowance: proxy spend must
+        // be capped by the proxy allowance alone, never able to borrow from the lookup budget.
+        let pc = node.p2p_content().expect("engine attached");
+        pc.set_miss_rate_limit(100.0, 0.0);
+        pc.set_proxy_rate_limit(1.0, 0.0);
+        let req = |proxy: bool| {
+            json!({"jsonrpc":"2.0","id":9,"method":"dig.fetchRange","params":{
+                "store_id": store_hex, "root": tip_hex, "retrieval_key": rk_hex,
+                "length": 4096, "offset": 0, "proxy": proxy,
+            }})
+        };
+        let peer = || crate::rate_limit::RequestorId::Peer("aaaa".to_string());
+        let call = |proxy: bool| {
+            rt.block_on(handle_rpc_as(
+                &node,
+                req(proxy),
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+                peer(),
+            ))
+        };
+
+        // 1st proxy miss: within the proxy allowance → fetches-through and serves the bytes.
+        let served = call(true);
+        assert!(
+            served.get("result").is_some(),
+            "1st proxy miss is within the proxy allowance and serves a frame: {served}"
+        );
+
+        // 2nd proxy miss: proxy allowance EXHAUSTED → degrades to a redirect (NOT served), even though
+        // the lookup budget still holds ~98 tokens. This is the #2189 invariant.
+        let throttled = call(true);
+        assert_eq!(
+            throttled["error"]["code"],
+            json!(CONTENT_REDIRECT),
+            "2nd proxy miss degrades to redirect once the proxy allowance is spent: {throttled}"
+        );
+        assert!(
+            throttled.get("result").is_none(),
+            "a throttled proxy miss serves NO bytes (fail-closed, not an unbounded fetch): {throttled}"
+        );
+
+        // The cheap-lookup path is UNCHANGED: plain (proxy:false) misses keep redirecting well past the
+        // spent proxy allowance, proving the lookup budget was never charged for the proxy fetches.
+        for i in 0..5 {
+            let lookup = call(false);
+            assert_eq!(
+                lookup["error"]["code"],
+                json!(CONTENT_REDIRECT),
+                "lookup-only miss {i} is untouched by the exhausted proxy allowance: {lookup}"
+            );
+        }
+    }
+
     /// dig_ecosystem#2007 Unit A: the miss → DHT-lookup path is rate-limited PER REQUESTOR — an
     /// over-budget requestor's miss is refused, a DIFFERENT requestor is unaffected.
     ///

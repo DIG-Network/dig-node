@@ -57,6 +57,13 @@ impl RequestorId {
         }
     }
 
+    /// Whether this is the node's OWN trusted operator ([`RequestorId::Local`]). The operator is
+    /// exempt from the tighter PROXY-fetch allowance (dig_ecosystem#2189): that bound targets the
+    /// REMOTE amplification vector, mirroring the lookup limiter's "the operator is trusted" rationale.
+    pub fn is_local(&self) -> bool {
+        matches!(self, RequestorId::Local)
+    }
+
     /// The stable map key for this requestor. Distinct requestors MUST map to distinct keys (that is
     /// the whole point — one abuser's exhausted bucket must never refuse a different requestor), and
     /// the same requestor MUST map to the same key across calls.
@@ -159,6 +166,22 @@ pub const DEFAULT_MISS_LOOKUP_BURST: f64 = 16.0;
 /// its burst is spent.
 pub const DEFAULT_MISS_LOOKUP_REFILL_PER_SEC: f64 = 4.0;
 
+/// The default per-requestor burst for the PROXY fetch-through leg (dig_ecosystem#2189). A
+/// `proxy:true` miss does NOT run a cheap DHT lookup — it pulls a FULL multi-source capsule from the
+/// holders and serves the bytes directly (large egress + merkle crypto), an order of magnitude
+/// costlier than the [`DEFAULT_MISS_LOOKUP_BURST`] lookup this node's miss budget is sized for. Drawing
+/// expensive proxy fetches from that lookup budget lets a caller convert cheap-lookup allowance into
+/// egress; so the proxy leg gets its OWN, tighter per-requestor allowance — a QUARTER the lookup burst.
+/// A legitimate NAT-blocked reader proxying a handful of resources is absorbed; sustained proxy spam is
+/// capped independently of, and far below, the lookup rate.
+pub const DEFAULT_PROXY_FETCH_BURST: f64 = 4.0;
+
+/// The default sustained PROXY fetch-through rate (tokens per second) a single requestor is refilled at
+/// once its proxy burst is spent — a QUARTER of [`DEFAULT_MISS_LOOKUP_REFILL_PER_SEC`], i.e. ~one full
+/// capsule fetch per second per requestor after the burst, calibrated against the per-fetch egress + CPU
+/// cost being ~an order of magnitude that of a cheap lookup.
+pub const DEFAULT_PROXY_FETCH_REFILL_PER_SEC: f64 = 1.0;
+
 /// The most distinct requestors tracked at once. Bounds the bucket map so a caller cycling identities
 /// (fresh mTLS leaves / spoofed source IPs) cannot grow it without bound. When full, only IDLE
 /// (full-bucket) entries are evicted to make room — dropping a full bucket is a no-op for the bound
@@ -204,6 +227,16 @@ impl MissRateLimiter {
         Self::new(
             DEFAULT_MISS_LOOKUP_BURST,
             DEFAULT_MISS_LOOKUP_REFILL_PER_SEC,
+        )
+    }
+
+    /// A limiter at the PROXY fetch-through defaults ([`DEFAULT_PROXY_FETCH_BURST`] /
+    /// [`DEFAULT_PROXY_FETCH_REFILL_PER_SEC`]) — the tighter, independent bound on the expensive proxy
+    /// leg (dig_ecosystem#2189), separate from the cheap miss-lookup budget.
+    pub fn with_proxy_defaults() -> Self {
+        Self::new(
+            DEFAULT_PROXY_FETCH_BURST,
+            DEFAULT_PROXY_FETCH_REFILL_PER_SEC,
         )
     }
 
@@ -304,6 +337,29 @@ mod tests {
             !limiter.check(&control),
             "control 3rd refused by its OWN bucket, not the abuser's"
         );
+    }
+
+    /// dig_ecosystem#2189: the PROXY fetch-through allowance is strictly TIGHTER than the cheap
+    /// miss-lookup budget, so expensive proxy fetches drain far faster than cheap lookups. Pins the
+    /// calibration from the constants so a future loosening that erased the separation reds here.
+    #[test]
+    fn proxy_fetch_allowance_is_tighter_than_the_lookup_budget() {
+        // Compile-time so a future edit that erased the separation FAILS the build, not just a run.
+        const _: () = assert!(
+            DEFAULT_PROXY_FETCH_BURST < DEFAULT_MISS_LOOKUP_BURST,
+            "proxy burst must be smaller than the lookup burst"
+        );
+        const _: () = assert!(
+            DEFAULT_PROXY_FETCH_REFILL_PER_SEC < DEFAULT_MISS_LOOKUP_REFILL_PER_SEC,
+            "proxy refill must be slower than the lookup refill"
+        );
+    }
+
+    #[test]
+    fn local_is_local_and_remote_requestors_are_not() {
+        assert!(RequestorId::Local.is_local());
+        assert!(!RequestorId::Peer("aaaa".to_string()).is_local());
+        assert!(!RequestorId::Anonymous("10.0.0.1".to_string()).is_local());
     }
 
     #[test]
