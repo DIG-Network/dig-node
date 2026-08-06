@@ -528,7 +528,25 @@ impl WalletBackend {
         let source = routing::route(db_synced, scoped);
         // Disclose the tier in the node log as well as on the wire, so an operator reading
         // `dig-node.jsonl` can tell a local-replica answer from a third-party oracle call.
-        tracing::debug!(tier = source.as_wire(), "wallet balance read routed");
+        //
+        // Split by level deliberately. `dig-logging`'s baked-in default is `info`
+        // (dig-logging `filter.rs:21`), and a stock install sets none of the overrides -- so a
+        // `debug!` here is INVISIBLE on every default node, which would make SPEC §18.7b's
+        // "dig-node.jsonl records the same tier the wire reports" false in the field and would
+        // let an acceptance run reading the log mistake silence for "no fallback occurred"
+        // (dig-node#189 review).
+        //
+        // FALLBACK is `info`: it is the exceptional path, it means this read was disclosed to a
+        // third-party oracle, and it is the evidence #2232's acceptance depends on. DB is `debug`:
+        // once sync works it is the ordinary path, and logging every local read at `info` would
+        // amplify an OPEN unauthenticated loopback endpoint into a log-volume lever.
+        match source {
+            Source::Db => tracing::debug!(tier = source.as_wire(), "wallet balance read routed"),
+            Source::Fallback => tracing::info!(
+                tier = source.as_wire(),
+                "wallet balance read routed to the third-party chain oracle"
+            ),
+        }
 
         match source {
             Source::Db => {

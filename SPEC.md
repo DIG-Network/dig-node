@@ -3662,6 +3662,15 @@ answered, and MUST derive every freshness field from that tier.
   so `dig-node.jsonl` records the same tier the wire reports. Diagnostics go through `tracing`,
   never stderr (a Windows service discards it).
 
+  **The FALLBACK tier MUST be logged at a level a stock node actually emits.** `dig-logging`'s
+  baked-in default is `info` and a default install sets none of the overrides, so a `debug!` here is
+  invisible in the field — which would make the sentence above false on every stock node, and would
+  let an acceptance run reading `dig-node.jsonl` mistake silence for "no fallback occurred". Fallback
+  is therefore `info`; it is the exceptional path and it means the read was disclosed to a
+  third-party oracle. The DB tier stays `debug`: once the §18.6 sync loop lands it is the ordinary
+  path, and logging every local read at `info` would turn an OPEN unauthenticated loopback endpoint
+  into a log-volume lever.
+
 18.8. **Method surface — reads (served).** `login`, `logout`, `get_version`,
 `get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,
 `get_spendable_coin_count`, `get_coins`, `get_coins_by_ids`, `get_cats`, `get_all_cats`, `get_token`,
