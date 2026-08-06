@@ -1030,3 +1030,20 @@ intact — the proxy serves bytes but the middle node does NOT become a holder, 
 plant attacker-chosen inventory. `TokenBucket` here is a byte-identical MIRROR of dig-wallet's #1957
 primitive (dig-node-core must not depend on dig-wallet); consolidating both into a lower shared crate
 is the remaining follow-up.
+
+## A retention ceiling is NOT a response ceiling — an anonymous whole-section render needs its own bound (#2145)
+
+The decoded-manifest memo already bounds RESIDENCY: total bytes (`MANIFEST_MEMO_MAX_BYTES`, 32 MiB,
+LRU-evicted) with a per-entry ceiling (`MANIFEST_ENTRY_MAX_BYTES`, 4 MiB) so one hostile capsule can
+neither pin the budget nor evict everything to fit. But that ceiling governs what is KEPT, not what is
+SENT. `dig.getMetadata` renders a WHOLE data section into one JSON-RPC response — it cannot be windowed
+like `dig.getContent`/`dig.getCapsule`, whose 3 MiB windows seek the module — and `MetadataManifest`'s
+`custom`/`links` are publisher-controlled and unbounded. So a section that is REFUSED memoization (over
+4 MiB) is re-decoded per request AND still rendered + parsed + re-serialized (3–4 in-RAM copies) into
+the response on every anonymous call: a ~200-byte request → ~100 MB out. The fix is a separate RESPONSE
+ceiling (`METADATA_RESPONSE_MAX_BYTES` = `WINDOW` = 3 MiB): check the RENDERED length BEFORE parsing and
+refuse with a bounded `METADATA_TOO_LARGE` (-32015). Note the two ceilings deliberately differ (4 MiB
+retain vs 3 MiB respond), so a 3–4 MiB section is memoizable yet un-servable — that is correct, both are
+DoS bounds, not a wire contract. Second gap in the same class: a lifetime-of-process memo with no idle
+TTL is only reclaimable if `cache.clear` actually DRAINS it — `clear_cache`/`clear_content_cache` did
+not touch the manifest memo, so an operator clearing the cache still held its RAM until process exit.

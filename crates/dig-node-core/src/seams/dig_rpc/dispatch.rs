@@ -545,6 +545,10 @@ impl RpcDispatch for Node {
                 // Also drop the in-memory decoded-content cache so a cleared capsule can't still be served
                 // from RAM (audit #179).
                 node.clear_content_cache();
+                // And drain the process-lifetime decoded-MANIFEST memo (#2145): it is a RAM residency
+                // with no TTL that `clear_cache`/`clear_content_cache` did not touch, so without this
+                // an operator clearing the cache could not reclaim it.
+                clear_manifest_memo();
                 return json!({"jsonrpc":"2.0","id":id,"result":{}});
             }
             // cache.listCached / removeCached / fetchAndCache — the cached-store manager

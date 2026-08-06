@@ -1325,6 +1325,25 @@ const MANIFEST_MEMO_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// transient read is survivable, retention is not.
 const MANIFEST_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// The hard ceiling on the rendered metadata JSON `dig.getMetadata` will return in ONE response.
+///
+/// `dig.getMetadata` is on the ANONYMOUS public-read allowlist and renders a WHOLE data section —
+/// unlike its sibling window reads (`dig.getContent`/`dig.getCapsule`), which seek and return one
+/// [`WINDOW`] at a time. A `MetadataManifest`'s `custom`/`links` are publisher-controlled and
+/// unbounded, so a single hostile capsule could otherwise turn a ~200-byte request into a ~100 MB
+/// response — parsed, re-wrapped, and re-serialized (3–4 in-RAM copies) on EVERY call. The
+/// section is a whole JSON object, not a byte stream, so it cannot be windowed like the sibling
+/// reads; instead an oversized section is refused with [`METADATA_TOO_LARGE`] rather than rendered.
+/// Pinned to [`WINDOW`] so the public-tier response bound is the same 3 MiB ceiling everywhere.
+/// This is a DoS bound only: a normal store's metadata is kilobytes and is unaffected.
+const METADATA_RESPONSE_MAX_BYTES: usize = WINDOW;
+
+/// JSON-RPC error code: the `dig.getMetadata` metadata section is larger than
+/// [`METADATA_RESPONSE_MAX_BYTES`], so it is refused rather than rendered into one response
+/// (#2145). A bounded error, never the oversized body. Catalogued in docs.dig.net (L7 error
+/// catalog).
+const METADATA_TOO_LARGE: i64 = -32015;
+
 /// A byte-budgeted LRU of decoded manifests.
 ///
 /// `lru::LruCache` bounds entries; this bounds BYTES, using each entry's own
@@ -1370,6 +1389,29 @@ impl ManifestMemo {
             }
         }
     }
+
+    /// Drop every memoized manifest and reset the running byte total to zero.
+    ///
+    /// Backs `cache.clear` (via [`clear_manifest_memo`]): the memo is process-lifetime and has no
+    /// idle TTL, so without an explicit drain an operator who cleared the on-disk cache would still
+    /// see its RAM held by decoded manifests until the process exits. A drained memo simply
+    /// re-decodes on the next read — a miss always recomputes, never errors.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
+
+/// Drain the process-wide decoded-manifest memo (the `cache.clear` reclaim path).
+///
+/// The memo is a lifetime-of-process residency that `clear_cache` + `clear_content_cache` did not
+/// touch, so an operator reclaiming memory had no way to release it. Draining it here closes that
+/// gap; the next anonymous read for any capsule simply re-decodes.
+fn clear_manifest_memo() {
+    manifest_memo()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 /// The process-wide DECODED-manifest memo, keyed by `(cache_dir, capsule)`, bounded in BYTES by
@@ -1637,12 +1679,19 @@ fn read_public_manifest_json(
 ///
 /// Shares [`cached_manifests_blocking`] with [`read_public_manifest_json`], so one whole-module
 /// read answers both methods rather than each paying its own. Same `Some/None` semantics.
+///
+/// Returns the RENDERED JSON string, NOT a parsed [`Value`], so [`Node::get_metadata`] can enforce
+/// [`METADATA_RESPONSE_MAX_BYTES`] on the raw length BEFORE paying to parse + re-serialize it — an
+/// oversized section is refused, never rendered into a response (#2145).
+/// - `Ok(Some(Some(json)))` — held, carries a metadata section.
+/// - `Ok(Some(None))` — held, NO metadata section (older `.dig` / no publisher metadata).
+/// - `Ok(None)` — not held.
+/// - `Err(_)` — held but the data section is malformed.
 fn read_metadata_manifest_json(
     cache_dir: &Path,
     key: &CapsuleKey,
-) -> Result<Option<Option<Value>>, String> {
-    Ok(cached_manifests_blocking(cache_dir, key)?
-        .map(|m| m.metadata_json.as_ref().map(|s| parse_cached_json(s))))
+) -> Result<Option<Option<Arc<str>>>, String> {
+    Ok(cached_manifests_blocking(cache_dir, key)?.map(|m| m.metadata_json.clone()))
 }
 
 /// Parse JSON this node rendered itself moments ago.
@@ -2731,6 +2780,10 @@ impl Node {
     ///   root }`.
     /// - Held with NO metadata section → `{ manifest: null, root }` — never an error, for the same
     ///   store-format §5.1 reason as the public manifest.
+    /// - Held but the metadata section renders over [`METADATA_RESPONSE_MAX_BYTES`] → `-32015`
+    ///   (bounded error, never the oversized body). This section is rendered WHOLE — it cannot be
+    ///   windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so without
+    ///   this a ~200-byte anonymous request could return ~100 MB (#2145).
     /// - Not held at this root → `-32004`. A corrupt data section → `-32000`.
     async fn get_metadata(&self, params: &Value, id: Value) -> Value {
         let root_hex = match self.resolve_capsule_root(params, &id).await {
@@ -2746,8 +2799,28 @@ impl Node {
             tokio::task::spawn_blocking(move || read_metadata_manifest_json(&cache_dir, &capsule))
                 .await;
         match outcome {
-            Ok(Ok(Some(manifest))) => json!({"jsonrpc":"2.0","id":id,"result":{
-                "manifest": manifest.unwrap_or(Value::Null),
+            // Held with a metadata section: enforce the response ceiling on the RENDERED length
+            // before parsing (#2145). An oversized section is refused with a BOUNDED error rather
+            // than parsed + re-serialized into a ~100 MB response.
+            Ok(Ok(Some(Some(rendered)))) => {
+                if rendered.len() > METADATA_RESPONSE_MAX_BYTES {
+                    return rpc_err(
+                        &id,
+                        METADATA_TOO_LARGE,
+                        &format!(
+                            "metadata section is {} bytes, over the {METADATA_RESPONSE_MAX_BYTES}-byte response ceiling",
+                            rendered.len()
+                        ),
+                    );
+                }
+                json!({"jsonrpc":"2.0","id":id,"result":{
+                    "manifest": parse_cached_json(&rendered),
+                    "root": root_hex,
+                }})
+            }
+            // Held, but no metadata section — `null`, never an error (store-format §5.1).
+            Ok(Ok(Some(None))) => json!({"jsonrpc":"2.0","id":id,"result":{
+                "manifest": Value::Null,
                 "root": root_hex,
             }}),
             Ok(Ok(None)) => rpc_err(
@@ -9592,6 +9665,194 @@ mod tests {
         );
     }
 
+    /// `ManifestMemo::clear` drops every entry and resets the running byte total to zero (#2145).
+    ///
+    /// The memo is process-lifetime with no idle TTL, so `cache.clear` must be able to reclaim it.
+    /// Unit-tested on a LOCAL instance (not the process-wide memo) so parallel tests cannot race the
+    /// assertion.
+    #[test]
+    fn clearing_the_manifest_memo_resets_its_entries_and_byte_total() {
+        let mut memo = ManifestMemo {
+            entries: lru::LruCache::unbounded(),
+            bytes: 0,
+        };
+        let entry = |bytes: usize| {
+            Arc::new(CachedManifests {
+                len: 1,
+                modified: None,
+                public_json: Some(Arc::from("m".repeat(bytes).as_str())),
+                metadata_json: None,
+            })
+        };
+        for i in 0..5 {
+            memo.insert((format!("dir{i}"), format!("cap{i}")), entry(256 * 1024));
+        }
+        assert!(
+            memo.bytes > 0 && !memo.entries.is_empty(),
+            "precondition: memo is populated"
+        );
+
+        memo.clear();
+        assert_eq!(memo.bytes, 0, "clear must reset the running byte total");
+        assert_eq!(memo.entries.len(), 0, "clear must drop every entry");
+    }
+
+    /// `cache.clear` DRAINS the process-wide manifest memo, so an operator can reclaim its RAM
+    /// (#2145 — the second gap: the memo is a lifetime residency `clear_cache`/`clear_content_cache`
+    /// never touched).
+    ///
+    /// Asserted on ONE uniquely-keyed capsule so parallel tests populating the global memo with
+    /// their OWN capsules cannot make it flaky: nothing but this test writes this store_id, and the
+    /// only `cache.clear` caller is this test — so after the clear THIS capsule's entry is gone,
+    /// deterministically, regardless of what else the global memo holds.
+    #[tokio::test]
+    async fn cache_clear_drains_the_manifest_memo() {
+        let store_id = Bytes32([0x2Du8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>drain</h1>".to_vec())];
+        let (root, module_bytes) =
+            compile_fixture_module(store_id, digstore_core::Visibility::Public, true, &files);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+        let capsule = CapsuleKey::parse(&store_id.to_hex(), &root.to_hex()).unwrap();
+
+        // Populate the memo for this capsule via an anonymous public read.
+        let read = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getPublicManifest","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(read.get("error").is_none(), "{read}");
+        assert!(
+            memoized_manifest_bytes(&node.cache_dir, &capsule).is_some(),
+            "precondition: the read must have memoized this capsule"
+        );
+
+        // cache.clear must drain it.
+        let cleared = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":2,"method":"cache.clear"}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(cleared.get("error").is_none(), "{cleared}");
+        assert!(
+            memoized_manifest_bytes(&node.cache_dir, &capsule).is_none(),
+            "cache.clear must drain the manifest memo — this capsule's entry is still resident"
+        );
+    }
+
+    /// `dig.getMetadata` REFUSES a metadata section over the response ceiling with a bounded error,
+    /// instead of rendering ~100 MB into one response (#2145).
+    ///
+    /// The section is rendered WHOLE (it cannot be windowed like `dig.getCapsule`) and `custom` is
+    /// publisher-controlled, so a hostile capsule could otherwise turn a ~200-byte anonymous request
+    /// into a huge response. Non-vacuous: the fixture's rendered metadata genuinely exceeds
+    /// [`METADATA_RESPONSE_MAX_BYTES`], and removing the ceiling check makes `getMetadata` return
+    /// that whole body with no error — this assertion then fails.
+    #[tokio::test]
+    async fn dig_get_metadata_refuses_a_section_over_the_response_ceiling() {
+        let store_id = Bytes32([0x2Eu8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>huge-meta</h1>".to_vec())];
+        // A publisher-controlled `custom` field big enough that the rendered JSON clears the ceiling.
+        let mut metadata = digstore_stage::empty_manifest();
+        let filler = "z".repeat(METADATA_RESPONSE_MAX_BYTES + 512 * 1024);
+        metadata
+            .custom
+            .insert("payload".to_string(), Value::String(filler));
+        let (root, module_bytes) = compile_fixture_module_with_metadata(store_id, &files, metadata);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getMetadata","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+
+        assert_eq!(
+            resp["error"]["code"],
+            json!(METADATA_TOO_LARGE),
+            "an oversized metadata section must be refused with the bounded error, not rendered: {resp}"
+        );
+        assert!(
+            resp.get("result").is_none(),
+            "a refused read must carry no result body"
+        );
+        // The bounded error itself is tiny — the whole point is that the oversized body never leaves.
+        assert!(
+            resp.to_string().len() < 4096,
+            "the refusal response must be bounded, not the ~{}-byte section it declined",
+            module_bytes.len()
+        );
+    }
+
+    /// A NORMAL-size metadata section is served identically — the ceiling only bites the hostile
+    /// case (#2145 — no behaviour change for in-bounds stores).
+    #[tokio::test]
+    async fn dig_get_metadata_serves_a_normal_section_unchanged() {
+        let store_id = Bytes32([0x2Fu8; 32]);
+        let files = vec![("index.html".to_string(), b"<h1>ok-meta</h1>".to_vec())];
+        let mut metadata = digstore_stage::empty_manifest();
+        metadata.name = "Ordinary Store".to_string();
+        metadata
+            .custom
+            .insert("note".to_string(), Value::String("small".to_string()));
+        let (root, module_bytes) = compile_fixture_module_with_metadata(store_id, &files, metadata);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::one(&store_id.to_hex(), root));
+        seed_cached_module(
+            &node.cache_dir,
+            &store_id.to_hex(),
+            &root.to_hex(),
+            &module_bytes,
+        );
+
+        let resp = handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getMetadata","params":{
+                "store_id": store_id.to_hex(), "root": root.to_hex(),
+            }}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        assert!(
+            resp.get("error").is_none(),
+            "a normal section must serve, not error: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["manifest"]["name"].as_str(),
+            Some("Ordinary Store"),
+            "{resp}"
+        );
+        assert_eq!(
+            resp["result"]["manifest"]["custom"]["note"].as_str(),
+            Some("small"),
+            "{resp}"
+        );
+    }
+
     /// `dig.getCapsule` reads only the requested WINDOW off disk, never the whole module.
     ///
     /// Asserted in BYTES READ, not bytes returned. Both implementations return byte-identical
@@ -9761,6 +10022,44 @@ mod tests {
             &opts,
         )
         .expect("stage + compile a fixture module");
+        let bytes = std::fs::read(&compiled.module_path).expect("read compiled module bytes");
+        (compiled.root, bytes)
+    }
+
+    /// Build a real compiled `.dig` carrying a caller-supplied publisher `MetadataManifest`, so a
+    /// `dig.getMetadata` test can exercise an oversized (hostile) metadata section through the real
+    /// stage/compile + data-section decode path. Returns `(root, module_bytes)`.
+    fn compile_fixture_module_with_metadata(
+        store_id: Bytes32,
+        files: &[(String, Vec<u8>)],
+        metadata: digstore_core::MetadataManifest,
+    ) -> (Bytes32, Vec<u8>) {
+        let scratch = tempfile::tempdir().unwrap();
+        let secret = digstore_crypto::bls::SecretKey::from_seed(&[42u8; 32]);
+        let pubkey = secret.public_key().to_bytes();
+        let opts = digstore_stage::FinalizeOptions {
+            data_dir: scratch.path().to_path_buf(),
+            trusted_keys: vec![digstore_core::TrustedHostKey {
+                public_key: pubkey.0,
+                label: "test-fixture".to_string(),
+            }],
+            store_pubkey: pubkey,
+            metadata,
+            chain_state: None,
+            auth: digstore_stage::no_auth(),
+            include_public_manifest: true,
+        };
+        let compiled = digstore_stage::stage_and_compile(
+            files,
+            store_id,
+            &digstore_core::Visibility::Public,
+            digstore_core::MAX_STORE_BYTES,
+            false,
+            0,
+            0,
+            &opts,
+        )
+        .expect("stage + compile a fixture module with metadata");
         let bytes = std::fs::read(&compiled.module_path).expect("read compiled module bytes");
         (compiled.root, bytes)
     }
