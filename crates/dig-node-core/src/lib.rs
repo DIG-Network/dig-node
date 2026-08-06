@@ -13181,6 +13181,32 @@ mod tests {
         );
     }
 
+    /// dig_ecosystem#2247 regression: the miss-lookup-budget-exhausted condition and the
+    /// range-metadata-unrepresentable condition surface DISTINCT JSON-RPC codes. Before the fix,
+    /// `CONTENT_MISS_RATE_LIMITED` squatted `-32009`, colliding with `dig-rpc-protocol`'s
+    /// `RangeMetadataUnrepresentable`, so both conditions minted the SAME code on the wire. It now
+    /// lives at `-32003` (canonical since dig-rpc-protocol 0.7), leaving `-32009` unambiguously
+    /// `RangeMetadataUnrepresentable`. This test would fail on the pre-fix collision (both `-32009`).
+    #[test]
+    fn miss_rate_limit_and_range_unrepresentable_use_distinct_codes() {
+        let miss_rate_limited = crate::download::CONTENT_MISS_RATE_LIMITED;
+        let range_unrepresentable =
+            dig_rpc_protocol::ErrorCode::RangeMetadataUnrepresentable.code() as i64;
+
+        assert_eq!(
+            miss_rate_limited, -32003,
+            "a miss-lookup-budget-exhausted refusal is -32003 CONTENT_MISS_RATE_LIMITED"
+        );
+        assert_eq!(
+            range_unrepresentable, -32009,
+            "a dig.fetchRange metadata-unrepresentable refusal stays -32009 RangeMetadataUnrepresentable"
+        );
+        assert_ne!(
+            miss_rate_limited, range_unrepresentable,
+            "the two refusal conditions MUST surface distinct wire codes (#2247)"
+        );
+    }
+
     /// dig_ecosystem#2007 Unit B: the `dig.getAvailability` batch's not-held → DHT `find_providers`
     /// enrichment is bounded by the SAME per-requestor miss-lookup budget as the single-item legs,
     /// spent ONE TOKEN PER NOT-HELD ITEM — so a large batch cannot amplify a single token into an

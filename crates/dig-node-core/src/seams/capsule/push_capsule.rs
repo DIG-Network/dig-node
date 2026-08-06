@@ -55,7 +55,7 @@ use super::MAX_CAPSULE_BYTES;
 /// The catalogued JSON-RPC error a push is refused with when it would exceed ANY in-flight
 /// reassembly bound — the per-requestor cap, the global cap, or the global pending-bytes budget
 /// (dig_ecosystem#2149). A DEDICATED code in the bounded/resource-limit cluster, distinct from the
-/// miss-lookup `-32009` and from `-32015 METADATA_TOO_LARGE` (a different bounded condition on
+/// miss-lookup `-32003` and from `-32015 METADATA_TOO_LARGE` (a different bounded condition on
 /// `dig.getMetadata`): the condition here is not "you are asking too fast" but "this node is holding
 /// too much unfinished push state to accept another window right now". The caller SHOULD complete or
 /// abandon an in-flight push, or retry after backing off; an abandoned partial frees its slot after
