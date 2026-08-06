@@ -344,11 +344,12 @@ mod tests {
     /// calibration from the constants so a future loosening that erased the separation reds here.
     #[test]
     fn proxy_fetch_allowance_is_tighter_than_the_lookup_budget() {
-        assert!(
+        // Compile-time so a future edit that erased the separation FAILS the build, not just a run.
+        const _: () = assert!(
             DEFAULT_PROXY_FETCH_BURST < DEFAULT_MISS_LOOKUP_BURST,
             "proxy burst must be smaller than the lookup burst"
         );
-        assert!(
+        const _: () = assert!(
             DEFAULT_PROXY_FETCH_REFILL_PER_SEC < DEFAULT_MISS_LOOKUP_REFILL_PER_SEC,
             "proxy refill must be slower than the lookup refill"
         );

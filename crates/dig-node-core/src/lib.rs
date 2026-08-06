@@ -12784,7 +12784,8 @@ mod tests {
         // Anchor the content's root on-chain (hermetic pin resolution) so the request resolves past the
         // #127 pin into the miss path, independent of test-ordering env state.
         let anchored_root = Bytes32::from_hex(&tip_hex).expect("64-hex root");
-        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store_hex, anchored_root));
+        let (node, td) =
+            test_node_with_resolver(None, MockResolver::one(&store_hex, anchored_root));
         attach_p2p(
             &node,
             vec![
