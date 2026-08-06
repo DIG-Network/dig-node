@@ -56,9 +56,13 @@ zeroize = "1"
 # file). We use the runtime `query()` API (NOT the compile-time `query!` macro) so the
 # build needs no live DATABASE_URL; `macros` is only for `#[derive(FromRow)]`.
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
-# Fallback tier (B.5): coinset.org + non-subscribing peer point-reads, reused AS-IS. Git
-# dep (not path) so a standalone dig-node checkout builds it in CI.
-chia-query = { git = "https://github.com/DIG-Network/chia-query.git", rev = "48f7f6521fcc109f6c935e56f96cb5a86da1ae22" }
+# Fallback tier (B.5): coinset.org + non-subscribing peer point-reads, reused AS-IS. From
+# crates.io, never a git rev (CLAUDE.md §3.6: consumers depend on the published version).
+# 0.6 is REQUIRED, not cosmetic: its `TlsIdentity::Generated` default builds the peer TLS
+# identity in memory instead of loading `~/.chia`, which is what lets a node running as a
+# Windows service (home = `config\systemprofile`, no `.chia`) construct a chain source at
+# all (#2210). Kept at the SAME version as dig-node-core so one `chia-query` resolves.
+chia-query = "0.6"
 # Dual transport (C.3): mTLS 9257 (Sage byte-parity) + plain-HTTP+CORS browser mirror.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

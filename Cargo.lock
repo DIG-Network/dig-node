@@ -772,7 +772,7 @@ dependencies = [
  "chia",
  "chia-protocol",
  "chia-wallet-sdk",
- "dig-chainsource-interface",
+ "dig-chainsource-interface 0.1.0",
  "futures-util",
  "hex",
  "log",
@@ -830,12 +830,15 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.2.1"
-source = "git+https://github.com/DIG-Network/chia-query.git?rev=48f7f6521fcc109f6c935e56f96cb5a86da1ae22#48f7f6521fcc109f6c935e56f96cb5a86da1ae22"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f5c159fa038efe011e17cf30ed5500a43fa738e617440e0af74d4f8ce05219f"
 dependencies = [
  "chia",
+ "chia-protocol",
  "chia-wallet-sdk",
  "clvmr",
+ "dig-chainsource-interface 0.1.0",
  "futures-util",
  "hex",
  "log",
@@ -853,15 +856,16 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f5c159fa038efe011e17cf30ed5500a43fa738e617440e0af74d4f8ce05219f"
+checksum = "e06d54946c125fddd1f2d8049d41b8a7828eb5b1a039fceaa168639cf7021981"
 dependencies = [
  "chia",
  "chia-protocol",
+ "chia-ssl",
  "chia-wallet-sdk",
  "clvmr",
- "dig-chainsource-interface",
+ "dig-chainsource-interface 0.2.0",
  "futures-util",
  "hex",
  "log",
@@ -1925,6 +1929,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-chainsource-interface"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bae5c5f343e98e9c2b1242d14ed9496db1bd42872509a8a29bb061ca105c4249"
+dependencies = [
+ "chia-protocol",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "dig-chat-protocol"
 version = "0.1.0"
 dependencies = [
@@ -2234,7 +2248,7 @@ dependencies = [
  "chia-query 0.5.1",
  "chia-sdk-utils",
  "chia-traits 0.26.0",
- "dig-chainsource-interface",
+ "dig-chainsource-interface 0.1.0",
  "dig-chat-protocol",
  "dig-constants 0.4.0",
  "dig-dht",
@@ -2464,7 +2478,7 @@ dependencies = [
  "bip39",
  "chia",
  "chia-protocol",
- "chia-query 0.2.1",
+ "chia-query 0.6.0",
  "chia-sdk-test",
  "chia-wallet-sdk",
  "clvmr",

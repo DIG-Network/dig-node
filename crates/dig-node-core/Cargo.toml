@@ -92,7 +92,17 @@ chia-traits = "0.26"
 # 0.1, so their types unify with the workspace (crates.io, never git).
 chia-peer = "0.1"
 dig-chainsource-interface = "0.1"
-chia-query = "0.5"
+# PINNED EXACTLY at 0.5.1 (#2210) — an `=` requirement, not a caret, and that is load-bearing.
+# chia-query 0.5.2 moved to `dig-chainsource-interface` 0.2, while `chia-peer` 0.1.3 (the
+# light-client seam registered into the `ProviderRegistry` below) is still built against 0.1.
+# The two `ChainSourceProvider` traits then fail to unify and `registry.register` stops
+# compiling, so a caret `0.5` silently breaks this crate the moment the lock refreshes.
+# 0.5.1 is the last version whose `dig-chainsource-interface` agrees with chia-peer's.
+# Unpinning (to 0.6, alongside dig-wallet) needs a `chia-peer` release built against
+# dig-chainsource-interface 0.2 FIRST (release-first, §4.1) — a separate repo, tracked
+# separately. dig-wallet is on chia-query 0.6 meanwhile: it does not exchange `chia_query`
+# types across this crate boundary, so the two lines coexist without unifying.
+chia-query = "=0.5.1"
 # The ecosystem's canonical address-family / IPv6-first primitive (CLAUDE.md §5.2). The advertise
 # path keys + orders candidate addresses via `dig_ip::Family` and aggregates them source-tagged +
 # de-duplicated via `dig_ip::PeerCandidates` — never a hand-rolled family sort (epic #1020, #1032).

@@ -332,3 +332,47 @@ mod tests {
         );
     }
 }
+
+/// Regression tests for the chain-source configuration the balance read depends on
+/// (dig_ecosystem#2210).
+///
+/// These pin CONFIGURATION, not network behaviour, and that is deliberate. The bug they guard
+/// against was invisible on a developer machine precisely because it depended on the ambient
+/// filesystem: `~/.chia` exists for an interactive user and does not exist for the SYSTEM
+/// account a Windows service runs under, so any test that merely constructs a client would
+/// have passed on the machine where the bug was reported. Asserting the config instead makes
+/// the property independent of whose home directory the suite happens to run in.
+#[cfg(test)]
+mod chain_source_config_tests {
+    /// The peer TLS identity MUST be generated in memory.
+    ///
+    /// `TlsIdentity::Files` resolved under the home directory is the exact shape that broke:
+    /// a service account's home has no `.chia`, so establishing the identity failed, and with
+    /// it the whole client — leaving every `control.wallet.balance` at `-32040`. Chia full
+    /// nodes accept any well-formed client certificate, so a file is nothing but a liability.
+    #[test]
+    fn peer_identity_needs_nothing_from_the_filesystem() {
+        let cfg = chia_query::ChiaQueryConfig::default();
+        assert_eq!(
+            cfg.tls_identity,
+            chia_query::TlsIdentity::Generated,
+            "the wallet builds its chain source from ChiaQueryConfig::default(); a file-backed \
+             identity reintroduces the ~/.chia dependency that makes a service account fail"
+        );
+    }
+
+    /// The coinset tier MUST stay enabled.
+    ///
+    /// This is load-bearing beyond the fallback reads themselves: chia-query derives
+    /// `PeerRequirement::Optional` from it, which is what lets the client construct — and
+    /// serve over plain HTTP — when the peer pool comes up empty. Disabling it turns a
+    /// peerless host back into a total construction failure rather than a degraded read.
+    #[test]
+    fn coinset_tier_stays_enabled_so_an_empty_peer_pool_still_serves() {
+        assert!(
+            chia_query::ChiaQueryConfig::default().coinset_fallback_enabled,
+            "coinset is the keyless HTTP tier; disabling it makes peers REQUIRED and a \
+             peerless host cannot build a chain source at all"
+        );
+    }
+}
