@@ -473,63 +473,54 @@ impl ContentServer for Node {
         // peer tier outright, and the response says so rather than letting a gateway serve pass for
         // a measured P2P result.
         let peer_tier = self.peer_tier();
-        // -- Generation resolution (#2088) -------------------------------------------------------
-        // The pin above resolved the store's chain-anchored TIP. A resource UNCHANGED since an
-        // earlier commit lives in an OLDER capsule whose own root ≠ tip; serving it at the tip (where
-        // its ciphertext is absent) folds to a decoy and fails closed — the file reads as a 404 for
-        // every generation but the latest (#2088). The tip's embedded `PublicManifest` (§13) records,
-        // per public path, the `latest_root` of the generation that actually holds the file plus its
-        // `sha256_latest` leaf, so resolve BOTH:
-        //   - `serve_root`     — the capsule the tiers fetch + verify against (the tip, or the older
-        //     generation's own root when the file predates the tip).
-        //   - `expected_leaf`  — the tip-anchored `sha256_latest` every tier's `verify_and_decrypt`
-        //     must match. This is the SECURITY link: an older capsule's root is not chain-anchored
-        //     (attacker-choosable in isolation), so the leaf — sourced from the chain-anchored tip
-        //     manifest, NEVER the request or the older capsule — is what binds the served bytes back
-        //     to the tip. The client-supplied-root pin (#127, above) is UNTOUCHED: a superseded root
-        //     named in the REQUEST still fails `-32005`; only the node's own trusted tip manifest may
-        //     redirect the read to an older capsule.
-        // No manifest / no entry (legacy `.dig`, private store, or a key outside the public surface)
-        // ⇒ serve at the tip with no leaf binding, byte-identical to the pre-#2088 behaviour (the
-        // tip's constant-time decoy still classifies a genuine miss as a clean 404/SPA fallback).
-        // `X-Dig-Generation` (#486) reports the generation that actually holds the file, which may be
-        // BELOW the tip's ordinal.
-        let mut serve_root = pinned_root;
-        let mut serve_root_hex = root_hex.clone();
-        let mut expected_leaf: Option<Bytes32> = None;
+        // -- Generation resolution (#2088 / #2211) ----------------------------------------------
+        // The pin above resolved the store's chain-anchored TIP. Two facts about the tip's embedded
+        // `PublicManifest` (§13) drive the serve below:
+        //   1. §13 is an ADDITIVE data section — it is NOT committed into the chain-anchored
+        //      `current_root`, and NOT checked by the capsule anchor gate (#2203). A malicious holder
+        //      can therefore serve a GENUINE, anchor-passing tip capsule carrying a FORGED §13 whose
+        //      per-path `(latest_root, sha256_latest)` redirect the read at attacker-chosen content.
+        //   2. The tip's own `current_root` commits ONLY the tip generation's leaves — a resource
+        //      UNCHANGED since an earlier commit is physically ABSENT from the tip capsule, so serving
+        //      it at the tip folds to the constant-time decoy and reads as a miss (#2088).
+        //
+        // The #2211 anti-rollback rule reconciles the two: serve TIP-AUTHORITATIVE. A path whose
+        // current bytes the tip's `current_root` commits is served from the TIP with NO §13 leaf
+        // binding — bound purely by `proof.root == tip` (the chain-anchored tip; the pre-#2088 path) —
+        // so a §13 forged to redirect that path at a genuine-but-superseded prior generation is NEVER
+        // consulted for it, and the tip's current version wins (Case A). The §13 redirect + its
+        // `expected_leaf` are consulted ONLY on a genuine tip MISS (Case B): a path whose latest
+        // version legitimately lives in an older generation, absent from the tip, which then resolves
+        // to that older capsule below. `X-Dig-Generation` (#486) reports the generation the §13 entry
+        // records for the path.
+        //
+        // Resolve — but do NOT yet serve — the §13 redirect candidate (Case B). It is honoured only
+        // after the tip serve misses, and only when `latest_root` is a GENUINE root in the store's
+        // AUTHENTICATED on-chain lineage (the #184 cross-check): a fabricated/unconfirmable root is
+        // dropped, so a tip miss for it falls through to a clean 404, never attacker-named bytes.
         let mut generation: Option<u64> = None;
+        let mut redirect: Option<(Bytes32, String, Bytes32)> = None;
         if !root_hex.is_empty() {
             if let Some(entry) = self
                 .resource_manifest_entry(store_hex, &root_hex, effective_key)
                 .await
             {
                 generation = Some(entry.generation_index);
-                expected_leaf = Some(entry.sha256_latest);
                 // The tip (bytes) whose manifest we just read — `pinned_root` under the pin, else the
-                // resolved concrete root. Redirect only when the file's latest generation is elsewhere.
+                // resolved concrete root. A redirect exists only when §13 names a DIFFERENT capsule.
                 let tip = pinned_root.or_else(|| Bytes32::from_hex(&root_hex).ok());
-                if Some(entry.latest_root) != tip {
-                    // SECURITY (#2088 / #127 anti-rollback): `latest_root` is read from the tip's
-                    // §13 `PublicManifest` — an ADDITIVE section NOT committed into the chain-anchored
-                    // `current_root` and NOT checked by the capsule anchor gate (#2203). A malicious
-                    // holder can therefore serve a genuine tip capsule carrying a FORGED §13 whose
-                    // `latest_root`/`sha256_latest` point at attacker content. Before honouring the
-                    // redirect, cross-check `latest_root` against the store's AUTHENTICATED on-chain
-                    // lineage (the same singleton walk the pin above uses). Only a genuine historical
-                    // root may be served from — then `proof.root == serve_root` binds the served bytes
-                    // to real committed data of that authenticated generation. If the root is NOT in
-                    // the lineage (fabricated, or the chain can't confirm it), FAIL CLOSED: leave the
-                    // serve pinned to the tip, where an older-generation file folds to the constant-time
-                    // decoy / a clean miss — never the attacker-named bytes.
-                    if self
+                if Some(entry.latest_root) != tip
+                    && self
                         .anchored_root_resolver
                         .verify_lineage_root(&store_id.0, entry.latest_root)
                         .await
                         .is_ok()
-                    {
-                        serve_root = Some(entry.latest_root);
-                        serve_root_hex = entry.latest_root.to_hex();
-                    }
+                {
+                    redirect = Some((
+                        entry.latest_root,
+                        entry.latest_root.to_hex(),
+                        entry.sha256_latest,
+                    ));
                 }
             }
         }
@@ -537,151 +528,66 @@ impl ContentServer for Node {
         let retrieval_key = derive_retrieval_key(&store_id, effective_key).0;
         let rk_hex = hex::encode(retrieval_key);
 
-        // -- Tier 1: LOCAL-FIRST (no network) ----------------------------------------------------
-        // A cached module returns a DECOY (constant-time, to hide key existence) for a key it does not
-        // hold, whose proof does not fold to the anchored root. So a verify/decrypt failure here means
-        // "not genuinely held locally" — treat it as a MISS and fall through, NOT a hard error.
-        if !serve_root_hex.is_empty() {
-            if let Some(resp) = self
-                .serve_local_cached(store_hex, &serve_root_hex, &retrieval_key)
-                .await
-            {
-                if let Some(served) = self.decrypt_local(
-                    &store_id,
-                    effective_key,
-                    &resp,
-                    serve_root,
-                    expected_leaf,
-                    salt.as_ref(),
-                    &root_hex,
-                    verified,
-                ) {
-                    return with_serve_metadata(served, owner_puzzle_hash, generation, peer_tier);
-                }
-                // else: a decoy / verify or decrypt failure → fall through to peer/RPC.
-            }
+        // -- TIP-AUTHORITATIVE serve (#2211 Case A) ----------------------------------------------
+        // Serve the chain-anchored tip FIRST, with NO §13 leaf binding (`expected_leaf = None`): a
+        // path the tip's own `current_root` commits is bound purely by `proof.root == tip`, so a §13
+        // `PublicManifest` forged to redirect that path at a genuine-but-superseded prior generation
+        // is never reached for it — the tip's current bytes win. This is the pre-#2088 tip serve path,
+        // still running the full anchor-gate/uniform enforcement resolved above (#1764/#1765).
+        if let Some(out) = self
+            .serve_tiers_at_root(
+                store_hex,
+                &store_id,
+                effective_key,
+                pinned_root,
+                &root_hex,
+                None,
+                salt.as_ref(),
+                verified,
+                &root_hex,
+                land_origin,
+                &retrieval_key,
+                &rk_hex,
+                &owner_puzzle_hash,
+                generation,
+                peer_tier,
+            )
+            .await
+        {
+            return out;
         }
 
-        // -- Tier 2: PEER (P2P content engine, when attached) ------------------------------------
-        // Best-effort: any failure falls through to the public-RPC tier so a resource is never
-        // dead-ended while the gateway can still serve it. Only a concrete root has a content id.
-        if !serve_root_hex.is_empty() {
-            if let Some(peer) = self
-                .peer_serve_plaintext(
+        // -- §13 REDIRECT serve (#2088 Case B) ---------------------------------------------------
+        // A genuine tip MISS: the path is ABSENT from the tip capsule (its latest version lives in an
+        // older generation). Only now consult the §13 redirect — already resolved + lineage-
+        // authenticated above (#184). Bind the older, non-chain-anchored capsule via `expected_leaf`
+        // (the tip-anchored `sha256_latest`) so no other content can substitute for it.
+        if let Some((redirect_root, ref redirect_hex, redirect_leaf)) = redirect {
+            if let Some(out) = self
+                .serve_tiers_at_root(
                     store_hex,
-                    &serve_root_hex,
-                    &rk_hex,
                     &store_id,
                     effective_key,
-                    serve_root,
-                    expected_leaf,
+                    Some(redirect_root),
+                    redirect_hex,
+                    Some(redirect_leaf),
                     salt.as_ref(),
                     verified,
-                    land_origin,
                     &root_hex,
+                    land_origin,
+                    &retrieval_key,
+                    &rk_hex,
+                    &owner_puzzle_hash,
+                    generation,
+                    peer_tier,
                 )
                 .await
             {
-                // A peer served the resource; warm the (older-gen) capsule that holds it locally for
-                // next time (#290) — `serve_root_hex`, the capsule the bytes actually live in.
-                self.maybe_backfill_capsule(store_hex, &serve_root_hex, land_origin);
-                return with_serve_metadata(peer, owner_puzzle_hash, generation, peer_tier);
+                return out;
             }
         }
 
-        // -- Tier 3: an OPTIONAL configured upstream, the final fallback -------------------------
-        //
-        // Skipped entirely when no upstream is configured, which is the DEFAULT since #1997 (there is
-        // no well-known fallback host any more). Skipping rather than attempting-and-failing is what
-        // keeps the outcome honest: a resource no peer holds is a MISS (`NotFound`, which drives the
-        // caller's SPA/404 decision), not an `Unreadable` server error blaming this node's upstream
-        // configuration for a resource that simply is not available.
-        if !serve_root_hex.is_empty() && self.has_upstream() {
-            match self
-                .proxy_full_content(store_hex, &serve_root_hex, &rk_hex)
-                .await
-            {
-                Ok((ciphertext, proof, chunk_lens)) => {
-                    let trusted = serve_root.unwrap_or(proof.root);
-                    // Warm the (older-gen) capsule that holds the bytes locally for next time (#290).
-                    self.maybe_backfill_capsule(store_hex, &serve_root_hex, land_origin);
-                    return match verify_and_decrypt(
-                        &store_id,
-                        effective_key,
-                        &ciphertext,
-                        &proof,
-                        &trusted,
-                        expected_leaf,
-                        salt.as_ref(),
-                        &chunk_lens,
-                    ) {
-                        Ok(bytes) => {
-                            // Ledger (#307): record the verified RPC serve + its proof.
-                            self.record_verification(
-                                store_hex,
-                                &root_hex,
-                                effective_key,
-                                ServeSource::Rpc.as_str(),
-                                verified,
-                                &proof,
-                                None,
-                            );
-                            with_serve_metadata(
-                                PlaintextOutcome::Served {
-                                    bytes,
-                                    root_hex: root_hex.clone(),
-                                    verified,
-                                    source: ServeSource::Rpc,
-                                    // All three stamped just below by `with_serve_metadata`.
-                                    peer_tier: PeerTier::Unattached,
-                                    owner_puzzle_hash: None,
-                                    generation: None,
-                                },
-                                owner_puzzle_hash,
-                                generation,
-                                peer_tier,
-                            )
-                        }
-                        // The gateway returned bytes that do not verify against the anchored root — a
-                        // decoy for a missing key (or tampered). Either way the resource is NOT
-                        // genuinely available at this root → a clean miss (drives the SPA/404 decision),
-                        // never a served-garbage result (fail-closed: no plaintext is returned).
-                        // Ledger (#307): the bytes were fetched via RPC and FAILED verification, so
-                        // record a fail-closed entry (verified=false + the reason) — never served, but
-                        // retained so the badge reads "Unverified" + the modal shows the failed proof.
-                        Err(reason) => {
-                            self.record_verification(
-                                store_hex,
-                                &root_hex,
-                                effective_key,
-                                ServeSource::Rpc.as_str(),
-                                false,
-                                &proof,
-                                Some(reason),
-                            );
-                            PlaintextOutcome::NotFound {
-                                root_hex: root_hex.clone(),
-                            }
-                        }
-                    };
-                }
-                Err(ProxyMiss::NotFound) => {
-                    self.maybe_backfill_capsule(store_hex, &serve_root_hex, land_origin);
-                    return PlaintextOutcome::NotFound {
-                        root_hex: root_hex.clone(),
-                    };
-                }
-                Err(ProxyMiss::Error(message)) => {
-                    return PlaintextOutcome::Unreadable {
-                        code: SERVE_UNREADABLE,
-                        message,
-                        root_hex: root_hex.clone(),
-                    }
-                }
-            }
-        }
-
-        // Rootless with the pin off and nothing served — a miss.
+        // Nothing served at the tip or any §13 redirect — a clean miss (drives the SPA/404 decision).
         PlaintextOutcome::NotFound { root_hex }
     }
 
@@ -839,6 +745,186 @@ impl Node {
                 generation: None,
             }
         })
+    }
+
+    /// Run the three serve tiers (local → peer → optional upstream) against ONE candidate capsule
+    /// `serve_root`, returning:
+    ///   - `Some(outcome)` — a DEFINITIVE result for this root: a metadata-stamped `Served`, or a
+    ///     hard `Unreadable` upstream error. The caller returns it verbatim.
+    ///   - `None` — nothing genuinely available at this root (every tier missed, decoyed, or the
+    ///     upstream reported not-found / returned bytes that failed verification). The caller may
+    ///     retry at the next candidate — the #2211 tip-first → §13-redirect fall-through — or, when
+    ///     there is none, answer `NotFound`.
+    ///
+    /// `expected_leaf` is the tip-anchored `sha256_latest` binding for a §13 REDIRECT read (#2088);
+    /// it is `None` for the TIP-AUTHORITATIVE read (#2211), where `proof.root == serve_root` (the
+    /// chain-anchored tip) is the sole binding and no §13 leaf is trusted. `serve_root_hex` empty ⇒
+    /// no concrete capsule to serve (rootless with the pin off) ⇒ an immediate `None`.
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_tiers_at_root(
+        &self,
+        store_hex: &str,
+        store_id: &Bytes32,
+        effective_key: &str,
+        serve_root: Option<Bytes32>,
+        serve_root_hex: &str,
+        expected_leaf: Option<Bytes32>,
+        salt: Option<&[u8; 32]>,
+        verified: bool,
+        root_hex: &str,
+        land_origin: crate::download::ReadOrigin,
+        retrieval_key: &[u8; 32],
+        rk_hex: &str,
+        owner_puzzle_hash: &Option<String>,
+        generation: Option<u64>,
+        peer_tier: PeerTier,
+    ) -> Option<PlaintextOutcome> {
+        if serve_root_hex.is_empty() {
+            return None;
+        }
+
+        // -- Tier 1: LOCAL-FIRST (no network) ----------------------------------------------------
+        // A cached module returns a DECOY (constant-time, to hide key existence) for a key it does not
+        // hold, whose proof does not fold to the anchored root. So a verify/decrypt failure here means
+        // "not genuinely held at this root" — treat it as a MISS and fall through, NOT a hard error.
+        if let Some(resp) = self
+            .serve_local_cached(store_hex, serve_root_hex, retrieval_key)
+            .await
+        {
+            if let Some(served) = self.decrypt_local(
+                store_id,
+                effective_key,
+                &resp,
+                serve_root,
+                expected_leaf,
+                salt,
+                root_hex,
+                verified,
+            ) {
+                return Some(with_serve_metadata(
+                    served,
+                    owner_puzzle_hash.clone(),
+                    generation,
+                    peer_tier,
+                ));
+            }
+            // else: a decoy / verify or decrypt failure → fall through to peer/RPC.
+        }
+
+        // -- Tier 2: PEER (P2P content engine, when attached) ------------------------------------
+        // Best-effort: any failure falls through to the public-RPC tier so a resource is never
+        // dead-ended while the gateway can still serve it.
+        if let Some(peer) = self
+            .peer_serve_plaintext(
+                store_hex,
+                serve_root_hex,
+                rk_hex,
+                store_id,
+                effective_key,
+                serve_root,
+                expected_leaf,
+                salt,
+                verified,
+                land_origin,
+                root_hex,
+            )
+            .await
+        {
+            // A peer served the resource; warm the capsule that holds it locally for next time (#290).
+            self.maybe_backfill_capsule(store_hex, serve_root_hex, land_origin);
+            return Some(with_serve_metadata(
+                peer,
+                owner_puzzle_hash.clone(),
+                generation,
+                peer_tier,
+            ));
+        }
+
+        // -- Tier 3: an OPTIONAL configured upstream, the final fallback -------------------------
+        //
+        // Skipped entirely when no upstream is configured, which is the DEFAULT since #1997 (there is
+        // no well-known fallback host any more). Skipping rather than attempting-and-failing is what
+        // keeps the outcome honest: a resource no peer holds is a MISS (`None` → the caller's SPA/404
+        // decision), not an `Unreadable` server error blaming this node's upstream configuration.
+        if self.has_upstream() {
+            match self
+                .proxy_full_content(store_hex, serve_root_hex, rk_hex)
+                .await
+            {
+                Ok((ciphertext, proof, chunk_lens)) => {
+                    let trusted = serve_root.unwrap_or(proof.root);
+                    // Warm the capsule that holds the bytes locally for next time (#290).
+                    self.maybe_backfill_capsule(store_hex, serve_root_hex, land_origin);
+                    match verify_and_decrypt(
+                        store_id,
+                        effective_key,
+                        &ciphertext,
+                        &proof,
+                        &trusted,
+                        expected_leaf,
+                        salt,
+                        &chunk_lens,
+                    ) {
+                        Ok(bytes) => {
+                            // Ledger (#307): record the verified RPC serve + its proof.
+                            self.record_verification(
+                                store_hex,
+                                root_hex,
+                                effective_key,
+                                ServeSource::Rpc.as_str(),
+                                verified,
+                                &proof,
+                                None,
+                            );
+                            Some(with_serve_metadata(
+                                PlaintextOutcome::Served {
+                                    bytes,
+                                    root_hex: root_hex.to_string(),
+                                    verified,
+                                    source: ServeSource::Rpc,
+                                    // All three stamped just below by `with_serve_metadata`.
+                                    peer_tier: PeerTier::Unattached,
+                                    owner_puzzle_hash: None,
+                                    generation: None,
+                                },
+                                owner_puzzle_hash.clone(),
+                                generation,
+                                peer_tier,
+                            ))
+                        }
+                        // The gateway returned bytes that do not verify against the anchored root — a
+                        // decoy for a missing key (or tampered). Either way the resource is NOT
+                        // genuinely available at this root → a miss (`None`, so a tip miss can still
+                        // fall through to the §13 redirect), never a served-garbage result (fail-
+                        // closed: no plaintext is returned). Ledger (#307): retain the failed proof
+                        // (verified=false + the reason) so the badge reads "Unverified".
+                        Err(reason) => {
+                            self.record_verification(
+                                store_hex,
+                                root_hex,
+                                effective_key,
+                                ServeSource::Rpc.as_str(),
+                                false,
+                                &proof,
+                                Some(reason),
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(ProxyMiss::NotFound) => {
+                    self.maybe_backfill_capsule(store_hex, serve_root_hex, land_origin);
+                    None
+                }
+                Err(ProxyMiss::Error(message)) => Some(PlaintextOutcome::Unreadable {
+                    code: SERVE_UNREADABLE,
+                    message,
+                    root_hex: root_hex.to_string(),
+                }),
+            }
+        } else {
+            None
+        }
     }
 
     /// Best-effort PEER serve: fetch the whole resource from the P2P content engine (dig-download

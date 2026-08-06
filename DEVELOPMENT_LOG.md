@@ -111,6 +111,30 @@ chain vouches for — extending the EXISTING tip-capsule trust, not opening a ne
 client-supplied superseded root still fails `-32005` (anti-rollback preserved); only the node's own
 trusted tip manifest may redirect a read to an older capsule.
 
+## §13 lineage cross-check is NOT enough — serve TIP-AUTHORITATIVE to close the Case-A downgrade (#2211)
+
+The #2088 leaf binding + the #184 lineage cross-check together bind a redirected serve to *a genuine
+lineage generation*, but NOT to the path's *canonical/maximal* one — because `latest_root` is read
+from the §13 `PublicManifest`, which is additive and NOT committed into the chain-anchored
+`current_root`. A malicious holder can serve a genuine, anchor-passing TIP capsule whose §13 is forged
+to redirect a path at a genuine-but-SUPERSEDED prior generation (a real lineage root, so the cross-
+check honours it) — a downgrade bounded to owner-committed content.
+
+Case A (a path whose CURRENT bytes the tip's own `current_root` commits) is closed at the serve tier:
+serve TIP-FIRST with NO §13 leaf binding — bind purely by `proof.root == tip` (the pre-#2088 path) —
+and consult the §13 redirect + `expected_leaf` ONLY on a genuine tip MISS (the tip capsule folds the
+older-generation file to its constant-time decoy). A tip-committed path is served from the chain-
+anchored tip, so a forged redirect is never reached; a legitimately-older-generation file misses at
+the tip and falls through to the (still §13-driven, still lineage-authenticated) redirect exactly as
+#2088 intends. Sharp edge: `current_root = MerkleTree::from_leaves(merkle_leaves)` commits ONLY the
+tip generation's own leaves (digstore `data_section.rs`), which is WHY a tip-committed path is present
+at the tip and an unchanged-since-older-gen path is absent — the whole tip-first split rests on it.
+
+Case B (a path whose current version genuinely lives in an OLDER generation than a forged §13 names)
+stays OPEN on #2211, blocked on the per-path current-state commitment the tip must anchor (digstore
+#2203). `expected_leaf` proves the served bytes are *a* genuine lineage generation, not that it is the
+path's canonical current one.
+
 ## §21 backfill and the #1576 reshare are TWO transports for the same capsule — one gate, not two (#1614)
 
 A read miss can pull the SAME `(store, root)` whole `.dig` down two independent legs, and for a long

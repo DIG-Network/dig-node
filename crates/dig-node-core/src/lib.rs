@@ -10843,7 +10843,11 @@ mod tests {
                 .section(SectionId::PublicManifest)
                 .expect("tip carries a §13 PublicManifest");
             let off = body.as_ptr() as usize - blob.as_ptr() as usize;
-            (off, body.len(), PublicManifest::from_bytes(body).expect("decode §13"))
+            (
+                off,
+                body.len(),
+                PublicManifest::from_bytes(body).expect("decode §13"),
+            )
         };
         let entry = pm
             .entries
@@ -11957,7 +11961,10 @@ mod tests {
         assert_ne!(root0, root1, "the two generations must have distinct roots");
         // The GENUINE older leaf the forged §13 names — gen0's asset.js (v1).
         let gen0_asset = manifest_entry_of(&module0, "asset.js");
-        assert_eq!(gen0_asset.latest_root, root0, "gen0 holds asset.js at root0");
+        assert_eq!(
+            gen0_asset.latest_root, root0,
+            "gen0 holds asset.js at root0"
+        );
         // THE FORGE: rewrite the tip's §13 so asset.js redirects at the genuine-but-superseded gen0.
         let forged_tip =
             forge_tip_manifest_redirect(&module1, "asset.js", root0, 0, gen0_asset.sha256_latest);
@@ -11968,7 +11975,12 @@ mod tests {
             MockResolver::one_with_lineage(&store.to_hex(), root1, vec![root0, root1]),
         );
         seed_cached_module(&node.cache_dir, &store.to_hex(), &root0.to_hex(), &module0);
-        seed_cached_module(&node.cache_dir, &store.to_hex(), &root1.to_hex(), &forged_tip);
+        seed_cached_module(
+            &node.cache_dir,
+            &store.to_hex(),
+            &root1.to_hex(),
+            &forged_tip,
+        );
 
         let out = rt.block_on(node.serve_content_plaintext(
             &store.to_hex(),
