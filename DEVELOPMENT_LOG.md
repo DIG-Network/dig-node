@@ -1047,3 +1047,27 @@ retain vs 3 MiB respond), so a 3–4 MiB section is memoizable yet un-servable �
 DoS bounds, not a wire contract. Second gap in the same class: a lifetime-of-process memo with no idle
 TTL is only reclaimable if `cache.clear` actually DRAINS it — `clear_cache`/`clear_content_cache` did
 not touch the manifest memo, so an operator clearing the cache still held its RAM until process exit.
+
+## Size the INPUT and MEASURE the peak — do not size the decoded output (#2160)
+
+The `dig.getMetadata` cold decode holds ~1.1 GiB transient at peak, and a hostile `custom` decoded from
+JSON TEXT expands ~16× (a flat-numeric `[0,0,…]` becomes one `serde_json::Value` node per element, ~2
+bytes of text → ~24+ bytes of node), so a `custom` filling a 128 MiB section reaches ~2 GiB on a ~1.9
+GiB host. Hand-sizing that decoded `MetadataManifest` failed five rounds in PR #179 — a recursive,
+attacker-shaped value has unboundedly many places to be wrong and the compiler checks none of them.
+
+The durable lesson, two halves: (1) cap the INPUT structurally BEFORE decode — the ENCODED section
+length (3 MiB, equal to the response ceiling, so it refuses nothing that was servable) plus the `custom`
+shape (entry count + JSON depth + node count, streamed over the raw text, never materialized). Refusing
+the oversized/hostile section before `MetadataManifest::decode` removes the expansion a rendered-output
+check can only see after it has already happened. (2) PROVE it with a counting allocator, not by
+reasoning: a `#[global_allocator]` test harness with THREAD-LOCAL current/peak counters (so parallel
+`cargo test` threads don't pollute the reading, and production is untouched under `#[cfg(test)]`) drives
+one cold decode and asserts the measured peak stays under budget — run BOTH the capped and uncapped path
+on the same bytes so the budget sits strictly between them and the test cannot go vacuous.
+
+Sharp edge — advancing the wire cursor without re-implementing it: the shape scan must reach the
+`custom` block past a dozen leading fields. It decodes those with the store library's OWN `Decode` impls
+(discarding the values) so the wire format lives in one place and cannot drift; only the `custom` block
+is read by hand, and each value's JSON text is read as RAW BYTES — never `serde_json`-parsed — so nothing
+the hostile value describes is ever materialized.
