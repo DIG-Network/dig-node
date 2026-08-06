@@ -1454,7 +1454,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.hostedStores.status` | `store` = `storeId[:rootHash]` | `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` |
 | `control.sync.status` | — | `available` (always `true` — the chunked capsule download needs no identity), `method: "chunked-capsule-download-with-section-21-clone-fallback"`, `identity_loaded`, `pinned_total`, `pinned_synced`, `whole_store_trigger_supported` (`true` — a store id alone is enough) |
 | `control.sync.trigger` | `store` = `storeId[:rootHash]`, or `store_id` [+ `root`] — the root is OPTIONAL; without one the node resolves the store's CHAIN-ANCHORED tip and syncs that generation | `status: "synced"`, `root`, `size_bytes`, `served_root` |
-| `control.wallet.balance` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"`, default `"xch"`) | `balance` (confirmed, spendable — JSON NUMBER, u64 base units), `pending` (unspent + unconfirmed — JSON NUMBER, u64 base units), `synced` (bool — whether a fully-synced view answered), `peak_height` (the node's chain-view peak, or `null`). Matches `dig-node-control-interface` 0.3.0's `WalletBalanceResult { balance: u64, pending: u64, .. }` and dig-app's `BalanceResponse { balance: u64 }` — a Rust-to-Rust numeric contract, never a decimal string. The wallet backend tracks the base-unit total as `u128` (headroom for summed intermediate math); the wire boundary saturating-casts to `u64` (a single address's balance can never exceed `u64::MAX` mojos, ~18.4M XCH). READ-ONLY chain read of a PUBLIC address (no seed/signing key). Reuses the B.6 sync-state routing: the local DB when the address is the wallet's own and the DB is synced, else the coinset fallback. This is an OPEN read (`is_open_control_read`, no token); the cheap local-DB fast path is unbounded, but the EXPENSIVE coinset-fallback leg is subject to a GLOBAL token-bucket rate bound (defense-in-depth against an open-read amplification/oracle sweep — #1957): a burst of arbitrary-address fallback reads beyond the bound is refused with `WALLET_RATE_LIMITED` (§10), while any single honest read (DB fast path or one fallback) always succeeds. `$DIG` scopes by the canonical CAT asset id `digstore_chain::dig::DIG_ASSET_ID`. A synced empty address is a SUCCESS `{balance:0, synced:true}`, never an error; the read-failure shapes are DISTINCT errors `WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED` (§10), never a fabricated `0`. `INVALID_PARAMS` on a missing/malformed `address` or a bad `asset`. |
+| `control.wallet.balance` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"`, default `"xch"`) | `balance` (confirmed, spendable — JSON NUMBER, u64 base units), `pending` (unspent + unconfirmed — JSON NUMBER, u64 base units), `source` (`"db"` \| `"fallback"` — which tier produced the figure, §18.7b), `synced` (bool), `peak_height` (`u32` or `null`). Matches `dig-node-control-interface` 0.3.0's `WalletBalanceResult { balance: u64, pending: u64, .. }` and dig-app's `BalanceResponse { balance: u64 }` — a Rust-to-Rust numeric contract, never a decimal string. The wallet backend tracks the base-unit total as `u128` (headroom for summed intermediate math); the wire boundary saturating-casts to `u64` (a single address's balance can never exceed `u64::MAX` mojos, ~18.4M XCH). READ-ONLY chain read of a PUBLIC address (no seed/signing key). Reuses the B.6 sync-state routing: the local DB when the address is the wallet's own and the DB is synced, else the coinset fallback. Per §18.7b, `source`/`synced`/`peak_height` describe the TIER that answered: a `"db"` answer reports `synced: true` and the node's own peak; a `"fallback"` answer reports `synced: false` and `peak_height: null`. This is an OPEN read (`is_open_control_read`, no token); the cheap local-DB fast path is unbounded, but the EXPENSIVE coinset-fallback leg is subject to a GLOBAL token-bucket rate bound (defense-in-depth against an open-read amplification/oracle sweep — #1957): a burst of arbitrary-address fallback reads beyond the bound is refused with `WALLET_RATE_LIMITED` (§10), while any single honest read (DB fast path or one fallback) always succeeds. `$DIG` scopes by the canonical CAT asset id `digstore_chain::dig::DIG_ASSET_ID`. A synced empty address is a SUCCESS `{balance:0, synced:true}`, never an error; the read-failure shapes are DISTINCT errors `WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED` (§10), never a fabricated `0`. `INVALID_PARAMS` on a missing/malformed `address` or a bad `asset`. |
 | `control.peers.ping` | `peer` (a 64-hex `peer_id`, or a dialable `host:port` with IPv6 bracketed), `peer_id` (OPTIONAL 64-hex — pins the identity the presented certificate MUST derive) | The connection-ladder report — see §7.4a. `INVALID_PARAMS` on a missing/blank `peer`; `CONTROL_ERROR` when no peer network is running; `PEER_PING_REFUSED` (§10) when the anti-amplification gate refuses before dialing. |
 
 ### 7.4a. `control.peers.ping` — the connection-ladder diagnostic
@@ -3637,6 +3637,30 @@ hashes/addresses).
   (`0` of at-least-`1`), so an empty or not-yet-caught-up DB, and a wallet the node is not tracking,
   read as NOT synced and never as a synced-zero. `selectable_balance` is the identity-scoped unspent XCH
   balance (0 when not tracking).
+
+18.7b. **Tier disclosure — the reported state describes the ANSWER, not the node (#2233).** Every
+wallet read that chooses a source per the §18.7 routing table MUST disclose the tier that actually
+answered, and MUST derive every freshness field from that tier.
+
+- **`source` is additive and REQUIRED on the result.** `control.wallet.balance` returns
+  `source: "db" | "fallback"` alongside its figures. `"db"` means the node's own chain replica
+  produced the figure; `"fallback"` means a third-party coinset HTTP oracle did, which additionally
+  means the queried address WAS DISCLOSED off-node — a fact a caller on a metered or private
+  connection has a legitimate interest in. The field is additive per §5.1: a consumer that does not
+  read it parses unchanged.
+- **`synced` and `peak_height` are properties of the tier.** A `"db"` answer reports `synced: true`
+  and the replica's own peak. A `"fallback"` answer reports `synced: false` and `peak_height: null`,
+  **regardless of the local DB's state** — the DB neither produced that figure nor bounds its
+  freshness, so its flag and peak say nothing about it. Implementations MUST NOT read those two
+  fields outside the tier decision.
+- **Rationale — this is the falsifiability instrument for §18.6.** A success criterion phrased as a
+  flag value rather than as the path taken is satisfiable with the goal unmet: once the §18.6 sync
+  loop sets `initial_sync_complete`, a read still served by the oracle would report itself as a
+  synced local read. Acceptance for any sync work MUST name the `source` tier, never the `synced`
+  flag alone.
+- **Operator visibility.** The routing branch emits a `tracing` event carrying `tier=db|fallback`,
+  so `dig-node.jsonl` records the same tier the wire reports. Diagnostics go through `tracing`,
+  never stderr (a Windows service discards it).
 
 18.8. **Method surface — reads (served).** `login`, `logout`, `get_version`,
 `get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,

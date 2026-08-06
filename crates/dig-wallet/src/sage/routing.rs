@@ -14,12 +14,30 @@
 //! has a single, auditable definition; the RPC layer calls it once per wallet-data read.
 
 /// Where a wallet-data read is served from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// This is also the WIRE spelling of the tier (`"db"` / `"fallback"`), reported on every
+/// read result that makes a tier choice (#2233). One definition serves both the routing
+/// decision and its disclosure, so the reported tier cannot drift from the tier taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Source {
     /// The local SQLite wallet DB (peer-maintained, design B.3/B.6).
     Db,
     /// The `chia-query`/coinset.org fallback tier (design B.5).
     Fallback,
+}
+
+impl Source {
+    /// The wire/log spelling of this tier — the SAME string [`serde::Serialize`] emits.
+    ///
+    /// Used for the `tier` field on the routing `tracing` event, so a log line and the JSON
+    /// result a caller reads always name the tier identically.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Db => "db",
+            Self::Fallback => "fallback",
+        }
+    }
 }
 
 /// Select the source for a wallet-data read given the two B.6 axes.
@@ -58,5 +76,15 @@ mod tests {
     fn non_wallet_chain_reads_always_fall_back() {
         assert_eq!(route(true, false), Source::Fallback);
         assert_eq!(route(false, false), Source::Fallback);
+    }
+
+    /// The wire spelling and the log spelling are the SAME string, pinned literally so a
+    /// rename of the Rust variant cannot silently change what a consumer parses (#2233).
+    #[test]
+    fn tier_serializes_and_logs_as_the_same_lowercase_wire_string() {
+        for (src, wire) in [(Source::Db, "db"), (Source::Fallback, "fallback")] {
+            assert_eq!(serde_json::to_value(src).unwrap(), serde_json::json!(wire));
+            assert_eq!(src.as_wire(), wire);
+        }
     }
 }

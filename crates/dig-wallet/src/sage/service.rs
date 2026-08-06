@@ -11,8 +11,12 @@
 //! SQLite wallet DB under the node config dir, and defaults the fallback tier to the graceful
 //! [`EmptyFallback`] so bring-up never waits on network/TLS peer discovery. The live direct-peer
 //! sync loop (which would swap in the [`CoinsetFallback`](super::fallback::CoinsetFallback) and
-//! feed the DB) remains the documented remaining integration (SPEC §18.12); the [`EventBus`] is
-//! wired here so that loop — and the WS sync-status push (#369) — publish to one shared bus.
+//! feed the DB) remains the documented remaining integration: it is **SPEC §18.6**, explicitly
+//! deferred by **§18.12a**. It is NOT §18.12 — §18.12 is the live spend *broadcaster*, which has
+//! shipped. (This comment cited §18.12 and sent three separate readers to the wrong clause,
+//! making the sync loop look like a wiring job against already-written machinery; #2232.)
+//! The [`EventBus`] is wired here so that loop — and the WS sync-status push (#369) — publish to
+//! one shared bus.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
