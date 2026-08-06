@@ -4376,6 +4376,35 @@ pub(crate) mod test_support {
         (Arc::new(resp), chunk_lens)
     }
 
+    /// A REAL served resource with `chunk_count` uniform `chunk_len`-byte chunks, committed under a
+    /// single-leaf generation root with its genuine digstore inclusion proof.
+    ///
+    /// It exists to exercise the PAGED prologue: a `chunk_count` above
+    /// [`dig_nat::MAX_CHUNK_LENS_PER_FRAME`] cannot state its `chunk_lens` on one frame, so the serve
+    /// path must split the layout across several frames and the reader must reassemble it. The chunks
+    /// are deliberately tiny — the point is the ENTRY COUNT of the layout, not the byte volume, so the
+    /// fixture stays small enough to build thousands of chunks cheaply.
+    pub(crate) fn many_chunk_served_resource(
+        chunk_count: usize,
+        chunk_len: usize,
+    ) -> (Arc<ContentResponse>, Vec<u64>) {
+        use digstore_core::merkle::{resource_leaf, MerkleTree};
+
+        let total = chunk_count * chunk_len;
+        // Byte i is `i mod 251` (a prime, so the pattern never aligns with a chunk boundary): a
+        // mis-ordered or dropped chunk changes the bytes, unlike a constant fill.
+        let ciphertext: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let tree = MerkleTree::from_leaves(vec![resource_leaf(&ciphertext)]);
+        let resp = ContentResponse {
+            merkle_proof: tree.prove(0).expect("single-leaf proof"),
+            roothash: tree.root(),
+            chunk_lens: std::iter::repeat_n(chunk_len as u32, chunk_count).collect(),
+            ciphertext,
+        };
+        let chunk_lens = resp.chunk_lens.iter().map(|&l| u64::from(l)).collect();
+        (Arc::new(resp), chunk_lens)
+    }
+
     /// Seed `resource` into `node`'s memoized serve cache so [`Node::fetch_range_frame`] serves it,
     /// and return the `(store_id, root, retrieval_key)` hex triple that names it.
     pub(crate) fn seed_served_resource(

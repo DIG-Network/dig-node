@@ -1855,7 +1855,14 @@ async fn stream_range_frames(
     loop {
         let take = range_frame::FRAME_PAYLOAD.min(end_of_span.saturating_sub(off));
         let window = bytes[off..off + take].to_vec();
-        let frame = framer.next_frame(off as u64, window);
+        // A trailing prologue-only continuation frame carries NO data payload — only the next
+        // `chunk_lens` page. It must be stamped with byte-offset 0, NOT the ascending cursor `off`
+        // (which by now equals the resource length): the 0.17 reader's establish probe reads a 1-byte
+        // span and rejects any frame whose `offset >= max_len`, so a page-only frame at `off == total`
+        // would be refused before its layout could be reassembled. A zero-length window is never a real
+        // byte position, so anchoring it at 0 loses nothing.
+        let frame_start = if take == 0 { 0 } else { off as u64 };
+        let frame = framer.next_frame(frame_start, window);
         // This frame is the FINAL one only when the bytes are done AND the prologue is fully sent.
         // The page this frame just took is already accounted for, so `prologue_pending` here answers
         // "are there pages still to come AFTER this frame".
@@ -5310,6 +5317,146 @@ pub(crate) mod tests {
             frames[0]["complete"],
             json!(false),
             "the RESOURCE is far from exhausted — only the REQUEST was satisfied"
+        );
+    }
+
+    /// **Proves the PAGED-prologue producer contract at the REAL wire (#2230).** A resource with more
+    /// than [`dig_nat::MAX_CHUNK_LENS_PER_FRAME`] chunks cannot state its whole `chunk_lens` on one
+    /// frame, so the serve path pages it: the layout rides several frames, and when the requested bytes
+    /// run out before the layout is fully sent, the remaining pages travel on trailing PROLOGUE-ONLY
+    /// frames (zero data payload).
+    ///
+    /// The two properties a conforming 0.17 reader depends on, asserted on the bytes actually written:
+    ///
+    /// * every prologue-only frame is stamped with byte-`offset 0` — NOT the ascending cursor, which by
+    ///   then equals the resource length and would trip the reader's `offset >= max_len` establish
+    ///   guard;
+    /// * a prologue-only frame carries NO `chunk_index` — it begins no chunk, and a stale index would
+    ///   trip the reader's ascending-index rewind guard.
+    ///
+    /// The stream must also NOT early-terminate: the full 2,049-entry layout is delivered across the
+    /// frames, so a paged read reassembles it in full.
+    #[tokio::test]
+    async fn a_paged_prologue_rides_offset_zero_frames_with_no_chunk_index_over_the_real_wire() {
+        // 2,049 chunks → one entry past the 2,048/page ceiling → exactly two prologue pages.
+        let chunk_count = dig_nat::MAX_CHUNK_LENS_PER_FRAME + 1;
+        let (resource, served_layout) =
+            crate::test_support::many_chunk_served_resource(chunk_count, 8);
+
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let (store, root, rk) = crate::test_support::seed_served_resource(&node, resource);
+        let responder = NodeResponder::without_pool(node);
+        // A one-byte probe: the bytes run out on the first frame, forcing the second prologue page onto
+        // a trailing data-less frame — the exact shape the offset-0 fix governs.
+        let req = json!({
+            "store_id": store, "root": root, "retrieval_key": rk,
+            "offset": 0, "length": 1,
+        });
+
+        let (mut client, mut server) = tokio::io::duplex(256 * 1024);
+        let served = tokio::spawn(async move {
+            responder
+                .stream_range(req, &test_caller(), &mut server)
+                .await
+        });
+        served.await.expect("serve task join").expect("served");
+
+        let mut frames = Vec::new();
+        while let Some(frame) = read_framed(&mut client)
+            .await
+            .expect("no I/O error reading the frame stream")
+        {
+            frames.push(frame);
+        }
+
+        // A prologue-only frame carries a `chunk_lens` page but zero data bytes (`bytes` is base64, so
+        // an empty payload serializes to the empty string).
+        let prologue_only: Vec<&Value> = frames
+            .iter()
+            .filter(|f| f["bytes"].as_str() == Some("") && f.get("chunk_lens").is_some())
+            .collect();
+        assert!(
+            !prologue_only.is_empty(),
+            "a 2,049-chunk layout past the request span must trail a prologue-only frame: {frames:?}"
+        );
+        for frame in &prologue_only {
+            assert_eq!(
+                frame["offset"],
+                json!(0),
+                "a prologue-only frame must be stamped offset 0, not the ascending cursor: {frame:?}"
+            );
+            assert!(
+                frame.get("chunk_index").is_none(),
+                "a prologue-only frame begins no chunk, so it carries no chunk_index: {frame:?}"
+            );
+            assert!(
+                frame["chunk_lens_offset"].is_u64(),
+                "a prologue-only frame carries a located page: {frame:?}"
+            );
+        }
+
+        // The stream did not early-terminate: reassembling every page's entries yields the whole layout.
+        let mut reassembled: Vec<u64> = Vec::new();
+        for frame in &frames {
+            if let Some(page) = frame["chunk_lens"].as_array() {
+                reassembled.extend(page.iter().map(|v| v.as_u64().expect("chunk_lens entry")));
+            }
+        }
+        assert_eq!(
+            reassembled, served_layout,
+            "the paged prologue must reassemble to the full served layout, byte-for-byte"
+        );
+        assert!(
+            frames
+                .iter()
+                .filter(|f| f.get("chunk_lens").is_some())
+                .count()
+                >= 2,
+            "a 2,049-entry layout must span at least two prologue pages: {frames:?}"
+        );
+    }
+
+    /// **The primary end-to-end proof (#2230): the paged-prologue PRODUCER against the SHIPPED 0.17
+    /// reader.** Drives the production [`NodeResponder::stream_range`] over a real `tokio::io::duplex`
+    /// and feeds the raw wire bytes into `dig_download::assemble_range_stream` — the actual reassembler
+    /// a downloading peer runs — with the `max_len: 1` establish probe dig-download sends on every
+    /// download.
+    ///
+    /// Pre-fix this FAILS for the right reason: the trailing prologue page rides a frame stamped with
+    /// the ascending cursor (== the resource length), which the reader rejects as
+    /// `offset >= max_len`. After the fix the reader reassembles the full 2,049-entry layout with no
+    /// paged-prologue or offset error.
+    #[tokio::test]
+    async fn the_paged_prologue_producer_reads_end_to_end_through_the_shipped_reader() {
+        let chunk_count = dig_nat::MAX_CHUNK_LENS_PER_FRAME + 1;
+        let (resource, served_layout) =
+            crate::test_support::many_chunk_served_resource(chunk_count, 8);
+
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let (store, root, rk) = crate::test_support::seed_served_resource(&node, resource);
+        let responder = NodeResponder::without_pool(node);
+        let req = json!({
+            "store_id": store, "root": root, "retrieval_key": rk,
+            "offset": 0, "length": 1,
+        });
+
+        let (mut client, mut server) = tokio::io::duplex(256 * 1024);
+        let served = tokio::spawn(async move {
+            responder
+                .stream_range(req, &test_caller(), &mut server)
+                .await
+        });
+        served.await.expect("serve task join").expect("served");
+
+        // The 1-byte establish probe dig-download's orchestrator sends on every download.
+        let (_bytes, meta) = dig_download::assemble_range_stream(&mut client, 1)
+            .await
+            .expect("the shipped 0.17 reader reassembles the paged prologue with no offset error");
+
+        assert_eq!(
+            meta.chunk_lens,
+            Some(served_layout),
+            "the reassembled layout must equal the full 2,049-entry served layout"
         );
     }
 
