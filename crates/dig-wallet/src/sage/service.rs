@@ -180,9 +180,9 @@ async fn build_live_wallet() -> Option<LiveWallet> {
                 Arc::new(ConfirmingBroadcaster::new(raw.clone(), confirmer.clone()));
             let lineage: Arc<dyn LineageSource> = Arc::new(ChiaQueryLineage::new(query.clone()));
             let fallback: Arc<dyn ChainFallback> = Arc::new(CoinsetFallback::new(query.clone()));
-            eprintln!(
-                "dig-node: wallet LIVE broadcast ENABLED — node-custodied spends will execute on \
-                 mainnet (real $DIG). Disable by unsetting DIG_WALLET_ENABLE_LIVE_BROADCAST."
+            tracing::info!(
+                "wallet LIVE broadcast ENABLED — node-custodied spends will execute on mainnet \
+                 (real $DIG). Disable by unsetting DIG_WALLET_ENABLE_LIVE_BROADCAST."
             );
             Some(LiveWallet {
                 tip_broadcaster: raw,
@@ -193,14 +193,31 @@ async fn build_live_wallet() -> Option<LiveWallet> {
             })
         }
         Err(e) => {
-            eprintln!(
-                "dig-node: WARN DIG_WALLET_ENABLE_LIVE_BROADCAST is set but the chia_query client \
-                 failed to start ({e}); LIVE broadcast DISABLED (no $DIG will move) — the wallet \
-                 stays offline-safe until a node/network is reachable"
-            );
+            warn_chain_source_unavailable(&e);
             None
         }
     }
+}
+
+/// Report, through the process log sink, that the live chain source could not be built.
+///
+/// This is the ONLY account of why every subsequent balance read will answer
+/// `WALLET_NO_CHAIN_SOURCE`, so where it goes matters as much as what it says. It was an
+/// `eprintln!`, and dig-node runs as an OS service with no stderr attached: the message went
+/// nowhere, and the failure it described took three debugging rounds to find because of it
+/// (#2210). `tracing` reaches the `dig-logging` sink the node installs process-globally, so the
+/// explanation lands in `dig-node.jsonl` where an operator will actually meet it.
+///
+/// Adopting chia-query 0.6 removed the *most common* reason to arrive here — a missing
+/// `~/.chia` under a service account — but every other reason (no network, a coinset outage,
+/// a malformed base URL) still ends up on this line, so the diagnostic keeps earning its place.
+fn warn_chain_source_unavailable(error: &dyn std::fmt::Display) {
+    tracing::warn!(
+        %error,
+        "wallet chain source unavailable: the chia_query client failed to start, so LIVE \
+         broadcast is DISABLED (no $DIG will move) and balance reads will answer \
+         WALLET_NO_CHAIN_SOURCE until a chain source is reachable"
+    );
 }
 
 /// The wallet DB path under the node config dir.
@@ -373,6 +390,108 @@ mod chain_source_config_tests {
             chia_query::ChiaQueryConfig::default().coinset_fallback_enabled,
             "coinset is the keyless HTTP tier; disabling it makes peers REQUIRED and a \
              peerless host cannot build a chain source at all"
+        );
+    }
+}
+
+/// Regression tests for where the chain-source diagnostic GOES (dig_ecosystem#2210, #2216).
+///
+/// The failure these guard is not a wrong message but an unreachable one: the explanation was
+/// written to stderr, and a Windows service has no stderr, so it was discarded every time. A
+/// test that only checked the wording would have passed throughout. These assert the message
+/// arrives at a `tracing` subscriber — the same channel `dig-logging` attaches in production.
+#[cfg(test)]
+mod chain_source_diagnostic_tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    /// A `MakeWriter` that keeps everything written to it, so a test can read back exactly what
+    /// a subscriber emitted.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("capture buffer poisoned")).into_owned()
+        }
+    }
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("capture buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `body` with a capturing subscriber installed, and return everything it logged.
+    fn logged(body: impl FnOnce()) -> String {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        capture.contents()
+    }
+
+    /// The reason the chain source failed MUST reach the log sink, and MUST carry the
+    /// underlying error — a bare "chain source unavailable" would not have shortened the
+    /// hunt that motivated this.
+    #[test]
+    fn the_failure_reason_reaches_the_log_sink() {
+        // A distinctive value, so the assertion cannot pass on some other incidental log line.
+        let underlying = "the system cannot find the path specified. (os error 3)";
+
+        let output = logged(|| super::warn_chain_source_unavailable(&underlying));
+
+        assert!(
+            output.contains(underlying),
+            "the underlying error must be carried to the sink, not summarised away; got: {output}"
+        );
+        assert!(
+            output.contains("WALLET_NO_CHAIN_SOURCE"),
+            "the diagnostic must name the error code an operator will actually see on the RPC, \
+             so the log line is findable from the symptom; got: {output}"
+        );
+        assert!(
+            output.contains("WARN"),
+            "a chain source that failed to start is a warning, not a debug detail; got: {output}"
+        );
+    }
+
+    /// Nothing is emitted OUTSIDE the subscriber, which is what distinguishes `tracing` from the
+    /// `eprintln!` this replaced. With no subscriber installed the call is a no-op rather than a
+    /// write to a stream the service does not have; with one installed it produces output. The
+    /// two halves together show the message travels the subscriber, not the process's stderr.
+    #[test]
+    fn the_diagnostic_travels_the_subscriber_not_a_raw_stream() {
+        let capture = Capture::default();
+
+        // No subscriber in scope: the capture must stay empty.
+        super::warn_chain_source_unavailable(&"ignored");
+        assert!(
+            capture.contents().is_empty(),
+            "a capture with no subscriber attached must see nothing"
+        );
+
+        // Same call, subscriber installed: now it lands.
+        let output = logged(|| super::warn_chain_source_unavailable(&"observed"));
+        assert!(
+            output.contains("observed"),
+            "with a subscriber installed the diagnostic must land in it; got: {output}"
         );
     }
 }

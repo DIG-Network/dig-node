@@ -63,6 +63,11 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 # Windows service (home = `config\systemprofile`, no `.chia`) construct a chain source at
 # all (#2210). Kept at the SAME version as dig-node-core so one `chia-query` resolves.
 chia-query = "0.6"
+# Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
+# subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr
+# to discard to — an `eprintln!` here reaches nobody, which is why a chain-source failure stayed
+# invisible across three debugging rounds and 8,000 log lines (#2210, #2216).
+tracing = "0.1"
 # Dual transport (C.3): mTLS 9257 (Sage byte-parity) + plain-HTTP+CORS browser mirror.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -108,6 +113,10 @@ totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Capture emitted `tracing` events in-process so a test can assert a diagnostic actually
+# reaches the log sink, rather than trusting that it was written at all (#2210).
+# The SAME 0.3 line dig-logging builds on, so one tracing-subscriber resolves.
+tracing-subscriber = "0.3"
 # K1Pair — real secp256k1 test key pairs for the vault config / K1 pubkey parse tests.
 chia-sdk-test = { version = "0.30", features = ["peer-simulator"] }
 # Drive the axum Router transport-independently (oneshot) and read response bodies in
