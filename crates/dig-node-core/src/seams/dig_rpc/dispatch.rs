@@ -55,6 +55,66 @@ pub trait RpcDispatch: Send + Sync {
     ) -> Value;
 }
 
+/// Resolve the mandatory chain-anchored pin (#127) for one serve/read request, fail-closed.
+///
+/// This is the SINGLE source of truth for "which generation may this node serve", shared byte-for-
+/// byte by the `dig.getContent` READ arm AND the `dig.fetchRange` peer-SERVE arm (#1764 — the serve
+/// arm formerly bypassed the gate entirely, letting a permissionless peer fetch ranges of a
+/// generation the local read path already refuses). The chain — not the request, a cached module,
+/// or an upstream — is the authority over which root is served.
+///
+/// Returns the concrete root to serve against:
+/// - `Ok(Some(root))` — the pin is enforced and resolved: the chain-anchored tip (a rootless
+///   request), or the requested root proven equal to the on-chain generation.
+/// - `Ok(None)` — the pin is disabled (`DIG_NODE_PIN=off`, local dev): serve against the requested
+///   root as-is; the client still verifies the Merkle proof against its own trust root.
+/// - `Err((code, message))` — FAIL CLOSED: a superseded/forged root (`-32005` anti-rollback, the
+///   real rollback attack), a store with no confirmed generation, or an unreachable chain — the
+///   catalogued rejection the caller returns verbatim.
+async fn resolve_enforced_pin(
+    node: &Node,
+    store_id_arr: &[u8; 32],
+    requested_root: Option<Bytes32>,
+) -> Result<Option<Bytes32>, (i64, String)> {
+    if !pin_enforced() {
+        // Pin disabled: serve against the requested root as-is (the client still verifies).
+        return Ok(requested_root);
+    }
+    let anchored = node.anchored_root_resolver.anchored_root(store_id_arr).await;
+    match requested_root {
+        // ROOTED: the requested root must BE the current on-chain generation (#127 anti-rollback).
+        // Prefer the lineage walk's tip; a walk aborted by one unparseable intermediate generation
+        // (#747 "parse next store: missing child") must NOT block a valid pinned root — fall back to
+        // the BOUNDED verify (one launcher-hint query, no walk). Fail-closed either way.
+        Some(req) => match &anchored {
+            Ok(Some(tip)) if *tip == req => Ok(Some(req)),
+            Ok(Some(tip)) => Err((
+                ROOT_NOT_ANCHORED,
+                format!(
+                    "served root {} does not match the store's on-chain root {} (chain is the authority)",
+                    req.to_hex(),
+                    tip.to_hex()
+                ),
+            )),
+            Ok(None) | Err(_) => match node
+                .anchored_root_resolver
+                .verify_pinned_root(store_id_arr, req)
+                .await
+            {
+                Ok(()) => Ok(Some(req)),
+                Err(msg) => Err((ROOT_NOT_ANCHORED, msg)),
+            },
+        },
+        // ROOTLESS: resolve the chain-anchored tip (the authority) via the shared `decide_pin`.
+        None => match decide_pin(true, None, anchored) {
+            PinDecision::ServeAt(root) => Ok(Some(root)),
+            PinDecision::Reject(code, msg) => Err((code, msg)),
+            // `decide_pin(true, ..)` never returns Unpinned.
+            PinDecision::Unpinned => Ok(None),
+        },
+    }
+}
+
 #[async_trait::async_trait]
 impl RpcDispatch for Node {
     async fn dispatch(
@@ -342,6 +402,41 @@ impl RpcDispatch for Node {
                         "resource fetchRange requires retrieval_key + root (64-hex each)",
                     );
                 }
+                // #1764 — the peer-SERVE arm enforces the SAME chain-anchored pin (#127) the READ
+                // arms (`dig.getContent`, the local `/s` tier) enforce, via the shared
+                // [`resolve_enforced_pin`]. Without it a permissionless peer could fetch ranges of a
+                // forged or superseded generation that every local read path already refuses — the
+                // serve side answering 200 where `/s` answers `-32005`. The chain, not the
+                // client-named `root`, decides which generation is served.
+                let store_id_arr: [u8; 32] = match parse_store_id_arg(&params) {
+                    // `store_hex` was validated 64-hex above, so this is unreachable; still fail
+                    // closed rather than serve an unpinned range.
+                    Ok(b) => b.into(),
+                    Err(()) => {
+                        return rpc_err(
+                            &id,
+                            -32602,
+                            "dig.fetchRange store_id must be a 64-hex launcher id",
+                        )
+                    }
+                };
+                let pinned_root = match resolve_enforced_pin(
+                    node,
+                    &store_id_arr,
+                    Bytes32::from_hex(root_hex).ok(),
+                )
+                .await
+                {
+                    Ok(root) => root,
+                    Err((code, msg)) => return rpc_err(&id, code, &msg),
+                };
+                // Serve against the resolved pin (the chain tip / verified root). In every ACCEPTED
+                // case this equals the client-named root, so the range bytes are unchanged — the
+                // gate only REFUSES an unanchored root; it never re-points an accepted read.
+                let pinned_root_hex = pinned_root
+                    .map(|r| r.to_hex())
+                    .unwrap_or_else(|| root_hex.to_string());
+                let root_hex = pinned_root_hex.as_str();
                 return match node
                     .fetch_range_frame(store_hex, root_hex, rk_hex, offset, length)
                     .await
@@ -709,7 +804,7 @@ impl RpcDispatch for Node {
         // explicit root must equal it. This is the same pin the CLI clone/pull enforce,
         // now uniform across the node read path (a compromised upstream can no longer
         // choose the served generation).
-        let store_id_arr = match parse_store_id_arg(&params) {
+        let store_id_arr: [u8; 32] = match parse_store_id_arg(&params) {
             Ok(b) => b.into(),
             Err(()) => {
                 return err(
@@ -722,53 +817,14 @@ impl RpcDispatch for Node {
         // A concrete, valid requested root (non-empty, 64-hex). The `"latest"`
         // sentinel and any malformed value are treated as ROOTLESS (resolve the tip).
         let requested_root = Bytes32::from_hex(requested_root_hex).ok();
-        let pinned_root: Option<Bytes32> = if pin_enforced() {
-            let anchored = node
-                .anchored_root_resolver
-                .anchored_root(&store_id_arr)
-                .await;
-            match requested_root {
-                // ROOTED (`dig://<store>:<root>`): the pinned root must equal the current on-chain
-                // root (#127 anti-rollback). Prefer the lineage walk's tip, but a walk aborted by a
-                // single unparseable intermediate generation (#747 "parse next store: missing child")
-                // MUST NOT block a valid pinned root — fall back to the BOUNDED verify (one
-                // launcher-hint query, no walk) so the read stays available (#747/#841). Fail-closed
-                // either way.
-                Some(req) => match &anchored {
-                    Ok(Some(tip)) if *tip == req => Some(req),
-                    Ok(Some(tip)) => {
-                        return err(
-                            &id,
-                            ROOT_NOT_ANCHORED,
-                            format!(
-                                "served root {} does not match the store's on-chain root {} (chain is the authority)",
-                                req.to_hex(),
-                                tip.to_hex()
-                            ),
-                        )
-                    }
-                    Ok(None) | Err(_) => match node
-                        .anchored_root_resolver
-                        .verify_pinned_root(&store_id_arr, req)
-                        .await
-                    {
-                        Ok(()) => Some(req),
-                        Err(msg) => return err(&id, ROOT_NOT_ANCHORED, msg),
-                    },
-                },
-                // ROOTLESS (`dig://<store>`): resolve the chain-anchored tip (the authority).
-                None => match decide_pin(true, None, anchored) {
-                    PinDecision::ServeAt(root) => Some(root),
-                    PinDecision::Reject(code, msg) => return err(&id, code, msg),
-                    // `decide_pin(true, ..)` never returns Unpinned.
-                    PinDecision::Unpinned => None,
-                },
-            }
-        } else {
-            // Pin disabled (DIG_NODE_PIN=off, offline/local dev): serve against the
-            // requested root as-is; the client still verifies against its trust root.
-            requested_root
-        };
+        // The mandatory chain-anchored pin (#127), resolved through the SAME shared
+        // [`resolve_enforced_pin`] the `dig.fetchRange` peer-serve arm uses (#1764) — one policy,
+        // no drift between the read and serve paths.
+        let pinned_root: Option<Bytes32> =
+            match resolve_enforced_pin(node, &store_id_arr, requested_root).await {
+                Ok(root) => root,
+                Err((code, msg)) => return err(&id, code, msg),
+            };
 
         // The concrete root hash everything below serves against. With the pin on this
         // is the chain-anchored tip; with it off it is the requested root (or empty).
