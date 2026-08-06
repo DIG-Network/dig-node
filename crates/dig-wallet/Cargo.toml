@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.12.1"
+version = "0.12.2"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -61,7 +61,15 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 # 0.6 is REQUIRED, not cosmetic: its `TlsIdentity::Generated` default builds the peer TLS
 # identity in memory instead of loading `~/.chia`, which is what lets a node running as a
 # Windows service (home = `config\systemprofile`, no `.chia`) construct a chain source at
-# all (#2210). Kept at the SAME version as dig-node-core so one `chia-query` resolves.
+# all (#2210).
+#
+# DELIBERATELY a DIFFERENT version from dig-node-core, which stays pinned `=0.5.1` because
+# `chia-peer` 0.1.3 is still built against dig-chainsource-interface 0.1 and the two
+# `ChainSourceProvider` traits will not unify (`dig-node-core/src/seams/chia_peer/light_client.rs`).
+# So the lock carries TWO chia-query lines and two dci lines, on purpose. That is sound here only
+# because no `chia_query` type crosses the dig-wallet -> dig-node-core boundary; do NOT "align them"
+# on sight -- doing so breaks dig-node-core. Collapsing to one version is dig_ecosystem#2227, which
+# needs a chia-peer release against dci 0.2 first.
 chia-query = "0.6"
 # Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
 # subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr
