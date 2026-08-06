@@ -1008,6 +1008,40 @@ version per path) as of a given capsule's commit. PUBLIC, unencrypted data; no `
   from the "held but no manifest" case above.
 - Malformed `store_id`/`root` (not 64-hex) → `-32602` before any filesystem access.
 
+##### Decoded-manifest memo — a BYTE budget, not an entry count (DoS bound, #2145)
+
+`dig.getManifest`, `dig.getPublicManifest`, and `dig.getMetadata` all decode from the SAME whole-`.dig`
+read (the public/metadata data sections share the wasm data section with the content chunk pool, so
+the parse cannot seek past them). All three are on the ANONYMOUS public-read allowlist, so that decode
+is memoized per `(cache_dir, store, root)` to keep a ~200-byte unauthenticated request from re-reading a
+128 MiB capsule per call.
+
+The memo is bounded in **total BYTES**, never in entry COUNT. A manifest entry's size is
+publisher-controlled and unbounded (a `PublicManifest` is one row per public path; a
+`MetadataManifest`'s `custom`/`links`/`authors`/… are open-ended), so an entry-count cap would let one
+hostile capsule pin arbitrary memory. The memo MUST therefore:
+
+- retain only the RENDERED JSON of each section (an exact byte length, never a hand-estimated size of a
+  decoded attacker-shaped tree);
+- bound the SUM of retained bytes across all entries to a fixed budget (`MANIFEST_MEMO_MAX_BYTES`,
+  32 MiB — a hard RAM bound, NOT scaled by publisher input), evicting least-recently-used entries on
+  insertion until within budget;
+- REFUSE to retain any single entry over a per-entry ceiling (`MANIFEST_ENTRY_MAX_BYTES`, 4 MiB) — an
+  oversized capsule is re-decoded per request under a process-wide serialization lock instead of pinned;
+- a memo MISS always recomputes and MUST still succeed (never an error);
+- `cache.clear` MUST DRAIN the memo (it is a process-lifetime residency with no idle TTL), so an
+  operator can reclaim its RAM.
+
+##### `dig.getMetadata` — the response ceiling (DoS bound, #2145)
+
+`dig.getMetadata` renders the WHOLE publisher metadata section into one JSON-RPC response — it cannot be
+windowed like `dig.getContent`/`dig.getCapsule`, whose 3 MiB windows seek the module. Because `custom`/
+`links` are publisher-controlled, an oversized section is REFUSED with `METADATA_TOO_LARGE` (`-32015`)
+when its rendered length exceeds `METADATA_RESPONSE_MAX_BYTES` (3 MiB, the same ceiling as a content
+window), rather than rendered + re-serialized (3–4 in-RAM copies) into a ~100 MB response. The refusal is
+a bounded error, never the oversized body. A normal (kilobyte) metadata section is served unchanged — the
+ceiling only bites the hostile case.
+
 #### 5.5.2. Chat subsystem — `chat.send` / `chat.poll` (epic #793)
 
 The node is the directed-message **TRANSPORT** for dig-chat: an application seals its own opaque
@@ -2662,6 +2696,7 @@ NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
 | -32008 | `CONTENT_REDIRECT` | node | The node does not (or, under §17's throttle, will not right now) serve the requested content itself, but the DHT located peer(s) that hold it — `error.data.redirect` names them (`content`, `providers[].peer_id`/`addresses`, `redirect_depth`, `max_redirects`) so the caller re-requests there. The candidate set is CAPPED at `MAX_REDIRECT_PROVIDERS` (= dig-dht's `MAX_ADDRESSES_PER_RECORD`): a redirect NAMES holders (the requestor dials them over its own §5.2 reachability ladder — this node does NOT dial/probe them), so a few candidates suffice and probing-on-miss would itself be an amplification vector. Minted on a content miss (`dig.getContent`/`dig.fetchRange`/the peer range-stream) and on outgoing-bandwidth saturation (§17), bounded by the same redirect-hop cap either way. |
 | -32009 | `CONTENT_MISS_RATE_LIMITED` | node | The requested content is not held, and the miss → DHT-lookup path is being driven too fast BY THIS REQUESTOR (§10.4). Minted instead of a redirect/fetch when the per-requestor token-bucket budget is exhausted, so an abusive caller backs off while a DIFFERENT requestor (its own bucket) is unaffected. A well-formed JSON-RPC error, never a silent empty success. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
+| -32015 | `METADATA_TOO_LARGE` | node | `dig.getMetadata` refused: the publisher metadata section renders larger than `METADATA_RESPONSE_MAX_BYTES` (3 MiB). This section is rendered WHOLE — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so an oversized capsule is refused with this bounded error rather than blasted into a ~100 MB response (§5.5.1, #2145). A normal (kilobyte) metadata section is served unchanged. |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
 | -32022 | *(reserved: onion `onion_hops_out_of_range`)* | — | Reserved for the onion-routing contract. |
