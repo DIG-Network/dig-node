@@ -167,6 +167,35 @@ fn reconciled_error_codes_are_catalogued_with_correct_origin() {
     );
 }
 
+/// The push-reassembly bound (`cache.pushCapsule`, dig_ecosystem#2149) is catalogued under a
+/// DEDICATED code — `-32016 PUSH_PENDING_LIMITED` — and NOT the `-32015` that already belongs to
+/// `METADATA_TOO_LARGE`. Two distinct conditions must never collide on one code (the deterministic
+/// error-catalogue contract, §6.2). This pins the reassignment caught during salvage.
+#[test]
+fn push_pending_limited_is_catalogued_on_its_own_code() {
+    assert_eq!(ErrorCode::PushPendingLimited.code(), -32016);
+    assert_eq!(ErrorCode::PushPendingLimited.name(), "PUSH_PENDING_LIMITED");
+    assert_eq!(ErrorCode::PushPendingLimited.origin(), "node");
+
+    // -32016 is used by nothing else in the catalogue, and -32015 is not PUSH_PENDING_LIMITED.
+    let codes: Vec<i64> = ErrorCode::all().iter().map(|e| e.code()).collect();
+    assert_eq!(
+        codes.iter().filter(|&&c| c == -32016).count(),
+        1,
+        "-32016 must be catalogued exactly once"
+    );
+
+    let catalogue = meta::error_catalogue();
+    let arr = catalogue.as_array().expect("error catalogue array");
+    assert!(
+        arr.iter()
+            .any(|e| e["name"] == json!("PUSH_PENDING_LIMITED")
+                && e["code"] == json!(-32016)
+                && e["origin"] == json!("node")),
+        "error catalogue missing -32016 PUSH_PENDING_LIMITED"
+    );
+}
+
 /// **Proves (#1075):** the shell catalogue does not DRIFT below the canonical
 /// node<->node contract crate. Every method that `dig_rpc_protocol` marks
 /// peer-reachable (the public read/discovery/announce surface other DIG nodes call)
