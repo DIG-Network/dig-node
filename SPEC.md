@@ -2605,7 +2605,7 @@ whole chain, so a privileged-owned leaf under a user-writable parent is refused,
 cannot act on a refusal that does not say which level failed. A **user-scope** install runs as the
 very user who owns the binary, crosses no privilege boundary, and is always allowed. The canonical
 install paths (native OS package, §9.7; the dig-installer's root-owned `/opt/dig/bin`) place the
-binary in a protected admin-owned location (`%ProgramFiles%\DIG Network\dig-node\`, `/usr/…`), so
+binary in a protected admin-owned location (`%ProgramFiles%\DIG\bin\`, `/usr/…`), so
 they satisfy the gate; a manual system-scope `dig-node install` from a user-writable download
 directory is what the gate refuses — and it is refused loudly, never downgraded to user scope. **The program FILE itself MUST also clear the bar** — owned by root/SYSTEM, no group/other write
 bit, not a symlink/reparse point — and not merely sit inside a privileged directory: directory
@@ -2650,23 +2650,64 @@ out to both listeners (§4.1).
 ### 9.7. Native install packages (#503)
 
 The canonical end-user install path is a NATIVE OS PACKAGE built by this repo's CI (`package.yml`),
-published as GitHub Release assets on each `vX.Y.Z` tag. The `dig-installer` simply fetches + runs
-the right package; it does not re-implement service registration. Each package installs the binary,
+published as GitHub Release assets on each `vX.Y.Z` tag. `dig-updater` fetches + runs the right
+package on every update; on Windows `dig-installer` currently places a raw binary instead of running
+the `.msi` (unifying that is planned, and until it lands the `.msi` MUST tolerate a foreign binary
+already present in the install root — see the Windows entry below). Each package installs the binary,
 registers the OS service, registers the `chia://` scheme handler (→ `dig-node open`, §8.5), creates
 the machine-wide state dir (§7.3a), and sets the `dig.local` → `127.0.0.2` hosts entry (via the
 idempotent, no-shell `dig-node ensure-hosts`, §8.1). The `dig-node install`/`uninstall` CLI (§9.1)
 remains for manual/dev use.
 
-- **Windows `.msi`** (WiX; `dig-node-<ver>-windows-x64.msi`). Installs `dig-node.exe` under
-  `%ProgramFiles%\DIG Network\dig-node\`; `ServiceInstall`+`ServiceControl` register
+- **Windows `.msi`** (WiX; `dig-node-<ver>-windows-x64.msi`). **`dig-updater` runs this package on
+  every Windows update** (`msiexec /i <pkg> /qn /norestart`; dig-node's Windows `InstallMethod` is
+  `WindowsMsi`), so it is load-bearing for auto-update. `dig-installer` does NOT currently run it —
+  it places a raw binary in the install root itself.
+
+  Installs `dig-node.exe` under `%ProgramFiles%\DIG\bin\` — the CANONICAL protected install root.
+  That root is MANDATORY for two independent reasons:
+
+  1. **Auto-update convergence.** `dig-updater` reads the installed version from
+     `<install-root>\dig-node.exe` after running the package. If the package installs anywhere else,
+     the probe reads a file the install never wrote: the probed version never changes, every beacon
+     cycle re-runs the same install, and the host never advances — a non-convergent update loop, not
+     a cosmetic path difference.
+  2. **The installer's own audit.** `dig-installer` verifies the registered service image and the
+     fresh-session PATH resolution of `dig-node.exe` against that root, so a package installing
+     elsewhere makes every install fail a check against its own payload.
+
+  `ServiceInstall`+`ServiceControl` register
   `net.dignetwork.dig-node` (DisplayName **"DIG NETWORK: NODE"**) running `dig-node.exe run-service`
   as LocalSystem, auto-start, STARTED on install, STOPPED+REMOVED on uninstall; creates
   `C:\ProgramData\DigNode` with a **restrictive DACL — inheritance broken, only SYSTEM +
   Administrators (never Users)** so the token is not world-readable (§7.3a; dig-node leaves a
   pre-existing dir's ACL intact); registers `chia://` under `HKLM\Software\Classes\chia`
-  (`shell\open\command` = `"…\dig-node.exe" open "%1"`); appends the install dir to the system PATH;
+  (`shell\open\command` = `"…\dig-node.exe" open "%1"`); MUST NOT modify the machine `PATH` (the
+  install root's PATH entry has exactly ONE owner, `dig-installer`, which writes it in the USER hive
+  — a machine-hive entry from this package precedes it in a fresh session and shadows it);
   runs `dig-node ensure-hosts` as a deferred (SYSTEM) custom action. A stable `UpgradeCode` +
   `MajorUpgrade` give clean in-place upgrades.
+
+  **Upgrade sequencing (normative).** `MajorUpgrade` MUST schedule `RemoveExistingProducts` BEFORE
+  the new files install (`afterInstallValidate`). The previous product's binary, machine-`PATH` row
+  and `net.dignetwork.dig-node` registration are then removed, and the service reinstalled and
+  started, inside ONE transaction: an interrupted upgrade rolls back to the previous product with
+  its service intact, and a completed upgrade ends with the service registered against the new
+  image. No reachable resting state has a registered product and no service. Scheduling the removal
+  LATER is forbidden: the previous product's `ServiceControl Remove="uninstall"` matches the service
+  by NAME and would delete the service the new product had just registered. `REINSTALLMODE=amus`
+  MUST NOT be used to force file replacement: it turns a repair into a silent downgrade.
+
+  The package MUST also remove any pre-existing `dig-node.exe` in the shared root before installing
+  its own (`RemoveFile`, on install). The root is shared and this package is not its only writer —
+  `dig-installer` drops a raw `dig-node.exe` there — and Windows Installer's file-versioning rules
+  KEEP such a foreign, unversioned-looking file rather than overwrite it. Without the removal the
+  package completes over a binary it did not install, and the version `dig-updater` probes next is
+  the stale file's. The removal MUST be scoped to that one file by name: the root also holds
+  `digstore`, `dig-dns`, `dig-updater` and `dig-app`.
+
+  All four requirements above — root, no machine `PATH` row, removal schedule, and the scoped
+  `RemoveFile` — are asserted by `scripts/tests/msi-install-root.test.sh`.
 - **macOS `.pkg`** (`dig-node-<ver>-macos.pkg`, universal arm64+x86_64). Installs `dig-node` to
   `/usr/local/bin`; a LaunchDaemon `/Library/LaunchDaemons/net.dignetwork.dig-node.plist`
   (`RunAtLoad`+`KeepAlive`, `run` with `DIG_NODE_RUN_CONTEXT=service`); a tiny AppleScript app
