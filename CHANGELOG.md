@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.99.1] - 2026-08-06
+
+### Features
+- **node:** Rate-limit the miss→DHT-lookup path + explicit proxy fallback for the redirect (#2007) (#182)
+
+### Bug Fixes
+- **dig-node:** Resolve reads to the generation that holds the file (#184)
+
 ## [0.98.0] - 2026-08-05
 
 ### Features
