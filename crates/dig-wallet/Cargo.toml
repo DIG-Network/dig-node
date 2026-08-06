@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.12.0"
+version = "0.12.2"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -56,9 +56,26 @@ zeroize = "1"
 # file). We use the runtime `query()` API (NOT the compile-time `query!` macro) so the
 # build needs no live DATABASE_URL; `macros` is only for `#[derive(FromRow)]`.
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio", "macros"] }
-# Fallback tier (B.5): coinset.org + non-subscribing peer point-reads, reused AS-IS. Git
-# dep (not path) so a standalone dig-node checkout builds it in CI.
-chia-query = { git = "https://github.com/DIG-Network/chia-query.git", rev = "48f7f6521fcc109f6c935e56f96cb5a86da1ae22" }
+# Fallback tier (B.5): coinset.org + non-subscribing peer point-reads, reused AS-IS. From
+# crates.io, never a git rev (CLAUDE.md §3.6: consumers depend on the published version).
+# 0.6 is REQUIRED, not cosmetic: its `TlsIdentity::Generated` default builds the peer TLS
+# identity in memory instead of loading `~/.chia`, which is what lets a node running as a
+# Windows service (home = `config\systemprofile`, no `.chia`) construct a chain source at
+# all (#2210).
+#
+# DELIBERATELY a DIFFERENT version from dig-node-core, which stays pinned `=0.5.1` because
+# `chia-peer` 0.1.3 is still built against dig-chainsource-interface 0.1 and the two
+# `ChainSourceProvider` traits will not unify (`dig-node-core/src/seams/chia_peer/light_client.rs`).
+# So the lock carries TWO chia-query lines and two dci lines, on purpose. That is sound here only
+# because no `chia_query` type crosses the dig-wallet -> dig-node-core boundary; do NOT "align them"
+# on sight -- doing so breaks dig-node-core. Collapsing to one version is dig_ecosystem#2227, which
+# needs a chia-peer release against dci 0.2 first.
+chia-query = "0.6"
+# Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
+# subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr
+# to discard to — an `eprintln!` here reaches nobody, which is why a chain-source failure stayed
+# invisible across three debugging rounds and 8,000 log lines (#2210, #2216).
+tracing = "0.1"
 # Dual transport (C.3): mTLS 9257 (Sage byte-parity) + plain-HTTP+CORS browser mirror.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
@@ -104,6 +121,10 @@ totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Capture emitted `tracing` events in-process so a test can assert a diagnostic actually
+# reaches the log sink, rather than trusting that it was written at all (#2210).
+# The SAME 0.3 line dig-logging builds on, so one tracing-subscriber resolves.
+tracing-subscriber = "0.3"
 # K1Pair — real secp256k1 test key pairs for the vault config / K1 pubkey parse tests.
 chia-sdk-test = { version = "0.30", features = ["peer-simulator"] }
 # Drive the axum Router transport-independently (oneshot) and read response bodies in

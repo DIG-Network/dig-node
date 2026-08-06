@@ -3679,6 +3679,17 @@ unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only
   (CAT/singleton parent-spend reads via `get_puzzle_and_solution`), and a `fallback::CoinsetFallback`
   read tier. A client-construction failure (offline / no peer reachable) is NON-FATAL and DISABLES
   live broadcast (logged) — a half-built client can never send.
+- **The chain source MUST require nothing from the filesystem.** The peer TLS identity is generated
+  in memory (`chia_query::TlsIdentity::Generated`, the `ChiaQueryConfig::default()`), never loaded
+  from `~/.chia`. Chia full nodes accept any well-formed client certificate, so a file-backed
+  identity buys nothing and costs correctness: the node runs as an OS service, whose account has no
+  populated `~/.chia` (on Windows, `…\config\systemprofile`), so a file-backed identity made client
+  construction fail and every `control.wallet.balance` answer `WALLET_NO_CHAIN_SOURCE` (§10). The
+  coinset tier MUST also stay enabled, which keeps peers OPTIONAL: an empty peer pool degrades to
+  keyless HTTP reads rather than failing construction outright. Requires `chia-query` ≥ 0.6.
+- **A construction failure MUST be reported through the process log sink** (`tracing` ⇒
+  `dig-logging`), never `stderr`: a service has no stderr attached, and this is the only account of
+  why subsequent balance reads answer `WALLET_NO_CHAIN_SOURCE`.
 - **Broadcaster split (no double-confirm).** The GENERAL wallet surface (send/offer/mint,
   `finalize_spend`/`submit_transaction`/`sign_coin_spends`) gets a `spend::ConfirmingBroadcaster`
   wrapping the raw broadcaster: it pushes to the mempool (the money boundary — a push error

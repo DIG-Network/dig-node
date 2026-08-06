@@ -4,6 +4,47 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## A service account's home is not a place to keep credentials (#2210)
+
+Every `control.wallet.balance` answered `-32040 WALLET_NO_CHAIN_SOURCE` on an otherwise healthy
+node. The chain: `chia-query` resolved its peer TLS certificate under `dirs_home()/.chia`, and
+dig-node runs as a Windows service under SYSTEM, whose home is
+`C:\Windows\system32\config\systemprofile` and has no `.chia` at all. The certificate was
+generated fine and the *write* of it failed (`os error 3`), so `ChiaQuery::new()` failed,
+`build_live_wallet()` returned `None` by design, and the wallet fell back to `EmptyFallback`,
+whose `is_live() == false` is exactly what the balance read reports as `-32040`.
+
+Three durable points, each of which cost time:
+
+- **Chia peer TLS does not authenticate the client certificate — any well-formed one works.** So a
+  certificate on disk was never a credential, only a dependency. Generating one in memory
+  (`TlsIdentity::Generated`, chia-query 0.6) removes the filesystem from the path entirely. Two
+  earlier remedies — lazy cert loading, a service-appropriate cert directory — were both elaborate
+  ways to satisfy a requirement that did not exist.
+- **A keyless tier must not sit behind a credentialed one.** The coinset fallback is plain HTTP and
+  needs neither cert nor peer, yet the whole client failed to construct before it was reachable.
+  chia-query 0.6 makes peers `Optional` whenever the coinset tier is enabled, so an empty peer pool
+  degrades to HTTP reads instead of denying the reader the fallback that exists for that case.
+- **The bug hid on developer machines because it depended on ambient filesystem state.** An
+  interactive user has `~/.chia`; the service account does not. Any test that merely constructed a
+  client passed on the machine where the bug was reported. The regression tests therefore assert
+  the CONFIGURATION (identity is `Generated`, coinset stays enabled) rather than construction
+  success, which makes them independent of whose home directory the suite runs in.
+
+Sharp edge — **a service has no stderr.** The one message explaining the failure was an
+`eprintln!`, so it was discarded on every run: 8,000 log lines across three restarts contained
+nothing, and the answer sat in that string. Diagnostics in this repo go through `tracing` to the
+`dig-logging` sink, never a raw stream. Adopting 0.6 removed the most common reason to reach that
+line but not the others (no network, coinset outage), so the log route matters independently.
+
+Sharp edge — **`chia-query` and `chia-peer` disagree about `dig-chainsource-interface`.**
+chia-query 0.5.2+ moved to dci 0.2 while `chia-peer` 0.1.3 is still on 0.1, and the two
+`ChainSourceProvider` traits then fail to unify where dig-node-core registers the light client into
+the `ProviderRegistry`. dig-node-core is pinned `=0.5.1` (an exact requirement, deliberately: a
+caret `0.5` breaks the build the moment the lock refreshes) until a `chia-peer` release built
+against dci 0.2 exists. dig-wallet is on 0.6 meanwhile — safe only because no `chia_query` type
+crosses the crate boundary between them.
+
 ## PublicManifest (§13) is NOT committed into the current_root — older-gen reads bind via `sha256_latest` (#2088)
 
 A >1-generation store was unreadable for every file NOT in its latest commit: the serve pinned every
