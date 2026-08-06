@@ -10797,6 +10797,74 @@ mod tests {
         std::fs::write(&path, module_bytes).unwrap();
     }
 
+    /// Read the §13 `PublicManifest` entry a compiled module records for `path` — the honest
+    /// `(latest_root, generation_index, sha256_latest)` the generation-resolution serve reads.
+    fn manifest_entry_of(module: &[u8], path: &str) -> digstore_core::PublicManifestEntry {
+        use digstore_core::datasection::{DataView, SectionId};
+        use digstore_core::PublicManifest;
+        let blob = digstore_compiler::extract_data_section_blob(module).expect("extract DIGS blob");
+        let view = DataView::parse(&blob).expect("parse DIGS blob");
+        let body = view
+            .section(SectionId::PublicManifest)
+            .expect("module carries a §13 PublicManifest");
+        PublicManifest::from_bytes(body)
+            .expect("decode §13")
+            .entries
+            .into_iter()
+            .find(|e| e.path == path)
+            .expect("path present in §13")
+    }
+
+    /// FORGE a tip capsule's §13 `PublicManifest` so `path`'s entry points at
+    /// `(forged_root, forged_gen, forged_leaf)` instead of the honest tip — the exact #2211 attack.
+    ///
+    /// §13 is an ADDITIVE data section that is NOT committed into the chain-anchored `current_root`,
+    /// so a malicious holder can serve a GENUINE, anchor-passing tip capsule whose §13 lies about a
+    /// path the tip itself commits. This rewrites ONLY the §13 entry (root + leaf are 32 bytes,
+    /// generation is a `u64`, so the section length is unchanged) and re-injects the blob, leaving
+    /// every other section — the key table / chunk pool / merkle leaves / `current_root` — BYTE
+    /// IDENTICAL, so the forged tip still decrypts + serves its real (v2) bytes.
+    fn forge_tip_manifest_redirect(
+        module_tip: &[u8],
+        path: &str,
+        forged_root: Bytes32,
+        forged_gen: u64,
+        forged_leaf: Bytes32,
+    ) -> Vec<u8> {
+        use digstore_compiler::{
+            extract_data_section_blob, inject_data_section, DATA_SECTION_MEM_OFFSET,
+        };
+        use digstore_core::datasection::{DataView, SectionId};
+        use digstore_core::PublicManifest;
+        let blob = extract_data_section_blob(module_tip).expect("extract tip DIGS blob");
+        let (pm_off, pm_len, mut pm) = {
+            let view = DataView::parse(&blob).expect("parse tip DIGS blob");
+            let body = view
+                .section(SectionId::PublicManifest)
+                .expect("tip carries a §13 PublicManifest");
+            let off = body.as_ptr() as usize - blob.as_ptr() as usize;
+            (off, body.len(), PublicManifest::from_bytes(body).expect("decode §13"))
+        };
+        let entry = pm
+            .entries
+            .iter_mut()
+            .find(|e| e.path == path)
+            .expect("path present in tip §13");
+        entry.latest_root = forged_root;
+        entry.generation_index = forged_gen;
+        entry.sha256_latest = forged_leaf;
+        let forged_body = pm.to_bytes();
+        assert_eq!(
+            forged_body.len(),
+            pm_len,
+            "forging root/leaf/gen must not change the §13 section length"
+        );
+        let mut forged_blob = blob.clone();
+        forged_blob[pm_off..pm_off + pm_len].copy_from_slice(&forged_body);
+        inject_data_section(module_tip, &forged_blob, DATA_SECTION_MEM_OFFSET)
+            .expect("re-inject the forged §13 blob")
+    }
+
     #[tokio::test]
     async fn dig_get_manifest_returns_embedded_manifest_json_when_present() {
         // A PUBLIC store's compiled module embeds the PublicManifest section (#176 Phase A);
@@ -11850,6 +11918,73 @@ mod tests {
                 "a forged §13 redirect to an out-of-lineage root MUST NOT serve the attacker bytes"
             );
             panic!("expected a fail-closed miss for the forged redirect, got Served: {out:?}");
+        }
+    }
+
+    /// **Proves (#2211 Case A — the interim anti-rollback closure):** a path whose CURRENT bytes are
+    /// committed by the tip's chain-anchored `current_root` is served from the TIP, even when the
+    /// tip's §13 `PublicManifest` is FORGED to redirect that path at a GENUINE-but-SUPERSEDED prior
+    /// generation. §13 is an additive section NOT committed into `current_root` (#2211), so a
+    /// malicious holder can serve a genuine, anchor-passing tip capsule whose §13 names a real older
+    /// root for a path the tip itself commits — a DOWNGRADE bounded to owner-committed content.
+    ///
+    /// Distinct from the out-of-lineage forgery above: here the forged `latest_root` (gen0) IS in the
+    /// authenticated lineage, so the #184 lineage cross-check ALONE would honour the redirect and
+    /// serve the stale v1. The fix serves TIP-AUTHORITATIVE — the tip's own root binds the read (no
+    /// §13 leaf binding), so the forged redirect is never reached for a tip-committed path and v2
+    /// wins. (Case B — a path whose current version genuinely lives in an older generation — stays
+    /// open on #2211, blocked on the per-path current-state commitment tracked in digstore #2203.)
+    #[test]
+    fn serve_content_plaintext_serves_tip_authoritative_against_a_forged_downgrade_2211() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([48u8; 32]);
+        // gen0 holds asset.js = v1; gen1 (the tip) REWRITES asset.js = v2, so the tip's own
+        // `current_root` commits v2 and the tip capsule physically holds it (Case A).
+        let gen0_files = vec![
+            ("index.html".to_string(), b"<h1>A</h1>".to_vec()),
+            ("asset.js".to_string(), b"V1-OLD".to_vec()),
+        ];
+        let gen1_files = vec![
+            ("index.html".to_string(), b"<h1>A2</h1>".to_vec()),
+            ("asset.js".to_string(), b"V2-NEW".to_vec()),
+        ];
+        let ((root0, module0), (root1, module1)) =
+            compile_two_generation_module(store, &gen0_files, &gen1_files);
+        assert_ne!(root0, root1, "the two generations must have distinct roots");
+        // The GENUINE older leaf the forged §13 names — gen0's asset.js (v1).
+        let gen0_asset = manifest_entry_of(&module0, "asset.js");
+        assert_eq!(gen0_asset.latest_root, root0, "gen0 holds asset.js at root0");
+        // THE FORGE: rewrite the tip's §13 so asset.js redirects at the genuine-but-superseded gen0.
+        let forged_tip =
+            forge_tip_manifest_redirect(&module1, "asset.js", root0, 0, gen0_asset.sha256_latest);
+        // Both gen0 and gen1 are GENUINE on-chain generations (so the lineage cross-check ALONE would
+        // honour the redirect); gen1 (root1) is the tip.
+        let (node, _td) = test_node_with_resolver(
+            None,
+            MockResolver::one_with_lineage(&store.to_hex(), root1, vec![root0, root1]),
+        );
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root0.to_hex(), &module0);
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root1.to_hex(), &forged_tip);
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            "", // rootless → resolve the tip, then per-path generation resolution
+            "asset.js",
+            None,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        match out {
+            PlaintextOutcome::Served { bytes, .. } => assert_eq!(
+                bytes, b"V2-NEW",
+                "the tip's chain-anchored asset.js (v2) MUST win over a forged §13 downgrade to the \
+                 genuine-but-superseded gen0 (v1)"
+            ),
+            other => panic!("expected the tip-authoritative v2 bytes served, got {other:?}"),
         }
     }
 
