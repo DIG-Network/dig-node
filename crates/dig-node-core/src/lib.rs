@@ -12101,13 +12101,13 @@ mod tests {
         // The read then falls through to the remote tier (which has nothing to give) — a fail-closed
         // miss (`NotFound`, or `Unreadable` when the remote leg errors). The ONE outcome the fix
         // forbids is a `Served` result: that would be the rolled-back v1 the redirect used to yield.
-        match out {
-            PlaintextOutcome::Served { bytes, .. } => panic!(
+        // Any non-Served outcome is fail-closed: the downgrade to v1 was refused.
+        if let PlaintextOutcome::Served { bytes, .. } = out {
+            panic!(
                 "a tampered tip capsule must not drive a §13 rollback — served {} bytes ({:?})",
                 bytes.len(),
                 String::from_utf8_lossy(&bytes)
-            ),
-            _ => {} // any non-Served outcome is fail-closed: the downgrade to v1 was refused
+            );
         }
     }
 
