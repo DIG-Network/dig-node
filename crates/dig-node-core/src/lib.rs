@@ -8345,6 +8345,144 @@ mod tests {
         assert_eq!(resp["error"]["code"], ROOT_NOT_ANCHORED, "{resp}");
     }
 
+    // -- #1764 / #1765: the peer-SERVE arm (`dig.fetchRange`) enforces the SAME chain-anchored pin
+    // the READ arms enforce ------------------------------------------------------------------------
+    //
+    // Before #1764 `dig.fetchRange` had NO anchor gate: it validated shape then served any range
+    // that Merkle-verified against the CLIENT-named root, so a peer could fetch bytes of a forged or
+    // superseded generation the local `/s` and `dig.getContent` paths already refuse. These prove
+    // the serve arm now fails closed identically, WITHOUT serving content (the gate precedes
+    // `fetch_range_frame`, so no fixture is seeded — a served range would be a 200/`-32004`, never a
+    // `-32005`).
+
+    /// A `dig.fetchRange` request for the given store/root, keyed by any retrieval key.
+    fn fetch_range_req(store: &Bytes32, root: &Bytes32) -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"dig.fetchRange","params":{
+            "store_id": store.to_hex(),
+            "root": root.to_hex(),
+            "retrieval_key": any_rk_hex(),
+            "offset": 0,
+            "length": 4096,
+        }})
+    }
+
+    #[test]
+    fn fetch_range_fails_closed_when_store_has_no_confirmed_generation() {
+        // #1764/#1765: a store with no confirmed on-chain generation (`Ok(None)`) has no anchored
+        // root — the peer-serve arm must fail closed with `ROOT_NOT_ANCHORED`, exactly as the read
+        // arms do, rather than serve a range of an unanchored generation.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([21u8; 32]);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::always(Ok(None)));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            fetch_range_req(&store, &Bytes32([0xAA; 32])),
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            resp["error"]["code"], ROOT_NOT_ANCHORED,
+            "dig.fetchRange must fail closed for an unanchored store: {resp}"
+        );
+        assert!(resp.get("result").is_none(), "no range served: {resp}");
+    }
+
+    #[test]
+    fn fetch_range_fails_closed_when_chain_is_unreachable() {
+        // #1765 face: an unanchored read yields the SAME outcome whether the chain (the authority)
+        // is reachable or not — a chain error (`Err`) fails closed identically, never a fallback to
+        // serving the client-named root.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([22u8; 32]);
+        let (node, _td) =
+            test_node_with_resolver(None, MockResolver::always(Err("coinset 503".into())));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            fetch_range_req(&store, &Bytes32([0xAA; 32])),
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(resp["error"]["code"], ROOT_NOT_ANCHORED, "{resp}");
+        assert!(resp.get("result").is_none());
+    }
+
+    #[test]
+    fn fetch_range_refuses_a_superseded_client_root_with_rollback_code() {
+        // #127/#2088 anti-rollback on the SERVE path: when the store HAS a confirmed tip
+        // (`Ok(Some(tip))`) but the request names a DIFFERENT root (a superseded/forged generation —
+        // the real rollback attack), the serve arm hard-rejects `-32005`, exactly as `dig.getContent`
+        // does. This is the property Path 3 gaining the gate must PRESERVE, not just tighten.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([23u8; 32]);
+        let tip = Bytes32([0xAA; 32]);
+        let attacker_root = Bytes32([0xBB; 32]);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+
+        let resp = rt.block_on(handle_rpc(
+            &node,
+            fetch_range_req(&store, &attacker_root),
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            resp["error"]["code"], ROOT_NOT_ANCHORED,
+            "a superseded client root must fail closed on the serve path too: {resp}"
+        );
+        assert!(resp.get("result").is_none(), "no range served: {resp}");
+    }
+
+    #[test]
+    fn unanchored_content_is_refused_uniformly_across_get_content_and_fetch_range() {
+        // The #1764 face, stated as PARITY: the exact same store+root that `dig.getContent` refuses
+        // (`Ok(None)` ⇒ `ROOT_NOT_ANCHORED`) is ALSO refused by `dig.fetchRange` — proving the serve
+        // arm no longer serves a 200 where the read arm answers a fail-closed error.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([24u8; 32]);
+        let root = Bytes32([0xAA; 32]);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::always(Ok(None)));
+
+        let get_content = rt.block_on(handle_rpc(
+            &node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getContent","params":{
+                "store_id": store.to_hex(),
+                "root": root.to_hex(),
+                "retrieval_key": any_rk_hex(),
+            }}),
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        let fetch_range = rt.block_on(handle_rpc(
+            &node,
+            fetch_range_req(&store, &root),
+            crate::download::ReadOrigin::Peer,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+
+        assert_eq!(
+            get_content["error"]["code"], ROOT_NOT_ANCHORED,
+            "read path must refuse: {get_content}"
+        );
+        assert_eq!(
+            fetch_range["error"]["code"], ROOT_NOT_ANCHORED,
+            "serve path must refuse identically: {fetch_range}"
+        );
+        assert!(get_content.get("result").is_none());
+        assert!(fetch_range.get("result").is_none());
+    }
+
     #[test]
     fn get_content_rejects_a_bad_store_id_before_touching_the_chain() {
         // Param validation precedes the chain read (a -32602, not a pin error).
@@ -11575,6 +11713,86 @@ mod tests {
         }
     }
 
+    /// **Proves (#1765, the local `/s` leg — Path 3):** the `GET /s/<store>/<path>` handler
+    /// (`serve_content_plaintext`) fails closed with `ROOT_NOT_ANCHORED` for a store with no
+    /// confirmed on-chain generation (`Ok(None)`), EXACTLY as the `dig.getContent` and
+    /// `dig.fetchRange` RPC arms do (#1764). This completes the uniform-refusal proof across all
+    /// THREE serve paths: an unanchored read is refused identically whether it arrives over the
+    /// local HTTP tier, the peer-serve RPC arm, or the read RPC arm — no leg serves where another
+    /// refuses. The gate precedes every content tier (local → peer → gateway), so the refusal is
+    /// reached before any bytes are fetched.
+    #[test]
+    fn serve_content_plaintext_fails_closed_for_an_unanchored_store_1765() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([45u8; 32]);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::always(Ok(None)));
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &Bytes32([0xAA; 32]).to_hex(),
+            "index.html",
+            None,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        match out {
+            PlaintextOutcome::RootError { code, .. } => assert_eq!(
+                code, ROOT_NOT_ANCHORED,
+                "the /s tier must fail closed for an unanchored store"
+            ),
+            other => panic!("expected ROOT_NOT_ANCHORED on the /s tier, got {other:?}"),
+        }
+    }
+
+    /// **Proves (#1765, the face of the bug):** an unanchored read (`Ok(None)`) reaches the IDENTICAL
+    /// fail-closed `ROOT_NOT_ANCHORED` on the local `/s` tier whether or not the node has an upstream
+    /// gateway configured — so there is no leg that serves where another refuses. The original #1765
+    /// hazard was a serve path that answered where a sibling path refused; because the chain-anchor
+    /// gate precedes tier selection (local → peer → gateway), the presence of a reachable gateway
+    /// can never turn a refusal into a serve. Both nodes hold the same unanchored store; one has a
+    /// (would-be-reachable) upstream and one has none, and both refuse before the gateway is consulted.
+    #[test]
+    fn serve_content_plaintext_refuses_unanchored_identically_with_and_without_a_gateway_1765() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([46u8; 32]);
+        let root_hex = Bytes32([0xAA; 32]).to_hex();
+
+        let outcome_code = |upstream: &str| -> i64 {
+            let (mut node, _td) = test_node_with_resolver(None, MockResolver::always(Ok(None)));
+            node.upstream = upstream.to_string();
+            let out = rt.block_on(node.serve_content_plaintext(
+                &store.to_hex(),
+                &root_hex,
+                "index.html",
+                None,
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            match out {
+                PlaintextOutcome::RootError { code, .. } => code,
+                other => panic!("expected a RootError, got {other:?}"),
+            }
+        };
+
+        // "No gateway" (empty upstream) and "a gateway is configured" both fail closed identically —
+        // the anchor gate runs first, so gateway reachability is orthogonal to the refusal.
+        let no_gateway = outcome_code("");
+        let with_gateway = outcome_code("http://127.0.0.1:9/");
+        assert_eq!(no_gateway, ROOT_NOT_ANCHORED);
+        assert_eq!(
+            no_gateway, with_gateway,
+            "an unanchored read must reach the same fail-closed outcome regardless of the gateway"
+        );
+    }
+
     /// **Proves (#2088 / #127 anti-rollback — the load-bearing lineage gate):** a genuine tip capsule
     /// whose §13 `PublicManifest` points a path at a `latest_root` that is NOT in the store's
     /// authenticated on-chain lineage is REFUSED — the node must NEVER serve the attacker-named bytes.
@@ -11923,7 +12141,9 @@ mod tests {
         std::env::remove_var("DIG_NODE_ON_MISS");
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (node, td) = test_node(None);
+        // The requested root IS the anchored tip, so the #1764 serve-side pin gate PASSES and the
+        // miss/redirect path under it is exercised (the pin is tested separately).
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
         attach_p2p(
             &node,
@@ -11932,7 +12152,7 @@ mod tests {
             MissMode::Redirect,
             &td,
         );
-        // dig.fetchRange for a resource the node does not hold → redirect (fetchRange has no pin gate).
+        // dig.fetchRange for a resource the node does not hold → redirect (past the anchor gate).
         let resp = rt.block_on(handle_rpc(
             &node,
             json!({"jsonrpc":"2.0","id":7,"method":"dig.fetchRange","params":{
@@ -11970,7 +12190,9 @@ mod tests {
         std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (node, td) = test_node(None);
+        // Anchor the tip so the #1764 serve-side pin gate PASSES and the miss/backfill path under it
+        // runs; the backfill-origin gate (not the pin) is what this test exercises.
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
         let node = Arc::new(node);
         node.set_self_ref(Arc::downgrade(&node));
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
@@ -12017,7 +12239,9 @@ mod tests {
         std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (node, td) = test_node(None);
+        // Anchor the tip so the #1764 serve-side pin gate PASSES and the miss/backfill path under it
+        // runs; the backfill-origin gate (not the pin) is what this test exercises.
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
         let node = Arc::new(node);
         node.set_self_ref(Arc::downgrade(&node));
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
@@ -12061,7 +12285,9 @@ mod tests {
         std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (node, td) = test_node(None);
+        // Anchor the tip so the #1764 serve-side pin gate PASSES and the miss/backfill path under it
+        // runs; the backfill-origin gate (not the pin) is what this test exercises.
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
         let node = Arc::new(node);
         node.set_self_ref(Arc::downgrade(&node));
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
@@ -12114,7 +12340,9 @@ mod tests {
         std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (node, td) = test_node(None);
+        // Anchor the tip so the #1764 serve-side pin gate PASSES and the miss/backfill path under it
+        // runs; the backfill-origin gate (not the pin) is what this test exercises.
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
         let node = Arc::new(node);
         node.set_self_ref(Arc::downgrade(&node));
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
@@ -12174,7 +12402,9 @@ mod tests {
         std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS"); // default ON
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (node, td) = test_node(None);
+        // Anchor the tip so the #1764 serve-side pin gate PASSES and the miss/backfill path under it
+        // runs; the backfill-origin gate (not the pin) is what this test exercises.
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
         let node = Arc::new(node);
         node.set_self_ref(Arc::downgrade(&node));
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
