@@ -80,7 +80,10 @@ async fn resolve_enforced_pin(
         // Pin disabled: serve against the requested root as-is (the client still verifies).
         return Ok(requested_root);
     }
-    let anchored = node.anchored_root_resolver.anchored_root(store_id_arr).await;
+    let anchored = node
+        .anchored_root_resolver
+        .anchored_root(store_id_arr)
+        .await;
     match requested_root {
         // ROOTED: the requested root must BE the current on-chain generation (#127 anti-rollback).
         // Prefer the lineage walk's tip; a walk aborted by one unparseable intermediate generation

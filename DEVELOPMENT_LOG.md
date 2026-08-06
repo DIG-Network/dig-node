@@ -45,6 +45,23 @@ caret `0.5` breaks the build the moment the lock refreshes) until a `chia-peer` 
 against dci 0.2 exists. dig-wallet is on 0.6 meanwhile — safe only because no `chia_query` type
 crosses the crate boundary between them.
 
+## The `dig.fetchRange` peer-serve arm was the MISSING half of the chain-anchor invariant (#1764/#1765)
+
+The #127 fail-closed anchor pin was enforced on the read paths (`/s` HTTP tier, `dig.getContent`) but
+`dig.fetchRange` — the PEER-SERVE arm a remote peer hits — had NO anchor gate: it validated shape then
+served any range that Merkle-verified against the CLIENT-named root. So a permissionless peer could
+fetch ranges of a forged or superseded generation that every local read path already refused (`-32005`),
+the serve side answering where the read side fails closed (#1765: "no leg serves where another refuses").
+The fix hoists the pin into ONE shared `resolve_enforced_pin` (dig_rpc/dispatch.rs) applied to
+getContent AND fetchRange, gating BEFORE `fetch_range_frame`, so unanchored content (`Ok(None)`), a
+chain error, and a superseded client root all fail closed with `-32005` uniformly across all three paths.
+
+Sharp edge — `x-dig-source` ⊥ `x-dig-verified`: `source` (local|peer|rpc) reports the serving TIER;
+`verified` reports only whether the bytes were bound to the chain-anchored root. `verified` is computed
+ONCE (`= pin_enforced()`) and threaded identically to the local/peer/rpc `Served` constructions, so a
+peer/gateway serve is still `verified:true` under the default pin (the reader re-binds to the anchor);
+`verified:false` appears ONLY under `DIG_NODE_PIN=off`, and then on every leg equally.
+
 ## PublicManifest (§13) is NOT committed into the current_root — older-gen reads bind via `sha256_latest` (#2088)
 
 A >1-generation store was unreadable for every file NOT in its latest commit: the serve pinned every

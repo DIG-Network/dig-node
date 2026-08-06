@@ -254,7 +254,7 @@ ROUTING.md §11` Phase 4). §2.5 + §8 are the normative target the integration 
 | `-32602` | invalid params | missing/malformed params (bad hex, wrong type, out-of-range) |
 | `-32000` | server error | upstream failure, chain read failure, file I/O, config write |
 | `-32004` | resource unavailable | this node does not hold the content AND located no holder (genuine not-found) |
-| `-32005` | `ROOT_NOT_ANCHORED` | served/requested root ≠ chain-anchored root, chain unreachable, or no confirmed generation (§4) — the read-path pin failing closed |
+| `-32005` | `ROOT_NOT_ANCHORED` | served/requested root ≠ chain-anchored root, chain unreachable, or no confirmed generation (§4) — the anchor pin failing closed, UNIFORMLY across the `/s` tier, `dig.getContent` (read), AND `dig.fetchRange` (serve) |
 | `-32006` | `PEER_UNREACHABLE` | no traversal strategy reached the named peer |
 | `-32007` | `RANGE_NOT_SATISFIABLE` | `offset ≥ total_length` or the range is otherwise unsatisfiable |
 | `-32008` | `CONTENT_REDIRECT` | this node does not hold the content but located holders — a redirect, not a 404 (§5.4) |
@@ -352,7 +352,8 @@ but the stored artifact and the served wire stay ciphertext + proof.
 Every window/range the node serves — from a local module, a synced module, a cached response, or a
 fetch-through pull — MUST carry the same verification metadata (`total_length`, `chunk_lens`,
 `inclusion_proof`, `root`) so it is indistinguishable in shape and the client verifies it against the
-chain-anchored root. The node MUST NOT serve content under a root it has not confirmed on-chain (§4).
+chain-anchored root. The node MUST NOT serve content under a root it has not confirmed on-chain (§4) —
+this applies to the peer-serve `dig.fetchRange` arm exactly as it does to the read paths (§4.2).
 
 ---
 
@@ -413,10 +414,21 @@ Before serving ANY content the node resolves the store's anchored root and gates
 - an explicit requested root ≠ the anchored tip → reject `-32005` ("root mismatch");
 - otherwise → serve at the anchored tip (a rootless request resolves to it).
 
-The pin is enforced by DEFAULT and re-validated on every serve path (local module, §21 sync, cached
-window, upstream proxy). A compromised upstream/host can never choose which generation is served, and a
-module with no on-chain anchor is rejected, never silently downgraded to a no-op. This is uniform with
-the CLI `clone`/`pull` pin ("chain is the authority", fail closed).
+The pin is enforced by DEFAULT and re-validated on EVERY serve path, UNIFORMLY — the local `/s` HTTP
+tier, the `dig.getContent` read arm, and the `dig.fetchRange` peer-SERVE arm all resolve the anchored
+root through one shared decision (`resolve_enforced_pin`) before any content tier (local module, §21
+sync, cached window, upstream proxy) runs. An unanchored read (`Ok(None)`) is refused with `-32005`
+IDENTICALLY across all three paths — no leg serves where another refuses. In particular `dig.fetchRange`
+(the peer-serve arm) is NOT exempt: a permissionless peer cannot fetch ranges of a forged or superseded
+generation that the read paths already refuse. A compromised upstream/host can never choose which
+generation is served, and a module with no on-chain anchor is rejected, never silently downgraded to a
+no-op. This is uniform with the CLI `clone`/`pull` pin ("chain is the authority", fail closed).
+
+**Provenance ⊥ verification.** The `X-Dig-Source` header (`local` | `peer` | `rpc`) reports which TIER
+served the bytes; it is ORTHOGONAL to `X-Dig-Verified`, which reports only whether the bytes were bound
+to the chain-anchored root. A peer- or gateway-served resource is still `X-Dig-Verified: true` under the
+default pin, because the reader re-binds the served bytes to the anchor (§3.5). `X-Dig-Verified: false`
+appears ONLY under the `DIG_NODE_PIN=off` dev opt-out, and then on EVERY leg equally (local, peer, rpc).
 
 **Anti-rollback invariant (client-supplied roots).** A superseded root named in the REQUEST is ALWAYS
 refused with `-32005`: only the current on-chain tip (or a rootless request that resolves to it) is

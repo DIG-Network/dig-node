@@ -11713,6 +11713,86 @@ mod tests {
         }
     }
 
+    /// **Proves (#1765, the local `/s` leg — Path 3):** the `GET /s/<store>/<path>` handler
+    /// (`serve_content_plaintext`) fails closed with `ROOT_NOT_ANCHORED` for a store with no
+    /// confirmed on-chain generation (`Ok(None)`), EXACTLY as the `dig.getContent` and
+    /// `dig.fetchRange` RPC arms do (#1764). This completes the uniform-refusal proof across all
+    /// THREE serve paths: an unanchored read is refused identically whether it arrives over the
+    /// local HTTP tier, the peer-serve RPC arm, or the read RPC arm — no leg serves where another
+    /// refuses. The gate precedes every content tier (local → peer → gateway), so the refusal is
+    /// reached before any bytes are fetched.
+    #[test]
+    fn serve_content_plaintext_fails_closed_for_an_unanchored_store_1765() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([45u8; 32]);
+        let (node, _td) = test_node_with_resolver(None, MockResolver::always(Ok(None)));
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            &Bytes32([0xAA; 32]).to_hex(),
+            "index.html",
+            None,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        match out {
+            PlaintextOutcome::RootError { code, .. } => assert_eq!(
+                code, ROOT_NOT_ANCHORED,
+                "the /s tier must fail closed for an unanchored store"
+            ),
+            other => panic!("expected ROOT_NOT_ANCHORED on the /s tier, got {other:?}"),
+        }
+    }
+
+    /// **Proves (#1765, the face of the bug):** an unanchored read (`Ok(None)`) reaches the IDENTICAL
+    /// fail-closed `ROOT_NOT_ANCHORED` on the local `/s` tier whether or not the node has an upstream
+    /// gateway configured — so there is no leg that serves where another refuses. The original #1765
+    /// hazard was a serve path that answered where a sibling path refused; because the chain-anchor
+    /// gate precedes tier selection (local → peer → gateway), the presence of a reachable gateway
+    /// can never turn a refusal into a serve. Both nodes hold the same unanchored store; one has a
+    /// (would-be-reachable) upstream and one has none, and both refuse before the gateway is consulted.
+    #[test]
+    fn serve_content_plaintext_refuses_unanchored_identically_with_and_without_a_gateway_1765() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN");
+        let rt = pin_test_rt();
+        let store = Bytes32([46u8; 32]);
+        let root_hex = Bytes32([0xAA; 32]).to_hex();
+
+        let outcome_code = |upstream: &str| -> i64 {
+            let (mut node, _td) = test_node_with_resolver(None, MockResolver::always(Ok(None)));
+            node.upstream = upstream.to_string();
+            let out = rt.block_on(node.serve_content_plaintext(
+                &store.to_hex(),
+                &root_hex,
+                "index.html",
+                None,
+                crate::download::ReadOrigin::Local,
+                crate::download::RequestProvenance::FirstParty,
+            ));
+            match out {
+                PlaintextOutcome::RootError { code, .. } => code,
+                other => panic!("expected a RootError, got {other:?}"),
+            }
+        };
+
+        // "No gateway" (empty upstream) and "a gateway is configured" both fail closed identically —
+        // the anchor gate runs first, so gateway reachability is orthogonal to the refusal.
+        let no_gateway = outcome_code("");
+        let with_gateway = outcome_code("http://127.0.0.1:9/");
+        assert_eq!(no_gateway, ROOT_NOT_ANCHORED);
+        assert_eq!(
+            no_gateway, with_gateway,
+            "an unanchored read must reach the same fail-closed outcome regardless of the gateway"
+        );
+    }
+
     /// **Proves (#2088 / #127 anti-rollback — the load-bearing lineage gate):** a genuine tip capsule
     /// whose §13 `PublicManifest` points a path at a `latest_root` that is NOT in the store's
     /// authenticated on-chain lineage is REFUSED — the node must NEVER serve the attacker-named bytes.

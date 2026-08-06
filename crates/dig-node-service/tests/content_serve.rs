@@ -884,6 +884,19 @@ async fn cold_start_gateway_serve_reports_the_peer_tier_as_unattached() {
         "rpc",
         "the gateway served these bytes"
     );
+    // #1765 (source ⊥ verified): the reader ran with `DIG_NODE_PIN=off` (the hermetic harness), so
+    // the bytes were NOT bound to a chain-anchored root — the GATEWAY leg must report
+    // `x-dig-verified:false`, EXACTLY as the local leg does under the same pin-off condition
+    // (asserted for the local tier in `serves_index_html_decrypted_with_headers_and_injected_base`).
+    // `x-dig-verified` is derived solely from the pin state (`Served.verified`), never from the
+    // serve `source`, so the header is consistent across the local, peer, and gateway legs (the
+    // three legs thread the SAME `verified` value — dig-node-core `content_serve.rs`, the
+    // local/peer/rpc `Served { verified, .. }` constructions). No code change was needed here.
+    assert_eq!(
+        h.get("x-dig-verified").unwrap(),
+        "false",
+        "with the pin off the gateway leg must report unverified, like the local leg"
+    );
     assert_eq!(
         h.get("x-dig-peer-tier")
             .map(|v| v.to_str().unwrap())
