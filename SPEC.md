@@ -1042,6 +1042,29 @@ window), rather than rendered + re-serialized (3–4 in-RAM copies) into a ~100 
 a bounded error, never the oversized body. A normal (kilobyte) metadata section is served unchanged — the
 ceiling only bites the hostile case.
 
+##### `dig.getMetadata` — pre-decode input caps (memory-DoS bound, #2160)
+
+The response ceiling above bounds the RENDERED output, but the danger is the DECODE that precedes it:
+decoding the metadata section materializes each `custom` value from JSON TEXT into a `serde_json::Value`
+tree, and the flat-numeric shape (`[0,0,…]`) expands ~16× (a 40 KB `custom` → ~640 KB of `Value` nodes).
+A hostile `custom` filling a 128 MiB section therefore reaches ~2 GiB of transient `Value` on a ~1.9 GiB
+host — BEFORE the rendered-length check can fire. Sizing that decoded output by hand is intractable
+(five failed attempts); the node instead caps the INPUT structurally, before decode:
+
+- **Section size** — an ENCODED metadata section over `METADATA_SECTION_MAX_BYTES` (3 MiB, equal to the
+  response ceiling) is refused with `METADATA_TOO_LARGE` (`-32015`) without decoding. Rendering does not
+  shrink these shapes, so any section whose encoded body clears 3 MiB would fail the response ceiling
+  anyway — this only moves the same refusal ahead of the ~16× expansion. A section this size decodes to
+  at most ~48 MiB of transient `Value`, and the cold decode is SERIALIZED so at most one runs at once.
+- **`custom` shape** — before any `custom` value is parsed, its raw JSON text is streamed (never
+  materialized) and refused with `-32015` if the map carries more than `MAX_CUSTOM_ENTRIES` (4 096)
+  entries, or any value nests past `MAX_CUSTOM_JSON_DEPTH` (32) or exceeds `MAX_CUSTOM_JSON_ELEMENTS`
+  (65 536) structural nodes. These bound the amplifier shapes that fit under the size cap.
+
+Both caps run BEFORE `MetadataManifest::decode`, and the refusal verdict is memoized like any other, so a
+repeated hostile request cannot re-drive the decode. A normal (kilobyte) metadata section decodes and
+serves BYTE-IDENTICALLY — the caps only bite oversized or hostile-shaped input.
+
 #### 5.5.2. Chat subsystem — `chat.send` / `chat.poll` (epic #793)
 
 The node is the directed-message **TRANSPORT** for dig-chat: an application seals its own opaque
@@ -2696,7 +2719,7 @@ NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
 | -32008 | `CONTENT_REDIRECT` | node | The node does not (or, under §17's throttle, will not right now) serve the requested content itself, but the DHT located peer(s) that hold it — `error.data.redirect` names them (`content`, `providers[].peer_id`/`addresses`, `redirect_depth`, `max_redirects`) so the caller re-requests there. The candidate set is CAPPED at `MAX_REDIRECT_PROVIDERS` (= dig-dht's `MAX_ADDRESSES_PER_RECORD`): a redirect NAMES holders (the requestor dials them over its own §5.2 reachability ladder — this node does NOT dial/probe them), so a few candidates suffice and probing-on-miss would itself be an amplification vector. Minted on a content miss (`dig.getContent`/`dig.fetchRange`/the peer range-stream) and on outgoing-bandwidth saturation (§17), bounded by the same redirect-hop cap either way. |
 | -32009 | `CONTENT_MISS_RATE_LIMITED` | node | The requested content is not held, and the miss → DHT-lookup path is being driven too fast BY THIS REQUESTOR (§10.4). Minted instead of a redirect/fetch when the per-requestor token-bucket budget is exhausted, so an abusive caller backs off while a DIFFERENT requestor (its own bucket) is unaffected. A well-formed JSON-RPC error, never a silent empty success. |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
-| -32015 | `METADATA_TOO_LARGE` | node | `dig.getMetadata` refused: the publisher metadata section renders larger than `METADATA_RESPONSE_MAX_BYTES` (3 MiB). This section is rendered WHOLE — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so an oversized capsule is refused with this bounded error rather than blasted into a ~100 MB response (§5.5.1, #2145). A normal (kilobyte) metadata section is served unchanged. |
+| -32015 | `METADATA_TOO_LARGE` | node | `dig.getMetadata` refused: the publisher metadata section is too large or too complex to render safely. Refused when the ENCODED section exceeds `METADATA_SECTION_MAX_BYTES` (3 MiB) or its `custom` exceeds `MAX_CUSTOM_ENTRIES`/`MAX_CUSTOM_JSON_DEPTH`/`MAX_CUSTOM_JSON_ELEMENTS` (both checked BEFORE decode, #2160), or the RENDERED body exceeds `METADATA_RESPONSE_MAX_BYTES` (3 MiB, #2145). This section is rendered WHOLE — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so an oversized/hostile capsule is refused with this bounded error rather than expanded ~16× in memory or blasted into a ~100 MB response (§5.5.1). A normal (kilobyte) metadata section is served unchanged. |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
 | -32022 | *(reserved: onion `onion_hops_out_of_range`)* | — | Reserved for the onion-routing contract. |

@@ -1338,11 +1338,235 @@ const MANIFEST_ENTRY_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// This is a DoS bound only: a normal store's metadata is kilobytes and is unaffected.
 const METADATA_RESPONSE_MAX_BYTES: usize = WINDOW;
 
-/// JSON-RPC error code: the `dig.getMetadata` metadata section is larger than
-/// [`METADATA_RESPONSE_MAX_BYTES`], so it is refused rather than rendered into one response
-/// (#2145). A bounded error, never the oversized body. Catalogued in docs.dig.net (L7 error
-/// catalog).
+/// JSON-RPC error code: the publisher-metadata section is refused as too large or too complex to
+/// render safely — either the ENCODED section is over [`METADATA_SECTION_MAX_BYTES`] or its
+/// `custom` shape is over [`MAX_CUSTOM_ENTRIES`] / [`MAX_CUSTOM_JSON_DEPTH`] /
+/// [`MAX_CUSTOM_JSON_ELEMENTS`] (#2160), OR the rendered body is over
+/// [`METADATA_RESPONSE_MAX_BYTES`] (#2145). One bounded error in every case, never the oversized
+/// body. Catalogued in docs.dig.net (L7 error catalog).
 const METADATA_TOO_LARGE: i64 = -32015;
+
+/// The largest ENCODED metadata data-section body decoded on the anonymous read path.
+///
+/// This is the #2160 companion to [`METADATA_RESPONSE_MAX_BYTES`], and the fix PR #179 spent five
+/// rounds failing to reach by sizing the OUTPUT: cap the INPUT structurally, before decode.
+///
+/// **Why cap the ENCODED body and not the rendered output.** Decoding the metadata section
+/// materializes `custom` from JSON TEXT into a `serde_json::Value` tree, which expands ~16× for the
+/// flat-numeric shape (a 40 KB `custom` → ~640 KB of `Value` nodes). A hostile `custom` filling a
+/// 128 MiB section therefore reaches ~2 GiB of transient `Value` on a ~1.9 GiB host — AFTER #2145's
+/// response ceiling, which only fires on the already-rendered String. Refusing the oversized section
+/// BEFORE `MetadataManifest::decode` runs is what removes that expansion.
+///
+/// **Why 3 MiB is the right number, measured against ~1.9 GiB usable.** A section this size decodes
+/// to at most ~16× ≈ 48 MiB of transient `Value`, and its render is bounded likewise; the cold
+/// decode is SERIALIZED (see [`manifest_extract_lock`]) so at most ONE runs at a time, peaking well
+/// under 200 MiB even alongside the 128 MiB module read. It is also behaviour-preserving: rendering
+/// does not shrink these shapes, so any section whose ENCODED body clears 3 MiB would render past
+/// the equal [`METADATA_RESPONSE_MAX_BYTES`] ceiling and be refused anyway — this cap only moves that
+/// same refusal ahead of the expansion. Pinned equal to [`METADATA_RESPONSE_MAX_BYTES`] so the
+/// public-tier metadata bound is one number everywhere.
+const METADATA_SECTION_MAX_BYTES: usize = METADATA_RESPONSE_MAX_BYTES;
+
+/// The most `custom` map entries a metadata section may carry before it is refused pre-decode.
+///
+/// A backstop beneath [`METADATA_SECTION_MAX_BYTES`]: a normal store has a handful of `custom`
+/// keys, and each entry costs a `serde_json::from_str` + a `Value` tree, so a high-count `custom`
+/// that still fits the section budget is refused before it is materialized.
+const MAX_CUSTOM_ENTRIES: usize = 4_096;
+
+/// The deepest a single `custom` value's JSON text may nest before it is refused pre-decode.
+///
+/// Nesting is the second amplifier: each level is another `Value` allocation and another frame in
+/// `serde_json`'s recursive descent. Normal publisher metadata is shallow; 32 is comfortably above
+/// any honest use and far below the depth at which recursion cost matters.
+const MAX_CUSTOM_JSON_DEPTH: usize = 32;
+
+/// The most structural nodes a single `custom` value's JSON text may contain before it is refused
+/// pre-decode.
+///
+/// Counted by a streaming scan of the RAW text (container-opens + commas, strings skipped), never
+/// by materializing the value — the flat-numeric `[0,0,…]` shape is exactly the ~16× amplifier, and
+/// its node count is what the expansion is proportional to. 65 536 nodes is orders of magnitude
+/// above any honest `custom` and caps the expanded `Value` at a few MiB even if the section budget
+/// were ever raised.
+const MAX_CUSTOM_JSON_ELEMENTS: usize = 65_536;
+
+/// How a capsule's publisher-metadata section resolved during the cold decode.
+///
+/// The cold path decides the section's fate ONCE and memoizes THIS, so a repeated anonymous request
+/// re-serves the verdict without re-reading the module — including the refusal verdict, so a hostile
+/// capsule cannot force the decode again by asking again.
+#[derive(Clone, Default)]
+enum MetadataOutcome {
+    /// No metadata section in the module (an older `.dig`, or a private store) — served as `null`,
+    /// never an error (store-format §5.1, additive).
+    #[default]
+    Absent,
+    /// Present but refused by the pre-decode input caps (an oversized section, or a `custom` over
+    /// the entry / depth / element bounds). Surfaced as [`METADATA_TOO_LARGE`] — a bounded error,
+    /// never the oversized body, and the decode into `Value` never happens.
+    Refused,
+    /// Rendered metadata JSON, ready to serve — still subject to [`METADATA_RESPONSE_MAX_BYTES`] at
+    /// the response layer (#2145).
+    Rendered(Arc<str>),
+}
+
+impl MetadataOutcome {
+    /// Heap bytes this outcome retains — the rendered JSON's length, or zero for a verdict that
+    /// holds no buffer. EXACT, like the buffer fields it sits beside (`CachedManifests`): there is
+    /// no decoded tree here to mis-size.
+    fn retained_bytes(&self) -> usize {
+        match self {
+            MetadataOutcome::Rendered(json) => json.len(),
+            MetadataOutcome::Absent | MetadataOutcome::Refused => 0,
+        }
+    }
+}
+
+/// A metadata section that survived the pre-decode caps, ready to render (or refused).
+enum CappedMetadata {
+    /// Refused by an input cap before `MetadataManifest::decode` was ever called.
+    Refused,
+    /// Accepted and decoded into an owned manifest, independent of the section buffer. Boxed so this
+    /// large variant does not inflate the whole enum (the refusal path carries no payload).
+    Decoded(Box<digstore_core::MetadataManifest>),
+}
+
+/// Decode a metadata data-section body, refusing oversized or hostile-shaped input BEFORE it
+/// expands in memory (#2160).
+///
+/// The two structural caps, in order:
+/// 1. The ENCODED section over [`METADATA_SECTION_MAX_BYTES`] is refused without decoding — this is
+///    the primary bound, and it catches every oversized shape including a single giant scalar.
+/// 2. A `custom` over [`MAX_CUSTOM_ENTRIES`] / [`MAX_CUSTOM_JSON_DEPTH`] / [`MAX_CUSTOM_JSON_ELEMENTS`]
+///    is refused before `serde_json::from_str` materializes it — this catches the ~16× amplifier
+///    shapes that fit under the section budget.
+///
+/// `Ok(Refused)` is a bounded refusal (→ [`METADATA_TOO_LARGE`]); `Ok(Decoded)` is an accepted,
+/// rendered-elsewhere manifest; `Err` is a genuinely malformed section (→ `-32000`).
+fn decode_capped_metadata(body: &[u8]) -> Result<CappedMetadata, String> {
+    if body.len() > METADATA_SECTION_MAX_BYTES {
+        return Ok(CappedMetadata::Refused);
+    }
+    if scan_metadata_custom_shape(body)? == CustomShape::Refused {
+        return Ok(CappedMetadata::Refused);
+    }
+    let mut decoder = digstore_core::codec::Decoder::new(body);
+    let decoded = digstore_core::MetadataManifest::decode(&mut decoder)
+        .map_err(|e| format!("malformed metadata section: {e:?}"))?;
+    Ok(CappedMetadata::Decoded(Box::new(decoded)))
+}
+
+/// Whether a metadata section's `custom` shape is within the pre-decode bounds.
+#[derive(Debug, PartialEq, Eq)]
+enum CustomShape {
+    Acceptable,
+    Refused,
+}
+
+/// Walk an encoded metadata section to its `custom` block and bound its shape WITHOUT materializing
+/// any `custom` value (#2160).
+///
+/// The leading fields are advanced past using the store library's OWN decoders, so this can never
+/// drift from the wire format it is validating; their small, bounded values (the section is capped
+/// at [`METADATA_SECTION_MAX_BYTES`] before this runs) are decoded and discarded. Only the `custom`
+/// block is inspected by hand: its entry COUNT is bounded, and each value's raw JSON TEXT is read
+/// as bytes — never parsed to a `Value` — and streamed through [`scan_json_shape`].
+///
+/// `Err` means the section is malformed (the same verdict `MetadataManifest::decode` would reach);
+/// the caller maps it to `-32000`, distinct from a bounded refusal.
+fn scan_metadata_custom_shape(body: &[u8]) -> Result<CustomShape, String> {
+    use digstore_core::codec::{Decode, Decoder};
+    use digstore_core::Author;
+
+    let malformed = |e: digstore_core::DecodeError| format!("malformed metadata section: {e:?}");
+    let mut dec = Decoder::new(body);
+
+    // Advance past every field that precedes `custom`, in the exact order `MetadataManifest` encodes
+    // them, using the library's decoders so the wire format lives in ONE place. The `_ =` marks the
+    // decoded values as intentionally discarded — we want the cursor, not the data.
+    let _ = u32::decode(&mut dec).map_err(malformed)?; // schema_version
+    let _ = String::decode(&mut dec).map_err(malformed)?; // name
+    let _ = Option::<String>::decode(&mut dec).map_err(malformed)?; // version
+    let _ = Option::<String>::decode(&mut dec).map_err(malformed)?; // description
+    let _ = Vec::<Author>::decode(&mut dec).map_err(malformed)?; // authors
+    let _ = Option::<String>::decode(&mut dec).map_err(malformed)?; // license
+    let _ = Option::<String>::decode(&mut dec).map_err(malformed)?; // homepage
+    let _ = Option::<String>::decode(&mut dec).map_err(malformed)?; // repository
+    let _ = Vec::<String>::decode(&mut dec).map_err(malformed)?; // keywords
+    let _ = Vec::<String>::decode(&mut dec).map_err(malformed)?; // categories
+    let _ = Option::<String>::decode(&mut dec).map_err(malformed)?; // icon
+    let _ = Option::<String>::decode(&mut dec).map_err(malformed)?; // content_type
+                                                                    // links: a 4-byte count then that many (key, value) string pairs (encode_str_map).
+    let link_count = u32::decode(&mut dec).map_err(malformed)? as usize;
+    for _ in 0..link_count {
+        let _ = String::decode(&mut dec).map_err(malformed)?; // key
+        let _ = String::decode(&mut dec).map_err(malformed)?; // value
+    }
+
+    // custom: a 4-byte count then that many (key string, JSON-TEXT string) pairs. The amplifier.
+    let custom_count = u32::decode(&mut dec).map_err(malformed)? as usize;
+    if custom_count > MAX_CUSTOM_ENTRIES {
+        return Ok(CustomShape::Refused);
+    }
+    for _ in 0..custom_count {
+        let _ = String::decode(&mut dec).map_err(malformed)?; // key
+                                                              // Read the value's JSON TEXT as raw bytes — NOT `String::decode`'d into an owned copy and
+                                                              // NOT `serde_json`-parsed — so nothing this hostile value describes is materialized.
+        let value_len = u32::decode(&mut dec).map_err(malformed)? as usize;
+        let value_text = dec.read_bytes(value_len).map_err(malformed)?;
+        if scan_json_shape(value_text) == CustomShape::Refused {
+            return Ok(CustomShape::Refused);
+        }
+    }
+    Ok(CustomShape::Acceptable)
+}
+
+/// Stream a JSON text and refuse it if it nests past [`MAX_CUSTOM_JSON_DEPTH`] or carries more than
+/// [`MAX_CUSTOM_JSON_ELEMENTS`] structural nodes — without materializing any of it (#2160).
+///
+/// A single left-to-right byte pass: `{`/`[` deepen and count a node, `}`/`]` unwind, `,` counts the
+/// next element, and string contents are skipped (with escapes honoured) so punctuation inside a
+/// string is never miscounted as structure. Node count is a monotone proxy for the `Value` tree the
+/// real decode would allocate, so bounding it here bounds that allocation.
+fn scan_json_shape(text: &[u8]) -> CustomShape {
+    let mut depth = 0usize;
+    let mut nodes = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for &byte in text {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                nodes += 1;
+                if depth > MAX_CUSTOM_JSON_DEPTH || nodes > MAX_CUSTOM_JSON_ELEMENTS {
+                    return CustomShape::Refused;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            b',' => {
+                nodes += 1;
+                if nodes > MAX_CUSTOM_JSON_ELEMENTS {
+                    return CustomShape::Refused;
+                }
+            }
+            _ => {}
+        }
+    }
+    CustomShape::Acceptable
+}
 
 /// A byte-budgeted LRU of decoded manifests.
 ///
@@ -1475,8 +1699,9 @@ struct CachedManifests {
     modified: Option<std::time::SystemTime>,
     /// `PublicManifest::to_json()` output, byte-identical to what every DIG reader consumes.
     public_json: Option<Arc<str>>,
-    /// `metadata_manifest_to_json()` output.
-    metadata_json: Option<Arc<str>>,
+    /// The metadata section's fate: absent, refused by the #2160 input caps, or rendered JSON
+    /// (`metadata_manifest_to_json()` output).
+    metadata: MetadataOutcome,
 }
 
 impl CachedManifests {
@@ -1504,12 +1729,12 @@ impl CachedManifests {
             len,
             modified,
             public_json,
-            metadata_json,
+            metadata,
         } = self;
         let _ = (len, modified); // Copy scalars, no heap.
         std::mem::size_of::<Self>()
             + public_json.as_ref().map_or(0, |s| s.len())
-            + metadata_json.as_ref().map_or(0, |s| s.len())
+            + metadata.retained_bytes()
     }
 }
 
@@ -1608,33 +1833,44 @@ fn cached_manifests_blocking(
         // two are never both live.
         drop(module);
 
-        // Decode, RENDER, and drop the trees. Only the rendered bytes are retained, so the decoded
-        // `MetadataManifest` — the recursive, attacker-shaped value whose size defeated four
-        // rounds of hand-written accounting — is transient and never sized.
-        let public_json = digstore_core::datasection::read_public_manifest(&blob)
-            .map_err(|e| format!("malformed public manifest section: {e:?}"))?
-            .map(|pm| Arc::from(pm.to_json().as_str()));
+        // Decode into OWNED trees, then drop the blob BEFORE rendering. Only the rendered bytes are
+        // retained, so the decoded `MetadataManifest` — the recursive, attacker-shaped value whose
+        // size defeated four rounds of hand-written accounting — is transient and never sized.
+        let public_manifest = digstore_core::datasection::read_public_manifest(&blob)
+            .map_err(|e| format!("malformed public manifest section: {e:?}"))?;
 
+        // Cap the metadata section's INPUT before it is decoded into a `Value` tree (#2160): an
+        // oversized encoded section or a hostile `custom` shape is refused here, so the ~16×
+        // JSON-text expansion never runs. Only in-bounds sections reach `decode`.
         let view = digstore_core::datasection::DataView::parse(&blob)
             .map_err(|e| format!("malformed module data section: {e:?}"))?;
-        let metadata_json = match view.section(digstore_core::datasection::SectionId::Metadata) {
-            Some(body) => {
-                let mut decoder = digstore_core::codec::Decoder::new(body);
-                let decoded = digstore_core::MetadataManifest::decode(&mut decoder)
-                    .map_err(|e| format!("malformed metadata section: {e:?}"))?;
-                Some(Arc::from(
-                    metadata_manifest_to_json(&decoded).to_string().as_str(),
-                ))
-            }
+        let metadata_decoded = match view.section(digstore_core::datasection::SectionId::Metadata) {
+            Some(body) => Some(decode_capped_metadata(body)?),
             None => None,
         };
-        // `blob` (128 MiB) and both decoded trees go out of scope HERE, before anything is
-        // retained. What survives is two `Arc<str>` whose lengths ARE their cost.
+
+        // `blob` (128 MiB) is dead now: both `public_manifest` and `metadata_decoded` are owned and
+        // no longer borrow it. Drop it BEFORE the `to_json` renders so the big buffer and the render
+        // output are never both live (#2160 — removes one 128 MiB term from the peak for free).
+        drop(view);
+        drop(blob);
+
+        let public_json = public_manifest.map(|pm| Arc::from(pm.to_json().as_str()));
+        let metadata = match metadata_decoded {
+            None => MetadataOutcome::Absent,
+            Some(CappedMetadata::Refused) => MetadataOutcome::Refused,
+            Some(CappedMetadata::Decoded(m)) => MetadataOutcome::Rendered(Arc::from(
+                metadata_manifest_to_json(&m).to_string().as_str(),
+            )),
+        };
+
+        // Both decoded trees go out of scope HERE, before anything is retained. What survives is the
+        // rendered buffers whose lengths ARE their cost.
         Arc::new(CachedManifests {
             len,
             modified,
             public_json,
-            metadata_json,
+            metadata,
         })
     };
 
@@ -1680,18 +1916,19 @@ fn read_public_manifest_json(
 /// Shares [`cached_manifests_blocking`] with [`read_public_manifest_json`], so one whole-module
 /// read answers both methods rather than each paying its own. Same `Some/None` semantics.
 ///
-/// Returns the RENDERED JSON string, NOT a parsed [`Value`], so [`Node::get_metadata`] can enforce
-/// [`METADATA_RESPONSE_MAX_BYTES`] on the raw length BEFORE paying to parse + re-serialize it — an
-/// oversized section is refused, never rendered into a response (#2145).
-/// - `Ok(Some(Some(json)))` — held, carries a metadata section.
-/// - `Ok(Some(None))` — held, NO metadata section (older `.dig` / no publisher metadata).
+/// Returns the section's [`MetadataOutcome`], NOT a parsed [`Value`], so [`Node::get_metadata`] can
+/// map each verdict to a response without re-decoding: a [`MetadataOutcome::Rendered`] is still
+/// checked against [`METADATA_RESPONSE_MAX_BYTES`] on its raw length (#2145), a
+/// [`MetadataOutcome::Refused`] became [`METADATA_TOO_LARGE`] before the decode ran (#2160), and a
+/// [`MetadataOutcome::Absent`] is `null`.
+/// - `Ok(Some(outcome))` — held; the outcome carries the section's fate.
 /// - `Ok(None)` — not held.
 /// - `Err(_)` — held but the data section is malformed.
 fn read_metadata_manifest_json(
     cache_dir: &Path,
     key: &CapsuleKey,
-) -> Result<Option<Option<Arc<str>>>, String> {
-    Ok(cached_manifests_blocking(cache_dir, key)?.map(|m| m.metadata_json.clone()))
+) -> Result<Option<MetadataOutcome>, String> {
+    Ok(cached_manifests_blocking(cache_dir, key)?.map(|m| m.metadata.clone()))
 }
 
 /// Parse JSON this node rendered itself moments ago.
@@ -2780,10 +3017,13 @@ impl Node {
     ///   root }`.
     /// - Held with NO metadata section → `{ manifest: null, root }` — never an error, for the same
     ///   store-format §5.1 reason as the public manifest.
-    /// - Held but the metadata section renders over [`METADATA_RESPONSE_MAX_BYTES`] → `-32015`
-    ///   (bounded error, never the oversized body). This section is rendered WHOLE — it cannot be
-    ///   windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so without
-    ///   this a ~200-byte anonymous request could return ~100 MB (#2145).
+    /// - Held but the metadata section is refused as too large/complex → `-32015` (bounded error,
+    ///   never the oversized body). Refused BEFORE decode when the encoded section is over
+    ///   [`METADATA_SECTION_MAX_BYTES`] or its `custom` is over [`MAX_CUSTOM_ENTRIES`] /
+    ///   [`MAX_CUSTOM_JSON_DEPTH`] / [`MAX_CUSTOM_JSON_ELEMENTS`] (#2160), or after decode when the
+    ///   rendered body is over [`METADATA_RESPONSE_MAX_BYTES`] (#2145). The section is rendered WHOLE
+    ///   — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled,
+    ///   so without these a ~200-byte anonymous request could expand ~16× in memory or return ~100 MB.
     /// - Not held at this root → `-32004`. A corrupt data section → `-32000`.
     async fn get_metadata(&self, params: &Value, id: Value) -> Value {
         let root_hex = match self.resolve_capsule_root(params, &id).await {
@@ -2799,10 +3039,10 @@ impl Node {
             tokio::task::spawn_blocking(move || read_metadata_manifest_json(&cache_dir, &capsule))
                 .await;
         match outcome {
-            // Held with a metadata section: enforce the response ceiling on the RENDERED length
-            // before parsing (#2145). An oversized section is refused with a BOUNDED error rather
-            // than parsed + re-serialized into a ~100 MB response.
-            Ok(Ok(Some(Some(rendered)))) => {
+            // Held, rendered, in-bounds: enforce the response ceiling on the RENDERED length before
+            // parsing (#2145). An oversized render is refused with a BOUNDED error rather than
+            // parsed + re-serialized into a huge response.
+            Ok(Ok(Some(MetadataOutcome::Rendered(rendered)))) => {
                 if rendered.len() > METADATA_RESPONSE_MAX_BYTES {
                     return rpc_err(
                         &id,
@@ -2818,8 +3058,15 @@ impl Node {
                     "root": root_hex,
                 }})
             }
+            // Held, but the section was refused pre-decode by the #2160 input caps — a bounded error,
+            // never the oversized body, and the `Value` expansion never happened.
+            Ok(Ok(Some(MetadataOutcome::Refused))) => rpc_err(
+                &id,
+                METADATA_TOO_LARGE,
+                "metadata section refused pre-decode: over the size cap or the custom shape bounds",
+            ),
             // Held, but no metadata section — `null`, never an error (store-format §5.1).
-            Ok(Ok(Some(None))) => json!({"jsonrpc":"2.0","id":id,"result":{
+            Ok(Ok(Some(MetadataOutcome::Absent))) => json!({"jsonrpc":"2.0","id":id,"result":{
                 "manifest": Value::Null,
                 "root": root_hex,
             }}),
@@ -4149,6 +4396,77 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    /// A per-THREAD counting allocator, installed process-wide only for the test binary.
+    ///
+    /// The #2160 acceptance bar is MEASURED, not reasoned: the peak-RSS test drives one cold decode
+    /// and asserts the live-byte peak stays under a budget. A counting allocator is the only way to
+    /// observe that. It wraps [`System`] and updates THREAD-LOCAL current/peak counters, so a decode
+    /// measured on one test thread is not polluted by allocations on the parallel threads `cargo
+    /// test` runs — and production is untouched because the whole module is `#[cfg(test)]`.
+    mod counting_allocator {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static CURRENT: Cell<usize> = const { Cell::new(0) };
+            static PEAK: Cell<usize> = const { Cell::new(0) };
+        }
+
+        /// The allocator itself: `System` plus a thread-local tally. `Cell<usize>` never allocates,
+        /// so accounting cannot recurse into the allocator it accounts for.
+        pub struct CountingAllocator;
+
+        // SAFETY: every method forwards to `System`, the process default allocator, and only reads/
+        // writes non-allocating thread-local `Cell`s around it. `realloc` is left as the trait
+        // default, which routes through `alloc`/`dealloc` here, so it is counted too.
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let ptr = System.alloc(layout);
+                if !ptr.is_null() {
+                    record_alloc(layout.size());
+                }
+                ptr
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout);
+                CURRENT.with(|c| c.set(c.get().saturating_sub(layout.size())));
+            }
+        }
+
+        fn record_alloc(size: usize) {
+            CURRENT.with(|current| {
+                let live = current.get() + size;
+                current.set(live);
+                PEAK.with(|peak| {
+                    if live > peak.get() {
+                        peak.set(live);
+                    }
+                });
+            });
+        }
+
+        /// Live bytes on THIS thread right now.
+        pub fn current() -> usize {
+            CURRENT.with(Cell::get)
+        }
+
+        /// Re-baseline the peak to the current live bytes, so a following [`peak`] read reports only
+        /// the peak REACHED SINCE this call.
+        pub fn reset_peak() {
+            CURRENT.with(|current| PEAK.with(|peak| peak.set(current.get())));
+        }
+
+        /// The high-water mark of live bytes on this thread since the last [`reset_peak`].
+        pub fn peak() -> usize {
+            PEAK.with(Cell::get)
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING_ALLOCATOR: counting_allocator::CountingAllocator =
+        counting_allocator::CountingAllocator;
 
     /// The cached-module path for a capsule named by hex ids, for fixtures that seed or inspect the
     /// cache directly.
@@ -9537,7 +9855,9 @@ mod tests {
             len: 1,
             modified: None,
             public_json: public.map(Arc::from),
-            metadata_json: metadata.map(Arc::from),
+            metadata: metadata.map_or(MetadataOutcome::Absent, |s| {
+                MetadataOutcome::Rendered(Arc::from(s))
+            }),
         };
 
         // Empty: nothing but the struct itself.
@@ -9595,7 +9915,7 @@ mod tests {
             len: 1,
             modified: None,
             public_json: Some(Arc::from(rendered.as_str())),
-            metadata_json: None,
+            metadata: MetadataOutcome::Absent,
         };
         assert!(
             entry.retained_bytes() > MANIFEST_ENTRY_MAX_BYTES,
@@ -9630,7 +9950,7 @@ mod tests {
                 len: 1,
                 modified: None,
                 public_json: Some(Arc::from("m".repeat(bytes).as_str())),
-                metadata_json: None,
+                metadata: MetadataOutcome::Absent,
             })
         };
 
@@ -9681,7 +10001,7 @@ mod tests {
                 len: 1,
                 modified: None,
                 public_json: Some(Arc::from("m".repeat(bytes).as_str())),
-                metadata_json: None,
+                metadata: MetadataOutcome::Absent,
             })
         };
         for i in 0..5 {
@@ -9850,6 +10170,226 @@ mod tests {
             resp["result"]["manifest"]["custom"]["note"].as_str(),
             Some("small"),
             "{resp}"
+        );
+    }
+
+    // ---- #2160: cap the metadata section INPUT before decode ---------------------------------
+
+    /// Encode a `MetadataManifest` to its data-section body, the exact bytes the cold decode reads.
+    fn encode_metadata_section(manifest: &digstore_core::MetadataManifest) -> Vec<u8> {
+        use digstore_core::codec::{Encode, Encoder};
+        let mut encoder = Encoder::new();
+        manifest.encode(&mut encoder);
+        encoder.finish()
+    }
+
+    /// Render a section body the UNCAPPED way — decode straight into the `Value` tree, then
+    /// serialize — i.e. the pre-#2160 behaviour. The peak-RSS test measures this to prove the caps
+    /// are non-vacuous, and the byte-identity test measures it as the reference render.
+    fn decode_and_render_uncapped(body: &[u8]) -> String {
+        let mut decoder = digstore_core::codec::Decoder::new(body);
+        let decoded =
+            digstore_core::MetadataManifest::decode(&mut decoder).expect("fixture section decodes");
+        metadata_manifest_to_json(&decoded).to_string()
+    }
+
+    /// A `custom` value that decodes to a huge `Value` tree: a long flat array of zeros. Its text is
+    /// ~2 bytes per element but each element becomes a `serde_json::Value` node, the ~16× amplifier.
+    fn flat_numeric_custom(elements: usize) -> serde_json::Value {
+        serde_json::Value::Array(vec![serde_json::Value::from(0u8); elements])
+    }
+
+    /// THE load-bearing test: a counting allocator MEASURES the cold-decode peak, and the caps keep
+    /// it under budget while removing them blows past it (#2160).
+    ///
+    /// The section is in-bounds by SIZE (well under [`METADATA_SECTION_MAX_BYTES`]) but its `custom`
+    /// is a flat-numeric array over [`MAX_CUSTOM_JSON_ELEMENTS`] — exactly the shape that fits the
+    /// byte budget yet expands ~16× when decoded into a `Value` tree. The capped path refuses it by
+    /// SHAPE before that expansion; the uncapped path materializes the tree.
+    ///
+    /// Non-vacuous by construction: the SAME body is run both ways and the budget sits strictly
+    /// between the two measured peaks, so a regression that dropped the shape cap would fail here.
+    #[test]
+    fn cold_metadata_decode_peak_stays_under_budget_and_the_cap_is_what_holds_it() {
+        // ~600k elements: text ≈ 1.2 MB (under the 3 MiB section cap), but the decoded `Value` tree
+        // is ~600k nodes ≈ 15+ MB. The element cap (65 536) refuses it long before that.
+        let mut manifest = digstore_stage::empty_manifest();
+        manifest
+            .custom
+            .insert("payload".to_string(), flat_numeric_custom(600_000));
+        let body = encode_metadata_section(&manifest);
+        assert!(
+            body.len() < METADATA_SECTION_MAX_BYTES,
+            "fixture must be within the SIZE cap so the SHAPE cap is what is under test ({} bytes)",
+            body.len()
+        );
+
+        // The budget: comfortably above the streaming scan's transient cost, comfortably below the
+        // materialized tree. 4 MiB.
+        const PEAK_BUDGET: usize = 4 * 1024 * 1024;
+
+        // Capped path — the production decode. Measure ONLY the call, not the fixture build.
+        let base = counting_allocator::current();
+        counting_allocator::reset_peak();
+        let capped = decode_capped_metadata(&body).expect("capped decode does not error");
+        let capped_peak = counting_allocator::peak() - base;
+        assert!(
+            matches!(capped, CappedMetadata::Refused),
+            "the hostile flat-numeric custom must be refused by the element cap, not decoded"
+        );
+        assert!(
+            capped_peak < PEAK_BUDGET,
+            "capped cold decode peaked at {capped_peak} bytes, over the {PEAK_BUDGET} budget — the \
+             pre-decode caps did not hold the peak"
+        );
+
+        // Uncapped path — the pre-#2160 behaviour. Same bytes; the tree it declines to bound.
+        let base = counting_allocator::current();
+        counting_allocator::reset_peak();
+        let rendered = decode_and_render_uncapped(&body);
+        let uncapped_peak = counting_allocator::peak() - base;
+        drop(rendered);
+        assert!(
+            uncapped_peak > PEAK_BUDGET,
+            "uncapped decode peaked at only {uncapped_peak} bytes, not over the {PEAK_BUDGET} \
+             budget — the test is vacuous: it is not measuring an expansion the caps prevent"
+        );
+    }
+
+    /// An oversized ENCODED section is refused by SIZE before `MetadataManifest::decode` is ever
+    /// called (#2160).
+    ///
+    /// The seam that proves "decode never ran": the body is BOTH over the size cap AND malformed as
+    /// a manifest, so if the length check did not short-circuit, `decode` would return `Err`.
+    /// Getting `Refused` (never `Err`) is only possible if the size cap fired first.
+    #[test]
+    fn an_oversized_metadata_section_is_refused_before_decode_is_reached() {
+        let body = vec![0xFFu8; METADATA_SECTION_MAX_BYTES + 1];
+        let outcome = decode_capped_metadata(&body).expect("size cap refuses, it does not error");
+        assert!(
+            matches!(outcome, CappedMetadata::Refused),
+            "an over-cap section must be REFUSED, not decoded — and this garbage body would Err if \
+             decode had been reached, so Refused proves the decode was skipped"
+        );
+    }
+
+    /// A `custom` value nested past [`MAX_CUSTOM_JSON_DEPTH`] is refused before decode; a shallow one
+    /// is accepted (#2160).
+    #[test]
+    fn a_custom_value_over_the_depth_cap_is_refused() {
+        let deep = (0..MAX_CUSTOM_JSON_DEPTH + 8).fold(
+            serde_json::json!(1),
+            |acc, _| serde_json::json!({ "n": acc }),
+        );
+        let mut manifest = digstore_stage::empty_manifest();
+        manifest.custom.insert("deep".to_string(), deep);
+        let body = encode_metadata_section(&manifest);
+        assert!(
+            matches!(decode_capped_metadata(&body), Ok(CappedMetadata::Refused)),
+            "a custom value nested past the depth cap must be refused pre-decode"
+        );
+
+        let mut shallow = digstore_stage::empty_manifest();
+        shallow
+            .custom
+            .insert("ok".to_string(), serde_json::json!({ "n": { "n": 1 } }));
+        let shallow_body = encode_metadata_section(&shallow);
+        assert!(
+            matches!(
+                decode_capped_metadata(&shallow_body),
+                Ok(CappedMetadata::Decoded(_))
+            ),
+            "an ordinary shallow custom value must decode unchanged"
+        );
+    }
+
+    /// A `custom` map with more than [`MAX_CUSTOM_ENTRIES`] entries is refused before decode; a small
+    /// map is accepted (#2160).
+    #[test]
+    fn a_custom_map_over_the_entry_cap_is_refused() {
+        let mut manifest = digstore_stage::empty_manifest();
+        for i in 0..MAX_CUSTOM_ENTRIES + 16 {
+            manifest
+                .custom
+                .insert(format!("k{i}"), serde_json::Value::from(i as u64));
+        }
+        let body = encode_metadata_section(&manifest);
+        assert!(
+            matches!(decode_capped_metadata(&body), Ok(CappedMetadata::Refused)),
+            "a custom map over the entry cap must be refused pre-decode"
+        );
+
+        let mut small = digstore_stage::empty_manifest();
+        for i in 0..8 {
+            small
+                .custom
+                .insert(format!("k{i}"), serde_json::Value::from(i as u64));
+        }
+        assert!(
+            matches!(
+                decode_capped_metadata(&encode_metadata_section(&small)),
+                Ok(CappedMetadata::Decoded(_))
+            ),
+            "an ordinary small custom map must decode unchanged"
+        );
+    }
+
+    /// A normal metadata section decodes to BYTE-IDENTICAL JSON through the capped path and the old
+    /// uncapped path — the caps only bite oversized/hostile input, never ordinary stores (#2160).
+    #[test]
+    fn a_normal_metadata_section_decodes_byte_identically_through_the_caps() {
+        let mut manifest = digstore_stage::empty_manifest();
+        manifest.name = "Ordinary Store".to_string();
+        manifest.version = Some("1.2.3".to_string());
+        manifest.keywords = vec!["chia".to_string(), "dig".to_string()];
+        manifest.custom.insert(
+            "note".to_string(),
+            serde_json::json!({ "nested": [1, 2, 3] }),
+        );
+        let body = encode_metadata_section(&manifest);
+
+        let capped = match decode_capped_metadata(&body).expect("normal section decodes") {
+            CappedMetadata::Decoded(m) => metadata_manifest_to_json(&m).to_string(),
+            CappedMetadata::Refused => panic!("a normal section must not be refused"),
+        };
+        assert_eq!(
+            capped,
+            decode_and_render_uncapped(&body),
+            "the capped decode must render byte-identically to the pre-#2160 path"
+        );
+    }
+
+    /// [`scan_json_shape`] refuses flat over-count and deep nesting, and does NOT miscount
+    /// punctuation inside strings (#2160).
+    #[test]
+    fn scan_json_shape_bounds_count_and_depth_without_miscounting_strings() {
+        // A string full of commas and brackets is ONE node, not thousands — punctuation inside a
+        // string must not be counted as structure.
+        let stringy = format!("\"{}\"", ",[{".repeat(MAX_CUSTOM_JSON_ELEMENTS));
+        assert_eq!(
+            scan_json_shape(stringy.as_bytes()),
+            CustomShape::Acceptable,
+            "punctuation inside a JSON string must not be counted as structural nodes"
+        );
+
+        let flat = format!("[{}]", vec!["0"; MAX_CUSTOM_JSON_ELEMENTS + 1].join(","));
+        assert_eq!(
+            scan_json_shape(flat.as_bytes()),
+            CustomShape::Refused,
+            "a flat array over the element cap must be refused"
+        );
+
+        let deep: String = "[".repeat(MAX_CUSTOM_JSON_DEPTH + 1);
+        assert_eq!(
+            scan_json_shape(deep.as_bytes()),
+            CustomShape::Refused,
+            "nesting past the depth cap must be refused"
+        );
+
+        assert_eq!(
+            scan_json_shape(br#"{"a":1,"b":[2,3]}"#),
+            CustomShape::Acceptable,
+            "an ordinary small value must pass"
         );
     }
 
