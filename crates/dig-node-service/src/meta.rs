@@ -171,9 +171,16 @@ pub fn methods() -> &'static [MethodInfo] {
         MethodInfo {
             // #1476: the publish→seed push. Local-only by default; the HTTP surface adds a control-token
             // landing gate (server.rs) and, under DIG_NODE_PUSH_OPEN, a §21.9 authorized-writer check.
+            // `requires_auth: false` reflects the §21.9 remote-auth CONVENTION (peer reads are
+            // unauthenticated), NOT "no auth": as a mutator the method is loopback-only and demands the
+            // local control token over the HTTP surface unless DIG_NODE_PUSH_OPEN=true opens it to peers
+            // behind the authorized-writer signature gate. Refuses over-buffered pushes with
+            // -32016 PUSH_PENDING_LIMITED (#2149).
             name: "cache.pushCapsule",
             served: "local",
-            summary: "Push a freshly-committed capsule's bytes to seed this node as a holder.",
+            summary: "Push a freshly-committed capsule's bytes to seed this node as a holder \
+                      (control-token gated over loopback; §21.9 authorized-writer signature when \
+                      DIG_NODE_PUSH_OPEN=true).",
             requires_auth: false,
         },
         MethodInfo {
@@ -695,6 +702,15 @@ pub enum ErrorCode {
     /// dial it, so it is bounded as an anti-amplification measure; the caller should back off and
     /// retry. Node error. (Peer range `-3206x`.)
     PeerPingRefused,
+    /// `-32016` — a `cache.pushCapsule` window was refused because accepting it would exceed an
+    /// in-flight push-reassembly bound: the per-requestor concurrent-partial cap, the global
+    /// concurrent-partial cap, or the global pending-bytes budget (dig_ecosystem#2149). Defense
+    /// against an authorized-but-abusive (or identity-cycling open-push) peer pinning unbounded
+    /// reassembly memory with never-completed partials. Distinct from `-32015 METADATA_TOO_LARGE`
+    /// (a different bounded condition on `dig.getMetadata`). Retriable: the caller should complete or
+    /// abandon an in-flight push and back off; abandoned partials free their slot after the push TTL.
+    /// Node error. (Bounded/resource cluster.)
+    PushPendingLimited,
 }
 
 impl ErrorCode {
@@ -716,6 +732,7 @@ impl ErrorCode {
             ErrorCode::WalletReadFailed => -32042,
             ErrorCode::WalletRateLimited => -32043,
             ErrorCode::PeerPingRefused => -32060,
+            ErrorCode::PushPendingLimited => -32016,
         }
     }
 
@@ -738,6 +755,7 @@ impl ErrorCode {
             ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
             ErrorCode::WalletRateLimited => "WALLET_RATE_LIMITED",
             ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
+            ErrorCode::PushPendingLimited => "PUSH_PENDING_LIMITED",
         }
     }
 
@@ -761,7 +779,9 @@ impl ErrorCode {
             | ErrorCode::WalletReadFailed
             | ErrorCode::WalletRateLimited
             // The peer ping is run BY the node's own peer network, so the refusal is the node's.
-            | ErrorCode::PeerPingRefused => "node",
+            | ErrorCode::PeerPingRefused
+            // The push-reassembly bound is enforced by the node's own capsule seam.
+            | ErrorCode::PushPendingLimited => "node",
             // INVALID_PARAMS is returned by the embedded read path's locally-served
             // read methods (bad store_id / retrieval_key) before any I/O.
             ErrorCode::InvalidParams => "node",
@@ -808,6 +828,10 @@ impl ErrorCode {
                 "A peer ping was refused before dialing: a ladder is already running on this node, \
                  or the start-rate bound is exhausted."
             }
+            ErrorCode::PushPendingLimited => {
+                "A cache.pushCapsule window was refused: accepting it would exceed an in-flight \
+                 push-reassembly bound (per-requestor cap, global cap, or pending-bytes budget)."
+            }
         }
     }
 
@@ -829,6 +853,7 @@ impl ErrorCode {
             ErrorCode::WalletReadFailed,
             ErrorCode::WalletRateLimited,
             ErrorCode::PeerPingRefused,
+            ErrorCode::PushPendingLimited,
         ]
     }
 }

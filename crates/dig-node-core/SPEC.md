@@ -185,6 +185,22 @@ loopback admin / in-process FFI dispatch (`handle_rpc`).
 - **`cache.removeCached`** `{ store_id: 64hex, root: 64hex }` → `{ removed: bool }`. Error `-32602`.
 - **`cache.fetchAndCache`** `{ store_id: 64hex, root: 64hex }` → `{ status:
   "cached"|"already_cached"|"failed", size_bytes?: u64, served_root?: 64hex, message?: string }`.
+- **`cache.pushCapsule`** `{ store_id: 64hex, root: 64hex, data: base64, offset?: u64,
+  total_length?: u64, signature?: 192hex }` → an ack window `{ offset, complete: bool, next_offset:
+  u64|null, size_bytes, served_root?, already_cached? }`. The store owner hands a freshly-committed
+  capsule's bytes to their own node to seed it as a holder immediately; the bytes arrive in windows
+  reassembled by strictly-forward `offset` until `total_length` is met, then the whole capsule is
+  integrity-verified and landed once. **Local-only by default**; `DIG_NODE_PUSH_OPEN=true` admits it
+  to the mTLS peer surface, where it ADDITIONALLY requires a §21.6/§21.9 authorized-writer BLS
+  `signature` over `SHA-256(root || store_id)` under the publisher key that derives `store_id`.
+  **In-flight reassembly state is BOUNDED (a peer cannot pin unbounded memory):** each requestor may
+  hold at most `MAX_PENDING_PUSHES_PER_REQUESTOR = 8` concurrent incomplete pushes (keyed on the
+  non-spoofable transport identity — the loopback operator or the verified `peer_id`); at most
+  `MAX_GLOBAL_PENDING_PUSHES = 256` are in flight process-wide; the sum of all buffered partial bytes
+  may not exceed `MAX_PENDING_PUSH_BYTES = 512 MiB`; and a partial that does not advance within
+  `PENDING_PUSH_TTL = 60 s` is reaped. A window that would breach any bound is refused BEFORE its
+  bytes are buffered (fail-closed) with **`-32016` `PUSH_PENDING_LIMITED`**. Errors: `-32602`,
+  `-32001` (missing/invalid authorized-writer signature on the peer surface), `-32016`, `-32603`.
 - **`control.peerStatus`** → the peer-network status snapshot (§7.2); always safe to call, reports
   "not running" on the FFI path.
 - **`control.subscribe`** `{ store_id: 64hex }` → `{ subscribed: true, added: bool, store_id }`,
@@ -259,6 +275,8 @@ ROUTING.md §11` Phase 4). §2.5 + §8 are the normative target the integration 
 | `-32007` | `RANGE_NOT_SATISFIABLE` | `offset ≥ total_length` or the range is otherwise unsatisfiable |
 | `-32008` | `CONTENT_REDIRECT` | this node does not hold the content but located holders — a redirect, not a 404 (§5.4) |
 | `-32011`..`-32014` | stage errors | dir not readable / no files / over cap / compile-IO (`dig.stage`) |
+| `-32015` | `METADATA_TOO_LARGE` | a `dig.getMetadata` read is refused because the metadata section exceeds the bounded read limit |
+| `-32016` | `PUSH_PENDING_LIMITED` | a `cache.pushCapsule` window is refused because it would exceed an in-flight reassembly bound — the per-requestor cap, the global concurrent-push cap, or the global pending-bytes budget (§2.3.2); retry after in-flight pushes complete or an abandoned partial is reaped |
 | `-32020` | `ONION_CIRCUIT_UNAVAILABLE` | (target) a `mode:"privacy"` request could not be served privately — MUST NOT downgrade (§8) |
 | `-32021` | `PRIVACY_REQUIRES_LOCAL_NODE` | (target) `mode:"privacy"` on a node with no trusted local originator |
 | `-32022` | `ONION_HOPS_OUT_OF_RANGE` | (target) requested hop count outside `[2,5]` |

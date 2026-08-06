@@ -37,6 +37,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use digstore_core::datasection::{DataView, SectionId};
@@ -45,10 +46,54 @@ use digstore_remote::verify_push_signature;
 use serde_json::{json, Value};
 
 use crate::download::{landing_origin, ReadOrigin, RequestProvenance};
+use crate::rate_limit::RequestorId;
 use crate::seams::dig_peer::ChainAnchoredModuleVerifier;
 use crate::{CapsuleKey, InMemoryModule, Node};
 
 use super::MAX_CAPSULE_BYTES;
+
+/// The catalogued JSON-RPC error a push is refused with when it would exceed ANY in-flight
+/// reassembly bound — the per-requestor cap, the global cap, or the global pending-bytes budget
+/// (dig_ecosystem#2149). A DEDICATED code in the bounded/resource-limit cluster, distinct from the
+/// miss-lookup `-32009` and from `-32015 METADATA_TOO_LARGE` (a different bounded condition on
+/// `dig.getMetadata`): the condition here is not "you are asking too fast" but "this node is holding
+/// too much unfinished push state to accept another window right now". The caller SHOULD complete or
+/// abandon an in-flight push, or retry after backing off; an abandoned partial frees its slot after
+/// [`PENDING_PUSH_TTL`]. Catalogued symbolically as `PUSH_PENDING_LIMITED` (see
+/// `dig_node_service::meta::ErrorCode`).
+pub(crate) const PUSH_PENDING_LIMITED: i64 = -32016;
+
+/// The most concurrent in-flight (incomplete) pushes ONE requestor may hold open at once
+/// (dig_ecosystem#2149). A legitimate publisher seeds a handful of freshly-committed stores in
+/// parallel; eight distinct simultaneous partial uploads is already well beyond an honest workload,
+/// while being small enough that the per-requestor share of reassembly memory stays modest. Keyed on
+/// the non-spoofable transport identity ([`RequestorId::key`]), so one opened peer flooding distinct
+/// `(store_id, root)` partials exhausts only ITS OWN slots — a different peer is untouched.
+const MAX_PENDING_PUSHES_PER_REQUESTOR: usize = 8;
+
+/// The most concurrent in-flight pushes across ALL requestors (dig_ecosystem#2149). Bounds the
+/// reassembly table so a caller cycling identities (fresh self-signed mTLS leaves under
+/// `DIG_NODE_PUSH_OPEN`) cannot grow it without bound past the per-requestor cap. Sized as
+/// `MAX_PENDING_PUSHES_PER_REQUESTOR` × 32 authorized writers' worth of parallel seeding — generous
+/// for a real multi-peer seed host, yet a hard ceiling on entry proliferation. The pending-BYTES
+/// budget below is the true memory bound; this caps the count/overhead.
+const MAX_GLOBAL_PENDING_PUSHES: usize = 256;
+
+/// The global ceiling on bytes buffered across ALL in-flight partial pushes (dig_ecosystem#2149).
+/// This is the real memory bound: each window arrives ≤ the 64 KiB transport frame cap, but windows
+/// accumulate toward the declared `total_length` (up to [`MAX_CAPSULE_BYTES`]), so without an
+/// aggregate budget many never-completed partials would pin memory until restart. 512 MiB admits
+/// several full-capsule reassemblies (a compiled module is ~128 MiB) in parallel on a real host while
+/// capping the worst case; a window that would push the aggregate past this is refused BEFORE its
+/// bytes are buffered (fail-closed).
+const MAX_PENDING_PUSH_BYTES: usize = 512 * 1024 * 1024;
+
+/// How long an in-flight partial may sit WITHOUT advancing before the reaper evicts it
+/// (dig_ecosystem#2149). A genuine multi-window push advances every network round-trip, so 60 s
+/// between windows is far beyond any honest gap yet promptly reclaims the slot + bytes of a partial
+/// an attacker (or a crashed client) opened and abandoned. Eviction is lazy: every push call reaps
+/// expired partials first, so no background task is needed.
+const PENDING_PUSH_TTL: Duration = Duration::from_secs(60);
 
 /// The dig-node-LOCAL method name. NOT a `dig-rpc-protocol` `Method` variant: that crate is a
 /// crates.io pin this repo cannot extend, and — being a mutator — the method is deliberately kept OUT
@@ -89,14 +134,107 @@ struct PendingPush {
     /// The bytes assembled so far. `buf.len()` is the next expected `offset` — pushes are strictly
     /// forward with no gaps or overlaps.
     buf: Vec<u8>,
+    /// The non-spoofable requestor ([`RequestorId::key`]) that opened this partial, so the
+    /// per-requestor concurrent-push cap counts only a given peer's OWN in-flight entries
+    /// (dig_ecosystem#2149).
+    requestor: String,
+    /// When this partial last advanced (opened or extended). Drives the [`PENDING_PUSH_TTL`] reaper
+    /// that reclaims abandoned partials (dig_ecosystem#2149).
+    last_activity: Instant,
 }
 
-/// The process-wide table of in-flight chunked pushes. A `std::sync::Mutex` (never held across an
-/// `.await`) guarding transient per-capsule reassembly state — a completed or abandoned push is
-/// removed, so the table holds only genuinely in-flight uploads.
-fn pending_pushes() -> &'static Mutex<HashMap<(PathBuf, CapsuleKey), PendingPush>> {
-    static PENDING: OnceLock<Mutex<HashMap<(PathBuf, CapsuleKey), PendingPush>>> = OnceLock::new();
-    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+/// The bounded, process-wide table of in-flight chunked pushes (dig_ecosystem#2149). Holds transient
+/// per-capsule reassembly state — a completed or abandoned push is removed — under a `std::sync::Mutex`
+/// (never held across an `.await`). The bounds (per-requestor / global entry caps + a global
+/// pending-bytes budget + a TTL reaper) turn the previously-unbounded `cache.pushCapsule` open surface
+/// into one that can pin only a fixed amount of memory. The limits are fields (not bare consts) so the
+/// tests can construct a small, deterministic instance instead of allocating production-sized budgets.
+struct PendingPushes {
+    entries: HashMap<(PathBuf, CapsuleKey), PendingPush>,
+    max_per_requestor: usize,
+    max_global: usize,
+    max_bytes: usize,
+    ttl: Duration,
+}
+
+impl PendingPushes {
+    /// A table at the production bounds ([`MAX_PENDING_PUSHES_PER_REQUESTOR`] /
+    /// [`MAX_GLOBAL_PENDING_PUSHES`] / [`MAX_PENDING_PUSH_BYTES`] / [`PENDING_PUSH_TTL`]).
+    fn with_defaults() -> Self {
+        Self {
+            entries: HashMap::new(),
+            max_per_requestor: MAX_PENDING_PUSHES_PER_REQUESTOR,
+            max_global: MAX_GLOBAL_PENDING_PUSHES,
+            max_bytes: MAX_PENDING_PUSH_BYTES,
+            ttl: PENDING_PUSH_TTL,
+        }
+    }
+
+    /// Evict every partial that has not advanced within [`Self::ttl`] as of `now`. Called at the top
+    /// of every window so an abandoned partial's slot + bytes are reclaimed lazily, without a
+    /// background task.
+    fn reap_expired(&mut self, now: Instant) {
+        let ttl = self.ttl;
+        self.entries
+            .retain(|_, p| now.duration_since(p.last_activity) < ttl);
+    }
+
+    /// Bytes buffered across ALL in-flight partials right now — the quantity the global byte budget
+    /// bounds. Recomputed on demand (the table is small — bounded by [`Self::max_global`]) rather than
+    /// tracked incrementally, so no counter can drift out of step with the map.
+    fn buffered_bytes(&self) -> usize {
+        self.entries.values().map(|p| p.buf.len()).sum()
+    }
+
+    /// How many in-flight partials `requestor` currently owns — the per-requestor cap's measure.
+    fn count_for(&self, requestor: &str) -> usize {
+        self.entries
+            .values()
+            .filter(|p| p.requestor == requestor)
+            .count()
+    }
+
+    /// Decide whether one incoming window may be buffered, WITHOUT mutating the entry set — the single
+    /// place every DoS bound (dig_ecosystem#2149) is enforced, so the handler and the tests agree by
+    /// construction. Reaps expired partials first (so a stalled attacker cannot hold slots past the
+    /// TTL), then, for a NEW `(cache_dir, capsule)`, enforces the global then per-requestor entry caps,
+    /// and finally the global byte budget for EVERY window. Fail-closed: a refusal happens before any
+    /// bytes are buffered.
+    fn admit_window(
+        &mut self,
+        map_key: &(PathBuf, CapsuleKey),
+        requestor: &str,
+        incoming_len: usize,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        self.reap_expired(now);
+        if !self.entries.contains_key(map_key) {
+            if self.entries.len() >= self.max_global {
+                return Err(
+                    "too many concurrent pending pushes on this node; retry after in-flight pushes complete",
+                );
+            }
+            if self.count_for(requestor) >= self.max_per_requestor {
+                return Err(
+                    "too many concurrent pending pushes for this requestor; complete or abandon one first",
+                );
+            }
+        }
+        if self.buffered_bytes() + incoming_len > self.max_bytes {
+            return Err(
+                "the pending-push memory budget is exhausted; retry after in-flight pushes complete",
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The process-wide bounded pending-push table (dig_ecosystem#2149). One instance for the whole
+/// process; entries are keyed by `(cache_dir, capsule)`, so two nodes sharing a process never
+/// cross-contaminate.
+fn pending_pushes() -> &'static Mutex<PendingPushes> {
+    static PENDING: OnceLock<Mutex<PendingPushes>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(PendingPushes::with_defaults()))
 }
 
 impl Node {
@@ -113,6 +251,7 @@ impl Node {
         id: Value,
         origin: ReadOrigin,
         provenance: RequestProvenance,
+        requestor: RequestorId,
     ) -> Value {
         let err = |code: i64, msg: &str| json!({"jsonrpc":"2.0","id":id.clone(),"error":{"code":code,"message":msg}});
 
@@ -175,6 +314,7 @@ impl Node {
             pending_pushes()
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
+                .entries
                 .remove(&(self.cache_dir.clone(), key.clone()));
             let size = std::fs::metadata(key.module_path(&self.cache_dir))
                 .map(|m| m.len())
@@ -191,17 +331,32 @@ impl Node {
 
         // Reassemble this window into the in-flight buffer. On the completing window, take the whole
         // buffer OUT of the table so the verify+land below runs on owned bytes with no lock held.
+        let requestor_key = requestor.key();
         let bytes = {
+            let now = Instant::now();
             let mut table = pending_pushes().lock().unwrap_or_else(|p| p.into_inner());
             let map_key = (self.cache_dir.clone(), key.clone());
-            let pending = table.entry(map_key.clone()).or_insert_with(|| PendingPush {
-                total_length,
-                buf: Vec::new(),
-            });
+
+            // DoS bounds (dig_ecosystem#2149): refuse a push that would exceed any reassembly bound
+            // BEFORE buffering its bytes (fail-closed). All bound logic + the TTL reap lives in
+            // `admit_window`, the one place the caps are enforced.
+            if let Err(msg) = table.admit_window(&map_key, &requestor_key, data.len(), now) {
+                return err(PUSH_PENDING_LIMITED, msg);
+            }
+
+            let pending = table
+                .entries
+                .entry(map_key.clone())
+                .or_insert_with(|| PendingPush {
+                    total_length,
+                    buf: Vec::new(),
+                    requestor: requestor_key.clone(),
+                    last_activity: now,
+                });
             // total_length is a commitment made on the first window; a later disagreement is a caller
             // rewriting the push mid-flight.
             if pending.total_length != total_length {
-                table.remove(&map_key);
+                table.entries.remove(&map_key);
                 return err(-32602, "total_length changed mid-push");
             }
             // Strict forward progress: the only accepted offset is exactly where the buffer stands, so
@@ -213,10 +368,11 @@ impl Node {
                 );
             }
             if offset + data.len() as u64 > pending.total_length {
-                table.remove(&map_key);
+                table.entries.remove(&map_key);
                 return err(-32602, "chunk overflows the declared total_length");
             }
             pending.buf.extend_from_slice(&data);
+            pending.last_activity = now;
             let assembled = pending.buf.len() as u64;
             if assembled < pending.total_length {
                 // Ack this window and ask for the next; nothing lands until the capsule is whole.
@@ -228,7 +384,11 @@ impl Node {
                 }});
             }
             // Whole: remove and own the buffer.
-            table.remove(&map_key).map(|p| p.buf).unwrap_or(data)
+            table
+                .entries
+                .remove(&map_key)
+                .map(|p| p.buf)
+                .unwrap_or(data)
         };
 
         // INTEGRITY (D1): the bytes must be a genuine `.dig` committing exactly (store_id, root).
@@ -393,7 +553,7 @@ mod tests {
         (ReadOrigin::Peer, RequestProvenance::FirstParty)
     }
 
-    /// Push a whole capsule single-shot (one window) and return the response.
+    /// Push a whole capsule single-shot (one window) as the local operator and return the response.
     async fn push_one_shot(
         node: &Node,
         store_hex: &str,
@@ -410,8 +570,43 @@ mod tests {
         if let Some(sig) = signature {
             params["signature"] = json!(sig);
         }
-        node.push_capsule(&params, json!(1), origin, provenance)
+        node.push_capsule(&params, json!(1), origin, provenance, RequestorId::Local)
             .await
+    }
+
+    /// Open ONE incomplete partial push for `(store, root)` as `requestor`: a first window whose
+    /// declared `total_length` exceeds the sent bytes, so the push stays PENDING (never lands). The
+    /// bytes need not be a genuine `.dig` — the bound is enforced BEFORE integrity/authority — so a
+    /// tiny window suffices. Local origin keeps the auth path out of the way; the cap keys purely on
+    /// `requestor`.
+    async fn open_partial(
+        node: &Node,
+        store_hex: &str,
+        root_hex: &str,
+        window: &[u8],
+        requestor: RequestorId,
+    ) -> Value {
+        let params = json!({
+            "store_id": store_hex,
+            "root": root_hex,
+            "data": base64::engine::general_purpose::STANDARD.encode(window),
+            "offset": 0,
+            "total_length": window.len() as u64 + 4096, // > sent → stays pending
+        });
+        node.push_capsule(
+            &params,
+            json!(1),
+            ReadOrigin::Local,
+            RequestProvenance::FirstParty,
+            requestor,
+        )
+        .await
+    }
+
+    /// A distinct `(store_hex, root_hex)` pair seeded from one byte, for opening many independent
+    /// partials in the cap tests.
+    fn distinct_capsule(seed: u8) -> (String, String) {
+        (hex::encode([seed; 32]), hex::encode([seed ^ 0xff; 32]))
     }
 
     /// (a) A loopback push lands the capsule — it appears on disk at `module_path` and in the cached
@@ -512,6 +707,7 @@ mod tests {
                     json!(1),
                     ReadOrigin::Local,
                     RequestProvenance::FirstParty,
+                    RequestorId::Local,
                 )
                 .await;
             offset = last["result"]["next_offset"]
@@ -649,5 +845,203 @@ mod tests {
             "the authorized writer's push must land: {ok}"
         );
         assert!(crate::module_exists(&node.cache_dir, &store_hex, &root_hex));
+    }
+
+    // ---- dig_ecosystem#2149: DoS bounds on in-flight pending-reassembly state ----
+    //
+    // The bounds live in one pure method, `PendingPushes::admit_window` — the SAME code the handler
+    // calls. Testing it directly on local instances (rather than mutating the process-wide static that
+    // the end-to-end push tests share) keeps every bound test deterministic and free of cross-test
+    // interference, and lets the TTL reaper run against an INJECTED clock with no wall-clock sleep.
+
+    /// A small bounded table for a bound test: caps + budget + TTL as given, starting empty.
+    fn table(max_per_requestor: usize, max_global: usize, max_bytes: usize) -> PendingPushes {
+        PendingPushes {
+            entries: HashMap::new(),
+            max_per_requestor,
+            max_global,
+            max_bytes,
+            ttl: Duration::from_secs(60),
+        }
+    }
+
+    /// A distinct `(cache_dir, capsule)` map key seeded from one byte, for opening independent
+    /// partials.
+    fn map_key(seed: u8) -> (PathBuf, CapsuleKey) {
+        let capsule = CapsuleKey::parse(&hex::encode([seed; 32]), &hex::encode([seed ^ 0xff; 32]))
+            .expect("valid 64-hex");
+        (PathBuf::from("/cache"), capsule)
+    }
+
+    /// Admit one window into the table (mutating it as the handler does on success): reserve via
+    /// `admit_window`, then insert/extend the partial. Returns the admission result so a test can
+    /// assert acceptance or the refusal message.
+    fn admit(
+        t: &mut PendingPushes,
+        key: &(PathBuf, CapsuleKey),
+        requestor: &str,
+        len: usize,
+        now: Instant,
+    ) -> Result<(), &'static str> {
+        t.admit_window(key, requestor, len, now)?;
+        let pending = t.entries.entry(key.clone()).or_insert_with(|| PendingPush {
+            total_length: len as u64 + 4096, // > buffered → stays pending
+            buf: Vec::new(),
+            requestor: requestor.to_string(),
+            last_activity: now,
+        });
+        pending.buf.resize(pending.buf.len() + len, 0u8);
+        pending.last_activity = now;
+        Ok(())
+    }
+
+    /// The (N+1)th concurrent partial from ONE requestor is refused, while the first N are accepted;
+    /// a DIFFERENT requestor is untouched. Pins the per-requestor cap.
+    #[test]
+    fn per_requestor_cap_refuses_the_nth_concurrent_partial() {
+        let mut t = table(3, 1000, usize::MAX);
+        let now = Instant::now();
+
+        for i in 0..3u8 {
+            assert!(
+                admit(&mut t, &map_key(0x10 + i), "peer:aaaa", 20, now).is_ok(),
+                "partial {i} must be accepted"
+            );
+        }
+        assert_eq!(
+            admit(&mut t, &map_key(0x1f), "peer:aaaa", 20, now),
+            Err("too many concurrent pending pushes for this requestor; complete or abandon one first"),
+            "the 4th concurrent partial from one requestor must be refused"
+        );
+        // A different requestor draws from its OWN per-requestor slots.
+        assert!(
+            admit(&mut t, &map_key(0x2a), "peer:bbbb", 20, now).is_ok(),
+            "a different requestor is unaffected by the abuser's exhausted slots"
+        );
+    }
+
+    /// Once the GLOBAL concurrent-push cap is hit, a push from a SECOND requestor is refused — the
+    /// bound is process-wide, not merely per-requestor.
+    #[test]
+    fn global_cap_refuses_a_second_requestor_once_full() {
+        let mut t = table(1000, 2, usize::MAX);
+        let now = Instant::now();
+
+        assert!(admit(&mut t, &map_key(0x40), "peer:aaaa", 20, now).is_ok());
+        assert!(admit(&mut t, &map_key(0x41), "peer:aaaa", 20, now).is_ok());
+        assert_eq!(
+            admit(&mut t, &map_key(0x4f), "peer:bbbb", 20, now),
+            Err("too many concurrent pending pushes on this node; retry after in-flight pushes complete"),
+            "a second requestor is refused once the global cap is full"
+        );
+    }
+
+    /// A window that would push the aggregate buffered bytes past the global byte budget is refused
+    /// BEFORE its bytes are buffered (fail-closed: the refused window leaves no bytes behind).
+    #[test]
+    fn byte_budget_refuses_before_buffering() {
+        // Budget admits one 20-byte window but not two.
+        let mut t = table(1000, 1000, 21);
+        let now = Instant::now();
+
+        assert!(
+            admit(&mut t, &map_key(0x60), "peer:aaaa", 20, now).is_ok(),
+            "first window fits"
+        );
+        assert_eq!(
+            admit(&mut t, &map_key(0x61), "peer:aaaa", 20, now),
+            Err("the pending-push memory budget is exhausted; retry after in-flight pushes complete"),
+            "a window over the byte budget must be refused"
+        );
+        assert_eq!(
+            t.buffered_bytes(),
+            20,
+            "only the first (admitted) window's bytes are buffered — the refusal buffered nothing"
+        );
+    }
+
+    /// The catalogued reject code reaches the wire END-TO-END through the real handler: opening one
+    /// more than the DEFAULT per-requestor cap of concurrent partials answers [`PUSH_PENDING_LIMITED`].
+    ///
+    /// Uses a UNIQUE requestor id so `count_for` is isolated from any parallel test sharing the
+    /// process-wide table — no shared limit is mutated, so this cannot flake a sibling test.
+    #[tokio::test]
+    async fn handler_answers_the_catalogued_error_at_the_per_requestor_cap() {
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let node = node.as_ref();
+        let who = || RequestorId::Peer("peer:test-2149-per-requestor-cap".to_string());
+
+        // The first MAX_PENDING_PUSHES_PER_REQUESTOR partials are accepted (each stays pending).
+        for i in 0..MAX_PENDING_PUSHES_PER_REQUESTOR as u8 {
+            let (s, r) = distinct_capsule(0xA0 + i);
+            let resp = open_partial(node, &s, &r, b"partial-window", who()).await;
+            assert_eq!(
+                resp["result"]["complete"],
+                json!(false),
+                "partial {i} within the cap must be accepted and pending: {resp}"
+            );
+        }
+        // One more distinct partial from the SAME requestor trips the cap.
+        let (s, r) = distinct_capsule(0xBF);
+        let refused = open_partial(node, &s, &r, b"partial-window", who()).await;
+        assert_eq!(
+            refused["error"]["code"],
+            json!(PUSH_PENDING_LIMITED),
+            "the (cap+1)th concurrent partial must answer PUSH_PENDING_LIMITED: {refused}"
+        );
+    }
+
+    /// The reaper evicts a partial that has not advanced within the TTL — freeing its slot + bytes —
+    /// while a fresh partial survives. Driven with an INJECTED clock (no wall-clock sleep).
+    #[test]
+    fn reaper_evicts_only_partials_past_the_ttl() {
+        let mut t = table(1000, 1000, usize::MAX);
+        let now = Instant::now();
+
+        let stale = map_key(0x81);
+        let fresh = map_key(0x83);
+        t.entries.insert(
+            stale.clone(),
+            PendingPush {
+                total_length: 4096,
+                buf: vec![0u8; 100],
+                requestor: "peer:aaaa".to_string(),
+                last_activity: now.checked_sub(Duration::from_secs(120)).expect("clock"),
+            },
+        );
+        t.entries.insert(
+            fresh.clone(),
+            PendingPush {
+                total_length: 4096,
+                buf: vec![0u8; 50],
+                requestor: "peer:aaaa".to_string(),
+                last_activity: now,
+            },
+        );
+        assert_eq!(t.buffered_bytes(), 150);
+
+        t.reap_expired(now);
+
+        assert!(
+            !t.entries.contains_key(&stale),
+            "the stale partial is reaped"
+        );
+        assert!(t.entries.contains_key(&fresh), "the fresh partial survives");
+        assert_eq!(
+            t.buffered_bytes(),
+            50,
+            "the reaped partial's bytes are reclaimed"
+        );
+        assert_eq!(
+            t.count_for("peer:aaaa"),
+            1,
+            "only the fresh partial remains for the requestor"
+        );
+
+        // A completing push AFTER the TTL is treated as new: the freed slot is available again.
+        assert!(
+            admit(&mut t, &stale, "peer:aaaa", 10, now).is_ok(),
+            "the reaped capsule's slot is free for a fresh push"
+        );
     }
 }

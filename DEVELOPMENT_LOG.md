@@ -4,6 +4,37 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## Authority validation is not memory backpressure — bound the reassembly state too (#2149)
+
+`cache.pushCapsule` reassembles chunked capsule uploads in a process-wide `HashMap<(cache_dir,
+capsule), PendingPush>`. The §21.6/§21.9 authorized-writer signature and the merkle-integrity check
+are only validated on the COMPLETING window (after the whole capsule is buffered) — and, on the peer
+surface, only signature *presence* is checked before the first byte is buffered. So with
+`DIG_NODE_PUSH_OPEN=true`, any self-signed mTLS peer could open many distinct `(store_id, root)`
+partials, never complete them, and pin memory until restart. Authority ≠ backpressure: a gate that
+runs after buffering does nothing to bound the buffer.
+
+Durable points:
+
+- **Bound in-flight state on the NON-SPOOFABLE identity, before buffering.** The fix keys a
+  per-requestor concurrent-push cap on the same `RequestorId` (verified `peer_id` / loopback operator)
+  the #2007/#2189 miss-lookup limiter uses — never on anything in the request body. Pair it with a
+  global entry cap (stops identity-cycling), a global pending-BYTES budget (the real memory bound —
+  windows accumulate toward `total_length`, so counting entries is not enough), and a lazy TTL reaper
+  (an abandoned partial is reclaimed on the next call, no background task).
+- **Make the bound one pure, injectable method.** Enforcing every cap in `PendingPushes::admit_window`
+  (limits as struct fields, clock passed in) let the tests drive the exact reject paths and the reaper
+  on a local instance with an injected `Instant` — no wall-clock sleep, no mutating the shared static
+  (which would flake sibling tests running in parallel).
+- **A new JSON-RPC code needs a catalogue check, not a "looks free" guess.** The first cut minted
+  `PUSH_PENDING_LIMITED = -32015`, but `-32015` was already `METADATA_TOO_LARGE` (dig.getMetadata,
+  #2145/#2160) — two conditions colliding on one code silently breaks the deterministic error
+  catalogue (§6.2, agents branch on the code). Reassigned to the genuinely free `-32016` in the
+  bounded/resource cluster and registered it as a named `ErrorCode` variant so the machine-readable
+  catalogue (`meta::error_catalogue`) stays complete. Rule: `git grep` the numeric range across the
+  crate AND the docs mirror before assigning a code; the dig-node `-320xx` codes are LOCAL consts (not
+  from `dig-rpc-types`), so there is no compiler check for collision — the catalogue is the only guard.
+
 ## A service account's home is not a place to keep credentials (#2210)
 
 Every `control.wallet.balance` answered `-32040 WALLET_NO_CHAIN_SOURCE` on an otherwise healthy
