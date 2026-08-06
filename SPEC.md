@@ -3180,29 +3180,49 @@ content. To defeat this, the node MUST resolve the read in this order:
    The tip's own `current_root` commits exactly the tip generation's leaves, so a path whose CURRENT
    version the tip holds is served from the tip — the §13 redirect is never consulted for it, and a
    §13 forged to name a genuine-but-superseded prior generation for that path CANNOT downgrade it.
-2. **§13 redirect only on a genuine tip MISS.** When the path is ABSENT from the tip capsule (its
-   latest version legitimately lives in an older generation, so the tip serve folds to the decoy),
-   the node consults the §13 entry and MAY redirect to that older `serve_root`. The redirect is
-   honoured ONLY when `serve_root` is a GENUINE root in the store's authenticated on-chain singleton
-   lineage — the SAME lineage authority the §14.4 pin walks (`sync_datastore_with_history`
-   membership). A root NOT in the lineage (fabricated, or unconfirmable) MUST NOT be served from: the
-   read stays a clean miss. On this redirect path `expected_leaf` (= the tip manifest's
-   `sha256_latest`) IS enforced fail-closed on every tier so the older, non-chain-anchored capsule
-   cannot substitute other bytes for the path.
+2. **§13 redirect only on a genuine tip MISS, and only from a tip capsule that BACKS its committed
+   root.** When the path is ABSENT from the tip capsule (its latest version legitimately lives in an
+   older generation, so the tip serve folds to the decoy), the node consults the §13 entry and MAY
+   redirect to that older `serve_root`. The redirect is honoured ONLY when BOTH hold:
+   - **(a) the tip capsule genuinely backs its committed `current_root`.** The node re-derives the tip
+     capsule and requires the merkle root recomputed from its own `MerkleNodes` to equal the committed
+     `CurrentRoot`, AND that committed root to equal the chain-anchored tip. The capsule anchor gate
+     compares only the 32-byte `CurrentRoot` HEADER against the chain, so it admits a capsule whose
+     header still names the genuine tip while its data was tampered so a tip-committed path no longer
+     folds to it — which would turn a forged tip MISS into a §13 redirect (a rollback). A tip capsule
+     whose data does not fold to its committed tip is refused as a redirect source: its misses are
+     untrustworthy, so the read stays a clean miss rather than a downgrade. (Implemented
+     dig-node-locally by recomputing the tree via digstore's `verify_module_root`; the premise that "a
+     tip MISS means the path is legitimately absent from the tip generation" is thereby ENFORCED, not
+     assumed.)
+   - **(b) `serve_root` is a GENUINE root in the store's authenticated on-chain singleton lineage** —
+     the SAME lineage authority the §14.4 pin walks (`sync_datastore_with_history` membership). A root
+     NOT in the lineage (fabricated, or unconfirmable) MUST NOT be served from.
+
+   On this redirect path `expected_leaf` (= the tip manifest's `sha256_latest`) IS additionally
+   enforced fail-closed on every tier so the older, non-chain-anchored capsule cannot substitute other
+   bytes for the path. A non-Served tip outcome — a decoy MISS or an upstream ERROR — is deferred while
+   a §13 redirect candidate remains, so a tip-pass upstream error never pre-empts a legitimate
+   older-generation read (#2088).
 
 - `serve_root` is NEVER client-derivable: a superseded root named in the REQUEST still fails
   `-32005` (§14.4) — only the node's own trusted tip manifest, cross-checked against the lineage, may
   redirect the read.
-- **Residual gap — closes Case A only.** The lineage cross-check binds a redirected serve to *a
-  genuine lineage generation*, NOT necessarily the *canonical/maximal* one. A §13 forged to name a
-  genuine-but-superseded PRIOR generation is a real lineage root, so the cross-check alone would honour
-  it. The tip-authoritative order above closes this for **Case A** — a path whose CURRENT version the
-  tip commits (served from the tip, forged redirect never reached). It does NOT close **Case B** — a
-  path whose current version genuinely lives in an OLDER generation than the one a forged §13 names:
-  the redirect is honoured for it, a rollback BOUNDED to owner-committed content. Full closure requires
-  a per-path current-state commitment the tip anchors (tracked in digstore #2203); `expected_leaf`
-  binds the served bytes to *a* genuine lineage generation, it does NOT prove that generation is the
-  path's canonical current one.
+- **Case A is CLOSED (including against a tampered tip capsule).** A path whose CURRENT version the
+  tip commits is served from the chain-anchored tip (forged redirect never reached), and a redirect is
+  refused entirely when the tip capsule does not back its committed root — so a holder cannot forge a
+  tip MISS to force the downgrade (#2211). **Case B remains OPEN:** a path whose current version
+  genuinely lives in an OLDER generation than the one a forged §13 names — here the tip capsule
+  legitimately backs its root and the path is genuinely absent from the tip, so the redirect is
+  honoured and a §13 forged to name a genuine-but-superseded prior generation still rolls that path
+  back, a downgrade BOUNDED to owner-committed content. Full closure requires a per-path current-state
+  commitment the tip anchors (tracked in digstore #2203); `expected_leaf` binds the served bytes to
+  *a* genuine lineage generation, it does NOT prove that generation is the path's canonical current one.
+- **`X-Dig-Generation` is advisory, not trusted.** It is stamped from the §13 `generation_index`,
+  which is additive/uncommitted and thus attacker-forgeable — a forged §13 can misreport the
+  generation NUMBER even for a Case-A serve whose BYTES are the correct chain-anchored tip. The served
+  bytes stay safe; only this cosmetic header can be spoofed. Closed by the same #2203 per-path
+  commitment.
 - No manifest / no entry (legacy `.dig`, private store, or a key outside the public surface) ⇒ serve at
   the tip with no leaf binding, byte-identical to the pre-#2088 behaviour.
 

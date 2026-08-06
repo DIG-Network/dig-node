@@ -505,11 +505,30 @@ impl ContentServer for Node {
                 .resource_manifest_entry(store_hex, &root_hex, effective_key)
                 .await
             {
+                // `X-Dig-Generation` (#486) is stamped from the §13 `generation_index`, which is
+                // additive/uncommitted and thus attacker-forgeable: a forged §13 can misreport the
+                // generation NUMBER even for a Case-A serve whose BYTES are the correct chain-anchored
+                // tip. The served bytes stay safe (bound by `proof.root == tip`); only this cosmetic
+                // header can be spoofed. A committed per-path generation closes it (digstore #2203).
                 generation = Some(entry.generation_index);
                 // The tip (bytes) whose manifest we just read — `pinned_root` under the pin, else the
                 // resolved concrete root. A redirect exists only when §13 names a DIFFERENT capsule.
                 let tip = pinned_root.or_else(|| Bytes32::from_hex(&root_hex).ok());
+                // #2211 (the tampered-capsule closure): a §13 redirect may move this read OFF the
+                // chain-anchored tip only when the tip capsule genuinely BACKS its committed
+                // `current_root` — its own data folds to the `CurrentRoot` it commits, and that root
+                // IS the tip. The tip-authoritative closure above rests on "a tip MISS means the path
+                // is legitimately absent from the tip generation"; that holds ONLY if the tip capsule
+                // actually holds every leaf its `current_root` commits. The anchor gate compares just
+                // the 32-byte `CurrentRoot` HEADER, so it admits a capsule whose header still names the
+                // genuine tip while its data was tampered so a tip-committed path no longer folds to
+                // it — turning a forged tip MISS into a §13 redirect (rollback). So re-derive the tip
+                // capsule here and refuse the redirect if its data does not fold to its committed tip:
+                // a tampered tip yields a clean miss, never a downgrade (fail closed).
                 if Some(entry.latest_root) != tip
+                    && self
+                        .tip_capsule_backs_its_committed_root(store_hex, &root_hex, &store_id)
+                        .await
                     && self
                         .anchored_root_resolver
                         .verify_lineage_root(&store_id.0, entry.latest_root)
@@ -534,7 +553,7 @@ impl ContentServer for Node {
         // `PublicManifest` forged to redirect that path at a genuine-but-superseded prior generation
         // is never reached for it — the tip's current bytes win. This is the pre-#2088 tip serve path,
         // still running the full anchor-gate/uniform enforcement resolved above (#1764/#1765).
-        if let Some(out) = self
+        let tip_outcome = self
             .serve_tiers_at_root(
                 store_hex,
                 &store_id,
@@ -552,16 +571,24 @@ impl ContentServer for Node {
                 generation,
                 peer_tier,
             )
-            .await
-        {
-            return out;
-        }
+            .await;
+
+        // A genuine tip SERVE wins outright (Case A): the path is committed by the chain-anchored
+        // tip's own `current_root`, so no §13 redirect is consulted for it. Any other tip outcome —
+        // a clean miss (`None`) or a deferred `Unreadable` — flows to the §13 redirect pass below.
+        let tip_outcome = match tip_outcome {
+            Some(out @ PlaintextOutcome::Served { .. }) => return out,
+            other => other,
+        };
 
         // -- §13 REDIRECT serve (#2088 Case B) ---------------------------------------------------
-        // A genuine tip MISS: the path is ABSENT from the tip capsule (its latest version lives in an
-        // older generation). Only now consult the §13 redirect — already resolved + lineage-
-        // authenticated above (#184). Bind the older, non-chain-anchored capsule via `expected_leaf`
-        // (the tip-anchored `sha256_latest`) so no other content can substitute for it.
+        // The tip did NOT serve — either a clean MISS (the path is absent from the tip generation,
+        // its latest version living in an older capsule) or an upstream ERROR in the tip pass. A
+        // non-Served tip outcome is NOT definitive while a §13 redirect candidate remains (#2088): an
+        // upstream error on the tip pass must not pre-empt the older-generation read. So consult the
+        // §13 redirect — already resolved + lineage-authenticated above (#184) — binding the older,
+        // non-chain-anchored capsule via `expected_leaf` (the tip-anchored `sha256_latest`) so no
+        // other content can substitute for it.
         if let Some((redirect_root, ref redirect_hex, redirect_leaf)) = redirect {
             if let Some(out) = self
                 .serve_tiers_at_root(
@@ -587,8 +614,10 @@ impl ContentServer for Node {
             }
         }
 
-        // Nothing served at the tip or any §13 redirect — a clean miss (drives the SPA/404 decision).
-        PlaintextOutcome::NotFound { root_hex }
+        // No §13 redirect served either. Surface the tip pass's own non-Served outcome — an
+        // `Unreadable` (an upstream error, deferred until now so it could not pre-empt the redirect),
+        // else a clean MISS → the `NotFound` that drives the SPA/404 decision.
+        tip_outcome.unwrap_or(PlaintextOutcome::NotFound { root_hex })
     }
 
     async fn manifest_paths(&self, store_hex: &str, root_hex: &str) -> Option<Vec<String>> {
@@ -677,6 +706,52 @@ impl Node {
             generation_index: entry.get("generation_index")?.as_u64()?,
             sha256_latest: Bytes32::from_hex(entry.get("sha256_latest")?.as_str()?).ok()?,
         })
+    }
+
+    /// Whether the cached TIP capsule at `(store, tip_root_hex)` genuinely BACKS its committed
+    /// `current_root`: its own data folds to the `CurrentRoot` it commits, AND that committed root is
+    /// the chain-anchored tip being served.
+    ///
+    /// This is the premise the #2211 tip-authoritative closure depends on. A tip serve MISS is treated
+    /// as "this path is legitimately absent from the tip generation" (Case B → consult the §13
+    /// redirect). That inference is sound only when the tip capsule actually holds every leaf its
+    /// `current_root` commits. The capsule anchor gate ([`ChainAnchoredModuleVerifier`]) compares only
+    /// the 32-byte `CurrentRoot` HEADER against the chain, never re-deriving the tree from the capsule
+    /// data — so it admits a capsule whose header still names the genuine tip while a tip-committed
+    /// path has been tampered out of its data. For such a capsule a forged tip MISS would drive a §13
+    /// redirect at a genuine-but-superseded prior generation: a rollback.
+    ///
+    /// So before a redirect is trusted, the tip capsule is re-derived here:
+    /// [`digstore_compiler::verify_module_root`] recomputes the merkle root from the capsule's own
+    /// `MerkleNodes` and requires it to equal the committed `CurrentRoot`, and that committed root must
+    /// equal `tip_root_hex`. Either mismatch means the capsule does not back its committed tip, its
+    /// misses are untrustworthy, and the redirect is refused (fail closed). A whole-module read + a
+    /// merkle recompute is the cost, so it is run only on the redirect-candidate path (§13 names a
+    /// DIFFERENT capsule), never on the common tip-hit read.
+    async fn tip_capsule_backs_its_committed_root(
+        &self,
+        store_hex: &str,
+        tip_root_hex: &str,
+        store_id: &Bytes32,
+    ) -> bool {
+        let Some(key) = crate::CapsuleKey::parse(store_hex, tip_root_hex) else {
+            return false;
+        };
+        let cache_dir = self.cache_dir.clone();
+        let store_id = *store_id;
+        let tip = tip_root_hex.to_string();
+        tokio::task::spawn_blocking(move || {
+            let path = key.resolve_cached_path(&cache_dir);
+            let Ok(module) = std::fs::read(&path) else {
+                return false;
+            };
+            match digstore_compiler::verify_module_root(&module, &store_id) {
+                Ok(identity) => identity.root.to_hex() == tip,
+                Err(_) => false,
+            }
+        })
+        .await
+        .unwrap_or(false)
     }
 }
 

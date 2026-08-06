@@ -10869,6 +10869,34 @@ mod tests {
             .expect("re-inject the forged §13 blob")
     }
 
+    /// RELABEL a capsule's committed `CurrentRoot` HEADER to `new_root`, leaving its `MerkleNodes`,
+    /// key table, and chunk pool BYTE IDENTICAL — the #2211 tampered-tip primitive.
+    ///
+    /// This models the malicious holder who serves a capsule whose `CurrentRoot` header still names
+    /// the genuine chain tip (the lie the anchor gate's header-only compare accepts) while the data
+    /// backing it is an OLDER generation's — so the capsule's own merkle recompute no longer folds to
+    /// its committed root, and a tip-committed path reads as a miss. Rewrites only the 32-byte
+    /// `CurrentRoot` section (length unchanged) and re-injects the blob.
+    fn relabel_current_root(module: &[u8], new_root: Bytes32) -> Vec<u8> {
+        use digstore_compiler::{
+            extract_data_section_blob, inject_data_section, DATA_SECTION_MEM_OFFSET,
+        };
+        use digstore_core::datasection::{DataView, SectionId};
+        let blob = extract_data_section_blob(module).expect("extract DIGS blob");
+        let (cr_off, cr_len) = {
+            let view = DataView::parse(&blob).expect("parse DIGS blob");
+            let body = view
+                .section(SectionId::CurrentRoot)
+                .expect("capsule carries a CurrentRoot section");
+            (body.as_ptr() as usize - blob.as_ptr() as usize, body.len())
+        };
+        assert_eq!(cr_len, 32, "CurrentRoot is a 32-byte section");
+        let mut relabeled = blob.clone();
+        relabeled[cr_off..cr_off + 32].copy_from_slice(&new_root.0);
+        inject_data_section(module, &relabeled, DATA_SECTION_MEM_OFFSET)
+            .expect("re-inject the relabeled blob")
+    }
+
     #[tokio::test]
     async fn dig_get_manifest_returns_embedded_manifest_json_when_present() {
         // A PUBLIC store's compiled module embeds the PublicManifest section (#176 Phase A);
@@ -11997,6 +12025,89 @@ mod tests {
                  genuine-but-superseded gen0 (v1)"
             ),
             other => panic!("expected the tip-authoritative v2 bytes served, got {other:?}"),
+        }
+    }
+
+    /// **Proves (#2211 — the tampered-capsule closure):** a §13 redirect is REFUSED when the tip
+    /// capsule does not genuinely BACK its committed `current_root`, so a tampered tip can never drive
+    /// an anti-rollback downgrade. This closes the concrete attack the adversarial gate found on the
+    /// interim Case-A fix.
+    ///
+    /// THE ATTACK: a single malicious holder serves a tip capsule whose `CurrentRoot` HEADER still
+    /// names the genuine chain tip (`root1`) — which the anchor gate accepts, since it compares only
+    /// that 32-byte header — while the data backing it is the OLDER gen0 (`asset.js` = v1). So the
+    /// tip's own merkle recompute folds to `root0`, `asset.js` no longer folds to the committed tip,
+    /// and the tip serve MISSES for it. The capsule's (honest, for gen0) §13 then redirects `asset.js`
+    /// at the genuine-but-superseded gen0 — and `root0` IS in the authenticated lineage, so the #184
+    /// cross-check alone would honour it and serve the rolled-back v1 stamped `verified`.
+    ///
+    /// The fix re-derives the tip capsule before trusting its §13: its data must fold to the committed
+    /// `current_root` AND that root must be the tip. The relabeled capsule fails the recompute
+    /// (`root0` != committed `root1`), so the redirect is refused and the read is a clean MISS — never
+    /// the v1 downgrade. Without the fix the redirect fires and v1 is served (the test then fails).
+    #[test]
+    fn serve_content_plaintext_refuses_a_tampered_tip_capsule_redirect_2211() {
+        use crate::content_serve::PlaintextOutcome;
+        use crate::ContentServer;
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("DIG_NODE_PIN"); // enforce the chain-anchored pin (the default)
+        let rt = pin_test_rt();
+        let store = Bytes32([49u8; 32]);
+        // gen0 holds asset.js = v1; gen1 is the genuine chain tip (root1) that rewrites it to v2.
+        let gen0_files = vec![
+            ("index.html".to_string(), b"<h1>A</h1>".to_vec()),
+            ("asset.js".to_string(), b"V1-OLD".to_vec()),
+        ];
+        let gen1_files = vec![
+            ("index.html".to_string(), b"<h1>A2</h1>".to_vec()),
+            ("asset.js".to_string(), b"V2-NEW".to_vec()),
+        ];
+        let ((root0, module0), (root1, _module1)) =
+            compile_two_generation_module(store, &gen0_files, &gen1_files);
+        assert_ne!(root0, root1, "the two generations must have distinct roots");
+        // gen0's honest §13 redirects asset.js at gen0 (root0) — the genuine-but-superseded target.
+        let gen0_asset = manifest_entry_of(&module0, "asset.js");
+        assert_eq!(
+            gen0_asset.latest_root, root0,
+            "gen0 holds asset.js at root0"
+        );
+        // THE TAMPERED TIP: gen0's data (asset.js = v1, MerkleNodes folding to root0) with its
+        // committed CurrentRoot HEADER relabeled to the genuine chain tip root1 (the lie). Its data
+        // does NOT back root1, so asset.js no longer folds to the tip and the tip serve misses it.
+        let tampered_tip = relabel_current_root(&module0, root1);
+        // Both gen0 and gen1 are GENUINE on-chain generations (so the #184 lineage cross-check ALONE
+        // would honour the redirect); gen1 (root1) is the resolved tip.
+        let (node, _td) = test_node_with_resolver(
+            None,
+            MockResolver::one_with_lineage(&store.to_hex(), root1, vec![root0, root1]),
+        );
+        seed_cached_module(&node.cache_dir, &store.to_hex(), &root0.to_hex(), &module0);
+        seed_cached_module(
+            &node.cache_dir,
+            &store.to_hex(),
+            &root1.to_hex(),
+            &tampered_tip,
+        );
+
+        let out = rt.block_on(node.serve_content_plaintext(
+            &store.to_hex(),
+            "", // rootless → resolve the tip, then per-path generation resolution
+            "asset.js",
+            None,
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        ));
+        // The tampered tip holds only v1, so a genuine tip serve MISSES and the redirect is refused.
+        // The read then falls through to the remote tier (which has nothing to give) — a fail-closed
+        // miss (`NotFound`, or `Unreadable` when the remote leg errors). The ONE outcome the fix
+        // forbids is a `Served` result: that would be the rolled-back v1 the redirect used to yield.
+        match out {
+            PlaintextOutcome::Served { bytes, .. } => panic!(
+                "a tampered tip capsule must not drive a §13 rollback — served {} bytes ({:?})",
+                bytes.len(),
+                String::from_utf8_lossy(&bytes)
+            ),
+            _ => {} // any non-Served outcome is fail-closed: the downgrade to v1 was refused
         }
     }
 
