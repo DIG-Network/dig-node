@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.99.4] - 2026-08-06
+
+### Bug Fixes
+- **dig-node:** Cap the metadata section + custom shape before decode (#2160)- **dig-wallet:** Adopt chia-query 0.6.0 so a service account can read a balance (#187)
+
+## [0.99.2] - 2026-08-06
+
+### Bug Fixes
+- **dig-node:** Drain the manifest memo on cache.clear + cap dig.getMetadata (#185)
+
 ## [0.99.1] - 2026-08-06
 
 ### Features
