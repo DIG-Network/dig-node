@@ -635,6 +635,13 @@ pub struct NodeContent {
     /// spend per requestor, so one abusive caller cannot drive the aggregate lookup rate while an
     /// honest caller is untouched. See [`crate::rate_limit`].
     miss_rate_limiter: crate::rate_limit::MissRateLimiter,
+    /// A SEPARATE, tighter per-requestor limiter in front of the PROXY fetch-through leg
+    /// (dig_ecosystem#2189). A `proxy:true` miss does not run a cheap DHT lookup — it pulls a full
+    /// multi-source capsule and serves the bytes (large egress + crypto), an order of magnitude
+    /// costlier than a lookup. Bounding it here — independently of [`Self::miss_rate_limiter`] — stops a
+    /// caller draining expensive proxy egress from the budget calibrated for cheap lookups. See
+    /// [`crate::rate_limit::MissRateLimiter::with_proxy_defaults`].
+    proxy_rate_limiter: crate::rate_limit::MissRateLimiter,
 }
 
 /// A [`StateStore`] wrapper over a [`FileStateStore`] that SNAPSHOTS every saved [`DownloadState`]
@@ -899,6 +906,7 @@ impl NodeContent {
             connected_pool,
             capsule_warmer: std::sync::OnceLock::new(),
             miss_rate_limiter: crate::rate_limit::MissRateLimiter::with_defaults(),
+            proxy_rate_limiter: crate::rate_limit::MissRateLimiter::with_proxy_defaults(),
         })
     }
 
@@ -909,6 +917,15 @@ impl NodeContent {
     #[cfg(test)]
     pub(crate) fn set_miss_rate_limit(&self, capacity: f64, refill_per_sec: f64) {
         self.miss_rate_limiter.reconfigure(capacity, refill_per_sec);
+    }
+
+    /// Reconfigure the SEPARATE proxy fetch-through limiter's per-requestor bound (dig_ecosystem#2189).
+    /// Test-only: the enforcement test pins a tiny, deterministic (no-refill) proxy pool to exercise the
+    /// "proxy allowance exhausted → degrade to redirect" bound without a wall-clock refill race.
+    #[cfg(test)]
+    pub(crate) fn set_proxy_rate_limit(&self, capacity: f64, refill_per_sec: f64) {
+        self.proxy_rate_limiter
+            .reconfigure(capacity, refill_per_sec);
     }
 
     /// Admit one miss → DHT `find_providers` lookup for `requestor` against its per-requestor budget,
@@ -1516,7 +1533,9 @@ impl crate::Node {
     ///    reach the holders (NAT asymmetry). The `origin != Local` reshare refusal stays intact — the
     ///    proxy serves bytes but this middle node does NOT become a holder (the amplification
     ///    boundary). The env-configured [`MissMode::FetchThrough`] still applies for the operator's
-    ///    own reads.
+    ///    own reads. This expensive leg is bounded by a SEPARATE, tighter per-requestor allowance than
+    ///    the cheap lookup budget (dig_ecosystem#2189) — an exhausted proxy allowance degrades to (3)
+    ///    the redirect, never an unbounded fetch.
     /// 3. **Redirect** (default): locate the holders (bounded lookup) and name a capped candidate set
     ///    so the requestor re-requests against a holder over its OWN reachability ladder.
     /// 4. else **not-found** — NEVER a silent 404 while a provider exists.
@@ -1545,7 +1564,16 @@ impl crate::Node {
         // or an explicit per-request `proxy` fallback for a requestor that cannot reach the holders
         // itself. On any failure, fall through to the redirect so a provider-held resource is never
         // silently 404'd.
-        if proxy || pc.miss_mode() == MissMode::FetchThrough {
+        //
+        // This leg pulls a FULL multi-source capsule and serves the bytes (large egress + crypto) — an
+        // order of magnitude costlier than the cheap DHT lookup the (1) budget is sized for. It is bounded
+        // SEPARATELY by the tighter `proxy_rate_limiter` (dig_ecosystem#2189) so a caller cannot drain
+        // expensive proxy egress from the cheap-lookup allowance. Fail-closed: an exhausted proxy
+        // allowance degrades to the (3) redirect below — never an unbounded fetch. The trusted operator
+        // (Local) is exempt, mirroring the lookup limiter's rationale; the bound targets remote callers.
+        if (proxy || pc.miss_mode() == MissMode::FetchThrough)
+            && (requestor.is_local() || pc.proxy_rate_limiter.check(requestor))
+        {
             if let Ok(fetched) = pc.fetch_resource(content, origin).await {
                 return MissOutcome::Fetched(fetched);
             }
