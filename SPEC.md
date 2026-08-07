@@ -2866,6 +2866,21 @@ boolean, default `false`). It MUST NOT trigger on `push` to `main`.
   force-moved tag breaks git tag-immutability; because dig-node updates are gated by the dig-updater
   signed feed (an Ed25519 signature over the update descriptor, verified before apply), that
   signature — not the mutable tag — is the integrity anchor. Ship new code by bumping the version.
+- **The tag push is a request, not a guarantee.** Creating a workflow run from a pushed tag is an
+  event delivery this repo does not control, and it has been observed to not occur even though the
+  push succeeded. After pushing the tag the stable job MUST confirm that both `release.yml` and
+  `package.yml` have a run for that tag, and MUST dispatch — against the tag ref — whichever is
+  absent. Both workflows gate publication on `github.ref_type == 'tag'`, which a dispatch against a
+  tag satisfies, so the dispatched run is equivalent to the event-triggered one. The confirmation
+  MUST be idempotent: where the event was delivered normally, it dispatches nothing.
+- **A stable release MUST carry the native install packages.** dig-updater's feedsign resolves
+  dig-node by the `.deb`/`.pkg`/`.msi` file names and fails closed on the ENTIRE signed manifest
+  when they are absent, so a stable release of bare binaries does not ship a partial dig-node — it
+  freezes auto-update for every component on the channel. The stable path MUST therefore verify the
+  published release's asset list (`verify-release-assets.yml`) and MUST fail the release run when
+  `dig-node_<version>_amd64.deb`, `dig-node_<version>_arm64.deb`, `dig-node-<version>-macos.pkg`, or
+  `dig-node-<version>-windows-x64.msi` is missing. Repairing a failed release by publishing only the
+  binaries is NOT a repair.
 
 11.1a. **Doc-only commits never release** (the version is unchanged → the tag exists → the stable
 job is a no-op). The manual-dispatch `workflow_dispatch` on `release.yml` is a build-only "does main

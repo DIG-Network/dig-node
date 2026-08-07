@@ -104,6 +104,7 @@ a bug in the beacon:
 | `release.yml` | `push: tags: v*` (+ dispatch canary) | Builds + publishes the stable Release for a `vX.Y.Z` tag. |
 | `build-binaries.yml` | `workflow_call` | Reusable cross-OS build, dual-named + `dign` (both channels call it). |
 | `package.yml` | PR + `push: tags: v*` + `workflow_call` | Builds the `.deb`/`.pkg`/`.msi`. Attaches them itself on a `v*` tag; on a `workflow_call` (the nightly channel) it leaves them as run artifacts for the caller to publish. |
+| `verify-release-assets.yml` | `workflow_call` (stable path) + `workflow_dispatch` | Asserts a `vX.Y.Z` release carries the four native install packages dig-updater's feedsign resolves dig-node by. Dispatch it at any tag to check a release by hand — a package-less release freezes the stable signed feed for every product. |
 | `ci.yml` | PR + push to main | fmt/clippy + `cargo llvm-cov nextest --workspace` (pre-merge). NOTE: `ubuntu-latest` only — Windows/macOS build breaks are first caught by the nightly channel, not PR CI (SPEC §11 / follow-up). |
 
 ## Local build (dev)

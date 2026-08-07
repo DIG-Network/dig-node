@@ -80,6 +80,10 @@ jobs:
         (github.event_name == 'schedule' || inputs.channel == 'stable' || inputs.channel == 'both')
       }}
     runs-on: ubuntu-latest
+    # Consumed by `stable-verify-assets` below, which must know WHETHER a tag was actually cut
+    # (a no-op run must not verify anything) and WHICH tag to verify.
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
       - name: Require RELEASE_TOKEN (else no-op)
         id: token
@@ -193,7 +197,107 @@ jobs:
             git push origin "HEAD:main"
             git push origin "${{ steps.ver.outputs.tag }}"
           fi
-          echo "Pushed changelog commit + ${{ steps.ver.outputs.tag }} — release.yml (stable build) will fire."
+          echo "Pushed changelog commit + ${{ steps.ver.outputs.tag }} — release.yml (stable build) should now fire."
+
+      # THE TAG-PUSH EVENT IS NOT A GUARANTEE (dig_ecosystem#2290).
+      #
+      # Everything the stable channel produces — the binaries (release.yml) and the native install
+      # packages (package.yml) — hangs off ONE thing: GitHub delivering a `push` event for the tag
+      # above and creating a workflow run from it. That is an at-most-once delivery this repo does
+      # not control, and on 2026-08-06 it simply did not happen. The push itself succeeded
+      # (`* [new tag] v0.99.9 -> v0.99.9`) and the branch push one second earlier DID create a run,
+      # but the tag created NONE. Neither release.yml nor package.yml ran. The release was then
+      # repaired by hand by dispatching release.yml alone, which produced a `latest` release of
+      # bare binaries — and because feedsign resolves dig-node by its native-package names, that
+      # froze the stable signed feed for every product until the manifest expired.
+      #
+      # So the tag push is treated as a REQUEST, and this step confirms it was honoured. Where a
+      # run is missing, it is dispatched explicitly against the tag ref, which is equivalent: both
+      # workflows gate their publish on `github.ref_type == 'tag'`, which a dispatch against a tag
+      # satisfies. The step is idempotent — it dispatches only what is absent, so on the normal
+      # path (both runs present) it does nothing at all.
+      #
+      # This deliberately does NOT restructure the release into `workflow_call` jobs. Both
+      # workflows already publish to the tag's release, and adding a second publisher for the same
+      # assets would trade a rare lost event for a routine race.
+      - name: Confirm the tag push actually created the release runs
+        if: steps.token.outputs.present == 'true' && steps.ver.outputs.skip == 'false'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          FORCE_TAG: ${{ steps.ver.outputs.force }}
+        run: |
+          set -euo pipefail
+
+          # A run "for this tag" must mean a run for THIS CUT of the tag, not merely one that
+          # carried the same tag NAME at some point. `gh run list --branch` matches on the name
+          # alone, and a tag name is not stable: a `force` re-cut moves it onto a new commit. So
+          # the commit is the identity, and the run's `headSha` is what is compared.
+          #
+          # Without that, a force re-cut whose tag event is lost finds the PREVIOUS cut's runs,
+          # dispatches nothing, and the asset guard then passes on the PREVIOUS cut's packages —
+          # a green release run shipping stale binaries under a moved tag, wearing exactly the
+          # success signature of a correct release. That is the failure class this step exists to
+          # remove, so it must not be reachable through the step itself.
+          TAG_COMMIT="$(git rev-parse "$TAG^{commit}")"
+
+          runs_for_this_cut() {
+            gh run list --repo "$REPO" --workflow "$1" --branch "$TAG" \
+              --json headSha --jq "[.[] | select(.headSha == \"$TAG_COMMIT\")] | length"
+          }
+
+          # A force re-cut ALWAYS dispatches, without consulting history. The documented reason to
+          # force is "the build failed, re-fire it" — and a failed run is still a run at the right
+          # commit, so any count-based check reads the wreckage of the previous attempt as success
+          # and turns the retry into a silent no-op that then burns the guard's full timeout before
+          # going red. Re-cutting is an explicit request for fresh builds; treat it as one.
+          if [ "${FORCE_TAG:-}" = "true" ]; then
+            echo "force re-cut of $TAG at $TAG_COMMIT — dispatching both release workflows unconditionally (a re-cut is a request for fresh builds; an earlier run at this tag may be the failed one being retried)."
+            for wf in release.yml package.yml; do
+              gh workflow run "$wf" --repo "$REPO" --ref "$TAG"
+            done
+            exit 0
+          fi
+
+          # Run creation is asynchronous; give the event a fair chance before declaring it lost.
+          # A false "lost" is cheap here (the dispatch is idempotent and the publish is tag-gated),
+          # but waiting avoids a pointless duplicate run on every single release.
+          for _ in $(seq 1 12); do
+            sleep 10
+            [ "$(runs_for_this_cut release.yml)" -gt 0 ] && [ "$(runs_for_this_cut package.yml)" -gt 0 ] && break
+          done
+
+          for wf in release.yml package.yml; do
+            if [ "$(runs_for_this_cut "$wf")" -gt 0 ]; then
+              echo "$wf: the tag push created a run for $TAG at $TAG_COMMIT."
+              continue
+            fi
+            echo "::warning::$wf did NOT run for $TAG at $TAG_COMMIT — the tag-push event was not delivered. Dispatching it explicitly against the tag ref so the release is not published incomplete."
+            gh workflow run "$wf" --repo "$REPO" --ref "$TAG"
+          done
+
+  # The stable channel's ACCEPTANCE TEST (dig_ecosystem#2290). Cutting a tag and dispatching the
+  # builds is a request; this is the confirmation. It blocks until the published release carries
+  # the native install packages dig-updater's feedsign resolves dig-node by, and reddens this
+  # release run if it never does.
+  #
+  # It exists because every layer above it can report success while the release is unusable: the
+  # stable job succeeds when the tag is pushed, release.yml succeeds when the binaries are
+  # attached, and neither knows or cares whether the packages arrived. The only signal that a
+  # stable release is actually shippable is the asset list itself, and until now nobody read it.
+  # The consequence landed in a different repo hours later (dig-updater's feed.yml failing closed),
+  # which is the worst possible place for it to surface.
+  #
+  # Skipped on a no-op run (`stable` found the version already tagged, so `tag` is empty).
+  stable-verify-assets:
+    name: Stable — verify release assets
+    needs: stable
+    if: needs.stable.outputs.tag != ''
+    uses: ./.github/workflows/verify-release-assets.yml
+    with:
+      tag: ${{ needs.stable.outputs.tag }}
 
   # ───────────────────────────────── NIGHTLY channel ─────────────────────────────────
   # 1) meta: gate on the token + synthesize the nightly version and tags (nothing is committed).
