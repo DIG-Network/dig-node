@@ -57,7 +57,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use digstore_core::datasection::{decode_merkle_leaves, read_chunk, DataView, SectionId};
+use digstore_core::datasection::{decode_merkle_leaves, DataView, SectionId};
 use digstore_core::merkle::MerkleTree;
 use digstore_core::{Bytes32, Decode, Decoder, KeyTableEntry};
 use sha2::{Digest, Sha256};
@@ -300,6 +300,16 @@ impl ChainAnchoredModuleVerifier {
 ///
 /// Processed resource-by-resource (each resource's leaf computed then its ciphertext borrows dropped)
 /// so no second whole-module copy is held in RAM.
+///
+/// **Chunk lookup is O(1), so the whole recompute is O(pool_size + total_references).** The
+/// `ChunkPool` framing is parsed ONCE into per-chunk byte ranges ([`index_chunk_pool`]) and each
+/// `KeyTable` reference resolves by index into that table. This closes a quadratic CPU-DoS: the
+/// canonical `read_chunk` is O(global_index) — it re-walks the pool from offset 0 on every call — so
+/// resolving N references against an M-chunk pool was Θ(N·M). An attacker could make that ≈Θ(module²)
+/// with a pool of M ZERO-LENGTH chunks + one current-generation entry referencing index `M-1` N times;
+/// worse, zero-length chunks add 0 bytes, so the `MAX_STORE_BYTES` accumulator never tripped. The
+/// pre-index removes the quadratic root cause; the cumulative reference-count cap
+/// ([`MAX_MODULE_CHUNK_REFERENCES`]) bounds scan+hash work even independent of it.
 fn content_leaves(
     view: &DataView<'_>,
     committed_root: [u8; 32],
@@ -309,6 +319,13 @@ fn content_leaves(
     };
     let Some(chunk_pool_body) = view.section(SectionId::ChunkPool) else {
         return Err("the module commits no ChunkPool to recompute its content root from");
+    };
+
+    // Pre-index the ChunkPool ONCE: a single linear pass building each chunk's byte range, so every
+    // reference below is an O(1) index rather than a fresh O(global_index) `read_chunk` re-scan (the
+    // quadratic-DoS fix). Malformed framing fails closed here, exactly as `read_chunk` would per call.
+    let Some(chunk_ranges) = index_chunk_pool(chunk_pool_body) else {
+        return Err("the module's ChunkPool framing does not decode");
     };
 
     let mut decoder = Decoder::new(key_table_body);
@@ -331,6 +348,12 @@ fn content_leaves(
     // leaf hash (below) so memory stays O(1); this cap additionally bounds the CPU of the hashing.
     let mut total_referenced_bytes: u64 = 0;
 
+    // Defense-in-depth CPU bound: cap the cumulative number of chunk REFERENCES across the whole
+    // current generation, so scan+hash work stays bounded even for ZERO-LENGTH chunks (which add
+    // nothing to `total_referenced_bytes` and so slip past the byte cap — the quadratic scan-bomb's
+    // fuel). See [`MAX_MODULE_CHUNK_REFERENCES`] for the ceiling's derivation.
+    let mut total_referenced_chunks: u64 = 0;
+
     for _ in 0..entry_count {
         let Ok(entry) = KeyTableEntry::decode(&mut decoder) else {
             return Err("the module's KeyTable does not decode into entries");
@@ -347,9 +370,17 @@ fn content_leaves(
         // incrementally is byte-identical AND holds no second copy of the content in RAM.
         let mut hasher = Sha256::new();
         for &global_index in &entry.chunk_indices {
-            let Some(ciphertext) = read_chunk(chunk_pool_body, global_index) else {
+            total_referenced_chunks = total_referenced_chunks.saturating_add(1);
+            if total_referenced_chunks > MAX_MODULE_CHUNK_REFERENCES {
+                return Err("the module's KeyTable references more chunks than a store may hold");
+            }
+            // O(1) lookup into the pre-indexed pool: byte-identical to `read_chunk(chunk_pool_body,
+            // global_index)`, without its per-call O(global_index) re-scan. Out of range fails closed
+            // exactly as `read_chunk` returning `None` does.
+            let Some(range) = chunk_ranges.get(global_index as usize) else {
                 return Err("a KeyTable entry references a chunk absent from the ChunkPool");
             };
+            let ciphertext = &chunk_pool_body[range.clone()];
             total_referenced_bytes = total_referenced_bytes.saturating_add(ciphertext.len() as u64);
             if total_referenced_bytes > digstore_core::MAX_STORE_BYTES {
                 return Err("the module's KeyTable references more content than a store may hold");
@@ -362,6 +393,58 @@ fn content_leaves(
 
     leaves.sort_by_key(|(static_key, _)| static_key.0);
     Ok(leaves.into_iter().map(|(_, leaf)| leaf).collect())
+}
+
+/// Ceiling on the cumulative number of `KeyTable` chunk references a module's current generation may
+/// make before it fails closed.
+///
+/// Derived from `MAX_STORE_BYTES / MIN_CHUNK_FRAMING`: every chunk in the `ChunkPool` costs at least
+/// its 4-byte length prefix (the encoding in `datasection::encode_chunk_pool`), so a store within the
+/// `MAX_STORE_BYTES` budget cannot frame — and thus a genuine current generation cannot reference —
+/// more than `MAX_STORE_BYTES / 4` chunks. The existing `MAX_STORE_BYTES` byte cap bounds work for
+/// NON-empty chunks; this reference-count cap additionally bounds scan+hash work for ZERO-LENGTH
+/// chunks, which contribute no bytes and so cannot trip the byte cap on their own.
+const MAX_MODULE_CHUNK_REFERENCES: u64 = digstore_core::MAX_STORE_BYTES / 4;
+
+/// Parse a `ChunkPool` body's length-prefixed framing ONCE into each chunk's byte range within
+/// `pool_body`, or `None` if the framing is malformed (a truncated count, a length that overruns the
+/// body).
+///
+/// This is the pre-index that makes [`content_leaves`] linear. It walks the exact same encoding
+/// [`read_chunk`](digstore_core::datasection::read_chunk) parses — a `u32` BE count, then per chunk a
+/// `u32` BE length prefix followed by that many bytes — but records every chunk's slice bounds in one
+/// pass so a later reference is an O(1) `Vec` index, not another O(global_index) walk from offset 0.
+/// `pool_body[range]` for the returned range is byte-identical to `read_chunk(pool_body, index)`.
+///
+/// The returned `Vec` grows on demand: the claimed count is NOT pre-allocated (it is attacker-supplied
+/// up to `u32::MAX`), and a count larger than the body can satisfy simply runs the body out and fails
+/// closed on the next length read.
+fn index_chunk_pool(pool_body: &[u8]) -> Option<Vec<std::ops::Range<usize>>> {
+    if pool_body.len() < 4 {
+        return None;
+    }
+    let count = u32::from_be_bytes([pool_body[0], pool_body[1], pool_body[2], pool_body[3]]);
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut pos = 4usize;
+    for _ in 0..count {
+        if pos + 4 > pool_body.len() {
+            return None;
+        }
+        let len = u32::from_be_bytes([
+            pool_body[pos],
+            pool_body[pos + 1],
+            pool_body[pos + 2],
+            pool_body[pos + 3],
+        ]) as usize;
+        pos += 4;
+        let end = pos.checked_add(len)?;
+        if end > pool_body.len() {
+            return None;
+        }
+        ranges.push(pos..end);
+        pos = end;
+    }
+    Some(ranges)
 }
 
 #[async_trait::async_trait]
@@ -461,7 +544,7 @@ fn section_id32(view: &DataView<'_>, id: SectionId) -> Option<[u8; 32]> {
 mod tests {
     use super::*;
     use digstore_core::datasection::{
-        encode_blob, encode_chunk_pool, encode_key_table, encode_merkle_nodes,
+        encode_blob, encode_chunk_pool, encode_key_table, encode_merkle_nodes, read_chunk,
     };
     use digstore_core::merkle::resource_leaf;
     use digstore_core::serving::concat_output;
@@ -1010,6 +1093,98 @@ mod tests {
             ModuleAnchor::NotAnchored,
             "an index-repetition amplification bomb must fail closed, not OOM the node"
         );
+    }
+
+    /// **Proves:** the quadratic scan-DoS is CLOSED — a module with M ZERO-LENGTH `ChunkPool` chunks
+    /// and one current-generation entry referencing the HIGHEST index N times completes in
+    /// O(pool+refs), not Θ(N·M). The canonical `read_chunk` is O(global_index) (it re-walks the pool
+    /// from offset 0 per call), and zero-length chunks add 0 bytes so the `MAX_STORE_BYTES` cap never
+    /// trips — so before the pre-index this input pinned a CPU core for Θ(module²) iterations per
+    /// unauthenticated reshare request (M=N=100k ⇒ 10^10 scans, tens of seconds→minutes). With the
+    /// one-pass pre-index each reference is O(1), so the whole recompute is ~200k ops and returns
+    /// promptly, fail-closed (`NotAnchored`: empty content folds to `sha256(&[])` ≠ chain root).
+    /// **Catches:** any reintroduction of a per-reference `read_chunk` re-scan.
+    #[test]
+    fn bounds_a_zero_length_chunk_scan_bomb() {
+        use std::time::Instant;
+        // M zero-length chunks in the pool; N references, all at the highest index — the worst case
+        // for an O(global_index) per-call scan.
+        const M: u32 = 100_000;
+        const N: usize = 100_000;
+
+        let zero_chunks: Vec<&[u8]> = vec![&[][..]; M as usize];
+        let entry = KeyTableEntry {
+            static_key: Bytes32([0x01; 32]),
+            generation: Bytes32(CHAIN_ROOT),
+            chunk_indices: vec![M - 1; N],
+            total_size: 0,
+        };
+        let module = encode_blob(&[
+            (SectionId::StoreId as u16, STORE.to_vec()),
+            (SectionId::CurrentRoot as u16, CHAIN_ROOT.to_vec()),
+            (SectionId::KeyTable as u16, encode_key_table(&[entry])),
+            (SectionId::ChunkPool as u16, encode_chunk_pool(&zero_chunks)),
+            (
+                SectionId::MerkleNodes as u16,
+                encode_merkle_nodes(&[Bytes32(CHAIN_ROOT)]),
+            ),
+        ]);
+
+        let start = Instant::now();
+        let verdict = verdict(&module, &hex32(STORE), &hex32(CHAIN_ROOT));
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            verdict,
+            ModuleAnchor::NotAnchored,
+            "a zero-length scan bomb must fail closed, never be admitted"
+        );
+        // A generous ceiling: the pre-indexed path is milliseconds; the pre-fix Θ(N·M) path would
+        // take tens of seconds to minutes and blow this bound.
+        assert!(
+            elapsed.as_secs() < 5,
+            "content_leaves must be O(pool+refs), not O(pool*refs): took {elapsed:?} for {M}×{N}"
+        );
+    }
+
+    /// **Proves:** the pre-indexed lookup is byte-identical to the canonical `read_chunk` for every
+    /// index of a normal (mixed-length, including zero-length) pool, and mirrors its out-of-range
+    /// `None`. This is what lets [`content_leaves`] swap `read_chunk` for the O(1) pre-index without
+    /// changing which bytes fold into a leaf.
+    #[test]
+    fn the_prebuilt_chunk_index_matches_read_chunk() {
+        let chunks: Vec<Vec<u8>> = vec![
+            b"first chunk".to_vec(),
+            Vec::new(), // a zero-length chunk — the framing must still advance
+            b"a third, longer chunk of ciphertext".to_vec(),
+            b"x".to_vec(),
+        ];
+        let slices: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let pool = encode_chunk_pool(&slices);
+
+        let ranges = index_chunk_pool(&pool).expect("a well-formed pool indexes");
+        assert_eq!(ranges.len(), chunks.len());
+        for i in 0..chunks.len() as u32 {
+            let via_read = read_chunk(&pool, i).expect("read_chunk in range");
+            let via_index = &pool[ranges[i as usize].clone()];
+            assert_eq!(
+                via_index, via_read,
+                "pre-indexed range {i} must equal read_chunk's slice"
+            );
+        }
+        // Out of range mirrors read_chunk's None.
+        assert!(read_chunk(&pool, chunks.len() as u32).is_none());
+        assert!(ranges.get(chunks.len()).is_none());
+    }
+
+    /// **Proves:** malformed `ChunkPool` framing fails closed — a body whose declared count exceeds
+    /// the bytes present cannot be indexed, so the recompute refuses rather than reading past the end.
+    #[test]
+    fn a_malformed_chunk_pool_fails_the_preindex_closed() {
+        // Claims one chunk of length 100 but supplies no body bytes → overruns.
+        let mut malformed = 1u32.to_be_bytes().to_vec();
+        malformed.extend_from_slice(&100u32.to_be_bytes());
+        assert!(index_chunk_pool(&malformed).is_none());
     }
 
     /// **Proves:** a module missing its `ChunkPool` is refused — the content the root must bind is

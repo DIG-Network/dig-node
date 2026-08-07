@@ -25,6 +25,19 @@ dig-updater's feedsign resolves dig-node by native-package file names and fails 
 ENTIRE manifest, that froze — then expired — stable auto-update for all five components, dig-app
 included. A dig-node release without its `.msi`/`.pkg`/`.deb` is not a partial dig-node release,
 it is an ecosystem-wide auto-update outage.
+## `read_chunk` is O(global_index) — per-reference lookup is a quadratic CPU-DoS (#2246)
+
+`digstore_core::datasection::read_chunk(pool_body, i)` re-walks the length-prefixed `ChunkPool` from
+offset 0 on EVERY call (no offset table). The admit gate's `content_leaves` called it once per
+`chunk_index`, so resolving N references over an M-chunk pool was Θ(N·M). The byte cap
+(`total_referenced_bytes > MAX_STORE_BYTES`) keys on `ciphertext.len()`, so ZERO-LENGTH chunks add 0 and
+never trip it — an attacker sends a pool of M zero-length chunks + one current-gen entry referencing
+index `M-1` N times ⇒ ≈Θ(module²) iterations (a ~10 MB module ⇒ ~10^12) with the accumulator stuck at 0,
+pinning a core per unauthenticated reshare request. Fix: PRE-INDEX the pool once into per-chunk byte
+ranges (O(1) lookup ⇒ recompute is O(pool + refs)) AND cap cumulative references at `MAX_STORE_BYTES / 4`
+(defense-in-depth for the zero-length case the byte cap can't see). Lesson: any per-item call into a
+scan-from-start reader over attacker-sized input is silently quadratic; index once.
+
 ## Admit gate must recompute from CONTENT, not from the attacker's MerkleNodes digests (#2246/#2240)
 
 `ChainAnchoredModuleVerifier` (the capsule-admit gate shared by the reshare-admit pull AND the

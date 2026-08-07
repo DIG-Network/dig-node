@@ -1188,13 +1188,22 @@ attacker-controlled and permits repeated indices (the producer dedups chunks), s
 ciphertext bytes across the module is capped at `MAX_STORE_BYTES` and each resource's leaf is hashed by
 STREAMING its ciphertexts into an incremental SHA-256 (O(1) memory) rather than materializing their
 concatenation — without which a ~1 MB module addressing one chunk N times could reference gigabytes and
-abort the allocator (#2246). The attacker-supplied `MerkleNodes` digests are NEVER trusted for this
+abort the allocator (#2246). The recompute resolves each reference through a `ChunkPool` PRE-INDEX built
+in ONE linear pass (per-chunk byte ranges), so the whole recompute is O(pool + references), NOT the
+Θ(references × pool) it would be if each reference re-walked the pool from offset 0 (the canonical
+`read_chunk` is O(global_index)); an attacker could otherwise pin a CPU core for ≈Θ(module²) with a pool
+of ZERO-LENGTH chunks + one entry referencing the highest index N times — and because zero-length chunks
+add 0 bytes, the byte cap alone never fired. As additional defense-in-depth the CUMULATIVE reference
+count across the current generation is capped at `MAX_STORE_BYTES / 4` (a genuine store cannot frame more
+chunks than that 4-byte-minimum-framing ceiling permits), bounding scan+hash work even for zero-length
+chunks (#2246). The attacker-supplied `MerkleNodes` digests are NEVER trusted for this
 decision (retained only as a defense-in-depth cross-check that the served inclusion proofs match the
 content): a single-leaf `from_leaves(vec![x]).root() == x` meant a `MerkleNodes = [chain_root]` plus an
 empty/garbage `ChunkPool` recomputed to the committed root for free, admitting a contentless
 phantom-holder capsule (#2246/#2240). An absent `KeyTable`/`ChunkPool`, a chunk index the pool cannot
-satisfy, an undecodable section, a `MerkleNodes`↔content mismatch, or referenced content exceeding
-`MAX_STORE_BYTES` fails closed; a legitimately EMPTY store folds to `from_leaves(vec![]).root() == sha256(&[])` and passes. A header naming the chain root is
+satisfy, an undecodable section (including malformed `ChunkPool` framing), a `MerkleNodes`↔content
+mismatch, referenced content exceeding `MAX_STORE_BYTES`, or references exceeding `MAX_STORE_BYTES / 4`
+fails closed; a legitimately EMPTY store folds to `from_leaves(vec![]).root() == sha256(&[])` and passes. A header naming the chain root is
 not proof the bytes hash to it. This
 check gives INTEGRITY, never AUTHORITY — without the writer check an opened node would be an
 unauthenticated cache-poison + DHT-announce-amplification surface (the #179/#1576 class). A push that
