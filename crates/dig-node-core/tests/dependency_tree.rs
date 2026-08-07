@@ -135,3 +135,70 @@ fn the_peer_client_and_pull_engine_are_not_duplicated() {
         );
     }
 }
+
+/// A `major.minor.patch` triple, ordered, so a version can be compared against a FLOOR rather than
+/// checked for equality against one known-bad release.
+fn semver_triple(version: &str) -> (u64, u64, u64) {
+    let mut parts = version
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(version)
+        .split('.')
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    )
+}
+
+/// The release in which `dig-constants` replaced its PLACEHOLDER DIG L2 genesis challenge with the
+/// real one. Every copy at or above this floor agrees on the chain identity; every copy below it does
+/// not. See the assertion below for why this is a floor and not an equality check.
+const REAL_GENESIS_FLOOR: (u64, u64, u64) = (0, 4, 0);
+
+/// **Proves:** no `dig-constants` copy in the resolved workspace predates the real DIG L2 genesis
+/// challenge — that is, every copy is at or above 0.4.0.
+///
+/// **Catches:** a dependency edit that pulls a pre-0.4.0 `dig-constants` back into the tree. That is
+/// not hypothetical — it is the state this test was written to close (#2072). `dig-constants` 0.1.0
+/// shipped an all-zeros PLACEHOLDER `DIG_MAINNET_GENESIS_CHALLENGE`, and it reached production through
+/// `dig-clvm` 0.1.1, whose requirement `>=0.1.0, <0.2.0` could never resolve forward off it. So
+/// `dig-wallet`'s spend-validation `ValidationContext` described a different chain identity than the
+/// rest of the node. 0.4.0 finalized the real value (`0af98186…`, the header hash of DIG L2 block
+/// 9021277) and recomputed all six AGG_SIG additional-data domains from it.
+///
+/// **Why the lock and not a source assertion.** No line of Rust pins the genesis literal, and none
+/// should: every runtime check reads `dig_constants::DIG_MAINNET.genesis_challenge()` on BOTH sides of
+/// its comparison, which is circular — it passes identically under the real value and under the
+/// placeholder. The defect was therefore invisible to the entire suite, before the fix and after it.
+/// It is decided by the BUILD, so it is asserted where it is decided.
+///
+/// **Why a FLOOR and not `!= "0.1.0"`.** The property is "no copy predating the real genesis", not
+/// "not that one bad release" — an equality check is bypassed by the next pre-0.4.0 version to appear
+/// (0.2.x and 0.3.x carry the same placeholder). This is the same rule the release gate enforces as
+/// its 0.4.0 floor; one property, asserted at two levels.
+#[test]
+fn no_dig_constants_copy_predates_the_real_genesis_challenge() {
+    let versions = locked_versions("dig-constants");
+
+    // Without this the assertion below is vacuous: a lock with no dig-constants at all — a rename, a
+    // vendoring, a botched merge — would satisfy an "every copy is current" claim while proving nothing.
+    assert!(
+        !versions.is_empty(),
+        "the workspace must resolve dig-constants; finding none means this assertion has stopped \
+         guarding anything"
+    );
+
+    let below_floor: Vec<&&str> = versions
+        .iter()
+        .filter(|v| semver_triple(v) < REAL_GENESIS_FLOOR)
+        .collect();
+    assert!(
+        below_floor.is_empty(),
+        "dig-constants {below_floor:?} predates 0.4.0, the release that replaced the PLACEHOLDER DIG \
+         L2 genesis challenge with the real one. A copy below that floor puts a different chain \
+         identity — and six differently-derived AGG_SIG domains — inside this binary. Find the holder \
+         with `cargo tree -i dig-constants@<version>` and bump it; the resolved set was {versions:?}"
+    );
+}

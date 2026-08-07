@@ -1245,3 +1245,50 @@ Sharp edge — advancing the wire cursor without re-implementing it: the shape s
 (discarding the values) so the wire format lives in one place and cannot drift; only the `custom` block
 is read by hand, and each value's JSON text is read as RAW BYTES — never `serde_json`-parsed — so nothing
 the hostile value describes is ever materialized.
+
+## dig-constants drift is a chia-line boundary, not a version-string gap (#2072)
+
+dig-node's lock carried FOUR `dig-constants` copies at once (0.1.0, 0.4.0, 0.5.1, 0.8.0) against a
+published tip of 0.10.0. The instinct is to read that as four stale pins. It is not: only two of the
+holders are dig-node's own crates. The rest are held down by upstream crates whose PUBLISHED metadata
+names an old range, and a published range cannot be edited from a consumer — `dig-gossip` (`>=0.2, <0.5`),
+`dig-nat` (`>=0.4, <0.6`), `dig-download` (`^0.8`), `digstore-chain` (`^0.5`), `dig-clvm` (`^0.9`). Each
+needs its own release before dig-node can unify. Derive that set from `cargo tree -i dig-constants@<ver>`;
+a manifest read shows only the two pins dig-node owns and hides the other five entirely.
+
+**The 0.10.0 tip is not reachable from this workspace at all, and the reason is not dig-constants.**
+0.9.0 → 0.10.0 moved the crate from `chia-protocol` 0.26 / `chia-wallet-sdk` 0.30 to 0.36.1 / 0.34.
+dig-node builds against the 0.26 line, including a VENDORED `chia-protocol` fork that `dig-gossip`
+supplies through `[patch.crates-io]`. Depending on dig-constants 0.10 therefore links a SECOND
+`chia_protocol` into the graph, and `DIG_MAINNET.genesis_challenge()` returns a `Bytes32` that no
+function in the workspace accepts — eleven type errors of the form "expected `BytesImpl<32>`, found
+`chia_protocol::bytes::BytesImpl<32>`". Being current on dig-constants is downstream of migrating the
+whole node to chia 0.36; it is a platform migration wearing a dependency bump's clothes. 0.9 is the tip
+of dig-node's chia line and is the correct target until that migration lands.
+
+**The one value that actually moved: the DIG L2 genesis challenge, in 0.1.0 → 0.4.0.** 0.1.0 shipped an
+all-zeros PLACEHOLDER `DIG_MAINNET_GENESIS_CHALLENGE`, with all six AGG_SIG additional-data domains
+correctly derived from that placeholder — self-consistent, so no derivation test could see it. 0.4.0
+finalized the real challenge (`0af98186…`) and recomputed all six. Every value is stable from 0.4.0
+through 0.10.0; 0.5.1/0.8.0/0.9.0 are purely additive (DIG_ASSET_ID, treasury hash/address, DEK labels,
+`dig.local`, `rpc.dig.net`), and 0.9.0 → 0.10.0 changes only upstream chia plot-consensus FIELD NAMES,
+no DIG value. So a bump anywhere at or above 0.4.0 is value-neutral, and the ONE copy that mattered was
+0.1.0 — reached through `dig-clvm` 0.1.1, pinned by git rev in dig-wallet, whose spend-validation
+`ValidationContext` therefore described a different chain identity than the rest of the node. Nothing
+was mis-signed (that call site sets `DONT_VALIDATE_SIGNATURE`, and the signing domain is injected by the
+caller, not read from `DIG_MAINNET`), but the divergence was one refactor away from mattering. Moving
+dig-clvm to crates.io `0.2` removes it.
+
+The general lesson: when a shared-constants crate shows several versions in one lock, diff the VALUES
+across them before treating the collapse as a chore, and diff the crate's own dependency line before
+treating the tip as reachable. Here the version count was the least informative number in the problem.
+
+The placeholder was invisible to the test suite in both directions, and the reason generalizes: no
+source line pins the genesis literal (`grep 0af98186 --include=*.rs` finds nothing), and every runtime
+check reads `dig_constants::DIG_MAINNET.genesis_challenge()` on BOTH sides of its comparison. That is
+circular — it passes identically under the real value and under an all-zeros placeholder, so the suite
+stayed green while the defect shipped AND stayed green after it was fixed. A constant that is only ever
+compared against itself is unguarded no matter how many assertions mention it. The guard therefore lives
+where the defect is decided, in `dig-node-core/tests/dependency_tree.rs` against the workspace lock, as
+a FLOOR (no copy below 0.4.0) rather than an inequality against the one known-bad release — 0.2.x and
+0.3.x carry the same placeholder, so `!= "0.1.0"` would be bypassed by the next one.

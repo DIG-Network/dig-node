@@ -215,10 +215,25 @@ dig-nat = "0.18"
 # are re-declared at this SAME rev in the workspace `[patch.crates-io]` (a git dep's own patches do not
 # apply transitively — the #1529 3-rev lockstep: this dep rev + the two patch revs move together).
 dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "06bd79fb359834b416c466eca770d4a3c3f71aa1", default-features = false, features = ["rustls", "relay"] }
-# The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope. From
-# crates.io: dig-nat 0.7 requires `>=0.4, <0.6` and dig-gossip 0.7.1 requires `>=0.2, <0.5`, so `0.4`
-# sits in both windows and the whole graph resolves to ONE crates.io dig-constants 0.4.x.
-dig-constants = "0.4"
+# The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope.
+#
+# 0.9 is the TIP OF DIG-NODE'S CHIA LINE, and that — not 0.10 — is the correct target here (#2072).
+# dig-constants 0.10.0 moved to chia-protocol 0.36.1 / chia-wallet-sdk 0.34, while this workspace
+# builds against 0.26 / 0.30 including the chia-protocol fork dig-gossip vendors via
+# `[patch.crates-io]` above. Depending on 0.10 links a SECOND chia_protocol and every `Bytes32` this
+# crate reads off `DIG_MAINNET` stops unifying with the rest of the workspace. Being current on
+# dig-constants is therefore downstream of the chia 0.36 migration, not a version-string edit.
+#
+# Values are identical from 0.4.0 through 0.10.0 — the L2 genesis challenge and its six AGG_SIG
+# domains were finalized in 0.4.0 and have not moved since — so this bump is value-neutral and buys
+# the additive surface (DIG_ASSET_ID, the treasury hash/address, `dig.local`, `rpc.dig.net`).
+#
+# The graph still carries 0.4.0/0.5.1/0.8.0 because upstream crates hold them down through their
+# PUBLISHED ranges (dig-gossip `>=0.2, <0.5`, dig-nat `>=0.4, <0.6`, dig-download `^0.8`), which a
+# consumer cannot edit. Collapsing to a single copy needs each of those to release against 0.9 —
+# the release-first cascade on #2072. Do NOT pin this BACK to widen a window: the fix is upstream
+# moving forward, never dig-node drifting backward.
+dig-constants = "0.9"
 # -- L7 content-location DHT (PHASE-B, #163) ---------------------------------------------------------
 # The Kademlia DHT that maps DIG content (store / capsule / root / resource) to the peer_ids holding
 # it. The node LOCATES content it lacks via `find_providers`, and keeps its OWN held-inventory provider
