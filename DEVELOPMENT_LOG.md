@@ -4,6 +4,18 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## Local-RPC authz — holder-REVEALING reads gate too, not just mutators (#2108)
+
+Holder-revealing `cache.*` READS must be control-token-gated over the HTTP (loopback) surface, not
+just the holder-MUTATING ones (`fetchAndCache`/`pushCapsule`). `cache.listCached` enumerates the
+operator's cached-capsule inventory (storeId:rootHash, sizes, LRU order), deanonymizing consumed
+content, so a cross-site page POSTing to `dig.local` (DNS-rebinding / local-service attack) could read
+it. The gate lives at the transport (`server.rs` `rpc`), not the core dispatch handler. The #2032
+WS-parity lesson applies to reads too: verify the second (`/ws`) transport before declaring a method
+gated — here `cache.*` is NOT WS-routable because `ws_dispatch`'s fall-through hits `WalletBackend::
+dispatch`, whose match has no `cache.*` arm (returns "unknown method"), so the HTTP gate is the only
+reachable surface. FFI/in-process callers never reach the HTTP handler and stay open.
+
 ## Authority validation is not memory backpressure — bound the reassembly state too (#2149)
 
 `cache.pushCapsule` reassembles chunked capsule uploads in a process-wide `HashMap<(cache_dir,

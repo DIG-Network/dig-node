@@ -980,14 +980,23 @@ async fn rpc(
         );
     }
 
-    // LANDING gate (#1654/#1476): `cache.fetchAndCache` (fetch + cache + DHT-announce a capsule of the
-    // CALLER'S choosing) and `cache.pushCapsule` (accept + cache + DHT-announce capsule BYTES the caller
-    // supplies) both make this node a durable holder — the same holder side effect (SPEC §14.3/§21.3).
-    // Over the HTTP surface a loopback address does not prove the operator authorized the call (a
-    // cross-site page can POST to `dig.local`), so each requires the control token exactly like
-    // `control.*`: the master control token OR a valid paired token. The in-process FFI `cache.*` path
-    // stays open (SYSTEM.md) — it never reaches this HTTP `rpc` handler. Reads remain ungated.
-    if method == "cache.fetchAndCache" || method == "cache.pushCapsule" {
+    // LANDING gate (#1654/#1476/#2108): the holder-revealing `cache.*` methods over the HTTP surface.
+    // `cache.fetchAndCache` (fetch + cache + DHT-announce a capsule of the CALLER'S choosing) and
+    // `cache.pushCapsule` (accept + cache + DHT-announce capsule BYTES the caller supplies) both make
+    // this node a durable holder — the same holder side effect (SPEC §14.3/§21.3). `cache.listCached`
+    // ENUMERATES the operator's full cached-capsule inventory (storeId:rootHash, sizes, LRU order),
+    // which deanonymizes what content the user has consumed (#2108) — a read, but a HOLDINGS-revealing
+    // one, so it is gated identically. Over the HTTP surface a loopback address does not prove the
+    // operator authorized the call (a cross-site page can POST to `dig.local` — DNS-rebinding /
+    // local-service attack), so each requires the control token exactly like `control.*`: the master
+    // control token OR a valid paired token. The in-process FFI `cache.*` path stays open (SYSTEM.md) —
+    // it never reaches this HTTP `rpc` handler. Anonymous public CONTENT reads remain ungated; only
+    // these holder-/holdings-revealing methods are gated. (WS parity: `cache.*` is not routable over
+    // `/ws` — the wallet-backend fall-through has no `cache.*` arm — asserted in the server tests.)
+    if method == "cache.fetchAndCache"
+        || method == "cache.pushCapsule"
+        || method == "cache.listCached"
+    {
         let header_tok = headers
             .get(control::CONTROL_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok());
@@ -1006,10 +1015,12 @@ async fn rpc(
                 Json(rpc_error(
                     id,
                     ErrorCode::Unauthorized,
-                    "cache.fetchAndCache / cache.pushCapsule require the local control token \
-                     (X-Dig-Control-Token header or params._control_token) or a paired controller \
-                     token (see `dig-node pair`): each makes this node a durable DHT holder of the \
-                     requested capsule, so it is not a public read",
+                    "cache.fetchAndCache / cache.pushCapsule / cache.listCached require the local \
+                     control token (X-Dig-Control-Token header or params._control_token) or a paired \
+                     controller token (see `dig-node pair`): fetchAndCache/pushCapsule make this node \
+                     a durable DHT holder of the requested capsule, and listCached enumerates the \
+                     operator's cached-capsule inventory (deanonymizing consumed content) — none is a \
+                     public read",
                 )),
             );
         }
