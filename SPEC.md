@@ -929,7 +929,7 @@ windows itself. The envelope MUST therefore describe both the WHOLE resource and
 | `next_offset` | every window | the next window's offset, or **`null`** on the last one |
 | `root` | every window | the generation root the window was served against |
 | `inclusion_proof` | every window | base64 whole-resource Merkle inclusion proof |
-| `chunk_lens` | first window (`offset == 0`) | per-chunk ciphertext lengths of the WHOLE resource |
+| `chunk_lens` | prologue (once per stream, PAGED) | per-chunk ciphertext lengths of the WHOLE resource |
 | `source` | node profile | `"local"` or `"remote"` — where this node served it from |
 
 This table is normative and MUST agree field-for-field with `ChunkObject` in docs.dig.net's
@@ -959,9 +959,21 @@ isolation and MUST hold the complete resource before verifying. Every window car
 that whichever window a client happens to receive first can supply it — not so that windows can be
 verified independently.
 
-`chunk_lens` is the ONE field that rides the first window only. It describes how to split the
-REASSEMBLED resource, which a client cannot act on until it holds every window; a client that
-begins mid-resource therefore cannot decrypt a multi-chunk resource and MUST fetch window 0.
+`chunk_lens` is a PROLOGUE field: it describes how to split the REASSEMBLED resource, so a client
+cannot act on it until it holds every window, and a client that begins mid-resource cannot decrypt a
+multi-chunk resource and MUST fetch from the start. It is sent once per stream and MUST NOT be
+repeated. On the peer length-prefixed frame stream it is **PAGED**: a layout exceeding
+`dig_nat::MAX_CHUNK_LENS_PER_FRAME` (2048) entries cannot state itself on one frame, so it is split
+into pages of at most 2048 entries each, and every frame carrying a page is stamped with the
+`chunk_lens_offset` at which its page begins. When the requested bytes are exhausted before the
+layout is fully sent, the remaining pages ride trailing **prologue-only continuation frames** — a
+frame with a zero-length data payload that carries byte-`offset = 0` (NOT the ascending byte cursor,
+which by then equals the resource length and would trip a reader's `offset >= max_len` establish
+guard) and NO `chunk_index` (it begins no chunk, and a stale index would trip the reader's
+ascending-index rewind guard). A prologue-only frame does NOT terminate the stream; the stream is
+complete only once the bytes are exhausted AND every prologue page has been sent. (The single-frame
+JSON-RPC `dig.fetchRange` response is not framing-bound and carries the whole layout on its one
+frame.)
 
 **Window size.** A window is at most **3 MiB** of ciphertext. This node currently IGNORES the
 `length` request parameter and always serves a full window (or the remainder), where

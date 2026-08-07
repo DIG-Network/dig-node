@@ -104,42 +104,6 @@ pub(crate) struct RangeVerification<'a> {
     pub inclusion_proof: Option<&'a str>,
 }
 
-/// Split `chunk_lens` into the pages a paged prologue is made of: page-aligned offsets, each page
-/// exactly [`dig_nat::MAX_CHUNK_LENS_PER_FRAME`] entries except a possibly-short tail.
-///
-/// This mirrors `dig_nat::RangeFrame::split_chunk_lens_pages`, which is the normative split and the
-/// reassembler's own mirror. It is reproduced here ONLY because that helper landed in dig-nat 0.14,
-/// while this node is held at 0.13 by dig-download and dig-gossip (see the dependency rationale in
-/// `Cargo.toml`); the moment the tree reaches 0.14 this function MUST be deleted in favour of it —
-/// tracked as DIG-Network/dig_ecosystem#1686 (the dig-gossip + dig-peer-selector cascade onto dig-nat
-/// ^0.14 / dig-dht ^0.8), so the mirror's removal is traceable from here rather than depending on
-/// someone remembering why it exists,
-/// because #1640 was precisely two sides of one rule maintained separately. The page SIZE is read from
-/// dig-nat either way, so the one number that matters cannot drift.
-///
-/// The shape is what the reassembler requires, and each requirement excludes a whole class rather
-/// than one observed misbehaviour:
-///
-/// * no page is EMPTY — an empty page fills nothing, so accepting one lets a sender stream frames
-///   forever without ever completing the prologue;
-/// * every page except the tail is exactly full — a short page anywhere but the end leaves a gap no
-///   page-aligned page can ever fill, so it is refused on arrival rather than surfacing later as an
-///   unexplained incompleteness;
-/// * an empty ARRAY yields no pages at all, which is a complete prologue for a resource with no chunk
-///   table rather than a stream that can never finish.
-fn chunk_lens_pages(chunk_lens: &[u64]) -> Vec<(u64, Vec<u64>)> {
-    chunk_lens
-        .chunks(dig_nat::MAX_CHUNK_LENS_PER_FRAME)
-        .enumerate()
-        .map(|(page, entries)| {
-            (
-                (page * dig_nat::MAX_CHUNK_LENS_PER_FRAME) as u64,
-                entries.to_vec(),
-            )
-        })
-        .collect()
-}
-
 /// The absolute chunk index that byte `offset` begins, or `None` when `offset` is not on a chunk
 /// boundary (or lies past the resource).
 ///
@@ -186,7 +150,11 @@ impl<'a> RangeStreamFramer<'a> {
         let pending_pages = if skip_layout {
             VecDeque::new()
         } else {
-            chunk_lens_pages(verification.chunk_lens).into()
+            // The normative split lives in dig-nat, published together with its reassembler mirror so
+            // encode + decode cannot drift (#1640/#1686): page-aligned offsets, each page exactly
+            // `MAX_CHUNK_LENS_PER_FRAME` entries except a possibly-short tail; an empty layout yields no
+            // pages, which is a complete prologue for a resource with no chunk table.
+            dig_nat::RangeFrame::split_chunk_lens_pages(verification.chunk_lens).into()
         };
         RangeStreamFramer {
             verification,
@@ -205,6 +173,7 @@ impl<'a> RangeStreamFramer<'a> {
     /// afterwards and applies `with_complete` itself. Setting `complete` on a frame that still owes
     /// pages would stop a conforming reader before the layout it needs to DECRYPT ever arrives.
     pub(crate) fn next_frame(&mut self, start: u64, bytes: Vec<u8>) -> dig_nat::RangeFrame {
+        let has_payload = !bytes.is_empty();
         let mut frame = dig_nat::RangeFrame::data(start, bytes);
 
         // The identity set rides EVERY frame. `chunk_count` is the resource's TOTAL entry count, so a
@@ -229,8 +198,14 @@ impl<'a> RangeStreamFramer<'a> {
             frame.total_length = Some(self.verification.total_length);
             frame.chunk_count = Some(chunk_count);
         }
-        if let Some(index) = chunk_index_at(self.verification.chunk_lens, start) {
-            frame = frame.with_chunk_index(index);
+        // A chunk index identifies which chunk this frame's PAYLOAD begins. A zero-payload frame (a
+        // trailing prologue-only continuation) begins no chunk, so it must carry no index: the 0.17
+        // reader's rewind guard rejects a frame whose `chunk_index < highest_chunk_index`, and a
+        // page-only frame stamped with chunk 0 after real chunks have gone out would trip exactly that.
+        if has_payload {
+            if let Some(index) = chunk_index_at(self.verification.chunk_lens, start) {
+                frame = frame.with_chunk_index(index);
+            }
         }
 
         if self.skip_layout {
