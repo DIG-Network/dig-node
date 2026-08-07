@@ -181,7 +181,11 @@ loopback admin / in-process FFI dispatch (`handle_rpc`).
   through it.
 - **`cache.clear`** → `{}`.
 - **`cache.listCached`** → the durable module inventory: `{ cached: [ { capsule: "storeId:rootHash",
-  store_id: 64hex, root: 64hex, size_bytes: u64, last_used_unix_ms: u64 } ] }` (§3, §6).
+  store_id: 64hex, root: 64hex, size_bytes: u64, last_used_unix_ms: u64 } ] }` (§3, §6). Over the HTTP
+  (loopback) surface this READ is **control-token gated** like `cache.fetchAndCache` (#2108): the
+  inventory reveals the operator's held capsules, deanonymizing consumed content, so an unauthorized
+  HTTP call is rejected `UNAUTHORIZED` (-32030) with no inventory in the body. The in-process FFI
+  `cache.*` path stays open — it never reaches the HTTP handler.
 - **`cache.removeCached`** `{ store_id: 64hex, root: 64hex }` → `{ removed: bool }`. Error `-32602`.
 - **`cache.fetchAndCache`** `{ store_id: 64hex, root: 64hex }` → `{ status:
   "cached"|"already_cached"|"failed", size_bytes?: u64, served_root?: 64hex, message?: string }`.

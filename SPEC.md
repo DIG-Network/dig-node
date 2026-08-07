@@ -5060,7 +5060,17 @@ address does not prove operator intent (a cross-site page can POST to `dig.local
 require the local control token (the `X-Dig-Control-Token` header or `params._control_token`) OR a valid
 paired controller token, exactly like a `control.*` method; an unauthorized call is rejected
 `UNAUTHORIZED` (-32030) before any landing work. The in-process FFI `cache.*` path is the operator's own
-process and MUST stay open — it never traverses this HTTP handler. Reads remain ungated.
+process and MUST stay open — it never traverses this HTTP handler. Anonymous public CONTENT reads remain
+ungated.
+
+The same HTTP token-gate MUST also bind `cache.pushCapsule` (§5.5.3, the same holder side effect) and
+`cache.listCached` (#2108). `cache.listCached` is a READ, but a HOLDINGS-revealing one: it enumerates the
+operator's full cached-capsule inventory (`storeId:rootHash`, sizes, LRU order), which deanonymizes what
+content the user has consumed. Over the loopback HTTP surface a cross-site page (DNS-rebinding /
+local-service attack) could otherwise POST here and read it, so `cache.listCached` MUST require the same
+control/paired token and is rejected `UNAUTHORIZED` (-32030) with no inventory in the body when
+unauthorized. The FFI path stays open, and `cache.*` is not routable over the `/ws` transport (the
+wallet-backend fall-through has no `cache.*` arm), so the HTTP gate is the only reachable surface.
 
 ### 21.10. Reverse-proxy trust caveat (informative)
 
