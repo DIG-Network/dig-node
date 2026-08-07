@@ -4,6 +4,28 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## A tag push can succeed and create ZERO workflow runs (dig_ecosystem#2290)
+
+`git push origin vX.Y.Z` reporting `* [new tag] v0.99.9 -> v0.99.9` does NOT mean a `push: tags:`
+workflow ran. On 2026-08-06 that push landed and GitHub created **no** runs from it — neither
+`release.yml` nor `package.yml` — while the `HEAD:main` push one second earlier in the same step
+DID create one. So this was not an outage, a disabled workflow, or the documented
+`GITHUB_TOKEN`-does-not-retrigger rule (the tag was pushed by `RELEASE_TOKEN`, as the eleven
+preceding tags were, and `package.yml` has fired on tags 55 times). Run creation from a push event
+is effectively at-most-once, and a release path that assumes otherwise has a silent single point
+of failure. **Never treat a successful tag push as proof the release fired — confirm the run
+exists, and dispatch against the tag ref if it does not** (`ref_type == 'tag'` publish gates are
+satisfied by a dispatch selected against a tag, which is what makes the repair equivalent).
+
+Two traps around it. **Reading run history by recency lies:** `package.yml`'s ten most recent runs
+were all `event=pull_request`, which reads as "this has never fired on a tag" — filter by
+`?event=push` before concluding a trigger is dead. And **a partial manual repair is worse than
+none:** dispatching `release.yml` alone produced a `latest` release of bare binaries, and because
+dig-updater's feedsign resolves dig-node by native-package file names and fails closed on the
+ENTIRE manifest, that froze — then expired — stable auto-update for all five components, dig-app
+included. A dig-node release without its `.msi`/`.pkg`/`.deb` is not a partial dig-node release,
+it is an ecosystem-wide auto-update outage.
+
 ## Local-RPC authz — holder-REVEALING reads gate too, not just mutators (#2108)
 
 Holder-revealing `cache.*` READS must be control-token-gated over the HTTP (loopback) surface, not
