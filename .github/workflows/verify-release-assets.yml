@@ -76,7 +76,25 @@ jobs:
           # EXACTLY the names dig-updater's feedsign looks for. Kept as a literal list rather than
           # derived from a glob: a glob would happily accept a `.deb` for the wrong arch or a
           # stale version and call the release complete, which is the failure this guard exists to
-          # catch. If feedsign's expectations change, this list changes with them.
+          # catch.
+          #
+          # THIS IS THE THIRD COPY OF A CROSS-REPO CONTRACT, and a shell step cannot import the
+          # Rust constant that owns it. Producer: `package.yml` in this repo. Consumer:
+          # `dig-updater/crates/dig-updater-feedsign/src/resolve.rs` (`asset_name_parts`).
+          # Verifier: here. Nothing enforces that the three agree, so they are held together by
+          # `SYSTEM.md` (dig-updater section, "dig-node release-asset file names") and the
+          # `canonical` skill (beacon/update trust anchors). Change one, change all three.
+          #
+          # Note macOS contributes ONE name, not two: the `.pkg` is universal and carries no arch
+          # token, so `macos/arm64` and `macos/x64` both resolve to it — feedsign's five platforms
+          # yield four distinct file names.
+          #
+          # `arm64.deb` is required here DELIBERATELY, and this is stricter than feedsign's own
+          # failure condition. feedsign fails closed only when a component resolves ZERO assets, so
+          # a release missing just `arm64.deb` would still publish — silently dropping linux/arm64
+          # hosts from auto-update rather than reddening anything. That silent drop is exactly the
+          # arm64 platform floor (#1741/#1736/#2126), so the stable channel treats a missing arm64
+          # package as a failed release. Do not relax this to match feedsign.
           EXPECTED=(
             "dig-node_${VERSION}_amd64.deb"
             "dig-node_${VERSION}_arm64.deb"

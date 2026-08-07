@@ -227,26 +227,54 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
           REPO: ${{ github.repository }}
           TAG: ${{ steps.ver.outputs.tag }}
+          FORCE_TAG: ${{ steps.ver.outputs.force }}
         run: |
           set -euo pipefail
+
+          # A run "for this tag" must mean a run for THIS CUT of the tag, not merely one that
+          # carried the same tag NAME at some point. `gh run list --branch` matches on the name
+          # alone, and a tag name is not stable: a `force` re-cut moves it onto a new commit. So
+          # the commit is the identity, and the run's `headSha` is what is compared.
+          #
+          # Without that, a force re-cut whose tag event is lost finds the PREVIOUS cut's runs,
+          # dispatches nothing, and the asset guard then passes on the PREVIOUS cut's packages —
+          # a green release run shipping stale binaries under a moved tag, wearing exactly the
+          # success signature of a correct release. That is the failure class this step exists to
+          # remove, so it must not be reachable through the step itself.
+          TAG_COMMIT="$(git rev-parse "$TAG^{commit}")"
+
+          runs_for_this_cut() {
+            gh run list --repo "$REPO" --workflow "$1" --branch "$TAG" \
+              --json headSha --jq "[.[] | select(.headSha == \"$TAG_COMMIT\")] | length"
+          }
+
+          # A force re-cut ALWAYS dispatches, without consulting history. The documented reason to
+          # force is "the build failed, re-fire it" — and a failed run is still a run at the right
+          # commit, so any count-based check reads the wreckage of the previous attempt as success
+          # and turns the retry into a silent no-op that then burns the guard's full timeout before
+          # going red. Re-cutting is an explicit request for fresh builds; treat it as one.
+          if [ "${FORCE_TAG:-}" = "true" ]; then
+            echo "force re-cut of $TAG at $TAG_COMMIT — dispatching both release workflows unconditionally (a re-cut is a request for fresh builds; an earlier run at this tag may be the failed one being retried)."
+            for wf in release.yml package.yml; do
+              gh workflow run "$wf" --repo "$REPO" --ref "$TAG"
+            done
+            exit 0
+          fi
 
           # Run creation is asynchronous; give the event a fair chance before declaring it lost.
           # A false "lost" is cheap here (the dispatch is idempotent and the publish is tag-gated),
           # but waiting avoids a pointless duplicate run on every single release.
           for _ in $(seq 1 12); do
             sleep 10
-            release_runs="$(gh run list --repo "$REPO" --workflow release.yml --branch "$TAG" --json databaseId --jq 'length')"
-            package_runs="$(gh run list --repo "$REPO" --workflow package.yml --branch "$TAG" --json databaseId --jq 'length')"
-            [ "$release_runs" -gt 0 ] && [ "$package_runs" -gt 0 ] && break
+            [ "$(runs_for_this_cut release.yml)" -gt 0 ] && [ "$(runs_for_this_cut package.yml)" -gt 0 ] && break
           done
 
           for wf in release.yml package.yml; do
-            count="$(gh run list --repo "$REPO" --workflow "$wf" --branch "$TAG" --json databaseId --jq 'length')"
-            if [ "$count" -gt 0 ]; then
-              echo "$wf: the tag push created a run for $TAG."
+            if [ "$(runs_for_this_cut "$wf")" -gt 0 ]; then
+              echo "$wf: the tag push created a run for $TAG at $TAG_COMMIT."
               continue
             fi
-            echo "::warning::$wf did NOT run for $TAG — the tag-push event was not delivered. Dispatching it explicitly against the tag ref so the release is not published incomplete."
+            echo "::warning::$wf did NOT run for $TAG at $TAG_COMMIT — the tag-push event was not delivered. Dispatching it explicitly against the tag ref so the release is not published incomplete."
             gh workflow run "$wf" --repo "$REPO" --ref "$TAG"
           done
 
