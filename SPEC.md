@@ -1174,6 +1174,28 @@ OPENED push MUST additionally prove the caller is the store's **§21.6/§21.9 au
 the target store: the pushed module commits a publisher public key whose `SHA-256` DERIVES `store_id`
 (`store_id = sha256(publisher_pubkey)`, the DIG store-identity derivation), AND the request carries a
 BLS signature over `SHA-256(root || store_id)` that verifies under that key. The merkle-integrity
+check RECOMPUTES the merkle root from the capsule's own SERVED CONTENT — for each **current-generation**
+`KeyTable` entry, `leaf = resource_leaf(concat_output(its ChunkPool ciphertexts))`, the leaves sorted
+ASCENDING by `static_key`, folded with `MerkleTree::from_leaves` — and refuses the push unless it
+reproduces the committed `CurrentRoot`. The recompute is SCOPED TO THE CURRENT GENERATION: the embedded
+`KeyTable` is multi-generation (the producer stores one entry per (generation, resource), each stamped
+with THAT generation's root), but the committed `CurrentRoot` is folded over the CURRENT generation only
+(`current_generation_leaves(generations.last())`), whose `gen.root()` equals `CurrentRoot`. So the
+recompute folds ONLY entries whose `entry.generation == CurrentRoot`; folding every generation's entries
+over-counts and would false-reject the genuine current content of any store published then updated even
+once (#2246). The recompute is also BOUNDED against a remote pre-auth OOM/CPU-DoS: `chunk_indices` is
+attacker-controlled and permits repeated indices (the producer dedups chunks), so the TOTAL referenced
+ciphertext bytes across the module is capped at `MAX_STORE_BYTES` and each resource's leaf is hashed by
+STREAMING its ciphertexts into an incremental SHA-256 (O(1) memory) rather than materializing their
+concatenation — without which a ~1 MB module addressing one chunk N times could reference gigabytes and
+abort the allocator (#2246). The attacker-supplied `MerkleNodes` digests are NEVER trusted for this
+decision (retained only as a defense-in-depth cross-check that the served inclusion proofs match the
+content): a single-leaf `from_leaves(vec![x]).root() == x` meant a `MerkleNodes = [chain_root]` plus an
+empty/garbage `ChunkPool` recomputed to the committed root for free, admitting a contentless
+phantom-holder capsule (#2246/#2240). An absent `KeyTable`/`ChunkPool`, a chunk index the pool cannot
+satisfy, an undecodable section, a `MerkleNodes`↔content mismatch, or referenced content exceeding
+`MAX_STORE_BYTES` fails closed; a legitimately EMPTY store folds to `from_leaves(vec![]).root() == sha256(&[])` and passes. A header naming the chain root is
+not proof the bytes hash to it. This
 check gives INTEGRITY, never AUTHORITY — without the writer check an opened node would be an
 unauthenticated cache-poison + DHT-announce-amplification surface (the #179/#1576 class). A push that
 arrives on the peer surface with no signature, a signature under a key that does not derive
@@ -1912,7 +1934,18 @@ NOT make naming a near key cost an on-chain mint: a peer may name any `(store, r
 near our `peer_id` and, on an opted-in node, drive a CHEAP DHT provider-lookup for it (a key that names
 no real store simply finds no providers and the pull fails there — the low cost is "no providers", not
 a per-key mint). The on-chain-mint + merkle cost binds a LATER step — actually becoming a cached
-HOLDER: a pulled module is bound to its `root` by merkle verification and is never SERVED as current
+HOLDER: a pulled module is bound to its `root` by merkle verification — the admit gate
+(`ChainAnchoredModuleVerifier`, shared by the reshare-admit pull AND the `cache.pushCapsule` land via
+`verify_capsule_integrity`) RECOMPUTES the merkle root from the capsule's own SERVED CONTENT (per
+`KeyTable` entry, `leaf = resource_leaf(concat_output(its ChunkPool ciphertexts))`, leaves sorted
+ASCENDING by `static_key`, folded via `MerkleTree::from_leaves`) and refuses (`NotAnchored`) unless it
+equals the committed `CurrentRoot`. The attacker-supplied `MerkleNodes` digests are NEVER trusted for
+the admit decision (only cross-checked for served-proof consistency): trusting them let a single-leaf
+`MerkleNodes = [chain_root]` plus an empty/garbage `ChunkPool` recompute to the committed root for free
+and admit a contentless phantom-holder capsule (#2246/#2240). So a header-matching but
+tampered/incomplete `.dig` (or one with an absent `KeyTable`/`ChunkPool`, an out-of-range chunk index,
+or an undecodable section) is never admitted; a legitimately EMPTY store folds to `sha256(&[])` and is.
+It is never SERVED as current
 unless `root` equals the chain-anchored tip (the serve-time read-path pin, §7.10d(a) / §14.4). So the
 worst a near-key attacker extracts from an opted-in node is a bounded, single-flighted, byte-capped
 pull of REAL near-neighbourhood content of a possibly-old generation — never caching of fabricated,

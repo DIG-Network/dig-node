@@ -25,6 +25,47 @@ dig-updater's feedsign resolves dig-node by native-package file names and fails 
 ENTIRE manifest, that froze — then expired — stable auto-update for all five components, dig-app
 included. A dig-node release without its `.msi`/`.pkg`/`.deb` is not a partial dig-node release,
 it is an ecosystem-wide auto-update outage.
+## Admit gate must recompute from CONTENT, not from the attacker's MerkleNodes digests (#2246/#2240)
+
+`ChainAnchoredModuleVerifier` (the capsule-admit gate shared by the reshare-admit pull AND the
+`cache.pushCapsule` land via `verify_capsule_integrity`) once only byte-compared the capsule's committed
+`CurrentRoot` header against the chain-anchored root. A first fix RECOMPUTED
+`MerkleTree::from_leaves(decode_merkle_leaves(MerkleNodes)).root()` — but that was HOLLOW and adversarial
+verification refuted it. Rule 4 already forces `committed_root == chain_root` (a public value); a
+one-leaf tree's root IS that leaf (`from_leaves` does NOT re-tag leaves — `LEAF_TAG` is applied only in
+`build`, and there is no fold for a single leaf); and `decode_merkle_leaves` accepts arbitrary bytes. So
+`MerkleNodes = [chain_root]` plus an empty or garbage `ChunkPool` recomputed to the committed root FOR
+FREE — admitting, caching, serving, and DHT-announcing a contentless phantom-holder capsule. Trusting
+attacker-supplied digests for an admit decision proves nothing.
+
+The gate now recomputes the root from the SERVED CONTENT: for each `KeyTable` (id 8) entry, gather its
+chunk ciphertexts from the `ChunkPool` (id 9) via `datasection::read_chunk`, `leaf =
+merkle::resource_leaf(serving::concat_output(cts))`, SORT the `(static_key, leaf)` pairs ASCENDING by
+`static_key`, then fold `MerkleTree::from_leaves`. The sort is load-bearing: the producer
+(`digstore-store` `store.rs`) sorts `resource_leaves.sort_by_key(|r| r.0)` before folding, but KeyTable
+storage order is NOT guaranteed sorted, so recomputing in storage order yields the wrong root for ≥2
+resources. `MerkleNodes` is retained ONLY as a defense-in-depth cross-check (its leaves must equal the
+sorted content leaves, since the served inclusion proofs are generated from it) — never as the trust
+anchor. Fail-closed on an absent `KeyTable`/`ChunkPool`, an out-of-range chunk index, an undecodable
+section, or a `MerkleNodes`↔content mismatch. A legitimately EMPTY store (no entries) folds to
+`from_leaves(vec![]).root() == sha256(&[])` and MUST be admitted, not errored (§5.1). Lesson: an
+integrity gate must bind the BYTES it will serve, never a sibling digest field the same attacker chose.
+
+The content recompute is CURRENT-GENERATION-SCOPED (#2246 gen-scoping fix): the embedded `KeyTable` is
+MULTI-generation (`digstore-compiler` `key_table.rs` pushes one entry per (generation, resource), each
+stamped `entry.generation = gen.root()`), but the committed `CurrentRoot` is folded over the CURRENT
+generation ONLY (`pipeline.rs` → `current_generation_leaves(generations.last())`, whose `gen.root()` ==
+`CurrentRoot`). Folding EVERY entry over-counts leaves, so ANY store published then updated even once
+(≥2 generations — the normal lifecycle) was false-rejected `NotAnchored`, breaking admit/cache/announce.
+Fix: fold only entries where `entry.generation.0 == committed_root`. The single-generation fixtures
+missed this — a faithful multi-gen fixture is now the regression. Also DoS-bounded (#2246): `chunk_indices`
+is attacker-controlled and legitimately permits REPEATED indices (the producer dedups chunks — identical
+or shared chunks yield repeated/non-increasing global indices, so repeats can't be banned), so a ~1 MB
+module with `chunk_indices=[0;N]` over one large chunk would `concat_output` gigabytes and abort the
+allocator. Fix: STREAM each ciphertext into an incremental SHA-256 (`resource_leaf(concat)==sha256(ct0++ct1++…)`
+since `resource_leaf` is plain sha256 and `concat_output` is plain concat → O(1) memory) AND cap total
+referenced bytes at `MAX_STORE_BYTES` (bounds CPU). Lesson: recompute-from-content must scope to the
+producer's committed generation AND bound attacker-controlled index fan-out.
 
 ## Local-RPC authz — holder-REVEALING reads gate too, not just mutators (#2108)
 

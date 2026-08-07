@@ -506,19 +506,82 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use digstore_core::datasection::encode_blob;
+    use digstore_core::datasection::{
+        encode_blob, encode_chunk_pool, encode_key_table, encode_merkle_nodes,
+    };
+    use digstore_core::merkle::{resource_leaf, MerkleTree};
+    use digstore_core::serving::concat_output;
+    use digstore_core::KeyTableEntry;
 
     use crate::seams::dig_peer::peer_network::PeerNetwork;
 
-    /// A minimal but genuine `.dig` data-section blob committing `(store_id, root, publisher_pk)` plus
-    /// filler to reach `min_len` bytes — enough for the anchor verifier AND the authority check, and
-    /// (with a large `min_len`) a multi-window fixture.
-    fn push_module(store: [u8; 32], root: [u8; 32], pk: &Bytes48, min_len: usize) -> Vec<u8> {
-        encode_blob(&[
+    /// A FAITHFUL `.dig` data-section blob committing `(store_id, root, publisher_pk)` whose `ChunkPool`
+    /// content actually recomputes to the committed `root`, plus filler to reach `min_len` bytes —
+    /// enough for the anchor verifier AND the authority check, and (with a large `min_len`) a
+    /// multi-window fixture. Returns `(blob, root)`: the root is DERIVED from the content (a preimage
+    /// of an arbitrary root cannot be chosen), so callers use the returned root as the capsule's root.
+    ///
+    /// Mirrors the producer recipe (`module_anchor.rs::honest_capsule_blob`): one resource with a
+    /// `seed`-derived `static_key` and a single content chunk; its leaf is
+    /// `resource_leaf(concat_output(cts))`, the one-leaf tree's root IS the committed root, and the
+    /// `KeyTable`/`ChunkPool`/`MerkleNodes` are mutually consistent — the shape a genuine capsule has,
+    /// so the admit gate's rule-5 recompute admits it. A capsule whose ChunkPool does NOT recompute is
+    /// refused; `push_module_bad_merkle` builds that shape.
+    fn push_module(store: [u8; 32], pk: &Bytes48, seed: u8, min_len: usize) -> (Vec<u8>, [u8; 32]) {
+        let chunk = format!("faithful capsule content for seed {seed:#04x}").into_bytes();
+        let leaf = resource_leaf(&concat_output(&[chunk.as_slice()]));
+        let leaves = vec![leaf];
+        let root = MerkleTree::from_leaves(leaves.clone()).root().0;
+        let entries = vec![KeyTableEntry {
+            static_key: Bytes32([seed; 32]),
+            generation: Bytes32(root),
+            chunk_indices: vec![0],
+            total_size: chunk.len() as u64,
+        }];
+
+        let mut sections = vec![
             (SectionId::StoreId as u16, store.to_vec()),
             (SectionId::CurrentRoot as u16, root.to_vec()),
             (SectionId::PublicKey as u16, pk.0.to_vec()),
-            (SectionId::Filler as u16, vec![0x5a; min_len]),
+            (SectionId::KeyTable as u16, encode_key_table(&entries)),
+            (
+                SectionId::ChunkPool as u16,
+                encode_chunk_pool(&[chunk.as_slice()]),
+            ),
+            (SectionId::MerkleNodes as u16, encode_merkle_nodes(&leaves)),
+        ];
+        if min_len > 0 {
+            sections.push((SectionId::Filler as u16, vec![0x5a; min_len]));
+        }
+        (encode_blob(&sections), root)
+    }
+
+    /// Like [`push_module`] but the `ChunkPool` content recomputes to a DIFFERENT root than the
+    /// committed `CurrentRoot` — a header-matching-but-tampered capsule (#2246/#2240). The committed
+    /// header commits the caller's `root` (so a byte-compare on `CurrentRoot` passes), while the served
+    /// `ChunkPool`/`KeyTable` fold to the content's own root, which cannot equal an arbitrary `root`.
+    /// The integrity gate's rule-5 recompute must refuse it before it lands.
+    fn push_module_bad_merkle(store: [u8; 32], root: [u8; 32], pk: &Bytes48) -> Vec<u8> {
+        let chunk = b"tampered capsule content".to_vec();
+        let leaf = resource_leaf(&concat_output(&[chunk.as_slice()]));
+        let leaves = vec![leaf];
+        let entries = vec![KeyTableEntry {
+            static_key: Bytes32([0xab; 32]),
+            generation: Bytes32(root),
+            chunk_indices: vec![0],
+            total_size: chunk.len() as u64,
+        }];
+        encode_blob(&[
+            (SectionId::StoreId as u16, store.to_vec()),
+            // Header commits the caller's `root`, but the ChunkPool below folds to the content's root.
+            (SectionId::CurrentRoot as u16, root.to_vec()),
+            (SectionId::PublicKey as u16, pk.0.to_vec()),
+            (SectionId::KeyTable as u16, encode_key_table(&entries)),
+            (
+                SectionId::ChunkPool as u16,
+                encode_chunk_pool(&[chunk.as_slice()]),
+            ),
+            (SectionId::MerkleNodes as u16, encode_merkle_nodes(&leaves)),
         ])
     }
 
@@ -614,9 +677,8 @@ mod tests {
     #[tokio::test]
     async fn a_local_push_lands_and_announces_exactly_once() {
         let (_sk, pk, store) = store_keypair(0x11);
-        let root = [0x22; 32];
+        let (module, root) = push_module(store, &pk, 0x22, 0);
         let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
-        let module = push_module(store, root, &pk, 0);
 
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
         let node = node.as_ref();
@@ -649,9 +711,8 @@ mod tests {
     #[tokio::test]
     async fn a_repushed_capsule_does_not_announce_twice() {
         let (_sk, pk, store) = store_keypair(0x33);
-        let root = [0x44; 32];
+        let (module, root) = push_module(store, &pk, 0x44, 0);
         let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
-        let module = push_module(store, root, &pk, 0);
 
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
         let node = node.as_ref();
@@ -679,10 +740,9 @@ mod tests {
     #[tokio::test]
     async fn chunked_reassembly_lands_and_root_mismatch_is_rejected() {
         let (_sk, pk, store) = store_keypair(0x55);
-        let root = [0x66; 32];
-        let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
         // A ~200 KiB module so a small window forces multiple chunks.
-        let module = push_module(store, root, &pk, 200 * 1024);
+        let (module, root) = push_module(store, &pk, 0x66, 200 * 1024);
+        let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
         let total = module.len();
         let win = 64 * 1024;
 
@@ -734,7 +794,9 @@ mod tests {
         // Root-mismatch: bytes commit a DIFFERENT root than requested → rejected, nothing lands.
         let wrong_root = [0x67; 32];
         let wrong_root_hex = hex::encode(wrong_root);
-        let mismatched = push_module(store, [0x99; 32], &pk, 0); // commits neither the requested root
+        // A faithful capsule committing its OWN content-derived root, pushed under `wrong_root_hex` —
+        // its committed root is neither the requested root nor the chain root, so it is rejected.
+        let (mismatched, _mroot) = push_module(store, &pk, 0x99, 0);
         let resp = push_one_shot(
             node,
             &store_hex,
@@ -753,6 +815,42 @@ mod tests {
             &store_hex,
             &wrong_root_hex
         ));
+    }
+
+    /// (#2246/#2240) A push whose bytes commit the requested `(store_id, root)` in their HEADER but
+    /// whose `MerkleNodes` leaves recompute to a different root is refused BEFORE landing. The integrity
+    /// gate reuses `ChainAnchoredModuleVerifier`, so the admit-gate recompute (rule 5) guards the push
+    /// land too: a header-matching-but-tampered capsule never reaches disk or the announce.
+    /// **Catches:** an integrity gate that trusts the committed `CurrentRoot` header without recomputing
+    /// the merkle root from the capsule's own data.
+    #[tokio::test]
+    async fn a_push_whose_data_does_not_recompute_to_its_root_is_refused_before_landing() {
+        let (_sk, pk, store) = store_keypair(0x5b);
+        let root = [0x6c; 32];
+        let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+        // Commits the requested root in its header (clears the byte-compare) but its leaves recompute to
+        // a different root — the tampered/incomplete capsule.
+        let tampered = push_module_bad_merkle(store, root, &pk);
+
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let node = node.as_ref();
+        let announces = Arc::new(AtomicUsize::new(0));
+        install_announce_counter(node, announces.clone());
+
+        let resp = push_one_shot(node, &store_hex, &root_hex, &tampered, None, local()).await;
+        assert!(
+            resp.get("error").is_some(),
+            "a push whose data does not recompute to its committed root must be refused: {resp}"
+        );
+        assert!(
+            !crate::module_exists(&node.cache_dir, &store_hex, &root_hex),
+            "the tampered capsule must never reach disk"
+        );
+        assert_eq!(
+            announces.load(Ordering::SeqCst),
+            0,
+            "a refused push must not announce"
+        );
     }
 
     /// (c) With `DIG_NODE_PUSH_OPEN` unset, `cache.pushCapsule` is not peer-reachable — the peer
@@ -790,9 +888,8 @@ mod tests {
     #[tokio::test]
     async fn open_push_requires_the_authorized_writer_signature() {
         let (sk, pk, store) = store_keypair(0x77);
-        let root = [0x88; 32];
+        let (module, root) = push_module(store, &pk, 0x88, 0);
         let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
-        let module = push_module(store, root, &pk, 0);
 
         // A DIFFERENT keypair — an attacker who owns a key, but not THIS store's key.
         let (attacker_sk, _apk, _astore) = store_keypair(0xEE);

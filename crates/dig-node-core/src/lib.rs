@@ -4917,21 +4917,25 @@ mod tests {
     }
 
     /// Spawn the REAL §21 `RemoteServer` (auth REQUIRED by default) over an
-    /// in-memory backend seeded with one store whose module is `module` at root
-    /// 0x10. Returns `(base_url, store_id_hex)`. Unlike the header-recording mock
-    /// below, this exercises the actual §21.9 auth middleware end-to-end.
+    /// in-memory backend seeded with one store serving `module` at the generation
+    /// root the module itself commits (parsed from its `CurrentRoot`) — so a faithful
+    /// capsule is served under the same root its content folds to (#2246). Returns
+    /// `(base_url, store_id_hex)`. Unlike the header-recording mock below, this
+    /// exercises the actual §21.9 auth middleware end-to-end.
     async fn spawn_authed_remote(module: Vec<u8>) -> (String, String) {
+        use digstore_core::datasection::{DataView, SectionId};
         use digstore_core::Bytes48;
         use digstore_remote::{InMemoryBackend, RemoteServer};
+        let served_root = {
+            let view = DataView::parse(&module).expect("module is a valid data section");
+            let body = view
+                .section(SectionId::CurrentRoot)
+                .expect("module commits a CurrentRoot");
+            Bytes32(<[u8; 32]>::try_from(body).expect("CurrentRoot is 32 bytes"))
+        };
         let be = Arc::new(InMemoryBackend::new());
         let store_id = Bytes32([1u8; 32]);
-        be.add_store(
-            store_id,
-            Bytes48([2u8; 48]),
-            Bytes32([0x10; 32]),
-            module,
-            None,
-        );
+        be.add_store(store_id, Bytes48([2u8; 48]), served_root, module, None);
         let app = RemoteServer::new(be).router();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4947,7 +4951,7 @@ mod tests {
         // whole module is synced, and it lands in the on-disk cache for local-first.
         let store = Bytes32([1u8; 32]); // the id spawn_authed_remote seeds
         let root = Bytes32([0x10; 32]); // its served genesis root
-        let module = chain_anchored_module(store.0, root.0);
+        let (module, root) = chain_anchored_module(store.0, root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let (node, _td) =
             test_node_with_resolver(Some([5u8; 32]), MockResolver::one(&store_hex, root));
@@ -4971,7 +4975,7 @@ mod tests {
     async fn gap_fill_pulls_a_missing_generation_from_a_remote() {
         // The remote's served genesis root.
         let root = Bytes32([0x10; 32]);
-        let module = chain_anchored_module([1u8; 32], root.0);
+        let (module, root) = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let store_id: [u8; 32] = Bytes32::from_hex(&store_hex).unwrap().0;
         // A node with a §21 identity whose UPSTREAM is the authed remote (gap-fill pulls via upstream).
@@ -5023,7 +5027,7 @@ mod tests {
     #[tokio::test]
     async fn chain_watch_tick_gap_fills_a_subscribed_store_end_to_end() {
         let root = Bytes32([0x10; 32]);
-        let module = chain_anchored_module([1u8; 32], root.0);
+        let (module, root) = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let td = tempfile::tempdir().unwrap();
         let node = Arc::new(Node {
@@ -5102,7 +5106,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let root = Bytes32([0x10; 32]);
-            let module = chain_anchored_module([1u8; 32], root.0);
+            let (module, root) = chain_anchored_module([1u8; 32], root.0);
             let (base, store_hex) = spawn_authed_remote(module.clone()).await;
             let td = tempfile::tempdir().unwrap();
 
@@ -5182,7 +5186,7 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let root = Bytes32([0x10; 32]);
-            let module = chain_anchored_module([1u8; 32], root.0);
+            let (module, root) = chain_anchored_module([1u8; 32], root.0);
             let (base, store_hex) = spawn_authed_remote(module.clone()).await;
             let td = tempfile::tempdir().unwrap();
 
@@ -5465,7 +5469,7 @@ mod tests {
         let store_a = Bytes32([0x2au8; 32]);
         let root = Bytes32([0x2bu8; 32]);
         let store_b = "bb".repeat(32);
-        let capsule = chain_anchored_module(store_a.0, root.0);
+        let (capsule, root) = chain_anchored_module(store_a.0, root.0);
         assert!(
             (capsule.len() as u64) < 100_000,
             "the synced capsule must fit UNDER the cap so ONLY the tier-0 module is the eviction victim"
@@ -5534,7 +5538,7 @@ mod tests {
         let served = Bytes32([0xAAu8; 32]);
         let requested = Bytes32([0xBBu8; 32]);
         let store_b = "cc".repeat(32);
-        let module = chain_anchored_module(store.0, served.0);
+        let (module, served) = chain_anchored_module(store.0, served.0);
         assert!(
             (module.len() as u64) < 100_000,
             "the synced capsule must fit UNDER the cap so ONLY the tier-0 module is the eviction victim"
@@ -5617,11 +5621,13 @@ mod tests {
         // Store A: landed by a real reshare warm (chain-anchored, verified, promoted). Store B: a
         // PRE-EXISTING tier-0 precache module, oversized so the cache is over the cap the instant A lands.
         let store_a = [0x5au8; 32];
-        let root = [0x5bu8; 32];
         let store_a_hex = hex::encode(store_a);
-        let root_hex = hex::encode(root);
         let store_b = "b5".repeat(32);
-        let module = chain_anchored_module(store_a, root);
+        // The served generation is DERIVED from the faithful capsule's content (rule 5, #2246); the
+        // seed only distinguishes this fixture's generation.
+        let (module, root) = chain_anchored_module(store_a, [0x5bu8; 32]);
+        let root = root.0;
+        let root_hex = hex::encode(root);
         assert!(
             (module.len() as u64) < 100_000,
             "the warmed capsule must fit UNDER the cap so ONLY the tier-0 module is the eviction victim"
@@ -6027,7 +6033,7 @@ mod tests {
         let window = 4096;
         // A REAL chain-anchored capsule (so the verify-before-land gate admits it) padded past three
         // windows by a large filler section, so a single-response implementation still cannot pass.
-        let capsule = chain_anchored_module_with_filler(store.0, root.0, window * 2 + 101);
+        let (capsule, root) = chain_anchored_module_with_filler(store.0, root.0, window * 2 + 101);
         assert!(
             capsule.len() > window * 2,
             "the fixture must span >2 windows"
@@ -6111,7 +6117,7 @@ mod tests {
         let seed = [7u8; 32];
         let store = Bytes32([3u8; 32]);
         let root = Bytes32([9u8; 32]);
-        let module = chain_anchored_module(store.0, root.0);
+        let (module, root) = chain_anchored_module(store.0, root.0);
         let captured = Arc::new(std::sync::Mutex::new(None));
         let url = spawn_mock_module_server(captured.clone(), root, module).await;
 
@@ -6164,7 +6170,7 @@ mod tests {
         let store = Bytes32([2u8; 32]);
         let served = Bytes32([0xAA; 32]); // the chain-anchored generation the upstream serves
         let requested = Bytes32([0xBB; 32]); // differs from served
-        let module = chain_anchored_module(store.0, served.0);
+        let (module, served) = chain_anchored_module(store.0, served.0);
         let captured = Arc::new(std::sync::Mutex::new(None));
         let url = spawn_mock_module_server(captured, served, module.clone()).await;
 
@@ -6187,31 +6193,62 @@ mod tests {
 
     // -- Chain-anchored verify before announce (#1623) ------------------------------------------
 
-    /// A minimal chain-anchored `.dig` data section committing `(store, root)` — the shape the reshare
-    /// leg's [`ChainAnchoredModuleVerifier`] admits, so a test upstream can serve a capsule that is
-    /// genuinely the store's generation.
-    fn chain_anchored_module(store: [u8; 32], root: [u8; 32]) -> Vec<u8> {
-        use digstore_core::datasection::{encode_blob, SectionId};
-        encode_blob(&[
-            (SectionId::StoreId as u16, store.to_vec()),
-            (SectionId::CurrentRoot as u16, root.to_vec()),
-        ])
+    /// A FAITHFUL chain-anchored `.dig` data section — the shape the reshare leg's
+    /// [`ChainAnchoredModuleVerifier`] admits under the hardened admit gate (rule 5, #2246): its
+    /// `ChunkPool`/`KeyTable`/`MerkleNodes` reproduce the committed root. The root is DERIVED from the
+    /// content (a preimage of an arbitrary root cannot be chosen), so `seed` merely distinguishes one
+    /// fixture's generation from another; the returned [`Bytes32`] is the generation the module commits.
+    /// Returns `(module, root)` — callers use the returned root as this capsule's generation.
+    fn chain_anchored_module(store: [u8; 32], seed: [u8; 32]) -> (Vec<u8>, Bytes32) {
+        chain_anchored_module_with_filler(store, seed, 0)
     }
 
-    /// A chain-anchored module (as above) padded past `min_len` bytes with a filler section, for the
-    /// multi-window capsule fixture — the padding lives in an extra section the verifier ignores, so the
-    /// module still commits exactly `(store, root)`.
+    /// Like [`chain_anchored_module`] but padded past `min_len` bytes with a filler section (an extra
+    /// section the verifier ignores) for the multi-window capsule fixture. Returns `(module, root)`.
     fn chain_anchored_module_with_filler(
         store: [u8; 32],
-        root: [u8; 32],
+        seed: [u8; 32],
         min_len: usize,
-    ) -> Vec<u8> {
-        use digstore_core::datasection::{encode_blob, SectionId};
-        encode_blob(&[
+    ) -> (Vec<u8>, Bytes32) {
+        use digstore_core::datasection::{
+            encode_blob, encode_chunk_pool, encode_key_table, encode_merkle_nodes, SectionId,
+        };
+        use digstore_core::merkle::{resource_leaf, MerkleTree};
+        use digstore_core::serving::concat_output;
+        use digstore_core::KeyTableEntry;
+
+        // One resource: a `seed`-distinguished static_key and a `seed`-derived content chunk. Its leaf
+        // is the producer's `resource_leaf(concat_output(cts))`, and the one-leaf tree's root IS the
+        // committed root — so the served content folds to exactly the root the header commits.
+        let chunk = {
+            let mut c = b"chain-anchored capsule content:".to_vec();
+            c.extend_from_slice(&seed);
+            c
+        };
+        let leaf = resource_leaf(&concat_output(&[chunk.as_slice()]));
+        let leaves = vec![leaf];
+        let root = MerkleTree::from_leaves(leaves.clone()).root();
+        let entries = vec![KeyTableEntry {
+            static_key: Bytes32(seed),
+            generation: root,
+            chunk_indices: vec![0],
+            total_size: chunk.len() as u64,
+        }];
+
+        let mut sections = vec![
             (SectionId::StoreId as u16, store.to_vec()),
-            (SectionId::CurrentRoot as u16, root.to_vec()),
-            (SectionId::Filler as u16, vec![0x5a; min_len]),
-        ])
+            (SectionId::CurrentRoot as u16, root.0.to_vec()),
+            (SectionId::KeyTable as u16, encode_key_table(&entries)),
+            (
+                SectionId::ChunkPool as u16,
+                encode_chunk_pool(&[chunk.as_slice()]),
+            ),
+            (SectionId::MerkleNodes as u16, encode_merkle_nodes(&leaves)),
+        ];
+        if min_len > 0 {
+            sections.push((SectionId::Filler as u16, vec![0x5a; min_len]));
+        }
+        (encode_blob(&sections), root)
     }
 
     /// Install an inventory-refresher spy that records whether the node announced itself a holder, so a
@@ -6236,7 +6273,7 @@ mod tests {
     async fn a_capsule_whose_root_is_not_chain_confirmed_is_never_announced() {
         let store = Bytes32([1u8; 32]); // the id spawn_authed_remote seeds
         let served_root = Bytes32([0x10; 32]); // the genesis root it serves at
-        let module = chain_anchored_module(store.0, served_root.0);
+        let (module, served_root) = chain_anchored_module(store.0, served_root.0);
         let (base, store_hex) = spawn_authed_remote(module).await;
 
         // The chain has NO confirmed generation for this store, so the served root is unverifiable.
@@ -6271,7 +6308,7 @@ mod tests {
     async fn a_chain_confirmed_capsule_lands_and_is_announced() {
         let store = Bytes32([1u8; 32]);
         let root = Bytes32([0x10; 32]);
-        let module = chain_anchored_module(store.0, root.0);
+        let (module, root) = chain_anchored_module(store.0, root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
 
         let (mut node, _td) =
@@ -7243,7 +7280,7 @@ mod tests {
         // (its own backend, isolated per test on an ephemeral port) — matched here exactly as
         // `gap_fill_pulls_a_missing_generation_from_a_remote` does.
         let root = Bytes32([0x10; 32]);
-        let module = chain_anchored_module([1u8; 32], root.0);
+        let (module, root) = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let store_id: [u8; 32] = Bytes32::from_hex(&store_hex).unwrap().0;
         let td = tempfile::tempdir().unwrap();
@@ -7544,7 +7581,7 @@ mod tests {
         // cache.fetchAndCache pulls a whole store over the §21 authed sync path and
         // lands it in the cache, reporting the served root + size.
         let root = Bytes32([0x10; 32]); // the served genesis root
-        let module = chain_anchored_module([1u8; 32], root.0);
+        let (module, root) = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let (mut node, _td) =
             test_node_with_resolver(Some([5u8; 32]), MockResolver::one(&store_hex, root));
@@ -7602,7 +7639,7 @@ mod tests {
         // NOT re-announce (unchanged inventory).
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = Bytes32([0x10; 32]);
-        let module = chain_anchored_module([1u8; 32], root.0);
+        let (module, root) = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let (mut node, _td) =
             test_node_with_resolver(Some([7u8; 32]), MockResolver::one(&store_hex, root));
@@ -7646,7 +7683,7 @@ mod tests {
         // removed, so a gap-fill announces EXACTLY once — not twice.
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = Bytes32([0x10; 32]);
-        let module = chain_anchored_module([1u8; 32], root.0);
+        let (module, root) = chain_anchored_module([1u8; 32], root.0);
         let (base, store_hex) = spawn_authed_remote(module.clone()).await;
         let (mut node, _td) =
             test_node_with_resolver(Some([8u8; 32]), MockResolver::one(&store_hex, root));
