@@ -1197,6 +1197,7 @@ fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
     json!({
         "balance": u64::try_from(r.balance).unwrap_or(u64::MAX),
         "pending": u64::try_from(r.pending).unwrap_or(u64::MAX),
+        "source": r.source,
         "synced": r.synced,
         "peak_height": r.peak_height,
     })
@@ -1208,7 +1209,10 @@ fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
 /// sync-state routing ([`dig_wallet::sage::rpc::WalletBackend::balance_for_address`]).
 ///
 /// Params: `{ address (bech32m string), asset ("xch" | "dig") }`. Result:
-/// `{ balance, pending, synced, peak_height }`. A synced empty address is a SUCCESS with a zero
+/// `{ balance, pending, source, synced, peak_height }`, where `source` is `"db"` (the node's own
+/// chain replica) or `"fallback"` (a third-party coinset oracle — the address was disclosed
+/// off-node), and `synced`/`peak_height` describe THAT tier (#2233).
+/// A synced empty address is a SUCCESS with a zero
 /// figure; the three read-failure shapes map to DISTINCT catalogued errors (never a fabricated
 /// `0`): `WALLET_NO_CHAIN_SOURCE`, `WALLET_NOT_SYNCED`, `WALLET_READ_FAILED`.
 async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
@@ -1816,6 +1820,7 @@ mod tests {
     /// against the printed JSON.
     #[test]
     fn balance_wire_emits_numeric_amounts_matching_app_contract() {
+        use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletBalanceResult;
 
         #[derive(serde::Deserialize)]
@@ -1826,6 +1831,7 @@ mod tests {
         let r = WalletBalanceResult {
             balance: 12_345,
             pending: 6,
+            source: Source::Db,
             synced: true,
             peak_height: Some(42),
         };
@@ -1834,7 +1840,10 @@ mod tests {
         // Golden shape: numeric, not string.
         assert_eq!(
             emitted,
-            json!({"balance": 12345u64, "pending": 6u64, "synced": true, "peak_height": 42}),
+            json!({
+                "balance": 12345u64, "pending": 6u64,
+                "source": "db", "synced": true, "peak_height": 42
+            }),
         );
         assert!(
             emitted["balance"].is_number(),
@@ -1858,15 +1867,51 @@ mod tests {
     /// overflow.
     #[test]
     fn balance_wire_saturates_u128_overflow_to_u64_max() {
+        use dig_wallet::sage::routing::Source;
         use dig_wallet::sage::rpc::WalletBalanceResult;
 
         let r = WalletBalanceResult {
             balance: u128::from(u64::MAX) + 1,
             pending: 0,
+            source: Source::Fallback,
             synced: false,
             peak_height: None,
         };
         let emitted = balance_wire(&r);
         assert_eq!(emitted["balance"], json!(u64::MAX));
+    }
+
+    /// (#2233) The tier reaches the WIRE as the lowercase token a consumer keys on, for BOTH
+    /// tiers — so a mapper that dropped the field, or emitted the Rust variant name (`"Db"`),
+    /// fails here rather than at a consumer.
+    ///
+    /// The `source` field is ADDITIVE (§5.1): the same test asserts a consumer struct that
+    /// does not know about it still deserializes, so ignoring it cannot break a caller.
+    #[test]
+    fn balance_wire_discloses_the_answering_tier_additively() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::WalletBalanceResult;
+
+        #[derive(serde::Deserialize)]
+        struct OldConsumer {
+            balance: u64,
+            synced: bool,
+        }
+
+        for (source, wire) in [(Source::Db, "db"), (Source::Fallback, "fallback")] {
+            let emitted = balance_wire(&WalletBalanceResult {
+                balance: 1,
+                pending: 0,
+                source,
+                synced: source == Source::Db,
+                peak_height: None,
+            });
+            assert_eq!(emitted["source"], json!(wire));
+
+            let old: OldConsumer = serde_json::from_value(emitted)
+                .expect("a consumer unaware of `source` must still parse");
+            assert_eq!(old.balance, 1);
+            assert_eq!(old.synced, source == Source::Db);
+        }
     }
 }

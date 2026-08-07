@@ -75,10 +75,22 @@ pub struct WalletBalanceResult {
     pub balance: u128,
     /// Pending balance: unspent coins not yet confirmed on-chain (in-flight value).
     pub pending: u128,
-    /// Whether the answer reflects a fully-synced view (DB caught up), vs a fallback read
-    /// taken while the local replica is still converging.
+    /// Which tier actually produced this figure (#2233): [`Source::Db`] — the node's own
+    /// chain replica — or [`Source::Fallback`] — a third-party coinset HTTP oracle, which
+    /// means the queried address was disclosed off-node.
+    ///
+    /// Additive per §5.1: a consumer that ignores it parses unchanged.
+    pub source: Source,
+    /// Whether THIS answer reflects a fully-synced local view.
+    ///
+    /// Derived from the tier, never from the DB flag independently: only a
+    /// [`Source::Db`] answer can be synced, because only that tier read the local
+    /// replica. A fallback answer reports `false` however caught-up the DB happens to
+    /// be — the DB's state does not describe an answer the DB did not give (#2233).
     pub synced: bool,
-    /// The node's best-known chain peak height, when known.
+    /// The chain peak height THIS answer reflects, when known — `None` for a
+    /// [`Source::Fallback`] answer, whose figure came from the oracle's chain view, not
+    /// the node's (#2233).
     pub peak_height: Option<u32>,
 }
 
@@ -483,15 +495,19 @@ impl WalletBackend {
     ///
     /// - **Wallet-owned address, DB synced** → the local DB is authoritative:
     ///   [`db::WalletDb::balance_scoped`] (confirmed) + [`db::WalletDb::pending_scoped`]
-    ///   (unconfirmed), `synced = true`.
-    /// - **Otherwise** → the fallback (coinset) tier answers, `synced` reflecting the real DB
-    ///   sync state. If no LIVE fallback is attached, the read cannot honestly answer, so it
-    ///   returns a DISTINCT error rather than a fabricated `0`: [`BalanceError::NotSynced`]
-    ///   for the wallet's own address (the DB would answer once synced),
-    ///   [`BalanceError::NoChainSource`] for an arbitrary address (only a chain source could).
+    ///   (unconfirmed); `source = "db"`, `synced = true`, `peak_height` = the node's own peak.
+    /// - **Otherwise** → the fallback (coinset) tier answers; `source = "fallback"`,
+    ///   `synced = false`, `peak_height = null`. If no LIVE fallback is attached, the read
+    ///   cannot honestly answer, so it returns a DISTINCT error rather than a fabricated `0`:
+    ///   [`BalanceError::NotSynced`] for the wallet's own address (the DB would answer once
+    ///   synced), [`BalanceError::NoChainSource`] for an arbitrary address (only a chain
+    ///   source could).
     ///
-    /// `peak_height` is sourced from the node's real chain view (the DB sync-state peak),
-    /// never fabricated.
+    /// **Every reported state field describes the tier that answered** (#2233). Reading the
+    /// DB's `synced` / `peak_height` on a coinset-served answer would describe the local
+    /// replica rather than the figure returned — so once a sync loop flips that flag, a
+    /// third-party oracle read would report itself as a synced local read. Those two fields
+    /// are therefore produced INSIDE the tier arms, never before the decision.
     pub async fn balance_for_address(
         &self,
         address: &str,
@@ -503,19 +519,36 @@ impl WalletBackend {
 
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
         let db_synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
-        let peak_height = self
-            .db
-            .sync_state()
-            .await
-            .map_err(|e| read_err(e.into()))?
-            .peak_height;
         let scoped = self
             .db
             .derivation_exists(&puzzle_hash)
             .await
             .map_err(|e| read_err(e.into()))?;
 
-        match routing::route(db_synced, scoped) {
+        let source = routing::route(db_synced, scoped);
+        // Disclose the tier in the node log as well as on the wire, so an operator reading
+        // `dig-node.jsonl` can tell a local-replica answer from a third-party oracle call.
+        //
+        // Split by level deliberately. `dig-logging`'s baked-in default is `info`
+        // (dig-logging `filter.rs:21`), and a stock install sets none of the overrides -- so a
+        // `debug!` here is INVISIBLE on every default node, which would make SPEC §18.7b's
+        // "dig-node.jsonl records the same tier the wire reports" false in the field and would
+        // let an acceptance run reading the log mistake silence for "no fallback occurred"
+        // (dig-node#189 review).
+        //
+        // FALLBACK is `info`: it is the exceptional path, it means this read was disclosed to a
+        // third-party oracle, and it is the evidence #2232's acceptance depends on. DB is `debug`:
+        // once sync works it is the ordinary path, and logging every local read at `info` would
+        // amplify an OPEN unauthenticated loopback endpoint into a log-volume lever.
+        match source {
+            Source::Db => tracing::debug!(tier = source.as_wire(), "wallet balance read routed"),
+            Source::Fallback => tracing::info!(
+                tier = source.as_wire(),
+                "wallet balance read routed to the third-party chain oracle"
+            ),
+        }
+
+        match source {
             Source::Db => {
                 let scope = [puzzle_hash];
                 let balance = self
@@ -528,9 +561,18 @@ impl WalletBackend {
                     .pending_scoped(asset_id.as_deref(), &scope)
                     .await
                     .map_err(|e| read_err(e.into()))?;
+                // The peak is read HERE, inside the arm, because it describes the replica
+                // this answer came from — it is not context for an answer taken elsewhere.
+                let peak_height = self
+                    .db
+                    .sync_state()
+                    .await
+                    .map_err(|e| read_err(e.into()))?
+                    .peak_height;
                 Ok(WalletBalanceResult {
                     balance,
                     pending,
+                    source,
                     synced: true,
                     peak_height,
                 })
@@ -574,8 +616,12 @@ impl WalletBackend {
                 Ok(WalletBalanceResult {
                     balance,
                     pending,
-                    synced: db_synced,
-                    peak_height,
+                    source,
+                    // The DB neither produced this figure nor bounds its freshness, so its
+                    // flag and its peak say nothing about it. `false` / `null` is the truth
+                    // about a coinset-served answer, whatever the local replica's state.
+                    synced: false,
+                    peak_height: None,
                 })
             }
         }
@@ -3295,31 +3341,100 @@ mod tests {
         assert_eq!(xch_bal.balance, 100, "XCH at the address, not the CAT");
     }
 
-    /// An arbitrary (non-wallet) address routes to the LIVE fallback, and `synced` reflects the
-    /// DB's real `is_synced()` — asserted BOTH ways (false while syncing, true once caught up)
-    /// so the field cannot be a constant.
+    /// An arbitrary (non-wallet) address routes to the LIVE fallback and returns its figures.
     #[tokio::test]
-    async fn arbitrary_address_uses_fallback_and_synced_tracks_db_state() {
-        let arbitrary = encode_address(&"22".repeat(32), "xch").unwrap();
+    async fn arbitrary_address_uses_fallback_tier() {
         let arb_ph = "22".repeat(32);
-        let coins = vec![
+        let arbitrary = encode_address(&arb_ph, "xch").unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![
             fallback_coin("c1", &arb_ph, 42, Some(10), None),
             fallback_coin("pend", &arb_ph, 5, None, None),
-        ];
+        ]));
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb,
+            WalletConfig::default(),
+        );
 
-        for synced in [false, true] {
-            let db = WalletDb::open_in_memory().await.unwrap();
-            db.set_initial_sync_complete(synced).await.unwrap();
-            let fb = Arc::new(MockFallback::with_coins(coins.clone()));
-            let be = WalletBackend::new(db, fb, WalletConfig::default());
-            let r = be
-                .balance_for_address(&arbitrary, BalanceAsset::Xch)
-                .await
-                .unwrap();
-            assert_eq!(r.balance, 42, "confirmed fallback coin");
-            assert_eq!(r.pending, 5, "unconfirmed fallback coin");
-            assert_eq!(r.synced, synced, "synced mirrors is_synced()");
-        }
+        let r = be
+            .balance_for_address(&arbitrary, BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(r.balance, 42, "confirmed fallback coin");
+        assert_eq!(r.pending, 5, "unconfirmed fallback coin");
+        assert_eq!(r.source, Source::Fallback);
+    }
+
+    /// **The instrument (#2233).** A coinset-served answer reports the FALLBACK tier and
+    /// reports NOTHING about the local replica — even when that replica is fully caught up.
+    ///
+    /// The fixture is chosen to distinguish the fix from the nearest wrong implementation:
+    /// the DB here is `set_initial_sync_complete(true)` with peak `9_000_000`, while the
+    /// queried address is unscoped, so routing still picks `Fallback`. The pre-fix code read
+    /// `synced` / `peak_height` OUTSIDE the tier decision and would answer
+    /// `synced: true, peak_height: Some(9_000_000)` on this input — a third-party oracle read
+    /// presented as a synced local one. An unsynced-DB fixture (the shipped state today, and
+    /// the one every prior test used) cannot see that difference at all: it is honest by
+    /// coincidence, which is exactly how this defect survived.
+    #[tokio::test]
+    async fn a_fallback_served_read_never_reports_the_dbs_sync_state() {
+        let arb_ph = "22".repeat(32);
+        let arbitrary = encode_address(&arb_ph, "xch").unwrap();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        db.set_peak(9_000_000, &"cc".repeat(32)).await.unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "c1",
+            &arb_ph,
+            42,
+            Some(10),
+            None,
+        )]));
+        let be = WalletBackend::new(db, fb, WalletConfig::default());
+
+        let r = be
+            .balance_for_address(&arbitrary, BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(r.balance, 42, "the coinset figure, so the tier really ran");
+        assert_eq!(r.source, Source::Fallback, "the tier that answered");
+        assert!(
+            !r.synced,
+            "a coinset answer is never a synced local read, however synced the DB is"
+        );
+        assert_eq!(
+            r.peak_height, None,
+            "the DB's peak does not bound a coinset answer's freshness"
+        );
+    }
+
+    /// The DB tier reports itself as the DB tier, with the replica's real peak.
+    ///
+    /// **Reachability caveat (#2234):** this asserts the arm, not an end-to-end path. The
+    /// `scoped_to_wallet` axis is `db.derivation_exists`, and `upsert_derivation` has no
+    /// production caller — so on a shipped node the `derivations` table is empty, `scoped`
+    /// is always `false`, and `balance_for_address` NEVER reaches this arm. The fixture
+    /// writes the derivation directly. This is fixture-only coverage until #2234 replaces
+    /// the routing axis with a production-written subscription watermark.
+    #[tokio::test]
+    async fn a_db_served_read_reports_the_db_tier_and_the_replicas_peak() {
+        let db = db_with_owned_derivation(true, Some(500)).await;
+        db.upsert_coins(&[coin_at_ph("confirmed", &owned_ph(), 100, Some(10), None)])
+            .await
+            .unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+
+        let r = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(r.source, Source::Db, "the tier that answered");
+        assert!(r.synced);
+        assert_eq!(r.peak_height, Some(500), "the replica's own peak");
     }
 
     /// A synced, wallet-owned, EMPTY address is a SUCCESS with a zero figure — never an error.
