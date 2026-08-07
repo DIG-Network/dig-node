@@ -1283,6 +1283,94 @@ async fn cache_fetch_and_cache_over_http_requires_the_control_token() {
     );
 }
 
+/// **Proves (dig_ecosystem#2108):** `cache.listCached` over the HTTP `POST /` surface is
+/// control-token-gated like the holder-mutating `cache.*` methods — an untokened call is
+/// UNAUTHORIZED (-32030) and NEVER leaks the cached-capsule inventory (`result.cached`), while the
+/// master control token gets PAST the gate and the inventory is returned.
+///
+/// The method enumerates the operator's full cached-capsule inventory (storeId:rootHash, sizes, LRU
+/// order), which deanonymizes what content the user has consumed; over the loopback HTTP surface a
+/// cross-site page (DNS-rebinding / local-service attack) could otherwise POST here and read it. The
+/// in-process FFI `cache.*` path (which never reaches this handler) stays open; anonymous public
+/// CONTENT reads are unaffected.
+#[tokio::test]
+async fn cache_list_cached_over_http_requires_the_control_token() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
+
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "cache.listCached",
+    });
+
+    // Untokened → rejected at the gate before any enumeration; no inventory leaks.
+    let rejected = post_rpc(&addr, body.clone(), None).await;
+    assert_eq!(rejected["error"]["code"], json!(-32030));
+    assert_eq!(rejected["error"]["data"]["code"], json!("UNAUTHORIZED"));
+    assert!(
+        rejected.get("result").is_none(),
+        "no result on a rejected enumeration"
+    );
+    assert!(
+        rejected.pointer("/result/cached").is_none(),
+        "the cached-capsule inventory must NEVER be present on a rejected call, got {rejected:?}"
+    );
+
+    // With the master control token → PAST the gate: the inventory is returned.
+    let authorized = post_rpc(&addr, body, Some(&token)).await;
+    let is_unauthorized = authorized
+        .get("error")
+        .and_then(|e| e.get("data"))
+        .and_then(|d| d.get("code"))
+        .is_some_and(|c| c == &json!("UNAUTHORIZED"));
+    assert!(
+        !is_unauthorized,
+        "a control-token call must clear the gate, got {authorized:?}"
+    );
+    assert!(
+        authorized["result"]["cached"].is_array(),
+        "an authorized call returns the cached array, got {authorized:?}"
+    );
+}
+
+/// **Proves (dig_ecosystem#2108, WS parity — the #2032 lesson for READS):** `cache.listCached` is
+/// NOT routable over the `/ws` transport, so gating it at the HTTP transport is sufficient and there
+/// is no second, ungated path that leaks the inventory. The WS `ws_dispatch` fall-through routes an
+/// unrecognized method to the wallet backend (`WalletBackend::dispatch`), whose match has NO `cache.*`
+/// arm — so `cache.listCached` returns the backend's "unknown method" error, never the inventory.
+#[tokio::test]
+async fn cache_list_cached_is_not_routable_over_ws() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await; // drain the initial sync_status snapshot
+
+    // Present the control token; even so, the WS transport has no route to the cache enumerator.
+    ws.send(Message::Text(
+        json!({ "id": "lc1", "type": "request", "method": "cache.listCached", "token": token })
+            .to_string(),
+    ))
+    .await
+    .unwrap();
+    let resp = next_ws_json(&mut ws).await;
+    assert_eq!(resp["id"], json!("lc1"));
+    assert_eq!(resp["type"], json!("response"));
+    assert_eq!(
+        resp["ok"],
+        json!(false),
+        "cache.listCached is not a WS method, got {resp:?}"
+    );
+    assert!(
+        resp.pointer("/result/cached").is_none(),
+        "the cached-capsule inventory must NEVER be reachable over WS, got {resp:?}"
+    );
+}
+
 /// **Proves (dig_ecosystem#1985):** `control.peers.ping` is REACHABLE over the real HTTP control
 /// surface — token-gated, registered, and routed to its own handler.
 ///

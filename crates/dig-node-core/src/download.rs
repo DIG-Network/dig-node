@@ -69,7 +69,15 @@ pub const CONTENT_REDIRECT: i64 = -32008;
 /// [`MissRateLimiter`](crate::rate_limit::MissRateLimiter) bucket is exhausted, so an abusive caller
 /// backs off while a different caller is unaffected. An old client sees a plain JSON-RPC error (it
 /// never silently succeeds). Catalogued in docs.dig.net (L7 error catalog).
-pub const CONTENT_MISS_RATE_LIMITED: i64 = -32009;
+///
+/// MUST equal `dig_rpc_protocol::ErrorCode::ContentMissRateLimited` (`-32003`, canonical since
+/// dig-rpc-protocol 0.7). Kept as a local const — NOT the crate enum — only until the shared
+/// module-wire crates (dig-peer / dig-download) are republished against dig-rpc-protocol 0.7 (they
+/// pin `^0.6`, and a mixed 0.6/0.7 tree skews the `ModuleInfo` wire, #1576); at that point dig-node
+/// bumps to 0.7 and this const is replaced by the enum. Until then the number is pinned here to
+/// match the canonical value so the wire never disagrees. (#2247; follow-up: adopt 0.7.) Distinct
+/// from `-32009 RangeMetadataUnrepresentable` (dig-rpc-protocol), which keeps `-32009`.
+pub const CONTENT_MISS_RATE_LIMITED: i64 = -32003;
 
 /// The hard cap on how many holder candidates a single [`CONTENT_REDIRECT`] names
 /// (dig_ecosystem#2007). A redirect NAMES candidates; this node does NOT dial/probe them

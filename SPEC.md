@@ -929,7 +929,7 @@ windows itself. The envelope MUST therefore describe both the WHOLE resource and
 | `next_offset` | every window | the next window's offset, or **`null`** on the last one |
 | `root` | every window | the generation root the window was served against |
 | `inclusion_proof` | every window | base64 whole-resource Merkle inclusion proof |
-| `chunk_lens` | first window (`offset == 0`) | per-chunk ciphertext lengths of the WHOLE resource |
+| `chunk_lens` | prologue (once per stream, PAGED) | per-chunk ciphertext lengths of the WHOLE resource |
 | `source` | node profile | `"local"` or `"remote"` — where this node served it from |
 
 This table is normative and MUST agree field-for-field with `ChunkObject` in docs.dig.net's
@@ -959,9 +959,21 @@ isolation and MUST hold the complete resource before verifying. Every window car
 that whichever window a client happens to receive first can supply it — not so that windows can be
 verified independently.
 
-`chunk_lens` is the ONE field that rides the first window only. It describes how to split the
-REASSEMBLED resource, which a client cannot act on until it holds every window; a client that
-begins mid-resource therefore cannot decrypt a multi-chunk resource and MUST fetch window 0.
+`chunk_lens` is a PROLOGUE field: it describes how to split the REASSEMBLED resource, so a client
+cannot act on it until it holds every window, and a client that begins mid-resource cannot decrypt a
+multi-chunk resource and MUST fetch from the start. It is sent once per stream and MUST NOT be
+repeated. On the peer length-prefixed frame stream it is **PAGED**: a layout exceeding
+`dig_nat::MAX_CHUNK_LENS_PER_FRAME` (2048) entries cannot state itself on one frame, so it is split
+into pages of at most 2048 entries each, and every frame carrying a page is stamped with the
+`chunk_lens_offset` at which its page begins. When the requested bytes are exhausted before the
+layout is fully sent, the remaining pages ride trailing **prologue-only continuation frames** — a
+frame with a zero-length data payload that carries byte-`offset = 0` (NOT the ascending byte cursor,
+which by then equals the resource length and would trip a reader's `offset >= max_len` establish
+guard) and NO `chunk_index` (it begins no chunk, and a stale index would trip the reader's
+ascending-index rewind guard). A prologue-only frame does NOT terminate the stream; the stream is
+complete only once the bytes are exhausted AND every prologue page has been sent. (The single-frame
+JSON-RPC `dig.fetchRange` response is not framing-bound and carries the whole layout on its one
+frame.)
 
 **Window size.** A window is at most **3 MiB** of ciphertext. This node currently IGNORES the
 `length` request parameter and always serves a full window (or the remainder), where
@@ -2605,7 +2617,7 @@ whole chain, so a privileged-owned leaf under a user-writable parent is refused,
 cannot act on a refusal that does not say which level failed. A **user-scope** install runs as the
 very user who owns the binary, crosses no privilege boundary, and is always allowed. The canonical
 install paths (native OS package, §9.7; the dig-installer's root-owned `/opt/dig/bin`) place the
-binary in a protected admin-owned location (`%ProgramFiles%\DIG Network\dig-node\`, `/usr/…`), so
+binary in a protected admin-owned location (`%ProgramFiles%\DIG\bin\`, `/usr/…`), so
 they satisfy the gate; a manual system-scope `dig-node install` from a user-writable download
 directory is what the gate refuses — and it is refused loudly, never downgraded to user scope. **The program FILE itself MUST also clear the bar** — owned by root/SYSTEM, no group/other write
 bit, not a symlink/reparse point — and not merely sit inside a privileged directory: directory
@@ -2650,23 +2662,64 @@ out to both listeners (§4.1).
 ### 9.7. Native install packages (#503)
 
 The canonical end-user install path is a NATIVE OS PACKAGE built by this repo's CI (`package.yml`),
-published as GitHub Release assets on each `vX.Y.Z` tag. The `dig-installer` simply fetches + runs
-the right package; it does not re-implement service registration. Each package installs the binary,
+published as GitHub Release assets on each `vX.Y.Z` tag. `dig-updater` fetches + runs the right
+package on every update; on Windows `dig-installer` currently places a raw binary instead of running
+the `.msi` (unifying that is planned, and until it lands the `.msi` MUST tolerate a foreign binary
+already present in the install root — see the Windows entry below). Each package installs the binary,
 registers the OS service, registers the `chia://` scheme handler (→ `dig-node open`, §8.5), creates
 the machine-wide state dir (§7.3a), and sets the `dig.local` → `127.0.0.2` hosts entry (via the
 idempotent, no-shell `dig-node ensure-hosts`, §8.1). The `dig-node install`/`uninstall` CLI (§9.1)
 remains for manual/dev use.
 
-- **Windows `.msi`** (WiX; `dig-node-<ver>-windows-x64.msi`). Installs `dig-node.exe` under
-  `%ProgramFiles%\DIG Network\dig-node\`; `ServiceInstall`+`ServiceControl` register
+- **Windows `.msi`** (WiX; `dig-node-<ver>-windows-x64.msi`). **`dig-updater` runs this package on
+  every Windows update** (`msiexec /i <pkg> /qn /norestart`; dig-node's Windows `InstallMethod` is
+  `WindowsMsi`), so it is load-bearing for auto-update. `dig-installer` does NOT currently run it —
+  it places a raw binary in the install root itself.
+
+  Installs `dig-node.exe` under `%ProgramFiles%\DIG\bin\` — the CANONICAL protected install root.
+  That root is MANDATORY for two independent reasons:
+
+  1. **Auto-update convergence.** `dig-updater` reads the installed version from
+     `<install-root>\dig-node.exe` after running the package. If the package installs anywhere else,
+     the probe reads a file the install never wrote: the probed version never changes, every beacon
+     cycle re-runs the same install, and the host never advances — a non-convergent update loop, not
+     a cosmetic path difference.
+  2. **The installer's own audit.** `dig-installer` verifies the registered service image and the
+     fresh-session PATH resolution of `dig-node.exe` against that root, so a package installing
+     elsewhere makes every install fail a check against its own payload.
+
+  `ServiceInstall`+`ServiceControl` register
   `net.dignetwork.dig-node` (DisplayName **"DIG NETWORK: NODE"**) running `dig-node.exe run-service`
   as LocalSystem, auto-start, STARTED on install, STOPPED+REMOVED on uninstall; creates
   `C:\ProgramData\DigNode` with a **restrictive DACL — inheritance broken, only SYSTEM +
   Administrators (never Users)** so the token is not world-readable (§7.3a; dig-node leaves a
   pre-existing dir's ACL intact); registers `chia://` under `HKLM\Software\Classes\chia`
-  (`shell\open\command` = `"…\dig-node.exe" open "%1"`); appends the install dir to the system PATH;
+  (`shell\open\command` = `"…\dig-node.exe" open "%1"`); MUST NOT modify the machine `PATH` (the
+  install root's PATH entry has exactly ONE owner, `dig-installer`, which writes it in the USER hive
+  — a machine-hive entry from this package precedes it in a fresh session and shadows it);
   runs `dig-node ensure-hosts` as a deferred (SYSTEM) custom action. A stable `UpgradeCode` +
   `MajorUpgrade` give clean in-place upgrades.
+
+  **Upgrade sequencing (normative).** `MajorUpgrade` MUST schedule `RemoveExistingProducts` BEFORE
+  the new files install (`afterInstallValidate`). The previous product's binary, machine-`PATH` row
+  and `net.dignetwork.dig-node` registration are then removed, and the service reinstalled and
+  started, inside ONE transaction: an interrupted upgrade rolls back to the previous product with
+  its service intact, and a completed upgrade ends with the service registered against the new
+  image. No reachable resting state has a registered product and no service. Scheduling the removal
+  LATER is forbidden: the previous product's `ServiceControl Remove="uninstall"` matches the service
+  by NAME and would delete the service the new product had just registered. `REINSTALLMODE=amus`
+  MUST NOT be used to force file replacement: it turns a repair into a silent downgrade.
+
+  The package MUST also remove any pre-existing `dig-node.exe` in the shared root before installing
+  its own (`RemoveFile`, on install). The root is shared and this package is not its only writer —
+  `dig-installer` drops a raw `dig-node.exe` there — and Windows Installer's file-versioning rules
+  KEEP such a foreign, unversioned-looking file rather than overwrite it. Without the removal the
+  package completes over a binary it did not install, and the version `dig-updater` probes next is
+  the stale file's. The removal MUST be scoped to that one file by name: the root also holds
+  `digstore`, `dig-dns`, `dig-updater` and `dig-app`.
+
+  All four requirements above — root, no machine `PATH` row, removal schedule, and the scoped
+  `RemoveFile` — are asserted by `scripts/tests/msi-install-root.test.sh`.
 - **macOS `.pkg`** (`dig-node-<ver>-macos.pkg`, universal arm64+x86_64). Installs `dig-node` to
   `/usr/local/bin`; a LaunchDaemon `/Library/LaunchDaemons/net.dignetwork.dig-node.plist`
   (`RunAtLoad`+`KeepAlive`, `run` with `DIG_NODE_RUN_CONTEXT=service`); a tiny AppleScript app
@@ -2717,7 +2770,8 @@ NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
 | -32004 | `RESOURCE_NOT_AVAILABLE_AT_ROOT` | upstream | Genuine content miss at the requested root (relayed); distinct from transport failure. Also minted directly by the node library for a LOCAL miss at this same root — `dig.fetchRange` ("resource not held") and `dig.getManifest` ("capsule not held locally") — never a fabricated result. |
 | -32005 | `ROOT_NOT_ANCHORED` | node | The node's mandatory read-path anchored-root pin (§14.4) fails closed: the requested root does not match the chain-anchored tip, the store has no confirmed on-chain generation, the chain is unreachable, or a rootless request cannot be resolved under enforcement. Minted by the node library on `dig.getContent`. |
 | -32008 | `CONTENT_REDIRECT` | node | The node does not (or, under §17's throttle, will not right now) serve the requested content itself, but the DHT located peer(s) that hold it — `error.data.redirect` names them (`content`, `providers[].peer_id`/`addresses`, `redirect_depth`, `max_redirects`) so the caller re-requests there. The candidate set is CAPPED at `MAX_REDIRECT_PROVIDERS` (= dig-dht's `MAX_ADDRESSES_PER_RECORD`): a redirect NAMES holders (the requestor dials them over its own §5.2 reachability ladder — this node does NOT dial/probe them), so a few candidates suffice and probing-on-miss would itself be an amplification vector. Minted on a content miss (`dig.getContent`/`dig.fetchRange`/the peer range-stream) and on outgoing-bandwidth saturation (§17), bounded by the same redirect-hop cap either way. |
-| -32009 | `CONTENT_MISS_RATE_LIMITED` | node | The requested content is not held, and the miss → DHT-lookup path is being driven too fast BY THIS REQUESTOR (§10.4). Minted instead of a redirect/fetch when the per-requestor token-bucket budget is exhausted, so an abusive caller backs off while a DIFFERENT requestor (its own bucket) is unaffected. A well-formed JSON-RPC error, never a silent empty success. |
+| -32003 | `CONTENT_MISS_RATE_LIMITED` | node | The requested content is not held, and the miss → DHT-lookup path is being driven too fast BY THIS REQUESTOR (§10.4). Minted instead of a redirect/fetch when the per-requestor token-bucket budget is exhausted, so an abusive caller backs off while a DIFFERENT requestor (its own bucket) is unaffected. A well-formed JSON-RPC error, never a silent empty success. Matches `dig_rpc_protocol::ErrorCode::ContentMissRateLimited` (`-32003`, canonical since dig-rpc-protocol 0.7). |
+| -32009 | `RANGE_METADATA_UNREPRESENTABLE` | node | A holder cannot frame a conforming range stream for this resource (an inclusion proof over `MAX_INCLUSION_PROOF_B64` is the real case): the resource's own range metadata cannot fit a conforming frame, so this holder can NEVER serve the range. Named explicitly on the peer range-stream serve instead of truncating the stream with a bare `Err`. Matches `dig_rpc_protocol::ErrorCode::RangeMetadataUnrepresentable` (`-32009`). |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32015 | `METADATA_TOO_LARGE` | node | `dig.getMetadata` refused: the publisher metadata section is too large or too complex to render safely. Refused when the ENCODED section exceeds `METADATA_SECTION_MAX_BYTES` (3 MiB) or its `custom` exceeds `MAX_CUSTOM_ENTRIES`/`MAX_CUSTOM_JSON_DEPTH`/`MAX_CUSTOM_JSON_ELEMENTS` (both checked BEFORE decode, #2160), or the RENDERED body exceeds `METADATA_RESPONSE_MAX_BYTES` (3 MiB, #2145). This section is rendered WHOLE — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so an oversized/hostile capsule is refused with this bounded error rather than expanded ~16× in memory or blasted into a ~100 MB response (§5.5.1). A normal (kilobyte) metadata section is served unchanged. |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
@@ -2750,7 +2804,7 @@ naming up to `MAX_AVAILABILITY_ITEMS` (= 512) content ids in one request. Three 
 `DEFAULT_MISS_LOOKUP_BURST` = 16, refill `DEFAULT_MISS_LOOKUP_REFILL_PER_SEC` = 4/s) sits in FRONT of
 both the DHT lookup and the proxy fetch, keyed by REQUESTOR identity — the mTLS-verified `peer_id`
 for a peer-origin request, the connection IP for an anonymous/gateway HTTP request, one shared bucket
-for the trusted operator loopback. An over-budget requestor's miss is refused with `-32009`
+for the trusted operator loopback. An over-budget requestor's miss is refused with `-32003`
 `CONTENT_MISS_RATE_LIMITED`; a DIFFERENT requestor draws from its own bucket and is unaffected. The
 tracked-requestor table is bounded (`MAX_TRACKED_REQUESTORS`), evicting only idle (full) buckets so
 eviction can never weaken a live bound. The oracle bound is enforced upstream: a caller that cannot
@@ -5039,7 +5093,17 @@ address does not prove operator intent (a cross-site page can POST to `dig.local
 require the local control token (the `X-Dig-Control-Token` header or `params._control_token`) OR a valid
 paired controller token, exactly like a `control.*` method; an unauthorized call is rejected
 `UNAUTHORIZED` (-32030) before any landing work. The in-process FFI `cache.*` path is the operator's own
-process and MUST stay open — it never traverses this HTTP handler. Reads remain ungated.
+process and MUST stay open — it never traverses this HTTP handler. Anonymous public CONTENT reads remain
+ungated.
+
+The same HTTP token-gate MUST also bind `cache.pushCapsule` (§5.5.3, the same holder side effect) and
+`cache.listCached` (#2108). `cache.listCached` is a READ, but a HOLDINGS-revealing one: it enumerates the
+operator's full cached-capsule inventory (`storeId:rootHash`, sizes, LRU order), which deanonymizes what
+content the user has consumed. Over the loopback HTTP surface a cross-site page (DNS-rebinding /
+local-service attack) could otherwise POST here and read it, so `cache.listCached` MUST require the same
+control/paired token and is rejected `UNAUTHORIZED` (-32030) with no inventory in the body when
+unauthorized. The FFI path stays open, and `cache.*` is not routable over the `/ws` transport (the
+wallet-backend fall-through has no `cache.*` arm), so the HTTP gate is the only reachable surface.
 
 ### 21.10. Reverse-proxy trust caveat (informative)
 

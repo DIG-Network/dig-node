@@ -1,10 +1,31 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  WiX v4/v5 source for the dig-node Windows .msi (#503). This IS the Windows install
-  architecture: the dig-installer just fetches + runs this .msi.
+  WiX v4/v5 source for the dig-node Windows .msi (#503).
+
+  WHO RUNS THIS PACKAGE, accurately (dig_ecosystem#2251 — the previous wording here said dig-installer
+  runs it, which it does not, and that false premise is what let the install location drift):
+
+    * dig-updater runs it on EVERY Windows update — `msiexec /i <pkg> /qn /norestart`
+      (dig-updater-broker `install.rs`), because dig-node's Windows InstallMethod is `WindowsMsi`
+      (`plan.rs`) and the signed manifest serves `dig-node-<ver>-windows-x64.msi`. This package is
+      LOAD-BEARING for Windows auto-update; it cannot be retired.
+    * dig-installer today does NOT run it — it drops a raw binary into the install root itself.
+      Making dig-installer run this same .msi, so the file has ONE owner, is planned separately.
+
+  The install ROOT below is what makes auto-update CONVERGE. dig-updater probes
+  `<install-root>\dig-node.exe` for the installed version after running the package; while this
+  package installed elsewhere, the probe read a file the install never touched, so the probed version
+  never changed and every beacon cycle re-ran the same install, forever.
 
   It (declaratively):
-    * installs dig-node.exe to "%ProgramFiles%\DIG Network\dig-node\";
+    * installs dig-node.exe to the canonical protected install root "%ProgramFiles%\DIG\bin\" — the
+      root dig-updater probes and dig-installer manages (SYSTEM.md install-root section;
+      dig_ecosystem#2251). It must be that root and no other, for two independent reasons: auto-update
+      does not converge unless the installed file IS the probed file (above), and dig-installer audits
+      the registered service image and the PATH resolution of `dig-node.exe` against this root, so a
+      package installing elsewhere makes every install fail a safety check against its own payload — a
+      failure that survives a hand-repair, because the next update re-runs this package and recreates
+      the directory;
     * registers the OS service `net.dignetwork.dig-node` (display "DIG NETWORK: NODE")
       running `dig-node.exe run-service` as LocalSystem, auto-start, STARTED on install,
       STOPPED + REMOVED on uninstall (ServiceInstall + ServiceControl);
@@ -15,7 +36,10 @@
       dir it creates fresh), so this ACL is authoritative.
     * registers the `chia://` scheme handler (HKLM\Software\Classes\chia →
       `"…\dig-node.exe" open "%1"`, #389);
-    * appends the install dir to the system PATH;
+    * does NOT touch the machine PATH — dig-installer is the single owner of the shared install
+      root's PATH entry. Two owners of one entry is what produced the shadowing this package used to
+      cause, and an MSI `Environment` row is removed on uninstall, which would strip the shared root
+      from PATH for every other component installed there (#2251);
     * ensures the dig.local → 127.0.0.2 hosts entry via a deferred (SYSTEM) custom action
       calling `dig-node ensure-hosts` (no shell).
   A stable UpgradeCode + MajorUpgrade gives clean in-place upgrades.
@@ -53,9 +77,32 @@
          same hazard for a stable re-install of an unchanged vX.Y.Z. (WiX raises ICE61 for this by
          design; the warning IS this decision.)
          The invariant this preserves is stated in SPEC §11.5b and asserted by
-         scripts/tests/package-version.test.sh. -->
+         scripts/tests/package-version.test.sh.
+
+         Schedule is stated EXPLICITLY (it happens to be WiX's default) because the migration off the
+         superseded `%ProgramFiles%\DIG Network\dig-node\` root depends on it, and the plausible
+         "improvement" is the broken one (#2251). afterInstallValidate removes the old product FIRST,
+         so the sequence over one transaction is:
+
+             StopServices → DeleteServices → (old product removed: its files, its machine-PATH
+             Environment row, its Add/Remove registration) → InstallFiles into the new root →
+             InstallServices → StartServices
+
+         All three things the old package owned — binary, PATH row and service — move in that one
+         transaction, and `net.dignetwork.dig-node` is absent only INSIDE it: an interruption rolls
+         the whole transaction back to the old product, service included, and a completed run ends
+         with the service registered against the new image. There is no reachable resting state with
+         a registered product and no service.
+
+         The tempting alternative — scheduling RemoveExistingProducts late (afterInstallExecute) to
+         avoid re-copying files — inverts that into the exact failure a hand-repair already produced
+         on a real machine: the OLD package's `ServiceControl Remove="uninstall"` matches the service
+         by NAME, so removing it after the new install DELETES the service the new product just
+         registered, leaving files and no service. Asserted by
+         scripts/tests/msi-install-root.test.sh. -->
     <MajorUpgrade
         AllowSameVersionUpgrades="yes"
+        Schedule="afterInstallValidate"
         DowngradeErrorMessage="A newer version of DIG NETWORK: NODE is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
@@ -64,10 +111,12 @@
       <ComponentGroupRef Id="NodeComponents" />
     </Feature>
 
-    <!-- INSTALLFOLDER = %ProgramFiles%\DIG Network\dig-node\ -->
+    <!-- INSTALLFOLDER = %ProgramFiles%\DIG\bin\ — the canonical protected install root, shared with
+         every other DIG component dig-installer places (#2251). NOT a per-manufacturer subtree: the
+         root is a contract, asserted by scripts/tests/msi-install-root.test.sh. -->
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="MANUFACTURERFOLDER" Name="DIG Network">
-        <Directory Id="INSTALLFOLDER" Name="dig-node" />
+      <Directory Id="DIGROOTFOLDER" Name="DIG">
+        <Directory Id="INSTALLFOLDER" Name="bin" />
       </Directory>
     </StandardDirectory>
 
@@ -79,6 +128,22 @@
     <ComponentGroup Id="NodeComponents">
       <!-- The binary + the OS service (install/start/stop/remove). -->
       <Component Id="DigNodeExe" Directory="INSTALLFOLDER" Guid="*">
+        <!-- Remove any dig-node.exe already sitting in the shared root before installing this one.
+             The root is SHARED and this package is not its only writer: dig-installer drops a raw
+             `dig-node.exe` there itself, so the first `msiexec /i` after that meets a file the
+             Installer did not place. Windows Installer's file-versioning rules KEEP such a foreign,
+             unversioned-looking file rather than overwrite it, so without this the package completes
+             "successfully" over a binary it did not install — the stale-install shape #2251 is about,
+             and the one auto-update cannot escape, since the version dig-updater probes next is the
+             stale file's.
+
+             Scoped deliberately to `dig-node.exe` by NAME. The shared root also holds digstore,
+             dig-dns, dig-updater and dig-app; a directory-wide removal here would delete another
+             component's binary. RemoveFiles is sequenced before InstallFiles (and after StopServices,
+             so the image is not locked), which makes this deterministic rather than dependent on
+             REINSTALLMODE — `amus` is NOT used, because forcing file replacement that way turns a
+             repair into a silent downgrade. -->
+        <RemoveFile Id="RemoveForeignDigNodeExe" Name="dig-node.exe" On="install" />
         <File Id="dig_node_exe" Source="$(var.BinDir)\dig-node.exe" KeyPath="yes" />
         <ServiceInstall
             Id="DigNodeService"
@@ -101,13 +166,24 @@
             Wait="yes" />
       </Component>
 
-      <!-- Append the install dir to the SYSTEM PATH. -->
-      <Component Id="PathEntry" Directory="INSTALLFOLDER" Guid="*">
-        <Environment Id="PathAppend" Name="PATH" Value="[INSTALLFOLDER]" Part="last"
-                     Action="set" Permanent="no" System="yes" />
-        <RegistryValue Root="HKLM" Key="Software\DIG Network\dig-node" Name="PathAdded"
-                       Type="integer" Value="1" KeyPath="yes" />
-      </Component>
+      <!-- No PATH component, deliberately (#2251).
+
+           dig-installer already puts `%ProgramFiles%\DIG\bin` on PATH, in the USER hive
+           (HKCU\Environment\Path — see dig-installer's paths.rs), and that hive difference is the
+           whole shadowing mechanism: a fresh session composes MACHINE `Path` BEFORE user `Path`, so
+           a machine-hive entry added by this package always WON over dig-installer's user-hive entry
+           for the shared root. When the two entries named different directories — which is exactly
+           what the superseded install root made them — `dig-node.exe` resolved to this package's
+           copy and the install's own reachability check correctly failed.
+
+           Removing the row rather than re-pointing it at the shared root also keeps ONE owner: an
+           MSI `Environment` row is removed when the package is uninstalled, so a machine row naming
+           the SHARED root would take that root off machine PATH for digstore, dig-updater and every
+           other component living there. The service does not need PATH at all (it is registered with
+           an absolute image path), and the user-facing CLI is `dign`, which dig-installer places.
+
+           An upgrade from a version that DID own a machine PATH row still removes that row: it
+           belonged to the old product, and RemoveExistingProducts (scheduled above) uninstalls it. -->
 
       <!-- chia:// OS scheme handler (#389). -->
       <Component Id="ChiaScheme" Directory="INSTALLFOLDER" Guid="*">

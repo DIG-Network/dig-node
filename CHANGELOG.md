@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.99.9] - 2026-08-06
+
+### Bug Fixes
+- **dig-node:** Enforce chain-anchor uniformly across local, peer-serve, gateway paths (#1764, #1765)- **dig-node:** Budget the proxy-fetch leg separately from cheap miss-lookups (#2189)- **dig-node:** Bound cache.pushCapsule pending-reassembly state (per-peer/global/bytes/TTL) (#2149)- **dig-node:** Serve tip-authoritative to close the Case-A §13 downgrade (#2211)- **dig-node:** Move CONTENT_MISS_RATE_LIMITED to -32003, freeing -32009 (#2247)
+
 ## [0.99.4] - 2026-08-06
 
 ### Bug Fixes
