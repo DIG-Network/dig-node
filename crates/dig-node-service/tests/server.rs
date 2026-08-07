@@ -1353,8 +1353,7 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     // Present the control token; even so, the WS transport has no route to the cache enumerator.
     ws.send(Message::Text(
         json!({ "id": "lc1", "type": "request", "method": "cache.listCached", "token": token })
-            .to_string()
-            .into(),
+            .to_string(),
     ))
     .await
     .unwrap();
