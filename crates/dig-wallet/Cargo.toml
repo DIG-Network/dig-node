@@ -86,7 +86,14 @@ async-trait = "0.1"
 # Pre-broadcast spend-bundle validation (C.6 fail-closed): validate_spend_bundle runs the
 # bundle through chia-consensus before any peer broadcast. Same chia-* 0.26 / SDK 0.30 line
 # as dig-wallet, so Coin/CoinSpend/SpendBundle unify across the crate boundary.
-dig-clvm = { git = "https://github.com/DIG-Network/dig-clvm.git", rev = "356771034afd54a61d6199bc5960786139e39988" }
+#
+# crates.io, NOT the old git rev (#2072). That rev resolved to dig-clvm 0.1.1, which re-exported
+# `dig_constants::DIG_MAINNET` from dig-constants **0.1.0** — the version whose DIG L2 genesis
+# challenge was still the all-zeros PLACEHOLDER, with every AGG_SIG domain derived from it. Those
+# values were finalized in 0.4.0, so the git rev pinned a spend-validation context describing a
+# different chain identity than the rest of the node. Signature checking is disabled at that call
+# site, so nothing was mis-signed, but the divergence must not be allowed to persist.
+dig-clvm = "0.2"
 # Spend building (XCH/CAT), coin selection, signing, and NFT/DID/CAT singleton
 # reconstruction all reuse the canonical `chia-wallet-sdk` driver constructors
 # (SpendContext + StandardLayer + Cat::spend_all + the Nft/Did parsers) already depended on
