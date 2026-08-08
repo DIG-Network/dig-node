@@ -4248,15 +4248,137 @@ mod tests {
 
     // ---- the node's own money stays behind the live-broadcast flag (18.12) ----------
 
-    /// Build a spend of ONE coin sitting at `puzzle_hash`, as `sign_coin_spends` takes it.
-    fn a_spend_at(puzzle_hash: Bytes32) -> super::super::types::CoinSpendJson {
-        use chia_protocol::{Coin, CoinSpend, Program};
-        super::super::spend::coin_spend_to_json(&CoinSpend::new(
-            Coin::new(Bytes32::new([9u8; 32]), puzzle_hash, 1_000),
-            Program::from(vec![0x01]),
-            Program::from(vec![0x80]),
-        ))
-        .unwrap()
+    use chia::puzzles::Memos;
+    use chia_sdk_test::Simulator;
+    use chia_wallet_sdk::driver::{Cat as SdkCat, Launcher, SpendContext, StandardLayer};
+    use chia_wallet_sdk::types::Conditions;
+
+    /// Where every fixture below pays: a puzzle hash nobody in these tests holds a key for.
+    const ATTACKER_PH: Bytes32 = Bytes32::new([0x5a; 32]);
+
+    /// A key the node does NOT custody, standing in for a third party whose bundle the node is
+    /// asked to relay.
+    fn a_stranger() -> BlsPair {
+        BlsPair::new(77)
+    }
+
+    /// The standard p2 puzzle hash a coin owned by `pk` sits at.
+    fn p2_hash(pk: PublicKey) -> Bytes32 {
+        Bytes32::from(chia::puzzles::standard::StandardArgs::curry_tree_hash(pk).to_bytes())
+    }
+
+    /// Render built [`CoinSpend`]s in the JSON form `sign_coin_spends` takes.
+    fn as_json(spends: Vec<CoinSpend>) -> Vec<super::super::types::CoinSpendJson> {
+        spends
+            .iter()
+            .map(|cs| super::super::spend::coin_spend_to_json(cs).unwrap())
+            .collect()
+    }
+
+    /// A BARE standard-layer spend of a coin owned by `pk`, paying [`ATTACKER_PH`].
+    ///
+    /// The ONLY shape whose coin actually sits at its owner's p2 puzzle hash — which is why a
+    /// hash-literal guard looked correct for as long as this was the only fixture.
+    fn bare_xch_spend(pk: PublicKey) -> Vec<super::super::types::CoinSpendJson> {
+        let ctx = &mut SpendContext::new();
+        let coin = Coin::new(Bytes32::new([9u8; 32]), p2_hash(pk), 1_000);
+        StandardLayer::new(pk)
+            .spend(
+                ctx,
+                coin,
+                Conditions::new().create_coin(ATTACKER_PH, 1_000, Memos::None),
+            )
+            .unwrap();
+        as_json(ctx.take())
+    }
+
+    /// A CAT spend of a coin owned by `owner`, paying [`ATTACKER_PH`] — the shape the guard used
+    /// to wave through.
+    ///
+    /// Issued on the simulator so the input CAT is a real coin with real lineage. Its puzzle hash
+    /// is `CatArgs::curry_tree_hash(asset_id, owner_p2)`, asserted below rather than assumed,
+    /// because the whole finding is that this is NOT the owner's p2 hash.
+    fn cat_spend_owned_by(
+        sim: &mut Simulator,
+        owner: &chia_sdk_test::BlsPairWithCoin,
+        signer: &WalletSigner,
+    ) -> (Vec<super::super::types::CoinSpendJson>, Bytes32) {
+        let ctx = &mut SpendContext::new();
+        let p2 = StandardLayer::new(owner.pk);
+        let memos = ctx.hint(owner.puzzle_hash).unwrap();
+        let (issue, cats) = SdkCat::issue_with_coin(
+            ctx,
+            owner.coin.coin_id(),
+            1_000,
+            Conditions::new().create_coin(owner.puzzle_hash, 1_000, memos),
+        )
+        .unwrap();
+        p2.spend(ctx, owner.coin, issue).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&owner.sk))
+            .unwrap();
+
+        let spends = super::super::spend::build_cat_send(
+            signer,
+            &[cats[0]],
+            ATTACKER_PH,
+            1_000,
+            owner.puzzle_hash,
+            true,
+            0,
+            &[],
+        )
+        .unwrap();
+        let spent_ph = spends[0].coin.puzzle_hash;
+        (as_json(spends), spent_ph)
+    }
+
+    /// A SINGLETON spend — a DID owned by `owner`, transferred to [`ATTACKER_PH`].
+    ///
+    /// Present so the tests assert the property over the CLASS of wrapped puzzles rather than the
+    /// one instance the audit happened to find. A DID coin sits at a singleton puzzle hash, which
+    /// is a different wrapper from the CAT's and equally unlike the owner's p2 hash.
+    fn did_spend_owned_by(
+        sim: &mut Simulator,
+        owner: &chia_sdk_test::BlsPairWithCoin,
+    ) -> (Vec<super::super::types::CoinSpendJson>, Bytes32) {
+        let ctx = &mut SpendContext::new();
+        let p2 = StandardLayer::new(owner.pk);
+        let (create, did) = Launcher::new(owner.coin.coin_id(), 1)
+            .create_simple_did(ctx, &p2)
+            .unwrap();
+        p2.spend(ctx, owner.coin, create).unwrap();
+        sim.spend_coins(ctx.take(), std::slice::from_ref(&owner.sk))
+            .unwrap();
+
+        let _child = did
+            .transfer(ctx, &p2, ATTACKER_PH, Conditions::new())
+            .unwrap();
+        let spends = ctx.take();
+        let spent_ph = spends[0].coin.puzzle_hash;
+        (as_json(spends), spent_ph)
+    }
+
+    /// A backend custodying `sk` and nothing else, wired to `pusher`, live broadcast at its
+    /// shipped default (OFF).
+    ///
+    /// Signs for testnet11 because the wrapped fixtures are built on the simulator, whose
+    /// consensus verifies the aggregate signature — so a bundle that reaches the guard here is one
+    /// the network would really have accepted, not one that merely looks like a spend.
+    async fn push_backend(sk: chia::bls::SecretKey, pusher: Arc<FakePusher>) -> WalletBackend {
+        let signer = Arc::new(WalletSigner::new(
+            vec![sk],
+            TESTNET11_CONSTANTS.agg_sig_me_additional_data,
+        ));
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let cfg = WalletConfig {
+            network_id: "testnet11".into(),
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        WalletBackend::new(db, Arc::new(MockFallback::default()), cfg)
+            .with_signer(signer)
+            .with_pusher(pusher)
     }
 
     /// Sign `coin_spends` through `be`'s OWN custodied key WITHOUT submitting, and return the
@@ -4297,23 +4419,22 @@ mod tests {
     /// so a refusal that still leaked bytes onto the network would be visible.
     #[tokio::test]
     async fn the_nodes_own_signed_spend_is_refused_while_live_broadcast_is_off() {
-        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let node = BlsPair::new(1);
         let pusher = FakePusher::accepting();
-        let be = be.with_pusher(pusher.clone());
+        let be = push_backend(node.sk.clone(), pusher.clone()).await;
         assert!(
             !be.node_custodied_spending,
             "the shipped default is OFF -- if this ever flips, this whole test is vacuous"
         );
 
-        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+        let own = signed_by_the_node(&be, bare_xch_spend(node.pk)).await;
         assert_eq!(
             be.push_signed_bundle(&own).await,
             Err(PushError::NodeCustodiedSpend),
             "the node must not relay a spend of its OWN coins with live broadcast off"
         );
 
-        let somebody_else =
-            signed_by_the_node(&be, vec![a_spend_at(Bytes32::new([0x5a; 32]))]).await;
+        let somebody_else = signed_by_the_node(&be, bare_xch_spend(a_stranger().pk)).await;
         assert!(
             be.push_signed_bundle(&somebody_else).await.is_ok(),
             "relaying a bundle over somebody ELSE's coins is the capability this method adds, and \
@@ -4333,6 +4454,85 @@ mod tests {
         );
     }
 
+    /// **The node's own CAT is refused too — the coin the guard used to wave through.**
+    ///
+    /// The node holds real $DIG, which is a CAT, and that is the whole reason the tipping
+    /// subsystem exists. A CAT coin does NOT sit at its owner's p2 puzzle hash: it sits at
+    /// `CatArgs::curry_tree_hash(asset_id, p2_hash)`. `WalletSigner::sign` never looks at the
+    /// puzzle hash — it matches the required BLS key — so the node signed this bundle happily
+    /// while a hash-literal guard saw an unfamiliar coin and relayed it, sending the node's $DIG
+    /// with `DIG_WALLET_ENABLE_LIVE_BROADCAST` off.
+    ///
+    /// The fixture asserts the divergence it depends on rather than assuming it: if the spent
+    /// coin's puzzle hash ever equalled the node's p2 hash, the old guard would have caught this
+    /// and the test would prove nothing.
+    #[tokio::test]
+    async fn the_nodes_own_cat_spend_is_refused_though_the_coin_is_not_at_its_puzzle_hash() {
+        let mut sim = Simulator::new();
+        let node = sim.bls(1_000);
+        let pusher = FakePusher::accepting();
+        let be = push_backend(node.sk.clone(), pusher.clone()).await;
+
+        let signer = WalletSigner::new(
+            vec![node.sk.clone()],
+            TESTNET11_CONSTANTS.agg_sig_me_additional_data,
+        );
+        let (spends, spent_ph) = cat_spend_owned_by(&mut sim, &node, &signer);
+        assert_ne!(
+            spent_ph,
+            p2_hash(node.pk),
+            "the CAT must not sit at the node's own p2 hash, or this fixture cannot see the bug"
+        );
+
+        let own = signed_by_the_node(&be, spends).await;
+        assert_ne!(
+            super::super::chain::decode_signed_bundle(&own)
+                .unwrap()
+                .aggregated_signature,
+            chia::bls::Signature::default(),
+            "the node really signed it -- an unsigned bundle would refute nothing"
+        );
+        assert_eq!(
+            be.push_signed_bundle(&own).await,
+            Err(PushError::NodeCustodiedSpend),
+            "a CAT the node can sign for is the node's own money, wherever the coin sits"
+        );
+        assert!(
+            pusher.pushed.lock().unwrap().is_empty(),
+            "the refused bundle must not have leaked onto the network"
+        );
+    }
+
+    /// **A SINGLETON the node owns is refused on the same rule** — the property holds over the
+    /// CLASS of wrapped puzzles, not just the CAT instance the audit happened to find.
+    ///
+    /// A DID coin sits at a singleton puzzle hash: a different wrapper from the CAT's, equally
+    /// unlike the owner's p2 hash, and equally signable by the node. A guard patched by adding
+    /// CAT-wrapped hashes to a hash set would pass the CAT test above and fail here — which is
+    /// exactly why the fix asks the signer's own question instead.
+    #[tokio::test]
+    async fn a_singleton_the_node_owns_is_refused_on_the_same_rule() {
+        let mut sim = Simulator::new();
+        let node = sim.bls(2);
+        let pusher = FakePusher::accepting();
+        let be = push_backend(node.sk.clone(), pusher.clone()).await;
+
+        let (spends, spent_ph) = did_spend_owned_by(&mut sim, &node);
+        assert_ne!(
+            spent_ph,
+            p2_hash(node.pk),
+            "a singleton does not sit at its owner's p2 hash either"
+        );
+
+        let own = signed_by_the_node(&be, spends).await;
+        assert_eq!(
+            be.push_signed_bundle(&own).await,
+            Err(PushError::NodeCustodiedSpend),
+            "every puzzle wrapper over the node's key is still the node's money"
+        );
+        assert!(pusher.pushed.lock().unwrap().is_empty());
+    }
+
     /// **A bundle that spends the node's coins ALONGSIDE somebody else's is still refused.**
     ///
     /// The nearest wrong implementation checks only the FIRST coin spend, or asks whether the
@@ -4340,13 +4540,11 @@ mod tests {
     /// so the fixture puts the node's coin SECOND behind a third party's.
     #[tokio::test]
     async fn a_mixed_bundle_touching_the_nodes_coins_is_refused_too() {
-        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
-        let be = be.with_pusher(FakePusher::accepting());
-        let mixed = signed_by_the_node(
-            &be,
-            vec![a_spend_at(Bytes32::new([0x5a; 32])), a_spend_at(own_ph)],
-        )
-        .await;
+        let node = BlsPair::new(1);
+        let be = push_backend(node.sk.clone(), FakePusher::accepting()).await;
+        let mut spends = bare_xch_spend(a_stranger().pk);
+        spends.extend(bare_xch_spend(node.pk));
+        let mixed = signed_by_the_node(&be, spends).await;
         assert_eq!(
             be.push_signed_bundle(&mixed).await,
             Err(PushError::NodeCustodiedSpend),
@@ -4364,13 +4562,15 @@ mod tests {
     /// the guard would consult an empty set on precisely the path it was written to stop.
     #[tokio::test]
     async fn the_refusal_survives_the_signing_grant_expiring() {
-        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
-        let be = be.with_pusher(FakePusher::accepting());
-        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+        let node = BlsPair::new(1);
+        let be = push_backend(node.sk.clone(), FakePusher::accepting()).await;
+        let own = signed_by_the_node(&be, bare_xch_spend(node.pk)).await;
 
         // The grant is gone: no signer resolves any more, exactly as after a one-shot sign. The
         // config's watched puzzle hashes are cleared with it, so the only thing that can still
-        // recognise the coin is the memo.
+        // recognise the coin is the memo. The default config also flips the network back to
+        // mainnet, which changes the MESSAGE each signature commits to -- and must not change
+        // which KEY the guard sees required.
         let relocked = WalletBackend {
             signer: None,
             config: WalletConfig::default(),
@@ -4393,12 +4593,12 @@ mod tests {
     /// one field different -- so a hardcoded "always refuse the node's coins" fails here.
     #[tokio::test]
     async fn the_nodes_own_signed_spend_pushes_when_live_broadcast_is_on() {
-        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let node = BlsPair::new(1);
         let pusher = FakePusher::accepting();
-        let be = be
-            .with_pusher(pusher.clone())
+        let be = push_backend(node.sk.clone(), pusher.clone())
+            .await
             .with_node_custodied_spending(true);
-        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+        let own = signed_by_the_node(&be, bare_xch_spend(node.pk)).await;
         assert!(
             be.push_signed_bundle(&own).await.unwrap().accepted,
             "with the flag on, the node's own send is exactly what is being enabled"
