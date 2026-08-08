@@ -19,7 +19,9 @@ use chia_protocol::{Bytes32, Coin, CoinSpend, SpendBundle};
 use serde::Serialize;
 use serde_json::Value;
 
+use chia::bls::PublicKey;
 use chia_wallet_sdk::driver::Cat;
+use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 
 use super::auth::{AuthMethod, Credential, UnlockAuth, UnlockMode};
 use super::chain::PushOutcome;
@@ -29,7 +31,7 @@ use super::events::EventBus;
 use super::fallback::{ChainFallback, FallbackCoin};
 use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
-use super::spend::{self, Broadcaster, WalletSigner};
+use super::spend::{self, required_public_keys, Broadcaster, WalletSigner};
 use super::types::*;
 use super::{actions, mint, network, offers, options, themes};
 use super::{Error, Result};
@@ -301,16 +303,19 @@ pub struct WalletBackend {
     /// decision, and any future caller that attaches a broadcaster for another reason would
     /// silently switch the node's own money back on.
     node_custodied_spending: bool,
-    /// Every puzzle hash this backend has seen a NODE-CUSTODIED signer hold, accumulated as
+    /// Every BLS public key this backend has seen a NODE-CUSTODIED signer hold, accumulated as
     /// signers come and go.
     ///
     /// Needed because the default custody mode (§18.24 per-transaction re-auth) drops the signer
     /// the moment it has signed: by the time a caller pushes the bundle it just obtained from
-    /// `sign_coin_spends`, [`Self::current_signer`] is `None` again and the live signer's hashes
-    /// are no longer reachable. Without this memo the push guard would be looking at an empty set
-    /// on exactly the path it exists to stop. Shared across `Clone`s so one memo governs the whole
-    /// backend. PUBLIC data only — puzzle hashes, never a key.
-    custodied_puzzle_hashes: Arc<RwLock<HashSet<Bytes32>>>,
+    /// `sign_coin_spends`, [`Self::current_signer`] is `None` again and the live signer is no
+    /// longer reachable. Without this memo the push guard would be looking at an empty set on
+    /// exactly the path it exists to stop. Shared across `Clone`s so one memo governs the whole
+    /// backend.
+    ///
+    /// Keyed on public keys rather than puzzle hashes so it answers the signer's own question
+    /// (see [`Self::spends_node_custodied_coin`]). PUBLIC data only — never a secret key.
+    custodied_public_keys: Arc<RwLock<HashSet<PublicKey>>>,
     /// The lineage source for CAT-send input resolution (parent-spend reads).
     lineage: Option<Arc<dyn LineageSource>>,
     /// The `SyncEvent` publish bus (design A.9, #205 PR4). Always present (a fresh bus with
@@ -381,7 +386,7 @@ impl WalletBackend {
             broadcaster: None,
             pusher: None,
             node_custodied_spending: false,
-            custodied_puzzle_hashes: Arc::new(RwLock::new(HashSet::new())),
+            custodied_public_keys: Arc::new(RwLock::new(HashSet::new())),
             lineage: None,
             events: Arc::new(EventBus::default()),
             identity: Arc::new(RwLock::new(None)),
@@ -989,46 +994,60 @@ impl WalletBackend {
             .map_err(|e| PushError::Unreachable(e.to_string()))
     }
 
-    /// Whether any coin `bundle` spends sits at a puzzle hash this node holds the key for.
+    /// Whether this node could have signed any part of `bundle` itself.
+    ///
+    /// The question is deliberately about KEYS, not puzzle hashes. A coin's puzzle hash says where
+    /// it sits, and the node's coins only sit at its own p2 hashes when they are bare XCH: a CAT
+    /// sits at `CatArgs::curry_tree_hash(asset_id, p2_hash)`, and singleton/NFT/DID coins wrap the
+    /// owner puzzle again. [`WalletSigner::sign`] does not care — it matches the REQUIRED BLS
+    /// public key and signs — so a hash-literal guard would wave through the node's own $DIG while
+    /// the node happily signed it away.
+    ///
+    /// Asking [`required_public_keys`] is the same derivation the signer decides on, so the guard
+    /// cannot drift from what it guards, and it is complete over every puzzle wrapper that exists
+    /// or is added later.
+    ///
+    /// Fails CLOSED: a bundle whose conditions will not evaluate is treated as custodied rather
+    /// than relayed unexamined.
     fn spends_node_custodied_coin(&self, bundle: &SpendBundle) -> bool {
-        let custodied = self.node_custodied_puzzle_hashes();
-        bundle
-            .coin_spends
-            .iter()
-            .any(|cs| custodied.contains(&cs.coin.puzzle_hash))
+        let Ok(required) = required_public_keys(&bundle.coin_spends, self.agg_sig_data()) else {
+            return true;
+        };
+        let custodied = self.node_custodied_public_keys();
+        required.iter().any(|pk| custodied.contains(pk))
     }
 
-    /// Every puzzle hash the NODE holds a signing key for, as far as this node can know it.
+    /// The network domain the consensus computes this node's required signatures under.
+    fn agg_sig_data(&self) -> Bytes32 {
+        if self.config.network_id == "testnet11" {
+            TESTNET11_CONSTANTS.agg_sig_me_additional_data
+        } else {
+            MAINNET_CONSTANTS.agg_sig_me_additional_data
+        }
+    }
+
+    /// Every BLS public key the NODE holds a signing key for, as far as this node can know it.
     ///
-    /// Three sources, unioned because each alone has a blind spot:
+    /// Two sources, unioned because each alone has a blind spot:
     ///
     /// - the signer loaded right now — present during a session unlock, absent under the default
     ///   per-transaction grant;
-    /// - [`Self::custodied_puzzle_hashes`], the memo of every signer this process has loaded —
-    ///   which is what covers "sign, then push after the grant expired";
-    /// - the custody manifest's receive addresses — non-secret, readable while every wallet is
-    ///   LOCKED, so a node that has not unlocked since restart still refuses its own primary
-    ///   address.
+    /// - [`WalletCustody::custodied_public_keys`], which covers both "sign, then push after the
+    ///   grant expired" and — because it is persisted in the manifest — "restart, then push while
+    ///   still locked".
     ///
-    /// Deliberately NOT `wallet_puzzle_hashes()`: that one falls back to the configured WATCHED
-    /// puzzle hashes, which the node holds no key for. Refusing to relay a bundle spending those
-    /// would block a legitimate third-party push, and the question here is custody, not interest.
-    fn node_custodied_puzzle_hashes(&self) -> HashSet<Bytes32> {
-        let mut hashes = self.custodied_puzzle_hashes.read().unwrap().clone();
+    /// Deliberately NOT the configured WATCHED puzzle hashes: the node holds no key for those, and
+    /// refusing them would block the legitimate third-party push this method exists to serve. The
+    /// question here is custody, not interest.
+    fn node_custodied_public_keys(&self) -> HashSet<PublicKey> {
+        let mut keys = self.custodied_public_keys.read().unwrap().clone();
         if let Some(signer) = self.current_signer() {
-            hashes.extend(signer.puzzle_hashes());
+            keys.extend(signer.public_keys());
         }
         if let Some(custody) = self.custody.as_ref() {
-            hashes.extend(
-                custody
-                    .list()
-                    .iter()
-                    .filter_map(|w| w.address.as_deref())
-                    .filter_map(decode_address)
-                    .filter_map(|ph| singleton::bytes32_from_hex(&ph).ok()),
-            );
+            keys.extend(custody.custodied_public_keys());
         }
-        hashes
+        keys
     }
 
     // ---- session identity scoping (#407) ---------------------------------
@@ -1601,7 +1620,7 @@ impl WalletBackend {
     fn current_signer(&self) -> Option<Arc<WalletSigner>> {
         let signer = self.resolve_signer();
         if let Some(s) = signer.as_ref() {
-            self.remember_custodied_puzzle_hashes(s);
+            self.remember_custodied_public_keys(s);
         }
         signer
     }
@@ -1619,17 +1638,17 @@ impl WalletBackend {
         self.custody.as_ref().and_then(|c| c.signer(None))
     }
 
-    /// Record `signer`'s puzzle hashes so the push guard still recognises the node's own coins
-    /// after the signer is gone (see [`Self::custodied_puzzle_hashes`]).
+    /// Record `signer`'s public keys so the push guard still recognises the node's own coins after
+    /// the signer is gone (see [`Self::custodied_public_keys`]).
     ///
     /// Takes the write lock only when there is something new to add: a signer resolves on many
     /// read paths, and the set is stable after the first sight of a given wallet.
-    fn remember_custodied_puzzle_hashes(&self, signer: &WalletSigner) {
-        let hashes = signer.puzzle_hashes();
-        if hashes.is_subset(&self.custodied_puzzle_hashes.read().unwrap()) {
+    fn remember_custodied_public_keys(&self, signer: &WalletSigner) {
+        let keys = signer.public_keys();
+        if keys.is_subset(&self.custodied_public_keys.read().unwrap()) {
             return;
         }
-        self.custodied_puzzle_hashes.write().unwrap().extend(hashes);
+        self.custodied_public_keys.write().unwrap().extend(keys);
     }
 
     /// The signer, or a locked-wallet error (C.6: spends need node-custodied keys).
