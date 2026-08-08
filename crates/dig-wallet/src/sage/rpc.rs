@@ -22,6 +22,7 @@ use serde_json::Value;
 use chia_wallet_sdk::driver::Cat;
 
 use super::auth::{AuthMethod, Credential, UnlockAuth, UnlockMode};
+use super::chain::PushOutcome;
 use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
@@ -54,6 +55,17 @@ impl BalanceAsset {
         }
     }
 
+    /// The lowercase wire token this asset spells itself as — the SAME string [`from_wire`]
+    /// parses, so a result can echo the asset it was asked for without a second spelling of it.
+    ///
+    /// [`from_wire`]: BalanceAsset::from_wire
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Xch => "xch",
+            Self::Dig => "dig",
+        }
+    }
+
     /// The CAT asset id (bare lowercase hex) this asset scopes to, or `None` for native XCH
     /// — the `asset_id` argument the DB / fallback reads take. Sourced from
     /// `digstore_chain::dig::DIG_ASSET_ID` so the $DIG TAIL never drifts from the canonical
@@ -64,6 +76,115 @@ impl BalanceAsset {
             Self::Dig => Some(hex::encode(digstore_chain::dig::DIG_ASSET_ID)),
         }
     }
+}
+
+/// A DB coin row as a [`WalletCoin`].
+///
+/// Fallible because the row stores its amount as a decimal STRING: a value that will not fit is a
+/// corrupt row, and a corrupt row must surface as a read failure rather than vanish from the list.
+/// A silently dropped coin is the same lie as an empty list — it under-reports what somebody holds.
+fn coin_from_row(row: &CoinRow) -> Result<WalletCoin> {
+    let amount = row.amount.parse::<u64>().map_err(|e| {
+        Error::internal(format!(
+            "coin {} has an unrepresentable amount {:?}: {e}",
+            row.coin_id, row.amount
+        ))
+    })?;
+    Ok(WalletCoin {
+        coin_id: row.coin_id.clone(),
+        parent_coin_info: row.parent_coin_info.clone(),
+        puzzle_hash: row.puzzle_hash.clone(),
+        amount,
+        created_height: row.created_height.and_then(|h| u32::try_from(h).ok()),
+    })
+}
+
+/// A fallback-tier coin as a [`WalletCoin`]. Infallible: the tier already parsed the amount.
+fn coin_from_fallback(coin: &FallbackCoin) -> WalletCoin {
+    WalletCoin {
+        coin_id: coin.coin_id.clone(),
+        parent_coin_info: coin.parent_coin_info.clone(),
+        puzzle_hash: coin.puzzle_hash.clone(),
+        amount: coin.amount,
+        created_height: coin.created_height,
+    }
+}
+
+/// Why a [`WalletBackend::push_signed_bundle`] could not report a mempool verdict.
+///
+/// A mempool REFUSAL is deliberately NOT in here: that is a successful call reporting
+/// [`PushOutcome::accepted`] `== false`. These are the ways the network was never asked at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushError {
+    /// The hex did not decode to a streamable `SpendBundle`. Retrying cannot help.
+    InvalidBundle(String),
+    /// This node has no way to reach a mempool at all.
+    NoChainSource,
+    /// The bundle spends a coin at one of the NODE's OWN custodied puzzle hashes while
+    /// `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off (§18.12). Relaying it would send the node's own
+    /// money, which is precisely the question that flag answers `no` to. Retrying cannot help;
+    /// the remedy is either a bundle that does not spend the node's coins, or the flag.
+    NodeCustodiedSpend,
+    /// A mempool could not be reached. The SAME bundle may succeed on a retry.
+    Unreachable(String),
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushError::InvalidBundle(e) => write!(f, "{e}"),
+            PushError::NoChainSource => {
+                f.write_str("this node has no chain source to push through")
+            }
+            PushError::NodeCustodiedSpend => f.write_str(
+                "this bundle spends the node's own custodied coins, and this node may not send \
+                 its own money (DIG_WALLET_ENABLE_LIVE_BROADCAST is off)",
+            ),
+            PushError::Unreachable(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// One UNSPENT coin as a chain read saw it (dig_ecosystem#2376).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WalletCoin {
+    /// The coin id (hex, no `0x`).
+    pub coin_id: String,
+    /// The parent coin's id (hex).
+    pub parent_coin_info: String,
+    /// The coin's puzzle hash (hex).
+    pub puzzle_hash: String,
+    /// The amount, in mojos / CAT base units.
+    pub amount: u64,
+    /// The height the coin was created at, or `None` while it is known only from the mempool.
+    pub created_height: Option<u32>,
+}
+
+/// The UNSPENT coins held at ONE address for one asset, and the tier that saw them
+/// (dig_ecosystem#2376).
+///
+/// An empty `coins` means a chain WAS consulted and the address holds nothing. A read that could
+/// not consult a chain is a [`BalanceError`], never an empty list — see
+/// [`WalletBackend::coins_for_address`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCoinsResult {
+    /// The unspent coins, newest-first is NOT guaranteed; order is the source's.
+    pub coins: Vec<WalletCoin>,
+    /// Which tier produced these coins.
+    pub source: Source,
+    /// Whether THIS answer reflects a fully-synced local view (only a [`Source::Db`] answer can be).
+    pub synced: bool,
+    /// The chain peak height THIS answer reflects, when known.
+    pub peak_height: Option<u32>,
+}
+
+/// The node's current chain peak (dig_ecosystem#2376).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainPeak {
+    /// The peak height, or `None` when no source could name one. `None` is UNKNOWN, never zero.
+    pub peak_height: Option<u32>,
+    /// Whether the node's own replica is caught up to it.
+    pub synced: bool,
 }
 
 /// The result of a [`WalletBackend::balance_for_address`] read (#1851): the confirmed +
@@ -165,6 +286,31 @@ pub struct WalletBackend {
     signer: Option<Arc<WalletSigner>>,
     /// The network broadcaster. `None` in tests/CI so a built spend is NEVER auto-broadcast.
     broadcaster: Option<Arc<dyn Broadcaster>>,
+    /// The pusher for ALREADY-SIGNED bundles (dig_ecosystem#2376).
+    ///
+    /// Deliberately separate from `broadcaster`: that one is attached only when the node may sign
+    /// and send its OWN custodied spends, a custody decision that is default-OFF. Relaying a bundle
+    /// somebody else signed is a different question and does not turn on the node's own key.
+    pusher: Option<Arc<dyn super::chain::SignedBundlePusher>>,
+    /// Whether the node's OWN custodied wallet may SEND — `DIG_WALLET_ENABLE_LIVE_BROADCAST`
+    /// (§18.12), default `false`.
+    ///
+    /// Read by [`Self::push_signed_bundle`], which refuses a bundle spending the node's own coins
+    /// while this is `false`. Kept as an explicit flag rather than inferred from `broadcaster`
+    /// being attached: that would make the custody rule a side effect of an unrelated wiring
+    /// decision, and any future caller that attaches a broadcaster for another reason would
+    /// silently switch the node's own money back on.
+    node_custodied_spending: bool,
+    /// Every puzzle hash this backend has seen a NODE-CUSTODIED signer hold, accumulated as
+    /// signers come and go.
+    ///
+    /// Needed because the default custody mode (§18.24 per-transaction re-auth) drops the signer
+    /// the moment it has signed: by the time a caller pushes the bundle it just obtained from
+    /// `sign_coin_spends`, [`Self::current_signer`] is `None` again and the live signer's hashes
+    /// are no longer reachable. Without this memo the push guard would be looking at an empty set
+    /// on exactly the path it exists to stop. Shared across `Clone`s so one memo governs the whole
+    /// backend. PUBLIC data only — puzzle hashes, never a key.
+    custodied_puzzle_hashes: Arc<RwLock<HashSet<Bytes32>>>,
     /// The lineage source for CAT-send input resolution (parent-spend reads).
     lineage: Option<Arc<dyn LineageSource>>,
     /// The `SyncEvent` publish bus (design A.9, #205 PR4). Always present (a fresh bus with
@@ -233,6 +379,9 @@ impl WalletBackend {
             config,
             signer: None,
             broadcaster: None,
+            pusher: None,
+            node_custodied_spending: false,
+            custodied_puzzle_hashes: Arc::new(RwLock::new(HashSet::new())),
             lineage: None,
             events: Arc::new(EventBus::default()),
             identity: Arc::new(RwLock::new(None)),
@@ -319,6 +468,27 @@ impl WalletBackend {
     /// The node-managed unlock authority, if attached (#431/#432).
     pub fn auth(&self) -> Option<&Arc<UnlockAuth>> {
         self.auth.as_ref()
+    }
+
+    /// Attach the pusher for ALREADY-SIGNED bundles (`control.wallet.broadcast`).
+    ///
+    /// Attaching this does NOT let the node spend its own coins: it holds no key either way. It
+    /// only gives the node a way to relay bytes a caller signed elsewhere.
+    pub fn with_pusher(mut self, pusher: Arc<dyn super::chain::SignedBundlePusher>) -> Self {
+        self.pusher = Some(pusher);
+        self
+    }
+
+    /// Declare whether the node's OWN custodied wallet may SEND (§18.12,
+    /// `DIG_WALLET_ENABLE_LIVE_BROADCAST`). Default `false`.
+    ///
+    /// Set from the same config flag that decides whether a broadcaster is attached, so the one
+    /// question "may this node move its own money" has one answer across every path that could
+    /// move it — the node's own spend methods AND the relay of an already-signed bundle.
+    #[must_use]
+    pub fn with_node_custodied_spending(mut self, enabled: bool) -> Self {
+        self.node_custodied_spending = enabled;
+        self
     }
 
     /// Attach the network broadcaster (enables `auto_submit` + `submit_transaction`).
@@ -625,6 +795,240 @@ impl WalletBackend {
                 })
             }
         }
+    }
+
+    /// The UNSPENT coins held at ONE address for XCH or $DIG (dig_ecosystem#2376).
+    ///
+    /// The read a caller building a spend needs, and the exact sibling of
+    /// [`balance_for_address`](Self::balance_for_address) — a balance is this read reduced to a
+    /// sum, so it takes the same params and routes through the same B.6 tiers.
+    ///
+    /// # An empty list is an ANSWER
+    ///
+    /// `coins: []` means a chain WAS consulted and this address holds nothing. Every way of not
+    /// reaching a chain is a [`BalanceError`] instead. Degrading an unreachable chain into an empty
+    /// list would tell a person holding funds that they hold none, and a spend built on that answer
+    /// refuses with a shortfall that is not true.
+    ///
+    /// # "Unspent", not "confirmed"
+    ///
+    /// Coins seen only in the mempool are INCLUDED, with `created_height: None`. The caller decides
+    /// whether an unconfirmed coin is spendable for its purpose; the node does not decide for it by
+    /// hiding one.
+    pub async fn coins_for_address(
+        &self,
+        address: &str,
+        asset: BalanceAsset,
+    ) -> std::result::Result<WalletCoinsResult, BalanceError> {
+        let puzzle_hash =
+            normalize_ph(&decode_address(address).ok_or(BalanceError::InvalidAddress)?);
+        let asset_id = asset.asset_id_hex();
+
+        let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
+        let db_synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        let scoped = self
+            .db
+            .derivation_exists(&puzzle_hash)
+            .await
+            .map_err(|e| read_err(e.into()))?;
+
+        let source = routing::route(db_synced, scoped);
+        match source {
+            Source::Db => tracing::debug!(tier = source.as_wire(), "wallet coin read routed"),
+            Source::Fallback => tracing::info!(
+                tier = source.as_wire(),
+                "wallet coin read routed to the third-party chain oracle"
+            ),
+        }
+
+        match source {
+            Source::Db => {
+                let scope = [puzzle_hash];
+                let rows = self
+                    .db
+                    .coins_scoped(asset_id.as_deref(), &scope)
+                    .await
+                    .map_err(|e| read_err(e.into()))?;
+                let peak_height = self
+                    .db
+                    .sync_state()
+                    .await
+                    .map_err(|e| read_err(e.into()))?
+                    .peak_height;
+                let coins = rows
+                    .iter()
+                    .filter(|r| r.spent_height.is_none())
+                    .map(coin_from_row)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(read_err)?;
+                Ok(WalletCoinsResult {
+                    coins,
+                    source,
+                    synced: true,
+                    peak_height,
+                })
+            }
+            Source::Fallback => {
+                // Identical routing to the balance read: no live source means the answer is
+                // UNKNOWN, and WHICH unknown it is tells the caller why (#1851).
+                if !self.fallback.is_live() {
+                    return Err(if scoped {
+                        BalanceError::NotSynced
+                    } else {
+                        BalanceError::NoChainSource
+                    });
+                }
+                if !self.fallback_rate.try_acquire() {
+                    return Err(BalanceError::RateLimited);
+                }
+                let phs = [puzzle_hash];
+                // XCH coins sit AT the puzzle hash; CAT coins are HINTED to it.
+                let coins = match asset {
+                    BalanceAsset::Xch => self.fallback.coin_records_by_puzzle_hashes(&phs).await,
+                    BalanceAsset::Dig => self.fallback.coin_records_by_hints(&phs).await,
+                }
+                .map_err(read_err)?;
+                Ok(WalletCoinsResult {
+                    coins: coins
+                        .iter()
+                        .filter(|c| c.spent_height.is_none())
+                        .map(coin_from_fallback)
+                        .collect(),
+                    source,
+                    // The replica neither produced these coins nor bounds their freshness (#2233).
+                    synced: false,
+                    peak_height: None,
+                })
+            }
+        }
+    }
+
+    /// The node's current chain peak (dig_ecosystem#2376).
+    ///
+    /// Its own method rather than a field on a balance, because a balance's `peak_height` is `null`
+    /// on every fallback-tier answer by design (#2233) — so a caller bounding a claimed
+    /// confirmation could not obtain one from a node whose replica has not synced, which is exactly
+    /// the node that most needs to answer.
+    ///
+    /// Prefers the node's own replica and falls back to the chain tier when the replica has no
+    /// height. `peak_height: None` means UNKNOWN and MUST NOT be read as height zero.
+    pub async fn chain_peak(&self) -> std::result::Result<ChainPeak, BalanceError> {
+        let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
+        let synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        let replica_peak = self
+            .db
+            .sync_state()
+            .await
+            .map_err(|e| read_err(e.into()))?
+            .peak_height;
+        if let Some(peak_height) = replica_peak {
+            return Ok(ChainPeak {
+                peak_height: Some(peak_height),
+                synced,
+            });
+        }
+        // The replica has no height, so answering means an OUTBOUND call to the third-party tier.
+        // That call is subject to the SAME global bound as the other open reads (#1957): this is an
+        // unauthenticated loopback endpoint, so without the bound a local process (or a
+        // CORS-reflected origin) could loop it into egress amplification against that third party.
+        //
+        // Guarded HERE rather than inherited from the coin read, because a bound that lives inside
+        // one method's fallback arm covers exactly that method -- and a caller bounding a claimed
+        // confirmation calls THIS one.
+        if !self.fallback_rate.try_acquire() {
+            return Err(BalanceError::RateLimited);
+        }
+        let peak_height = self.fallback.peak_height().await.map_err(read_err)?;
+        Ok(ChainPeak {
+            peak_height,
+            // A height the replica did not produce says nothing about the replica being caught up.
+            synced: false,
+        })
+    }
+
+    /// Push an ALREADY-SIGNED spend bundle to the network (dig_ecosystem#2376).
+    ///
+    /// # The custody boundary (§908)
+    ///
+    /// The bundle arrives complete. This method holds no key, derives none, and signs nothing — the
+    /// node's role on the money path is to read chain state and to relay what somebody else signed.
+    ///
+    /// # Why the node's OWN coins are refused when live broadcast is off (§18.12)
+    ///
+    /// §908 governs the USER's key, which never enters the node. It says nothing about the node's
+    /// own custodied wallet — which holds real $DIG (the tipping subsystem spends it) and which
+    /// `sign_coin_spends` will sign with on request. So "somebody else signed it" is not, on its
+    /// own, true of every bundle that arrives here: a token holder can obtain a bundle signed by
+    /// the node's own key and hand it straight back for relay. That path would make
+    /// `DIG_WALLET_ENABLE_LIVE_BROADCAST` decorative — the node would send its own money with the
+    /// flag off, which is the one thing the flag exists to prevent.
+    ///
+    /// So while [`Self::node_custodied_spending`] is off, a bundle spending a coin at any puzzle
+    /// hash this node custodies a key for is [`PushError::NodeCustodiedSpend`]. Relaying a bundle
+    /// signed by anyone ELSE stays open on every install, which is the capability this method was
+    /// added for.
+    ///
+    /// # Outcomes
+    ///
+    /// A mempool refusal is `Ok` with `accepted: false`; failing to REACH a mempool is `Err`. A
+    /// node with no pusher attached is [`PushError::NoChainSource`] — never a fabricated
+    /// acceptance.
+    pub async fn push_signed_bundle(
+        &self,
+        signed_bundle_hex: &str,
+    ) -> std::result::Result<PushOutcome, PushError> {
+        let bundle = super::chain::decode_signed_bundle(signed_bundle_hex)
+            .map_err(|e| PushError::InvalidBundle(e.to_string()))?;
+        if !self.node_custodied_spending && self.spends_node_custodied_coin(&bundle) {
+            return Err(PushError::NodeCustodiedSpend);
+        }
+        let pusher = self.pusher.as_ref().ok_or(PushError::NoChainSource)?;
+        pusher
+            .push(&bundle)
+            .await
+            .map_err(|e| PushError::Unreachable(e.to_string()))
+    }
+
+    /// Whether any coin `bundle` spends sits at a puzzle hash this node holds the key for.
+    fn spends_node_custodied_coin(&self, bundle: &SpendBundle) -> bool {
+        let custodied = self.node_custodied_puzzle_hashes();
+        bundle
+            .coin_spends
+            .iter()
+            .any(|cs| custodied.contains(&cs.coin.puzzle_hash))
+    }
+
+    /// Every puzzle hash the NODE holds a signing key for, as far as this node can know it.
+    ///
+    /// Three sources, unioned because each alone has a blind spot:
+    ///
+    /// - the signer loaded right now — present during a session unlock, absent under the default
+    ///   per-transaction grant;
+    /// - [`Self::custodied_puzzle_hashes`], the memo of every signer this process has loaded —
+    ///   which is what covers "sign, then push after the grant expired";
+    /// - the custody manifest's receive addresses — non-secret, readable while every wallet is
+    ///   LOCKED, so a node that has not unlocked since restart still refuses its own primary
+    ///   address.
+    ///
+    /// Deliberately NOT `wallet_puzzle_hashes()`: that one falls back to the configured WATCHED
+    /// puzzle hashes, which the node holds no key for. Refusing to relay a bundle spending those
+    /// would block a legitimate third-party push, and the question here is custody, not interest.
+    fn node_custodied_puzzle_hashes(&self) -> HashSet<Bytes32> {
+        let mut hashes = self.custodied_puzzle_hashes.read().unwrap().clone();
+        if let Some(signer) = self.current_signer() {
+            hashes.extend(signer.puzzle_hashes());
+        }
+        if let Some(custody) = self.custody.as_ref() {
+            hashes.extend(
+                custody
+                    .list()
+                    .iter()
+                    .filter_map(|w| w.address.as_deref())
+                    .filter_map(decode_address)
+                    .filter_map(|ph| singleton::bytes32_from_hex(&ph).ok()),
+            );
+        }
+        hashes
     }
 
     // ---- session identity scoping (#407) ---------------------------------
@@ -1195,6 +1599,15 @@ impl WalletBackend {
     /// Returns an owned `Arc` because the gated signer lives behind another lock, so it cannot be
     /// borrowed out of `&self`.
     fn current_signer(&self) -> Option<Arc<WalletSigner>> {
+        let signer = self.resolve_signer();
+        if let Some(s) = signer.as_ref() {
+            self.remember_custodied_puzzle_hashes(s);
+        }
+        signer
+    }
+
+    /// [`Self::current_signer`] without the bookkeeping — the resolution rule itself.
+    fn resolve_signer(&self) -> Option<Arc<WalletSigner>> {
         if let Some(s) = self.signer.clone() {
             return Some(s);
         }
@@ -1204,6 +1617,19 @@ impl WalletBackend {
             return auth.effective_signer();
         }
         self.custody.as_ref().and_then(|c| c.signer(None))
+    }
+
+    /// Record `signer`'s puzzle hashes so the push guard still recognises the node's own coins
+    /// after the signer is gone (see [`Self::custodied_puzzle_hashes`]).
+    ///
+    /// Takes the write lock only when there is something new to add: a signer resolves on many
+    /// read paths, and the set is stable after the first sight of a given wallet.
+    fn remember_custodied_puzzle_hashes(&self, signer: &WalletSigner) {
+        let hashes = signer.puzzle_hashes();
+        if hashes.is_subset(&self.custodied_puzzle_hashes.read().unwrap()) {
+            return;
+        }
+        self.custodied_puzzle_hashes.write().unwrap().extend(hashes);
     }
 
     /// The signer, or a locked-wallet error (C.6: spends need node-custodied keys).
@@ -3519,6 +3945,504 @@ mod tests {
         fn is_live(&self) -> bool {
             true
         }
+    }
+
+    // ---- the chain transport dig-app needs (dig_ecosystem#2376) ----------------------
+
+    /// A [`SignedBundlePusher`] double: records what it was handed and answers as told.
+    ///
+    /// It can express ALL THREE outcomes — accepted, mempool-refused, unreachable — because a
+    /// double that could only accept could not tell a refusal from an outage, which is the exact
+    /// distinction these tests exist to pin.
+    struct FakePusher {
+        answer: std::sync::Mutex<Option<std::result::Result<PushOutcome, String>>>,
+        pushed: std::sync::Mutex<Vec<chia_protocol::SpendBundle>>,
+    }
+
+    impl FakePusher {
+        fn answering(answer: std::result::Result<PushOutcome, String>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: std::sync::Mutex::new(Some(answer)),
+                pushed: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn accepting() -> Arc<Self> {
+            Self::answering(Ok(PushOutcome {
+                accepted: true,
+                transaction_id: Some("tx".repeat(32)),
+                rejection: None,
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::chain::SignedBundlePusher for FakePusher {
+        async fn push(&self, bundle: &chia_protocol::SpendBundle) -> Result<PushOutcome> {
+            self.pushed.lock().unwrap().push(bundle.clone());
+            match self.answer.lock().unwrap().clone() {
+                Some(Ok(outcome)) => Ok(outcome),
+                Some(Err(e)) => Err(Error::internal(e)),
+                None => Err(Error::internal("no answer configured")),
+            }
+        }
+    }
+
+    /// A real, signed-shaped bundle in the hex form the wire carries.
+    fn a_signed_bundle_hex() -> String {
+        use chia_protocol::{Bytes32, Coin, CoinSpend, Program, SpendBundle};
+        let coin = Coin::new(Bytes32::new([7u8; 32]), Bytes32::new([8u8; 32]), 42);
+        let spend = CoinSpend::new(coin, Program::from(vec![0x01]), Program::from(vec![0x80]));
+        super::super::chain::encode_signed_bundle(&SpendBundle::new(
+            vec![spend],
+            Default::default(),
+        ))
+        .unwrap()
+    }
+
+    /// **The DB path returns REAL coins, not a sum.** Three coins in three states, so an
+    /// implementation that returned all rows (or dropped the unconfirmed one) fails here: the spent
+    /// coin must be gone, the unconfirmed one must be PRESENT and marked unconfirmed.
+    ///
+    /// The live fallback holds a decoy coin that must never appear — the same control the balance
+    /// test uses to prove the DB path did not secretly consult the oracle.
+    #[tokio::test]
+    async fn a_synced_owned_address_reads_its_real_unspent_coins_from_the_replica() {
+        let db = db_with_owned_derivation(true, Some(500)).await;
+        db.upsert_coins(&[
+            coin_at_ph("confirmed", &owned_ph(), 100, Some(10), None),
+            coin_at_ph("spent", &owned_ph(), 50, Some(10), Some(20)),
+            coin_at_ph("pending", &owned_ph(), 7, None, None),
+        ])
+        .await
+        .unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "ghost",
+            &owned_ph(),
+            9999,
+            Some(1),
+            None,
+        )]));
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+
+        let r = be
+            .coins_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
+        assert_eq!(ids, vec!["confirmed", "pending"], "unspent coins only");
+        assert_eq!(r.coins[0].amount, 100);
+        assert_eq!(r.coins[0].created_height, Some(10));
+        assert_eq!(
+            r.coins[1].created_height, None,
+            "a mempool-only coin is REPORTED, marked unconfirmed -- hiding it would under-report \
+             what the address holds"
+        );
+        assert_eq!(r.source, Source::Db);
+        assert!(r.synced);
+        assert_eq!(r.peak_height, Some(500));
+        assert_eq!(fb.call_count(), 0, "the DB path never touches the oracle");
+    }
+
+    /// The fallback path returns the oracle's coins, marked as NOT the replica's.
+    #[tokio::test]
+    async fn an_arbitrary_address_reads_its_coins_from_the_chain_tier() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![
+            fallback_coin("live", &"33".repeat(32), 1_750, Some(9), None),
+            fallback_coin("already-spent", &"33".repeat(32), 5, Some(9), Some(11)),
+        ]));
+        let be = WalletBackend::new(db, fb, WalletConfig::default());
+        let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
+
+        let r = be
+            .coins_for_address(&arbitrary, BalanceAsset::Xch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.coins
+                .iter()
+                .map(|c| c.coin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["live"]
+        );
+        assert_eq!(r.coins[0].amount, 1_750);
+        assert_eq!(r.source, Source::Fallback);
+        assert!(!r.synced, "the replica did not produce this answer");
+        assert_eq!(r.peak_height, None, "nor does it bound its freshness");
+    }
+
+    /// **The read that MUST NOT become an empty list.** Every way of failing to reach a chain is a
+    /// distinct error; none of them is `coins: []`.
+    ///
+    /// Each case varies ONE thing from a working read — whether the tier is live, whether the
+    /// replica is synced, whether the address is the wallet's — so a handler that collapsed them
+    /// into one code, or into a success, fails on the case it collapsed.
+    #[tokio::test]
+    async fn a_chain_it_could_not_reach_is_an_error_never_an_empty_coin_list() {
+        // No chain source: an arbitrary address, synced replica, a tier that is not live.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
+        assert_eq!(
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            Err(BalanceError::NoChainSource)
+        );
+
+        // Still syncing: the wallet's OWN address, replica not synced, tier not live.
+        let db = db_with_owned_derivation(false, None).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.coins_for_address(&owned_address(), BalanceAsset::Xch)
+                .await,
+            Err(BalanceError::NotSynced)
+        );
+
+        // A live tier that errors: the answer is unknown, not empty.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
+        assert!(matches!(
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            Err(BalanceError::ReadFailed(_))
+        ));
+
+        // A malformed address never reaches the chain at all.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.coins_for_address("not-an-address", BalanceAsset::Xch)
+                .await,
+            Err(BalanceError::InvalidAddress)
+        );
+    }
+
+    /// The peak comes from the node's own replica when it has one.
+    #[tokio::test]
+    async fn the_peak_is_the_replicas_when_the_replica_has_one() {
+        let db = db_with_owned_derivation(true, Some(5_000_000)).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.chain_peak().await.unwrap(),
+            ChainPeak {
+                peak_height: Some(5_000_000),
+                synced: true
+            }
+        );
+    }
+
+    /// **With no replica height and no chain, the peak is UNKNOWN — never zero.**
+    ///
+    /// The nearest wrong implementation defaults the height to `0`, which every real height is
+    /// above, so every "is it buried yet" comparison would silently succeed. This fixture is the
+    /// only one that can see that, because it is the only one where no height exists at all.
+    #[tokio::test]
+    async fn an_unknown_peak_is_none_and_never_zero() {
+        let db = db_with_owned_derivation(true, None).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        let peak = be.chain_peak().await.unwrap();
+        assert_eq!(peak.peak_height, None);
+        assert_ne!(peak.peak_height, Some(0));
+        assert!(
+            !peak.synced,
+            "a height nobody produced is not a synced view"
+        );
+    }
+
+    /// **Every open chain read that reaches the third-party tier passes the SAME bound.**
+    ///
+    /// The bound lives inside each method's fallback arm, so "the balance read is limited" says
+    /// nothing about the two methods added beside it. This drains the bucket with ONE read and then
+    /// asserts the other two are refused — which they can only be if each consults the bound
+    /// itself. A method that inherited nothing would answer happily and fail here.
+    ///
+    /// The peak case is the one that needs a replica with NO height: a node whose replica knows its
+    /// peak never reaches the tier at all, so it could not exhibit the property under test.
+    #[tokio::test]
+    async fn every_open_read_that_leaves_the_node_passes_the_same_rate_bound() {
+        let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
+
+        // A single token in the bucket, no refill: the first outbound read spends it.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(1.0, 0.0);
+        assert!(
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch)
+                .await
+                .is_ok(),
+            "the first read spends the only token"
+        );
+        assert_eq!(
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            Err(BalanceError::RateLimited),
+            "a second coin read must be refused, not amplified onto the third party"
+        );
+
+        // The peak read reaches the tier only when the replica has no height of its own.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(0.0, 0.0);
+        assert_eq!(
+            be.chain_peak().await,
+            Err(BalanceError::RateLimited),
+            "the peak read must consult the bound too"
+        );
+    }
+
+    /// **The push actually pushes.** The bundle the pusher receives must be the SAME bundle the hex
+    /// described — asserted at the PUSHER, because a client-side check would only prove the client's
+    /// own idea of what it sent.
+    #[tokio::test]
+    async fn an_accepted_push_reaches_the_network_with_the_bundle_it_was_given() {
+        let pusher = FakePusher::accepting();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_pusher(pusher.clone());
+
+        let hex = a_signed_bundle_hex();
+        let outcome = be.push_signed_bundle(&hex).await.unwrap();
+
+        assert!(outcome.accepted);
+        assert!(outcome.rejection.is_none());
+        let pushed = pusher.pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 1, "exactly one bundle reached the network");
+        assert_eq!(
+            super::super::chain::encode_signed_bundle(&pushed[0]).unwrap(),
+            hex,
+            "the bytes pushed must be the bytes signed -- a re-encoded bundle is a DIFFERENT \
+             transaction, and the signature would no longer cover it"
+        );
+    }
+
+    // ---- the node's own money stays behind the live-broadcast flag (18.12) ----------
+
+    /// Build a spend of ONE coin sitting at `puzzle_hash`, as `sign_coin_spends` takes it.
+    fn a_spend_at(puzzle_hash: Bytes32) -> super::super::types::CoinSpendJson {
+        use chia_protocol::{Coin, CoinSpend, Program};
+        super::super::spend::coin_spend_to_json(&CoinSpend::new(
+            Coin::new(Bytes32::new([9u8; 32]), puzzle_hash, 1_000),
+            Program::from(vec![0x01]),
+            Program::from(vec![0x80]),
+        ))
+        .unwrap()
+    }
+
+    /// Sign `coin_spends` through `be`'s OWN custodied key WITHOUT submitting, and return the
+    /// bundle in the hex form `control.wallet.broadcast` accepts.
+    ///
+    /// This is the attacker's chain, verbatim: `sign_coin_spends {auto_submit:false}` ->
+    /// hex-encode the returned bundle -> push. Written as a helper so the tests below cannot
+    /// accidentally push a bundle the node did NOT sign, which would prove nothing.
+    async fn signed_by_the_node(
+        be: &WalletBackend,
+        coin_spends: Vec<super::super::types::CoinSpendJson>,
+    ) -> String {
+        let signed = be
+            .sign_coin_spends(&SignCoinSpends {
+                coin_spends,
+                auto_submit: false,
+                partial: false,
+            })
+            .await
+            .expect("the node signs with its own custodied key on request");
+        super::super::chain::encode_signed_bundle(
+            &super::super::spend::spend_bundle_from_json(&signed.spend_bundle).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// **A bundle signed by the NODE's own key cannot be pushed while live broadcast is off.**
+    ///
+    /// The chain this closes: a token holder calls `sign_coin_spends {auto_submit:false}`, gets a
+    /// fully-signed bundle spending the node's coins, hex-encodes it, and hands it back to
+    /// `control.wallet.broadcast`. Every step is individually permitted, and together they send the
+    /// node's own money with `DIG_WALLET_ENABLE_LIVE_BROADCAST` off.
+    ///
+    /// The SECOND bundle is the control that makes this test load-bearing: it is signed by the same
+    /// node, over the same surface, on the same backend, and differs ONLY in whose puzzle hash the
+    /// coin sits at. A guard that simply refused every push while the flag is off -- which would
+    /// break the capability this method exists for -- fails on it. Both are asserted at the PUSHER,
+    /// so a refusal that still leaked bytes onto the network would be visible.
+    #[tokio::test]
+    async fn the_nodes_own_signed_spend_is_refused_while_live_broadcast_is_off() {
+        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let pusher = FakePusher::accepting();
+        let be = be.with_pusher(pusher.clone());
+        assert!(
+            !be.node_custodied_spending,
+            "the shipped default is OFF -- if this ever flips, this whole test is vacuous"
+        );
+
+        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+        assert_eq!(
+            be.push_signed_bundle(&own).await,
+            Err(PushError::NodeCustodiedSpend),
+            "the node must not relay a spend of its OWN coins with live broadcast off"
+        );
+
+        let somebody_else =
+            signed_by_the_node(&be, vec![a_spend_at(Bytes32::new([0x5a; 32]))]).await;
+        assert!(
+            be.push_signed_bundle(&somebody_else).await.is_ok(),
+            "relaying a bundle over somebody ELSE's coins is the capability this method adds, and \
+             must stay open on every install"
+        );
+
+        let pushed = pusher.pushed.lock().unwrap();
+        assert_eq!(
+            pushed.len(),
+            1,
+            "exactly one bundle reached the network -- the refused one must not have leaked"
+        );
+        assert_eq!(
+            super::super::chain::encode_signed_bundle(&pushed[0]).unwrap(),
+            somebody_else,
+            "and it must be the third-party bundle, not the node's own"
+        );
+    }
+
+    /// **A bundle that spends the node's coins ALONGSIDE somebody else's is still refused.**
+    ///
+    /// The nearest wrong implementation checks only the FIRST coin spend, or asks whether the
+    /// bundle is *entirely* the node's. Either reads the node's money out through one extra spend,
+    /// so the fixture puts the node's coin SECOND behind a third party's.
+    #[tokio::test]
+    async fn a_mixed_bundle_touching_the_nodes_coins_is_refused_too() {
+        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let be = be.with_pusher(FakePusher::accepting());
+        let mixed = signed_by_the_node(
+            &be,
+            vec![a_spend_at(Bytes32::new([0x5a; 32])), a_spend_at(own_ph)],
+        )
+        .await;
+        assert_eq!(
+            be.push_signed_bundle(&mixed).await,
+            Err(PushError::NodeCustodiedSpend),
+            "one spend of the node's coins is enough to refuse the whole bundle"
+        );
+    }
+
+    /// **The refusal survives the signer being dropped**, which is the DEFAULT custody mode.
+    ///
+    /// Under 18.24 per-transaction re-auth the one-shot grant is consumed by the signature, so by
+    /// the time the caller pushes, `current_signer()` is `None` and the live signer's hashes are
+    /// unreachable. This reproduces exactly that: sign, then drop the signer, then push.
+    ///
+    /// Without the memo this test is the one that fails while every other guard test still passes --
+    /// the guard would consult an empty set on precisely the path it was written to stop.
+    #[tokio::test]
+    async fn the_refusal_survives_the_signing_grant_expiring() {
+        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let be = be.with_pusher(FakePusher::accepting());
+        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+
+        // The grant is gone: no signer resolves any more, exactly as after a one-shot sign. The
+        // config's watched puzzle hashes are cleared with it, so the only thing that can still
+        // recognise the coin is the memo.
+        let relocked = WalletBackend {
+            signer: None,
+            config: WalletConfig::default(),
+            ..be.clone()
+        };
+        assert!(
+            relocked.current_signer().is_none(),
+            "the fixture must actually be signer-less, or it proves nothing"
+        );
+        assert_eq!(
+            relocked.push_signed_bundle(&own).await,
+            Err(PushError::NodeCustodiedSpend),
+            "a bundle the node signed a moment ago is still the node's own money"
+        );
+    }
+
+    /// **With live broadcast ON, the node's own signed spend pushes.**
+    ///
+    /// The guard must be the FLAG's answer, not a permanent refusal. Same backend, same bundle,
+    /// one field different -- so a hardcoded "always refuse the node's coins" fails here.
+    #[tokio::test]
+    async fn the_nodes_own_signed_spend_pushes_when_live_broadcast_is_on() {
+        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let pusher = FakePusher::accepting();
+        let be = be
+            .with_pusher(pusher.clone())
+            .with_node_custodied_spending(true);
+        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+        assert!(
+            be.push_signed_bundle(&own).await.unwrap().accepted,
+            "with the flag on, the node's own send is exactly what is being enabled"
+        );
+        assert_eq!(pusher.pushed.lock().unwrap().len(), 1);
+    }
+
+    /// **A mempool refusal is a VALUE; an unreachable mempool is an ERROR.**
+    ///
+    /// Both cases push the SAME well-formed bundle through the SAME code path and vary only what
+    /// the network said, so an implementation that routed a refusal onto the error channel — where
+    /// it is indistinguishable from an outage — fails here.
+    #[tokio::test]
+    async fn a_refusal_and_an_outage_are_different_answers() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let refused = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_pusher(FakePusher::answering(Ok(PushOutcome {
+                accepted: false,
+                transaction_id: None,
+                rejection: Some("DOUBLE_SPEND".into()),
+            })));
+        let outcome = refused
+            .push_signed_bundle(&a_signed_bundle_hex())
+            .await
+            .expect("a refusal is a successful call");
+        assert!(!outcome.accepted);
+        assert_eq!(outcome.rejection.as_deref(), Some("DOUBLE_SPEND"));
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let offline = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_pusher(FakePusher::answering(Err("connection reset".into())));
+        assert!(matches!(
+            offline.push_signed_bundle(&a_signed_bundle_hex()).await,
+            Err(PushError::Unreachable(_))
+        ));
+    }
+
+    /// A node with no pusher says so, rather than reporting an acceptance it never obtained.
+    #[tokio::test]
+    async fn a_node_that_cannot_push_never_reports_an_acceptance() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.push_signed_bundle(&a_signed_bundle_hex()).await,
+            Err(PushError::NoChainSource)
+        );
+    }
+
+    /// Garbage is rejected BEFORE any network call, because retrying it can never help.
+    #[tokio::test]
+    async fn a_malformed_bundle_is_refused_without_touching_the_network() {
+        let pusher = FakePusher::accepting();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_pusher(pusher.clone());
+        assert!(matches!(
+            be.push_signed_bundle("not-hex").await,
+            Err(PushError::InvalidBundle(_))
+        ));
+        assert!(
+            pusher.pushed.lock().unwrap().is_empty(),
+            "nothing may be sent for a bundle that cannot be parsed"
+        );
     }
 
     // ---- #1957: the coinset-fallback path is abuse-bounded -----------------------------------

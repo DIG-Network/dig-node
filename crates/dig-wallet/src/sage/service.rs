@@ -9,8 +9,8 @@
 //!
 //! The assembly is deliberately **offline-safe and non-blocking**: it opens (or creates) the
 //! SQLite wallet DB under the node config dir, and defaults the fallback tier to the graceful
-//! [`EmptyFallback`] so bring-up never waits on network/TLS peer discovery. The live direct-peer
-//! sync loop (which would swap in the [`CoinsetFallback`](super::fallback::CoinsetFallback) and
+//! a LAZY [`ChainTransport`] so bring-up never waits on network/TLS peer discovery. The live direct-peer
+//! sync loop (which would swap in the live peer tier and
 //! feed the DB) remains the documented remaining integration: it is **SPEC §18.6**, explicitly
 //! deferred by **§18.12a**. It is NOT §18.12 — §18.12 is the live spend *broadcaster*, which has
 //! shipped. (This comment cited §18.12 and sent three separate readers to the wrong clause,
@@ -22,10 +22,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::auth::UnlockAuth;
+use super::chain::ChainTransport;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
-use super::fallback::{ChainFallback, ChiaQueryLineage, CoinsetFallback, EmptyFallback};
+use super::fallback::{ChainFallback, ChiaQueryLineage};
 use super::rpc::{WalletBackend, WalletConfig};
 use super::singleton::LineageSource;
 use super::spend::{
@@ -48,7 +49,11 @@ pub struct WalletServiceConfig {
 
 /// The live-broadcast wiring: one shared `chia_query` client backs a real broadcaster (for the
 /// tip path — which surfaces confirmation itself), a confirming broadcaster (for the general
-/// send/offer/mint surface), a confirmer, a lineage source, and a coinset fallback read tier.
+/// send/offer/mint surface), a confirmer and a lineage source.
+///
+/// It no longer carries its own read tier: the chain READS are served by the one
+/// [`ChainTransport`] on every install (dig_ecosystem#2376), so a live node does not maintain a
+/// second, differently-configured view of the same chain.
 struct LiveWallet {
     /// The RAW broadcaster the tip path uses (it runs its own confirmer, so must NOT double-confirm).
     tip_broadcaster: Arc<dyn Broadcaster>,
@@ -58,8 +63,6 @@ struct LiveWallet {
     confirmer: Arc<dyn Confirmer>,
     /// The live lineage source (CAT/singleton parent-spend reads).
     lineage: Arc<dyn LineageSource>,
-    /// The coinset/peer fallback read tier.
-    fallback: Arc<dyn ChainFallback>,
 }
 
 /// A fully-assembled, ready-to-serve wallet: the dispatch backend, the shared event bus the WS
@@ -82,7 +85,7 @@ impl WalletService {
     /// is `<config_dir>/wallet.sqlite`; the encrypted seeds are `<config_dir>/wallets/<id>.seed`
     /// (mainnet MULTI-wallet custody, #427; a legacy `<config_dir>/wallet-seed.bin` is adopted).
     /// Never blocks on network: the fallback tier defaults to
-    /// [`EmptyFallback`]. A DB-open failure falls back to an in-memory DB so the node still serves
+    /// a lazy [`ChainTransport`]. A DB-open failure falls back to an in-memory DB so the node still serves
     /// the version/custody/sync-status surface (reported, not fatal).
     /// Assemble the served wallet, offline-safe (no live broadcast). Equivalent to
     /// [`WalletService::build_with`] with the default [`WalletServiceConfig`].
@@ -116,10 +119,21 @@ impl WalletService {
             None
         };
 
-        let fallback: Arc<dyn ChainFallback> = match &live {
-            Some(l) => l.fallback.clone(),
-            None => Arc::new(EmptyFallback),
-        };
+        // The chain transport (dig_ecosystem#2376) serves the wallet's chain READS and the push of
+        // an already-signed bundle on EVERY install, live-broadcast or not. Those two need no key,
+        // so they are not the question `enable_live_broadcast` answers -- that flag governs whether
+        // the node's OWN custodied wallet may sign and send, and it is still default-OFF. Tying the
+        // reads to it is what made a stock node answer `WALLET_NO_CHAIN_SOURCE` to every wallet read
+        // and unable to push at all.
+        //
+        // The flag is ALSO handed to the backend below, because "push an already-signed bundle" is
+        // only a different question while the bundle is somebody else's: the node will sign with its
+        // own key on request, so a relay that did not check would let a caller round-trip the node's
+        // own money onto mainnet with the flag off. The backend refuses exactly that bundle.
+        //
+        // It dials nothing until something asks it to, so an idle node still makes no chain call.
+        let chain = Arc::new(ChainTransport::new());
+        let fallback: Arc<dyn ChainFallback> = chain.clone();
         // The base backend WITHOUT the tipping engine attached — cloned into the tip spender so the
         // spender's backend handle has `tipping == None` (no reference cycle engine↔backend). Both
         // share the SAME inner Arcs (db/custody/events/tip_events), so a runtime `wallet.unlock` is
@@ -128,7 +142,9 @@ impl WalletService {
             .with_events(events.clone())
             .with_custody(custody)
             .with_auth(auth)
-            .with_tip_events(tip_events.clone());
+            .with_tip_events(tip_events.clone())
+            .with_pusher(chain.clone())
+            .with_node_custodied_spending(cfg.enable_live_broadcast);
         if let Some(l) = &live {
             // The GENERAL wallet surface (send/offer/mint) gets the confirming broadcaster + the
             // live lineage source so CAT/singleton spends resolve inputs.
@@ -170,7 +186,7 @@ impl WalletService {
 }
 
 /// Build the live-broadcast wiring (§18.12): ONE shared `chia_query` client backing a real
-/// broadcaster, a confirming broadcaster, a confirmer, a lineage source, and a coinset fallback.
+/// broadcaster, a confirming broadcaster, a confirmer and a lineage source.
 /// Returns `None` (non-fatally, with a logged warning) when the client cannot start — so
 /// `enable_live_broadcast` on an offline/peerless host degrades to no-broadcast (never a
 /// half-built live sender). Mainnet only (the node's wallet is mainnet custody).
@@ -183,7 +199,6 @@ async fn build_live_wallet() -> Option<LiveWallet> {
             let general: Arc<dyn Broadcaster> =
                 Arc::new(ConfirmingBroadcaster::new(raw.clone(), confirmer.clone()));
             let lineage: Arc<dyn LineageSource> = Arc::new(ChiaQueryLineage::new(query.clone()));
-            let fallback: Arc<dyn ChainFallback> = Arc::new(CoinsetFallback::new(query.clone()));
             tracing::info!(
                 "wallet LIVE broadcast ENABLED — node-custodied spends will execute on mainnet \
                  (real $DIG). Disable by unsetting DIG_WALLET_ENABLE_LIVE_BROADCAST."
@@ -193,7 +208,6 @@ async fn build_live_wallet() -> Option<LiveWallet> {
                 general_broadcaster: general,
                 confirmer,
                 lineage,
-                fallback,
             })
         }
         Err(e) => {

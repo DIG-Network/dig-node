@@ -60,6 +60,7 @@
 
 pub mod actions;
 pub mod auth;
+pub mod chain;
 pub mod custody;
 pub mod db;
 pub mod events;

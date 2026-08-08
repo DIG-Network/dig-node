@@ -2236,6 +2236,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-node-control-interface"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82ab25a25af68b512c80de1cc8058966318f382ca3c2e358cec0a4a1b1107911"
+dependencies = [
+ "async-trait",
+ "semver",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "dig-node-core"
 version = "0.44.0"
 dependencies = [
@@ -2295,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.102.2"
+version = "0.103.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2305,6 +2317,7 @@ dependencies = [
  "dig-cert",
  "dig-constants 0.9.0",
  "dig-logging",
+ "dig-node-control-interface",
  "dig-node-core",
  "dig-node-service",
  "dig-rpc-protocol",
@@ -2470,7 +2483,7 @@ dependencies = [
 
 [[package]]
 name = "dig-wallet"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2480,6 +2493,7 @@ dependencies = [
  "chia-protocol",
  "chia-query 0.6.0",
  "chia-sdk-test",
+ "chia-traits 0.26.0",
  "chia-wallet-sdk",
  "clvmr",
  "dig-clvm",
@@ -5174,6 +5188,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"

@@ -178,7 +178,7 @@ impl ChiaQueryBroadcaster {
 /// Convert a `chia_protocol::SpendBundle` into the `chia_query` wire bundle `push_tx` accepts
 /// (hex-encoded coin spends + aggregate signature; `chia_query` parses these 0x-tolerantly). PURE
 /// — unit-tested against a known bundle so the field encoding can't silently drift.
-fn to_query_bundle(bundle: &SpendBundle) -> Result<chia_query::SpendBundle> {
+pub(crate) fn to_query_bundle(bundle: &SpendBundle) -> Result<chia_query::SpendBundle> {
     let coin_spends = bundle
         .coin_spends
         .iter()

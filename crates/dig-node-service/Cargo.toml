@@ -194,6 +194,12 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
+# The PUBLISHED control-method catalog, as a TEST-only dependency (dig_ecosystem#2376).
+#
+# The node's own `CONTROL_METHODS` stays the runtime source of truth; this pins the two against
+# each other in CI, so a method served here but absent from the published contract -- or an auth
+# posture the two disagree on -- fails a test instead of shipping as drift a consumer discovers.
+dig-node-control-interface = "0.6.0"
 # The crate's own integration tests need its test-construction seams (the `testkit` feature above).
 # Depending on self with the feature on is what keeps those seams available to `tests/` while staying
 # absent from any production build of this crate.

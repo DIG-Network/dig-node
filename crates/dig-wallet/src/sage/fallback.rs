@@ -59,6 +59,15 @@ pub trait ChainFallback: Send + Sync {
     fn is_live(&self) -> bool {
         false
     }
+
+    /// The chain peak height this tier can see, or `Ok(None)` when it tracks none.
+    ///
+    /// The default is `Ok(None)`, which is the truthful answer for a tier with no chain behind it
+    /// ([`EmptyFallback`]). `None` means UNKNOWN and MUST NOT be read as height zero — every block
+    /// is above zero, so a "is it buried yet" comparison against zero silently succeeds.
+    async fn peak_height(&self) -> Result<Option<u32>> {
+        Ok(None)
+    }
 }
 
 /// The production fallback: `chia_query::ChiaQuery` (coinset.org + peer point-reads),
@@ -133,6 +142,13 @@ impl CoinsetFallback {
 
 #[async_trait]
 impl ChainFallback for CoinsetFallback {
+    async fn peak_height(&self) -> Result<Option<u32>> {
+        self.query
+            .peak_height_opt()
+            .await
+            .map_err(|e| Error::internal(format!("peak-height read failed: {e}")))
+    }
+
     /// A real coinset/peer connection: a genuinely live chain source (#1851).
     fn is_live(&self) -> bool {
         true
