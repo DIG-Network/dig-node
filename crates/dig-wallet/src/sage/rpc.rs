@@ -55,6 +55,17 @@ impl BalanceAsset {
         }
     }
 
+    /// The lowercase wire token this asset spells itself as — the SAME string [`from_wire`]
+    /// parses, so a result can echo the asset it was asked for without a second spelling of it.
+    ///
+    /// [`from_wire`]: BalanceAsset::from_wire
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Xch => "xch",
+            Self::Dig => "dig",
+        }
+    }
+
     /// The CAT asset id (bare lowercase hex) this asset scopes to, or `None` for native XCH
     /// — the `asset_id` argument the DB / fallback reads take. Sourced from
     /// `digstore_chain::dig::DIG_ASSET_ID` so the $DIG TAIL never drifts from the canonical
@@ -3797,6 +3808,296 @@ mod tests {
         fn is_live(&self) -> bool {
             true
         }
+    }
+
+    // ---- the chain transport dig-app needs (dig_ecosystem#2376) ----------------------
+
+    /// A [`SignedBundlePusher`] double: records what it was handed and answers as told.
+    ///
+    /// It can express ALL THREE outcomes — accepted, mempool-refused, unreachable — because a
+    /// double that could only accept could not tell a refusal from an outage, which is the exact
+    /// distinction these tests exist to pin.
+    struct FakePusher {
+        answer: std::sync::Mutex<Option<std::result::Result<PushOutcome, String>>>,
+        pushed: std::sync::Mutex<Vec<chia_protocol::SpendBundle>>,
+    }
+
+    impl FakePusher {
+        fn answering(answer: std::result::Result<PushOutcome, String>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: std::sync::Mutex::new(Some(answer)),
+                pushed: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+        fn accepting() -> Arc<Self> {
+            Self::answering(Ok(PushOutcome {
+                accepted: true,
+                transaction_id: Some("tx".repeat(32)),
+                rejection: None,
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::chain::SignedBundlePusher for FakePusher {
+        async fn push(&self, bundle: &chia_protocol::SpendBundle) -> Result<PushOutcome> {
+            self.pushed.lock().unwrap().push(bundle.clone());
+            match self.answer.lock().unwrap().clone() {
+                Some(Ok(outcome)) => Ok(outcome),
+                Some(Err(e)) => Err(Error::internal(e)),
+                None => Err(Error::internal("no answer configured")),
+            }
+        }
+    }
+
+    /// A real, signed-shaped bundle in the hex form the wire carries.
+    fn a_signed_bundle_hex() -> String {
+        use chia_protocol::{Bytes32, Coin, CoinSpend, Program, SpendBundle};
+        let coin = Coin::new(Bytes32::new([7u8; 32]), Bytes32::new([8u8; 32]), 42);
+        let spend = CoinSpend::new(
+            coin,
+            Program::from(vec![0x01]).into(),
+            Program::from(vec![0x80]).into(),
+        );
+        super::super::chain::encode_signed_bundle(&SpendBundle::new(
+            vec![spend],
+            Default::default(),
+        ))
+        .unwrap()
+    }
+
+    /// **The DB path returns REAL coins, not a sum.** Three coins in three states, so an
+    /// implementation that returned all rows (or dropped the unconfirmed one) fails here: the spent
+    /// coin must be gone, the unconfirmed one must be PRESENT and marked unconfirmed.
+    ///
+    /// The live fallback holds a decoy coin that must never appear — the same control the balance
+    /// test uses to prove the DB path did not secretly consult the oracle.
+    #[tokio::test]
+    async fn a_synced_owned_address_reads_its_real_unspent_coins_from_the_replica() {
+        let db = db_with_owned_derivation(true, Some(500)).await;
+        db.upsert_coins(&[
+            coin_at_ph("confirmed", &owned_ph(), 100, Some(10), None),
+            coin_at_ph("spent", &owned_ph(), 50, Some(10), Some(20)),
+            coin_at_ph("pending", &owned_ph(), 7, None, None),
+        ])
+        .await
+        .unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "ghost",
+            &owned_ph(),
+            9999,
+            Some(1),
+            None,
+        )]));
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+
+        let r = be
+            .coins_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+
+        let ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
+        assert_eq!(ids, vec!["confirmed", "pending"], "unspent coins only");
+        assert_eq!(r.coins[0].amount, 100);
+        assert_eq!(r.coins[0].created_height, Some(10));
+        assert_eq!(
+            r.coins[1].created_height, None,
+            "a mempool-only coin is REPORTED, marked unconfirmed -- hiding it would under-report \
+             what the address holds"
+        );
+        assert_eq!(r.source, Source::Db);
+        assert!(r.synced);
+        assert_eq!(r.peak_height, Some(500));
+        assert_eq!(fb.call_count(), 0, "the DB path never touches the oracle");
+    }
+
+    /// The fallback path returns the oracle's coins, marked as NOT the replica's.
+    #[tokio::test]
+    async fn an_arbitrary_address_reads_its_coins_from_the_chain_tier() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![
+            fallback_coin("live", &"33".repeat(32), 1_750, Some(9), None),
+            fallback_coin("already-spent", &"33".repeat(32), 5, Some(9), Some(11)),
+        ]));
+        let be = WalletBackend::new(db, fb, WalletConfig::default());
+        let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
+
+        let r = be
+            .coins_for_address(&arbitrary, BalanceAsset::Xch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            r.coins.iter().map(|c| c.coin_id.as_str()).collect::<Vec<_>>(),
+            vec!["live"]
+        );
+        assert_eq!(r.coins[0].amount, 1_750);
+        assert_eq!(r.source, Source::Fallback);
+        assert!(!r.synced, "the replica did not produce this answer");
+        assert_eq!(r.peak_height, None, "nor does it bound its freshness");
+    }
+
+    /// **The read that MUST NOT become an empty list.** Every way of failing to reach a chain is a
+    /// distinct error; none of them is `coins: []`.
+    ///
+    /// Each case varies ONE thing from a working read — whether the tier is live, whether the
+    /// replica is synced, whether the address is the wallet's — so a handler that collapsed them
+    /// into one code, or into a success, fails on the case it collapsed.
+    #[tokio::test]
+    async fn a_chain_it_could_not_reach_is_an_error_never_an_empty_coin_list() {
+        // No chain source: an arbitrary address, synced replica, a tier that is not live.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
+        assert_eq!(
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            Err(BalanceError::NoChainSource)
+        );
+
+        // Still syncing: the wallet's OWN address, replica not synced, tier not live.
+        let db = db_with_owned_derivation(false, None).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.coins_for_address(&owned_address(), BalanceAsset::Xch)
+                .await,
+            Err(BalanceError::NotSynced)
+        );
+
+        // A live tier that errors: the answer is unknown, not empty.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(ErringFallback), WalletConfig::default());
+        assert!(matches!(
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            Err(BalanceError::ReadFailed(_))
+        ));
+
+        // A malformed address never reaches the chain at all.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.coins_for_address("not-an-address", BalanceAsset::Xch)
+                .await,
+            Err(BalanceError::InvalidAddress)
+        );
+    }
+
+    /// The peak comes from the node's own replica when it has one.
+    #[tokio::test]
+    async fn the_peak_is_the_replicas_when_the_replica_has_one() {
+        let db = db_with_owned_derivation(true, Some(5_000_000)).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.chain_peak().await.unwrap(),
+            ChainPeak {
+                peak_height: Some(5_000_000),
+                synced: true
+            }
+        );
+    }
+
+    /// **With no replica height and no chain, the peak is UNKNOWN — never zero.**
+    ///
+    /// The nearest wrong implementation defaults the height to `0`, which every real height is
+    /// above, so every "is it buried yet" comparison would silently succeed. This fixture is the
+    /// only one that can see that, because it is the only one where no height exists at all.
+    #[tokio::test]
+    async fn an_unknown_peak_is_none_and_never_zero() {
+        let db = db_with_owned_derivation(true, None).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        let peak = be.chain_peak().await.unwrap();
+        assert_eq!(peak.peak_height, None);
+        assert_ne!(peak.peak_height, Some(0));
+        assert!(!peak.synced, "a height nobody produced is not a synced view");
+    }
+
+    /// **The push actually pushes.** The bundle the pusher receives must be the SAME bundle the hex
+    /// described — asserted at the PUSHER, because a client-side check would only prove the client's
+    /// own idea of what it sent.
+    #[tokio::test]
+    async fn an_accepted_push_reaches_the_network_with_the_bundle_it_was_given() {
+        let pusher = FakePusher::accepting();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_pusher(pusher.clone());
+
+        let hex = a_signed_bundle_hex();
+        let outcome = be.push_signed_bundle(&hex).await.unwrap();
+
+        assert!(outcome.accepted);
+        assert!(outcome.rejection.is_none());
+        let pushed = pusher.pushed.lock().unwrap();
+        assert_eq!(pushed.len(), 1, "exactly one bundle reached the network");
+        assert_eq!(
+            super::super::chain::encode_signed_bundle(&pushed[0]).unwrap(),
+            hex,
+            "the bytes pushed must be the bytes signed -- a re-encoded bundle is a DIFFERENT \
+             transaction, and the signature would no longer cover it"
+        );
+    }
+
+    /// **A mempool refusal is a VALUE; an unreachable mempool is an ERROR.**
+    ///
+    /// Both cases push the SAME well-formed bundle through the SAME code path and vary only what
+    /// the network said, so an implementation that routed a refusal onto the error channel — where
+    /// it is indistinguishable from an outage — fails here.
+    #[tokio::test]
+    async fn a_refusal_and_an_outage_are_different_answers() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let refused = WalletBackend::new(
+            db,
+            Arc::new(EmptyFallback),
+            WalletConfig::default(),
+        )
+        .with_pusher(FakePusher::answering(Ok(PushOutcome {
+            accepted: false,
+            transaction_id: None,
+            rejection: Some("DOUBLE_SPEND".into()),
+        })));
+        let outcome = refused
+            .push_signed_bundle(&a_signed_bundle_hex())
+            .await
+            .expect("a refusal is a successful call");
+        assert!(!outcome.accepted);
+        assert_eq!(outcome.rejection.as_deref(), Some("DOUBLE_SPEND"));
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let offline = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_pusher(FakePusher::answering(Err("connection reset".into())));
+        assert!(matches!(
+            offline.push_signed_bundle(&a_signed_bundle_hex()).await,
+            Err(PushError::Unreachable(_))
+        ));
+    }
+
+    /// A node with no pusher says so, rather than reporting an acceptance it never obtained.
+    #[tokio::test]
+    async fn a_node_that_cannot_push_never_reports_an_acceptance() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            be.push_signed_bundle(&a_signed_bundle_hex()).await,
+            Err(PushError::NoChainSource)
+        );
+    }
+
+    /// Garbage is rejected BEFORE any network call, because retrying it can never help.
+    #[tokio::test]
+    async fn a_malformed_bundle_is_refused_without_touching_the_network() {
+        let pusher = FakePusher::accepting();
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_pusher(pusher.clone());
+        assert!(matches!(
+            be.push_signed_bundle("not-hex").await,
+            Err(PushError::InvalidBundle(_))
+        ));
+        assert!(
+            pusher.pushed.lock().unwrap().is_empty(),
+            "nothing may be sent for a bundle that cannot be parsed"
+        );
     }
 
     // ---- #1957: the coinset-fallback path is abuse-bounded -----------------------------------

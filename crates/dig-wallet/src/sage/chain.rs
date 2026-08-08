@@ -249,7 +249,7 @@ mod tests {
             Program::from(vec![0x01]).into(),
             Program::from(vec![0x80]).into(),
         );
-        SpendBundle::new(vec![spend], chia_bls::Signature::default())
+        SpendBundle::new(vec![spend], Default::default())
     }
 
     /// **The hex form round-trips.** Pinned because the wire carries hex, not a struct: a bundle

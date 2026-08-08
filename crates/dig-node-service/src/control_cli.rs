@@ -58,6 +58,12 @@ pub enum ControlAction {
     SyncTrigger { store: String },
     /// `control.wallet.balance` — the READ-ONLY balance of a public address (XCH or $DIG).
     WalletBalance { address: String, asset: String },
+    /// `control.wallet.coins` — the READ-ONLY unspent coins of a public address (XCH or $DIG).
+    WalletCoins { address: String, asset: String },
+    /// `control.wallet.peak` — the READ-ONLY chain peak height the node can see.
+    WalletPeak,
+    /// `control.wallet.broadcast` — push an ALREADY-SIGNED spend bundle. The node signs nothing.
+    WalletBroadcast { signed_bundle_hex: String },
     /// `control.updater.status` — the DIG auto-update beacon's status.
     UpdaterStatus,
     /// `control.updater.setChannel` — set the beacon channel (`nightly` | `stable`).
@@ -94,6 +100,9 @@ impl ControlAction {
             ControlAction::SyncStatus => "control.sync.status",
             ControlAction::SyncTrigger { .. } => "control.sync.trigger",
             ControlAction::WalletBalance { .. } => "control.wallet.balance",
+            ControlAction::WalletCoins { .. } => "control.wallet.coins",
+            ControlAction::WalletPeak => "control.wallet.peak",
+            ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
             ControlAction::UpdaterStatus => "control.updater.status",
             ControlAction::UpdaterSetChannel { .. } => "control.updater.setChannel",
             ControlAction::UpdaterPause { .. } => "control.updater.pause",
@@ -114,8 +123,12 @@ impl ControlAction {
             | ControlAction::StoresUnpin { store }
             | ControlAction::StoresStatus { store }
             | ControlAction::SyncTrigger { store } => json!({ "store": store }),
-            ControlAction::WalletBalance { address, asset } => {
+            ControlAction::WalletBalance { address, asset }
+            | ControlAction::WalletCoins { address, asset } => {
                 json!({ "address": address, "asset": asset })
+            }
+            ControlAction::WalletBroadcast { signed_bundle_hex } => {
+                json!({ "signed_bundle_hex": signed_bundle_hex })
             }
             ControlAction::UpdaterSetChannel { channel } => json!({ "channel": channel }),
             ControlAction::UpdaterPause { until: Some(u) } => json!({ "until": u }),
@@ -170,6 +183,16 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         ControlAction::WalletBalance {
             address: String::new(),
             asset: String::new(),
+        }
+        .method(),
+        ControlAction::WalletCoins {
+            address: String::new(),
+            asset: String::new(),
+        }
+        .method(),
+        ControlAction::WalletPeak.method(),
+        ControlAction::WalletBroadcast {
+            signed_bundle_hex: String::new(),
         }
         .method(),
         ControlAction::UpdaterStatus.method(),

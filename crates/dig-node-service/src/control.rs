@@ -87,13 +87,22 @@ pub fn is_control_method(method: &str) -> bool {
 /// Is this a control method that is READ-ONLY and safe to answer WITHOUT the control token —
 /// an OPEN read on the loopback read plane? PURE.
 ///
-/// `control.wallet.balance` (#1851) is a chain-read of a PUBLIC address (no seed, no signing
-/// key, no custody), so it is exposed like the other reads rather than behind the control-token
-/// gate: a local UI can poll a balance without pairing. It is still routed through the control
+/// The wallet CHAIN READS (`control.wallet.balance` #1851, plus `.coins` and `.peak`
+/// dig_ecosystem#2376) are reads of PUBLIC chain state (no seed, no signing key, no custody), so
+/// they are exposed like the other reads rather than behind the control-token gate: a local UI can
+/// poll a balance, list coins to build a spend, and bound a confirmation, without pairing.
+///
+/// `control.wallet.broadcast` is deliberately NOT here. It puts bytes on the network, so the token
+/// is what stands between a local process and a broadcast — and an `UNAUTHORIZED` from it therefore
+/// means exactly that, with the token as the remedy, where the same code on an OPEN read can only
+/// have come from a node too old to serve it (remedy: an upgrade). It is still routed through the control
 /// dispatcher (so it stays discoverable in [`CONTROL_METHODS`] and gets its CLI verb), but the
 /// server skips the token requirement for it. NO mutation or custody method is ever open here.
 pub fn is_open_control_read(method: &str) -> bool {
-    method == "control.wallet.balance"
+    matches!(
+        method,
+        "control.wallet.balance" | "control.wallet.coins" | "control.wallet.peak"
+    )
 }
 
 /// The canonical set of `control.*` methods the node's control plane RESOLVES — the
@@ -125,6 +134,9 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.sync.status",
     "control.sync.trigger",
     "control.wallet.balance",
+    "control.wallet.coins",
+    "control.wallet.peak",
+    "control.wallet.broadcast",
     "control.updater.status",
     "control.updater.setChannel",
     "control.updater.pause",
@@ -163,6 +175,9 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.sync.status",
     "control.sync.trigger",
     "control.wallet.balance",
+    "control.wallet.coins",
+    "control.wallet.peak",
+    "control.wallet.broadcast",
     "control.updater.status",
     "control.updater.setChannel",
     "control.updater.pause",
@@ -729,6 +744,9 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.sync.status" => control_ok(id, sync_status(ctx).await),
         "control.sync.trigger" => sync_trigger(ctx, id, params).await,
         "control.wallet.balance" => wallet_balance(ctx, id, params).await,
+        "control.wallet.coins" => wallet_coins(ctx, id, params).await,
+        "control.wallet.peak" => wallet_peak(ctx, id).await,
+        "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
         // re-implements the beacon's trust/install logic).
@@ -1216,7 +1234,6 @@ fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
 /// figure; the three read-failure shapes map to DISTINCT catalogued errors (never a fabricated
 /// `0`): `WALLET_NO_CHAIN_SOURCE`, `WALLET_NOT_SYNCED`, `WALLET_READ_FAILED`.
 async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
-    use dig_wallet::sage::rpc::{BalanceAsset, BalanceError};
 
     let Some(address) = params.get("address").and_then(|v| v.as_str()) else {
         return control_error(
@@ -1265,6 +1282,187 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             "balance read refused: the open coinset-fallback rate limit is exhausted; back off and retry",
         ),
     }
+}
+
+
+use dig_wallet::sage::rpc::{BalanceAsset, BalanceError};
+
+/// The address + asset params shared by `control.wallet.balance` and `control.wallet.coins` — a
+/// balance is a coins read reduced to a sum, so the two take the SAME shape (and dig-app's frozen
+/// `CoinsRequest` doubles as its balance request for the same reason).
+///
+/// Returns the parsed pair, or the JSON-RPC error response to send back verbatim.
+fn wallet_address_params(
+    method: &str,
+    id: &Value,
+    params: &Value,
+) -> std::result::Result<(String, dig_wallet::sage::rpc::BalanceAsset), Value> {
+    let Some(address) = params.get("address").and_then(|v| v.as_str()) else {
+        return Err(control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{method} requires params.address (a bech32m address string)"),
+        ));
+    };
+    let asset_str = params
+        .get("asset")
+        .and_then(|v| v.as_str())
+        .unwrap_or("xch");
+    let Some(asset) = BalanceAsset::from_wire(asset_str) else {
+        return Err(control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{method} asset must be \"xch\" or \"dig\", got {asset_str:?}"),
+        ));
+    };
+    Ok((address.to_string(), asset))
+}
+
+/// Map a wallet READ failure onto its catalogued control error. Shared by the balance and coin
+/// reads so the two can never classify the same failure differently.
+fn wallet_read_error(method: &str, id: Value, address: &str, e: BalanceError) -> Value {
+    match e {
+        BalanceError::InvalidAddress => control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!("{method}: {address:?} is not a valid bech32m address"),
+        ),
+        BalanceError::NoChainSource => control_error(
+            id,
+            ErrorCode::WalletNoChainSource,
+            "no live chain source could answer this read",
+        ),
+        BalanceError::NotSynced => control_error(
+            id,
+            ErrorCode::WalletNotSynced,
+            "the wallet is still syncing and no fallback is available to answer",
+        ),
+        BalanceError::ReadFailed(e) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("chain read failed: {e}"),
+        ),
+        BalanceError::RateLimited => control_error(
+            id,
+            ErrorCode::WalletRateLimited,
+            "read refused: the open coinset-fallback rate limit is exhausted; back off and retry",
+        ),
+    }
+}
+
+/// `control.wallet.coins` (dig_ecosystem#2376) — the UNSPENT coins at a PUBLIC address, for XCH or
+/// $DIG. An OPEN read for the same reason as the balance: it needs only an address.
+///
+/// Params: `{ address, asset }` (identical to the balance read). Result:
+/// `{ coins:[{coin_id, asset, amount, parent_coin_info, puzzle_hash, created_height, spent_height}],
+/// source, synced, peak_height }`.
+///
+/// `coins: []` means a chain was consulted and the address holds nothing. Every way of failing to
+/// consult one is a DISTINCT catalogued error, never an empty list — an empty list would tell a
+/// holder of funds that they hold none, and a spend built on that refuses with an untrue shortfall.
+async fn wallet_coins(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    const METHOD: &str = "control.wallet.coins";
+    let (address, asset) = match wallet_address_params(METHOD, &id, params) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    match ctx.wallet.coins_for_address(&address, asset).await {
+        Ok(r) => control_ok(id, coins_wire(&r, asset)),
+        Err(e) => wallet_read_error(METHOD, id, &address, e),
+    }
+}
+
+/// `control.wallet.peak` (dig_ecosystem#2376) — the node's current chain peak height.
+///
+/// Its own method rather than a field on a balance: a balance reports `peak_height: null` on every
+/// fallback-tier answer by design (#2233), so a caller bounding a claimed confirmation could not get
+/// one from the very node that most needs to answer. `peak_height: null` here means UNKNOWN — never
+/// height zero, which every block is trivially above.
+async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
+    match ctx.wallet.chain_peak().await {
+        Ok(peak) => control_ok(
+            id,
+            json!({ "peak_height": peak.peak_height, "synced": peak.synced }),
+        ),
+        Err(e) => wallet_read_error("control.wallet.peak", id, "", e),
+    }
+}
+
+/// `control.wallet.broadcast` (dig_ecosystem#2376) — push an ALREADY-SIGNED spend bundle.
+///
+/// # The custody boundary (§908)
+///
+/// The params carry signed bytes and nothing else: no key, no seed, no unsigned plan. The node
+/// cannot sign and is never given anything it could sign with — its role on the money path is to
+/// read chain state and to relay what somebody else signed.
+///
+/// # TOKEN-GATED, unlike the reads
+///
+/// This is not an open read ([`is_open_control_read`]), so an `UNAUTHORIZED` from it means exactly
+/// that and the remedy is the control token.
+///
+/// # A refusal is a RESULT
+///
+/// A mempool that examined the bundle and refused it answers `{accepted:false, rejection}` with a
+/// `200`. Failing to REACH a mempool is an error. Collapsing the two turns "your wifi dropped" into
+/// "your mint failed", and the remedies are opposite.
+async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    use dig_wallet::sage::rpc::PushError;
+
+    let Some(hex) = params.get("signed_bundle_hex").and_then(|v| v.as_str()) else {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            "control.wallet.broadcast requires params.signed_bundle_hex (hex of a signed \
+             SpendBundle)",
+        );
+    };
+    match ctx.wallet.push_signed_bundle(hex).await {
+        Ok(outcome) => control_ok(
+            id,
+            json!({
+                "accepted": outcome.accepted,
+                "transaction_id": outcome.transaction_id,
+                "rejection": outcome.rejection,
+            }),
+        ),
+        Err(PushError::InvalidBundle(e)) => control_error(id, ErrorCode::InvalidParams, e),
+        Err(PushError::NoChainSource) => control_error(
+            id,
+            ErrorCode::WalletNoChainSource,
+            "this node has no chain source to push through",
+        ),
+        Err(PushError::Unreachable(e)) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("the bundle never reached a mempool: {e}"),
+        ),
+    }
+}
+
+/// Map a coin read onto the wire contract published by `dig-node-control-interface`.
+///
+/// The `asset` is echoed onto every coin because dig-app's frozen `CoinRecord` carries one and
+/// filters by it; the read is already scoped to a single asset, so echoing the REQUESTED one is
+/// exactly what the coins are.
+fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset) -> Value {
+    let asset = asset.as_wire();
+    json!({
+        "coins": r.coins.iter().map(|c| json!({
+            "coin_id": c.coin_id,
+            "asset": asset,
+            "amount": c.amount,
+            "parent_coin_info": c.parent_coin_info,
+            "puzzle_hash": c.puzzle_hash,
+            "created_height": c.created_height,
+            // Every coin here is unspent by construction; the field is present so the shape matches
+            // the contract, and `null` is the truthful value for an unspent coin.
+            "spent_height": Value::Null,
+        })).collect::<Vec<_>>(),
+        "source": r.source.as_wire(),
+        "synced": r.synced,
+        "peak_height": r.peak_height,
+    })
 }
 
 /// Count distinct store ids among the cached capsules. PURE-ish (reads the slice).
