@@ -4533,6 +4533,74 @@ mod tests {
         assert!(pusher.pushed.lock().unwrap().is_empty());
     }
 
+    /// **A restarted, still-LOCKED node refuses a bundle over a key beyond its receive address.**
+    ///
+    /// The memo of loaded signers lives in the process, so a restart empties it and the guard falls
+    /// back to what the custody manifest persisted. When that was the receive ADDRESS, the fallback
+    /// covered HD index 0 alone while the signer covers `0..derivation_count` — so a bundle
+    /// pre-signed over the wallet's index-1 coin passed a guard whose own signer would have signed
+    /// it. Persisting the public keys closes that, because keys enumerate where wrapped puzzle
+    /// hashes do not.
+    ///
+    /// The fixture deliberately uses the NON-primary key: an index-0 bundle is caught by the
+    /// address fallback too, so it could not tell the two implementations apart.
+    #[tokio::test]
+    async fn a_restarted_locked_node_still_refuses_a_bundle_over_its_non_primary_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "dig-wallet-restart-guard-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let custody = WalletCustody::new(dir.clone(), Network::Testnet11, 2);
+        let created = custody.create("hunter2pw", None).unwrap();
+
+        let pusher = FakePusher::accepting();
+        let cfg = WalletConfig {
+            network_id: "testnet11".into(),
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), cfg.clone())
+            .with_custody(custody.clone())
+            .with_pusher(pusher.clone());
+
+        // The key at an HD index the receive address does NOT describe.
+        let primary_ph = singleton::bytes32_from_hex(&decode_address(&created.address).unwrap())
+            .expect("the manifest address decodes to a puzzle hash");
+        let secondary = custody
+            .signer(None)
+            .unwrap()
+            .public_keys()
+            .into_iter()
+            .find(|pk| p2_hash(*pk) != primary_ph)
+            .expect("the signer must cover more than the receive address, or this proves nothing");
+
+        let own = signed_by_the_node(&be, bare_xch_spend(secondary)).await;
+
+        // Restart: a fresh custody over the SAME directory, nothing unlocked, and a fresh backend
+        // whose memo of loaded signers is empty.
+        let restarted = WalletCustody::new(dir.clone(), Network::Testnet11, 2);
+        let db2 = WalletDb::open_in_memory().await.unwrap();
+        db2.set_initial_sync_complete(true).await.unwrap();
+        let after = WalletBackend::new(db2, Arc::new(MockFallback::default()), cfg)
+            .with_custody(restarted)
+            .with_pusher(pusher.clone());
+        assert!(
+            after.current_signer().is_none(),
+            "the restarted node must really be locked, or the fallback is never exercised"
+        );
+
+        assert_eq!(
+            after.push_signed_bundle(&own).await,
+            Err(PushError::NodeCustodiedSpend),
+            "a locked node still custodies every key in its derivation range"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **A bundle that spends the node's coins ALONGSIDE somebody else's is still refused.**
     ///
     /// The nearest wrong implementation checks only the FIRST coin spend, or asks whether the
