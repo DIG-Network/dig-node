@@ -244,11 +244,7 @@ mod tests {
     /// A minimal but REAL signed bundle: one coin spend and an aggregate signature slot.
     fn a_bundle() -> SpendBundle {
         let coin = Coin::new(Bytes32::new([1u8; 32]), Bytes32::new([2u8; 32]), 1_000);
-        let spend = CoinSpend::new(
-            coin,
-            Program::from(vec![0x01]),
-            Program::from(vec![0x80]),
-        );
+        let spend = CoinSpend::new(coin, Program::from(vec![0x01]), Program::from(vec![0x80]));
         SpendBundle::new(vec![spend], Default::default())
     }
 

@@ -885,6 +885,17 @@ impl WalletBackend {
                 synced,
             });
         }
+        // The replica has no height, so answering means an OUTBOUND call to the third-party tier.
+        // That call is subject to the SAME global bound as the other open reads (#1957): this is an
+        // unauthenticated loopback endpoint, so without the bound a local process (or a
+        // CORS-reflected origin) could loop it into egress amplification against that third party.
+        //
+        // Guarded HERE rather than inherited from the coin read, because a bound that lives inside
+        // one method's fallback arm covers exactly that method -- and a caller bounding a claimed
+        // confirmation calls THIS one.
+        if !self.fallback_rate.try_acquire() {
+            return Err(BalanceError::RateLimited);
+        }
         let peak_height = self.fallback.peak_height().await.map_err(read_err)?;
         Ok(ChainPeak {
             peak_height,
@@ -3854,11 +3865,7 @@ mod tests {
     fn a_signed_bundle_hex() -> String {
         use chia_protocol::{Bytes32, Coin, CoinSpend, Program, SpendBundle};
         let coin = Coin::new(Bytes32::new([7u8; 32]), Bytes32::new([8u8; 32]), 42);
-        let spend = CoinSpend::new(
-            coin,
-            Program::from(vec![0x01]),
-            Program::from(vec![0x80]),
-        );
+        let spend = CoinSpend::new(coin, Program::from(vec![0x01]), Program::from(vec![0x80]));
         super::super::chain::encode_signed_bundle(&SpendBundle::new(
             vec![spend],
             Default::default(),
@@ -4016,6 +4023,56 @@ mod tests {
         assert!(
             !peak.synced,
             "a height nobody produced is not a synced view"
+        );
+    }
+
+    /// **Every open chain read that reaches the third-party tier passes the SAME bound.**
+    ///
+    /// The bound lives inside each method's fallback arm, so "the balance read is limited" says
+    /// nothing about the two methods added beside it. This drains the bucket with ONE read and then
+    /// asserts the other two are refused — which they can only be if each consults the bound
+    /// itself. A method that inherited nothing would answer happily and fail here.
+    ///
+    /// The peak case is the one that needs a replica with NO height: a node whose replica knows its
+    /// peak never reaches the tier at all, so it could not exhibit the property under test.
+    #[tokio::test]
+    async fn every_open_read_that_leaves_the_node_passes_the_same_rate_bound() {
+        let arbitrary = encode_address(&"33".repeat(32), "xch").unwrap();
+
+        // A single token in the bucket, no refill: the first outbound read spends it.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(1.0, 0.0);
+        assert!(
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch)
+                .await
+                .is_ok(),
+            "the first read spends the only token"
+        );
+        assert_eq!(
+            be.coins_for_address(&arbitrary, BalanceAsset::Xch).await,
+            Err(BalanceError::RateLimited),
+            "a second coin read must be refused, not amplified onto the third party"
+        );
+
+        // The peak read reaches the tier only when the replica has no height of its own.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(0.0, 0.0);
+        assert_eq!(
+            be.chain_peak().await,
+            Err(BalanceError::RateLimited),
+            "the peak read must consult the bound too"
         );
     }
 
