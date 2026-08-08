@@ -978,8 +978,8 @@ mod tests {
     /// rust/hard-coded-cryptographic-value alert. The test only needs a stable, deterministic
     /// passphrase, not a specific one.
     fn test_custody_password() -> String {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         b"dig-wallet-custody-test".hash(&mut hasher);
         format!("{:x}", hasher.finish())

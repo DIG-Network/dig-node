@@ -3711,8 +3711,8 @@ mod tests {
     /// rust/hard-coded-cryptographic-value alert. The test only needs a stable, deterministic
     /// passphrase, not a specific one.
     fn test_custody_password() -> String {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         b"dig-wallet-rpc-test".hash(&mut hasher);
         format!("{:x}", hasher.finish())
@@ -6042,7 +6042,10 @@ mod tests {
 
         // Create a wallet over the custody dispatch surface — leaves it unlocked with a signer.
         let (status, body) = be
-            .dispatch("wallet.create", &format!(r#"{{"password":"{}"}}"#, test_custody_password()))
+            .dispatch(
+                "wallet.create",
+                &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
+            )
             .await;
         assert_eq!(status, 200, "wallet.create failed: {body}");
         assert!(body.contains("address"), "wallet.create returns an address");
@@ -6072,7 +6075,10 @@ mod tests {
         assert_eq!(state(&body), "none");
 
         let (s, _b) = be
-            .dispatch("wallet.create", &format!(r#"{{"password":"{}"}}"#, test_custody_password()))
+            .dispatch(
+                "wallet.create",
+                &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
+            )
             .await;
         assert_eq!(s, 200);
         let (_s, body) = be.dispatch("wallet.status", "{}").await;
@@ -6084,14 +6090,20 @@ mod tests {
         assert_eq!(state(&body), "locked");
 
         let (s, _b) = be
-            .dispatch("wallet.unlock", &format!(r#"{{"password":"{}"}}"#, test_custody_password()))
+            .dispatch(
+                "wallet.unlock",
+                &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
+            )
             .await;
         assert_eq!(s, 200);
         let (_s, body) = be.dispatch("wallet.status", "{}").await;
         assert_eq!(state(&body), "unlocked");
 
         let (s, _b) = be
-            .dispatch("wallet.delete", &format!(r#"{{"password":"{}"}}"#, test_custody_password()))
+            .dispatch(
+                "wallet.delete",
+                &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
+            )
             .await;
         assert_eq!(s, 200);
         let (_s, body) = be.dispatch("wallet.status", "{}").await;

@@ -289,8 +289,8 @@ mod tests {
     /// rust/hard-coded-cryptographic-value alert. The test only needs a stable, deterministic
     /// passphrase, not a specific one.
     fn test_custody_password() -> String {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         b"dig-wallet-service-test".hash(&mut hasher);
         format!("{:x}", hasher.finish())
@@ -365,7 +365,10 @@ mod tests {
             let svc = WalletService::build(&dir).await;
             let (s, _b) = svc
                 .backend
-                .dispatch("wallet.create", &format!(r#"{{"password":"{}"}}"#, test_custody_password()))
+                .dispatch(
+                    "wallet.create",
+                    &format!(r#"{{"password":"{}"}}"#, test_custody_password()),
+                )
                 .await;
             assert_eq!(s, 200);
         }
