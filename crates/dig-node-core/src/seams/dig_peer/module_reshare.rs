@@ -547,21 +547,58 @@ fn decode_id(hex: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use digstore_core::datasection::{encode_blob, SectionId};
+    use digstore_core::datasection::{
+        encode_blob, encode_chunk_pool, encode_key_table, encode_merkle_nodes, SectionId,
+    };
+    use digstore_core::merkle::{resource_leaf, MerkleTree};
+    use digstore_core::serving::concat_output;
+    use digstore_core::KeyTableEntry;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const STORE: [u8; 32] = [0xa1; 32];
-    const CHAIN_ROOT: [u8; 32] = [0xb2; 32];
 
     fn hex32(bytes: [u8; 32]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// A `.dig`-shaped module committing `store` + `root`.
+    /// The single fixed resource every reshare fixture serves: one resource with a known `static_key`
+    /// and one content chunk. Its merkle root is DERIVED from the content (a preimage of an arbitrary
+    /// root cannot be chosen), so [`chain_root`] is whatever this content folds to.
+    fn faithful_resource() -> ([u8; 32], Vec<u8>) {
+        ([0x01; 32], b"reshare capsule content".to_vec())
+    }
+
+    /// The chain-anchored generation root the reshare fixtures commit — the merkle root of
+    /// [`faithful_resource`]'s content. Deterministic, so every fixture and every verifier/resolver in
+    /// this module agree on the same root.
+    fn chain_root() -> [u8; 32] {
+        let (_static_key, chunk) = faithful_resource();
+        let leaf = resource_leaf(&concat_output(&[chunk.as_slice()]));
+        MerkleTree::from_leaves(vec![leaf]).root().0
+    }
+
+    /// A FAITHFUL `.dig`-shaped module committing `store` + `root` whose `ChunkPool`/`KeyTable`/
+    /// `MerkleNodes` reproduce `root` under the hardened admit gate (rule 5, #2246). Callers pass
+    /// [`chain_root`] as `root`; the served content folds to exactly that.
     fn module_committing(store: [u8; 32], root: [u8; 32]) -> Vec<u8> {
+        let (static_key, chunk) = faithful_resource();
+        let leaf = resource_leaf(&concat_output(&[chunk.as_slice()]));
+        let leaves = vec![leaf];
+        let entries = vec![KeyTableEntry {
+            static_key: Bytes32(static_key),
+            generation: Bytes32(root),
+            chunk_indices: vec![0],
+            total_size: chunk.len() as u64,
+        }];
         encode_blob(&[
             (SectionId::StoreId as u16, store.to_vec()),
             (SectionId::CurrentRoot as u16, root.to_vec()),
+            (SectionId::KeyTable as u16, encode_key_table(&entries)),
+            (
+                SectionId::ChunkPool as u16,
+                encode_chunk_pool(&[chunk.as_slice()]),
+            ),
+            (SectionId::MerkleNodes as u16, encode_merkle_nodes(&leaves)),
         ])
     }
 
@@ -617,18 +654,18 @@ mod tests {
     #[test]
     fn promotes_the_artifact_the_gate_admitted() {
         let dir = temp_dir("promote-ok");
-        let module = module_committing(STORE, CHAIN_ROOT);
+        let module = module_committing(STORE, chain_root());
         let staged = dir.join("staged.dig");
         std::fs::write(&staged, &module).unwrap();
 
         let verifier =
-            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
+            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(chain_root()));
         assert_eq!(
             futures::executor::block_on(dig_download::ModuleAnchorVerifier::verify_module_anchor(
                 &verifier,
                 &SliceReader(module.clone()),
                 &hex32(STORE),
-                &hex32(CHAIN_ROOT)
+                &hex32(chain_root())
             )),
             dig_download::ModuleAnchor::Anchored
         );
@@ -648,16 +685,16 @@ mod tests {
     #[test]
     fn promoting_an_admitted_artifact_bumps_the_refetch_counter() {
         let dir = temp_dir("promote-refetch-counter");
-        let module = module_committing(STORE, CHAIN_ROOT);
+        let module = module_committing(STORE, chain_root());
         let staged = dir.join("staged.dig");
         std::fs::write(&staged, &module).unwrap();
         let verifier =
-            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
+            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(chain_root()));
         futures::executor::block_on(dig_download::ModuleAnchorVerifier::verify_module_anchor(
             &verifier,
             &SliceReader(module.clone()),
             &hex32(STORE),
-            &hex32(CHAIN_ROOT),
+            &hex32(chain_root()),
         ));
 
         // `>=` rather than exact `==`: `CACHE_REFETCH_COUNT` is a PROCESS-GLOBAL atomic shared with
@@ -684,15 +721,15 @@ mod tests {
     #[test]
     fn refuses_an_artifact_tampered_after_the_gate_admitted_it() {
         let dir = temp_dir("promote-tampered");
-        let module = module_committing(STORE, CHAIN_ROOT);
+        let module = module_committing(STORE, chain_root());
         let verifier =
-            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
+            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(chain_root()));
         assert_eq!(
             futures::executor::block_on(dig_download::ModuleAnchorVerifier::verify_module_anchor(
                 &verifier,
                 &SliceReader(module.clone()),
                 &hex32(STORE),
-                &hex32(CHAIN_ROOT)
+                &hex32(chain_root())
             )),
             dig_download::ModuleAnchor::Anchored
         );
@@ -722,9 +759,9 @@ mod tests {
     fn refuses_to_promote_an_artifact_no_gate_admitted() {
         let dir = temp_dir("promote-ungated");
         let staged = dir.join("staged.dig");
-        std::fs::write(&staged, module_committing(STORE, CHAIN_ROOT)).unwrap();
+        std::fs::write(&staged, module_committing(STORE, chain_root())).unwrap();
         let verifier =
-            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(CHAIN_ROOT));
+            ChainAnchoredModuleVerifier::for_generation(Bytes32(STORE), Bytes32(chain_root()));
 
         let cached = dir.join("cached.module");
         assert_eq!(
@@ -781,7 +818,7 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::shared::AnchoredRootResolver for ConfirmingResolver {
         async fn anchored_root(&self, _store_id: &[u8; 32]) -> Result<Option<Bytes32>, String> {
-            Ok(Some(Bytes32(CHAIN_ROOT)))
+            Ok(Some(Bytes32(chain_root())))
         }
     }
 
@@ -856,7 +893,7 @@ mod tests {
         let spy = Arc::new(AnnounceSpy::default());
         let warmer = warmer_with(Arc::new(ConfirmingResolver), Arc::clone(&spy), &dir);
 
-        let outcome = warmer.warm(&hex32(STORE), &hex32(CHAIN_ROOT)).await;
+        let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
 
         assert_eq!(outcome, WarmOutcome::Refused(WarmFailure::PullFailed));
         assert_eq!(
@@ -882,8 +919,8 @@ mod tests {
     #[tokio::test]
     async fn a_successful_pull_is_held_cached_and_announced_once() {
         let dir = temp_dir("happy-path");
-        let (store_hex, root_hex) = (hex32(STORE), hex32(CHAIN_ROOT));
-        let module = module_committing(STORE, CHAIN_ROOT);
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let module = module_committing(STORE, chain_root());
 
         // One real holder, served through dig-download's own mock transport — the SAME production
         // `ModuleDownloader`/`FileSink` path the refusal tests exercise, just with a source that
@@ -989,8 +1026,8 @@ mod tests {
     #[tokio::test]
     async fn a_successful_reshare_warm_land_sweeps_the_modules_cache_once() {
         let dir = temp_dir("reshare-sweep-once");
-        let (store_hex, root_hex) = (hex32(STORE), hex32(CHAIN_ROOT));
-        let module = module_committing(STORE, CHAIN_ROOT);
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let module = module_committing(STORE, chain_root());
         let content = dig_download::module_content_id(&store_hex, &root_hex)
             .expect("canonical ids yield a content id");
         let locator = Arc::new(dig_download::testkit::MockProviderLocator::fixed(
@@ -1053,7 +1090,7 @@ mod tests {
             Arc::clone(&evictor) as Arc<dyn crate::tier0_live::ModulesCacheEvictor>,
         );
 
-        let outcome = warmer.warm(&hex32(STORE), &hex32(CHAIN_ROOT)).await;
+        let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
 
         assert_eq!(outcome, WarmOutcome::Refused(WarmFailure::PullFailed));
         assert_eq!(
@@ -1074,7 +1111,7 @@ mod tests {
         let spy = Arc::new(AnnounceSpy::default());
         let warmer = warmer_with(Arc::new(UnreachableChain), Arc::clone(&spy), &dir);
 
-        let outcome = warmer.warm(&hex32(STORE), &hex32(CHAIN_ROOT)).await;
+        let outcome = warmer.warm(&hex32(STORE), &hex32(chain_root())).await;
 
         assert_eq!(outcome, WarmOutcome::Refused(WarmFailure::NoChainAnchor));
         assert_eq!(spy.calls.load(Ordering::SeqCst), 0);
@@ -1104,7 +1141,7 @@ mod tests {
         let spy = Arc::new(AnnounceSpy::default());
         let warmer = warmer_with(Arc::new(ConfirmingResolver), Arc::clone(&spy), &dir);
         assert_eq!(
-            warmer.warm("not-an-id", &hex32(CHAIN_ROOT)).await,
+            warmer.warm("not-an-id", &hex32(chain_root())).await,
             WarmOutcome::Refused(WarmFailure::NoChainAnchor)
         );
         assert_eq!(spy.calls.load(Ordering::SeqCst), 0);
