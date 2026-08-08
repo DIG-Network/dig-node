@@ -120,11 +120,16 @@ impl WalletService {
         };
 
         // The chain transport (dig_ecosystem#2376) serves the wallet's chain READS and the push of
-        // an already-signed bundle on EVERY install, live-broadcast or not. Those two need no key
-        // and move nothing of the node's, so they are not the question `enable_live_broadcast`
-        // answers -- that flag still governs whether the node's OWN custodied wallet may sign and
-        // send, and it is still default-OFF. Tying the reads to it is what made a stock node answer
-        // `WALLET_NO_CHAIN_SOURCE` to every wallet read and unable to push at all.
+        // an already-signed bundle on EVERY install, live-broadcast or not. Those two need no key,
+        // so they are not the question `enable_live_broadcast` answers -- that flag governs whether
+        // the node's OWN custodied wallet may sign and send, and it is still default-OFF. Tying the
+        // reads to it is what made a stock node answer `WALLET_NO_CHAIN_SOURCE` to every wallet read
+        // and unable to push at all.
+        //
+        // The flag is ALSO handed to the backend below, because "push an already-signed bundle" is
+        // only a different question while the bundle is somebody else's: the node will sign with its
+        // own key on request, so a relay that did not check would let a caller round-trip the node's
+        // own money onto mainnet with the flag off. The backend refuses exactly that bundle.
         //
         // It dials nothing until something asks it to, so an idle node still makes no chain call.
         let chain = Arc::new(ChainTransport::new());
@@ -138,7 +143,8 @@ impl WalletService {
             .with_custody(custody)
             .with_auth(auth)
             .with_tip_events(tip_events.clone())
-            .with_pusher(chain.clone());
+            .with_pusher(chain.clone())
+            .with_node_custodied_spending(cfg.enable_live_broadcast);
         if let Some(l) = &live {
             // The GENERAL wallet surface (send/offer/mint) gets the confirming broadcaster + the
             // live lineage source so CAT/singleton spends resolve inputs.

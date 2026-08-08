@@ -695,6 +695,13 @@ pub enum ErrorCode {
     /// sweep; the caller should back off and retry. The cheap local-DB fast path is never gated.
     /// Node error. (Wallet range `-3204x`.)
     WalletRateLimited,
+    /// `-32044` — a `control.wallet.broadcast` was refused because the bundle spends a coin at one
+    /// of the NODE's OWN custodied puzzle hashes while `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off
+    /// (§18.12). The node relays bundles somebody else signed on every install; sending its own
+    /// money is a separate, default-OFF custody decision, and a caller could otherwise sign through
+    /// the node and hand the bundle straight back. Retrying cannot help. Node error.
+    /// (Wallet range `-3204x`.)
+    WalletNodeSpendDisabled,
     /// `-32060` — a `control.peers.ping` (dig_ecosystem#1985) was refused BEFORE any dial: either a
     /// ladder is already running (single-flight) or the start-rate bound for the window is spent.
     /// Distinct from a ladder that ran and reached nothing, which is a RESULT (`verdict:
@@ -731,6 +738,7 @@ impl ErrorCode {
             ErrorCode::WalletNotSynced => -32041,
             ErrorCode::WalletReadFailed => -32042,
             ErrorCode::WalletRateLimited => -32043,
+            ErrorCode::WalletNodeSpendDisabled => -32044,
             ErrorCode::PeerPingRefused => -32060,
             ErrorCode::PushPendingLimited => -32016,
         }
@@ -754,6 +762,7 @@ impl ErrorCode {
             ErrorCode::WalletNotSynced => "WALLET_NOT_SYNCED",
             ErrorCode::WalletReadFailed => "WALLET_READ_FAILED",
             ErrorCode::WalletRateLimited => "WALLET_RATE_LIMITED",
+            ErrorCode::WalletNodeSpendDisabled => "WALLET_NODE_SPEND_DISABLED",
             ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
             ErrorCode::PushPendingLimited => "PUSH_PENDING_LIMITED",
         }
@@ -778,6 +787,7 @@ impl ErrorCode {
             | ErrorCode::WalletNotSynced
             | ErrorCode::WalletReadFailed
             | ErrorCode::WalletRateLimited
+            | ErrorCode::WalletNodeSpendDisabled
             // The peer ping is run BY the node's own peer network, so the refusal is the node's.
             | ErrorCode::PeerPingRefused
             // The push-reassembly bound is enforced by the node's own capsule seam.
@@ -824,6 +834,9 @@ impl ErrorCode {
             ErrorCode::WalletRateLimited => {
                 "A wallet balance read was refused: the open coinset-fallback rate bound is exhausted."
             }
+            ErrorCode::WalletNodeSpendDisabled => {
+                "A push was refused: the bundle spends the node's own custodied coins and this node                  may not send its own money."
+            }
             ErrorCode::PeerPingRefused => {
                 "A peer ping was refused before dialing: a ladder is already running on this node, \
                  or the start-rate bound is exhausted."
@@ -852,6 +865,7 @@ impl ErrorCode {
             ErrorCode::WalletNotSynced,
             ErrorCode::WalletReadFailed,
             ErrorCode::WalletRateLimited,
+            ErrorCode::WalletNodeSpendDisabled,
             ErrorCode::PeerPingRefused,
             ErrorCode::PushPendingLimited,
         ]

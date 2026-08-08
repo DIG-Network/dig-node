@@ -120,6 +120,11 @@ pub enum PushError {
     InvalidBundle(String),
     /// This node has no way to reach a mempool at all.
     NoChainSource,
+    /// The bundle spends a coin at one of the NODE's OWN custodied puzzle hashes while
+    /// `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off (§18.12). Relaying it would send the node's own
+    /// money, which is precisely the question that flag answers `no` to. Retrying cannot help;
+    /// the remedy is either a bundle that does not spend the node's coins, or the flag.
+    NodeCustodiedSpend,
     /// A mempool could not be reached. The SAME bundle may succeed on a retry.
     Unreachable(String),
 }
@@ -131,6 +136,10 @@ impl std::fmt::Display for PushError {
             PushError::NoChainSource => {
                 f.write_str("this node has no chain source to push through")
             }
+            PushError::NodeCustodiedSpend => f.write_str(
+                "this bundle spends the node's own custodied coins, and this node may not send \
+                 its own money (DIG_WALLET_ENABLE_LIVE_BROADCAST is off)",
+            ),
             PushError::Unreachable(e) => write!(f, "{e}"),
         }
     }
@@ -283,6 +292,25 @@ pub struct WalletBackend {
     /// and send its OWN custodied spends, a custody decision that is default-OFF. Relaying a bundle
     /// somebody else signed is a different question and does not turn on the node's own key.
     pusher: Option<Arc<dyn super::chain::SignedBundlePusher>>,
+    /// Whether the node's OWN custodied wallet may SEND — `DIG_WALLET_ENABLE_LIVE_BROADCAST`
+    /// (§18.12), default `false`.
+    ///
+    /// Read by [`Self::push_signed_bundle`], which refuses a bundle spending the node's own coins
+    /// while this is `false`. Kept as an explicit flag rather than inferred from `broadcaster`
+    /// being attached: that would make the custody rule a side effect of an unrelated wiring
+    /// decision, and any future caller that attaches a broadcaster for another reason would
+    /// silently switch the node's own money back on.
+    node_custodied_spending: bool,
+    /// Every puzzle hash this backend has seen a NODE-CUSTODIED signer hold, accumulated as
+    /// signers come and go.
+    ///
+    /// Needed because the default custody mode (§18.24 per-transaction re-auth) drops the signer
+    /// the moment it has signed: by the time a caller pushes the bundle it just obtained from
+    /// `sign_coin_spends`, [`Self::current_signer`] is `None` again and the live signer's hashes
+    /// are no longer reachable. Without this memo the push guard would be looking at an empty set
+    /// on exactly the path it exists to stop. Shared across `Clone`s so one memo governs the whole
+    /// backend. PUBLIC data only — puzzle hashes, never a key.
+    custodied_puzzle_hashes: Arc<RwLock<HashSet<Bytes32>>>,
     /// The lineage source for CAT-send input resolution (parent-spend reads).
     lineage: Option<Arc<dyn LineageSource>>,
     /// The `SyncEvent` publish bus (design A.9, #205 PR4). Always present (a fresh bus with
@@ -352,6 +380,8 @@ impl WalletBackend {
             signer: None,
             broadcaster: None,
             pusher: None,
+            node_custodied_spending: false,
+            custodied_puzzle_hashes: Arc::new(RwLock::new(HashSet::new())),
             lineage: None,
             events: Arc::new(EventBus::default()),
             identity: Arc::new(RwLock::new(None)),
@@ -446,6 +476,18 @@ impl WalletBackend {
     /// only gives the node a way to relay bytes a caller signed elsewhere.
     pub fn with_pusher(mut self, pusher: Arc<dyn super::chain::SignedBundlePusher>) -> Self {
         self.pusher = Some(pusher);
+        self
+    }
+
+    /// Declare whether the node's OWN custodied wallet may SEND (§18.12,
+    /// `DIG_WALLET_ENABLE_LIVE_BROADCAST`). Default `false`.
+    ///
+    /// Set from the same config flag that decides whether a broadcaster is attached, so the one
+    /// question "may this node move its own money" has one answer across every path that could
+    /// move it — the node's own spend methods AND the relay of an already-signed bundle.
+    #[must_use]
+    pub fn with_node_custodied_spending(mut self, enabled: bool) -> Self {
+        self.node_custodied_spending = enabled;
         self
     }
 
@@ -911,6 +953,23 @@ impl WalletBackend {
     /// The bundle arrives complete. This method holds no key, derives none, and signs nothing — the
     /// node's role on the money path is to read chain state and to relay what somebody else signed.
     ///
+    /// # Why the node's OWN coins are refused when live broadcast is off (§18.12)
+    ///
+    /// §908 governs the USER's key, which never enters the node. It says nothing about the node's
+    /// own custodied wallet — which holds real $DIG (the tipping subsystem spends it) and which
+    /// `sign_coin_spends` will sign with on request. So "somebody else signed it" is not, on its
+    /// own, true of every bundle that arrives here: a token holder can obtain a bundle signed by
+    /// the node's own key and hand it straight back for relay. That path would make
+    /// `DIG_WALLET_ENABLE_LIVE_BROADCAST` decorative — the node would send its own money with the
+    /// flag off, which is the one thing the flag exists to prevent.
+    ///
+    /// So while [`Self::node_custodied_spending`] is off, a bundle spending a coin at any puzzle
+    /// hash this node custodies a key for is [`PushError::NodeCustodiedSpend`]. Relaying a bundle
+    /// signed by anyone ELSE stays open on every install, which is the capability this method was
+    /// added for.
+    ///
+    /// # Outcomes
+    ///
     /// A mempool refusal is `Ok` with `accepted: false`; failing to REACH a mempool is `Err`. A
     /// node with no pusher attached is [`PushError::NoChainSource`] — never a fabricated
     /// acceptance.
@@ -920,11 +979,56 @@ impl WalletBackend {
     ) -> std::result::Result<PushOutcome, PushError> {
         let bundle = super::chain::decode_signed_bundle(signed_bundle_hex)
             .map_err(|e| PushError::InvalidBundle(e.to_string()))?;
+        if !self.node_custodied_spending && self.spends_node_custodied_coin(&bundle) {
+            return Err(PushError::NodeCustodiedSpend);
+        }
         let pusher = self.pusher.as_ref().ok_or(PushError::NoChainSource)?;
         pusher
             .push(&bundle)
             .await
             .map_err(|e| PushError::Unreachable(e.to_string()))
+    }
+
+    /// Whether any coin `bundle` spends sits at a puzzle hash this node holds the key for.
+    fn spends_node_custodied_coin(&self, bundle: &SpendBundle) -> bool {
+        let custodied = self.node_custodied_puzzle_hashes();
+        bundle
+            .coin_spends
+            .iter()
+            .any(|cs| custodied.contains(&cs.coin.puzzle_hash))
+    }
+
+    /// Every puzzle hash the NODE holds a signing key for, as far as this node can know it.
+    ///
+    /// Three sources, unioned because each alone has a blind spot:
+    ///
+    /// - the signer loaded right now — present during a session unlock, absent under the default
+    ///   per-transaction grant;
+    /// - [`Self::custodied_puzzle_hashes`], the memo of every signer this process has loaded —
+    ///   which is what covers "sign, then push after the grant expired";
+    /// - the custody manifest's receive addresses — non-secret, readable while every wallet is
+    ///   LOCKED, so a node that has not unlocked since restart still refuses its own primary
+    ///   address.
+    ///
+    /// Deliberately NOT `wallet_puzzle_hashes()`: that one falls back to the configured WATCHED
+    /// puzzle hashes, which the node holds no key for. Refusing to relay a bundle spending those
+    /// would block a legitimate third-party push, and the question here is custody, not interest.
+    fn node_custodied_puzzle_hashes(&self) -> HashSet<Bytes32> {
+        let mut hashes = self.custodied_puzzle_hashes.read().unwrap().clone();
+        if let Some(signer) = self.current_signer() {
+            hashes.extend(signer.puzzle_hashes());
+        }
+        if let Some(custody) = self.custody.as_ref() {
+            hashes.extend(
+                custody
+                    .list()
+                    .iter()
+                    .filter_map(|w| w.address.as_deref())
+                    .filter_map(decode_address)
+                    .filter_map(|ph| singleton::bytes32_from_hex(&ph).ok()),
+            );
+        }
+        hashes
     }
 
     // ---- session identity scoping (#407) ---------------------------------
@@ -1495,6 +1599,15 @@ impl WalletBackend {
     /// Returns an owned `Arc` because the gated signer lives behind another lock, so it cannot be
     /// borrowed out of `&self`.
     fn current_signer(&self) -> Option<Arc<WalletSigner>> {
+        let signer = self.resolve_signer();
+        if let Some(s) = signer.as_ref() {
+            self.remember_custodied_puzzle_hashes(s);
+        }
+        signer
+    }
+
+    /// [`Self::current_signer`] without the bookkeeping — the resolution rule itself.
+    fn resolve_signer(&self) -> Option<Arc<WalletSigner>> {
         if let Some(s) = self.signer.clone() {
             return Some(s);
         }
@@ -1504,6 +1617,19 @@ impl WalletBackend {
             return auth.effective_signer();
         }
         self.custody.as_ref().and_then(|c| c.signer(None))
+    }
+
+    /// Record `signer`'s puzzle hashes so the push guard still recognises the node's own coins
+    /// after the signer is gone (see [`Self::custodied_puzzle_hashes`]).
+    ///
+    /// Takes the write lock only when there is something new to add: a signer resolves on many
+    /// read paths, and the set is stable after the first sight of a given wallet.
+    fn remember_custodied_puzzle_hashes(&self, signer: &WalletSigner) {
+        let hashes = signer.puzzle_hashes();
+        if hashes.is_subset(&self.custodied_puzzle_hashes.read().unwrap()) {
+            return;
+        }
+        self.custodied_puzzle_hashes.write().unwrap().extend(hashes);
     }
 
     /// The signer, or a locked-wallet error (C.6: spends need node-custodied keys).
@@ -4099,6 +4225,166 @@ mod tests {
             "the bytes pushed must be the bytes signed -- a re-encoded bundle is a DIFFERENT \
              transaction, and the signature would no longer cover it"
         );
+    }
+
+    // ---- the node's own money stays behind the live-broadcast flag (18.12) ----------
+
+    /// Build a spend of ONE coin sitting at `puzzle_hash`, as `sign_coin_spends` takes it.
+    fn a_spend_at(puzzle_hash: Bytes32) -> super::super::types::CoinSpendJson {
+        use chia_protocol::{Coin, CoinSpend, Program};
+        super::super::spend::coin_spend_to_json(&CoinSpend::new(
+            Coin::new(Bytes32::new([9u8; 32]), puzzle_hash, 1_000),
+            Program::from(vec![0x01]),
+            Program::from(vec![0x80]),
+        ))
+        .unwrap()
+    }
+
+    /// Sign `coin_spends` through `be`'s OWN custodied key WITHOUT submitting, and return the
+    /// bundle in the hex form `control.wallet.broadcast` accepts.
+    ///
+    /// This is the attacker's chain, verbatim: `sign_coin_spends {auto_submit:false}` ->
+    /// hex-encode the returned bundle -> push. Written as a helper so the tests below cannot
+    /// accidentally push a bundle the node did NOT sign, which would prove nothing.
+    async fn signed_by_the_node(
+        be: &WalletBackend,
+        coin_spends: Vec<super::super::types::CoinSpendJson>,
+    ) -> String {
+        let signed = be
+            .sign_coin_spends(&SignCoinSpends {
+                coin_spends,
+                auto_submit: false,
+                partial: false,
+            })
+            .await
+            .expect("the node signs with its own custodied key on request");
+        super::super::chain::encode_signed_bundle(
+            &super::super::spend::spend_bundle_from_json(&signed.spend_bundle).unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// **A bundle signed by the NODE's own key cannot be pushed while live broadcast is off.**
+    ///
+    /// The chain this closes: a token holder calls `sign_coin_spends {auto_submit:false}`, gets a
+    /// fully-signed bundle spending the node's coins, hex-encodes it, and hands it back to
+    /// `control.wallet.broadcast`. Every step is individually permitted, and together they send the
+    /// node's own money with `DIG_WALLET_ENABLE_LIVE_BROADCAST` off.
+    ///
+    /// The SECOND bundle is the control that makes this test load-bearing: it is signed by the same
+    /// node, over the same surface, on the same backend, and differs ONLY in whose puzzle hash the
+    /// coin sits at. A guard that simply refused every push while the flag is off -- which would
+    /// break the capability this method exists for -- fails on it. Both are asserted at the PUSHER,
+    /// so a refusal that still leaked bytes onto the network would be visible.
+    #[tokio::test]
+    async fn the_nodes_own_signed_spend_is_refused_while_live_broadcast_is_off() {
+        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let pusher = FakePusher::accepting();
+        let be = be.with_pusher(pusher.clone());
+        assert!(
+            !be.node_custodied_spending,
+            "the shipped default is OFF -- if this ever flips, this whole test is vacuous"
+        );
+
+        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+        assert_eq!(
+            be.push_signed_bundle(&own).await,
+            Err(PushError::NodeCustodiedSpend),
+            "the node must not relay a spend of its OWN coins with live broadcast off"
+        );
+
+        let somebody_else =
+            signed_by_the_node(&be, vec![a_spend_at(Bytes32::new([0x5a; 32]))]).await;
+        assert!(
+            be.push_signed_bundle(&somebody_else).await.is_ok(),
+            "relaying a bundle over somebody ELSE's coins is the capability this method adds, and \
+             must stay open on every install"
+        );
+
+        let pushed = pusher.pushed.lock().unwrap();
+        assert_eq!(
+            pushed.len(),
+            1,
+            "exactly one bundle reached the network -- the refused one must not have leaked"
+        );
+        assert_eq!(
+            super::super::chain::encode_signed_bundle(&pushed[0]).unwrap(),
+            somebody_else,
+            "and it must be the third-party bundle, not the node's own"
+        );
+    }
+
+    /// **A bundle that spends the node's coins ALONGSIDE somebody else's is still refused.**
+    ///
+    /// The nearest wrong implementation checks only the FIRST coin spend, or asks whether the
+    /// bundle is *entirely* the node's. Either reads the node's money out through one extra spend,
+    /// so the fixture puts the node's coin SECOND behind a third party's.
+    #[tokio::test]
+    async fn a_mixed_bundle_touching_the_nodes_coins_is_refused_too() {
+        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let be = be.with_pusher(FakePusher::accepting());
+        let mixed = signed_by_the_node(
+            &be,
+            vec![a_spend_at(Bytes32::new([0x5a; 32])), a_spend_at(own_ph)],
+        )
+        .await;
+        assert_eq!(
+            be.push_signed_bundle(&mixed).await,
+            Err(PushError::NodeCustodiedSpend),
+            "one spend of the node's coins is enough to refuse the whole bundle"
+        );
+    }
+
+    /// **The refusal survives the signer being dropped**, which is the DEFAULT custody mode.
+    ///
+    /// Under 18.24 per-transaction re-auth the one-shot grant is consumed by the signature, so by
+    /// the time the caller pushes, `current_signer()` is `None` and the live signer's hashes are
+    /// unreachable. This reproduces exactly that: sign, then drop the signer, then push.
+    ///
+    /// Without the memo this test is the one that fails while every other guard test still passes --
+    /// the guard would consult an empty set on precisely the path it was written to stop.
+    #[tokio::test]
+    async fn the_refusal_survives_the_signing_grant_expiring() {
+        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let be = be.with_pusher(FakePusher::accepting());
+        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+
+        // The grant is gone: no signer resolves any more, exactly as after a one-shot sign. The
+        // config's watched puzzle hashes are cleared with it, so the only thing that can still
+        // recognise the coin is the memo.
+        let relocked = WalletBackend {
+            signer: None,
+            config: WalletConfig::default(),
+            ..be.clone()
+        };
+        assert!(
+            relocked.current_signer().is_none(),
+            "the fixture must actually be signer-less, or it proves nothing"
+        );
+        assert_eq!(
+            relocked.push_signed_bundle(&own).await,
+            Err(PushError::NodeCustodiedSpend),
+            "a bundle the node signed a moment ago is still the node's own money"
+        );
+    }
+
+    /// **With live broadcast ON, the node's own signed spend pushes.**
+    ///
+    /// The guard must be the FLAG's answer, not a permanent refusal. Same backend, same bundle,
+    /// one field different -- so a hardcoded "always refuse the node's coins" fails here.
+    #[tokio::test]
+    async fn the_nodes_own_signed_spend_pushes_when_live_broadcast_is_on() {
+        let (be, _bc, own_ph) = spend_backend(1_000_000).await;
+        let pusher = FakePusher::accepting();
+        let be = be
+            .with_pusher(pusher.clone())
+            .with_node_custodied_spending(true);
+        let own = signed_by_the_node(&be, vec![a_spend_at(own_ph)]).await;
+        assert!(
+            be.push_signed_bundle(&own).await.unwrap().accepted,
+            "with the flag on, the node's own send is exactly what is being enabled"
+        );
+        assert_eq!(pusher.pushed.lock().unwrap().len(), 1);
     }
 
     /// **A mempool refusal is a VALUE; an unreachable mempool is an ERROR.**

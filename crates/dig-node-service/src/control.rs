@@ -1390,9 +1390,14 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 ///
 /// # The custody boundary (§908)
 ///
-/// The params carry signed bytes and nothing else: no key, no seed, no unsigned plan. The node
-/// cannot sign and is never given anything it could sign with — its role on the money path is to
-/// read chain state and to relay what somebody else signed.
+/// The params carry signed bytes and nothing else: no key, no seed, no unsigned plan. The USER's
+/// key never enters the node — its role on the money path is to read chain state and to relay what
+/// somebody else signed.
+///
+/// The node's OWN custodied wallet is a different matter: it holds real $DIG and it signs on
+/// request, so a token holder could sign through the node and hand the bundle back here. While
+/// `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off, a bundle spending the node's own coins is refused
+/// with `WALLET_NODE_SPEND_DISABLED` (§18.12).
 ///
 /// # TOKEN-GATED, unlike the reads
 ///
@@ -1429,6 +1434,12 @@ async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
             id,
             ErrorCode::WalletNoChainSource,
             "this node has no chain source to push through",
+        ),
+        Err(PushError::NodeCustodiedSpend) => control_error(
+            id,
+            ErrorCode::WalletNodeSpendDisabled,
+            "this bundle spends the node's own custodied coins; this node may not send its own \
+             money (DIG_WALLET_ENABLE_LIVE_BROADCAST is off)",
         ),
         Err(PushError::Unreachable(e)) => control_error(
             id,

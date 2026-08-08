@@ -5,11 +5,17 @@
 //!
 //! `DIG_WALLET_ENABLE_LIVE_BROADCAST` (§18.12) answers one question: *may the node's OWN custodied
 //! wallet sign and send?* That is a custody decision and it stays default-OFF. It is NOT the same
-//! question as *may the node look at the chain, and may it relay a bundle somebody else already
+//! question as *may the node look at the chain, and may it relay a bundle somebody ELSE already
 //! signed* — and the two were previously answered by the same flag, which is why a default install
-//! answered `WALLET_NO_CHAIN_SOURCE` to every wallet read and could not push at all. Those reads
-//! disclose nothing the node holds, and the push carries signed bytes the node could not have
-//! produced (§908), so they are served on every install.
+//! answered `WALLET_NO_CHAIN_SOURCE` to every wallet read and could not push at all. The reads
+//! disclose nothing the node holds, so they are served on every install.
+//!
+//! The push is served on every install too, but NOT unconditionally: the node's own custodied
+//! wallet will sign on request, so "somebody else signed it" has to be CHECKED rather than assumed.
+//! With the flag off, [`super::rpc::WalletBackend::push_signed_bundle`] refuses any bundle spending
+//! a coin at a puzzle hash the node custodies a key for. Without that check the flag would be
+//! decorative — sign through the node, then hand the bundle back for relay, and the node's own
+//! money is on mainnet with live broadcast disabled.
 //!
 //! # The client is built LAZILY
 //!
@@ -31,7 +37,7 @@ use chia_protocol::SpendBundle;
 use tokio::sync::Mutex;
 
 use super::fallback::{ChainFallback, CoinsetFallback, FallbackCoin};
-use super::spend::{to_query_bundle, Broadcaster};
+use super::spend::to_query_bundle;
 use super::{Error, Result};
 
 /// The outcome of pushing an already-signed bundle to the network.
@@ -188,22 +194,14 @@ impl ChainFallback for ChainTransport {
     }
 }
 
-/// Pushing through the transport as a plain [`Broadcaster`], for the node's own spend paths.
-///
-/// Those paths only need "did it go"; the richer [`PushOutcome`] is for `control.wallet.broadcast`,
-/// whose caller must tell a refusal from an outage.
-#[async_trait]
-impl Broadcaster for ChainTransport {
-    async fn broadcast(&self, bundle: &SpendBundle) -> Result<()> {
-        match self.push(bundle).await? {
-            PushOutcome { accepted: true, .. } => Ok(()),
-            PushOutcome { rejection, .. } => Err(Error::internal(format!(
-                "the mempool refused the bundle: {}",
-                rejection.unwrap_or_else(|| "no reason given".into())
-            ))),
-        }
-    }
-}
+// DELIBERATELY NOT a `Broadcaster` (dig_ecosystem#2376 review).
+//
+// `Broadcaster` is the node's OWN-SPEND path: attaching one turns on `auto_submit` and
+// `submit_transaction` for the node's custodied key, which is the decision
+// `DIG_WALLET_ENABLE_LIVE_BROADCAST` owns. An unused `impl Broadcaster for ChainTransport` sat here
+// and made a one-line `.with_broadcaster(chain.clone())` compile, pass every test, and silently
+// enable node-custodied sending on a default install. The transport is reachable only as a
+// `SignedBundlePusher`, whose contract is a bundle somebody already signed.
 
 /// Decode a hex-encoded, already-signed spend bundle.
 ///
