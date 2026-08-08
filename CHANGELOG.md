@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.102.2] - 2026-08-08
+
+### Bug Fixes
+- **dig-node-core:** Bind admit root to ChunkPool content (#2246 #2240) (#197)
+
+### CI
+- **release:** Gate stable tags on the dig-constants real-genesis floor (#178)
+
 ## [0.102.0] - 2026-08-08
 
 ### Features
