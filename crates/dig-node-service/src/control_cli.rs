@@ -115,7 +115,10 @@ impl ControlAction {
     }
 
     /// The JSON-RPC params for this action (an empty object for the read/no-arg methods).
-    fn params(&self) -> Value {
+    ///
+    /// Public so a test can assert that a parsed command line's operands actually reach the wire,
+    /// not merely that it selected the right method (see `entrypoint`'s parser tests).
+    pub fn wire_params(&self) -> Value {
         match self {
             ControlAction::ConfigSetUpstream { url } => json!({ "upstream": url }),
             ControlAction::CacheSetCap { bytes } => json!({ "cap_bytes": bytes }),
@@ -145,7 +148,7 @@ impl ControlAction {
 /// `--json`). Transport / node errors surface as `io::Error` for the differentiated exit code.
 pub fn run(config: &Config, action: ControlAction) -> std::io::Result<Outcome> {
     let method = action.method();
-    let result = call_control(config, method, action.params())?;
+    let result = call_control(config, method, action.wire_params())?;
     Ok(Outcome::new(summarize(method, &result), result))
 }
 
@@ -401,30 +404,30 @@ mod tests {
     #[test]
     fn params_carry_the_expected_fields() {
         assert_eq!(
-            ControlAction::CacheSetCap { bytes: 123 }.params(),
+            ControlAction::CacheSetCap { bytes: 123 }.wire_params(),
             json!({ "cap_bytes": 123 })
         );
         assert_eq!(
             ControlAction::StoresPin {
                 store: "abc".into()
             }
-            .params(),
+            .wire_params(),
             json!({ "store": "abc" })
         );
         assert_eq!(
-            ControlAction::UpdaterPause { until: Some(99) }.params(),
+            ControlAction::UpdaterPause { until: Some(99) }.wire_params(),
             json!({ "until": 99 })
         );
         // A pause with no deadline sends an empty object (indefinite pause).
         assert_eq!(
-            ControlAction::UpdaterPause { until: None }.params(),
+            ControlAction::UpdaterPause { until: None }.wire_params(),
             json!({})
         );
         assert_eq!(
             ControlAction::SubsAdd {
                 store_id: "s".into()
             }
-            .params(),
+            .wire_params(),
             json!({ "store_id": "s" })
         );
     }

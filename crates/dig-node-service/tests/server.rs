@@ -1453,6 +1453,17 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
             json!("METHOD_NOT_FOUND"),
             "{method} must be registered: got {response:?}"
         );
+        // ...and reached ITS OWN handler. Registration and routing are separate: mutating the
+        // dispatch arm so `control.wallet.coins` runs `wallet_broadcast` leaves the method
+        // registered and the gate open, so both assertions above still pass — but these params
+        // carry no `signed_bundle_hex`, so the wrong handler answers INVALID_PARAMS. Each call
+        // here sends params that are VALID for its own handler, which is what makes this
+        // discriminating rather than decorative.
+        assert_ne!(
+            response["error"]["data"]["code"],
+            json!("INVALID_PARAMS"),
+            "{method} was routed to a handler that wanted different params: got {response:?}"
+        );
     }
 }
 

@@ -835,7 +835,8 @@ impl ErrorCode {
                 "A wallet balance read was refused: the open coinset-fallback rate bound is exhausted."
             }
             ErrorCode::WalletNodeSpendDisabled => {
-                "A push was refused: the bundle spends the node's own custodied coins and this node                  may not send its own money."
+                "A push was refused: the bundle spends the node's own custodied coins and this \
+                 node may not send its own money."
             }
             ErrorCode::PeerPingRefused => {
                 "A peer ping was refused before dialing: a ladder is already running on this node, \
