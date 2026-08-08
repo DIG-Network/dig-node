@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.102.0] - 2026-08-08
+
+### Features
+- **dig-node:** Page the chunk_lens prologue for >2048-chunk reads (dig-download 0.17) (#2230)
+
+### Bug Fixes
+- **msi:** Install into the root dig-updater probes, closing a non-convergent update loop (#194)- **dig-node:** Gate cache.listCached behind the local control token (#2108)- **release:** Stop a stable cut from silently shipping without native packages (#198)- **dig-wallet:** Report which tier answered a wallet balance read (#189)
+
+### Chores
+- **deps:** Drop the placeholder-genesis dig-constants copy, pin to the chia tip (#199)
+
 ## [0.99.9] - 2026-08-06
 
 ### Bug Fixes
