@@ -20,6 +20,25 @@ How this repo's `dig-node` binary (+ the `dign` alias) is built and released. Th
   the nightly publish step fails rather than shipping an incomplete set. The nightly `.deb` is
   amd64-only; the stable one also ships arm64 for apt.dig.net (SPEC §11.5a).
 
+## If a stable cut is refused: "dig-constants X predates 0.4.0"
+
+The stable job runs `scripts/check-dig-constants-current.sh` before it resolves a version, so a
+breach means the run stops with NO tag cut and nothing to clean up. It refuses because a
+`dig-constants` below 0.4.0 carries the all-zeros PLACEHOLDER DIG L2 genesis challenge (SPEC §11.3a),
+which no test can see — every runtime check compares that constant against itself.
+
+The error names the package that pulls the bad copy in. Bump that consumer and re-lock; a 0.x minor
+gap is semver-BREAKING, so a caret range will never resolve forward on its own. Reproduce locally
+with `bash scripts/check-dig-constants-current.sh` and confirm the holder with
+`cargo tree -i dig-constants@<version>`.
+
+The same step also emits `::warning::` annotations when several `dig-constants` versions resolve at
+once, or when a newer one is published. **Neither blocks a release, and neither should be "fixed"
+here** — the duplicate copies are pinned by published metadata this repo cannot edit
+(dig_ecosystem#2072), and the published tip periodically moves to a `chia-protocol`/`chia-wallet-sdk`
+line this repo cannot build against while the `dig-gossip` fork is patched in. A green run with those
+warnings is the expected steady state.
+
 ## Prerequisites / credentials
 
 - **`RELEASE_TOKEN`** — an org-level classic PAT (the ecosystem release token). Both channels no-op

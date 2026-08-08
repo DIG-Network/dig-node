@@ -2936,6 +2936,32 @@ Raising the floor is a DELIBERATE, coordinated act: the declared value, every ca
 `container:` image, this section, and the published docs move together. Both Linux architectures
 build NATIVELY (aarch64 on the arm64 runner), so no vendored-OpenSSL cross-compile is involved.
 
+11.3a. **The `dig-constants` genesis floor (HARD RULE).** A stable tag MUST NOT be cut while any
+`dig-constants` copy in the resolved workspace lock is below **0.4.0**.
+
+0.4.0 is the first release carrying the real DIG L2 mainnet genesis challenge. `dig-constants` 0.1.0
+shipped an all-zeros PLACEHOLDER, with all six AGG_SIG additional-data domains correctly DERIVED from
+that placeholder — a self-consistent set, and therefore invisible to every test, because each runtime
+check compares the constant against itself. A copy below the floor puts a different chain identity
+inside the binary. The rule is stated as a FLOOR over the whole pre-0.4.0 CLASS, not as an inequality
+against 0.1.0: 0.2.x and 0.3.x carry the same placeholder.
+
+It is enforced at two levels, and both MUST hold:
+
+- `crates/dig-node-core/tests/dependency_tree.rs` asserts it against the workspace lock on every
+  build, so a dependency edit that reintroduces a pre-0.4.0 copy fails CI, not the release;
+- `scripts/check-dig-constants-current.sh` re-asserts it in the stable release job, BEFORE version
+  resolution, so a breach means no tag exists to deploy. It fails closed on the lock: a missing
+  lockfile, or one carrying no `dig-constants` at all, is refused rather than vacuously passed.
+
+The gate additionally REPORTS, without blocking, that several `dig-constants` versions resolve at
+once, naming the package that pins each. That stays advisory because those pins live in published
+metadata this repo cannot edit, and every copy at or above the floor agrees on the chain identity.
+Currency against the published crates.io tip is NOT required and MUST NOT be gated on: a
+`dig-constants` release that advances the `chia-protocol`/`chia-wallet-sdk` line cannot be adopted
+here while `dig-gossip`'s vendored `chia-protocol` fork is patched in, so a currency gate would ban
+releasing rather than protect a property.
+
 11.4. **Release hardening.** The release profile keeps `overflow-checks = true` (the read path
 does offset/length arithmetic over untrusted serialized input).
 
