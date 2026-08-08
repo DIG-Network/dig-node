@@ -4,6 +4,35 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## A dependency gate keyed to "the crates.io tip" is unsatisfiable, not strict (#178)
+
+The first draft of `scripts/check-dig-constants-current.sh` refused a stable tag unless
+`dig-constants` was SINGLE and equal to the published tip. It was fully tested and provably fired —
+and it could never have passed. Both halves are unreachable for structural reasons worth
+remembering, because they generalize to any "must be current" dependency gate:
+
+**"Current" is unreachable across a transitive-dependency line jump.** `dig-constants` 0.10.0 moved
+to `chia-protocol` 0.36.1 / `chia-wallet-sdk` 0.34 while this repo builds on 0.26 / 0.30, including
+the `chia-protocol` fork `dig-gossip` vendors through `[patch.crates-io]`. Adopting 0.10 links a
+SECOND `chia_protocol` and produces 11 errors shaped `expected BytesImpl<32>, found
+chia_protocol::bytes::BytesImpl<32>` — the tell that two copies of one type are in the graph, not
+that a signature changed. This recurs on every chia-line jump, for every consumer, forever.
+
+**"Single" is not fixable by the consumer.** The copies are pinned by PUBLISHED metadata: `dig-gossip`
+`>=0.2,<0.5`, `dig-nat` 0.18.0, `digstore-chain` `^0.5`, `dig-download` 0.17.0. No edit in this repo
+collapses them; it takes a cross-repo publish cascade (dig_ecosystem#2072).
+
+The lesson is to gate on the PROPERTY the gate exists to protect, not on a proxy that happens to
+imply it. Here the property is "no copy predates the real DIG L2 genesis challenge", so the rule is a
+0.4.0 FLOOR — and every release from 0.4.0 up is value-NEUTRAL for this repo, since the full
+`DIG_MAINNET` const body is byte-identical across 0.4.0 / 0.5.1 / 0.8.0 / 0.9.0. Tip-equality caught
+the placeholder only incidentally, at the price of periodically banning releases.
+
+And a gate that blocks on a condition only ANOTHER repo can fix does not hold a line — it gets
+bypassed the first time someone needs a release, which teaches everyone that the gate is noise. That
+is why duplication warns (naming the holder of each copy, read out of the same lock) while the floor
+blocks.
+
 ## A tag push can succeed and create ZERO workflow runs (dig_ecosystem#2290)
 
 `git push origin vX.Y.Z` reporting `* [new tag] v0.99.9 -> v0.99.9` does NOT mean a `push: tags:`

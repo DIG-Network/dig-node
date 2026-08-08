@@ -108,6 +108,30 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_TOKEN }}
 
+      # Refuse to cut a stable tag while any dig-constants copy predates the real DIG L2 genesis.
+      #
+      # dig-constants 0.1.0 shipped an all-zeros PLACEHOLDER genesis challenge and derived all six
+      # AGG_SIG domains FROM it, so the whole set was self-consistent and no test could see it. It
+      # reached production through a dig-clvm git rev into dig-wallet's spend validator
+      # (dig_ecosystem#2316). 0.4.0 is the first release with the real value. Below that floor this
+      # binary carries a different chain identity than the network it is talking to.
+      #
+      # Placed BEFORE version resolution deliberately: the point is that no tag exists to deploy,
+      # not that a bad build is caught later. Releasing is the moment the drift escapes the repo.
+      #
+      # The step also WARNS — without blocking — when dig-constants resolves to several versions at
+      # once, naming the package that pins each one. That stays advisory because the pins live in
+      # published metadata this repo cannot edit, so blocking on it would ban releasing until a
+      # five-repo publish cascade lands (dig_ecosystem#2072).
+      #
+      # Invoked as `bash scripts/...`, matching how build-binaries.yml calls check-glibc-floor.sh:
+      # the exec bit is set in git, but not depending on it is what keeps a mode-100644 checkout
+      # from failing the release with a bare "Permission denied".
+      - name: Require dig-constants at or above the real-genesis floor
+        if: steps.token.outputs.present == 'true'
+        shell: bash
+        run: bash scripts/check-dig-constants-current.sh
+
       - name: Resolve version + skip if already tagged
         if: steps.token.outputs.present == 'true'
         id: ver
