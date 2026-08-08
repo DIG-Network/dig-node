@@ -25,6 +25,7 @@ use super::auth::{AuthMethod, Credential, UnlockAuth, UnlockMode};
 use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
+use super::chain::PushOutcome;
 use super::fallback::{ChainFallback, FallbackCoin};
 use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
@@ -64,6 +65,106 @@ impl BalanceAsset {
             Self::Dig => Some(hex::encode(digstore_chain::dig::DIG_ASSET_ID)),
         }
     }
+}
+
+/// A DB coin row as a [`WalletCoin`].
+///
+/// Fallible because the row stores its amount as a decimal STRING: a value that will not fit is a
+/// corrupt row, and a corrupt row must surface as a read failure rather than vanish from the list.
+/// A silently dropped coin is the same lie as an empty list — it under-reports what somebody holds.
+fn coin_from_row(row: &CoinRow) -> Result<WalletCoin> {
+    let amount = row.amount.parse::<u64>().map_err(|e| {
+        Error::internal(format!(
+            "coin {} has an unrepresentable amount {:?}: {e}",
+            row.coin_id, row.amount
+        ))
+    })?;
+    Ok(WalletCoin {
+        coin_id: row.coin_id.clone(),
+        parent_coin_info: row.parent_coin_info.clone(),
+        puzzle_hash: row.puzzle_hash.clone(),
+        amount,
+        created_height: row.created_height.and_then(|h| u32::try_from(h).ok()),
+    })
+}
+
+/// A fallback-tier coin as a [`WalletCoin`]. Infallible: the tier already parsed the amount.
+fn coin_from_fallback(coin: &FallbackCoin) -> WalletCoin {
+    WalletCoin {
+        coin_id: coin.coin_id.clone(),
+        parent_coin_info: coin.parent_coin_info.clone(),
+        puzzle_hash: coin.puzzle_hash.clone(),
+        amount: coin.amount,
+        created_height: coin.created_height,
+    }
+}
+
+/// Why a [`WalletBackend::push_signed_bundle`] could not report a mempool verdict.
+///
+/// A mempool REFUSAL is deliberately NOT in here: that is a successful call reporting
+/// [`PushOutcome::accepted`] `== false`. These are the ways the network was never asked at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushError {
+    /// The hex did not decode to a streamable `SpendBundle`. Retrying cannot help.
+    InvalidBundle(String),
+    /// This node has no way to reach a mempool at all.
+    NoChainSource,
+    /// A mempool could not be reached. The SAME bundle may succeed on a retry.
+    Unreachable(String),
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushError::InvalidBundle(e) => write!(f, "{e}"),
+            PushError::NoChainSource => {
+                f.write_str("this node has no chain source to push through")
+            }
+            PushError::Unreachable(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// One UNSPENT coin as a chain read saw it (dig_ecosystem#2376).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WalletCoin {
+    /// The coin id (hex, no `0x`).
+    pub coin_id: String,
+    /// The parent coin's id (hex).
+    pub parent_coin_info: String,
+    /// The coin's puzzle hash (hex).
+    pub puzzle_hash: String,
+    /// The amount, in mojos / CAT base units.
+    pub amount: u64,
+    /// The height the coin was created at, or `None` while it is known only from the mempool.
+    pub created_height: Option<u32>,
+}
+
+/// The UNSPENT coins held at ONE address for one asset, and the tier that saw them
+/// (dig_ecosystem#2376).
+///
+/// An empty `coins` means a chain WAS consulted and the address holds nothing. A read that could
+/// not consult a chain is a [`BalanceError`], never an empty list — see
+/// [`WalletBackend::coins_for_address`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCoinsResult {
+    /// The unspent coins, newest-first is NOT guaranteed; order is the source's.
+    pub coins: Vec<WalletCoin>,
+    /// Which tier produced these coins.
+    pub source: Source,
+    /// Whether THIS answer reflects a fully-synced local view (only a [`Source::Db`] answer can be).
+    pub synced: bool,
+    /// The chain peak height THIS answer reflects, when known.
+    pub peak_height: Option<u32>,
+}
+
+/// The node's current chain peak (dig_ecosystem#2376).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainPeak {
+    /// The peak height, or `None` when no source could name one. `None` is UNKNOWN, never zero.
+    pub peak_height: Option<u32>,
+    /// Whether the node's own replica is caught up to it.
+    pub synced: bool,
 }
 
 /// The result of a [`WalletBackend::balance_for_address`] read (#1851): the confirmed +
@@ -165,6 +266,12 @@ pub struct WalletBackend {
     signer: Option<Arc<WalletSigner>>,
     /// The network broadcaster. `None` in tests/CI so a built spend is NEVER auto-broadcast.
     broadcaster: Option<Arc<dyn Broadcaster>>,
+    /// The pusher for ALREADY-SIGNED bundles (dig_ecosystem#2376).
+    ///
+    /// Deliberately separate from `broadcaster`: that one is attached only when the node may sign
+    /// and send its OWN custodied spends, a custody decision that is default-OFF. Relaying a bundle
+    /// somebody else signed is a different question and does not turn on the node's own key.
+    pusher: Option<Arc<dyn super::chain::SignedBundlePusher>>,
     /// The lineage source for CAT-send input resolution (parent-spend reads).
     lineage: Option<Arc<dyn LineageSource>>,
     /// The `SyncEvent` publish bus (design A.9, #205 PR4). Always present (a fresh bus with
@@ -233,6 +340,7 @@ impl WalletBackend {
             config,
             signer: None,
             broadcaster: None,
+            pusher: None,
             lineage: None,
             events: Arc::new(EventBus::default()),
             identity: Arc::new(RwLock::new(None)),
@@ -319,6 +427,15 @@ impl WalletBackend {
     /// The node-managed unlock authority, if attached (#431/#432).
     pub fn auth(&self) -> Option<&Arc<UnlockAuth>> {
         self.auth.as_ref()
+    }
+
+    /// Attach the pusher for ALREADY-SIGNED bundles (`control.wallet.broadcast`).
+    ///
+    /// Attaching this does NOT let the node spend its own coins: it holds no key either way. It
+    /// only gives the node a way to relay bytes a caller signed elsewhere.
+    pub fn with_pusher(mut self, pusher: Arc<dyn super::chain::SignedBundlePusher>) -> Self {
+        self.pusher = Some(pusher);
+        self
     }
 
     /// Attach the network broadcaster (enables `auto_submit` + `submit_transaction`).
@@ -625,6 +742,167 @@ impl WalletBackend {
                 })
             }
         }
+    }
+
+    /// The UNSPENT coins held at ONE address for XCH or $DIG (dig_ecosystem#2376).
+    ///
+    /// The read a caller building a spend needs, and the exact sibling of
+    /// [`balance_for_address`](Self::balance_for_address) — a balance is this read reduced to a
+    /// sum, so it takes the same params and routes through the same B.6 tiers.
+    ///
+    /// # An empty list is an ANSWER
+    ///
+    /// `coins: []` means a chain WAS consulted and this address holds nothing. Every way of not
+    /// reaching a chain is a [`BalanceError`] instead. Degrading an unreachable chain into an empty
+    /// list would tell a person holding funds that they hold none, and a spend built on that answer
+    /// refuses with a shortfall that is not true.
+    ///
+    /// # "Unspent", not "confirmed"
+    ///
+    /// Coins seen only in the mempool are INCLUDED, with `created_height: None`. The caller decides
+    /// whether an unconfirmed coin is spendable for its purpose; the node does not decide for it by
+    /// hiding one.
+    pub async fn coins_for_address(
+        &self,
+        address: &str,
+        asset: BalanceAsset,
+    ) -> std::result::Result<WalletCoinsResult, BalanceError> {
+        let puzzle_hash =
+            normalize_ph(&decode_address(address).ok_or(BalanceError::InvalidAddress)?);
+        let asset_id = asset.asset_id_hex();
+
+        let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
+        let db_synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        let scoped = self
+            .db
+            .derivation_exists(&puzzle_hash)
+            .await
+            .map_err(|e| read_err(e.into()))?;
+
+        let source = routing::route(db_synced, scoped);
+        match source {
+            Source::Db => tracing::debug!(tier = source.as_wire(), "wallet coin read routed"),
+            Source::Fallback => tracing::info!(
+                tier = source.as_wire(),
+                "wallet coin read routed to the third-party chain oracle"
+            ),
+        }
+
+        match source {
+            Source::Db => {
+                let scope = [puzzle_hash];
+                let rows = self
+                    .db
+                    .coins_scoped(asset_id.as_deref(), &scope)
+                    .await
+                    .map_err(|e| read_err(e.into()))?;
+                let peak_height = self
+                    .db
+                    .sync_state()
+                    .await
+                    .map_err(|e| read_err(e.into()))?
+                    .peak_height;
+                let coins = rows
+                    .iter()
+                    .filter(|r| r.spent_height.is_none())
+                    .map(coin_from_row)
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(read_err)?;
+                Ok(WalletCoinsResult {
+                    coins,
+                    source,
+                    synced: true,
+                    peak_height,
+                })
+            }
+            Source::Fallback => {
+                // Identical routing to the balance read: no live source means the answer is
+                // UNKNOWN, and WHICH unknown it is tells the caller why (#1851).
+                if !self.fallback.is_live() {
+                    return Err(if scoped {
+                        BalanceError::NotSynced
+                    } else {
+                        BalanceError::NoChainSource
+                    });
+                }
+                if !self.fallback_rate.try_acquire() {
+                    return Err(BalanceError::RateLimited);
+                }
+                let phs = [puzzle_hash];
+                // XCH coins sit AT the puzzle hash; CAT coins are HINTED to it.
+                let coins = match asset {
+                    BalanceAsset::Xch => self.fallback.coin_records_by_puzzle_hashes(&phs).await,
+                    BalanceAsset::Dig => self.fallback.coin_records_by_hints(&phs).await,
+                }
+                .map_err(read_err)?;
+                Ok(WalletCoinsResult {
+                    coins: coins
+                        .iter()
+                        .filter(|c| c.spent_height.is_none())
+                        .map(coin_from_fallback)
+                        .collect(),
+                    source,
+                    // The replica neither produced these coins nor bounds their freshness (#2233).
+                    synced: false,
+                    peak_height: None,
+                })
+            }
+        }
+    }
+
+    /// The node's current chain peak (dig_ecosystem#2376).
+    ///
+    /// Its own method rather than a field on a balance, because a balance's `peak_height` is `null`
+    /// on every fallback-tier answer by design (#2233) — so a caller bounding a claimed
+    /// confirmation could not obtain one from a node whose replica has not synced, which is exactly
+    /// the node that most needs to answer.
+    ///
+    /// Prefers the node's own replica and falls back to the chain tier when the replica has no
+    /// height. `peak_height: None` means UNKNOWN and MUST NOT be read as height zero.
+    pub async fn chain_peak(&self) -> std::result::Result<ChainPeak, BalanceError> {
+        let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
+        let synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        let replica_peak = self
+            .db
+            .sync_state()
+            .await
+            .map_err(|e| read_err(e.into()))?
+            .peak_height;
+        if let Some(peak_height) = replica_peak {
+            return Ok(ChainPeak {
+                peak_height: Some(peak_height),
+                synced,
+            });
+        }
+        let peak_height = self.fallback.peak_height().await.map_err(read_err)?;
+        Ok(ChainPeak {
+            peak_height,
+            // A height the replica did not produce says nothing about the replica being caught up.
+            synced: false,
+        })
+    }
+
+    /// Push an ALREADY-SIGNED spend bundle to the network (dig_ecosystem#2376).
+    ///
+    /// # The custody boundary (§908)
+    ///
+    /// The bundle arrives complete. This method holds no key, derives none, and signs nothing — the
+    /// node's role on the money path is to read chain state and to relay what somebody else signed.
+    ///
+    /// A mempool refusal is `Ok` with `accepted: false`; failing to REACH a mempool is `Err`. A
+    /// node with no pusher attached is [`PushError::NoChainSource`] — never a fabricated
+    /// acceptance.
+    pub async fn push_signed_bundle(
+        &self,
+        signed_bundle_hex: &str,
+    ) -> std::result::Result<PushOutcome, PushError> {
+        let bundle = super::chain::decode_signed_bundle(signed_bundle_hex)
+            .map_err(|e| PushError::InvalidBundle(e.to_string()))?;
+        let pusher = self.pusher.as_ref().ok_or(PushError::NoChainSource)?;
+        pusher
+            .push(&bundle)
+            .await
+            .map_err(|e| PushError::Unreachable(e.to_string()))
     }
 
     // ---- session identity scoping (#407) ---------------------------------

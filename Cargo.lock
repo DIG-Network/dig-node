@@ -2480,6 +2480,7 @@ dependencies = [
  "chia-protocol",
  "chia-query 0.6.0",
  "chia-sdk-test",
+ "chia-traits 0.26.0",
  "chia-wallet-sdk",
  "clvmr",
  "dig-clvm",

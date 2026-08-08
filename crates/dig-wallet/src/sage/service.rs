@@ -9,7 +9,7 @@
 //!
 //! The assembly is deliberately **offline-safe and non-blocking**: it opens (or creates) the
 //! SQLite wallet DB under the node config dir, and defaults the fallback tier to the graceful
-//! [`EmptyFallback`] so bring-up never waits on network/TLS peer discovery. The live direct-peer
+//! a LAZY [`ChainTransport`] so bring-up never waits on network/TLS peer discovery. The live direct-peer
 //! sync loop (which would swap in the [`CoinsetFallback`](super::fallback::CoinsetFallback) and
 //! feed the DB) remains the documented remaining integration: it is **SPEC §18.6**, explicitly
 //! deferred by **§18.12a**. It is NOT §18.12 — §18.12 is the live spend *broadcaster*, which has
@@ -25,7 +25,8 @@ use super::auth::UnlockAuth;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
-use super::fallback::{ChainFallback, ChiaQueryLineage, CoinsetFallback, EmptyFallback};
+use super::chain::ChainTransport;
+use super::fallback::{ChainFallback, ChiaQueryLineage, CoinsetFallback};
 use super::rpc::{WalletBackend, WalletConfig};
 use super::singleton::LineageSource;
 use super::spend::{
@@ -82,7 +83,7 @@ impl WalletService {
     /// is `<config_dir>/wallet.sqlite`; the encrypted seeds are `<config_dir>/wallets/<id>.seed`
     /// (mainnet MULTI-wallet custody, #427; a legacy `<config_dir>/wallet-seed.bin` is adopted).
     /// Never blocks on network: the fallback tier defaults to
-    /// [`EmptyFallback`]. A DB-open failure falls back to an in-memory DB so the node still serves
+    /// a lazy [`ChainTransport`]. A DB-open failure falls back to an in-memory DB so the node still serves
     /// the version/custody/sync-status surface (reported, not fatal).
     /// Assemble the served wallet, offline-safe (no live broadcast). Equivalent to
     /// [`WalletService::build_with`] with the default [`WalletServiceConfig`].
@@ -116,10 +117,16 @@ impl WalletService {
             None
         };
 
-        let fallback: Arc<dyn ChainFallback> = match &live {
-            Some(l) => l.fallback.clone(),
-            None => Arc::new(EmptyFallback),
-        };
+        // The chain transport (dig_ecosystem#2376) serves the wallet's chain READS and the push of
+        // an already-signed bundle on EVERY install, live-broadcast or not. Those two need no key
+        // and move nothing of the node's, so they are not the question `enable_live_broadcast`
+        // answers -- that flag still governs whether the node's OWN custodied wallet may sign and
+        // send, and it is still default-OFF. Tying the reads to it is what made a stock node answer
+        // `WALLET_NO_CHAIN_SOURCE` to every wallet read and unable to push at all.
+        //
+        // It dials nothing until something asks it to, so an idle node still makes no chain call.
+        let chain = Arc::new(ChainTransport::new());
+        let fallback: Arc<dyn ChainFallback> = chain.clone();
         // The base backend WITHOUT the tipping engine attached — cloned into the tip spender so the
         // spender's backend handle has `tipping == None` (no reference cycle engine↔backend). Both
         // share the SAME inner Arcs (db/custody/events/tip_events), so a runtime `wallet.unlock` is
@@ -128,7 +135,8 @@ impl WalletService {
             .with_events(events.clone())
             .with_custody(custody)
             .with_auth(auth)
-            .with_tip_events(tip_events.clone());
+            .with_tip_events(tip_events.clone())
+            .with_pusher(chain.clone());
         if let Some(l) = &live {
             // The GENERAL wallet surface (send/offer/mint) gets the confirming broadcaster + the
             // live lineage source so CAT/singleton spends resolve inputs.

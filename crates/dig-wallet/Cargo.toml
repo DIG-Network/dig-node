@@ -125,6 +125,7 @@ futures-core = "0.3"
 # `webauthn-rs` ceremony is finalized with the extension origin in the follow-up, since
 # webauthn-rs pulls OpenSSL and the RP/origin is defined by the paired extension #433.)
 totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
+chia-traits = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
