@@ -22,10 +22,10 @@ use serde_json::Value;
 use chia_wallet_sdk::driver::Cat;
 
 use super::auth::{AuthMethod, Credential, UnlockAuth, UnlockMode};
+use super::chain::PushOutcome;
 use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
-use super::chain::PushOutcome;
 use super::fallback::{ChainFallback, FallbackCoin};
 use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
@@ -3856,8 +3856,8 @@ mod tests {
         let coin = Coin::new(Bytes32::new([7u8; 32]), Bytes32::new([8u8; 32]), 42);
         let spend = CoinSpend::new(
             coin,
-            Program::from(vec![0x01]).into(),
-            Program::from(vec![0x80]).into(),
+            Program::from(vec![0x01]),
+            Program::from(vec![0x80]),
         );
         super::super::chain::encode_signed_bundle(&SpendBundle::new(
             vec![spend],
@@ -3929,7 +3929,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            r.coins.iter().map(|c| c.coin_id.as_str()).collect::<Vec<_>>(),
+            r.coins
+                .iter()
+                .map(|c| c.coin_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["live"]
         );
         assert_eq!(r.coins[0].amount, 1_750);
@@ -4010,7 +4013,10 @@ mod tests {
         let peak = be.chain_peak().await.unwrap();
         assert_eq!(peak.peak_height, None);
         assert_ne!(peak.peak_height, Some(0));
-        assert!(!peak.synced, "a height nobody produced is not a synced view");
+        assert!(
+            !peak.synced,
+            "a height nobody produced is not a synced view"
+        );
     }
 
     /// **The push actually pushes.** The bundle the pusher receives must be the SAME bundle the hex
@@ -4046,16 +4052,12 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_and_an_outage_are_different_answers() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        let refused = WalletBackend::new(
-            db,
-            Arc::new(EmptyFallback),
-            WalletConfig::default(),
-        )
-        .with_pusher(FakePusher::answering(Ok(PushOutcome {
-            accepted: false,
-            transaction_id: None,
-            rejection: Some("DOUBLE_SPEND".into()),
-        })));
+        let refused = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_pusher(FakePusher::answering(Ok(PushOutcome {
+                accepted: false,
+                transaction_id: None,
+                rejection: Some("DOUBLE_SPEND".into()),
+            })));
         let outcome = refused
             .push_signed_bundle(&a_signed_bundle_hex())
             .await

@@ -1234,7 +1234,6 @@ fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
 /// figure; the three read-failure shapes map to DISTINCT catalogued errors (never a fabricated
 /// `0`): `WALLET_NO_CHAIN_SOURCE`, `WALLET_NOT_SYNCED`, `WALLET_READ_FAILED`.
 async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
-
     let Some(address) = params.get("address").and_then(|v| v.as_str()) else {
         return control_error(
             id,
@@ -1283,7 +1282,6 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         ),
     }
 }
-
 
 use dig_wallet::sage::rpc::{BalanceAsset, BalanceError};
 
@@ -1478,6 +1476,103 @@ fn distinct_store_count(cached: &[dig_node_core::CachedCapsule]) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// **The chain reads are token-less and the PUSH is not.**
+    ///
+    /// Written as the exact expected SET rather than derived from the predicate, so it pins the
+    /// membership and not the implementation's opinion of itself. Opening the push would be a
+    /// silent, catastrophic widening — any local process could then broadcast — so it must fail a
+    /// test rather than pass review.
+    #[test]
+    fn every_wallet_chain_read_is_open_and_the_push_is_token_gated() {
+        let open: Vec<&str> = CONTROL_METHODS
+            .iter()
+            .copied()
+            .filter(|m| is_open_control_read(m))
+            .collect();
+        assert_eq!(
+            open,
+            vec![
+                "control.wallet.balance",
+                "control.wallet.coins",
+                "control.wallet.peak"
+            ]
+        );
+        assert!(
+            !is_open_control_read("control.wallet.broadcast"),
+            "the push must stay behind the control token"
+        );
+    }
+
+    /// `coins_wire` emits the contract shape: the requested asset echoed onto every coin, an
+    /// explicitly-null `spent_height` (every coin here is unspent), and the tier fields.
+    ///
+    /// The two coins differ in `created_height` — one confirmed, one mempool-only — so a mapping
+    /// that dropped or defaulted that field fails here rather than passing on a uniform fixture.
+    #[test]
+    fn coins_wire_emits_the_published_contract_shape() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{WalletCoin, WalletCoinsResult};
+
+        let wire = coins_wire(
+            &WalletCoinsResult {
+                coins: vec![
+                    WalletCoin {
+                        coin_id: "aa".repeat(32),
+                        parent_coin_info: "bb".repeat(32),
+                        puzzle_hash: "cc".repeat(32),
+                        amount: 1_750_000_000_000,
+                        created_height: Some(5_000_000),
+                    },
+                    WalletCoin {
+                        coin_id: "dd".repeat(32),
+                        parent_coin_info: "ee".repeat(32),
+                        puzzle_hash: "cc".repeat(32),
+                        amount: 7,
+                        created_height: None,
+                    },
+                ],
+                source: Source::Db,
+                synced: true,
+                peak_height: Some(5_000_000),
+            },
+            BalanceAsset::Dig,
+        );
+
+        assert_eq!(
+            wire,
+            json!({
+                "coins": [
+                    {
+                        "coin_id": "aa".repeat(32), "asset": "dig", "amount": 1_750_000_000_000u64,
+                        "parent_coin_info": "bb".repeat(32), "puzzle_hash": "cc".repeat(32),
+                        "created_height": 5_000_000, "spent_height": null
+                    },
+                    {
+                        "coin_id": "dd".repeat(32), "asset": "dig", "amount": 7,
+                        "parent_coin_info": "ee".repeat(32), "puzzle_hash": "cc".repeat(32),
+                        "created_height": null, "spent_height": null
+                    }
+                ],
+                "source": "db", "synced": true, "peak_height": 5_000_000
+            })
+        );
+    }
+
+    /// An address-less coin read is INVALID_PARAMS, and it names the parameter it wants.
+    #[test]
+    fn a_coin_read_without_an_address_is_invalid_params() {
+        let response = wallet_address_params("control.wallet.coins", &json!(1), &json!({}))
+            .expect_err("must refuse");
+        assert_eq!(
+            response["error"]["data"]["code"],
+            json!(ErrorCode::InvalidParams.name())
+        );
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("params.address"));
+    }
 
     /// LOCKSTEP GATE (#711): [`dispatch_control`] resolves EXACTLY [`CONTROL_METHODS`] — the
     /// owned set it routes to `dispatch_owned` ([`OWNED_CONTROL_METHODS`]) plus the set it

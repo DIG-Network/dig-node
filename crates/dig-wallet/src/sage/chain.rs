@@ -246,8 +246,8 @@ mod tests {
         let coin = Coin::new(Bytes32::new([1u8; 32]), Bytes32::new([2u8; 32]), 1_000);
         let spend = CoinSpend::new(
             coin,
-            Program::from(vec![0x01]).into(),
-            Program::from(vec![0x80]).into(),
+            Program::from(vec![0x01]),
+            Program::from(vec![0x80]),
         );
         SpendBundle::new(vec![spend], Default::default())
     }
