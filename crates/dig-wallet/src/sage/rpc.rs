@@ -968,10 +968,11 @@ impl WalletBackend {
     /// `DIG_WALLET_ENABLE_LIVE_BROADCAST` decorative — the node would send its own money with the
     /// flag off, which is the one thing the flag exists to prevent.
     ///
-    /// So while [`Self::node_custodied_spending`] is off, a bundle spending a coin at any puzzle
-    /// hash this node custodies a key for is [`PushError::NodeCustodiedSpend`]. Relaying a bundle
-    /// signed by anyone ELSE stays open on every install, which is the capability this method was
-    /// added for.
+    /// So while [`Self::node_custodied_spending`] is off, a bundle requiring a signature from any
+    /// key this node custodies is [`PushError::NodeCustodiedSpend`] — asked of the KEYS rather than
+    /// the puzzle hashes, because the node's own $DIG is a CAT and a CAT coin does not sit at its
+    /// owner's p2 hash (see [`Self::spends_node_custodied_coin`]). Relaying a bundle signed by
+    /// anyone ELSE stays open on every install, which is the capability this method was added for.
     ///
     /// # Outcomes
     ///
