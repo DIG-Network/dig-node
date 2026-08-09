@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use chia::protocol::{
     Coin, CoinState, CoinStateFilters, CoinStateUpdate, Message, NewPeakWallet,
-    ProtocolMessageTypes,
+    ProtocolMessageTypes, RespondPuzzleState,
 };
 use chia_protocol::Bytes32;
 use chia_wallet_sdk::client::Peer;
@@ -37,6 +37,15 @@ pub enum SyncError {
     Db(sqlx::Error),
     /// A CAT/singleton attribution error (parent-spend read / uncurry).
     Attribution(String),
+    /// [`initial_sync`] was asked to catch up over an EMPTY puzzle-hash set.
+    ///
+    /// Refused rather than performed. Subscribing nothing makes a peer answer
+    /// `is_finished` on the first response, which would mark the DB
+    /// initial-sync-complete over a wallet whose coins were never requested — and
+    /// [`crate::sage::routing::route`] then treats that empty DB as authoritative for
+    /// every wallet-scoped read. A wallet with no puzzle hashes is not synced; it has
+    /// nothing to sync, and those are different states.
+    NoPuzzleHashes,
 }
 
 impl std::fmt::Display for SyncError {
@@ -46,6 +55,10 @@ impl std::fmt::Display for SyncError {
             SyncError::Rejected(e) => write!(f, "subscription rejected: {e}"),
             SyncError::Db(e) => write!(f, "db: {e}"),
             SyncError::Attribution(e) => write!(f, "attribution: {e}"),
+            SyncError::NoPuzzleHashes => write!(
+                f,
+                "refusing to catch up over an empty puzzle-hash set (nothing to subscribe)"
+            ),
         }
     }
 }
@@ -153,6 +166,69 @@ pub async fn initial_sync(
     peer_ip: &str,
     events: &EventBus,
 ) -> Result<(), SyncError> {
+    initial_sync_with(peer, db, puzzle_hashes, genesis_challenge, peer_ip, events).await
+}
+
+/// The one peer call [`initial_sync`] makes, behind a trait.
+///
+/// `chia_wallet_sdk::client::Peer` can only exist on top of a live socket, so the catch-up
+/// loop — including the empty-set refusal that protects `initial_sync_complete` — would
+/// otherwise be unreachable from a test. The trait is deliberately the narrowest possible
+/// surface: one request, the same arguments the protocol takes.
+#[async_trait::async_trait]
+pub trait PuzzleStateSource: Sync {
+    /// Request (and subscribe) puzzle state from `header_hash` forward.
+    async fn request_puzzle_state(
+        &self,
+        puzzle_hashes: Vec<Bytes32>,
+        previous_height: Option<u32>,
+        header_hash: Bytes32,
+    ) -> Result<RespondPuzzleState, SyncError>;
+}
+
+#[async_trait::async_trait]
+impl PuzzleStateSource for Peer {
+    async fn request_puzzle_state(
+        &self,
+        puzzle_hashes: Vec<Bytes32>,
+        previous_height: Option<u32>,
+        header_hash: Bytes32,
+    ) -> Result<RespondPuzzleState, SyncError> {
+        match Peer::request_puzzle_state(
+            self,
+            puzzle_hashes,
+            previous_height,
+            header_hash,
+            CoinStateFilters::new(true, true, true, 0),
+            true,
+        )
+        .await
+        .map_err(|e| SyncError::Peer(e.to_string()))?
+        {
+            Ok(r) => Ok(r),
+            Err(reject) => Err(SyncError::Rejected(format!("{reject:?}"))),
+        }
+    }
+}
+
+/// [`initial_sync`] over any [`PuzzleStateSource`]. Production passes a `Peer`.
+pub async fn initial_sync_with(
+    peer: &dyn PuzzleStateSource,
+    db: &WalletDb,
+    puzzle_hashes: Vec<Bytes32>,
+    genesis_challenge: Bytes32,
+    peer_ip: &str,
+    events: &EventBus,
+) -> Result<(), SyncError> {
+    // THE INVARIANT. An empty subscription is answered `is_finished` at once, and the
+    // completion flag below would then declare an un-queried DB authoritative for every
+    // wallet-scoped read (`routing::route(true, true) == Source::Db`). The guard lives HERE,
+    // at the floor, and not only in the supervisor that calls it: a caller-side check is one
+    // refactor away from gone, and this function is the only thing that can set the flag.
+    if puzzle_hashes.is_empty() {
+        return Err(SyncError::NoPuzzleHashes);
+    }
+
     let mut previous_height: Option<u32> = None;
     let mut header_hash = genesis_challenge;
     events.publish(SyncEvent::Start {
@@ -161,21 +237,9 @@ pub async fn initial_sync(
 
     let mut first_batch = true;
     loop {
-        let response = peer
-            .request_puzzle_state(
-                puzzle_hashes.clone(),
-                previous_height,
-                header_hash,
-                CoinStateFilters::new(true, true, true, 0),
-                true,
-            )
-            .await
-            .map_err(|e| SyncError::Peer(e.to_string()))?;
-
-        let respond = match response {
-            Ok(r) => r,
-            Err(reject) => return Err(SyncError::Rejected(format!("{reject:?}"))),
-        };
+        let respond = peer
+            .request_puzzle_state(puzzle_hashes.clone(), previous_height, header_hash)
+            .await?;
         if first_batch {
             events.publish(SyncEvent::Subscribed);
             first_batch = false;
@@ -336,6 +400,88 @@ mod tests {
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 8);
         assert_eq!(db.sync_state().await.unwrap().peak_height, Some(50));
+    }
+
+    /// A peer that answers every subscription with "caught up, nothing here" — which is
+    /// exactly what a real full node answers when you subscribe ZERO puzzle hashes. It is
+    /// the counterfactual the guard exists to stop, so a test built on it fails loudly if
+    /// the guard is removed rather than merely losing an error variant.
+    struct CaughtUpAtOnce;
+
+    #[async_trait::async_trait]
+    impl PuzzleStateSource for CaughtUpAtOnce {
+        async fn request_puzzle_state(
+            &self,
+            _puzzle_hashes: Vec<Bytes32>,
+            _previous_height: Option<u32>,
+            _header_hash: Bytes32,
+        ) -> Result<RespondPuzzleState, SyncError> {
+            Ok(RespondPuzzleState {
+                puzzle_hashes: vec![],
+                coin_states: vec![],
+                height: 6_000_000,
+                header_hash: Bytes32::new([9; 32]),
+                is_finished: true,
+            })
+        }
+    }
+
+    /// **Proves (T1, #2501):** [`initial_sync_with`] REFUSES an empty puzzle-hash set, and
+    /// the DB is left un-synced.
+    ///
+    /// The peer double here would happily report `is_finished` on the first response, so
+    /// without the guard the function reaches `set_initial_sync_complete(true)` over a DB
+    /// that was never queried for a single coin — and `routing::route(true, true)` then
+    /// answers every wallet-scoped read from it. This is the floor of that invariant.
+    #[tokio::test]
+    async fn initial_sync_refuses_an_empty_puzzle_hash_set() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let events = EventBus::default();
+
+        let err = initial_sync_with(
+            &CaughtUpAtOnce,
+            &db,
+            vec![],
+            Bytes32::new([0; 32]),
+            "127.0.0.1",
+            &events,
+        )
+        .await
+        .expect_err("an empty subscription set must be refused, not performed");
+
+        assert!(matches!(err, SyncError::NoPuzzleHashes), "got {err:?}");
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "the initial-sync-complete flag must NOT be set over an empty subscription"
+        );
+        assert_eq!(
+            crate::sage::routing::route(db.is_synced().await.unwrap(), true),
+            crate::sage::routing::Source::Fallback,
+            "wallet-scoped reads must still route to the fallback, not the empty DB"
+        );
+    }
+
+    /// **Proves:** the same catch-up path DOES complete — and sets the flag — once there is
+    /// at least one puzzle hash. Without this control, T1 would also pass if `initial_sync`
+    /// simply never worked.
+    #[tokio::test]
+    async fn initial_sync_completes_over_a_non_empty_puzzle_hash_set() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let events = EventBus::default();
+
+        initial_sync_with(
+            &CaughtUpAtOnce,
+            &db,
+            vec![Bytes32::new([4; 32])],
+            Bytes32::new([0; 32]),
+            "127.0.0.1",
+            &events,
+        )
+        .await
+        .expect("a non-empty subscription set catches up normally");
+
+        assert!(db.is_synced().await.unwrap());
+        assert_eq!(db.sync_state().await.unwrap().peak_height, Some(6_000_000));
     }
 
     /// **Proves:** [`run_update_loop`] publishes [`SyncEvent::Stop`] when its receiver

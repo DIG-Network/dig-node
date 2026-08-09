@@ -100,6 +100,11 @@ pub struct AppState {
     /// The shared self-signed cert the mTLS `9257` listener presents (Sage byte-parity, node-class
     /// clients). Held so [`serve_with_shutdown`] can bring up that sibling listener.
     wallet_cert: SharedCert,
+    /// The background chain-sync supervisor (§18.6, #2501) — the ONE place a live Chia peer
+    /// count is observed. `control.wallet.syncStatus` and `control.peerCounts` both report that
+    /// count and MUST take it from here, so the two can never disagree. `None` when chain sync
+    /// is disabled.
+    wallet_sync: Option<dig_wallet::sage::sync_supervisor::SyncHandle>,
 }
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
@@ -385,6 +390,9 @@ pub async fn build_state(config: &Config) -> AppState {
         &config_dir,
         dig_wallet::sage::service::WalletServiceConfig {
             enable_live_broadcast: config.enable_live_broadcast,
+            // Chain sync is a READ into the node's own replica, so it runs on every install —
+            // deliberately NOT gated on the spend flag above (#2501).
+            enable_chain_sync: true,
         },
     )
     .await;
@@ -420,6 +428,7 @@ pub async fn build_state(config: &Config) -> AppState {
         )),
         wallet: wallet_service.backend,
         wallet_cert: wallet_service.cert,
+        wallet_sync: wallet_service.sync,
     }
 }
 
@@ -429,6 +438,16 @@ impl AppState {
     /// backend + its event bus the router dispatches to.
     pub fn wallet_backend(&self) -> Arc<WalletBackend> {
         self.wallet.clone()
+    }
+
+    /// The running chain-sync supervisor (§18.6, #2501), if any.
+    ///
+    /// The single source for the live Chia peer count and the wallet sync phase. A caller with
+    /// no handle reports an UNOBSERVABLE peer count
+    /// ([`dig_wallet::sage::sync_supervisor::status_without_supervisor`]) — never zero, which
+    /// would claim an observation nobody made.
+    pub fn wallet_sync(&self) -> Option<&dig_wallet::sage::sync_supervisor::SyncHandle> {
+        self.wallet_sync.as_ref()
     }
 
     /// This node's loop-probe request (#1997) — the exact body [`crate::relay`] sends to the

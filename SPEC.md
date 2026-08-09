@@ -3756,6 +3756,33 @@ then consumes `coin_state_update` pushes into the DB. A reorg (a `coin_state_upd
 is below the current peak) rolls the DB back above the fork — coins created above it are deleted, coins
 spent above it become unspent again — then applies the update's coin states and advances the peak.
 
+18.6a. **The sync supervisor (the production call site).** A background supervisor owns the §18.6 loop's
+lifecycle on every install: it dials a peer, catches up, consumes pushes, and reconnects with an
+exponential 1s→60s jittered backoff that resets after a connection lasting at least 60 seconds. It holds
+EXACTLY ONE subscription peer — the subscription is per-connection state, and concurrent peers would drive
+interleaved reorg rollbacks into a DB with a single writer. A reconnect re-runs the catch-up from the
+genesis challenge, because a fresh peer has no memory of the previous subscription. Sync is a chain READ
+plus a write to the node's own replica, so it MUST NOT be gated on the live-broadcast (spend) flag.
+
+The subscription set is derived from the node's custodied PUBLIC keys via `StandardArgs::curry_tree_hash`,
+re-read on every connect attempt so a wallet created after boot is picked up without a restart. No seed is
+read and nothing on this path can sign (§908).
+
+**Invariant.** A catch-up MUST NOT run over an empty puzzle-hash set, and `initial_sync_complete` MUST NOT
+be set as a result of one. `initial_sync` itself refuses with `NoPuzzleHashes`. An empty subscription is
+answered "finished" immediately, so completing it would mark an un-queried DB authoritative under §18.7 and
+report a funded wallet as empty. A node with no wallet therefore advances only its peak and stays unsynced.
+
+18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
+chia_peer_count}`. `phase` is `not_started` (no peer has ever attached), `syncing`, or `synced` — and
+`synced` requires BOTH a completed catch-up AND at least one live Chia peer, so a replica that caught up
+and then went offline reports `syncing`. It is not a freshness guarantee: a live connection to a stalled
+peer satisfies it. `peak_height` is the REPLICA's own height read from `sync_state`; it MUST NOT fall back
+to the coinset oracle (unlike `control.wallet.peak`, which answers a different question), and `null` means
+unknown, never height zero. `chia_peer_count` is `0` when observed and `null` when unobservable.
+`control.peerCounts` reports `{dig_peer_count, chia_peer_count}`, and its `chia_peer_count` MUST be the
+SAME observation this method reports.
+
 18.7. **Fallback tier + sync-state-gated routing.** `chia-query` (coinset.org + non-subscribing peer
 point-reads) is reused AS-IS as a fallback tier — never the primary. The B.3 subscription loop is NOT
 added to `chia-query`. Every wallet-data read selects its source:

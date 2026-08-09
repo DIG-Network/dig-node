@@ -356,6 +356,12 @@ pub struct WalletBackend {
     /// subscribe; [`Self::with_events`] lets bring-up share the SAME bus the sync loop
     /// publishes to.
     events: Arc<EventBus>,
+    /// The background chain-sync supervisor's handle (§18.6, #2501), attached at bring-up
+    /// ([`Self::with_sync_handle`]). It carries the one fact the wallet DB cannot express —
+    /// whether a peer is attached RIGHT NOW — which the control plane composes with the DB's
+    /// persisted sync state. `None` where no supervisor runs (tests, and any bring-up that
+    /// disables chain sync), and that is reported as an UNOBSERVABLE peer count, never zero.
+    sync_handle: Option<super::sync_supervisor::SyncHandle>,
     /// The connected client's per-session PUBLIC identity (#407), seeded by `login` and
     /// cleared by `logout`. Interior-mutable + shared across `Clone`s so a `login` on one
     /// dispatch is visible to subsequent reads on the same backend. `None` until a client
@@ -422,6 +428,7 @@ impl WalletBackend {
             custodied_public_keys: Arc::new(RwLock::new(HashSet::new())),
             lineage: None,
             events: Arc::new(EventBus::default()),
+            sync_handle: None,
             identity: Arc::new(RwLock::new(None)),
             custody: None,
             auth: None,
@@ -551,6 +558,43 @@ impl WalletBackend {
     /// The event bus `GET /events` (SSE, [`super::transport`]) subscribes to.
     pub fn events(&self) -> &Arc<EventBus> {
         &self.events
+    }
+
+    /// Attach the running chain-sync supervisor's handle (§18.6, #2501), so the control plane
+    /// can report the live sync phase without reaching past the backend for it.
+    pub fn with_sync_handle(mut self, handle: super::sync_supervisor::SyncHandle) -> Self {
+        self.sync_handle = Some(handle);
+        self
+    }
+
+    /// The chain-sync supervisor's handle, if one is running.
+    pub fn sync_handle(&self) -> Option<&super::sync_supervisor::SyncHandle> {
+        self.sync_handle.as_ref()
+    }
+
+    /// The wallet's background chain-sync status (§18.6, #2501) — **the one source** for both
+    /// the sync phase and the live Chia peer count.
+    ///
+    /// `control.wallet.syncStatus` and `control.peerCounts` both report that peer count, and
+    /// serving them from one place is what makes it impossible for the two to disagree.
+    ///
+    /// The peak reported is the REPLICA's own
+    /// ([`super::db::WalletDb::sync_state`]) and is read directly from the DB. It must never come
+    /// from [`Self::chain_peak`]: that method falls back to a coinset ORACLE behind the
+    /// `fallback_rate` limiter, so routing this unauthenticated loopback read through it would
+    /// both answer the wallet's own progress with a third party's height and open a second
+    /// unbounded egress path (dig_ecosystem#1957) that also discloses `{IP, timestamp, coin id}`
+    /// to that third party.
+    ///
+    /// With no supervisor the peer count is reported UNOBSERVABLE (`None`), never zero — zero
+    /// would claim an observation nobody made.
+    pub async fn wallet_sync_status(
+        &self,
+    ) -> sqlx::Result<super::sync_supervisor::WalletSyncStatus> {
+        match &self.sync_handle {
+            Some(h) => h.status(&self.db).await,
+            None => super::sync_supervisor::status_without_supervisor(&self.db).await,
+        }
     }
 
     /// The exact method set this PR serves (the core READ surface). Used by the

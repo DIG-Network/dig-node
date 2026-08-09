@@ -1471,6 +1471,52 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
     }
 }
 
+/// **Proves (dig_ecosystem#2501):** `control.wallet.syncStatus` and `control.peerCounts` are served
+/// over the real gate, and their shared `chia_peer_count` comes from ONE observation.
+///
+/// The duplicated field is the interesting part. Two handlers each reaching for their own peer
+/// count is the natural implementation and it is the one that eventually disagrees with itself —
+/// so this asserts the two calls, made independently over HTTP, return the SAME value. A test that
+/// only checked each field's type would pass on the divergent implementation.
+///
+/// The phase is asserted to be one of the three declared tokens rather than a specific one: this
+/// node has no chain source, so whether it ever attaches a peer is not the property under test.
+/// What IS pinned is that a peak-less replica reports `null` and never `0` — a zero here reads as
+/// "synced to genesis", a claim about the chain that would be false.
+#[tokio::test]
+async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+
+    let call = |method: &str| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
+
+    let sync = post_rpc(&addr, call("control.wallet.syncStatus"), None).await;
+    assert!(
+        sync["error"].is_null(),
+        "syncStatus is an open read and must answer: got {sync:?}"
+    );
+    let phase = sync["result"]["phase"].as_str().unwrap_or_default();
+    assert!(
+        ["not_started", "syncing", "synced"].contains(&phase),
+        "phase must be one of the three declared tokens, got {phase:?}"
+    );
+    assert!(
+        sync["result"]["peak_height"].is_null() || sync["result"]["peak_height"].as_u64() > Some(0),
+        "an unknown peak is null, never 0: got {sync:?}"
+    );
+
+    let counts = post_rpc(&addr, call("control.peerCounts"), None).await;
+    assert!(
+        counts["error"].is_null(),
+        "peerCounts is an open read and must answer: got {counts:?}"
+    );
+    assert_eq!(
+        counts["result"]["chia_peer_count"], sync["result"]["chia_peer_count"],
+        "both methods report the SAME Chia peer observation; serving them from two sources is \
+         how they start to disagree"
+    );
+}
+
 /// **Proves (dig_ecosystem#2392):** `control.wallet.coinById` validates its `coin_id` BEFORE any
 /// chain work — ahead of the chain-source liveness check, and therefore ahead of the rate limiter
 /// and the network call behind it.

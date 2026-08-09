@@ -86,11 +86,17 @@ pub enum PeersAction {
     SetBan { peer: String, state: BanState },
     /// Set the peer-pool max-connections cap.
     SetPoolConfig { max_connections: u32 },
+    /// `control.peerCounts` — the peer count on EACH network: DIG gossip and Chia full nodes.
+    Counts,
 }
 
 /// Run a `peers` subcommand: dispatch the mapped `control.*` method and render an [`Outcome`].
 pub fn run(config: &Config, action: PeersAction) -> std::io::Result<Outcome> {
     match action {
+        PeersAction::Counts => {
+            let result = call_control(config, "control.peerCounts", json!({}))?;
+            Ok(Outcome::new(format_counts(&result), result))
+        }
         PeersAction::List => {
             let result = call_control(config, "control.peerStatus", json!({}))?;
             Ok(Outcome::new(format_status(&result), result))
@@ -143,6 +149,20 @@ pub fn run(config: &Config, action: PeersAction) -> std::io::Result<Outcome> {
             ))
         }
     }
+}
+
+/// Render `control.peerCounts`. An absent count prints as `unknown`, never as `0`: nobody
+/// observed a zero, and printing one would invent an observation.
+fn format_counts(result: &Value) -> String {
+    fn count(v: &Value) -> String {
+        v.as_u64()
+            .map_or_else(|| "unknown".to_string(), |n| n.to_string())
+    }
+    format!(
+        "dig-node peer counts: DIG network {} · Chia full nodes {}",
+        count(&result["dig_peer_count"]),
+        count(&result["chia_peer_count"]),
+    )
 }
 
 /// Render `control.peerStatus` as an operator-friendly summary. Shows the running flag, the

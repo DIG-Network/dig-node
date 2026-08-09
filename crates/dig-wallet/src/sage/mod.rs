@@ -76,6 +76,7 @@ pub mod service;
 pub mod singleton;
 pub mod spend;
 pub mod sync;
+pub mod sync_supervisor;
 pub mod themes;
 pub mod tipping;
 pub mod transport;

@@ -8,15 +8,15 @@
 //! shared mTLS cert, ready for the dig-node service shell to serve over its loopback transports.
 //!
 //! The assembly is deliberately **offline-safe and non-blocking**: it opens (or creates) the
-//! SQLite wallet DB under the node config dir, and defaults the fallback tier to the graceful
-//! a LAZY [`ChainTransport`] so bring-up never waits on network/TLS peer discovery. The live direct-peer
-//! sync loop (which would swap in the live peer tier and
-//! feed the DB) remains the documented remaining integration: it is **SPEC §18.6**, explicitly
-//! deferred by **§18.12a**. It is NOT §18.12 — §18.12 is the live spend *broadcaster*, which has
-//! shipped. (This comment cited §18.12 and sent three separate readers to the wrong clause,
-//! making the sync loop look like a wiring job against already-written machinery; #2232.)
-//! The [`EventBus`] is wired here so that loop — and the WS sync-status push (#369) — publish to
-//! one shared bus.
+//! SQLite wallet DB under the node config dir, and defaults the fallback tier to a LAZY
+//! [`ChainTransport`] so bring-up never waits on network/TLS peer discovery.
+//!
+//! The live direct-peer sync loop — **SPEC §18.6**, deferred by §18.12a and shipped in
+//! dig_ecosystem#2501 — is now assembled here too: [`super::sync_supervisor`] is spawned in the
+//! background, dialling peers and feeding the wallet DB. It is NOT §18.12; §18.12 is the live
+//! spend *broadcaster*, and the two are gated separately on purpose (reads need no key). The
+//! [`EventBus`] wired here is the one bus that loop — and the WS sync-status push (#369) —
+//! publish to.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,11 +32,14 @@ use super::singleton::LineageSource;
 use super::spend::{
     Broadcaster, ChiaQueryBroadcaster, ChiaQueryConfirmer, Confirmer, ConfirmingBroadcaster,
 };
+use super::sync_supervisor::{
+    spawn_supervisor, ChiaPeerSessionFactory, Supervisor, SyncHandle, TokioTime,
+};
 use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
 
 /// Bring-up configuration for the served wallet (§18.12).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WalletServiceConfig {
     /// Enable REAL mainnet broadcast of node-custodied spends (the tip spend #378, the
     /// sign+broadcast-on-behalf path #371, and any wallet send/offer/mint). **Default `false`** —
@@ -45,6 +48,24 @@ pub struct WalletServiceConfig {
     /// [`ChiaQueryBroadcaster`] + [`ChiaQueryConfirmer`] + [`ChiaQueryLineage`] + [`CoinsetFallback`]
     /// so spends execute + confirm on mainnet. Sourced from `DIG_WALLET_ENABLE_LIVE_BROADCAST`.
     pub enable_live_broadcast: bool,
+    /// Run the background chain-sync supervisor (§18.6, #2501). **Default `true`.**
+    ///
+    /// This is a TEST SEAM, not a user knob: no env var feeds it, and nothing should add one.
+    /// Sync is a chain READ plus a write to the node's OWN replica, so it must not sit behind
+    /// `enable_live_broadcast` — conflating chain reads with "may this node's custodied wallet
+    /// sign and send?" is what made a stock node answer `WALLET_NO_CHAIN_SOURCE` to every
+    /// wallet read (#2210). Unit tests set it `false` so they do not dial the network.
+    pub enable_chain_sync: bool,
+}
+
+impl Default for WalletServiceConfig {
+    /// Offline-safe for SPENDING, live for READING: no broadcaster, but chain sync on.
+    fn default() -> Self {
+        Self {
+            enable_live_broadcast: false,
+            enable_chain_sync: true,
+        }
+    }
 }
 
 /// The live-broadcast wiring: one shared `chia_query` client backs a real broadcaster (for the
@@ -78,6 +99,10 @@ pub struct WalletService {
     pub events: Arc<EventBus>,
     /// The shared self-signed cert the mTLS `9257` listener presents (Sage byte-parity).
     pub cert: SharedCert,
+    /// The running chain-sync supervisor (§18.6, #2501), or `None` when chain sync is
+    /// disabled. Also attached to [`Self::backend`], so a control-plane handler holding only
+    /// the backend can still report the live sync phase.
+    pub sync: Option<SyncHandle>,
 }
 
 impl WalletService {
@@ -138,6 +163,27 @@ impl WalletService {
         // spender's backend handle has `tipping == None` (no reference cycle engine↔backend). Both
         // share the SAME inner Arcs (db/custody/events/tip_events), so a runtime `wallet.unlock` is
         // visible to the spender.
+        // The background chain-sync supervisor (§18.6, #2501): the production call site
+        // `sage::sync` never had. It starts at boot with NO seed and NO unlock — its
+        // subscription set is custody's persisted PUBLIC keys, readable while every wallet is
+        // locked — and it refuses to run a catch-up over an empty set, so a wallet-less
+        // install advances only its peak and keeps `initial_sync_complete` false.
+        // The task handle is dropped deliberately: the supervisor lives for the process, and
+        // its stop signal is `SyncHandle::shutdown`, not a dropped join handle.
+        let sync = if cfg.enable_chain_sync {
+            Some(spawn_supervisor(Supervisor {
+                db: db.clone(),
+                puzzle_hashes: Arc::new(custody.clone()),
+                factory: Arc::new(ChiaPeerSessionFactory::mainnet(db.clone())),
+                events: events.clone(),
+                genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
+                time: Arc::new(TokioTime),
+            }))
+        } else {
+            None
+        }
+        .map(|(handle, _task)| handle);
+
         let mut base = WalletBackend::new(db, fallback, WalletConfig::default())
             .with_events(events.clone())
             .with_custody(custody)
@@ -145,6 +191,9 @@ impl WalletService {
             .with_tip_events(tip_events.clone())
             .with_pusher(chain.clone())
             .with_node_custodied_spending(cfg.enable_live_broadcast);
+        if let Some(h) = &sync {
+            base = base.with_sync_handle(h.clone());
+        }
         if let Some(l) = &live {
             // The GENERAL wallet surface (send/offer/mint) gets the confirming broadcaster + the
             // live lineage source so CAT/singleton spends resolve inputs.
@@ -181,6 +230,7 @@ impl WalletService {
             backend,
             events,
             cert,
+            sync,
         }
     }
 }
@@ -276,6 +326,21 @@ async fn in_memory_db() -> WalletDb {
 mod tests {
     use super::*;
 
+    /// Build the service WITHOUT the background chain-sync supervisor.
+    ///
+    /// Chain sync is on by default in production; a unit test must not dial mainnet, and a
+    /// spawned supervisor would also make these tests depend on network reachability.
+    async fn build_offline(dir: &Path) -> WalletService {
+        WalletService::build_with(
+            dir,
+            WalletServiceConfig {
+                enable_chain_sync: false,
+                ..WalletServiceConfig::default()
+            },
+        )
+        .await
+    }
+
     /// A unique temp config dir per test.
     fn scratch() -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -302,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn build_assembles_a_served_backend() {
         let dir = scratch();
-        let svc = WalletService::build(&dir).await;
+        let svc = build_offline(&dir).await;
 
         let (status, body) = svc.backend.dispatch("get_version", "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -328,7 +393,7 @@ mod tests {
     #[tokio::test]
     async fn build_serves_the_tipping_subsystem() {
         let dir = scratch();
-        let svc = WalletService::build(&dir).await;
+        let svc = build_offline(&dir).await;
 
         let (status, body) = svc.backend.dispatch("tip.get_config", "{}").await;
         assert_eq!(status, 200, "{body}");
@@ -362,7 +427,7 @@ mod tests {
     async fn on_disk_db_and_seed_persist_across_builds() {
         let dir = scratch();
         {
-            let svc = WalletService::build(&dir).await;
+            let svc = build_offline(&dir).await;
             let (s, _b) = svc
                 .backend
                 .dispatch(
@@ -373,7 +438,7 @@ mod tests {
             assert_eq!(s, 200);
         }
         // A second build over the same dir sees the persisted (locked) wallet.
-        let svc2 = WalletService::build(&dir).await;
+        let svc2 = build_offline(&dir).await;
         let (_s, body) = svc2.backend.dispatch("wallet.status", "{}").await;
         assert!(
             body.contains("locked"),
