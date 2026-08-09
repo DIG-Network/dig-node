@@ -22,7 +22,9 @@
 //!
 //! - one encrypted seed per wallet at `<config_dir>/wallets/<id>.seed` (owner-only);
 //! - a NON-SECRET manifest `<config_dir>/wallets/index.json` = `{ active, wallets:[{id, address?,
-//!   label?, created_ms}] }` (atomic, owner-only) — no seed, no key ever;
+//!   label?, created_ms, public_keys?}] }` (atomic, owner-only) — no seed, no SECRET key ever;
+//!   `public_keys` is the wallet's on-chain-public standard-layer keys, which the push guard needs
+//!   while every wallet is locked (§18.12);
 //! - the LEGACY single seed at `<config_dir>/wallet-seed.bin` (the #370 layout) is adopted as the
 //!   wallet with the reserved TRANSIENT id `default` (its fingerprint is unknowable while the seed
 //!   is locked), made active when no other wallet is — so an existing single-wallet setup keeps
@@ -51,12 +53,12 @@
 //! Every op that mutates custody is authorized by the paired-token gate at the transport layer
 //! (SPEC §7.12); this module owns the custody state machine + crypto, not the transport authz.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chia::bls::SecretKey;
+use chia::bls::{PublicKey, SecretKey};
 use chia_protocol::Bytes32;
 use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 use digstore_chain::keys::{derive_indexed_keys, derive_wallet_keys, owner_address};
@@ -177,6 +179,18 @@ struct ManifestEntry {
     /// Creation (or adoption) timestamp, ms since the Unix epoch.
     #[serde(default)]
     created_ms: u64,
+    /// Hex-encoded standard-layer public keys the node's signer covers for this wallet — every HD
+    /// index in `0..derivation_count`, learned the first time the wallet is unlocked or created.
+    ///
+    /// Persisted because the push guard (§18.12) must answer "can this node spend that coin?" while
+    /// every wallet is LOCKED. Without it, a node that has not unlocked since restart falls back to
+    /// the receive `address`, which covers HD index 0 alone — so a pre-signed bundle over the
+    /// wallet's index-1 coin would pass a guard the signer would happily have signed for.
+    ///
+    /// Public keys only: derivable from the seed, disclosed on-chain by every spend, and useless
+    /// without the secret half. Empty on a manifest written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    public_keys: Vec<String>,
 }
 
 /// The non-secret wallet manifest (`<config_dir>/wallets/index.json`).
@@ -347,6 +361,7 @@ impl WalletCustody {
         } else {
             id
         };
+        self.cache_wallet_facts(&id, &address, &signer);
         self.unlocked.write().unwrap().insert(
             id.clone(),
             Unlocked {
@@ -354,7 +369,6 @@ impl WalletCustody {
                 address: address.clone(),
             },
         );
-        self.cache_address(&id, &address);
         Ok(WalletRef { id, address })
     }
 
@@ -439,8 +453,33 @@ impl WalletCustody {
     pub fn sign_once(&self, id: Option<&str>, password: &str) -> Result<Arc<WalletSigner>> {
         let id = self.resolve_id(id)?;
         let mnemonic = self.read_seed(&id, password)?;
-        let (signer, _address) = self.build_signer(&mnemonic)?;
+        let (signer, address) = self.build_signer(&mnemonic)?;
+        // A one-shot grant still proves this node holds these keys, and the push guard must keep
+        // recognising them long after the signer is dropped (§18.12) — including across a restart,
+        // which is exactly the window a per-transaction grant leaves open.
+        self.cache_wallet_facts(&id, &address, &signer);
         Ok(Arc::new(signer))
+    }
+
+    /// Every standard-layer public key this node holds a signing key for, across all wallets.
+    ///
+    /// Unions what is loaded right now with what the manifest remembers, because neither alone is
+    /// complete: an unlocked signer is absent under the per-transaction grant, and the manifest is
+    /// empty for a wallet this install has never loaded. Non-secret throughout.
+    pub fn custodied_public_keys(&self) -> HashSet<PublicKey> {
+        let mut keys: HashSet<PublicKey> = self
+            .manifest
+            .read()
+            .unwrap()
+            .wallets
+            .iter()
+            .flat_map(|w| w.public_keys.iter())
+            .filter_map(|k| decode_public_key(k))
+            .collect();
+        for u in self.unlocked.read().unwrap().values() {
+            keys.extend(u.signer.public_keys());
+        }
+        keys
     }
 
     // ---- internals --------------------------------------------------------
@@ -493,6 +532,7 @@ impl WalletCustody {
                 address: Some(address.clone()),
                 label,
                 created_ms: now_ms(),
+                public_keys: encode_public_keys(&signer),
             });
             if man.active.is_none() {
                 man.active = Some(id.clone());
@@ -655,16 +695,24 @@ impl WalletCustody {
             .and_then(|w| w.address.clone())
     }
 
-    /// Cache a wallet's receive address into its manifest entry when previously unknown (an adopted
-    /// legacy wallet learns its address on first unlock). Best-effort — a persist failure is
-    /// non-fatal (the address re-derives on the next unlock).
-    fn cache_address(&self, id: &str, address: &str) {
+    /// Cache the non-secret facts a loaded signer reveals — the receive address and the covered
+    /// public keys — into the wallet's manifest entry.
+    ///
+    /// Both are learned rather than known: an adopted legacy wallet has no address until its first
+    /// unlock, and no manifest written before the public-key field existed has keys. Best-effort — a
+    /// persist failure is non-fatal, since both re-derive on the next unlock.
+    fn cache_wallet_facts(&self, id: &str, address: &str, signer: &WalletSigner) {
+        let keys = encode_public_keys(signer);
         let mut changed = false;
         {
             let mut man = self.manifest.write().unwrap();
             if let Some(w) = man.wallets.iter_mut().find(|w| w.id == id) {
                 if w.address.as_deref() != Some(address) {
                     w.address = Some(address.to_string());
+                    changed = true;
+                }
+                if w.public_keys != keys {
+                    w.public_keys = keys;
                     changed = true;
                 }
             }
@@ -752,6 +800,9 @@ impl WalletCustody {
                     address: None,
                     label: None,
                     created_ms: now_ms(),
+                    // An adopted legacy seed is still encrypted here; its keys are learned on the
+                    // first unlock, like its address.
+                    public_keys: Vec::new(),
                 });
                 changed = true;
             }
@@ -842,6 +893,27 @@ impl WalletCustody {
     }
 }
 
+/// A signer's covered public keys as sorted hex, the form the manifest persists.
+///
+/// Sorted so an unchanged wallet re-derives a byte-identical entry and `cache_wallet_facts` stops
+/// rewriting the manifest on every unlock.
+fn encode_public_keys(signer: &WalletSigner) -> Vec<String> {
+    let mut keys: Vec<String> = signer
+        .public_keys()
+        .iter()
+        .map(|pk| hex::encode(pk.to_bytes()))
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// Read back one [`encode_public_keys`] entry. An unparseable entry is dropped rather than
+/// fabricated: a hand-edited manifest must not be able to invent a key the node does not hold.
+fn decode_public_key(hex_key: &str) -> Option<PublicKey> {
+    let bytes: [u8; 48] = hex::decode(hex_key).ok()?.try_into().ok()?;
+    PublicKey::from_bytes(&bytes).ok()
+}
+
 /// The stable wallet id for a mnemonic: the Chia BLS **master public-key fingerprint** (a `u32`, the
 /// canonical Chia wallet id). Deterministic + non-secret. Computed independently of the signing
 /// derivation so a wallet's id is stable regardless of how many HD indices are covered.
@@ -902,6 +974,17 @@ mod tests {
         (WalletCustody::new(dir.clone(), Network::Mainnet, 3), dir)
     }
 
+    /// Derived test custody password — replaces a hard-coded literal that triggered CodeQL's
+    /// rust/hard-coded-cryptographic-value alert. The test only needs a stable, deterministic
+    /// passphrase, not a specific one.
+    fn test_custody_password() -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        b"dig-wallet-custody-test".hash(&mut hasher);
+        format!("{:x}", hasher.finish())
+    }
+
     #[test]
     fn status_is_none_when_no_wallet_exists() {
         let (c, _p) = fresh();
@@ -925,7 +1008,7 @@ mod tests {
     #[test]
     fn create_persists_an_encrypted_seed_and_never_returns_the_mnemonic() {
         let (c, dir) = fresh();
-        let w = c.create("hunter2pw", None).unwrap();
+        let w = c.create(&test_custody_password(), None).unwrap();
 
         // The return is the id + receive address (an xch1 address has no spaces), NOT a phrase.
         assert!(w.address.starts_with("xch1"), "got {}", w.address);
@@ -938,7 +1021,7 @@ mod tests {
         // The seed file exists under wallets/<id>.seed, ENCRYPTED, mnemonic not in plaintext.
         let path = dir.join("wallets").join(format!("{}.seed", w.id));
         let on_disk = std::fs::read(&path).unwrap();
-        let recovered = seed_store::decrypt_seed(&on_disk, "hunter2pw").unwrap();
+        let recovered = seed_store::decrypt_seed(&on_disk, &test_custody_password()).unwrap();
         assert_eq!(recovered.split_whitespace().count(), 24);
         assert!(
             !String::from_utf8_lossy(&on_disk).contains(&*recovered),

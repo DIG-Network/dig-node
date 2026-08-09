@@ -232,7 +232,7 @@ enum SyncCommand {
     },
 }
 
-/// `dig-node wallet` sub-actions (#1851).
+/// `dig-node wallet` sub-actions (#1851, dig_ecosystem#2376).
 #[derive(Subcommand)]
 enum WalletCommand {
     /// Print the balance of a public address (READ-ONLY; needs no seed or pairing).
@@ -242,6 +242,25 @@ enum WalletCommand {
         /// The asset to total: `xch` (default) or `dig`.
         #[arg(long, default_value = "xch")]
         asset: String,
+    },
+    /// List the unspent coins at a public address (READ-ONLY; needs no seed or pairing).
+    Coins {
+        /// The bech32m address to read (`xch1…`).
+        address: String,
+        /// The asset to list: `xch` (default) or `dig`.
+        #[arg(long, default_value = "xch")]
+        asset: String,
+    },
+    /// Print the chain peak this node reads against (READ-ONLY).
+    Peak,
+    /// Push an ALREADY-SIGNED spend bundle to the mempool.
+    ///
+    /// The bundle arrives complete: this verb holds no key and signs nothing. A bundle spending
+    /// the NODE's own custodied coins is refused unless `DIG_WALLET_ENABLE_LIVE_BROADCAST` is on
+    /// (§18.12) — sending the node's own money is a separate, default-OFF custody decision.
+    Broadcast {
+        /// Hex of the signed `SpendBundle` to relay.
+        signed_bundle_hex: String,
     },
 }
 
@@ -522,11 +541,16 @@ fn sync_action(cmd: Option<SyncCommand>) -> ControlAction {
     }
 }
 
-/// Map the `wallet` subcommand to its [`ControlAction`] (#1851).
+/// Map the `wallet` subcommand to its [`ControlAction`] (#1851, dig_ecosystem#2376).
 fn wallet_action(cmd: WalletCommand) -> ControlAction {
     match cmd {
         WalletCommand::Balance { address, asset } => {
             ControlAction::WalletBalance { address, asset }
+        }
+        WalletCommand::Coins { address, asset } => ControlAction::WalletCoins { address, asset },
+        WalletCommand::Peak => ControlAction::WalletPeak,
+        WalletCommand::Broadcast { signed_bundle_hex } => {
+            ControlAction::WalletBroadcast { signed_bundle_hex }
         }
     }
 }
@@ -743,5 +767,86 @@ mod tests {
     fn cli_definition_is_valid() {
         // clap's derived command builds without a malformed-definition panic.
         Cli::command().debug_assert();
+    }
+
+    /// The `control.*` method a real argv reaches, or `None` if the parser rejects it.
+    ///
+    /// Goes through [`Cli::try_parse_from`] rather than constructing a [`ControlAction`] directly:
+    /// that is the whole point of these tests (see below).
+    fn method_for_argv(argv: &[&str]) -> Option<&'static str> {
+        match Cli::try_parse_from(argv).ok()?.command? {
+            Command::Wallet { action } => Some(wallet_action(action).method()),
+            _ => None,
+        }
+    }
+
+    /// **Every wallet control method is reachable from an argv a user can actually type.**
+    ///
+    /// `control_cli::cli_covered_control_methods` is the drift gate that claims each `control.*`
+    /// method has a CLI verb, but it builds its own list out of `ControlAction` variants — so it
+    /// was satisfiable by adding a variant and nothing else, which is exactly what happened to
+    /// `control.wallet.{coins,peak,broadcast}` (dig_ecosystem#2376): three variants existed, the
+    /// gate passed, and `dig-node wallet coins` was an unknown subcommand.
+    ///
+    /// This test cannot be satisfied that way. Its input is a COMMAND LINE, so it fails unless the
+    /// clap parser really accepts the verb, and the assertion is on the dispatched method, so it
+    /// also fails if the verb parses but maps to the wrong one.
+    #[test]
+    fn every_wallet_control_method_is_reachable_from_a_real_command_line() {
+        let address = "xch1up0vfatgtwrcgcvc360jd57t3p2kjskncutvzakh9mhdmlvejj3shn8wln";
+        for (argv, expected) in [
+            (
+                vec!["dig-node", "wallet", "balance", address],
+                "control.wallet.balance",
+            ),
+            (
+                vec!["dig-node", "wallet", "coins", address],
+                "control.wallet.coins",
+            ),
+            (vec!["dig-node", "wallet", "peak"], "control.wallet.peak"),
+            (
+                vec!["dig-node", "wallet", "broadcast", "deadbeef"],
+                "control.wallet.broadcast",
+            ),
+        ] {
+            assert_eq!(
+                method_for_argv(&argv),
+                Some(expected),
+                "`{}` must dispatch {expected}",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// **The parsed arguments reach the wire, not just the method name.**
+    ///
+    /// The nearest wrong implementation maps every new verb onto the right method while dropping
+    /// its operands — `wallet coins <addr>` reading some other address, `wallet broadcast <hex>`
+    /// pushing nothing. Each verb is given a value only IT could carry, and the emitted params are
+    /// asserted to contain it.
+    #[test]
+    fn wallet_verbs_carry_their_operands_onto_the_wire() {
+        let address = "xch1up0vfatgtwrcgcvc360jd57t3p2kjskncutvzakh9mhdmlvejj3shn8wln";
+        let coins = Cli::try_parse_from(["dig-node", "wallet", "coins", address, "--asset", "dig"])
+            .expect("`wallet coins --asset` parses");
+        let Some(Command::Wallet { action }) = coins.command else {
+            panic!("parsed to something other than `wallet`");
+        };
+        assert_eq!(
+            wallet_action(action).wire_params(),
+            serde_json::json!({ "address": address, "asset": "dig" }),
+            "the address and the non-default asset must both survive the mapping"
+        );
+
+        let push = Cli::try_parse_from(["dig-node", "wallet", "broadcast", "0xfeed"])
+            .expect("`wallet broadcast <hex>` parses");
+        let Some(Command::Wallet { action }) = push.command else {
+            panic!("parsed to something other than `wallet`");
+        };
+        assert_eq!(
+            wallet_action(action).wire_params(),
+            serde_json::json!({ "signed_bundle_hex": "0xfeed" }),
+            "the bundle the operator typed must be the bundle that is pushed"
+        );
     }
 }

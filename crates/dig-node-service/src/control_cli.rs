@@ -58,6 +58,12 @@ pub enum ControlAction {
     SyncTrigger { store: String },
     /// `control.wallet.balance` — the READ-ONLY balance of a public address (XCH or $DIG).
     WalletBalance { address: String, asset: String },
+    /// `control.wallet.coins` — the READ-ONLY unspent coins of a public address (XCH or $DIG).
+    WalletCoins { address: String, asset: String },
+    /// `control.wallet.peak` — the READ-ONLY chain peak height the node can see.
+    WalletPeak,
+    /// `control.wallet.broadcast` — push an ALREADY-SIGNED spend bundle. The node signs nothing.
+    WalletBroadcast { signed_bundle_hex: String },
     /// `control.updater.status` — the DIG auto-update beacon's status.
     UpdaterStatus,
     /// `control.updater.setChannel` — set the beacon channel (`nightly` | `stable`).
@@ -94,6 +100,9 @@ impl ControlAction {
             ControlAction::SyncStatus => "control.sync.status",
             ControlAction::SyncTrigger { .. } => "control.sync.trigger",
             ControlAction::WalletBalance { .. } => "control.wallet.balance",
+            ControlAction::WalletCoins { .. } => "control.wallet.coins",
+            ControlAction::WalletPeak => "control.wallet.peak",
+            ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
             ControlAction::UpdaterStatus => "control.updater.status",
             ControlAction::UpdaterSetChannel { .. } => "control.updater.setChannel",
             ControlAction::UpdaterPause { .. } => "control.updater.pause",
@@ -106,7 +115,10 @@ impl ControlAction {
     }
 
     /// The JSON-RPC params for this action (an empty object for the read/no-arg methods).
-    fn params(&self) -> Value {
+    ///
+    /// Public so a test can assert that a parsed command line's operands actually reach the wire,
+    /// not merely that it selected the right method (see `entrypoint`'s parser tests).
+    pub fn wire_params(&self) -> Value {
         match self {
             ControlAction::ConfigSetUpstream { url } => json!({ "upstream": url }),
             ControlAction::CacheSetCap { bytes } => json!({ "cap_bytes": bytes }),
@@ -114,8 +126,12 @@ impl ControlAction {
             | ControlAction::StoresUnpin { store }
             | ControlAction::StoresStatus { store }
             | ControlAction::SyncTrigger { store } => json!({ "store": store }),
-            ControlAction::WalletBalance { address, asset } => {
+            ControlAction::WalletBalance { address, asset }
+            | ControlAction::WalletCoins { address, asset } => {
                 json!({ "address": address, "asset": asset })
+            }
+            ControlAction::WalletBroadcast { signed_bundle_hex } => {
+                json!({ "signed_bundle_hex": signed_bundle_hex })
             }
             ControlAction::UpdaterSetChannel { channel } => json!({ "channel": channel }),
             ControlAction::UpdaterPause { until: Some(u) } => json!({ "until": u }),
@@ -132,7 +148,7 @@ impl ControlAction {
 /// `--json`). Transport / node errors surface as `io::Error` for the differentiated exit code.
 pub fn run(config: &Config, action: ControlAction) -> std::io::Result<Outcome> {
     let method = action.method();
-    let result = call_control(config, method, action.params())?;
+    let result = call_control(config, method, action.wire_params())?;
     Ok(Outcome::new(summarize(method, &result), result))
 }
 
@@ -170,6 +186,16 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         ControlAction::WalletBalance {
             address: String::new(),
             asset: String::new(),
+        }
+        .method(),
+        ControlAction::WalletCoins {
+            address: String::new(),
+            asset: String::new(),
+        }
+        .method(),
+        ControlAction::WalletPeak.method(),
+        ControlAction::WalletBroadcast {
+            signed_bundle_hex: String::new(),
         }
         .method(),
         ControlAction::UpdaterStatus.method(),
@@ -378,30 +404,30 @@ mod tests {
     #[test]
     fn params_carry_the_expected_fields() {
         assert_eq!(
-            ControlAction::CacheSetCap { bytes: 123 }.params(),
+            ControlAction::CacheSetCap { bytes: 123 }.wire_params(),
             json!({ "cap_bytes": 123 })
         );
         assert_eq!(
             ControlAction::StoresPin {
                 store: "abc".into()
             }
-            .params(),
+            .wire_params(),
             json!({ "store": "abc" })
         );
         assert_eq!(
-            ControlAction::UpdaterPause { until: Some(99) }.params(),
+            ControlAction::UpdaterPause { until: Some(99) }.wire_params(),
             json!({ "until": 99 })
         );
         // A pause with no deadline sends an empty object (indefinite pause).
         assert_eq!(
-            ControlAction::UpdaterPause { until: None }.params(),
+            ControlAction::UpdaterPause { until: None }.wire_params(),
             json!({})
         );
         assert_eq!(
             ControlAction::SubsAdd {
                 store_id: "s".into()
             }
-            .params(),
+            .wire_params(),
             json!({ "store_id": "s" })
         );
     }

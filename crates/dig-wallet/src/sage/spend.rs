@@ -98,6 +98,17 @@ impl WalletSigner {
         self.keys.iter().map(|k| k.puzzle_hash).collect()
     }
 
+    /// The standard-layer public keys this wallet can produce a signature for.
+    ///
+    /// This — not [`Self::puzzle_hashes`] — is the set [`Self::sign`] actually decides on, so it
+    /// is the honest answer to "what can this node spend?". A coin's puzzle hash equals its
+    /// owner's p2 hash only for a BARE standard coin; a CAT sits at
+    /// `CatArgs::curry_tree_hash(asset_id, p2_hash)`, and singleton/NFT/DID coins are wrapped
+    /// again. The required KEY is invariant under every one of those wrappers.
+    pub fn public_keys(&self) -> HashSet<PublicKey> {
+        self.keys.iter().map(|k| k.p2_pk).collect()
+    }
+
     /// The ordered `owner puzzle hash -> standard-layer public key` map the chia-wallet-sdk
     /// action system's `Spends::finish_with_keys` needs (offer building, [`super::offers`]).
     pub fn key_map(&self) -> indexmap::IndexMap<Bytes32, PublicKey> {
@@ -117,13 +128,9 @@ impl WalletSigner {
     /// Produce the aggregated BLS signature for `coin_spends` (the `dig-l1-wallet` pattern:
     /// each required BLS signature is matched to the original or synthetic key).
     pub fn sign(&self, coin_spends: &[CoinSpend]) -> Result<Signature> {
-        let mut allocator = Allocator::new();
-        let agg = AggSigConstants::new(self.agg_sig_data);
-        let required = RequiredSignature::from_coin_spends(&mut allocator, coin_spends, &agg)
-            .map_err(|e| Error::internal(format!("required-signature extraction: {e:?}")))?;
         let pairs = self.key_pairs();
         let mut sig = Signature::default();
-        for req in required {
+        for req in required_signatures(coin_spends, self.agg_sig_data)? {
             let RequiredSignature::Bls(bls) = req else {
                 continue;
             };
@@ -133,6 +140,44 @@ impl WalletSigner {
         }
         Ok(sig)
     }
+}
+
+/// Every signature `coin_spends` requires, as the consensus computes them under `agg_sig_data`.
+///
+/// Sole extraction point: [`WalletSigner::sign`] decides what to sign from this, and
+/// [`required_public_keys`] decides what a node custodies from the same call. Two callers, one
+/// derivation — so the push guard (§18.12) cannot drift away from the signer it is guarding.
+pub fn required_signatures(
+    coin_spends: &[CoinSpend],
+    agg_sig_data: Bytes32,
+) -> Result<Vec<RequiredSignature>> {
+    let mut allocator = Allocator::new();
+    let agg = AggSigConstants::new(agg_sig_data);
+    RequiredSignature::from_coin_spends(&mut allocator, coin_spends, &agg)
+        .map_err(|e| Error::internal(format!("required-signature extraction: {e:?}")))
+}
+
+/// The BLS public keys that must sign `coin_spends` for it to be valid.
+///
+/// The push guard asks this instead of inspecting puzzle hashes, because a puzzle hash tells you
+/// where a coin SITS and the question is who can MOVE it. Those differ under every puzzle wrapper
+/// the ecosystem uses — CAT, singleton, NFT, DID — and a hash-literal guard misses each one while
+/// [`WalletSigner::sign`] signs it regardless, since signing matches on the required key alone.
+///
+/// `agg_sig_data` selects the network domain, which changes the MESSAGE each signature commits to
+/// and never the key that must produce it. So a guard reading this cannot be opened by pointing it
+/// at the wrong network.
+pub fn required_public_keys(
+    coin_spends: &[CoinSpend],
+    agg_sig_data: Bytes32,
+) -> Result<HashSet<PublicKey>> {
+    Ok(required_signatures(coin_spends, agg_sig_data)?
+        .into_iter()
+        .filter_map(|req| match req {
+            RequiredSignature::Bls(bls) => Some(bls.public_key),
+            _ => None,
+        })
+        .collect())
 }
 
 /// Broadcast a signed spend bundle to the network. Node-class production broadcasts via the
@@ -178,7 +223,7 @@ impl ChiaQueryBroadcaster {
 /// Convert a `chia_protocol::SpendBundle` into the `chia_query` wire bundle `push_tx` accepts
 /// (hex-encoded coin spends + aggregate signature; `chia_query` parses these 0x-tolerantly). PURE
 /// — unit-tested against a known bundle so the field encoding can't silently drift.
-fn to_query_bundle(bundle: &SpendBundle) -> Result<chia_query::SpendBundle> {
+pub(crate) fn to_query_bundle(bundle: &SpendBundle) -> Result<chia_query::SpendBundle> {
     let coin_spends = bundle
         .coin_spends
         .iter()

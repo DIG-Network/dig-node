@@ -1371,6 +1371,102 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     );
 }
 
+/// **The money push is behind the token, over the REAL server gate** (dig_ecosystem#2376).
+///
+/// The unit test beside `is_open_control_read` pins the predicate; this pins what a caller actually
+/// experiences, through `server::rpc`'s auth gate and the control dispatcher — the two can only
+/// agree by accident otherwise.
+///
+/// The fixture varies ONE thing across three calls: which wallet method is asked, all untokened.
+/// That is what makes it able to see the specific defect this guards. The obvious way to widen the
+/// open-read set for three new methods is `method.starts_with("control.wallet.")`, which compiles,
+/// passes every read-focused test, and silently makes the money push reachable with no token at
+/// all. A test that only checked "the reads are open" would pass on that implementation.
+///
+/// The reads are asserted NOT to be `UNAUTHORIZED` rather than to succeed, because a node with no
+/// chain source answers `WALLET_NO_CHAIN_SOURCE` — a different, honest answer that still proves the
+/// call got PAST the gate.
+#[tokio::test]
+async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
+
+    let call = |method: &str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    let address = "xch1up0vfatgtwrcgcvc360jd57t3p2kjskncutvzakh9mhdmlvejj3shn8wln";
+
+    // The push, untokened: refused BY THE GATE, before any bundle is looked at.
+    let pushed = post_rpc(
+        &addr,
+        call(
+            "control.wallet.broadcast",
+            json!({ "signed_bundle_hex": "deadbeef" }),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(
+        pushed["error"]["data"]["code"],
+        json!("UNAUTHORIZED"),
+        "an untokened push must be refused: got {pushed:?}"
+    );
+
+    // The same push WITH the token gets past the gate — so the refusal above was the token, not a
+    // missing method. Without this, a node that had never registered the method would pass the
+    // assertion above for entirely the wrong reason.
+    let tokened = post_rpc(
+        &addr,
+        call(
+            "control.wallet.broadcast",
+            json!({ "signed_bundle_hex": "deadbeef" }),
+        ),
+        Some(&token),
+    )
+    .await;
+    assert_ne!(
+        tokened["error"]["data"]["code"],
+        json!("METHOD_NOT_FOUND"),
+        "control.wallet.broadcast must be registered: got {tokened:?}"
+    );
+    assert_ne!(
+        tokened["error"]["data"]["code"],
+        json!("UNAUTHORIZED"),
+        "the token must actually authorize the push: got {tokened:?}"
+    );
+
+    // The chain reads, untokened: they reach their handlers. Whatever they answer, it is not the
+    // gate's refusal.
+    for (method, params) in [
+        (
+            "control.wallet.coins",
+            json!({ "address": address, "asset": "xch" }),
+        ),
+        ("control.wallet.peak", json!({})),
+    ] {
+        let response = post_rpc(&addr, call(method, params), None).await;
+        assert_ne!(
+            response["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} is an open read and must not need a token: got {response:?}"
+        );
+        assert_ne!(
+            response["error"]["data"]["code"],
+            json!("METHOD_NOT_FOUND"),
+            "{method} must be registered: got {response:?}"
+        );
+        // ...and reached ITS OWN handler. Registration and routing are separate: mutating the
+        // dispatch arm so `control.wallet.coins` runs `wallet_broadcast` leaves the method
+        // registered and the gate open, so both assertions above still pass — but these params
+        // carry no `signed_bundle_hex`, so the wrong handler answers INVALID_PARAMS. Each call
+        // here sends params that are VALID for its own handler, which is what makes this
+        // discriminating rather than decorative.
+        assert_ne!(
+            response["error"]["data"]["code"],
+            json!("INVALID_PARAMS"),
+            "{method} was routed to a handler that wanted different params: got {response:?}"
+        );
+    }
+}
+
 /// **Proves (dig_ecosystem#1985):** `control.peers.ping` is REACHABLE over the real HTTP control
 /// surface — token-gated, registered, and routed to its own handler.
 ///

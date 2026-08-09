@@ -1306,10 +1306,14 @@ Two layers, both REQUIRED:
 Exactly the `control.` method prefix is gated (`is_control_method`); unknown `control.*` methods
 still pass the auth gate first, then yield `METHOD_NOT_FOUND`. The pairing-administration methods
 (`control.pairing.list`/`approve`/`revoke`, §7.11) require the MASTER token specifically — a paired
-token is NOT accepted for them. The ONE exception is `control.wallet.balance` (`is_open_control_read`):
-a READ-ONLY chain read of a PUBLIC address with no custody, so it is served WITHOUT a token like the
-other reads — it still routes through `dispatch_control` (so it stays in the control catalog and gets
-its CLI verb) but the server skips the token requirement. No mutation or custody method is ever open.
+token is NOT accepted for them. The exceptions are the wallet CHAIN READS — `control.wallet.balance`, `control.wallet.coins` and
+`control.wallet.peak` (`is_open_control_read`): each is a READ-ONLY read of PUBLIC chain state with
+no custody, so each is served WITHOUT a token. They still route through `dispatch_control` (so they
+stay in the control catalog and get their CLI verbs) but the server skips the token requirement.
+`control.wallet.broadcast` is NOT among them: it puts bytes on the network, so it is token-gated like
+every other mutation, and an `UNAUTHORIZED` from it means exactly that (remedy: the token) — where the
+same code on an open read can only come from a node too old to serve it (remedy: an upgrade). No
+mutation or custody method is ever open.
 
 ### 7.3. The control token
 
@@ -1498,6 +1502,9 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.sync.status` | — | `available` (always `true` — the chunked capsule download needs no identity), `method: "chunked-capsule-download-with-section-21-clone-fallback"`, `identity_loaded`, `pinned_total`, `pinned_synced`, `whole_store_trigger_supported` (`true` — a store id alone is enough) |
 | `control.sync.trigger` | `store` = `storeId[:rootHash]`, or `store_id` [+ `root`] — the root is OPTIONAL; without one the node resolves the store's CHAIN-ANCHORED tip and syncs that generation | `status: "synced"`, `root`, `size_bytes`, `served_root` |
 | `control.wallet.balance` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"`, default `"xch"`) | `balance` (confirmed, spendable — JSON NUMBER, u64 base units), `pending` (unspent + unconfirmed — JSON NUMBER, u64 base units), `source` (`"db"` \| `"fallback"` — which tier produced the figure, §18.7b), `synced` (bool), `peak_height` (`u32` or `null`). Matches `dig-node-control-interface` 0.3.0's `WalletBalanceResult { balance: u64, pending: u64, .. }` and dig-app's `BalanceResponse { balance: u64 }` — a Rust-to-Rust numeric contract, never a decimal string. The wallet backend tracks the base-unit total as `u128` (headroom for summed intermediate math); the wire boundary saturating-casts to `u64` (a single address's balance can never exceed `u64::MAX` mojos, ~18.4M XCH). READ-ONLY chain read of a PUBLIC address (no seed/signing key). Reuses the B.6 sync-state routing: the local DB when the address is the wallet's own and the DB is synced, else the coinset fallback. Per §18.7b, `source`/`synced`/`peak_height` describe the TIER that answered: a `"db"` answer reports `synced: true` and the node's own peak; a `"fallback"` answer reports `synced: false` and `peak_height: null`. This is an OPEN read (`is_open_control_read`, no token); the cheap local-DB fast path is unbounded, but the EXPENSIVE coinset-fallback leg is subject to a GLOBAL token-bucket rate bound (defense-in-depth against an open-read amplification/oracle sweep — #1957): a burst of arbitrary-address fallback reads beyond the bound is refused with `WALLET_RATE_LIMITED` (§10), while any single honest read (DB fast path or one fallback) always succeeds. `$DIG` scopes by the canonical CAT asset id `digstore_chain::dig::DIG_ASSET_ID`. A synced empty address is a SUCCESS `{balance:0, synced:true}`, never an error; the read-failure shapes are DISTINCT errors `WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED` (§10), never a fabricated `0`. `INVALID_PARAMS` on a missing/malformed `address` or a bad `asset`. |
+| `control.wallet.coins` | `address` (bech32m string), `asset` (`"xch"` \| `"dig"`, default `"xch"`) | `coins` (array of `{coin_id, asset, amount, parent_coin_info, puzzle_hash, created_height, spent_height}`; all hashes lowercase 64-hex unprefixed, `amount` a JSON NUMBER in base units), `source`, `synced`, `peak_height` — the tier fields carrying exactly their `control.wallet.balance` meanings (§18.7b). The UNSPENT coins at the address for the asset, i.e. the read a caller building a spend needs; a balance is this read reduced to a sum, which is why the two take identical params. Coins seen only in the mempool are INCLUDED with `created_height: null`, so the caller decides what is spendable for its purpose rather than the node hiding one. `coins: []` MUST mean a chain WAS consulted and the address holds nothing; every way of failing to consult one is a DISTINCT error (`WALLET_NO_CHAIN_SOURCE`/`WALLET_NOT_SYNCED`/`WALLET_READ_FAILED`/`WALLET_RATE_LIMITED`, §10), NEVER an empty list — an empty list would tell a holder of funds that they hold none, and a spend built on it refuses with an untrue shortfall. OPEN read, same global fallback rate bound as the balance. `INVALID_PARAMS` on a missing/malformed `address` or a bad `asset`. |
+| `control.wallet.peak` | — | `peak_height` (`u32` or `null`), `synced` (bool). The node's current chain peak, independent of any address. Its OWN method rather than a field on a balance because a balance reports `peak_height: null` on every `"fallback"`-tier answer by design (§18.7b), so a caller bounding a claimed confirmation could not obtain one from the node that most needs to answer. Prefers the node's own replica and falls back to the chain tier. `peak_height: null` means UNKNOWN and MUST NOT be read as height zero, which every block is trivially above. OPEN read. |
+| `control.wallet.broadcast` | `signed_bundle_hex` (lowercase hex, optionally `0x`-prefixed, of a chia `Streamable` `SpendBundle`) | `accepted` (bool), `transaction_id` (lowercase 64-hex or `null`), `rejection` (string or `null`). Pushes an ALREADY-SIGNED bundle. **§908: the node signs nothing and is never given anything it could sign with** — there is no key, seed, phrase or unsigned-plan parameter here and none may be added; the node's role on the money path is to read chain state and relay what somebody else signed. A mempool that examined the bundle and refused it is a SUCCESSFUL call reporting `{accepted:false, rejection}`; failing to REACH a mempool is `WALLET_READ_FAILED`, and a node with no chain source is `WALLET_NO_CHAIN_SOURCE`. These MUST NOT be collapsed: the first says build a different bundle, the second says retry this one. `accepted:true` reports mempool admission ONLY and is NOT evidence anything reached a block — a caller MUST NOT record an outcome from it; only a buried confirmation of the created coin is evidence. `INVALID_PARAMS` on hex that is not a streamable `SpendBundle`, refused BEFORE any network call. A bundle requiring a signature from any key the NODE custodies — whatever puzzle wraps the coin — while `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off is `WALLET_NODE_SPEND_DISABLED`, also refused before any network call — the node relays what somebody ELSE signed, and it signs on request, so whether the node could have signed it is CHECKED rather than assumed. TOKEN-GATED (not an open read). |
 | `control.peers.ping` | `peer` (a 64-hex `peer_id`, or a dialable `host:port` with IPv6 bracketed), `peer_id` (OPTIONAL 64-hex — pins the identity the presented certificate MUST derive) | The connection-ladder report — see §7.4a. `INVALID_PARAMS` on a missing/blank `peer`; `CONTROL_ERROR` when no peer network is running; `PEER_PING_REFUSED` (§10) when the anti-amplification gate refuses before dialing. |
 
 ### 7.4a. `control.peers.ping` — the connection-ladder diagnostic
@@ -2290,6 +2297,11 @@ on-disk master token = local-machine control), never an unauthenticated backdoor
 - `stores [list]` → `control.hostedStores.list`; `stores pin|unpin|status <store>` →
   `control.hostedStores.pin|unpin|status`.
 - `sync [status]` → `control.sync.status`; `sync trigger <store>` → `control.sync.trigger`.
+- `wallet balance <address> [--asset xch|dig]` → `control.wallet.balance`;
+  `wallet coins <address> [--asset xch|dig]` → `control.wallet.coins`; `wallet peak` →
+  `control.wallet.peak`; `wallet broadcast <signed_bundle_hex>` → `control.wallet.broadcast`. The
+  first three are the OPEN chain reads and need no token; `broadcast` is token-gated like every
+  other mutation, and carries only already-signed bytes (§908).
 - `updater [status]` → `control.updater.status`; `updater set-channel <ch>` / `pause [--until <s>]`
   / `resume` / `check-now` → the matching `control.updater.*`.
 - `subscriptions [list]` → `control.listSubscriptions`; `subscriptions add|remove <store_id>` →
@@ -2297,7 +2309,10 @@ on-disk master token = local-machine control), never an unauthenticated backdoor
 
 **Parity is enforced mechanically.** `control::CONTROL_METHODS` is the canonical set of every
 `control.*` method the node resolves; a compile-time-adjacent test asserts every method in it is
-reachable from a CLI verb, so a new node control method cannot ship without a CLI subcommand.
+reachable from a CLI verb, so a new node control method cannot ship without a CLI subcommand. That
+test reads a list built from the CLI's own action enum, so it proves an action EXISTS, not that a
+command line reaches it; the wallet verbs are additionally pinned by tests whose input is an argv,
+which fail unless the parser really accepts the verb and carries its operands through to the wire.
 
 ### 8.7. `peers` — view + manage peer connections (#559)
 
@@ -2822,10 +2837,11 @@ NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
 | -32030 | `UNAUTHORIZED` | shell | `control.*` called without a valid local control token. |
 | -32031 | `NOT_SUPPORTED` | shell | A control operation this build/pin cannot perform (e.g. §21 sync without an identity). |
 | -32032 | `CONTROL_ERROR` | shell | A control operation failed at runtime (distinct from bad input / absent capability). |
-| -32040 | `WALLET_NO_CHAIN_SOURCE` | node | `control.wallet.balance` (§ control catalog) had NO live chain source able to answer an arbitrary (non-wallet) address. Distinct from a truthful `0`. |
+| -32040 | `WALLET_NO_CHAIN_SOURCE` | node | a wallet chain read (`control.wallet.balance`/`.coins`/`.peak`) or `control.wallet.broadcast` had NO live chain source able to answer an arbitrary (non-wallet) address. Distinct from a truthful `0`. |
 | -32041 | `WALLET_NOT_SYNCED` | node | `control.wallet.balance` of the wallet's OWN address while the local DB is still syncing and no live fallback is attached (nothing can answer yet). |
 | -32042 | `WALLET_READ_FAILED` | node | `control.wallet.balance` failed at the underlying DB / chain-source layer. Distinct from `WALLET_NO_CHAIN_SOURCE` and `WALLET_NOT_SYNCED`. |
 | -32043 | `WALLET_RATE_LIMITED` | node | `control.wallet.balance` refused: the GLOBAL coinset-fallback rate bound is exhausted (too many arbitrary-address reads hit the expensive fallback in a short window). Defense-in-depth against an open-read amplification/oracle sweep; back off and retry. The cheap local-DB fast path is never gated. |
+| -32044 | `WALLET_NODE_SPEND_DISABLED` | node | `control.wallet.broadcast` refused: the bundle requires a signature from one of the NODE's OWN custodied keys while `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off (§18.12). The node relays bundles somebody else signed on every install; sending its own money is a separate, default-OFF custody decision, and a caller could otherwise sign through the node and hand the bundle straight back. Retrying cannot help: the remedy is a bundle that does not spend the node's coins, or the flag. |
 | -32060 | `PEER_PING_REFUSED` | node | `control.peers.ping` (§7.4a) refused BEFORE dialing: a ladder is already running on this node (single-flight), or the start-rate bound for the window is exhausted. Anti-amplification — the method makes this node dial a caller-supplied address. Distinct from a ladder that ran and reached nothing, which is a RESULT (`verdict: "unreachable"`), not an error. |
 
 Read-path and upstream errors outside this table are relayed verbatim; this catalogue governs what
@@ -3925,8 +3941,44 @@ unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only
   tip spender (and any node-custodied send) invokes it BEFORE selecting, so the spend builds over
   current chain state. Idempotent + non-destructive (upsert-only; a re-sync marks a now-spent coin
   spent so it drops out of selection). A sync failure is NOT a spend failure — selection then reports
-  `NotExecutable`/insufficient-balance (retryable, never a false spend). A no-op under the graceful
-  `EmptyFallback`.
+  `NotExecutable`/insufficient-balance (retryable, never a false spend). A no-op when the chain transport cannot reach a
+  source.
+- **The chain transport is attached on EVERY install (dig_ecosystem#2376).** The wallet's chain
+  READS (`control.wallet.balance`/`.coins`/`.peak`) and the push of an ALREADY-SIGNED bundle
+  (`control.wallet.broadcast`) are served whether or not `DIG_WALLET_ENABLE_LIVE_BROADCAST` is set.
+  That flag answers ONE question and keeps answering only it: may the node's OWN custodied wallet
+  sign and send? It is still default-OFF. Whether the node may LOOK at the chain, and whether it may
+  relay bytes somebody else signed, are different questions — neither needs a key and neither moves
+  anything the node holds. Tying them together is what made a stock install answer
+  `WALLET_NO_CHAIN_SOURCE` to every wallet read and unable to push at all.
+
+  The push is served on every install but NOT unconditionally, because "somebody else signed it" is
+  a claim about the bundle, not a property of the method: the node's own custodied wallet signs on
+  request (`sign_coin_spends`), so a token holder could obtain a bundle signed by the node's key and
+  hand it straight back for relay. While the flag is off, a bundle requiring a signature from ANY BLS
+  public key the node custodies is refused with `WALLET_NODE_SPEND_DISABLED` (§10) — a single such
+  spend refuses the whole bundle.
+
+  The test is on KEYS, not on puzzle hashes, and the difference is the whole guarantee. A coin sits
+  at its owner's standard p2 hash ONLY when it is bare XCH: a CAT sits at
+  `CatArgs::curry_tree_hash(asset_id, p2_hash)`, and singleton/NFT/DID coins wrap the owner puzzle
+  again — while signing matches the REQUIRED key and ignores where the coin sits. A guard comparing
+  puzzle hashes would therefore relay the node's own $DIG, which is a CAT. The required keys MUST be
+  extracted with the same derivation the signer decides on, so the guard covers every puzzle wrapper
+  present or future and cannot drift from what it guards. A bundle whose conditions cannot be
+  evaluated MUST be treated as custodied.
+
+  The custodied set is the union of the loaded signer, every signer this process has loaded (the
+  §18.24 per-transaction grant is already gone by push time), and the custody manifest's PERSISTED
+  public keys — non-secret, readable while every wallet is locked, and covering the whole
+  `0..derivation_count` range rather than the index-0 receive address alone. Merely WATCHED puzzle
+  hashes are NOT in it: the node holds no key for those, and refusing them would block a legitimate
+  third-party push. Without this check the flag would be decorative on the one path that matters.
+
+  The transport's client is built on FIRST USE, so an idle node still makes no chain call, and a
+  build failure is NOT cached: a node that was offline when first asked can answer when its network
+  returns. A failure to reach the chain is always an error, never an empty result (§10).
+
 - **Canonical query hex.** All coin-record queries into `chia_query` (the fallback tier: peers +
   coinset.org) MUST pass hashes/hints as lowercased **`0x`-prefixed** hex. The coinset RPC matches
   ONLY `0x`-prefixed hex (the peer tier tolerantly strips an optional `0x`); a bare-hex query silently
