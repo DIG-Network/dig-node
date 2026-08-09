@@ -182,13 +182,31 @@ impl ChainFallback for CoinsetFallback {
     /// it. Collapsing an unreachable chain into "no such coin" is a money lie: a caller polling a
     /// mint would read a dropped connection as "your coin does not exist", so a pending mint stays
     /// awaiting forever and a spent funding coin can never report failure.
+    ///
+    /// The returned record is bound to the coin that was ASKED for: a coin id is self-certifying
+    /// (`SHA256(parent ‖ puzzle_hash ‖ amount)`), and the tier underneath answers from one
+    /// unauthenticated, DNS-discovered peer that never hashes what it forwards. A record for a
+    /// different coin is therefore a read FAILURE — not this coin's record (which would let a
+    /// substituted coin read as "the mint landed") and not absence (which is the lie above).
     async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
         let record = self
             .query
             .get_coin_record_by_name_opt(&Self::query_hash(coin_id))
             .await
             .map_err(|e| Error::internal(format!("fallback coin-id read: {e}")))?;
-        record.as_ref().map(Self::map_record).transpose()
+        let Some(record) = record else {
+            return Ok(None);
+        };
+        let coin = Self::map_record(&record)?;
+        if coin.coin_id != Self::norm_hex(coin_id) {
+            return Err(Error::internal(format!(
+                "fallback coin-id read: source answered with a different coin ({} for a request \
+                 for {})",
+                coin.coin_id,
+                Self::norm_hex(coin_id)
+            )));
+        }
+        Ok(Some(coin))
     }
 }
 
@@ -374,6 +392,21 @@ mod chain_failure_tests {
     /// A coin id the fixtures ask for. Its value is irrelevant — what varies is the SOURCE.
     const SOME_COIN_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
+    /// The coin record [`KNOWN_COIN_RECORD`] describes, as JSON.
+    const KNOWN_COIN_RECORD: &str = r#"{"success":true,"coin_record":{
+                "coin":{"parent_coin_info":"0x2222222222222222222222222222222222222222222222222222222222222222",
+                        "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
+                        "amount":7},
+                "confirmed_block_index":100,"spent_block_index":140,"spent":true,
+                "coinbase":false,"timestamp":1700000000}}"#;
+
+    /// The id of the coin in [`KNOWN_COIN_RECORD`]: `SHA256(parent ‖ puzzle_hash ‖ amount)` over
+    /// `0x22…22`, `0x33…33` and the minimal big-endian encoding of `7` (`0x07`).
+    ///
+    /// Pinned as a literal computed independently of this crate, so a mistake in the production
+    /// coin-id derivation cannot make the fixture agree with itself.
+    const KNOWN_COIN_ID: &str = "626443fb96579ab5eb3cbd9d75a39d8e428356af2fce9077ae5b4f7db4e72f9f";
+
     /// **A chain that could not answer MUST NOT report "no such coin".**
     ///
     /// A dropped connection, a `500`, a TLS failure and a rate-limit are all "we do not know".
@@ -418,19 +451,11 @@ mod chain_failure_tests {
     /// `control.wallet.coinById` exists to carry.
     #[tokio::test]
     async fn a_known_coin_is_mapped_through_with_its_spent_height() {
-        let base = serve_json(
-            r#"{"success":true,"coin_record":{
-                "coin":{"parent_coin_info":"0x2222222222222222222222222222222222222222222222222222222222222222",
-                        "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
-                        "amount":7},
-                "confirmed_block_index":100,"spent_block_index":140,"spent":true,
-                "coinbase":false,"timestamp":1700000000}}"#,
-        )
-        .await;
+        let base = serve_json(KNOWN_COIN_RECORD).await;
         let fallback = fallback_against(base).await;
 
         let coin = fallback
-            .coin_record_by_id(SOME_COIN_ID)
+            .coin_record_by_id(KNOWN_COIN_ID)
             .await
             .expect("a reachable chain answers")
             .expect("the chain knows this coin");
@@ -441,6 +466,36 @@ mod chain_failure_tests {
             coin.spent_height,
             Some(140),
             "a spent coin carries its real spent height"
+        );
+    }
+
+    /// **A record for a DIFFERENT coin is a read failure — never this coin's record, and never
+    /// absence.**
+    ///
+    /// The peer tier takes the first coin state a peer returns and never hashes it, and the pool is
+    /// unauthenticated DNS-discovered mainnet nodes. So a single hostile peer can answer a lookup
+    /// for X with any other real coin. Served as X's record it is a money lie in the worst
+    /// direction: a caller polling a mint reads "coin present" as "the mint landed" and records a
+    /// DID that is not on chain. Reported as absence it would be the #2392 lie again.
+    ///
+    /// A coin id is self-certifying — `SHA256(parent ‖ puzzle_hash ‖ amount)` — so the substitution
+    /// is detectable locally, with no second source needed. The fixture serves the coin whose id is
+    /// [`KNOWN_COIN_ID`] in answer to a request for [`SOME_COIN_ID`].
+    #[tokio::test]
+    async fn a_record_for_a_different_coin_is_an_error_never_this_coins_record() {
+        let base = serve_json(KNOWN_COIN_RECORD).await;
+        let fallback = fallback_against(base).await;
+
+        let result = fallback.coin_record_by_id(SOME_COIN_ID).await;
+
+        assert!(
+            result.is_err(),
+            "a source that answered with a different coin must surface as a read failure, \
+             got {result:?}"
+        );
+        assert!(
+            !matches!(result, Ok(None)),
+            "a substituted coin must NEVER be reported as a missing coin"
         );
     }
 }
