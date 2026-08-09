@@ -377,7 +377,6 @@ fn avail(v: &Value) -> &'static str {
     }
 }
 
-/// "pinned" / "not pinned" for a store's boolean pin flag.
 /// A block height for a human line: the number, or `pending` for a null.
 ///
 /// `null` means the coin is known only from the mempool — NOT height zero, which every block is
@@ -389,6 +388,7 @@ fn height(v: &Value) -> String {
     }
 }
 
+/// "pinned" / "not pinned" for a store's boolean pin flag.
 fn pinned(v: &Value) -> &'static str {
     if v.as_bool().unwrap_or(false) {
         "pinned"

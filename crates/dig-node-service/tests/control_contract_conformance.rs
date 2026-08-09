@@ -11,7 +11,11 @@
 use std::collections::BTreeSet;
 
 use dig_node_control_interface::method::{Category, ControlMethod};
-use dig_node_service::control::{is_open_control_read, CONTROL_METHODS};
+use dig_node_control_interface::params::WalletCoinByIdParams;
+use dig_node_service::control::{
+    is_open_control_read, wallet_coin_id_param_for_test, CONTROL_METHODS,
+};
+use serde_json::json;
 
 /// Drift that PREDATES this gate, found by it on its first run (dig_ecosystem#2376).
 ///
@@ -127,5 +131,92 @@ fn the_node_and_the_contract_agree_on_the_token_less_wallet_surface() {
             "{} disagrees on whether it needs the control token",
             method.name()
         );
+    }
+}
+
+/// **The node's `coin_id` validator agrees with the published contract's `WalletCoinByIdParams::validated()` on every input.**
+///
+/// Both sides implement the same normative rule independently. This test pins them against a shared
+/// corpus and asserts they agree on BOTH the accept/reject verdict AND the normalised output.
+/// It FAILS if either side's rule changes alone — that is the property the reviewer requires.
+///
+/// The two implementations are kept separate on purpose: calling one from inside the other and then
+/// asserting they match is circular and proves nothing. This test is the mechanical check.
+#[test]
+fn wallet_coin_id_param_agrees_with_published_contract() {
+    const BARE: &str = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+
+    let corpus: &[(&str, bool)] = &[
+        // (input, should_be_accepted)
+        (BARE, true), // bare 64 lowercase-hex
+        (
+            "0xa1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            true,
+        ), // 0x-prefixed
+        (
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
+            false,
+        ), // 63 hex chars
+        (
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2bb",
+            false,
+        ), // 65 hex chars
+        (
+            "0xa1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1",
+            false,
+        ), // 0x + 63 hex
+        (
+            "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2",
+            false,
+        ), // all-uppercase
+        (
+            "A1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            false,
+        ), // single uppercase in valid id
+        (
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            false,
+        ), // 64 non-hex chars
+        ("", false),  // empty string
+        (
+            " a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+            false,
+        ), // whitespace-padded valid id
+    ];
+
+    for (input, expected_accept) in corpus {
+        // Node's validator result.
+        let node_result = wallet_coin_id_param_for_test(&json!(1), &json!({ "coin_id": input }));
+
+        // Contract's validator result.
+        let contract_result = WalletCoinByIdParams {
+            coin_id: input.to_string(),
+        }
+        .validated();
+
+        let node_accepted = node_result.is_ok();
+        let contract_accepted = contract_result.is_ok();
+
+        assert_eq!(
+            node_accepted, contract_accepted,
+            "input {:?}: node accepted={node_accepted} but contract accepted={contract_accepted}",
+            input
+        );
+        assert_eq!(
+            node_accepted, *expected_accept,
+            "input {:?}: expected accepted={expected_accept} but got {node_accepted}",
+            input
+        );
+
+        // When both accept, the normalised output must also agree.
+        if node_accepted {
+            let node_coin_id = node_result.unwrap();
+            let contract_coin_id = contract_result.unwrap().coin_id;
+            assert_eq!(
+                node_coin_id, contract_coin_id,
+                "input {:?}: node normalised to {node_coin_id:?} but contract normalised to {contract_coin_id:?}",
+                input
+            );
+        }
     }
 }

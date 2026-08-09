@@ -1363,6 +1363,17 @@ fn wallet_coin_id_param(id: &Value, params: &Value) -> std::result::Result<Strin
     Ok(hex.to_string())
 }
 
+/// TEST-CONSTRUCTION ONLY, behind `testkit`. Thin public wrapper over [`wallet_coin_id_param`]
+/// for integration tests that need to pin the validator's accept/reject verdict against the
+/// published contract's `WalletCoinByIdParams::validated()`.
+#[cfg(any(test, feature = "testkit"))]
+pub fn wallet_coin_id_param_for_test(
+    id: &serde_json::Value,
+    params: &serde_json::Value,
+) -> std::result::Result<String, serde_json::Value> {
+    wallet_coin_id_param(id, params)
+}
+
 /// Map a wallet READ failure onto its catalogued control error. Shared by the balance and coin
 /// reads so the two can never classify the same failure differently.
 fn wallet_read_error(method: &str, id: Value, address: &str, e: BalanceError) -> Value {
