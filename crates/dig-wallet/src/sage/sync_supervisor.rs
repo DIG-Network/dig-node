@@ -51,6 +51,14 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 /// Per-attempt dial timeout for the production factory.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often a peak-only session re-reads the subscription set.
+///
+/// The default install has ZERO puzzle hashes, so the peak-only session is the common path, and
+/// a subscription is per-connection state: the set is fixed for the life of a connection. Without
+/// this poll a wallet created after boot waits for the peer to drop — which can be hours — before
+/// anything subscribes it. Five seconds is imperceptible to the user creating the wallet and is a
+/// local read of already-loaded public keys, so it costs nothing on the wire.
+const PUZZLE_HASH_POLL: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // The observable state
@@ -171,8 +179,11 @@ pub async fn status_without_supervisor(db: &WalletDb) -> sqlx::Result<WalletSync
 // Seams
 // ---------------------------------------------------------------------------
 
-/// Where the supervisor's subscription set comes from. Re-read on every connect attempt, so a
-/// wallet created after boot is picked up without restarting the node.
+/// Where the supervisor's subscription set comes from.
+///
+/// Re-read on every connect attempt, and — while a session is running with NOTHING subscribed —
+/// re-polled every [`PUZZLE_HASH_POLL`], so a wallet created after boot is picked up within
+/// seconds without restarting the node and without waiting for the peer to drop.
 pub trait PuzzleHashSource: Send + Sync {
     /// The puzzle hashes to subscribe. Empty is a legitimate answer (no wallet yet).
     fn puzzle_hashes(&self) -> Vec<Bytes32>;
@@ -230,7 +241,15 @@ pub trait SyncSession: Send + Sync {
     ) -> Result<(), SyncError>;
 
     /// Consume peer pushes until the peer disconnects. Consumes the session.
-    async fn run(self: Box<Self>, db: &WalletDb, events: &EventBus) -> Result<(), SyncError>;
+    ///
+    /// `subscribed` is the set this session subscribed in [`SyncSession::catch_up`]; pushed coins
+    /// outside it are dropped, because a peer answers a subscription rather than defining one.
+    async fn run(
+        self: Box<Self>,
+        db: &WalletDb,
+        events: &EventBus,
+        subscribed: &sync::SubscribedHashes,
+    ) -> Result<(), SyncError>;
 }
 
 /// Waiting and the passage of time, injectable so the backoff ladder is testable without a
@@ -304,6 +323,16 @@ fn jitter(base: Duration) -> Duration {
 // The supervisor
 // ---------------------------------------------------------------------------
 
+/// Why a session stopped, which decides what the supervisor does next.
+enum SessionOutcome {
+    /// Shutdown was requested; the supervisor exits.
+    Stop,
+    /// The subscription set changed under a peak-only session; reconnect immediately.
+    Resubscribe,
+    /// The peer disconnected (or the loop errored); back off and retry.
+    Ended,
+}
+
 /// Everything the supervisor loop needs. Assembled by [`spawn_supervisor`].
 pub struct Supervisor {
     /// The local replica the session writes into.
@@ -360,11 +389,14 @@ impl Supervisor {
             // (height, header_hash) is not safe while `run_update_loop`'s `NewPeakWallet` arm
             // advances the height while carrying the OLD hash forward.
             let puzzle_hashes = self.puzzle_hashes.puzzle_hashes();
-            if puzzle_hashes.is_empty() {
+            let subscribed: sync::SubscribedHashes = puzzle_hashes.iter().copied().collect();
+            let peak_only = puzzle_hashes.is_empty();
+            if peak_only {
                 // Nothing to subscribe. The session still runs: `new_peak_wallet` needs no
                 // subscription, so the replica's peak keeps advancing, and `is_synced()`
                 // stays false — which is the truth, and what keeps wallet-scoped reads on
-                // the fallback tier.
+                // the fallback tier. It is also re-polled below, so a wallet created after
+                // boot is subscribed within seconds rather than at the next disconnect.
                 tracing::debug!("wallet sync: no custodied puzzle hashes; peak-only session");
             } else if let Err(e) = session
                 .catch_up(
@@ -383,20 +415,33 @@ impl Supervisor {
                 continue;
             }
 
-            let stop = tokio::select! {
-                result = session.run(&self.db, &self.events) => {
+            let outcome = tokio::select! {
+                result = session.run(&self.db, &self.events, &subscribed) => {
                     if let Err(e) = result {
                         tracing::warn!(error = %e, "wallet sync: update loop ended in error");
                     }
-                    false
+                    SessionOutcome::Ended
                 }
+                // A wallet appeared while this peak-only session was running. The subscription
+                // is per-connection state, so the only way to subscribe it is a new session.
+                () = self.await_puzzle_hashes(peak_only) => SessionOutcome::Resubscribe,
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
-                _ = shutdown.changed() => true,
+                _ = shutdown.changed() => SessionOutcome::Stop,
             };
             handle.set_connected(0);
-            if stop {
-                break;
+            match outcome {
+                SessionOutcome::Stop => break,
+                // Reconnect at once: this is a user action, not a failure, so the backoff
+                // ladder has nothing to say about it.
+                SessionOutcome::Resubscribe => {
+                    tracing::info!(
+                        "wallet sync: custodied puzzle hashes appeared; reconnecting to subscribe"
+                    );
+                    backoff.reset();
+                    continue;
+                }
+                SessionOutcome::Ended => {}
             }
 
             if self.time.now().duration_since(started) >= HEALTHY_SESSION {
@@ -407,6 +452,22 @@ impl Supervisor {
             }
         }
         tracing::debug!("wallet sync: supervisor stopped");
+    }
+
+    /// Resolve once the subscription set stops being empty.
+    ///
+    /// Returns a future that NEVER resolves when `poll` is false — a session that already
+    /// subscribed has nothing to wait for, and its set is fixed for the life of the connection.
+    async fn await_puzzle_hashes(&self, poll: bool) {
+        if !poll {
+            std::future::pending::<()>().await;
+        }
+        loop {
+            self.time.sleep(PUZZLE_HASH_POLL).await;
+            if !self.puzzle_hashes.puzzle_hashes().is_empty() {
+                return;
+            }
+        }
     }
 
     /// Wait out the next backoff delay. Returns `false` if shutdown arrived meanwhile.
@@ -550,14 +611,19 @@ impl SyncSession for ChiaPeerSession {
         .await
     }
 
-    async fn run(self: Box<Self>, db: &WalletDb, events: &EventBus) -> Result<(), SyncError> {
+    async fn run(
+        self: Box<Self>,
+        db: &WalletDb,
+        events: &EventBus,
+        subscribed: &sync::SubscribedHashes,
+    ) -> Result<(), SyncError> {
         let receiver = self
             .receiver
             .lock()
             .await
             .take()
             .ok_or_else(|| SyncError::Peer("sync session already consumed".into()))?;
-        sync::run_update_loop(db, receiver, events, None).await
+        sync::run_update_loop(db, receiver, events, None, subscribed).await
     }
 }
 

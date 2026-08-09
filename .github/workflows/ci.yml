@@ -120,6 +120,12 @@ jobs:
       # `--fail-under-lines 80`.
       - name: cargo llvm-cov nextest (test + coverage, flaky-retried)
         run: |
+          # WITHOUT pipefail this step's status is `tee`'s, not cargo's: the Actions default
+          # `run:` shell is `bash -e {0}`, which does NOT set pipefail (`shell: bash` is the
+          # opt-IN that adds it). A run that died with `exit status: 102` reported this
+          # REQUIRED check green in 29s. Setting it here rather than via `shell:` keeps the
+          # reason visible at the point it matters.
+          set -o pipefail
           cargo llvm-cov nextest --workspace --locked --retries 2 --summary-only | tee coverage-summary.txt
 
       - name: Coverage summary to job summary

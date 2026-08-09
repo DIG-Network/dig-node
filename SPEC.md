@@ -3765,13 +3765,34 @@ genesis challenge, because a fresh peer has no memory of the previous subscripti
 plus a write to the node's own replica, so it MUST NOT be gated on the live-broadcast (spend) flag.
 
 The subscription set is derived from the node's custodied PUBLIC keys via `StandardArgs::curry_tree_hash`,
-re-read on every connect attempt so a wallet created after boot is picked up without a restart. No seed is
-read and nothing on this path can sign (§908).
+re-read on every connect attempt AND — while a session is running with nothing subscribed — re-polled at
+least every 5 seconds, so a wallet created after boot is picked up without a restart and without waiting
+for the peer to drop. A newly non-empty set ends the peak-only session and reconnects immediately, since
+the subscription is per-connection state. No seed is read and nothing on this path can sign (§908).
 
 **Invariant.** A catch-up MUST NOT run over an empty puzzle-hash set, and `initial_sync_complete` MUST NOT
 be set as a result of one. `initial_sync` itself refuses with `NoPuzzleHashes`. An empty subscription is
 answered "finished" immediately, so completing it would mark an un-queried DB authoritative under §18.7 and
 report a funded wallet as empty. A node with no wallet therefore advances only its peak and stays unsynced.
+
+18.6c. **The peer is untrusted.** The peer socket is attacker-reachable: peer discovery tries
+`127.0.0.1:8444` before any introducer and the client does not verify the server certificate, so an
+unprivileged co-resident process can become the node's chain source. The supervisor therefore MUST hold all
+four of the following.
+
+* **Subscription filtering.** A `CoinState` at a puzzle hash outside the set this session subscribed MUST
+  be dropped, in both the catch-up response and every `coin_state_update` push. A peer answers a
+  subscription; it does not define one.
+* **A bounded fork depth.** A `coin_state_update` claiming a fork more than 128 blocks below the replica's
+  peak MUST be refused and the session dropped, with the replica left intact. A light client cannot
+  validate a fork claim, and `rollback_above(0)` erases the whole replica.
+* **Fail closed on any backwards move.** When a rollback is applied, or the update's height is below the
+  current peak, `initial_sync_complete` MUST be cleared. Wallet-scoped reads then route to the fallback
+  tier (§18.7) until a genuine catch-up re-establishes the flag. Without this a single frame makes a funded
+  wallet report `balance 0` with `phase: synced`, permanently.
+* **A monotonic replica peak.** `new_peak_wallet` MUST only ADVANCE `sync_state.peak_height`; a backwards
+  claim is refused. That height bounds a claimed confirmation on an OPEN read, so a peer able to lower it
+  can make settled money read unconfirmed.
 
 18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
 chia_peer_count}`. `phase` is `not_started` (no peer has ever attached), `syncing`, or `synced` — and

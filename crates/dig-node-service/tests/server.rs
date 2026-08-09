@@ -113,6 +113,7 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0, // bind ephemeral
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 
@@ -175,6 +176,7 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -214,6 +216,7 @@ async fn start_companion_probe_state(
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -249,6 +252,7 @@ async fn start_companion_wallet(
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -554,6 +558,7 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
         upstream: upstream.to_string(),
         port,
         dig_local: true, // attempt the privileged 127.0.0.2:80 bind (expected to fail in CI)
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 
@@ -622,6 +627,7 @@ async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
         upstream: upstream.to_string(),
         port,
         dig_local: false, // skip the privileged 127.0.0.2:80 bind in tests
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()  // host: None → dual-stack default
     };
 
@@ -2294,6 +2300,7 @@ async fn start_serving_node(
         upstream,
         port,
         dig_local: false, // skip the privileged 127.0.0.2:80 bind in tests
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 

@@ -176,12 +176,34 @@ impl SyncSession for ScriptedSession {
         .await
     }
 
-    async fn run(self: Box<Self>, db: &WalletDb, events: &EventBus) -> Result<(), SyncError> {
+    async fn run(
+        self: Box<Self>,
+        db: &WalletDb,
+        events: &EventBus,
+        subscribed: &sync::SubscribedHashes,
+    ) -> Result<(), SyncError> {
         let receiver = self.receiver.lock().await.take().expect("run called once");
-        let result = sync::run_update_loop(db, receiver, events, None).await;
+        let result = sync::run_update_loop(db, receiver, events, None, subscribed).await;
         let lifetime = *self.script.session_lifetime.lock().unwrap();
         self.script.advance(lifetime);
         result
+    }
+}
+
+/// A puzzle-hash set the TEST can change while the supervisor is running — the shape of a user
+/// creating a wallet on a node that booted with none.
+#[derive(Default)]
+struct MutableHashes(Mutex<Vec<Bytes32>>);
+
+impl MutableHashes {
+    fn set(&self, hashes: Vec<Bytes32>) {
+        *self.0.lock().unwrap() = hashes;
+    }
+}
+
+impl PuzzleHashSource for MutableHashes {
+    fn puzzle_hashes(&self) -> Vec<Bytes32> {
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -441,6 +463,52 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
     h.stop().await;
 }
 
+/// **Proves (R3, #2501):** a wallet created AFTER boot is subscribed while the peer-only session
+/// is still connected — not at the next disconnect.
+///
+/// The fixture is built so the two are distinguishable: the scripted peer never disconnects (the
+/// test does not touch `disconnect_all`, so the session channel stays open and `run` is still
+/// awaiting), which is exactly the measured default install — zero puzzle hashes, one long-lived
+/// peer. A supervisor that only re-reads the set on connect therefore CANNOT pass this test: it
+/// has no next connect to re-read on.
+#[tokio::test]
+async fn a_wallet_created_after_boot_is_subscribed_without_waiting_for_a_disconnect() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let hashes = Arc::new(MutableHashes::default());
+
+    let h = Harness::start(
+        db.clone(),
+        hashes.clone(),
+        Script::new(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+    h.until("a connection", |s| s.connects.load(Ordering::SeqCst) >= 1)
+        .await;
+    assert_eq!(
+        h.script.catch_up_count(),
+        0,
+        "nothing is subscribed while custody is empty"
+    );
+
+    // The user creates a wallet. Nothing disconnects the peer.
+    let created = Bytes32::new([4; 32]);
+    hashes.set(vec![created]);
+
+    h.until("the new wallet to be subscribed", |s| {
+        s.catch_up_count() >= 1
+    })
+    .await;
+    assert_eq!(
+        h.script.catch_ups.lock().unwrap()[0],
+        vec![created],
+        "the catch-up must subscribe exactly the newly-created wallet's hash"
+    );
+    h.until_db("the catch-up to complete", |s| s.initial_sync_complete)
+        .await;
+    h.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // T5 / T6 / T7 — the phase ladder
 // ---------------------------------------------------------------------------
@@ -564,7 +632,10 @@ async fn backoff_grows_then_resets_after_a_long_lived_connection() {
 
     let h = Harness::start(
         db,
-        Arc::new(FixedHashes(vec![])),
+        // A subscribed wallet, so `slept` records ONLY the backoff ladder: a peak-only session
+        // additionally re-polls for a newly-created wallet on its own interval, and those sleeps
+        // would be indistinguishable from backoff rungs here.
+        Arc::new(FixedHashes(vec![Bytes32::new([4; 32])])),
         script,
         vec!["203.0.113.1:8444".into()],
     )
