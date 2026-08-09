@@ -959,9 +959,17 @@ impl WalletBackend {
     /// never as "this mint will never land". Requiring corroboration before believing an absence
     /// is dig_ecosystem#2456, one crate down; this method's shape does not change when it lands.
     ///
-    /// A POSITIVE answer carries no such caveat: a coin id is self-certifying, and the fallback
-    /// tier rejects a record whose `SHA256(parent ‖ puzzle_hash ‖ amount)` is not the id asked for
-    /// ([`super::fallback::CoinsetFallback`]), so a substituted coin surfaces as an error.
+    /// **A POSITIVE answer is bound in IDENTITY only, and carries the same caveat otherwise.** A
+    /// coin id is self-certifying, so the fallback tier rejects a record whose
+    /// `SHA256(parent ‖ puzzle_hash ‖ amount)` is not the id asked for
+    /// ([`super::fallback::CoinsetFallback`]) and a substituted coin surfaces as an error. That
+    /// authenticates WHICH coin the record describes — it does not authenticate whether that coin
+    /// is on chain, at what height it was created, or whether it has been spent. `created_height`
+    /// and `spent_height` still come from ONE unauthenticated peer's answer, exactly as `None`
+    /// does, and those two fields are the entire reason this method exists. A peer that watched
+    /// the mempool knows a pending coin's preimage, so it can report a `created_height` for a coin
+    /// that never landed and pass the binding check. Corroboration (dig_ecosystem#2456) must cover
+    /// positive state, not only absence.
     ///
     /// # The FALLBACK tier only, deliberately
     ///
