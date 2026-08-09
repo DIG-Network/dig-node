@@ -60,6 +60,8 @@ pub enum ControlAction {
     WalletBalance { address: String, asset: String },
     /// `control.wallet.coins` — the READ-ONLY unspent coins of a public address (XCH or $DIG).
     WalletCoins { address: String, asset: String },
+    /// `control.wallet.coinById` — the READ-ONLY lookup of ONE coin by coin id (spent or not).
+    WalletCoinById { coin_id: String },
     /// `control.wallet.peak` — the READ-ONLY chain peak height the node can see.
     WalletPeak,
     /// `control.wallet.broadcast` — push an ALREADY-SIGNED spend bundle. The node signs nothing.
@@ -101,6 +103,7 @@ impl ControlAction {
             ControlAction::SyncTrigger { .. } => "control.sync.trigger",
             ControlAction::WalletBalance { .. } => "control.wallet.balance",
             ControlAction::WalletCoins { .. } => "control.wallet.coins",
+            ControlAction::WalletCoinById { .. } => "control.wallet.coinById",
             ControlAction::WalletPeak => "control.wallet.peak",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
             ControlAction::UpdaterStatus => "control.updater.status",
@@ -130,6 +133,7 @@ impl ControlAction {
             | ControlAction::WalletCoins { address, asset } => {
                 json!({ "address": address, "asset": asset })
             }
+            ControlAction::WalletCoinById { coin_id } => json!({ "coin_id": coin_id }),
             ControlAction::WalletBroadcast { signed_bundle_hex } => {
                 json!({ "signed_bundle_hex": signed_bundle_hex })
             }
@@ -191,6 +195,10 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         ControlAction::WalletCoins {
             address: String::new(),
             asset: String::new(),
+        }
+        .method(),
+        ControlAction::WalletCoinById {
+            coin_id: String::new(),
         }
         .method(),
         ControlAction::WalletPeak.method(),
@@ -316,6 +324,25 @@ fn summarize(method: &str, result: &Value) -> String {
                 "syncing"
             },
         ),
+        // `result["coin"]` yields `Null` for a missing key, but indexing the INNER map would
+        // panic on one — so every field is read with `get`, and a coin record short of a field
+        // prints an honest unknown instead of aborting the CLI.
+        "control.wallet.coinById" => match result["coin"].as_object() {
+            None => "no such coin on chain".to_string(),
+            Some(coin) => {
+                let field = |key: &str| coin.get(key).unwrap_or(&Value::Null).clone();
+                format!(
+                    "coin {} · {} · created {} · {}",
+                    field("coin_id").as_str().unwrap_or("?"),
+                    mojos(&field("amount")),
+                    height(&field("created_height")),
+                    match field("spent_height").as_u64() {
+                        Some(h) => format!("spent at {h}"),
+                        None => "unspent".to_string(),
+                    },
+                )
+            }
+        },
         "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
     }
@@ -353,6 +380,29 @@ fn avail(v: &Value) -> &'static str {
         "available"
     } else {
         "unavailable"
+    }
+}
+
+/// A coin amount for a human line: `N mojos`, or `amount unknown` when the field is missing or is
+/// not a number.
+///
+/// Never `0 mojos` on a miss: a zero amount is a real, readable claim about a coin, so printing one
+/// for an unreadable field states a fact the CLI does not have.
+fn mojos(v: &Value) -> String {
+    match v.as_u64() {
+        Some(a) => format!("{a} mojos"),
+        None => "amount unknown".to_string(),
+    }
+}
+
+/// A block height for a human line: the number, or `pending` for a null.
+///
+/// `null` means the coin is known only from the mempool — NOT height zero, which every block is
+/// trivially above.
+fn height(v: &Value) -> String {
+    match v.as_u64() {
+        Some(h) => h.to_string(),
+        None => "pending".to_string(),
     }
 }
 
@@ -501,6 +551,11 @@ mod tests {
                 vec!["unsubscribed", "abc"],
             ),
             (
+                "control.wallet.coinById",
+                json!({ "coin": { "coin_id": "ab", "amount": 7, "created_height": 100, "spent_height": 140 }, "source": "fallback" }),
+                vec!["ab", "7 mojos", "100", "spent at 140"],
+            ),
+            (
                 "control.hostedStores.status",
                 json!({ "store_id": "abc", "pinned": true, "capsule_count": 2, "total_bytes": 99 }),
                 vec!["abc", "pinned", "2 cached capsule"],
@@ -529,6 +584,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An unreadable amount must not print as `0 mojos` — a zero is a real claim about a coin, and
+    /// a caller reading a funding coin would take it as "this coin holds nothing".
+    #[test]
+    fn coin_by_id_summary_never_prints_zero_for_an_unreadable_amount() {
+        let s = summarize(
+            "control.wallet.coinById",
+            &json!({ "coin": { "coin_id": "ab", "created_height": 100, "spent_height": null } }),
+        );
+        assert!(!s.contains("0 mojos"), "got: {s}");
+        assert!(s.contains("amount unknown"), "got: {s}");
     }
 
     #[test]

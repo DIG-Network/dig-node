@@ -1440,6 +1440,10 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
             "control.wallet.coins",
             json!({ "address": address, "asset": "xch" }),
         ),
+        (
+            "control.wallet.coinById",
+            json!({ "coin_id": "ab".repeat(32) }),
+        ),
         ("control.wallet.peak", json!({})),
     ] {
         let response = post_rpc(&addr, call(method, params), None).await;
@@ -1465,6 +1469,67 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
             "{method} was routed to a handler that wanted different params: got {response:?}"
         );
     }
+}
+
+/// **Proves (dig_ecosystem#2392):** `control.wallet.coinById` validates its `coin_id` BEFORE any
+/// chain work — ahead of the chain-source liveness check, and therefore ahead of the rate limiter
+/// and the network call behind it.
+///
+/// **Why an `INVALID_PARAMS` assertion alone would NOT prove this.** `-32602` is also exactly what
+/// a handler returns when it forwards a malformed id to the oracle, gets a rejection, and maps it
+/// back to a param error. The code is the same; the byte that left the host is not. Since
+/// `control.wallet.coinById` is an OPEN, token-less method whose argument is forwarded to a
+/// third-party oracle, "refused before the network" is a security property, not a nicety: any local
+/// process could otherwise push arbitrary content at that oracle through this node.
+///
+/// **The observable.** `wallet_coin_by_id` calls `coin_by_id`, which checks liveness first
+/// (`WALLET_NO_CHAIN_SOURCE`), then the rate limiter, then the network. This test node has NO live
+/// chain source, so the ladder is stopped at its first rung and the two calls below vary in exactly
+/// one way — whether the `coin_id` is well-formed:
+/// * malformed → `INVALID_PARAMS`, which can only come from the validator;
+/// * well-formed → something ELSE, which can only come from the chain path.
+///
+/// The two answers DIFFERING is the proof. **Catches** moving the validation after the chain call:
+/// the malformed id would then reach the liveness check too and answer identically to the
+/// well-formed one, and this test fails. (Verified by performing that reorder locally and
+/// confirming the failure.) A same-answer assertion is impossible to fake by narrowing the fixture,
+/// because the control call is the one that must NOT be `INVALID_PARAMS`.
+#[tokio::test]
+async fn a_malformed_coin_id_is_refused_before_the_chain_is_ever_consulted() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+
+    let coin_by_id = |coin_id: Value| {
+        json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "control.wallet.coinById",
+            "params": { "coin_id": coin_id },
+        })
+    };
+
+    // Malformed: 63 hex characters, one short of the contract's 64. Untokened, as a real caller
+    // of this open read would be.
+    let malformed = post_rpc(&addr, coin_by_id(json!("a".repeat(63))), None).await;
+    assert_eq!(
+        malformed["error"]["data"]["code"],
+        json!("INVALID_PARAMS"),
+        "a malformed coin id must be refused by the validator: got {malformed:?}"
+    );
+
+    // Well-formed, same shape of call, same node. This one DOES reach the chain path and fails
+    // there, because the test node has no chain source.
+    let well_formed = post_rpc(&addr, coin_by_id(json!("ab".repeat(32))), None).await;
+    assert_ne!(
+        well_formed["error"]["data"]["code"],
+        json!("INVALID_PARAMS"),
+        "a well-formed coin id must get PAST validation into the chain path: got {well_formed:?}"
+    );
+    assert_ne!(
+        malformed["error"]["data"]["code"], well_formed["error"]["data"]["code"],
+        "the malformed id must be answered by the validator and the well-formed one by the chain \
+         path; identical answers mean validation ran AFTER the chain was consulted: \
+         malformed={malformed:?} well_formed={well_formed:?}"
+    );
 }
 
 /// **Proves (dig_ecosystem#1985):** `control.peers.ping` is REACHABLE over the real HTTP control

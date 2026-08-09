@@ -251,6 +251,14 @@ enum WalletCommand {
         #[arg(long, default_value = "xch")]
         asset: String,
     },
+    /// Look up ONE coin by its coin id, spent or unspent (READ-ONLY; needs no seed or pairing).
+    ///
+    /// Answers the question a spend poll asks and an address cannot: did my coin appear, and is
+    /// the coin that funded it gone?
+    CoinById {
+        /// The coin id: 64 lowercase-hex characters (an optional `0x` prefix is allowed).
+        coin_id: String,
+    },
     /// Print the chain peak this node reads against (READ-ONLY).
     Peak,
     /// Push an ALREADY-SIGNED spend bundle to the mempool.
@@ -548,6 +556,7 @@ fn wallet_action(cmd: WalletCommand) -> ControlAction {
             ControlAction::WalletBalance { address, asset }
         }
         WalletCommand::Coins { address, asset } => ControlAction::WalletCoins { address, asset },
+        WalletCommand::CoinById { coin_id } => ControlAction::WalletCoinById { coin_id },
         WalletCommand::Peak => ControlAction::WalletPeak,
         WalletCommand::Broadcast { signed_bundle_hex } => {
             ControlAction::WalletBroadcast { signed_bundle_hex }

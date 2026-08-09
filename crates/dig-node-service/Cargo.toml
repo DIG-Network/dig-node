@@ -66,6 +66,26 @@ testkit = []
 # around it, and produces the `dig-node` binary (distinct name from the engine lib).
 dig-node-core = { path = "../dig-node-core" }
 
+# The PUBLISHED control-plane contract (dig_ecosystem#2376, #2392).
+#
+# Consumed at RUNTIME, not only in tests, so the coin-id well-formedness rule
+# `control.wallet.coinById` enforces IS the contract's own `WalletCoinByIdParams::validated()`
+# rather than a second copy of it. Two copies of a published rule agree until they do not, and the
+# divergence would surface as a mint that never confirms while the conformance suite -- which pins
+# method names and auth posture only -- stayed green.
+#
+# It also backs the conformance tests, which pin the node's own `CONTROL_METHODS` (still the
+# runtime source of truth for the served set) against the published catalog, so a method served
+# here but absent from the contract -- or an auth posture the two disagree on -- fails a test
+# instead of shipping as drift a consumer discovers.
+#
+# The requirement is `0.7`, not `0.7.0`, and that MATTERS: that gate ITERATES the contract, so any
+# method the pinned version does not declare is invisible to it rather than failing it. Pinned at
+# "0.6.0" the suite went green over a `control.wallet.coinById` the contract had never heard of --
+# it checked nothing about the very method the change added. A caret range keeps the pin moving
+# with the published catalog instead of silently narrowing what CI can see.
+dig-node-control-interface = "0.7"
+
 # The OS CSPRNG for all authorization material — the control token, pairing ids/tokens
 # (§7), and the relay loop-probe id (`control::fill_random`). Wraps `getrandom(2)` /
 # `/dev/urandom` on Unix and `BCryptGenRandom` on Windows, one code path on every
@@ -194,12 +214,6 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
-# The PUBLISHED control-method catalog, as a TEST-only dependency (dig_ecosystem#2376).
-#
-# The node's own `CONTROL_METHODS` stays the runtime source of truth; this pins the two against
-# each other in CI, so a method served here but absent from the published contract -- or an auth
-# posture the two disagree on -- fails a test instead of shipping as drift a consumer discovers.
-dig-node-control-interface = "0.6.0"
 # The crate's own integration tests need its test-construction seams (the `testkit` feature above).
 # Depending on self with the feature on is what keeps those seams available to `tests/` while staying
 # absent from any production build of this crate.
