@@ -4119,7 +4119,11 @@ mod tests {
 
         let r = be.coin_by_id("watched").await.unwrap();
 
-        assert_eq!(r.coin.unwrap().amount, 7, "the chain tier's figure, not the replica's");
+        assert_eq!(
+            r.coin.unwrap().amount,
+            7,
+            "the chain tier's figure, not the replica's"
+        );
         assert_eq!(fb.call_count(), 1, "the chain tier really ran");
         assert_eq!(r.source, Source::Fallback);
         assert!(!r.synced, "no local replica produced this answer");
@@ -4147,8 +4151,11 @@ mod tests {
     async fn every_way_of_not_reaching_a_chain_is_a_distinct_error() {
         let db = || WalletDb::open_in_memory();
 
-        let no_source =
-            WalletBackend::new(db().await.unwrap(), Arc::new(EmptyFallback), WalletConfig::default());
+        let no_source = WalletBackend::new(
+            db().await.unwrap(),
+            Arc::new(EmptyFallback),
+            WalletConfig::default(),
+        );
         assert_eq!(
             no_source.coin_by_id("c1").await,
             Err(BalanceError::NoChainSource)

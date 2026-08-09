@@ -372,8 +372,7 @@ mod chain_failure_tests {
     }
 
     /// A coin id the fixtures ask for. Its value is irrelevant — what varies is the SOURCE.
-    const SOME_COIN_ID: &str =
-        "1111111111111111111111111111111111111111111111111111111111111111";
+    const SOME_COIN_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
     /// **A chain that could not answer MUST NOT report "no such coin".**
     ///

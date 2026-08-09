@@ -1351,8 +1351,14 @@ fn wallet_coin_id_param(id: &Value, params: &Value) -> std::result::Result<Strin
         return invalid("a 64-character lowercase-hex coin id string");
     };
     let hex = raw.strip_prefix("0x").unwrap_or(raw);
-    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return invalid("a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)");
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return invalid(
+            "a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)",
+        );
     }
     Ok(hex.to_string())
 }
@@ -1592,6 +1598,7 @@ mod tests {
             vec![
                 "control.wallet.balance",
                 "control.wallet.coins",
+                "control.wallet.coinById",
                 "control.wallet.peak"
             ]
         );
@@ -1620,6 +1627,7 @@ mod tests {
                         puzzle_hash: "cc".repeat(32),
                         amount: 1_750_000_000_000,
                         created_height: Some(5_000_000),
+                        spent_height: None,
                     },
                     WalletCoin {
                         coin_id: "dd".repeat(32),
@@ -1627,6 +1635,7 @@ mod tests {
                         puzzle_hash: "cc".repeat(32),
                         amount: 7,
                         created_height: None,
+                        spent_height: None,
                     },
                 ],
                 source: Source::Db,
@@ -1653,6 +1662,46 @@ mod tests {
                 ],
                 "source": "db", "synced": true, "peak_height": 5_000_000
             })
+        );
+    }
+
+    /// **`coins_wire` REPORTS a coin's `spent_height`; it does not assert one.**
+    ///
+    /// The mapper used to emit a hardcoded `null` here, justified by "every coin in an
+    /// address-scoped read is unspent by construction". That was true of the CALLER, not of this
+    /// function — the filtering lives at the read sites, two layers up. A literal in a mapper is a
+    /// claim the mapper cannot check, and it silently outlives the invariant that motivated it.
+    ///
+    /// So this feeds `coins_wire` a SPENT coin, which the production callers never will, purely to
+    /// prove the value travels. Reverting the mapper to a literal `null` fails this and nothing
+    /// else — the two unspent-coin assertions above pass either way, which is exactly why they
+    /// could not be left as the only coverage.
+    #[test]
+    fn coins_wire_reports_a_spent_height_rather_than_asserting_null() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{WalletCoin, WalletCoinsResult};
+
+        let wire = coins_wire(
+            &WalletCoinsResult {
+                coins: vec![WalletCoin {
+                    coin_id: "aa".repeat(32),
+                    parent_coin_info: "bb".repeat(32),
+                    puzzle_hash: "cc".repeat(32),
+                    amount: 1,
+                    created_height: Some(5_000_000),
+                    spent_height: Some(5_000_042),
+                }],
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            BalanceAsset::Xch,
+        );
+
+        assert_eq!(
+            wire["coins"][0]["spent_height"],
+            json!(5_000_042),
+            "the coin's own spent height reaches the wire; a hardcoded null would fail here"
         );
     }
 
