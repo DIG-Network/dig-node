@@ -60,6 +60,8 @@ pub enum ControlAction {
     WalletBalance { address: String, asset: String },
     /// `control.wallet.coins` — the READ-ONLY unspent coins of a public address (XCH or $DIG).
     WalletCoins { address: String, asset: String },
+    /// `control.wallet.coinById` — the READ-ONLY lookup of ONE coin by coin id (spent or not).
+    WalletCoinById { coin_id: String },
     /// `control.wallet.peak` — the READ-ONLY chain peak height the node can see.
     WalletPeak,
     /// `control.wallet.broadcast` — push an ALREADY-SIGNED spend bundle. The node signs nothing.
@@ -101,6 +103,7 @@ impl ControlAction {
             ControlAction::SyncTrigger { .. } => "control.sync.trigger",
             ControlAction::WalletBalance { .. } => "control.wallet.balance",
             ControlAction::WalletCoins { .. } => "control.wallet.coins",
+            ControlAction::WalletCoinById { .. } => "control.wallet.coinById",
             ControlAction::WalletPeak => "control.wallet.peak",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
             ControlAction::UpdaterStatus => "control.updater.status",
@@ -130,6 +133,7 @@ impl ControlAction {
             | ControlAction::WalletCoins { address, asset } => {
                 json!({ "address": address, "asset": asset })
             }
+            ControlAction::WalletCoinById { coin_id } => json!({ "coin_id": coin_id }),
             ControlAction::WalletBroadcast { signed_bundle_hex } => {
                 json!({ "signed_bundle_hex": signed_bundle_hex })
             }
@@ -191,6 +195,10 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         ControlAction::WalletCoins {
             address: String::new(),
             asset: String::new(),
+        }
+        .method(),
+        ControlAction::WalletCoinById {
+            coin_id: String::new(),
         }
         .method(),
         ControlAction::WalletPeak.method(),
@@ -316,6 +324,19 @@ fn summarize(method: &str, result: &Value) -> String {
                 "syncing"
             },
         ),
+        "control.wallet.coinById" => match result["coin"].as_object() {
+            None => "no such coin on chain".to_string(),
+            Some(coin) => format!(
+                "coin {} · {} mojos · created {} · {}",
+                coin["coin_id"].as_str().unwrap_or("?"),
+                coin["amount"].as_u64().unwrap_or(0),
+                height(&coin["created_height"]),
+                match coin["spent_height"].as_u64() {
+                    Some(h) => format!("spent at {h}"),
+                    None => "unspent".to_string(),
+                },
+            ),
+        },
         "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
     }
@@ -357,6 +378,17 @@ fn avail(v: &Value) -> &'static str {
 }
 
 /// "pinned" / "not pinned" for a store's boolean pin flag.
+/// A block height for a human line: the number, or `pending` for a null.
+///
+/// `null` means the coin is known only from the mempool — NOT height zero, which every block is
+/// trivially above.
+fn height(v: &Value) -> String {
+    match v.as_u64() {
+        Some(h) => h.to_string(),
+        None => "pending".to_string(),
+    }
+}
+
 fn pinned(v: &Value) -> &'static str {
     if v.as_bool().unwrap_or(false) {
         "pinned"

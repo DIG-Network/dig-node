@@ -98,6 +98,7 @@ fn coin_from_row(row: &CoinRow) -> Result<WalletCoin> {
         puzzle_hash: row.puzzle_hash.clone(),
         amount,
         created_height: row.created_height.and_then(|h| u32::try_from(h).ok()),
+        spent_height: row.spent_height.and_then(|h| u32::try_from(h).ok()),
     })
 }
 
@@ -109,6 +110,7 @@ fn coin_from_fallback(coin: &FallbackCoin) -> WalletCoin {
         puzzle_hash: coin.puzzle_hash.clone(),
         amount: coin.amount,
         created_height: coin.created_height,
+        spent_height: coin.spent_height,
     }
 }
 
@@ -160,6 +162,13 @@ pub struct WalletCoin {
     pub amount: u64,
     /// The height the coin was created at, or `None` while it is known only from the mempool.
     pub created_height: Option<u32>,
+    /// The height the coin was SPENT at, or `None` while it is unspent.
+    ///
+    /// `None` is the truthful value for an unspent coin, and every coin an address-scoped read
+    /// returns is unspent by construction — but a coin looked up BY ID may well be spent, and that
+    /// is the whole point of [`WalletBackend::coin_by_id`]: a mint poll cannot report failure
+    /// without seeing that its funding coin went.
+    pub spent_height: Option<u32>,
 }
 
 /// The UNSPENT coins held at ONE address for one asset, and the tier that saw them
@@ -177,6 +186,22 @@ pub struct WalletCoinsResult {
     /// Whether THIS answer reflects a fully-synced local view (only a [`Source::Db`] answer can be).
     pub synced: bool,
     /// The chain peak height THIS answer reflects, when known.
+    pub peak_height: Option<u32>,
+}
+
+/// ONE coin looked up by coin id, or its provable absence (dig_ecosystem#2392).
+///
+/// `coin: None` means a chain WAS consulted and has no such coin. Every way of failing to consult
+/// one is a [`BalanceError`] — see [`WalletBackend::coin_by_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCoinByIdResult {
+    /// The coin, or `None` for a coin the chain provably does not have.
+    pub coin: Option<WalletCoin>,
+    /// Which tier produced this answer. Always [`Source::Fallback`]: see [`WalletBackend::coin_by_id`].
+    pub source: Source,
+    /// Always `false` — no local replica produced this answer.
+    pub synced: bool,
+    /// Always `None` — a caller bounding confirmations reads `control.wallet.peak` instead.
     pub peak_height: Option<u32>,
 }
 
@@ -906,6 +931,62 @@ impl WalletBackend {
                 })
             }
         }
+    }
+
+    /// ONE coin looked up by COIN ID (dig_ecosystem#2392).
+    ///
+    /// The read a caller polling a spend needs: "did the coin I created appear, and is the coin I
+    /// funded it with gone?" Neither question can be asked by address.
+    ///
+    /// # Absence is an ANSWER; unreachable is an ERROR
+    ///
+    /// `coin: None` means a chain WAS consulted and provably has no such coin. Every way of failing
+    /// to reach one is a [`BalanceError`]. Collapsing the two would make an outage look like a mint
+    /// that never happened.
+    ///
+    /// # The FALLBACK tier only, deliberately
+    ///
+    /// This read does NOT go through [`routing::route`]. That router keys on whether the coin's
+    /// puzzle hash is one the node derives — which is not known until AFTER the coin is read — and,
+    /// more importantly, the local `coins` replica is populated only from the node's own
+    /// subscriptions. A miss there means "this node does not watch that coin", which is NOT
+    /// absence; serving it as absence would declare a live mint dead. So the answer always comes
+    /// from the chain tier, and says so: `source: fallback`, `synced: false`, `peak_height: null`.
+    /// A caller bounding confirmations reads [`chain_peak`](Self::chain_peak).
+    ///
+    /// # The custody boundary (§908)
+    ///
+    /// A pure chain read of public data. One hex string in; no address, no key, no seed, no
+    /// signature.
+    pub async fn coin_by_id(
+        &self,
+        coin_id: &str,
+    ) -> std::result::Result<WalletCoinByIdResult, BalanceError> {
+        // No live source means the answer is UNKNOWN, never "no such coin" (#1851).
+        if !self.fallback.is_live() {
+            return Err(BalanceError::NoChainSource);
+        }
+        // The same global bound the other open chain reads carry (#1957): this is an
+        // unauthenticated loopback endpoint, so without it a local process could loop it into
+        // egress amplification against the third-party oracle.
+        if !self.fallback_rate.try_acquire() {
+            return Err(BalanceError::RateLimited);
+        }
+        tracing::info!(
+            tier = Source::Fallback.as_wire(),
+            "coin-id read routed to the third-party chain oracle"
+        );
+        let coin = self
+            .fallback
+            .coin_record_by_id(coin_id)
+            .await
+            .map_err(|e| BalanceError::ReadFailed(e.to_string()))?;
+        Ok(WalletCoinByIdResult {
+            coin: coin.as_ref().map(coin_from_fallback),
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        })
     }
 
     /// The node's current chain peak (dig_ecosystem#2376).
@@ -3976,6 +4057,123 @@ mod tests {
         fn is_live(&self) -> bool {
             true
         }
+    }
+
+    // ---- control.wallet.coinById: coin_by_id (dig_ecosystem#2392) --------------------
+
+    /// **A SPENT coin is returned, with its real spent height.**
+    ///
+    /// The address-scoped reads drop spent coins (`.filter(|c| c.spent_height.is_none())`) because
+    /// a balance is about what you still hold. Inheriting that filter here would make the by-id
+    /// read structurally unable to say "this coin is gone" — so a mint poll could never report
+    /// failure, only await forever. The fixture holds BOTH a spent and an unspent coin so a
+    /// filter would change the answer rather than merely fail to appear.
+    #[tokio::test]
+    async fn a_spent_coin_is_returned_with_its_spent_height() {
+        let fb = Arc::new(MockFallback::with_coins(vec![
+            fallback_coin("spent-one", &owned_ph(), 100, Some(10), Some(42)),
+            fallback_coin("unspent-one", &owned_ph(), 100, Some(10), None),
+        ]));
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb,
+            WalletConfig::default(),
+        );
+
+        let spent = be.coin_by_id("spent-one").await.unwrap().coin.unwrap();
+        assert_eq!(
+            spent.spent_height,
+            Some(42),
+            "a spent coin is returned, carrying the height it went at"
+        );
+        let unspent = be.coin_by_id("unspent-one").await.unwrap().coin.unwrap();
+        assert_eq!(
+            unspent.spent_height, None,
+            "and an unspent coin still reports no spend"
+        );
+    }
+
+    /// **The by-id read never consults the local replica — pinned so an "optimisation" cannot
+    /// reintroduce the Db-miss-as-absence trap.**
+    ///
+    /// The fixture is chosen to distinguish this from the nearest wrong implementation: the DB is
+    /// fully synced, holds a peak, AND holds the very coin being asked for, so a routed
+    /// implementation would answer `source: db, synced: true, peak_height: Some(500)` here. It
+    /// would also, on a coin the DB did NOT hold, report absence — which for a replica populated
+    /// only from this node's own subscriptions means "not watched", not "does not exist", and would
+    /// declare a live mint dead.
+    #[tokio::test]
+    async fn the_by_id_read_never_consults_the_local_replica() {
+        let db = db_with_owned_derivation(true, Some(500)).await;
+        db.upsert_coins(&[coin_at_ph("watched", &owned_ph(), 100, Some(10), None)])
+            .await
+            .unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "watched",
+            &owned_ph(),
+            7,
+            Some(11),
+            None,
+        )]));
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+
+        let r = be.coin_by_id("watched").await.unwrap();
+
+        assert_eq!(r.coin.unwrap().amount, 7, "the chain tier's figure, not the replica's");
+        assert_eq!(fb.call_count(), 1, "the chain tier really ran");
+        assert_eq!(r.source, Source::Fallback);
+        assert!(!r.synced, "no local replica produced this answer");
+        assert_eq!(
+            r.peak_height, None,
+            "a caller bounding confirmations reads control.wallet.peak"
+        );
+    }
+
+    /// A coin the chain provably does not have is a SUCCESSFUL `coin: None`, never an error —
+    /// paired with the error shapes below so neither direction can be satisfied by collapsing
+    /// the other.
+    #[tokio::test]
+    async fn an_unknown_coin_is_a_successful_none() {
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+        assert_eq!(be.coin_by_id("nope").await.unwrap().coin, None);
+    }
+
+    /// The three ways of NOT reaching a chain are distinct errors, and NONE of them is `None`.
+    #[tokio::test]
+    async fn every_way_of_not_reaching_a_chain_is_a_distinct_error() {
+        let db = || WalletDb::open_in_memory();
+
+        let no_source =
+            WalletBackend::new(db().await.unwrap(), Arc::new(EmptyFallback), WalletConfig::default());
+        assert_eq!(
+            no_source.coin_by_id("c1").await,
+            Err(BalanceError::NoChainSource)
+        );
+
+        let erring = WalletBackend::new(
+            db().await.unwrap(),
+            Arc::new(ErringFallback),
+            WalletConfig::default(),
+        );
+        assert!(matches!(
+            erring.coin_by_id("c1").await,
+            Err(BalanceError::ReadFailed(_))
+        ));
+
+        let limited = WalletBackend::new(
+            db().await.unwrap(),
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(0.0, 0.0);
+        assert_eq!(
+            limited.coin_by_id("c1").await,
+            Err(BalanceError::RateLimited)
+        );
     }
 
     // ---- the chain transport dig-app needs (dig_ecosystem#2376) ----------------------

@@ -101,7 +101,10 @@ pub fn is_control_method(method: &str) -> bool {
 pub fn is_open_control_read(method: &str) -> bool {
     matches!(
         method,
-        "control.wallet.balance" | "control.wallet.coins" | "control.wallet.peak"
+        "control.wallet.balance"
+            | "control.wallet.coins"
+            | "control.wallet.coinById"
+            | "control.wallet.peak"
     )
 }
 
@@ -135,6 +138,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.sync.trigger",
     "control.wallet.balance",
     "control.wallet.coins",
+    "control.wallet.coinById",
     "control.wallet.peak",
     "control.wallet.broadcast",
     "control.updater.status",
@@ -176,6 +180,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.sync.trigger",
     "control.wallet.balance",
     "control.wallet.coins",
+    "control.wallet.coinById",
     "control.wallet.peak",
     "control.wallet.broadcast",
     "control.updater.status",
@@ -745,6 +750,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.sync.trigger" => sync_trigger(ctx, id, params).await,
         "control.wallet.balance" => wallet_balance(ctx, id, params).await,
         "control.wallet.coins" => wallet_coins(ctx, id, params).await,
+        "control.wallet.coinById" => wallet_coin_by_id(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
@@ -1316,6 +1322,41 @@ fn wallet_address_params(
     Ok((address.to_string(), asset))
 }
 
+/// Parse + validate `params.coin_id` for `control.wallet.coinById`, yielding the canonical bare
+/// lowercase 64-hex form.
+///
+/// # Refused BEFORE any network call
+///
+/// This runs first in [`wallet_coin_by_id`], ahead of the liveness check, the rate limiter and the
+/// chain read. `control.wallet.coinById` is an OPEN, token-less method whose argument is forwarded
+/// to a third-party oracle, so accepting an unvalidated string would let any local process push
+/// arbitrary content at that oracle through this node.
+///
+/// # Why uppercase is REFUSED rather than normalized
+///
+/// The contract (`dig-node-control-interface`) accepts exactly one spelling of a coin id and
+/// strips only the `0x` prefix, so two callers can never disagree about what "the same coin id"
+/// is. Silently lowercasing would make this node accept ids the contract rejects, and a caller
+/// that works here would break against a conforming implementation.
+fn wallet_coin_id_param(id: &Value, params: &Value) -> std::result::Result<String, Value> {
+    const METHOD: &str = "control.wallet.coinById";
+    let invalid = |detail: &str| {
+        Err(control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{METHOD} requires params.coin_id, {detail}"),
+        ))
+    };
+    let Some(raw) = params.get("coin_id").and_then(|v| v.as_str()) else {
+        return invalid("a 64-character lowercase-hex coin id string");
+    };
+    let hex = raw.strip_prefix("0x").unwrap_or(raw);
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return invalid("a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)");
+    }
+    Ok(hex.to_string())
+}
+
 /// Map a wallet READ failure onto its catalogued control error. Shared by the balance and coin
 /// reads so the two can never classify the same failure differently.
 fn wallet_read_error(method: &str, id: Value, address: &str, e: BalanceError) -> Value {
@@ -1367,6 +1408,28 @@ async fn wallet_coins(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     match ctx.wallet.coins_for_address(&address, asset).await {
         Ok(r) => control_ok(id, coins_wire(&r, asset)),
         Err(e) => wallet_read_error(METHOD, id, &address, e),
+    }
+}
+
+/// `control.wallet.coinById` (dig_ecosystem#2392) — ONE coin by coin id, spent or unspent.
+///
+/// The read a caller polling a spend needs: "did the coin I created appear, and is the coin I
+/// funded it with gone?" Neither can be asked by address. An OPEN read for the same reason as the
+/// balance and `.coins`: its argument is a public chain identifier and nothing else.
+///
+/// Params: `{ coin_id }`. Result: `{ coin: <record|null>, source, synced, peak_height }`.
+///
+/// `coin: null` means a chain was consulted and provably has no such coin. Every way of failing to
+/// consult one is a distinct catalogued error carrying NO `result` member at all — so a `null`
+/// coin is unambiguous by construction rather than by convention.
+async fn wallet_coin_by_id(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let coin_id = match wallet_coin_id_param(&id, params) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    match ctx.wallet.coin_by_id(&coin_id).await {
+        Ok(r) => control_ok(id, coin_by_id_wire(&r)),
+        Err(e) => wallet_read_error("control.wallet.coinById", id, &coin_id, e),
     }
 }
 
@@ -1464,10 +1527,33 @@ fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset)
             "parent_coin_info": c.parent_coin_info,
             "puzzle_hash": c.puzzle_hash,
             "created_height": c.created_height,
-            // Every coin here is unspent by construction; the field is present so the shape matches
-            // the contract, and `null` is the truthful value for an unspent coin.
-            "spent_height": Value::Null,
+            // Every coin an address-scoped read returns is unspent, so this is `null` here —
+            // but it is the COIN's own value, not a literal, so the shape stays truthful if the
+            // read's filtering ever changes.
+            "spent_height": c.spent_height,
         })).collect::<Vec<_>>(),
+        "source": r.source.as_wire(),
+        "synced": r.synced,
+        "peak_height": r.peak_height,
+    })
+}
+
+/// Map a by-id coin read onto the wire contract published by `dig-node-control-interface`.
+///
+/// `asset` is ALWAYS `null` here, unlike [`coins_wire`]. A coin id alone does not reveal whether a
+/// coin is XCH, a CAT or a singleton — that needs the puzzle, which this read never inspects — so
+/// naming one would be asserting a classification the node did not verify.
+fn coin_by_id_wire(r: &dig_wallet::sage::rpc::WalletCoinByIdResult) -> Value {
+    json!({
+        "coin": r.coin.as_ref().map(|c| json!({
+            "coin_id": c.coin_id,
+            "asset": Value::Null,
+            "amount": c.amount,
+            "parent_coin_info": c.parent_coin_info,
+            "puzzle_hash": c.puzzle_hash,
+            "created_height": c.created_height,
+            "spent_height": c.spent_height,
+        })),
         "source": r.source.as_wire(),
         "synced": r.synced,
         "peak_height": r.peak_height,
