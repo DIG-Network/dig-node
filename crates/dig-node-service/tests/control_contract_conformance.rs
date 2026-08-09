@@ -21,6 +21,13 @@ use dig_node_service::control::{is_open_control_read, CONTROL_METHODS};
 /// fixing them blind would be a change nobody reviewed.
 const KNOWN_PREEXISTING_DRIFT: &[&str] = &["control.peers.disconnect"];
 
+/// Methods this node SERVES that the published contract does not declare (dig_ecosystem#2392).
+///
+/// Same shape and same reason as [`KNOWN_PREEXISTING_DRIFT`], in the opposite direction: listed
+/// explicitly so the set can only shrink, and publishing them is its own reviewed change rather
+/// than something this gate does blind.
+const KNOWN_UNPUBLISHED: &[&str] = &["control.peers.ping"];
+
 /// **Every `control.*` method the contract publishes is actually served.**
 ///
 /// A published method the node does not resolve is worse than an absent one: a client reads the
@@ -45,6 +52,36 @@ fn the_node_serves_every_control_method_the_contract_publishes() {
     );
 }
 
+/// **Every `control.*` method this node serves is one the contract publishes.**
+///
+/// The converse of the test above, and its absence is what let `control.wallet.coinById` ship
+/// against a contract that had never declared it (dig_ecosystem#2392). Every assertion in this
+/// file iterates the CONTRACT, so a method the pinned version does not know is not tested loosely
+/// -- it is not tested at all, and the suite goes green having checked nothing about it. That is
+/// invisible in a way the other direction is not: a published-but-unserved method breaks a client
+/// loudly, while a served-but-unpublished one just means no consumer can discover it, and the
+/// stale-pin case means the node's own CI cannot see its newest method.
+///
+/// Pinning the direction here is what makes the dependency's version range load-bearing: with the
+/// requirement narrowed to a version predating a method, this test fails instead of passing
+/// vacuously.
+#[test]
+fn the_contract_publishes_every_control_method_the_node_serves() {
+    let published: BTreeSet<&str> = ControlMethod::ALL.iter().map(|m| m.name()).collect();
+
+    let unpublished: Vec<&str> = CONTROL_METHODS
+        .iter()
+        .copied()
+        .filter(|m| !published.contains(m))
+        .filter(|m| !KNOWN_UNPUBLISHED.contains(m))
+        .collect();
+    assert!(
+        unpublished.is_empty(),
+        "this node serves methods the contract does not publish: {unpublished:?} -- \
+         publish them in dig-node-control-interface, or add them to KNOWN_UNPUBLISHED with a ticket"
+    );
+}
+
 /// The known-drift list stays HONEST: an entry that is no longer drifting must be deleted, or the
 /// list rots into a permanent excuse that hides the next real drift behind it.
 #[test]
@@ -54,6 +91,19 @@ fn the_known_drift_list_still_describes_real_drift() {
         assert!(
             !served.contains(method),
             "{method} is served now -- remove it from KNOWN_PREEXISTING_DRIFT"
+        );
+    }
+}
+
+/// The same honesty rule for the other list: a method the contract has since published must leave
+/// [`KNOWN_UNPUBLISHED`], or it becomes a standing excuse hiding the next unpublished method.
+#[test]
+fn the_unpublished_list_still_describes_real_drift() {
+    let published: BTreeSet<&str> = ControlMethod::ALL.iter().map(|m| m.name()).collect();
+    for method in KNOWN_UNPUBLISHED {
+        assert!(
+            !published.contains(method),
+            "{method} is published now -- remove it from KNOWN_UNPUBLISHED"
         );
     }
 }
