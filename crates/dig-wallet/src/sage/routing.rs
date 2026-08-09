@@ -88,3 +88,12 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod pipefail_proof {
+    /// TEMPORARY: deliberately fails, to observe whether the coverage gate reports red.
+    #[test]
+    fn deliberate_failure_to_prove_the_coverage_gate_is_load_bearing() {
+        panic!("deliberate failure (pipefail proof)");
+    }
+}
