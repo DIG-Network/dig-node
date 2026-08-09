@@ -1720,6 +1720,233 @@ mod tests {
             .contains("params.address"));
     }
 
+    // ---- control.wallet.coinById (dig_ecosystem#2392) --------------------------------------
+
+    /// Assert one `coin_id` spelling is REFUSED as `INVALID_PARAMS` naming the parameter.
+    ///
+    /// Both halves matter: the code alone would also be produced by a handler that wanted
+    /// different params entirely, and the message is what tells a caller WHICH argument it got
+    /// wrong.
+    fn assert_coin_id_refused(params: Value, why: &str) {
+        let response = wallet_coin_id_param(&json!(1), &params)
+            .expect_err(&format!("must refuse {why}: {params}"));
+        assert_eq!(
+            response["error"]["data"]["code"],
+            json!(ErrorCode::InvalidParams.name()),
+            "{why} must be INVALID_PARAMS: {response:?}"
+        );
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("coin_id"),
+            "{why}: the refusal must name coin_id: {response:?}"
+        );
+    }
+
+    /// **Proves:** every malformed `coin_id` spelling is refused, naming the parameter.
+    ///
+    /// **Catches** a validator that accepts anything string-shaped and forwards it to the chain
+    /// oracle. The two length cases are 63 and 65 hex characters — the exact off-by-one
+    /// neighbours of the 64-character contract — so a `>= 64`, `<= 64` or `!= 63` length check
+    /// fails here rather than passing on a wildly-wrong fixture. `"zz".repeat(32)` is the RIGHT
+    /// length and the wrong alphabet, which isolates the alphabet check from the length check;
+    /// without it, a validator that only measured length would pass every other case.
+    #[test]
+    fn a_malformed_coin_id_is_refused_before_anything_else() {
+        assert_coin_id_refused(json!({}), "a missing coin_id");
+        assert_coin_id_refused(json!({ "coin_id": 12345 }), "a non-string coin_id");
+        assert_coin_id_refused(json!({ "coin_id": "" }), "an empty coin_id");
+        assert_coin_id_refused(json!({ "coin_id": "a".repeat(63) }), "63 hex characters");
+        assert_coin_id_refused(json!({ "coin_id": "a".repeat(65) }), "65 hex characters");
+        assert_coin_id_refused(
+            json!({ "coin_id": "zz".repeat(32) }),
+            "64 NON-hex characters",
+        );
+        // `0x` + 63 hex is 65 characters of input and 63 of id: the length must be measured
+        // AFTER the prefix is stripped, or the prefix silently buys a character of slack.
+        assert_coin_id_refused(
+            json!({ "coin_id": format!("0x{}", "a".repeat(63)) }),
+            "a 0x prefix over 63 hex characters",
+        );
+    }
+
+    /// **Proves:** UPPERCASE hex is REFUSED, not silently lowercased.
+    ///
+    /// Its own test because it is the one refusal a reviewer is most likely to read as a bug and
+    /// "fix" into a normalization. The contract accepts exactly one spelling of a coin id (see
+    /// [`wallet_coin_id_param`]'s doc comment), so a node that lowercased would accept ids a
+    /// conforming implementation rejects, and a caller built against this node would break
+    /// against any other. **Catches** exactly that leniency: adding `.to_ascii_lowercase()` to
+    /// the validator fails here and nowhere else.
+    #[test]
+    fn an_uppercase_coin_id_is_refused_rather_than_normalized() {
+        assert_coin_id_refused(json!({ "coin_id": "A".repeat(64) }), "all-uppercase hex");
+        // One uppercase character in an otherwise-valid id — the case a per-character check with
+        // an accidentally case-insensitive comparison would let through.
+        let mut mixed = "a".repeat(63);
+        mixed.push('B');
+        assert_coin_id_refused(json!({ "coin_id": mixed }), "a single uppercase character");
+    }
+
+    /// **Proves:** a well-formed id is accepted and returned in the canonical BARE lowercase
+    /// form, with an optional `0x` prefix stripped.
+    ///
+    /// **Catches** a validator that returns the caller's raw string. Both spellings must map to
+    /// the SAME output — if the prefixed form came back with its prefix, the node would send two
+    /// different strings to the oracle for one coin, and a caller polling a spend would see one
+    /// of them answer `coin: null` forever.
+    #[test]
+    fn a_well_formed_coin_id_is_accepted_bare_and_lowercase() {
+        let bare = "ab".repeat(32);
+        assert_eq!(
+            wallet_coin_id_param(&json!(1), &json!({ "coin_id": bare.clone() })).unwrap(),
+            bare,
+            "a bare id must come back unchanged"
+        );
+        assert_eq!(
+            wallet_coin_id_param(&json!(1), &json!({ "coin_id": format!("0x{bare}") })).unwrap(),
+            bare,
+            "the 0x prefix must be stripped, yielding the identical bare id"
+        );
+    }
+
+    /// **Proves:** `coin_by_id_wire` emits the published contract shape for a FOUND coin,
+    /// carrying both heights.
+    ///
+    /// The fixture is a coin that is created AND spent, at two different heights, on the fallback
+    /// tier with an unknown peak — the shape a mint poll actually observes once its funding coin
+    /// is gone. **Catches** a mapper that drops `spent_height`, defaults either height, or
+    /// renames a field: every field is pinned by whole-value equality, so an added or missing
+    /// member fails too.
+    #[test]
+    fn coin_by_id_wire_emits_the_published_contract_shape() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{WalletCoin, WalletCoinByIdResult};
+
+        let wire = coin_by_id_wire(&WalletCoinByIdResult {
+            coin: Some(WalletCoin {
+                coin_id: "aa".repeat(32),
+                parent_coin_info: "bb".repeat(32),
+                puzzle_hash: "cc".repeat(32),
+                amount: 1_000_000_000_000,
+                created_height: Some(5_000_000),
+                spent_height: Some(5_000_042),
+            }),
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        });
+
+        assert_eq!(
+            wire,
+            json!({
+                "coin": {
+                    "coin_id": "aa".repeat(32),
+                    "asset": null,
+                    "amount": 1_000_000_000_000u64,
+                    "parent_coin_info": "bb".repeat(32),
+                    "puzzle_hash": "cc".repeat(32),
+                    "created_height": 5_000_000,
+                    "spent_height": 5_000_042
+                },
+                "source": "fallback",
+                "synced": false,
+                "peak_height": null
+            })
+        );
+    }
+
+    /// **Proves:** `asset` on a by-id coin is ALWAYS `null`, whatever the coin looks like.
+    ///
+    /// Its own test because the whole-shape test above could pass on a mapper that guessed an
+    /// asset and happened to guess `null` for that one fixture. A coin id alone does not reveal
+    /// whether the coin is XCH, a CAT or a singleton — that needs the puzzle, which this read
+    /// never inspects — so any non-null value here is a classification the node did not verify.
+    ///
+    /// **Catches** the tempting copy-paste from [`coins_wire`], which echoes the REQUESTED asset:
+    /// there is no requested asset here, so such a mapper would have to invent one (`"xch"` being
+    /// the obvious default), and inventing anything fails here.
+    #[test]
+    fn coin_by_id_wire_never_names_an_asset_it_did_not_verify() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{WalletCoin, WalletCoinByIdResult};
+
+        // A CAT-sized amount on a synced DB-tier answer: deliberately the case most likely to
+        // tempt a classification, and the opposite tier/sync combination to the test above.
+        let wire = coin_by_id_wire(&WalletCoinByIdResult {
+            coin: Some(WalletCoin {
+                coin_id: "11".repeat(32),
+                parent_coin_info: "22".repeat(32),
+                puzzle_hash: "33".repeat(32),
+                amount: 1_000,
+                created_height: Some(1),
+                spent_height: None,
+            }),
+            source: Source::Db,
+            synced: true,
+            peak_height: Some(6_000_000),
+        });
+
+        assert_eq!(
+            wire["coin"]["asset"],
+            Value::Null,
+            "a by-id read must not name an asset: {wire}"
+        );
+        // The tier fields still travel, so this fixture is not passing merely by being empty.
+        assert_eq!(wire["source"], json!("db"));
+        assert_eq!(wire["synced"], json!(true));
+        assert_eq!(wire["peak_height"], json!(6_000_000));
+        assert_eq!(wire["coin"]["spent_height"], Value::Null);
+    }
+
+    /// **Proves:** an ABSENT coin is a SUCCESS carrying `coin: null` — a `result` member, never an
+    /// `error` member.
+    ///
+    /// This distinction is the entire point of dig_ecosystem#2392. "The chain was consulted and
+    /// has no such coin" and "no chain could be consulted" are opposite facts with opposite
+    /// remedies: a mint poll that reads the first as the second reports a failed mint on a
+    /// dropped connection, and one that reads the second as the first declares a mint missing
+    /// that is merely unobserved.
+    ///
+    /// **Catches** a handler that mapped `None` onto a catalogued error. Asserting only
+    /// `wire["coin"] == null` would NOT catch it — a JSON-RPC error response has no `coin` member
+    /// at all, so that lookup is also `null`. Hence the assertion is on the RESPONSE envelope:
+    /// `result` present, `error` absent.
+    #[test]
+    fn an_absent_coin_is_a_result_carrying_null_not_an_error() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::WalletCoinByIdResult;
+
+        let wire = coin_by_id_wire(&WalletCoinByIdResult {
+            coin: None,
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        });
+        assert_eq!(
+            wire,
+            json!({
+                "coin": null,
+                "source": "fallback",
+                "synced": false,
+                "peak_height": null
+            })
+        );
+
+        // The envelope the handler actually returns for this mapping.
+        let response = control_ok(json!(7), wire);
+        assert!(
+            response.get("result").is_some(),
+            "an absent coin must answer with a result member: {response:?}"
+        );
+        assert!(
+            response.get("error").is_none(),
+            "an absent coin must NOT be an error: {response:?}"
+        );
+        assert_eq!(response["result"]["coin"], Value::Null);
+    }
+
     /// LOCKSTEP GATE (#711): [`dispatch_control`] resolves EXACTLY [`CONTROL_METHODS`] — the
     /// owned set it routes to `dispatch_owned` ([`OWNED_CONTROL_METHODS`]) plus the set it
     /// delegates to the node ([`DELEGATED_CONTROL_METHODS`]) — the two disjoint, and their union
