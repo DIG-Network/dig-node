@@ -59,6 +59,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use dig_node_control_interface::params::WalletCoinByIdParams;
 use dig_node_core::{CapsuleStore, Node};
 use serde_json::{json, Value};
 
@@ -1332,12 +1333,18 @@ fn wallet_address_params(
 /// to a third-party oracle, so accepting an unvalidated string would let any local process push
 /// arbitrary content at that oracle through this node.
 ///
-/// # Why uppercase is REFUSED rather than normalized
+/// # The RULE is the published contract's, not this node's
 ///
-/// The contract (`dig-node-control-interface`) accepts exactly one spelling of a coin id and
-/// strips only the `0x` prefix, so two callers can never disagree about what "the same coin id"
-/// is. Silently lowercasing would make this node accept ids the contract rejects, and a caller
-/// that works here would break against a conforming implementation.
+/// The well-formedness rule itself is [`WalletCoinByIdParams::validated`], consumed from
+/// `dig-node-control-interface` rather than restated here. A second copy of a published rule agrees
+/// until it does not, and the divergence would surface as a mint that never confirms — while the
+/// conformance suite, which pins method names and auth posture only, stayed green throughout. This
+/// function contributes only what the contract type cannot: reading the field off an untyped
+/// JSON-RPC `params` value, and shaping the refusal as this node's catalogued error.
+///
+/// Uppercase is therefore REFUSED rather than normalized, because the contract accepts exactly one
+/// spelling and strips only the `0x` prefix. Lowercasing here would make this node accept ids a
+/// conforming implementation rejects.
 fn wallet_coin_id_param(id: &Value, params: &Value) -> std::result::Result<String, Value> {
     const METHOD: &str = "control.wallet.coinById";
     let invalid = |detail: &str| {
@@ -1350,17 +1357,14 @@ fn wallet_coin_id_param(id: &Value, params: &Value) -> std::result::Result<Strin
     let Some(raw) = params.get("coin_id").and_then(|v| v.as_str()) else {
         return invalid("a 64-character lowercase-hex coin id string");
     };
-    let hex = raw.strip_prefix("0x").unwrap_or(raw);
-    if hex.len() != 64
-        || !hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return invalid(
-            "a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)",
-        );
+    WalletCoinByIdParams {
+        coin_id: raw.to_string(),
     }
-    Ok(hex.to_string())
+    .validated()
+    .map(|params| params.coin_id)
+    .or_else(|_| {
+        invalid("a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)")
+    })
 }
 
 /// Map a wallet READ failure onto its catalogued control error. Shared by the balance and coin
@@ -1425,9 +1429,15 @@ async fn wallet_coins(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 ///
 /// Params: `{ coin_id }`. Result: `{ coin: <record|null>, source, synced, peak_height }`.
 ///
-/// `coin: null` means a chain was consulted and provably has no such coin. Every way of failing to
-/// consult one is a distinct catalogued error carrying NO `result` member at all — so a `null`
-/// coin is unambiguous by construction rather than by convention.
+/// `coin: null` means a chain source ANSWERED and reported no such coin. Every way of failing to
+/// get an answer at all is a distinct catalogued error carrying NO `result` member at all — so a
+/// `null` coin is unambiguous by construction rather than by convention.
+///
+/// `null` is NOT proof the chain has no such coin: it can come from ONE peer's empty coin-state
+/// list (dig_ecosystem#2456, one crate down), and such a peer may be a block behind, mid-reorg,
+/// pruning or hostile. A caller polling a mint reads `null` as "not seen yet" and keeps polling.
+/// A non-null coin IS bound to the id asked for — a coin id is self-certifying and the wallet
+/// rejects a substituted record.
 async fn wallet_coin_by_id(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     let coin_id = match wallet_coin_id_param(&id, params) {
         Ok(parsed) => parsed,

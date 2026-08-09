@@ -174,8 +174,13 @@ impl ChainFallback for CoinsetFallback {
         records.iter().map(Self::map_record).collect()
     }
 
-    /// `Ok(None)` ONLY for a coin the chain PROVABLY does not have; every failure to read is an
-    /// `Err` (dig_ecosystem#2392).
+    /// `Ok(None)` ONLY when a chain source ANSWERED and reported no such coin; every failure to
+    /// read is an `Err` (dig_ecosystem#2392).
+    ///
+    /// `Ok(None)` is NOT yet proof of absence: `chia-query` 0.6 mints it from ONE peer's empty
+    /// coin-state list without consulting coinset, so a peer that is a block behind, mid-reorg,
+    /// pruning or hostile produces it. Requiring corroboration is dig_ecosystem#2456, one crate
+    /// down. Callers polling a mint read `None` as "not seen yet", never as "never happened".
     ///
     /// The absence-aware `_opt` variant carries that distinction (a `success: true` envelope with a
     /// null record is absence; a transport/API failure is not), so this method must not re-decide
@@ -431,7 +436,7 @@ mod chain_failure_tests {
 
     /// **The paired direction: a chain that ANSWERED "no such coin" is `Ok(None)`, not an error.**
     ///
-    /// coinset spells provable absence as a `success: true` envelope with a null record. Without
+    /// coinset spells a reported absence as a `success: true` envelope with a null record. Without
     /// this half, the fix above could be satisfied by erroring on everything — which would make a
     /// never-minted coin indistinguishable from an outage, the same lie in the other direction.
     #[tokio::test]

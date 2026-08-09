@@ -189,15 +189,23 @@ pub struct WalletCoinsResult {
     pub peak_height: Option<u32>,
 }
 
-/// ONE coin looked up by coin id, or its provable absence (dig_ecosystem#2392).
+/// ONE coin looked up by coin id, or a chain source's report that it has no such coin
+/// (dig_ecosystem#2392).
 ///
-/// `coin: None` means a chain WAS consulted and has no such coin. Every way of failing to consult
-/// one is a [`BalanceError`] — see [`WalletBackend::coin_by_id`].
+/// `coin: None` means a chain source ANSWERED and reported no such coin. It is NOT yet a proof of
+/// absence — see [`WalletBackend::coin_by_id`]. Every way of failing to get an answer at all is a
+/// [`BalanceError`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletCoinByIdResult {
-    /// The coin, or `None` for a coin the chain provably does not have.
+    /// The coin, or `None` when a chain source reported none (see the type doc for what that does
+    /// and does not prove).
     pub coin: Option<WalletCoin>,
-    /// Which tier produced this answer. Always [`Source::Fallback`]: see [`WalletBackend::coin_by_id`].
+    /// Which tier produced this answer. Always [`Source::Fallback`]: see
+    /// [`WalletBackend::coin_by_id`].
+    ///
+    /// [`Source::Fallback`] covers BOTH chain sub-tiers — a direct peer and the coinset oracle —
+    /// and this field does not say which one answered, because the tier underneath does not report
+    /// it. Naming the sub-tier would be a wire-contract change and is not made here.
     pub source: Source,
     /// Always `false` — no local replica produced this answer.
     pub synced: bool,
@@ -940,9 +948,20 @@ impl WalletBackend {
     ///
     /// # Absence is an ANSWER; unreachable is an ERROR
     ///
-    /// `coin: None` means a chain WAS consulted and provably has no such coin. Every way of failing
-    /// to reach one is a [`BalanceError`]. Collapsing the two would make an outage look like a mint
-    /// that never happened.
+    /// `coin: None` means a chain source ANSWERED and reported no such coin; every way of failing
+    /// to get an answer at all is a [`BalanceError`]. Collapsing the two would make an outage look
+    /// like a mint that never happened.
+    ///
+    /// **What `None` does NOT yet mean.** It is not proof the chain has no such coin. Today the
+    /// tier underneath (`chia-query` 0.6) returns a single peer's empty coin-state list as `None`
+    /// without consulting coinset, and that peer may be a block behind, mid-reorg, pruning, or
+    /// hostile. So a caller polling a mint MUST treat `None` as "not seen yet" and keep polling —
+    /// never as "this mint will never land". Requiring corroboration before believing an absence
+    /// is dig_ecosystem#2456, one crate down; this method's shape does not change when it lands.
+    ///
+    /// A POSITIVE answer carries no such caveat: a coin id is self-certifying, and the fallback
+    /// tier rejects a record whose `SHA256(parent ‖ puzzle_hash ‖ amount)` is not the id asked for
+    /// ([`super::fallback::CoinsetFallback`]), so a substituted coin surfaces as an error.
     ///
     /// # The FALLBACK tier only, deliberately
     ///
@@ -4133,7 +4152,7 @@ mod tests {
         );
     }
 
-    /// A coin the chain provably does not have is a SUCCESSFUL `coin: None`, never an error —
+    /// A coin a chain source reports it does not have is a SUCCESSFUL `coin: None`, never an error —
     /// paired with the error shapes below so neither direction can be satisfied by collapsing
     /// the other.
     #[tokio::test]

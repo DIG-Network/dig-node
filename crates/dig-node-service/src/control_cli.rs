@@ -324,18 +324,24 @@ fn summarize(method: &str, result: &Value) -> String {
                 "syncing"
             },
         ),
+        // `result["coin"]` yields `Null` for a missing key, but indexing the INNER map would
+        // panic on one — so every field is read with `get`, and a coin record short of a field
+        // prints an honest unknown instead of aborting the CLI.
         "control.wallet.coinById" => match result["coin"].as_object() {
             None => "no such coin on chain".to_string(),
-            Some(coin) => format!(
-                "coin {} · {} mojos · created {} · {}",
-                coin["coin_id"].as_str().unwrap_or("?"),
-                coin["amount"].as_u64().unwrap_or(0),
-                height(&coin["created_height"]),
-                match coin["spent_height"].as_u64() {
-                    Some(h) => format!("spent at {h}"),
-                    None => "unspent".to_string(),
-                },
-            ),
+            Some(coin) => {
+                let field = |key: &str| coin.get(key).unwrap_or(&Value::Null).clone();
+                format!(
+                    "coin {} · {} · created {} · {}",
+                    field("coin_id").as_str().unwrap_or("?"),
+                    mojos(&field("amount")),
+                    height(&field("created_height")),
+                    match field("spent_height").as_u64() {
+                        Some(h) => format!("spent at {h}"),
+                        None => "unspent".to_string(),
+                    },
+                )
+            }
         },
         "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
@@ -377,7 +383,18 @@ fn avail(v: &Value) -> &'static str {
     }
 }
 
-/// "pinned" / "not pinned" for a store's boolean pin flag.
+/// A coin amount for a human line: `N mojos`, or `amount unknown` when the field is missing or is
+/// not a number.
+///
+/// Never `0 mojos` on a miss: a zero amount is a real, readable claim about a coin, so printing one
+/// for an unreadable field states a fact the CLI does not have.
+fn mojos(v: &Value) -> String {
+    match v.as_u64() {
+        Some(a) => format!("{a} mojos"),
+        None => "amount unknown".to_string(),
+    }
+}
+
 /// A block height for a human line: the number, or `pending` for a null.
 ///
 /// `null` means the coin is known only from the mempool — NOT height zero, which every block is
@@ -389,6 +406,7 @@ fn height(v: &Value) -> String {
     }
 }
 
+/// "pinned" / "not pinned" for a store's boolean pin flag.
 fn pinned(v: &Value) -> &'static str {
     if v.as_bool().unwrap_or(false) {
         "pinned"
@@ -533,6 +551,11 @@ mod tests {
                 vec!["unsubscribed", "abc"],
             ),
             (
+                "control.wallet.coinById",
+                json!({ "coin": { "coin_id": "ab", "amount": 7, "created_height": 100, "spent_height": 140 }, "source": "fallback" }),
+                vec!["ab", "7 mojos", "100", "spent at 140"],
+            ),
+            (
                 "control.hostedStores.status",
                 json!({ "store_id": "abc", "pinned": true, "capsule_count": 2, "total_bytes": 99 }),
                 vec!["abc", "pinned", "2 cached capsule"],
@@ -561,6 +584,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An unreadable amount must not print as `0 mojos` — a zero is a real claim about a coin, and
+    /// a caller reading a funding coin would take it as "this coin holds nothing".
+    #[test]
+    fn coin_by_id_summary_never_prints_zero_for_an_unreadable_amount() {
+        let s = summarize(
+            "control.wallet.coinById",
+            &json!({ "coin": { "coin_id": "ab", "created_height": 100, "spent_height": null } }),
+        );
+        assert!(!s.contains("0 mojos"), "got: {s}");
+        assert!(s.contains("amount unknown"), "got: {s}");
     }
 
     #[test]
