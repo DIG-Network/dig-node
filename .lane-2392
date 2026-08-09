@@ -1,2 +1,0 @@
-Lane anchor for dig_ecosystem#2392 — serve a coin read BY COIN ID (including spent coins).
-Removed before review; exists so a cap can never lose this lane.

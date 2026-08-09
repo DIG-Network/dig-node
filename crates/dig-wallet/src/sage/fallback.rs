@@ -174,16 +174,21 @@ impl ChainFallback for CoinsetFallback {
         records.iter().map(Self::map_record).collect()
     }
 
+    /// `Ok(None)` ONLY for a coin the chain PROVABLY does not have; every failure to read is an
+    /// `Err` (dig_ecosystem#2392).
+    ///
+    /// The absence-aware `_opt` variant carries that distinction (a `success: true` envelope with a
+    /// null record is absence; a transport/API failure is not), so this method must not re-decide
+    /// it. Collapsing an unreachable chain into "no such coin" is a money lie: a caller polling a
+    /// mint would read a dropped connection as "your coin does not exist", so a pending mint stays
+    /// awaiting forever and a spent funding coin can never report failure.
     async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
-        match self
+        let record = self
             .query
-            .get_coin_record_by_name(&Self::query_hash(coin_id))
+            .get_coin_record_by_name_opt(&Self::query_hash(coin_id))
             .await
-        {
-            Ok(r) => Ok(Some(Self::map_record(&r)?)),
-            // A missing coin surfaces as an error from coinset; treat as "not found".
-            Err(_) => Ok(None),
-        }
+            .map_err(|e| Error::internal(format!("fallback coin-id read: {e}")))?;
+        record.as_ref().map(Self::map_record).transpose()
     }
 }
 
@@ -300,6 +305,144 @@ mod empty_fallback_tests {
             .unwrap()
             .is_empty());
         assert!(fb.coin_record_by_id("cc").await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod chain_failure_tests {
+    //! The money-critical mapping: a chain that could not be READ is an error, and only a chain
+    //! that PROVABLY has no such coin is `Ok(None)` (dig_ecosystem#2392).
+    //!
+    //! Both directions are pinned together on purpose. Either one alone is satisfiable by
+    //! collapsing the other — an implementation that always errors passes the first, one that
+    //! always answers `Ok(None)` passes the second.
+    //!
+    //! The fixture is a real [`chia_query::ChiaQuery`] over a REAL socket, because the mapping
+    //! under test lives in how `chia-query` classifies a transport outcome; a double that returns
+    //! a pre-decided `Result` would assert the test's own opinion instead. `max_peers: 0` keeps it
+    //! deterministic and offline: the peer tier has nothing to dial (and never refills, so it
+    //! performs no DNS), so every read falls through to the local coinset stand-in below.
+
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// A `ChiaQuery` whose only reachable tier is the coinset URL given.
+    async fn fallback_against(coinset_base_url: String) -> CoinsetFallback {
+        let query = chia_query::ChiaQuery::new(chia_query::ChiaQueryConfig {
+            coinset_base_url,
+            max_peers: 0,
+            coinset_fallback_enabled: true,
+            coinset_request_timeout: std::time::Duration::from_secs(5),
+            ..Default::default()
+        })
+        .await
+        .expect("a zero-peer client with the coinset fallback enabled always constructs");
+        CoinsetFallback::new(Arc::new(query))
+    }
+
+    /// A base URL nothing listens on: bind a port, learn it, then release it. More reliable than
+    /// guessing an unused port number.
+    async fn dead_base_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A one-shot coinset stand-in that answers every POST with `body`, and its base URL.
+    async fn serve_json(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// A coin id the fixtures ask for. Its value is irrelevant — what varies is the SOURCE.
+    const SOME_COIN_ID: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// **A chain that could not answer MUST NOT report "no such coin".**
+    ///
+    /// A dropped connection, a `500`, a TLS failure and a rate-limit are all "we do not know".
+    /// Reporting them as absence tells a caller polling a mint that its coin does not exist — so a
+    /// pending mint reads as still-awaiting forever, and a genuinely-spent funding coin can never
+    /// report failure either. Both are money lies.
+    #[tokio::test]
+    async fn an_unreachable_chain_is_an_error_never_a_missing_coin() {
+        let fallback = fallback_against(dead_base_url().await).await;
+
+        let result = fallback.coin_record_by_id(SOME_COIN_ID).await;
+
+        assert!(
+            result.is_err(),
+            "an unreachable chain must surface as an error, got {result:?}"
+        );
+        assert!(
+            !matches!(result, Ok(None)),
+            "an unreachable chain must NEVER be reported as a missing coin"
+        );
+    }
+
+    /// **The paired direction: a chain that ANSWERED "no such coin" is `Ok(None)`, not an error.**
+    ///
+    /// coinset spells provable absence as a `success: true` envelope with a null record. Without
+    /// this half, the fix above could be satisfied by erroring on everything — which would make a
+    /// never-minted coin indistinguishable from an outage, the same lie in the other direction.
+    #[tokio::test]
+    async fn an_absent_coin_is_ok_none_not_an_error() {
+        let base = serve_json(r#"{"success":true,"coin_record":null}"#).await;
+        let fallback = fallback_against(base).await;
+
+        let result = fallback.coin_record_by_id(SOME_COIN_ID).await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a chain that answered 'no such coin' is Ok(None), got {result:?}"
+        );
+    }
+
+    /// A coin the chain DOES know is mapped through, spent height and all — the value
+    /// `control.wallet.coinById` exists to carry.
+    #[tokio::test]
+    async fn a_known_coin_is_mapped_through_with_its_spent_height() {
+        let base = serve_json(
+            r#"{"success":true,"coin_record":{
+                "coin":{"parent_coin_info":"0x2222222222222222222222222222222222222222222222222222222222222222",
+                        "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
+                        "amount":7},
+                "confirmed_block_index":100,"spent_block_index":140,"spent":true,
+                "coinbase":false,"timestamp":1700000000}}"#,
+        )
+        .await;
+        let fallback = fallback_against(base).await;
+
+        let coin = fallback
+            .coin_record_by_id(SOME_COIN_ID)
+            .await
+            .expect("a reachable chain answers")
+            .expect("the chain knows this coin");
+
+        assert_eq!(coin.amount, 7);
+        assert_eq!(coin.created_height, Some(100));
+        assert_eq!(
+            coin.spent_height,
+            Some(140),
+            "a spent coin carries its real spent height"
+        );
     }
 }
 
