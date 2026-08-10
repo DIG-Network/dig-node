@@ -294,5 +294,7 @@ pub fn assemble_addresses(operator: &[SocketAddr], discovered: &[SocketAddr]) ->
         .collect()
 }
 
+pub mod chia;
+
 #[cfg(test)]
 mod tests;
