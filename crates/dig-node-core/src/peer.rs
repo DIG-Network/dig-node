@@ -205,6 +205,18 @@ pub struct PeerStatus {
     /// `dig-nat` discovered over the held socket and folded into the pool (#870). Reported
     /// alongside `connected_peers` so `control.peerStatus` reflects relay-reachable peers.
     relay_peer_count: AtomicU64,
+    /// DIG peers this node has LEARNED OF — the size of dig-gossip's address manager, which holds
+    /// every peer discovered by any route (relay introduction, PEX, `dig.getPeers`) whether or not
+    /// a connection to it succeeded. A SUPERSET of `connected_peers`, and the number that separates
+    /// "connected to nobody" from "nobody to connect to" (dig_ecosystem#2570).
+    ///
+    /// Held beside [`known_peers_sampled`](Self::known_peers_sampled) rather than as a sentinel
+    /// value, because an unsampled count is UNKNOWN and every `u64` is a plausible count.
+    known_peers: AtomicU64,
+    /// Whether [`set_known_peers`](Self::set_known_peers) has ever run. Until it has, the node has
+    /// not consulted its address book and `known_peers` reports `null` rather than a zero it never
+    /// measured.
+    known_peers_sampled: AtomicBool,
     /// The node's own `peer_id` (64-hex SHA-256 of its TLS SPKI DER), once the identity is known.
     peer_id: std::sync::Mutex<Option<String>>,
     /// The most recent peer-network error (best-effort diagnostics).
@@ -235,6 +247,18 @@ impl PeerStatus {
         self.relay_reserved.store(relay_reserved, Ordering::Relaxed);
     }
 
+    /// Record the size of the discovered-peer address book (called from the maintenance loop
+    /// alongside [`set_pool`](Self::set_pool), from the SAME `GossipStats` snapshot).
+    ///
+    /// Kept a separate setter from `set_pool` deliberately: this is a different question about a
+    /// different structure, and folding it into the pool triple would invite the very aliasing the
+    /// field exists to expose. The first call is also what turns the reported count from `null`
+    /// (never looked) into a measurement.
+    pub fn set_known_peers(&self, known_peers: u64) {
+        self.known_peers.store(known_peers, Ordering::Relaxed);
+        self.known_peers_sampled.store(true, Ordering::Relaxed);
+    }
+
     /// Record a peer-network error (best-effort; does not stop the node).
     pub fn set_error(&self, error: String) {
         *self.last_error.lock().unwrap() = Some(error);
@@ -260,6 +284,12 @@ impl PeerStatus {
                 "peer_count": self.relay_peer_count.load(Ordering::Relaxed),
             },
             "connected_peers": self.connected_peers.load(Ordering::Relaxed),
+            // `null` until the pool loop has sampled the address book: a count nobody took is not
+            // a count of none (#2570).
+            "known_peers": self
+                .known_peers_sampled
+                .load(Ordering::Relaxed)
+                .then(|| self.known_peers.load(Ordering::Relaxed)),
             // (Reachability posture — direct vs relayed — is reported by `dig.getNetworkInfo`, which
             // reads this same relay-reservation flag; kept out of the terse status snapshot here.)
             "last_error": self.last_error.lock().unwrap().clone(),
@@ -2359,8 +2389,9 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
     );
 
     // 3. Keep the pool status fresh for `control.peerStatus`: the directly-connected count, the
-    //    relay-reachable count (#870), and the REAL relay-reservation flag read from the shared
-    //    `dig-nat` status (#872) — never the synthetic "relay configured" value it replaced.
+    //    relay-reachable count (#870), the REAL relay-reservation flag read from the shared
+    //    `dig-nat` status (#872) — never the synthetic "relay configured" value it replaced — and
+    //    the DISCOVERED-peer count (#2570).
     {
         let status = status.clone();
         let handle = handle.clone();
@@ -2373,6 +2404,10 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
                     stats.relay_peer_count as u64,
                     relay_status.is_connected(),
                 );
+                // The DISCOVERED-peer count (#2570), from the same snapshot: dig-gossip's address
+                // manager holds every peer this node has been introduced to by any route, which is
+                // what makes "connected to nobody while knowing of many" reportable.
+                status.set_known_peers(stats.known_addresses as u64);
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
         });
@@ -3173,6 +3208,54 @@ pub(crate) mod tests {
         assert_eq!(v["relay"]["url"], DEFAULT_RELAY_URL);
         assert_eq!(v["relay"]["reserved"], false);
         assert_eq!(v["connected_peers"], 0);
+    }
+
+    /// **A known-peer count nobody has taken is `null`, never `0` (dig_ecosystem#2570).**
+    ///
+    /// The snapshot must be able to say "I have not looked" — a node whose pool loop has not yet
+    /// sampled its address book has an UNKNOWN known-peer count, and reporting `0` there would
+    /// claim it looked and found nothing. The fixture marks the node RUNNING before asserting,
+    /// because running-with-no-sample-yet is the state a zero-default would silently mislabel; on a
+    /// not-running node the control layer suppresses the count anyway, so that case could not tell
+    /// a defaulted zero from a suppressed one.
+    #[test]
+    fn an_unsampled_known_peer_count_is_null_not_zero() {
+        let s = PeerStatus::new();
+        s.set_running("ab".repeat(32));
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID, TEST_GENESIS_HEX);
+        assert_eq!(
+            v["known_peers"],
+            Value::Null,
+            "a count never sampled is unknown; a zero would assert an empty address book"
+        );
+        s.set_known_peers(0);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID, TEST_GENESIS_HEX);
+        assert_eq!(
+            v["known_peers"], 0,
+            "an OBSERVED zero must be reported as a zero, distinctly from never having looked"
+        );
+    }
+
+    /// **The known-peer count is a SEPARATE observation from the connected count (#2570).**
+    ///
+    /// The field exists to express "knows of peers, connected to none", so the nearest wrong
+    /// implementation — sourcing it from the connected-pool size — must be visible. The fixture
+    /// drives the two to DIFFERENT values through their two setters, keeping `connected_peers` at
+    /// zero: an aliased implementation reports `0` known here and fails, while a fixture that set
+    /// both to the same number could not tell the two apart at all.
+    #[test]
+    fn knowing_of_peers_while_connected_to_none_survives_the_snapshot() {
+        let s = PeerStatus::new();
+        s.set_running("ab".repeat(32));
+        s.set_pool(0, 7, true);
+        s.set_known_peers(41);
+        let v = s.snapshot_json(DEFAULT_RELAY_URL, DEFAULT_NETWORK_ID, TEST_GENESIS_HEX);
+        assert_eq!(v["connected_peers"], 0, "connected to nobody");
+        assert_eq!(v["known_peers"], 41, "while knowing of 41");
+        assert_eq!(
+            v["relay"]["peer_count"], 7,
+            "and the RELAY's own view stays its own number, distinct from both"
+        );
     }
 
     #[test]
