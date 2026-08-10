@@ -125,6 +125,12 @@ futures-core = "0.3"
 # `webauthn-rs` ceremony is finalized with the extension origin in the follow-up, since
 # webauthn-rs pulls OpenSSL and the RP/origin is defined by the paired extension #433.)
 totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
+# Cryptographically-secure randomness for quorum peer selection (dig_ecosystem#2568). The OS
+# CSPRNG DIRECTLY (`/dev/urandom` / `getrandom(2)` / `BCryptGenRandom`) rather than a seeded
+# userspace generator: random selection IS the trust model's defence, so the source must be one
+# an attacker cannot predict, observe or steer (dig_ecosystem#2549). Deliberately not `rand` --
+# `thread_rng` would work but adds a seeded layer whose provenance a reader has to go and check.
+getrandom = "0.2"
 chia-traits = "0.26"
 
 [dev-dependencies]

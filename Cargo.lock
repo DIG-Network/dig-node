@@ -2502,6 +2502,7 @@ dependencies = [
  "digstore-chain",
  "digstore-core 0.19.2",
  "futures-core",
+ "getrandom 0.2.17",
  "hex",
  "http-body-util",
  "indexmap",
