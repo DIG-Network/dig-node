@@ -3952,20 +3952,23 @@ known_dig_peer_count}`, and its `chia_peer_count` MUST be the SAME observation t
 **`no_addresses_to_watch` is the DEFAULT-INSTALL state and MUST NOT be reported as `syncing`.** A node with
 no wallet enrolled holds zero puzzle hashes; §18.6 REFUSES a catch-up over an empty set, so
 `initial_sync_complete` can never latch, while `new_peak_wallet` keeps the replica's peak advancing with the
-chain indefinitely. The node is therefore current and will never report `synced`. This phase MUST be
-reported when, and only when, ALL THREE hold: a Chia peer is attached RIGHT NOW; that peer's effective trust
-is authoritative (`Operator` or `Corroborated`, §18.6a) so it MAY write; and the attached session resolved a
-MEASURED-EMPTY custody set. The trust condition is load-bearing — an uncorroborated writer's subscription set
-is forced empty too, and that replica is deliberately NOT being written and IS falling behind, so reporting
-it as "nothing to watch" would present a stalled replica as a healthy one. It MUST NOT be folded into
-`synced`, which additionally licenses §18.7 routing wallet-scoped reads to the local replica; latching that
-over an un-queried DB reads a funded wallet as empty.
+chain indefinitely. This phase MUST be reported when, and only when, ALL FOUR hold: a Chia peer is attached
+RIGHT NOW; that peer's effective trust is authoritative (`Operator` or `Corroborated`, §18.6a) so it MAY
+write; the attached session resolved a MEASURED-EMPTY custody set; and `initial_sync_complete` has NOT
+latched. `synced` outranks this phase: once catch-up has completed and `initial_sync_complete` is `true`, the
+same attached authoritative measured-empty session reports `synced`, not `no_addresses_to_watch`, because
+`synced` additionally licenses §18.7 routing wallet-scoped reads to the local replica. The trust condition is
+load-bearing — an uncorroborated writer's subscription set is forced empty too, and that replica is
+deliberately NOT being written and IS falling behind, so reporting it as "nothing to watch" would present a
+stalled replica as a healthy one.
 
 `watched_addresses` reports how many custodied puzzle hashes the attached session resolved: a MEASURED `0`
 (the reason for `no_addresses_to_watch`), a positive count, or `null` when no attached session has resolved
 a set yet — a peer mid-corroboration, or none attached. A consumer MUST NOT read `null` as `0`. A consumer
-MUST render `no_addresses_to_watch` as its own statement — the node is current and there is nothing
-wallet-scoped to sync — and MUST NOT render it as chain lag or as a balance still being awaited.
+MUST render `no_addresses_to_watch` as its own statement — the replica is following an attached writer and
+there is nothing wallet-scoped to sync — and MUST NOT render it as chain lag or as a balance still being
+awaited. Like `synced`, it is NOT a freshness guarantee: a live connection to a stalled peer still satisfies
+the phase, so a consumer wanting freshness MUST read `peak_height`.
 
 18.6c. **The known DIG peer count.** `control.peerCounts.known_dig_peer_count` is the number of DIG peers
 this node has LEARNED OF, connected or not — the size of the gossip layer's discovered-peer address book,
