@@ -957,17 +957,26 @@ fn supervisor_tls_identity_is_generated_never_file_backed() {
 // T13 — the live acceptance step (never run in CI)
 // ---------------------------------------------------------------------------
 
-/// **Proves (T13, #2501):** a real DISCOVERED mainnet peer connects, is COUNTED, and writes
-/// nothing to the replica.
+/// **THE ACCEPTANCE TEST (#2568):** on a real mainnet default install — nothing in the `peers`
+/// table, no configuration — a DISCOVERED peer is corroborated by an independently drawn quorum
+/// and the replica peak becomes known and ADVANCES.
 ///
-/// This is the ONLY test that can falsify the assumption a discovery-only install rests on —
-/// that dialling a stranger yields a live session at all. What that session is worth changed in
-/// the third audit round: a discovered peer no longer advances the peak (see
-/// [`sync::PeerTrust`]), so its entire contribution is the liveness this test observes. Ignored
-/// because it dials mainnet; run it by hand.
+/// This is the only test that can falsify the two assumptions the whole design rests on: that
+/// dialling strangers yields enough DISTINCT reachable peers to form a quorum at all, and that
+/// real mainnet full nodes actually agree with each other at a settled height. Neither is
+/// provable against a double, and getting either wrong means the node silently never syncs —
+/// exactly the condition #2568 exists to end.
+///
+/// It asserts the peak ADVANCES rather than merely becoming non-null: a single write could come
+/// from one lucky frame, whereas movement over the window is the replica genuinely following the
+/// chain. `initial_sync_complete` is deliberately NOT asserted here, because this fixture holds no
+/// wallet: with zero puzzle hashes there is nothing to catch up, and §18.6's empty-set invariant
+/// correctly refuses to mark an un-queried DB authoritative. That invariant is unchanged by #2568.
+///
+/// Ignored because it dials mainnet; run it by hand.
 #[tokio::test]
-#[ignore = "dials real mainnet peers; run by hand as the #2501 acceptance step"]
-async fn live_mainnet_discovered_peer_is_counted_and_writes_nothing() {
+#[ignore = "dials real mainnet peers; run by hand as the #2568 acceptance step"]
+async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let factory = Arc::new(ChiaPeerSessionFactory::mainnet(db.clone()));
     let (handle, join) = spawn_supervisor(Supervisor {
@@ -980,37 +989,45 @@ async fn live_mainnet_discovered_peer_is_counted_and_writes_nothing() {
         corroborator: Some(Arc::new(ChiaQuorumCorroborator::mainnet())),
     });
 
-    // A mainnet block lands roughly every 19s; three minutes is several peaks of margin, so a
-    // peer that was going to push anything has pushed it well inside this window.
-    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    // A mainnet block lands roughly every 19s. Corroboration itself needs several sequential
+    // dials before the first write is even possible, so the window has to cover that PLUS enough
+    // blocks to see movement: six minutes is ~19 peaks of margin.
+    let deadline = std::time::Instant::now() + Duration::from_secs(360);
     let mut peers = None;
+    let mut first_peak: Option<u32> = None;
+    let mut latest_peak: Option<u32> = None;
     while std::time::Instant::now() < deadline {
         peers = handle.status(&db).await.unwrap().chia_peer_count;
-        if peers.is_some_and(|n| n >= 1) {
-            break;
+        latest_peak = db.sync_state().await.unwrap().peak_height;
+        if let Some(seen) = latest_peak {
+            first_peak.get_or_insert(seen);
+            // Movement, not merely presence: one lucky frame is not "following the chain".
+            if latest_peak > first_peak {
+                break;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    let peak_after = db.sync_state().await.unwrap().peak_height;
     handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
 
-    // Printed because this test is run by hand as an acceptance step, and the operator's
-    // question is "did a real stranger actually answer", not merely "did it pass".
-    println!("live mainnet discovered peers observed: {peers:?}");
+    // Printed because this is run by hand as an acceptance step, and the operator's question is
+    // "did real strangers actually corroborate each other", not merely "did it pass".
+    println!("live mainnet: peers={peers:?} first_peak={first_peak:?} latest_peak={latest_peak:?}");
     assert!(
         peers.is_some_and(|n| n >= 1),
         "discovery must yield a live session; without one a default install has no liveness at \
-         all and the supervisor should idle instead. Got {peers:?}"
-    );
-    assert_eq!(
-        peak_after, None,
-        "a discovered peer must write NOTHING — the peak stays UNKNOWN however many frames it \
-         pushed over three minutes"
+         all. Got {peers:?}"
     );
     assert!(
-        !db.is_synced().await.unwrap(),
-        "and must never mark the replica caught up"
+        first_peak.is_some(),
+        "the replica peak stayed UNKNOWN: no discovered peer was corroborated in six minutes, so \
+         a default install still does not sync"
+    );
+    assert!(
+        latest_peak > first_peak,
+        "the peak was written once but never ADVANCED ({first_peak:?} -> {latest_peak:?}); the \
+         replica is not following the chain"
     );
 }
 
