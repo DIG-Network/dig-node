@@ -245,16 +245,27 @@ impl SyncHandle {
         }
     }
 
-    /// Record what the attached session resolved: whether it may write, and how many custodied
-    /// puzzle hashes it found. Called once per session, AFTER corroboration settles the trust.
+    /// Record the trust the supervisor resolved for the attached session — whether it may write.
     ///
-    /// `#[doc(hidden)]` + public so the phase ladder's arms are directly expressible in a test
-    /// without dialling the network. Every arm depends on a combination of these two facts, and a
-    /// test that could only reach them through a live supervisor could not vary one at a time.
+    /// Written SEPARATELY from, and BEFORE, [`Self::set_watched`], because that is the order the
+    /// supervisor actually learns the two facts: `trust_for_session` settles the trust (a
+    /// corroboration round that dials several peers), and only then is a subscription set
+    /// resolved for it. Writing both at once would make the in-between state — trust known, set
+    /// not yet resolved — unreachable, and an unreachable state cannot be tested, which is
+    /// exactly how a defensive condition rots into a decoration.
     #[doc(hidden)]
-    pub fn set_subscription(&self, may_write: bool, watched: u32) {
+    pub fn set_trust(&self, may_write: bool) {
         let mut o = self.inner.observed.write().expect("observed lock poisoned");
         o.session_may_write = may_write;
+    }
+
+    /// Record how many custodied puzzle hashes the attached session resolved for subscription.
+    ///
+    /// This is the MEASUREMENT that turns `watched` from `None` into `Some(n)`; until it lands,
+    /// the count is genuinely unknown even though the trust may already be decided.
+    #[doc(hidden)]
+    pub fn set_watched(&self, watched: u32) {
+        let mut o = self.inner.observed.write().expect("observed lock poisoned");
         o.watched = Some(watched);
     }
 }
@@ -591,17 +602,21 @@ impl Supervisor {
             // for the inversion that made this the vulnerability). It runs as a write-free
             // session, which is what powers the live sync status.
             let trust = self.trust_for_session(&*session, &mut splits).await;
+            // Publish the trust the INSTANT it is settled, before a subscription set is resolved
+            // for it — the order the supervisor genuinely learns the two facts. Until
+            // `set_watched` lands just below, the count is honestly unknown.
+            handle.set_trust(trust.is_authoritative());
             let puzzle_hashes = match trust {
                 PeerTrust::Operator | PeerTrust::Corroborated => self.puzzle_hashes.puzzle_hashes(),
                 PeerTrust::Discovered => Vec::new(),
             };
             let subscribed: sync::SubscribedHashes = puzzle_hashes.iter().copied().collect();
             let nothing_subscribed = puzzle_hashes.is_empty();
-            // Publish what this session resolved, so the phase can tell "custody holds nothing"
-            // from "this writer was refused" — the two produce an identical empty set here, and
-            // only the first is the benign `NoAddressesToWatch` (dig_ecosystem#2609). Recorded
-            // AFTER corroboration, because before it the trust is not yet decided.
-            handle.set_subscription(trust.is_authoritative(), puzzle_hashes.len() as u32);
+            // The MEASUREMENT of the subscription set. Paired with the trust recorded above, the
+            // phase can now tell "custody holds nothing" from "this writer was refused" — the two
+            // produce an identical empty set here, and only the first is the benign
+            // `NoAddressesToWatch` (dig_ecosystem#2609).
+            handle.set_watched(puzzle_hashes.len() as u32);
             if nothing_subscribed {
                 // Nothing to subscribe. The session still runs: for an OPERATOR peer with an
                 // empty puzzle-hash set, `new_peak_wallet` needs no subscription and the

@@ -787,7 +787,8 @@ async fn phase_is_no_addresses_to_watch_when_custody_is_empty_on_a_writing_peer(
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
-    handle.set_subscription(true, 0);
+    handle.set_trust(true);
+    handle.set_watched(0);
 
     let status = handle.status(&db).await.unwrap();
     assert_eq!(
@@ -820,7 +821,8 @@ async fn a_refused_writer_is_not_reported_as_nothing_to_watch() {
     handle.set_connected(1);
     // What the supervisor records for an uncorroborated session: it subscribed nothing, but it
     // subscribed nothing because it may not write — not because custody is empty.
-    handle.set_subscription(false, 0);
+    handle.set_trust(false);
+    handle.set_watched(0);
 
     assert_eq!(
         handle.status(&db).await.unwrap().phase,
@@ -830,13 +832,39 @@ async fn a_refused_writer_is_not_reported_as_nothing_to_watch() {
 }
 
 /// **Proves (#2609):** the phase does not flip to `NoAddressesToWatch` on an UNMEASURED
-/// subscription set.
+/// subscription set, EVEN WHEN the attached peer may write.
 ///
-/// `watched` is `Option<u32>` rather than `u32` precisely so that "we have not resolved this
-/// session's set yet" cannot be spelled the same way as "we resolved it and it is empty". A
-/// session spends real time in the unmeasured state — corroboration dials four peers before the
-/// set is decided — and a `0` default there would announce "nothing to watch" during every single
-/// connect, which is the vacuous-default shape this ecosystem keeps finding.
+/// This is the state the supervisor genuinely occupies between `trust_for_session` returning and
+/// the subscription set being resolved, and it is the ONLY input that makes the ladder's
+/// `watched == Some(0)` load-bearing: with the trust condition already satisfied, a `watched`
+/// treated as `unwrap_or(0)` would announce "nothing to watch" here, on a session that has not yet
+/// looked at custody. A review of the first version of this fix measured exactly that — replacing
+/// `== Some(0)` with `unwrap_or(0) == 0` left the whole suite green, because the only unmeasured
+/// test also left `may_write` false and was rejected a condition earlier. Hence `set_trust` and
+/// `set_watched` are separate calls: the in-between state has to be reachable to be tested.
+///
+/// Acceptance bar for this test: `unwrap_or(0) == 0` in the ladder MUST turn it red.
+#[tokio::test]
+async fn a_writing_peer_with_an_unmeasured_set_does_not_claim_nothing_to_watch() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    // Trust settled; the set has NOT been resolved yet.
+    handle.set_trust(true);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::Syncing,
+        "a writing session that has not yet resolved its set has measured nothing to report"
+    );
+    assert_eq!(
+        status.watched_addresses, None,
+        "unmeasured must be distinguishable from measured-zero"
+    );
+}
+
+/// **Proves (#2609):** before any trust is settled, an attached peer is still just `Syncing`.
 #[tokio::test]
 async fn an_unmeasured_subscription_set_does_not_claim_nothing_to_watch() {
     let db = WalletDb::open_in_memory().await.unwrap();
@@ -864,7 +892,8 @@ async fn dropping_a_session_clears_its_subscription_facts() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
-    handle.set_subscription(true, 0);
+    handle.set_trust(true);
+    handle.set_watched(0);
     assert_eq!(
         handle.status(&db).await.unwrap().phase,
         SyncPhase::NoAddressesToWatch
@@ -888,7 +917,8 @@ async fn an_enrolled_wallet_mid_catch_up_still_reports_syncing() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
-    handle.set_subscription(true, 3);
+    handle.set_trust(true);
+    handle.set_watched(3);
 
     let status = handle.status(&db).await.unwrap();
     assert_eq!(status.phase, SyncPhase::Syncing);
