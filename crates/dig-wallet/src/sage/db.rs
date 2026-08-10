@@ -224,7 +224,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
     peak_height INTEGER,
     header_hash TEXT,
     initial_sync_complete INTEGER NOT NULL DEFAULT 0,
-    arrival_baseline_height INTEGER
+    arrival_baseline_height INTEGER,
+    send_baseline_height INTEGER
 );
 INSERT OR IGNORE INTO sync_state (id, peak_height, header_hash, initial_sync_complete)
     VALUES (0, NULL, NULL, 0);
@@ -242,6 +243,14 @@ CREATE TABLE IF NOT EXISTS arrivals (
 CREATE TABLE IF NOT EXISTS arrival_pending (
     coin_id TEXT PRIMARY KEY,
     created_height INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sends (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    confirmed_height INTEGER NOT NULL UNIQUE,
+    net_outflow TEXT NOT NULL,
+    asset_id TEXT,
+    recorded_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS derivations (
@@ -374,6 +383,9 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // arrives NULL — which is exactly right: an existing replica has never established a line
     // between history and news, so it records nothing until the next completed catch-up arms it.
     "ALTER TABLE sync_state ADD COLUMN arrival_baseline_height INTEGER",
+    // dig_ecosystem#2565, and NULL for the same reason: a replica that has never drawn the
+    // history/news line must record no SENDS either, until a completed catch-up arms it.
+    "ALTER TABLE sync_state ADD COLUMN send_baseline_height INTEGER",
 ];
 
 /// Evidence that a full address-history catch-up ran to COMPLETION.
@@ -539,6 +551,13 @@ impl WalletDb {
     /// has not caught up to, and a coin above the watermark would otherwise be announced on the very
     /// next pass.
     ///
+    /// The SEND baseline (dig_ecosystem#2565) is armed in this same statement, deliberately rather
+    /// than through a second arming path — a second path is a second thing to get wrong, and the
+    /// incident this arming exists to prevent was caused by exactly that. It additionally takes
+    /// `MAX(spent_height)` into account, because the catch-up subscribes with `include_spent`, so a
+    /// wallet's whole SPEND history is replayed too and every one of those heights must fall at or
+    /// below the line.
+    ///
     /// Clearing the flag (a reorg, a backwards move) deliberately does NOT disarm the baseline —
     /// [`Self::rollback_above`] walks it back to the fork instead, so the coins that were undone
     /// become eligible again and nothing below the fork does.
@@ -552,11 +571,20 @@ impl WalletDb {
                  arrival_baseline_height = COALESCE(
                      arrival_baseline_height,
                      MAX(?, COALESCE((SELECT MAX(created_height) FROM coins), 0))
+                 ),
+                 send_baseline_height = COALESCE(
+                     send_baseline_height,
+                     MAX(
+                         ?,
+                         COALESCE((SELECT MAX(created_height) FROM coins), 0),
+                         COALESCE((SELECT MAX(spent_height) FROM coins), 0)
+                     )
                  )
              WHERE id = 0",
         )
         .bind(i64::from(replay.peak_height()))
         .bind(replay.header_hash())
+        .bind(i64::from(replay.peak_height()))
         .bind(i64::from(replay.peak_height()))
         .execute(&mut *tx)
         .await?;
@@ -779,9 +807,23 @@ impl WalletDb {
             .bind(h)
             .execute(&mut *tx)
             .await?;
+        // A send unmade by a reorg goes by the same predicate, in the same transaction: the spend
+        // it described did not happen on the chain that won.
+        sqlx::query("DELETE FROM sends WHERE confirmed_height > ?")
+            .bind(h)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "UPDATE sync_state SET arrival_baseline_height = ?
              WHERE id = 0 AND arrival_baseline_height > ?",
+        )
+        .bind(h)
+        .bind(h)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE sync_state SET send_baseline_height = ?
+             WHERE id = 0 AND send_baseline_height > ?",
         )
         .bind(h)
         .bind(h)
@@ -1056,6 +1098,205 @@ impl WalletDb {
     /// start "from now" rather than replaying the whole ledger on first run.
     pub async fn arrival_cursor(&self) -> sqlx::Result<i64> {
         let row = sqlx::query("SELECT COALESCE(MAX(seq), 0) AS v FROM arrivals")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("v"))
+    }
+
+    /// Record every outgoing SEND confirmed since the send baseline, up to `through_height`
+    /// (dig_ecosystem#2565). Returns how many were newly recorded.
+    ///
+    /// The outgoing twin of [`Self::record_arrivals`], and it shares that method's two structural
+    /// commitments: it runs AFTER the coins are committed (so a spend and its change cannot race
+    /// the batch that wrote them), and the ledger insert and the watermark advance commit together
+    /// (so a crash between them can only re-examine, never skip).
+    ///
+    /// # The unit is a HEIGHT, not a coin
+    ///
+    /// A send is a difference, not a row: the figure is the wallet's own inputs minus its own
+    /// outputs, which is a question about a whole confirmed height. Judging coins one at a time is
+    /// what would announce a spent coin's amount as the send and then announce its change as a
+    /// second event. [`crate::sage::sends::settle`] holds the whole judgement, once per height.
+    ///
+    /// # Every height is examined EXACTLY once
+    ///
+    /// The window is `(baseline, through_height]` and the watermark then jumps to `through_height`,
+    /// so a coin state for an already-passed height that arrives late is never scored. That loses a
+    /// notification in a rare case and it is the deliberate direction to fail in: re-examining a
+    /// height whose data was incomplete the first time would produce a SECOND figure for the same
+    /// transaction, and `UNIQUE (confirmed_height)` would then keep whichever one happened to be
+    /// wrong. A missed toast costs the user nothing.
+    ///
+    /// # Not called from the oracle tier, deliberately
+    ///
+    /// Unlike [`Self::record_arrivals`], only the live sync path calls this. The coinset point read
+    /// (`refresh_tracked_coins`) has no height of its own and can easily see a spend's removal in
+    /// one pass and its change in the next; scoring the difference between them would announce the
+    /// wallet's own change as money sent. A node with no peer therefore reports no sends, which is
+    /// the honest answer from a replica that cannot see a whole block at once.
+    pub async fn record_sends(
+        &self,
+        watched_p2_hashes: &[String],
+        through_height: u32,
+    ) -> sqlx::Result<usize> {
+        use crate::sage::sends::{settle, CreatedCoin, SpentCoin, Verdict};
+
+        let watched: std::collections::HashSet<String> = watched_p2_hashes
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        let mut tx = self.pool.begin().await?;
+
+        let baseline: Option<i64> =
+            sqlx::query("SELECT send_baseline_height FROM sync_state WHERE id = 0")
+                .fetch_one(&mut *tx)
+                .await?
+                .get("send_baseline_height");
+        let Some(baseline_h) = baseline else {
+            // Fail closed, exactly as arrivals does: no catch-up has completed, so every spend
+            // present is history the wallet cannot distinguish from news. Arming belongs to
+            // `complete_catch_up` and must not happen here.
+            tx.commit().await?;
+            return Ok(0);
+        };
+
+        // `spent_height` is written only from a CONFIRMED `CoinState`, so a mempool sighting has
+        // none and belongs to no height — a spend the chain has not accepted cannot be enumerated
+        // here even by a caller that wanted it.
+        let heights: Vec<i64> = sqlx::query(
+            "SELECT DISTINCT spent_height FROM coins
+             WHERE spent_height IS NOT NULL AND spent_height > ? AND spent_height <= ?
+             ORDER BY spent_height ASC",
+        )
+        .bind(baseline_h)
+        .bind(i64::from(through_height))
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|r| r.get::<i64, _>("spent_height"))
+        .collect();
+
+        let mut recorded = 0usize;
+        for h in heights {
+            let spent: Vec<SpentCoin> = sqlx::query(
+                "SELECT coin_id, puzzle_hash, amount, asset_id FROM coins WHERE spent_height = ?",
+            )
+            .bind(h)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(|r| SpentCoin {
+                coin_id: r.get("coin_id"),
+                puzzle_hash: r.get("puzzle_hash"),
+                amount: r.get("amount"),
+                asset_id: r.get("asset_id"),
+            })
+            .collect();
+            let created: Vec<CreatedCoin> = sqlx::query(
+                "SELECT parent_coin_info, puzzle_hash, amount, asset_id FROM coins
+                 WHERE created_height = ?",
+            )
+            .bind(h)
+            .fetch_all(&mut *tx)
+            .await?
+            .iter()
+            .map(|r| CreatedCoin {
+                parent_coin_info: r.get("parent_coin_info"),
+                puzzle_hash: r.get("puzzle_hash"),
+                amount: r.get("amount"),
+                asset_id: r.get("asset_id"),
+            })
+            .collect();
+
+            let height = u32::try_from(h).unwrap_or(u32::MAX);
+            let verdict = settle(
+                height,
+                u32::try_from(baseline_h).ok(),
+                &spent,
+                &created,
+                &watched,
+            );
+            if let Verdict::Send { net_outflow } = verdict {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_default();
+                // `INSERT OR IGNORE` against a `UNIQUE` confirmed height: a replayed height cannot
+                // become a second send even if every window check above were removed, and the
+                // constraint is on disk, so it survives a restart.
+                let done = sqlx::query(
+                    "INSERT OR IGNORE INTO sends
+                         (confirmed_height, net_outflow, asset_id, recorded_at)
+                     VALUES (?, ?, NULL, ?)",
+                )
+                .bind(h)
+                .bind(net_outflow.to_string())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                recorded += done.rows_affected() as usize;
+            }
+        }
+
+        // Forward only, for the same reason the arrival watermark is: a caller with a lower
+        // `through_height` must never walk it back and re-open history.
+        sqlx::query(
+            "UPDATE sync_state SET send_baseline_height = MAX(send_baseline_height, ?)
+             WHERE id = 0",
+        )
+        .bind(i64::from(through_height))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(recorded)
+    }
+
+    /// The send baseline: the height at or below which a confirmed spend is BACKFILL.
+    ///
+    /// `None` means no catch-up has ever completed, and the recorder announces nothing at all.
+    pub async fn send_baseline(&self) -> sqlx::Result<crate::sage::sends::SendBaseline> {
+        let row = sqlx::query("SELECT send_baseline_height FROM sync_state WHERE id = 0")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row
+            .get::<Option<i64>, _>("send_baseline_height")
+            .and_then(|h| u32::try_from(h).ok()))
+    }
+
+    /// Sends strictly after cursor position `after_seq`, oldest first, at most `limit`.
+    ///
+    /// The cursor is `AUTOINCREMENT`, so it is monotonic and never reused: a client that stores the
+    /// last `seq` it saw resumes exactly where it left off, and a reorg that deletes rows cannot
+    /// make an old cursor point at a different send.
+    pub async fn sends_since(
+        &self,
+        after_seq: i64,
+        limit: i64,
+    ) -> sqlx::Result<Vec<crate::sage::sends::Send>> {
+        let rows = sqlx::query(
+            "SELECT seq, net_outflow, asset_id, confirmed_height
+             FROM sends WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(after_seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| crate::sage::sends::Send {
+                seq: r.get("seq"),
+                net_outflow: r.get("net_outflow"),
+                asset_id: r.get("asset_id"),
+                confirmed_height: r.get::<i64, _>("confirmed_height") as u32,
+            })
+            .collect())
+    }
+
+    /// The newest send cursor position, or 0 when nothing has been recorded — what a client asks
+    /// for to start "from now" rather than replaying the whole ledger on first run.
+    pub async fn send_cursor(&self) -> sqlx::Result<i64> {
+        let row = sqlx::query("SELECT COALESCE(MAX(seq), 0) AS v FROM sends")
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get("v"))
@@ -2997,5 +3238,343 @@ mod tests {
         assert!(!s2.delta_sync);
         assert_eq!(s2.delta_sync_override, Some(true));
         assert_eq!(s2.change_address.as_deref(), Some("xch1change"));
+    }
+
+    // ---- sends (dig_ecosystem#2565) ---------------------------------------
+    //
+    // The same discipline the arrival tests above use: every negative assertion is paired with a
+    // positive control differing in exactly the tested dimension, because a recorder that refused
+    // everything would satisfy every negative on its own.
+
+    /// A coin of OURS spent at `spent_h`. Its puzzle hash is the watched one, so it is accountable.
+    fn ours_spent(id: &str, amount: u64, created_h: i64, spent_h: i64) -> CoinRow {
+        coin(id, amount, Some(created_h), Some(spent_h))
+    }
+
+    /// Change: created at `created_h` by spending `parent`, landing back at our own address.
+    fn change_from(id: &str, parent: &str, amount: u64, created_h: i64) -> CoinRow {
+        let mut c = coin(id, amount, Some(created_h), None);
+        c.parent_coin_info = parent.into();
+        c
+    }
+
+    /// TRAP 1 — the recorded figure is the NET OUTFLOW, never the spent coin's amount.
+    ///
+    /// A 9 XCH coin spent to send 1 XCH with ~8 XCH of change. The row must read 1, and the test
+    /// asserts the wrong answer is absent by name so a recorder that wrote the input fails loudly.
+    #[tokio::test]
+    async fn a_large_coin_spent_for_a_small_payment_records_only_what_left() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coin(&ours_spent("big", 9_000_000_000_000, 50, 101))
+            .await
+            .unwrap();
+        db.upsert_coin(&change_from("chg", "big", 7_999_995_000_000, 101))
+            .await
+            .unwrap();
+
+        assert_eq!(db.record_sends(&watched(), 101).await.unwrap(), 1);
+        let page = db.sends_since(0, 100).await.unwrap();
+        assert_eq!(page.len(), 1, "a send and its change are ONE notification");
+        assert_eq!(
+            page[0].net_outflow, "1000005000000",
+            "the figure is inputs minus what came back"
+        );
+        assert_ne!(
+            page[0].net_outflow, "9000000000000",
+            "recording the spent coin's amount is the money lie this ledger prevents"
+        );
+        assert_eq!(page[0].confirmed_height, 101);
+        assert_eq!(page[0].asset_id, None);
+    }
+
+    /// TRAP 2 — a send and its change are ONE row, and a multi-input spend is not double-counted.
+    ///
+    /// Two inputs of 5 and 4 with 8 returning as change that names only ONE of them as its parent.
+    /// A recorder grouping by the parent link would score the orphaned input as a second send of
+    /// its full 4; summing over the height makes that unreachable.
+    #[tokio::test]
+    async fn a_multi_input_spend_with_change_is_one_row_reading_the_difference() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coin(&ours_spent("in1", 5_000_000_000_000, 50, 101))
+            .await
+            .unwrap();
+        db.upsert_coin(&ours_spent("in2", 4_000_000_000_000, 50, 101))
+            .await
+            .unwrap();
+        db.upsert_coin(&change_from("chg", "in1", 8_000_000_000_000, 101))
+            .await
+            .unwrap();
+
+        assert_eq!(db.record_sends(&watched(), 101).await.unwrap(), 1);
+        let page = db.sends_since(0, 100).await.unwrap();
+        assert_eq!(page.len(), 1, "two inputs are one transaction, one row");
+        assert_eq!(page[0].net_outflow, "1000000000000");
+        assert_ne!(
+            page[0].net_outflow, "4000000000000",
+            "the input the change does not name is not a second send"
+        );
+    }
+
+    /// TRAP 4a — an UNCONFIRMED spend is never announced.
+    ///
+    /// A coin sighted in the mempool has `spent_height` NULL, so it belongs to no height and
+    /// cannot be enumerated. The positive control is the SAME coin once it confirms.
+    #[tokio::test]
+    async fn an_unconfirmed_spend_is_never_recorded_until_it_confirms() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        // Spent in the mempool: no confirmation height anywhere.
+        db.upsert_coin(&coin("pending", 9_000_000_000_000, Some(50), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.record_sends(&watched(), 105).await.unwrap(),
+            0,
+            "a mempool sighting is not money that left"
+        );
+        assert!(db.sends_since(0, 100).await.unwrap().is_empty());
+
+        // POSITIVE CONTROL: the same coin, now confirmed spent one height above the watermark the
+        // refused pass already advanced to.
+        db.upsert_coin(&ours_spent("pending", 9_000_000_000_000, 50, 106))
+            .await
+            .unwrap();
+        assert_eq!(db.record_sends(&watched(), 106).await.unwrap(), 1);
+        assert_eq!(
+            db.sends_since(0, 100).await.unwrap()[0].net_outflow,
+            "9000000000000"
+        );
+    }
+
+    /// TRAP 4b — an initial sync replays no sends.
+    ///
+    /// The catch-up subscribes with `include_spent`, so a lifetime of spends passes the write
+    /// point. None may be announced, and completing the catch-up must not announce them
+    /// retroactively. Note the baseline must clear the highest SPENT height, not only the highest
+    /// created one — the history being replayed here is spends.
+    #[tokio::test]
+    async fn a_first_sync_records_no_sends() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        for (i, h) in [10i64, 20, 30].iter().enumerate() {
+            db.upsert_coin(&ours_spent(&format!("hist{i}"), 100, 5, *h))
+                .await
+                .unwrap();
+        }
+        db.set_peak(30, "hh").await.unwrap();
+
+        // During the catch-up there is no baseline, so nothing is a send.
+        assert_eq!(db.send_baseline().await.unwrap(), None);
+        assert_eq!(db.record_sends(&watched(), 30).await.unwrap(), 0);
+
+        // Completing the catch-up arms the baseline at or above the history it just wrote...
+        db.complete_catch_up(&CatchUpReplay::finished_at(30, "hh"))
+            .await
+            .unwrap();
+        assert_eq!(db.send_baseline().await.unwrap(), Some(30));
+        // ...and re-running the recorder over that same history still announces nothing.
+        assert_eq!(db.record_sends(&watched(), 30).await.unwrap(), 0);
+        assert!(db.sends_since(0, 100).await.unwrap().is_empty());
+
+        // POSITIVE CONTROL: the very next spend, one block higher, IS a send.
+        db.upsert_coin(&ours_spent("fresh", 700, 5, 31))
+            .await
+            .unwrap();
+        assert_eq!(db.record_sends(&watched(), 31).await.unwrap(), 1);
+    }
+
+    /// **The send baseline clears a spend history that sits ABOVE the highest created height.**
+    ///
+    /// A wallet whose coins were all created long ago and spent recently would, under an arming
+    /// value that considered only `created_height`, come out of its first catch-up with a baseline
+    /// BELOW its own spend history — and replay every one of those spends as a toast.
+    #[tokio::test]
+    async fn arming_clears_spends_confirmed_above_the_highest_created_height() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&ours_spent("old", 100, 10, 900))
+            .await
+            .unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(20, "hh"))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.send_baseline().await.unwrap(),
+            Some(900),
+            "the baseline must clear the highest SPENT height, not only the highest created one"
+        );
+        assert_eq!(db.record_sends(&watched(), 900).await.unwrap(), 0);
+    }
+
+    /// **A restart replaying the same spends re-announces nothing**, and the dedup is DURABLE:
+    /// `UNIQUE (confirmed_height)` holds even when the height watermark is walked back by hand.
+    #[tokio::test]
+    async fn a_restart_replaying_the_same_spends_re_announces_nothing() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coin(&ours_spent("sent", 500, 50, 101))
+            .await
+            .unwrap();
+        assert_eq!(db.record_sends(&watched(), 101).await.unwrap(), 1);
+        assert_eq!(db.record_sends(&watched(), 101).await.unwrap(), 0);
+
+        // Underneath the watermark, the UNIQUE height is what actually holds. Force the window
+        // back open and the second insert is still a no-op.
+        sqlx::query("UPDATE sync_state SET send_baseline_height = 100 WHERE id = 0")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.record_sends(&watched(), 101).await.unwrap(),
+            0,
+            "the UNIQUE confirmed height is dedup on disk, independent of the watermark"
+        );
+        assert_eq!(db.sends_since(0, 100).await.unwrap().len(), 1);
+    }
+
+    /// **A spend the replica cannot fully account for is recorded as NOTHING.**
+    ///
+    /// A CAT lives at a curried puzzle hash the peer sync path drops, so its change can be absent
+    /// while its input is present — and the difference would be announced as the whole balance
+    /// leaving. The positive control is a plain XCH spend at the SAME height in a fresh DB.
+    #[tokio::test]
+    async fn a_cat_spend_is_recorded_as_nothing_rather_than_as_its_input() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        let mut cat = ours_spent("cat", 5_000, 50, 101);
+        cat.asset_id = Some("a406d3".into());
+        db.upsert_coin(&cat).await.unwrap();
+        assert_eq!(
+            db.record_sends(&watched(), 101).await.unwrap(),
+            0,
+            "a CAT send whose change is invisible must produce silence, not its input's amount"
+        );
+        assert!(db.sends_since(0, 100).await.unwrap().is_empty());
+
+        // POSITIVE CONTROL: the same shape, plain XCH, one height higher.
+        db.upsert_coin(&ours_spent("xch", 5_000, 50, 102))
+            .await
+            .unwrap();
+        assert_eq!(db.record_sends(&watched(), 102).await.unwrap(), 1);
+    }
+
+    /// **A self-transfer that returns everything is not a send**, and a fee-only spend IS one:
+    /// the fee genuinely left the wallet, and the figure says so rather than claiming a payment.
+    #[tokio::test]
+    async fn a_spend_that_returns_everything_is_not_a_send() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coin(&ours_spent("a", 1_000, 50, 101))
+            .await
+            .unwrap();
+        db.upsert_coin(&ours_spent("b", 500, 50, 101))
+            .await
+            .unwrap();
+        db.upsert_coin(&change_from("merged", "a", 1_500, 101))
+            .await
+            .unwrap();
+        assert_eq!(db.record_sends(&watched(), 101).await.unwrap(), 0);
+
+        // POSITIVE CONTROL: the same consolidation minus a fee. Something DID leave.
+        db.upsert_coin(&ours_spent("c", 1_000, 50, 102))
+            .await
+            .unwrap();
+        db.upsert_coin(&change_from("kept", "c", 995, 102))
+            .await
+            .unwrap();
+        assert_eq!(db.record_sends(&watched(), 102).await.unwrap(), 1);
+        assert_eq!(db.sends_since(0, 100).await.unwrap()[0].net_outflow, "5");
+    }
+
+    /// **A reorg unmakes a send.** The spend it described did not happen on the chain that won, so
+    /// the row goes and the baseline walks back with it — leaving a re-confirmed spend eligible
+    /// again rather than silently swallowed.
+    #[tokio::test]
+    async fn a_reorg_deletes_the_sends_above_the_fork_and_walks_the_baseline_back() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coin(&ours_spent("sent", 500, 50, 105))
+            .await
+            .unwrap();
+        assert_eq!(db.record_sends(&watched(), 105).await.unwrap(), 1);
+        assert_eq!(db.send_baseline().await.unwrap(), Some(105));
+
+        db.rollback_above(102).await.unwrap();
+        assert!(
+            db.sends_since(0, 100).await.unwrap().is_empty(),
+            "a send above the fork did not happen"
+        );
+        assert_eq!(
+            db.send_baseline().await.unwrap(),
+            Some(102),
+            "the baseline must walk back, or a re-confirmed spend is swallowed"
+        );
+
+        // POSITIVE CONTROL: the spend re-confirms on the winning chain and IS recorded again.
+        db.upsert_coin(&ours_spent("sent", 500, 50, 104))
+            .await
+            .unwrap();
+        assert_eq!(db.record_sends(&watched(), 104).await.unwrap(), 1);
+    }
+
+    /// **The send cursor is monotonic and pages, exactly like the arrival cursor.**
+    #[tokio::test]
+    async fn the_send_cursor_pages_oldest_first_and_never_rewinds() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        assert_eq!(db.send_cursor().await.unwrap(), 0);
+        for h in [101i64, 102, 103] {
+            db.upsert_coin(&ours_spent(&format!("s{h}"), 100, 50, h))
+                .await
+                .unwrap();
+        }
+        assert_eq!(db.record_sends(&watched(), 103).await.unwrap(), 3);
+
+        let first = db.sends_since(0, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].confirmed_height, 101);
+        assert_eq!(first[1].confirmed_height, 102);
+        let rest = db.sends_since(first[1].seq, 100).await.unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].confirmed_height, 103);
+        assert_eq!(db.send_cursor().await.unwrap(), rest[0].seq);
+        assert!(db.sends_since(rest[0].seq, 100).await.unwrap().is_empty());
+    }
+
+    /// **An incoming payment in the same block is not netted against the send.** A coin created at
+    /// this height by a stranger is an ARRIVAL and belongs to the other ledger; subtracting it
+    /// would understate what left.
+    #[tokio::test]
+    async fn a_payment_received_in_the_same_block_does_not_reduce_the_send() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coin(&ours_spent("mine", 9_000, 50, 101))
+            .await
+            .unwrap();
+        db.upsert_coin(&change_from("chg", "mine", 8_000, 101))
+            .await
+            .unwrap();
+        db.upsert_coin(&incoming("gift", 5_000, 101)).await.unwrap();
+
+        assert_eq!(db.record_sends(&watched(), 101).await.unwrap(), 1);
+        assert_eq!(db.sends_since(0, 100).await.unwrap()[0].net_outflow, "1000");
     }
 }

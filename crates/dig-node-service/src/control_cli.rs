@@ -64,6 +64,9 @@ pub enum ControlAction {
     WalletCoinById { coin_id: String },
     /// `control.wallet.arrivals` — the READ-ONLY incoming funds confirmed since a cursor.
     WalletArrivals { after_seq: i64, limit: i64 },
+    /// `control.wallet.sends` — the READ-ONLY outgoing funds confirmed since a cursor. Each row's
+    /// figure is what LEFT the wallet, never a spent coin's amount.
+    WalletSends { after_seq: i64, limit: i64 },
     /// `control.wallet.syncStatus` — the READ-ONLY wallet chain-sync phase, replica height and
     /// Chia peer count. Distinct from `control.sync.status`, which is about DIG stores.
     WalletSyncStatus,
@@ -110,6 +113,7 @@ impl ControlAction {
             ControlAction::WalletCoins { .. } => "control.wallet.coins",
             ControlAction::WalletCoinById { .. } => "control.wallet.coinById",
             ControlAction::WalletArrivals { .. } => "control.wallet.arrivals",
+            ControlAction::WalletSends { .. } => "control.wallet.sends",
             ControlAction::WalletPeak => "control.wallet.peak",
             ControlAction::WalletSyncStatus => "control.wallet.syncStatus",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
@@ -141,7 +145,8 @@ impl ControlAction {
                 json!({ "address": address, "asset": asset })
             }
             ControlAction::WalletCoinById { coin_id } => json!({ "coin_id": coin_id }),
-            ControlAction::WalletArrivals { after_seq, limit } => {
+            ControlAction::WalletArrivals { after_seq, limit }
+            | ControlAction::WalletSends { after_seq, limit } => {
                 json!({ "after_seq": after_seq, "limit": limit })
             }
             ControlAction::WalletBroadcast { signed_bundle_hex } => {
@@ -212,6 +217,11 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         }
         .method(),
         ControlAction::WalletArrivals {
+            after_seq: 0,
+            limit: 0,
+        }
+        .method(),
+        ControlAction::WalletSends {
             after_seq: 0,
             limit: 0,
         }
@@ -351,6 +361,13 @@ fn summarize(method: &str, result: &Value) -> String {
             let n = result["arrivals"].as_array().map(Vec::len).unwrap_or(0);
             format!(
                 "{n} arrival(s) · cursor {}",
+                result["cursor"].as_i64().unwrap_or(0)
+            )
+        }
+        "control.wallet.sends" => {
+            let n = result["sends"].as_array().map(Vec::len).unwrap_or(0);
+            format!(
+                "{n} send(s) · cursor {}",
                 result["cursor"].as_i64().unwrap_or(0)
             )
         }

@@ -2127,9 +2127,12 @@ impl WalletBackend {
     /// would I be if I skipped to now", the question a first-run client asks so it does not replay
     /// the whole ledger as notifications.
     ///
-    /// Reads the local replica ONLY. There is no oracle path here and there must not be: this is
-    /// an open, token-less read, and routing it outbound would disclose the wallet's addresses to
-    /// a third party on every poll.
+    /// Reads the local replica ONLY. There is no oracle path here and there must not be: routing it
+    /// outbound would disclose the wallet's own watched addresses to a third party on every poll —
+    /// which is the same disclosure that makes the method TOKEN-GATED at the control surface
+    /// (`ControlMethod::WalletArrivals::requires_auth`). An earlier version of this comment called
+    /// it "an open, token-less read", which was the reverse of the truth and is corrected here
+    /// before someone "fixes" the gate to match it.
     pub async fn wallet_arrivals(
         &self,
         after_seq: i64,
@@ -2137,6 +2140,30 @@ impl WalletBackend {
     ) -> sqlx::Result<(Vec<super::arrivals::Arrival>, i64)> {
         let page = self.db.arrivals_since(after_seq, limit).await?;
         let latest = self.db.arrival_cursor().await?;
+        Ok((page, latest))
+    }
+
+    /// The outgoing-funds SENDS recorded after cursor position `after_seq`, oldest first
+    /// (dig_ecosystem#2565) — what `control.wallet.sends` serves.
+    ///
+    /// The outgoing twin of [`Self::wallet_arrivals`]: same cursor discipline, same local-replica
+    /// -only rule, and TOKEN-GATED for the same disclosure reason plus one more — a send history
+    /// says when this wallet is SPENDING.
+    ///
+    /// Each row's `net_outflow` is what LEFT the wallet at that height (owned inputs minus owned
+    /// outputs), never a spent coin's amount, and it includes any network fee because chain
+    /// observation of the wallet's own coins cannot separate the two. See
+    /// [`crate::sage::sends`] for why that is structural rather than a gap.
+    ///
+    /// Returns `(page, latest)`. `latest` is read AFTER the page, so a client MUST resume from the
+    /// last row it actually RECEIVED and never from `latest`.
+    pub async fn wallet_sends(
+        &self,
+        after_seq: i64,
+        limit: i64,
+    ) -> sqlx::Result<(Vec<super::sends::Send>, i64)> {
+        let page = self.db.sends_since(after_seq, limit).await?;
+        let latest = self.db.send_cursor().await?;
         Ok((page, latest))
     }
 

@@ -97,11 +97,13 @@ pub fn is_control_method(method: &str) -> bool {
 /// CALLER named, and `.peak`/`.syncStatus` name this node's own chain position and no address at
 /// all; neither discloses an association between this node and any address.
 ///
-/// Two wallet methods are deliberately NOT here. `control.wallet.arrivals` (dig_ecosystem#2548) is
+/// Three wallet methods are deliberately NOT here. `control.wallet.arrivals` (dig_ecosystem#2548) is
 /// a chain read and still gated: the caller supplies only a cursor, so the answer volunteers this
 /// node's OWN watched puzzle hashes together with the receive history behind them. The chain facts
 /// are public; the node-to-address association is not, and a token-less caller could replay those
-/// addresses into the reads above. `control.wallet.broadcast` puts bytes on the network, so the
+/// addresses into the reads above. `control.wallet.sends` (dig_ecosystem#2565) is gated for that
+/// same reason and one more: its answer says when this wallet is SPENDING, which is a fact about
+/// the operator's behaviour rather than about an address. `control.wallet.broadcast` puts bytes on the network, so the
 /// token is what stands between a local process and a broadcast — and an `UNAUTHORIZED` from it therefore
 /// means exactly that, with the token as the remedy, where the same code on an OPEN read can only
 /// have come from a node too old to serve it (remedy: an upgrade). Both are still routed through
@@ -152,6 +154,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.coins",
     "control.wallet.coinById",
     "control.wallet.arrivals",
+    "control.wallet.sends",
     "control.wallet.peak",
     "control.wallet.syncStatus",
     "control.wallet.broadcast",
@@ -197,6 +200,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.coins",
     "control.wallet.coinById",
     "control.wallet.arrivals",
+    "control.wallet.sends",
     "control.wallet.peak",
     "control.wallet.syncStatus",
     "control.wallet.broadcast",
@@ -770,6 +774,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.coins" => wallet_coins(ctx, id, params).await,
         "control.wallet.coinById" => wallet_coin_by_id(ctx, id, params).await,
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
+        "control.wallet.sends" => wallet_sends(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
         "control.peerCounts" => peer_counts(ctx, id).await,
@@ -1588,6 +1593,71 @@ fn arrivals_wire(
             "amount": a.amount,
             "asset_id": a.asset_id,
             "confirmed_height": a.confirmed_height,
+        })).collect::<Vec<_>>(),
+        "cursor": cursor,
+        "latest": latest,
+    })
+}
+
+/// `control.wallet.sends` (dig_ecosystem#2565) — confirmed OUTGOING funds since a cursor position.
+///
+/// The outgoing twin of [`wallet_arrivals`], and a SEPARATE method rather than a widening of that
+/// one. The arrivals record carries no unknown-field rejection, so a discriminator added to it is
+/// silently dropped by every already-shipped client — and those clients count every row they are
+/// handed as money RECEIVED. Serving a send on the arrivals wire would therefore make this node
+/// tell a correct old client that an outgoing payment was income. A separate method makes that
+/// unexpressible: a client that has never heard of it cannot call it.
+///
+/// # TOKEN-GATED
+///
+/// For the arrivals reason (the answer volunteers this node's own activity to a caller that named
+/// nothing) plus one more: a send history says when the operator is SPENDING.
+async fn wallet_sends(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    const METHOD: &str = "control.wallet.sends";
+    let after_seq = params
+        .get("after_seq")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if after_seq < 0 {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!("{METHOD} after_seq must be a non-negative integer"),
+        );
+    }
+    match ctx
+        .wallet
+        .wallet_sends(after_seq, arrivals_limit(params))
+        .await
+    {
+        Ok((page, latest)) => control_ok(id, sends_wire(after_seq, &page, latest)),
+        // Only the local wallet DB can fail here — there is no chain call to blame.
+        Err(e) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("{METHOD}: reading the local send ledger failed: {e}"),
+        ),
+    }
+}
+
+/// Map recorded sends onto the wire.
+///
+/// The figure is `net_outflow`, not `amount`, and the name is load-bearing: it is what LEFT the
+/// wallet (owned inputs minus owned outputs), never a spent coin's amount, and it INCLUDES any
+/// network fee because chain observation cannot separate the two. A field called `amount` would
+/// invite a reader to believe the wrong one of those.
+///
+/// `cursor` is where the CLIENT got to — the last `seq` actually returned, falling back to the
+/// caller's own `after_seq` on an empty page, deliberately NOT `latest`; see [`arrivals_wire`] for
+/// why collapsing the two silently loses a notification.
+fn sends_wire(after_seq: i64, sends: &[dig_wallet::sage::sends::Send], latest: i64) -> Value {
+    let cursor = sends.last().map_or(after_seq, |s| s.seq);
+    json!({
+        "sends": sends.iter().map(|s| json!({
+            "seq": s.seq,
+            "net_outflow": s.net_outflow,
+            "asset_id": s.asset_id,
+            "confirmed_height": s.confirmed_height,
         })).collect::<Vec<_>>(),
         "cursor": cursor,
         "latest": latest,

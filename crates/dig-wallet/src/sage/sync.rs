@@ -509,6 +509,20 @@ pub async fn handle_coin_state_update(
             "wallet sync: recording incoming-funds arrivals failed; retrying on the next update"
         );
     }
+    // The outgoing twin (dig_ecosystem#2565), on the same post-commit hook and for the same
+    // reason: a spend and its change land in ONE batch, and the send's figure is the difference
+    // between them, so it can only be computed once that batch has landed.
+    //
+    // This is also the whole of trap 3 — a send made from ANOTHER client on the same seed reaches
+    // here identically, because what is being observed is the chain rather than anything this
+    // process built.
+    if let Err(e) = db.record_sends(&watched, update.height).await {
+        tracing::warn!(
+            error = %e,
+            height = update.height,
+            "wallet sync: recording outgoing-funds sends failed; retrying on the next update"
+        );
+    }
     events.publish(SyncEvent::CoinState);
     Ok(())
 }

@@ -73,6 +73,7 @@ pub mod options;
 pub mod rate_limit;
 pub mod routing;
 pub mod rpc;
+pub mod sends;
 pub mod service;
 pub mod singleton;
 pub mod spend;
