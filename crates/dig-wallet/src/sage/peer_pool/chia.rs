@@ -24,6 +24,7 @@ use chia_wallet_sdk::client::{connect_peer, Connector, Network, Peer, PeerOption
 use tokio::sync::mpsc;
 
 use super::{AddressBook, PeerDialer, PoolPeer};
+use crate::sage::db::WalletDb;
 use crate::sage::quorum::PeakClaim;
 
 /// How many introducer lookups run concurrently, and how many addresses one batch resolves.
@@ -33,37 +34,48 @@ const LOOKUP_BATCH: usize = 30;
 // The address book
 // ---------------------------------------------------------------------------
 
-/// Operator-named addresses first, then DNS-introducer answers, shuffled.
-pub struct ChiaAddressBook {
-    /// Addresses a human named: `user_managed` peer rows, plus `TRUSTED_FULLNODE`.
-    ///
-    /// Resolved by the caller from the DB so this type needs no database handle, and so the
-    /// #2573 rule — loopback is admitted only on a human's say-so — is decided at one visible
-    /// call site rather than inside a lookup.
-    operator: Vec<SocketAddr>,
-    network: chia_wallet_sdk::client::Network,
+/// Operator-named addresses first, then DNS-introducer answers.
+///
+/// The operator half is read from the `peers` table on resolution rather than passed in, because
+/// the pool resolves its list once and lazily — by which time a peer row added during start-up is
+/// present, which a list captured at construction would have missed.
+pub struct DbAddressBook {
+    db: WalletDb,
+    network: Network,
     lookup_timeout: Duration,
+    default_port: u16,
 }
 
-impl ChiaAddressBook {
-    /// A book over `operator`'s addresses plus mainnet's introducers.
-    pub fn mainnet(operator: Vec<SocketAddr>, lookup_timeout: Duration) -> Self {
+impl DbAddressBook {
+    /// A mainnet book over `db`'s `user_managed` peer rows plus mainnet's DNS introducers.
+    pub fn mainnet(db: WalletDb, lookup_timeout: Duration) -> Self {
         Self {
-            operator,
+            db,
             network: Network::default_mainnet(),
             lookup_timeout,
+            default_port: crate::sage::network::DEFAULT_PEER_PORT as u16,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl AddressBook for ChiaAddressBook {
+impl AddressBook for DbAddressBook {
     async fn addresses(&self) -> Vec<SocketAddr> {
+        let rows = self.db.all_peers().await.unwrap_or_default();
+        let operator = operator_addresses(
+            rows.into_iter()
+                .filter(|row| row.user_managed)
+                .map(|row| (row.ip_addr, row.port as u16)),
+            std::env::var("TRUSTED_FULLNODE").ok().as_deref(),
+            self.default_port,
+        );
+
         let discovered = self
             .network
             .lookup_all(self.lookup_timeout, LOOKUP_BATCH)
             .await;
-        super::assemble_addresses(&self.operator, &discovered)
+
+        super::assemble_addresses(&operator, &discovered)
     }
 }
 

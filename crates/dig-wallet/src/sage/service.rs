@@ -32,15 +32,45 @@ use super::singleton::LineageSource;
 use super::spend::{
     Broadcaster, ChiaQueryBroadcaster, ChiaQueryConfirmer, Confirmer, ConfirmingBroadcaster,
 };
+use super::peer_pool::{chia as pool_chia, PeerPool};
 use super::sync_supervisor::{
-    spawn_supervisor, ChiaPeerSessionFactory, ChiaQuorumCorroborator, Supervisor, SyncHandle,
-    TokioTime,
+    spawn_supervisor, ChiaPeerSessionFactory, ChiaQuorumCorroborator, Corroborator, Supervisor,
+    SyncHandle, TokioTime,
 };
 use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
 
 /// Bring-up configuration for the served wallet (§18.12).
 #[derive(Debug, Clone)]
+/// How long peer discovery and one dial may take.
+///
+/// The same ten seconds the supervisor's own dial uses, so a slow network degrades the pool and
+/// the writer session at the same rate rather than leaving one of them mysteriously ahead.
+const POOL_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The held peer pool the corroboration quorum is drawn from (dig_ecosystem#2606).
+///
+/// `None` when a TLS identity cannot be generated. That is the same condition under which the
+/// writer session cannot dial either, so returning `None` degrades to the pre-pool behaviour —
+/// no corroboration, therefore no writes — rather than to a pool that silently holds nothing.
+fn chain_sync_pool(db: &WalletDb) -> Option<Arc<PeerPool>> {
+    let tls = match chia_query::peer::connect::create_generated_tls() {
+        Ok(tls) => tls,
+        Err(e) => {
+            tracing::warn!(error = %e, "wallet sync: no TLS identity; the peer pool is disabled");
+            return None;
+        }
+    };
+    let book = pool_chia::DbAddressBook::mainnet(db.clone(), POOL_DIAL_TIMEOUT);
+    let dialer = pool_chia::ChiaDialer::new(
+        chia_query::NetworkType::Mainnet.network_id().to_string(),
+        tls,
+        POOL_DIAL_TIMEOUT,
+    );
+    Some(Arc::new(PeerPool::mainnet(Arc::new(book), Arc::new(dialer))))
+}
+
+
 pub struct WalletServiceConfig {
     /// Enable REAL mainnet broadcast of node-custodied spends (the tip spend #378, the
     /// sign+broadcast-on-behalf path #371, and any wallet send/offer/mint). **Default `false`** —
@@ -189,6 +219,12 @@ impl WalletService {
         // writes", never a silent downgrade.
         // The task handle is dropped deliberately: the supervisor lives for the process, and
         // its stop signal is `SyncHandle::shutdown`, not a dropped join handle.
+        //
+        // The quorum is drawn from a HELD pool of distinct peers (dig_ecosystem#2606) rather than
+        // from connections opened and dropped per round: cheaper, steadier, and — because the
+        // pool resolves its candidate list once and admits each address at most once — no longer
+        // collapsible onto a single co-resident node (dig_ecosystem#2573).
+        let pool = chain_sync_pool(&db);
         let sync = if cfg.enable_chain_sync {
             Some(spawn_supervisor(Supervisor {
                 db: db.clone(),
@@ -197,7 +233,10 @@ impl WalletService {
                 events: events.clone(),
                 genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
                 time: Arc::new(TokioTime),
-                corroborator: Some(Arc::new(ChiaQuorumCorroborator::mainnet())),
+                corroborator: pool
+                    .clone()
+                    .map(|pool| Arc::new(ChiaQuorumCorroborator::new(pool)) as Arc<dyn Corroborator>),
+                pool,
             }))
         } else {
             None

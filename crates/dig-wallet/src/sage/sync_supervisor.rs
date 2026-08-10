@@ -51,6 +51,7 @@ use chia_protocol::Bytes32;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
+use super::peer_pool;
 use super::quorum::{self, Verdict};
 use super::sync::{self, PeerTrust, SyncError};
 
@@ -109,7 +110,13 @@ pub struct WalletSyncStatus {
 struct Observed {
     /// Whether a peer has ever been attached in this process.
     ever_connected: bool,
-    /// Subscription peers held right now — 0 or 1 (see [`SyncSession`] on why one).
+    /// Chia peer connections held right now: the writer session, plus every member of the
+    /// corroboration pool (dig_ecosystem#2606).
+    ///
+    /// NOT the subscription count, which is still 0 or 1 (see [`SyncSession`] on why one). The
+    /// name `chia_peer_count` has always meant "peers this node is talking to", and reporting 1
+    /// while five connections are held would understate the node's actual footprint on the
+    /// network by a factor of five.
     peers: u32,
 }
 
@@ -471,6 +478,13 @@ pub struct Supervisor {
     /// no-op implementation — "corroboration is switched off" and "corroboration ran and refused"
     /// must not look the same in a stack trace.
     pub corroborator: Option<Arc<dyn Corroborator>>,
+    /// The held peer pool, when one is attached (dig_ecosystem#2606).
+    ///
+    /// Read only to REPORT how many peers are held; the pool is filled and sampled by the
+    /// [`Corroborator`] that shares it. `None` means no pool — a test, or a build with
+    /// corroboration switched off — and the reported count is then just the writer, exactly as
+    /// before.
+    pub pool: Option<Arc<peer_pool::PeerPool>>,
 }
 
 /// Spawn the supervisor on the current runtime.
@@ -505,7 +519,7 @@ impl Supervisor {
                     continue;
                 }
             };
-            handle.set_connected(1);
+            handle.set_connected(self.held_peers().await);
             let started = self.time.now();
 
             // The subscription set is re-read HERE, per connection: a wallet created after
@@ -522,6 +536,8 @@ impl Supervisor {
             // for the inversion that made this the vulnerability). It runs as a write-free
             // session, which is what powers the live sync status.
             let trust = self.trust_for_session(&*session, &mut splits).await;
+            // Corroboration is what fills the pool, so the count is only complete afterwards.
+            handle.set_connected(self.held_peers().await);
             let puzzle_hashes = match trust {
                 PeerTrust::Operator | PeerTrust::Corroborated => self.puzzle_hashes.puzzle_hashes(),
                 PeerTrust::Discovered => Vec::new(),
@@ -678,6 +694,18 @@ impl Supervisor {
         PeerTrust::Corroborated
     }
 
+    /// Peer connections held right now: the writer session plus every pool member.
+    ///
+    /// The writer is dialled by the [`SyncSessionFactory`] and is not a pool member, so the two
+    /// are disjoint and adding them double-counts nothing.
+    async fn held_peers(&self) -> u32 {
+        let pooled = match self.pool.as_ref() {
+            Some(pool) => pool.len().await,
+            None => 0,
+        };
+        1 + u32::try_from(pooled).unwrap_or(u32::MAX - 1)
+    }
+
     /// Resolve once the subscription set stops being empty.
     ///
     /// Returns a future that NEVER resolves when `poll` is false — a session that already
@@ -830,123 +858,64 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
     }
 }
 
-/// The production [`Corroborator`]: repeated independent dials, heights compared, then one
-/// settled question put to all of them (dig_ecosystem#2568).
+/// The production [`Corroborator`]: a sample drawn from the HELD peer pool, heights compared,
+/// then one settled question put to all of them (dig_ecosystem#2568, #2606).
 ///
 /// # How a sample is drawn
 ///
-/// Each member comes from calling `chia_query`'s `connect_random_peer` again — a fresh discovery
-/// per member rather than one list carved up — so no single resolution step decides the whole
-/// sample.
-///
-/// Two properties of that helper have to be compensated for HERE, because they would otherwise
-/// silently collapse the quorum, and neither is hypothetical:
+/// From [`peer_pool::PeerPool`], which holds [`peer_pool::TARGET_PEERS`] DISTINCT peers dialled
+/// from a candidate list resolved ONCE. That replaces the previous shape — a fresh
+/// `connect_random_peer` call per member, per round — and it is a strengthening, not just a
+/// saving. The old shape had to compensate, inside this type, for two properties of that helper:
 ///
 /// * **It tries `127.0.0.1` before anything else, unconditionally.** Any unprivileged co-resident
-///   process that binds `8444` first is therefore the peer EVERY call returns — the loopback-probe
-///   hazard [`PeerTrust`] already names. Four calls would yield four connections to one attacker
-///   and a "unanimous" verdict from a sample of one.
+///   process that binds `8444` first was therefore the peer EVERY call returned — the
+///   loopback-probe hazard [`PeerTrust`] names. Four calls would yield four connections to one
+///   attacker and a "unanimous" verdict from a sample of one.
 /// * **It returns the FIRST address that connects** out of a concurrent batch. That is
 ///   latency-biased selection, and latency is something an attacker running a fast, always-up node
 ///   controls.
 ///
-/// The compensation is DISTINCTNESS: an address already in this round's sample is discarded and
-/// re-drawn, within [`MAX_PROBE_ATTEMPTS`]. That is not a tidiness rule — it is the difference
-/// between four opinions and one opinion counted four times. Failing to assemble
-/// [`quorum::QUORUM_SAMPLE`] distinct peers inside the budget yields [`Verdict::Insufficient`],
-/// which writes nothing.
+/// The compensation was a retry-until-distinct loop, which removed the duplicates but left the
+/// bias: a fast, always-up peer stayed over-represented among the probes. The pool closes it at
+/// the source — the address list is resolved once, loopback is admitted only when the OPERATOR
+/// named it (dig_ecosystem#2573), and the sample is drawn uniformly over held members with
+/// [`quorum::select_sample`], so position in the list buys nothing.
 ///
-/// The residual bias is real and `SPEC.md` says so: a peer that is fast and always up remains
-/// over-represented among the probes. This raises an attacker's cost; it does not remove the
-/// advantage. Resolving the full introducer address list once and drawing from it with
-/// [`quorum::select_sample`] is the stronger form and is the tracked follow-up.
+/// A round that cannot draw [`quorum::QUORUM_SAMPLE`] distinct members yields
+/// [`Verdict::Insufficient`], which writes nothing. That is the pool being small, not the bar
+/// being lowered: agreement is still [`quorum::QUORUM_AGREEMENT`] of
+/// [`quorum::QUORUM_SAMPLE`].
 pub struct ChiaQuorumCorroborator {
-    network: chia_query::NetworkType,
-    /// How long to wait for one probe's dial and for its peak announcement.
-    timeout: Duration,
+    /// The held peers a sample is drawn from. Topped up at the start of every round, so a
+    /// member lost since the last round is replaced before anything is asked.
+    pool: Arc<peer_pool::PeerPool>,
 }
-
-/// How many dial attempts one round may make while assembling [`quorum::QUORUM_SAMPLE`] DISTINCT
-/// peers.
-///
-/// Bounded because the distinctness compensation is a retry loop over a helper that may keep
-/// returning the same address — a host with a co-resident full node returns localhost every single
-/// time — and an unbounded retry there is a hang, not a defence. Three attempts per required
-/// member is generous on a healthy network and short enough that a degenerate or hostile one
-/// degrades to "no quorum, nothing written" in seconds.
-const MAX_PROBE_ATTEMPTS: usize = quorum::QUORUM_SAMPLE * 3;
 
 impl ChiaQuorumCorroborator {
-    /// A mainnet corroborator.
-    pub fn mainnet() -> Self {
-        Self {
-            network: chia_query::NetworkType::Mainnet,
-            timeout: DIAL_TIMEOUT,
-        }
+    /// A corroborator drawing from `pool`.
+    pub fn new(pool: Arc<peer_pool::PeerPool>) -> Self {
+        Self { pool }
     }
 
-    /// Dial repeatedly, keeping the first [`quorum::QUORUM_SAMPLE`] DISTINCT addresses together
-    /// with each one's claimed peak.
-    async fn probe(&self) -> Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> {
-        let Ok(tls) = chia_query::peer::connect::create_generated_tls() else {
-            return Vec::new();
-        };
-        let mut sample: Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> = Vec::new();
+    /// Top the pool up, then draw [`quorum::QUORUM_SAMPLE`] distinct members with their own
+    /// peak claims.
+    ///
+    /// A member that has announced no peak yet is not a candidate ([`peer_pool::Member::candidate`])
+    /// and is EVICTED, so the next round refills its slot rather than sampling a mute peer
+    /// forever. Evicting is safe here precisely because it is not a punishment: the slot refills
+    /// from the same candidate list, and a peer that was merely slow to announce is re-dialled.
+    async fn probe(&self) -> Vec<(quorum::Candidate, peer_pool::Member)> {
+        self.pool.fill().await;
 
-        for _ in 0..MAX_PROBE_ATTEMPTS {
-            if sample.len() >= quorum::QUORUM_SAMPLE {
-                break;
+        let mut sample = Vec::new();
+        for member in self.pool.sample(quorum::QUORUM_SAMPLE).await {
+            match member.candidate() {
+                Some(candidate) => sample.push((candidate, member)),
+                None => self.pool.evict(member.addr).await,
             }
-            let Ok((peer, addr, receiver)) =
-                chia_query::peer::connect::connect_random_peer(self.network, &tls, self.timeout)
-                    .await
-            else {
-                continue;
-            };
-            let id = addr.to_string();
-            if sample.iter().any(|(c, _)| c.id == id) {
-                // The same peer again. Counting it twice would let one node supply an entire
-                // "independent" quorum, so it is discarded rather than admitted.
-                continue;
-            }
-            let Some(claim) = await_peak(receiver, self.timeout).await else {
-                continue;
-            };
-            sample.push((quorum::Candidate { id, claim }, peer));
         }
         sample
-    }
-}
-
-/// Read a peer's claimed tip from the `new_peak_wallet` it announces after the handshake.
-///
-/// A CLAIM, never a fact: a light client cannot verify either field. It is used only to COMPARE
-/// HEIGHTS — to exclude the badly-lagged, and to settle the height everyone is then asked about —
-/// and never reaches the replica.
-async fn await_peak(
-    mut receiver: tokio::sync::mpsc::Receiver<chia::protocol::Message>,
-    timeout: Duration,
-) -> Option<quorum::PeakClaim> {
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            () = &mut deadline => return None,
-            message = receiver.recv() => {
-                let message = message?;
-                if message.msg_type == chia::protocol::ProtocolMessageTypes::NewPeakWallet {
-                    let peak =
-                        <chia::protocol::NewPeakWallet as chia::traits::Streamable>::from_bytes(
-                            &message.data,
-                        )
-                        .ok()?;
-                    return Some(quorum::PeakClaim {
-                        height: peak.height,
-                        header_hash: peak.header_hash,
-                    });
-                }
-            }
-        }
     }
 }
 
@@ -959,7 +928,8 @@ impl Corroborator for ChiaQuorumCorroborator {
         // peer that is merely behind never becomes a dissenting vote. Then settle the question at
         // a height every survivor passed some blocks ago — where a lagging-but-honest peer and a
         // fully caught-up one hold the SAME answer, so a disagreement can no longer be explained
-        // by lag. That is the whole behind-versus-lying discriminator.
+        // by lag. That is the whole behind-versus-lying discriminator, and drawing from a pool
+        // does not touch it: the sample is smaller or larger, the normalisation is identical.
         let candidates: Vec<quorum::Candidate> = probes.iter().map(|(c, _)| c.clone()).collect();
         let eligible = quorum::eligible(&candidates, quorum::PEAK_LAG_TOLERANCE);
         let Some(height) = quorum::common_height(&eligible, quorum::SETTLED_LAG) else {
@@ -969,13 +939,13 @@ impl Corroborator for ChiaQuorumCorroborator {
         };
 
         let mut responses = Vec::new();
-        for (candidate, peer) in &probes {
+        for (candidate, member) in &probes {
             if !eligible.iter().any(|e| e.id == candidate.id) {
                 continue;
             }
             // A probe that will not answer is simply ABSENT from the tally, which counts against
             // reaching the quorum rather than for it.
-            if let Ok(Some(answer)) = header_hash_from(peer, height).await {
+            if let Some(answer) = member.peer.header_hash_at(height).await {
                 responses.push(quorum::Response {
                     peer: candidate.id.clone(),
                     answer,
