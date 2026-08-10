@@ -39,6 +39,33 @@ pub struct FallbackCoin {
     pub spent_timestamp: Option<u64>,
 }
 
+/// A coin's SPEND normalized from the fallback source: the coin that was consumed, plus the two
+/// programs that consumed it (dig_ecosystem#2572).
+///
+/// Deliberately NOT a [`FallbackCoin`]: a spend read tells you what a coin BECAME, and carries no
+/// heights at all — the source answers with a bare `(coin, puzzle_reveal, solution)` triple. Giving
+/// this type `created_height`/`spent_height` fields would invite a mapper to fill them with `None`
+/// and a caller to read that as "unconfirmed", when the truth is "this read never asked". The
+/// heights come from a SEPARATE coin-record read, composed one layer up
+/// ([`super::rpc::WalletBackend::coin_spend`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackCoinSpend {
+    /// The spent coin's id (hex, no `0x`), RECOMPUTED from the returned coin rather than echoed
+    /// from the request — see [`ChainFallback::coin_spend`] for why that distinction is the whole
+    /// point.
+    pub coin_id: String,
+    /// The spent coin's parent coin id (hex).
+    pub parent_coin_info: String,
+    /// The spent coin's puzzle hash (hex). The [`Self::puzzle_reveal`] tree-hashes to this.
+    pub puzzle_hash: String,
+    /// The spent coin's amount in mojos / base units.
+    pub amount: u64,
+    /// The puzzle reveal: hex of the serialized CLVM program, no `0x`.
+    pub puzzle_reveal: String,
+    /// The solution the puzzle ran with: hex of the serialized CLVM, no `0x`.
+    pub solution: String,
+}
+
 /// The fallback chain-read surface (design B.5). Small on purpose: only the reads the
 /// core wallet-data endpoints need while syncing or for out-of-DB lookups.
 #[async_trait]
@@ -49,6 +76,41 @@ pub trait ChainFallback: Send + Sync {
     async fn coin_records_by_hints(&self, hints: &[String]) -> Result<Vec<FallbackCoin>>;
     /// A single coin by id (out-of-DB / arbitrary lookup).
     async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>>;
+
+    /// The SPEND that spent `coin_id`, or `Ok(None)` when a chain ANSWERED that no such spend
+    /// exists — the coin is unspent, or unknown (dig_ecosystem#2572).
+    ///
+    /// # Three values, never two
+    ///
+    /// A spend, a legitimate absence, and a failure to read are three DIFFERENT answers. `Ok(None)`
+    /// is the middle one only. Collapsing a failure into it is a money lie in the direction that
+    /// costs the most: a caller following a singleton forward reads "no spend" as *this coin is the
+    /// tip* and builds its next spend against a coin that has in fact already been spent, which the
+    /// mempool then rejects — or, on a mint poll, reads a dropped connection as "the funding coin is
+    /// still there" and funds the same mint twice.
+    ///
+    /// # The answer is BOUND to the question
+    ///
+    /// An implementation MUST recompute the returned coin's id — `SHA256(parent ‖ puzzle_hash ‖
+    /// amount)`, self-certifying — and return `Err` when it is not the id asked for, exactly as
+    /// [`Self::coin_record_by_id`] does. It MUST also verify that the puzzle reveal tree-hashes to
+    /// the spent coin's own puzzle hash, and fail closed when it does not or when the reveal will
+    /// not parse. Both checks are local and need no second source; without them a single hostile
+    /// peer decides what a caller believes a coin became.
+    async fn coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>>;
+
+    /// The DIRECT children created by spending `parent_coin_id` — ONE hop, never a walk
+    /// (dig_ecosystem#2572).
+    ///
+    /// An empty vector means a chain ANSWERED and that parent created no children it knows of
+    /// (typically: the parent is unspent). Every failure to reach a chain is an `Err` — an empty
+    /// list returned for an outage reads as "that spend created nothing", which terminates a lineage
+    /// walk early and silently.
+    ///
+    /// An implementation MUST assert that every returned child's `parent_coin_info` is the parent
+    /// asked for, and return `Err` on any that is not: an unrelated coin admitted here becomes a
+    /// forged branch of somebody's lineage.
+    async fn coin_records_by_parent(&self, parent_coin_id: &str) -> Result<Vec<FallbackCoin>>;
 
     /// Whether this fallback can actually reach a chain source. `true` for a live tier
     /// ([`CoinsetFallback`]); `false` for the graceful no-network [`EmptyFallback`], whose
@@ -124,6 +186,37 @@ impl CoinsetFallback {
             amount: coin.amount,
         };
         Ok(hex::encode(c.coin_id()))
+    }
+
+    /// Verify a puzzle reveal against the puzzle hash it claims to reveal, yielding the reveal's
+    /// canonical bare-hex form.
+    ///
+    /// A puzzle reveal arrives from an unauthenticated peer, and a peer can send any program at
+    /// all. The check is purely local because a puzzle hash IS the reveal's CLVM tree hash: a
+    /// substituted program cannot hash to the coin's own puzzle hash. Skipping it would let a peer
+    /// dictate what a caller believes a coin's puzzle was — and a caller reconstructing a singleton
+    /// lineage curries that program forward, so the forgery propagates into the spend it builds.
+    ///
+    /// Fails CLOSED on both a mismatch and an unparseable reveal, because "I could not check it" and
+    /// "it failed the check" oblige the same refusal.
+    fn verified_reveal(puzzle_reveal: &str, puzzle_hash: &str) -> Result<String> {
+        let reveal_hex = Self::norm_hex(puzzle_reveal);
+        let bytes = hex::decode(&reveal_hex)
+            .map_err(|e| Error::internal(format!("fallback spend read: puzzle_reveal hex: {e}")))?;
+        let tree_hash = chia::clvm_utils::tree_hash_from_bytes(&bytes).map_err(|e| {
+            Error::internal(format!(
+                "fallback spend read: puzzle_reveal is not a parseable CLVM program: {e}"
+            ))
+        })?;
+        let claimed = Self::norm_hex(puzzle_hash);
+        let actual = hex::encode(tree_hash.to_bytes());
+        if actual != claimed {
+            return Err(Error::internal(format!(
+                "fallback spend read: the puzzle reveal tree-hashes to {actual}, not to the spent \
+                 coin's puzzle hash {claimed}"
+            )));
+        }
+        Ok(reveal_hex)
     }
 
     fn map_record(r: &chia_query::CoinRecord) -> Result<FallbackCoin> {
@@ -213,6 +306,82 @@ impl ChainFallback for CoinsetFallback {
         }
         Ok(Some(coin))
     }
+
+    /// `Ok(None)` ONLY when a chain ANSWERED that the coin has no spend; every failure is an `Err`
+    /// (dig_ecosystem#2572).
+    ///
+    /// Uses `chia-query`'s absence-aware `get_coin_spend_opt`, whose `Ok(None)` is a `success: true`
+    /// envelope carrying a null `coin_solution`. The nearby [`ChiaQueryLineage::parent_spend`]
+    /// deliberately does NOT share this path: it maps EVERY error to `Ok(None)`, which is precisely
+    /// the collapse this method must not make.
+    ///
+    /// Both bindings from the trait contract are enforced here, and they check different things: the
+    /// coin-id recomputation says WHICH coin the answer describes, and the reveal's tree hash says
+    /// the program really is that coin's puzzle. A substitution passing one still fails the other.
+    async fn coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+        let spend = self
+            .query
+            .get_coin_spend_opt(&Self::query_hash(coin_id))
+            .await
+            .map_err(|e| Error::internal(format!("fallback coin-spend read: {e}")))?;
+        let Some(spend) = spend else {
+            return Ok(None);
+        };
+        let answered_id = Self::coin_id_of(&spend.coin)?;
+        let asked_id = Self::norm_hex(coin_id);
+        if answered_id != asked_id {
+            return Err(Error::internal(format!(
+                "fallback coin-spend read: source answered with the spend of a different coin \
+                 ({answered_id} for a request for {asked_id})"
+            )));
+        }
+        let puzzle_hash = Self::norm_hex(&spend.coin.puzzle_hash);
+        let puzzle_reveal = Self::verified_reveal(&spend.puzzle_reveal, &puzzle_hash)?;
+        Ok(Some(FallbackCoinSpend {
+            coin_id: answered_id,
+            parent_coin_info: Self::norm_hex(&spend.coin.parent_coin_info),
+            puzzle_hash,
+            amount: spend.coin.amount,
+            puzzle_reveal,
+            solution: Self::norm_hex(&spend.solution),
+        }))
+    }
+
+    /// The parent's DIRECT children. An empty vector is an ANSWER; every failure is an `Err`
+    /// (dig_ecosystem#2572).
+    ///
+    /// `include_spent_coins: true` because a child that has since been spent is still a child — a
+    /// lineage walk follows exactly those, so filtering them out would hide every hop but the last.
+    /// No height window, for the same reason: a caller naming a parent has not named a height, and
+    /// inventing one would silently drop children outside it.
+    ///
+    /// Every child is checked to actually name the requested parent. Unlike a coin id, a
+    /// parent-child link is NOT self-certifying from the child alone, so this check is a
+    /// consistency assertion on what the source said rather than a cryptographic proof — but it is
+    /// what stops an unrelated coin being admitted as somebody's descendant, which a caller would
+    /// then walk forward as if it were theirs.
+    async fn coin_records_by_parent(&self, parent_coin_id: &str) -> Result<Vec<FallbackCoin>> {
+        let asked = Self::norm_hex(parent_coin_id);
+        let records = self
+            .query
+            .get_coin_records_by_parent_ids(&[Self::query_hash(parent_coin_id)], None, None, true)
+            .await
+            .map_err(|e| Error::internal(format!("fallback children read: {e}")))?;
+        records
+            .iter()
+            .map(|r| {
+                let child = Self::map_record(r)?;
+                if child.parent_coin_info != asked {
+                    return Err(Error::internal(format!(
+                        "fallback children read: source answered with a child of {} for a request \
+                         for the children of {asked}",
+                        child.parent_coin_info
+                    )));
+                }
+                Ok(child)
+            })
+            .collect()
+    }
 }
 
 /// The production lineage source (§18.12): resolves a parent coin's spend (puzzle reveal +
@@ -285,7 +454,16 @@ impl ChainFallback for EmptyFallback {
     async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
         Ok(None)
     }
+    async fn coin_spend(&self, _coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+        Ok(None)
+    }
+    async fn coin_records_by_parent(&self, _parent_coin_id: &str) -> Result<Vec<FallbackCoin>> {
+        Ok(Vec::new())
+    }
     /// No network: not a live chain source (#1851).
+    ///
+    /// This is what keeps the silent empties above from ever being SERVED as absence: every caller
+    /// checks [`Self::is_live`] first and answers `WALLET_NO_CHAIN_SOURCE` instead.
     fn is_live(&self) -> bool {
         false
     }
@@ -517,6 +695,8 @@ pub(crate) mod mock {
     #[derive(Default)]
     pub struct MockFallback {
         pub coins: Vec<FallbackCoin>,
+        /// The spends this double knows, keyed by their spent coin's id (dig_ecosystem#2572).
+        pub spends: Vec<FallbackCoinSpend>,
         pub calls: Arc<AtomicUsize>,
     }
 
@@ -524,8 +704,16 @@ pub(crate) mod mock {
         pub fn with_coins(coins: Vec<FallbackCoin>) -> Self {
             Self {
                 coins,
+                spends: Vec::new(),
                 calls: Arc::new(AtomicUsize::new(0)),
             }
+        }
+        /// Add the spends this double will answer with. Kept SEPARATE from `coins` so a fixture can
+        /// express a coin that exists with no spend, and a spend whose coin record is missing —
+        /// two states the composed read must tell apart.
+        pub fn with_spends(mut self, spends: Vec<FallbackCoinSpend>) -> Self {
+            self.spends = spends;
+            self
         }
         pub fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
@@ -556,6 +744,19 @@ pub(crate) mod mock {
         async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.coins.iter().find(|c| c.coin_id == coin_id).cloned())
+        }
+        async fn coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.spends.iter().find(|s| s.coin_id == coin_id).cloned())
+        }
+        async fn coin_records_by_parent(&self, parent_coin_id: &str) -> Result<Vec<FallbackCoin>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .coins
+                .iter()
+                .filter(|c| c.parent_coin_info == parent_coin_id)
+                .cloned()
+                .collect())
         }
     }
 }

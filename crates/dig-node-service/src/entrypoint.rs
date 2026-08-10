@@ -259,6 +259,28 @@ enum WalletCommand {
         /// The coin id: 64 lowercase-hex characters (an optional `0x` prefix is allowed).
         coin_id: String,
     },
+    /// Look up the SPEND that spent one coin (READ-ONLY; needs no seed or pairing).
+    ///
+    /// A coin record says a coin is gone; only its spend says what it became. Answers with the
+    /// puzzle reveal and the solution, which is what a lineage walk needs.
+    CoinSpend {
+        /// The SPENT coin's id: 64 lowercase-hex characters (an optional `0x` prefix is allowed).
+        coin_id: String,
+    },
+    /// List the DIRECT children one coin's spend created (READ-ONLY; needs no seed or pairing).
+    ///
+    /// ONE hop, never a recursive walk: to follow a lineage, call this again with a child's id.
+    CoinsByParent {
+        /// The PARENT coin's id: 64 lowercase-hex characters (an optional `0x` prefix is allowed).
+        parent_coin_id: String,
+        /// Resume STRICTLY AFTER this child — pass the `cursor` from the previous page. Omit to
+        /// start at the first child.
+        #[arg(long)]
+        after_coin_id: Option<String>,
+        /// The page size (1..=1000). Omit to let the node use the contract's default of 100.
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// List incoming funds CONFIRMED since a cursor (READ-ONLY; needs no seed or pairing).
     ///
     /// Each row is money that ARRIVED: confirmed on chain, above this wallet's arrival baseline,
@@ -576,6 +598,16 @@ fn wallet_action(cmd: WalletCommand) -> ControlAction {
         }
         WalletCommand::Coins { address, asset } => ControlAction::WalletCoins { address, asset },
         WalletCommand::CoinById { coin_id } => ControlAction::WalletCoinById { coin_id },
+        WalletCommand::CoinSpend { coin_id } => ControlAction::WalletCoinSpend { coin_id },
+        WalletCommand::CoinsByParent {
+            parent_coin_id,
+            after_coin_id,
+            limit,
+        } => ControlAction::WalletCoinsByParent {
+            parent_coin_id,
+            after_coin_id,
+            limit,
+        },
         WalletCommand::Arrivals { after_seq, limit } => {
             ControlAction::WalletArrivals { after_seq, limit }
         }
@@ -826,14 +858,36 @@ mod tests {
     /// also fails if the verb parses but maps to the wrong one.
     #[test]
     fn every_wallet_control_method_is_reachable_from_a_real_command_line() {
-        let address = "xch1up0vfatgtwrcgcvc360jd57t3p2kjskncutvzakh9mhdmlvejj3shn8wln";
-        for (argv, expected) in [
+        for (argv, expected) in wallet_command_lines() {
+            assert_eq!(
+                method_for_argv(&argv),
+                Some(expected),
+                "`{}` must dispatch {expected}",
+                argv.join(" ")
+            );
+        }
+    }
+
+    /// A well-formed coin id for the command lines below. Its value is irrelevant — the parser
+    /// never inspects it — but it must be well-formed so a future clap-level validator would not
+    /// silently turn these into parse failures.
+    const A_COIN_ID: &str = "abababababababababababababababababababababababababababababababab";
+
+    /// Every wallet verb as a REAL command line, paired with the method it must dispatch.
+    ///
+    /// Hoisted out of the test so a second test can assert the table is COMPLETE
+    /// ([`the_command_line_table_covers_every_wallet_control_method`]); a table that lives inside
+    /// the assertion that consumes it can only ever prove things about the rows somebody
+    /// remembered to add.
+    fn wallet_command_lines() -> Vec<(Vec<&'static str>, &'static str)> {
+        const ADDRESS: &str = "xch1up0vfatgtwrcgcvc360jd57t3p2kjskncutvzakh9mhdmlvejj3shn8wln";
+        vec![
             (
-                vec!["dig-node", "wallet", "balance", address],
+                vec!["dig-node", "wallet", "balance", ADDRESS],
                 "control.wallet.balance",
             ),
             (
-                vec!["dig-node", "wallet", "coins", address],
+                vec!["dig-node", "wallet", "coins", ADDRESS],
                 "control.wallet.coins",
             ),
             (
@@ -845,14 +899,54 @@ mod tests {
                 vec!["dig-node", "wallet", "broadcast", "deadbeef"],
                 "control.wallet.broadcast",
             ),
-        ] {
-            assert_eq!(
-                method_for_argv(&argv),
-                Some(expected),
-                "`{}` must dispatch {expected}",
-                argv.join(" ")
-            );
-        }
+            (
+                vec!["dig-node", "wallet", "coin-by-id", A_COIN_ID],
+                "control.wallet.coinById",
+            ),
+            (
+                vec!["dig-node", "wallet", "coin-spend", A_COIN_ID],
+                "control.wallet.coinSpend",
+            ),
+            (
+                vec!["dig-node", "wallet", "coins-by-parent", A_COIN_ID],
+                "control.wallet.coinsByParent",
+            ),
+            (
+                vec!["dig-node", "wallet", "sync-status"],
+                "control.wallet.syncStatus",
+            ),
+        ]
+    }
+
+    /// **The table above is COMPLETE: every wallet method with a CLI verb appears in it.**
+    ///
+    /// The test above proves each LISTED verb really parses. It says nothing at all about a method
+    /// that was never listed — and that silence is not hypothetical: `control.wallet.coinById` and
+    /// `control.wallet.syncStatus` were both absent from it for months while every gate stayed
+    /// green, because the enforcing lists (`cli_covered_control_methods`, `CONTROL_METHODS`) are
+    /// satisfied by an ACTION variant existing, which is exactly the thing that once shipped with
+    /// no clap subcommand behind it (dig_ecosystem#2376).
+    ///
+    /// So this asserts the table's coverage against the declared surface rather than against
+    /// memory. Adding a wallet method now fails HERE until its verb is exercised by a real command
+    /// line, which is the only assertion in this file that a parser cannot pass vacuously.
+    #[test]
+    fn the_command_line_table_covers_every_wallet_control_method() {
+        use std::collections::BTreeSet;
+
+        let exercised: BTreeSet<&str> =
+            wallet_command_lines().into_iter().map(|(_, m)| m).collect();
+        let declared: BTreeSet<&str> = crate::control_cli::cli_covered_control_methods()
+            .into_iter()
+            .filter(|m| m.starts_with("control.wallet."))
+            .collect();
+
+        let unexercised: Vec<&&str> = declared.difference(&exercised).collect();
+        assert!(
+            unexercised.is_empty(),
+            "these wallet control methods have a CLI action but no command line proving the verb \
+             parses: {unexercised:?}"
+        );
     }
 
     /// **The parsed arguments reach the wire, not just the method name.**

@@ -62,6 +62,15 @@ pub enum ControlAction {
     WalletCoins { address: String, asset: String },
     /// `control.wallet.coinById` — the READ-ONLY lookup of ONE coin by coin id (spent or not).
     WalletCoinById { coin_id: String },
+    /// `control.wallet.coinSpend` — the READ-ONLY spend that spent one coin (reveal + solution).
+    WalletCoinSpend { coin_id: String },
+    /// `control.wallet.coinsByParent` — ONE PAGE of the READ-ONLY direct children one coin's
+    /// spend created. `after_coin_id` resumes from the `cursor` of a previous page.
+    WalletCoinsByParent {
+        parent_coin_id: String,
+        after_coin_id: Option<String>,
+        limit: Option<u32>,
+    },
     /// `control.wallet.arrivals` — the READ-ONLY incoming funds confirmed since a cursor.
     WalletArrivals { after_seq: i64, limit: i64 },
     /// `control.wallet.syncStatus` — the READ-ONLY wallet chain-sync phase, replica height and
@@ -109,6 +118,8 @@ impl ControlAction {
             ControlAction::WalletBalance { .. } => "control.wallet.balance",
             ControlAction::WalletCoins { .. } => "control.wallet.coins",
             ControlAction::WalletCoinById { .. } => "control.wallet.coinById",
+            ControlAction::WalletCoinSpend { .. } => "control.wallet.coinSpend",
+            ControlAction::WalletCoinsByParent { .. } => "control.wallet.coinsByParent",
             ControlAction::WalletArrivals { .. } => "control.wallet.arrivals",
             ControlAction::WalletPeak => "control.wallet.peak",
             ControlAction::WalletSyncStatus => "control.wallet.syncStatus",
@@ -140,7 +151,29 @@ impl ControlAction {
             | ControlAction::WalletCoins { address, asset } => {
                 json!({ "address": address, "asset": asset })
             }
-            ControlAction::WalletCoinById { coin_id } => json!({ "coin_id": coin_id }),
+            ControlAction::WalletCoinById { coin_id }
+            | ControlAction::WalletCoinSpend { coin_id } => json!({ "coin_id": coin_id }),
+            // A DIFFERENT field name, on purpose: the contract names the subject
+            // `parent_coin_id` so a one-hop answer cannot read as a truncated lineage. Folding it
+            // into the arm above would send `coin_id` and the node would refuse it as missing.
+            ControlAction::WalletCoinsByParent {
+                parent_coin_id,
+                after_coin_id,
+                limit,
+            } => {
+                // The two page fields are OMITTED when unset rather than sent as null, so the node
+                // applies the CONTRACT's default page size. Sending a number this CLI invented
+                // would make `dig-node wallet coins-by-parent` page differently from every other
+                // client for no reason a user asked for.
+                let mut params = json!({ "parent_coin_id": parent_coin_id });
+                if let Some(after) = after_coin_id {
+                    params["after_coin_id"] = json!(after);
+                }
+                if let Some(limit) = limit {
+                    params["limit"] = json!(limit);
+                }
+                params
+            }
             ControlAction::WalletArrivals { after_seq, limit } => {
                 json!({ "after_seq": after_seq, "limit": limit })
             }
@@ -209,6 +242,16 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         .method(),
         ControlAction::WalletCoinById {
             coin_id: String::new(),
+        }
+        .method(),
+        ControlAction::WalletCoinSpend {
+            coin_id: String::new(),
+        }
+        .method(),
+        ControlAction::WalletCoinsByParent {
+            parent_coin_id: String::new(),
+            after_coin_id: None,
+            limit: None,
         }
         .method(),
         ControlAction::WalletArrivals {
@@ -370,6 +413,34 @@ fn summarize(method: &str, result: &Value) -> String {
                 )
             }
         },
+        // Reports the reveal/solution SIZES rather than their hex, which routinely runs to
+        // kilobytes: a human summary that scrolls a terminal off its own screen is not a summary.
+        // `--json` carries the bytes for anything that needs them.
+        "control.wallet.coinSpend" => match result["spend"].as_object() {
+            None => "no spend of that coin on chain (unspent, or unknown)".to_string(),
+            Some(spend) => {
+                let hex_len = |key: &str| spend[key].as_str().unwrap_or_default().len() / 2;
+                format!(
+                    "spend of {} at height {} · puzzle reveal {} bytes · solution {} bytes",
+                    spend["coin"]["coin_id"].as_str().unwrap_or("?"),
+                    height(&spend["coin"]["spent_height"]),
+                    hex_len("puzzle_reveal"),
+                    hex_len("solution"),
+                )
+            }
+        },
+        // Says explicitly whether the page is the whole child set, and how to get the rest. A
+        // summary that printed only a count would let a truncated page read as a finished hop --
+        // the exact misreading `complete` exists to prevent.
+        "control.wallet.coinsByParent" => {
+            let coins = result["coins"].as_array().map(Vec::len).unwrap_or(0);
+            let more = match (result["complete"].as_bool(), result["cursor"].as_str()) {
+                (Some(true), _) => " · complete".to_string(),
+                (_, Some(cursor)) => format!(" · MORE remain — resume after {cursor}"),
+                _ => " · completeness unknown (a node too old to say)".to_string(),
+            };
+            format!("{coins} direct child coin(s) — one hop, not a lineage{more}")
+        }
         "control.updater.status" => summarize_updater_status(result),
         _ => compact(result),
     }
