@@ -396,7 +396,10 @@ async fn supervisor_with_no_derivations_never_marks_initial_sync_complete() {
 /// **Proves (T3, #2501):** the replica's peak advances even with zero derivations.
 ///
 /// `new_peak_wallet` is not a subscription response, so it arrives regardless of what was
-/// subscribed — which is what makes a peak-only session useful on a wallet-less node. The
+/// subscribed — which is what lets an OPERATOR peer's session keep the peak current on a
+/// wallet-less node. [`Harness::start`] dials as [`PeerTrust::Operator`]; a DISCOVERED peer
+/// subscribes nothing AND writes nothing, so it never advances the peak (see
+/// [`a_discovered_peer_never_marks_the_replica_authoritative_across_reconnects`]). The
 /// message here is a real encoded `NewPeakWallet` decoded by the real
 /// [`sync::run_update_loop`]; the double supplies only the socket.
 #[tokio::test]
@@ -426,7 +429,7 @@ async fn supervisor_with_no_derivations_still_advances_the_replica_peak() {
     assert_eq!(
         db.sync_state().await.unwrap().peak_height,
         Some(6_123_456),
-        "a peak-only session must still advance the replica peak"
+        "an operator peer's nothing-subscribed session must still advance the replica peak"
     );
     assert!(
         !db.is_synced().await.unwrap(),
@@ -744,7 +747,8 @@ async fn backoff_grows_then_resets_after_a_long_lived_connection() {
 
     let h = Harness::start(
         db,
-        // A subscribed wallet, so `slept` records ONLY the backoff ladder: a peak-only session
+        // A subscribed wallet, so `slept` records ONLY the backoff ladder: a nothing-subscribed
+        // session
         // additionally re-polls for a newly-created wallet on its own interval, and those sleeps
         // would be indistinguishable from backoff rungs here.
         Arc::new(FixedHashes(vec![Bytes32::new([4; 32])])),

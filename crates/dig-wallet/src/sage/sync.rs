@@ -650,9 +650,11 @@ pub async fn initial_sync_with(
 }
 
 /// Consume peer pushes on the receiver until it closes: `coin_state_update` →
-/// [`handle_coin_state_update`]; `new_peak_wallet` → advance the peak. This is the
-/// production loop run after [`initial_sync`]; it returns when the peer disconnects, at
-/// which point it publishes [`SyncEvent::Stop`] on `events`.
+/// [`handle_coin_state_update`]; `new_peak_wallet` → advance the peak, but ONLY from an
+/// authoritative peer — a [`PeerTrust::Discovered`] peer's height is dropped here, for the same
+/// reason its coins are (see [`PeerTrust`]). This is the production loop run after
+/// [`initial_sync`]; it returns when the peer disconnects, at which point it publishes
+/// [`SyncEvent::Stop`] on `events`.
 ///
 /// When `attributor` is `Some`, each applied `coin_state_update` is followed by a CAT/
 /// singleton attribution pass (#407) so newly-synced CAT coins gain their `asset_id`. When
