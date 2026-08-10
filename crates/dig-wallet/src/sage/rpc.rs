@@ -1828,14 +1828,48 @@ impl WalletBackend {
         singleton::bytes32_from_hex(&hex)
     }
 
+    /// Refuse to select spend inputs from a replica that is not authoritative.
+    ///
+    /// Every OTHER wallet-scoped read passes through [`routing::route`]; the two spend-input
+    /// readers below did not, so they selected coins straight out of the local table even while
+    /// `initial_sync_complete` was false — the tier gate that guards every displayed balance
+    /// never guarded the money path at all. The table is written by a peer, and the
+    /// subscription filter is no defence against the peer itself: the wallet HANDS it the
+    /// puzzle-hash set, so every hash that passes the filter is one the peer was just given.
+    ///
+    /// Refusing is the right failure. An unsynced replica cannot be corrected into a safe input
+    /// set by falling back per-coin — the fallback tier can say a coin exists, but the *set* of
+    /// spendable coins is exactly what the replica is not entitled to assert yet. The remedy is
+    /// to finish an authoritative sync (an operator-chosen peer, or
+    /// [`Self::refresh_tracked_coins`] off the chain-oracle tier), which is a state the caller
+    /// can reach; a spend built from unverified inputs is not.
+    async fn require_authoritative_coins(&self) -> Result<()> {
+        if routing::route(self.synced().await?, true) == Source::Db {
+            return Ok(());
+        }
+        Err(Error::internal(
+            "the local coin replica is not authoritative (initial sync incomplete): refusing to \
+             build a spend from it",
+        ))
+    }
+
     /// The spendable coins for an asset (`None` = XCH), as `chia_protocol::Coin`s.
+    ///
+    /// Gated on [`Self::require_authoritative_coins`] — this is a spend-input read, not a
+    /// display read.
     async fn spendable_coins(&self, asset_id: Option<&str>) -> Result<Vec<Coin>> {
+        self.require_authoritative_coins().await?;
         let rows = self.db.unspent_coins(asset_id).await?;
         rows.iter().map(singleton::coin_from_row).collect()
     }
 
     /// Fetch specific coins by id (all must exist), as `chia_protocol::Coin`s.
+    ///
+    /// Gated on [`Self::require_authoritative_coins`] for the same reason as
+    /// [`Self::spendable_coins`]: naming a coin id does not make the row describing it any more
+    /// verified than the rest of the table.
     async fn coins_from_ids(&self, ids: &[String]) -> Result<Vec<Coin>> {
+        self.require_authoritative_coins().await?;
         let rows = self.db.coins_by_ids(ids).await?;
         if rows.len() != ids.len() {
             return Err(Error::not_found(
@@ -5296,6 +5330,97 @@ mod tests {
         (be, bc, ph)
     }
 
+    // ---- F2: the spend path is tier-gated like every other wallet read --------------------
+
+    /// **Proves (F2, #2501 re-audit):** coins a peer put in the local table cannot fund a spend
+    /// while the replica is not authoritative - at BOTH hops, the input reader and the RPC that
+    /// calls it.
+    ///
+    /// The fixture is the auditor's: FIFTY fabricated coins at the wallet's own puzzle hash,
+    /// which is exactly the shape the subscription filter cannot catch, because the wallet HANDS
+    /// the peer that hash. They are worth 50 XCH, so a run that selects them is unmistakable.
+    ///
+    /// Two hops, deliberately. This defect is a PLACEMENT - the gate existed in
+    /// [`routing::route`] and the spend readers simply never called it - so a test that only
+    /// drove `send_xch` would stay green if the guard were later moved somewhere that leaves
+    /// `spendable_coins` open to its other callers (offers, mint, the node-custodied tip spend).
+    /// The control at the end flips ONLY the authority flag and shows the very same rows
+    /// becoming selectable, so the test cannot be passed by a backend that is simply broken.
+    #[tokio::test]
+    async fn fabricated_coins_cannot_fund_a_spend_from_an_unauthoritative_replica() {
+        let pair = BlsPair::new(3);
+        let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
+        let ph = *signer.puzzle_hashes().iter().next().unwrap();
+        let ph_hex = hex::encode(ph);
+
+        let fabricated: Vec<CoinRow> = (0..50)
+            .map(|i| CoinRow {
+                coin_id: format!("{i:064x}"),
+                parent_coin_info: "11".repeat(32),
+                puzzle_hash: ph_hex.clone(),
+                amount: 1_000_000_000_000u64.to_string(),
+                created_height: Some(5),
+                spent_height: None,
+                asset_id: None,
+                hint: None,
+                created_timestamp: Some(1),
+                spent_timestamp: None,
+            })
+            .collect();
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&fabricated).await.unwrap();
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "the fixture must exercise the UNAUTHORITATIVE tier"
+        );
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![ph_hex.clone()],
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), cfg).with_signer(signer);
+
+        // Hop 1: the input reader every spend builder shares.
+        assert!(
+            be.spendable_coins(None).await.is_err(),
+            "spend inputs must not be read from an unauthoritative replica"
+        );
+        assert!(
+            be.coins_from_ids(&["0".repeat(63) + "0"]).await.is_err(),
+            "naming a coin id does not make its row any more verified"
+        );
+
+        // Hop 2: the RPC a caller actually reaches, end to end.
+        let sent = be
+            .send_xch(&SendXch {
+                address: encode_address(&ph_hex, "txch").unwrap(),
+                amount: Amount::Number(1),
+                fee: Amount::Number(0),
+                memos: vec![],
+                clawback: None,
+                auto_submit: false,
+            })
+            .await;
+        assert!(
+            sent.is_err(),
+            "send_xch must refuse rather than spend fabricated inputs"
+        );
+
+        // The control: the ONLY thing that changes is the authority flag.
+        be.db.set_initial_sync_complete(true).await.unwrap();
+        let coins = be
+            .spendable_coins(None)
+            .await
+            .expect("an authoritative replica supplies inputs normally");
+        assert_eq!(
+            coins.len(),
+            50,
+            "the same rows are selectable once the replica is authoritative - so the refusal \
+             above was the tier gate and not an empty table"
+        );
+    }
+
     /// Point-read live sync (§18.12): `refresh_tracked_coins` reads the wallet's coins from the
     /// fallback tier, upserts them into the DB, and marks the DB synced — so coin selection then
     /// runs over live-synced state. Proven with a [`MockFallback`] holding one XCH coin at the
@@ -5324,8 +5449,13 @@ mod tests {
         };
         let be = WalletBackend::new(db, Arc::new(fallback), cfg).with_signer(signer);
 
-        // Before the sync the DB has no spendable coins.
-        assert!(be.spendable_coins(None).await.unwrap().is_empty());
+        // Before the sync the replica is not authoritative, so selecting spend inputs from it
+        // is REFUSED — not answered with an empty set, which a caller could not distinguish
+        // from a genuinely empty wallet.
+        assert!(
+            be.spendable_coins(None).await.is_err(),
+            "an unsynced replica must refuse to supply spend inputs"
+        );
         // Sync from the fallback → the coin lands in the DB.
         let n = be.refresh_tracked_coins().await.unwrap();
         assert_eq!(n, 1, "one XCH coin synced from the fallback");

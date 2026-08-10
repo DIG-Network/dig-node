@@ -1709,9 +1709,15 @@ mod tests {
                 "control.wallet.coins",
                 "control.wallet.coinById",
                 "control.wallet.peak",
-                // Both report only how far THIS node has got and how many peers it holds —
-                // no address, no coin, nothing a caller does not already know by being on
-                // the loopback. `dig-node-control-interface` declares them open too.
+                // `control.wallet.syncStatus` reports only how far THIS node has got.
+                //
+                // `control.peerCounts` is a DELIBERATE disclosure rather than an inert one, and
+                // the distinction matters: its `dig_peer_count` is obtained by internally
+                // dispatching `control.peerStatus`, which IS token-gated. What is opened is the
+                // bare cardinality — how many peers this node holds — which a caller needs to
+                // render a connection indicator and which reveals nothing about WHICH peers or
+                // how they are reached. The identity/topology half of `peerStatus` stays behind
+                // the token. Both are published open in `dig-node-control-interface`.
                 "control.wallet.syncStatus",
                 "control.peerCounts",
             ]

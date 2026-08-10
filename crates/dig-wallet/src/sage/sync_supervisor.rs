@@ -39,7 +39,7 @@ use chia_protocol::Bytes32;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
-use super::sync::{self, SyncError};
+use super::sync::{self, PeerTrust, SyncError};
 
 /// The initial reconnect delay.
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -231,6 +231,11 @@ pub trait SyncSession: Send + Sync {
     /// The address dialed, for the [`crate::sage::events::SyncEvent::Start`] event.
     fn peer_ip(&self) -> String;
 
+    /// How far this session's peer is trusted — decided by HOW it was reached, not by anything
+    /// it says. See [`PeerTrust`]: only an operator-chosen peer may make the replica
+    /// authoritative, so this is the single fact the whole trust model turns on.
+    fn trust(&self) -> PeerTrust;
+
     /// Subscribe `puzzle_hashes` and catch the replica up.
     async fn catch_up(
         &self,
@@ -242,13 +247,14 @@ pub trait SyncSession: Send + Sync {
 
     /// Consume peer pushes until the peer disconnects. Consumes the session.
     ///
-    /// `subscribed` is the set this session subscribed in [`SyncSession::catch_up`]; pushed coins
-    /// outside it are dropped, because a peer answers a subscription rather than defining one.
+    /// `session` carries the set this session subscribed in [`SyncSession::catch_up`] (pushed
+    /// coins outside it are dropped, because a peer answers a subscription rather than defining
+    /// one), its peer's trust level, and its rollback allowance.
     async fn run(
         self: Box<Self>,
         db: &WalletDb,
         events: &EventBus,
-        subscribed: &sync::SubscribedHashes,
+        session: &mut sync::SessionState<'_>,
     ) -> Result<(), SyncError>;
 }
 
@@ -388,7 +394,16 @@ impl Supervisor {
             // memory of the previous subscription, and resuming from the stored
             // (height, header_hash) is not safe while `run_update_loop`'s `NewPeakWallet` arm
             // advances the height while carrying the OLD hash forward.
-            let puzzle_hashes = self.puzzle_hashes.puzzle_hashes();
+            //
+            // A DISCOVERED peer subscribes nothing, whatever the wallet holds: its answers may
+            // never make the replica authoritative (`sync::PeerTrust`), so a subscription would
+            // buy only a coin table it is not allowed to be believed about. It runs as a
+            // peak-only session, which is what powers the live sync status.
+            let trust = session.trust();
+            let puzzle_hashes = match trust {
+                PeerTrust::Operator => self.puzzle_hashes.puzzle_hashes(),
+                PeerTrust::Discovered => Vec::new(),
+            };
             let subscribed: sync::SubscribedHashes = puzzle_hashes.iter().copied().collect();
             let peak_only = puzzle_hashes.is_empty();
             if peak_only {
@@ -415,8 +430,9 @@ impl Supervisor {
                 continue;
             }
 
+            let mut state = sync::SessionState::new(&subscribed, trust);
             let outcome = tokio::select! {
-                result = session.run(&self.db, &self.events, &subscribed) => {
+                result = session.run(&self.db, &self.events, &mut state) => {
                     if let Err(e) = result {
                         tracing::warn!(error = %e, "wallet sync: update loop ended in error");
                     }
@@ -424,7 +440,10 @@ impl Supervisor {
                 }
                 // A wallet appeared while this peak-only session was running. The subscription
                 // is per-connection state, so the only way to subscribe it is a new session.
-                () = self.await_puzzle_hashes(peak_only) => SessionOutcome::Resubscribe,
+                // Only worth waiting for on a peer that could actually subscribe them; a
+                // discovered peer stays peak-only however many wallets appear.
+                () = self.await_puzzle_hashes(peak_only && trust.is_authoritative())
+                    => SessionOutcome::Resubscribe,
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
                 _ = shutdown.changed() => SessionOutcome::Stop,
@@ -544,6 +563,7 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
                     return Ok(Box::new(ChiaPeerSession {
                         peer,
                         ip: addr.to_string(),
+                        trust: PeerTrust::Operator,
                         receiver: tokio::sync::Mutex::new(Some(receiver)),
                     }))
                 }
@@ -573,6 +593,7 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
         Ok(Box::new(ChiaPeerSession {
             peer,
             ip: addr.to_string(),
+            trust: PeerTrust::Discovered,
             receiver: tokio::sync::Mutex::new(Some(receiver)),
         }))
     }
@@ -582,6 +603,9 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
 struct ChiaPeerSession {
     peer: chia_wallet_sdk::client::Peer,
     ip: String,
+    /// Set by the factory from HOW this peer was reached: an operator's `peers` row, or
+    /// discovery. Never from anything the peer itself claims.
+    trust: PeerTrust,
     /// Taken by [`SyncSession::run`]. Behind a mutex only because the trait's `catch_up` takes
     /// `&self`; exactly one `run` ever consumes it.
     receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<chia::protocol::Message>>>,
@@ -591,6 +615,10 @@ struct ChiaPeerSession {
 impl SyncSession for ChiaPeerSession {
     fn peer_ip(&self) -> String {
         self.ip.clone()
+    }
+
+    fn trust(&self) -> PeerTrust {
+        self.trust
     }
 
     async fn catch_up(
@@ -607,6 +635,7 @@ impl SyncSession for ChiaPeerSession {
             genesis_challenge,
             &self.ip,
             events,
+            self.trust,
         )
         .await
     }
@@ -615,7 +644,7 @@ impl SyncSession for ChiaPeerSession {
         self: Box<Self>,
         db: &WalletDb,
         events: &EventBus,
-        subscribed: &sync::SubscribedHashes,
+        session: &mut sync::SessionState<'_>,
     ) -> Result<(), SyncError> {
         let receiver = self
             .receiver
@@ -623,7 +652,7 @@ impl SyncSession for ChiaPeerSession {
             .await
             .take()
             .ok_or_else(|| SyncError::Peer("sync session already consumed".into()))?;
-        sync::run_update_loop(db, receiver, events, None, subscribed).await
+        sync::run_update_loop(db, receiver, events, None, session).await
     }
 }
 

@@ -109,6 +109,9 @@ struct ScriptedFactory {
     script: Arc<Script>,
     /// Addresses this factory pretends to dial, in preference order.
     addrs: Vec<String>,
+    /// How far the sessions it hands out are trusted — the fact the production factory
+    /// derives from WHICH list an address came from.
+    trust: PeerTrust,
 }
 
 #[async_trait::async_trait]
@@ -135,6 +138,7 @@ impl SyncSessionFactory for ScriptedFactory {
         self.script.senders.lock().unwrap().push(tx);
         Ok(Box::new(ScriptedSession {
             script: self.script.clone(),
+            trust: self.trust,
             receiver: tokio::sync::Mutex::new(Some(rx)),
         }))
     }
@@ -142,6 +146,7 @@ impl SyncSessionFactory for ScriptedFactory {
 
 struct ScriptedSession {
     script: Arc<Script>,
+    trust: PeerTrust,
     receiver: tokio::sync::Mutex<Option<tokio::sync::mpsc::Receiver<Message>>>,
 }
 
@@ -149,6 +154,10 @@ struct ScriptedSession {
 impl SyncSession for ScriptedSession {
     fn peer_ip(&self) -> String {
         "203.0.113.1:8444".to_string()
+    }
+
+    fn trust(&self) -> PeerTrust {
+        self.trust
     }
 
     async fn catch_up(
@@ -172,6 +181,7 @@ impl SyncSession for ScriptedSession {
             genesis_challenge,
             &self.peer_ip(),
             events,
+            self.trust,
         )
         .await
     }
@@ -180,10 +190,10 @@ impl SyncSession for ScriptedSession {
         self: Box<Self>,
         db: &WalletDb,
         events: &EventBus,
-        subscribed: &sync::SubscribedHashes,
+        session: &mut sync::SessionState<'_>,
     ) -> Result<(), SyncError> {
         let receiver = self.receiver.lock().await.take().expect("run called once");
-        let result = sync::run_update_loop(db, receiver, events, None, subscribed).await;
+        let result = sync::run_update_loop(db, receiver, events, None, session).await;
         let lifetime = *self.script.session_lifetime.lock().unwrap();
         self.script.advance(lifetime);
         result
@@ -228,15 +238,27 @@ struct Harness {
 }
 
 impl Harness {
+    /// Start a supervisor over an OPERATOR-chosen peer (the authoritative path).
     async fn start(
         db: WalletDb,
         hashes: Arc<dyn PuzzleHashSource>,
         script: Arc<Script>,
         addrs: Vec<String>,
     ) -> Self {
+        Self::start_with_trust(db, hashes, script, addrs, PeerTrust::Operator).await
+    }
+
+    async fn start_with_trust(
+        db: WalletDb,
+        hashes: Arc<dyn PuzzleHashSource>,
+        script: Arc<Script>,
+        addrs: Vec<String>,
+        trust: PeerTrust,
+    ) -> Self {
         let factory = Arc::new(ScriptedFactory {
             script: script.clone(),
             addrs,
+            trust,
         });
         let (handle, join) = spawn_supervisor(Supervisor {
             db: db.clone(),
@@ -459,6 +481,76 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
     assert_eq!(
         db.sync_state().await.unwrap().peak_height,
         Some(CATCH_UP_HEIGHT)
+    );
+    h.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// F1 - the trust boundary, driven through the REAL supervisor
+// ---------------------------------------------------------------------------
+
+/// **Proves (F1c, the auditor's backoff-cycle exploit):** a DISCOVERED peer never marks the
+/// replica authoritative, however many times it drops the connection and is reconnected to.
+///
+/// This is the exploit the previous round could not close: the attacker empties the table, the
+/// per-frame latch fires correctly, the attacker then simply CLOSES THE SOCKET, the supervisor
+/// backs off ~1s, reconnects to the same attacker, and the fresh catch-up re-sets the flag over
+/// whatever it answers. Here the supervisor is driven through three full connect cycles against
+/// a wallet that HAS puzzle hashes - so there is a real subscription to run and the test cannot
+/// pass by the empty-set guard - and no catch-up is ever attempted.
+///
+/// The peak assertion is the control: a supervisor that satisfied the trust boundary by ignoring
+/// discovered peers altogether would take the live sync status with it, and would fail here.
+#[tokio::test]
+async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnects() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let h = Harness::start_with_trust(
+        db.clone(),
+        Arc::new(FixedHashes(vec![Bytes32::new([4; 32])])),
+        Script::new(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+    )
+    .await;
+
+    for cycle in 1..=3u32 {
+        h.until(&format!("connection {cycle}"), move |s| {
+            s.connects.load(Ordering::SeqCst) >= cycle as usize
+        })
+        .await;
+        h.until("a live session", |s| !s.senders.lock().unwrap().is_empty())
+            .await;
+        let sender = h.script.senders.lock().unwrap().last().unwrap().clone();
+        sender
+            .send(peak_message(6_000_000 + cycle))
+            .await
+            .expect("the session consumes peer pushes");
+        h.until_db("the advisory peak to land", move |s| {
+            s.peak_height == Some(6_000_000 + cycle)
+        })
+        .await;
+        // The attacker hangs up, buying itself a reconnect.
+        h.script.disconnect_all();
+    }
+
+    assert_eq!(
+        h.script.catch_up_count(),
+        0,
+        "a discovered peer must never be handed a subscription, on any cycle"
+    );
+    assert!(
+        !db.is_synced().await.unwrap(),
+        "and must never make the replica authoritative"
+    );
+    assert_eq!(
+        routing::route(db.is_synced().await.unwrap(), true),
+        Source::Fallback,
+        "so every wallet-scoped read stays on the fallback tier"
+    );
+    assert_eq!(
+        db.sync_state().await.unwrap().peak_height,
+        Some(6_000_003),
+        "while the peak - the one thing an advisory peer may move - kept advancing"
     );
     h.stop().await;
 }
