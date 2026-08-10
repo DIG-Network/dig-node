@@ -1845,6 +1845,12 @@ async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
 /// RELAY rather than to this node — and which, being the only lively-looking number in that
 /// payload, is the one that gets misread.
 ///
+/// A third number answers a third question: `known_dig_peer_count` is how many DIG peers this node
+/// has LEARNED OF, connected or not (dig_ecosystem#2570). It separates a REACHABILITY fault — no
+/// connections despite a full address book — from a DISCOVERY fault, which `dig_peer_count: 0`
+/// alone cannot distinguish. It is ONE node's local view and a lower bound, never the size of the
+/// network, and it is never derived from the connected count.
+///
 /// `null` means UNOBSERVABLE, never zero: a count nobody could take is not a count of none.
 /// `chia_peer_count` is taken from the SAME accessor `control.wallet.syncStatus` uses, so the two
 /// methods cannot disagree.
@@ -1855,18 +1861,30 @@ async fn peer_counts(ctx: &ControlCtx, id: Value) -> Value {
         .await
         .ok()
         .and_then(|s| s.chia_peer_count);
-    let dig_peer_count = dig_peer_count(ctx).await;
+    let dig_peer_status = dig_peer_status(ctx).await;
+    let count = |key: &str| {
+        dig_peer_status
+            .as_ref()
+            .and_then(|status| status[key].as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    };
     control_ok(
         id,
-        json!({ "dig_peer_count": dig_peer_count, "chia_peer_count": chia_peer_count }),
+        json!({
+            "dig_peer_count": count("connected_peers"),
+            "chia_peer_count": chia_peer_count,
+            "known_dig_peer_count": count("known_peers"),
+        }),
     )
 }
 
-/// The DIG gossip pool size, from the node's own `control.peerStatus` snapshot.
+/// The node's own `control.peerStatus` snapshot, or `None` when the peer network is not running.
 ///
-/// `None` when the peer network is not running or the snapshot does not carry the field — an
-/// absent observation, which is a different fact from an observed zero.
-async fn dig_peer_count(ctx: &ControlCtx) -> Option<u32> {
+/// A not-running network cannot observe ANY of its counts, so the caller reports them all as
+/// `null`. Reading each count out of the returned object individually keeps a count the snapshot
+/// omits — an older field, or one the peer layer could not sample — `null` too, which is a
+/// different fact from an observed zero.
+async fn dig_peer_status(ctx: &ControlCtx) -> Option<Value> {
     let req = json!({
         "jsonrpc": "2.0", "id": 1, "method": "control.peerStatus", "params": {}
     });
@@ -1877,12 +1895,10 @@ async fn dig_peer_count(ctx: &ControlCtx) -> Option<u32> {
         dig_node_core::download::RequestProvenance::FirstParty,
     )
     .await;
-    if !parsed["result"]["running"].as_bool().unwrap_or(false) {
-        return None;
-    }
-    parsed["result"]["connected_peers"]
-        .as_u64()
-        .and_then(|n| u32::try_from(n).ok())
+    parsed["result"]["running"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| parsed["result"].clone())
 }
 
 /// `control.wallet.broadcast` (dig_ecosystem#2376) — push an ALREADY-SIGNED spend bundle.

@@ -158,9 +158,14 @@ fn format_counts(result: &Value) -> String {
         v.as_u64()
             .map_or_else(|| "unknown".to_string(), |n| n.to_string())
     }
+    // The known count is printed BESIDE the connected one because the pair is the diagnostic: a
+    // lonely node with a full address book has a reachability problem, one with an empty address
+    // book has a discovery problem, and the connected count alone reads as the same zero for both.
+    // It is labelled "known" rather than "total" -- it is this node's local view, not the network.
     format!(
-        "dig-node peer counts: DIG network {} · Chia full nodes {}",
+        "dig-node peer counts: DIG network {} connected, {} known · Chia full nodes {}",
         count(&result["dig_peer_count"]),
+        count(&result["known_dig_peer_count"]),
         count(&result["chia_peer_count"]),
     )
 }
