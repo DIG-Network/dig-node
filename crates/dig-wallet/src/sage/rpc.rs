@@ -28,7 +28,12 @@ use super::chain::PushOutcome;
 use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
-use super::fallback::{ChainFallback, FallbackCoin, FallbackCoinSpend};
+use super::fallback::{ChainFallback, FallbackCoin};
+// Test-only: `WalletBackend` never names a `FallbackCoinSpend` directly -- it consumes one through
+// the trait and immediately composes it with a coin record -- so only the doubles below spell the
+// type. Ungated, this is an unused import in a release build, and clippy runs with `-D warnings`.
+#[cfg(test)]
+use super::fallback::FallbackCoinSpend;
 use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
 use super::spend::{self, required_public_keys, Broadcaster, WalletSigner};
