@@ -108,16 +108,6 @@ pub struct AppState {
 /// request to the upstream.
 const METHOD_NOT_FOUND: i64 = ErrorCode::MethodNotFound.code();
 
-/// Build the dig-node service's axum router. Beside `POST /` (JSON-RPC) and `GET /health`
-/// it exposes the self-describing discovery surface so an agent can introspect the
-/// node with zero out-of-band knowledge:
-///   * `GET /version`                    — build/commit/version fingerprint
-///   * `GET /openrpc.json`               — the OpenRPC method+error spec
-///   * `GET /.well-known/dig-node.json`  — addr + cache + methods + errors + spec links
-///   * `GET /ws/status`                  — WebSocket status/liveness channel (#239)
-///
-/// Split out from [`serve`] so it can be exercised by an in-process test without
-/// binding a port.
 impl AppState {
     /// Re-attach the wallet backend with a chain-sync handle reporting `peers` Chia peers,
     /// WITHOUT starting a supervisor (so no test dials mainnet).
@@ -135,6 +125,16 @@ impl AppState {
     }
 }
 
+/// Build the dig-node service's axum router. Beside `POST /` (JSON-RPC) and `GET /health`
+/// it exposes the self-describing discovery surface so an agent can introspect the
+/// node with zero out-of-band knowledge:
+///   * `GET /version`                    — build/commit/version fingerprint
+///   * `GET /openrpc.json`               — the OpenRPC method+error spec
+///   * `GET /.well-known/dig-node.json`  — addr + cache + methods + errors + spec links
+///   * `GET /ws/status`                  — WebSocket status/liveness channel (#239)
+///
+/// Split out from [`serve`] so it can be exercised by an in-process test without
+/// binding a port.
 pub fn router(state: AppState) -> Router {
     // The extension calls from a `chrome-extension://` origin; a same-machine page
     // calls from `http://localhost`, `http://dig.local`, or a loopback IP (#91 —

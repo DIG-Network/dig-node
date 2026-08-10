@@ -269,7 +269,7 @@ pub type SubscribedHashes = HashSet<Bytes32>;
 /// free function handed one frame at a time cannot enforce either. [`run_update_loop`] owns one
 /// and lends it to every [`handle_coin_state_update`] call.
 pub struct SessionState<'a> {
-    /// The puzzle hashes this session subscribed. Empty for a peak-only session.
+    /// The puzzle hashes this session subscribed. Empty when the session subscribes nothing.
     pub subscribed: &'a SubscribedHashes,
     /// How far this session's peer is trusted.
     pub trust: PeerTrust,
@@ -660,7 +660,7 @@ pub async fn initial_sync_with(
 ///
 /// `session` carries the puzzle-hash set this session actually subscribed (pushed coins outside
 /// it are dropped — see [`apply_coin_states`]; an empty set is meaningful and correct, because a
-/// peak-only session subscribes nothing and must therefore write no coins), how far its peer is
+/// nothing-subscribed session writes no coins), how far its peer is
 /// trusted ([`PeerTrust`]), and its cumulative rollback allowance.
 pub async fn run_update_loop(
     db: &WalletDb,
@@ -1374,7 +1374,7 @@ mod tests {
             &mut discovered(&subscribed),
         )
         .await
-        .expect("an advisory frame is discarded, not an error");
+        .expect("a discovered-peer frame is dropped whole, not an error");
 
         assert_eq!(
             db.balance(None).await.unwrap(),

@@ -180,9 +180,6 @@ async fn start_companion_full_inner(
     (addr, token, EnvHold(hold))
 }
 
-/// Like [`start_companion`] but ALSO returns this node's loop-probe request (#1997) — the exact
-/// body the bring-up probe puts on the wire. A loop-breaker test must be able to stage the probe
-/// COMING BACK, and only the node knows the random id it generated.
 /// Like [`start_companion_full`], but with the wallet's Chia peer count pinned to `peers`. No
 /// supervisor is started and nothing is dialled — see `AppState::with_chia_peer_count_for_tests`.
 async fn start_companion_full_with_chia_peers(
@@ -192,6 +189,9 @@ async fn start_companion_full_with_chia_peers(
     start_companion_full_inner(upstream, Some(peers)).await
 }
 
+/// Like [`start_companion`] but ALSO returns this node's loop-probe request (#1997) — the exact
+/// body the bring-up probe puts on the wire. A loop-breaker test must be able to stage the probe
+/// COMING BACK, and only the node knows the random id it generated.
 async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
