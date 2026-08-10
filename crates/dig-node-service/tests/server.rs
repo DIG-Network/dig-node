@@ -1651,6 +1651,169 @@ async fn a_malformed_coin_id_is_refused_before_the_chain_is_ever_consulted() {
     );
 }
 
+/// **Proves (dig_ecosystem#2572):** both new chain reads validate their caller-supplied ids BEFORE
+/// any chain work — ahead of the liveness check, the rate limiter and the network call.
+///
+/// The same design as `a_malformed_coin_id_is_refused_before_the_chain_is_ever_consulted`, and for
+/// the same reason: an `INVALID_PARAMS` assertion ALONE would not prove it, because `-32602` is also
+/// what a handler returns after forwarding a bad id to the oracle and mapping the rejection back.
+/// The code is identical; the byte that left the host is not. These are OPEN, token-less methods
+/// forwarding a caller-supplied string to a third party, so "refused before the network" is a
+/// security property.
+///
+/// **The observable is that a malformed and a well-formed id get DIFFERENT answers.** This node has
+/// no live chain source, so a well-formed id is stopped at the first rung of the chain ladder and
+/// answers something other than `INVALID_PARAMS`. Move the validation after the chain call and both
+/// ids reach the same rung, both answers become identical, and this fails.
+///
+/// `coinsByParent` is exercised through TWO malformed shapes — a bad `parent_coin_id` and a bad
+/// `after_coin_id` — because they are validated on different fields, and a node that checked only
+/// the parent would silently restart a caller's walk from the beginning on a corrupt cursor.
+#[tokio::test]
+async fn the_chain_reads_refuse_malformed_ids_before_the_chain_is_ever_consulted() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+
+    let call_with = |method: &'static str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    let good = "ab".repeat(32);
+    // 63 hex characters, one short of the contract's 64.
+    let bad = "a".repeat(63);
+
+    for (label, method, malformed, well_formed) in [
+        (
+            "coinSpend",
+            "control.wallet.coinSpend",
+            json!({ "coin_id": bad }),
+            json!({ "coin_id": good }),
+        ),
+        (
+            "coinsByParent/parent",
+            "control.wallet.coinsByParent",
+            json!({ "parent_coin_id": bad }),
+            json!({ "parent_coin_id": good }),
+        ),
+        (
+            "coinsByParent/cursor",
+            "control.wallet.coinsByParent",
+            json!({ "parent_coin_id": good, "after_coin_id": bad }),
+            json!({ "parent_coin_id": good, "after_coin_id": good }),
+        ),
+    ] {
+        // Untokened, as a real caller of an open read would be.
+        let refused = post_rpc(&addr, call_with(method, malformed), None).await;
+        assert_eq!(
+            refused["error"]["data"]["code"],
+            json!("INVALID_PARAMS"),
+            "{label}: a malformed id must be refused by the validator: got {refused:?}"
+        );
+
+        let reached = post_rpc(&addr, call_with(method, well_formed), None).await;
+        assert_ne!(
+            reached["error"]["data"]["code"],
+            json!("INVALID_PARAMS"),
+            "{label}: a well-formed id must get PAST validation into the chain path: got {reached:?}"
+        );
+        assert_ne!(
+            refused["error"]["data"]["code"], reached["error"]["data"]["code"],
+            "{label}: identical answers mean validation ran AFTER the chain was consulted: \
+             refused={refused:?} reached={reached:?}"
+        );
+    }
+}
+
+/// **Proves (dig_ecosystem#2572):** both new chain reads are OPEN over HTTP — reachable, routed to
+/// their own handlers, and never answered `UNAUTHORIZED` to a token-less caller.
+///
+/// Three distinct silent failures are ruled out, because each looks like the others from outside:
+/// * `UNAUTHORIZED` — the method was registered but left out of `is_open_control_read`. This is the
+///   one that costs the most: the published contract declares both open, so a client following it
+///   sends no token, and the two refusals demand OPPOSITE remedies (get a token vs upgrade the
+///   node). A caller told `UNAUTHORIZED` goes hunting for a permissions fault that does not exist.
+/// * `METHOD_NOT_FOUND` — the method was never added to `OWNED_CONTROL_METHODS`, so
+///   `dispatch_control` silently delegated it to the embedded node, which answers `-32601`. That
+///   omission does NOT fail to compile.
+/// * `INVALID_PARAMS` from a MISSING required field — reachable only from this shell's own
+///   validator, which proves `dispatch_owned` routed to the right arm rather than hitting its
+///   `unreachable!()` or delegating. A listed method with a typo'd match arm compiles fine.
+///
+/// The well-formed call at the end asserts a DISJUNCTION, deliberately. This harness wires the real
+/// lazy [`ChainTransport`], so whether that call reaches a chain depends on the machine's network —
+/// pinning either outcome alone would make the test assert the environment rather than the node.
+/// Both honest outcomes are accepted: a catalogued `WALLET_*` error, or a result carrying the
+/// contract's declared members. What is ruled out is everything else — a panic, a hang, an
+/// `INTERNAL_ERROR`, or a success whose body is missing the members a client decodes.
+#[tokio::test]
+async fn the_chain_reads_are_open_reachable_and_degrade_honestly() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+
+    let call_with = |method: &'static str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
+    let good = "ab".repeat(32);
+
+    for (method, missing_field, well_formed, required_members) in [
+        (
+            "control.wallet.coinSpend",
+            json!({}),
+            json!({ "coin_id": good }),
+            &["spend", "source", "synced", "peak_height"][..],
+        ),
+        (
+            "control.wallet.coinsByParent",
+            json!({}),
+            json!({ "parent_coin_id": good }),
+            &[
+                "coins",
+                "complete",
+                "cursor",
+                "source",
+                "synced",
+                "peak_height",
+            ][..],
+        ),
+    ] {
+        let empty = post_rpc(&addr, call_with(method, missing_field), None).await;
+        assert_ne!(
+            empty["error"]["data"]["code"],
+            json!("UNAUTHORIZED"),
+            "{method} is published as an OPEN read and must not demand a token: got {empty:?}"
+        );
+        assert_ne!(
+            empty["error"]["data"]["code"],
+            json!("METHOD_NOT_FOUND"),
+            "{method} must be registered in OWNED_CONTROL_METHODS: got {empty:?}"
+        );
+        assert_eq!(
+            empty["error"]["data"]["code"],
+            json!("INVALID_PARAMS"),
+            "a missing required id must be THIS handler's own rejection, which is only reachable \
+             if dispatch_owned routed here: got {empty:?}"
+        );
+
+        let answered = post_rpc(&addr, call_with(method, well_formed), None).await;
+        match answered.get("result") {
+            Some(result) => {
+                for member in required_members {
+                    assert!(
+                        result.get(member).is_some(),
+                        "{method} answered a result missing the required `{member}` member, which \
+                         a conforming client decodes as a hard failure: got {answered:?}"
+                    );
+                }
+            }
+            None => {
+                let code = answered["error"]["data"]["code"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(
+                    code.starts_with("WALLET_"),
+                    "{method} must fail as a catalogued wallet error a caller can act on, \
+                     got {answered:?}"
+                );
+            }
+        }
+    }
+}
+
 /// **Proves (dig_ecosystem#1985):** `control.peers.ping` is REACHABLE over the real HTTP control
 /// surface — token-gated, registered, and routed to its own handler.
 ///

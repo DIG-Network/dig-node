@@ -59,7 +59,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use dig_node_control_interface::params::WalletCoinByIdParams;
+use dig_node_control_interface::params::{
+    WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
+};
 use dig_node_core::{CapsuleStore, Node};
 use serde_json::{json, Value};
 
@@ -114,6 +116,8 @@ pub fn is_open_control_read(method: &str) -> bool {
         "control.wallet.balance"
             | "control.wallet.coins"
             | "control.wallet.coinById"
+            | "control.wallet.coinSpend"
+            | "control.wallet.coinsByParent"
             | "control.wallet.peak"
             | "control.wallet.syncStatus"
             | "control.peerCounts"
@@ -151,6 +155,8 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.balance",
     "control.wallet.coins",
     "control.wallet.coinById",
+    "control.wallet.coinSpend",
+    "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
     "control.wallet.syncStatus",
@@ -196,6 +202,8 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.balance",
     "control.wallet.coins",
     "control.wallet.coinById",
+    "control.wallet.coinSpend",
+    "control.wallet.coinsByParent",
     "control.wallet.arrivals",
     "control.wallet.peak",
     "control.wallet.syncStatus",
@@ -769,6 +777,8 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.balance" => wallet_balance(ctx, id, params).await,
         "control.wallet.coins" => wallet_coins(ctx, id, params).await,
         "control.wallet.coinById" => wallet_coin_by_id(ctx, id, params).await,
+        "control.wallet.coinSpend" => wallet_coin_spend(ctx, id, params).await,
+        "control.wallet.coinsByParent" => wallet_coins_by_parent(ctx, id, params).await,
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
@@ -1366,25 +1376,128 @@ fn wallet_address_params(
 /// spelling and strips only the `0x` prefix. Lowercasing here would make this node accept ids a
 /// conforming implementation rejects.
 fn wallet_coin_id_param(id: &Value, params: &Value) -> std::result::Result<String, Value> {
-    const METHOD: &str = "control.wallet.coinById";
+    coin_id_field(id, "control.wallet.coinById", "coin_id", params, |raw| {
+        WalletCoinByIdParams { coin_id: raw }
+            .validated()
+            .ok()
+            .map(|p| p.coin_id)
+    })
+}
+
+/// Parse + validate `params.coin_id` for `control.wallet.coinSpend` (dig_ecosystem#2572).
+///
+/// Same field, same rule, same refuse-before-the-network ordering as
+/// [`wallet_coin_id_param`] — but the rule is taken from the contract's OWN
+/// [`WalletCoinSpendParams`] rather than reusing `coinById`'s type. The two are identical today and
+/// the contract is free to let them diverge; a node that borrowed one method's validator for
+/// another would silently stop conforming the day they did.
+fn wallet_coin_spend_param(id: &Value, params: &Value) -> std::result::Result<String, Value> {
+    coin_id_field(id, "control.wallet.coinSpend", "coin_id", params, |raw| {
+        WalletCoinSpendParams { coin_id: raw }
+            .validated()
+            .ok()
+            .map(|p| p.coin_id)
+    })
+}
+
+/// Parse + validate the whole `control.wallet.coinsByParent` request: the parent id, the optional
+/// resume cursor, and the optional page size (dig_ecosystem#2572).
+///
+/// # Every rule comes from the contract's own [`WalletCoinsByParentParams::validated`]
+///
+/// Including the ones a node would be tempted to soften. A `limit` of zero or above the maximum is
+/// REFUSED, never clamped, because this read's page boundary is what the caller resumes from: a
+/// silently shrunk page hands back a cursor for a position the caller never asked about, and a
+/// caller trusting its own number mis-sizes every request after it. `after_coin_id` is held to the
+/// same hex rule as the parent, so a malformed cursor is a refusal rather than a page that silently
+/// starts from the beginning.
+///
+/// # Refused BEFORE any network call
+///
+/// Same ordering, and same reason, as [`wallet_coin_id_param`]: this is an OPEN, token-less method
+/// forwarding caller-supplied strings to a third-party oracle.
+///
+/// The three fields are read separately from the untyped `params` and then validated TOGETHER, so a
+/// request that is wrong in two ways is still refused, and refused before anything is dialed.
+fn wallet_coins_by_parent_params(
+    id: &Value,
+    params: &Value,
+) -> std::result::Result<WalletCoinsByParentParams, Value> {
+    const METHOD: &str = "control.wallet.coinsByParent";
+    let invalid = |detail: String| {
+        Err(control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{METHOD}: {detail}"),
+        ))
+    };
+    let Some(parent_coin_id) = params.get("parent_coin_id").and_then(|v| v.as_str()) else {
+        return invalid(
+            "params.parent_coin_id must be a 64-character lowercase-hex coin id string".to_string(),
+        );
+    };
+    // A present-but-wrong-typed field is refused rather than silently ignored: a caller that sent
+    // `limit: "50"` asked for a page size, and serving it the default while reporting success would
+    // make the page boundary — the thing it resumes from — different from the one it believes in.
+    let after_coin_id = match params.get("after_coin_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(other) => {
+            return invalid(format!(
+                "params.after_coin_id must be a coin id string or omitted, got {other}"
+            ))
+        }
+    };
+    let limit = match params.get("limit") {
+        None | Some(Value::Null) => None,
+        Some(v) => match v.as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) => Some(n),
+            None => {
+                return invalid(format!(
+                    "params.limit must be a positive whole number or omitted, got {v}"
+                ))
+            }
+        },
+    };
+    WalletCoinsByParentParams {
+        parent_coin_id: parent_coin_id.to_string(),
+        after_coin_id,
+        limit,
+    }
+    .validated()
+    .or_else(|e| invalid(e.message))
+}
+
+/// Read one coin-id field off untyped JSON-RPC `params` and hand it to the CONTRACT's validator,
+/// shaping any refusal as this node's catalogued `INVALID_PARAMS`.
+///
+/// The three by-coin reads enforce the same well-formedness rule under two field names, and each
+/// supplies its own `validate` — the published rule for THAT method — so this function never
+/// restates the rule and cannot drift from it. What it contributes is the part the contract types
+/// cannot: pulling a named string out of a `Value`, and the error prose.
+fn coin_id_field(
+    id: &Value,
+    method: &str,
+    field: &str,
+    params: &Value,
+    validate: impl FnOnce(String) -> Option<String>,
+) -> std::result::Result<String, Value> {
     let invalid = |detail: &str| {
         Err(control_error(
             id.clone(),
             ErrorCode::InvalidParams,
-            format!("{METHOD} requires params.coin_id, {detail}"),
+            format!("{method} requires params.{field}, {detail}"),
         ))
     };
-    let Some(raw) = params.get("coin_id").and_then(|v| v.as_str()) else {
+    let Some(raw) = params.get(field).and_then(|v| v.as_str()) else {
         return invalid("a 64-character lowercase-hex coin id string");
     };
-    WalletCoinByIdParams {
-        coin_id: raw.to_string(),
+    match validate(raw.to_string()) {
+        Some(valid) => Ok(valid),
+        None => {
+            invalid("a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)")
+        }
     }
-    .validated()
-    .map(|params| params.coin_id)
-    .or_else(|_| {
-        invalid("a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)")
-    })
 }
 
 /// Map a wallet READ failure onto its catalogued control error. Shared by the balance and coin
@@ -1466,6 +1579,77 @@ async fn wallet_coin_by_id(ctx: &ControlCtx, id: Value, params: &Value) -> Value
     match ctx.wallet.coin_by_id(&coin_id).await {
         Ok(r) => control_ok(id, coin_by_id_wire(&r)),
         Err(e) => wallet_read_error("control.wallet.coinById", id, &coin_id, e),
+    }
+}
+
+/// `control.wallet.coinSpend` (dig_ecosystem#2572) — the SPEND that spent ONE coin.
+///
+/// The read that turns "my coin is gone" into "here is what it became": a coin record carries a
+/// puzzle HASH, and only a spend carries the puzzle REVEAL and the solution. Following a DID
+/// singleton forward — the walk a dig-profile resolution performs — is this method plus
+/// [`wallet_coins_by_parent`], composed by the caller. An OPEN read for the same reason as
+/// `coinById`: its argument is a public chain identifier and nothing else.
+///
+/// Params: `{ coin_id }`. Result: `{ spend: <spend|null>, source, synced, peak_height }`.
+///
+/// `spend: null` means a chain source ANSWERED and holds no spend of that coin — it is unspent, or
+/// unknown. Telling those two apart is `control.wallet.coinById`'s job, not this one's. Every way of
+/// failing to get an answer at all is a distinct catalogued error carrying no `result` member, so a
+/// `null` spend is unambiguous by construction: a caller walking a lineage may read `null` as "this
+/// is the tip I can see" without also having to rule out an outage.
+///
+/// A returned spend's puzzle reveal has been verified to tree-hash to the spent coin's own puzzle
+/// hash, and its coin carries a real `spent_height` — the node refuses rather than emitting either
+/// unchecked.
+async fn wallet_coin_spend(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    const METHOD: &str = "control.wallet.coinSpend";
+    let coin_id = match wallet_coin_spend_param(&id, params) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    match ctx.wallet.coin_spend(&coin_id).await {
+        Ok(r) => control_ok(id, coin_spend_wire(&r)),
+        Err(e) => wallet_read_error(METHOD, id, &coin_id, e),
+    }
+}
+
+/// `control.wallet.coinsByParent` (dig_ecosystem#2572) — the DIRECT children a coin's spend created.
+///
+/// ONE hop. The node never recurses: a transitive walk over a caller-supplied id is unbounded work
+/// on a token-less endpoint, and a partial walk served as a complete one is a lineage with a silent
+/// hole in it. A caller wanting a lineage composes hops itself.
+///
+/// Params: `{ parent_coin_id, after_coin_id?, limit? }`. Result:
+/// `{ coins: [...], complete, cursor, source, synced, peak_height }`.
+///
+/// `coins: []` means a chain source ANSWERED and that parent created no children it knows of —
+/// typically because the parent is unspent. Every way of failing to consult a chain is a catalogued
+/// error, never an empty list, because an empty list reads as *that spend created nothing* and ends
+/// a lineage walk early.
+///
+/// The answer is ONE PAGE, ascending by `coin_id`. `complete` states whether it is the whole child
+/// set and is never left to be inferred from the page's length; `cursor` is the last child handed
+/// over, which the caller passes back as `after_coin_id`.
+async fn wallet_coins_by_parent(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    const METHOD: &str = "control.wallet.coinsByParent";
+    let request = match wallet_coins_by_parent_params(&id, params) {
+        Ok(parsed) => parsed,
+        Err(response) => return response,
+    };
+    // `effective_limit` resolves an omitted page size using the CONTRACT's default, so a node and a
+    // client can never disagree about where an unspecified page ends.
+    let limit = request.effective_limit();
+    match ctx
+        .wallet
+        .coins_by_parent(
+            &request.parent_coin_id,
+            request.after_coin_id.as_deref(),
+            limit,
+        )
+        .await
+    {
+        Ok(r) => control_ok(id, coins_by_parent_wire(&r)),
+        Err(e) => wallet_read_error(METHOD, id, &request.parent_coin_id, e),
     }
 }
 
@@ -1812,6 +1996,63 @@ fn coin_by_id_wire(r: &dig_wallet::sage::rpc::WalletCoinByIdResult) -> Value {
     })
 }
 
+/// One coin as the by-coin reads publish it: every field the contract's `WalletCoinRecord` names,
+/// with `asset` explicitly `null`.
+///
+/// Shared by [`coin_spend_wire`] and [`coins_by_parent_wire`] because they classify nothing for the
+/// SAME reason [`coin_by_id_wire`] does not — the subject is named by a coin id or a parent, never
+/// by an asset — and two hand-written copies of a record shape are two places for a field to go
+/// missing. `coin_by_id_wire` is left inlined rather than folded in: it is the pinned reference
+/// shape three tests assert against literally, and rewriting it to prove a point about the new
+/// methods would put those tests' subject behind an indirection.
+fn unclassified_coin_wire(c: &dig_wallet::sage::rpc::WalletCoin) -> Value {
+    json!({
+        "coin_id": c.coin_id,
+        "asset": Value::Null,
+        "amount": c.amount,
+        "parent_coin_info": c.parent_coin_info,
+        "puzzle_hash": c.puzzle_hash,
+        "created_height": c.created_height,
+        "spent_height": c.spent_height,
+    })
+}
+
+/// Map a coin-SPEND read onto the wire contract published by `dig-node-control-interface`.
+///
+/// `spend: null` is emitted as an explicit null member rather than an omitted key: the contract
+/// decodes this field with `required_option`, so an absent key is a decode FAILURE on the client
+/// and not a verdict. That is deliberate on both sides — "no spend" must be something the node
+/// actually said.
+fn coin_spend_wire(r: &dig_wallet::sage::rpc::WalletCoinSpendResult) -> Value {
+    json!({
+        "spend": r.spend.as_ref().map(|s| json!({
+            "coin": unclassified_coin_wire(&s.coin),
+            "puzzle_reveal": s.puzzle_reveal,
+            "solution": s.solution,
+        })),
+        "source": r.source.as_wire(),
+        "synced": r.synced,
+        "peak_height": r.peak_height,
+    })
+}
+
+/// Map a children PAGE onto the wire contract published by `dig-node-control-interface`.
+///
+/// `complete` and `cursor` are both emitted unconditionally. The contract spells the flag
+/// positively — `complete`, not `truncated` — precisely so that the reading a client falls into when
+/// the field is missing or defaulted is "there may be more", and it decodes `cursor` with
+/// `required_option` so an absent key cannot become a confident "nothing to resume from".
+fn coins_by_parent_wire(r: &dig_wallet::sage::rpc::WalletCoinsByParentResult) -> Value {
+    json!({
+        "coins": r.coins.iter().map(unclassified_coin_wire).collect::<Vec<_>>(),
+        "complete": r.complete,
+        "cursor": r.cursor,
+        "source": r.source.as_wire(),
+        "synced": r.synced,
+        "peak_height": r.peak_height,
+    })
+}
+
 /// Count distinct store ids among the cached capsules. PURE-ish (reads the slice).
 fn distinct_store_count(cached: &[dig_node_core::CachedCapsule]) -> usize {
     cached
@@ -1845,6 +2086,14 @@ mod tests {
                 "control.wallet.balance",
                 "control.wallet.coins",
                 "control.wallet.coinById",
+                // The two chain primitives (dig_ecosystem#2572) are `coinById`'s neighbours, not
+                // `arrivals`': each names its subject with a caller-supplied public coin id and
+                // answers a deterministic public chain fact, disclosing no node-to-address
+                // association. They are also the reads a client needs to implement `ChainSource`
+                // over this plane at all, which is what makes a dig-profile mint possible through
+                // the node instead of via third-party HTTPS.
+                "control.wallet.coinSpend",
+                "control.wallet.coinsByParent",
                 // `control.wallet.arrivals` (dig_ecosystem#2548) is NOT here, and the reasoning
                 // that once put it here is the trap this test exists to spring. It is the
                 // narrowest chain read on the list and still the only one that names an address
@@ -2304,6 +2553,294 @@ mod tests {
             "an absent coin must NOT be an error: {response:?}"
         );
         assert_eq!(response["result"]["coin"], Value::Null);
+    }
+
+    // ---- control.wallet.coinSpend + coinsByParent wire shapes (dig_ecosystem#2572) ----
+
+    fn a_spent_coin() -> dig_wallet::sage::rpc::WalletCoin {
+        dig_wallet::sage::rpc::WalletCoin {
+            coin_id: "aa".repeat(32),
+            parent_coin_info: "bb".repeat(32),
+            puzzle_hash: "cc".repeat(32),
+            amount: 1_000_000_000_000,
+            created_height: Some(5_000_000),
+            spent_height: Some(5_000_042),
+        }
+    }
+
+    /// **Proves:** `coin_spend_wire` emits the published contract shape for a FOUND spend.
+    ///
+    /// Pinned by whole-value equality, so a renamed, added or dropped member fails — including the
+    /// `solution`, the one field with no verification attached to it and therefore the easy one to
+    /// lose. The coin's `spent_height` is non-null in the fixture because the contract requires it:
+    /// a spend of a coin nothing calls spent is a contradiction.
+    #[test]
+    fn coin_spend_wire_emits_the_published_contract_shape() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{WalletCoinSpend, WalletCoinSpendResult};
+
+        let wire = coin_spend_wire(&WalletCoinSpendResult {
+            spend: Some(WalletCoinSpend {
+                coin: a_spent_coin(),
+                puzzle_reveal: "ff0180".to_string(),
+                solution: "80".to_string(),
+            }),
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        });
+
+        assert_eq!(
+            wire,
+            json!({
+                "spend": {
+                    "coin": {
+                        "coin_id": "aa".repeat(32),
+                        "asset": null,
+                        "amount": 1_000_000_000_000u64,
+                        "parent_coin_info": "bb".repeat(32),
+                        "puzzle_hash": "cc".repeat(32),
+                        "created_height": 5_000_000,
+                        "spent_height": 5_000_042
+                    },
+                    "puzzle_reveal": "ff0180",
+                    "solution": "80"
+                },
+                "source": "fallback",
+                "synced": false,
+                "peak_height": null
+            })
+        );
+    }
+
+    /// **Proves:** an ABSENT spend is a SUCCESS carrying `spend: null` — a `result` member, never
+    /// an `error` member.
+    ///
+    /// The same distinction `an_absent_coin_is_a_result_carrying_null_not_an_error` pins for
+    /// `coinById`, on the read where collapsing it is worse: `spend: null` tells a caller the coin
+    /// is still unspent, which is the go-ahead to spend it, so an outage wearing that shape invites
+    /// a double-spend.
+    ///
+    /// **Catches** a handler that mapped `None` onto a catalogued error. Asserting only
+    /// `wire["spend"] == null` would NOT catch it — a JSON-RPC error response has no `spend` member
+    /// at all, so that lookup is `null` too. Hence the assertion is on the ENVELOPE.
+    #[test]
+    fn an_absent_spend_is_a_result_carrying_null_not_an_error() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::WalletCoinSpendResult;
+
+        let wire = coin_spend_wire(&WalletCoinSpendResult {
+            spend: None,
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        });
+        assert_eq!(
+            wire,
+            json!({
+                "spend": null,
+                "source": "fallback",
+                "synced": false,
+                "peak_height": null
+            })
+        );
+
+        let response = control_ok(json!(7), wire);
+        assert!(
+            response.get("result").is_some(),
+            "an absent spend must answer with a result member: {response:?}"
+        );
+        assert!(
+            response.get("error").is_none(),
+            "an absent spend must NOT be an error: {response:?}"
+        );
+    }
+
+    /// **Proves:** `coins_by_parent_wire` emits the paged contract shape, `complete` and `cursor`
+    /// included.
+    ///
+    /// **Catches** a mapper that emitted only the coin list. A client decodes `complete` as a plain
+    /// `bool` (no serde default) and `cursor` with `required_option`, so an omitted member is a hard
+    /// decode error rather than a silent default — but the failure would then surface on the CLIENT,
+    /// on a live node, rather than here.
+    #[test]
+    fn coins_by_parent_wire_emits_the_paged_contract_shape() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::WalletCoinsByParentResult;
+
+        let wire = coins_by_parent_wire(&WalletCoinsByParentResult {
+            coins: vec![a_spent_coin()],
+            complete: false,
+            cursor: Some("aa".repeat(32)),
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        });
+
+        assert_eq!(
+            wire,
+            json!({
+                "coins": [{
+                    "coin_id": "aa".repeat(32),
+                    "asset": null,
+                    "amount": 1_000_000_000_000u64,
+                    "parent_coin_info": "bb".repeat(32),
+                    "puzzle_hash": "cc".repeat(32),
+                    "created_height": 5_000_000,
+                    "spent_height": 5_000_042
+                }],
+                "complete": false,
+                "cursor": "aa".repeat(32),
+                "source": "fallback",
+                "synced": false,
+                "peak_height": null
+            })
+        );
+    }
+
+    /// **Proves:** an empty page still carries both paging members, with `cursor: null`.
+    ///
+    /// Its own test because the shape above is non-empty, and the empty page is where a mapper is
+    /// most likely to omit `cursor` (there is nothing to put in it) — which on the client decodes as
+    /// an error rather than as "nothing to resume from". `complete: true` here is what tells a
+    /// lineage walker the branch genuinely ends.
+    #[test]
+    fn an_empty_child_page_still_carries_complete_and_a_null_cursor() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::WalletCoinsByParentResult;
+
+        let wire = coins_by_parent_wire(&WalletCoinsByParentResult {
+            coins: vec![],
+            complete: true,
+            cursor: None,
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        });
+
+        assert_eq!(
+            wire,
+            json!({
+                "coins": [],
+                "complete": true,
+                "cursor": null,
+                "source": "fallback",
+                "synced": false,
+                "peak_height": null
+            })
+        );
+    }
+
+    /// **Proves:** neither new read names an asset it did not verify.
+    ///
+    /// A coin id and a parent id both classify nothing — telling XCH from a CAT from a singleton
+    /// needs the puzzle, which neither read inspects. **Catches** the tempting copy-paste from
+    /// [`coins_wire`], which echoes the REQUESTED asset: there is no requested asset on either of
+    /// these, so such a mapper has to invent one (`"xch"` being the obvious guess).
+    #[test]
+    fn neither_new_read_names_an_asset_it_did_not_verify() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{
+            WalletCoinSpend, WalletCoinSpendResult, WalletCoinsByParentResult,
+        };
+
+        let spend = coin_spend_wire(&WalletCoinSpendResult {
+            spend: Some(WalletCoinSpend {
+                coin: a_spent_coin(),
+                puzzle_reveal: "01".into(),
+                solution: "80".into(),
+            }),
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        });
+        assert_eq!(spend["spend"]["coin"]["asset"], Value::Null);
+
+        let children = coins_by_parent_wire(&WalletCoinsByParentResult {
+            coins: vec![a_spent_coin()],
+            complete: true,
+            cursor: Some("aa".repeat(32)),
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        });
+        assert_eq!(children["coins"][0]["asset"], Value::Null);
+    }
+
+    /// **Proves:** the page bound is refused from BOTH sides — at-bound passes, one over fails, and
+    /// zero fails.
+    ///
+    /// A bound tested only from below can only confirm itself. `1000` is the contract's maximum and
+    /// MUST be accepted; `1001` and `0` MUST be refused rather than clamped, because this read's
+    /// page boundary is what the caller resumes from — a silently shrunk page hands back a cursor
+    /// for a position the caller never asked about, and a `limit: 0` page makes no progress, so a
+    /// caller looping until a short page arrives loops forever.
+    #[test]
+    fn the_page_bound_is_enforced_from_both_sides_and_never_clamped() {
+        let parent = "ab".repeat(32);
+        let with_limit = |limit: Value| {
+            wallet_coins_by_parent_params(
+                &json!(1),
+                &json!({ "parent_coin_id": parent, "limit": limit }),
+            )
+        };
+
+        assert_eq!(
+            with_limit(json!(1000)).expect("the maximum is legal").limit,
+            Some(1000)
+        );
+        assert!(with_limit(json!(1001)).is_err(), "one over must be refused");
+        assert!(
+            with_limit(json!(0)).is_err(),
+            "a page of zero makes no progress"
+        );
+
+        // Omitted resolves to the CONTRACT's default, not a number this node invented — so a node
+        // and a client can never disagree about where an unspecified page ends.
+        let defaulted =
+            wallet_coins_by_parent_params(&json!(1), &json!({ "parent_coin_id": parent }))
+                .expect("an omitted limit is legal");
+        assert_eq!(defaulted.limit, None);
+        assert_eq!(
+            defaulted.effective_limit(),
+            dig_node_control_interface::params::COINS_BY_PARENT_DEFAULT_LIMIT
+        );
+    }
+
+    /// **Proves:** a malformed resume cursor is REFUSED, never treated as "start from the
+    /// beginning".
+    ///
+    /// The dangerous default. A caller that sent a bad `after_coin_id` and got page one back would
+    /// re-walk children it had already processed, and — since the answer looks like a perfectly
+    /// normal page — would never learn it had restarted. The well-formed control alongside it is
+    /// what proves the refusal comes from the cursor's spelling rather than from the field being
+    /// present at all.
+    #[test]
+    fn a_malformed_resume_cursor_is_refused_not_silently_ignored() {
+        let parent = "ab".repeat(32);
+        let with_cursor = |cursor: &str| {
+            wallet_coins_by_parent_params(
+                &json!(1),
+                &json!({ "parent_coin_id": parent, "after_coin_id": cursor }),
+            )
+        };
+
+        assert!(
+            with_cursor(&"a".repeat(63)).is_err(),
+            "a 63-hex cursor must be refused, not dropped"
+        );
+        assert!(
+            with_cursor(&"AB".repeat(32)).is_err(),
+            "uppercase is refused, exactly as it is for a coin id"
+        );
+        assert_eq!(
+            with_cursor(&format!("0x{}", "cd".repeat(32)))
+                .expect("a 0x-prefixed cursor is legal")
+                .after_coin_id
+                .as_deref(),
+            Some("cd".repeat(32).as_str()),
+            "the 0x prefix is stripped, never emitted"
+        );
     }
 
     /// LOCKSTEP GATE (#711): [`dispatch_control`] resolves EXACTLY [`CONTROL_METHODS`] — the

@@ -29,6 +29,11 @@ use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
 use super::fallback::{ChainFallback, FallbackCoin};
+// Test-only: `WalletBackend` never names a `FallbackCoinSpend` directly -- it consumes one through
+// the trait and immediately composes it with a coin record -- so only the doubles below spell the
+// type. Ungated, this is an unused import in a release build, and clippy runs with `-D warnings`.
+#[cfg(test)]
+use super::fallback::FallbackCoinSpend;
 use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
 use super::spend::{self, required_public_keys, Broadcaster, WalletSigner};
@@ -206,6 +211,67 @@ pub struct WalletCoinByIdResult {
     /// [`Source::Fallback`] covers BOTH chain sub-tiers — a direct peer and the coinset oracle —
     /// and this field does not say which one answered, because the tier underneath does not report
     /// it. Naming the sub-tier would be a wire-contract change and is not made here.
+    pub source: Source,
+    /// Always `false` — no local replica produced this answer.
+    pub synced: bool,
+    /// Always `None` — a caller bounding confirmations reads `control.wallet.peak` instead.
+    pub peak_height: Option<u32>,
+}
+
+/// ONE coin's spend: the coin it consumed, and the two programs that consumed it
+/// (dig_ecosystem#2572).
+///
+/// The coin is a full [`WalletCoin`] rather than a bare parent/puzzle-hash/amount triple, so a
+/// caller gets the spent height in the same answer and never has to make a second call to learn
+/// WHEN the thing it is looking at happened. Its `spent_height` is non-null by construction — see
+/// [`WalletBackend::coin_spend`], which refuses to report a spend of a coin no record calls spent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCoinSpend {
+    /// The coin this spend consumed. Its `spent_height` is always `Some`.
+    pub coin: WalletCoin,
+    /// The puzzle reveal: hex of the serialized CLVM program, verified to tree-hash to
+    /// `coin.puzzle_hash` before it ever reaches this struct.
+    pub puzzle_reveal: String,
+    /// The solution the puzzle was run with: hex of the serialized CLVM.
+    pub solution: String,
+}
+
+/// The spend that spent one coin, or a chain source's report that there is none
+/// (dig_ecosystem#2572).
+///
+/// `spend: None` means a chain ANSWERED: the coin is unspent, or the chain holds no such coin.
+/// Every way of failing to get an answer at all is a [`BalanceError`] — see
+/// [`WalletBackend::coin_spend`] for why that distinction is money-critical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCoinSpendResult {
+    /// The spend, or `None` when a chain source reported none.
+    pub spend: Option<WalletCoinSpend>,
+    /// Which tier produced this answer. Always [`Source::Fallback`], for the reason
+    /// [`WalletCoinByIdResult::source`] records.
+    pub source: Source,
+    /// Always `false` — no local replica produced this answer.
+    pub synced: bool,
+    /// Always `None` — a caller bounding confirmations reads `control.wallet.peak` instead.
+    pub peak_height: Option<u32>,
+}
+
+/// ONE PAGE of the DIRECT children created by spending one coin — one hop (dig_ecosystem#2572).
+///
+/// An empty `coins` means a chain ANSWERED and that parent created no children it knows of. Every
+/// way of failing to get an answer is a [`BalanceError`], never an empty list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletCoinsByParentResult {
+    /// One page of the parent's direct children, ASCENDING by `coin_id`.
+    pub coins: Vec<WalletCoin>,
+    /// Whether [`Self::coins`] is the WHOLE child set.
+    ///
+    /// Derived from whether children remain BEYOND this page, never from whether the page filled.
+    /// The two differ exactly when the child count is a multiple of the page size, and getting it
+    /// wrong there ends a lineage walk one hop early while looking finished.
+    pub complete: bool,
+    /// The last child in this page — what a caller resumes from — or `None` for an empty page.
+    pub cursor: Option<String>,
+    /// Which tier produced this answer. Always [`Source::Fallback`].
     pub source: Source,
     /// Always `false` — no local replica produced this answer.
     pub synced: bool,
@@ -1054,6 +1120,175 @@ impl WalletBackend {
             .map_err(|e| BalanceError::ReadFailed(e.to_string()))?;
         Ok(WalletCoinByIdResult {
             coin: coin.as_ref().map(coin_from_fallback),
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        })
+    }
+
+    /// The SPEND that spent one coin (dig_ecosystem#2572).
+    ///
+    /// The read that turns a coin record into a lineage: a record says a coin is GONE, and only the
+    /// spend says what it became. Following a DID singleton forward — which is how a dig-profile is
+    /// resolved — is this read applied repeatedly.
+    ///
+    /// # Absence is an ANSWER; unreachable is an ERROR
+    ///
+    /// `spend: None` means a chain source ANSWERED and holds no spend of that coin: it is unspent,
+    /// or unknown. Which of the two is [`coin_by_id`](Self::coin_by_id)'s question, not this one's.
+    /// Every failure to get an answer at all is a [`BalanceError`], because a caller walking a
+    /// lineage reads "no spend" as *this is the tip* and stops — so a dropped connection served as
+    /// absence produces a spend built against a singleton that has already moved on.
+    ///
+    /// # TWO reads, ONE answer, and a contradiction between them is fatal
+    ///
+    /// The chain tier's spend read carries no heights, so the coin record is read alongside it and
+    /// the two are composed. That is not merely cosmetic: it makes the answer self-checking. A
+    /// spend whose coin no record knows, or whose record calls the coin unspent, is a CONTRADICTION
+    /// — a source disagreeing with itself — and this method fails closed rather than emitting a
+    /// spend with an invented or absent `spent_height`. A caller cannot tell an invented height
+    /// from a real one, so it must never be handed either.
+    ///
+    /// Both reads share ONE rate-limit token. The bound exists to stop a local process amplifying
+    /// egress at the third-party oracle (#1957), and the pair is one caller-visible operation; two
+    /// tokens per call would halve the visible budget for no gain in protection.
+    ///
+    /// # The custody boundary (§908)
+    ///
+    /// A pure chain read of public data. One hex string in; no address, no key, no seed, no
+    /// signature — and a puzzle REVEAL is a program the chain already published, not a secret.
+    pub async fn coin_spend(
+        &self,
+        coin_id: &str,
+    ) -> std::result::Result<WalletCoinSpendResult, BalanceError> {
+        if !self.fallback.is_live() {
+            return Err(BalanceError::NoChainSource);
+        }
+        if !self.fallback_rate.try_acquire() {
+            return Err(BalanceError::RateLimited);
+        }
+        tracing::info!(
+            tier = Source::Fallback.as_wire(),
+            "coin-spend read routed to the third-party chain oracle"
+        );
+        let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
+        let spend = self
+            .fallback
+            .coin_spend(coin_id)
+            .await
+            .map_err(|e| BalanceError::ReadFailed(e.to_string()))?;
+        let spend = match spend {
+            None => None,
+            Some(spend) => {
+                let record = self
+                    .fallback
+                    .coin_record_by_id(coin_id)
+                    .await
+                    .map_err(read_err)?
+                    .ok_or_else(|| {
+                        BalanceError::ReadFailed(format!(
+                            "chain source reported a spend of {coin_id} and no record of that coin"
+                        ))
+                    })?;
+                if record.spent_height.is_none() {
+                    return Err(BalanceError::ReadFailed(format!(
+                        "chain source reported a spend of {coin_id} while its record calls the \
+                         coin unspent"
+                    )));
+                }
+                Some(WalletCoinSpend {
+                    coin: coin_from_fallback(&record),
+                    puzzle_reveal: spend.puzzle_reveal,
+                    solution: spend.solution,
+                })
+            }
+        };
+        Ok(WalletCoinSpendResult {
+            spend,
+            source: Source::Fallback,
+            synced: false,
+            peak_height: None,
+        })
+    }
+
+    /// ONE PAGE of the DIRECT children created by spending one coin — ONE hop
+    /// (dig_ecosystem#2572).
+    ///
+    /// Composed with [`coin_spend`](Self::coin_spend), this is a lineage walk the CALLER drives.
+    /// The node never recurses: a transitive walk over a caller-supplied id is unbounded work the
+    /// caller cannot bound, on a token-less endpoint.
+    ///
+    /// # An empty page is an ANSWER
+    ///
+    /// `coins: []` means a chain was consulted and the parent created no children it knows of —
+    /// usually because the parent is unspent. Every failure to consult one is a [`BalanceError`],
+    /// for the same reason [`coin_spend`](Self::coin_spend) states: an empty list reads as *that
+    /// spend created nothing*, which ends a lineage walk silently and early. That applies to a
+    /// failure MID-page too: a short page is never marked complete to salvage a partial read.
+    ///
+    /// # Paged, in ASCENDING `coin_id` order
+    ///
+    /// `after_coin_id` resumes strictly after a child the caller was HANDED, and the order is total
+    /// and stable because coin ids are unique fixed-length hex — so a page boundary names one
+    /// position and a walk can neither skip nor repeat a child. `limit` is the caller's page size,
+    /// already validated against the contract's bounds before it arrives here.
+    ///
+    /// # `complete` is derived from what REMAINS, never from whether the page filled
+    ///
+    /// One extra child is fetched past the page and then dropped. The cheap-looking alternative —
+    /// `complete = coins.len() < limit` — agrees with this one on every input EXCEPT a child count
+    /// that is an exact multiple of the page size, where it declares a truncated page whole. A
+    /// caller walking a lineage reads that as *this branch ends here*, so it presents a partial
+    /// lineage as a complete one and never learns otherwise.
+    ///
+    /// # Why the page is cut HERE and not upstream
+    ///
+    /// The chain tier answers a parent query with the parent's whole child set in one call; it has
+    /// no cursor to push the paging down into. So the page bound is not protecting THIS node from
+    /// the source — it bounds the RESPONSE, which is what the contract's frame-derived maximum is
+    /// about. The upstream call count is one per request either way.
+    pub async fn coins_by_parent(
+        &self,
+        parent_coin_id: &str,
+        after_coin_id: Option<&str>,
+        limit: u32,
+    ) -> std::result::Result<WalletCoinsByParentResult, BalanceError> {
+        if !self.fallback.is_live() {
+            return Err(BalanceError::NoChainSource);
+        }
+        if !self.fallback_rate.try_acquire() {
+            return Err(BalanceError::RateLimited);
+        }
+        tracing::info!(
+            tier = Source::Fallback.as_wire(),
+            "children read routed to the third-party chain oracle"
+        );
+        let mut children: Vec<WalletCoin> = self
+            .fallback
+            .coin_records_by_parent(parent_coin_id)
+            .await
+            .map_err(|e| BalanceError::ReadFailed(e.to_string()))?
+            .iter()
+            .map(coin_from_fallback)
+            .collect();
+        // The total, stable order the cursor names a position in. Sorted HERE rather than trusted
+        // from the source: the tier underneath merges peer and coinset answers and promises no
+        // order at all, and an order that varies between pages loses rows silently.
+        children.sort_by(|a, b| a.coin_id.cmp(&b.coin_id));
+        let remaining = match after_coin_id {
+            Some(cursor) => children
+                .into_iter()
+                .filter(|c| c.coin_id.as_str() > cursor)
+                .collect(),
+            None => children,
+        };
+        let page_size = limit as usize;
+        let complete = remaining.len() <= page_size;
+        let coins: Vec<WalletCoin> = remaining.into_iter().take(page_size).collect();
+        Ok(WalletCoinsByParentResult {
+            cursor: coins.last().map(|c| c.coin_id.clone()),
+            complete,
+            coins,
             source: Source::Fallback,
             synced: false,
             peak_height: None,
@@ -4260,6 +4495,12 @@ mod tests {
         async fn coin_record_by_id(&self, _: &str) -> Result<Option<FallbackCoin>> {
             Err(Error::internal("boom"))
         }
+        async fn coin_spend(&self, _: &str) -> Result<Option<FallbackCoinSpend>> {
+            Err(Error::internal("boom"))
+        }
+        async fn coin_records_by_parent(&self, _: &str) -> Result<Vec<FallbackCoin>> {
+            Err(Error::internal("boom"))
+        }
         // A live source whose reads fail — proves the READ_FAILED shape (#1851: the trait
         // default is now fail-closed, so a live double must say so explicitly).
         fn is_live(&self) -> bool {
@@ -4389,6 +4630,385 @@ mod tests {
             limited.coin_by_id("c1").await,
             Err(BalanceError::RateLimited)
         );
+    }
+
+    // ---- control.wallet.coinSpend + coinsByParent (dig_ecosystem#2572) ----------------
+
+    /// A [`FallbackCoinSpend`] for `coin_id`. The programs are placeholders: this layer composes
+    /// and pages, and the reveal VERIFICATION lives one tier down where a real CLVM fixture proves
+    /// it (`fallback::chain_failure_tests`).
+    fn fallback_spend(coin_id: &str) -> FallbackCoinSpend {
+        FallbackCoinSpend {
+            coin_id: coin_id.into(),
+            parent_coin_info: "pp".into(),
+            puzzle_hash: "ph".into(),
+            amount: 100,
+            puzzle_reveal: "01".into(),
+            solution: "80".into(),
+        }
+    }
+
+    /// A child coin of `parent`, named so its id ordering is explicit in each test.
+    fn child_of(parent: &str, coin_id: &str) -> FallbackCoin {
+        FallbackCoin {
+            coin_id: coin_id.into(),
+            parent_coin_info: parent.into(),
+            puzzle_hash: "ph".into(),
+            amount: 1,
+            created_height: Some(10),
+            spent_height: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    async fn backend_over(fb: Arc<dyn ChainFallback>) -> WalletBackend {
+        WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb,
+            WalletConfig::default(),
+        )
+    }
+
+    /// **A spend is composed with its coin record, so the answer carries a real `spent_height`.**
+    ///
+    /// The chain tier's spend read returns no heights at all, so a mapper that used only it would
+    /// have to emit `spent_height: null` — and the contract requires a spend's coin to report the
+    /// height it was spent at, because "when did this happen" is half of what a lineage walker is
+    /// asking. **Catches** the single-read implementation, which is the obvious one.
+    #[tokio::test]
+    async fn a_spend_is_composed_with_its_record_so_it_carries_a_spent_height() {
+        let fb = Arc::new(
+            MockFallback::with_coins(vec![fallback_coin(
+                "spent-one",
+                &owned_ph(),
+                100,
+                Some(10),
+                Some(42),
+            )])
+            .with_spends(vec![fallback_spend("spent-one")]),
+        );
+        let be = backend_over(fb).await;
+
+        let spend = be
+            .coin_spend("spent-one")
+            .await
+            .expect("a live source answers")
+            .spend
+            .expect("the chain knows this spend");
+
+        assert_eq!(spend.coin.coin_id, "spent-one");
+        assert_eq!(
+            spend.coin.spent_height,
+            Some(42),
+            "a spend's coin must carry the height it was spent at"
+        );
+        assert_eq!(spend.puzzle_reveal, "01");
+        assert_eq!(spend.solution, "80");
+    }
+
+    /// **An UNSPENT coin answers `spend: None` — a verdict, not an error.**
+    ///
+    /// The fixture holds the coin RECORD and no spend for it, which is exactly the state a mint
+    /// poll observes before its funding coin is consumed. **Catches** an implementation that
+    /// treated a missing spend as a failure: a caller polling for confirmation would then see an
+    /// error on every poll before the spend lands, and could not tell that from a real outage.
+    #[tokio::test]
+    async fn an_unspent_coin_answers_with_no_spend_rather_than_an_error() {
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "unspent-one",
+            &owned_ph(),
+            100,
+            Some(10),
+            None,
+        )]));
+        let be = backend_over(fb).await;
+
+        let result = be.coin_spend("unspent-one").await.expect("an answer");
+
+        assert_eq!(result.spend, None);
+        assert_eq!(result.source, Source::Fallback);
+        assert!(!result.synced);
+        assert_eq!(result.peak_height, None);
+    }
+
+    /// **A spend whose coin no record knows is a CONTRADICTION, and fails closed.**
+    ///
+    /// A source that reports a spend of a coin it has no record of is disagreeing with itself. The
+    /// tempting recovery is to emit the spend with `spent_height: null` — but a caller cannot tell
+    /// an absent height from an unconfirmed one, so it would read a fabricated answer as a real
+    /// observation. **Catches** exactly that recovery. The fixture holds the spend and NO coin.
+    #[tokio::test]
+    async fn a_spend_with_no_coin_record_is_refused_rather_than_reported_without_a_height() {
+        let fb = Arc::new(MockFallback::default().with_spends(vec![fallback_spend("ghost")]));
+        let be = backend_over(fb).await;
+
+        assert!(
+            matches!(
+                be.coin_spend("ghost").await,
+                Err(BalanceError::ReadFailed(_))
+            ),
+            "a spend with no coin record must fail closed"
+        );
+    }
+
+    /// **A spend whose record calls the coin UNSPENT is the same contradiction, and also fails.**
+    ///
+    /// Its own test because it takes a different branch from the one above — the record EXISTS
+    /// here — so an implementation that only checked for a missing record would pass that test and
+    /// emit a "spend" of a coin nothing on chain says was spent. That is the shape a caller reads
+    /// as "the mint landed".
+    #[tokio::test]
+    async fn a_spend_whose_record_calls_the_coin_unspent_is_refused() {
+        let fb = Arc::new(
+            MockFallback::with_coins(vec![fallback_coin("odd", &owned_ph(), 100, Some(10), None)])
+                .with_spends(vec![fallback_spend("odd")]),
+        );
+        let be = backend_over(fb).await;
+
+        assert!(
+            matches!(be.coin_spend("odd").await, Err(BalanceError::ReadFailed(_))),
+            "a spend of a coin the record calls unspent must fail closed"
+        );
+    }
+
+    /// **Every way of not reaching a chain is a distinct error, and none of them is `spend: None`.**
+    ///
+    /// The three-valued rule at the layer that serves it. `spend: None` tells a caller the coin is
+    /// still unspent — which is the go-ahead to spend it — so an outage wearing that shape invites
+    /// a double-spend. All three refusals are asserted together because collapsing any one of them
+    /// into another loses the remedy the caller needs (upgrade / retry / back off).
+    #[tokio::test]
+    async fn no_chain_source_rate_limit_and_read_failure_are_never_an_absent_spend() {
+        let no_source = backend_over(Arc::new(EmptyFallback)).await;
+        assert_eq!(
+            no_source.coin_spend("c1").await,
+            Err(BalanceError::NoChainSource)
+        );
+
+        let erring = backend_over(Arc::new(ErringFallback)).await;
+        assert!(matches!(
+            erring.coin_spend("c1").await,
+            Err(BalanceError::ReadFailed(_))
+        ));
+
+        let limited = backend_over(Arc::new(MockFallback::default()))
+            .await
+            .with_fallback_rate_limit(0.0, 0.0);
+        assert_eq!(
+            limited.coin_spend("c1").await,
+            Err(BalanceError::RateLimited)
+        );
+
+        // The paired direction, on the SAME shape of double: a live source that genuinely has no
+        // spend DOES answer None. Without this the three assertions above are satisfied by a
+        // method that errors unconditionally.
+        let live = backend_over(Arc::new(MockFallback::with_coins(vec![]))).await;
+        assert_eq!(live.coin_spend("c1").await.expect("an answer").spend, None);
+    }
+
+    /// **The same three refusals for the children read, and none of them is an empty page.**
+    ///
+    /// An empty child list means *that spend created nothing*, which ends a lineage walk. The
+    /// live-but-childless control at the end is what stops an unconditionally-erroring
+    /// implementation from passing.
+    #[tokio::test]
+    async fn no_chain_source_rate_limit_and_read_failure_are_never_an_empty_child_page() {
+        let no_source = backend_over(Arc::new(EmptyFallback)).await;
+        assert_eq!(
+            no_source.coins_by_parent("p", None, 100).await,
+            Err(BalanceError::NoChainSource)
+        );
+
+        let erring = backend_over(Arc::new(ErringFallback)).await;
+        assert!(matches!(
+            erring.coins_by_parent("p", None, 100).await,
+            Err(BalanceError::ReadFailed(_))
+        ));
+
+        let limited = backend_over(Arc::new(MockFallback::default()))
+            .await
+            .with_fallback_rate_limit(0.0, 0.0);
+        assert_eq!(
+            limited.coins_by_parent("p", None, 100).await,
+            Err(BalanceError::RateLimited)
+        );
+
+        let live = backend_over(Arc::new(MockFallback::with_coins(vec![]))).await;
+        let page = live
+            .coins_by_parent("p", None, 100)
+            .await
+            .expect("an answer");
+        assert!(page.coins.is_empty());
+        assert!(page.complete, "a childless parent is a COMPLETE answer");
+        assert_eq!(
+            page.cursor, None,
+            "an empty page has nothing to resume from"
+        );
+    }
+
+    /// **`complete` is derived from what REMAINS, not from whether the page filled.**
+    ///
+    /// The single most likely defect in this method, and the reason this test is shaped the way it
+    /// is. The naive `complete = coins.len() < limit` agrees with the correct derivation on almost
+    /// every input; the two differ EXACTLY when the child count is an integer multiple of the page
+    /// size. So the fixture is 4 children at a limit of 2 — an exact multiple — and the first page
+    /// is full and NOT the whole set.
+    ///
+    /// A fixture of, say, 5 children at a limit of 2 would pass under BOTH derivations and prove
+    /// nothing. Under the naive one, a lineage walker reading page 1 of an exactly-divisible child
+    /// set concludes the branch ends there and silently presents a partial lineage as whole.
+    ///
+    /// The second page is asserted too: it is where the naive derivation would report `false` on a
+    /// genuinely final full page, stalling the walk in the other direction.
+    #[tokio::test]
+    async fn complete_distinguishes_a_full_page_from_the_whole_child_set() {
+        let fb = Arc::new(MockFallback::with_coins(vec![
+            child_of("p", "aa"),
+            child_of("p", "bb"),
+            child_of("p", "cc"),
+            child_of("p", "dd"),
+        ]));
+        let be = backend_over(fb).await;
+
+        let first = be.coins_by_parent("p", None, 2).await.expect("page 1");
+        assert_eq!(ids(&first.coins), vec!["aa", "bb"]);
+        assert!(
+            !first.complete,
+            "a page that filled exactly is NOT evidence the child set ended"
+        );
+        assert_eq!(first.cursor.as_deref(), Some("bb"));
+
+        let second = be
+            .coins_by_parent("p", Some("bb"), 2)
+            .await
+            .expect("page 2");
+        assert_eq!(ids(&second.coins), vec!["cc", "dd"]);
+        assert!(
+            second.complete,
+            "the final page is complete even though it is FULL — 4 children over pages of 2 \
+             leaves nothing after 'dd'"
+        );
+        assert_eq!(second.cursor.as_deref(), Some("dd"));
+    }
+
+    /// **A truncated page ALWAYS carries a cursor: `{complete: false, cursor: null}` is
+    /// unrepresentable.**
+    ///
+    /// The contract specifies the two fields independently, so that contradiction is expressible on
+    /// the wire and is forbidden nowhere in the type. A client receiving it either re-requests the
+    /// identical page forever or silently restarts the walk from the beginning — an infinite stall
+    /// or a silent re-scan. The server is where it has to be impossible.
+    ///
+    /// Asserted across EVERY page of a real multi-page walk rather than on one hand-picked page, so
+    /// it cannot pass by happening to sample a page where the invariant holds. The converse pairing
+    /// — `complete: true` WITH a cursor — is legitimate (a whole non-empty final page still has a
+    /// last child) and is deliberately not forbidden here.
+    #[tokio::test]
+    async fn a_truncated_page_never_arrives_without_a_cursor_to_resume_from() {
+        let fb = Arc::new(MockFallback::with_coins(
+            (0..7).map(|i| child_of("p", &format!("c{i}"))).collect(),
+        ));
+        let be = backend_over(fb).await;
+
+        let mut after: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let page = be
+                .coins_by_parent("p", after.as_deref(), 2)
+                .await
+                .expect("a page");
+            pages += 1;
+            if !page.complete {
+                assert!(
+                    page.cursor.is_some(),
+                    "page {pages} says more children remain and gives nothing to resume from: \
+                     {page:?}"
+                );
+            }
+            match (page.complete, page.cursor) {
+                (true, _) => break,
+                (false, Some(cursor)) => after = Some(cursor),
+                (false, None) => unreachable!("asserted above"),
+            }
+            assert!(pages < 10, "the walk must terminate");
+        }
+        assert_eq!(pages, 4, "7 children over pages of 2 is four pages");
+    }
+
+    /// **Children come back in ASCENDING `coin_id` order, whatever order the source used.**
+    ///
+    /// The cursor names a position in an order, so without a total, stable one a walk repeats some
+    /// children and skips others. **Catches** an implementation that forwards the source's order:
+    /// the fixture is supplied in DESCENDING order, so passing through unchanged fails, and the
+    /// tier underneath merges peer and coinset answers and promises no order at all.
+    ///
+    /// The paging assertion is what makes the ordering load-bearing rather than cosmetic — a
+    /// resume that used the source's order would skip `bb` entirely here.
+    #[tokio::test]
+    async fn children_are_ordered_by_coin_id_regardless_of_the_sources_order() {
+        let fb = Arc::new(MockFallback::with_coins(vec![
+            child_of("p", "dd"),
+            child_of("p", "bb"),
+            child_of("p", "cc"),
+            child_of("p", "aa"),
+        ]));
+        let be = backend_over(fb).await;
+
+        let all = be.coins_by_parent("p", None, 100).await.expect("one page");
+        assert_eq!(ids(&all.coins), vec!["aa", "bb", "cc", "dd"]);
+
+        let resumed = be
+            .coins_by_parent("p", Some("aa"), 100)
+            .await
+            .expect("resumed");
+        assert_eq!(
+            ids(&resumed.coins),
+            vec!["bb", "cc", "dd"],
+            "resume is STRICTLY after the cursor in ascending id order"
+        );
+    }
+
+    /// **`after_coin_id` is STRICTLY after: the cursor child is never handed out twice.**
+    ///
+    /// An inclusive boundary (`>=`) repeats one child on every page of a walk, which a caller
+    /// summing amounts or counting outputs double-counts. The single-child fixture makes the
+    /// off-by-one unmissable: inclusive returns one row, strict returns none.
+    #[tokio::test]
+    async fn resuming_from_a_cursor_never_repeats_that_child() {
+        let fb = Arc::new(MockFallback::with_coins(vec![child_of("p", "only")]));
+        let be = backend_over(fb).await;
+
+        let page = be
+            .coins_by_parent("p", Some("only"), 100)
+            .await
+            .expect("a page");
+
+        assert!(page.coins.is_empty(), "got {:?}", ids(&page.coins));
+        assert!(page.complete);
+        assert_eq!(page.cursor, None);
+    }
+
+    /// **Only the named parent's children are returned.**
+    ///
+    /// The read is one hop over a caller-supplied id; another parent's child grafted into the page
+    /// becomes a forged branch of the caller's lineage. The fixture holds children of two parents
+    /// so a pass-through of everything the source held would fail.
+    #[tokio::test]
+    async fn another_parents_children_are_not_in_the_page() {
+        let fb = Arc::new(MockFallback::with_coins(vec![
+            child_of("p", "mine"),
+            child_of("other", "theirs"),
+        ]));
+        let be = backend_over(fb).await;
+
+        let page = be.coins_by_parent("p", None, 100).await.expect("a page");
+        assert_eq!(ids(&page.coins), vec!["mine"]);
+    }
+
+    /// The coin ids of a page, for order assertions.
+    fn ids(coins: &[WalletCoin]) -> Vec<&str> {
+        coins.iter().map(|c| c.coin_id.as_str()).collect()
     }
 
     // ---- the chain transport dig-app needs (dig_ecosystem#2376) ----------------------
@@ -4644,6 +5264,30 @@ mod tests {
             Err(BalanceError::RateLimited),
             "the peak read must consult the bound too"
         );
+
+        // The by-coin reads (dig_ecosystem#2392, #2572). Each forwards a caller-supplied
+        // identifier to the third-party oracle on a token-less method, which is precisely the
+        // egress-amplification shape the bound exists for.
+        //
+        // KNOWN LIMITATION, stated so nobody reads more into a green run than it earns: this test
+        // ENUMERATES the open reads rather than deriving them, so a NEW read that skips the bucket
+        // is not caught here -- it is simply absent. Deriving the list is not possible today
+        // because these are inherent methods, not a trait the test could iterate. Adding a read
+        // means adding it here.
+        for (name, refused) in [
+            ("coin_by_id", be.coin_by_id("c1").await.err()),
+            ("coin_spend", be.coin_spend("c1").await.err()),
+            (
+                "coins_by_parent",
+                be.coins_by_parent("p", None, 100).await.err(),
+            ),
+        ] {
+            assert_eq!(
+                refused,
+                Some(BalanceError::RateLimited),
+                "{name} must consult the same bound"
+            );
+        }
     }
 
     /// **The push actually pushes.** The bundle the pusher receives must be the SAME bundle the hex
@@ -6443,6 +7087,12 @@ mod tests {
             }
             async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
                 Ok(None)
+            }
+            async fn coin_spend(&self, _coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+                Ok(None)
+            }
+            async fn coin_records_by_parent(&self, _parent: &str) -> Result<Vec<FallbackCoin>> {
+                Ok(vec![])
             }
             // Stands in for the live coinset/peer tier (#1851: the trait default is fail-closed).
             fn is_live(&self) -> bool {

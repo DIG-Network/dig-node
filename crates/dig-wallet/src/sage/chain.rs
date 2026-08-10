@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use chia_protocol::SpendBundle;
 use tokio::sync::Mutex;
 
-use super::fallback::{ChainFallback, CoinsetFallback, FallbackCoin};
+use super::fallback::{ChainFallback, CoinsetFallback, FallbackCoin, FallbackCoinSpend};
 use super::spend::to_query_bundle;
 use super::{Error, Result};
 
@@ -179,6 +179,18 @@ impl ChainFallback for ChainTransport {
     async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
         CoinsetFallback::new(self.client().await?)
             .coin_record_by_id(coin_id)
+            .await
+    }
+
+    async fn coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+        CoinsetFallback::new(self.client().await?)
+            .coin_spend(coin_id)
+            .await
+    }
+
+    async fn coin_records_by_parent(&self, parent_coin_id: &str) -> Result<Vec<FallbackCoin>> {
+        CoinsetFallback::new(self.client().await?)
+            .coin_records_by_parent(parent_coin_id)
             .await
     }
 
