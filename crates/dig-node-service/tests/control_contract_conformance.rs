@@ -26,14 +26,7 @@ const KNOWN_PREEXISTING_DRIFT: &[&str] = &["control.peers.disconnect"];
 /// Same shape and same reason as [`KNOWN_PREEXISTING_DRIFT`], in the opposite direction: listed
 /// explicitly so the set can only shrink, and publishing them is its own reviewed change rather
 /// than something this gate does blind.
-const KNOWN_UNPUBLISHED: &[&str] = &[
-    "control.peers.ping",
-    // dig_ecosystem#2548. The node serves the arrival cursor now; publishing it is a RELEASE-FIRST
-    // change to `dig-node-control-interface` (a `ControlMethod::WalletArrivals` variant, its
-    // `is_open_read()` membership, a `WalletArrivalsResult`, and a `WalletArrivalsParams`), which
-    // ships as its own crate release before this entry is removed and before any consumer pins it.
-    "control.wallet.arrivals",
-];
+const KNOWN_UNPUBLISHED: &[&str] = &["control.peers.ping"];
 
 /// **Every `control.*` method the contract publishes is actually served.**
 ///
