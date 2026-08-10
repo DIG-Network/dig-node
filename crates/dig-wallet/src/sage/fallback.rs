@@ -681,6 +681,299 @@ mod chain_failure_tests {
             "a substituted coin must NEVER be reported as a missing coin"
         );
     }
+
+    // ---- coin_spend + coin_records_by_parent (dig_ecosystem#2572) ----------------------
+
+    /// The puzzle reveal used by the spend fixtures: the serialized CLVM atom `0x01`.
+    ///
+    /// A real, parseable program rather than arbitrary bytes, because the verification under test
+    /// PARSES the reveal — a garbage value would be rejected for being unparseable and the tests
+    /// would never reach the hash comparison they exist to exercise.
+    const A_PUZZLE_REVEAL: &str = "01";
+
+    /// `A_PUZZLE_REVEAL`'s CLVM tree hash — `SHA256(0x01 ‖ 0x01)` — pinned as a literal computed
+    /// OUTSIDE this crate.
+    ///
+    /// A fixture that asked the production code for this value would agree with a broken production
+    /// code path by construction, which is the one thing a verification test must not do.
+    const A_PUZZLE_HASH: &str = "9dcf97a184f32623d11a73124ceb99a5709b083721e878a16d78f596718ba7b2";
+
+    /// The id of the coin the spend fixtures describe: parent `0x22…22`, puzzle hash
+    /// [`A_PUZZLE_HASH`], amount 7. Also computed independently of this crate.
+    const SPENT_COIN_ID: &str = "3191419897f34473b9b63d60f35f8984c0bc2e74da6c074b50df72f41a4383a3";
+
+    /// A coinset `get_puzzle_and_solution` answer for [`SPENT_COIN_ID`], whose reveal really does
+    /// tree-hash to the coin's puzzle hash.
+    const HONEST_SPEND: &str = r#"{"success":true,"coin_solution":{
+                "coin":{"parent_coin_info":"0x2222222222222222222222222222222222222222222222222222222222222222",
+                        "puzzle_hash":"0x9dcf97a184f32623d11a73124ceb99a5709b083721e878a16d78f596718ba7b2",
+                        "amount":7},
+                "puzzle_reveal":"0x01","solution":"0x80"}}"#;
+
+    /// **An unreachable chain is an ERROR, never "this coin has no spend".**
+    ///
+    /// The three-valued rule, on the read where collapsing it costs the most. A caller walking a
+    /// singleton forward reads "no spend" as *this coin is the tip* and builds its next spend
+    /// against it; served for an outage, that spend is invalid because the singleton has in fact
+    /// already moved on. **Catches** the shape of [`ChiaQueryLineage::parent_spend`], four hundred
+    /// lines up, which maps every error to `Ok(None)` — the tempting thing to copy.
+    #[tokio::test]
+    async fn an_unreachable_chain_is_an_error_never_a_missing_spend() {
+        let fallback = fallback_against(dead_base_url().await).await;
+
+        let result = fallback.coin_spend(SOME_COIN_ID).await;
+
+        assert!(result.is_err(), "an outage must be an error, got {result:?}");
+        assert!(
+            !matches!(result, Ok(None)),
+            "an unreachable chain must NEVER be reported as 'this coin is unspent'"
+        );
+    }
+
+    /// **The paired direction: a chain that ANSWERED "no spend" is `Ok(None)`, not an error.**
+    ///
+    /// Without this half, the test above is satisfied by an implementation that errors on
+    /// everything — which would make an unspent coin indistinguishable from an outage, the same
+    /// collapse in the other direction. coinset spells a reported absence as `success: true` with a
+    /// null `coin_solution`.
+    #[tokio::test]
+    async fn an_unspent_coin_is_ok_none_not_an_error() {
+        let base = serve_json(r#"{"success":true,"coin_solution":null}"#).await;
+        let fallback = fallback_against(base).await;
+
+        let result = fallback.coin_spend(SOME_COIN_ID).await;
+
+        assert!(
+            matches!(result, Ok(None)),
+            "a chain that answered 'no spend' is Ok(None), got {result:?}"
+        );
+    }
+
+    /// **An honest spend is mapped through: the reveal and the solution both arrive, normalized.**
+    ///
+    /// The value the whole method exists to carry — a coin record says a coin is gone, and only
+    /// these two fields say what it became. **Catches** a mapper that drops the solution (the field
+    /// with no verification attached to it, and therefore the easy one to lose), and one that leaves
+    /// the `0x` prefix on: the contract's hex wire form is bare, and a consumer decoding `0x01` as
+    /// hex gets a parse error rather than a program.
+    #[tokio::test]
+    async fn an_honest_spend_is_mapped_through_with_its_reveal_and_solution() {
+        let base = serve_json(HONEST_SPEND).await;
+        let fallback = fallback_against(base).await;
+
+        let spend = fallback
+            .coin_spend(SPENT_COIN_ID)
+            .await
+            .expect("a reachable chain answers")
+            .expect("the chain knows this spend");
+
+        assert_eq!(spend.coin_id, SPENT_COIN_ID);
+        assert_eq!(spend.puzzle_hash, A_PUZZLE_HASH);
+        assert_eq!(spend.parent_coin_info, "22".repeat(32));
+        assert_eq!(spend.amount, 7);
+        assert_eq!(spend.puzzle_reveal, A_PUZZLE_REVEAL, "no 0x prefix survives");
+        assert_eq!(spend.solution, "80", "the solution travels, unprefixed");
+    }
+
+    /// **A spend of a DIFFERENT coin is a read failure — never this coin's spend, never absence.**
+    ///
+    /// The same substitution attack [`a_record_for_a_different_coin_is_an_error_never_this_coins_record`]
+    /// covers for coin records, on the read where the consequence is worse: a caller handed somebody
+    /// else's spend curries somebody else's puzzle forward as its own lineage.
+    ///
+    /// The fixture serves the (internally consistent, genuinely honest) spend of [`SPENT_COIN_ID`]
+    /// in answer to a request for [`SOME_COIN_ID`]. Nothing about the payload is malformed — the
+    /// reveal even verifies against its own coin — so the ONLY thing that can reject it is the
+    /// binding to what was asked.
+    #[tokio::test]
+    async fn a_spend_of_a_different_coin_is_an_error_never_this_coins_spend() {
+        let base = serve_json(HONEST_SPEND).await;
+        let fallback = fallback_against(base).await;
+
+        let result = fallback.coin_spend(SOME_COIN_ID).await;
+
+        assert!(
+            result.is_err(),
+            "a source answering with another coin's spend must be a read failure, got {result:?}"
+        );
+        assert!(
+            !matches!(result, Ok(None)),
+            "a substituted spend must NEVER be reported as 'unspent'"
+        );
+    }
+
+    /// **A puzzle reveal that does not tree-hash to the coin's puzzle hash is REFUSED.**
+    ///
+    /// The second, independent binding. A peer supplies the reveal, and a peer can send any program
+    /// at all; a coin's puzzle hash IS its reveal's CLVM tree hash, so the lie is locally
+    /// detectable with no second source. Without this check a peer decides what a caller believes a
+    /// coin's puzzle was, and a caller reconstructing a singleton curries that forged program into
+    /// the spend it then signs.
+    ///
+    /// **This test is why the coin-id binding is not sufficient on its own.** The fixture's coin id
+    /// is genuine — it is the real id of a coin at puzzle hash `0x33…33` — so the request is for
+    /// exactly the coin that comes back and the id check PASSES. Only the hash comparison can
+    /// reject it. Swap the fixture's puzzle hash for a matching one and this is the honest case.
+    #[tokio::test]
+    async fn a_reveal_that_does_not_hash_to_the_coins_puzzle_is_refused() {
+        // Coin `626443fb…` really does live at puzzle hash 0x33…33 (it is `KNOWN_COIN_ID`), so the
+        // ONLY defect here is the reveal: `0x01` hashes to A_PUZZLE_HASH, not to 0x33…33.
+        let base = serve_json(
+            r#"{"success":true,"coin_solution":{
+                "coin":{"parent_coin_info":"0x2222222222222222222222222222222222222222222222222222222222222222",
+                        "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
+                        "amount":7},
+                "puzzle_reveal":"0x01","solution":"0x80"}}"#,
+        )
+        .await;
+        let fallback = fallback_against(base).await;
+
+        let result = fallback.coin_spend(KNOWN_COIN_ID).await;
+
+        assert!(
+            result.is_err(),
+            "a reveal that does not hash to the coin's puzzle hash must be refused, got {result:?}"
+        );
+        assert!(
+            !matches!(result, Ok(None)),
+            "an unverifiable reveal must NEVER be reported as 'unspent'"
+        );
+    }
+
+    /// **A reveal that will not PARSE is refused, and refused the same way.**
+    ///
+    /// "I could not check it" and "it failed the check" oblige the same refusal, but they take
+    /// different code paths — the parse happens before any comparison — so a fail-open `unwrap_or`
+    /// on the parse would leave this case admitted while the test above stayed green. `0xff` is a
+    /// CLVM prefix byte that introduces bytes never supplied.
+    #[tokio::test]
+    async fn an_unparseable_reveal_is_refused_rather_than_waved_through() {
+        let base = serve_json(
+            r#"{"success":true,"coin_solution":{
+                "coin":{"parent_coin_info":"0x2222222222222222222222222222222222222222222222222222222222222222",
+                        "puzzle_hash":"0x9dcf97a184f32623d11a73124ceb99a5709b083721e878a16d78f596718ba7b2",
+                        "amount":7},
+                "puzzle_reveal":"0xff","solution":"0x80"}}"#,
+        )
+        .await;
+        let fallback = fallback_against(base).await;
+
+        let result = fallback.coin_spend(SPENT_COIN_ID).await;
+
+        assert!(
+            result.is_err(),
+            "an unparseable reveal must be refused, got {result:?}"
+        );
+    }
+
+    /// **An unreachable chain is an ERROR, never "that parent created no children".**
+    ///
+    /// An empty child list terminates a lineage walk: the caller concludes the branch ends there.
+    /// Serving an outage as one turns a transient network fault into a permanent, silent wrong
+    /// answer about the shape of somebody's lineage.
+    #[tokio::test]
+    async fn an_unreachable_chain_is_an_error_never_a_childless_parent() {
+        let fallback = fallback_against(dead_base_url().await).await;
+
+        let result = fallback.coin_records_by_parent(SOME_COIN_ID).await;
+
+        assert!(result.is_err(), "an outage must be an error, got {result:?}");
+        assert!(
+            !matches!(result, Ok(ref v) if v.is_empty()),
+            "an unreachable chain must NEVER be reported as a childless parent"
+        );
+    }
+
+    /// **The paired direction: a chain that ANSWERED "no children" is an empty `Ok`.**
+    ///
+    /// Pins the other half so the rule above cannot be satisfied by erroring on everything, which
+    /// would make an unspent parent unreadable.
+    #[tokio::test]
+    async fn a_parent_with_no_children_is_an_empty_ok_not_an_error() {
+        let base = serve_json(r#"{"success":true,"coin_records":[]}"#).await;
+        let fallback = fallback_against(base).await;
+
+        let children = fallback
+            .coin_records_by_parent(SOME_COIN_ID)
+            .await
+            .expect("a chain that answered is not an error");
+
+        assert!(children.is_empty(), "got {children:?}");
+    }
+
+    /// **A "child" that names a different parent is a read failure — the whole page, not just that
+    /// row.**
+    ///
+    /// Unlike a coin id, a parent-child link cannot be verified from the child alone, so this is a
+    /// consistency check on what the source said. Admitting the row would graft an unrelated coin
+    /// onto somebody's lineage, and the caller would walk it forward as its own.
+    ///
+    /// **The fixture is deliberately MIXED — one genuine child, one foreign one — and asserts the
+    /// call fails.** An all-foreign fixture would also pass against an implementation that returned
+    /// only the rows it liked, silently dropping the rest; that implementation is the nearest wrong
+    /// one here, because a silently filtered page is exactly the hole in a lineage this method must
+    /// not produce. With a genuine child present, "filter it out" and "refuse the answer" give
+    /// different observable results.
+    #[tokio::test]
+    async fn a_child_of_another_parent_fails_the_whole_read() {
+        let base = serve_json(
+            r#"{"success":true,"coin_records":[
+                {"coin":{"parent_coin_info":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                         "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
+                         "amount":7},
+                 "confirmed_block_index":100,"spent_block_index":0,"spent":false,
+                 "coinbase":false,"timestamp":1700000000},
+                {"coin":{"parent_coin_info":"0x9999999999999999999999999999999999999999999999999999999999999999",
+                         "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
+                         "amount":9},
+                 "confirmed_block_index":101,"spent_block_index":0,"spent":false,
+                 "coinbase":false,"timestamp":1700000001}]}"#,
+        )
+        .await;
+        let fallback = fallback_against(base).await;
+
+        let result = fallback.coin_records_by_parent(SOME_COIN_ID).await;
+
+        assert!(
+            result.is_err(),
+            "a page containing a foreign child must fail, not be quietly filtered: got {result:?}"
+        );
+    }
+
+    /// **Genuine children are mapped through with their heights.**
+    ///
+    /// The positive control for the test above: without it, "refuse everything" passes that one.
+    /// The two children differ in spent state, so a mapper that inherited the address-scoped reads'
+    /// unspent filter would return one row here instead of two — and a lineage walk needs precisely
+    /// the SPENT children, since those are the ones with a next hop.
+    #[tokio::test]
+    async fn genuine_children_are_mapped_through_spent_and_unspent_alike() {
+        let base = serve_json(
+            r#"{"success":true,"coin_records":[
+                {"coin":{"parent_coin_info":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                         "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
+                         "amount":7},
+                 "confirmed_block_index":100,"spent_block_index":140,"spent":true,
+                 "coinbase":false,"timestamp":1700000000},
+                {"coin":{"parent_coin_info":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                         "puzzle_hash":"0x3333333333333333333333333333333333333333333333333333333333333333",
+                         "amount":9},
+                 "confirmed_block_index":101,"spent_block_index":0,"spent":false,
+                 "coinbase":false,"timestamp":1700000001}]}"#,
+        )
+        .await;
+        let fallback = fallback_against(base).await;
+
+        let children = fallback
+            .coin_records_by_parent(SOME_COIN_ID)
+            .await
+            .expect("a reachable chain answers");
+
+        assert_eq!(children.len(), 2, "a spent child is still a child");
+        assert!(children.iter().all(|c| c.parent_coin_info == SOME_COIN_ID));
+        assert_eq!(children[0].spent_height, Some(140));
+        assert_eq!(children[1].spent_height, None);
+    }
 }
 
 #[cfg(test)]

@@ -28,7 +28,7 @@ use super::chain::PushOutcome;
 use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
-use super::fallback::{ChainFallback, FallbackCoin};
+use super::fallback::{ChainFallback, FallbackCoin, FallbackCoinSpend};
 use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
 use super::spend::{self, required_public_keys, Broadcaster, WalletSigner};
