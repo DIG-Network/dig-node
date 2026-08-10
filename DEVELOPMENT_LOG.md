@@ -4,6 +4,39 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## `initial_sync_complete` can NEVER latch on a default install — so it cannot mean "synced" (dig_ecosystem#2609)
+
+`sync_state.initial_sync_complete` is written by exactly one statement, `WalletDb::complete_catch_up`,
+whose only caller is `sync::initial_sync`. `Supervisor::run` skips that call entirely when the
+puzzle-hash set is empty. A node with no wallet enrolled therefore holds the flag at `false`
+**permanently** — not transiently — while `run_update_loop`'s `NewPeakWallet` arm keeps advancing
+`sync_state.peak_height` with the chain for an authoritative peer.
+
+The trap: the flag reads like "is this replica caught up", so a derived status naturally spells
+`false` as *"still catching up"*. On the commonest install in existence that sentence is false — the
+replica is AT the tip. It cost a user-visible defect: dig-app withheld the balance for ever behind
+"your node is still catching up with the blockchain", on a node whose peak was advancing the whole
+time. **Read the flag as "a catch-up has completed", never as "the replica is current"; they differ
+precisely when there is nothing to catch up on.**
+
+Do not fix that by latching the flag over an empty set. `sage::routing::route` treats
+`initial_sync_complete` as permission to serve wallet-scoped reads from the local DB, so latching it
+over an un-queried replica makes a funded wallet read as empty — which is why `initial_sync` refuses
+the empty set at the floor in the first place. The honest fix is a separate state
+(`SyncPhase::NoAddressesToWatch`).
+
+**The sharp edge when deriving that state:** "the session subscribed nothing" is NOT the same fact as
+"custody holds nothing". `Supervisor::run` FORCES the subscription set empty for an uncorroborated
+peer, so an empty set also describes a refused writer whose replica is deliberately not being written
+and IS falling behind. Keying a benign state on the empty set alone reports a stalled replica as
+healthy. The gate needs the trust fact too — and a measured-vs-unmeasured distinction
+(`Option<u32>`, not `u32`), because corroboration dials four peers before the set is decided and a
+`0` default would announce "nothing to watch" during every connect.
+
+Observed live, which is how the trust half was caught: a fresh node reported
+`{"phase":"syncing","peak_height":null,"chia_peer_count":1,"watched_addresses":0}` — empty set,
+still syncing, correctly — and only settled once its peer was authoritative.
+
 ## Arrival detection: a height watermark alone silently eats the coins it is meant to gate (#2548)
 
 Announcing "you were paid" needs a line between the address history a catch-up replays and money that

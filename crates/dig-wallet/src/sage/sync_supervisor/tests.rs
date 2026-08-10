@@ -334,6 +334,18 @@ impl Harness {
         panic!("timed out waiting for: {what}");
     }
 
+    /// Poll the COMPOSED status until `predicate` holds, or fail. The phase depends on live
+    /// session facts that no DB row carries, so it can only be awaited through the handle.
+    async fn until_status(&self, what: &str, mut predicate: impl FnMut(&WalletSyncStatus) -> bool) {
+        for _ in 0..2_000 {
+            if predicate(&self.handle.status(&self.db).await.unwrap()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
     /// Wait until the supervisor has connected AND finished deciding what that session may do.
     ///
     /// Anchored on an OBSERVED event (a completed connect) rather than a bare sleep, then given a
@@ -479,6 +491,44 @@ async fn supervisor_with_no_derivations_still_advances_the_replica_peak() {
     assert!(
         !db.is_synced().await.unwrap(),
         "advancing the peak must NOT imply the wallet is caught up"
+    );
+    h.stop().await;
+}
+
+/// **Proves (#2609), end to end through the real supervisor:** a default install — an
+/// authoritative peer and NO wallet enrolled — settles on `NoAddressesToWatch` rather than
+/// reporting `Syncing` for ever.
+///
+/// The handle-level tests above set the two session facts directly, which pins the ladder but not
+/// the WIRING. This one runs the actual supervisor loop over an empty custody set and asserts the
+/// phase it publishes, so a fix that changed the ladder and forgot to record the facts — the
+/// version that still reproduces the defect on a real machine — fails here.
+#[tokio::test]
+async fn a_default_install_with_no_wallet_settles_on_nothing_to_watch() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let h = Harness::start(
+        db.clone(),
+        Arc::new(FixedHashes(Vec::new())),
+        Script::new(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+
+    h.until_status("nothing to watch", |s| {
+        s.phase == SyncPhase::NoAddressesToWatch
+    })
+    .await;
+
+    let status = h.handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.watched_addresses,
+        Some(0),
+        "the empty custody set must be reported as a MEASURED zero, not as unknown"
+    );
+    assert!(
+        !db.sync_state().await.unwrap().initial_sync_complete,
+        "the phase must settle WITHOUT latching initial_sync_complete: latching it would flip \
+         wallet-scoped reads to an un-queried local DB and read a funded wallet as empty"
     );
     h.stop().await;
 }
@@ -715,6 +765,164 @@ async fn phase_ladder_not_started_syncing_synced() {
 
     db.set_initial_sync_complete(true).await.unwrap();
     assert_eq!(handle.status(&db).await.unwrap().phase, SyncPhase::Synced);
+}
+
+/// **Proves (#2609):** an authoritative peer attached over a GENUINELY empty custody set reports
+/// `NoAddressesToWatch`, not `Syncing`.
+///
+/// This is the default-install shape and the whole defect: with no wallet enrolled there are zero
+/// puzzle hashes, so `initial_sync::catch_up` is never called, so `initial_sync_complete` can
+/// never latch — while `new_peak_wallet` keeps the replica's peak advancing with the chain. The
+/// old ladder mapped that to `Syncing`, and dig-app rendered "your node is still catching up",
+/// which is false: there is nothing to catch up ON.
+#[tokio::test]
+async fn phase_is_no_addresses_to_watch_when_custody_is_empty_on_a_writing_peer() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    // The replica is at the tip and following it — exactly what the machine measured.
+    db.set_peak(9_131_403, "aa").await.unwrap();
+    assert!(
+        !db.sync_state().await.unwrap().initial_sync_complete,
+        "the premise: an empty custody set never latches initial_sync_complete"
+    );
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(0);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::NoAddressesToWatch,
+        "a replica at the tip with nothing to watch is not 'catching up'"
+    );
+    assert_eq!(status.peak_height, Some(9_131_403));
+    assert_eq!(
+        status.watched_addresses,
+        Some(0),
+        "the reason for the phase must be machine-readable, not inferred from the word"
+    );
+}
+
+/// **Proves (#2609):** a DISCOVERED peer is NOT reported as "nothing to watch", even though its
+/// subscription set is also empty.
+///
+/// The anti-conflation guard, and the reason the phase cannot key on `nothing_subscribed`. The
+/// supervisor FORCES the subscription set to empty for an uncorroborated peer, so "the set the
+/// session subscribed is empty" is true in two completely different situations: custody holds
+/// nothing (benign — nothing to do), and the writer was refused (NOT benign — the replica is
+/// deliberately not being written and is falling behind). Reporting the second as "nothing to
+/// watch" would tell a user everything was fine while their node silently stopped following the
+/// chain.
+#[tokio::test]
+async fn a_refused_writer_is_not_reported_as_nothing_to_watch() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    // What the supervisor records for an uncorroborated session: it subscribed nothing, but it
+    // subscribed nothing because it may not write — not because custody is empty.
+    handle.set_trust(false);
+    handle.set_watched(0);
+
+    assert_eq!(
+        handle.status(&db).await.unwrap().phase,
+        SyncPhase::Syncing,
+        "a peer that may not write is genuinely not synced; it must not read as 'nothing to watch'"
+    );
+}
+
+/// **Proves (#2609):** the phase does not flip to `NoAddressesToWatch` on an UNMEASURED
+/// subscription set, EVEN WHEN the attached peer may write.
+///
+/// This is the state the supervisor genuinely occupies between `trust_for_session` returning and
+/// the subscription set being resolved, and it is the ONLY input that makes the ladder's
+/// `watched == Some(0)` load-bearing: with the trust condition already satisfied, a `watched`
+/// treated as `unwrap_or(0)` would announce "nothing to watch" here, on a session that has not yet
+/// looked at custody. A review of the first version of this fix measured exactly that — replacing
+/// `== Some(0)` with `unwrap_or(0) == 0` left the whole suite green, because the only unmeasured
+/// test also left `may_write` false and was rejected a condition earlier. Hence `set_trust` and
+/// `set_watched` are separate calls: the in-between state has to be reachable to be tested.
+///
+/// Acceptance bar for this test: `unwrap_or(0) == 0` in the ladder MUST turn it red.
+#[tokio::test]
+async fn a_writing_peer_with_an_unmeasured_set_does_not_claim_nothing_to_watch() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    // Trust settled; the set has NOT been resolved yet.
+    handle.set_trust(true);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::Syncing,
+        "a writing session that has not yet resolved its set has measured nothing to report"
+    );
+    assert_eq!(
+        status.watched_addresses, None,
+        "unmeasured must be distinguishable from measured-zero"
+    );
+}
+
+/// **Proves (#2609):** before any trust is settled, an attached peer is still just `Syncing`.
+#[tokio::test]
+async fn an_unmeasured_subscription_set_does_not_claim_nothing_to_watch() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::Syncing,
+        "a session whose set is not yet resolved is still syncing"
+    );
+    assert_eq!(
+        status.watched_addresses, None,
+        "unmeasured must be distinguishable from measured-zero"
+    );
+}
+
+/// **Proves (#2609):** a peer that DROPS does not leave its subscription facts behind.
+///
+/// Stale facts would let a disconnected node keep answering `watched_addresses: 0` as though a
+/// session had just measured it.
+#[tokio::test]
+async fn dropping_a_session_clears_its_subscription_facts() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(0);
+    assert_eq!(
+        handle.status(&db).await.unwrap().phase,
+        SyncPhase::NoAddressesToWatch
+    );
+
+    handle.set_connected(0);
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(status.phase, SyncPhase::Syncing);
+    assert_eq!(
+        status.watched_addresses, None,
+        "a dropped session's measurement is no longer a measurement"
+    );
+}
+
+/// **Proves (#2609):** an enrolled wallet that has NOT finished its catch-up still reports
+/// `Syncing`.
+///
+/// The new variant must not swallow the genuine catching-up case it sits next to.
+#[tokio::test]
+async fn an_enrolled_wallet_mid_catch_up_still_reports_syncing() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(3);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(status.phase, SyncPhase::Syncing);
+    assert_eq!(status.watched_addresses, Some(3));
 }
 
 /// **Proves (T7, #2501):** an observed zero peers and an unobservable peer count are different

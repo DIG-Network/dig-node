@@ -1817,6 +1817,24 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 ///
 /// `{phase: not_started, peak_height: <n>}` is legitimate, not a contradiction: it is the RESTART
 /// state — a node with a height recorded by a previous run that has not yet begun syncing.
+///
+/// # `no_addresses_to_watch` is NOT a kind of `syncing` (dig_ecosystem#2609)
+///
+/// The four tokens are `not_started`, `syncing`, `synced` and `no_addresses_to_watch`. The last is
+/// the DEFAULT-INSTALL state: a node with no wallet enrolled has zero puzzle hashes, and a
+/// catch-up over an empty set is refused rather than performed, so `initial_sync_complete` never
+/// latches — while the replica's peak advances with the chain the whole time. Reporting that as
+/// `syncing` told every consumer the node was behind when it was at the tip, and dig-app withheld
+/// the balance forever behind "your node is still catching up with the blockchain".
+///
+/// A consumer must render it as ITS OWN sentence — the node is current, and there is simply
+/// nothing wallet-scoped to sync — never as chain lag and never as a balance it is still waiting
+/// for. It is deliberately not folded into `synced`, which additionally licenses serving
+/// wallet-scoped reads from the local replica.
+///
+/// `watched_addresses` reports WHY: `0` is a measured empty custody set, a positive count is a
+/// real subscription, and `null` means no attached session has resolved a set yet (a peer is
+/// mid-corroboration, or none is attached). A consumer must not read `null` as `0`.
 async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.wallet_sync_status().await {
         Ok(s) => control_ok(
@@ -1825,6 +1843,7 @@ async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
                 "phase": s.phase,
                 "peak_height": s.peak_height,
                 "chia_peer_count": s.chia_peer_count,
+                "watched_addresses": s.watched_addresses,
             }),
         ),
         // Only the local wallet DB can fail here — there is no chain call to blame.

@@ -89,6 +89,21 @@ pub enum SyncPhase {
     Syncing,
     /// A catch-up has completed AND a peer is attached right now.
     Synced,
+    /// A peer that MAY WRITE is attached and the replica is following the chain, but custody
+    /// holds no puzzle hashes — so there is nothing wallet-scoped to catch up on.
+    ///
+    /// This is the DEFAULT-INSTALL state, not an edge (dig_ecosystem#2609). A node with no wallet
+    /// enrolled has zero puzzle hashes; [`crate::sage::sync::initial_sync`] refuses to run over an
+    /// empty set, so `initial_sync_complete` never latches — while `new_peak_wallet` keeps the
+    /// replica's peak advancing with the chain. Reported as `Syncing`, that made every consumer
+    /// say "your node is still catching up" forever about a node that was at the tip.
+    ///
+    /// It is a SEPARATE variant rather than a fourth way of spelling `Synced` because the two
+    /// claims differ in what they license: `Synced` says wallet-scoped reads may be served from
+    /// the local replica, and [`crate::sage::routing::route`] would then treat an un-queried DB as
+    /// authoritative and read a funded wallet as empty. This variant says the chain replica is
+    /// current AND that no wallet-scoped claim is being made at all.
+    NoAddressesToWatch,
 }
 
 /// The composed sync status: the phase, the replica's own peak, and the live peer count.
@@ -102,6 +117,17 @@ pub struct WalletSyncStatus {
     /// Live subscription peers. `Some(0)` is an OBSERVED zero (a supervisor is running and
     /// holds no peer); `None` is unobservable (no supervisor attached at all).
     pub chia_peer_count: Option<u32>,
+    /// How many custodied puzzle hashes the ATTACHED session resolved for subscription.
+    ///
+    /// `Some(0)` is a MEASURED zero — custody genuinely holds nothing, which is the reason behind
+    /// [`SyncPhase::NoAddressesToWatch`]. `None` is unmeasured: no session is attached, or one is
+    /// attached but has not yet resolved its set (corroboration runs first, and takes real time).
+    /// The two must stay distinguishable — a `0` that merely means "not looked yet" would announce
+    /// "nothing to watch" during every connect.
+    ///
+    /// It is reported so a consumer can state the REASON for the phase rather than infer it from
+    /// the phase word (dig_ecosystem#2609).
+    pub watched_addresses: Option<u32>,
 }
 
 /// Live counters the supervisor writes and the control layer only reads.
@@ -111,6 +137,18 @@ struct Observed {
     ever_connected: bool,
     /// Subscription peers held right now — 0 or 1 (see [`SyncSession`] on why one).
     peers: u32,
+    /// Whether the ATTACHED session may write, i.e. the effective trust the supervisor resolved
+    /// for it is [`PeerTrust::Operator`] or [`PeerTrust::Corroborated`].
+    ///
+    /// Recorded separately from the subscription count because the supervisor FORCES the
+    /// subscription set empty for an uncorroborated peer. Without this flag, "subscribed nothing"
+    /// cannot be told apart from "custody holds nothing", and a refused writer — a replica
+    /// deliberately not being written — would report as the benign nothing-to-watch state.
+    session_may_write: bool,
+    /// How many puzzle hashes the ATTACHED session resolved. `None` until a session resolves its
+    /// set; see [`WalletSyncStatus::watched_addresses`] on why measured-zero must not be spelled
+    /// the same way as unmeasured.
+    watched: Option<u32>,
 }
 
 struct SyncHandleInner {
@@ -149,6 +187,15 @@ impl SyncHandle {
             SyncPhase::NotStarted
         } else if state.initial_sync_complete && observed.peers >= 1 {
             SyncPhase::Synced
+        } else if observed.peers >= 1 && observed.session_may_write && observed.watched == Some(0) {
+            // Three facts, all required, and each rules out a different lie:
+            //   * a peer attached RIGHT NOW      — an offline replica is stale, not current;
+            //   * that peer MAY WRITE            — a refused writer subscribes nothing too, and
+            //                                      its replica is falling behind, not idle;
+            //   * a MEASURED zero watched set    — `None` means the set is not resolved yet, and
+            //                                      claiming "nothing to watch" then would be an
+            //                                      unmeasured default announcing itself as a fact.
+            SyncPhase::NoAddressesToWatch
         } else {
             SyncPhase::Syncing
         };
@@ -156,6 +203,7 @@ impl SyncHandle {
             phase,
             peak_height: state.peak_height,
             chia_peer_count: Some(observed.peers),
+            watched_addresses: observed.watched,
         })
     }
 
@@ -189,6 +237,36 @@ impl SyncHandle {
             o.ever_connected = true;
         }
         o.peers = peers;
+        if peers == 0 {
+            // A dropped session's measurement is no longer a measurement. Leaving it behind would
+            // let a peerless node keep answering as though a session had just resolved its set.
+            o.session_may_write = false;
+            o.watched = None;
+        }
+    }
+
+    /// Record the trust the supervisor resolved for the attached session — whether it may write.
+    ///
+    /// Written SEPARATELY from, and BEFORE, [`Self::set_watched`], because that is the order the
+    /// supervisor actually learns the two facts: `trust_for_session` settles the trust (a
+    /// corroboration round that dials several peers), and only then is a subscription set
+    /// resolved for it. Writing both at once would make the in-between state — trust known, set
+    /// not yet resolved — unreachable, and an unreachable state cannot be tested, which is
+    /// exactly how a defensive condition rots into a decoration.
+    #[doc(hidden)]
+    pub fn set_trust(&self, may_write: bool) {
+        let mut o = self.inner.observed.write().expect("observed lock poisoned");
+        o.session_may_write = may_write;
+    }
+
+    /// Record how many custodied puzzle hashes the attached session resolved for subscription.
+    ///
+    /// This is the MEASUREMENT that turns `watched` from `None` into `Some(n)`; until it lands,
+    /// the count is genuinely unknown even though the trust may already be decided.
+    #[doc(hidden)]
+    pub fn set_watched(&self, watched: u32) {
+        let mut o = self.inner.observed.write().expect("observed lock poisoned");
+        o.watched = Some(watched);
     }
 }
 
@@ -200,6 +278,8 @@ pub async fn status_without_supervisor(db: &WalletDb) -> sqlx::Result<WalletSync
         phase: SyncPhase::NotStarted,
         peak_height: state.peak_height,
         chia_peer_count: None,
+        // Nothing is attached, so nothing has resolved a subscription set to report.
+        watched_addresses: None,
     })
 }
 
@@ -522,12 +602,21 @@ impl Supervisor {
             // for the inversion that made this the vulnerability). It runs as a write-free
             // session, which is what powers the live sync status.
             let trust = self.trust_for_session(&*session, &mut splits).await;
+            // Publish the trust the INSTANT it is settled, before a subscription set is resolved
+            // for it — the order the supervisor genuinely learns the two facts. Until
+            // `set_watched` lands just below, the count is honestly unknown.
+            handle.set_trust(trust.is_authoritative());
             let puzzle_hashes = match trust {
                 PeerTrust::Operator | PeerTrust::Corroborated => self.puzzle_hashes.puzzle_hashes(),
                 PeerTrust::Discovered => Vec::new(),
             };
             let subscribed: sync::SubscribedHashes = puzzle_hashes.iter().copied().collect();
             let nothing_subscribed = puzzle_hashes.is_empty();
+            // The MEASUREMENT of the subscription set. Paired with the trust recorded above, the
+            // phase can now tell "custody holds nothing" from "this writer was refused" — the two
+            // produce an identical empty set here, and only the first is the benign
+            // `NoAddressesToWatch` (dig_ecosystem#2609).
+            handle.set_watched(puzzle_hashes.len() as u32);
             if nothing_subscribed {
                 // Nothing to subscribe. The session still runs: for an OPERATOR peer with an
                 // empty puzzle-hash set, `new_peak_wallet` needs no subscription and the
