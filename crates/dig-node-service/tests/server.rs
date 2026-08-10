@@ -1397,7 +1397,8 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     );
 }
 
-/// **The money push is behind the token, over the REAL server gate** (dig_ecosystem#2376).
+/// **The money push AND the arrival cursor are behind the token, over the REAL server gate**
+/// (dig_ecosystem#2376, dig_ecosystem#2548).
 ///
 /// The unit test beside `is_open_control_read` pins the predicate; this pins what a caller actually
 /// experiences, through `server::rpc`'s auth gate and the control dispatcher — the two can only
@@ -1413,7 +1414,7 @@ async fn cache_list_cached_is_not_routable_over_ws() {
 /// chain source answers `WALLET_NO_CHAIN_SOURCE` — a different, honest answer that still proves the
 /// call got PAST the gate.
 #[tokio::test]
-async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
+async fn the_push_and_the_arrival_cursor_are_gated_while_the_chain_reads_are_open() {
     let (upstream, _calls) = start_mock_upstream().await;
     let (addr, token, _hold) = start_companion_full(&upstream).await;
 
@@ -1458,6 +1459,39 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
         json!("UNAUTHORIZED"),
         "the token must actually authorize the push: got {tokened:?}"
     );
+
+    // The arrival cursor, untokened: refused BY THE GATE. It is a chain read, which is exactly why
+    // it was briefly served open -- but the caller supplies only a cursor, so the answer names this
+    // node's OWN watched puzzle hashes and the receive history behind them. The open reads below
+    // are the control: they take the same untokened path and are NOT refused, so this assertion
+    // pins the arrival cursor specifically and not a gate that has closed over the whole wallet.
+    let arrivals = post_rpc(
+        &addr,
+        call("control.wallet.arrivals", json!({ "after_seq": 0 })),
+        None,
+    )
+    .await;
+    assert_eq!(
+        arrivals["error"]["data"]["code"],
+        json!("UNAUTHORIZED"),
+        "an untokened arrivals read must be refused: got {arrivals:?}"
+    );
+
+    // ...and WITH the token it gets past the gate to its own handler. Without this, the assertion
+    // above would pass just as well against a node that never registered the method at all.
+    let arrivals_tokened = post_rpc(
+        &addr,
+        call("control.wallet.arrivals", json!({ "after_seq": 0 })),
+        Some(&token),
+    )
+    .await;
+    for wrong in ["UNAUTHORIZED", "METHOD_NOT_FOUND", "INVALID_PARAMS"] {
+        assert_ne!(
+            arrivals_tokened["error"]["data"]["code"],
+            json!(wrong),
+            "a tokened arrivals read must reach its own handler, got {wrong}: {arrivals_tokened:?}"
+        );
+    }
 
     // The chain reads, untokened: they reach their handlers. Whatever they answer, it is not the
     // gate's refusal.

@@ -93,19 +93,27 @@ pub fn is_control_method(method: &str) -> bool {
 /// they are exposed like the other reads rather than behind the control-token gate: a local UI can
 /// poll a balance, list coins to build a spend, and bound a confirmation, without pairing.
 ///
-/// `control.wallet.broadcast` is deliberately NOT here. It puts bytes on the network, so the token
-/// is what stands between a local process and a broadcast — and an `UNAUTHORIZED` from it therefore
+/// Membership turns on WHO NAMES THE ADDRESS. `.balance`/`.coins`/`.coinById` relay a chain fact the
+/// CALLER named, and `.peak`/`.syncStatus` name this node's own chain position and no address at
+/// all; neither discloses an association between this node and any address.
+///
+/// Two wallet methods are deliberately NOT here. `control.wallet.arrivals` (dig_ecosystem#2548) is
+/// a chain read and still gated: the caller supplies only a cursor, so the answer volunteers this
+/// node's OWN watched puzzle hashes together with the receive history behind them. The chain facts
+/// are public; the node-to-address association is not, and a token-less caller could replay those
+/// addresses into the reads above. `control.wallet.broadcast` puts bytes on the network, so the
+/// token is what stands between a local process and a broadcast — and an `UNAUTHORIZED` from it therefore
 /// means exactly that, with the token as the remedy, where the same code on an OPEN read can only
-/// have come from a node too old to serve it (remedy: an upgrade). It is still routed through the control
-/// dispatcher (so it stays discoverable in [`CONTROL_METHODS`] and gets its CLI verb), but the
-/// server skips the token requirement for it. NO mutation or custody method is ever open here.
+/// have come from a node too old to serve it (remedy: an upgrade). Both are still routed through
+/// the control dispatcher, so they stay discoverable in [`CONTROL_METHODS`] and keep their CLI
+/// verbs; it is only the token requirement the server skips, and only for the set below. NO
+/// mutation or custody method is ever open here.
 pub fn is_open_control_read(method: &str) -> bool {
     matches!(
         method,
         "control.wallet.balance"
             | "control.wallet.coins"
             | "control.wallet.coinById"
-            | "control.wallet.arrivals"
             | "control.wallet.peak"
             | "control.wallet.syncStatus"
             | "control.peerCounts"
@@ -1498,9 +1506,15 @@ const ARRIVALS_MAX_LIMIT: i64 = 500;
 /// has never completed a catch-up has no arrival baseline and reports an empty list forever, which
 /// is the honest answer to "what arrived?" from a wallet that cannot tell history from news.
 ///
-/// OPEN (token-less) for the same reason as the other wallet reads, and more narrowly: it touches
-/// only this node's LOCAL replica. There is no oracle path, so polling it discloses nothing to a
-/// third party and cannot amplify into outbound requests.
+/// # TOKEN-GATED, unlike the other wallet reads
+///
+/// It touches only this node's LOCAL replica and has no oracle path, so polling it discloses
+/// nothing to a THIRD party — but it discloses plenty to the CALLER. The other reads answer about
+/// an address the caller already named; this one takes a cursor and answers with the node's OWN
+/// watched puzzle hashes and the receive history behind them. The chain facts are public; the
+/// association between this node and those addresses is not, and a token-less caller could replay
+/// the disclosed addresses into `.balance` and `.coins`. So an `UNAUTHORIZED` here means exactly
+/// what it says, and the remedy is the token — not an upgrade ([`is_open_control_read`]).
 async fn wallet_arrivals(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     const METHOD: &str = "control.wallet.arrivals";
     let after_seq = params
@@ -1812,14 +1826,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// **The chain reads are token-less and the PUSH is not.**
+    /// **The CALLER-ADDRESSED reads are token-less; the arrival cursor and the PUSH are not.**
     ///
     /// Written as the exact expected SET rather than derived from the predicate, so it pins the
     /// membership and not the implementation's opinion of itself. Opening the push would be a
     /// silent, catastrophic widening — any local process could then broadcast — so it must fail a
     /// test rather than pass review.
     #[test]
-    fn every_wallet_chain_read_is_open_and_the_push_is_token_gated() {
+    fn the_caller_addressed_reads_are_open_and_the_arrival_cursor_and_push_are_not() {
         let open: Vec<&str> = CONTROL_METHODS
             .iter()
             .copied()
@@ -1831,12 +1845,11 @@ mod tests {
                 "control.wallet.balance",
                 "control.wallet.coins",
                 "control.wallet.coinById",
-                // `control.wallet.arrivals` (dig_ecosystem#2548) is the NARROWEST of these: it
-                // reads this node's own local arrival ledger and has no oracle path at all, so
-                // unlike the address-scoped reads it cannot disclose anything off-node or amplify
-                // a poll into outbound requests. It reports amounts, coin ids and heights — public
-                // chain facts about addresses this node already watches — and never a key or seed.
-                "control.wallet.arrivals",
+                // `control.wallet.arrivals` (dig_ecosystem#2548) is NOT here, and the reasoning
+                // that once put it here is the trap this test exists to spring. It is the
+                // narrowest chain read on the list and still the only one that names an address
+                // the CALLER did not: it takes a cursor and answers with this node's OWN watched
+                // puzzle hashes. Public facts, private association.
                 "control.wallet.peak",
                 // `control.wallet.syncStatus` reports only how far THIS node has got.
                 //
@@ -1854,6 +1867,10 @@ mod tests {
         assert!(
             !is_open_control_read("control.wallet.broadcast"),
             "the push must stay behind the control token"
+        );
+        assert!(
+            !is_open_control_read("control.wallet.arrivals"),
+            "the arrival cursor names this node's own watched puzzle hashes to a caller that              supplied nothing, so it must stay behind the control token"
         );
     }
 
