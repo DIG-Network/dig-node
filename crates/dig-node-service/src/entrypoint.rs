@@ -259,6 +259,19 @@ enum WalletCommand {
         /// The coin id: 64 lowercase-hex characters (an optional `0x` prefix is allowed).
         coin_id: String,
     },
+    /// List incoming funds CONFIRMED since a cursor (READ-ONLY; needs no seed or pairing).
+    ///
+    /// Each row is money that ARRIVED: confirmed on chain, above this wallet's arrival baseline,
+    /// not previously reported, and not the wallet's own change. Pass the `cursor` from the last
+    /// call as `--after-seq` to see only what is new.
+    Arrivals {
+        /// Only arrivals strictly after this cursor position (0 = from the beginning).
+        #[arg(long, default_value_t = 0)]
+        after_seq: i64,
+        /// Maximum rows to return (clamped to 500 by the node).
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
     /// Print the chain peak this node reads against (READ-ONLY).
     Peak,
     /// Print the wallet's chain-sync phase, replica height and Chia peer count (READ-ONLY).
@@ -563,6 +576,9 @@ fn wallet_action(cmd: WalletCommand) -> ControlAction {
         }
         WalletCommand::Coins { address, asset } => ControlAction::WalletCoins { address, asset },
         WalletCommand::CoinById { coin_id } => ControlAction::WalletCoinById { coin_id },
+        WalletCommand::Arrivals { after_seq, limit } => {
+            ControlAction::WalletArrivals { after_seq, limit }
+        }
         WalletCommand::Peak => ControlAction::WalletPeak,
         WalletCommand::SyncStatus => ControlAction::WalletSyncStatus,
         WalletCommand::Broadcast { signed_bundle_hex } => {
@@ -820,6 +836,10 @@ mod tests {
                 vec!["dig-node", "wallet", "coins", address],
                 "control.wallet.coins",
             ),
+            (
+                vec!["dig-node", "wallet", "arrivals"],
+                "control.wallet.arrivals",
+            ),
             (vec!["dig-node", "wallet", "peak"], "control.wallet.peak"),
             (
                 vec!["dig-node", "wallet", "broadcast", "deadbeef"],
@@ -853,6 +873,25 @@ mod tests {
             wallet_action(action).wire_params(),
             serde_json::json!({ "address": address, "asset": "dig" }),
             "the address and the non-default asset must both survive the mapping"
+        );
+
+        let arrivals = Cli::try_parse_from([
+            "dig-node",
+            "wallet",
+            "arrivals",
+            "--after-seq",
+            "17",
+            "--limit",
+            "3",
+        ])
+        .expect("`wallet arrivals --after-seq --limit` parses");
+        let Some(Command::Wallet { action }) = arrivals.command else {
+            panic!("parsed to something other than `wallet`");
+        };
+        assert_eq!(
+            wallet_action(action).wire_params(),
+            serde_json::json!({ "after_seq": 17, "limit": 3 }),
+            "the cursor the caller resumed from must be the cursor that is asked for"
         );
 
         let push = Cli::try_parse_from(["dig-node", "wallet", "broadcast", "0xfeed"])

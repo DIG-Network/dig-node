@@ -62,6 +62,8 @@ pub enum ControlAction {
     WalletCoins { address: String, asset: String },
     /// `control.wallet.coinById` — the READ-ONLY lookup of ONE coin by coin id (spent or not).
     WalletCoinById { coin_id: String },
+    /// `control.wallet.arrivals` — the READ-ONLY incoming funds confirmed since a cursor.
+    WalletArrivals { after_seq: i64, limit: i64 },
     /// `control.wallet.syncStatus` — the READ-ONLY wallet chain-sync phase, replica height and
     /// Chia peer count. Distinct from `control.sync.status`, which is about DIG stores.
     WalletSyncStatus,
@@ -107,6 +109,7 @@ impl ControlAction {
             ControlAction::WalletBalance { .. } => "control.wallet.balance",
             ControlAction::WalletCoins { .. } => "control.wallet.coins",
             ControlAction::WalletCoinById { .. } => "control.wallet.coinById",
+            ControlAction::WalletArrivals { .. } => "control.wallet.arrivals",
             ControlAction::WalletPeak => "control.wallet.peak",
             ControlAction::WalletSyncStatus => "control.wallet.syncStatus",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
@@ -138,6 +141,9 @@ impl ControlAction {
                 json!({ "address": address, "asset": asset })
             }
             ControlAction::WalletCoinById { coin_id } => json!({ "coin_id": coin_id }),
+            ControlAction::WalletArrivals { after_seq, limit } => {
+                json!({ "after_seq": after_seq, "limit": limit })
+            }
             ControlAction::WalletBroadcast { signed_bundle_hex } => {
                 json!({ "signed_bundle_hex": signed_bundle_hex })
             }
@@ -203,6 +209,11 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         .method(),
         ControlAction::WalletCoinById {
             coin_id: String::new(),
+        }
+        .method(),
+        ControlAction::WalletArrivals {
+            after_seq: 0,
+            limit: 0,
         }
         .method(),
         ControlAction::WalletPeak.method(),
@@ -336,6 +347,13 @@ fn summarize(method: &str, result: &Value) -> String {
         // `result["coin"]` yields `Null` for a missing key, but indexing the INNER map would
         // panic on one — so every field is read with `get`, and a coin record short of a field
         // prints an honest unknown instead of aborting the CLI.
+        "control.wallet.arrivals" => {
+            let n = result["arrivals"].as_array().map(Vec::len).unwrap_or(0);
+            format!(
+                "{n} arrival(s) · cursor {}",
+                result["cursor"].as_i64().unwrap_or(0)
+            )
+        }
         "control.wallet.coinById" => match result["coin"].as_object() {
             None => "no such coin on chain".to_string(),
             Some(coin) => {

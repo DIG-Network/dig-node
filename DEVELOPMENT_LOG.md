@@ -4,6 +4,46 @@ High-signal realizations from debugging/development: non-obvious cross-system co
 sharp edges, and gotchas. Concise durable facts with context — NOT a change diary. See
 `CLAUDE.md` §4.5 for the maintenance contract (a curator periodically re-verifies + prunes).
 
+## Arrival detection: a height watermark alone silently eats the coins it is meant to gate (#2548)
+
+Announcing "you were paid" needs a line between the address history a catch-up replays and money that
+is genuinely new. The obvious line is a persisted height watermark — record coins above it, advance it
+to the peak each pass — and it is wrong in a way that shows up only as SILENCE, never as a wrong claim,
+which is why it survives review.
+
+Two coins fall through it, and both are ordinary:
+
+* **A coin sighted in the mempool and confirmed at the height the pass is advancing to.** It is
+  unconfirmed when examined, so it is not recorded; the watermark then moves to that same height, and on
+  the next pass the coin reads as backfill. `<=` versus `<` does not fix it — the coin WAS examined, and
+  legitimately not judged.
+* **A CAT whose asset id has not been attributed yet.** `asset_id` is filled in by a LATER parent-spend
+  uncurry pass, so at examination time the coin cannot be named. Announcing it as XCH is a wrong claim
+  about which money arrived; skipping it means the watermark passes it and it is never announced at all.
+
+The fix is that "examined" and "settled" are different states: a coin the recorder saw and deliberately
+did not judge is HELD, and a held coin is EXEMPT from the height window until it settles. Both defects
+were caught only by the POSITIVE CONTROL half of the trap tests — the negative assertions ("no arrival
+was recorded") passed happily against a recorder that had lost the money. A negative assertion about a
+notification is satisfied by any amount of silence, so each one needs a paired coin that differs in
+exactly the tested dimension and IS recorded.
+
+Two structural facts about this wallet bound what such a feature can honestly claim:
+
+* **The direct-peer sync path cannot see CAT coins at all.** `apply_coin_states` drops every coin whose
+  puzzle hash is outside the subscribed set, and that set is the wallet's bare p2 hashes, while a CAT
+  lives at `CatArgs::curry_tree_hash(asset_id, p2)`. CAT coins reach the replica only through
+  `refresh_tracked_coins`' hinted coinset read, which is not a background loop — so a CAT arrival is
+  detectable only on the oracle tier today. The useful converse: a coin AT a watched p2 hash is a
+  standard-transaction coin by construction, so naming it XCH is a fact rather than a guess.
+* **There is no record of the wallet's own outbound spends.** `get_pending_transactions` returns an
+  empty list by construction and history is derived after the fact by grouping coins on height, so the
+  ONLY discriminator between an incoming payment and the user's own change is whether the new coin's
+  `parent_coin_info` names a coin the wallet already holds. That test is sound in the direction that
+  matters, but only if it runs AFTER the batch commits: a parent and its change coin arrive in the same
+  `coin_state_update` frame in whatever order the peer chose, so answering it inside the write races the
+  batch and reports the user's own change as a receipt.
+
 ## A dependency gate keyed to "the crates.io tip" is unsatisfiable, not strict (#178)
 
 The first draft of `scripts/check-dig-constants-current.sh` refused a stable tag unless

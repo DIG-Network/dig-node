@@ -2083,7 +2083,54 @@ impl WalletBackend {
         // failure mode is a refusal-shaped one (no inputs to select), not a wrong spend, which
         // is why it is recorded rather than changed here; dig_ecosystem#2514 owns it.
         self.db.set_initial_sync_complete(true).await?;
+        // Incoming-funds arrivals (dig_ecosystem#2548). Run AFTER attribution, so a CAT coin this
+        // pass fetched is announced with its asset id rather than held as indeterminate — the
+        // direct-peer sync path cannot see CAT coins at all (they sit at a curried puzzle hash,
+        // outside the subscribed p2 set), so this is the ONLY path on which a CAT arrival exists.
+        //
+        // Best-effort, like the attribution above: failing to record an arrival must never turn a
+        // successful coin refresh into a hard error, and the next pass re-examines what this one
+        // missed.
+        let through = rows
+            .iter()
+            .filter_map(|r| r.created_height)
+            .max()
+            .unwrap_or(0)
+            .max(i64::from(
+                self.db.sync_state().await?.peak_height.unwrap_or(0),
+            ));
+        let _ = self
+            .db
+            .record_arrivals(&phs, u32::try_from(through).unwrap_or(0))
+            .await;
         Ok(n)
+    }
+
+    /// The incoming-funds ARRIVALS recorded after cursor position `after_seq`, oldest first
+    /// (dig_ecosystem#2548) — what `control.wallet.arrivals` serves.
+    ///
+    /// A pull, not a push: the control surface is request/response, and inventing a streaming
+    /// protocol to carry this would be a three-repo contract change for something a cursor answers.
+    /// The cursor is monotonic and persisted, so a client that stores its last `seq` learns about
+    /// every arrival exactly once across restarts of either side.
+    ///
+    /// Returns `(page, latest)`. `latest` is the newest position the ledger holds and is read
+    /// AFTER the page, so it may already be ahead of it — which is exactly why a client must resume
+    /// from the last row it actually RECEIVED and never from `latest`. `latest` answers only "where
+    /// would I be if I skipped to now", the question a first-run client asks so it does not replay
+    /// the whole ledger as notifications.
+    ///
+    /// Reads the local replica ONLY. There is no oracle path here and there must not be: this is
+    /// an open, token-less read, and routing it outbound would disclose the wallet's addresses to
+    /// a third party on every poll.
+    pub async fn wallet_arrivals(
+        &self,
+        after_seq: i64,
+        limit: i64,
+    ) -> sqlx::Result<(Vec<super::arrivals::Arrival>, i64)> {
+        let page = self.db.arrivals_since(after_seq, limit).await?;
+        let latest = self.db.arrival_cursor().await?;
+        Ok((page, latest))
     }
 
     async fn send_xch(&self, req: &SendXch) -> Result<TransactionResponse> {
