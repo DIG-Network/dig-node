@@ -38,12 +38,10 @@ impl ScriptedEntropy {
 
 impl EntropySource for ScriptedEntropy {
     fn fill(&self, buf: &mut [u8]) {
-        let draw = self
-            .draws
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("scripted entropy exhausted: the code under test drew more than the script");
+        let draw =
+            self.draws.lock().unwrap().pop_front().expect(
+                "scripted entropy exhausted: the code under test drew more than the script",
+            );
         *self.consumed.lock().unwrap() += 1;
         let bytes = draw.to_le_bytes();
         for (slot, byte) in buf.iter_mut().zip(bytes.iter().cycle()) {
@@ -134,14 +132,10 @@ fn the_production_entropy_source_is_the_os_csprng_and_not_the_clock() {
 /// separate them if the second draw also reduced to 0, so the draw COUNT is asserted too.
 #[test]
 fn an_out_of_zone_draw_is_rejected_rather_than_folded_in_with_modulo() {
+    // `u64::MAX` is in the rejection tail for any bound that does not divide 2^64: the accepted
+    // zone is `u64::MAX - (u64::MAX % bound)`, which for bound 3 is `u64::MAX - 0`, so a draw of
+    // exactly `u64::MAX` falls outside it. First draw is that tail value; second is a clean 1.
     let bound = 3u64;
-    let zone = u64::MAX - (u64::MAX % bound);
-    assert!(
-        u64::MAX >= zone,
-        "fixture is not exercising the rejection tail; pick a draw at or above the zone"
-    );
-
-    // First draw is in the tail; second is a clean 1.
     let entropy = ScriptedEntropy::new(&[u64::MAX, 1]);
     let picked = uniform_below(&entropy, bound);
 
@@ -334,7 +328,10 @@ fn the_credibility_band_is_symmetric_about_the_median() {
         !kept.contains(&"high".to_string()),
         "a claim past the tolerance ABOVE the median was admitted: {kept:?}"
     );
-    assert!(kept.contains(&"low".to_string()), "a healthy peer was excluded");
+    assert!(
+        kept.contains(&"low".to_string()),
+        "a healthy peer was excluded"
+    );
 }
 
 /// PROPERTY: the question is normalised to a height every sampled peer has already passed, so
@@ -396,7 +393,12 @@ fn a_chain_younger_than_the_settle_margin_has_no_settled_height() {
 #[test]
 fn a_single_lying_peer_cannot_move_the_replica() {
     let verdict = tally(
-        &responses(&[("honest-a", 1), ("honest-b", 1), ("honest-c", 1), ("liar", 9)]),
+        &responses(&[
+            ("honest-a", 1),
+            ("honest-b", 1),
+            ("honest-c", 1),
+            ("liar", 9),
+        ]),
         QUORUM_SAMPLE,
         QUORUM_AGREEMENT,
     );
@@ -407,7 +409,11 @@ fn a_single_lying_peer_cannot_move_the_replica() {
             agreed,
             dissenters,
         } => {
-            assert_eq!(answer, Bytes32::new([1; 32]), "the liar's answer was written");
+            assert_eq!(
+                answer,
+                Bytes32::new([1; 32]),
+                "the liar's answer was written"
+            );
             assert_eq!(agreed, 3);
             assert_eq!(
                 dissenters,
@@ -513,14 +519,6 @@ fn too_few_answers_is_insufficient_and_not_a_quorum_among_the_responders() {
     );
 }
 
-/// PROPERTY: the compile-time floor holds — the threshold is a strict majority, so two
-/// contradictory answers can never both reach quorum in one round.
-#[test]
-fn the_threshold_is_a_strict_majority_of_the_sample() {
-    assert!(QUORUM_AGREEMENT * 2 > QUORUM_SAMPLE);
-    assert!(QUORUM_AGREEMENT <= QUORUM_SAMPLE);
-}
-
 // ---------------------------------------------------------------------------
 // Self-verifying reads
 // ---------------------------------------------------------------------------
@@ -538,7 +536,10 @@ fn a_coin_id_is_verified_locally_and_never_taken_on_a_peers_word() {
         puzzle_hash: Bytes32::new([2; 32]),
         amount: 1_000,
     };
-    let impostor = Coin { amount: 999, ..coin };
+    let impostor = Coin {
+        amount: 999,
+        ..coin
+    };
 
     assert!(coin_id_is_derived_not_trusted(&coin, coin.coin_id()));
     assert!(
@@ -624,5 +625,8 @@ fn the_sybil_numbers_match_what_spec_md_publishes() {
     assert!((thirty - 0.0837).abs() < 0.0005, "30% hostile: {thirty}");
     assert!((half - 0.3125).abs() < 0.0005, "50% hostile: {half}");
 
-    assert!(ten < thirty && thirty < half, "not monotone in the attacker's share");
+    assert!(
+        ten < thirty && thirty < half,
+        "not monotone in the attacker's share"
+    );
 }

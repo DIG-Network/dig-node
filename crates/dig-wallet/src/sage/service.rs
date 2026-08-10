@@ -33,7 +33,8 @@ use super::spend::{
     Broadcaster, ChiaQueryBroadcaster, ChiaQueryConfirmer, Confirmer, ConfirmingBroadcaster,
 };
 use super::sync_supervisor::{
-    spawn_supervisor, ChiaPeerSessionFactory, Supervisor, SyncHandle, TokioTime,
+    spawn_supervisor, ChiaPeerSessionFactory, ChiaQuorumCorroborator, Supervisor, SyncHandle,
+    TokioTime,
 };
 use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
@@ -173,11 +174,19 @@ impl WalletService {
         // The background chain-sync supervisor (§18.6, #2501): the production call site
         // `sage::sync` never had. It starts at boot with NO seed and NO unlock — its
         // subscription set is custody's persisted PUBLIC keys, readable while every wallet is
-        // locked — and it refuses to run a catch-up over an empty set. A default install
-        // (no operator-chosen peer in the `peers` table) therefore reaches only DISCOVERED
-        // peers, which write nothing at all: `initial_sync_complete` stays false, the replica
-        // peak stays NULL, and the whole contribution is the live peer count. See
-        // `sync::PeerTrust` for why the peak is not the harmless half of that.
+        // locked — and it refuses to run a catch-up over an empty set.
+        //
+        // A default install has no operator-chosen peer in the `peers` table and so reaches only
+        // DISCOVERED peers. Until dig_ecosystem#2568 those wrote nothing at all, which meant the
+        // shipped default never synced: `initial_sync_complete` stayed false and the replica peak
+        // stayed NULL forever. dig-node is a light client, so that default IS the product.
+        //
+        // The `ChiaQuorumCorroborator` attached here is what changes it. A discovered peer is
+        // still untrusted on arrival; it earns write authority for one session only, by agreeing
+        // with an independently drawn quorum of randomly dialled peers about a SETTLED height
+        // (`sage::quorum`). Attaching it is therefore the difference between a node that syncs and
+        // one that does not — and leaving it `None` is a deliberate, honest "no corroboration, no
+        // writes", never a silent downgrade.
         // The task handle is dropped deliberately: the supervisor lives for the process, and
         // its stop signal is `SyncHandle::shutdown`, not a dropped join handle.
         let sync = if cfg.enable_chain_sync {
@@ -188,6 +197,7 @@ impl WalletService {
                 events: events.clone(),
                 genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
                 time: Arc::new(TokioTime),
+                corroborator: Some(Arc::new(ChiaQuorumCorroborator::mainnet())),
             }))
         } else {
             None
