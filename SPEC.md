@@ -3940,14 +3940,32 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
   can make settled money read unconfirmed.
 
 18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
-chia_peer_count}`. `phase` is `not_started` (no peer has ever attached), `syncing`, or `synced` — and
-`synced` requires BOTH a completed catch-up AND at least one live Chia peer, so a replica that caught up
-and then went offline reports `syncing`. It is not a freshness guarantee: a live connection to a stalled
-peer satisfies it. `peak_height` is the REPLICA's own height read from `sync_state`; it MUST NOT fall back
-to the coinset oracle (unlike `control.wallet.peak`, which answers a different question), and `null` means
-unknown, never height zero. `chia_peer_count` is `0` when observed and `null` when unobservable.
-`control.peerCounts` reports `{dig_peer_count, chia_peer_count, known_dig_peer_count}`, and its
-`chia_peer_count` MUST be the SAME observation this method reports.
+chia_peer_count, watched_addresses}`. `phase` is `not_started` (no peer has ever attached), `syncing`,
+`synced`, or `no_addresses_to_watch` — and `synced` requires BOTH a completed catch-up AND at least one
+live Chia peer, so a replica that caught up and then went offline reports `syncing`. It is not a freshness
+guarantee: a live connection to a stalled peer satisfies it. `peak_height` is the REPLICA's own height read
+from `sync_state`; it MUST NOT fall back to the coinset oracle (unlike `control.wallet.peak`, which answers
+a different question), and `null` means unknown, never height zero. `chia_peer_count` is `0` when observed
+and `null` when unobservable. `control.peerCounts` reports `{dig_peer_count, chia_peer_count,
+known_dig_peer_count}`, and its `chia_peer_count` MUST be the SAME observation this method reports.
+
+**`no_addresses_to_watch` is the DEFAULT-INSTALL state and MUST NOT be reported as `syncing`.** A node with
+no wallet enrolled holds zero puzzle hashes; §18.6 REFUSES a catch-up over an empty set, so
+`initial_sync_complete` can never latch, while `new_peak_wallet` keeps the replica's peak advancing with the
+chain indefinitely. The node is therefore current and will never report `synced`. This phase MUST be
+reported when, and only when, ALL THREE hold: a Chia peer is attached RIGHT NOW; that peer's effective trust
+is authoritative (`Operator` or `Corroborated`, §18.6a) so it MAY write; and the attached session resolved a
+MEASURED-EMPTY custody set. The trust condition is load-bearing — an uncorroborated writer's subscription set
+is forced empty too, and that replica is deliberately NOT being written and IS falling behind, so reporting
+it as "nothing to watch" would present a stalled replica as a healthy one. It MUST NOT be folded into
+`synced`, which additionally licenses §18.7 routing wallet-scoped reads to the local replica; latching that
+over an un-queried DB reads a funded wallet as empty.
+
+`watched_addresses` reports how many custodied puzzle hashes the attached session resolved: a MEASURED `0`
+(the reason for `no_addresses_to_watch`), a positive count, or `null` when no attached session has resolved
+a set yet — a peer mid-corroboration, or none attached. A consumer MUST NOT read `null` as `0`. A consumer
+MUST render `no_addresses_to_watch` as its own statement — the node is current and there is nothing
+wallet-scoped to sync — and MUST NOT render it as chain lag or as a balance still being awaited.
 
 18.6c. **The known DIG peer count.** `control.peerCounts.known_dig_peer_count` is the number of DIG peers
 this node has LEARNED OF, connected or not — the size of the gossip layer's discovered-peer address book,

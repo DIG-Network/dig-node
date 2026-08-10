@@ -336,11 +336,7 @@ impl Harness {
 
     /// Poll the COMPOSED status until `predicate` holds, or fail. The phase depends on live
     /// session facts that no DB row carries, so it can only be awaited through the handle.
-    async fn until_status(
-        &self,
-        what: &str,
-        mut predicate: impl FnMut(&WalletSyncStatus) -> bool,
-    ) {
+    async fn until_status(&self, what: &str, mut predicate: impl FnMut(&WalletSyncStatus) -> bool) {
         for _ in 0..2_000 {
             if predicate(&self.handle.status(&self.db).await.unwrap()) {
                 return;
