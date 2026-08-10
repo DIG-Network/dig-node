@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.111.0] - 2026-08-10
+
+### Features
+- **wallet:** Quorum-by-agreement peer trust so a default install syncs (#209)
+
 ## [0.110.0] - 2026-08-10
 
 ### Features
