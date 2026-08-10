@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.107.0] - 2026-08-10
+
+### Bug Fixes
+- **wallet:** A discovered peer writes nothing, and gate every spend-input reader (#207)
+
 ## [0.106.0] - 2026-08-10
 
 ### Features
