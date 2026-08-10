@@ -2,9 +2,16 @@
 //!
 //! [`crate::sage::sync`] is a complete subscription loop that, until now, had **no production
 //! call site**: nothing connected a peer, nothing subscribed, and so `sync_state.peak_height`
-//! stayed NULL on every install. This module is that missing call site — it owns the peer
-//! lifecycle (connect, catch up, consume pushes, reconnect with backoff, shut down) and
-//! exposes the small amount of live state the DB alone cannot express.
+//! stayed NULL on installs with only operator-chosen peers. This module is that missing call site
+//! — it owns the peer lifecycle (connect, catch up, consume pushes, reconnect with backoff, shut
+//! down) and exposes the small amount of live state the DB alone cannot express.
+//!
+//! On a DEFAULT install (no `user_managed` peer rows) the node dials a DISCOVERED peer, which
+//! writes nothing to the DB (see [`crate::sage::sync::PeerTrust`]): `peak_height` stays NULL,
+//! `is_synced()` stays false, and wallet reads remain on the fallback tier — which is the
+//! correct answer, since no authoritative sync has run. The module's contribution on a default
+//! install is liveness only: `chia_peer_count` stays non-null, so the phase advances from
+//! `not_started` to `syncing`.
 //!
 //! # What the DB cannot say
 //!
@@ -51,13 +58,14 @@ const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const HEALTHY_SESSION: Duration = Duration::from_secs(60);
 /// Per-attempt dial timeout for the production factory.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often a peak-only session re-reads the subscription set.
+/// How often a nothing-subscribed session re-reads the subscription set.
 ///
-/// The default install has ZERO puzzle hashes, so the peak-only session is the common path, and
-/// a subscription is per-connection state: the set is fixed for the life of a connection. Without
-/// this poll a wallet created after boot waits for the peer to drop — which can be hours — before
-/// anything subscribes it. Five seconds is imperceptible to the user creating the wallet and is a
-/// local read of already-loaded public keys, so it costs nothing on the wire.
+/// The default install has ZERO puzzle hashes, so the nothing-subscribed session is the common
+/// path, and a subscription is per-connection state: the set is fixed for the life of a
+/// connection. Without this poll a wallet created after boot waits for the peer to drop — which
+/// can be hours — before anything subscribes it. Five seconds is imperceptible to the user
+/// creating the wallet and is a local read of already-loaded public keys, so it costs nothing on
+/// the wire.
 const PUZZLE_HASH_POLL: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
@@ -153,6 +161,20 @@ impl SyncHandle {
 
     fn observed(&self) -> Observed {
         *self.inner.observed.read().expect("observed lock poisoned")
+    }
+
+    /// A handle attached to NO supervisor, reporting `peers` peers — so a test can give the
+    /// Chia peer count a distinctive, non-default value without dialling the network.
+    ///
+    /// It exists because the "both methods report ONE observation" conformance property is
+    /// otherwise inexpressible: with no supervisor running, both methods answer `null`, and a
+    /// test comparing two `null`s compares two unobservables and passes against a handler that
+    /// returns a literal. Dropping this handle stops nothing, because it started nothing.
+    #[doc(hidden)]
+    pub fn detached_for_tests(peers: u32) -> Self {
+        let (handle, _rx) = Self::new();
+        handle.set_connected(peers);
+        handle
     }
 
     fn set_connected(&self, peers: u32) {
@@ -333,7 +355,7 @@ fn jitter(base: Duration) -> Duration {
 enum SessionOutcome {
     /// Shutdown was requested; the supervisor exits.
     Stop,
-    /// The subscription set changed under a peak-only session; reconnect immediately.
+    /// The subscription set changed under a nothing-subscribed session; reconnect immediately.
     Resubscribe,
     /// The peer disconnected (or the loop errored); back off and retry.
     Ended,
@@ -395,24 +417,28 @@ impl Supervisor {
             // (height, header_hash) is not safe while `run_update_loop`'s `NewPeakWallet` arm
             // advances the height while carrying the OLD hash forward.
             //
-            // A DISCOVERED peer subscribes nothing, whatever the wallet holds: its answers may
-            // never make the replica authoritative (`sync::PeerTrust`), so a subscription would
-            // buy only a coin table it is not allowed to be believed about. It runs as a
-            // peak-only session, which is what powers the live sync status.
+            // A DISCOVERED peer subscribes nothing AND writes nothing, whatever the wallet holds:
+            // its answers may never make the replica authoritative (`sync::PeerTrust`), and a
+            // higher peak would inflate apparent confirmation counts (see [`sync::PeerTrust`]
+            // for the inversion that made this the vulnerability). It runs as a write-free
+            // session, which is what powers the live sync status.
             let trust = session.trust();
             let puzzle_hashes = match trust {
                 PeerTrust::Operator => self.puzzle_hashes.puzzle_hashes(),
                 PeerTrust::Discovered => Vec::new(),
             };
             let subscribed: sync::SubscribedHashes = puzzle_hashes.iter().copied().collect();
-            let peak_only = puzzle_hashes.is_empty();
-            if peak_only {
-                // Nothing to subscribe. The session still runs: `new_peak_wallet` needs no
-                // subscription, so the replica's peak keeps advancing, and `is_synced()`
-                // stays false — which is the truth, and what keeps wallet-scoped reads on
-                // the fallback tier. It is also re-polled below, so a wallet created after
-                // boot is subscribed within seconds rather than at the next disconnect.
-                tracing::debug!("wallet sync: no custodied puzzle hashes; peak-only session");
+            let nothing_subscribed = puzzle_hashes.is_empty();
+            if nothing_subscribed {
+                // Nothing to subscribe. The session still runs: for an OPERATOR peer with an
+                // empty puzzle-hash set, `new_peak_wallet` needs no subscription and the
+                // replica's peak keeps advancing. A DISCOVERED peer subscribes nothing AND
+                // writes nothing — its frames are dropped by `handle_coin_state_update` and
+                // `run_update_loop` before any DB write, including the peak. In both cases
+                // `is_synced()` stays false — the truth, and what keeps wallet-scoped reads on
+                // the fallback tier. The session is also re-polled below, so a wallet created
+                // after boot is subscribed within seconds rather than at the next disconnect.
+                tracing::debug!("wallet sync: no custodied puzzle hashes; nothing subscribed");
             } else if let Err(e) = session
                 .catch_up(
                     &self.db,
@@ -438,11 +464,12 @@ impl Supervisor {
                     }
                     SessionOutcome::Ended
                 }
-                // A wallet appeared while this peak-only session was running. The subscription
-                // is per-connection state, so the only way to subscribe it is a new session.
-                // Only worth waiting for on a peer that could actually subscribe them; a
-                // discovered peer stays peak-only however many wallets appear.
-                () = self.await_puzzle_hashes(peak_only && trust.is_authoritative())
+                // A wallet appeared while this nothing-subscribed session was running. The
+                // subscription is per-connection state, so the only way to subscribe it is a
+                // new session. Only worth waiting for on a peer that could actually subscribe
+                // them; a discovered peer subscribes nothing AND writes nothing however many
+                // wallets appear.
+                () = self.await_puzzle_hashes(nothing_subscribed && trust.is_authoritative())
                     => SessionOutcome::Resubscribe,
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
@@ -529,6 +556,32 @@ impl ChiaPeerSessionFactory {
     }
 }
 
+/// HOW a peer connection was obtained — the only input the trust label is allowed to have.
+///
+/// Named as a type rather than left as a `bool` or an inline literal because the mapping below
+/// is the single line the whole trust model rests on, and an inline literal is invisible: the
+/// previous round's audit flipped `PeerTrust::Discovered` to `PeerTrust::Operator` at the
+/// discovery call site and the entire crate's test suite stayed green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialSource {
+    /// A `user_managed` row in the `peers` table: an address the OPERATOR typed in.
+    UserManagedPeerRow,
+    /// A DNS-introducer answer or the loopback probe — whoever answered first.
+    Discovery,
+}
+
+/// The trust a peer earns from HOW it was reached, and from nothing else.
+///
+/// Deliberately total, pure, and `const`: it takes no peer input, so there is no argument a peer
+/// can supply that changes its answer, and both arms are pinned by
+/// [`tests::the_trust_label_is_fixed_by_the_dial_source`].
+pub const fn trust_for(source: DialSource) -> PeerTrust {
+    match source {
+        DialSource::UserManagedPeerRow => PeerTrust::Operator,
+        DialSource::Discovery => PeerTrust::Discovered,
+    }
+}
+
 #[async_trait::async_trait]
 impl SyncSessionFactory for ChiaPeerSessionFactory {
     async fn connect(&self) -> Result<Box<dyn SyncSession>, SyncError> {
@@ -563,7 +616,7 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
                     return Ok(Box::new(ChiaPeerSession {
                         peer,
                         ip: addr.to_string(),
-                        trust: PeerTrust::Operator,
+                        trust: trust_for(DialSource::UserManagedPeerRow),
                         receiver: tokio::sync::Mutex::new(Some(receiver)),
                     }))
                 }
@@ -593,7 +646,7 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
         Ok(Box::new(ChiaPeerSession {
             peer,
             ip: addr.to_string(),
-            trust: PeerTrust::Discovered,
+            trust: trust_for(DialSource::Discovery),
             receiver: tokio::sync::Mutex::new(Some(receiver)),
         }))
     }

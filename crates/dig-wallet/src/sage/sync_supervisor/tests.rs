@@ -396,7 +396,10 @@ async fn supervisor_with_no_derivations_never_marks_initial_sync_complete() {
 /// **Proves (T3, #2501):** the replica's peak advances even with zero derivations.
 ///
 /// `new_peak_wallet` is not a subscription response, so it arrives regardless of what was
-/// subscribed — which is what makes a peak-only session useful on a wallet-less node. The
+/// subscribed — which is what lets an OPERATOR peer's session keep the peak current on a
+/// wallet-less node. [`Harness::start`] dials as [`PeerTrust::Operator`]; a DISCOVERED peer
+/// subscribes nothing AND writes nothing, so it never advances the peak (see
+/// [`a_discovered_peer_never_marks_the_replica_authoritative_across_reconnects`]). The
 /// message here is a real encoded `NewPeakWallet` decoded by the real
 /// [`sync::run_update_loop`]; the double supplies only the socket.
 #[tokio::test]
@@ -426,7 +429,7 @@ async fn supervisor_with_no_derivations_still_advances_the_replica_peak() {
     assert_eq!(
         db.sync_state().await.unwrap().peak_height,
         Some(6_123_456),
-        "a peak-only session must still advance the replica peak"
+        "an operator peer's nothing-subscribed session must still advance the replica peak"
     );
     assert!(
         !db.is_synced().await.unwrap(),
@@ -499,8 +502,11 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
 /// a wallet that HAS puzzle hashes - so there is a real subscription to run and the test cannot
 /// pass by the empty-set guard - and no catch-up is ever attempted.
 ///
-/// The peak assertion is the control: a supervisor that satisfied the trust boundary by ignoring
-/// discovered peers altogether would take the live sync status with it, and would fail here.
+/// The LIVENESS assertion is the control: a supervisor that satisfied the trust boundary by
+/// refusing to dial discovered peers at all would leave a default install with no peer count and
+/// no `syncing` phase, and would fail here. It replaces the peak assertion this test used to
+/// carry — the third audit round established that the peak was never the harmless half (see
+/// [`sync::PeerTrust`]), so the peak is now asserted to stay UNKNOWN instead.
 #[tokio::test]
 async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnects() {
     let db = WalletDb::open_in_memory().await.unwrap();
@@ -527,16 +533,25 @@ async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnec
         );
         h.until("a live session", |s| !s.senders.lock().unwrap().is_empty())
             .await;
+        assert!(
+            h.handle
+                .status(&db)
+                .await
+                .unwrap()
+                .chia_peer_count
+                .is_some_and(|n| n >= 1),
+            "cycle {cycle}: the session must still COUNT — liveness is the whole of what a \
+             discovered peer contributes, so a supervisor that simply refuses to dial one fails \
+             here"
+        );
         let sender = h.script.senders.lock().unwrap().last().unwrap().clone();
         sender
             .send(peak_message(6_000_000 + cycle))
             .await
             .expect("the session consumes peer pushes");
-        h.until_db("the advisory peak to land", move |s| {
-            s.peak_height == Some(6_000_000 + cycle)
-        })
-        .await;
-        // The attacker hangs up, buying itself a reconnect.
+        // The attacker hangs up, buying itself a reconnect. Observing the NEXT connect (the top
+        // of the following iteration) is what proves the frame above was consumed first: the
+        // loop only returns once its receiver closes, which happens here.
         h.script.disconnect_all();
     }
 
@@ -556,8 +571,9 @@ async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnec
     );
     assert_eq!(
         db.sync_state().await.unwrap().peak_height,
-        Some(6_000_003),
-        "while the peak - the one thing an advisory peer may move - kept advancing"
+        None,
+        "and must not have moved the peak either: three sessions pushed a new_peak_wallet each \
+         and the replica's own height is still UNKNOWN"
     );
     h.stop().await;
 }
@@ -731,7 +747,8 @@ async fn backoff_grows_then_resets_after_a_long_lived_connection() {
 
     let h = Harness::start(
         db,
-        // A subscribed wallet, so `slept` records ONLY the backoff ladder: a peak-only session
+        // A subscribed wallet, so `slept` records ONLY the backoff ladder: a nothing-subscribed
+        // session
         // additionally re-polls for a newly-created wallet on its own interval, and those sleeps
         // would be indistinguishable from backoff rungs here.
         Arc::new(FixedHashes(vec![Bytes32::new([4; 32])])),
@@ -895,17 +912,17 @@ fn supervisor_tls_identity_is_generated_never_file_backed() {
 // T13 — the live acceptance step (never run in CI)
 // ---------------------------------------------------------------------------
 
-/// **Proves (T13, #2501):** a real mainnet peer advances the replica's peak with ZERO
-/// derivations subscribed.
+/// **Proves (T13, #2501):** a real DISCOVERED mainnet peer connects, is COUNTED, and writes
+/// nothing to the replica.
 ///
-/// This is the ONLY test that can falsify the assumption the peak-only session rests on — that
-/// a full node pushes `new_peak_wallet` unsolicited to a wallet peer that has subscribed
-/// nothing. Nothing in this repo asserts it and no offline test can: the doubles above supply
-/// the frame that the real question is whether a peer would have sent. Ignored because it dials
-/// mainnet; run it by hand.
+/// This is the ONLY test that can falsify the assumption a discovery-only install rests on —
+/// that dialling a stranger yields a live session at all. What that session is worth changed in
+/// the third audit round: a discovered peer no longer advances the peak (see
+/// [`sync::PeerTrust`]), so its entire contribution is the liveness this test observes. Ignored
+/// because it dials mainnet; run it by hand.
 #[tokio::test]
 #[ignore = "dials real mainnet peers; run by hand as the #2501 acceptance step"]
-async fn live_mainnet_peer_advances_the_peak() {
+async fn live_mainnet_discovered_peer_is_counted_and_writes_nothing() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let factory = Arc::new(ChiaPeerSessionFactory::mainnet(db.clone()));
     let (handle, join) = spawn_supervisor(Supervisor {
@@ -917,29 +934,73 @@ async fn live_mainnet_peer_advances_the_peak() {
         time: Arc::new(TokioTime),
     });
 
-    // A mainnet block lands roughly every 19s; three minutes is several peaks of margin.
+    // A mainnet block lands roughly every 19s; three minutes is several peaks of margin, so a
+    // peer that was going to push anything has pushed it well inside this window.
     let deadline = std::time::Instant::now() + Duration::from_secs(180);
-    let mut peak = None;
+    let mut peers = None;
     while std::time::Instant::now() < deadline {
-        peak = db.sync_state().await.unwrap().peak_height;
-        if peak.is_some() {
+        peers = handle.status(&db).await.unwrap().chia_peer_count;
+        if peers.is_some_and(|n| n >= 1) {
             break;
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+    let peak_after = db.sync_state().await.unwrap().peak_height;
     handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
 
-    let peak = peak.expect(
-        "a mainnet peer must push new_peak_wallet to a wallet peer with no subscription; if this \
-         fails, the peak-only session is not viable and the supervisor should idle instead",
-    );
     // Printed because this test is run by hand as an acceptance step, and the operator's
-    // question is "which height did a real peer actually report", not merely "did it pass".
-    println!("live mainnet peak reported with ZERO subscriptions: {peak}");
-    assert!(peak > 5_000_000, "a plausible mainnet height, got {peak}");
+    // question is "did a real stranger actually answer", not merely "did it pass".
+    println!("live mainnet discovered peers observed: {peers:?}");
+    assert!(
+        peers.is_some_and(|n| n >= 1),
+        "discovery must yield a live session; without one a default install has no liveness at \
+         all and the supervisor should idle instead. Got {peers:?}"
+    );
+    assert_eq!(
+        peak_after, None,
+        "a discovered peer must write NOTHING — the peak stays UNKNOWN however many frames it \
+         pushed over three minutes"
+    );
     assert!(
         !db.is_synced().await.unwrap(),
-        "a peak-only session must never mark the replica caught up"
+        "and must never mark the replica caught up"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T14 — the trust label itself
+// ---------------------------------------------------------------------------
+
+/// **Proves (F2, #2501):** the trust label is a total function of the DIAL SOURCE, pinned on
+/// BOTH arms.
+///
+/// **Why this test exists at all.** The third audit round flipped the discovery call site's
+/// label from `Discovered` to `Operator` — handing every stranger on the DNS introducer list the
+/// authority to rewrite the replica — and all 365 dig-wallet tests stayed green. Nothing pinned
+/// the mapping: [`ScriptedFactory`] takes its `trust` from the harness, so no supervisor test
+/// ever observes the production label, and
+/// [`user_managed_peers_are_tried_before_discovery`] asserts dial ORDER only, which the
+/// inverted version satisfies exactly as well as the correct one.
+///
+/// **What it can and cannot catch.** It catches the mapping being inverted, widened, or made to
+/// depend on anything else — the function takes no peer input, so there is no argument by which
+/// a peer could influence its own label. It does NOT catch a call site passing the wrong
+/// `DialSource`; that residual is why the two constructors below sit immediately beside the
+/// dial they describe, where a reader can see the source and the label in one line.
+#[test]
+fn the_trust_label_is_fixed_by_the_dial_source() {
+    assert_eq!(
+        trust_for(DialSource::UserManagedPeerRow),
+        PeerTrust::Operator,
+        "an address the operator typed in is the ONE thing that earns write authority; a wallet \
+         pointed at the operator's own full node that then refused to sync from it would be \
+         useless, so this arm is as load-bearing as the other"
+    );
+    assert_eq!(
+        trust_for(DialSource::Discovery),
+        PeerTrust::Discovered,
+        "a DNS-introducer answer, or whoever won the race to bind 127.0.0.1:8444, may never \
+         write to wallet.sqlite"
     );
 }

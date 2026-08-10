@@ -108,6 +108,23 @@ pub struct AppState {
 /// request to the upstream.
 const METHOD_NOT_FOUND: i64 = ErrorCode::MethodNotFound.code();
 
+impl AppState {
+    /// Re-attach the wallet backend with a chain-sync handle reporting `peers` Chia peers,
+    /// WITHOUT starting a supervisor (so no test dials mainnet).
+    ///
+    /// The integration harness runs `enable_chain_sync: false`, which leaves every Chia peer
+    /// count `null` — and a `null == null` comparison cannot see `control.peerCounts` and
+    /// `control.wallet.syncStatus` drifting onto different sources, which
+    /// dig-node-control-interface 0.8.0 makes a conformance MUST. This seam gives the count a
+    /// distinctive value so the two answers become distinguishable.
+    #[doc(hidden)]
+    pub fn with_chia_peer_count_for_tests(mut self, peers: u32) -> Self {
+        let handle = dig_wallet::sage::sync_supervisor::SyncHandle::detached_for_tests(peers);
+        self.wallet = Arc::new((*self.wallet).clone().with_sync_handle(handle));
+        self
+    }
+}
+
 /// Build the dig-node service's axum router. Beside `POST /` (JSON-RPC) and `GET /health`
 /// it exposes the self-describing discovery surface so an agent can introspect the
 /// node with zero out-of-band knowledge:

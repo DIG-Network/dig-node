@@ -1830,12 +1830,36 @@ impl WalletBackend {
 
     /// Refuse to select spend inputs from a replica that is not authoritative.
     ///
-    /// Every OTHER wallet-scoped read passes through [`routing::route`]; the two spend-input
-    /// readers below did not, so they selected coins straight out of the local table even while
+    /// The DISPLAY reads pass through [`routing::route`], which picks a tier; the spend-input
+    /// readers did not, so they selected coins straight out of the local table even while
     /// `initial_sync_complete` was false — the tier gate that guards every displayed balance
     /// never guarded the money path at all. The table is written by a peer, and the
     /// subscription filter is no defence against the peer itself: the wallet HANDS it the
     /// puzzle-hash set, so every hash that passes the filter is one the peer was just given.
+    ///
+    /// # The four readers, and why the count matters
+    ///
+    /// An earlier version of this doc said "the two spend-input readers below", and there were
+    /// four. The two it missed were the ones that matter most in practice:
+    /// [`Self::select_cats`] is the **$DIG** path behind `send_cat`, `bulk_send_cat` and the
+    /// node-custodied tip, and [`Self::singleton_parent_child`] is the single reader every
+    /// NFT/DID/option spend resolves its input coin through. Naming a subset is how the previous
+    /// round's finding recurred, so the complete list is written here and each entry is pinned
+    /// by its own mutation-proved test:
+    ///
+    /// | reader | rows become | reached by |
+    /// |---|---|---|
+    /// | [`Self::spendable_coins`] | XCH inputs + every fee | `send_xch`, `combine`, `split`, mints |
+    /// | [`Self::coins_from_ids`] | caller-named XCH inputs | `multi_send`, `combine`, `split` |
+    /// | [`Self::select_cats`] | CAT/$DIG inputs | `send_cat`, `bulk_send_cat`, offers, the tip |
+    /// | [`Self::singleton_parent_child`] | the singleton being spent | NFT/DID/option transfers |
+    ///
+    /// The last two were reachable UNGATED on the ordinary path: `select_cats` touched the gate
+    /// only through its XCH *fee* coins, and only when `fee > 0`, while `resolve_offer_cats`
+    /// passes fee `0` unconditionally and a plain `send_cat` does whenever the caller sets no
+    /// fee. That is not a dormant hole — [`super::sync::handle_coin_state_update`] clears
+    /// `initial_sync_complete` on any backwards move, so an ordinary reorg leaves the replica
+    /// unauthoritative while a fee-0 CAT send proceeds from it.
     ///
     /// Refusing is the right failure. An unsynced replica cannot be corrected into a safe input
     /// set by falling back per-coin — the fallback tier can say a coin exists, but the *set* of
@@ -2046,6 +2070,18 @@ impl WalletBackend {
                     .await;
         }
         // Mark the DB synced so wallet-data reads flip from the fallback to the local DB (routing).
+        //
+        // This is the OTHER writer of `initial_sync_complete` besides
+        // [`super::sync::initial_sync_with`] — worth stating, because that function's own note
+        // claimed to be the only one. It is outside the peer trust boundary: its rows come from
+        // the coinset ORACLE, never from a peer, and its only caller returns early unless
+        // live-broadcast is on.
+        //
+        // It DOES latch over zero rows, though: an oracle that answers an empty set for both
+        // reads leaves `n == 0` and the flag set anyway, declaring an empty table authoritative
+        // — which now additionally opens the spend gate above over that empty table. The
+        // failure mode is a refusal-shaped one (no inputs to select), not a wrong spend, which
+        // is why it is recorded rather than changed here; dig_ecosystem#2514 owns it.
         self.db.set_initial_sync_complete(true).await?;
         Ok(n)
     }
@@ -2132,12 +2168,19 @@ impl WalletBackend {
 
     /// Resolve the spendable input `Cat`s covering `amount` of `asset_id`, and the XCH fee
     /// coins covering `fee`, via the attached lineage source.
+    ///
+    /// Gated on [`Self::require_authoritative_coins`] IN ITS OWN RIGHT, not through the fee
+    /// coins: the fee branch is skipped entirely when `fee == 0`, which is the ordinary case and
+    /// the unconditional one for offers.
     async fn select_cats(
         &self,
         asset_id: &str,
         amount: u64,
         fee: u64,
     ) -> Result<(Vec<chia_wallet_sdk::driver::Cat>, Vec<Coin>)> {
+        // FIRST, ahead of the lineage lookup: an unauthoritative replica must be refused for
+        // being unauthoritative, whatever else is or is not attached to this backend.
+        self.require_authoritative_coins().await?;
         let lineage = self
             .lineage
             .as_deref()
@@ -2270,8 +2313,14 @@ impl WalletBackend {
     }
 
     /// Resolve a coin's parent spend + the current coin, from the wallet DB + lineage — the
-    /// input a singleton (NFT/DID) spend reconstruction needs.
+    /// input a singleton (NFT/DID/option) spend reconstruction needs.
+    ///
+    /// Gated on [`Self::require_authoritative_coins`]: this is the ONE reader every singleton
+    /// spend resolves its input coin through ([`Self::nft_parent_child`],
+    /// [`Self::did_parent_child`], [`Self::option_parent_child`] all delegate here), so gating
+    /// it covers all three rather than three sites that can drift apart.
     async fn singleton_parent_child(&self, coin_id: &str) -> Result<(ParentSpend, Coin)> {
+        self.require_authoritative_coins().await?;
         let lineage = self.require_lineage()?;
         let row = self
             .db
@@ -5421,6 +5470,97 @@ mod tests {
         );
     }
 
+    /// **Proves (F3, #2501 third audit):** the CAT/$DIG and singleton readers are gated TOO, on
+    /// the ordinary NO-FEE path where the previous round's gate never fired.
+    ///
+    /// **Why fee 0 is the whole fixture.** `select_cats` did touch
+    /// [`WalletBackend::require_authoritative_coins`] — through the XCH coins it selects to pay
+    /// the FEE, and only when `fee > 0`. `resolve_offer_cats` passes fee `0` unconditionally and
+    /// an ordinary `send_cat` does whenever the caller sets none, so the CAT path reached the
+    /// replica ungated in exactly the common case. A fixture with a fee would have gone green
+    /// against the unfixed code — it is the "strongest-looking input is the blindest" trap, with
+    /// the fee doing the hiding.
+    ///
+    /// **Why the assertion is on WHICH error, not merely that one occurred.** Both readers can
+    /// fail for a second reason on this backend (no lineage source attached), and a test that
+    /// accepted any error would pass against code with no gate at all. The refusal is therefore
+    /// pinned to the tier message, and the control flips ONLY the authority flag and shows the
+    /// SAME calls getting past it to the lineage failure underneath — which is the observable a
+    /// guard relocated below the lineage lookup could not produce.
+    #[tokio::test]
+    async fn the_cat_and_singleton_readers_refuse_an_unauthoritative_replica_at_zero_fee() {
+        let pair = BlsPair::new(4);
+        let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
+        let ph_hex = hex::encode(*signer.puzzle_hashes().iter().next().unwrap());
+        let asset = "dd".repeat(32);
+
+        // A funded CAT position at the wallet's OWN hash — the shape the subscription filter
+        // cannot catch, because the wallet hands the peer that hash.
+        let mut row = coin_at("c0", &ph_hex, 5_000_000);
+        row.asset_id = Some(asset.clone());
+        row.created_height = Some(5);
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[row]).await.unwrap();
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "the fixture must exercise the UNAUTHORITATIVE tier"
+        );
+        let cfg = WalletConfig {
+            puzzle_hashes: vec![ph_hex.clone()],
+            address_prefix: "txch".into(),
+            ..Default::default()
+        };
+        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), cfg).with_signer(signer);
+
+        let tier_error = |e: &Error| e.to_string().contains("not authoritative");
+
+        // Hop 1: the two readers, called directly at fee 0.
+        let cats = be.select_cats(&asset, 1_000, 0).await.unwrap_err();
+        assert!(
+            tier_error(&cats),
+            "select_cats must refuse for being unauthoritative, got {cats}"
+        );
+        let singleton = be.singleton_parent_child("c0").await.unwrap_err();
+        assert!(
+            tier_error(&singleton),
+            "singleton_parent_child must refuse for being unauthoritative, got {singleton}"
+        );
+
+        // Hop 2: the RPC a caller actually reaches, with no fee set.
+        let sent = be
+            .send_cat(&SendCat {
+                asset_id: asset.clone(),
+                address: encode_address(&ph_hex, "txch").unwrap(),
+                amount: Amount::Number(1_000),
+                fee: Amount::Number(0),
+                include_hint: true,
+                memos: vec![],
+                clawback: None,
+                auto_submit: false,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            tier_error(&sent),
+            "a fee-0 send_cat must refuse rather than spend from an unauthoritative replica, \
+             got {sent}"
+        );
+
+        // The control: the ONLY thing that changes is the authority flag. Both calls now get
+        // PAST the tier gate and fail on the missing lineage source underneath, which is a
+        // different failure — so the refusals above were the gate, not the empty backend.
+        be.db.set_initial_sync_complete(true).await.unwrap();
+        for e in [
+            be.select_cats(&asset, 1_000, 0).await.unwrap_err(),
+            be.singleton_parent_child("c0").await.unwrap_err(),
+        ] {
+            assert!(
+                !tier_error(&e) && e.to_string().contains("lineage"),
+                "past the gate, the next failure is the lineage source, got {e}"
+            );
+        }
+    }
+
     /// Point-read live sync (§18.12): `refresh_tracked_coins` reads the wallet's coins from the
     /// fallback tier, upserts them into the DB, and marks the DB synced — so coin selection then
     /// runs over live-synced state. Proven with a [`MockFallback`] holding one XCH coin at the
@@ -6346,11 +6486,17 @@ mod tests {
             .with_lineage(Arc::new(lineage))
             .with_broadcaster(mock.clone());
 
-        // BEFORE the sync: the DB is empty → selection reports the exact live-funds failure.
+        // BEFORE the sync: selection is REFUSED for the tier, ahead of counting anything.
+        //
+        // This assertion used to read "insufficient CAT balance: have 0", and that it did is
+        // itself the F3 finding: with both spend gates deleted this test stayed green, because
+        // the CAT path never reached a gate either way. "Have 0" is also the wrong answer to
+        // give — an unauthoritative replica does not know the balance is zero, and a caller
+        // cannot distinguish that sentence from a genuinely empty wallet.
         let err = be.select_cats(&asset_hex, 1_000, 0).await.unwrap_err();
         assert!(
-            err.to_string().contains("insufficient CAT balance: have 0"),
-            "pre-sync selection reproduces the live 'have 0' skip, got: {err}"
+            err.to_string().contains("not authoritative"),
+            "pre-sync selection is refused for the tier, not answered with a count, got: {err}"
         );
 
         // The wallet coin-DB sync: read the wallet's own coins from chain + attribute the CAT.

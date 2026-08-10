@@ -97,12 +97,22 @@ pub enum SyncError {
 ///
 /// # What a discovered peer may and may not do
 ///
-/// It MAY advance the replica's chain peak, monotonically — that is a public, checkable,
-/// non-destructive fact, and it is what powers `control.wallet.syncStatus` and the status
-/// display. It MAY NOT write coins, roll the replica back, or set `initial_sync_complete`. That
-/// last one is the whole point: [`crate::sage::routing::route`] keys wallet-scoped reads on that
-/// flag, so a peer that cannot set it can never make its own answers authoritative for money,
-/// no matter how it lies or how many times it reconnects.
+/// It writes NOTHING. Not coins, not `initial_sync_complete`, and not the chain peak. The one
+/// thing it contributes is LIVENESS: it counts toward `chia_peer_count`, which is an observation
+/// this node makes about its own socket rather than a claim the peer gets to make. Every
+/// persisted byte in `wallet.sqlite` is reachable only through a peer the operator chose.
+///
+/// An earlier version of this note let it "advance the peak, monotonically", on the reasoning
+/// that a too-high peak only makes a confirmation read more conservative. That reasoning was
+/// inverted, and the inversion was the vulnerability: a confirmation count is
+/// `peak − created_height`, so a HIGHER peak means MORE confirmations, not fewer. One frame at
+/// `u32::MAX` therefore reads as ~4.29e9 confirmations for a spend that never landed — and
+/// `control.wallet.peak` exists precisely so a caller can bound a claimed confirmation with it.
+/// The monotonic rule then made the lie permanent: it refuses every honest peer's correction,
+/// and on a default install (no operator peer) nothing else can ever lower the value again.
+///
+/// There is deliberately no in-memory advisory peak either. Nothing consumes one, and an unread
+/// field is the foothold the next version of this defect grows from.
 ///
 /// The alternative — patching each individual leak — was tried and walked around: an attacker
 /// that empties the replica and then simply closes the socket gets a fresh catch-up on the
@@ -118,7 +128,8 @@ pub enum PeerTrust {
     /// A `user_managed` row in the `peers` table: an address the operator chose. Full
     /// authority — catch-up, rollback, and the `initial_sync_complete` flag.
     Operator,
-    /// Found by DNS introducer or the loopback probe. Advisory only: peak, and nothing else.
+    /// Found by DNS introducer or the loopback probe. Contributes liveness only, and writes
+    /// nothing at all.
     Discovered,
 }
 
@@ -258,7 +269,7 @@ pub type SubscribedHashes = HashSet<Bytes32>;
 /// free function handed one frame at a time cannot enforce either. [`run_update_loop`] owns one
 /// and lends it to every [`handle_coin_state_update`] call.
 pub struct SessionState<'a> {
-    /// The puzzle hashes this session subscribed. Empty for a peak-only session.
+    /// The puzzle hashes this session subscribed. Empty when the session subscribes nothing.
     pub subscribed: &'a SubscribedHashes,
     /// How far this session's peer is trusted.
     pub trust: PeerTrust,
@@ -428,21 +439,26 @@ impl CatAttributor<'_> {
 /// The cost of being conservative here is a temporary fallback read after a *legitimate* reorg,
 /// which is correct: after a rollback the replica genuinely is behind.
 ///
-/// # A discovered peer takes the advisory path
+/// # A discovered peer's frame is dropped whole
 ///
-/// When `session.trust` is [`PeerTrust::Discovered`] this does exactly one thing: advance the
-/// peak, monotonically. No rollback, no coin write, no touching the routing flag. Every
-/// destructive verb in this function is reachable only through a peer the operator chose.
+/// When `session.trust` is [`PeerTrust::Discovered`] this returns without touching the database:
+/// no rollback, no coin write, no routing flag, and no peak (see [`PeerTrust`] for why the peak
+/// is not the harmless half). Dropping the frame is not an error — the session stays up, because
+/// the peer still counts toward `chia_peer_count`.
 pub async fn handle_coin_state_update(
     db: &WalletDb,
     update: &CoinStateUpdate,
     events: &EventBus,
     session: &mut SessionState<'_>,
 ) -> Result<(), SyncError> {
-    let current_peak = db.sync_state().await?.peak_height;
     if !session.trust.is_authoritative() {
-        return advance_peak_only(db, update, current_peak).await;
+        tracing::debug!(
+            claimed_height = update.height,
+            "wallet sync: dropping a coin_state_update from a discovered peer"
+        );
+        return Ok(());
     }
+    let current_peak = db.sync_state().await?.peak_height;
     let mut moved_backwards = false;
     if let Some(peak) = current_peak {
         if update.fork_height < peak {
@@ -473,33 +489,6 @@ pub async fn handle_coin_state_update(
     db.set_peak(update.height, &hex::encode(update.peak_hash))
         .await?;
     events.publish(SyncEvent::CoinState);
-    Ok(())
-}
-
-/// The advisory half of [`handle_coin_state_update`]: take the peak if it moves FORWARD and
-/// discard everything else the frame claims.
-///
-/// A discovered peer's `coin_state_update` is not evidence about this wallet's money — the
-/// wallet handed that peer its own puzzle-hash set, so every hash the peer can name is one it
-/// was just given, and the subscription filter proves nothing against it. What the frame does
-/// carry is a height, which is public and cheap to be wrong about in only one direction: taking
-/// it only when it advances means the worst a hostile peer achieves is a peak that is too high,
-/// which makes a confirmation read MORE conservative, never less.
-async fn advance_peak_only(
-    db: &WalletDb,
-    update: &CoinStateUpdate,
-    current_peak: Option<u32>,
-) -> Result<(), SyncError> {
-    if current_peak.is_some_and(|peak| update.height <= peak) {
-        tracing::debug!(
-            claimed = update.height,
-            current = ?current_peak,
-            "wallet sync: discarding a non-advancing coin_state_update from a discovered peer"
-        );
-        return Ok(());
-    }
-    db.set_peak(update.height, &hex::encode(update.peak_hash))
-        .await?;
     Ok(())
 }
 
@@ -585,12 +574,17 @@ pub async fn initial_sync_with(
     events: &EventBus,
     trust: PeerTrust,
 ) -> Result<(), SyncError> {
-    // THE TRUST BOUNDARY. This function is the ONLY thing in the crate that sets
-    // `initial_sync_complete`, and that flag is what `routing::route` turns into "the local
-    // replica answers for money". So the check belongs HERE, at the floor, rather than only in
+    // THE TRUST BOUNDARY. This is the only place a PEER can set `initial_sync_complete`, and
+    // that flag is what `routing::route` turns into "the local replica answers for money". So
+    // the check belongs HERE, at the floor, rather than only in
     // the supervisor that decides which peer to dial: a supervisor-side check is one refactor —
     // or one reconnect after a hostile disconnect — away from gone, which is precisely how the
     // previous, per-leak version of this defence was walked around.
+    //
+    // "Only place a PEER can set it" is precise, not loose: [`crate::sage::rpc::WalletBackend::
+    // refresh_tracked_coins`] also latches the flag, from the coinset ORACLE tier. That path
+    // takes no peer input, so it is outside this boundary — but it is not outside notice, and
+    // its own doc records the empty-fallback case it latches over.
     if !trust.is_authoritative() {
         return Err(SyncError::UntrustedPeer);
     }
@@ -656,9 +650,11 @@ pub async fn initial_sync_with(
 }
 
 /// Consume peer pushes on the receiver until it closes: `coin_state_update` →
-/// [`handle_coin_state_update`]; `new_peak_wallet` → advance the peak. This is the
-/// production loop run after [`initial_sync`]; it returns when the peer disconnects, at
-/// which point it publishes [`SyncEvent::Stop`] on `events`.
+/// [`handle_coin_state_update`]; `new_peak_wallet` → advance the peak, but ONLY from an
+/// authoritative peer — a [`PeerTrust::Discovered`] peer's height is dropped here, for the same
+/// reason its coins are (see [`PeerTrust`]). This is the production loop run after
+/// [`initial_sync`]; it returns when the peer disconnects, at which point it publishes
+/// [`SyncEvent::Stop`] on `events`.
 ///
 /// When `attributor` is `Some`, each applied `coin_state_update` is followed by a CAT/
 /// singleton attribution pass (#407) so newly-synced CAT coins gain their `asset_id`. When
@@ -666,7 +662,7 @@ pub async fn initial_sync_with(
 ///
 /// `session` carries the puzzle-hash set this session actually subscribed (pushed coins outside
 /// it are dropped — see [`apply_coin_states`]; an empty set is meaningful and correct, because a
-/// peak-only session subscribes nothing and must therefore write no coins), how far its peer is
+/// nothing-subscribed session writes no coins), how far its peer is
 /// trusted ([`PeerTrust`]), and its cumulative rollback allowance.
 pub async fn run_update_loop(
     db: &WalletDb,
@@ -687,6 +683,17 @@ pub async fn run_update_loop(
             }
             ProtocolMessageTypes::NewPeakWallet => {
                 if let Ok(peak) = decode::<NewPeakWallet>(&message) {
+                    // A discovered peer's height is not written, for the same reason its coins
+                    // are not: `new_peak_wallet` is the CHEAPEST frame on the wire to lie in,
+                    // and the value it would land in is the one a caller divides into a
+                    // confirmation count (see [`PeerTrust`]).
+                    if !session.trust.is_authoritative() {
+                        tracing::debug!(
+                            claimed = peak.height,
+                            "wallet sync: dropping a new_peak_wallet from a discovered peer"
+                        );
+                        continue;
+                    }
                     let state = db.sync_state().await?;
                     // The recorded peak only ever ADVANCES here. This value is served on OPEN
                     // reads and is what a caller bounding a claimed confirmation reads, so a
@@ -747,7 +754,22 @@ mod tests {
         SessionState::new(subscribed, PeerTrust::Operator)
     }
 
-    /// A session over a peer this node merely DISCOVERED — advisory only.
+    /// A `new_peak_wallet` frame claiming `height`, exactly as it arrives on the wire.
+    fn new_peak_message(height: u32) -> Message {
+        let peak = NewPeakWallet {
+            header_hash: Bytes32::new([3; 32]),
+            height,
+            weight: 0u128,
+            fork_point_with_previous_peak: 0,
+        };
+        Message {
+            msg_type: ProtocolMessageTypes::NewPeakWallet,
+            id: None,
+            data: chia::traits::Streamable::to_bytes(&peak).unwrap().into(),
+        }
+    }
+
+    /// A session over a peer this node merely DISCOVERED — writes nothing.
     fn discovered(subscribed: &SubscribedHashes) -> SessionState<'_> {
         SessionState::new(subscribed, PeerTrust::Discovered)
     }
@@ -1354,7 +1376,7 @@ mod tests {
             &mut discovered(&subscribed),
         )
         .await
-        .expect("an advisory frame is discarded, not an error");
+        .expect("a discovered-peer frame is dropped whole, not an error");
 
         assert_eq!(
             db.balance(None).await.unwrap(),
@@ -1387,45 +1409,150 @@ mod tests {
         );
     }
 
-    /// **Proves (F1c):** the one thing a discovered peer MAY do - advance the peak - still
-    /// works, and only forwards.
+    /// **Proves (F1c, the corrected shape):** a discovered peer's `coin_state_update` leaves
+    /// `sync_state` COMPLETELY unchanged — including the peak, which the previous round let it
+    /// advance.
     ///
-    /// Without this the trust boundary could be satisfied by ignoring discovered peers entirely,
-    /// which would take the live sync status down with it. The backwards frame in the same test
-    /// is the control that stops "just take whatever height it says" from passing.
+    /// **Why `u32::MAX` and not some ordinary higher height.** The defect this pins is not "the
+    /// peak can be nudged"; it is that a confirmation count is `peak − created_height`, so the
+    /// forward direction is the DANGEROUS one. `u32::MAX` is the value at which a spend that
+    /// never landed reads as ~4.29e9 confirmations, and it is one frame away on the wire. A
+    /// fixture that moved the peak by a plausible-looking amount would assert the same equality
+    /// while leaving the reader unable to see what the equality is FOR.
+    ///
+    /// **Why the header hash is asserted too.** Peak height and header hash are written by one
+    /// call (`set_peak`), so a fix that guarded only the height would leave the hash a
+    /// peer-controlled value attached to an operator-established height — a worse state than
+    /// either alone.
     #[tokio::test]
-    async fn a_discovered_peer_advances_the_peak_but_never_retreats_it() {
+    async fn a_discovered_peer_coin_state_update_changes_no_sync_state_at_all() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(6_000_000, "aa").await.unwrap();
+        let before = db.sync_state().await.unwrap();
+        let events = EventBus::default();
+        let subscribed = subscribed_owned();
+
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: u32::MAX,
+                fork_height: u32::MAX - 1,
+                peak_hash: Bytes32::new([7; 32]),
+                // A coin at the SUBSCRIBED hash, which an authoritative session WOULD write:
+                // the subscription filter is no defence against the peer we handed the set to.
+                items: vec![state(coin(1, OWNED, 999), Some(6_000_001), None)],
+            },
+            &events,
+            &mut discovered(&subscribed),
+        )
+        .await
+        .expect("a dropped frame is not an error: the session stays up for its liveness");
+
+        let after = db.sync_state().await.unwrap();
+        assert_eq!(
+            after.peak_height,
+            Some(6_000_000),
+            "a discovered peer must not move the peak, in EITHER direction"
+        );
+        assert_eq!(
+            after.header_hash, before.header_hash,
+            "nor the header hash the peak was established with"
+        );
+        assert_eq!(
+            after.initial_sync_complete, before.initial_sync_complete,
+            "nor the routing gate"
+        );
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            0,
+            "nor write coins, even at a subscribed hash"
+        );
+    }
+
+    /// **Proves (F1c):** the same refusal on the OTHER frame that carries a height.
+    /// `new_peak_wallet` needs no subscription and no coin state, so it is the cheapest frame on
+    /// the wire for a discovered peer to lie in — a guard placed only in
+    /// [`handle_coin_state_update`] would leave this path wide open while every
+    /// `coin_state_update` test stayed green.
+    ///
+    /// **The honest control in the same run.** An OPERATOR peer's `new_peak_wallet` at an
+    /// ordinary height is delivered over the identical loop, and must still land. Without it
+    /// this test is satisfied by a `run_update_loop` that ignores `new_peak_wallet` entirely.
+    #[tokio::test]
+    async fn a_discovered_peer_new_peak_wallet_is_dropped_while_an_operators_still_lands() {
+        for (trust, claimed, expected) in [
+            (PeerTrust::Discovered, u32::MAX, 6_000_000u32),
+            (PeerTrust::Operator, 6_000_010, 6_000_010),
+        ] {
+            let db = WalletDb::open_in_memory().await.unwrap();
+            db.set_peak(6_000_000, "aa").await.unwrap();
+            let events = EventBus::default();
+            let subscribed = subscribed_owned();
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tx.send(new_peak_message(claimed)).await.unwrap();
+            drop(tx); // closing the channel is how the loop returns
+
+            run_update_loop(
+                &db,
+                rx,
+                &events,
+                None,
+                &mut SessionState::new(&subscribed, trust),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                db.sync_state().await.unwrap().peak_height,
+                Some(expected),
+                "{trust:?} peer claiming height {claimed}"
+            );
+        }
+    }
+
+    /// **Proves (F1c):** dropping a discovered peer's frames does not poison the replica against
+    /// the honest peer that follows.
+    ///
+    /// This is the property the *previous* round's monotonic rule destroyed: once a hostile
+    /// height landed, every truthful correction below it was refused, and on a default install
+    /// nothing could ever lower it again. Here the hostile frame arrives FIRST, and the operator
+    /// session that follows must still establish an ordinary height BELOW `u32::MAX` — which a
+    /// never-retreats implementation cannot do.
+    #[tokio::test]
+    async fn an_honest_operator_correction_still_lands_after_a_hostile_discovered_frame() {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.set_peak(6_000_000, "aa").await.unwrap();
         let events = EventBus::default();
         let subscribed = subscribed_owned();
 
-        for (height, expected) in [(6_000_010u32, 6_000_010u32), (5_000_000, 6_000_010)] {
-            handle_coin_state_update(
-                &db,
-                &CoinStateUpdate {
-                    height,
-                    fork_height: height.saturating_sub(1),
-                    peak_hash: Bytes32::new([7; 32]),
-                    // A coin at the SUBSCRIBED hash, which an authoritative session would
-                    // write: it must not land here either.
-                    items: vec![state(coin(1, OWNED, 999), Some(height), None)],
-                },
-                &events,
-                &mut discovered(&subscribed),
-            )
+        let hostile = CoinStateUpdate {
+            height: u32::MAX,
+            fork_height: u32::MAX - 1,
+            peak_hash: Bytes32::new([7; 32]),
+            items: vec![],
+        };
+        handle_coin_state_update(&db, &hostile, &events, &mut discovered(&subscribed))
             .await
             .unwrap();
-            assert_eq!(
-                db.sync_state().await.unwrap().peak_height,
-                Some(expected),
-                "the peak advances forward only"
-            );
-        }
+
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: 6_000_100,
+                fork_height: 6_000_099,
+                peak_hash: Bytes32::new([9; 32]),
+                items: vec![],
+            },
+            &events,
+            &mut operator(&subscribed),
+        )
+        .await
+        .expect("the honest peer's correction must be accepted");
+
         assert_eq!(
-            db.balance(None).await.unwrap(),
-            0,
-            "an advisory frame writes no coins, even at a subscribed hash"
+            db.sync_state().await.unwrap().peak_height,
+            Some(6_000_100),
+            "the honest height is not fenced out by anything the hostile frame left behind"
         );
     }
 
