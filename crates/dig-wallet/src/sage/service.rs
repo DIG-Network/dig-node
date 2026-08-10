@@ -50,7 +50,14 @@ pub struct WalletServiceConfig {
     pub enable_live_broadcast: bool,
     /// Run the background chain-sync supervisor (§18.6, #2501). **Default `true`.**
     ///
-    /// This is a TEST SEAM, not a user knob: no env var feeds it, and nothing should add one.
+    /// It IS a user knob, and `DIG_WALLET_ENABLE_CHAIN_SYNC` feeds it
+    /// (`dig_node_service::Config`). An earlier version of this line said the opposite — "a TEST
+    /// SEAM, not a user knob: no env var feeds it, and nothing should add one" — while the env
+    /// var already existed and was already plumbed in. The doc was the wrong half: an operator
+    /// on an air-gapped or metered host must be able to stop the node dialling strangers, and
+    /// removing a shipped switch to make a comment true would be a behaviour regression for no
+    /// gain. It stays default-`true`, so declining is a deliberate act.
+    ///
     /// Sync is a chain READ plus a write to the node's OWN replica, so it must not sit behind
     /// `enable_live_broadcast` — conflating chain reads with "may this node's custodied wallet
     /// sign and send?" is what made a stock node answer `WALLET_NO_CHAIN_SOURCE` to every
@@ -166,8 +173,11 @@ impl WalletService {
         // The background chain-sync supervisor (§18.6, #2501): the production call site
         // `sage::sync` never had. It starts at boot with NO seed and NO unlock — its
         // subscription set is custody's persisted PUBLIC keys, readable while every wallet is
-        // locked — and it refuses to run a catch-up over an empty set, so a wallet-less
-        // install advances only its peak and keeps `initial_sync_complete` false.
+        // locked — and it refuses to run a catch-up over an empty set. A default install
+        // (no operator-chosen peer in the `peers` table) therefore reaches only DISCOVERED
+        // peers, which write nothing at all: `initial_sync_complete` stays false, the replica
+        // peak stays NULL, and the whole contribution is the live peer count. See
+        // `sync::PeerTrust` for why the peak is not the harmless half of that.
         // The task handle is dropped deliberately: the supervisor lives for the process, and
         // its stop signal is `SyncHandle::shutdown`, not a dropped join handle.
         let sync = if cfg.enable_chain_sync {

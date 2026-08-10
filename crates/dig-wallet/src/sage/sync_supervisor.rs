@@ -155,6 +155,20 @@ impl SyncHandle {
         *self.inner.observed.read().expect("observed lock poisoned")
     }
 
+    /// A handle attached to NO supervisor, reporting `peers` peers — so a test can give the
+    /// Chia peer count a distinctive, non-default value without dialling the network.
+    ///
+    /// It exists because the "both methods report ONE observation" conformance property is
+    /// otherwise inexpressible: with no supervisor running, both methods answer `null`, and a
+    /// test comparing two `null`s compares two unobservables and passes against a handler that
+    /// returns a literal. Dropping this handle stops nothing, because it started nothing.
+    #[doc(hidden)]
+    pub fn detached_for_tests(peers: u32) -> Self {
+        let (handle, _rx) = Self::new();
+        handle.set_connected(peers);
+        handle
+    }
+
     fn set_connected(&self, peers: u32) {
         let mut o = self.inner.observed.write().expect("observed lock poisoned");
         if peers > 0 {
@@ -529,6 +543,32 @@ impl ChiaPeerSessionFactory {
     }
 }
 
+/// HOW a peer connection was obtained — the only input the trust label is allowed to have.
+///
+/// Named as a type rather than left as a `bool` or an inline literal because the mapping below
+/// is the single line the whole trust model rests on, and an inline literal is invisible: the
+/// previous round's audit flipped `PeerTrust::Discovered` to `PeerTrust::Operator` at the
+/// discovery call site and the entire crate's test suite stayed green.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialSource {
+    /// A `user_managed` row in the `peers` table: an address the OPERATOR typed in.
+    UserManagedPeerRow,
+    /// A DNS-introducer answer or the loopback probe — whoever answered first.
+    Discovery,
+}
+
+/// The trust a peer earns from HOW it was reached, and from nothing else.
+///
+/// Deliberately total, pure, and `const`: it takes no peer input, so there is no argument a peer
+/// can supply that changes its answer, and both arms are pinned by
+/// [`tests::the_trust_label_is_fixed_by_the_dial_source`].
+pub const fn trust_for(source: DialSource) -> PeerTrust {
+    match source {
+        DialSource::UserManagedPeerRow => PeerTrust::Operator,
+        DialSource::Discovery => PeerTrust::Discovered,
+    }
+}
+
 #[async_trait::async_trait]
 impl SyncSessionFactory for ChiaPeerSessionFactory {
     async fn connect(&self) -> Result<Box<dyn SyncSession>, SyncError> {
@@ -563,7 +603,7 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
                     return Ok(Box::new(ChiaPeerSession {
                         peer,
                         ip: addr.to_string(),
-                        trust: PeerTrust::Operator,
+                        trust: trust_for(DialSource::UserManagedPeerRow),
                         receiver: tokio::sync::Mutex::new(Some(receiver)),
                     }))
                 }
@@ -593,7 +633,7 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
         Ok(Box::new(ChiaPeerSession {
             peer,
             ip: addr.to_string(),
-            trust: PeerTrust::Discovered,
+            trust: trust_for(DialSource::Discovery),
             receiver: tokio::sync::Mutex::new(Some(receiver)),
         }))
     }

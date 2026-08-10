@@ -110,6 +110,13 @@ async fn start_companion(upstream: &str) -> (SocketAddr, EnvHold) {
 /// host controller reads it from `<config_dir>/control-token`; here the test reads
 /// the same on-disk token the server wrote, mirroring exactly that controller flow).
 async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
+    start_companion_full_inner(upstream, None).await
+}
+
+async fn start_companion_full_inner(
+    upstream: &str,
+    chia_peers: Option<u32>,
+) -> (SocketAddr, String, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,                  // bind ephemeral
@@ -150,6 +157,10 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
         // designed test/deploy override) pins it to this test's base dir, identity-independently.
         std::env::set_var("DIG_NODE_STATE_DIR", &base);
         let state = dig_node_service::server::build_state(&config).await;
+        let state = match chia_peers {
+            Some(n) => state.with_chia_peer_count_for_tests(n),
+            None => state,
+        };
         // The token the server wrote (read from disk, exactly as a real controller
         // would). config_path() resolves under the temp DIG_NODE_CACHE we just set.
         let token = dig_node_service::control::load_or_create_token().unwrap();
@@ -172,6 +183,15 @@ async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
 /// Like [`start_companion`] but ALSO returns this node's loop-probe request (#1997) — the exact
 /// body the bring-up probe puts on the wire. A loop-breaker test must be able to stage the probe
 /// COMING BACK, and only the node knows the random id it generated.
+/// Like [`start_companion_full`], but with the wallet's Chia peer count pinned to `peers`. No
+/// supervisor is started and nothing is dialled — see `AppState::with_chia_peer_count_for_tests`.
+async fn start_companion_full_with_chia_peers(
+    upstream: &str,
+    peers: u32,
+) -> (SocketAddr, String, EnvHold) {
+    start_companion_full_inner(upstream, Some(peers)).await
+}
+
 async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
@@ -1480,10 +1500,13 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
 /// **Proves (dig_ecosystem#2501):** `control.wallet.syncStatus` and `control.peerCounts` are served
 /// over the real gate, share the same `chia_peer_count` shape, and keep the unknown-peak sentinel.
 ///
-/// On this fixture the node has no reachable Chia peer, so the equality assertion below compares
-/// one zero observation with the other. That still pins the shared response shape over real HTTP,
-/// while the single-source property itself is held structurally by the handlers reaching the same
-/// backend accessor.
+/// **Why the count is INJECTED and not left at its default.** This harness runs
+/// `enable_chain_sync: false`, so with no supervisor attached both methods answer `null` — and a
+/// `null == null` comparison compares two unobservables. It passed with `peer_counts`' shared
+/// read replaced by a literal `None`, which is exactly the divergence it claims to catch. The
+/// seam below attaches a detached handle reporting a distinctive count (no supervisor, no
+/// dialling), so a handler serving that field from anywhere else answers a DIFFERENT number and
+/// the assertion fails.
 ///
 /// The phase is asserted to be one of the three declared tokens rather than a specific one: this
 /// node has no chain source, so whether it ever attaches a peer is not the property under test.
@@ -1491,8 +1514,13 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
 /// "synced to genesis", a claim about the chain that would be false.
 #[tokio::test]
 async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
+    // Distinctive: not 0, not 1, and not a count this fixture could reach by accident, so an
+    // agreeing pair of answers can only have come from the one accessor that was given it.
+    const OBSERVED_CHIA_PEERS: u64 = 7;
+
     let (upstream, _calls) = start_mock_upstream().await;
-    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+    let (addr, _token, _hold) =
+        start_companion_full_with_chia_peers(&upstream, OBSERVED_CHIA_PEERS as u32).await;
 
     let call = |method: &str| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
 
@@ -1515,6 +1543,11 @@ async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
     assert!(
         counts["error"].is_null(),
         "peerCounts is an open read and must answer: got {counts:?}"
+    );
+    assert_eq!(
+        sync["result"]["chia_peer_count"].as_u64(),
+        Some(OBSERVED_CHIA_PEERS),
+        "syncStatus must report the observation the node actually holds, not a default"
     );
     assert_eq!(
         counts["result"]["chia_peer_count"], sync["result"]["chia_peer_count"],

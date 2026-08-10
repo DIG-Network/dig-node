@@ -118,6 +118,23 @@ const METHOD_NOT_FOUND: i64 = ErrorCode::MethodNotFound.code();
 ///
 /// Split out from [`serve`] so it can be exercised by an in-process test without
 /// binding a port.
+impl AppState {
+    /// Re-attach the wallet backend with a chain-sync handle reporting `peers` Chia peers,
+    /// WITHOUT starting a supervisor (so no test dials mainnet).
+    ///
+    /// The integration harness runs `enable_chain_sync: false`, which leaves every Chia peer
+    /// count `null` — and a `null == null` comparison cannot see `control.peerCounts` and
+    /// `control.wallet.syncStatus` drifting onto different sources, which
+    /// dig-node-control-interface 0.8.0 makes a conformance MUST. This seam gives the count a
+    /// distinctive value so the two answers become distinguishable.
+    #[doc(hidden)]
+    pub fn with_chia_peer_count_for_tests(mut self, peers: u32) -> Self {
+        let handle = dig_wallet::sage::sync_supervisor::SyncHandle::detached_for_tests(peers);
+        self.wallet = Arc::new((*self.wallet).clone().with_sync_handle(handle));
+        self
+    }
+}
+
 pub fn router(state: AppState) -> Router {
     // The extension calls from a `chrome-extension://` origin; a same-machine page
     // calls from `http://localhost`, `http://dig.local`, or a loopback IP (#91 —

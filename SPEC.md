@@ -3773,13 +3773,15 @@ the subscription is per-connection state. No seed is read and nothing on this pa
 **Invariant.** A catch-up MUST NOT run over an empty puzzle-hash set, and `initial_sync_complete` MUST NOT
 be set as a result of one. `initial_sync` itself refuses with `NoPuzzleHashes`. An empty subscription is
 answered "finished" immediately, so completing it would mark an un-queried DB authoritative under §18.7 and
-report a funded wallet as empty. A node with no wallet therefore advances only its peak and stays unsynced.
+report a funded wallet as empty. A node with no wallet therefore stays unsynced, and — where its only
+peer is a discovered one — writes nothing at all.
 
 **Invariant.** A catch-up MUST NOT run over a peer the node merely DISCOVERED, and
 `initial_sync_complete` MUST NOT be set as a result of one. `initial_sync` itself refuses with
 `UntrustedPeer`. See §18.6c for the trust model this enforces. The supervisor therefore runs a
-DISCOVERED peer as a peak-only session whatever the wallet holds: it subscribes nothing, and it does not
-re-poll the puzzle-hash set, because a wallet appearing cannot make an untrusted peer trusted.
+DISCOVERED peer as a WRITE-FREE session whatever the wallet holds: it subscribes nothing, it persists
+nothing, and it does not re-poll the puzzle-hash set, because a wallet appearing cannot make an untrusted
+peer trusted.
 
 **Bounded catch-up.** One catch-up MUST make at most 1,024 round trips and write at most 250,000 coin
 states in total, and a response carrying `is_finished: false` MUST report a height strictly greater than
@@ -3796,13 +3798,24 @@ verify the server certificate, so an unprivileged co-resident process can become
 * An **operator** peer is a `user_managed` row in the `peers` table — an address a human deliberately
   entered. It has full authority: it MAY run a catch-up, set `initial_sync_complete`, write coins, and
   drive a bounded rollback.
-* A **discovered** peer (a DNS introducer answer, or the loopback probe) is ADVISORY. It MAY advance the
-  replica peak, monotonically, which is what §18.6b's status reports. It MUST NOT write coins, MUST NOT
-  roll the replica back, and MUST NOT cause `initial_sync_complete` to become `true` — so §18.7 keeps
-  every wallet-scoped read on the fallback tier and its answers can never be authoritative for money.
+* A **discovered** peer (a DNS introducer answer, or the loopback probe) MUST NOT cause ANY write to
+  `wallet.sqlite`. It MUST NOT write coins, MUST NOT roll the replica back, MUST NOT cause
+  `initial_sync_complete` to become `true`, and MUST NOT move the replica peak in EITHER direction. Its
+  entire contribution is LIVENESS: it counts toward the `chia_peer_count` of §18.6b, which is an
+  observation the node makes about its own socket rather than a claim the peer makes.
+
+  The peak is named explicitly because it was once permitted, monotonically, on the reasoning that a
+  too-high peak only makes a confirmation read more conservative. That reasoning is INVERTED: a
+  confirmation count is `peak − created_height`, so a higher peak means MORE confirmations, and one frame
+  at `u32::MAX` reads as ~4.29e9 confirmations for a spend that never landed — on the value
+  `control.wallet.peak` exists to let a caller bound a claimed confirmation with. A monotonic rule also
+  makes that value PERMANENT, because it refuses every honest peer's correction and only an operator
+  peer's catch-up may lower it. An implementation MUST NOT substitute an in-memory advisory peak either.
 
 The consequence is deliberate: a default install with no operator-chosen peer does NOT get a full coin
-sync, and wallet-scoped reads stay on the fallback tier. The boundary is placed at the flag rather than at
+sync, its `sync_state.peak_height` stays NULL (so `control.wallet.syncStatus` reports `peak_height: null`,
+meaning UNKNOWN — never `0`, and `control.wallet.peak` continues to answer from the chain tier), and
+wallet-scoped reads stay on the fallback tier. The boundary is placed at the flag rather than at
 each individual leak because an attacker chooses when its connection survives — closing the socket costs
 it one backoff cycle and buys a fresh catch-up, which is how a per-leak defence is walked around.
 
@@ -3848,8 +3861,14 @@ added to `chia-query`. Every wallet-data read selects its source:
 
 So a caller never blocks on an unsynced replica. `get_sync_status` reports the gating sync state.
 
-**Spend inputs take the same gate.** Selecting the coins a spend is built from is a wallet-scoped read of
-the same replica, so it MUST consult this table: with the replica unsynced, the node MUST REFUSE to build
+**Spend inputs take the same gate — EVERY reader, not the XCH ones.** Selecting the coins a spend is
+built from is a wallet-scoped read of the same replica, so EVERY reader whose rows become spend inputs
+MUST consult this table on its OWN account: the XCH selector, the caller-named-coin reader, the CAT
+selector, and the singleton (NFT/DID/option) input reader. A reader that reaches the gate only through a
+SIBLING read does not satisfy this — the CAT selector once did so only via the XCH coins it picked to pay
+a fee, and only when that fee was non-zero, leaving the ordinary fee-0 path ungated. The gate MUST be
+consulted before any other precondition of the reader, so an unauthoritative replica is refused for being
+unauthoritative. Concretely, it MUST consult this table: with the replica unsynced, the node MUST REFUSE to build
 the spend rather than select inputs from a table it is not entitled to assert yet. A per-coin fallback is
 not a substitute — the fallback tier can confirm that a coin exists, but the SET of spendable coins is
 exactly what an unsynced replica cannot claim. The remedy available to a caller is to complete an
