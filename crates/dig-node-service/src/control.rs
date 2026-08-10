@@ -93,12 +93,21 @@ pub fn is_control_method(method: &str) -> bool {
 /// they are exposed like the other reads rather than behind the control-token gate: a local UI can
 /// poll a balance, list coins to build a spend, and bound a confirmation, without pairing.
 ///
-/// `control.wallet.broadcast` is deliberately NOT here. It puts bytes on the network, so the token
-/// is what stands between a local process and a broadcast — and an `UNAUTHORIZED` from it therefore
+/// Membership turns on WHO NAMES THE ADDRESS. `.balance`/`.coins`/`.coinById` relay a chain fact the
+/// CALLER named, and `.peak`/`.syncStatus` name this node's own chain position and no address at
+/// all; neither discloses an association between this node and any address.
+///
+/// Two wallet methods are deliberately NOT here. `control.wallet.arrivals` (dig_ecosystem#2548) is
+/// a chain read and still gated: the caller supplies only a cursor, so the answer volunteers this
+/// node's OWN watched puzzle hashes together with the receive history behind them. The chain facts
+/// are public; the node-to-address association is not, and a token-less caller could replay those
+/// addresses into the reads above. `control.wallet.broadcast` puts bytes on the network, so the
+/// token is what stands between a local process and a broadcast — and an `UNAUTHORIZED` from it therefore
 /// means exactly that, with the token as the remedy, where the same code on an OPEN read can only
-/// have come from a node too old to serve it (remedy: an upgrade). It is still routed through the control
-/// dispatcher (so it stays discoverable in [`CONTROL_METHODS`] and gets its CLI verb), but the
-/// server skips the token requirement for it. NO mutation or custody method is ever open here.
+/// have come from a node too old to serve it (remedy: an upgrade). Both are still routed through
+/// the control dispatcher, so they stay discoverable in [`CONTROL_METHODS`] and keep their CLI
+/// verbs; it is only the token requirement the server skips, and only for the set below. NO
+/// mutation or custody method is ever open here.
 pub fn is_open_control_read(method: &str) -> bool {
     matches!(
         method,
@@ -142,6 +151,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.balance",
     "control.wallet.coins",
     "control.wallet.coinById",
+    "control.wallet.arrivals",
     "control.wallet.peak",
     "control.wallet.syncStatus",
     "control.wallet.broadcast",
@@ -186,6 +196,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.balance",
     "control.wallet.coins",
     "control.wallet.coinById",
+    "control.wallet.arrivals",
     "control.wallet.peak",
     "control.wallet.syncStatus",
     "control.wallet.broadcast",
@@ -758,6 +769,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.balance" => wallet_balance(ctx, id, params).await,
         "control.wallet.coins" => wallet_coins(ctx, id, params).await,
         "control.wallet.coinById" => wallet_coin_by_id(ctx, id, params).await,
+        "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
         "control.peerCounts" => peer_counts(ctx, id).await,
@@ -1457,6 +1469,131 @@ async fn wallet_coin_by_id(ctx: &ControlCtx, id: Value, params: &Value) -> Value
     }
 }
 
+/// The default and maximum page size for `control.wallet.arrivals`.
+///
+/// Bounded because the page size is caller-chosen on an OPEN, token-less method: an unbounded
+/// `limit` lets any local process ask this node to materialize the whole ledger per call.
+const ARRIVALS_DEFAULT_LIMIT: i64 = 50;
+const ARRIVALS_MAX_LIMIT: i64 = 500;
+
+/// `control.wallet.arrivals` (dig_ecosystem#2548) — incoming funds CONFIRMED since a cursor.
+///
+/// The answer to "did the user just get paid?", which no other method can give: `.balance` reports
+/// a total that the user's own change also moves, and `.coins` cannot say which of its coins are
+/// new. Each row is a coin the node determined ARRIVED — confirmed on chain, above the wallet's
+/// arrival baseline, not previously reported, and not created by spending one of the wallet's own
+/// coins. The determination lives in [`dig_wallet::sage::arrivals`]; this method only pages it out.
+///
+/// Params: `{ after_seq?: integer (default 0), limit?: integer (default 50, max 500) }`.
+/// Result: `{ arrivals: [{seq, coin_id, puzzle_hash, amount, asset_id, confirmed_height}], cursor,
+/// latest }`.
+///
+/// # A pull, deliberately
+///
+/// The control envelope is strictly request→response — it has no server-initiated frame — so this
+/// is a cursor a client polls rather than a stream. A client resumes from `cursor`, the last `seq`
+/// it was actually handed; `latest` is the ledger's newest position and exists only so a first-run
+/// client can start from NOW instead of replaying the whole ledger (see [`arrivals_wire`] for why
+/// the two must not be collapsed). Positions are `AUTOINCREMENT` and persisted, so they survive a
+/// restart of either side and a reorg cannot make an old cursor point at a different arrival.
+///
+/// # Every row is CONFIRMED, and `arrivals: []` is an answer
+///
+/// A mempool sighting is structurally absent: the stored confirmation height is `NOT NULL` and a
+/// coin without one is never written. An empty list means the node consulted its own replica and
+/// nothing has arrived since the cursor — it is NOT a claim that the wallet is up to date. A caller
+/// that needs to know whether the replica is current asks `control.wallet.syncStatus`; a node that
+/// has never completed a catch-up has no arrival baseline and reports an empty list forever, which
+/// is the honest answer to "what arrived?" from a wallet that cannot tell history from news.
+///
+/// # TOKEN-GATED, unlike the other wallet reads
+///
+/// It touches only this node's LOCAL replica and has no oracle path, so polling it discloses
+/// nothing to a THIRD party — but it discloses plenty to the CALLER. The other reads answer about
+/// an address the caller already named; this one takes a cursor and answers with the node's OWN
+/// watched puzzle hashes and the receive history behind them. The chain facts are public; the
+/// association between this node and those addresses is not, and a token-less caller could replay
+/// the disclosed addresses into `.balance` and `.coins`. So an `UNAUTHORIZED` here means exactly
+/// what it says, and the remedy is the token — not an upgrade ([`is_open_control_read`]).
+async fn wallet_arrivals(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    const METHOD: &str = "control.wallet.arrivals";
+    let after_seq = params
+        .get("after_seq")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if after_seq < 0 {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!("{METHOD} after_seq must be a non-negative integer"),
+        );
+    }
+    match ctx
+        .wallet
+        .wallet_arrivals(after_seq, arrivals_limit(params))
+        .await
+    {
+        Ok((page, latest)) => control_ok(id, arrivals_wire(after_seq, &page, latest)),
+        // Only the local wallet DB can fail here — there is no chain call to blame.
+        Err(e) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("{METHOD}: reading the local arrival ledger failed: {e}"),
+        ),
+    }
+}
+
+/// The page size `control.wallet.arrivals` will actually use. PURE.
+///
+/// Clamped at BOTH ends rather than only the top: a zero or negative `limit` reaching SQLite's
+/// `LIMIT` would mean "no rows" or "no bound" depending on the value, and neither is what a caller
+/// asking for a page meant.
+fn arrivals_limit(params: &Value) -> i64 {
+    params
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(ARRIVALS_DEFAULT_LIMIT)
+        .clamp(1, ARRIVALS_MAX_LIMIT)
+}
+
+/// Map recorded arrivals onto the wire.
+///
+/// `amount` is a STRING because the ledger stores the full `u64` range and JSON numbers do not
+/// carry it losslessly; `asset_id` is `null` for native XCH and the CAT's hex TAIL otherwise —
+/// never a ticker, because naming an asset this node did not attribute would be a claim it cannot
+/// support.
+///
+/// # `cursor` is where the CLIENT got to, not where the LEDGER got to
+///
+/// It is the last `seq` actually returned, falling back to the caller's own `after_seq` on an empty
+/// page — deliberately NOT `latest`. `latest` is read after the page, so an arrival recorded in
+/// between would sit above the page and below `latest`, and a client resuming from `latest` would
+/// step straight over it. Silently losing one notification is the failure this method exists to
+/// prevent, so the resume value can only ever be a row the client was actually handed.
+///
+/// `latest` is reported alongside for the one question `cursor` cannot answer: a first-run client
+/// reads it and passes it back as `after_seq` to start from NOW, instead of replaying the whole
+/// ledger as a burst of notifications.
+fn arrivals_wire(
+    after_seq: i64,
+    arrivals: &[dig_wallet::sage::arrivals::Arrival],
+    latest: i64,
+) -> Value {
+    let cursor = arrivals.last().map_or(after_seq, |a| a.seq);
+    json!({
+        "arrivals": arrivals.iter().map(|a| json!({
+            "seq": a.seq,
+            "coin_id": a.coin_id,
+            "puzzle_hash": a.puzzle_hash,
+            "amount": a.amount,
+            "asset_id": a.asset_id,
+            "confirmed_height": a.confirmed_height,
+        })).collect::<Vec<_>>(),
+        "cursor": cursor,
+        "latest": latest,
+    })
+}
+
 /// `control.wallet.peak` (dig_ecosystem#2376) — the node's current chain peak height.
 ///
 /// Its own method rather than a field on a balance: a balance reports `peak_height: null` on every
@@ -1689,14 +1826,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// **The chain reads are token-less and the PUSH is not.**
+    /// **The CALLER-ADDRESSED reads are token-less; the arrival cursor and the PUSH are not.**
     ///
     /// Written as the exact expected SET rather than derived from the predicate, so it pins the
     /// membership and not the implementation's opinion of itself. Opening the push would be a
     /// silent, catastrophic widening — any local process could then broadcast — so it must fail a
     /// test rather than pass review.
     #[test]
-    fn every_wallet_chain_read_is_open_and_the_push_is_token_gated() {
+    fn the_caller_addressed_reads_are_open_and_the_arrival_cursor_and_push_are_not() {
         let open: Vec<&str> = CONTROL_METHODS
             .iter()
             .copied()
@@ -1708,6 +1845,11 @@ mod tests {
                 "control.wallet.balance",
                 "control.wallet.coins",
                 "control.wallet.coinById",
+                // `control.wallet.arrivals` (dig_ecosystem#2548) is NOT here, and the reasoning
+                // that once put it here is the trap this test exists to spring. It is the
+                // narrowest chain read on the list and still the only one that names an address
+                // the CALLER did not: it takes a cursor and answers with this node's OWN watched
+                // puzzle hashes. Public facts, private association.
                 "control.wallet.peak",
                 // `control.wallet.syncStatus` reports only how far THIS node has got.
                 //
@@ -1725,6 +1867,10 @@ mod tests {
         assert!(
             !is_open_control_read("control.wallet.broadcast"),
             "the push must stay behind the control token"
+        );
+        assert!(
+            !is_open_control_read("control.wallet.arrivals"),
+            "the arrival cursor names this node's own watched puzzle hashes to a caller that              supplied nothing, so it must stay behind the control token"
         );
     }
 
@@ -1838,6 +1984,99 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("params.address"));
+    }
+
+    // ---- control.wallet.arrivals (dig_ecosystem#2548) --------------------------------------
+
+    /// The amount reaches the wire as a STRING, and the asset id is carried verbatim for a CAT and
+    /// `null` for XCH — never a ticker this node did not attribute.
+    #[test]
+    fn the_arrivals_wire_carries_amounts_as_strings_and_asset_ids_verbatim() {
+        use dig_wallet::sage::arrivals::Arrival;
+        let wire = arrivals_wire(
+            0,
+            &[
+                Arrival {
+                    seq: 7,
+                    coin_id: "aa".repeat(32),
+                    puzzle_hash: "cc".repeat(32),
+                    // Beyond f64's exact-integer range: a JSON number would silently round it.
+                    amount: "18446744073709551615".into(),
+                    asset_id: None,
+                    confirmed_height: 5_000_000,
+                },
+                Arrival {
+                    seq: 8,
+                    coin_id: "bb".repeat(32),
+                    puzzle_hash: "dd".repeat(32),
+                    amount: "1000".into(),
+                    asset_id: Some("a406d3".into()),
+                    confirmed_height: 5_000_001,
+                },
+            ],
+            8,
+        );
+        assert_eq!(wire["arrivals"][0]["amount"], json!("18446744073709551615"));
+        assert_eq!(wire["arrivals"][0]["asset_id"], Value::Null);
+        assert_eq!(wire["arrivals"][0]["confirmed_height"], json!(5_000_000));
+        assert_eq!(wire["arrivals"][1]["asset_id"], json!("a406d3"));
+        assert_eq!(wire["cursor"], json!(8));
+    }
+
+    /// **The resume cursor is the last row HANDED OVER, never the ledger's newest position.**
+    ///
+    /// `latest` is read after the page, so an arrival recorded in between sits above the page and
+    /// below `latest`. A client resuming from `latest` steps straight over it and the user is never
+    /// told about that money — the one failure this whole method exists to prevent. Pinning the two
+    /// fields apart is what stops a later "simplification" from collapsing them.
+    #[test]
+    fn the_resume_cursor_never_skips_past_an_arrival_the_client_was_not_given() {
+        use dig_wallet::sage::arrivals::Arrival;
+        let row = |seq: i64| Arrival {
+            seq,
+            coin_id: "aa".repeat(32),
+            puzzle_hash: "cc".repeat(32),
+            amount: "1".into(),
+            asset_id: None,
+            confirmed_height: 100,
+        };
+        // The page ends at 8; the ledger has since reached 12.
+        let wire = arrivals_wire(0, &[row(7), row(8)], 12);
+        assert_eq!(
+            wire["cursor"],
+            json!(8),
+            "resuming from anything above 8 would silently drop arrivals 9..=12"
+        );
+        assert_eq!(wire["latest"], json!(12));
+    }
+
+    /// An empty page resumes from where the caller already was, and still reports `latest` so a
+    /// first-run client can start from NOW instead of replaying the ledger as a burst of toasts.
+    #[test]
+    fn an_empty_arrivals_page_holds_the_cursor_and_still_reports_latest() {
+        let wire = arrivals_wire(30, &[], 42);
+        assert_eq!(wire["arrivals"], json!([]));
+        assert_eq!(wire["cursor"], json!(30));
+        assert_eq!(wire["latest"], json!(42));
+    }
+
+    /// The page size is caller-chosen on an OPEN, token-less method, so it is bounded on BOTH
+    /// sides: a zero or negative limit cannot mean "no bound", and a huge one cannot mean "all".
+    #[test]
+    fn the_arrivals_page_size_is_clamped_at_both_ends() {
+        assert_eq!(arrivals_limit(&json!({})), ARRIVALS_DEFAULT_LIMIT);
+        assert_eq!(arrivals_limit(&json!({ "limit": 0 })), 1);
+        assert_eq!(arrivals_limit(&json!({ "limit": -5 })), 1);
+        assert_eq!(arrivals_limit(&json!({ "limit": 10 })), 10);
+        assert_eq!(
+            arrivals_limit(&json!({ "limit": 100_000 })),
+            ARRIVALS_MAX_LIMIT
+        );
+        // A non-numeric limit falls back to the default rather than erroring the whole read.
+        assert_eq!(
+            arrivals_limit(&json!({ "limit": "all" })),
+            ARRIVALS_DEFAULT_LIMIT
+        );
     }
 
     // ---- control.wallet.coinById (dig_ecosystem#2392) --------------------------------------

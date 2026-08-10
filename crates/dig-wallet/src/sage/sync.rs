@@ -22,7 +22,7 @@ use chia::protocol::{
 use chia_protocol::Bytes32;
 use chia_wallet_sdk::client::Peer;
 
-use super::db::{CoinRow, WalletDb};
+use super::db::{CatchUpReplay, CoinRow, WalletDb};
 use super::events::{EventBus, SyncEvent};
 use super::singleton::{self, LineageSource};
 
@@ -488,6 +488,27 @@ pub async fn handle_coin_state_update(
     apply_coin_states(db, &update.items, session.subscribed).await?;
     db.set_peak(update.height, &hex::encode(update.peak_hash))
         .await?;
+    // Incoming-funds arrivals (dig_ecosystem#2548), recorded AFTER the batch has committed and
+    // the peak has advanced — never during the write. A parent and its change coin arrive in the
+    // same frame in whatever order the peer chose, so deciding "did we create this coin ourselves?"
+    // inside the write would race the batch and read the user's own change as a payment.
+    //
+    // The recorder is fail-closed on its own: with no baseline (no completed catch-up) it records
+    // nothing, so the history this same function replays on every reconnect is never announced.
+    //
+    // A recorder failure is LOGGED, not propagated. Chain sync is the critical path and a
+    // notification ledger is not: returning `?` here would drop a live peer session over a
+    // NOTIFICATION write, which is a strictly worse outcome than a delayed toast. Nothing is lost
+    // by continuing — the ledger insert and the baseline advance share one transaction, so a failed
+    // pass leaves the watermark where it was and the next update re-examines the same coins.
+    let watched: Vec<String> = session.subscribed.iter().map(hex::encode).collect();
+    if let Err(e) = db.record_arrivals(&watched, update.height).await {
+        tracing::warn!(
+            error = %e,
+            height = update.height,
+            "wallet sync: recording incoming-funds arrivals failed; retrying on the next update"
+        );
+    }
     events.publish(SyncEvent::CoinState);
     Ok(())
 }
@@ -636,17 +657,21 @@ pub async fn initial_sync_with(
         events.publish(SyncEvent::PuzzleBatchSynced);
 
         if respond.is_finished {
-            db.set_peak(respond.height, &hex::encode(respond.header_hash))
-                .await?;
-            break;
+            // ONE statement ends the catch-up: the peak, the authoritative flag, and the arrival
+            // baseline are armed together from this response's own values. Splitting them is how
+            // the baseline came to be armable by a caller that had replayed nothing
+            // (dig_ecosystem#2548) -- see `WalletDb::complete_catch_up`.
+            db.complete_catch_up(&CatchUpReplay::finished_at(
+                respond.height,
+                hex::encode(respond.header_hash),
+            ))
+            .await?;
+            return Ok(());
         }
         // Continue from where this batch ended.
         previous_height = Some(respond.height);
         header_hash = respond.header_hash;
     }
-
-    db.set_initial_sync_complete(true).await?;
-    Ok(())
 }
 
 /// Consume peer pushes on the receiver until it closes: `coin_state_update` →
@@ -809,6 +834,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 0);
+    }
+
+    // ---- arrivals over the LIVE path (dig_ecosystem#2548) ------------------
+
+    /// TRAP 1, through the real code path rather than the recorder alone: a catch-up replays the
+    /// whole address history through [`apply_coin_states`], and a live update over that history
+    /// must announce none of it.
+    #[tokio::test]
+    async fn the_replayed_history_a_reconnect_writes_is_never_announced() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let subscribed = subscribed_owned();
+
+        // The catch-up: history written, then the flag that arms the baseline.
+        apply_coin_states(
+            &db,
+            &[
+                state(coin(1, OWNED, 5_000), Some(10), None),
+                state(coin(2, OWNED, 7_000), Some(20), None),
+            ],
+            &subscribed,
+        )
+        .await
+        .unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(20, "aa"))
+            .await
+            .unwrap();
+
+        // A reconnect replays the same history verbatim, and a live frame lands on top of it.
+        apply_coin_states(
+            &db,
+            &[
+                state(coin(1, OWNED, 5_000), Some(10), None),
+                state(coin(2, OWNED, 7_000), Some(20), None),
+            ],
+            &subscribed,
+        )
+        .await
+        .unwrap();
+        let events = EventBus::default();
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: 21,
+                fork_height: 21,
+                peak_hash: Bytes32::new([1; 32]),
+                items: vec![],
+            },
+            &events,
+            &mut operator(&subscribed),
+        )
+        .await
+        .unwrap();
+        assert!(db.arrivals_since(0, 100).await.unwrap().is_empty());
+
+        // POSITIVE CONTROL: a genuinely new coin on the next frame IS announced, so the assertion
+        // above cannot be satisfied by a path that records nothing at all.
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: 22,
+                fork_height: 22,
+                peak_hash: Bytes32::new([1; 32]),
+                items: vec![state(coin(3, OWNED, 900), Some(22), None)],
+            },
+            &events,
+            &mut operator(&subscribed),
+        )
+        .await
+        .unwrap();
+        let arrivals = db.arrivals_since(0, 100).await.unwrap();
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals[0].amount, "900");
+        assert_eq!(arrivals[0].confirmed_height, 22);
+        assert_eq!(arrivals[0].asset_id, None);
+    }
+
+    /// TRAP 4 over the live path, in the shape that actually occurs: the spent parent and the
+    /// change coin it created arrive in the SAME frame, change first. Only the stranger's payment
+    /// is announced.
+    #[tokio::test]
+    async fn change_arriving_in_the_same_frame_as_its_parent_is_not_announced() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let subscribed = subscribed_owned();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "aa"))
+            .await
+            .unwrap();
+
+        let funding = coin(1, OWNED, 10_000);
+        let change = Coin {
+            parent_coin_info: funding.coin_id(),
+            puzzle_hash: Bytes32::new([OWNED; 32]),
+            amount: 4_000,
+        };
+        let gift = coin(2, OWNED, 250);
+
+        let events = EventBus::default();
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: 101,
+                fork_height: 101,
+                peak_hash: Bytes32::new([1; 32]),
+                // Change BEFORE its parent, which is the order the peer is free to choose.
+                items: vec![
+                    state(change, Some(101), None),
+                    state(funding, Some(101), Some(101)),
+                    state(gift, Some(101), None),
+                ],
+            },
+            &events,
+            &mut operator(&subscribed),
+        )
+        .await
+        .unwrap();
+
+        let amounts: Vec<String> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.amount)
+            .collect();
+        // `funding` (foreign parent) and `gift` are arrivals; the 4_000 change is not.
+        assert!(amounts.contains(&"10000".to_string()));
+        assert!(amounts.contains(&"250".to_string()));
+        assert!(
+            !amounts.contains(&"4000".to_string()),
+            "the wallet's own change was announced as an incoming payment: {amounts:?}"
+        );
     }
 
     #[tokio::test]

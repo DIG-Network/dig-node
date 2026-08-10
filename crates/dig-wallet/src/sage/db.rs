@@ -18,6 +18,8 @@ use std::str::FromStr;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
+use super::arrivals::{classify, Arrival, ArrivalBaseline, Verdict};
+
 /// A handle to the local wallet database.
 #[derive(Clone)]
 pub struct WalletDb {
@@ -221,10 +223,26 @@ CREATE TABLE IF NOT EXISTS sync_state (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     peak_height INTEGER,
     header_hash TEXT,
-    initial_sync_complete INTEGER NOT NULL DEFAULT 0
+    initial_sync_complete INTEGER NOT NULL DEFAULT 0,
+    arrival_baseline_height INTEGER
 );
 INSERT OR IGNORE INTO sync_state (id, peak_height, header_hash, initial_sync_complete)
     VALUES (0, NULL, NULL, 0);
+
+CREATE TABLE IF NOT EXISTS arrivals (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    coin_id TEXT NOT NULL UNIQUE,
+    puzzle_hash TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    asset_id TEXT,
+    confirmed_height INTEGER NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS arrival_pending (
+    coin_id TEXT PRIMARY KEY,
+    created_height INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS derivations (
     hardened INTEGER NOT NULL,
@@ -352,7 +370,50 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     "ALTER TABLE nfts ADD COLUMN record_json TEXT",
     "ALTER TABLE dids ADD COLUMN record_json TEXT",
     "ALTER TABLE nft_collections ADD COLUMN record_json TEXT",
+    // dig_ecosystem#2548. A pre-#2548 wallet DB has coins but no arrival baseline, and the column
+    // arrives NULL — which is exactly right: an existing replica has never established a line
+    // between history and news, so it records nothing until the next completed catch-up arms it.
+    "ALTER TABLE sync_state ADD COLUMN arrival_baseline_height INTEGER",
 ];
+
+/// Evidence that a full address-history catch-up ran to COMPLETION.
+///
+/// The only thing [`WalletDb::complete_catch_up`] accepts, and therefore the only way the arrival
+/// baseline can be armed (dig_ecosystem#2548). It carries the two facts a completed catch-up has and
+/// a point read against the coinset oracle does not: the height the peer reported when it finally
+/// answered `is_finished`, and that block's header hash.
+///
+/// Naming those as a type rather than passing a loose `u32` is the point. A caller that has replayed
+/// no history has no header hash to offer and no finishing height that means anything, so arming
+/// from a partial view is something an author has to fabricate deliberately rather than something a
+/// plausible-looking call does by accident — which is exactly how the oracle-tier refresh came to
+/// arm a zero baseline in the first place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchUpReplay {
+    peak_height: u32,
+    header_hash: String,
+}
+
+impl CatchUpReplay {
+    /// The replay that ended at `peak_height` / `header_hash` — the terminal `is_finished`
+    /// puzzle-state response's own values, never a height borrowed from somewhere else.
+    pub fn finished_at(peak_height: u32, header_hash: impl Into<String>) -> Self {
+        Self {
+            peak_height,
+            header_hash: header_hash.into(),
+        }
+    }
+
+    /// The height the catch-up finished at.
+    pub fn peak_height(&self) -> u32 {
+        self.peak_height
+    }
+
+    /// The header hash of the block it finished at.
+    pub fn header_hash(&self) -> &str {
+        &self.header_hash
+    }
+}
 
 impl WalletDb {
     /// Open (creating if needed) a wallet DB at `path`, with WAL enabled, and apply the
@@ -433,13 +494,86 @@ impl WalletDb {
         Ok(())
     }
 
-    /// Mark the initial catch-up complete (or not).
+    /// Mark the initial catch-up complete (or not). Sets the FLAG and nothing else.
+    ///
+    /// # This deliberately cannot arm the arrival baseline (dig_ecosystem#2548)
+    ///
+    /// It used to, in the same statement, and that was wrong for one of its two callers.
+    /// [`super::rpc::WalletBackend::refresh_tracked_coins`] latches this flag from the coinset
+    /// ORACLE tier after a point read of the wallet's own puzzle hashes — it replays no history and
+    /// on a fresh install can complete with `coins` empty and no peak at all. Arming from that arms
+    /// the baseline at ZERO, and because arming is permanent the LATER, genuine catch-up leaves it
+    /// there; every historical coin then sits above the watermark and the first live update
+    /// announces the wallet's whole receive history as incoming payments.
+    ///
+    /// So arming moved to [`Self::complete_catch_up`], which takes a [`CatchUpReplay`] — a value
+    /// only the terminal answer of a full address-history catch-up produces. A caller that has not
+    /// replayed history has nothing to build one out of, which is what makes the unsafe arming hard
+    /// to write rather than merely discouraged.
     pub async fn set_initial_sync_complete(&self, complete: bool) -> sqlx::Result<()> {
         sqlx::query("UPDATE sync_state SET initial_sync_complete = ? WHERE id = 0")
             .bind(i64::from(complete))
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Record that a full address-history catch-up finished: advance the peak, mark the replica
+    /// authoritative, and ARM the arrival baseline — all in one transaction.
+    ///
+    /// # Why arming lives here and only here
+    ///
+    /// The catch-up replays every coin the wallet's addresses ever held through
+    /// [`Self::upsert_coins`], so any arrival recorder keyed on "a row appeared" would fire once per
+    /// historical coin. The defence is that the recorder refuses without a baseline
+    /// ([`crate::sage::arrivals::Verdict::NoBaseline`]) and a baseline can only come into existence
+    /// at the end of a replay — at or above everything that replay just wrote.
+    ///
+    /// Arming is `COALESCE`d, so it happens exactly once per wallet. A later catch-up (a restart, a
+    /// reconnect — each of which replays from the genesis challenge) finds the baseline already set
+    /// and leaves it alone, which is what makes coins received while the node was OFF still count as
+    /// arrivals while the history below the baseline never does.
+    ///
+    /// The armed value is the greater of the replay's own peak and the highest confirmed coin
+    /// height present, because either can lead: a batch can land at a height the terminal response
+    /// has not caught up to, and a coin above the watermark would otherwise be announced on the very
+    /// next pass.
+    ///
+    /// Clearing the flag (a reorg, a backwards move) deliberately does NOT disarm the baseline —
+    /// [`Self::rollback_above`] walks it back to the fork instead, so the coins that were undone
+    /// become eligible again and nothing below the fork does.
+    pub async fn complete_catch_up(&self, replay: &CatchUpReplay) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE sync_state SET
+                 peak_height = ?,
+                 header_hash = ?,
+                 initial_sync_complete = 1,
+                 arrival_baseline_height = COALESCE(
+                     arrival_baseline_height,
+                     MAX(?, COALESCE((SELECT MAX(created_height) FROM coins), 0))
+                 )
+             WHERE id = 0",
+        )
+        .bind(i64::from(replay.peak_height()))
+        .bind(replay.header_hash())
+        .bind(i64::from(replay.peak_height()))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The arrival baseline: the height at or below which a confirmed coin is BACKFILL.
+    ///
+    /// `None` means no catch-up has ever completed, and the recorder announces nothing at all.
+    pub async fn arrival_baseline(&self) -> sqlx::Result<ArrivalBaseline> {
+        let row = sqlx::query("SELECT arrival_baseline_height FROM sync_state WHERE id = 0")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row
+            .get::<Option<i64>, _>("arrival_baseline_height")
+            .map(|h| h as u32))
     }
 
     // ---- derivations ------------------------------------------------------
@@ -617,6 +751,19 @@ impl WalletDb {
     /// - coins **created** above `height` never existed → delete them;
     /// - coins **spent** above `height` are unspent again → clear the spend;
     /// - reset the synced peak to `height`.
+    ///
+    /// # Arrivals are unmade with the coins (dig_ecosystem#2548)
+    ///
+    /// An arrival above the fork describes money that, after the rollback, never arrived — so it
+    /// is deleted by the SAME predicate that deletes the coin, in the SAME transaction. Any other
+    /// arrangement leaves the ledger asserting a receipt at a height the chain no longer has.
+    ///
+    /// The baseline is walked back to the fork too, so a coin that re-confirms after the reorg is
+    /// eligible again rather than silently swallowed. A re-confirmed coin therefore CAN be
+    /// recorded a second time: a reorg is a genuinely new confirmation, and the alternative —
+    /// keeping a ledger row for a coin the replica has deleted — is the dishonest one. `seq` is
+    /// `AUTOINCREMENT`, so a deleted row's cursor position is never reused and a client's cursor
+    /// stays valid across the rollback.
     pub async fn rollback_above(&self, height: u32) -> sqlx::Result<()> {
         let h = i64::from(height);
         let mut tx = self.pool.begin().await?;
@@ -624,6 +771,22 @@ impl WalletDb {
             .bind(h)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM arrivals WHERE confirmed_height > ?")
+            .bind(h)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM arrival_pending WHERE created_height > ?")
+            .bind(h)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE sync_state SET arrival_baseline_height = ?
+             WHERE id = 0 AND arrival_baseline_height > ?",
+        )
+        .bind(h)
+        .bind(h)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE coins SET spent_height = NULL, spent_timestamp = NULL
              WHERE spent_height IS NOT NULL AND spent_height > ?",
@@ -678,6 +841,224 @@ impl WalletDb {
             }
         }
         Ok(out)
+    }
+
+    // ---- arrivals (dig_ecosystem#2548) ------------------------------------
+
+    /// Examine every candidate coin and record the ones that are ARRIVALS, then advance the
+    /// baseline to `through_height`. Returns how many arrivals were newly recorded.
+    ///
+    /// `watched_p2_hashes` are the wallet's own bare p2 puzzle hashes (lowercase hex) — the set
+    /// the chain subscription was taken over. A coin sitting at one of them with no `asset_id` is
+    /// XCH by construction; see [`crate::sage::arrivals::classify`] for the rest of the judgement.
+    ///
+    /// # Called AFTER the coins are committed, never during the write
+    ///
+    /// A parent and its change coin arrive in the SAME `coin_state_update` batch and are written
+    /// in one transaction in whatever order the peer chose. Deciding "is this coin's parent ours?"
+    /// inside that write would race the batch and read the user's own change as an incoming
+    /// payment — the exact false positive dig_ecosystem#2548 exists to prevent. Running here,
+    /// after the batch has landed, makes the ordering irrelevant.
+    ///
+    /// # Why the whole write is one transaction
+    ///
+    /// The ledger insert and the baseline advance must commit together: a crash between them
+    /// either re-examines coins already recorded (harmless — the `UNIQUE` coin id makes the second
+    /// insert a no-op) or, in the other order, skips coins it never recorded (money the user is
+    /// never told about). Only one of those is acceptable, so only one is expressible.
+    pub async fn record_arrivals(
+        &self,
+        watched_p2_hashes: &[String],
+        through_height: u32,
+    ) -> sqlx::Result<usize> {
+        let watched: std::collections::HashSet<String> = watched_p2_hashes
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        let mut tx = self.pool.begin().await?;
+
+        // Self-cleaning: a deferred coin the replica no longer has (a reorg deleted it) is not
+        // waiting for anything.
+        sqlx::query("DELETE FROM arrival_pending WHERE coin_id NOT IN (SELECT coin_id FROM coins)")
+            .execute(&mut *tx)
+            .await?;
+
+        let baseline: Option<i64> =
+            sqlx::query("SELECT arrival_baseline_height FROM sync_state WHERE id = 0")
+                .fetch_one(&mut *tx)
+                .await?
+                .get("arrival_baseline_height");
+        let Some(baseline_h) = baseline else {
+            // TRAP 1, fail closed. No catch-up has completed, so every coin present is history the
+            // wallet cannot distinguish from news. Record nothing, and do NOT arm the baseline
+            // here — arming belongs to `set_initial_sync_complete`, which is the one place that
+            // knows the catch-up actually finished.
+            tx.commit().await?;
+            return Ok(0);
+        };
+
+        // Candidates: everything confirmed above the baseline, everything not yet confirmed at
+        // all, and everything a previous pass HELD.
+        //
+        // The last two are what keep the watermark from swallowing real money. A coin sighted in
+        // the mempool is unconfirmed now and may confirm AT the height this pass is about to
+        // advance the baseline to; an unattributed CAT sits below the baseline as soon as the
+        // watermark moves. Both are re-examined every pass and exempted from the height window
+        // (`already_deferred`) until they settle. This query is therefore never NARROWER than
+        // [`crate::sage::arrivals::classify`], which remains the sole authority on the verdict.
+        let pending_ids: std::collections::HashSet<String> =
+            sqlx::query("SELECT coin_id FROM arrival_pending")
+                .fetch_all(&mut *tx)
+                .await?
+                .iter()
+                .map(|r| r.get::<String, _>("coin_id"))
+                .collect();
+        let candidates: Vec<CoinRow> = sqlx::query(
+            "SELECT * FROM coins
+             WHERE created_height IS NULL
+                OR created_height > ?
+                OR coin_id IN (SELECT coin_id FROM arrival_pending)",
+        )
+        .bind(baseline_h)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(Self::coin_from_row)
+        .collect();
+
+        let mut recorded = 0usize;
+        for c in &candidates {
+            let parent_is_ours = sqlx::query("SELECT 1 FROM coins WHERE coin_id = ?")
+                .bind(&c.parent_coin_info)
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+            let verdict = classify(
+                c,
+                Some(baseline_h as u32),
+                pending_ids.contains(&c.coin_id),
+                parent_is_ours,
+                &watched,
+            );
+            recorded += Self::apply_verdict(&mut tx, c, verdict, baseline_h).await?;
+        }
+
+        // Forward only. A caller with a lower `through_height` (the oracle-tier refresh, which has
+        // no peak of its own) must never walk the watermark back and re-open history.
+        sqlx::query(
+            "UPDATE sync_state SET arrival_baseline_height = MAX(arrival_baseline_height, ?)
+             WHERE id = 0",
+        )
+        .bind(i64::from(through_height))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(recorded)
+    }
+
+    /// Write one coin's [`Verdict`] into the ledger or the held set. Returns 1 if an arrival was
+    /// newly recorded, 0 otherwise.
+    ///
+    /// `held_height_fallback` is the height stored for an UNCONFIRMED held coin, which has none of
+    /// its own. It bounds only the reorg cleanup of `arrival_pending`; the coin's REAL confirmed
+    /// height is read back from `coins` when it settles, so nothing is ever fabricated into an
+    /// arrival.
+    async fn apply_verdict(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        coin: &CoinRow,
+        verdict: Verdict,
+        held_height_fallback: i64,
+    ) -> sqlx::Result<usize> {
+        match verdict {
+            Verdict::Arrival(asset_id) => {
+                // TRAP 2. `INSERT OR IGNORE` against a `UNIQUE` coin id: a replayed coin cannot
+                // become a second arrival even if every height check upstream were removed, and
+                // the constraint is on disk, so it survives a restart.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_default();
+                let done = sqlx::query(
+                    "INSERT OR IGNORE INTO arrivals
+                         (coin_id, puzzle_hash, amount, asset_id, confirmed_height, recorded_at)
+                     VALUES (?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&coin.coin_id)
+                .bind(&coin.puzzle_hash)
+                .bind(&coin.amount)
+                .bind(&asset_id)
+                .bind(coin.created_height)
+                .bind(now)
+                .execute(&mut **tx)
+                .await?;
+                Self::release_hold(tx, &coin.coin_id).await?;
+                Ok(done.rows_affected() as usize)
+            }
+            // Held: seen, deliberately not judged, and re-examined next pass.
+            Verdict::Deferred | Verdict::Unconfirmed => {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO arrival_pending (coin_id, created_height) VALUES (?, ?)",
+                )
+                .bind(&coin.coin_id)
+                .bind(coin.created_height.unwrap_or(held_height_fallback))
+                .execute(&mut **tx)
+                .await?;
+                Ok(0)
+            }
+            // Settled as not-an-arrival: stop holding it.
+            Verdict::OwnChange | Verdict::Backfill | Verdict::NoBaseline => {
+                Self::release_hold(tx, &coin.coin_id).await?;
+                Ok(0)
+            }
+        }
+    }
+
+    async fn release_hold(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        coin_id: &str,
+    ) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM arrival_pending WHERE coin_id = ?")
+            .bind(coin_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Arrivals strictly after cursor position `after_seq`, oldest first, at most `limit`.
+    ///
+    /// The cursor is `AUTOINCREMENT`, so it is monotonic and never reused: a client that stores
+    /// the last `seq` it saw resumes exactly where it left off, and a reorg that deletes rows
+    /// cannot make an old cursor point at a different arrival.
+    pub async fn arrivals_since(&self, after_seq: i64, limit: i64) -> sqlx::Result<Vec<Arrival>> {
+        let rows = sqlx::query(
+            "SELECT seq, coin_id, puzzle_hash, amount, asset_id, confirmed_height
+             FROM arrivals WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+        )
+        .bind(after_seq)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| Arrival {
+                seq: r.get("seq"),
+                coin_id: r.get("coin_id"),
+                puzzle_hash: r.get("puzzle_hash"),
+                amount: r.get("amount"),
+                asset_id: r.get("asset_id"),
+                confirmed_height: r.get::<i64, _>("confirmed_height") as u32,
+            })
+            .collect())
+    }
+
+    /// The newest cursor position, or 0 when nothing has been recorded — what a client asks for to
+    /// start "from now" rather than replaying the whole ledger on first run.
+    pub async fn arrival_cursor(&self) -> sqlx::Result<i64> {
+        let row = sqlx::query("SELECT COALESCE(MAX(seq), 0) AS v FROM arrivals")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("v"))
     }
 
     /// The unspent coins for an asset (`None` = XCH). Used for balance + spendable count.
@@ -1725,6 +2106,371 @@ mod tests {
         }
     }
 
+    // ---- arrivals (dig_ecosystem#2548) ------------------------------------
+    //
+    // Each of the four traps gets a test that fails for the RIGHT reason, plus a positive control
+    // beside it: a recorder that refuses everything would satisfy every negative assertion here,
+    // so each negative is paired with a coin that differs in exactly the tested dimension and IS
+    // recorded.
+
+    /// The wallet's own watched p2 puzzle hashes, as the recorder takes them.
+    fn watched() -> Vec<String> {
+        vec!["ph".to_string()]
+    }
+
+    /// A confirmed coin at our own address with a FOREIGN parent — the plain arrival shape.
+    fn incoming(id: &str, amount: u64, created: i64) -> CoinRow {
+        let mut c = coin(id, amount, Some(created), None);
+        c.parent_coin_info = format!("foreign_parent_of_{id}");
+        c
+    }
+
+    /// TRAP 1 — a first catch-up replays the whole address history through the write point. None
+    /// of it may be announced, and completing the catch-up must not retroactively announce it.
+    #[tokio::test]
+    async fn a_first_sync_records_no_arrivals() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        for (i, h) in [10i64, 20, 30].iter().enumerate() {
+            db.upsert_coin(&incoming(&format!("hist{i}"), 100, *h))
+                .await
+                .unwrap();
+        }
+        db.set_peak(30, "hh").await.unwrap();
+
+        // During the catch-up there is no baseline, so nothing is an arrival.
+        assert_eq!(db.arrival_baseline().await.unwrap(), None);
+        assert_eq!(db.record_arrivals(&watched(), 30).await.unwrap(), 0);
+
+        // Completing the catch-up arms the baseline at the history it just wrote...
+        db.complete_catch_up(&CatchUpReplay::finished_at(30, "hh"))
+            .await
+            .unwrap();
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(30));
+        // ...and re-running the recorder over that same history still announces nothing.
+        assert_eq!(db.record_arrivals(&watched(), 30).await.unwrap(), 0);
+        assert!(db.arrivals_since(0, 100).await.unwrap().is_empty());
+
+        // POSITIVE CONTROL: the very next coin, one block higher, IS an arrival. Without this the
+        // assertions above would hold against a recorder that never records anything.
+        db.upsert_coin(&incoming("fresh", 100, 31)).await.unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 31).await.unwrap(), 1);
+    }
+
+    /// TRAP 2 — a restart replays every coin again. Dedup must be DURABLE, and it is durable
+    /// twice: the persisted height watermark, and the `UNIQUE` coin id underneath it.
+    #[tokio::test]
+    async fn a_restart_replaying_the_same_coins_re_announces_nothing() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coin(&incoming("paid", 500, 101)).await.unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 1);
+
+        // A restart: the catch-up replays from the genesis challenge and re-upserts everything.
+        db.upsert_coin(&incoming("paid", 500, 101)).await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(101, "hh2"))
+            .await
+            .unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
+        assert_eq!(db.arrivals_since(0, 100).await.unwrap().len(), 1);
+
+        // And with the watermark defeated outright — the second line of defence on its own.
+        sqlx::query("UPDATE sync_state SET arrival_baseline_height = 0 WHERE id = 0")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
+        assert_eq!(db.arrivals_since(0, 100).await.unwrap().len(), 1);
+    }
+
+    /// TRAP 3 — a mempool sighting is not money. Only `created_height` is a confirmation.
+    #[tokio::test]
+    async fn an_unconfirmed_coin_is_never_recorded_as_an_arrival() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+
+        let mut pending = incoming("in_mempool", 700, 0);
+        pending.created_height = None;
+        db.upsert_coin(&pending).await.unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 105).await.unwrap(), 0);
+
+        // POSITIVE CONTROL: the same coin, once confirmed, IS an arrival.
+        db.upsert_coin(&incoming("in_mempool", 700, 105))
+            .await
+            .unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 105).await.unwrap(), 1);
+    }
+
+    /// TRAP 4 — the user's own change lands at the user's own address. The parent coin id is the
+    /// only signal the write point has, and it is checked AFTER the batch commits so a parent and
+    /// its change arriving together cannot race.
+    #[tokio::test]
+    async fn our_own_change_is_not_announced_as_an_arrival() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+
+        // The wallet holds `funding`; spending it creates `change` back at our own address, and a
+        // stranger's payment `gift` lands at the same address in the same batch.
+        let funding = incoming("funding", 1_000, 90);
+        let mut change = coin("change", 400, Some(101), None);
+        change.parent_coin_info = "funding".into();
+        let gift = incoming("gift", 250, 101);
+        db.upsert_coins(&[funding, change, gift]).await.unwrap();
+
+        assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 1);
+        let ids: Vec<String> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.coin_id)
+            .collect();
+        assert_eq!(ids, vec!["gift".to_string()]);
+    }
+
+    /// The batch-ordering hazard, isolated: the change coin is written BEFORE its parent within
+    /// the same batch (peers choose the order). The recorder must still see the parent.
+    #[tokio::test]
+    async fn change_is_refused_even_when_it_is_written_before_its_parent() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+
+        let mut change = coin("change", 400, Some(101), None);
+        change.parent_coin_info = "funding".into();
+        db.upsert_coins(&[change, incoming("funding", 1_000, 101)])
+            .await
+            .unwrap();
+
+        // `funding` itself is an arrival (foreign parent); `change` is not.
+        let ids: Vec<String> = {
+            db.record_arrivals(&watched(), 101).await.unwrap();
+            db.arrivals_since(0, 100)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|a| a.coin_id)
+                .collect()
+        };
+        assert_eq!(ids, vec!["funding".to_string()]);
+    }
+
+    /// A CAT arrival carries its asset id, and an UNATTRIBUTED coin away from our p2 hashes is
+    /// held rather than announced as XCH — then promoted once attribution names its asset.
+    #[tokio::test]
+    async fn a_cat_arrival_carries_its_asset_id_and_waits_until_attributed() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+
+        // A hinted CAT coin lands at a curried puzzle hash with no asset id yet.
+        let mut cat = incoming("catcoin", 300, 101);
+        cat.puzzle_hash = "curried_cat_hash".into();
+        db.upsert_coin(&cat).await.unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
+        assert!(db.arrivals_since(0, 100).await.unwrap().is_empty());
+
+        // Attribution fills in the asset; the deferred coin is promoted on the next pass, even
+        // though the baseline has since advanced past its height.
+        db.attribute_cat_coin("catcoin", "a406d3a9", Some("ph"))
+            .await
+            .unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 120).await.unwrap(), 1);
+        let a = &db.arrivals_since(0, 100).await.unwrap()[0];
+        assert_eq!(a.coin_id, "catcoin");
+        assert_eq!(a.asset_id.as_deref(), Some("a406d3a9"));
+        assert_eq!(a.confirmed_height, 101);
+        assert_eq!(a.amount, "300");
+    }
+
+    /// A reorg unmakes the coins above the fork, so it must unmake their arrivals with them and
+    /// walk the baseline back — otherwise the ledger asserts a receipt the chain no longer has.
+    #[tokio::test]
+    async fn a_reorg_unmakes_the_arrivals_it_unmakes_the_coins_for() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coins(&[incoming("kept", 1, 101), incoming("orphaned", 2, 110)])
+            .await
+            .unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 110).await.unwrap(), 2);
+
+        db.rollback_above(105).await.unwrap();
+        let ids: Vec<String> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.coin_id)
+            .collect();
+        assert_eq!(ids, vec!["kept".to_string()]);
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(105));
+    }
+
+    /// The cursor is monotonic and survives a deletion: a client's stored `seq` never comes to
+    /// point at a different arrival.
+    #[tokio::test]
+    async fn the_arrival_cursor_is_monotonic_and_never_reused() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        db.upsert_coin(&incoming("a", 1, 101)).await.unwrap();
+        db.record_arrivals(&watched(), 101).await.unwrap();
+        let first = db.arrival_cursor().await.unwrap();
+        assert!(first > 0);
+
+        db.rollback_above(100).await.unwrap();
+        assert!(db.arrivals_since(0, 100).await.unwrap().is_empty());
+
+        db.upsert_coin(&incoming("b", 2, 101)).await.unwrap();
+        db.record_arrivals(&watched(), 101).await.unwrap();
+        let page = db.arrivals_since(first, 100).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].coin_id, "b");
+        assert!(page[0].seq > first);
+    }
+
+    /// Money received while the node was OFF is news, not history: a later catch-up leaves the
+    /// baseline alone (it is armed once), so coins above it are still announced exactly once.
+    #[tokio::test]
+    async fn funds_received_while_offline_are_announced_once_on_the_next_sync() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "hh"))
+            .await
+            .unwrap();
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(100));
+
+        // Offline. The node comes back and its catch-up replays history plus what it missed.
+        db.upsert_coins(&[incoming("old", 1, 50), incoming("missed", 9, 150)])
+            .await
+            .unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(150, "hh2"))
+            .await
+            .unwrap();
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(100));
+
+        assert_eq!(db.record_arrivals(&watched(), 150).await.unwrap(), 1);
+        assert_eq!(
+            db.arrivals_since(0, 100).await.unwrap()[0].coin_id,
+            "missed"
+        );
+        // The watermark advances to what this pass examined, so the next pass need not re-read
+        // history. It is the SCAN BOUND, not the dedup: trap 2 is held by the `UNIQUE` coin id
+        // underneath (see the restart test), and this assertion exists so the bound cannot quietly
+        // stop advancing and turn every pass into a full-table scan.
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(150));
+        // And not again on the next pass.
+        assert_eq!(db.record_arrivals(&watched(), 151).await.unwrap(), 0);
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(151));
+    }
+
+    /// TRAP 1, the hole a caller opens rather than the one a coin walks through: the ORACLE-tier
+    /// refresh must not be able to arm the arrival baseline.
+    ///
+    /// `refresh_tracked_coins` is a point read against the coinset oracle for the wallet's own
+    /// puzzle hashes, and it latches `initial_sync_complete` so wallet reads flip to the local DB.
+    /// It has replayed no history — on a fresh install it can complete with `coins` empty and no
+    /// peak at all. Arming a baseline from that arms it at ZERO, and because arming is permanent
+    /// the LATER, genuine catch-up leaves it there. Every historical coin the catch-up then writes
+    /// sits above zero, and the first live update afterwards announces the wallet's entire receive
+    /// history as incoming payments — the exact burst the baseline exists to prevent.
+    ///
+    /// The fixture is that sequence verbatim, and it deliberately gives the oracle path NOTHING to
+    /// arm from: an empty `coins` table and an unset peak, which is what a fresh install has. The
+    /// positive control at the end is what stops this passing against a wallet that simply stopped
+    /// announcing anything.
+    #[tokio::test]
+    async fn the_oracle_refresh_cannot_arm_the_baseline_so_no_burst_follows_the_real_catch_up() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+
+        // What `refresh_tracked_coins` does on a fresh install with nothing in the DB yet.
+        db.set_initial_sync_complete(true).await.unwrap();
+        assert_eq!(
+            db.arrival_baseline().await.unwrap(),
+            None,
+            "a caller that replayed no history armed the baseline"
+        );
+
+        // The genuine catch-up now runs and replays ten years of receipts.
+        let history: Vec<CoinRow> = (1..=8)
+            .map(|i| incoming(&format!("hist{i}"), 100, i * 1_000))
+            .collect();
+        db.upsert_coins(&history).await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(8_000, "hh"))
+            .await
+            .unwrap();
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(8_000));
+
+        // The first live update after the catch-up. Nothing new has arrived.
+        assert_eq!(
+            db.record_arrivals(&watched(), 8_001).await.unwrap(),
+            0,
+            "the wallet's whole receive history was announced as incoming payments"
+        );
+        assert!(db.arrivals_since(0, 100).await.unwrap().is_empty());
+
+        // POSITIVE CONTROL: a coin above the armed baseline still arrives.
+        db.upsert_coin(&incoming("fresh", 100, 8_002))
+            .await
+            .unwrap();
+        assert_eq!(db.record_arrivals(&watched(), 8_002).await.unwrap(), 1);
+    }
+
+    /// The catch-up's completion carries the peak it finished at, so the baseline and the peak
+    /// cannot be armed from different facts.
+    ///
+    /// The fixture puts a coin ABOVE the reported peak, which happens when a batch lands at a
+    /// height the terminal response has not caught up to. The armed baseline must cover it, or that
+    /// coin is announced as an arrival on the very next pass.
+    #[tokio::test]
+    async fn completing_a_catch_up_arms_the_baseline_over_everything_it_wrote() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&incoming("high", 1, 220)).await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(200, "hh"))
+            .await
+            .unwrap();
+
+        assert_eq!(db.arrival_baseline().await.unwrap(), Some(220));
+        let state = db.sync_state().await.unwrap();
+        assert_eq!(
+            state.peak_height,
+            Some(200),
+            "the peak is the peer's, not the coin's"
+        );
+        assert!(state.initial_sync_complete);
+        assert_eq!(db.record_arrivals(&watched(), 220).await.unwrap(), 0);
+    }
+
+    /// The DB-level refusal that actually implements trap 1, isolated from the classifier's own
+    /// (redundant) [`Verdict::NoBaseline`] arm: with no baseline the recorder must not even reach
+    /// the candidate scan, and must NOT arm the baseline itself — arming belongs to the statement
+    /// that knows a catch-up completed.
+    #[tokio::test]
+    async fn the_recorder_refuses_and_arms_nothing_when_no_catch_up_has_completed() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(500, "hh").await.unwrap();
+        db.upsert_coin(&incoming("whatever", 42, 501))
+            .await
+            .unwrap();
+
+        assert_eq!(db.record_arrivals(&watched(), 501).await.unwrap(), 0);
+        assert!(db.arrivals_since(0, 100).await.unwrap().is_empty());
+        assert_eq!(
+            db.arrival_baseline().await.unwrap(),
+            None,
+            "the recorder armed a baseline it has no business arming"
+        );
+    }
+
     #[tokio::test]
     async fn migrations_create_the_single_sync_state_row() {
         let db = WalletDb::open_in_memory().await.unwrap();
@@ -1736,8 +2482,9 @@ mod tests {
     #[tokio::test]
     async fn peak_and_sync_flag_round_trip() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_peak(500, "deadbeef").await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(500, "deadbeef"))
+            .await
+            .unwrap();
         let s = db.sync_state().await.unwrap();
         assert_eq!(s.peak_height, Some(500));
         assert_eq!(s.header_hash.as_deref(), Some("deadbeef"));
