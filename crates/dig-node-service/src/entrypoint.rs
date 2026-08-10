@@ -261,6 +261,10 @@ enum WalletCommand {
     },
     /// Print the chain peak this node reads against (READ-ONLY).
     Peak,
+    /// Print the wallet's chain-sync phase, replica height and Chia peer count (READ-ONLY).
+    ///
+    /// Distinct from `dig-node sync status`, which is about DIG stores, not the chain.
+    SyncStatus,
     /// Push an ALREADY-SIGNED spend bundle to the mempool.
     ///
     /// The bundle arrives complete: this verb holds no key and signs nothing. A bundle spending
@@ -316,6 +320,8 @@ enum SubscriptionsCommand {
 enum PeersCommand {
     /// List the live peer status (running flag, connected count, relay, per-peer list).
     List,
+    /// Print this node's peer count on EACH network: DIG gossip and Chia full nodes.
+    Counts,
     /// Dial a peer by address or peer_id.
     Connect {
         /// The peer address or peer_id to dial.
@@ -558,6 +564,7 @@ fn wallet_action(cmd: WalletCommand) -> ControlAction {
         WalletCommand::Coins { address, asset } => ControlAction::WalletCoins { address, asset },
         WalletCommand::CoinById { coin_id } => ControlAction::WalletCoinById { coin_id },
         WalletCommand::Peak => ControlAction::WalletPeak,
+        WalletCommand::SyncStatus => ControlAction::WalletSyncStatus,
         WalletCommand::Broadcast { signed_bundle_hex } => {
             ControlAction::WalletBroadcast { signed_bundle_hex }
         }
@@ -591,6 +598,7 @@ fn subscriptions_action(cmd: Option<SubscriptionsCommand>) -> ControlAction {
 fn peers_action(cmd: Option<PeersCommand>) -> std::io::Result<PeersAction> {
     Ok(match cmd {
         None | Some(PeersCommand::List) => PeersAction::List,
+        Some(PeersCommand::Counts) => PeersAction::Counts,
         Some(PeersCommand::Connect { peer }) => PeersAction::Connect { peer },
         Some(PeersCommand::Ping { peer, peer_id }) => PeersAction::Ping { peer, peer_id },
         Some(PeersCommand::Disconnect { peer }) => PeersAction::Disconnect { peer },

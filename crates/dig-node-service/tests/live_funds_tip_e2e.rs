@@ -73,6 +73,9 @@ async fn live_funds_dev_tip_broadcasts_and_confirms() {
         &dir,
         WalletServiceConfig {
             enable_live_broadcast: true,
+            // This test drives the spend path against mainnet deliberately; it has no use for
+            // a background sync supervisor, and one would add unrelated peer traffic to it.
+            enable_chain_sync: false,
         },
     )
     .await;
@@ -183,6 +186,9 @@ async fn live_wallet_balance_reads_a_funded_address() {
         &dir,
         WalletServiceConfig {
             enable_live_broadcast: true,
+            // This test drives the spend path against mainnet deliberately; it has no use for
+            // a background sync supervisor, and one would add unrelated peer traffic to it.
+            enable_chain_sync: false,
         },
     )
     .await;

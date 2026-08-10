@@ -112,7 +112,8 @@ async fn start_companion(upstream: &str) -> (SocketAddr, EnvHold) {
 async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
-        port: 0, // bind ephemeral
+        port: 0,                  // bind ephemeral
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 
@@ -175,6 +176,7 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -214,6 +216,7 @@ async fn start_companion_probe_state(
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -249,6 +252,7 @@ async fn start_companion_wallet(
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -554,6 +558,7 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
         upstream: upstream.to_string(),
         port,
         dig_local: true, // attempt the privileged 127.0.0.2:80 bind (expected to fail in CI)
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 
@@ -621,7 +626,8 @@ async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port,
-        dig_local: false, // skip the privileged 127.0.0.2:80 bind in tests
+        dig_local: false,         // skip the privileged 127.0.0.2:80 bind in tests
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()  // host: None → dual-stack default
     };
 
@@ -1471,6 +1477,52 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
     }
 }
 
+/// **Proves (dig_ecosystem#2501):** `control.wallet.syncStatus` and `control.peerCounts` are served
+/// over the real gate, share the same `chia_peer_count` shape, and keep the unknown-peak sentinel.
+///
+/// On this fixture the node has no reachable Chia peer, so the equality assertion below compares
+/// one zero observation with the other. That still pins the shared response shape over real HTTP,
+/// while the single-source property itself is held structurally by the handlers reaching the same
+/// backend accessor.
+///
+/// The phase is asserted to be one of the three declared tokens rather than a specific one: this
+/// node has no chain source, so whether it ever attaches a peer is not the property under test.
+/// What IS pinned is that a peak-less replica reports `null` and never `0` — a zero here reads as
+/// "synced to genesis", a claim about the chain that would be false.
+#[tokio::test]
+async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _token, _hold) = start_companion_full(&upstream).await;
+
+    let call = |method: &str| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": {} });
+
+    let sync = post_rpc(&addr, call("control.wallet.syncStatus"), None).await;
+    assert!(
+        sync["error"].is_null(),
+        "syncStatus is an open read and must answer: got {sync:?}"
+    );
+    let phase = sync["result"]["phase"].as_str().unwrap_or_default();
+    assert!(
+        ["not_started", "syncing", "synced"].contains(&phase),
+        "phase must be one of the three declared tokens, got {phase:?}"
+    );
+    assert!(
+        sync["result"]["peak_height"].is_null() || sync["result"]["peak_height"].as_u64() > Some(0),
+        "an unknown peak is null, never 0: got {sync:?}"
+    );
+
+    let counts = post_rpc(&addr, call("control.peerCounts"), None).await;
+    assert!(
+        counts["error"].is_null(),
+        "peerCounts is an open read and must answer: got {counts:?}"
+    );
+    assert_eq!(
+        counts["result"]["chia_peer_count"], sync["result"]["chia_peer_count"],
+        "both methods report the SAME Chia peer observation; serving them from two sources is \
+         how they start to disagree"
+    );
+}
+
 /// **Proves (dig_ecosystem#2392):** `control.wallet.coinById` validates its `coin_id` BEFORE any
 /// chain work — ahead of the chain-source liveness check, and therefore ahead of the rate limiter
 /// and the network call behind it.
@@ -2247,7 +2299,8 @@ async fn start_serving_node(
     let config = dig_node_service::Config {
         upstream,
         port,
-        dig_local: false, // skip the privileged 127.0.0.2:80 bind in tests
+        dig_local: false,         // skip the privileged 127.0.0.2:80 bind in tests
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 

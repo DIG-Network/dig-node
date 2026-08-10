@@ -5934,7 +5934,11 @@ mod tests {
     async fn anonymous_request_rejected_by_authed_remote() {
         // Prove the auth gate is real (not an open server) — so the test above is
         // meaningful: a client carrying NO §21.9 identity is rejected.
-        let (base, store_hex) = spawn_authed_remote(b"m".to_vec()).await;
+        // A REAL capsule, not a one-byte stand-in: `spawn_authed_remote` parses the module to
+        // learn the root it should serve at (#2246), so a placeholder makes the helper panic
+        // before the auth gate under test is ever reached.
+        let (module, _root) = chain_anchored_module([1u8; 32], [0x10; 32]);
+        let (base, store_hex) = spawn_authed_remote(module).await;
         let store_id = Bytes32::from_hex(&store_hex).unwrap();
         let anon = DigClient::new(base);
         let r = anon.clone_store(&store_id, |_b, _r| Ok(()), None).await;
@@ -12938,12 +12942,20 @@ mod tests {
         std::env::remove_var("DIG_NODE_ON_MISS");
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (node, td) = test_node(None);
         // A holder serves an ANCHORED resource (real digstore proof over its bytes) so the download's
         // whole-resource verify against the chain-anchored root passes. The content id root MUST equal
         // the transport-reported root (dig-download #179 cross-check).
         let content = anchored_mock_content(30, 3);
         let cid = anchored_cid_for(&content);
+        // The resolver must ANCHOR the requested root on-chain: a serve is refused with
+        // `pinned root is not the current on-chain root` when it cannot, so a node built with the
+        // resolve-nothing default can never reach the fetch-through path under test.
+        let (anchored_store, anchored_root) = match &cid {
+            ContentId::Resource { store_id, root, .. } => (hex::encode(store_id), Bytes32(*root)),
+            _ => unreachable!("anchored_cid_for builds a resource id"),
+        };
+        let (node, td) =
+            test_node_with_resolver(None, MockResolver::one(&anchored_store, anchored_root));
         attach_p2p(
             &node,
             vec![
@@ -13011,9 +13023,16 @@ mod tests {
         std::env::remove_var("DIG_NODE_PIN");
         std::env::remove_var("DIG_NODE_ON_MISS"); // engine mode is Redirect (below), not env fetch
         let rt = pin_test_rt();
-        let (node, td) = test_node(None);
         let content = anchored_mock_content(30, 3);
         let cid = anchored_cid_for(&content);
+        // The resolver must anchor the content's own root, or both calls are refused for an
+        // unanchored root and neither branch of the proxy flag is exercised.
+        let (anchored_store, anchored_root) = match &cid {
+            ContentId::Resource { store_id, root, .. } => (hex::encode(store_id), Bytes32(*root)),
+            _ => unreachable!("anchored_cid_for builds a resource id"),
+        };
+        let (node, td) =
+            test_node_with_resolver(None, MockResolver::one(&anchored_store, anchored_root));
         attach_p2p(
             &node,
             vec![
@@ -13190,7 +13209,10 @@ mod tests {
         std::env::remove_var("DIG_NODE_ON_MISS");
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (node, td) = test_node(None);
+        // The requested root must ANCHOR: without a resolver that returns it, every call is
+        // refused with `pinned root is not the current on-chain root` before the rate limiter is
+        // consulted, and the test measures nothing.
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
         let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
         attach_p2p(
             &node,
@@ -13388,7 +13410,9 @@ mod tests {
         std::env::remove_var("DIG_RPC_UPSTREAM"); // no upstream — DEFAULT_UPSTREAM == ""
         let rt = pin_test_rt();
         let (store, tip, rk) = miss_setup();
-        let (mut node, td) = test_node(None);
+        // A resolver that anchors the requested root: otherwise the miss is refused for an
+        // unanchored root and the redirect path under test is never reached.
+        let (mut node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
         // An UNCONFIGURED node has no upstream (#1997, DEFAULT_UPSTREAM == ""): a miss can ONLY
         // redirect — there is no upstream HTTP leg to fall through to.
         node.upstream = String::new();

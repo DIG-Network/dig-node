@@ -3756,6 +3756,86 @@ then consumes `coin_state_update` pushes into the DB. A reorg (a `coin_state_upd
 is below the current peak) rolls the DB back above the fork — coins created above it are deleted, coins
 spent above it become unspent again — then applies the update's coin states and advances the peak.
 
+18.6a. **The sync supervisor (the production call site).** A background supervisor owns the §18.6 loop's
+lifecycle on every install: it dials a peer, catches up, consumes pushes, and reconnects with an
+exponential 1s→60s jittered backoff that resets after a connection lasting at least 60 seconds. It holds
+EXACTLY ONE subscription peer — the subscription is per-connection state, and concurrent peers would drive
+interleaved reorg rollbacks into a DB with a single writer. A reconnect re-runs the catch-up from the
+genesis challenge, because a fresh peer has no memory of the previous subscription. Sync is a chain READ
+plus a write to the node's own replica, so it MUST NOT be gated on the live-broadcast (spend) flag.
+
+The subscription set is derived from the node's custodied PUBLIC keys via `StandardArgs::curry_tree_hash`,
+re-read on every connect attempt AND — while a session is running with nothing subscribed — re-polled at
+least every 5 seconds, so a wallet created after boot is picked up without a restart and without waiting
+for the peer to drop. A newly non-empty set ends the peak-only session and reconnects immediately, since
+the subscription is per-connection state. No seed is read and nothing on this path can sign (§908).
+
+**Invariant.** A catch-up MUST NOT run over an empty puzzle-hash set, and `initial_sync_complete` MUST NOT
+be set as a result of one. `initial_sync` itself refuses with `NoPuzzleHashes`. An empty subscription is
+answered "finished" immediately, so completing it would mark an un-queried DB authoritative under §18.7 and
+report a funded wallet as empty. A node with no wallet therefore advances only its peak and stays unsynced.
+
+**Invariant.** A catch-up MUST NOT run over a peer the node merely DISCOVERED, and
+`initial_sync_complete` MUST NOT be set as a result of one. `initial_sync` itself refuses with
+`UntrustedPeer`. See §18.6c for the trust model this enforces. The supervisor therefore runs a
+DISCOVERED peer as a peak-only session whatever the wallet holds: it subscribes nothing, and it does not
+re-poll the puzzle-hash set, because a wallet appearing cannot make an untrusted peer trusted.
+
+**Bounded catch-up.** One catch-up MUST make at most 1,024 round trips and write at most 250,000 coin
+states in total, and a response carrying `is_finished: false` MUST report a height strictly greater than
+the previous response's, or the catch-up is abandoned. `is_finished` is a bit the peer chooses, so
+without these a peer answering `false` at a constant height loops forever, growing `wallet.sqlite` on
+every round trip.
+
+18.6c. **The peer is untrusted, and a DISCOVERED peer is never authoritative.** The peer socket is
+attacker-reachable: peer discovery tries `127.0.0.1:8444` before any introducer and the client does not
+verify the server certificate, so an unprivileged co-resident process can become the node's chain source.
+
+**The trust boundary.** A peer's authority is decided by HOW it was reached, never by anything it says:
+
+* An **operator** peer is a `user_managed` row in the `peers` table — an address a human deliberately
+  entered. It has full authority: it MAY run a catch-up, set `initial_sync_complete`, write coins, and
+  drive a bounded rollback.
+* A **discovered** peer (a DNS introducer answer, or the loopback probe) is ADVISORY. It MAY advance the
+  replica peak, monotonically, which is what §18.6b's status reports. It MUST NOT write coins, MUST NOT
+  roll the replica back, and MUST NOT cause `initial_sync_complete` to become `true` — so §18.7 keeps
+  every wallet-scoped read on the fallback tier and its answers can never be authoritative for money.
+
+The consequence is deliberate: a default install with no operator-chosen peer does NOT get a full coin
+sync, and wallet-scoped reads stay on the fallback tier. The boundary is placed at the flag rather than at
+each individual leak because an attacker chooses when its connection survives — closing the socket costs
+it one backoff cycle and buys a fresh catch-up, which is how a per-leak defence is walked around.
+
+Beyond the boundary, the supervisor MUST hold all four of the following for an operator peer too.
+
+* **Subscription filtering.** A `CoinState` at a puzzle hash outside the set this session subscribed MUST
+  be dropped, in both the catch-up response and every `coin_state_update` push. A peer answers a
+  subscription; it does not define one.
+* **A bounded fork depth.** A `coin_state_update` claiming a fork more than 128 blocks below the replica's
+  peak MUST be refused and the session dropped, with the replica left intact. A light client cannot
+  validate a fork claim, and `rollback_above(0)` erases the whole replica.
+* **A bounded rollback SEQUENCE.** An applied rollback lowers the peak, so the next frame's 128 blocks
+  are measured from the new mark and a peer that never exceeds the per-frame bound still walks the
+  replica down indefinitely. One session MUST therefore be dropped once its rollbacks total more than 128
+  blocks, however many individually-legal frames they arrived in.
+* **Fail closed on any backwards move.** When a rollback is applied, or the update's height is below the
+  current peak, `initial_sync_complete` MUST be cleared. Wallet-scoped reads then route to the fallback
+  tier (§18.7) until a genuine catch-up re-establishes the flag. Without this a single frame makes a funded
+  wallet report `balance 0` with `phase: synced`.
+* **A monotonic replica peak.** `new_peak_wallet` MUST only ADVANCE `sync_state.peak_height`; a backwards
+  claim is refused. That height bounds a claimed confirmation on an OPEN read, so a peer able to lower it
+  can make settled money read unconfirmed.
+
+18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
+chia_peer_count}`. `phase` is `not_started` (no peer has ever attached), `syncing`, or `synced` — and
+`synced` requires BOTH a completed catch-up AND at least one live Chia peer, so a replica that caught up
+and then went offline reports `syncing`. It is not a freshness guarantee: a live connection to a stalled
+peer satisfies it. `peak_height` is the REPLICA's own height read from `sync_state`; it MUST NOT fall back
+to the coinset oracle (unlike `control.wallet.peak`, which answers a different question), and `null` means
+unknown, never height zero. `chia_peer_count` is `0` when observed and `null` when unobservable.
+`control.peerCounts` reports `{dig_peer_count, chia_peer_count}`, and its `chia_peer_count` MUST be the
+SAME observation this method reports.
+
 18.7. **Fallback tier + sync-state-gated routing.** `chia-query` (coinset.org + non-subscribing peer
 point-reads) is reused AS-IS as a fallback tier — never the primary. The B.3 subscription loop is NOT
 added to `chia-query`. Every wallet-data read selects its source:
@@ -3767,6 +3847,13 @@ added to `chia-query`. Every wallet-data read selects its source:
 | Chain data not scoped to this wallet, not in the DB  | Fallback tier    |
 
 So a caller never blocks on an unsynced replica. `get_sync_status` reports the gating sync state.
+
+**Spend inputs take the same gate.** Selecting the coins a spend is built from is a wallet-scoped read of
+the same replica, so it MUST consult this table: with the replica unsynced, the node MUST REFUSE to build
+the spend rather than select inputs from a table it is not entitled to assert yet. A per-coin fallback is
+not a substitute — the fallback tier can confirm that a coin exists, but the SET of spendable coins is
+exactly what an unsynced replica cannot claim. The remedy available to a caller is to complete an
+authoritative sync (an operator peer, or the point-read refresh of §18.12).
 
 18.7a. **Identity-scoped reads + honest sync state (#407).** The dig-node answers wallet-data reads for
 the CLIENT's connected self-custody wallet, scoped by that wallet's PUBLIC identity — NEVER the node's

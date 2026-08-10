@@ -62,6 +62,9 @@ pub enum ControlAction {
     WalletCoins { address: String, asset: String },
     /// `control.wallet.coinById` — the READ-ONLY lookup of ONE coin by coin id (spent or not).
     WalletCoinById { coin_id: String },
+    /// `control.wallet.syncStatus` — the READ-ONLY wallet chain-sync phase, replica height and
+    /// Chia peer count. Distinct from `control.sync.status`, which is about DIG stores.
+    WalletSyncStatus,
     /// `control.wallet.peak` — the READ-ONLY chain peak height the node can see.
     WalletPeak,
     /// `control.wallet.broadcast` — push an ALREADY-SIGNED spend bundle. The node signs nothing.
@@ -105,6 +108,7 @@ impl ControlAction {
             ControlAction::WalletCoins { .. } => "control.wallet.coins",
             ControlAction::WalletCoinById { .. } => "control.wallet.coinById",
             ControlAction::WalletPeak => "control.wallet.peak",
+            ControlAction::WalletSyncStatus => "control.wallet.syncStatus",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
             ControlAction::UpdaterStatus => "control.updater.status",
             ControlAction::UpdaterSetChannel { .. } => "control.updater.setChannel",
@@ -202,6 +206,7 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         }
         .method(),
         ControlAction::WalletPeak.method(),
+        ControlAction::WalletSyncStatus.method(),
         ControlAction::WalletBroadcast {
             signed_bundle_hex: String::new(),
         }
@@ -223,6 +228,10 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
             store_id: String::new(),
         }
         .method(),
+        // `dig-node peers counts` reports both networks' peer counts (dig_ecosystem#2501); it
+        // lives beside the other peer verbs rather than under `wallet`, because only one of the
+        // two numbers it reports is the wallet's.
+        "control.peerCounts",
         // `dig-node logs level <filter>` drives the live level change (#553).
         "control.log.setLevel",
         // `dig-node peers` drives the live peer status (#559); `dig-node peers connect <peer>` dials

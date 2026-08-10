@@ -385,6 +385,11 @@ pub async fn build_state(config: &Config) -> AppState {
         &config_dir,
         dig_wallet::sage::service::WalletServiceConfig {
             enable_live_broadcast: config.enable_live_broadcast,
+            // Chain sync is a READ into the node's own replica, so it runs on every install —
+            // deliberately NOT gated on the spend flag above (#2501). It is separately
+            // switchable because starting it dials the network, which an integration harness
+            // must be able to decline (see `Config::enable_chain_sync`).
+            enable_chain_sync: config.enable_chain_sync,
         },
     )
     .await;

@@ -106,6 +106,8 @@ pub fn is_open_control_read(method: &str) -> bool {
             | "control.wallet.coins"
             | "control.wallet.coinById"
             | "control.wallet.peak"
+            | "control.wallet.syncStatus"
+            | "control.peerCounts"
     )
 }
 
@@ -141,6 +143,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.coins",
     "control.wallet.coinById",
     "control.wallet.peak",
+    "control.wallet.syncStatus",
     "control.wallet.broadcast",
     "control.updater.status",
     "control.updater.setChannel",
@@ -151,6 +154,7 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.pairing.approve",
     "control.pairing.revoke",
     "control.peers.ping",
+    "control.peerCounts",
     // Delegated to the embedded node's own control surface.
     "control.peerStatus",
     "control.peers.connect",
@@ -183,6 +187,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.coins",
     "control.wallet.coinById",
     "control.wallet.peak",
+    "control.wallet.syncStatus",
     "control.wallet.broadcast",
     "control.updater.status",
     "control.updater.setChannel",
@@ -193,6 +198,7 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.pairing.approve",
     "control.pairing.revoke",
     "control.peers.ping",
+    "control.peerCounts",
 ];
 
 /// The control methods [`dispatch_control`] DELEGATES to the embedded node's own control surface
@@ -753,6 +759,8 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.coins" => wallet_coins(ctx, id, params).await,
         "control.wallet.coinById" => wallet_coin_by_id(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
+        "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
+        "control.peerCounts" => peer_counts(ctx, id).await,
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
         // own status file + CLI (see `crate::updater`'s module doc for why nothing here
@@ -1465,6 +1473,97 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
     }
 }
 
+/// `control.wallet.syncStatus` (dig_ecosystem#2501) — is the wallet's chain replica being kept
+/// current, how far has it got, and how many Chia peers is it using?
+///
+/// # `synced` means CAUGHT UP **AND** CONNECTED
+///
+/// Not "once caught up". A wallet that finished its catch-up yesterday and has been offline since
+/// reports `syncing`, because it is trying to be current and is not. That makes this phase
+/// strictly stronger than `control.wallet.peak`'s `synced` flag, which only reflects the
+/// completed-catch-up bit. It is still NOT a freshness guarantee — a live connection to a stalled
+/// peer satisfies it — so a consumer needing freshness compares `peak_height` against something.
+///
+/// # The height is the REPLICA's, never an oracle's
+///
+/// `peak_height` is read straight from the wallet DB's `sync_state`. It must never come from
+/// [`dig_wallet::sage::rpc::WalletBackend::chain_peak`], which falls back to the coinset oracle:
+/// that would answer *how far has this replica got?* with a number the replica never reached, and
+/// would route an unauthenticated loopback read into outbound requests — the egress-amplification
+/// shape `WALLET_RATE_LIMITED` exists to bound (dig_ecosystem#1957), which also discloses
+/// `{IP, timestamp, coin id}` to the third party. The backend accessor used here has no oracle
+/// path at all.
+///
+/// `{phase: not_started, peak_height: <n>}` is legitimate, not a contradiction: it is the RESTART
+/// state — a node with a height recorded by a previous run that has not yet begun syncing.
+async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
+    match ctx.wallet.wallet_sync_status().await {
+        Ok(s) => control_ok(
+            id,
+            json!({
+                "phase": s.phase,
+                "peak_height": s.peak_height,
+                "chia_peer_count": s.chia_peer_count,
+            }),
+        ),
+        // Only the local wallet DB can fail here — there is no chain call to blame.
+        Err(e) => control_error(
+            id,
+            ErrorCode::WalletReadFailed,
+            format!("control.wallet.syncStatus: reading the local wallet sync state failed: {e}"),
+        ),
+    }
+}
+
+/// `control.peerCounts` (dig_ecosystem#2501) — how many peers this node holds on EACH network.
+///
+/// Two unrelated numbers, each named for its network, because they are routinely confused:
+/// `dig_peer_count` is the DIG content/gossip pool (the same figure `control.peerStatus` reports
+/// as `connected_peers`), and `chia_peer_count` is Chia full nodes serving the wallet's chain
+/// sync. Neither is `control.peerStatus`'s `relay.peer_count`, which counts peers connected to the
+/// RELAY rather than to this node — and which, being the only lively-looking number in that
+/// payload, is the one that gets misread.
+///
+/// `null` means UNOBSERVABLE, never zero: a count nobody could take is not a count of none.
+/// `chia_peer_count` is taken from the SAME accessor `control.wallet.syncStatus` uses, so the two
+/// methods cannot disagree.
+async fn peer_counts(ctx: &ControlCtx, id: Value) -> Value {
+    let chia_peer_count = ctx
+        .wallet
+        .wallet_sync_status()
+        .await
+        .ok()
+        .and_then(|s| s.chia_peer_count);
+    let dig_peer_count = dig_peer_count(ctx).await;
+    control_ok(
+        id,
+        json!({ "dig_peer_count": dig_peer_count, "chia_peer_count": chia_peer_count }),
+    )
+}
+
+/// The DIG gossip pool size, from the node's own `control.peerStatus` snapshot.
+///
+/// `None` when the peer network is not running or the snapshot does not carry the field — an
+/// absent observation, which is a different fact from an observed zero.
+async fn dig_peer_count(ctx: &ControlCtx) -> Option<u32> {
+    let req = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "control.peerStatus", "params": {}
+    });
+    let parsed = dig_node_core::handle_rpc(
+        &ctx.node,
+        req,
+        dig_node_core::download::ReadOrigin::Local,
+        dig_node_core::download::RequestProvenance::FirstParty,
+    )
+    .await;
+    if !parsed["result"]["running"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    parsed["result"]["connected_peers"]
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+}
+
 /// `control.wallet.broadcast` (dig_ecosystem#2376) — push an ALREADY-SIGNED spend bundle.
 ///
 /// # The custody boundary (§908)
@@ -1609,7 +1708,18 @@ mod tests {
                 "control.wallet.balance",
                 "control.wallet.coins",
                 "control.wallet.coinById",
-                "control.wallet.peak"
+                "control.wallet.peak",
+                // `control.wallet.syncStatus` reports only how far THIS node has got.
+                //
+                // `control.peerCounts` is a DELIBERATE disclosure rather than an inert one, and
+                // the distinction matters: its `dig_peer_count` is obtained by internally
+                // dispatching `control.peerStatus`, which IS token-gated. What is opened is the
+                // bare cardinality — how many peers this node holds — which a caller needs to
+                // render a connection indicator and which reveals nothing about WHICH peers or
+                // how they are reached. The identity/topology half of `peerStatus` stays behind
+                // the token. Both are published open in `dig-node-control-interface`.
+                "control.wallet.syncStatus",
+                "control.peerCounts",
             ]
         );
         assert!(
