@@ -64,6 +64,13 @@ struct Script {
     outcomes: Mutex<VecDeque<bool>>,
     /// The test clock's current instant.
     now: Mutex<Option<Instant>>,
+    /// What the WRITER session answers when asked for the header hash at the corroboration
+    /// height. `None` means it declines. Scripted so a test can make the writer agree with the
+    /// quorum, contradict it, or refuse — the three inputs `may_elevate` distinguishes.
+    writer_answer: Mutex<Option<Bytes32>>,
+    /// Heights the writer was asked about, in order, so a test can prove the writer never chose
+    /// its own exam height.
+    writer_asked_at: Mutex<Vec<u32>>,
 }
 
 impl Script {
@@ -160,12 +167,18 @@ impl SyncSession for ScriptedSession {
         self.trust
     }
 
+    async fn header_hash_at(&self, height: u32) -> Result<Option<Bytes32>, SyncError> {
+        self.script.writer_asked_at.lock().unwrap().push(height);
+        Ok(*self.script.writer_answer.lock().unwrap())
+    }
+
     async fn catch_up(
         &self,
         db: &WalletDb,
         puzzle_hashes: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
+        trust: PeerTrust,
     ) -> Result<(), SyncError> {
         self.script
             .catch_ups
@@ -181,7 +194,10 @@ impl SyncSession for ScriptedSession {
             genesis_challenge,
             &self.peer_ip(),
             events,
-            self.trust,
+            // The EFFECTIVE trust the supervisor resolved, exactly as production passes it --
+            // reading `self.trust` here would make the elevation invisible to the floor check and
+            // quietly re-create the bug this suite exists to exclude.
+            trust,
         )
         .await
     }
@@ -255,6 +271,19 @@ impl Harness {
         addrs: Vec<String>,
         trust: PeerTrust,
     ) -> Self {
+        Self::start_full(db, hashes, script, addrs, trust, None).await
+    }
+
+    /// Start a supervisor with an explicit corroborator — `None` reproduces the pre-#2568
+    /// behaviour, where a discovered peer writes nothing.
+    async fn start_full(
+        db: WalletDb,
+        hashes: Arc<dyn PuzzleHashSource>,
+        script: Arc<Script>,
+        addrs: Vec<String>,
+        trust: PeerTrust,
+        corroborator: Option<Arc<dyn Corroborator>>,
+    ) -> Self {
         let factory = Arc::new(ScriptedFactory {
             script: script.clone(),
             addrs,
@@ -267,6 +296,7 @@ impl Harness {
             events: Arc::new(EventBus::default()),
             genesis_challenge: Bytes32::new([0; 32]),
             time: script.clone(),
+            corroborator: corroborator.clone(),
         });
         Self {
             db,
@@ -302,6 +332,21 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("timed out waiting for: {what}");
+    }
+
+    /// Wait until the supervisor has connected AND finished deciding what that session may do.
+    ///
+    /// Anchored on an OBSERVED event (a completed connect) rather than a bare sleep, then given a
+    /// short grace for the trust decision that immediately follows it. The grace is what makes the
+    /// NEGATIVE assertions ("`catch_up` was never called") meaningful: without it the test could
+    /// assert zero simply by looking too early, which would pass against any implementation at
+    /// all.
+    async fn settle(&self) {
+        self.until("a session to be established", |s| {
+            s.connects.load(Ordering::SeqCst) >= 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
     async fn stop(self) {
@@ -912,17 +957,26 @@ fn supervisor_tls_identity_is_generated_never_file_backed() {
 // T13 — the live acceptance step (never run in CI)
 // ---------------------------------------------------------------------------
 
-/// **Proves (T13, #2501):** a real DISCOVERED mainnet peer connects, is COUNTED, and writes
-/// nothing to the replica.
+/// **THE ACCEPTANCE TEST (#2568):** on a real mainnet default install — nothing in the `peers`
+/// table, no configuration — a DISCOVERED peer is corroborated by an independently drawn quorum
+/// and the replica peak becomes known and ADVANCES.
 ///
-/// This is the ONLY test that can falsify the assumption a discovery-only install rests on —
-/// that dialling a stranger yields a live session at all. What that session is worth changed in
-/// the third audit round: a discovered peer no longer advances the peak (see
-/// [`sync::PeerTrust`]), so its entire contribution is the liveness this test observes. Ignored
-/// because it dials mainnet; run it by hand.
+/// This is the only test that can falsify the two assumptions the whole design rests on: that
+/// dialling strangers yields enough DISTINCT reachable peers to form a quorum at all, and that
+/// real mainnet full nodes actually agree with each other at a settled height. Neither is
+/// provable against a double, and getting either wrong means the node silently never syncs —
+/// exactly the condition #2568 exists to end.
+///
+/// It asserts the peak ADVANCES rather than merely becoming non-null: a single write could come
+/// from one lucky frame, whereas movement over the window is the replica genuinely following the
+/// chain. `initial_sync_complete` is deliberately NOT asserted here, because this fixture holds no
+/// wallet: with zero puzzle hashes there is nothing to catch up, and §18.6's empty-set invariant
+/// correctly refuses to mark an un-queried DB authoritative. That invariant is unchanged by #2568.
+///
+/// Ignored because it dials mainnet; run it by hand.
 #[tokio::test]
-#[ignore = "dials real mainnet peers; run by hand as the #2501 acceptance step"]
-async fn live_mainnet_discovered_peer_is_counted_and_writes_nothing() {
+#[ignore = "dials real mainnet peers; run by hand as the #2568 acceptance step"]
+async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let factory = Arc::new(ChiaPeerSessionFactory::mainnet(db.clone()));
     let (handle, join) = spawn_supervisor(Supervisor {
@@ -932,39 +986,48 @@ async fn live_mainnet_discovered_peer_is_counted_and_writes_nothing() {
         events: Arc::new(EventBus::default()),
         genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
         time: Arc::new(TokioTime),
+        corroborator: Some(Arc::new(ChiaQuorumCorroborator::mainnet())),
     });
 
-    // A mainnet block lands roughly every 19s; three minutes is several peaks of margin, so a
-    // peer that was going to push anything has pushed it well inside this window.
-    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    // A mainnet block lands roughly every 19s. Corroboration itself needs several sequential
+    // dials before the first write is even possible, so the window has to cover that PLUS enough
+    // blocks to see movement: six minutes is ~19 peaks of margin.
+    let deadline = std::time::Instant::now() + Duration::from_secs(360);
     let mut peers = None;
+    let mut first_peak: Option<u32> = None;
+    let mut latest_peak: Option<u32> = None;
     while std::time::Instant::now() < deadline {
         peers = handle.status(&db).await.unwrap().chia_peer_count;
-        if peers.is_some_and(|n| n >= 1) {
-            break;
+        latest_peak = db.sync_state().await.unwrap().peak_height;
+        if let Some(seen) = latest_peak {
+            first_peak.get_or_insert(seen);
+            // Movement, not merely presence: one lucky frame is not "following the chain".
+            if latest_peak > first_peak {
+                break;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    let peak_after = db.sync_state().await.unwrap().peak_height;
     handle.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), join).await;
 
-    // Printed because this test is run by hand as an acceptance step, and the operator's
-    // question is "did a real stranger actually answer", not merely "did it pass".
-    println!("live mainnet discovered peers observed: {peers:?}");
+    // Printed because this is run by hand as an acceptance step, and the operator's question is
+    // "did real strangers actually corroborate each other", not merely "did it pass".
+    println!("live mainnet: peers={peers:?} first_peak={first_peak:?} latest_peak={latest_peak:?}");
     assert!(
         peers.is_some_and(|n| n >= 1),
         "discovery must yield a live session; without one a default install has no liveness at \
-         all and the supervisor should idle instead. Got {peers:?}"
-    );
-    assert_eq!(
-        peak_after, None,
-        "a discovered peer must write NOTHING — the peak stays UNKNOWN however many frames it \
-         pushed over three minutes"
+         all. Got {peers:?}"
     );
     assert!(
-        !db.is_synced().await.unwrap(),
-        "and must never mark the replica caught up"
+        first_peak.is_some(),
+        "the replica peak stayed UNKNOWN: no discovered peer was corroborated in six minutes, so \
+         a default install still does not sync"
+    );
+    assert!(
+        latest_peak > first_peak,
+        "the peak was written once but never ADVANCED ({first_peak:?} -> {latest_peak:?}); the \
+         replica is not following the chain"
     );
 }
 
@@ -1003,4 +1066,292 @@ fn the_trust_label_is_fixed_by_the_dial_source() {
         "a DNS-introducer answer, or whoever won the race to bind 127.0.0.1:8444, may never \
          write to wallet.sqlite"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Quorum-by-agreement peer trust (dig_ecosystem#2568)
+// ---------------------------------------------------------------------------
+
+/// The header hash an honest quorum agrees on at the settled height.
+const HONEST_HASH: Bytes32 = Bytes32::new([0x11; 32]);
+/// A different hash — what a lying writer answers instead.
+const LIARS_HASH: Bytes32 = Bytes32::new([0x22; 32]);
+/// The settled height a scripted corroboration round lands on.
+const SETTLED_HEIGHT: u32 = 5_999_998;
+
+/// A corroborator returning a scripted round, recording how many rounds were run.
+///
+/// Deliberately able to express EVERY verdict rather than just pass/fail: a double that can only
+/// say yes or no cannot exhibit the difference between "the quorum split" and "the quorum agreed
+/// and the writer disagreed", which are the two refusals with different meanings.
+struct ScriptedCorroborator {
+    round: Mutex<CorroborationRound>,
+    rounds: AtomicUsize,
+}
+
+impl ScriptedCorroborator {
+    fn new(verdict: Verdict<Bytes32>) -> Arc<Self> {
+        Arc::new(Self {
+            round: Mutex::new(CorroborationRound {
+                height: SETTLED_HEIGHT,
+                verdict,
+            }),
+            rounds: AtomicUsize::new(0),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Corroborator for ScriptedCorroborator {
+    async fn corroborate(&self) -> Result<CorroborationRound, SyncError> {
+        self.rounds.fetch_add(1, Ordering::SeqCst);
+        Ok(self.round.lock().unwrap().clone())
+    }
+}
+
+/// Run one discovered-peer session to completion against a scripted corroborator, and report
+/// what the replica ended up holding.
+async fn run_discovered_session(
+    verdict: Verdict<Bytes32>,
+    writer_answer: Option<Bytes32>,
+) -> (WalletDb, Arc<Script>) {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = writer_answer;
+    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_full(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(ScriptedCorroborator::new(verdict)),
+    )
+    .await;
+
+    harness.settle().await;
+    harness.stop().await;
+    (db, script)
+}
+
+/// **Proves:** a single lying peer cannot move the replica.
+///
+/// FIXTURE DESIGN — exactly ONE actor varies. The quorum is honest and UNANIMOUS; only the writer
+/// lies. An all-hostile fixture would read as the harsher test and is precisely the one that
+/// cannot see a missed check, because there would be no honest answer for the liar to be caught
+/// contradicting.
+///
+/// TWO HOPS, because the fix is a PLACEMENT. Asserting only "the replica is empty" would be
+/// satisfied identically by a guard left down inside `initial_sync_with` — the pre-#2568
+/// placement — and a later refactor moving the check would keep such a test green. So this also
+/// asserts `catch_up` was never CALLED. Only a guard that runs BEFORE the catch-up can satisfy
+/// both, which is the property that actually matters: a peer that fails corroboration never gets
+/// a window in which its answers are already landing.
+#[tokio::test]
+async fn a_single_lying_writer_cannot_move_the_replica() {
+    let (db, script) =
+        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
+
+    assert_eq!(
+        script.catch_up_count(),
+        0,
+        "the catch-up RAN for a peer that contradicted the quorum; the guard is placed after the \
+         write path instead of before it"
+    );
+    let state = db.sync_state().await.unwrap();
+    assert_eq!(
+        state.peak_height, None,
+        "a lying peer moved the replica peak"
+    );
+    assert!(!state.initial_sync_complete);
+    assert!(!db.is_synced().await.unwrap());
+}
+
+/// **Proves:** the honest control — a writer that AGREES with the quorum IS elevated and does
+/// sync.
+///
+/// Without this, every assertion above is satisfied by a node that simply never syncs anything,
+/// which is the bug #2568 exists to fix. This is the acceptance property in unit form: a
+/// DISCOVERED peer, no operator peer anywhere, reaching `initial_sync_complete` and a non-NULL
+/// peak.
+#[tokio::test]
+async fn a_corroborated_discovered_peer_syncs_a_default_install() {
+    let (db, script) =
+        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+
+    assert!(
+        script.catch_up_count() >= 1,
+        "a corroborated peer never ran a catch-up, so a default install still does not sync"
+    );
+    let state = db.sync_state().await.unwrap();
+    // Asserted on the DB, which is where coin selection will read it from -- not on the script's
+    // record that a catch-up was attempted.
+    assert!(state.initial_sync_complete || state.peak_height.is_some());
+    let state = db.sync_state().await.unwrap();
+    assert!(
+        state.initial_sync_complete,
+        "initial_sync_complete stayed false for a corroborated peer"
+    );
+    assert_eq!(
+        state.peak_height,
+        Some(CATCH_UP_HEIGHT),
+        "the replica peak stayed unknown for a corroborated peer"
+    );
+}
+
+/// **Proves:** a SPLIT answer writes nothing, and is not silently resolved by taking a side.
+///
+/// FIXTURE DESIGN: the writer answers the value that a plurality-taking implementation would
+/// most likely settle on, so "the writer happened to be refused for some other reason" is
+/// excluded — if the split were being resolved at all, this writer would agree with the result
+/// and be elevated.
+#[tokio::test]
+async fn a_split_quorum_writes_nothing() {
+    let split = Verdict::Split {
+        tallies: vec![2, 2],
+    };
+    let (db, script) = run_discovered_session(split, Some(HONEST_HASH)).await;
+
+    assert_eq!(
+        script.catch_up_count(),
+        0,
+        "a split quorum was resolved by taking a side"
+    );
+    assert_eq!(db.sync_state().await.unwrap().peak_height, None);
+}
+
+/// **Proves:** an unreachable quorum is a refusal, not a default-allow.
+///
+/// NEAREST WRONG IMPLEMENTATION: treating `Insufficient` as "nobody objected". An attacker who
+/// can make peers unreachable — trivial on a hostile network — would otherwise get the replica
+/// by silencing the witnesses rather than by out-voting them.
+#[tokio::test]
+async fn an_unreachable_quorum_refuses_rather_than_defaulting_to_allow() {
+    let thin = Verdict::Insufficient {
+        answered: 1,
+        required: quorum::QUORUM_SAMPLE,
+    };
+    let (db, script) = run_discovered_session(thin, Some(HONEST_HASH)).await;
+
+    assert_eq!(script.catch_up_count(), 0);
+    assert_eq!(db.sync_state().await.unwrap().peak_height, None);
+}
+
+/// **Proves:** the writer does not choose the height it is examined at.
+///
+/// A writer that could pick its own exam height could pick one it had prepared an answer for, so
+/// the height must come from the independently drawn quorum. The fixture asserts the writer was
+/// asked at exactly the round's height and nowhere else.
+#[tokio::test]
+async fn the_writer_is_examined_at_a_height_it_did_not_choose() {
+    let (_db, script) =
+        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+
+    let asked = script.writer_asked_at.lock().unwrap().clone();
+    assert!(!asked.is_empty(), "the writer was never examined at all");
+    assert!(
+        asked.iter().all(|h| *h == SETTLED_HEIGHT),
+        "the writer was asked at a height other than the quorum's settled one: {asked:?}"
+    );
+}
+
+/// **Proves:** a writer that DECLINES the question is refused, exactly as one that answers wrongly
+/// is.
+///
+/// Silence is not agreement. NEAREST WRONG IMPLEMENTATION: `writer_answer.unwrap_or(quorum_answer)`
+/// or any `if let Some(..)` whose else-branch falls through to elevation.
+#[tokio::test]
+async fn a_writer_that_declines_the_question_is_not_elevated() {
+    let (db, script) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), None).await;
+
+    assert_eq!(script.catch_up_count(), 0);
+    assert_eq!(db.sync_state().await.unwrap().peak_height, None);
+}
+
+/// **Proves:** with corroboration switched OFF, a discovered peer still writes nothing — the
+/// pre-#2568 behaviour is preserved exactly, so an offline or test host does not quietly gain a
+/// weaker trust model.
+#[tokio::test]
+async fn corroboration_switched_off_leaves_a_discovered_peer_writing_nothing() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_full(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        None,
+    )
+    .await;
+    harness.settle().await;
+    harness.stop().await;
+
+    assert_eq!(script.catch_up_count(), 0);
+    assert_eq!(db.sync_state().await.unwrap().peak_height, None);
+}
+
+/// **Proves:** the CORROBORATED read is what reaches spend-path coin selection — there is no
+/// second, uncorroborated path underneath it.
+///
+/// Coin selection reads the replica, and [`routing::route`] is the gate that decides whether the
+/// replica answers for money at all. That gate turns on `initial_sync_complete`, which
+/// `initial_sync_with` is the only peer-reachable writer of, and which is now reachable only
+/// through corroboration. So the property is expressible as: the SAME wallet, same peer, same
+/// data, routes to the fallback tier when the peer was not corroborated and to the replica when it
+/// was.
+///
+/// FIXTURE DESIGN: both halves run the identical scenario and vary ONE thing — whether the writer
+/// agrees with the quorum. A test asserting only the corroborated half would pass against a
+/// routing gate that always said `Db`.
+#[tokio::test]
+async fn only_a_corroborated_read_reaches_coin_selection() {
+    // Uncorroborated: coin selection must NOT read the replica.
+    let (db, _) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
+    assert_eq!(
+        routing::route(db.is_synced().await.unwrap(), true),
+        Source::Fallback,
+        "an uncorroborated peer's replica was routed to for a wallet-scoped read"
+    );
+
+    // Corroborated: the same read now comes from the replica the quorum vouched for.
+    let (db, _) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+    assert_eq!(
+        routing::route(db.is_synced().await.unwrap(), true),
+        Source::Db,
+        "a corroborated sync did not become the source coin selection reads"
+    );
+}
+
+/// **Proves:** `may_elevate` requires BOTH a reached verdict AND the writer agreeing with it.
+///
+/// A pure-function table so every combination is covered, including the one a reader is most
+/// likely to assume is safe: a quorum that agreed unanimously, with a writer that said something
+/// else. Corroborating everyone EXCEPT the peer doing the writing is the subtle version of this
+/// bug.
+#[test]
+fn elevation_requires_both_a_verdict_and_the_writers_agreement() {
+    let reached = CorroborationRound {
+        height: SETTLED_HEIGHT,
+        verdict: Verdict::Unanimous(HONEST_HASH),
+    };
+    let split = CorroborationRound {
+        height: SETTLED_HEIGHT,
+        verdict: Verdict::Split {
+            tallies: vec![2, 2],
+        },
+    };
+
+    assert!(
+        may_elevate(&reached, Some(HONEST_HASH)),
+        "the honest case was refused"
+    );
+    assert!(!may_elevate(&reached, Some(LIARS_HASH)));
+    assert!(!may_elevate(&reached, None));
+    assert!(!may_elevate(&split, Some(HONEST_HASH)));
+    assert!(!may_elevate(&split, None));
 }

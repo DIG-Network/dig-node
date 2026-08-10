@@ -95,48 +95,82 @@ pub enum SyncError {
 /// unprivileged co-resident process can answer by binding that port first. Those two are given
 /// the same wire protocol and must not be given the same authority.
 ///
-/// # What a discovered peer may and may not do
+/// # Why a discovered peer can now earn authority (dig_ecosystem#2568)
 ///
-/// It writes NOTHING. Not coins, not `initial_sync_complete`, and not the chain peak. The one
-/// thing it contributes is LIVENESS: it counts toward `chia_peer_count`, which is an observation
-/// this node makes about its own socket rather than a claim the peer gets to make. Every
-/// persisted byte in `wallet.sqlite` is reachable only through a peer the operator chose.
+/// Until this change a discovered peer wrote NOTHING — no coins, no `initial_sync_complete`, no
+/// peak — and that was correct against the threat but wrong against the product: dig-node is a
+/// **light client**, almost nobody runs their own full node, and a default install therefore
+/// reached only discovered peers and so never synced at all. `peak_height` stayed NULL forever.
+/// The earlier note here called that "the deliberate cost"; a year of it is not a cost, it is
+/// the feature not existing.
 ///
-/// An earlier version of this note let it "advance the peak, monotonically", on the reasoning
+/// The replacement is not "trust discovered peers after all". It is that **a discovered peer's
+/// answer becomes authoritative only when a quorum of INDEPENDENTLY and RANDOMLY chosen peers
+/// agrees with it** ([`crate::sage::quorum`]), and never on its own. The distinction is the whole
+/// design: authority is a property of an ANSWER that survived corroboration, not a property the
+/// peer carries into the session.
+///
+/// # Why the peak is still not the harmless half
+///
+/// An earlier version let a discovered peer "advance the peak, monotonically", on the reasoning
 /// that a too-high peak only makes a confirmation read more conservative. That reasoning was
 /// inverted, and the inversion was the vulnerability: a confirmation count is
 /// `peak − created_height`, so a HIGHER peak means MORE confirmations, not fewer. One frame at
 /// `u32::MAX` therefore reads as ~4.29e9 confirmations for a spend that never landed — and
 /// `control.wallet.peak` exists precisely so a caller can bound a claimed confirmation with it.
-/// The monotonic rule then made the lie permanent: it refuses every honest peer's correction,
-/// and on a default install (no operator peer) nothing else can ever lower the value again.
+/// The monotonic rule then made the lie permanent.
 ///
-/// There is deliberately no in-memory advisory peak either. Nothing consumes one, and an unread
-/// field is the foothold the next version of this defect grows from.
+/// That finding is UNCHANGED and is exactly what corroboration is required to clear. An
+/// uncorroborated peer still writes no peak, and [`crate::sage::quorum::eligible`] deliberately
+/// anchors its credibility band on the MEDIAN claim so that a `u32::MAX` claimant cannot even
+/// shape the candidate set, let alone the replica.
 ///
-/// The alternative — patching each individual leak — was tried and walked around: an attacker
-/// that empties the replica and then simply closes the socket gets a fresh catch-up on the
-/// supervisor's next backoff cycle, and the flag comes back over whatever it chooses to answer.
-/// The fix has to be that an untrusted peer never reaches the flag at all.
+/// # Why patching individual leaks was rejected, and still is
 ///
-/// The deliberate cost is that a default install (no operator-chosen peer) does not get a full
-/// coin sync, and wallet-scoped reads stay on the fallback tier — which is exactly where they
-/// were before this module had a production call site. Establishing trust in a discovered peer
-/// is a separate decision (dig_ecosystem#2515).
+/// An attacker that empties the replica and then simply closes the socket gets a fresh catch-up
+/// on the supervisor's next backoff cycle, and any flag it cleared comes back over whatever it
+/// chooses to answer. So the boundary has to be that an uncorroborated peer never reaches the
+/// flag at all, which is why [`is_authoritative`](PeerTrust::is_authoritative) is the single
+/// question every write site asks, rather than each site re-deriving the rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerTrust {
     /// A `user_managed` row in the `peers` table: an address the operator chose. Full
     /// authority — catch-up, rollback, and the `initial_sync_complete` flag.
+    ///
+    /// It needs no quorum because the operator already made the trust decision by hand, and
+    /// second-guessing an explicit configuration with a vote of strangers would be a strange
+    /// inversion of who is in charge.
     Operator,
-    /// Found by DNS introducer or the loopback probe. Contributes liveness only, and writes
-    /// nothing at all.
+    /// Found by DNS introducer or the loopback probe, and NOT yet corroborated. Contributes
+    /// liveness only, and writes nothing at all.
+    ///
+    /// This is the state every discovered peer starts in, including one that will be elevated a
+    /// moment later: corroboration happens before the catch-up, so there is no window in which an
+    /// unproven answer has already landed.
     Discovered,
+    /// Found by discovery, and its answer AGREED WITH by a quorum of independently and randomly
+    /// chosen other peers at a settled height ([`crate::sage::quorum`]). Full authority, for this
+    /// session only.
+    ///
+    /// "For this session only" is load-bearing. The label is not cached against an address and
+    /// not persisted: a peer that corroborated an hour ago is a stranger again on the next
+    /// connect, because the thing that was verified was one answer at one height, not the peer's
+    /// character. Persisting it would recreate the operator-chosen list the user explicitly
+    /// declined to have, with the choosing done by a past round of strangers.
+    Corroborated,
 }
 
 impl PeerTrust {
     /// Whether this peer's answers may make the local replica authoritative for money.
+    ///
+    /// The ONE question every write site asks. Adding a variant without deciding this is a
+    /// compile error, which is deliberate: the previous audit found the trust rule re-derived
+    /// inline at several sites and walked around at one of them.
     pub fn is_authoritative(self) -> bool {
-        matches!(self, PeerTrust::Operator)
+        match self {
+            PeerTrust::Operator | PeerTrust::Corroborated => true,
+            PeerTrust::Discovered => false,
+        }
     }
 }
 

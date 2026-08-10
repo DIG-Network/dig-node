@@ -6,12 +6,17 @@
 //! — it owns the peer lifecycle (connect, catch up, consume pushes, reconnect with backoff, shut
 //! down) and exposes the small amount of live state the DB alone cannot express.
 //!
-//! On a DEFAULT install (no `user_managed` peer rows) the node dials a DISCOVERED peer, which
-//! writes nothing to the DB (see [`crate::sage::sync::PeerTrust`]): `peak_height` stays NULL,
-//! `is_synced()` stays false, and wallet reads remain on the fallback tier — which is the
-//! correct answer, since no authoritative sync has run. The module's contribution on a default
-//! install is liveness only: `chia_peer_count` stays non-null, so the phase advances from
-//! `not_started` to `syncing`.
+//! On a DEFAULT install (no `user_managed` peer rows) the node dials a DISCOVERED peer. Such a
+//! peer arrives untrusted and writes nothing — but it is no longer stuck there. Before any write,
+//! the supervisor puts a settled-height question to an independently drawn quorum of other
+//! randomly dialled peers ([`Corroborator`], [`crate::sage::quorum`]) and elevates the session to
+//! [`PeerTrust::Corroborated`] only if the writer agrees with them. A default install therefore
+//! reaches `initial_sync_complete` and an advancing `peak_height` without the operator naming a
+//! single peer, which is what dig-node being a LIGHT CLIENT requires (dig_ecosystem#2568).
+//!
+//! When corroboration is unavailable, splits, or catches the writer out, the session stays
+//! [`PeerTrust::Discovered`] and its whole contribution is liveness: `chia_peer_count` stays
+//! non-null so the phase advances from `not_started` to `syncing`, and nothing is written.
 //!
 //! # What the DB cannot say
 //!
@@ -46,6 +51,7 @@ use chia_protocol::Bytes32;
 use super::custody::WalletCustody;
 use super::db::WalletDb;
 use super::events::EventBus;
+use super::quorum::{self, Verdict};
 use super::sync::{self, PeerTrust, SyncError};
 
 /// The initial reconnect delay.
@@ -253,18 +259,40 @@ pub trait SyncSession: Send + Sync {
     /// The address dialed, for the [`crate::sage::events::SyncEvent::Start`] event.
     fn peer_ip(&self) -> String;
 
-    /// How far this session's peer is trusted — decided by HOW it was reached, not by anything
-    /// it says. See [`PeerTrust`]: only an operator-chosen peer may make the replica
-    /// authoritative, so this is the single fact the whole trust model turns on.
+    /// The trust this peer carries INTO the session, decided by HOW it was reached and by
+    /// nothing it says ([`trust_for`]).
+    ///
+    /// It is a starting point, not a verdict. A [`PeerTrust::Discovered`] peer may be elevated
+    /// to [`PeerTrust::Corroborated`] before any write, by the [`Corroborator`], and only then.
     fn trust(&self) -> PeerTrust;
 
-    /// Subscribe `puzzle_hashes` and catch the replica up.
+    /// This peer's answer to "what is the canonical header hash at `height`?".
+    ///
+    /// The question a would-be writer must answer correctly to be elevated. Note what the session
+    /// does NOT get to do: it never chooses `height`. That is settled entirely by the
+    /// independently drawn quorum ([`Corroborator::corroborate`]), because a writer that could
+    /// pick its own exam height could pick one it had prepared an answer for.
+    ///
+    /// `Ok(None)` means the peer declined or does not have the block — indistinguishable from a
+    /// wrong answer for elevation purposes, and treated the same way: no elevation.
+    async fn header_hash_at(&self, height: u32) -> Result<Option<Bytes32>, SyncError>;
+
+    /// Subscribe `puzzle_hashes` and catch the replica up, under the EFFECTIVE trust the
+    /// supervisor resolved for this session.
+    ///
+    /// `trust` is passed in rather than read from [`SyncSession::trust`] because the two can
+    /// legitimately differ: a discovered peer that cleared corroboration runs as
+    /// [`PeerTrust::Corroborated`] while its dial source is still discovery. The floor check that
+    /// actually guards `initial_sync_complete` lives down in [`sync::initial_sync_with`] — where
+    /// the previous audit deliberately put it, so no caller-side refactor can walk around it —
+    /// and it can only see the trust it is handed.
     async fn catch_up(
         &self,
         db: &WalletDb,
         puzzle_hashes: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
+        trust: PeerTrust,
     ) -> Result<(), SyncError>;
 
     /// Consume peer pushes until the peer disconnects. Consumes the session.
@@ -278,6 +306,65 @@ pub trait SyncSession: Send + Sync {
         events: &EventBus,
         session: &mut sync::SessionState<'_>,
     ) -> Result<(), SyncError>;
+}
+
+/// Corroborates a would-be writer's view of the chain against independently chosen peers
+/// (dig_ecosystem#2568).
+///
+/// This is the seam that makes a DISCOVERED peer usable without making it trusted. The
+/// supervisor holds exactly ONE subscription session — that constraint is unchanged, and its
+/// reason (N interleaved `rollback_above` calls into a DB with one writer) is unchanged too — so
+/// corroboration deliberately does NOT subscribe anywhere else. It opens short, read-only probes
+/// to [`quorum::QUORUM_SAMPLE`] other randomly chosen peers, asks each the same settled-height
+/// question, and closes them.
+///
+/// The writer is then elevated only if it AGREES with the corroborated answer. That ordering is
+/// what makes "a single lying peer cannot move the replica" true by construction rather than by
+/// vigilance: the liar is the one being checked, and it is checked before it writes.
+#[async_trait::async_trait]
+pub trait Corroborator: Send + Sync {
+    /// Draw a fresh random sample, settle a height from THEIR claims alone, and ask each of them
+    /// for the canonical header hash there.
+    ///
+    /// The writer is deliberately not an input. Every round draws a new sample
+    /// ([`quorum::select_sample`]) rather than reusing the last one, so a peer that lost a round
+    /// gains nothing by waiting for the retry.
+    ///
+    /// Returns the verdict AND the height it was reached at, so the caller can put the SAME
+    /// question to the writer. An `Err` is a probing failure (nothing reachable), which is
+    /// treated exactly as a refusal — never as consent.
+    async fn corroborate(&self) -> Result<CorroborationRound, SyncError>;
+}
+
+/// One completed corroboration round: what was asked, and what came back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorroborationRound {
+    /// The settled height every peer in this round was asked about
+    /// ([`quorum::common_height`]).
+    pub height: u32,
+    /// What the quorum concluded about the canonical header hash at that height.
+    pub verdict: Verdict<Bytes32>,
+}
+
+/// Decide whether a writer may be elevated, given a corroboration round and the writer's own
+/// answer at the same height.
+///
+/// Split out as a pure function with no I/O so the decision — the single line the whole trust
+/// model now rests on — is exhaustively testable, and so it reads as one rule instead of being
+/// spread across the supervisor's control flow.
+///
+/// Both conditions are required and neither is sufficient:
+///
+/// * the quorum must have REACHED a verdict (a [`Verdict::Split`] means the truth is unknown, and
+///   an unknown truth elevates nobody), and
+/// * the writer must AGREE with it. A writer that disagrees with an independently drawn quorum at
+///   a settled height is the anomaly in the round, and handing it the replica because "a quorum
+///   succeeded" would corroborate everyone except the peer actually doing the writing.
+pub fn may_elevate(round: &CorroborationRound, writer_answer: Option<Bytes32>) -> bool {
+    match (round.verdict.corroborated(), writer_answer) {
+        (Some(agreed), Some(mine)) => agreed == &mine,
+        _ => false,
+    }
 }
 
 /// Waiting and the passage of time, injectable so the backoff ladder is testable without a
@@ -375,6 +462,15 @@ pub struct Supervisor {
     pub genesis_challenge: Bytes32,
     /// Waiting + the clock.
     pub time: Arc<dyn TimeSource>,
+    /// Elevates a DISCOVERED writer to [`PeerTrust::Corroborated`] when an independently drawn
+    /// quorum agrees with it (dig_ecosystem#2568).
+    ///
+    /// `None` disables corroboration entirely, which reproduces the pre-#2568 behaviour exactly:
+    /// a discovered peer contributes liveness and writes nothing. That is the honest default for
+    /// a test or an offline host, and it is why the field is an `Option` rather than a
+    /// no-op implementation — "corroboration is switched off" and "corroboration ran and refused"
+    /// must not look the same in a stack trace.
+    pub corroborator: Option<Arc<dyn Corroborator>>,
 }
 
 /// Spawn the supervisor on the current runtime.
@@ -394,6 +490,9 @@ impl Supervisor {
     /// pushes -> backoff -> reconnect, until shutdown.
     async fn run(self, handle: SyncHandle, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let mut backoff = Backoff::new();
+        // Consecutive rounds that failed to reach a quorum. Reset by any round that does, so this
+        // counts a STANDING disagreement rather than a lifetime total.
+        let mut splits: u32 = 0;
 
         while !*shutdown.borrow() {
             let session = match self.factory.connect().await {
@@ -422,9 +521,9 @@ impl Supervisor {
             // higher peak would inflate apparent confirmation counts (see [`sync::PeerTrust`]
             // for the inversion that made this the vulnerability). It runs as a write-free
             // session, which is what powers the live sync status.
-            let trust = session.trust();
+            let trust = self.trust_for_session(&*session, &mut splits).await;
             let puzzle_hashes = match trust {
-                PeerTrust::Operator => self.puzzle_hashes.puzzle_hashes(),
+                PeerTrust::Operator | PeerTrust::Corroborated => self.puzzle_hashes.puzzle_hashes(),
                 PeerTrust::Discovered => Vec::new(),
             };
             let subscribed: sync::SubscribedHashes = puzzle_hashes.iter().copied().collect();
@@ -445,6 +544,7 @@ impl Supervisor {
                     puzzle_hashes,
                     self.genesis_challenge,
                     &self.events,
+                    trust,
                 )
                 .await
             {
@@ -498,6 +598,84 @@ impl Supervisor {
             }
         }
         tracing::debug!("wallet sync: supervisor stopped");
+    }
+
+    /// The trust this session actually runs under: its dial-source trust, plus one chance to be
+    /// elevated by corroboration (dig_ecosystem#2568).
+    ///
+    /// Ordering is the point. This runs BEFORE the catch-up and before any frame is handled, so a
+    /// peer that fails corroboration never had a window in which its answers were already
+    /// landing. Every refusal path returns [`PeerTrust::Discovered`], which writes nothing — a
+    /// probe error, an unreachable quorum, a split, a writer that disagrees, and corroboration
+    /// being switched off all fail the same, closed way.
+    async fn trust_for_session(&self, session: &dyn SyncSession, splits: &mut u32) -> PeerTrust {
+        let dialed = session.trust();
+        if dialed != PeerTrust::Discovered {
+            return dialed;
+        }
+        let Some(corroborator) = self.corroborator.as_ref() else {
+            return PeerTrust::Discovered;
+        };
+
+        let round = match corroborator.corroborate().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(error = %e, "wallet sync: corroboration probe failed; the peer                      stays uncorroborated and writes nothing");
+                return PeerTrust::Discovered;
+            }
+        };
+
+        // The writer answers the SAME question, at a height it did not choose.
+        let writer_answer = match session.header_hash_at(round.height).await {
+            Ok(answer) => answer,
+            Err(e) => {
+                tracing::debug!(error = %e, height = round.height, "wallet sync: the writer could                      not answer the corroboration question");
+                None
+            }
+        };
+
+        if !may_elevate(&round, writer_answer) {
+            *splits = splits.saturating_add(1);
+            let persistent = *splits >= quorum::PERSISTENT_DISAGREEMENT_ROUNDS;
+            // A run of failures is not "the network is slow". A fresh random sample failing to
+            // agree, repeatedly, is what a partition and a sustained attack both look like from a
+            // light client, and retrying quietly forever would present both as a node that merely
+            // never finishes syncing.
+            if persistent {
+                tracing::warn!(
+                    consecutive = *splits,
+                    height = round.height,
+                    peer = %session.peer_ip(),
+                    verdict = ?round.verdict,
+                    "wallet sync: peers persistently disagree about settled chain state; the                      replica is deliberately NOT being written. This is evidence of a network                      partition or a hostile peer set, not of a slow connection."
+                );
+            } else {
+                tracing::info!(
+                    consecutive = *splits,
+                    height = round.height,
+                    verdict = ?round.verdict,
+                    "wallet sync: no corroborated answer this round; re-drawing a fresh sample"
+                );
+            }
+            return PeerTrust::Discovered;
+        }
+
+        *splits = 0;
+        if let Verdict::MajorityWithDissent { dissenters, .. } = &round.verdict {
+            // Surfaced, never averaged away: at a settled height, past the lag filter, a peer
+            // contradicting the supermajority is not merely behind.
+            tracing::warn!(
+                height = round.height,
+                ?dissenters,
+                "wallet sync: a peer disagreed with the quorum about settled chain state"
+            );
+        }
+        tracing::info!(
+            height = round.height,
+            peer = %session.peer_ip(),
+            "wallet sync: discovered peer corroborated by an independent quorum; it may now write"
+        );
+        PeerTrust::Corroborated
     }
 
     /// Resolve once the subscription set stops being empty.
@@ -652,6 +830,193 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
     }
 }
 
+/// The production [`Corroborator`]: repeated independent dials, heights compared, then one
+/// settled question put to all of them (dig_ecosystem#2568).
+///
+/// # How a sample is drawn
+///
+/// Each member comes from calling `chia_query`'s `connect_random_peer` again — a fresh discovery
+/// per member rather than one list carved up — so no single resolution step decides the whole
+/// sample.
+///
+/// Two properties of that helper have to be compensated for HERE, because they would otherwise
+/// silently collapse the quorum, and neither is hypothetical:
+///
+/// * **It tries `127.0.0.1` before anything else, unconditionally.** Any unprivileged co-resident
+///   process that binds `8444` first is therefore the peer EVERY call returns — the loopback-probe
+///   hazard [`PeerTrust`] already names. Four calls would yield four connections to one attacker
+///   and a "unanimous" verdict from a sample of one.
+/// * **It returns the FIRST address that connects** out of a concurrent batch. That is
+///   latency-biased selection, and latency is something an attacker running a fast, always-up node
+///   controls.
+///
+/// The compensation is DISTINCTNESS: an address already in this round's sample is discarded and
+/// re-drawn, within [`MAX_PROBE_ATTEMPTS`]. That is not a tidiness rule — it is the difference
+/// between four opinions and one opinion counted four times. Failing to assemble
+/// [`quorum::QUORUM_SAMPLE`] distinct peers inside the budget yields [`Verdict::Insufficient`],
+/// which writes nothing.
+///
+/// The residual bias is real and `SPEC.md` says so: a peer that is fast and always up remains
+/// over-represented among the probes. This raises an attacker's cost; it does not remove the
+/// advantage. Resolving the full introducer address list once and drawing from it with
+/// [`quorum::select_sample`] is the stronger form and is the tracked follow-up.
+pub struct ChiaQuorumCorroborator {
+    network: chia_query::NetworkType,
+    /// How long to wait for one probe's dial and for its peak announcement.
+    timeout: Duration,
+}
+
+/// How many dial attempts one round may make while assembling [`quorum::QUORUM_SAMPLE`] DISTINCT
+/// peers.
+///
+/// Bounded because the distinctness compensation is a retry loop over a helper that may keep
+/// returning the same address — a host with a co-resident full node returns localhost every single
+/// time — and an unbounded retry there is a hang, not a defence. Three attempts per required
+/// member is generous on a healthy network and short enough that a degenerate or hostile one
+/// degrades to "no quorum, nothing written" in seconds.
+const MAX_PROBE_ATTEMPTS: usize = quorum::QUORUM_SAMPLE * 3;
+
+impl ChiaQuorumCorroborator {
+    /// A mainnet corroborator.
+    pub fn mainnet() -> Self {
+        Self {
+            network: chia_query::NetworkType::Mainnet,
+            timeout: DIAL_TIMEOUT,
+        }
+    }
+
+    /// Dial repeatedly, keeping the first [`quorum::QUORUM_SAMPLE`] DISTINCT addresses together
+    /// with each one's claimed peak.
+    async fn probe(&self) -> Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> {
+        let Ok(tls) = chia_query::peer::connect::create_generated_tls() else {
+            return Vec::new();
+        };
+        let mut sample: Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> = Vec::new();
+
+        for _ in 0..MAX_PROBE_ATTEMPTS {
+            if sample.len() >= quorum::QUORUM_SAMPLE {
+                break;
+            }
+            let Ok((peer, addr, receiver)) =
+                chia_query::peer::connect::connect_random_peer(self.network, &tls, self.timeout)
+                    .await
+            else {
+                continue;
+            };
+            let id = addr.to_string();
+            if sample.iter().any(|(c, _)| c.id == id) {
+                // The same peer again. Counting it twice would let one node supply an entire
+                // "independent" quorum, so it is discarded rather than admitted.
+                continue;
+            }
+            let Some(claim) = await_peak(receiver, self.timeout).await else {
+                continue;
+            };
+            sample.push((quorum::Candidate { id, claim }, peer));
+        }
+        sample
+    }
+}
+
+/// Read a peer's claimed tip from the `new_peak_wallet` it announces after the handshake.
+///
+/// A CLAIM, never a fact: a light client cannot verify either field. It is used only to COMPARE
+/// HEIGHTS — to exclude the badly-lagged, and to settle the height everyone is then asked about —
+/// and never reaches the replica.
+async fn await_peak(
+    mut receiver: tokio::sync::mpsc::Receiver<chia::protocol::Message>,
+    timeout: Duration,
+) -> Option<quorum::PeakClaim> {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            () = &mut deadline => return None,
+            message = receiver.recv() => {
+                let message = message?;
+                if message.msg_type == chia::protocol::ProtocolMessageTypes::NewPeakWallet {
+                    let peak =
+                        <chia::protocol::NewPeakWallet as chia::traits::Streamable>::from_bytes(
+                            &message.data,
+                        )
+                        .ok()?;
+                    return Some(quorum::PeakClaim {
+                        height: peak.height,
+                        header_hash: peak.header_hash,
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Corroborator for ChiaQuorumCorroborator {
+    async fn corroborate(&self) -> Result<CorroborationRound, SyncError> {
+        let probes = self.probe().await;
+
+        // COMPARE THE HEIGHTS, in two steps, in this order. First exclude the badly-lagged, so a
+        // peer that is merely behind never becomes a dissenting vote. Then settle the question at
+        // a height every survivor passed some blocks ago — where a lagging-but-honest peer and a
+        // fully caught-up one hold the SAME answer, so a disagreement can no longer be explained
+        // by lag. That is the whole behind-versus-lying discriminator.
+        let candidates: Vec<quorum::Candidate> = probes.iter().map(|(c, _)| c.clone()).collect();
+        let eligible = quorum::eligible(&candidates, quorum::PEAK_LAG_TOLERANCE);
+        let Some(height) = quorum::common_height(&eligible, quorum::SETTLED_LAG) else {
+            return Err(SyncError::Peer(
+                "no settled height: too few reachable peers agreed on a credible chain tip".into(),
+            ));
+        };
+
+        let mut responses = Vec::new();
+        for (candidate, peer) in &probes {
+            if !eligible.iter().any(|e| e.id == candidate.id) {
+                continue;
+            }
+            // A probe that will not answer is simply ABSENT from the tally, which counts against
+            // reaching the quorum rather than for it.
+            if let Ok(Some(answer)) = header_hash_from(peer, height).await {
+                responses.push(quorum::Response {
+                    peer: candidate.id.clone(),
+                    answer,
+                });
+            }
+        }
+
+        Ok(CorroborationRound {
+            height,
+            verdict: quorum::tally(&responses, quorum::QUORUM_SAMPLE, quorum::QUORUM_AGREEMENT),
+        })
+    }
+}
+
+/// Ask one peer for the canonical header hash at `height`.
+///
+/// SELF-VERIFYING (`quorum::SelfVerifying::HeaderBlockBinding`): the hash is COMPUTED from the
+/// block the peer sent — `HeaderBlock::header_hash()` folds the block's own foliage — never read
+/// out of a field the peer chose. So a peer cannot name a hash that does not belong to the block
+/// it handed over; it can only send a DIFFERENT block, which is exactly the claim the quorum then
+/// votes on. Verifying the binding locally and voting only on the remaining question is the split
+/// this module is built around.
+async fn header_hash_from(
+    peer: &chia_wallet_sdk::client::Peer,
+    height: u32,
+) -> Result<Option<Bytes32>, SyncError> {
+    use chia::protocol::{RejectHeaderRequest, RequestBlockHeader, RespondBlockHeader};
+
+    let response = peer
+        .request_fallible::<RespondBlockHeader, RejectHeaderRequest, _>(RequestBlockHeader::new(
+            height,
+        ))
+        .await
+        .map_err(|e| SyncError::Peer(e.to_string()))?;
+
+    Ok(match response {
+        Ok(respond) => Some(respond.header_block.header_hash()),
+        Err(_reject) => None,
+    })
+}
+
 /// One live `chia-wallet-sdk` peer connection.
 struct ChiaPeerSession {
     peer: chia_wallet_sdk::client::Peer,
@@ -680,7 +1045,10 @@ impl SyncSession for ChiaPeerSession {
         puzzle_hashes: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
+        trust: PeerTrust,
     ) -> Result<(), SyncError> {
+        // The EFFECTIVE trust, not `self.trust`: a corroborated discovered peer must reach the
+        // floor check as corroborated, or clearing the quorum would buy it nothing.
         sync::initial_sync(
             &self.peer,
             db,
@@ -688,9 +1056,15 @@ impl SyncSession for ChiaPeerSession {
             genesis_challenge,
             &self.ip,
             events,
-            self.trust,
+            trust,
         )
         .await
+    }
+
+    async fn header_hash_at(&self, height: u32) -> Result<Option<Bytes32>, SyncError> {
+        // Deliberately the SAME helper the corroboration probes use: the writer and the quorum
+        // must be asked identically, or comparing their answers compares two different questions.
+        header_hash_from(&self.peer, height).await
     }
 
     async fn run(
