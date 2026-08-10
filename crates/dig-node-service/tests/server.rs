@@ -1588,6 +1588,24 @@ async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
         "both methods report the SAME Chia peer observation; serving them from two sources is \
          how they start to disagree"
     );
+    // dig_ecosystem#2570 -- the known-peer count is PRESENT on the wire even when this node cannot
+    // observe it, so a client can tell "unknown" from "the node is too old to say". Asserting the
+    // KEY EXISTS rather than only that its value is null is what separates those: a handler that
+    // omitted the field entirely also reads as `Value::Null` through the index operator.
+    assert!(
+        counts["result"]
+            .as_object()
+            .expect("peerCounts answers with an object")
+            .contains_key("known_dig_peer_count"),
+        "peerCounts must always carry the known-peer key: got {counts:?}"
+    );
+    // This harness runs no peer network, so the count is UNOBSERVABLE. `null` here is the honest
+    // answer and a `0` would be the bug -- it would claim the node consulted an address book that
+    // does not exist.
+    assert!(
+        counts["result"]["known_dig_peer_count"].is_null(),
+        "a node with no peer network cannot have looked at an address book, so the count is          unknown, never a measured zero: got {counts:?}"
+    );
 }
 
 /// **Proves (dig_ecosystem#2392):** `control.wallet.coinById` validates its `coin_id` BEFORE any

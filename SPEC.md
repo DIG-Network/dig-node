@@ -3946,8 +3946,23 @@ and then went offline reports `syncing`. It is not a freshness guarantee: a live
 peer satisfies it. `peak_height` is the REPLICA's own height read from `sync_state`; it MUST NOT fall back
 to the coinset oracle (unlike `control.wallet.peak`, which answers a different question), and `null` means
 unknown, never height zero. `chia_peer_count` is `0` when observed and `null` when unobservable.
-`control.peerCounts` reports `{dig_peer_count, chia_peer_count}`, and its `chia_peer_count` MUST be the
-SAME observation this method reports.
+`control.peerCounts` reports `{dig_peer_count, chia_peer_count, known_dig_peer_count}`, and its
+`chia_peer_count` MUST be the SAME observation this method reports.
+
+18.6c. **The known DIG peer count.** `control.peerCounts.known_dig_peer_count` is the number of DIG peers
+this node has LEARNED OF, connected or not — the size of the gossip layer's discovered-peer address book,
+which the node also surfaces as `control.peerStatus.known_peers`. The node MUST source it from that
+address book and MUST NOT derive it from `connected_peers`: the field exists precisely to distinguish a
+REACHABILITY fault (no connections despite a populated address book) from a DISCOVERY fault (an empty
+one), and an aliased count reports both as the same zero. `null` means the node has not sampled the
+address book — a not-running peer network, or a pool loop that has not yet run its first pass — and MUST
+NOT be reported as `0`, which would claim an emptiness never observed.
+
+The count is this NODE's local view and a LOWER BOUND. Neither the node nor any client may present it as
+the size of the DIG network or as a total peer count: it omits every peer this node has not been
+introduced to, every peer reachable only via a relay it does not use, and every address-book entry evicted
+under the gossip layer's bucket limits. It is also distinct from `control.peerStatus`'s `relay.peer_count`,
+which is the RELAY's view of its own registrations.
 
 18.7. **Fallback tier + sync-state-gated routing.** `chia-query` (coinset.org + non-subscribing peer
 point-reads) is reused AS-IS as a fallback tier — never the primary. The B.3 subscription loop is NOT
