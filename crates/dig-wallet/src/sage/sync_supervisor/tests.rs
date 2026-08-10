@@ -518,6 +518,13 @@ async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnec
             s.connects.load(Ordering::SeqCst) >= cycle as usize
         })
         .await;
+        // Checked per cycle, and BEFORE the peak wait, so a supervisor that subscribes a
+        // discovered peer fails on this assertion rather than on a downstream timeout.
+        assert_eq!(
+            h.script.catch_up_count(),
+            0,
+            "cycle {cycle}: a discovered peer must not be handed a subscription"
+        );
         h.until("a live session", |s| !s.senders.lock().unwrap().is_empty())
             .await;
         let sender = h.script.senders.lock().unwrap().last().unwrap().clone();
