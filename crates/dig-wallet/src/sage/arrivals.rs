@@ -6,9 +6,14 @@
 //!
 //! 1. **A first sync is not a stream of arrivals.** The catch-up replays the whole address
 //!    history, so every historical coin passes the write point. [`classify`] refuses without an
-//!    [`ArrivalBaseline`], and the baseline is armed by the same statement that marks the replica
-//!    authoritative — so a wallet that has never completed a catch-up has no baseline, and a
-//!    wallet that has one has it at or above everything the catch-up wrote.
+//!    [`ArrivalBaseline`], and the baseline can be armed ONLY by
+//!    [`WalletDb::complete_catch_up`](super::db::WalletDb::complete_catch_up), which takes a
+//!    [`CatchUpReplay`](super::db::CatchUpReplay) — a value only the terminal answer of a full
+//!    address-history replay produces. A wallet that has never completed one has no baseline, and a
+//!    wallet that has one has it at or above everything that replay wrote. The arming used to hang
+//!    off the authoritative-replica FLAG instead, which the coinset-oracle point read also sets: on
+//!    a fresh install that armed the baseline at zero, permanently, and the first live update after
+//!    the real catch-up would have announced the wallet's entire receive history.
 //! 2. **A restart is not a second arrival.** The baseline is a persisted HEIGHT watermark and the
 //!    ledger is keyed `UNIQUE` on the coin id, so a replay is excluded twice over, from disk.
 //! 3. **A mempool sighting is not money.** A coin with no `created_height` is

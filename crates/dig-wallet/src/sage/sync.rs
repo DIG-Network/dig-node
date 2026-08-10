@@ -22,7 +22,7 @@ use chia::protocol::{
 use chia_protocol::Bytes32;
 use chia_wallet_sdk::client::Peer;
 
-use super::db::{CoinRow, WalletDb};
+use super::db::{CatchUpReplay, CoinRow, WalletDb};
 use super::events::{EventBus, SyncEvent};
 use super::singleton::{self, LineageSource};
 
@@ -657,17 +657,21 @@ pub async fn initial_sync_with(
         events.publish(SyncEvent::PuzzleBatchSynced);
 
         if respond.is_finished {
-            db.set_peak(respond.height, &hex::encode(respond.header_hash))
-                .await?;
-            break;
+            // ONE statement ends the catch-up: the peak, the authoritative flag, and the arrival
+            // baseline are armed together from this response's own values. Splitting them is how
+            // the baseline came to be armable by a caller that had replayed nothing
+            // (dig_ecosystem#2548) -- see `WalletDb::complete_catch_up`.
+            db.complete_catch_up(&CatchUpReplay::finished_at(
+                respond.height,
+                hex::encode(respond.header_hash),
+            ))
+            .await?;
+            return Ok(());
         }
         // Continue from where this batch ended.
         previous_height = Some(respond.height);
         header_hash = respond.header_hash;
     }
-
-    db.set_initial_sync_complete(true).await?;
-    Ok(())
 }
 
 /// Consume peer pushes on the receiver until it closes: `coin_state_update` →
@@ -853,8 +857,9 @@ mod tests {
         )
         .await
         .unwrap();
-        db.set_peak(20, "aa").await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(20, "aa"))
+            .await
+            .unwrap();
 
         // A reconnect replays the same history verbatim, and a live frame lands on top of it.
         apply_coin_states(
@@ -912,8 +917,9 @@ mod tests {
     async fn change_arriving_in_the_same_frame_as_its_parent_is_not_announced() {
         let db = WalletDb::open_in_memory().await.unwrap();
         let subscribed = subscribed_owned();
-        db.set_peak(100, "aa").await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(100, "aa"))
+            .await
+            .unwrap();
 
         let funding = coin(1, OWNED, 10_000);
         let change = Coin {

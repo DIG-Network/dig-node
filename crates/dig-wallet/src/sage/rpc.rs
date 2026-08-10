@@ -2082,6 +2082,13 @@ impl WalletBackend {
         // — which now additionally opens the spend gate above over that empty table. The
         // failure mode is a refusal-shaped one (no inputs to select), not a wrong spend, which
         // is why it is recorded rather than changed here; dig_ecosystem#2514 owns it.
+        //
+        // It cannot arm the ARRIVAL BASELINE, and that is load-bearing rather than incidental
+        // (dig_ecosystem#2548). This path has replayed no history, so a baseline armed from it
+        // would sit at zero — permanently, because arming is once-per-wallet — and the first live
+        // update after the real catch-up would announce the wallet's entire receive history as
+        // incoming payments. Arming requires a `CatchUpReplay`, which only the completed
+        // address-history catch-up produces; see `WalletDb::complete_catch_up`.
         self.db.set_initial_sync_complete(true).await?;
         // Incoming-funds arrivals (dig_ecosystem#2548). Run AFTER attribution, so a CAT coin this
         // pass fetched is announced with its asset id rather than held as indeterminate — the
