@@ -1494,7 +1494,9 @@ fn coin_id_field(
     };
     match validate(raw.to_string()) {
         Some(valid) => Ok(valid),
-        None => invalid("a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)"),
+        None => {
+            invalid("a 64-character LOWERCASE-hex coin id (an optional `0x` prefix is allowed)")
+        }
     }
 }
 
@@ -1639,7 +1641,11 @@ async fn wallet_coins_by_parent(ctx: &ControlCtx, id: Value, params: &Value) -> 
     let limit = request.effective_limit();
     match ctx
         .wallet
-        .coins_by_parent(&request.parent_coin_id, request.after_coin_id.as_deref(), limit)
+        .coins_by_parent(
+            &request.parent_coin_id,
+            request.after_coin_id.as_deref(),
+            limit,
+        )
         .await
     {
         Ok(r) => control_ok(id, coins_by_parent_wire(&r)),
@@ -2784,12 +2790,16 @@ mod tests {
             Some(1000)
         );
         assert!(with_limit(json!(1001)).is_err(), "one over must be refused");
-        assert!(with_limit(json!(0)).is_err(), "a page of zero makes no progress");
+        assert!(
+            with_limit(json!(0)).is_err(),
+            "a page of zero makes no progress"
+        );
 
         // Omitted resolves to the CONTRACT's default, not a number this node invented — so a node
         // and a client can never disagree about where an unspecified page ends.
-        let defaulted = wallet_coins_by_parent_params(&json!(1), &json!({ "parent_coin_id": parent }))
-            .expect("an omitted limit is legal");
+        let defaulted =
+            wallet_coins_by_parent_params(&json!(1), &json!({ "parent_coin_id": parent }))
+                .expect("an omitted limit is legal");
         assert_eq!(defaulted.limit, None);
         assert_eq!(
             defaulted.effective_limit(),

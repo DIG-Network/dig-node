@@ -723,7 +723,10 @@ mod chain_failure_tests {
 
         let result = fallback.coin_spend(SOME_COIN_ID).await;
 
-        assert!(result.is_err(), "an outage must be an error, got {result:?}");
+        assert!(
+            result.is_err(),
+            "an outage must be an error, got {result:?}"
+        );
         assert!(
             !matches!(result, Ok(None)),
             "an unreachable chain must NEVER be reported as 'this coin is unspent'"
@@ -771,7 +774,10 @@ mod chain_failure_tests {
         assert_eq!(spend.puzzle_hash, A_PUZZLE_HASH);
         assert_eq!(spend.parent_coin_info, "22".repeat(32));
         assert_eq!(spend.amount, 7);
-        assert_eq!(spend.puzzle_reveal, A_PUZZLE_REVEAL, "no 0x prefix survives");
+        assert_eq!(
+            spend.puzzle_reveal, A_PUZZLE_REVEAL,
+            "no 0x prefix survives"
+        );
         assert_eq!(spend.solution, "80", "the solution travels, unprefixed");
     }
 
@@ -877,7 +883,10 @@ mod chain_failure_tests {
 
         let result = fallback.coin_records_by_parent(SOME_COIN_ID).await;
 
-        assert!(result.is_err(), "an outage must be an error, got {result:?}");
+        assert!(
+            result.is_err(),
+            "an outage must be an error, got {result:?}"
+        );
         assert!(
             !matches!(result, Ok(ref v) if v.is_empty()),
             "an unreachable chain must NEVER be reported as a childless parent"

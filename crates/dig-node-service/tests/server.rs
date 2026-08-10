@@ -1674,9 +1674,7 @@ async fn the_chain_reads_refuse_malformed_ids_before_the_chain_is_ever_consulted
     let (upstream, _calls) = start_mock_upstream().await;
     let (addr, _token, _hold) = start_companion_full(&upstream).await;
 
-    let call_with = |method: &'static str, params: Value| {
-        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
-    };
+    let call_with = |method: &'static str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let good = "ab".repeat(32);
     // 63 hex characters, one short of the contract's 64.
     let bad = "a".repeat(63);
@@ -1749,9 +1747,7 @@ async fn the_chain_reads_are_open_reachable_and_degrade_honestly() {
     let (upstream, _calls) = start_mock_upstream().await;
     let (addr, _token, _hold) = start_companion_full(&upstream).await;
 
-    let call_with = |method: &'static str, params: Value| {
-        json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params })
-    };
+    let call_with = |method: &'static str, params: Value| json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params });
     let good = "ab".repeat(32);
 
     for (method, missing_field, well_formed, required_members) in [
@@ -1765,7 +1761,14 @@ async fn the_chain_reads_are_open_reachable_and_degrade_honestly() {
             "control.wallet.coinsByParent",
             json!({}),
             json!({ "parent_coin_id": good }),
-            &["coins", "complete", "cursor", "source", "synced", "peak_height"][..],
+            &[
+                "coins",
+                "complete",
+                "cursor",
+                "source",
+                "synced",
+                "peak_height",
+            ][..],
         ),
     ] {
         let empty = post_rpc(&addr, call_with(method, missing_field), None).await;
@@ -1798,7 +1801,9 @@ async fn the_chain_reads_are_open_reachable_and_degrade_honestly() {
                 }
             }
             None => {
-                let code = answered["error"]["data"]["code"].as_str().unwrap_or_default();
+                let code = answered["error"]["data"]["code"]
+                    .as_str()
+                    .unwrap_or_default();
                 assert!(
                     code.starts_with("WALLET_"),
                     "{method} must fail as a catalogued wallet error a caller can act on, \

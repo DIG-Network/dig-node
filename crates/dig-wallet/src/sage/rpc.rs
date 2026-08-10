@@ -4679,8 +4679,14 @@ mod tests {
     #[tokio::test]
     async fn a_spend_is_composed_with_its_record_so_it_carries_a_spent_height() {
         let fb = Arc::new(
-            MockFallback::with_coins(vec![fallback_coin("spent-one", &owned_ph(), 100, Some(10), Some(42))])
-                .with_spends(vec![fallback_spend("spent-one")]),
+            MockFallback::with_coins(vec![fallback_coin(
+                "spent-one",
+                &owned_ph(),
+                100,
+                Some(10),
+                Some(42),
+            )])
+            .with_spends(vec![fallback_spend("spent-one")]),
         );
         let be = backend_over(fb).await;
 
@@ -4738,7 +4744,10 @@ mod tests {
         let be = backend_over(fb).await;
 
         assert!(
-            matches!(be.coin_spend("ghost").await, Err(BalanceError::ReadFailed(_))),
+            matches!(
+                be.coin_spend("ghost").await,
+                Err(BalanceError::ReadFailed(_))
+            ),
             "a spend with no coin record must fail closed"
         );
     }
@@ -4786,7 +4795,10 @@ mod tests {
         let limited = backend_over(Arc::new(MockFallback::default()))
             .await
             .with_fallback_rate_limit(0.0, 0.0);
-        assert_eq!(limited.coin_spend("c1").await, Err(BalanceError::RateLimited));
+        assert_eq!(
+            limited.coin_spend("c1").await,
+            Err(BalanceError::RateLimited)
+        );
 
         // The paired direction, on the SAME shape of double: a live source that genuinely has no
         // spend DOES answer None. Without this the three assertions above are satisfied by a
@@ -4823,10 +4835,16 @@ mod tests {
         );
 
         let live = backend_over(Arc::new(MockFallback::with_coins(vec![]))).await;
-        let page = live.coins_by_parent("p", None, 100).await.expect("an answer");
+        let page = live
+            .coins_by_parent("p", None, 100)
+            .await
+            .expect("an answer");
         assert!(page.coins.is_empty());
         assert!(page.complete, "a childless parent is a COMPLETE answer");
-        assert_eq!(page.cursor, None, "an empty page has nothing to resume from");
+        assert_eq!(
+            page.cursor, None,
+            "an empty page has nothing to resume from"
+        );
     }
 
     /// **`complete` is derived from what REMAINS, not from whether the page filled.**
