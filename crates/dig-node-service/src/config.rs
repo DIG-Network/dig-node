@@ -143,6 +143,16 @@ pub struct Config {
     /// a real `chia_query` broadcaster + confirmer + lineage so node-custodied spends execute +
     /// confirm on mainnet. Enabling it means REAL $DIG movement — opt-in only.
     pub enable_live_broadcast: bool,
+    /// Whether the node runs the background chain-sync supervisor (§18.6, #2501). From
+    /// `DIG_WALLET_ENABLE_CHAIN_SYNC` (`0`/`false`/`no`/`off` ⇒ disabled); **default `true`** —
+    /// sync is a chain READ into the node's own replica and every install wants it. It is a
+    /// separate knob from [`Config::enable_live_broadcast`], which governs whether $DIG MOVES.
+    ///
+    /// The reason it is a knob at all is that a supervisor dials the network: it probes
+    /// `127.0.0.1:8444` and then the Chia DNS introducers. A test harness must be able to build
+    /// state without a shared CI runner making unrequested outbound connections — and without
+    /// whatever answers on a runner's `127.0.0.1:8444` becoming a test's chain source.
+    pub enable_chain_sync: bool,
     /// Whether a NON-loopback `DIG_NODE_HOST` override is permitted (#1662). From
     /// `DIG_NODE_ALLOW_REMOTE` (`1`/`true`/`yes`/`on` ⇒ permitted); **default `false`**
     /// — the security-safe default. When `false`, a non-loopback `host` is refused at
@@ -164,6 +174,8 @@ impl Default for Config {
             dig_local: true,
             // Money-safe default: live broadcast is OFF unless explicitly enabled.
             enable_live_broadcast: false,
+            // Chain sync is a read into the node's own replica; on by default (#2501).
+            enable_chain_sync: true,
             // Security-safe default: a non-loopback bind is opt-in only (#1662).
             allow_remote: false,
         }
@@ -229,6 +241,10 @@ impl Config {
         let enable_live_broadcast =
             parse_live_broadcast_flag(std::env::var("DIG_WALLET_ENABLE_LIVE_BROADCAST").ok());
 
+        // Chain sync is on unless explicitly turned off (a read, not a spend).
+        let enable_chain_sync =
+            parse_chain_sync_flag(std::env::var("DIG_WALLET_ENABLE_CHAIN_SYNC").ok());
+
         // A non-loopback DIG_NODE_HOST is opt-in only (#1662); enforcement happens at
         // the bind site (server::serve_with_shutdown) so `status`/`install` — which
         // never bind — still resolve the config the operator set.
@@ -241,6 +257,7 @@ impl Config {
             cache_dir,
             dig_local,
             enable_live_broadcast,
+            enable_chain_sync,
             allow_remote,
         }
     }
@@ -357,6 +374,22 @@ pub fn parse_live_broadcast_flag(raw: Option<String>) -> bool {
             .map(str::to_ascii_lowercase)
             .as_deref(),
         Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Parse the `DIG_WALLET_ENABLE_CHAIN_SYNC` toggle (§18.6, #2501). Falsy
+/// (`0`/`false`/`no`/`off`) ⇒ do NOT start the background chain-sync supervisor; **anything else
+/// — including unset, blank, or unrecognised — ⇒ the default `true`**. Default-ON, unlike
+/// [`parse_live_broadcast_flag`]: syncing reads the chain into the node's own replica and moves
+/// no money, so the money-safe reasoning does not apply. Case/whitespace-insensitive. PURE so the
+/// policy is unit-testable without process env.
+pub fn parse_chain_sync_flag(raw: Option<String>) -> bool {
+    !matches!(
+        raw.as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("0" | "false" | "no" | "off")
     )
 }
 

@@ -46,7 +46,29 @@ pub enum SyncError {
     /// every wallet-scoped read. A wallet with no puzzle hashes is not synced; it has
     /// nothing to sync, and those are different states.
     NoPuzzleHashes,
+    /// A peer claimed a reorg deeper than [`MAX_REORG_DEPTH`]. Refused, and the session is
+    /// dropped rather than the rollback applied (see [`MAX_REORG_DEPTH`]).
+    ForkTooDeep {
+        /// How many blocks below the current peak the claimed fork point sits.
+        depth: u32,
+        /// The bound that was exceeded.
+        max: u32,
+    },
 }
+
+/// The deepest reorg a `coin_state_update` may claim before the session is dropped.
+///
+/// A rollback is the one destructive operation a peer can drive: `rollback_above(h)` deletes
+/// every coin created above `h` and un-spends everything above it, so a single frame claiming
+/// `fork_height = 0` erases the entire replica. Chia's consensus makes a deep reorg vanishingly
+/// unlikely — a competing chain has to out-weigh the canonical one across the whole span — and a
+/// light client cannot validate the claim either way, so the bound has to be a policy rather than
+/// a verification. It is set where a real reorg comfortably fits and an erasure does not: 128
+/// blocks is roughly 40 minutes of chain at Chia's ~18.75s block time, an order of magnitude
+/// beyond any reorg observed on mainnet. A deeper claim is not accepted-and-rolled-back; the
+/// session is dropped, the replica is left intact, and the supervisor reconnects — a fresh
+/// catch-up is the correct way to resolve a fork we would otherwise be taking on faith.
+pub const MAX_REORG_DEPTH: u32 = 128;
 
 impl std::fmt::Display for SyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,6 +80,11 @@ impl std::fmt::Display for SyncError {
             SyncError::NoPuzzleHashes => write!(
                 f,
                 "refusing to catch up over an empty puzzle-hash set (nothing to subscribe)"
+            ),
+            SyncError::ForkTooDeep { depth, max } => write!(
+                f,
+                "peer claimed a reorg {depth} blocks deep (bound {max}); dropping the session \
+                 rather than rolling the replica back"
             ),
         }
     }
@@ -90,10 +117,40 @@ pub fn coin_state_to_row(state: &CoinState) -> CoinRow {
     }
 }
 
+/// The puzzle hashes a session actually subscribed — the only coins it is entitled to write.
+///
+/// A peer answers a subscription; it does not get to define one. `request_puzzle_state` hands the
+/// peer an explicit hash set, and every `CoinState` it pushes back is checked against that set
+/// here, because the socket is untrusted (a co-resident process that binds `127.0.0.1:8444` is
+/// the node's chain source on the very next connect) and an unfiltered upsert lets it invent
+/// coins at hashes the wallet never asked about.
+///
+/// It is deliberately NOT the whole defence: nothing here can stop a peer lying about coins the
+/// wallet *does* own. That is what [`handle_coin_state_update`]'s fail-closed latch is for.
+pub type SubscribedHashes = HashSet<Bytes32>;
+
 /// Apply a batch of `CoinState`s into the DB (the core of `coin_state_update`). Each state
 /// is upserted by coin id, so a later spend overwrites the earlier unspent row.
-pub async fn apply_coin_states(db: &WalletDb, states: &[CoinState]) -> Result<(), SyncError> {
-    let rows: Vec<CoinRow> = states.iter().map(coin_state_to_row).collect();
+///
+/// Coins at a puzzle hash outside `subscribed` are dropped — they were never requested, so a
+/// peer offering them is either confused or hostile, and either way the replica must not grow a
+/// row the wallet cannot account for.
+pub async fn apply_coin_states(
+    db: &WalletDb,
+    states: &[CoinState],
+    subscribed: &SubscribedHashes,
+) -> Result<(), SyncError> {
+    let rows: Vec<CoinRow> = states
+        .iter()
+        .filter(|s| subscribed.contains(&s.coin.puzzle_hash))
+        .map(coin_state_to_row)
+        .collect();
+    if rows.len() != states.len() {
+        tracing::warn!(
+            dropped = states.len() - rows.len(),
+            "wallet sync: peer pushed coin states outside the subscribed puzzle-hash set"
+        );
+    }
     db.upsert_coins(&rows).await?;
     Ok(())
 }
@@ -131,18 +188,52 @@ impl CatAttributor<'_> {
 /// and advance the synced peak. Publishes [`SyncEvent::CoinState`] on `events` once applied
 /// (design A.9) — a best-effort push notification; `get_sync_status` polling stays the
 /// authoritative source of truth regardless of whether anything is subscribed to `events`.
+///
+/// # Fail closed on any backwards move
+///
+/// A rollback, or a peak that moves backwards, means the replica no longer holds the state a
+/// completed catch-up established. The routing gate
+/// ([`crate::sage::db::WalletDb::is_synced`] → [`crate::sage::routing::route`]) is what makes an
+/// emptied DB *authoritative*, so a destructive push must clear it: the wallet then reads from
+/// the fallback tier until a genuine catch-up re-establishes the flag. Without this, one hostile
+/// frame makes a funded wallet answer `balance 0, synced true` — permanently, because nothing
+/// else ever re-runs the catch-up while the connection survives.
+///
+/// The cost of being conservative here is a temporary fallback read after a *legitimate* reorg,
+/// which is correct: after a rollback the replica genuinely is behind.
 pub async fn handle_coin_state_update(
     db: &WalletDb,
     update: &CoinStateUpdate,
     events: &EventBus,
+    subscribed: &SubscribedHashes,
 ) -> Result<(), SyncError> {
     let current_peak = db.sync_state().await?.peak_height;
+    let mut moved_backwards = false;
     if let Some(peak) = current_peak {
         if update.fork_height < peak {
+            let depth = peak - update.fork_height;
+            if depth > MAX_REORG_DEPTH {
+                return Err(SyncError::ForkTooDeep {
+                    depth,
+                    max: MAX_REORG_DEPTH,
+                });
+            }
             db.rollback_above(update.fork_height).await?;
+            moved_backwards = true;
         }
+        moved_backwards |= update.height < peak;
     }
-    apply_coin_states(db, &update.items).await?;
+    if moved_backwards {
+        tracing::warn!(
+            fork_height = update.fork_height,
+            height = update.height,
+            previous_peak = ?current_peak,
+            "wallet sync: replica moved backwards; clearing initial-sync-complete so wallet \
+             reads fall back until a fresh catch-up"
+        );
+        db.set_initial_sync_complete(false).await?;
+    }
+    apply_coin_states(db, &update.items, subscribed).await?;
     db.set_peak(update.height, &hex::encode(update.peak_hash))
         .await?;
     events.publish(SyncEvent::CoinState);
@@ -229,6 +320,7 @@ pub async fn initial_sync_with(
         return Err(SyncError::NoPuzzleHashes);
     }
 
+    let subscribed: SubscribedHashes = puzzle_hashes.iter().copied().collect();
     let mut previous_height: Option<u32> = None;
     let mut header_hash = genesis_challenge;
     events.publish(SyncEvent::Start {
@@ -245,7 +337,7 @@ pub async fn initial_sync_with(
             first_batch = false;
         }
 
-        apply_coin_states(db, &respond.coin_states).await?;
+        apply_coin_states(db, &respond.coin_states, &subscribed).await?;
         events.publish(SyncEvent::PuzzleBatchSynced);
 
         if respond.is_finished {
@@ -270,17 +362,22 @@ pub async fn initial_sync_with(
 /// When `attributor` is `Some`, each applied `coin_state_update` is followed by a CAT/
 /// singleton attribution pass (#407) so newly-synced CAT coins gain their `asset_id`. When
 /// `None`, coins are stored as-is (attribution runs elsewhere / not at all).
+///
+/// `subscribed` is the puzzle-hash set this session actually subscribed; pushed coins outside it
+/// are dropped (see [`apply_coin_states`]). An empty set is meaningful and correct — a
+/// peak-only session subscribes nothing and must therefore write no coins.
 pub async fn run_update_loop(
     db: &WalletDb,
     mut receiver: tokio::sync::mpsc::Receiver<Message>,
     events: &EventBus,
     attributor: Option<&CatAttributor<'_>>,
+    subscribed: &SubscribedHashes,
 ) -> Result<(), SyncError> {
     while let Some(message) = receiver.recv().await {
         match message.msg_type {
             ProtocolMessageTypes::CoinStateUpdate => {
                 if let Ok(update) = decode::<CoinStateUpdate>(&message) {
-                    handle_coin_state_update(db, &update, events).await?;
+                    handle_coin_state_update(db, &update, events, subscribed).await?;
                     if let Some(a) = attributor {
                         a.attribute(db).await?;
                     }
@@ -288,9 +385,26 @@ pub async fn run_update_loop(
             }
             ProtocolMessageTypes::NewPeakWallet => {
                 if let Ok(peak) = decode::<NewPeakWallet>(&message) {
-                    let hh = db.sync_state().await?.header_hash;
-                    // Only advance the recorded peak height (no rollback on a forward peak).
-                    db.set_peak(peak.height, hh.as_deref().unwrap_or(""))
+                    let state = db.sync_state().await?;
+                    // The recorded peak only ever ADVANCES here. This value is served on OPEN
+                    // reads and is what a caller bounding a claimed confirmation reads, so a
+                    // peer that can drive it downwards can make settled money read unconfirmed
+                    // (inviting a second send) — and `new_peak_wallet` carries no fork point to
+                    // justify a retreat. The authoritative way a peak legitimately moves back is
+                    // `coin_state_update`, which carries `fork_height` and unlatches the routing
+                    // gate; a bare backwards peak claim is simply refused.
+                    if state
+                        .peak_height
+                        .is_some_and(|current| peak.height < current)
+                    {
+                        tracing::warn!(
+                            claimed = peak.height,
+                            current = ?state.peak_height,
+                            "wallet sync: refusing a backwards new_peak_wallet"
+                        );
+                        continue;
+                    }
+                    db.set_peak(peak.height, state.header_hash.as_deref().unwrap_or(""))
                         .await?;
                 }
             }
@@ -318,6 +432,14 @@ mod tests {
         }
     }
 
+    /// The puzzle hash every fixture coin below sits at, and the one the tests subscribe.
+    const OWNED: u8 = 9;
+
+    /// The subscription a session would have made over [`OWNED`].
+    fn subscribed_owned() -> SubscribedHashes {
+        HashSet::from([Bytes32::new([OWNED; 32])])
+    }
+
     fn state(c: Coin, created: Option<u32>, spent: Option<u32>) -> CoinState {
         CoinState {
             coin: c,
@@ -333,7 +455,9 @@ mod tests {
             state(coin(1, 9, 1_000), Some(10), None),
             state(coin(2, 9, 2_000), Some(11), None),
         ];
-        apply_coin_states(&db, &states).await.unwrap();
+        apply_coin_states(&db, &states, &subscribed_owned())
+            .await
+            .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 3_000);
         assert_eq!(db.spendable_coin_count(None).await.unwrap(), 2);
     }
@@ -342,12 +466,12 @@ mod tests {
     async fn later_spend_state_marks_coin_spent() {
         let db = WalletDb::open_in_memory().await.unwrap();
         let c = coin(1, 9, 500);
-        apply_coin_states(&db, &[state(c, Some(10), None)])
+        apply_coin_states(&db, &[state(c, Some(10), None)], &subscribed_owned())
             .await
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 500);
         // The peer later reports the same coin as spent.
-        apply_coin_states(&db, &[state(c, Some(10), Some(20))])
+        apply_coin_states(&db, &[state(c, Some(10), Some(20))], &subscribed_owned())
             .await
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 0);
@@ -357,9 +481,13 @@ mod tests {
     async fn coin_state_update_reorg_rolls_back_then_applies() {
         let db = WalletDb::open_in_memory().await.unwrap();
         // Build initial state at peak 40.
-        apply_coin_states(&db, &[state(coin(1, 9, 5), Some(10), Some(30))])
-            .await
-            .unwrap();
+        apply_coin_states(
+            &db,
+            &[state(coin(1, 9, 5), Some(10), Some(30))],
+            &subscribed_owned(),
+        )
+        .await
+        .unwrap();
         db.set_peak(40, "aa").await.unwrap();
 
         // A reorg to fork_height 25 rolls back the spend@30, then applies the new items.
@@ -371,7 +499,7 @@ mod tests {
         };
         let events = EventBus::with_capacity(8);
         let mut rx = events.subscribe();
-        handle_coin_state_update(&db, &update, &events)
+        handle_coin_state_update(&db, &update, &events, &subscribed_owned())
             .await
             .unwrap();
         assert_eq!(rx.recv().await.unwrap(), SyncEvent::CoinState);
@@ -384,9 +512,13 @@ mod tests {
     #[tokio::test]
     async fn forward_update_advances_peak_without_rollback() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        apply_coin_states(&db, &[state(coin(1, 9, 5), Some(10), None)])
-            .await
-            .unwrap();
+        apply_coin_states(
+            &db,
+            &[state(coin(1, 9, 5), Some(10), None)],
+            &subscribed_owned(),
+        )
+        .await
+        .unwrap();
         db.set_peak(40, "aa").await.unwrap();
         let update = CoinStateUpdate {
             height: 50,
@@ -395,11 +527,245 @@ mod tests {
             items: vec![state(coin(2, 9, 3), Some(50), None)],
         };
         let events = EventBus::default();
-        handle_coin_state_update(&db, &update, &events)
+        handle_coin_state_update(&db, &update, &events, &subscribed_owned())
             .await
             .unwrap();
         assert_eq!(db.balance(None).await.unwrap(), 8);
         assert_eq!(db.sync_state().await.unwrap().peak_height, Some(50));
+    }
+
+    // -----------------------------------------------------------------------
+    // The hostile peer (S1/S2/S3)
+    //
+    // The socket in front of `handle_coin_state_update` is untrusted: `connect_random_peer`
+    // tries `127.0.0.1:8444` before any introducer, and the client accepts any certificate, so
+    // an unprivileged co-resident process becomes the chain source on the next connect. These
+    // fixtures are that process.
+    // -----------------------------------------------------------------------
+
+    /// A funded, caught-up replica: 6 XCH at [`OWNED`], created just below the peak, flag set.
+    ///
+    /// The wallet is FUNDED deliberately — an empty one cannot exhibit the defect, because the
+    /// lie under test is "a balance that exists reads as a synced zero".
+    async fn funded_and_synced() -> WalletDb {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        apply_coin_states(
+            &db,
+            &[state(
+                coin(1, OWNED, 6_000_000_000_000),
+                Some(5_999_990),
+                None,
+            )],
+            &subscribed_owned(),
+        )
+        .await
+        .unwrap();
+        db.set_peak(6_000_000, "aa").await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        db
+    }
+
+    /// **Proves (S1a, #2501):** a `coin_state_update` claiming a fork deeper than
+    /// [`MAX_REORG_DEPTH`] is REFUSED — the replica is untouched and the session errors out.
+    ///
+    /// `fork_height: 0` is the whole table: `rollback_above(0)` deletes every coin. One frame.
+    #[tokio::test]
+    async fn a_reorg_deeper_than_the_bound_is_refused_and_the_replica_is_untouched() {
+        let db = funded_and_synced().await;
+        let events = EventBus::default();
+
+        let err = handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: 0,
+                fork_height: 0,
+                peak_hash: Bytes32::new([7; 32]),
+                items: vec![],
+            },
+            &events,
+            &subscribed_owned(),
+        )
+        .await
+        .expect_err("a 6-million-block fork claim must be refused, not applied");
+
+        assert!(
+            matches!(
+                err,
+                SyncError::ForkTooDeep {
+                    depth: 6_000_000,
+                    max: MAX_REORG_DEPTH
+                }
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            6_000_000_000_000,
+            "the replica must be intact — nothing was rolled back"
+        );
+        assert_eq!(db.sync_state().await.unwrap().peak_height, Some(6_000_000));
+    }
+
+    /// **Proves (S1b, #2501):** an ACCEPTED rollback (within the depth bound) clears
+    /// `initial_sync_complete`, so an emptied replica stops being authoritative.
+    ///
+    /// This is the load-bearing half. The depth bound alone cannot fix the defect: a shallow
+    /// rollback is legitimate protocol behaviour and still empties a wallet whose coins were all
+    /// created recently. The fixture is built so the rollback SUCCEEDS and removes the funds —
+    /// the observable that distinguishes a latch from a depth check is where the read routes
+    /// afterwards, not whether the coin survived.
+    #[tokio::test]
+    async fn an_applied_rollback_stops_the_emptied_replica_being_authoritative() {
+        let db = funded_and_synced().await;
+        let events = EventBus::default();
+
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: 6_000_001,
+                // 10 blocks below the peak: a depth a real reorg could plausibly have, and one
+                // the bound therefore ACCEPTS. The wallet's only coin was created above it.
+                fork_height: 5_999_990 - 1,
+                peak_hash: Bytes32::new([7; 32]),
+                items: vec![],
+            },
+            &events,
+            &subscribed_owned(),
+        )
+        .await
+        .expect("a shallow reorg is applied, not refused");
+
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            0,
+            "the rollback did remove the coin — the fixture exercises the emptying path"
+        );
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "an emptied replica must NOT stay initial-sync-complete"
+        );
+        assert_eq!(
+            crate::sage::routing::route(db.is_synced().await.unwrap(), true),
+            crate::sage::routing::Source::Fallback,
+            "a funded wallet must never read 0 from a rolled-back replica as though synced"
+        );
+    }
+
+    /// **Proves (S1c, #2501):** a peak that moves BACKWARDS without any rollback also clears the
+    /// flag.
+    ///
+    /// `fork_height` at or above the peak skips the rollback branch entirely, so a latch wired
+    /// only to the rollback would leave this replica claiming to be synced at a height it has
+    /// not verified. The coin survives here, which is exactly why the balance is the wrong
+    /// observable and the routing decision is the right one.
+    #[tokio::test]
+    async fn a_backwards_peak_in_a_coin_state_update_clears_the_sync_flag() {
+        let db = funded_and_synced().await;
+        let events = EventBus::default();
+
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: 1,
+                fork_height: 6_000_000, // not below the peak → no rollback
+                peak_hash: Bytes32::new([7; 32]),
+                items: vec![],
+            },
+            &events,
+            &subscribed_owned(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            6_000_000_000_000,
+            "no rollback happened — the coin is still there"
+        );
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "a replica whose peak went backwards is not caught up"
+        );
+    }
+
+    /// **Proves (S2, #2501):** a `coin_state_update` may only write coins at hashes the session
+    /// subscribed.
+    ///
+    /// The fixture pushes THREE coins in one frame: one at the subscribed hash (which must
+    /// land, so the test cannot pass by dropping everything), and two at hashes that were never
+    /// subscribed. A filter placed on the wrong side of the subscription would keep the
+    /// foreign ones.
+    #[tokio::test]
+    async fn a_coin_state_update_cannot_write_coins_outside_the_subscription() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(6_000_000, "aa").await.unwrap();
+        let events = EventBus::default();
+
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: 6_000_001,
+                fork_height: 6_000_000,
+                peak_hash: Bytes32::new([7; 32]),
+                items: vec![
+                    state(coin(1, OWNED, 11), Some(6_000_001), None),
+                    state(coin(2, FOREIGN, 1_000_000), Some(6_000_001), None),
+                    state(coin(3, FOREIGN + 1, 2_000_000), Some(6_000_001), None),
+                ],
+            },
+            &events,
+            &subscribed_owned(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            11,
+            "only the subscribed coin may be written"
+        );
+        assert_eq!(db.spendable_coin_count(None).await.unwrap(), 1);
+    }
+
+    /// **Proves (S3, #2501):** `new_peak_wallet` may only ADVANCE the replica peak.
+    ///
+    /// The peak is served on OPEN reads and is what bounds a claimed confirmation, so a peer
+    /// that can drive it downwards makes settled money read unconfirmed. The forward peak in the
+    /// same run is the control: without it a supervisor that ignored `new_peak_wallet` entirely
+    /// would also pass.
+    #[tokio::test]
+    async fn new_peak_wallet_advances_but_never_retreats() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(6_000_000, "aa").await.unwrap();
+        let events = EventBus::default();
+        let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(4);
+
+        for height in [6_000_010, 1] {
+            let peak = NewPeakWallet {
+                header_hash: Bytes32::new([3; 32]),
+                height,
+                weight: 0u128,
+                fork_point_with_previous_peak: 0,
+            };
+            tx.send(Message {
+                msg_type: ProtocolMessageTypes::NewPeakWallet,
+                id: None,
+                data: chia::traits::Streamable::to_bytes(&peak).unwrap().into(),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+
+        run_update_loop(&db, receiver, &events, None, &subscribed_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.sync_state().await.unwrap().peak_height,
+            Some(6_000_010),
+            "the forward peak applies and the backwards one is refused"
+        );
     }
 
     /// A peer that answers every subscription with "caught up, nothing here" — which is
@@ -461,18 +827,56 @@ mod tests {
         );
     }
 
-    /// **Proves:** the same catch-up path DOES complete — and sets the flag — once there is
-    /// at least one puzzle hash. Without this control, T1 would also pass if `initial_sync`
-    /// simply never worked.
+    /// A peer that genuinely ANSWERS the subscription — one coin at the subscribed hash — and
+    /// also slips in a coin at a hash that was never subscribed.
+    ///
+    /// The honest coin is what makes this a control rather than another vacuous double: a
+    /// catch-up that completes here has actually transferred state, so the completion flag is
+    /// backed by something. The foreign coin rides along because the filter and the flag are
+    /// exercised by the same call, and a peer that can lie about one can lie about both.
+    struct AnswersSubscriptionAndSlipsOneIn;
+
+    /// The hash the fixtures never subscribe.
+    const FOREIGN: u8 = 200;
+
+    #[async_trait::async_trait]
+    impl PuzzleStateSource for AnswersSubscriptionAndSlipsOneIn {
+        async fn request_puzzle_state(
+            &self,
+            puzzle_hashes: Vec<Bytes32>,
+            _previous_height: Option<u32>,
+            _header_hash: Bytes32,
+        ) -> Result<RespondPuzzleState, SyncError> {
+            Ok(RespondPuzzleState {
+                puzzle_hashes: puzzle_hashes.clone(),
+                coin_states: vec![
+                    state(coin(1, OWNED, 700), Some(5_999_000), None),
+                    state(coin(2, FOREIGN, 999_999), Some(5_999_001), None),
+                ],
+                height: 6_000_000,
+                header_hash: Bytes32::new([9; 32]),
+                is_finished: true,
+            })
+        }
+    }
+
+    /// **Proves (control + S2, #2501):** the catch-up path DOES complete — and sets the flag —
+    /// once there is at least one puzzle hash AND the peer actually answers with that wallet's
+    /// coins; and a coin at an unsubscribed hash in the SAME response is dropped.
+    ///
+    /// The earlier version of this control used a peer answering `is_finished, coin_states: []`,
+    /// which encoded "a peer says caught-up-and-you-own-nothing, so flip the flag" as the
+    /// intended behaviour — the exact shape of the money lie the rest of this module defends
+    /// against. The peer here has to transfer real state to satisfy it.
     #[tokio::test]
-    async fn initial_sync_completes_over_a_non_empty_puzzle_hash_set() {
+    async fn initial_sync_completes_and_ignores_coins_outside_the_subscription() {
         let db = WalletDb::open_in_memory().await.unwrap();
         let events = EventBus::default();
 
         initial_sync_with(
-            &CaughtUpAtOnce,
+            &AnswersSubscriptionAndSlipsOneIn,
             &db,
-            vec![Bytes32::new([4; 32])],
+            vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
@@ -482,6 +886,12 @@ mod tests {
 
         assert!(db.is_synced().await.unwrap());
         assert_eq!(db.sync_state().await.unwrap().peak_height, Some(6_000_000));
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            700,
+            "only the subscribed coin may be persisted — the foreign one is not the wallet's"
+        );
+        assert_eq!(db.spendable_coin_count(None).await.unwrap(), 1);
     }
 
     /// **Proves:** [`run_update_loop`] publishes [`SyncEvent::Stop`] when its receiver
@@ -494,7 +904,9 @@ mod tests {
         let (tx, receiver) = tokio::sync::mpsc::channel::<Message>(1);
         drop(tx); // closes the channel immediately
 
-        run_update_loop(&db, receiver, &events, None).await.unwrap();
+        run_update_loop(&db, receiver, &events, None, &subscribed_owned())
+            .await
+            .unwrap();
 
         assert_eq!(rx.recv().await.unwrap(), SyncEvent::Stop);
     }
@@ -523,7 +935,9 @@ mod tests {
         tx.send(msg).await.unwrap();
         drop(tx);
 
-        run_update_loop(&db, receiver, &events, None).await.unwrap();
+        run_update_loop(&db, receiver, &events, None, &subscribed_owned())
+            .await
+            .unwrap();
 
         assert_eq!(rx.recv().await.unwrap(), SyncEvent::CoinState);
         assert_eq!(rx.recv().await.unwrap(), SyncEvent::Stop);
@@ -582,9 +996,15 @@ mod tests {
             prefix: "xch",
             plain_puzzle_hashes: &plain,
         };
-        run_update_loop(&db, receiver, &events, Some(&attributor))
-            .await
-            .unwrap();
+        run_update_loop(
+            &db,
+            receiver,
+            &events,
+            Some(&attributor),
+            &subscribed_owned(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             hits.load(Ordering::SeqCst),

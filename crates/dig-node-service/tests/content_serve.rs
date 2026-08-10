@@ -128,6 +128,7 @@ async fn spawn_node(upstream: &str) -> (SocketAddr, PathBuf) {
         upstream: upstream.to_string(),
         port: 0,
         dig_local: false,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let state = dig_node_service::server::build_state(&config).await;
@@ -666,6 +667,7 @@ async fn drive_s_get(
         upstream: "http://127.0.0.1:1/unreachable".to_string(),
         port: 0,
         dig_local: false,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let recorder = Arc::new(RecordingContentServer::default());

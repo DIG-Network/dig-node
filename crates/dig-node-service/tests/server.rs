@@ -112,7 +112,8 @@ async fn start_companion(upstream: &str) -> (SocketAddr, EnvHold) {
 async fn start_companion_full(upstream: &str) -> (SocketAddr, String, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
-        port: 0, // bind ephemeral
+        port: 0,                  // bind ephemeral
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 
@@ -175,6 +176,7 @@ async fn start_companion_probe(upstream: &str) -> (SocketAddr, Value, EnvHold) {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -214,6 +216,7 @@ async fn start_companion_probe_state(
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -249,6 +252,7 @@ async fn start_companion_wallet(
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port: 0,
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
     let hold = env_guard().lock_owned().await;
@@ -554,6 +558,7 @@ async fn dual_listener_serves_localhost_when_dig_local_bind_fails() {
         upstream: upstream.to_string(),
         port,
         dig_local: true, // attempt the privileged 127.0.0.2:80 bind (expected to fail in CI)
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 
@@ -621,7 +626,8 @@ async fn dual_stack_loopback_serves_both_ipv4_and_ipv6_on_the_same_port() {
     let config = dig_node_service::Config {
         upstream: upstream.to_string(),
         port,
-        dig_local: false, // skip the privileged 127.0.0.2:80 bind in tests
+        dig_local: false,         // skip the privileged 127.0.0.2:80 bind in tests
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()  // host: None → dual-stack default
     };
 
@@ -1472,12 +1478,12 @@ async fn the_wallet_push_is_token_gated_while_the_chain_reads_are_open() {
 }
 
 /// **Proves (dig_ecosystem#2501):** `control.wallet.syncStatus` and `control.peerCounts` are served
-/// over the real gate, and their shared `chia_peer_count` comes from ONE observation.
+/// over the real gate, share the same `chia_peer_count` shape, and keep the unknown-peak sentinel.
 ///
-/// The duplicated field is the interesting part. Two handlers each reaching for their own peer
-/// count is the natural implementation and it is the one that eventually disagrees with itself —
-/// so this asserts the two calls, made independently over HTTP, return the SAME value. A test that
-/// only checked each field's type would pass on the divergent implementation.
+/// On this fixture the node has no reachable Chia peer, so the equality assertion below compares
+/// one zero observation with the other. That still pins the shared response shape over real HTTP,
+/// while the single-source property itself is held structurally by the handlers reaching the same
+/// backend accessor.
 ///
 /// The phase is asserted to be one of the three declared tokens rather than a specific one: this
 /// node has no chain source, so whether it ever attaches a peer is not the property under test.
@@ -2293,7 +2299,8 @@ async fn start_serving_node(
     let config = dig_node_service::Config {
         upstream,
         port,
-        dig_local: false, // skip the privileged 127.0.0.2:80 bind in tests
+        dig_local: false,         // skip the privileged 127.0.0.2:80 bind in tests
+        enable_chain_sync: false, // never dial mainnet from the harness (#2501)
         ..dig_node_service::Config::default()
     };
 
