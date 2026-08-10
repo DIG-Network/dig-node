@@ -334,6 +334,22 @@ impl Harness {
         panic!("timed out waiting for: {what}");
     }
 
+    /// Poll the COMPOSED status until `predicate` holds, or fail. The phase depends on live
+    /// session facts that no DB row carries, so it can only be awaited through the handle.
+    async fn until_status(
+        &self,
+        what: &str,
+        mut predicate: impl FnMut(&WalletSyncStatus) -> bool,
+    ) {
+        for _ in 0..2_000 {
+            if predicate(&self.handle.status(&self.db).await.unwrap()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
     /// Wait until the supervisor has connected AND finished deciding what that session may do.
     ///
     /// Anchored on an OBSERVED event (a completed connect) rather than a bare sleep, then given a
@@ -479,6 +495,44 @@ async fn supervisor_with_no_derivations_still_advances_the_replica_peak() {
     assert!(
         !db.is_synced().await.unwrap(),
         "advancing the peak must NOT imply the wallet is caught up"
+    );
+    h.stop().await;
+}
+
+/// **Proves (#2609), end to end through the real supervisor:** a default install — an
+/// authoritative peer and NO wallet enrolled — settles on `NoAddressesToWatch` rather than
+/// reporting `Syncing` for ever.
+///
+/// The handle-level tests above set the two session facts directly, which pins the ladder but not
+/// the WIRING. This one runs the actual supervisor loop over an empty custody set and asserts the
+/// phase it publishes, so a fix that changed the ladder and forgot to record the facts — the
+/// version that still reproduces the defect on a real machine — fails here.
+#[tokio::test]
+async fn a_default_install_with_no_wallet_settles_on_nothing_to_watch() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let h = Harness::start(
+        db.clone(),
+        Arc::new(FixedHashes(Vec::new())),
+        Script::new(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+
+    h.until_status("nothing to watch", |s| {
+        s.phase == SyncPhase::NoAddressesToWatch
+    })
+    .await;
+
+    let status = h.handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.watched_addresses,
+        Some(0),
+        "the empty custody set must be reported as a MEASURED zero, not as unknown"
+    );
+    assert!(
+        !db.sync_state().await.unwrap().initial_sync_complete,
+        "the phase must settle WITHOUT latching initial_sync_complete: latching it would flip \
+         wallet-scoped reads to an un-queried local DB and read a funded wallet as empty"
     );
     h.stop().await;
 }

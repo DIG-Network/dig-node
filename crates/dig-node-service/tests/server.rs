@@ -1542,7 +1542,7 @@ async fn the_push_and_the_arrival_cursor_are_gated_while_the_chain_reads_are_ope
 /// dialling), so a handler serving that field from anywhere else answers a DIFFERENT number and
 /// the assertion fails.
 ///
-/// The phase is asserted to be one of the three declared tokens rather than a specific one: this
+/// The phase is asserted to be one of the four declared tokens rather than a specific one: this
 /// node has no chain source, so whether it ever attaches a peer is not the property under test.
 /// What IS pinned is that a peak-less replica reports `null` and never `0` — a zero here reads as
 /// "synced to genesis", a claim about the chain that would be false.
@@ -1565,8 +1565,8 @@ async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
     );
     let phase = sync["result"]["phase"].as_str().unwrap_or_default();
     assert!(
-        ["not_started", "syncing", "synced"].contains(&phase),
-        "phase must be one of the three declared tokens, got {phase:?}"
+        ["not_started", "syncing", "synced", "no_addresses_to_watch"].contains(&phase),
+        "phase must be one of the four declared tokens, got {phase:?}"
     );
     assert!(
         sync["result"]["peak_height"].is_null() || sync["result"]["peak_height"].as_u64() > Some(0),
