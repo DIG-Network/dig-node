@@ -3787,12 +3787,15 @@ answered "finished" immediately, so completing it would mark an un-queried DB au
 report a funded wallet as empty. A node with no wallet therefore stays unsynced, and — where its only
 peer is a discovered one — writes nothing at all.
 
-**Invariant.** A catch-up MUST NOT run over a peer the node merely DISCOVERED, and
-`initial_sync_complete` MUST NOT be set as a result of one. `initial_sync` itself refuses with
-`UntrustedPeer`. See §18.6c for the trust model this enforces. The supervisor therefore runs a
-DISCOVERED peer as a WRITE-FREE session whatever the wallet holds: it subscribes nothing, it persists
-nothing, and it does not re-poll the puzzle-hash set, because a wallet appearing cannot make an untrusted
-peer trusted.
+**Invariant.** A catch-up MUST NOT run over an UNCORROBORATED peer, and `initial_sync_complete` MUST NOT
+be set as a result of one. `initial_sync` itself refuses with `UntrustedPeer`, and it decides on the
+EFFECTIVE trust it is handed — which for a discovered peer is the trust resolved AFTER corroboration
+(§18.6d), not its dial source. The check MUST remain at that floor rather than only in the caller: a
+caller-side check is one refactor, or one reconnect after a hostile disconnect, away from gone.
+
+A discovered peer that has NOT been corroborated runs as a WRITE-FREE session whatever the wallet holds:
+it subscribes nothing and persists nothing. Corroboration MUST be attempted BEFORE the catch-up, so a peer
+that fails it never has a window in which its answers are already landing.
 
 **Bounded catch-up.** One catch-up MUST make at most 1,024 round trips and write at most 250,000 coin
 states in total, and a response carrying `is_finished: false` MUST report a height strictly greater than
@@ -3809,26 +3812,112 @@ verify the server certificate, so an unprivileged co-resident process can become
 * An **operator** peer is a `user_managed` row in the `peers` table — an address a human deliberately
   entered. It has full authority: it MAY run a catch-up, set `initial_sync_complete`, write coins, and
   drive a bounded rollback.
-* A **discovered** peer (a DNS introducer answer, or the loopback probe) MUST NOT cause ANY write to
-  `wallet.sqlite`. It MUST NOT write coins, MUST NOT roll the replica back, MUST NOT cause
-  `initial_sync_complete` to become `true`, and MUST NOT move the replica peak in EITHER direction. Its
-  entire contribution is LIVENESS: it counts toward the `chia_peer_count` of §18.6b, which is an
-  observation the node makes about its own socket rather than a claim the peer makes.
+* A **discovered** peer (a DNS introducer answer, or the loopback probe) arrives with NO authority. On
+  arrival it MUST NOT cause ANY write to `wallet.sqlite`: it MUST NOT write coins, MUST NOT roll the
+  replica back, MUST NOT cause `initial_sync_complete` to become `true`, and MUST NOT move the replica
+  peak in EITHER direction. Its entire contribution is LIVENESS: it counts toward the `chia_peer_count`
+  of §18.6b, which is an observation the node makes about its own socket rather than a claim the peer
+  makes.
 
   The peak is named explicitly because it was once permitted, monotonically, on the reasoning that a
   too-high peak only makes a confirmation read more conservative. That reasoning is INVERTED: a
   confirmation count is `peak − created_height`, so a higher peak means MORE confirmations, and one frame
   at `u32::MAX` reads as ~4.29e9 confirmations for a spend that never landed — on the value
   `control.wallet.peak` exists to let a caller bound a claimed confirmation with. A monotonic rule also
-  makes that value PERMANENT, because it refuses every honest peer's correction and only an operator
-  peer's catch-up may lower it. An implementation MUST NOT substitute an in-memory advisory peak either.
+  makes that value PERMANENT, because it refuses every honest peer's correction. An implementation MUST
+  NOT substitute an in-memory advisory peak either.
 
-The consequence is deliberate: a default install with no operator-chosen peer does NOT get a full coin
-sync, its `sync_state.peak_height` stays NULL (so `control.wallet.syncStatus` reports `peak_height: null`,
-meaning UNKNOWN — never `0`, and `control.wallet.peak` continues to answer from the chain tier), and
-wallet-scoped reads stay on the fallback tier. The boundary is placed at the flag rather than at
-each individual leak because an attacker chooses when its connection survives — closing the socket costs
-it one backoff cycle and buys a fresh catch-up, which is how a per-leak defence is walked around.
+* A **corroborated** peer is a discovered peer whose answer an independently drawn quorum agreed with,
+  for ONE session (§18.6d). It has the same authority as an operator peer for that session only. The
+  label MUST NOT be persisted and MUST NOT be cached against an address: what was verified is one answer
+  at one height, not the peer's character.
+
+The boundary is placed at the `initial_sync_complete` flag rather than at each individual leak because an
+attacker chooses when its connection survives — closing the socket costs it one backoff cycle and buys a
+fresh catch-up, which is how a per-leak defence is walked around.
+
+18.6d. **Quorum-by-agreement: how a discovered peer earns authority.** dig-node is a Chia LIGHT CLIENT.
+Almost no installation has an operator-chosen peer, so a rule under which only operator peers may write
+means the shipped default never syncs at all: `initial_sync_complete` stays false and
+`sync_state.peak_height` stays NULL indefinitely. There are no operator-chosen peers to fall back on, so
+trust MUST instead be established by AGREEMENT among randomly selected discovered peers.
+
+**The rule.** Before a discovered peer's session performs any write, the implementation MUST:
+
+1. Draw a sample of `QUORUM_SAMPLE` = **4** peers by repeated independent discovery dials, keeping only
+   DISTINCT peer addresses. Selection MUST NOT be biased by peer ordering, by first-responder-wins, or by
+   a cached fastest-peer list, and any explicit index selection MUST use a cryptographically secure
+   random source (the OS CSPRNG) with rejection sampling rather than modulo reduction.
+2. Compare their claimed peaks and EXCLUDE any peer whose claim is further than `PEAK_LAG_TOLERANCE` =
+   **3** blocks from the MEDIAN claim, in either direction. The median is REQUIRED: anchoring on the
+   maximum lets a single peer claiming `u32::MAX` place every honest peer outside the band and be left
+   alone in the pool.
+3. NORMALISE the question to a settled height `H = min(claimed peaks of the sample) − SETTLED_LAG`, with
+   `SETTLED_LAG` = **2**. Every quorum question MUST be asked as of `H`, never as of the tip.
+4. Ask every remaining sampled peer, and the would-be writer, the same question at `H`. The writer MUST
+   NOT choose `H`.
+5. Elevate the writer to **corroborated** if and only if at least `QUORUM_AGREEMENT` = **3** of the 4
+   sampled peers returned the SAME answer AND the writer's own answer equals it.
+
+**Behind versus lying.** Steps 2 and 3 exist because a peer that is merely BEHIND and a peer that is
+LYING are indistinguishable in any single answer, and treating ordinary propagation lag as an attack is
+itself a denial of service. At a settled height in the shared past, a lagging-but-honest peer and a fully
+caught-up peer hold the SAME answer, so lag cannot produce disagreement. A peer that still disagrees, at a
+height it claims to have passed, is lying, partitioned, or forked — never merely slow.
+
+**Outcomes.** The implementation MUST behave as follows, and MUST NOT collapse these into one:
+
+| Outcome | Meaning | Required behaviour |
+|---|---|---|
+| **Unanimous** — all 4 agree | Corroborated | Elevate; the session may write. |
+| **Majority with dissent** — ≥3 agree, ≥1 does not | Corroborated, with evidence | Elevate, AND surface the dissenting peers. At a settled height a dissenter is not merely behind. |
+| **Split** — no answer reaches 3 | Truth UNKNOWN | Write NOTHING. Re-draw a FRESH random sample and retry. MUST NOT take the plurality. After `PERSISTENT_DISAGREEMENT_ROUNDS` = **3** consecutive splits, surface the standing disagreement as evidence of a partition or an attack. |
+| **Insufficient** — fewer than 4 answered | Unreachable, not consensus | Write NOTHING. MUST NOT form a quorum among whoever replied; an attacker who can silence witnesses must not thereby shrink the quorum he has to capture. |
+
+**Reads that MUST be verified rather than voted on.** Voting on a locally decidable fact wastes round
+trips and, worse, lets a majority overrule arithmetic. The following are SELF-VERIFYING and MUST be
+checked locally, never put to a quorum:
+
+* **A coin id.** It is `sha256(parent_coin_info ‖ puzzle_hash ‖ amount)`. An implementation MUST DERIVE
+  the id from the coin's own fields and MUST NOT store a peer-supplied id.
+* **A header block's hash.** `HeaderBlock::header_hash()` folds the block's own foliage, so "is this the
+  block you named?" is decidable locally. WHICH header hash is canonical at a height is NOT decidable
+  locally and IS the quorum'd question; the two MUST NOT be conflated.
+* **The genesis challenge and network id.** These are pinned by the node and enforced by the peer
+  handshake. No quorum may change them.
+
+**Spentness is monotone and MUST NOT be voted on.** Believing a spent coin is spendable produces a double
+spend; believing a spendable coin is spent produces a smaller balance and a retry. Resolution is
+therefore fail-closed union, not majority rule: ANY credible report of SPENT marks the coin spent, even a
+lone one, while UNSPENT requires the WHOLE sample to answer and to agree. A peer that did not answer
+counts against unspentness. Only a coin the whole sample reported unspent at the settled height is
+selectable on the spend path.
+
+**The corroborated read is the one that reaches coin selection.** There MUST NOT be a separate display
+path carrying an uncorroborated single-peer read. `routing::route` gates wallet-scoped reads on
+`initial_sync_complete`, and that flag MUST be reachable only through an operator or corroborated
+session.
+
+18.6e. **The Sybil limit, stated honestly.** Random selection raises an attacker's cost; it does NOT
+eliminate the attack, and an implementation MUST NOT imply otherwise to a user.
+
+An attacker controlling a fraction `f` of the discoverable peer set carries a 3-of-4 round with
+probability `P(≥3 hostile of 4)`: about **0.4%** at `f = 0.1`, about **8%** at `f = 0.3`, and about
+**31%** at `f = 0.5`. As `f` approaches 1, agreement degrades to agreement among the attacker's own
+peers and the model provides no protection whatever.
+
+Three further limits are part of the honest statement:
+
+* **Denial is cheaper than forgery.** Two hostile peers of four suffice to force a Split and stall the
+  write, where three are needed to forge one. This asymmetry is deliberate: a stalled sync is visible and
+  recoverable, a forged one is neither.
+* **Discovery selection is imperfectly random.** `connect_random_peer` tries `127.0.0.1` before any
+  introducer and then returns the first address that connects, so a co-resident process and a fast,
+  always-up node are both over-represented among probes. Requiring DISTINCT addresses within a round
+  prevents one peer from supplying an entire quorum, but does not equalise the draw.
+* **A corroborated session is not a corroborated peer.** Authority is granted per session and per answer.
+  It MUST NOT be persisted.
+
 
 Beyond the boundary, the supervisor MUST hold all four of the following for an operator peer too.
 
