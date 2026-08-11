@@ -3950,15 +3950,31 @@ and `null` when unobservable. `control.peerCounts` reports `{dig_peer_count, chi
 known_dig_peer_count}`, and its `chia_peer_count` MUST be the SAME observation this method reports.
 
 **The two nothing-to-watch phases are DEFAULT-INSTALL states and MUST NOT be reported as `syncing`.** A
-node with no wallet enrolled holds zero puzzle hashes; §18.6 REFUSES a catch-up over an empty set, so
-`initial_sync_complete` can never latch, while `new_peak_wallet` keeps the replica's peak advancing with the
-chain indefinitely. Three facts establish that a session is watching nothing: a Chia peer is attached RIGHT
-NOW; that peer's effective trust is authoritative (`Operator` or `Corroborated`, §18.6a) so it MAY write;
-and the attached session resolved a MEASURED-EMPTY address set. The trust condition is load-bearing — an
-uncorroborated writer's subscription set is forced empty too, and that replica is deliberately NOT being
-written and IS falling behind, so reporting it as nothing-to-watch would present a stalled replica as a
-healthy one. `synced` outranks both: once `initial_sync_complete` is `true` with a peer attached, the node
-reports `synced`.
+node that has NEVER enrolled a wallet holds zero puzzle hashes; §18.6 REFUSES a catch-up over an empty set,
+so on that node `initial_sync_complete` never latches, while `new_peak_wallet` keeps the replica's peak
+advancing with the chain indefinitely. Three facts establish that a session is watching nothing: a Chia peer
+is attached RIGHT NOW; that peer's effective trust is authoritative (`Operator` or `Corroborated`, §18.6a)
+so it MAY write; and the attached session resolved a MEASURED-EMPTY address set. The trust condition is
+load-bearing — an uncorroborated writer's subscription set is forced empty too, and that replica is
+deliberately NOT being written and IS falling behind, so reporting it as nothing-to-watch would present a
+stalled replica as a healthy one.
+
+**The nothing-to-watch determination OUTRANKS `synced`, and that ORDER IS NORMATIVE.** A wallet that
+enrolled, completed a catch-up, and was then RESTARTED carries a latched `initial_sync_complete` — the flag
+is persistent, and only a backwards chain move clears it — while its addresses are not derivable because it
+is locked. A node MUST NOT report `synced` in that state; it MUST report `wallet_not_unlocked`. The latched
+flag records that a catch-up once finished, which is true and irrelevant to whether THIS session is
+following the user's coins. Testing `synced` first is exactly the defect dig_ecosystem#2609 removed: it
+reported `synced` beside `watched_addresses: 0` — settled, while the user's coins were not being followed —
+on the most common post-restart path there is.
+
+**A REFUSED writer is a KNOWN GAP, stated rather than glossed (dig_ecosystem#2666).** Because the empty-set
+determination requires an authoritative peer, an uncorroborated writer skips it and a node whose
+`initial_sync_complete` is latched reports `synced` while watching nothing and while its replica peak is
+frozen — §18.6a drops every `new_peak_wallet` from a non-authoritative peer. That is a stale reading
+presented as a current one, and it is NOT yet fixed. A conforming implementation SHOULD additionally
+require an authoritative peer before reporting `synced`; this specification will make that a MUST once
+#2666 lands.
 
 A FOURTH fact decides WHICH of the two, and they mean opposite things. The node MUST read it from custody's
 MANIFEST (is any wallet enrolled) and MUST NOT infer it from the derivable key set, which is empty for a
