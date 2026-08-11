@@ -8702,19 +8702,24 @@ mod tests {
         assert_eq!(present, 1, "the byte budget holds exactly one such entry");
     }
 
-    /// #2735: the blind-serve host identity is minted per serve and is never a STABLE key.
+    /// #2735: [`anonymous_blind_serve_config`] mints a fresh identity per call, never a STABLE key.
     ///
     /// The assertion is deliberately "two calls differ" rather than "is not `[0u8; 32]`", because
-    /// every wrong answer this guards against is stable across calls and so is refuted by the SAME
-    /// check: the world-known all-zero seed this replaced, the `[42u8; 32]` of the sibling defect
-    /// (#2553), and — the one that matters most — the node's own persisted machine identity, which
-    /// must never reach a sandbox running publisher-supplied wasm (#908, and the signing oracle
+    /// every wrong answer is stable across calls and so is refuted by the SAME check: the
+    /// world-known all-zero seed this replaced, the `[42u8; 32]` of the sibling defect (#2553),
+    /// and — the one that matters most — the node's own persisted machine identity, which must
+    /// never reach a sandbox running publisher-supplied wasm (#908, and the signing oracle
     /// documented on [`anonymous_blind_serve_config`]). A test naming only the all-zero seed would
     /// pass for a fix that swapped in the node's real key, which is a WORSE outcome than the defect.
     ///
-    /// The named seeds are then checked individually so a failure says which regression returned.
+    /// Scope, stated precisely because the first version of this test overclaimed it: this covers
+    /// the HELPER only. It does not execute [`serve_local_blocking`], so it cannot see the
+    /// production call site regressing back to a constant while the helper sits beside it, still
+    /// passing. That is what
+    /// [`no_production_site_builds_a_blind_serve_identity_from_a_fixed_seed`] is for; the two are
+    /// complementary and neither alone is sufficient.
     #[test]
-    fn blind_serve_identity_is_minted_per_serve_and_never_a_stable_key() {
+    fn blind_serve_identity_is_minted_per_call_and_never_a_stable_key() {
         let store_id = Bytes32([0x5au8; 32]);
 
         let first = anonymous_blind_serve_config(store_id).expect("OS CSPRNG available");
@@ -8730,16 +8735,98 @@ mod tests {
         for (seed, what) in [
             ([0u8; 32], "the world-known all-zero seed (#2735)"),
             ([42u8; 32], "the sibling constant seed (#2553)"),
-            ([0xABu8; 32], "a stand-in for the node's persisted identity seed (#908)"),
+            (
+                [0xABu8; 32],
+                "a stand-in for the node's persisted identity seed (#908)",
+            ),
         ] {
             let stable = BlindServeConfig::from_seed(store_id, &seed).bls_public.0;
-            assert_ne!(first.bls_public.0, stable, "blind serve derived from {what}");
-            assert_ne!(second.bls_public.0, stable, "blind serve derived from {what}");
+            assert_ne!(
+                first.bls_public.0, stable,
+                "blind serve derived from {what}"
+            );
+            assert_ne!(
+                second.bls_public.0, stable,
+                "blind serve derived from {what}"
+            );
         }
 
         // The store id is still the caller's — only the identity is anonymous.
         assert_eq!(first.store_id.0, store_id.0);
         assert_eq!(second.store_id.0, store_id.0);
+    }
+
+    /// #2735 at the SOURCE level: no production site may build a blind-serve identity from a fixed
+    /// seed, and [`serve_local_blocking`] must mint its own through the anonymous helper.
+    ///
+    /// The behavioural test above exercises the helper, which structurally cannot see the
+    /// regression that actually threatens this code: editing [`serve_local_blocking`] back to
+    /// `BlindServeConfig::from_seed(store_id, &[0u8; 32])` — or to the node's persisted identity —
+    /// leaves the helper intact and every behavioural assertion green, because the production path
+    /// no longer calls the thing under test. Only a `dead_code` warning would have caught that, and
+    /// only until a second caller existed. "No FUTURE call site either" is not expressible
+    /// behaviourally, so it is asserted over the source, the same way
+    /// `dig-node-service/src/service.rs` and `dig-wallet/src/lib.rs` assert their own such rules.
+    ///
+    /// Only the PRODUCTION half is scanned: this test module necessarily spells the forbidden
+    /// construction, and matching itself would make the guard unfalsifiable.
+    #[test]
+    fn no_production_site_builds_a_blind_serve_identity_from_a_fixed_seed() {
+        let whole = include_str!("lib.rs");
+        let production = whole
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(before, _)| before)
+            .expect("the test module marks the end of production code");
+
+        let sites: Vec<(usize, &str)> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("BlindServeConfig::from_seed("))
+            .map(|(i, line)| (i + 1, line.trim()))
+            .collect();
+        assert_eq!(
+            sites.len(),
+            1,
+            "exactly ONE production site may construct a blind-serve identity, and it must be \
+             anonymous_blind_serve_config. serve_blind hands this key to publisher-supplied wasm \
+             via host_create_attestation, so a second site is how a fixed or persisted key gets \
+             back in. Found: {sites:?}"
+        );
+        assert!(
+            sites[0].1.contains("&seed"),
+            "the sole blind-serve identity must be built from the OS-entropy `seed` buffer, never \
+             a literal seed and never a persisted key (#908). Found: {:?}",
+            sites[0]
+        );
+
+        let helper = production
+            .split("fn anonymous_blind_serve_config")
+            .nth(1)
+            .expect("anonymous_blind_serve_config is present")
+            .split("\nfn ")
+            .next()
+            .expect("the following item bounds the helper");
+        assert!(
+            helper.contains("getrandom::getrandom(&mut seed)"),
+            "the seed must come from the OS CSPRNG"
+        );
+        assert!(
+            helper.contains("BlindServeConfig::from_seed(store_id, &seed)"),
+            "the sole construction site must live inside the anonymous helper"
+        );
+
+        let serve = production
+            .split("fn serve_local_blocking")
+            .nth(1)
+            .expect("serve_local_blocking is present")
+            .split("\nfn ")
+            .next()
+            .expect("the following item bounds serve_local_blocking");
+        assert!(
+            serve.contains("anonymous_blind_serve_config(store_id)?"),
+            "the serve path must mint its identity through the anonymous helper and PROPAGATE its \
+             failure with `?`, never substitute a key when the CSPRNG is unavailable"
+        );
     }
 
     #[tokio::test]
