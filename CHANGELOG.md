@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.114.0] - 2026-08-11
+
+### Bug Fixes
+- **wallet:** Adopt the published phase contract and split the two empty-set states (#214)
+
 ## [0.113.0] - 2026-08-11
 
 ### Features
