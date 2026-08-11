@@ -976,6 +976,12 @@ fn production_any_wallet_reads_the_manifest_not_the_derivable_keys() {
 /// first fix left open.
 ///
 /// Acceptance bar: moving the `Synced` arm back above the empty-set arm MUST turn this red.
+///
+/// That is the WHOLE of what it pins. The peer here MAY write (`set_trust(true)`), so this test is
+/// silent about a REFUSED writer — that session skips the empty-set arm on `session_may_write` and
+/// still reaches `Synced` beside a measured `watched_addresses: 0` (#2666). Do not read a green
+/// here as "the node can no longer report synced while watching nothing"; it cannot report it
+/// *on this path*.
 #[tokio::test]
 async fn a_previously_synced_wallet_restarted_locked_is_not_reported_as_synced() {
     let db = WalletDb::open_in_memory().await.unwrap();

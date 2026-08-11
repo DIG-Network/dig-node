@@ -273,7 +273,15 @@ impl SyncHandle {
             // With `Synced` tested first, that node reported `synced` alongside
             // `watched_addresses: 0` — settled, while the user's coins were not being followed —
             // on the single most common post-restart path. Checking the empty set first means a
-            // completed catch-up can never speak for a session that is watching nothing.
+            // completed catch-up can never speak for a session that is watching nothing AND whose
+            // peer may write.
+            //
+            // THAT QUALIFIER IS LOAD-BEARING, NOT PEDANTRY. A REFUSED writer skips this arm
+            // entirely, because `session_may_write` is false, and falls through to `Synced` with a
+            // MEASURED zero watched set — `{phase: synced, watched_addresses: 0}`, the exact pair
+            // this arm exists to abolish, reached through the `PeerTrust::Discovered` door. This
+            // commit SHRINKS the set of states that can tell that lie; it does not empty it.
+            // The residue is #2666 and is not closed here.
             //
             // A FOURTH fact then decides WHICH nothing-to-watch this is, and the two mean opposite
             // things: no wallet at all is the honest all-clear, whereas an enrolled wallet whose

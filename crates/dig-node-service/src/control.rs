@@ -105,9 +105,12 @@ pub fn is_control_method(method: &str) -> bool {
 /// bit, never an identity: no address, key, or balance is revealed.
 ///
 /// Be precise about which field carries which disclosure, because the two are easy to swap. Both
-/// `no_wallet_enrolled` and `wallet_not_unlocked` report `watched_addresses: 0`; the measured zero
-/// separates that PAIR from `syncing`, and the ENROLLMENT bit — not the count — separates the two
-/// from each other. So the marginal disclosure this change adds is narrow: a node watching
+/// `no_wallet_enrolled` and `wallet_not_unlocked` report `watched_addresses: 0` — but so can
+/// `syncing`, since a refused writer watches nothing while still catching up
+/// (`a_refused_writer_is_not_reported_as_nothing_to_watch`). The count therefore does NOT identify
+/// that pair; the PHASE does, and the ENROLLMENT bit — not the count — separates the two from each
+/// other. Reading the zero as the discriminator over-credits it. So the marginal disclosure this
+/// change adds is narrow: a node watching
 /// addresses was already observably wallet-bearing via a non-zero count, and what is newly visible
 /// is the enrolled-but-unwatched case, previously indistinguishable from having no wallet.
 ///
