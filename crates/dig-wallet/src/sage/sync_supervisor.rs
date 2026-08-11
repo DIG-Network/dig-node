@@ -89,21 +89,37 @@ pub enum SyncPhase {
     Syncing,
     /// A catch-up has completed AND a peer is attached right now.
     Synced,
-    /// A peer that MAY WRITE is attached and the replica is following the chain, but custody
-    /// holds no puzzle hashes — so there is nothing wallet-scoped to catch up on.
+    /// **The honest all-clear: NO wallet is enrolled**, so there are no addresses to follow and a
+    /// sync has nothing to do.
     ///
-    /// This is the DEFAULT-INSTALL state, not an edge (dig_ecosystem#2609). A node with no wallet
-    /// enrolled has zero puzzle hashes; [`crate::sage::sync::initial_sync`] refuses to run over an
-    /// empty set, so `initial_sync_complete` never latches — while `new_peak_wallet` keeps the
-    /// replica's peak advancing with the chain. Reported as `Syncing`, that made every consumer
-    /// say "your node is still catching up" forever about a node that was at the tip.
+    /// This is the DEFAULT-INSTALL state, not an edge (dig_ecosystem#2609). With zero puzzle hashes
+    /// [`crate::sage::sync::initial_sync`] refuses to run, so `initial_sync_complete` never latches
+    /// — while `new_peak_wallet` keeps the replica's peak advancing with the chain. Reported as
+    /// `Syncing`, that made every consumer say "your node is still catching up" for ever about a
+    /// node sitting at the tip.
     ///
-    /// It is a SEPARATE variant rather than a fourth way of spelling `Synced` because the two
-    /// claims differ in what they license: `Synced` says wallet-scoped reads may be served from
-    /// the local replica, and [`crate::sage::routing::route`] would then treat an un-queried DB as
-    /// authoritative and read a funded wallet as empty. This variant says the chain replica is
+    /// It is NOT a fourth way of spelling `Synced`: `Synced` licenses
+    /// [`crate::sage::routing::route`] to serve wallet-scoped reads from the local replica, and
+    /// over an un-queried DB that reads a funded wallet as empty. This says the chain replica is
     /// current AND that no wallet-scoped claim is being made at all.
-    NoAddressesToWatch,
+    NoWalletEnrolled,
+    /// **A wallet IS enrolled, but no addresses are being watched for it** — so the user's coins
+    /// are not being followed.
+    ///
+    /// Distinguished from [`Self::NoWalletEnrolled`] because the two are identical from inside the
+    /// sync loop and mean opposite things: *nothing to do* versus *something to do that is not
+    /// being done*. Collapsing them would report a wallet whose coins are unwatched as an all-clear
+    /// — the exact class of falsehood #2609 exists to remove, one conflation further along.
+    ///
+    /// This is the COMMON state after every restart. [`super::custody::WalletCustody`] derives the
+    /// address set from key material it cannot reach while the wallet is locked, and nothing
+    /// back-fills it; an adopted legacy seed, a manifest predating the stored-public-keys field, a
+    /// self-healed manifest, and an entry whose key fails to decode all reach it too.
+    ///
+    /// Named NOT UNLOCKED rather than *locked* deliberately: an empty address set is what the node
+    /// can OBSERVE, and a lock is only the usual cause. A manifest that never carried the keys
+    /// arrives here with nothing locked. The phase claims the observation, not the cause.
+    WalletNotUnlocked,
 }
 
 /// The composed sync status: the phase, the replica's own peak, and the live peer count.
@@ -120,7 +136,7 @@ pub struct WalletSyncStatus {
     /// How many custodied puzzle hashes the ATTACHED session resolved for subscription.
     ///
     /// `Some(0)` is a MEASURED zero — custody genuinely holds nothing, which is the reason behind
-    /// [`SyncPhase::NoAddressesToWatch`]. `None` is unmeasured: no session is attached, or one is
+    /// [`SyncPhase::NoWalletEnrolled`]. `None` is unmeasured: no session is attached, or one is
     /// attached but has not yet resolved its set (corroboration runs first, and takes real time).
     /// The two must stay distinguishable — a `0` that merely means "not looked yet" would announce
     /// "nothing to watch" during every connect.
@@ -149,6 +165,11 @@ struct Observed {
     /// set; see [`WalletSyncStatus::watched_addresses`] on why measured-zero must not be spelled
     /// the same way as unmeasured.
     watched: Option<u32>,
+    /// Whether a wallet was enrolled when the attached session resolved its set — read from the
+    /// manifest, not from the derivable keys, so a LOCKED wallet still counts as enrolled.
+    /// Measured in the same breath as [`Self::watched`], because the pair is only meaningful
+    /// together.
+    wallet_enrolled: bool,
 }
 
 struct SyncHandleInner {
@@ -188,14 +209,25 @@ impl SyncHandle {
         } else if state.initial_sync_complete && observed.peers >= 1 {
             SyncPhase::Synced
         } else if observed.peers >= 1 && observed.session_may_write && observed.watched == Some(0) {
-            // Three facts, all required, and each rules out a different lie:
+            // Three facts get us to "this session is watching nothing", and each rules out a
+            // different lie:
             //   * a peer attached RIGHT NOW      — an offline replica is stale, not current;
             //   * that peer MAY WRITE            — a refused writer subscribes nothing too, and
             //                                      its replica is falling behind, not idle;
             //   * a MEASURED zero watched set    — `None` means the set is not resolved yet, and
-            //                                      claiming "nothing to watch" then would be an
-            //                                      unmeasured default announcing itself as a fact.
-            SyncPhase::NoAddressesToWatch
+            //                                      claiming anything then would be an unmeasured
+            //                                      default announcing itself as a fact.
+            //
+            // A FOURTH fact then decides WHICH nothing-to-watch this is, and the two mean opposite
+            // things: no wallet at all is the honest all-clear, whereas an enrolled wallet whose
+            // addresses are unreachable has coins that are NOT being followed. They are
+            // indistinguishable from the address set alone, which is exactly how the first version
+            // of this fix came to report a locked wallet as settled.
+            if observed.wallet_enrolled {
+                SyncPhase::WalletNotUnlocked
+            } else {
+                SyncPhase::NoWalletEnrolled
+            }
         } else {
             SyncPhase::Syncing
         };
@@ -242,6 +274,7 @@ impl SyncHandle {
             // let a peerless node keep answering as though a session had just resolved its set.
             o.session_may_write = false;
             o.watched = None;
+            o.wallet_enrolled = false;
         }
     }
 
@@ -263,10 +296,15 @@ impl SyncHandle {
     ///
     /// This is the MEASUREMENT that turns `watched` from `None` into `Some(n)`; until it lands,
     /// the count is genuinely unknown even though the trust may already be decided.
+    ///
+    /// `wallet_enrolled` is taken in the SAME call because an empty count is only interpretable
+    /// beside it: zero-with-no-wallet and zero-with-a-locked-wallet are the same number and
+    /// opposite states.
     #[doc(hidden)]
-    pub fn set_watched(&self, watched: u32) {
+    pub fn set_watched(&self, watched: u32, wallet_enrolled: bool) {
         let mut o = self.inner.observed.write().expect("observed lock poisoned");
         o.watched = Some(watched);
+        o.wallet_enrolled = wallet_enrolled;
     }
 }
 
@@ -295,6 +333,16 @@ pub async fn status_without_supervisor(db: &WalletDb) -> sqlx::Result<WalletSync
 pub trait PuzzleHashSource: Send + Sync {
     /// The puzzle hashes to subscribe. Empty is a legitimate answer (no wallet yet).
     fn puzzle_hashes(&self) -> Vec<Bytes32>;
+
+    /// Whether ANY wallet is enrolled on this node, regardless of whether its addresses are
+    /// currently derivable.
+    ///
+    /// The fact that separates the two empty-set states (dig_ecosystem#2609). An empty
+    /// [`Self::puzzle_hashes`] is produced BOTH by a node that has no wallet — the honest
+    /// all-clear — and by an enrolled wallet whose keys the node cannot reach, which is the common
+    /// state after every restart and means the user's coins are NOT being followed. The two are
+    /// indistinguishable from the address set alone, so the phase has to ask this separately.
+    fn any_wallet(&self) -> bool;
 }
 
 /// Custody's persisted PUBLIC keys, mapped through the crate's established
@@ -312,6 +360,13 @@ impl PuzzleHashSource for WalletCustody {
         // test asserting one) reproducible.
         hashes.sort();
         hashes
+    }
+
+    /// Reads the manifest, NOT the derivable key set — which is the entire point. A locked wallet
+    /// is enrolled and contributes no puzzle hashes, and only this distinguishes it from a node
+    /// that has no wallet at all.
+    fn any_wallet(&self) -> bool {
+        WalletCustody::any_wallet(self)
     }
 }
 
@@ -615,8 +670,11 @@ impl Supervisor {
             // The MEASUREMENT of the subscription set. Paired with the trust recorded above, the
             // phase can now tell "custody holds nothing" from "this writer was refused" — the two
             // produce an identical empty set here, and only the first is the benign
-            // `NoAddressesToWatch` (dig_ecosystem#2609).
-            handle.set_watched(puzzle_hashes.len() as u32);
+            // the two nothing-to-watch phases (dig_ecosystem#2609).
+            // Enrollment is read from the MANIFEST, not from the set above: a locked wallet
+            // contributes no hashes and is still enrolled, and that difference is the whole of
+            // `WalletNotUnlocked`.
+            handle.set_watched(puzzle_hashes.len() as u32, self.puzzle_hashes.any_wallet());
             if nothing_subscribed {
                 // Nothing to subscribe. The session still runs: for an OPERATOR peer with an
                 // empty puzzle-hash set, `new_peak_wallet` needs no subscription and the

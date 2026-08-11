@@ -231,14 +231,58 @@ impl PuzzleHashSource for MutableHashes {
     fn puzzle_hashes(&self) -> Vec<Bytes32> {
         self.0.lock().unwrap().clone()
     }
+
+    /// Hashes appearing IS the wallet appearing, for this double.
+    fn any_wallet(&self) -> bool {
+        !self.0.lock().unwrap().is_empty()
+    }
 }
 
 /// A fixed puzzle-hash set, for tests that do not need real custody.
-struct FixedHashes(Vec<Bytes32>);
+///
+/// `enrolled` is carried SEPARATELY from the set rather than derived from it, because the state
+/// this double has to be able to express is precisely the one where they disagree: an enrolled
+/// wallet whose addresses are unreachable (dig_ecosystem#2609). A double that computed enrollment
+/// from `is_empty()` could not represent a locked wallet at all, and the phase distinguishing them
+/// would be untestable.
+struct FixedHashes {
+    hashes: Vec<Bytes32>,
+    enrolled: bool,
+}
+
+impl FixedHashes {
+    /// No wallet at all: no hashes, nothing enrolled.
+    fn none() -> Self {
+        Self {
+            hashes: Vec::new(),
+            enrolled: false,
+        }
+    }
+
+    /// A wallet whose addresses ARE derivable.
+    fn unlocked(hashes: Vec<Bytes32>) -> Self {
+        Self {
+            hashes,
+            enrolled: true,
+        }
+    }
+
+    /// An ENROLLED wallet the node holds no addresses for — the post-restart shape.
+    fn enrolled_without_addresses() -> Self {
+        Self {
+            hashes: Vec::new(),
+            enrolled: true,
+        }
+    }
+}
 
 impl PuzzleHashSource for FixedHashes {
     fn puzzle_hashes(&self) -> Vec<Bytes32> {
-        self.0.clone()
+        self.hashes.clone()
+    }
+
+    fn any_wallet(&self) -> bool {
+        self.enrolled
     }
 }
 
@@ -470,7 +514,7 @@ async fn supervisor_with_no_derivations_still_advances_the_replica_peak() {
 
     let h = Harness::start(
         db.clone(),
-        Arc::new(FixedHashes(vec![])),
+        Arc::new(FixedHashes::none()),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
     )
@@ -496,7 +540,7 @@ async fn supervisor_with_no_derivations_still_advances_the_replica_peak() {
 }
 
 /// **Proves (#2609), end to end through the real supervisor:** a default install — an
-/// authoritative peer and NO wallet enrolled — settles on `NoAddressesToWatch` rather than
+/// authoritative peer and NO wallet enrolled — settles on `NoWalletEnrolled` rather than
 /// reporting `Syncing` for ever.
 ///
 /// The handle-level tests above set the two session facts directly, which pins the ladder but not
@@ -508,14 +552,14 @@ async fn a_default_install_with_no_wallet_settles_on_nothing_to_watch() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let h = Harness::start(
         db.clone(),
-        Arc::new(FixedHashes(Vec::new())),
+        Arc::new(FixedHashes::none()),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
     )
     .await;
 
     h.until_status("nothing to watch", |s| {
-        s.phase == SyncPhase::NoAddressesToWatch
+        s.phase == SyncPhase::NoWalletEnrolled
     })
     .await;
 
@@ -607,7 +651,7 @@ async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnec
     let db = WalletDb::open_in_memory().await.unwrap();
     let h = Harness::start_with_trust(
         db.clone(),
-        Arc::new(FixedHashes(vec![Bytes32::new([4; 32])])),
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([4; 32])])),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
         PeerTrust::Discovered,
@@ -768,7 +812,7 @@ async fn phase_ladder_not_started_syncing_synced() {
 }
 
 /// **Proves (#2609):** an authoritative peer attached over a GENUINELY empty custody set reports
-/// `NoAddressesToWatch`, not `Syncing`.
+/// `NoWalletEnrolled`, not `Syncing`.
 ///
 /// This is the default-install shape and the whole defect: with no wallet enrolled there are zero
 /// puzzle hashes, so `initial_sync::catch_up` is never called, so `initial_sync_complete` can
@@ -788,12 +832,12 @@ async fn phase_is_no_addresses_to_watch_when_custody_is_empty_on_a_writing_peer(
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
     handle.set_trust(true);
-    handle.set_watched(0);
+    handle.set_watched(0, false);
 
     let status = handle.status(&db).await.unwrap();
     assert_eq!(
         status.phase,
-        SyncPhase::NoAddressesToWatch,
+        SyncPhase::NoWalletEnrolled,
         "a replica at the tip with nothing to watch is not 'catching up'"
     );
     assert_eq!(status.peak_height, Some(9_131_403));
@@ -822,7 +866,7 @@ async fn a_refused_writer_is_not_reported_as_nothing_to_watch() {
     // What the supervisor records for an uncorroborated session: it subscribed nothing, but it
     // subscribed nothing because it may not write — not because custody is empty.
     handle.set_trust(false);
-    handle.set_watched(0);
+    handle.set_watched(0, false);
 
     assert_eq!(
         handle.status(&db).await.unwrap().phase,
@@ -831,7 +875,7 @@ async fn a_refused_writer_is_not_reported_as_nothing_to_watch() {
     );
 }
 
-/// **Proves (#2609):** the phase does not flip to `NoAddressesToWatch` on an UNMEASURED
+/// **Proves (#2609):** the phase does not flip to `NoWalletEnrolled` on an UNMEASURED
 /// subscription set, EVEN WHEN the attached peer may write.
 ///
 /// This is the state the supervisor genuinely occupies between `trust_for_session` returning and
@@ -893,10 +937,10 @@ async fn dropping_a_session_clears_its_subscription_facts() {
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
     handle.set_trust(true);
-    handle.set_watched(0);
+    handle.set_watched(0, false);
     assert_eq!(
         handle.status(&db).await.unwrap().phase,
-        SyncPhase::NoAddressesToWatch
+        SyncPhase::NoWalletEnrolled
     );
 
     handle.set_connected(0);
@@ -918,7 +962,7 @@ async fn an_enrolled_wallet_mid_catch_up_still_reports_syncing() {
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
     handle.set_trust(true);
-    handle.set_watched(3);
+    handle.set_watched(3, true);
 
     let status = handle.status(&db).await.unwrap();
     assert_eq!(status.phase, SyncPhase::Syncing);
@@ -1004,7 +1048,7 @@ async fn backoff_grows_then_resets_after_a_long_lived_connection() {
         // session
         // additionally re-polls for a newly-created wallet on its own interval, and those sleeps
         // would be indistinguishable from backoff rungs here.
-        Arc::new(FixedHashes(vec![Bytes32::new([4; 32])])),
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([4; 32])])),
         script,
         vec!["203.0.113.1:8444".into()],
     )
@@ -1050,7 +1094,7 @@ async fn reconnect_reruns_catch_up() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let h = Harness::start(
         db,
-        Arc::new(FixedHashes(vec![Bytes32::new([5; 32])])),
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([5; 32])])),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
     )
@@ -1074,7 +1118,7 @@ async fn shutdown_stops_the_supervisor_and_the_task_ends() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let h = Harness::start(
         db,
-        Arc::new(FixedHashes(vec![])),
+        Arc::new(FixedHashes::none()),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
     )
@@ -1128,7 +1172,7 @@ async fn user_managed_peers_are_tried_before_discovery() {
     let script = Script::new();
     script.outcomes.lock().unwrap().push_back(true);
 
-    let h = Harness::start(db, Arc::new(FixedHashes(vec![])), script, addrs).await;
+    let h = Harness::start(db, Arc::new(FixedHashes::none()), script, addrs).await;
     h.until("a dial", |s| !s.dialled.lock().unwrap().is_empty())
         .await;
 
@@ -1189,7 +1233,7 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
     let factory = Arc::new(ChiaPeerSessionFactory::mainnet(db.clone()));
     let (handle, join) = spawn_supervisor(Supervisor {
         db: db.clone(),
-        puzzle_hashes: Arc::new(FixedHashes(vec![])),
+        puzzle_hashes: Arc::new(FixedHashes::none()),
         factory,
         events: Arc::new(EventBus::default()),
         genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
@@ -1326,7 +1370,7 @@ async fn run_discovered_session(
     let db = WalletDb::open_in_memory().await.unwrap();
     let script = Script::new();
     *script.writer_answer.lock().unwrap() = writer_answer;
-    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes(vec![Bytes32::new([7; 32])]));
+    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
 
     let harness = Harness::start_full(
         db.clone(),
@@ -1485,7 +1529,7 @@ async fn corroboration_switched_off_leaves_a_discovered_peer_writing_nothing() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let script = Script::new();
     *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
-    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes(vec![Bytes32::new([7; 32])]));
+    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
 
     let harness = Harness::start_full(
         db.clone(),
