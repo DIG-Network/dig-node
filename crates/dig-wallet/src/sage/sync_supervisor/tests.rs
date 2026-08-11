@@ -815,9 +815,16 @@ async fn phase_ladder_not_started_syncing_synced() {
 /// every variant in `ALL`.
 ///
 /// `as_wire` is what the cross-crate conformance test compares against the published contract, so
-/// if it could drift from the real serialization that test would be checking a fiction. Driving
-/// both from the same variant list also means a NEW variant cannot be added without appearing
-/// here.
+/// if it could drift from the real serialization that test would be checking a fiction.
+///
+/// This test covers the SPELLING only. It does NOT establish that `ALL` is complete — an earlier
+/// version of this comment claimed it did, and both pre-merge gates proved that claim false by
+/// adding a variant, giving it an `as_wire` arm, and leaving `ALL` alone: every check here stayed
+/// green because they all iterate `ALL` and so could not see what was missing from it. That hole
+/// is now closed STRUCTURALLY rather than by assertion — `declare_sync_phases!` expands the enum,
+/// `ALL` and `as_wire` from one list, so a variant absent from `ALL` cannot be written. Saying so
+/// precisely matters: a gate whose rationale overstates its reach is how a gate becomes a
+/// decoration.
 #[test]
 fn as_wire_matches_the_serialized_token_for_every_phase() {
     for phase in SyncPhase::ALL {
@@ -904,6 +911,116 @@ async fn an_enrolled_wallet_with_no_derivable_addresses_is_not_an_all_clear() {
         "the two empty-set states must not collapse into one another"
     );
     assert_eq!(status.watched_addresses, Some(0));
+}
+
+/// **Proves (#2609, review finding 1):** the PRODUCTION `any_wallet()` reads the MANIFEST, not the
+/// derivable key set — over a real [`WalletCustody`], not a double.
+///
+/// Every other locked-wallet test in this file goes through `FixedHashes`, which carries the two
+/// facts independently by construction. That proves the ladder, and proves nothing about the one
+/// implementation the node actually runs. The review demonstrated the gap by replacing the body of
+/// `<WalletCustody as PuzzleHashSource>::any_wallet` with
+/// `!PuzzleHashSource::puzzle_hashes(self).is_empty()` — the exact wrong implementation the docs
+/// warn against, which makes `WalletNotUnlocked` unreachable in production and silently restores
+/// the all-clear — and the whole suite stayed green at 456 passed.
+///
+/// The state reproduced here is real and is one of the four the security audit enumerated: a
+/// SELF-HEALED manifest. `load_and_reconcile` rebuilds a missing `index.json` from the seed files
+/// on disk, adopting each with `public_keys: Vec::new()`, so the wallet is enrolled while no
+/// address is derivable — with nothing locked, incidentally, which is why the phase is named for
+/// the observation rather than the cause.
+///
+/// Acceptance bar: implementing `any_wallet()` in terms of `puzzle_hashes()` MUST turn this red.
+#[test]
+fn production_any_wallet_reads_the_manifest_not_the_derivable_keys() {
+    let dir = scratch();
+    let custody = WalletCustody::mainnet(dir.clone());
+    custody
+        .create(&test_custody_password(), None)
+        .expect("create a custodied wallet");
+
+    // Drop the manifest so the next construction must rebuild it from the seed files alone. No
+    // seed is read, written, or inspected here — only the index beside them is removed.
+    let manifest = dir.join("wallets").join("index.json");
+    assert!(
+        manifest.exists(),
+        "the fixture must have written a manifest"
+    );
+    std::fs::remove_file(&manifest).expect("remove the manifest");
+
+    // A fresh custody over the same directory: seeds present, manifest rebuilt without keys.
+    let healed = WalletCustody::mainnet(dir);
+
+    assert!(
+        PuzzleHashSource::puzzle_hashes(&healed).is_empty(),
+        "the premise: a self-healed manifest carries no public keys, so no address is derivable"
+    );
+    assert!(
+        PuzzleHashSource::any_wallet(&healed),
+        "the wallet IS enrolled — a seed file is on disk and the manifest was rebuilt from it. \
+         Sourcing this from the derivable key set would report the all-clear over a real wallet."
+    );
+}
+
+/// **Proves (#2609, review finding 3):** a wallet that ALREADY completed a catch-up and is then
+/// restarted LOCKED reports `WalletNotUnlocked`, never `Synced`.
+///
+/// The arm-ordering regression, and the nastiest case in this file because every input looks
+/// healthy. `initial_sync_complete` is PERSISTENT — `db.rs` only ever clears it on a backwards
+/// chain move — so it survives the restart and says "a catch-up once finished", which is true and
+/// irrelevant. Meanwhile the address set is empty, because keys are not derivable while locked.
+///
+/// With the `Synced` arm tested first, this node reported `synced` beside `watched_addresses: 0`:
+/// settled, while the user's coins were not being followed, on the most common post-restart path
+/// there is. It is the same falsehood #2609 exists to remove, arriving through the one door the
+/// first fix left open.
+///
+/// Acceptance bar: moving the `Synced` arm back above the empty-set arm MUST turn this red.
+#[tokio::test]
+async fn a_previously_synced_wallet_restarted_locked_is_not_reported_as_synced() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(9_131_403, "aa").await.unwrap();
+    // The catch-up genuinely completed in an earlier run, and the flag persists across restarts.
+    db.set_initial_sync_complete(true).await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    // Restarted locked: the wallet is still enrolled, its addresses are not derivable.
+    handle.set_watched(0, true);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::WalletNotUnlocked,
+        "a latched initial_sync_complete must not speak for a session watching zero addresses"
+    );
+    assert_ne!(
+        status.phase,
+        SyncPhase::Synced,
+        "reporting synced while watching nothing is the exact falsehood this ticket removes"
+    );
+    assert_eq!(status.watched_addresses, Some(0));
+}
+
+/// **Proves (#2609):** a completed catch-up that IS watching addresses still reports `Synced`.
+///
+/// The control for the test above — the reordering must not swallow the legitimate synced case.
+#[tokio::test]
+async fn a_completed_catch_up_still_reports_synced_while_watching_addresses() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_initial_sync_complete(true).await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(3, true);
+
+    assert_eq!(
+        handle.status(&db).await.unwrap().phase,
+        SyncPhase::Synced,
+        "a wallet actually watching addresses after a completed catch-up is synced"
+    );
 }
 
 /// **Proves (#2609):** the enrolled-but-unwatched state is reached through the REAL supervisor,

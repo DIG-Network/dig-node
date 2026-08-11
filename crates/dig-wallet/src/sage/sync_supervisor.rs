@@ -78,38 +78,88 @@ const PUZZLE_HASH_POLL: Duration = Duration::from_secs(5);
 // The observable state
 // ---------------------------------------------------------------------------
 
-/// The wallet's sync phase, as a consumer should render it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SyncPhase {
+/// Declares the sync phases ONCE, and derives everything from that single list.
+///
+/// The enum, [`SyncPhase::ALL`] and [`SyncPhase::as_wire`] are all expanded from the same
+/// invocation, so a variant CANNOT exist without appearing in `ALL` and without a wire spelling.
+/// That is the whole reason this is a macro rather than three hand-maintained lists.
+///
+/// # The hole this closes, which was found by execution
+///
+/// `ALL` used to be a hand-written slice with no compile-time tie to the enum. Both pre-merge
+/// gates independently built the same probe: add a variant, give it an `as_wire` arm (the compiler
+/// demands one), leave `ALL` alone — and every conformance check passed, because all three of them
+/// iterate `ALL` and therefore could not see the variant missing from it. The node would ship a
+/// token the published contract had never heard of: dig_ecosystem#2609, recurring through the very
+/// guard written to prevent it.
+///
+/// A gate that cannot observe the thing it claims to observe is a decoration. Deriving the list
+/// makes the omission unrepresentable rather than merely discouraged.
+macro_rules! declare_sync_phases {
+    ($( $(#[$variant_doc:meta])* $variant:ident => $wire:literal ),+ $(,)?) => {
+        /// The wallet's sync phase, as a consumer should render it.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum SyncPhase {
+            $( $(#[$variant_doc])* $variant, )+
+        }
+
+        impl SyncPhase {
+            /// Every phase this node can emit, derived from the declaration above.
+            ///
+            /// The published `dig_node_control_interface::results::WalletSyncPhase` carries the
+            /// same set, and this list MUST be a SUBSET of it — the contract states that a node
+            /// must not emit a token outside its declared set. `dig-wallet` cannot see that crate,
+            /// so the two are tied together by a conformance test in `dig-node-service`, which
+            /// can see both.
+            pub const ALL: &'static [SyncPhase] = &[ $( SyncPhase::$variant ),+ ];
+
+            /// This phase's exact wire spelling.
+            ///
+            /// Pinned against the serde output by a test in this module, so a `rename_all` change
+            /// cannot leave this describing a spelling the wire no longer uses.
+            pub fn as_wire(self) -> &'static str {
+                match self { $( SyncPhase::$variant => $wire ),+ }
+            }
+        }
+    };
+}
+
+declare_sync_phases! {
     /// No peer has ever been attached in this process. Nothing is known yet.
-    NotStarted,
+    NotStarted => "not_started",
     /// A peer is attaching, catching up, or the replica is otherwise not both caught up AND
     /// currently following the chain.
-    Syncing,
-    /// A catch-up has completed AND a peer is attached right now.
-    Synced,
+    Syncing => "syncing",
+    /// A catch-up has completed, a peer is attached right now, AND addresses are actually being
+    /// watched.
+    ///
+    /// The last clause is not decoration. `initial_sync_complete` is persistent, so on its own it
+    /// would report a wallet that caught up yesterday and restarted LOCKED as settled while
+    /// watching nothing — see the arm ordering in [`SyncHandle::status`].
+    Synced => "synced",
     /// **The honest all-clear: NO wallet is enrolled**, so there are no addresses to follow and a
     /// sync has nothing to do.
     ///
-    /// This is the DEFAULT-INSTALL state, not an edge (dig_ecosystem#2609). With zero puzzle hashes
-    /// [`crate::sage::sync::initial_sync`] refuses to run, so `initial_sync_complete` never latches
-    /// — while `new_peak_wallet` keeps the replica's peak advancing with the chain. Reported as
-    /// `Syncing`, that made every consumer say "your node is still catching up" for ever about a
-    /// node sitting at the tip.
+    /// This is the DEFAULT-INSTALL state, not an edge (dig_ecosystem#2609). With zero puzzle
+    /// hashes [`crate::sage::sync::initial_sync`] refuses to run, so `initial_sync_complete` never
+    /// latches — while `new_peak_wallet` keeps the replica's peak advancing with the chain.
+    /// Reported as `Syncing`, that made every consumer say "your node is still catching up" for
+    /// ever about a node sitting at the tip.
     ///
     /// It is NOT a fourth way of spelling `Synced`: `Synced` licenses
     /// [`crate::sage::routing::route`] to serve wallet-scoped reads from the local replica, and
     /// over an un-queried DB that reads a funded wallet as empty. This says the chain replica is
     /// current AND that no wallet-scoped claim is being made at all.
-    NoWalletEnrolled,
+    NoWalletEnrolled => "no_wallet_enrolled",
     /// **A wallet IS enrolled, but no addresses are being watched for it** — so the user's coins
     /// are not being followed.
     ///
     /// Distinguished from [`Self::NoWalletEnrolled`] because the two are identical from inside the
     /// sync loop and mean opposite things: *nothing to do* versus *something to do that is not
-    /// being done*. Collapsing them would report a wallet whose coins are unwatched as an all-clear
-    /// — the exact class of falsehood #2609 exists to remove, one conflation further along.
+    /// being done*. Collapsing them would report a wallet whose coins are unwatched as an
+    /// all-clear — the exact class of falsehood #2609 exists to remove, one conflation further
+    /// along.
     ///
     /// This is the COMMON state after every restart. [`super::custody::WalletCustody`] derives the
     /// address set from key material it cannot reach while the wallet is locked, and nothing
@@ -119,40 +169,7 @@ pub enum SyncPhase {
     /// Named NOT UNLOCKED rather than *locked* deliberately: an empty address set is what the node
     /// can OBSERVE, and a lock is only the usual cause. A manifest that never carried the keys
     /// arrives here with nothing locked. The phase claims the observation, not the cause.
-    WalletNotUnlocked,
-}
-
-impl SyncPhase {
-    /// Every phase this node can emit.
-    ///
-    /// Exists so the set is a VALUE rather than something a reader has to reconstruct by eye. The
-    /// published `dig_node_control_interface::results::WalletSyncPhase` carries the same list, and
-    /// the node's list MUST be a subset of it — the contract says a node must not emit a token
-    /// outside its declared set. `dig-wallet` cannot see that crate (it does not depend on it), so
-    /// the two are tied together by a conformance test up in `dig-node-service`, which can see
-    /// both. That test is the one that would have caught #2609 shipping a token the contract had
-    /// never heard of.
-    pub const ALL: &'static [SyncPhase] = &[
-        SyncPhase::NotStarted,
-        SyncPhase::Syncing,
-        SyncPhase::Synced,
-        SyncPhase::NoWalletEnrolled,
-        SyncPhase::WalletNotUnlocked,
-    ];
-
-    /// This phase's exact wire spelling.
-    ///
-    /// Pinned against the serde output by a test in this module, so a `rename_all` change cannot
-    /// leave this function describing a spelling the wire no longer uses.
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            SyncPhase::NotStarted => "not_started",
-            SyncPhase::Syncing => "syncing",
-            SyncPhase::Synced => "synced",
-            SyncPhase::NoWalletEnrolled => "no_wallet_enrolled",
-            SyncPhase::WalletNotUnlocked => "wallet_not_unlocked",
-        }
-    }
+    WalletNotUnlocked => "wallet_not_unlocked",
 }
 
 /// The composed sync status: the phase, the replica's own peak, and the live peer count.
@@ -239,8 +256,6 @@ impl SyncHandle {
         let state = db.sync_state().await?;
         let phase = if !observed.ever_connected {
             SyncPhase::NotStarted
-        } else if state.initial_sync_complete && observed.peers >= 1 {
-            SyncPhase::Synced
         } else if observed.peers >= 1 && observed.session_may_write && observed.watched == Some(0) {
             // Three facts get us to "this session is watching nothing", and each rules out a
             // different lie:
@@ -250,6 +265,15 @@ impl SyncHandle {
             //   * a MEASURED zero watched set    — `None` means the set is not resolved yet, and
             //                                      claiming anything then would be an unmeasured
             //                                      default announcing itself as a fact.
+            //
+            // THE ORDER OF THESE ARMS IS LOAD-BEARING: this one MUST precede `Synced`.
+            // `initial_sync_complete` is persistent — it records that a catch-up once finished, and
+            // only a backwards chain move clears it. So a wallet that was unlocked, caught up, and
+            // then RESTARTED (locked) still carries the latched flag while watching zero addresses.
+            // With `Synced` tested first, that node reported `synced` alongside
+            // `watched_addresses: 0` — settled, while the user's coins were not being followed —
+            // on the single most common post-restart path. Checking the empty set first means a
+            // completed catch-up can never speak for a session that is watching nothing.
             //
             // A FOURTH fact then decides WHICH nothing-to-watch this is, and the two mean opposite
             // things: no wallet at all is the honest all-clear, whereas an enrolled wallet whose
@@ -261,6 +285,8 @@ impl SyncHandle {
             } else {
                 SyncPhase::NoWalletEnrolled
             }
+        } else if state.initial_sync_complete && observed.peers >= 1 {
+            SyncPhase::Synced
         } else {
             SyncPhase::Syncing
         };

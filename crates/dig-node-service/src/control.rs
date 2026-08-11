@@ -101,14 +101,23 @@ pub fn is_control_method(method: &str) -> bool {
 ///
 /// `.syncStatus` is the partial exception, and it is stated rather than glossed. Since
 /// dig_ecosystem#2609 it also reports `watched_addresses` — HOW MANY addresses this node follows —
-/// and, through the phase, whether a wallet is enrolled at all. That is a count and an
-/// existence bit, never an identity: no address, key, or balance is revealed, and the count is
-/// exactly what makes `wallet_not_unlocked` distinguishable from `no_wallet_enrolled` instead of
-/// both reading as a bare "syncing". It stays open because the reads it sits beside are open for
-/// the same reason — a local UI must be able to say WHY it is not showing a balance without first
-/// pairing — and because the surface is loopback-bound, host-guarded, CORS-restricted, and
-/// local-origin-checked on `/ws`. It is nonetheless MORE than "no address at all", so a future
-/// field that narrowed it toward a specific address would not belong on this list.
+/// and, through the phase, whether a wallet is ENROLLED at all. That is a count and an existence
+/// bit, never an identity: no address, key, or balance is revealed.
+///
+/// Be precise about which field carries which disclosure, because the two are easy to swap. Both
+/// `no_wallet_enrolled` and `wallet_not_unlocked` report `watched_addresses: 0`; the measured zero
+/// separates that PAIR from `syncing`, and the ENROLLMENT bit — not the count — separates the two
+/// from each other. So the marginal disclosure this change adds is narrow: a node watching
+/// addresses was already observably wallet-bearing via a non-zero count, and what is newly visible
+/// is the enrolled-but-unwatched case, previously indistinguishable from having no wallet.
+///
+/// It stays open because the reads it sits beside are open for the same reason — a local UI must
+/// be able to say WHY it is not showing a balance without first pairing. Containment, stated
+/// completely: loopback-bound, host-guarded, CORS-restricted and local-origin-checked on `/ws` —
+/// **except under `DIG_NODE_ALLOW_REMOTE`**, which makes this open read network-reachable and
+/// unauthenticated like every other member of this list (see the same caveat on `control.rs`'s
+/// module header). It is nonetheless MORE than "no address at all", so a future field that
+/// narrowed it toward a SPECIFIC address would not belong here.
 ///
 /// Two wallet methods are deliberately NOT here. `control.wallet.arrivals` (dig_ecosystem#2548) is
 /// a chain read and still gated: the caller supplies only a cursor, so the answer volunteers this
