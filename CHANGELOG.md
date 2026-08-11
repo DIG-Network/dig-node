@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.113.0] - 2026-08-11
+
+### Features
+- Carry the PEX-known DIG peer count, not just the connected one (#210)
+
+### Bug Fixes
+- **wallet:** Report an honest phase when the node has no addresses to watch (#212)
+
 ## [0.111.0] - 2026-08-10
 
 ### Features
