@@ -231,14 +231,58 @@ impl PuzzleHashSource for MutableHashes {
     fn puzzle_hashes(&self) -> Vec<Bytes32> {
         self.0.lock().unwrap().clone()
     }
+
+    /// Hashes appearing IS the wallet appearing, for this double.
+    fn any_wallet(&self) -> bool {
+        !self.0.lock().unwrap().is_empty()
+    }
 }
 
 /// A fixed puzzle-hash set, for tests that do not need real custody.
-struct FixedHashes(Vec<Bytes32>);
+///
+/// `enrolled` is carried SEPARATELY from the set rather than derived from it, because the state
+/// this double has to be able to express is precisely the one where they disagree: an enrolled
+/// wallet whose addresses are unreachable (dig_ecosystem#2609). A double that computed enrollment
+/// from `is_empty()` could not represent a locked wallet at all, and the phase distinguishing them
+/// would be untestable.
+struct FixedHashes {
+    hashes: Vec<Bytes32>,
+    enrolled: bool,
+}
+
+impl FixedHashes {
+    /// No wallet at all: no hashes, nothing enrolled.
+    fn none() -> Self {
+        Self {
+            hashes: Vec::new(),
+            enrolled: false,
+        }
+    }
+
+    /// A wallet whose addresses ARE derivable.
+    fn unlocked(hashes: Vec<Bytes32>) -> Self {
+        Self {
+            hashes,
+            enrolled: true,
+        }
+    }
+
+    /// An ENROLLED wallet the node holds no addresses for — the post-restart shape.
+    fn enrolled_without_addresses() -> Self {
+        Self {
+            hashes: Vec::new(),
+            enrolled: true,
+        }
+    }
+}
 
 impl PuzzleHashSource for FixedHashes {
     fn puzzle_hashes(&self) -> Vec<Bytes32> {
-        self.0.clone()
+        self.hashes.clone()
+    }
+
+    fn any_wallet(&self) -> bool {
+        self.enrolled
     }
 }
 
@@ -470,7 +514,7 @@ async fn supervisor_with_no_derivations_still_advances_the_replica_peak() {
 
     let h = Harness::start(
         db.clone(),
-        Arc::new(FixedHashes(vec![])),
+        Arc::new(FixedHashes::none()),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
     )
@@ -496,7 +540,7 @@ async fn supervisor_with_no_derivations_still_advances_the_replica_peak() {
 }
 
 /// **Proves (#2609), end to end through the real supervisor:** a default install — an
-/// authoritative peer and NO wallet enrolled — settles on `NoAddressesToWatch` rather than
+/// authoritative peer and NO wallet enrolled — settles on `NoWalletEnrolled` rather than
 /// reporting `Syncing` for ever.
 ///
 /// The handle-level tests above set the two session facts directly, which pins the ladder but not
@@ -508,14 +552,14 @@ async fn a_default_install_with_no_wallet_settles_on_nothing_to_watch() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let h = Harness::start(
         db.clone(),
-        Arc::new(FixedHashes(Vec::new())),
+        Arc::new(FixedHashes::none()),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
     )
     .await;
 
     h.until_status("nothing to watch", |s| {
-        s.phase == SyncPhase::NoAddressesToWatch
+        s.phase == SyncPhase::NoWalletEnrolled
     })
     .await;
 
@@ -607,7 +651,7 @@ async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnec
     let db = WalletDb::open_in_memory().await.unwrap();
     let h = Harness::start_with_trust(
         db.clone(),
-        Arc::new(FixedHashes(vec![Bytes32::new([4; 32])])),
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([4; 32])])),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
         PeerTrust::Discovered,
@@ -767,8 +811,34 @@ async fn phase_ladder_not_started_syncing_synced() {
     assert_eq!(handle.status(&db).await.unwrap().phase, SyncPhase::Synced);
 }
 
+/// **Proves (#2609):** `SyncPhase::as_wire` agrees with what serde actually puts on the wire, for
+/// every variant in `ALL`.
+///
+/// `as_wire` is what the cross-crate conformance test compares against the published contract, so
+/// if it could drift from the real serialization that test would be checking a fiction.
+///
+/// This test covers the SPELLING only. It does NOT establish that `ALL` is complete — an earlier
+/// version of this comment claimed it did, and both pre-merge gates proved that claim false by
+/// adding a variant, giving it an `as_wire` arm, and leaving `ALL` alone: every check here stayed
+/// green because they all iterate `ALL` and so could not see what was missing from it. That hole
+/// is now closed STRUCTURALLY rather than by assertion — `declare_sync_phases!` expands the enum,
+/// `ALL` and `as_wire` from one list, so a variant absent from `ALL` cannot be written. Saying so
+/// precisely matters: a gate whose rationale overstates its reach is how a gate becomes a
+/// decoration.
+#[test]
+fn as_wire_matches_the_serialized_token_for_every_phase() {
+    for phase in SyncPhase::ALL {
+        let serialized = serde_json::to_string(phase).expect("a phase serializes");
+        let expected = format!("\"{}\"", phase.as_wire());
+        assert_eq!(
+            serialized, expected,
+            "as_wire disagrees with serde for {phase:?}"
+        );
+    }
+}
+
 /// **Proves (#2609):** an authoritative peer attached over a GENUINELY empty custody set reports
-/// `NoAddressesToWatch`, not `Syncing`.
+/// `NoWalletEnrolled`, not `Syncing`.
 ///
 /// This is the default-install shape and the whole defect: with no wallet enrolled there are zero
 /// puzzle hashes, so `initial_sync::catch_up` is never called, so `initial_sync_complete` can
@@ -776,7 +846,7 @@ async fn phase_ladder_not_started_syncing_synced() {
 /// old ladder mapped that to `Syncing`, and dig-app rendered "your node is still catching up",
 /// which is false: there is nothing to catch up ON.
 #[tokio::test]
-async fn phase_is_no_addresses_to_watch_when_custody_is_empty_on_a_writing_peer() {
+async fn phase_is_no_wallet_enrolled_when_custody_is_empty_on_a_writing_peer() {
     let db = WalletDb::open_in_memory().await.unwrap();
     // The replica is at the tip and following it — exactly what the machine measured.
     db.set_peak(9_131_403, "aa").await.unwrap();
@@ -788,12 +858,12 @@ async fn phase_is_no_addresses_to_watch_when_custody_is_empty_on_a_writing_peer(
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
     handle.set_trust(true);
-    handle.set_watched(0);
+    handle.set_watched(0, false);
 
     let status = handle.status(&db).await.unwrap();
     assert_eq!(
         status.phase,
-        SyncPhase::NoAddressesToWatch,
+        SyncPhase::NoWalletEnrolled,
         "a replica at the tip with nothing to watch is not 'catching up'"
     );
     assert_eq!(status.peak_height, Some(9_131_403));
@@ -802,6 +872,193 @@ async fn phase_is_no_addresses_to_watch_when_custody_is_empty_on_a_writing_peer(
         Some(0),
         "the reason for the phase must be machine-readable, not inferred from the word"
     );
+}
+
+/// **Proves (#2609, the security gate's second gating finding):** an ENROLLED wallet whose
+/// addresses the node cannot derive reports `WalletNotUnlocked`, NOT the all-clear.
+///
+/// The inputs here are byte-identical to the test above except for one bool, and that is the
+/// point: an empty address set is what both states look like from inside the sync loop, and they
+/// mean opposite things. The first version of this fix keyed only on the count, so a wallet whose
+/// coins were not being followed reported as settled — and, worse, the SPEC then instructed every
+/// consumer to render it as "there is nothing wallet-scoped to sync". That is the same falsehood
+/// #2609 exists to delete, one conflation further along.
+///
+/// `WalletCustody::custodied_public_keys` is empty by design in four reachable states — an adopted
+/// legacy seed file, a manifest predating the stored-public-keys field, a self-healed manifest, and
+/// an entry whose key fails to decode — and nothing back-fills it while the wallet is locked, which
+/// is the state after every restart. So this is the COMMON case, not an edge.
+#[tokio::test]
+async fn an_enrolled_wallet_with_no_derivable_addresses_is_not_an_all_clear() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(9_131_403, "aa").await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    // The ONLY difference from the no-wallet case above: a wallet IS enrolled.
+    handle.set_watched(0, true);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::WalletNotUnlocked,
+        "an enrolled wallet whose coins are not being followed must never read as settled"
+    );
+    assert_ne!(
+        status.phase,
+        SyncPhase::NoWalletEnrolled,
+        "the two empty-set states must not collapse into one another"
+    );
+    assert_eq!(status.watched_addresses, Some(0));
+}
+
+/// **Proves (#2609, review finding 1):** the PRODUCTION `any_wallet()` reads the MANIFEST, not the
+/// derivable key set — over a real [`WalletCustody`], not a double.
+///
+/// Every other locked-wallet test in this file goes through `FixedHashes`, which carries the two
+/// facts independently by construction. That proves the ladder, and proves nothing about the one
+/// implementation the node actually runs. The review demonstrated the gap by replacing the body of
+/// `<WalletCustody as PuzzleHashSource>::any_wallet` with
+/// `!PuzzleHashSource::puzzle_hashes(self).is_empty()` — the exact wrong implementation the docs
+/// warn against, which makes `WalletNotUnlocked` unreachable in production and silently restores
+/// the all-clear — and the whole suite stayed green at 456 passed.
+///
+/// The state reproduced here is real and is one of the four the security audit enumerated: a
+/// SELF-HEALED manifest. `load_and_reconcile` rebuilds a missing `index.json` from the seed files
+/// on disk, adopting each with `public_keys: Vec::new()`, so the wallet is enrolled while no
+/// address is derivable — with nothing locked, incidentally, which is why the phase is named for
+/// the observation rather than the cause.
+///
+/// Acceptance bar: implementing `any_wallet()` in terms of `puzzle_hashes()` MUST turn this red.
+#[test]
+fn production_any_wallet_reads_the_manifest_not_the_derivable_keys() {
+    let dir = scratch();
+    let custody = WalletCustody::mainnet(dir.clone());
+    custody
+        .create(&test_custody_password(), None)
+        .expect("create a custodied wallet");
+
+    // Drop the manifest so the next construction must rebuild it from the seed files alone. No
+    // seed is read, written, or inspected here — only the index beside them is removed.
+    let manifest = dir.join("wallets").join("index.json");
+    assert!(
+        manifest.exists(),
+        "the fixture must have written a manifest"
+    );
+    std::fs::remove_file(&manifest).expect("remove the manifest");
+
+    // A fresh custody over the same directory: seeds present, manifest rebuilt without keys.
+    let healed = WalletCustody::mainnet(dir);
+
+    assert!(
+        PuzzleHashSource::puzzle_hashes(&healed).is_empty(),
+        "the premise: a self-healed manifest carries no public keys, so no address is derivable"
+    );
+    assert!(
+        PuzzleHashSource::any_wallet(&healed),
+        "the wallet IS enrolled — a seed file is on disk and the manifest was rebuilt from it. \
+         Sourcing this from the derivable key set would report the all-clear over a real wallet."
+    );
+}
+
+/// **Proves (#2609, review finding 3):** a wallet that ALREADY completed a catch-up and is then
+/// restarted LOCKED reports `WalletNotUnlocked`, never `Synced`.
+///
+/// The arm-ordering regression, and the nastiest case in this file because every input looks
+/// healthy. `initial_sync_complete` is PERSISTENT — `db.rs` only ever clears it on a backwards
+/// chain move — so it survives the restart and says "a catch-up once finished", which is true and
+/// irrelevant. Meanwhile the address set is empty, because keys are not derivable while locked.
+///
+/// With the `Synced` arm tested first, this node reported `synced` beside `watched_addresses: 0`:
+/// settled, while the user's coins were not being followed, on the most common post-restart path
+/// there is. It is the same falsehood #2609 exists to remove, arriving through the one door the
+/// first fix left open.
+///
+/// Acceptance bar: moving the `Synced` arm back above the empty-set arm MUST turn this red.
+///
+/// That is the WHOLE of what it pins. The peer here MAY write (`set_trust(true)`), so this test is
+/// silent about a REFUSED writer — that session skips the empty-set arm on `session_may_write` and
+/// still reaches `Synced` beside a measured `watched_addresses: 0` (#2666). Do not read a green
+/// here as "the node can no longer report synced while watching nothing"; it cannot report it
+/// *on this path*.
+#[tokio::test]
+async fn a_previously_synced_wallet_restarted_locked_is_not_reported_as_synced() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(9_131_403, "aa").await.unwrap();
+    // The catch-up genuinely completed in an earlier run, and the flag persists across restarts.
+    db.set_initial_sync_complete(true).await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    // Restarted locked: the wallet is still enrolled, its addresses are not derivable.
+    handle.set_watched(0, true);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::WalletNotUnlocked,
+        "a latched initial_sync_complete must not speak for a session watching zero addresses"
+    );
+    assert_ne!(
+        status.phase,
+        SyncPhase::Synced,
+        "reporting synced while watching nothing is the exact falsehood this ticket removes"
+    );
+    assert_eq!(status.watched_addresses, Some(0));
+}
+
+/// **Proves (#2609):** a completed catch-up that IS watching addresses still reports `Synced`.
+///
+/// The control for the test above — the reordering must not swallow the legitimate synced case.
+#[tokio::test]
+async fn a_completed_catch_up_still_reports_synced_while_watching_addresses() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_initial_sync_complete(true).await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(3, true);
+
+    assert_eq!(
+        handle.status(&db).await.unwrap().phase,
+        SyncPhase::Synced,
+        "a wallet actually watching addresses after a completed catch-up is synced"
+    );
+}
+
+/// **Proves (#2609):** the enrolled-but-unwatched state is reached through the REAL supervisor,
+/// from custody's own answer, not just by setting the flag by hand.
+///
+/// Guards the wiring specifically: `any_wallet()` must be read from the MANIFEST rather than
+/// derived from the address set. A `PuzzleHashSource` that computed enrollment as
+/// `!puzzle_hashes().is_empty()` would make this state unreachable and silently restore the
+/// all-clear, which is why the test double carries the two facts independently.
+#[tokio::test]
+async fn a_locked_wallet_reaches_wallet_not_unlocked_through_the_supervisor() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let h = Harness::start(
+        db.clone(),
+        Arc::new(FixedHashes::enrolled_without_addresses()),
+        Script::new(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+
+    h.until_status("the locked-wallet phase", |s| {
+        s.phase == SyncPhase::WalletNotUnlocked
+    })
+    .await;
+
+    let status = h.handle.status(&db).await.unwrap();
+    assert_eq!(status.watched_addresses, Some(0));
+    assert!(
+        !db.sync_state().await.unwrap().initial_sync_complete,
+        "a locked wallet must not latch initial_sync_complete either"
+    );
+    h.stop().await;
 }
 
 /// **Proves (#2609):** a DISCOVERED peer is NOT reported as "nothing to watch", even though its
@@ -822,7 +1079,7 @@ async fn a_refused_writer_is_not_reported_as_nothing_to_watch() {
     // What the supervisor records for an uncorroborated session: it subscribed nothing, but it
     // subscribed nothing because it may not write — not because custody is empty.
     handle.set_trust(false);
-    handle.set_watched(0);
+    handle.set_watched(0, false);
 
     assert_eq!(
         handle.status(&db).await.unwrap().phase,
@@ -831,7 +1088,7 @@ async fn a_refused_writer_is_not_reported_as_nothing_to_watch() {
     );
 }
 
-/// **Proves (#2609):** the phase does not flip to `NoAddressesToWatch` on an UNMEASURED
+/// **Proves (#2609):** the phase does not flip to `NoWalletEnrolled` on an UNMEASURED
 /// subscription set, EVEN WHEN the attached peer may write.
 ///
 /// This is the state the supervisor genuinely occupies between `trust_for_session` returning and
@@ -893,10 +1150,10 @@ async fn dropping_a_session_clears_its_subscription_facts() {
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
     handle.set_trust(true);
-    handle.set_watched(0);
+    handle.set_watched(0, false);
     assert_eq!(
         handle.status(&db).await.unwrap().phase,
-        SyncPhase::NoAddressesToWatch
+        SyncPhase::NoWalletEnrolled
     );
 
     handle.set_connected(0);
@@ -918,7 +1175,7 @@ async fn an_enrolled_wallet_mid_catch_up_still_reports_syncing() {
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
     handle.set_trust(true);
-    handle.set_watched(3);
+    handle.set_watched(3, true);
 
     let status = handle.status(&db).await.unwrap();
     assert_eq!(status.phase, SyncPhase::Syncing);
@@ -1004,7 +1261,7 @@ async fn backoff_grows_then_resets_after_a_long_lived_connection() {
         // session
         // additionally re-polls for a newly-created wallet on its own interval, and those sleeps
         // would be indistinguishable from backoff rungs here.
-        Arc::new(FixedHashes(vec![Bytes32::new([4; 32])])),
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([4; 32])])),
         script,
         vec!["203.0.113.1:8444".into()],
     )
@@ -1050,7 +1307,7 @@ async fn reconnect_reruns_catch_up() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let h = Harness::start(
         db,
-        Arc::new(FixedHashes(vec![Bytes32::new([5; 32])])),
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([5; 32])])),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
     )
@@ -1074,7 +1331,7 @@ async fn shutdown_stops_the_supervisor_and_the_task_ends() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let h = Harness::start(
         db,
-        Arc::new(FixedHashes(vec![])),
+        Arc::new(FixedHashes::none()),
         Script::new(),
         vec!["203.0.113.1:8444".into()],
     )
@@ -1128,7 +1385,7 @@ async fn user_managed_peers_are_tried_before_discovery() {
     let script = Script::new();
     script.outcomes.lock().unwrap().push_back(true);
 
-    let h = Harness::start(db, Arc::new(FixedHashes(vec![])), script, addrs).await;
+    let h = Harness::start(db, Arc::new(FixedHashes::none()), script, addrs).await;
     h.until("a dial", |s| !s.dialled.lock().unwrap().is_empty())
         .await;
 
@@ -1189,7 +1446,7 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
     let factory = Arc::new(ChiaPeerSessionFactory::mainnet(db.clone()));
     let (handle, join) = spawn_supervisor(Supervisor {
         db: db.clone(),
-        puzzle_hashes: Arc::new(FixedHashes(vec![])),
+        puzzle_hashes: Arc::new(FixedHashes::none()),
         factory,
         events: Arc::new(EventBus::default()),
         genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
@@ -1326,7 +1583,8 @@ async fn run_discovered_session(
     let db = WalletDb::open_in_memory().await.unwrap();
     let script = Script::new();
     *script.writer_answer.lock().unwrap() = writer_answer;
-    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes(vec![Bytes32::new([7; 32])]));
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
 
     let harness = Harness::start_full(
         db.clone(),
@@ -1485,7 +1743,8 @@ async fn corroboration_switched_off_leaves_a_discovered_peer_writing_nothing() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let script = Script::new();
     *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
-    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes(vec![Bytes32::new([7; 32])]));
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
 
     let harness = Harness::start_full(
         db.clone(),

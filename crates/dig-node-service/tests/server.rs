@@ -1546,6 +1546,40 @@ async fn the_push_and_the_arrival_cursor_are_gated_while_the_chain_reads_are_ope
 /// node has no chain source, so whether it ever attaches a peer is not the property under test.
 /// What IS pinned is that a peak-less replica reports `null` and never `0` — a zero here reads as
 /// "synced to genesis", a claim about the chain that would be false.
+/// **Proves (dig_ecosystem#2609):** every phase this node can emit is a token the PUBLISHED
+/// contract declares.
+///
+/// This is the gate the #2609 incident was missing, and it is deliberately not a server test:
+/// it compares two lists of values, so it holds for phases no fixture can reach.
+///
+/// What happened without it: dig-node grew `no_addresses_to_watch` while
+/// `WalletSyncPhase` was a closed three-variant `Deserialize` enum with no `serde(other)`. The
+/// only coupling was a hand-typed token list in the test above, and the change widened that list
+/// alongside the node — so CI agreed with the bug. Every consumer on the older contract failed
+/// the ENTIRE `WalletSyncStatusResult` parse, not one field, and rendered nothing at all: strictly
+/// worse than the wrong-but-present word it replaced. dig-node referenced `WalletSyncPhase`
+/// nowhere, so nothing else could have caught it.
+///
+/// Subset, not equality: the contract MAY declare a token this node has no way to reach yet
+/// (a consumer can be ahead of a node), but the node MUST NOT emit one the contract has never
+/// heard of. That asymmetry is the contract's own wording.
+#[test]
+fn every_phase_the_node_can_emit_is_declared_by_the_published_contract() {
+    use dig_node_control_interface::results::WalletSyncPhase;
+
+    let declared: Vec<&str> = WalletSyncPhase::ALL.iter().map(|p| p.as_wire()).collect();
+    for phase in dig_wallet::sage::sync_supervisor::SyncPhase::ALL {
+        assert!(
+            declared.contains(&phase.as_wire()),
+            "the node can emit {:?} ({:?}), which the published WalletSyncPhase does not declare. \
+             A consumer deserializing it fails the WHOLE response, not one field. Publish the \
+             token in dig-node-control-interface FIRST, then emit it. Contract declares {declared:?}",
+            phase,
+            phase.as_wire()
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
     // Distinctive: not 0, not 1, and not a count this fixture could reach by accident, so an
@@ -1563,10 +1597,21 @@ async fn the_wallet_sync_status_and_peer_counts_agree_and_need_no_token() {
         sync["error"].is_null(),
         "syncStatus is an open read and must answer: got {sync:?}"
     );
+    // Derived from the CONTRACT, never retyped. A hand-written literal list here is what let
+    // dig-node ship a phase token the published `WalletSyncPhase` did not contain: the diff
+    // WIDENED the literal alongside the node, so the assertion agreed with the bug and stayed
+    // green, while every consumer deserializing the real enum failed the whole response
+    // (dig_ecosystem#2609). `ALL` is the in-crate anchor the conformance KATs pin against, so a
+    // node-side token that is not in the contract now turns this red automatically.
     let phase = sync["result"]["phase"].as_str().unwrap_or_default();
+    let declared: Vec<&str> = dig_node_control_interface::results::WalletSyncPhase::ALL
+        .iter()
+        .map(|p| p.as_wire())
+        .collect();
     assert!(
-        ["not_started", "syncing", "synced", "no_addresses_to_watch"].contains(&phase),
-        "phase must be one of the four declared tokens, got {phase:?}"
+        declared.contains(&phase),
+        "phase must be a token the published WalletSyncPhase declares; got {phase:?}, contract \
+         declares {declared:?}"
     );
     assert!(
         sync["result"]["peak_height"].is_null() || sync["result"]["peak_height"].as_u64() > Some(0),

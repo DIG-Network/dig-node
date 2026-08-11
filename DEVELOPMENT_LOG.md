@@ -23,7 +23,7 @@ Do not fix that by latching the flag over an empty set. `sage::routing::route` t
 `initial_sync_complete` as permission to serve wallet-scoped reads from the local DB, so latching it
 over an un-queried replica makes a funded wallet read as empty — which is why `initial_sync` refuses
 the empty set at the floor in the first place. The honest fix is a separate state
-(`SyncPhase::NoAddressesToWatch`).
+(`SyncPhase::NoWalletEnrolled`).
 
 **The sharp edge when deriving that state:** "the session subscribed nothing" is NOT the same fact as
 "custody holds nothing". `Supervisor::run` FORCES the subscription set empty for an uncorroborated
