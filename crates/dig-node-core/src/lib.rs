@@ -1279,10 +1279,55 @@ fn build_result(resp: &ContentResponse, offset: usize) -> Value {
     )
 }
 
+/// Build the [`BlindServeConfig`] for an ANONYMOUS blind serve: a fresh, single-use BLS identity
+/// from the OS CSPRNG, discarded when the serve returns.
+///
+/// # Why this identity is GENERATED and must never be configured (#2735)
+///
+/// [`BlindServeConfig`] requires a BLS keypair, but on this path **nothing consumes it as
+/// authority**. The only verifier of a host attestation is the served module's own gate, and
+/// digstore's `GateConfig::from_embedded` pins `require_attestation: false` deliberately, so that
+/// one stable program hash serves network-wide and anonymous nodes can serve at all. A client
+/// verifies the merkle proof against the chain-anchored root, never a host signature, and the
+/// [`ContentResponse`] wire (ciphertext + merkle proof + roothash + chunk lens) carries no host key
+/// and no host signature to verify. `dig-node-service/tests/content_serve.rs` demonstrates this
+/// end-to-end: its fixture modules trust ONE key that the serving host does not hold, and real
+/// content is served anyway. The keypair is a required parameter with no consumer.
+///
+/// # Why it must NOT be the node's real identity
+///
+/// [`serve_blind`] instantiates PUBLISHER-SUPPLIED wasm and exposes `host_create_attestation`,
+/// which signs 90 bytes (`ATTEST_DST` || nonce || store id || time) read from a GUEST-CHOSEN
+/// pointer using this secret key, validating only that the pointer is in bounds. A hostile `.dig`,
+/// once cached here, is therefore a signing oracle over whatever key it is handed. Giving it the
+/// node's persisted machine identity
+/// ([`shared::identity::load_or_generate_node_cert`]'s BLS-bound peer key) would let any publisher
+/// mint signatures under that identity. #908 binds independently: a node identity is not a user
+/// identity, and neither belongs inside a sandbox a publisher controls.
+///
+/// So the fix for the world-known `[0u8; 32]` seed is NOT a real identity and NOT a different
+/// constant — it is a key that carries no authority by construction. Regenerating per serve is what
+/// "this host serves anonymously" looks like when the config type cannot represent absence: it is
+/// unlinkable across serves, so `host_get_public_key` hands a hostile module no stable fingerprint
+/// to correlate a node's requests by. The seed is not zeroized because the key it derives is
+/// single-use and verifiable by nobody — there is no secret here to protect.
+///
+/// Fails CLOSED (`None`, so the caller simply does not serve locally) if the OS CSPRNG is
+/// unavailable, rather than falling back to a fixed seed.
+fn anonymous_blind_serve_config(store_id: Bytes32) -> Option<BlindServeConfig> {
+    let mut seed = [0u8; 32];
+    if let Err(e) = getrandom::getrandom(&mut seed) {
+        tracing::error!(error = %e, "OS CSPRNG unavailable; refusing to serve this capsule locally");
+        return None;
+    }
+    Some(BlindServeConfig::from_seed(store_id, &seed))
+}
+
 /// Decode a locally cached module into a [`ContentResponse`] (whole-module `fs::read` + wasmtime
 /// `serve_blind`). A free function (not a `Node` method) so it can be moved into a `spawn_blocking`
 /// closure with only the cache dir + request keys, never a `Node` borrow (audit #179). Returns
-/// `None` on a cache miss / decode failure. Touches the module file for on-disk LRU recency.
+/// `None` on a cache miss / decode failure, or if no anonymous serve identity can be minted
+/// ([`anonymous_blind_serve_config`]). Touches the module file for on-disk LRU recency.
 fn serve_local_blocking(
     cache_dir: &Path,
     key: &CapsuleKey,
@@ -1292,9 +1337,7 @@ fn serve_local_blocking(
     let path = key.resolve_cached_path(cache_dir);
     let module = std::fs::read(&path).ok()?;
     let store_id = Bytes32::from_hex(key.store()).ok()?;
-    // Ephemeral host key: the browser verifies the merkle proof against the chain-anchored root, not
-    // a host signature, so the serve key is local-only.
-    let cfg = BlindServeConfig::from_seed(store_id, &[0u8; 32]);
+    let cfg = anonymous_blind_serve_config(store_id)?;
     let bytes = serve_blind(&module, retrieval_key, cfg).ok()?;
     let resp = ContentResponse::from_bytes(&bytes).ok()?;
     touch(&path); // LRU recency
@@ -8657,6 +8700,46 @@ mod tests {
         .filter(|p| **p)
         .count();
         assert_eq!(present, 1, "the byte budget holds exactly one such entry");
+    }
+
+    /// #2735: the blind-serve host identity is minted per serve and is never a STABLE key.
+    ///
+    /// The assertion is deliberately "two calls differ" rather than "is not `[0u8; 32]`", because
+    /// every wrong answer this guards against is stable across calls and so is refuted by the SAME
+    /// check: the world-known all-zero seed this replaced, the `[42u8; 32]` of the sibling defect
+    /// (#2553), and — the one that matters most — the node's own persisted machine identity, which
+    /// must never reach a sandbox running publisher-supplied wasm (#908, and the signing oracle
+    /// documented on [`anonymous_blind_serve_config`]). A test naming only the all-zero seed would
+    /// pass for a fix that swapped in the node's real key, which is a WORSE outcome than the defect.
+    ///
+    /// The named seeds are then checked individually so a failure says which regression returned.
+    #[test]
+    fn blind_serve_identity_is_minted_per_serve_and_never_a_stable_key() {
+        let store_id = Bytes32([0x5au8; 32]);
+
+        let first = anonymous_blind_serve_config(store_id).expect("OS CSPRNG available");
+        let second = anonymous_blind_serve_config(store_id).expect("OS CSPRNG available");
+
+        // The load-bearing assertion: no stable key — of ANY provenance — can produce this.
+        assert_ne!(
+            first.bls_public.0, second.bls_public.0,
+            "two serves of the same store must not share a host identity"
+        );
+
+        // Every stable seed a future change might reach for, refuted by name.
+        for (seed, what) in [
+            ([0u8; 32], "the world-known all-zero seed (#2735)"),
+            ([42u8; 32], "the sibling constant seed (#2553)"),
+            ([0xABu8; 32], "a stand-in for the node's persisted identity seed (#908)"),
+        ] {
+            let stable = BlindServeConfig::from_seed(store_id, &seed).bls_public.0;
+            assert_ne!(first.bls_public.0, stable, "blind serve derived from {what}");
+            assert_ne!(second.bls_public.0, stable, "blind serve derived from {what}");
+        }
+
+        // The store id is still the caller's — only the identity is anonymous.
+        assert_eq!(first.store_id.0, store_id.0);
+        assert_eq!(second.store_id.0, store_id.0);
     }
 
     #[tokio::test]
