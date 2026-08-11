@@ -839,7 +839,7 @@ fn as_wire_matches_the_serialized_token_for_every_phase() {
 /// old ladder mapped that to `Syncing`, and dig-app rendered "your node is still catching up",
 /// which is false: there is nothing to catch up ON.
 #[tokio::test]
-async fn phase_is_no_addresses_to_watch_when_custody_is_empty_on_a_writing_peer() {
+async fn phase_is_no_wallet_enrolled_when_custody_is_empty_on_a_writing_peer() {
     let db = WalletDb::open_in_memory().await.unwrap();
     // The replica is at the tip and following it — exactly what the machine measured.
     db.set_peak(9_131_403, "aa").await.unwrap();
