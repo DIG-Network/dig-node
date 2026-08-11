@@ -122,6 +122,39 @@ pub enum SyncPhase {
     WalletNotUnlocked,
 }
 
+impl SyncPhase {
+    /// Every phase this node can emit.
+    ///
+    /// Exists so the set is a VALUE rather than something a reader has to reconstruct by eye. The
+    /// published `dig_node_control_interface::results::WalletSyncPhase` carries the same list, and
+    /// the node's list MUST be a subset of it — the contract says a node must not emit a token
+    /// outside its declared set. `dig-wallet` cannot see that crate (it does not depend on it), so
+    /// the two are tied together by a conformance test up in `dig-node-service`, which can see
+    /// both. That test is the one that would have caught #2609 shipping a token the contract had
+    /// never heard of.
+    pub const ALL: &'static [SyncPhase] = &[
+        SyncPhase::NotStarted,
+        SyncPhase::Syncing,
+        SyncPhase::Synced,
+        SyncPhase::NoWalletEnrolled,
+        SyncPhase::WalletNotUnlocked,
+    ];
+
+    /// This phase's exact wire spelling.
+    ///
+    /// Pinned against the serde output by a test in this module, so a `rename_all` change cannot
+    /// leave this function describing a spelling the wire no longer uses.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            SyncPhase::NotStarted => "not_started",
+            SyncPhase::Syncing => "syncing",
+            SyncPhase::Synced => "synced",
+            SyncPhase::NoWalletEnrolled => "no_wallet_enrolled",
+            SyncPhase::WalletNotUnlocked => "wallet_not_unlocked",
+        }
+    }
+}
+
 /// The composed sync status: the phase, the replica's own peak, and the live peer count.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct WalletSyncStatus {

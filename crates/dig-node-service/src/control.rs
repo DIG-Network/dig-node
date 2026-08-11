@@ -96,8 +96,19 @@ pub fn is_control_method(method: &str) -> bool {
 /// poll a balance, list coins to build a spend, and bound a confirmation, without pairing.
 ///
 /// Membership turns on WHO NAMES THE ADDRESS. `.balance`/`.coins`/`.coinById` relay a chain fact the
-/// CALLER named, and `.peak`/`.syncStatus` name this node's own chain position and no address at
-/// all; neither discloses an association between this node and any address.
+/// CALLER named, and `.peak`/`.syncStatus` name this node's own chain position; neither discloses
+/// an association between this node and any SPECIFIC address.
+///
+/// `.syncStatus` is the partial exception, and it is stated rather than glossed. Since
+/// dig_ecosystem#2609 it also reports `watched_addresses` — HOW MANY addresses this node follows —
+/// and, through the phase, whether a wallet is enrolled at all. That is a count and an
+/// existence bit, never an identity: no address, key, or balance is revealed, and the count is
+/// exactly what makes `wallet_not_unlocked` distinguishable from `no_wallet_enrolled` instead of
+/// both reading as a bare "syncing". It stays open because the reads it sits beside are open for
+/// the same reason — a local UI must be able to say WHY it is not showing a balance without first
+/// pairing — and because the surface is loopback-bound, host-guarded, CORS-restricted, and
+/// local-origin-checked on `/ws`. It is nonetheless MORE than "no address at all", so a future
+/// field that narrowed it toward a specific address would not belong on this list.
 ///
 /// Two wallet methods are deliberately NOT here. `control.wallet.arrivals` (dig_ecosystem#2548) is
 /// a chain read and still gated: the caller supplies only a cursor, so the answer volunteers this
@@ -1818,10 +1829,12 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 /// `{phase: not_started, peak_height: <n>}` is legitimate, not a contradiction: it is the RESTART
 /// state — a node with a height recorded by a previous run that has not yet begun syncing.
 ///
-/// # `no_addresses_to_watch` is NOT a kind of `syncing` (dig_ecosystem#2609)
+/// # The two nothing-to-watch phases are NOT kinds of `syncing` (dig_ecosystem#2609)
 ///
-/// The four tokens are `not_started`, `syncing`, `synced` and `no_addresses_to_watch`. The last is
-/// the DEFAULT-INSTALL state: a node with no wallet enrolled has zero puzzle hashes, and a
+/// The five tokens are `not_started`, `syncing`, `synced`, `no_wallet_enrolled` and
+/// `wallet_not_unlocked`, and they are the set published by
+/// `dig_node_control_interface::results::WalletSyncPhase` — a node MUST NOT emit anything outside
+/// it. `no_wallet_enrolled` is the DEFAULT-INSTALL state: a node with no wallet enrolled has zero puzzle hashes, and a
 /// catch-up over an empty set is refused rather than performed, so `initial_sync_complete` never
 /// latches — while the replica's peak advances with the chain the whole time. Reporting that as
 /// `syncing` told every consumer the node was behind when it was at the tip, and dig-app withheld
@@ -1832,9 +1845,33 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 /// for. It is deliberately not folded into `synced`, which additionally licenses serving
 /// wallet-scoped reads from the local replica.
 ///
-/// `watched_addresses` reports WHY: `0` is a measured empty custody set, a positive count is a
-/// real subscription, and `null` means no attached session has resolved a set yet (a peer is
+/// # `wallet_not_unlocked` looks identical from inside the sync loop and means the OPPOSITE
+///
+/// An empty address set is produced by two states that are indistinguishable from the subscription
+/// alone: no wallet exists (above — nothing to do), and a wallet EXISTS whose addresses this node
+/// cannot derive (something to do that is not being done). The node separates them by asking
+/// custody's manifest whether any wallet is enrolled, because the derivable key set answers the
+/// wrong question — it is empty for a LOCKED wallet, which is the common state after every
+/// restart, and also for an adopted legacy seed or a manifest predating the stored-key field.
+///
+/// Under `wallet_not_unlocked` the user's coins are NOT being followed. A consumer MUST NOT render
+/// it as synced, settled, or up to date, and MUST NOT present a balance read under it as complete.
+/// Collapsing the two would report an unwatched wallet as an all-clear — the same class of
+/// falsehood this method was fixed to remove, one conflation further along.
+///
+/// # The reason field
+///
+/// `watched_addresses` reports WHY: `0` is a measured empty address set, a positive count is a real
+/// subscription, and `null` means no attached session has resolved a set yet (a peer is
 /// mid-corroboration, or none is attached). A consumer must not read `null` as `0`.
+///
+/// # The token set is the CONTRACT's, not this file's
+///
+/// The five tokens are exactly `WalletSyncPhase::ALL` in `dig-node-control-interface`, and a token
+/// this node emits that the contract does not declare fails a consumer's ENTIRE response parse
+/// rather than one field — the #2609 regression. A new phase is published in that crate FIRST and
+/// emitted here second; `every_phase_the_node_can_emit_is_declared_by_the_published_contract`
+/// enforces the ordering.
 async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.wallet_sync_status().await {
         Ok(s) => control_ok(

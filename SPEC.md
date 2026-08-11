@@ -3941,7 +3941,7 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
 
 18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
 chia_peer_count, watched_addresses}`. `phase` is `not_started` (no peer has ever attached), `syncing`,
-`synced`, or `no_addresses_to_watch` — and `synced` requires BOTH a completed catch-up AND at least one
+`synced`, `no_wallet_enrolled` or `wallet_not_unlocked` — and `synced` requires BOTH a completed catch-up AND at least one
 live Chia peer, so a replica that caught up and then went offline reports `syncing`. It is not a freshness
 guarantee: a live connection to a stalled peer satisfies it. `peak_height` is the REPLICA's own height read
 from `sync_state`; it MUST NOT fall back to the coinset oracle (unlike `control.wallet.peak`, which answers
@@ -3949,26 +3949,45 @@ a different question), and `null` means unknown, never height zero. `chia_peer_c
 and `null` when unobservable. `control.peerCounts` reports `{dig_peer_count, chia_peer_count,
 known_dig_peer_count}`, and its `chia_peer_count` MUST be the SAME observation this method reports.
 
-**`no_addresses_to_watch` is the DEFAULT-INSTALL state and MUST NOT be reported as `syncing`.** A node with
-no wallet enrolled holds zero puzzle hashes; §18.6 REFUSES a catch-up over an empty set, so
+**The two nothing-to-watch phases are DEFAULT-INSTALL states and MUST NOT be reported as `syncing`.** A
+node with no wallet enrolled holds zero puzzle hashes; §18.6 REFUSES a catch-up over an empty set, so
 `initial_sync_complete` can never latch, while `new_peak_wallet` keeps the replica's peak advancing with the
-chain indefinitely. This phase MUST be reported when, and only when, ALL FOUR hold: a Chia peer is attached
-RIGHT NOW; that peer's effective trust is authoritative (`Operator` or `Corroborated`, §18.6a) so it MAY
-write; the attached session resolved a MEASURED-EMPTY custody set; and `initial_sync_complete` has NOT
-latched. `synced` outranks this phase: once catch-up has completed and `initial_sync_complete` is `true`, the
-same attached authoritative measured-empty session reports `synced`, not `no_addresses_to_watch`, because
-`synced` additionally licenses §18.7 routing wallet-scoped reads to the local replica. The trust condition is
-load-bearing — an uncorroborated writer's subscription set is forced empty too, and that replica is
-deliberately NOT being written and IS falling behind, so reporting it as "nothing to watch" would present a
-stalled replica as a healthy one.
+chain indefinitely. Three facts establish that a session is watching nothing: a Chia peer is attached RIGHT
+NOW; that peer's effective trust is authoritative (`Operator` or `Corroborated`, §18.6a) so it MAY write;
+and the attached session resolved a MEASURED-EMPTY address set. The trust condition is load-bearing — an
+uncorroborated writer's subscription set is forced empty too, and that replica is deliberately NOT being
+written and IS falling behind, so reporting it as nothing-to-watch would present a stalled replica as a
+healthy one. `synced` outranks both: once `initial_sync_complete` is `true` with a peer attached, the node
+reports `synced`.
 
-`watched_addresses` reports how many custodied puzzle hashes the attached session resolved: a MEASURED `0`
-(the reason for `no_addresses_to_watch`), a positive count, or `null` when no attached session has resolved
-a set yet — a peer mid-corroboration, or none attached. A consumer MUST NOT read `null` as `0`. A consumer
-MUST render `no_addresses_to_watch` as its own statement — the replica is following an attached writer and
-there is nothing wallet-scoped to sync — and MUST NOT render it as chain lag or as a balance still being
-awaited. Like `synced`, it is NOT a freshness guarantee: a live connection to a stalled peer still satisfies
-the phase, so a consumer wanting freshness MUST read `peak_height`.
+A FOURTH fact decides WHICH of the two, and they mean opposite things. The node MUST read it from custody's
+MANIFEST (is any wallet enrolled) and MUST NOT infer it from the derivable key set, which is empty for a
+locked wallet:
+
+- **`no_wallet_enrolled`** — no wallet exists, so watching nothing is correct and complete. A consumer MAY
+  present this as settled. `watched_addresses` is `0`.
+- **`wallet_not_unlocked`** — a wallet EXISTS and its addresses are not being followed, so the user's coins
+  are not being watched and their balance is not being maintained. This is the COMMON state after every
+  restart: the address set derives from key material the node cannot reach while the wallet is locked, and
+  nothing back-fills it; an adopted legacy seed, a manifest predating the stored-public-keys field, a
+  self-healed manifest, and an entry whose key fails to decode all reach it too. A consumer MUST NOT render
+  it as synced, settled, or up to date, and MUST NOT present a balance read under it as complete. It is
+  named NOT UNLOCKED rather than *locked* because an empty address set is what the node can OBSERVE and a
+  lock is only its usual cause.
+
+Neither MUST be folded into `synced`, which additionally licenses §18.7 routing wallet-scoped reads to the
+local replica; latching that over an un-queried DB reads a funded wallet as empty.
+
+`watched_addresses` reports how many addresses the attached session resolved: a MEASURED `0`, a positive
+count, or `null` when no attached session has resolved a set yet — a peer mid-corroboration, or none
+attached. A consumer MUST NOT read `null` as `0`.
+
+**The phase token set is normative and lives in `dig-node-control-interface`.** The tokens are exactly
+`WalletSyncPhase::ALL`: `not_started`, `syncing`, `synced`, `no_wallet_enrolled`, `wallet_not_unlocked`. A
+node MUST NOT emit a token outside that list, and a new phase MUST be published in that crate BEFORE a node
+emits it — an undeclared token fails a consumer's ENTIRE `WalletSyncStatusResult` parse rather than
+degrading one field, so the surface renders nothing at all. Consumers MUST treat an unrecognised token as
+UNKNOWN and MUST NOT infer progress, completion, or a trustworthy balance from it.
 
 18.6c. **The known DIG peer count.** `control.peerCounts.known_dig_peer_count` is the number of DIG peers
 this node has LEARNED OF, connected or not — the size of the gossip layer's discovered-peer address book,

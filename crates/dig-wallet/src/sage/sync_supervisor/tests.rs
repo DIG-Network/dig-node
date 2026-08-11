@@ -811,6 +811,25 @@ async fn phase_ladder_not_started_syncing_synced() {
     assert_eq!(handle.status(&db).await.unwrap().phase, SyncPhase::Synced);
 }
 
+/// **Proves (#2609):** `SyncPhase::as_wire` agrees with what serde actually puts on the wire, for
+/// every variant in `ALL`.
+///
+/// `as_wire` is what the cross-crate conformance test compares against the published contract, so
+/// if it could drift from the real serialization that test would be checking a fiction. Driving
+/// both from the same variant list also means a NEW variant cannot be added without appearing
+/// here.
+#[test]
+fn as_wire_matches_the_serialized_token_for_every_phase() {
+    for phase in SyncPhase::ALL {
+        let serialized = serde_json::to_string(phase).expect("a phase serializes");
+        let expected = format!("\"{}\"", phase.as_wire());
+        assert_eq!(
+            serialized, expected,
+            "as_wire disagrees with serde for {phase:?}"
+        );
+    }
+}
+
 /// **Proves (#2609):** an authoritative peer attached over a GENUINELY empty custody set reports
 /// `NoWalletEnrolled`, not `Syncing`.
 ///
@@ -846,6 +865,77 @@ async fn phase_is_no_addresses_to_watch_when_custody_is_empty_on_a_writing_peer(
         Some(0),
         "the reason for the phase must be machine-readable, not inferred from the word"
     );
+}
+
+/// **Proves (#2609, the security gate's second gating finding):** an ENROLLED wallet whose
+/// addresses the node cannot derive reports `WalletNotUnlocked`, NOT the all-clear.
+///
+/// The inputs here are byte-identical to the test above except for one bool, and that is the
+/// point: an empty address set is what both states look like from inside the sync loop, and they
+/// mean opposite things. The first version of this fix keyed only on the count, so a wallet whose
+/// coins were not being followed reported as settled — and, worse, the SPEC then instructed every
+/// consumer to render it as "there is nothing wallet-scoped to sync". That is the same falsehood
+/// #2609 exists to delete, one conflation further along.
+///
+/// `WalletCustody::custodied_public_keys` is empty by design in four reachable states — an adopted
+/// legacy seed file, a manifest predating the stored-public-keys field, a self-healed manifest, and
+/// an entry whose key fails to decode — and nothing back-fills it while the wallet is locked, which
+/// is the state after every restart. So this is the COMMON case, not an edge.
+#[tokio::test]
+async fn an_enrolled_wallet_with_no_derivable_addresses_is_not_an_all_clear() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(9_131_403, "aa").await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    // The ONLY difference from the no-wallet case above: a wallet IS enrolled.
+    handle.set_watched(0, true);
+
+    let status = handle.status(&db).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::WalletNotUnlocked,
+        "an enrolled wallet whose coins are not being followed must never read as settled"
+    );
+    assert_ne!(
+        status.phase,
+        SyncPhase::NoWalletEnrolled,
+        "the two empty-set states must not collapse into one another"
+    );
+    assert_eq!(status.watched_addresses, Some(0));
+}
+
+/// **Proves (#2609):** the enrolled-but-unwatched state is reached through the REAL supervisor,
+/// from custody's own answer, not just by setting the flag by hand.
+///
+/// Guards the wiring specifically: `any_wallet()` must be read from the MANIFEST rather than
+/// derived from the address set. A `PuzzleHashSource` that computed enrollment as
+/// `!puzzle_hashes().is_empty()` would make this state unreachable and silently restore the
+/// all-clear, which is why the test double carries the two facts independently.
+#[tokio::test]
+async fn a_locked_wallet_reaches_wallet_not_unlocked_through_the_supervisor() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let h = Harness::start(
+        db.clone(),
+        Arc::new(FixedHashes::enrolled_without_addresses()),
+        Script::new(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+
+    h.until_status("the locked-wallet phase", |s| {
+        s.phase == SyncPhase::WalletNotUnlocked
+    })
+    .await;
+
+    let status = h.handle.status(&db).await.unwrap();
+    assert_eq!(status.watched_addresses, Some(0));
+    assert!(
+        !db.sync_state().await.unwrap().initial_sync_complete,
+        "a locked wallet must not latch initial_sync_complete either"
+    );
+    h.stop().await;
 }
 
 /// **Proves (#2609):** a DISCOVERED peer is NOT reported as "nothing to watch", even though its
@@ -1370,7 +1460,8 @@ async fn run_discovered_session(
     let db = WalletDb::open_in_memory().await.unwrap();
     let script = Script::new();
     *script.writer_answer.lock().unwrap() = writer_answer;
-    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
 
     let harness = Harness::start_full(
         db.clone(),
@@ -1529,7 +1620,8 @@ async fn corroboration_switched_off_leaves_a_discovered_peer_writing_nothing() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let script = Script::new();
     *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
-    let hashes: Arc<dyn PuzzleHashSource> = Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
 
     let harness = Harness::start_full(
         db.clone(),
