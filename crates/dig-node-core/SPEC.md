@@ -1245,10 +1245,10 @@ cache cap is `config.json` > env > default).
 ## 11. Security properties
 
 - **Provider-blind at rest + on the wire.** Stored capsules and served windows are ciphertext +
-  merkle proofs; the serve host key is a single-use identity minted per serve from the OS CSPRNG. It
-  carries no authority — nothing verifies an attestation produced by it — and it MUST NOT be the
-  node's persisted machine identity, because the module executed on this path is publisher-supplied
-  and is handed a signing capability over that key. A LOCAL node MAY decrypt for its own consumer
+  merkle proofs; the serve host key is a single-use identity minted per serve from the OS CSPRNG. No
+  verifier accepts an attestation from it as authority, and it MUST NOT be the node's persisted
+  machine identity, because the module executed on this path is publisher-supplied and is handed a
+  signing capability over that key. A LOCAL node MAY decrypt for its own consumer
   (the user's machine); the served wire stays ciphertext + proof.
 - **Chain is the authority (fail-closed).** No content is served under a root not confirmed on-chain
   (§4.2); a compromised upstream cannot select the served generation.

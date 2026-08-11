@@ -8769,7 +8769,15 @@ mod tests {
     /// `dig-node-service/src/service.rs` and `dig-wallet/src/lib.rs` assert their own such rules.
     ///
     /// Only the PRODUCTION half is scanned: this test module necessarily spells the forbidden
-    /// construction, and matching itself would make the guard unfalsifiable.
+    /// construction, and matching itself would make the guard unfalsifiable. The split marker
+    /// occurs exactly once and `mod tests` runs to EOF, so no production code sits past it.
+    ///
+    /// KNOWN LIMIT, stated rather than papered over: this scans `lib.rs` only. A future
+    /// `seams/<new>.rs` that imported `serve_blind` and built its own config would be invisible to
+    /// both this guard and the behavioural test. Nothing does that today — `serve_blind` and
+    /// `BlindServeConfig` are imported once, at the top of this file, and nowhere else in the
+    /// crate — so widening the scan would be guarding a shape that does not exist. Widen it the
+    /// moment a second module imports either.
     #[test]
     fn no_production_site_builds_a_blind_serve_identity_from_a_fixed_seed() {
         let whole = include_str!("lib.rs");
