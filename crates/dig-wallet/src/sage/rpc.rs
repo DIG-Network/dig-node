@@ -7837,7 +7837,12 @@ mod tests {
         }
     }
 
-    fn pending_row(tx: &str, coin_ids: &[String], fee: Option<&str>, expires_at: i64) -> PendingTransactionRow {
+    fn pending_row(
+        tx: &str,
+        coin_ids: &[String],
+        fee: Option<&str>,
+        expires_at: i64,
+    ) -> PendingTransactionRow {
         PendingTransactionRow {
             transaction_id: tx.into(),
             bundle_hex: "00".into(),
@@ -7856,14 +7861,23 @@ mod tests {
     async fn a_reserved_coin_leaves_selection_but_not_the_balance() {
         let (a, b) = (spendable_row(0xa1, 100), spendable_row(0xb2, 500));
         let be = backend_with(vec![a.clone(), b.clone()], true).await;
-        let far_future = super::custody::now_ms() as i64 + 600_000;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
         be.db
-            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], Some("7"), far_future))
+            .reserve_spend(&pending_row(
+                "tx1",
+                &[a.coin_id.clone()],
+                Some("7"),
+                far_future,
+            ))
             .await
             .unwrap();
 
         let selectable = be.spendable_coins(None).await.unwrap();
-        assert_eq!(selectable.len(), 1, "the reserved coin was offered to a second spend");
+        assert_eq!(
+            selectable.len(),
+            1,
+            "the reserved coin was offered to a second spend"
+        );
         assert_eq!(selectable[0].amount, 500);
 
         assert_eq!(
@@ -7880,14 +7894,23 @@ mod tests {
     async fn pending_transactions_reports_an_in_flight_bundle() {
         let a = spendable_row(0xa1, 100);
         let be = backend_with(vec![a.clone()], true).await;
-        let far_future = super::custody::now_ms() as i64 + 600_000;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
         be.db
-            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], Some("7"), far_future))
+            .reserve_spend(&pending_row(
+                "tx1",
+                &[a.coin_id.clone()],
+                Some("7"),
+                far_future,
+            ))
             .await
             .unwrap();
 
         let pending = be.get_pending_transactions().await.unwrap().transactions;
-        assert_eq!(pending.len(), 1, "a pushed bundle was reported as nothing in flight");
+        assert_eq!(
+            pending.len(),
+            1,
+            "a pushed bundle was reported as nothing in flight"
+        );
         assert_eq!(pending[0].transaction_id, "tx1");
         assert_eq!(pending[0].fee, Some(Amount::u64(7)));
     }
@@ -7899,14 +7922,17 @@ mod tests {
     async fn an_uncomputable_fee_is_reported_as_null_not_zero() {
         let a = spendable_row(0xa1, 100);
         let be = backend_with(vec![a.clone()], true).await;
-        let far_future = super::custody::now_ms() as i64 + 600_000;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
         be.db
             .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], None, far_future))
             .await
             .unwrap();
 
         let pending = be.get_pending_transactions().await.unwrap().transactions;
-        assert_eq!(pending[0].fee, None, "an unknown fee was flattened to a number");
+        assert_eq!(
+            pending[0].fee, None,
+            "an unknown fee was flattened to a number"
+        );
     }
 
     /// A reservation ALWAYS lapses, and both surfaces observe the lapse: the bundle stops being
@@ -7923,7 +7949,11 @@ mod tests {
             .unwrap();
 
         assert!(
-            be.get_pending_transactions().await.unwrap().transactions.is_empty(),
+            be.get_pending_transactions()
+                .await
+                .unwrap()
+                .transactions
+                .is_empty(),
             "a lapsed bundle was still reported in flight"
         );
         assert_eq!(
