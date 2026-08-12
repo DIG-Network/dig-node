@@ -174,8 +174,32 @@ impl ChainTransport {
     /// node that started before its network permanently peerless, and a node reporting zero peers
     /// forever because of a transient DNS failure at start-up is indistinguishable from one that
     /// is broken.
+    ///
+    /// # A client that connected NO peers is not warm, and is discarded
+    ///
+    /// `ChiaQuery::new` succeeds with an empty pool on purpose — its coinset tier needs no peer,
+    /// so a peer-tier problem must not deny a reader the fallback that exists for it. That makes
+    /// "the client built" the wrong test here: a node offline at start-up would build an empty
+    /// client, report success, and end the retry loop holding nothing, which is exactly the
+    /// permanently-peerless outcome the retry exists to prevent.
+    ///
+    /// So an empty pool is dropped rather than kept. The pool refills only from inside a request
+    /// (`try_refill` runs when one selects a peer), so a cached empty client would still be empty
+    /// on the next attempt however many times it is retried — discarding it is what makes the
+    /// next attempt actually redial. It is replaced only if it is still the client this call
+    /// built, so a client somebody else has since built is never thrown away.
     pub async fn warm(&self) -> bool {
-        self.client().await.is_ok()
+        let Ok(client) = self.client().await else {
+            return false;
+        };
+        if client.peer_count().await > 0 {
+            return true;
+        }
+        let mut slot = self.client.lock().await;
+        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &client)) {
+            *slot = None;
+        }
+        false
     }
 
     /// Push an ALREADY-SIGNED bundle.
