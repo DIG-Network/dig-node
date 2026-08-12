@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.115.0] - 2026-08-12
+
+### Features
+- **wallet:** Report the Chia peers the node actually holds, and hold them (#217)
+
 ## [0.114.1] - 2026-08-12
 
 ### Bug Fixes
