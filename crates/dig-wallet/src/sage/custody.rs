@@ -59,8 +59,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chia::bls::{
-    master_to_wallet_hardened_intermediate, master_to_wallet_unhardened_intermediate,
-    DerivableKey, PublicKey, SecretKey,
+    master_to_wallet_hardened_intermediate, master_to_wallet_unhardened_intermediate, DerivableKey,
+    PublicKey, SecretKey,
 };
 use chia::puzzles::standard::StandardArgs;
 use chia::puzzles::DeriveSynthetic;
@@ -1624,11 +1624,8 @@ mod tests {
     fn custody_with_window(window: u32) -> (WalletCustody, PathBuf) {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "dig-node-coverage-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dig-node-coverage-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         (
             WalletCustody::new(dir.clone(), Network::Mainnet, window),
@@ -1707,7 +1704,9 @@ mod tests {
 
         let want = 3 + DERIVATION_GAP_LIMIT;
         assert!(
-            signer.puzzle_hashes().contains(&unhardened_p2(ABANDON, want)),
+            signer
+                .puzzle_hashes()
+                .contains(&unhardened_p2(ABANDON, want)),
             "the window did not extend a full gap past the highest used index"
         );
         assert!(
@@ -1781,7 +1780,10 @@ mod tests {
     fn the_window_is_bounded() {
         assert!(DEFAULT_DERIVATION_COUNT <= MAX_DERIVATION_COUNT);
         let (c, dir) = custody_with_window(MAX_DERIVATION_COUNT + 10_000);
-        assert_eq!(c.derivation_count.min(MAX_DERIVATION_COUNT), MAX_DERIVATION_COUNT);
+        assert_eq!(
+            c.derivation_count.min(MAX_DERIVATION_COUNT),
+            MAX_DERIVATION_COUNT
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1819,7 +1821,10 @@ mod tests {
     #[test]
     #[ignore = "a measurement, not an assertion; run with --ignored --nocapture to re-check"]
     fn measure_derivation_breakdown() {
-        use chia::bls::{master_to_wallet_hardened_intermediate, master_to_wallet_unhardened_intermediate, DerivableKey};
+        use chia::bls::{
+            master_to_wallet_hardened_intermediate, master_to_wallet_unhardened_intermediate,
+            DerivableKey,
+        };
         let m = master_secret_key(ABANDON).unwrap();
         let n = 500u32;
 
@@ -1829,16 +1834,26 @@ mod tests {
 
         let t = std::time::Instant::now();
         let inter = master_to_wallet_unhardened_intermediate(&m);
-        let v: Vec<_> = (0..n).map(|i| inter.derive_unhardened(i).derive_synthetic()).collect();
-        eprintln!("MEASURED unhardened via intermediate: {:?} ({})", t.elapsed(), v.len());
+        let v: Vec<_> = (0..n)
+            .map(|i| inter.derive_unhardened(i).derive_synthetic())
+            .collect();
+        eprintln!(
+            "MEASURED unhardened via intermediate: {:?} ({})",
+            t.elapsed(),
+            v.len()
+        );
 
         let t = std::time::Instant::now();
-        let _: Vec<_> = (0..n).map(|i| master_to_wallet_hardened(&m, i).derive_synthetic()).collect();
+        let _: Vec<_> = (0..n)
+            .map(|i| master_to_wallet_hardened(&m, i).derive_synthetic())
+            .collect();
         eprintln!("MEASURED hardened naive: {:?}", t.elapsed());
 
         let t = std::time::Instant::now();
         let hi = master_to_wallet_hardened_intermediate(&m);
-        let _: Vec<_> = (0..n).map(|i| hi.derive_hardened(i).derive_synthetic()).collect();
+        let _: Vec<_> = (0..n)
+            .map(|i| hi.derive_hardened(i).derive_synthetic())
+            .collect();
         eprintln!("MEASURED hardened via intermediate: {:?}", t.elapsed());
 
         let t = std::time::Instant::now();
@@ -1852,8 +1867,15 @@ mod tests {
         let (c, dir) = custody_with_window(DEFAULT_DERIVATION_COUNT);
         let t = std::time::Instant::now();
         c.import(ABANDON, "passphrase", None).unwrap();
-        eprintln!("MEASURED unlock at {} indices per tree: {:?}", DEFAULT_DERIVATION_COUNT, t.elapsed());
-        eprintln!("MEASURED keys covered: {}", c.signer(None).unwrap().puzzle_hashes().len());
+        eprintln!(
+            "MEASURED unlock at {} indices per tree: {:?}",
+            DEFAULT_DERIVATION_COUNT,
+            t.elapsed()
+        );
+        eprintln!(
+            "MEASURED keys covered: {}",
+            c.signer(None).unwrap().puzzle_hashes().len()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
