@@ -4299,6 +4299,7 @@ fn paginate(coins: Vec<CoinRecord>, offset: u32, limit: u32) -> Vec<CoinRecord> 
 #[cfg(test)]
 mod tests {
     use super::super::db::DerivationRow;
+    use super::super::db::PendingTransactionRow;
     use super::super::db::WalletDb;
     use super::super::fallback::mock::MockFallback;
     use super::super::fallback::EmptyFallback;
@@ -7811,5 +7812,124 @@ mod tests {
         let s = be.sync_status().await.unwrap();
         assert_eq!(s.state, SyncLifecycle::Synced);
         assert_eq!(s.peak_height, Some(123));
+    }
+
+    // ---- in-flight coin reservation + real pending set (#2763 / #2764) ------
+    //
+    // These drive the PRODUCTION reads (`spendable_coins`, `get_pending_transactions`), not the
+    // database primitives underneath them. The primitives already have their own tests in `db.rs`
+    // and passed while nothing called them: the defect these close is that the wiring did not
+    // exist, so a test that stops at the DB layer cannot see it.
+
+    /// A coin row with real hex, so `singleton::coin_from_row` can parse it.
+    fn spendable_row(id_byte: u8, amount: u64) -> CoinRow {
+        CoinRow {
+            coin_id: format!("{id_byte:02x}").repeat(32),
+            parent_coin_info: "11".repeat(32),
+            puzzle_hash: test_ph(),
+            amount: amount.to_string(),
+            created_height: Some(1),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    fn pending_row(tx: &str, coin_ids: &[String], fee: Option<&str>, expires_at: i64) -> PendingTransactionRow {
+        PendingTransactionRow {
+            transaction_id: tx.into(),
+            bundle_hex: "00".into(),
+            fee: fee.map(Into::into),
+            submitted_at: 1_000,
+            expires_at,
+            attempts: 1,
+            reserved_coin_ids: coin_ids.to_vec(),
+        }
+    }
+
+    /// **The defect (#2763), at the seam that actually selects.** A coin committed to a pushed,
+    /// unsettled bundle must not be offered to the next spend — while still counting as money the
+    /// wallet owns, because the chain has not said otherwise yet.
+    #[tokio::test]
+    async fn a_reserved_coin_leaves_selection_but_not_the_balance() {
+        let (a, b) = (spendable_row(0xa1, 100), spendable_row(0xb2, 500));
+        let be = backend_with(vec![a.clone(), b.clone()], true).await;
+        let far_future = super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], Some("7"), far_future))
+            .await
+            .unwrap();
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(selectable.len(), 1, "the reserved coin was offered to a second spend");
+        assert_eq!(selectable[0].amount, 500);
+
+        assert_eq!(
+            be.db.unspent_coins(None).await.unwrap().len(),
+            2,
+            "reserving a coin must not remove it from what the wallet owns"
+        );
+    }
+
+    /// **The defect (#2764).** `get_pending_transactions` returned a hardcoded empty list. A
+    /// caller that pushed a bundle and polled was told, as a measured fact, that nothing was in
+    /// flight.
+    #[tokio::test]
+    async fn pending_transactions_reports_an_in_flight_bundle() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        let far_future = super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], Some("7"), far_future))
+            .await
+            .unwrap();
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(pending.len(), 1, "a pushed bundle was reported as nothing in flight");
+        assert_eq!(pending[0].transaction_id, "tx1");
+        assert_eq!(pending[0].fee, Some(Amount::u64(7)));
+    }
+
+    /// A fee this node could not compute is reported as `null`, NEVER as zero. The node relays
+    /// bundles it did not build (§908), and a confident zero would be a claim about someone
+    /// else's money.
+    #[tokio::test]
+    async fn an_uncomputable_fee_is_reported_as_null_not_zero() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        let far_future = super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], None, far_future))
+            .await
+            .unwrap();
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(pending[0].fee, None, "an unknown fee was flattened to a number");
+    }
+
+    /// A reservation ALWAYS lapses, and both surfaces observe the lapse: the bundle stops being
+    /// reported in flight, and its coin returns to selection. This is the failure direction that
+    /// would otherwise be worse than the bug — a release path that never runs must not be able to
+    /// strand the user's money permanently.
+    #[tokio::test]
+    async fn an_expired_reservation_stops_being_pending_and_frees_its_coin() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        be.db
+            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], Some("7"), 1))
+            .await
+            .unwrap();
+
+        assert!(
+            be.get_pending_transactions().await.unwrap().transactions.is_empty(),
+            "a lapsed bundle was still reported in flight"
+        );
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            1,
+            "a lapsed reservation stranded the coin"
+        );
     }
 }

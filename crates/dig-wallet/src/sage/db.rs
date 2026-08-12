@@ -3471,7 +3471,7 @@ mod tests {
         let pending = db.pending_transactions().await.unwrap();
         let ids: Vec<&str> = pending.iter().map(|p| p.transaction_id.as_str()).collect();
         assert_eq!(ids, vec!["earlier", "later"]);
-        assert_eq!(pending[0].fee, "10");
+        assert_eq!(pending[0].fee.as_deref(), Some("10"));
         assert_eq!(pending[0].submitted_at, 1_000);
         assert_eq!(pending[0].bundle_hex, "bundle-of-earlier");
     }
