@@ -208,9 +208,11 @@ pub struct WalletCoinByIdResult {
     /// Which tier produced this answer. Always [`Source::Fallback`]: see
     /// [`WalletBackend::coin_by_id`].
     ///
-    /// [`Source::Fallback`] covers BOTH chain sub-tiers — a direct peer and the coinset oracle —
-    /// and this field does not say which one answered, because the tier underneath does not report
-    /// it. Naming the sub-tier would be a wire-contract change and is not made here.
+    /// [`Source::Fallback`] covers BOTH chain sub-tiers — a directly held peer and the coinset
+    /// oracle — and this field does not say which one answered THIS read, because the tier
+    /// underneath does not report it per call. What the node CAN say is which tier it is in a
+    /// position to use: `chia_peer_count` on `control.wallet.syncStatus` (dig_ecosystem#2806).
+    /// Naming the sub-tier per read would be a wire-contract change and is not made here.
     pub source: Source,
     /// Always `false` — no local replica produced this answer.
     pub synced: bool,
@@ -298,8 +300,13 @@ pub struct WalletBalanceResult {
     /// Pending balance: unspent coins not yet confirmed on-chain (in-flight value).
     pub pending: u128,
     /// Which tier actually produced this figure (#2233): [`Source::Db`] — the node's own
-    /// chain replica — or [`Source::Fallback`] — a third-party coinset HTTP oracle, which
-    /// means the queried address was disclosed off-node.
+    /// chain replica — or [`Source::Fallback`] — a chain source rather than the replica.
+    ///
+    /// [`Source::Fallback`] is the ROUTING decision, not a party. Underneath it the node asks its
+    /// OWN held Chia peers first and reaches the public coinset oracle only when they fail, so
+    /// this field alone does not say the address was disclosed off-node — an earlier version of
+    /// this doc claimed it did (dig_ecosystem#2806). `chia_peer_count` on
+    /// `control.wallet.syncStatus` says which tier the node is in a position to use.
     ///
     /// Additive per §5.1: a consumer that ignores it parses unchanged.
     pub source: Source,
@@ -428,6 +435,15 @@ pub struct WalletBackend {
     /// persisted sync state. `None` where no supervisor runs (tests, and any bring-up that
     /// disables chain sync), and that is reported as an UNOBSERVABLE peer count, never zero.
     sync_handle: Option<super::sync_supervisor::SyncHandle>,
+    /// A fixed Chia peer tier standing in for the chain transport's, for tests only.
+    ///
+    /// The integration harness runs with the transport deliberately never built (nothing may dial
+    /// mainnet), so the real tier is unobservable there and every peer count comes back `null` —
+    /// and a `null == null` comparison cannot see `control.peerCounts` and
+    /// `control.wallet.syncStatus` drifting onto different sources. This gives the harness a
+    /// distinctive value so the two answers stay distinguishable. `None` in every shipped build:
+    /// only `with_chain_peer_tier_for_tests` sets it.
+    chain_peer_tier_override: Option<super::fallback::ChainPeerTier>,
     /// The connected client's per-session PUBLIC identity (#407), seeded by `login` and
     /// cleared by `logout`. Interior-mutable + shared across `Clone`s so a `login` on one
     /// dispatch is visible to subsequent reads on the same backend. `None` until a client
@@ -495,6 +511,7 @@ impl WalletBackend {
             lineage: None,
             events: Arc::new(EventBus::default()),
             sync_handle: None,
+            chain_peer_tier_override: None,
             identity: Arc::new(RwLock::new(None)),
             custody: None,
             auth: None,
@@ -633,6 +650,17 @@ impl WalletBackend {
         self
     }
 
+    /// Report a FIXED Chia peer tier instead of the chain transport's — TESTS ONLY.
+    ///
+    /// The counterpart of [`super::sync_supervisor::SyncHandle::detached_for_tests`], and for the
+    /// same reason: the harness must be able to give these counts distinctive values without
+    /// anything dialling mainnet to earn them.
+    #[doc(hidden)]
+    pub fn with_chain_peer_tier_for_tests(mut self, tier: super::fallback::ChainPeerTier) -> Self {
+        self.chain_peer_tier_override = Some(tier);
+        self
+    }
+
     /// The chain-sync supervisor's handle, if one is running.
     pub fn sync_handle(&self) -> Option<&super::sync_supervisor::SyncHandle> {
         self.sync_handle.as_ref()
@@ -657,9 +685,22 @@ impl WalletBackend {
     pub async fn wallet_sync_status(
         &self,
     ) -> sqlx::Result<super::sync_supervisor::WalletSyncStatus> {
+        // The node's own Chia peer tier (dig_ecosystem#2806) comes from the chain transport, not
+        // from the supervisor: the transport holds the pool that SERVES chain reads, whereas the
+        // supervisor holds at most one subscription session to write the replica. Reporting the
+        // supervisor's session as the peer count is what made a node holding five peers say it
+        // held one.
+        //
+        // This is a local read of the transport's own state plus a cached peak the peers pushed;
+        // it makes no oracle call, so it does not open the egress path this method's doc above
+        // refuses for the peak.
+        let tier = match self.chain_peer_tier_override {
+            Some(fixed) => fixed,
+            None => self.fallback.peer_tier().await,
+        };
         match &self.sync_handle {
-            Some(h) => h.status(&self.db).await,
-            None => super::sync_supervisor::status_without_supervisor(&self.db).await,
+            Some(h) => h.status(&self.db, tier).await,
+            None => super::sync_supervisor::status_without_supervisor(&self.db, tier).await,
         }
     }
 

@@ -478,7 +478,7 @@ impl CatAttributor<'_> {
 /// When `session.trust` is [`PeerTrust::Discovered`] this returns without touching the database:
 /// no rollback, no coin write, no routing flag, and no peak (see [`PeerTrust`] for why the peak
 /// is not the harmless half). Dropping the frame is not an error — the session stays up, because
-/// the peer still counts toward `chia_peer_count`.
+/// the peer still counts toward `subscription_peer_count`.
 pub async fn handle_coin_state_update(
     db: &WalletDb,
     update: &CoinStateUpdate,

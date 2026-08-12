@@ -167,6 +167,29 @@ impl WalletService {
         // It dials nothing until something asks it to, so an idle node still makes no chain call.
         let chain = Arc::new(ChainTransport::new());
         let fallback: Arc<dyn ChainFallback> = chain.clone();
+
+        // Hold Chia peers because the node is RUNNING, not because somebody asked
+        // (dig_ecosystem#2806).
+        //
+        // The transport's peer pool is what serves the node's chain reads, and until this ran the
+        // pool did not exist until the first wallet read happened to build it. A node that had
+        // never been asked for a balance therefore held zero Chia peers while presenting itself
+        // as a light client, and `control.wallet.syncStatus` could only report the replica's
+        // single subscription session -- the `chia_peer_count: 1` this ticket exists to correct.
+        //
+        // Gated on `enable_chain_sync` because that flag already means "this node talks to the
+        // Chia network", and the integration harness sets it false precisely so no test dials
+        // mainnet. Backgrounded so peer discovery never delays start-up, and retried because a
+        // node that booted before its network came up must not stay peerless for the life of the
+        // process over one failed DNS lookup.
+        if cfg.enable_chain_sync {
+            let warming = chain.clone();
+            tokio::spawn(async move {
+                while !warming.warm().await {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            });
+        }
         // The base backend WITHOUT the tipping engine attached — cloned into the tip spender so the
         // spender's backend handle has `tipping == None` (no reference cycle engine↔backend). Both
         // share the SAME inner Arcs (db/custody/events/tip_events), so a runtime `wallet.unlock` is

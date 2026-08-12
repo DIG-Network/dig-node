@@ -36,7 +36,9 @@ use async_trait::async_trait;
 use chia_protocol::SpendBundle;
 use tokio::sync::Mutex;
 
-use super::fallback::{ChainFallback, CoinsetFallback, FallbackCoin, FallbackCoinSpend};
+use super::fallback::{
+    ChainFallback, ChainPeerTier, CoinsetFallback, FallbackCoin, FallbackCoinSpend,
+};
 use super::spend::to_query_bundle;
 use super::{Error, Result};
 
@@ -122,6 +124,60 @@ impl ChainTransport {
             .map_err(|e| Error::internal(format!("peak-height read failed: {e}")))
     }
 
+    /// The node's own Chia peer tier: full nodes HELD, and the peak they announced
+    /// (dig_ecosystem#2806).
+    ///
+    /// # This DIALS NOTHING
+    ///
+    /// It reports the client that already exists and answers [`ChainPeerTier::UNOBSERVABLE`] when
+    /// none does. Building one here would make merely ASKING a node how many peers it holds the
+    /// act that makes it hold them — so a status call would dial mainnet, including from a test
+    /// harness that exists precisely so nothing does.
+    ///
+    /// A node that should hold peers gets them from [`Self::warm`] at start-up instead, which is
+    /// the honest arrangement: the peers are held because the node is running, not because
+    /// somebody looked.
+    ///
+    /// # Why both numbers come from the same client
+    ///
+    /// They describe one tier, and a count from one place beside a peak from another can disagree
+    /// — five peers reporting a height they never sent. `peer_peak_height` is also the ONLY peak
+    /// that evidences a live light client: [`Self::peak_height`] answers "what is the chain's
+    /// peak" and consults the public oracle first, so its figure is a third party's view of the
+    /// chain even on a node holding five peers.
+    ///
+    /// Unbuildable is [`ChainPeerTier::UNOBSERVABLE`], never a zero count: a node that could not
+    /// look has not looked and found none.
+    pub async fn peer_tier(&self) -> ChainPeerTier {
+        let existing = self.client.lock().await.clone();
+        let Some(client) = existing else {
+            return ChainPeerTier::UNOBSERVABLE;
+        };
+        ChainPeerTier {
+            peer_count: u32::try_from(client.peer_count().await).ok(),
+            peak_height: client.peer_peak_height().await,
+        }
+    }
+
+    /// Connect the peer tier, so the node HOLDS Chia peers because it is running
+    /// (dig_ecosystem#2806).
+    ///
+    /// Returns whether the transport now has a client. The node calls this in the background at
+    /// start-up; nothing else needs it, because every chain read builds the client anyway.
+    ///
+    /// Separate from the lazy build in [`Self::client`] rather than replacing it: the laziness is
+    /// there so a node with the wallet surfaces switched off makes no chain call, and this is the
+    /// caller that decides such a node exists. A node meant to be a light client asks for its
+    /// peers up front; a node that is not, never calls this and dials nothing.
+    ///
+    /// It is deliberately retried by the caller rather than here: "connect once at boot" makes a
+    /// node that started before its network permanently peerless, and a node reporting zero peers
+    /// forever because of a transient DNS failure at start-up is indistinguishable from one that
+    /// is broken.
+    pub async fn warm(&self) -> bool {
+        self.client().await.is_ok()
+    }
+
     /// Push an ALREADY-SIGNED bundle.
     ///
     /// The node never signs and is never given anything it could sign with (§908): this takes a
@@ -160,6 +216,10 @@ impl SignedBundlePusher for ChainTransport {
 
 #[async_trait]
 impl ChainFallback for ChainTransport {
+    async fn peer_tier(&self) -> ChainPeerTier {
+        ChainTransport::peer_tier(self).await
+    }
+
     async fn peak_height(&self) -> Result<Option<u32>> {
         ChainTransport::peak_height(self).await
     }
@@ -295,6 +355,27 @@ mod tests {
                 "the error must name the offending parameter: {err}"
             );
         }
+    }
+
+    /// **An unbuilt transport holds an UNKNOWN number of peers, not zero — and asking does not
+    /// make it dial.**
+    ///
+    /// Both halves matter and neither is cosmetic. `Some(0)` would tell a user their machine is
+    /// connected to no Chia peers, which is a claim about their machine that nobody measured; the
+    /// node shows this number as evidence it is a light client, so an unmeasured default is the
+    /// one thing it must never be. And a version that built the client here would turn a status
+    /// call into a mainnet dial — from this very test process among others.
+    ///
+    /// Asserted through the public surface, so it stays true of what a caller can observe.
+    #[tokio::test]
+    async fn an_unbuilt_transport_reports_an_unknown_peer_count_without_dialing() {
+        let transport = ChainTransport::new();
+
+        assert_eq!(transport.peer_tier().await, ChainPeerTier::UNOBSERVABLE);
+        assert!(
+            transport.client.lock().await.is_none(),
+            "asking for the peer tier must not be what makes the node hold peers"
+        );
     }
 
     /// The transport starts with NO client, so merely constructing one dials nothing.

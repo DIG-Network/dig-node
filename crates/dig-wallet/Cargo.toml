@@ -70,7 +70,7 @@ sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runti
 # because no `chia_query` type crosses the dig-wallet -> dig-node-core boundary; do NOT "align them"
 # on sight -- doing so breaks dig-node-core. Collapsing to one version is dig_ecosystem#2227, which
 # needs a chia-peer release against dci 0.2 first.
-chia-query = "0.6"
+chia-query = "0.6.1"
 # Diagnostics MUST go through `tracing`, never stderr. dig-node installs the `dig-logging`
 # subscriber process-globally (dig-node-service::logging), and a Windows service has no stderr
 # to discard to — an `eprintln!` here reaches nobody, which is why a chain-source failure stayed

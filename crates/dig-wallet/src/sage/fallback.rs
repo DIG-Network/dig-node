@@ -66,10 +66,54 @@ pub struct FallbackCoinSpend {
     pub solution: String,
 }
 
+/// What the node's OWN Chia peer tier is, right now: how many full nodes it holds, and the peak
+/// those peers told it (dig_ecosystem#2806).
+///
+/// Both are `Option` and both spell UNKNOWN as `None`, never as a zero. A node that could not
+/// take the measurement has not measured none, and height zero is a height every block is above —
+/// a leaked `0` in either field would read as a confident statement about a chain nobody looked
+/// at. That is the same rule [`super::sync_supervisor::WalletSyncStatus`] states field by field,
+/// and it is here for the same reason: these two numbers are what a user is shown to decide
+/// whether their node is a real light client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChainPeerTier {
+    /// Chia full nodes the node HOLDS for its own chain reads. `None` is unobservable — no
+    /// transport exists or none could be built — never an observed zero.
+    ///
+    /// It is the LIVE count, never the configured target: a pool still filling reports the
+    /// smaller number, and reports the target only on reaching it.
+    pub peer_count: Option<u32>,
+    /// The peak height those peers announced. `None` until one of them says something.
+    ///
+    /// It is deliberately NOT the chain's peak as a public oracle would give it: this figure is
+    /// evidence the node's own peers are talking to it, which is the one thing an oracle reading
+    /// can never demonstrate.
+    pub peak_height: Option<u32>,
+}
+
+impl ChainPeerTier {
+    /// The measurement nobody could take: both fields unknown.
+    pub const UNOBSERVABLE: Self = Self {
+        peer_count: None,
+        peak_height: None,
+    };
+}
+
 /// The fallback chain-read surface (design B.5). Small on purpose: only the reads the
 /// core wallet-data endpoints need while syncing or for out-of-DB lookups.
 #[async_trait]
 pub trait ChainFallback: Send + Sync {
+    /// The node's own Chia peer tier: peers held and the peak they reported
+    /// (dig_ecosystem#2806).
+    ///
+    /// Defaulted to [`ChainPeerTier::UNOBSERVABLE`] because most implementations of this trait —
+    /// the empty tier, and every test double — genuinely hold no peers. A default of "no peers"
+    /// would be a measured zero they never took, and the node reports this number to a user as a
+    /// fact about their machine.
+    async fn peer_tier(&self) -> ChainPeerTier {
+        ChainPeerTier::UNOBSERVABLE
+    }
+
     /// Coins currently at the given puzzle hashes (unspent + recently spent).
     async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>>;
     /// Coins hinted to the given hints (CAT association).
