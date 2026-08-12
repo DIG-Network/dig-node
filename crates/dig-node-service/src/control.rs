@@ -1288,8 +1288,15 @@ fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
 ///
 /// Params: `{ address (bech32m string), asset ("xch" | "dig") }`. Result:
 /// `{ balance, pending, source, synced, peak_height }`, where `source` is `"db"` (the node's own
-/// chain replica) or `"fallback"` (a third-party coinset oracle — the address was disclosed
-/// off-node), and `synced`/`peak_height` describe THAT tier (#2233).
+/// chain replica) or `"fallback"` (NOT the replica — read from a chain source), and
+/// `synced`/`peak_height` describe THAT tier (#2233).
+///
+/// `"fallback"` names the ROUTING decision, not a party: underneath it the node tries its OWN
+/// held Chia peers FIRST and reaches the public coinset oracle only when they fail. This doc
+/// previously said `"fallback"` meant "a third-party coinset oracle — the address was disclosed
+/// off-node", which asserted a disclosure that most `"fallback"` reads never make
+/// (dig_ecosystem#2806). To see which it is, read `chia_peer_count` on
+/// `control.wallet.syncStatus`: a node holding peers serves these reads from them.
 /// A synced empty address is a SUCCESS with a zero
 /// figure; the three read-failure shapes map to DISTINCT catalogued errors (never a fabricated
 /// `0`): `WALLET_NO_CHAIN_SOURCE`, `WALLET_NOT_SYNCED`, `WALLET_READ_FAILED`.
@@ -1877,6 +1884,21 @@ async fn wallet_peak(ctx: &ControlCtx, id: Value) -> Value {
 /// subscription, and `null` means no attached session has resolved a set yet (a peer is
 /// mid-corroboration, or none is attached). A consumer must not read `null` as `0`.
 ///
+/// # Two peer counts, because the node holds two different sets (dig_ecosystem#2806)
+///
+/// `chia_peer_count` is the headline light-client number: Chia full nodes this node HOLDS, whose
+/// pool serves its chain reads. `subscription_peer_count` is the replica's subscription session,
+/// at most one by design. Until #2806 this method reported the SECOND number under the FIRST
+/// name, so a node holding five peers and serving every read from them announced
+/// `chia_peer_count: 1` — a figure that was neither the peers serving reads nor the total, and
+/// that made the node look like a one-peer client. They are separate sets with separate
+/// lifetimes: a consumer MUST NOT add them.
+///
+/// `chia_peer_peak_height` is the peak those held peers ANNOUNCED to this node. It is the one
+/// height on this payload that evidences a live light client — `peak_height` is the replica's own
+/// progress, and a peak fetched from a public oracle would prove nothing about the node's peers.
+/// `null` means no peer has announced one yet, never height zero.
+///
 /// # The token set is the CONTRACT's, not this file's
 ///
 /// The five tokens are exactly `WalletSyncPhase::ALL` in `dig-node-control-interface`, and a token
@@ -1892,6 +1914,8 @@ async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
                 "phase": s.phase,
                 "peak_height": s.peak_height,
                 "chia_peer_count": s.chia_peer_count,
+                "subscription_peer_count": s.subscription_peer_count,
+                "chia_peer_peak_height": s.chia_peer_peak_height,
                 "watched_addresses": s.watched_addresses,
             }),
         ),
@@ -1908,8 +1932,10 @@ async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
 ///
 /// Two unrelated numbers, each named for its network, because they are routinely confused:
 /// `dig_peer_count` is the DIG content/gossip pool (the same figure `control.peerStatus` reports
-/// as `connected_peers`), and `chia_peer_count` is Chia full nodes serving the wallet's chain
-/// sync. Neither is `control.peerStatus`'s `relay.peer_count`, which counts peers connected to the
+/// as `connected_peers`), and `chia_peer_count` is Chia full nodes this node HOLDS, whose pool
+/// serves its chain reads (dig_ecosystem#2806 — before that it reported the replica's single
+/// subscription session instead, so a node holding five peers said one). Neither is
+/// `control.peerStatus`'s `relay.peer_count`, which counts peers connected to the
 /// RELAY rather than to this node — and which, being the only lively-looking number in that
 /// payload, is the one that gets misread.
 ///

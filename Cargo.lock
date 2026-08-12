@@ -856,9 +856,9 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e06d54946c125fddd1f2d8049d41b8a7828eb5b1a039fceaa168639cf7021981"
+checksum = "dc05aab60f4b981bf8a0ecf2277f9c1547991134ef426a660dc9ed44a78db192"
 dependencies = [
  "chia",
  "chia-protocol",
@@ -2307,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.114.1"
+version = "0.115.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2491,7 +2491,7 @@ dependencies = [
  "bip39",
  "chia",
  "chia-protocol",
- "chia-query 0.6.0",
+ "chia-query 0.6.1",
  "chia-sdk-test",
  "chia-traits 0.26.0",
  "chia-wallet-sdk",

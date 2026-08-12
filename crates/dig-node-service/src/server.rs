@@ -109,18 +109,33 @@ pub struct AppState {
 const METHOD_NOT_FOUND: i64 = ErrorCode::MethodNotFound.code();
 
 impl AppState {
-    /// Re-attach the wallet backend with a chain-sync handle reporting `peers` Chia peers,
-    /// WITHOUT starting a supervisor (so no test dials mainnet).
+    /// Re-attach the wallet backend reporting `peers` Chia peers HELD and `peers` subscription
+    /// peers, WITHOUT starting a supervisor or building a chain transport (so no test dials
+    /// mainnet).
     ///
-    /// The integration harness runs `enable_chain_sync: false`, which leaves every Chia peer
-    /// count `null` — and a `null == null` comparison cannot see `control.peerCounts` and
-    /// `control.wallet.syncStatus` drifting onto different sources, which
-    /// dig-node-control-interface 0.8.0 makes a conformance MUST. This seam gives the count a
-    /// distinctive value so the two answers become distinguishable.
+    /// The integration harness runs `enable_chain_sync: false` and never builds the chain
+    /// transport, which leaves every Chia peer count `null` — and a `null == null` comparison
+    /// cannot see `control.peerCounts` and `control.wallet.syncStatus` drifting onto different
+    /// sources, which dig-node-control-interface 0.8.0 makes a conformance MUST. This seam gives
+    /// the counts a distinctive value so the two answers become distinguishable.
+    ///
+    /// BOTH counts are injected because since dig_ecosystem#2806 they are different facts:
+    /// `chia_peer_count` is the transport's held peer pool and `subscription_peer_count` is the
+    /// replica's session. Injecting only one would leave the other `null` and put the harness
+    /// back in the blind spot this seam exists to remove.
     #[doc(hidden)]
     pub fn with_chia_peer_count_for_tests(mut self, peers: u32) -> Self {
         let handle = dig_wallet::sage::sync_supervisor::SyncHandle::detached_for_tests(peers);
-        self.wallet = Arc::new((*self.wallet).clone().with_sync_handle(handle));
+        let tier = dig_wallet::sage::fallback::ChainPeerTier {
+            peer_count: Some(peers),
+            peak_height: None,
+        };
+        self.wallet = Arc::new(
+            (*self.wallet)
+                .clone()
+                .with_sync_handle(handle)
+                .with_chain_peer_tier_for_tests(tier),
+        );
         self
     }
 }

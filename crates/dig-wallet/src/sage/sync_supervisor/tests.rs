@@ -13,6 +13,7 @@ use std::sync::Mutex;
 use chia::protocol::{Message, NewPeakWallet, ProtocolMessageTypes, RespondPuzzleState};
 
 use super::*;
+use crate::sage::fallback::ChainPeerTier;
 use crate::sage::routing::{self, Source};
 use crate::sage::sync::PuzzleStateSource;
 
@@ -382,7 +383,13 @@ impl Harness {
     /// session facts that no DB row carries, so it can only be awaited through the handle.
     async fn until_status(&self, what: &str, mut predicate: impl FnMut(&WalletSyncStatus) -> bool) {
         for _ in 0..2_000 {
-            if predicate(&self.handle.status(&self.db).await.unwrap()) {
+            if predicate(
+                &self
+                    .handle
+                    .status(&self.db, ChainPeerTier::UNOBSERVABLE)
+                    .await
+                    .unwrap(),
+            ) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -563,7 +570,11 @@ async fn a_default_install_with_no_wallet_settles_on_nothing_to_watch() {
     })
     .await;
 
-    let status = h.handle.status(&db).await.unwrap();
+    let status = h
+        .handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(
         status.watched_addresses,
         Some(0),
@@ -674,10 +685,10 @@ async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnec
             .await;
         assert!(
             h.handle
-                .status(&db)
+                .status(&db, ChainPeerTier::UNOBSERVABLE)
                 .await
                 .unwrap()
-                .chia_peer_count
+                .subscription_peer_count
                 .is_some_and(|n| n >= 1),
             "cycle {cycle}: the session must still COUNT — liveness is the whole of what a \
              discovered peer contributes, so a supervisor that simply refuses to dial one fails \
@@ -780,10 +791,20 @@ async fn phase_is_syncing_when_caught_up_but_no_peer() {
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
-    assert_eq!(handle.status(&db).await.unwrap().phase, SyncPhase::Synced);
+    assert_eq!(
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
+        SyncPhase::Synced
+    );
 
     handle.set_connected(0);
-    let status = handle.status(&db).await.unwrap();
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(
         status.phase,
         SyncPhase::Syncing,
@@ -800,15 +821,33 @@ async fn phase_ladder_not_started_syncing_synced() {
     let (handle, _rx) = SyncHandle::new();
 
     assert_eq!(
-        handle.status(&db).await.unwrap().phase,
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
         SyncPhase::NotStarted
     );
 
     handle.set_connected(1);
-    assert_eq!(handle.status(&db).await.unwrap().phase, SyncPhase::Syncing);
+    assert_eq!(
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
+        SyncPhase::Syncing
+    );
 
     db.set_initial_sync_complete(true).await.unwrap();
-    assert_eq!(handle.status(&db).await.unwrap().phase, SyncPhase::Synced);
+    assert_eq!(
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
+        SyncPhase::Synced
+    );
 }
 
 /// **Proves (#2609):** `SyncPhase::as_wire` agrees with what serde actually puts on the wire, for
@@ -860,7 +899,10 @@ async fn phase_is_no_wallet_enrolled_when_custody_is_empty_on_a_writing_peer() {
     handle.set_trust(true);
     handle.set_watched(0, false);
 
-    let status = handle.status(&db).await.unwrap();
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(
         status.phase,
         SyncPhase::NoWalletEnrolled,
@@ -899,7 +941,10 @@ async fn an_enrolled_wallet_with_no_derivable_addresses_is_not_an_all_clear() {
     // The ONLY difference from the no-wallet case above: a wallet IS enrolled.
     handle.set_watched(0, true);
 
-    let status = handle.status(&db).await.unwrap();
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(
         status.phase,
         SyncPhase::WalletNotUnlocked,
@@ -995,7 +1040,10 @@ async fn a_previously_synced_wallet_restarted_locked_is_not_reported_as_synced()
     // Restarted locked: the wallet is still enrolled, its addresses are not derivable.
     handle.set_watched(0, true);
 
-    let status = handle.status(&db).await.unwrap();
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(
         status.phase,
         SyncPhase::WalletNotUnlocked,
@@ -1023,7 +1071,11 @@ async fn a_completed_catch_up_still_reports_synced_while_watching_addresses() {
     handle.set_watched(3, true);
 
     assert_eq!(
-        handle.status(&db).await.unwrap().phase,
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
         SyncPhase::Synced,
         "a wallet actually watching addresses after a completed catch-up is synced"
     );
@@ -1052,7 +1104,11 @@ async fn a_locked_wallet_reaches_wallet_not_unlocked_through_the_supervisor() {
     })
     .await;
 
-    let status = h.handle.status(&db).await.unwrap();
+    let status = h
+        .handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(status.watched_addresses, Some(0));
     assert!(
         !db.sync_state().await.unwrap().initial_sync_complete,
@@ -1082,7 +1138,11 @@ async fn a_refused_writer_is_not_reported_as_nothing_to_watch() {
     handle.set_watched(0, false);
 
     assert_eq!(
-        handle.status(&db).await.unwrap().phase,
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
         SyncPhase::Syncing,
         "a peer that may not write is genuinely not synced; it must not read as 'nothing to watch'"
     );
@@ -1109,7 +1169,10 @@ async fn a_writing_peer_with_an_unmeasured_set_does_not_claim_nothing_to_watch()
     // Trust settled; the set has NOT been resolved yet.
     handle.set_trust(true);
 
-    let status = handle.status(&db).await.unwrap();
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(
         status.phase,
         SyncPhase::Syncing,
@@ -1128,7 +1191,10 @@ async fn an_unmeasured_subscription_set_does_not_claim_nothing_to_watch() {
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
 
-    let status = handle.status(&db).await.unwrap();
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(
         status.phase,
         SyncPhase::Syncing,
@@ -1152,12 +1218,19 @@ async fn dropping_a_session_clears_its_subscription_facts() {
     handle.set_trust(true);
     handle.set_watched(0, false);
     assert_eq!(
-        handle.status(&db).await.unwrap().phase,
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
         SyncPhase::NoWalletEnrolled
     );
 
     handle.set_connected(0);
-    let status = handle.status(&db).await.unwrap();
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(status.phase, SyncPhase::Syncing);
     assert_eq!(
         status.watched_addresses, None,
@@ -1177,29 +1250,66 @@ async fn an_enrolled_wallet_mid_catch_up_still_reports_syncing() {
     handle.set_trust(true);
     handle.set_watched(3, true);
 
-    let status = handle.status(&db).await.unwrap();
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
     assert_eq!(status.phase, SyncPhase::Syncing);
     assert_eq!(status.watched_addresses, Some(3));
 }
 
 /// **Proves (T7, #2501):** an observed zero peers and an unobservable peer count are different
-/// answers. A consumer must be able to tell "the supervisor is running and has nobody" from
-/// "there is no supervisor to ask".
+/// answers, on BOTH peer counts. A consumer must be able to tell "the supervisor is running and
+/// has nobody" from "there is no supervisor to ask", and likewise "the transport holds no peers"
+/// from "no transport exists to ask".
+///
+/// The subscription half was `chia_peer_count` until dig_ecosystem#2806 moved that name onto the
+/// transport's held pool; the distinction it guards is unchanged and now has to hold twice.
 #[tokio::test]
-async fn chia_peer_count_distinguishes_observed_zero_from_unobservable() {
+async fn both_peer_counts_distinguish_observed_zero_from_unobservable() {
     let db = WalletDb::open_in_memory().await.unwrap();
     db.set_peak(42, "aa").await.unwrap();
 
     let (handle, _rx) = SyncHandle::new();
-    assert_eq!(handle.status(&db).await.unwrap().chia_peer_count, Some(0));
+    let held_none = ChainPeerTier {
+        peer_count: Some(0),
+        peak_height: None,
+    };
+    let with_supervisor = handle.status(&db, held_none).await.unwrap();
+    assert_eq!(with_supervisor.subscription_peer_count, Some(0));
+    assert_eq!(with_supervisor.chia_peer_count, Some(0));
 
-    let without = status_without_supervisor(&db).await.unwrap();
+    // A supervisor is running and holds nobody, yet the transport is unreachable: the two counts
+    // are independent, so a status must be able to say "observed zero" for one and "unknown" for
+    // the other in the SAME answer.
+    let unmeasured_transport = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
+    assert_eq!(unmeasured_transport.subscription_peer_count, Some(0));
+    assert_eq!(unmeasured_transport.chia_peer_count, None);
+
+    let without = status_without_supervisor(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
+    assert_eq!(without.subscription_peer_count, None);
     assert_eq!(without.chia_peer_count, None);
     assert_eq!(
         without.peak_height,
         Some(42),
         "the DB's peak stays honest without a supervisor"
     );
+
+    // Chain sync switched off does not mean the node holds no peers: the transport is a separate
+    // thing and its count survives the supervisor's absence.
+    let held_five = ChainPeerTier {
+        peer_count: Some(5),
+        peak_height: Some(9_139_211),
+    };
+    let transport_only = status_without_supervisor(&db, held_five).await.unwrap();
+    assert_eq!(transport_only.chia_peer_count, Some(5));
+    assert_eq!(transport_only.chia_peer_peak_height, Some(9_139_211));
+    assert_eq!(transport_only.subscription_peer_count, None);
 }
 
 /// **Proves (#2501, and the `control.wallet.syncStatus` contract):** the reported peak is the
@@ -1220,14 +1330,22 @@ async fn status_reports_the_replica_peak_and_never_an_oracle_height() {
     handle.set_connected(1);
 
     assert_eq!(
-        handle.status(&db).await.unwrap().peak_height,
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .peak_height,
         None,
         "an un-synced replica must report an UNKNOWN peak, not a borrowed one"
     );
 
     db.set_peak(6_000_001, "aa").await.unwrap();
     assert_eq!(
-        handle.status(&db).await.unwrap().peak_height,
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .peak_height,
         Some(6_000_001),
         "and once the replica has a peak, that exact value is what is reported"
     );
@@ -1462,7 +1580,11 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
     let mut first_peak: Option<u32> = None;
     let mut latest_peak: Option<u32> = None;
     while std::time::Instant::now() < deadline {
-        peers = handle.status(&db).await.unwrap().chia_peer_count;
+        peers = handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .chia_peer_count;
         latest_peak = db.sync_state().await.unwrap().peak_height;
         if let Some(seen) = latest_peak {
             first_peak.get_or_insert(seen);

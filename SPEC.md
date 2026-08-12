@@ -3815,7 +3815,7 @@ verify the server certificate, so an unprivileged co-resident process can become
 * A **discovered** peer (a DNS introducer answer, or the loopback probe) arrives with NO authority. On
   arrival it MUST NOT cause ANY write to `wallet.sqlite`: it MUST NOT write coins, MUST NOT roll the
   replica back, MUST NOT cause `initial_sync_complete` to become `true`, and MUST NOT move the replica
-  peak in EITHER direction. Its entire contribution is LIVENESS: it counts toward the `chia_peer_count`
+  peak in EITHER direction. Its entire contribution is LIVENESS: it counts toward the `subscription_peer_count`
   of §18.6b, which is an observation the node makes about its own socket rather than a claim the peer
   makes.
 
@@ -3940,13 +3940,32 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
   can make settled money read unconfirmed.
 
 18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
-chia_peer_count, watched_addresses}`. `phase` is `not_started` (no peer has ever attached), `syncing`,
+chia_peer_count, subscription_peer_count, chia_peer_peak_height, watched_addresses}`. `phase` is `not_started` (no peer has ever attached), `syncing`,
 `synced`, `no_wallet_enrolled` or `wallet_not_unlocked` — and `synced` requires BOTH a completed catch-up AND at least one
 live Chia peer, so a replica that caught up and then went offline reports `syncing`. It is not a freshness
 guarantee: a live connection to a stalled peer satisfies it. `peak_height` is the REPLICA's own height read
 from `sync_state`; it MUST NOT fall back to the coinset oracle (unlike `control.wallet.peak`, which answers
-a different question), and `null` means unknown, never height zero. `chia_peer_count` is `0` when observed
-and `null` when unobservable. `control.peerCounts` reports `{dig_peer_count, chia_peer_count,
+a different question), and `null` means unknown, never height zero.
+
+**The node reports TWO Chia peer counts, and they are different sets.** `chia_peer_count` is the Chia full
+nodes the node HOLDS — the chain transport's pool, which serves its chain reads. It MUST be the LIVE size
+of that pool and MUST NOT be the configured target: a pool still filling reports the smaller number.
+`subscription_peer_count` is the replica's subscription session, at most ONE by design. Each is `0` when
+observed and `null` when unobservable, and a consumer MUST NOT add them. A node MUST NOT report the
+subscription session as `chia_peer_count`: doing so made a node holding five peers and serving every read
+from them announce `chia_peer_count: 1`, a figure that was neither the peers serving reads nor the total.
+
+**A node with chain sync enabled MUST hold its Chia peers because it is running**, not because a read
+happened to build them. The chain transport is connected in the background at start-up and RETRIED, so a
+node that booted before its network came up does not stay peerless for the life of the process. Asking for
+the peer tier MUST NOT itself dial: a status call cannot be the act that makes the node hold peers.
+
+`chia_peer_peak_height` is the peak those held peers ANNOUNCED to this node. It is distinct from
+`peak_height` (the replica's own progress) and from any oracle reading, and it MUST NOT be sourced from
+one: a peak fetched from a public HTTP oracle evidences nothing about the node's peers. `null` means no
+peer has announced one yet, never height zero.
+
+`control.peerCounts` reports `{dig_peer_count, chia_peer_count,
 known_dig_peer_count}`, and its `chia_peer_count` MUST be the SAME observation this method reports.
 
 **The two nothing-to-watch phases are DEFAULT-INSTALL states and MUST NOT be reported as `syncing`.** A

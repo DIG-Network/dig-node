@@ -180,9 +180,36 @@ pub struct WalletSyncStatus {
     /// The REPLICA's own peak height. `None` means unknown — never 0-for-unknown, because a
     /// consumer cannot tell a genuine height 0 from "we have not looked".
     pub peak_height: Option<u32>,
-    /// Live subscription peers. `Some(0)` is an OBSERVED zero (a supervisor is running and
-    /// holds no peer); `None` is unobservable (no supervisor attached at all).
+    /// Chia full nodes this node HOLDS — the peers that serve its chain reads
+    /// (dig_ecosystem#2806).
+    ///
+    /// This is the node's headline "am I a light client" number, and it is the LIVE count of the
+    /// chain transport's peer pool: a pool still filling reports the smaller number and reports
+    /// its target only on reaching it. `None` is unobservable (no transport, or none could be
+    /// built), never an observed zero.
+    ///
+    /// It is deliberately NOT [`Self::subscription_peer_count`] and MUST NOT be summed with it.
+    /// Until dig_ecosystem#2806 this field carried that number instead, which is why a node with
+    /// five peers serving every read reported `chia_peer_count: 1`: it was quoting the
+    /// supervisor's single subscription session, which is neither the peers serving reads nor the
+    /// total. The two are separate sets with separate lifetimes, so adding them would produce a
+    /// larger number that describes nothing.
     pub chia_peer_count: Option<u32>,
+    /// The REPLICA's subscription peers — what [`Self::chia_peer_count`] used to report.
+    ///
+    /// `Some(0)` is an OBSERVED zero (a supervisor is running and holds no peer); `None` is
+    /// unobservable (no supervisor attached at all). The supervisor holds AT MOST ONE by design
+    /// (see [`SyncSession`]), so this is a 0-or-1 fact about whether the replica is being written,
+    /// never a measure of network reach — and reading it as one is exactly the confusion that
+    /// made the node look like a one-peer client.
+    pub subscription_peer_count: Option<u32>,
+    /// The peak height the node's OWN Chia peers announced (dig_ecosystem#2806).
+    ///
+    /// Distinct from [`Self::peak_height`], which is the replica's own progress, and from any
+    /// oracle reading: this is what the node's peers told it directly, so a value here is
+    /// evidence those peers are live and talking. `None` until one of them says something —
+    /// never zero, which every block is trivially above.
+    pub chia_peer_peak_height: Option<u32>,
     /// How many custodied puzzle hashes the ATTACHED session resolved for subscription.
     ///
     /// `Some(0)` is a MEASURED zero — custody genuinely holds nothing, which is the reason behind
@@ -251,7 +278,16 @@ impl SyncHandle {
     /// `Synced` requires BOTH a completed catch-up and a peer attached now: an offline
     /// replica is stale, however complete its last catch-up was, and reporting it synced is
     /// the shape that makes a client trust a day-old balance.
-    pub async fn status(&self, db: &WalletDb) -> sqlx::Result<WalletSyncStatus> {
+    ///
+    /// `tier` is the node's own Chia peer tier, measured by the caller (which holds the chain
+    /// transport; the supervisor does not). It is passed IN rather than defaulted so the status
+    /// is built complete in one place — a field left to be patched afterwards is a field that
+    /// ships as `None` the first time a new call site forgets it.
+    pub async fn status(
+        &self,
+        db: &WalletDb,
+        tier: super::fallback::ChainPeerTier,
+    ) -> sqlx::Result<WalletSyncStatus> {
         let observed = self.observed();
         let state = db.sync_state().await?;
         let phase = if !observed.ever_connected {
@@ -301,7 +337,9 @@ impl SyncHandle {
         Ok(WalletSyncStatus {
             phase,
             peak_height: state.peak_height,
-            chia_peer_count: Some(observed.peers),
+            chia_peer_count: tier.peer_count,
+            subscription_peer_count: Some(observed.peers),
+            chia_peer_peak_height: tier.peak_height,
             watched_addresses: observed.watched,
         })
     }
@@ -375,14 +413,24 @@ impl SyncHandle {
     }
 }
 
-/// The status to report when NO supervisor is attached: the DB's peak is still honest, but the
-/// peer count is unobservable rather than zero.
-pub async fn status_without_supervisor(db: &WalletDb) -> sqlx::Result<WalletSyncStatus> {
+/// The status to report when NO supervisor is attached: the DB's peak is still honest, and the
+/// SUBSCRIPTION peer count is unobservable rather than zero.
+///
+/// The chain-transport tier is still reported, because it is a different thing entirely: a node
+/// with chain sync switched off can still hold peers and serve reads from them, and saying
+/// otherwise would understate what the node is.
+pub async fn status_without_supervisor(
+    db: &WalletDb,
+    tier: super::fallback::ChainPeerTier,
+) -> sqlx::Result<WalletSyncStatus> {
     let state = db.sync_state().await?;
     Ok(WalletSyncStatus {
         phase: SyncPhase::NotStarted,
         peak_height: state.peak_height,
-        chia_peer_count: None,
+        chia_peer_count: tier.peer_count,
+        // No supervisor is attached, so nobody is holding a subscription session to count.
+        subscription_peer_count: None,
+        chia_peer_peak_height: tier.peak_height,
         // Nothing is attached, so nothing has resolved a subscription set to report.
         watched_addresses: None,
     })
