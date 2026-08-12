@@ -3941,8 +3941,10 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
 
 18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
 chia_peer_count, subscription_peer_count, chia_peer_peak_height, watched_addresses}`. `phase` is `not_started` (no peer has ever attached), `syncing`,
-`synced`, `no_wallet_enrolled` or `wallet_not_unlocked` — and `synced` requires BOTH a completed catch-up AND at least one
-live Chia peer, so a replica that caught up and then went offline reports `syncing`. It is not a freshness
+`synced`, `no_wallet_enrolled` or `wallet_not_unlocked` — and `synced` requires BOTH a completed catch-up AND a live
+SUBSCRIPTION peer (`subscription_peer_count >= 1`, NOT `chia_peer_count`), so a replica that caught up and then went
+offline reports `syncing`. The phase describes the REPLICA, so it keys off the session that writes the replica; held
+read-serving peers do not make a stale replica current. It is not a freshness
 guarantee: a live connection to a stalled peer satisfies it. `peak_height` is the REPLICA's own height read
 from `sync_state`; it MUST NOT fall back to the coinset oracle (unlike `control.wallet.peak`, which answers
 a different question), and `null` means unknown, never height zero.
