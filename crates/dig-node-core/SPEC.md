@@ -330,8 +330,11 @@ but the stored artifact and the served wire stay ciphertext + proof.
 
 - A read is served from a locally cached module via `digstore_host::serve_blind(module, retrieval_key,
   cfg)`, which instantiates the compiled module and returns a `ContentResponse` = ciphertext + merkle
-  proof + `chunk_lens`. The serve host key is local/ephemeral: the client verifies against the
-  chain-anchored root, not against a host signature.
+  proof + `chunk_lens`. The serve host key is minted fresh from the OS CSPRNG for EACH serve and
+  discarded with it: it MUST NOT be a fixed seed, a value shared between nodes, or the node's
+  persisted machine identity, and a serve MUST be refused rather than fall back to any of those when
+  the CSPRNG is unavailable. The client verifies against the chain-anchored root, not against a host
+  signature.
 - The whole-module read + `serve_blind` decrypt runs on a BLOCKING thread (`spawn_blocking`), never on
   an async worker, and the decoded `ContentResponse` is MEMOIZED in a bounded in-memory LRU keyed by
   `(store, root, retrieval_key)` (default 256 MiB, least-recently-used eviction). Successive windows of
@@ -1242,7 +1245,10 @@ cache cap is `config.json` > env > default).
 ## 11. Security properties
 
 - **Provider-blind at rest + on the wire.** Stored capsules and served windows are ciphertext +
-  merkle proofs; the serve host key is local/ephemeral. A LOCAL node MAY decrypt for its own consumer
+  merkle proofs; the serve host key is a single-use identity minted per serve from the OS CSPRNG. No
+  verifier accepts an attestation from it as authority, and it MUST NOT be the node's persisted
+  machine identity, because the module executed on this path is publisher-supplied and is handed a
+  signing capability over that key. A LOCAL node MAY decrypt for its own consumer
   (the user's machine); the served wire stays ciphertext + proof.
 - **Chain is the authority (fail-closed).** No content is served under a root not confirmed on-chain
   (§4.2); a compromised upstream cannot select the served generation.
