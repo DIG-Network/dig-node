@@ -114,8 +114,16 @@ pub struct PendingTransactionRow {
     /// Not a secret: these exact bytes were broadcast to a public mempool. Storing them adds no
     /// disclosure, and a bundle whose push was definitively refused is deleted rather than kept.
     pub bundle_hex: String,
-    /// The bundle's fee in mojos, as the consensus computes it (inputs minus outputs).
-    pub fee: String,
+    /// The bundle's fee in mojos, as the consensus computes it (inputs minus outputs), or `None`
+    /// when this node could not compute it.
+    ///
+    /// Optional because the node relays bundles it did not build and did not sign (§908). The fee
+    /// is recovered by running the spends through `dig-clvm`, which can legitimately fail for a
+    /// bundle that is still perfectly valid to relay. `None` is then the honest answer, and it is
+    /// kept as `None` all the way to the caller rather than being flattened to zero — a fee of
+    /// zero is a claim about money, and this row exists because the surface above it was making
+    /// claims it could not support (dig_ecosystem#2764).
+    pub fee: Option<String>,
     /// When the bundle was first pushed, ms since the Unix epoch.
     pub submitted_at: i64,
     /// When the reservation lapses, ms since the Unix epoch. A reservation ALWAYS expires: a
@@ -372,7 +380,7 @@ CREATE TABLE IF NOT EXISTS options (
 CREATE TABLE IF NOT EXISTS pending_transactions (
     transaction_id TEXT PRIMARY KEY,
     bundle_hex TEXT NOT NULL,
-    fee TEXT NOT NULL,
+    fee TEXT,
     submitted_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 1
@@ -1323,6 +1331,27 @@ impl WalletDb {
         Ok(rows
             .into_iter()
             .map(|r| r.get::<String, _>("coin_id").to_ascii_lowercase())
+            .collect())
+    }
+
+    /// Every p2 puzzle hash the replica has seen ANY coin at — the gap-limit scan's evidence that
+    /// an HD index is in use (dig_ecosystem#2762).
+    ///
+    /// Deliberately includes SPENT coins. A coin that arrived at index 400 and was then spent is
+    /// still proof the wallet handed out index 400, and the addresses the user is about to be paid
+    /// at are the ones just past it. Restricting this to unspent coins would let a wallet that had
+    /// swept itself collapse its own window back to the default and lose sight of its next
+    /// receive addresses.
+    ///
+    /// Returns PUBLIC puzzle hashes only. Nothing here is a key and nothing here widens what the
+    /// node may sign — it decides only how far a wallet looks for its own money.
+    pub async fn occupied_puzzle_hashes(&self) -> sqlx::Result<std::collections::HashSet<String>> {
+        let rows = sqlx::query("SELECT DISTINCT puzzle_hash FROM coins")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("puzzle_hash").to_ascii_lowercase())
             .collect())
     }
 
@@ -3221,7 +3250,7 @@ mod tests {
         PendingTransactionRow {
             transaction_id: tx.into(),
             bundle_hex: format!("bundle-of-{tx}"),
-            fee: "10".into(),
+            fee: Some("10".into()),
             submitted_at,
             expires_at,
             attempts: 1,

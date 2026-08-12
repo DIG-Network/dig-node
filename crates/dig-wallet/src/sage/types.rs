@@ -390,8 +390,12 @@ pub struct TransactionCoinRecord {
 pub struct PendingTransactionRecord {
     /// The transaction id (hex).
     pub transaction_id: String,
-    /// The fee.
-    pub fee: Amount,
+    /// The fee, or `null` when this node could not compute it.
+    ///
+    /// Optional for the same reason [`Self::submitted_at`] is: the node relays bundles it did not
+    /// build, and it must not answer a question about someone else's money with a confident zero
+    /// (dig_ecosystem#2764).
+    pub fee: Option<Amount>,
     /// The submission timestamp.
     pub submitted_at: Option<u64>,
 }

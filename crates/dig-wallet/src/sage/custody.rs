@@ -955,6 +955,27 @@ impl WalletCustody {
     /// The unhardened index 0 key stays FIRST in the signer, because
     /// [`WalletSigner::change_puzzle_hash`] is defined as its first key and the wallet's change
     /// must keep going to its own receive address.
+    ///
+    /// # Cost, measured rather than assumed
+    ///
+    /// Deriving the default window (500 indices in each tree, 1000 keys) costs **251ms** in a
+    /// release build — 132ms unhardened, 119ms hardened. A whole `import`/`unlock`, which also
+    /// runs the deliberately-expensive Argon2id seed decryption, measures **527ms**.
+    ///
+    /// Two things make that a non-issue, and both were checked rather than reasoned about:
+    ///
+    /// 1. This runs **once per [`WalletCustody::unlock`]**, not once per transaction. The result
+    ///    is cached as an `Arc<WalletSigner>` in `unlocked`, and [`WalletCustody::signer`] is an
+    ///    `Arc` clone. Nothing in the node re-locks between transactions.
+    /// 2. An earlier measurement of "1.8s per unlock" was taken in a DEBUG build, where BLS is
+    ///    several times slower. It is not the shipped cost, and it should not be used to argue
+    ///    the window down.
+    ///
+    /// The window is therefore NOT sized to a latency target. It could not be: narrowing it is
+    /// precisely the defect (dig_ecosystem#2762), so a version tuned for speed would close the
+    /// ticket by reproducing the bug it was filed for. Cost scales linearly with the window, so
+    /// the worst case is [`MAX_DERIVATION_COUNT`] — reachable only by a wallet with observed usage
+    /// near index 25,000, and bounded there on purpose.
     fn build_signer(&self, mnemonic: &str) -> Result<(WalletSigner, String)> {
         let master_sk = master_secret_key(mnemonic)?;
         let occupied = self.observed.read().unwrap().clone();
@@ -1036,15 +1057,20 @@ impl DerivedWindow {
         if occupied.is_empty() {
             return None;
         }
-        self.unhardened
-            .iter()
-            .chain(self.hardened.iter())
-            .enumerate()
-            .filter(|(_, sk)| occupied.contains(&p2_puzzle_hash(&sk.public_key())))
-            // Positions run `0..n` for the unhardened tree then `0..n` again for the hardened one,
-            // so the position modulo the per-tree length is the HD index.
-            .map(|(pos, _)| (pos % self.unhardened.len().max(1)) as u32)
-            .max()
+        // Each tree is enumerated SEPARATELY so a position is its own HD index directly. An
+        // earlier form chained the two and recovered the index with `pos % unhardened.len()`,
+        // which was correct only while both trees stayed exactly the same length — an invariant
+        // held in `extend_to` and nowhere near the arithmetic depending on it. A tree that ever
+        // fell behind would not fail; it would silently report the wrong index and size the
+        // window from it.
+        let highest = |keys: &[SecretKey]| -> Option<u32> {
+            keys.iter()
+                .enumerate()
+                .filter(|(_, sk)| occupied.contains(&p2_puzzle_hash(&sk.public_key())))
+                .map(|(i, _)| i as u32)
+                .max()
+        };
+        highest(&self.unhardened).max(highest(&self.hardened))
     }
 
     /// The signer's keys, unhardened index 0 first (see [`WalletCustody::build_signer`]).
@@ -1104,7 +1130,11 @@ fn wallet_fingerprint(mnemonic: &str) -> Result<u32> {
 }
 
 /// Milliseconds since the Unix epoch (0 if the clock is before the epoch — impossible in practice).
-fn now_ms() -> u64 {
+///
+/// Shared with the RPC layer, which stamps and expires coin reservations against the same clock
+/// (dig_ecosystem#2763). One implementation rather than two, so a reservation cannot be written
+/// on one notion of "now" and expired against another.
+pub(super) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1601,9 +1631,13 @@ mod tests {
 
     // ---- derivation coverage (dig_ecosystem#2762) --------------------------
 
-    /// The p2 hash of the unhardened synthetic key at `index` — computed the long way round, via
-    /// `digstore_chain`, so a test asserting coverage cannot be satisfied by the same helper the
-    /// production code uses.
+    /// The p2 hash of the unhardened synthetic key at `index`.
+    ///
+    /// The KEY is derived independently of the production path, via `digstore_chain`, so a
+    /// coverage test cannot be satisfied by the fast intermediate derivation agreeing with itself.
+    /// The p2 MAPPING is deliberately the shared [`p2_puzzle_hash`] — it is the mapping under
+    /// test elsewhere ([`p2_puzzle_hash_matches_the_signer`] pins it against `WalletSigner`), and
+    /// re-deriving it here would test a copy rather than the thing the subscription uses.
     fn unhardened_p2(mnemonic: &str, index: u32) -> Bytes32 {
         let k = derive_indexed_keys(mnemonic, index..index + 1).unwrap();
         p2_puzzle_hash(&k[0].synthetic_sk.public_key())
