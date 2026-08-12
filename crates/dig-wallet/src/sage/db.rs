@@ -97,6 +97,36 @@ pub struct DerivationRow {
     pub address: String,
 }
 
+/// A spend bundle this node pushed that has not yet been observed settling, together with the
+/// coins it committed (dig_ecosystem#2763).
+///
+/// This is the record the wallet previously did not keep. Without it a broadcast marked nothing,
+/// so a second send inside the confirmation window re-selected the same coin and was refused by
+/// the mempool for a reason the caller could not act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTransactionRow {
+    /// The spend bundle's id (`SpendBundle::name`, hex) — the transaction id a caller polls by.
+    pub transaction_id: String,
+    /// The complete signed bundle, hex-encoded, so a bundle accepted and then dropped from the
+    /// mempool can be re-pushed BYTE-IDENTICALLY rather than rebuilt (a rebuild would be a
+    /// different transaction, and the node cannot rebuild a bundle it did not sign).
+    ///
+    /// Not a secret: these exact bytes were broadcast to a public mempool. Storing them adds no
+    /// disclosure, and a bundle whose push was definitively refused is deleted rather than kept.
+    pub bundle_hex: String,
+    /// The bundle's fee in mojos, as the consensus computes it (inputs minus outputs).
+    pub fee: String,
+    /// When the bundle was first pushed, ms since the Unix epoch.
+    pub submitted_at: i64,
+    /// When the reservation lapses, ms since the Unix epoch. A reservation ALWAYS expires: a
+    /// release path that fails to run must not be able to strand a coin permanently.
+    pub expires_at: i64,
+    /// How many times this bundle has been pushed (1 on first broadcast).
+    pub attempts: i64,
+    /// The coin ids the bundle spends — the coins held out of further selection while it is live.
+    pub reserved_coin_ids: Vec<String>,
+}
+
 /// A reconstructed NFT row: filter columns + the full serialized `NftRecord` wire JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NftDbRow {
@@ -338,6 +368,22 @@ CREATE TABLE IF NOT EXISTS options (
     created_height INTEGER,
     record_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS pending_transactions (
+    transaction_id TEXT PRIMARY KEY,
+    bundle_hex TEXT NOT NULL,
+    fee TEXT NOT NULL,
+    submitted_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS coin_reservations (
+    coin_id TEXT PRIMARY KEY,
+    transaction_id TEXT NOT NULL
+        REFERENCES pending_transactions (transaction_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_coin_reservations_tx ON coin_reservations (transaction_id);
 
 CREATE TABLE IF NOT EXISTS peers (
     ip_addr TEXT PRIMARY KEY,
@@ -1114,6 +1160,170 @@ impl WalletDb {
             .iter()
             .filter_map(|c| c.amount.parse::<u128>().ok())
             .sum())
+    }
+
+    // ---- in-flight spends (dig_ecosystem#2763) ----------------------------
+    //
+    // A broadcast used to mark nothing. The DB only learned a coin was spent when a peer pushed a
+    // `coin_state_update`, tens of seconds later, and every selection inside that window re-picked
+    // the same coin. These four methods are the record that closes it: what was pushed, which
+    // coins it committed, and when the commitment lapses.
+    //
+    // Three properties are deliberate:
+    //
+    // * **The reservation always expires.** `expires_at` is not a tidy-up convenience — it is the
+    //   guarantee that a release path which never runs (a crash between push and confirmation, a
+    //   bundle the mempool silently dropped) cannot strand the user's coin forever. The failure
+    //   direction that matters here is "the wallet refuses to spend money it owns", and only an
+    //   unconditional expiry rules it out.
+    // * **Reservation narrows SELECTION, never BALANCE.** A reserved coin is still the user's
+    //   money until the spend confirms, so [`Self::balance`] and [`Self::unspent_coins`] are left
+    //   exactly as they were and only [`Self::unreserved_unspent_coins`] is new. Netting an
+    //   in-flight send out of the balance would report money as gone before the chain says so,
+    //   which is the same class of lie in the opposite direction.
+    // * **A reserved coin that is already observed spent is not held.** Release is driven by the
+    //   coin's own `spent_height`, so confirmation retires the reservation without anything having
+    //   to remember to call a release.
+
+    /// Record a pushed bundle and reserve the coins it spends.
+    ///
+    /// Idempotent on the transaction id: re-pushing the same bundle updates its expiry and attempt
+    /// count rather than duplicating it, because a resubmission is the same transaction.
+    pub async fn reserve_spend(&self, tx: &PendingTransactionRow) -> sqlx::Result<()> {
+        let mut conn = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO pending_transactions
+                (transaction_id, bundle_hex, fee, submitted_at, expires_at, attempts)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(transaction_id) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                attempts = pending_transactions.attempts + 1",
+        )
+        .bind(&tx.transaction_id)
+        .bind(&tx.bundle_hex)
+        .bind(&tx.fee)
+        .bind(tx.submitted_at)
+        .bind(tx.expires_at)
+        .bind(tx.attempts)
+        .execute(&mut *conn)
+        .await?;
+        for coin_id in &tx.reserved_coin_ids {
+            // A coin can only back ONE in-flight bundle. `INSERT OR REPLACE` would silently move
+            // the reservation to a newer transaction; `DO NOTHING` keeps the first claim, which is
+            // the one the mempool will honour.
+            sqlx::query(
+                "INSERT INTO coin_reservations (coin_id, transaction_id) VALUES (?, ?)
+                 ON CONFLICT(coin_id) DO NOTHING",
+            )
+            .bind(coin_id.to_ascii_lowercase())
+            .bind(&tx.transaction_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        conn.commit().await?;
+        Ok(())
+    }
+
+    /// Drop a pushed bundle and every coin it reserved — the definitive-outcome release (a mempool
+    /// refusal, or a settled spend). The cascade on `coin_reservations` frees the coins.
+    pub async fn release_spend(&self, transaction_id: &str) -> sqlx::Result<()> {
+        sqlx::query("DELETE FROM pending_transactions WHERE transaction_id = ?")
+            .bind(transaction_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Drop every reservation whose bundle has lapsed, settled, or become unspendable, and return
+    /// how many bundles were retired.
+    ///
+    /// `now_ms` is passed in rather than read from the clock so a test can drive the expiry edge
+    /// exactly instead of sleeping through it.
+    ///
+    /// Three retirement conditions, all of which mean the reservation no longer protects anything:
+    ///
+    /// 1. `expires_at <= now_ms` — the unconditional lapse.
+    /// 2. every reserved coin is now recorded spent — the spend settled, which is the outcome the
+    ///    reservation was waiting for.
+    /// 3. a reserved coin is recorded spent by SOMETHING ELSE while others are not — the bundle
+    ///    can never be included now, so holding its remaining inputs only strands them.
+    ///
+    /// Conditions 2 and 3 are the same SQL: any reserved coin observed spent retires the bundle.
+    /// They are named separately because they are different events and a reader should not have to
+    /// infer that the code treats them alike on purpose.
+    pub async fn prune_reservations(&self, now_ms: i64) -> sqlx::Result<u64> {
+        let n = sqlx::query(
+            "DELETE FROM pending_transactions WHERE expires_at <= ?
+             OR transaction_id IN (
+                SELECT r.transaction_id FROM coin_reservations r
+                JOIN coins c ON c.coin_id = r.coin_id
+                WHERE c.spent_height IS NOT NULL
+             )",
+        )
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
+    }
+
+    /// Every live in-flight bundle, oldest submission first, with the coins it reserved.
+    pub async fn pending_transactions(&self) -> sqlx::Result<Vec<PendingTransactionRow>> {
+        let rows = sqlx::query(
+            "SELECT transaction_id, bundle_hex, fee, submitted_at, expires_at, attempts
+             FROM pending_transactions ORDER BY submitted_at ASC, transaction_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let transaction_id: String = r.get("transaction_id");
+            let coins = sqlx::query(
+                "SELECT coin_id FROM coin_reservations WHERE transaction_id = ? ORDER BY coin_id",
+            )
+            .bind(&transaction_id)
+            .fetch_all(&self.pool)
+            .await?;
+            out.push(PendingTransactionRow {
+                transaction_id,
+                bundle_hex: r.get("bundle_hex"),
+                fee: r.get("fee"),
+                submitted_at: r.get("submitted_at"),
+                expires_at: r.get("expires_at"),
+                attempts: r.get("attempts"),
+                reserved_coin_ids: coins.into_iter().map(|c| c.get("coin_id")).collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The unspent coins for an asset MINUS any coin committed to a live in-flight bundle — the
+    /// set a new spend may select from (dig_ecosystem#2763).
+    ///
+    /// Deliberately a SEPARATE method from [`Self::unspent_coins`] rather than a filter added to
+    /// it: the two answer different questions. "What do I own" must keep counting a coin whose
+    /// spend has not settled; "what may I spend next" must not.
+    pub async fn unreserved_unspent_coins(
+        &self,
+        asset_id: Option<&str>,
+    ) -> sqlx::Result<Vec<CoinRow>> {
+        let coins = self.unspent_coins(asset_id).await?;
+        let reserved = self.reserved_coin_ids().await?;
+        Ok(coins
+            .into_iter()
+            .filter(|c| !reserved.contains(&c.coin_id.to_ascii_lowercase()))
+            .collect())
+    }
+
+    /// Every coin id currently committed to a live in-flight bundle, lower-cased.
+    pub async fn reserved_coin_ids(&self) -> sqlx::Result<std::collections::HashSet<String>> {
+        let rows = sqlx::query("SELECT coin_id FROM coin_reservations")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("coin_id").to_ascii_lowercase())
+            .collect())
     }
 
     // ---- identity-scoped reads (#407) -------------------------------------
@@ -2997,5 +3207,243 @@ mod tests {
         assert!(!s2.delta_sync);
         assert_eq!(s2.delta_sync_override, Some(true));
         assert_eq!(s2.change_address.as_deref(), Some("xch1change"));
+    }
+
+    // ---- in-flight spend reservations (dig_ecosystem#2763) ----------------
+
+    /// A reservation over `coin_ids`, submitted at `submitted_at` and lapsing at `expires_at`.
+    fn reservation(
+        tx: &str,
+        coin_ids: &[&str],
+        submitted_at: i64,
+        expires_at: i64,
+    ) -> PendingTransactionRow {
+        PendingTransactionRow {
+            transaction_id: tx.into(),
+            bundle_hex: format!("bundle-of-{tx}"),
+            fee: "10".into(),
+            submitted_at,
+            expires_at,
+            attempts: 1,
+            reserved_coin_ids: coin_ids.iter().map(|c| (*c).to_string()).collect(),
+        }
+    }
+
+    /// **The defect, at the DB layer.** A coin committed to a pushed, unsettled bundle must not be
+    /// offered to the next selection — while still counting as money the wallet owns, because the
+    /// chain has not said otherwise yet.
+    #[tokio::test]
+    async fn a_reserved_coin_leaves_selection_but_not_the_balance() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.upsert_coin(&coin("c2", 50, Some(10), None))
+            .await
+            .unwrap();
+
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        let selectable: Vec<String> = db
+            .unreserved_unspent_coins(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.coin_id)
+            .collect();
+        assert_eq!(
+            selectable,
+            vec!["c2".to_string()],
+            "a coin already in flight was offered for selection again"
+        );
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            150,
+            "an in-flight spend has not settled, so the coin is still the user's money"
+        );
+    }
+
+    /// Coin ids compare case-insensitively, as every other hex column here does. A caller that
+    /// reserves an upper-case id must not get the coin back from selection.
+    #[tokio::test]
+    async fn reservation_matching_is_case_insensitive() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("abcd", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        db.reserve_spend(&reservation("tx1", &["ABCD"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        assert!(
+            db.unreserved_unspent_coins(None).await.unwrap().is_empty(),
+            "an upper-case reservation failed to hold its coin"
+        );
+    }
+
+    /// **The reservation ALWAYS lapses.** This keeps a release path that never runs from stranding
+    /// the user's coin permanently — the failure direction that would be worse than the bug.
+    #[tokio::test]
+    async fn an_expired_reservation_releases_its_coin() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.prune_reservations(59_999).await.unwrap(),
+            0,
+            "pruned before the deadline"
+        );
+        assert!(db.unreserved_unspent_coins(None).await.unwrap().is_empty());
+
+        assert_eq!(
+            db.prune_reservations(60_000).await.unwrap(),
+            1,
+            "the deadline itself must lapse"
+        );
+        assert_eq!(db.unreserved_unspent_coins(None).await.unwrap().len(), 1);
+        assert!(db.pending_transactions().await.unwrap().is_empty());
+    }
+
+    /// Settlement retires the reservation without anything having to remember to release it: the
+    /// coin's own `spent_height` is the signal.
+    #[tokio::test]
+    async fn observing_a_reserved_coin_spent_retires_its_bundle() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.upsert_coin(&coin("c2", 50, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1", "c2"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        db.upsert_coin(&coin("c1", 100, Some(10), Some(11)))
+            .await
+            .unwrap();
+
+        assert_eq!(db.prune_reservations(2_000).await.unwrap(), 1);
+        assert!(
+            db.pending_transactions().await.unwrap().is_empty(),
+            "a bundle whose input is spent can never be included, so it must stop holding the rest"
+        );
+        let selectable: Vec<String> = db
+            .unreserved_unspent_coins(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.coin_id)
+            .collect();
+        assert_eq!(
+            selectable,
+            vec!["c2".to_string()],
+            "c2 stayed stranded behind a bundle that can never be included"
+        );
+    }
+
+    /// An explicit release (a definitive mempool refusal) frees the coins at once, without waiting
+    /// for the expiry.
+    #[tokio::test]
+    async fn releasing_a_refused_bundle_frees_its_coins_at_once() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        db.release_spend("tx1").await.unwrap();
+
+        assert_eq!(db.unreserved_unspent_coins(None).await.unwrap().len(), 1);
+        assert!(
+            db.reserved_coin_ids().await.unwrap().is_empty(),
+            "the cascade left an orphan reservation"
+        );
+    }
+
+    /// A resubmission is the SAME transaction: it refreshes the expiry and counts the attempt,
+    /// never appearing twice and never moving a coin's reservation onto a new row.
+    #[tokio::test]
+    async fn resubmitting_the_same_bundle_updates_it_in_place() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 120_000))
+            .await
+            .unwrap();
+
+        let pending = db.pending_transactions().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].attempts, 2);
+        assert_eq!(pending[0].expires_at, 120_000);
+        assert_eq!(
+            pending[0].submitted_at, 1_000,
+            "the FIRST submission time is what a caller has been polling against"
+        );
+        assert_eq!(pending[0].reserved_coin_ids, vec!["c1".to_string()]);
+    }
+
+    /// A coin already committed to one in-flight bundle keeps that commitment. The first claim is
+    /// the one the mempool will honour, so a later bundle must not silently take the coin over.
+    #[tokio::test]
+    async fn a_coin_backs_only_the_first_bundle_that_claimed_it() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx2", &["c1"], 2_000, 60_000))
+            .await
+            .unwrap();
+
+        let pending = db.pending_transactions().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "both bundles were pushed, so both are in flight"
+        );
+        let tx1 = pending.iter().find(|p| p.transaction_id == "tx1").unwrap();
+        let tx2 = pending.iter().find(|p| p.transaction_id == "tx2").unwrap();
+        assert_eq!(tx1.reserved_coin_ids, vec!["c1".to_string()]);
+        assert!(
+            tx2.reserved_coin_ids.is_empty(),
+            "the second bundle took over the first bundle's coin"
+        );
+    }
+
+    /// The pending set is what `get_pending_transactions` reports, so its ORDER and fields must be
+    /// stable: oldest submission first, carrying the fee and submission time a caller displays.
+    #[tokio::test]
+    async fn pending_transactions_report_oldest_first_with_fee_and_submission_time() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.reserve_spend(&reservation("later", &[], 5_000, 60_000))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("earlier", &[], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        let pending = db.pending_transactions().await.unwrap();
+        let ids: Vec<&str> = pending.iter().map(|p| p.transaction_id.as_str()).collect();
+        assert_eq!(ids, vec!["earlier", "later"]);
+        assert_eq!(pending[0].fee, "10");
+        assert_eq!(pending[0].submitted_at, 1_000);
+        assert_eq!(pending[0].bundle_hex, "bundle-of-earlier");
     }
 }
