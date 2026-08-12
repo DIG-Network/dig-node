@@ -1538,9 +1538,15 @@ async fn the_push_and_the_arrival_cursor_are_gated_while_the_chain_reads_are_ope
 /// `enable_chain_sync: false`, so with no supervisor attached both methods answer `null` — and a
 /// `null == null` comparison compares two unobservables. It passed with `peer_counts`' shared
 /// read replaced by a literal `None`, which is exactly the divergence it claims to catch. The
-/// seam below attaches a detached handle reporting a distinctive count (no supervisor, no
-/// dialling), so a handler serving that field from anywhere else answers a DIFFERENT number and
-/// the assertion fails.
+/// seam below attaches a detached handle AND a fixed chain peer tier, both reporting a
+/// distinctive count (no supervisor, no dialling), so a handler serving that field from anywhere
+/// else answers a DIFFERENT number and the assertion fails.
+///
+/// Since dig_ecosystem#2806 there are TWO counts and they are different facts: `chia_peer_count`
+/// is the Chia full nodes the node HOLDS (the transport's pool, which serves its chain reads) and
+/// `subscription_peer_count` is the replica's single subscription session. Both are injected,
+/// because leaving either at its default would put this test back in the `null == null` blind
+/// spot it exists to escape.
 ///
 /// The phase is asserted to be one of the four declared tokens rather than a specific one: this
 /// node has no chain source, so whether it ever attaches a peer is not the property under test.
