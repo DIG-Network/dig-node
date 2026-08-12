@@ -1297,6 +1297,11 @@ fn balance_wire(r: &dig_wallet::sage::rpc::WalletBalanceResult) -> Value {
 /// off-node", which asserted a disclosure that most `"fallback"` reads never make
 /// (dig_ecosystem#2806). To see which it is, read `chia_peer_count` on
 /// `control.wallet.syncStatus`: a node holding peers serves these reads from them.
+///
+/// A read that DID reach the oracle discloses the queried address to a third party, along with
+/// the requesting IP and a timestamp. That is a real cost and it is not softened here — what
+/// changed is that it is now stated of the reads it is true of, rather than of every
+/// `"fallback"` answer. A node holding zero peers takes it on every one.
 /// A synced empty address is a SUCCESS with a zero
 /// figure; the three read-failure shapes map to DISTINCT catalogued errors (never a fabricated
 /// `0`): `WALLET_NO_CHAIN_SOURCE`, `WALLET_NOT_SYNCED`, `WALLET_READ_FAILED`.
