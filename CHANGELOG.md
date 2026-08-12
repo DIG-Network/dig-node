@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.114.1] - 2026-08-12
+
+### Bug Fixes
+- **node:** Mint the blind-serve identity per serve instead of a world-known all-zero seed (#215)
+
 ## [0.114.0] - 2026-08-11
 
 ### Bug Fixes
