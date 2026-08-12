@@ -308,6 +308,11 @@ pub struct WalletBalanceResult {
     /// this doc claimed it did (dig_ecosystem#2806). `chia_peer_count` on
     /// `control.wallet.syncStatus` says which tier the node is in a position to use.
     ///
+    /// When a read DOES reach the oracle it discloses the address, the requesting IP and a
+    /// timestamp to a third party. That cost is unchanged and is not being talked down — it is
+    /// now stated of the reads it is true of, instead of all of them. A node holding zero peers
+    /// pays it on every [`Source::Fallback`] answer.
+    ///
     /// Additive per §5.1: a consumer that ignores it parses unchanged.
     pub source: Source,
     /// Whether THIS answer reflects a fully-synced local view.
