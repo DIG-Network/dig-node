@@ -543,11 +543,12 @@ impl Harness {
     /// Poll `predicate` until it holds, or fail. Bounded in real time so a wedged supervisor
     /// fails the test instead of hanging the suite.
     ///
-    /// The budget is deliberately generous. It is spent ONLY when a test is failing, whereas a
-    /// budget tight enough to be tripped by a loaded machine turns a real proof into an
-    /// intermittent one — and the supervisor tests share a runtime with five hundred others.
+    /// The budget is three times the original 2,000, because that one was tripped by a loaded
+    /// machine rather than by a real defect — and an intermittent proof is not a proof. It is not
+    /// larger still because it is also the time a genuinely broken supervisor takes to FAIL, and a
+    /// revert-proof that runs for seven minutes stops being run.
     async fn until(&self, what: &str, mut predicate: impl FnMut(&Script) -> bool) {
-        for _ in 0..20_000 {
+        for _ in 0..6_000 {
             if predicate(&self.script) {
                 return;
             }
@@ -2701,10 +2702,14 @@ async fn rotation_does_not_climb_the_backoff_ladder() {
         .filter(|d| *d != SESSION_MAX_LIFETIME)
         .collect();
     harness.stop().await;
+    // NO backoff wait at all, which is strictly stronger than "the delays stayed small" — and it is
+    // the only form of this assertion that can FAIL. A rotation falling through to the ordinary
+    // `Ended` path would reset the ladder anyway via `HEALTHY_SESSION`, because a 600-second session
+    // is trivially older than 60 — so an assertion about the SIZE of the delays passes against both
+    // implementations and proves nothing. Only the immediate `continue` produces none.
     assert!(
-        waited.iter().all(|d| *d <= Duration::from_millis(1_200)),
-        "a rotation fed the backoff ladder, so a rotating node backs off further every cycle: \
-         {waited:?}"
+        waited.is_empty(),
+        "a rotation went through the backoff path instead of reconnecting at once: {waited:?}"
     );
 }
 
