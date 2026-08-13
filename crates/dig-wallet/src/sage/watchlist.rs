@@ -4,7 +4,7 @@
 //!
 //! On a §908-correct install the user's account lives in **dig-app** and the node custodies no
 //! seed at all. [`super::custody::WalletCustody`] therefore contributes ZERO puzzle hashes, the
-//! supervisor's subscription set is empty, [`super::sync::initial_sync`] refuses to run over it
+//! supervisor's subscription set is empty, [`super::sync::initial_sync_with_authority`] refuses to run over it
 //! (by design — an un-queried DB marked synced reads a funded wallet as empty), and the replica's
 //! peak never advances. The default, correct install is the one that cannot sync.
 //!

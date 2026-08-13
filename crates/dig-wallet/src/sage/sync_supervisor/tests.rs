@@ -1,7 +1,7 @@
 //! Supervisor tests (dig_ecosystem#2501).
 //!
 //! The doubles here stop at the PEER boundary and nowhere else: `catch_up` runs the real
-//! [`sync::initial_sync_with`] (so the empty-set guard is genuinely in the path) and `run` runs
+//! [`sync::initial_sync_with_authority`] (so the empty-set guard is genuinely in the path) and `run` runs
 //! the real [`sync::run_update_loop`] (so a peak advance is a real decode + a real DB write).
 //! Only the socket is fake.
 
@@ -16,6 +16,18 @@ use super::*;
 use crate::sage::fallback::ChainPeerTier;
 use crate::sage::routing::{self, Source};
 use crate::sage::sync::PuzzleStateSource;
+
+/// The session lifetime a test passes when it is NOT testing rotation.
+///
+/// A DISTINCTIVE value, not `SESSION_MAX_LIFETIME`: this clock returns from every sleep instantly,
+/// so a timer is identifiable ONLY by the duration it asked for, and suppressing a duration
+/// silences every timer that asks for it. The real lifetime once shared `BACKOFF_MAX`'s 60 seconds,
+/// so suppressing it silenced backoff waits too — one in forty-one, whenever jitter landed on
+/// exactly 100% — and wedged the supervisor for good. A DAY is chosen now because no production
+/// timer will ever ask for one, which keeps the suppression unambiguous however the real constants
+/// move; 3600s was given up because `CATCH_UP_DEADLINE` came to share it, re-creating exactly that
+/// collision.
+const NO_ROTATION: Duration = Duration::from_secs(86_400);
 
 /// The height a scripted catch-up reports as the chain tip.
 const CATCH_UP_HEIGHT: u32 = 6_000_000;
@@ -51,6 +63,12 @@ impl PuzzleStateSource for CaughtUpAtOnce {
 struct Script {
     /// One entry per `catch_up`, holding the exact set that was subscribed.
     catch_ups: Mutex<Vec<Vec<Bytes32>>>,
+    /// One entry per `catch_up`, holding the EFFECTIVE authority the supervisor resolved.
+    ///
+    /// The ceiling has exactly one production construction site (`trust_for_session`), and until
+    /// this was recorded nothing in this suite could see what it built — so mutating its anchor
+    /// left every test green (dig_ecosystem#2851, A2).
+    authorities: Mutex<Vec<sync::WriteAuthority>>,
     /// Successful `connect` calls.
     connects: AtomicUsize,
     /// Addresses `connect` dialed, in order.
@@ -72,14 +90,46 @@ struct Script {
     /// Heights the writer was asked about, in order, so a test can prove the writer never chose
     /// its own exam height.
     writer_asked_at: Mutex<Vec<u32>>,
+    /// Sleep durations that NEVER return, so the timer they belong to cannot fire.
+    ///
+    /// This clock returns from every sleep immediately, which is what makes the backoff ladder
+    /// testable in milliseconds — and which also means EVERY timer in the supervisor's `select!`
+    /// fires at once. A test observing one timer must therefore silence the others, or it proves
+    /// only that *something* ended the session. [`NO_ROTATION`] is silenced by default
+    /// (dig_ecosystem#2851): rotation ends every session on its own, so without this the stall
+    /// tests would pass against a supervisor with no stall detection at all.
+    suppressed: Mutex<Vec<Duration>>,
+    /// Suppressed timers that were nonetheless ARMED, so a test can still prove the supervisor
+    /// asked to wait even though the wait was never allowed to finish.
+    suppressed_waits: Mutex<Vec<Duration>>,
+    /// When set, `catch_up` records its call and then NEVER returns — a peer that keeps a catch-up
+    /// alive on a live socket, which is the state the per-round-trip timeout cannot end
+    /// (dig_ecosystem#2851).
+    catch_up_parks: std::sync::atomic::AtomicBool,
 }
 
 impl Script {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             now: Mutex::new(Some(Instant::now())),
+            // Both of the supervisor's long timers are silenced by default, for the same reason:
+            // this clock returns instantly, so an unsilenced timer fires the moment it is armed and
+            // every test would prove only that *something* ended the session. A test that is ABOUT
+            // one of them lifts its own suppression.
+            suppressed: Mutex::new(vec![NO_ROTATION, CATCH_UP_DEADLINE]),
             ..Self::default()
         })
+    }
+
+    /// Let a timer that is silenced by default actually fire — for the test that is about it.
+    fn allow(&self, duration: Duration) {
+        self.suppressed.lock().unwrap().retain(|d| *d != duration);
+    }
+
+    /// Make every `catch_up` hang instead of completing, modelling a peer that answers each round
+    /// trip just inside its timeout and so never trips the per-round-trip bound.
+    fn park_the_catch_up(&self) {
+        self.catch_up_parks.store(true, Ordering::SeqCst);
     }
 
     fn catch_up_count(&self) -> usize {
@@ -101,6 +151,17 @@ impl Script {
 #[async_trait::async_trait]
 impl TimeSource for Script {
     async fn sleep(&self, duration: Duration) {
+        // Bound BEFORE the `if`: a guard created in the condition lives to the end of the whole
+        // statement, so testing it inline would hold the lock across the `.await` below and wedge
+        // every later sleep in the process.
+        let suppressed = self.suppressed.lock().unwrap().contains(&duration);
+        if suppressed {
+            // Recorded SEPARATELY — `slept` is read positionally by the backoff-ladder test, and a
+            // suppressed timer never elapses, so counting it there would insert a rung that no
+            // backoff ever waited.
+            self.suppressed_waits.lock().unwrap().push(duration);
+            std::future::pending::<()>().await;
+        }
         self.slept.lock().unwrap().push(duration);
         self.advance(duration);
         // Yield rather than sleep: the ladder is asserted from `slept`, so a test must not
@@ -179,26 +240,31 @@ impl SyncSession for ScriptedSession {
         puzzle_hashes: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
-        trust: PeerTrust,
+        authority: sync::WriteAuthority,
     ) -> Result<(), SyncError> {
         self.script
             .catch_ups
             .lock()
             .unwrap()
             .push(puzzle_hashes.clone());
+        self.script.authorities.lock().unwrap().push(authority);
+        if self.script.catch_up_parks.load(Ordering::SeqCst) {
+            // Recorded FIRST, so a test can still prove the catch-up was entered.
+            std::future::pending::<()>().await;
+        }
         // The REAL catch-up, so the empty-set guard and the completion-flag write are both
         // exercised exactly as production would exercise them.
-        sync::initial_sync_with(
+        sync::initial_sync_with_authority(
             &CaughtUpAtOnce,
             db,
             puzzle_hashes,
             genesis_challenge,
             &self.peer_ip(),
             events,
-            // The EFFECTIVE trust the supervisor resolved, exactly as production passes it --
+            // The EFFECTIVE authority the supervisor resolved, exactly as production passes it --
             // reading `self.trust` here would make the elevation invisible to the floor check and
             // quietly re-create the bug this suite exists to exclude.
-            trust,
+            authority,
         )
         .await
     }
@@ -287,6 +353,118 @@ impl PuzzleHashSource for FixedHashes {
     }
 }
 
+/// A chain tip the TEST moves — the node's own peers, seen independently of the session.
+///
+/// The peak is settable rather than fixed because the property under test is a RELATIONSHIP over
+/// time (the chain moved, the replica did not), and a double that could only report one height
+/// could not express the healthy case that must NOT trip the deadline.
+struct ScriptedChainTip {
+    peak: Mutex<Option<u32>>,
+    /// When set, the replica is written one block forward on every observation — a session that is
+    /// genuinely keeping up. Wired through this double because the stall check samples the two
+    /// heights TOGETHER, so "the replica advanced between polls" is only expressible by moving it
+    /// in step with the observation.
+    healthy_replica: Option<WalletDb>,
+    /// When set, the replica only starts advancing once a SECOND session has been opened — so the
+    /// first session genuinely stalls and the recovery genuinely belongs to its successor.
+    advance_from_connect: Option<Arc<Script>>,
+    /// Closes the live session after every second observation, so no single session can gather
+    /// enough stall evidence on its own.
+    drop_peer_every: Option<(Arc<Script>, Mutex<usize>)>,
+}
+
+impl ScriptedChainTip {
+    /// Peers announcing `peak`, with a replica that never moves.
+    fn at(peak: u32) -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(Some(peak)),
+            healthy_replica: None,
+            advance_from_connect: None,
+            drop_peer_every: None,
+        })
+    }
+
+    /// Peers that have said nothing — unobservable, which is not zero.
+    fn unobservable() -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(None),
+            healthy_replica: None,
+            advance_from_connect: None,
+            drop_peer_every: None,
+        })
+    }
+
+    /// Peers ahead of a replica that is ADVANCING — the healthy control.
+    fn ahead_of_an_advancing_replica(peak: u32, db: WalletDb) -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(Some(peak)),
+            healthy_replica: Some(db),
+            advance_from_connect: None,
+            drop_peer_every: None,
+        })
+    }
+
+    /// Peers ahead of a frozen replica, dropping the peer after every SECOND observation.
+    ///
+    /// Bounds how much stall evidence any ONE session can gather: at a 15-second poll, two polls
+    /// is 30 seconds of the 90 `STALL_AFTER` needs, so a stall clock scoped to a session could
+    /// never fire, and only a watch that survives the session boundary reaches the deadline.
+    fn ahead_and_dropping_the_peer(peak: u32, script: Arc<Script>) -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(Some(peak)),
+            healthy_replica: None,
+            advance_from_connect: None,
+            drop_peer_every: Some((script, Mutex::new(0))),
+        })
+    }
+
+    /// A replica frozen under the FIRST session and advancing again under the second — the whole
+    /// episode: stall, end, reconnect, recover.
+    fn recovers_on_reconnect(peak: u32, db: WalletDb, script: Arc<Script>) -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(Some(peak)),
+            healthy_replica: Some(db),
+            advance_from_connect: Some(script),
+            drop_peer_every: None,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ChainTipObserver for ScriptedChainTip {
+    async fn peers_peak(&self) -> Option<u32> {
+        if let Some((script, seen)) = &self.drop_peer_every {
+            let drop_now = {
+                let mut seen = seen.lock().unwrap();
+                *seen += 1;
+                *seen % 2 == 0
+            };
+            if drop_now {
+                script.disconnect_all();
+            }
+        }
+        let held_back = self
+            .advance_from_connect
+            .as_ref()
+            .is_some_and(|s| s.connects.load(Ordering::SeqCst) < 2);
+        let replica_now = {
+            let mut peak = self.peak.lock().unwrap();
+            if self.healthy_replica.is_none() || held_back {
+                return *peak;
+            }
+            let replica = peak.unwrap_or(1).saturating_sub(1);
+            // The chain keeps moving too, so the replica stays BEHIND throughout: this control
+            // isolates the advance-resets-the-clock rule from the level-heights rule beside it.
+            *peak = Some(peak.unwrap_or(1) + 1);
+            replica
+        };
+        if let Some(db) = &self.healthy_replica {
+            db.set_peak(replica_now, "aa").await.unwrap();
+        }
+        *self.peak.lock().unwrap()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -329,6 +507,49 @@ impl Harness {
         trust: PeerTrust,
         corroborator: Option<Arc<dyn Corroborator>>,
     ) -> Self {
+        // No chain-tip observer: stall detection off, which is exactly how every test written
+        // before dig_ecosystem#2851 expects the supervisor to behave.
+        Self::start_everything(db, hashes, script, addrs, trust, corroborator, None).await
+    }
+
+    /// Start a supervisor with stall detection attached, so a frozen replica can be observed
+    /// (dig_ecosystem#2851).
+    #[allow(clippy::too_many_arguments)]
+    async fn start_everything(
+        db: WalletDb,
+        hashes: Arc<dyn PuzzleHashSource>,
+        script: Arc<Script>,
+        addrs: Vec<String>,
+        trust: PeerTrust,
+        corroborator: Option<Arc<dyn Corroborator>>,
+        chain_tip: Option<Arc<dyn ChainTipObserver>>,
+    ) -> Self {
+        Self::start_with_lifetime(
+            db,
+            hashes,
+            script,
+            addrs,
+            trust,
+            corroborator,
+            chain_tip,
+            NO_ROTATION,
+        )
+        .await
+    }
+
+    /// Start a supervisor with an explicit session lifetime — for the tests that are ABOUT
+    /// rotation (dig_ecosystem#2851).
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_lifetime(
+        db: WalletDb,
+        hashes: Arc<dyn PuzzleHashSource>,
+        script: Arc<Script>,
+        addrs: Vec<String>,
+        trust: PeerTrust,
+        corroborator: Option<Arc<dyn Corroborator>>,
+        chain_tip: Option<Arc<dyn ChainTipObserver>>,
+        session_lifetime: Duration,
+    ) -> Self {
         let factory = Arc::new(ScriptedFactory {
             script: script.clone(),
             addrs,
@@ -342,6 +563,8 @@ impl Harness {
             genesis_challenge: Bytes32::new([0; 32]),
             time: script.clone(),
             corroborator: corroborator.clone(),
+            chain_tip,
+            session_lifetime,
         });
         Self {
             db,
@@ -353,14 +576,21 @@ impl Harness {
 
     /// Poll `predicate` until it holds, or fail. Bounded in real time so a wedged supervisor
     /// fails the test instead of hanging the suite.
+    ///
+    /// # It is a DEADLINE, not an iteration count (dig_ecosystem#2851, C2)
+    ///
+    /// These helpers used to loop a fixed number of times around a 1ms sleep and describe the
+    /// product as a duration. Windows' timer granularity is ~15ms, so the real budget was neither
+    /// the stated one nor a constant: it was an iteration count wearing a duration's clothing, and
+    /// under parallel load — where the sleeps get longer and the supervisor task gets less CPU —
+    /// it shortened exactly when tests needed it most. That produced a ~5% flake in the two
+    /// log-capture tests that survived the `tracing` interest-cache fix. Measure the thing you are
+    /// bounding.
     async fn until(&self, what: &str, mut predicate: impl FnMut(&Script) -> bool) {
-        for _ in 0..2_000 {
-            if predicate(&self.script) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let deadline = Deadline::start();
+        while !predicate(&self.script) {
+            deadline.tick(what).await;
         }
-        panic!("timed out waiting for: {what}");
     }
 
     /// Poll the DB until `predicate` holds, or fail. The supervisor records a call before it
@@ -370,31 +600,27 @@ impl Harness {
         what: &str,
         mut predicate: impl FnMut(&super::super::db::SyncState) -> bool,
     ) {
-        for _ in 0..2_000 {
-            if predicate(&self.db.sync_state().await.unwrap()) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let deadline = Deadline::start();
+        while !predicate(&self.db.sync_state().await.unwrap()) {
+            deadline.tick(what).await;
         }
-        panic!("timed out waiting for: {what}");
     }
 
     /// Poll the COMPOSED status until `predicate` holds, or fail. The phase depends on live
     /// session facts that no DB row carries, so it can only be awaited through the handle.
     async fn until_status(&self, what: &str, mut predicate: impl FnMut(&WalletSyncStatus) -> bool) {
-        for _ in 0..2_000 {
-            if predicate(
-                &self
-                    .handle
-                    .status(&self.db, ChainPeerTier::UNOBSERVABLE)
-                    .await
-                    .unwrap(),
-            ) {
+        let deadline = Deadline::start();
+        loop {
+            let status = self
+                .handle
+                .status(&self.db, ChainPeerTier::UNOBSERVABLE)
+                .await
+                .unwrap();
+            if predicate(&status) {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            deadline.tick(what).await;
         }
-        panic!("timed out waiting for: {what}");
     }
 
     /// Wait until the supervisor has connected AND finished deciding what that session may do.
@@ -1631,6 +1857,10 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
         genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
         time: Arc::new(TokioTime),
         corroborator: Some(Arc::new(ChiaQuorumCorroborator::mainnet())),
+        // The acceptance step watches a REAL peer follow mainnet; a stall deadline would only
+        // add a second reason for the session to end and blur what the run proves.
+        chain_tip: None,
+        session_lifetime: SESSION_MAX_LIFETIME,
     });
 
     // A mainnet block lands roughly every 19s. Corroboration itself needs several sequential
@@ -1722,6 +1952,47 @@ fn the_trust_label_is_fixed_by_the_dial_source() {
 
 /// The header hash an honest quorum agrees on at the settled height.
 const HONEST_HASH: Bytes32 = Bytes32::new([0x11; 32]);
+/// How long a `Harness` poll helper waits for a predicate before failing the test.
+///
+/// Generous, because it is also how long a genuinely BROKEN supervisor takes to fail, and a
+/// revert-proof nobody waits for stops being run.
+const WAIT_BUDGET: Duration = Duration::from_secs(120);
+
+/// How often those helpers re-check. Comfortably above the ~15ms Windows timer floor, so the
+/// number of checks is roughly what it looks like.
+const WAIT_POLL: Duration = Duration::from_millis(20);
+
+/// A real wall-clock deadline for the `Harness` poll helpers.
+///
+/// # It is a DEADLINE, not an iteration count (dig_ecosystem#2851, C2)
+///
+/// Those helpers used to loop a fixed number of times around a 1ms sleep and describe the product
+/// as a duration. Windows' timer granularity is ~15ms, so the real budget was neither the stated
+/// one nor a constant: it was an iteration count wearing a duration's clothing, and under parallel
+/// load — where each sleep stretches and the supervisor task gets less CPU — it shortened exactly
+/// when the tests needed it most. That is the ~5% flake in the two log-capture tests which survived
+/// the `tracing` interest-cache fix. Measure the thing you are bounding.
+struct Deadline {
+    expires_at: std::time::Instant,
+}
+
+impl Deadline {
+    fn start() -> Self {
+        Self {
+            expires_at: std::time::Instant::now() + WAIT_BUDGET,
+        }
+    }
+
+    /// Sleep one poll interval, or panic naming `what` once the budget is spent.
+    async fn tick(&self, what: &str) {
+        assert!(
+            std::time::Instant::now() < self.expires_at,
+            "timed out after {WAIT_BUDGET:?} waiting for: {what}"
+        );
+        tokio::time::sleep(WAIT_POLL).await;
+    }
+}
+
 /// A different hash — what a lying writer answers instead.
 const LIARS_HASH: Bytes32 = Bytes32::new([0x22; 32]);
 /// The settled height a scripted corroboration round lands on.
@@ -1746,6 +2017,12 @@ fn unanimous(answer: Bytes32) -> Verdict<Bytes32> {
 struct ScriptedCorroborator {
     round: Mutex<CorroborationRound>,
     rounds: AtomicUsize,
+    /// The verdict every round AFTER the first returns, when it differs from the first.
+    ///
+    /// A double that can only answer the same way for ever cannot express the one property that
+    /// distinguishes per-session corroboration from a verdict resolved once and reused: a quorum
+    /// that agreed and then, on an independently drawn sample, did not.
+    subsequent: Mutex<Option<Verdict<Bytes32>>>,
 }
 
 impl ScriptedCorroborator {
@@ -1756,15 +2033,35 @@ impl ScriptedCorroborator {
                 verdict,
             }),
             rounds: AtomicUsize::new(0),
+            subsequent: Mutex::new(None),
         })
+    }
+
+    /// A quorum that corroborates the writer once and then splits on every later sample.
+    fn corroborating_once_then_splitting(answer: Bytes32) -> Arc<Self> {
+        let corroborator = Self::new(unanimous(answer));
+        *corroborator.subsequent.lock().unwrap() = Some(Verdict::Split {
+            tallies: vec![2, 2],
+        });
+        corroborator
+    }
+
+    fn rounds(&self) -> usize {
+        self.rounds.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait::async_trait]
 impl Corroborator for ScriptedCorroborator {
     async fn corroborate(&self) -> Result<CorroborationRound, SyncError> {
-        self.rounds.fetch_add(1, Ordering::SeqCst);
-        Ok(self.round.lock().unwrap().clone())
+        let previous = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let mut round = self.round.lock().unwrap().clone();
+        if previous > 0 {
+            if let Some(later) = self.subsequent.lock().unwrap().clone() {
+                round.verdict = later;
+            }
+        }
+        Ok(round)
     }
 }
 
@@ -1803,7 +2100,7 @@ async fn run_discovered_session(
 /// contradicting.
 ///
 /// TWO HOPS, because the fix is a PLACEMENT. Asserting only "the replica is empty" would be
-/// satisfied identically by a guard left down inside `initial_sync_with` — the pre-#2568
+/// satisfied identically by a guard left down inside `initial_sync_with_authority` — the pre-#2568
 /// placement — and a later refactor moving the check would keep such a test green. So this also
 /// asserts `catch_up` was never CALLED. Only a guard that runs BEFORE the catch-up can satisfy
 /// both, which is the property that actually matters: a peer that fails corroboration never gets
@@ -2089,12 +2386,705 @@ async fn an_authoritative_session_is_not_ended_by_the_recorroboration_timer() {
     harness.stop().await;
 }
 
+// ---------------------------------------------------------------------------
+// The stall deadline (dig_ecosystem#2851)
+// ---------------------------------------------------------------------------
+
+/// The replica peak measured on the live 0.116.0 service while it reported `synced`.
+const FROZEN_REPLICA_PEAK: u32 = 9_142_861;
+/// What that node's OWN five peers announced at the same moment — 57 blocks ahead, and growing.
+const PEERS_PEAK: u32 = 9_142_918;
+
+/// **Proves (dig_ecosystem#2851):** an AUTHORITATIVE session whose peer goes silent while the chain
+/// advances is ENDED, and the supervisor reconnects.
+///
+/// THE BUG THIS PINS. `run_update_loop` waits on `recv()` with no deadline, so a half-open peer
+/// connection parks it for ever. For an authoritative subscribed session every other arm of the
+/// supervisor's `select!` is disarmed by construction — the resubscribe poll is armed only while
+/// nothing is subscribed, `await_recorroboration` only for a refused session — leaving a disconnect
+/// that never comes as the sole exit. The measured result was a replica frozen at
+/// [`FROZEN_REPLICA_PEAK`] while peers advanced past [`PEERS_PEAK`].
+///
+/// FIXTURE DESIGN — the peer is HEALTHY at the socket level and stays connected for the whole test:
+/// `disconnect_all` is never called, because a disconnect is the one exit the broken code already
+/// had, and a fixture that dropped the peer would pass against the defect. The single variable is
+/// that the chain is observed to move while the replica does not. Bounded by `until`'s real-time
+/// budget so the pre-fix failure is a LOUD timeout rather than a hang indistinguishable from a dead
+/// process.
+#[tokio::test]
+async fn a_stalled_authoritative_session_is_ended_and_reconnects() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::at(PEERS_PEAK)),
+    )
+    .await;
+
+    harness
+        .until("the stalled session to end and reconnect", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+
+    harness.stop().await;
+}
+
+/// Collects everything logged on the calling thread, so a test can assert a diagnostic actually
+/// reached the sink rather than trusting that it was written.
+///
+/// # Why ONE process-wide subscriber, and not a scoped one per test
+///
+/// The obvious fixture — `tracing::subscriber::set_default` per test — LOSES LINES, and loses them
+/// one callsite at a time. A callsite's [`tracing::subscriber::Interest`] is resolved the first time
+/// that source line executes and is then cached PROCESS-WIDE. Scoped subscribers do not participate
+/// in that resolution, so whichever test reaches `warn!("… has not advanced …")` first — and
+/// several stall tests reach it with no subscriber installed — cached that ONE line as disabled for
+/// the rest of the binary, while every other line kept working.
+///
+/// That is not a theory. Under the scoped fixture, a capture was observed holding the recovery
+/// `INFO` while MISSING the stall `WARN` that the same task had emitted microseconds earlier on the
+/// same thread — three failures in ten full-module runs, always on a `warn!` assertion. A fixture
+/// that can miss a line production really wrote can equally pass while production wrote nothing, so
+/// it was unsound in both directions and no amount of retrying would have fixed it.
+///
+/// Installing one real subscriber for the whole binary means interest is always resolved against a
+/// subscriber that says yes, and [`tracing::callsite::rebuild_interest_cache`] repairs any callsite
+/// that was already cached off before the first capture test ran. Isolation then comes from the
+/// SINK rather than from the dispatcher: events land in the calling thread's installed buffer, and
+/// a thread that installed none discards them, so concurrent tests cannot write into each other.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+thread_local! {
+    /// The buffer this thread's events are appended to, if it installed one.
+    static CAPTURE_SINK: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl Capture {
+    /// Route this thread's log events into this capture until the returned guard is dropped.
+    ///
+    /// Installs the process-wide subscriber on first use. A test's supervisor task must be polled
+    /// on the installing thread for its lines to land here — which `#[tokio::test]`'s
+    /// current-thread runtime guarantees, and which every caller then CHECKS rather than assumes
+    /// via [`Capture::assert_saw_the_supervisor`].
+    fn install(&self) -> CaptureGuard {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(ThreadSink)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish(),
+            );
+            // Repairs every callsite that was already resolved — against no subscriber, and so as
+            // disabled — by a test that ran before this one.
+            tracing::callsite::rebuild_interest_cache();
+        });
+        CAPTURE_SINK.with(|sink| *sink.borrow_mut() = Some(Arc::clone(&self.0)));
+        CaptureGuard
+    }
+
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+
+    /// Fail LOUDLY if the supervisor's own lines never reached this capture.
+    ///
+    /// The positive control for the one assumption the fixture still makes — that the supervisor
+    /// task is polled on the installing thread. Without it, a future runtime-flavour change would
+    /// turn every assertion here into a claim about an empty buffer, which is the failure mode this
+    /// fixture was rewritten to abolish rather than to relocate.
+    fn assert_saw_the_supervisor(&self) {
+        let log = self.contents();
+        assert!(
+            log.contains("wallet sync:"),
+            "the capture saw NOTHING from the supervisor, so every assertion below would be about \
+             an empty buffer rather than about production: {log}"
+        );
+    }
+}
+
+/// Detaches the calling thread's capture on drop.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURE_SINK.with(|sink| *sink.borrow_mut() = None);
+    }
+}
+
+/// The process-wide writer: appends to whatever buffer the emitting thread installed.
+struct ThreadSink;
+
+/// A borrowed handle on one thread's capture buffer. `None` discards, so a thread with no capture
+/// installed logs into nothing instead of into somebody else's assertions.
+struct ThreadWriter(Option<Arc<Mutex<Vec<u8>>>>);
+
+impl std::io::Write for ThreadWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(buffer) = &self.0 {
+            buffer.lock().unwrap().extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadSink {
+    type Writer = ThreadWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        ThreadWriter(CAPTURE_SINK.with(|sink| sink.borrow().clone()))
+    }
+}
+
+/// **Proves (dig_ecosystem#2851):** the WHOLE episode is greppable from the log in one pass — the
+/// stall names its reason and both heights, and the RECOVERY says the replica is moving again.
+///
+/// This is the on-host acceptance evidence, not decoration. An operator who blackholes the peer's
+/// traffic sees a warning and then, without the second line, silence — which is indistinguishable
+/// from the failure itself, because silence is exactly what this defect hid behind for two hours.
+/// The recovery is deliberately reported by the SUCCESSOR session: the session that stalls cannot
+/// observe its own recovery, so the fact has to survive its end.
+///
+/// FIXTURE DESIGN — the chain-tip double holds the replica still until a SECOND session exists, so
+/// the first session genuinely stalls on positive evidence and the recovery genuinely belongs to
+/// its successor. A double that advanced from the start would log a recovery that was never owed.
+///
+/// The two lines are awaited and asserted SEPARATELY, in the order production emits them. Awaiting
+/// only the recovery and then asserting the stall reads as one check but is two, and the wait can
+/// be satisfied while the stall line is absent — which is exactly how a lost line surfaced as a
+/// baffling assertion failure instead of as a named instrument fault. The stall line needs no wait
+/// of its own: `await_stall` emits it synchronously BEFORE returning, so a second connect already
+/// implies it.
+#[tokio::test]
+async fn a_stall_and_its_recovery_are_both_named_in_the_log() {
+    let capture = Capture::default();
+    let guard = capture.install();
+
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::recovers_on_reconnect(
+            PEERS_PEAK,
+            db,
+            script.clone(),
+        )),
+    )
+    .await;
+
+    // Waited on OBSERVABLE STATE, not on the log. With rotation silenced and the peer never
+    // disconnected, a second connect can only come from the stall arm, and a third only after the
+    // successor session has been observing long enough to see the replica move again. Polling the
+    // log text instead makes the wait depend on how promptly a writer flushes under load, which is
+    // not the property and turns a real proof into an intermittent one.
+    harness
+        .until("the stalled session to end", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+    // Checked HERE, before anything else is awaited: the session ended, so the warning that ends it
+    // has already been written, and a capture missing it is an instrument fault rather than a
+    // production one. Asserting it after the recovery wait would have blamed the wrong thing.
+    capture.assert_saw_the_supervisor();
+    assert!(
+        capture.contents().contains("has not advanced"),
+        "the stall itself must be named: {}",
+        capture.contents()
+    );
+
+    harness
+        .until(
+            "the successor session to observe the replica advancing",
+            |_| capture.contents().contains("advancing again"),
+        )
+        .await;
+
+    let log = capture.contents();
+    harness.stop().await;
+    drop(guard);
+
+    assert!(
+        log.contains("has not advanced"),
+        "the stall itself must be named: {log}"
+    );
+    assert!(
+        log.contains("advancing again"),
+        "the recovery must be named, or the log shows a failure and then silence: {log}"
+    );
+
+    // Both heights and the elapsed stall, because "the replica is behind" without numbers cannot
+    // be checked against the chain by the operator reading it.
+    assert!(
+        log.contains("replica_peak"),
+        "the stall must name the replica's peak: {log}"
+    );
+    assert!(
+        log.contains("peers_peak"),
+        "the stall must name the peers' peak: {log}"
+    );
+    assert!(
+        log.contains("observed_behind_for_secs"),
+        "the stall must say how long it was OBSERVED behind — and say only that, because the          freeze may predate the first observation by any amount: {log}"
+    );
+    assert!(
+        !log.contains("stalled_for_secs"),
+        "the old field name claimed time-since-freeze, which this value is not: {log}"
+    );
+    assert!(
+        log.contains("203.0.113.1:8444"),
+        "both lines must name the peer the episode was about: {log}"
+    );
+}
+
+/// **Proves (dig_ecosystem#2851):** a replica that is ADVANCING is never ended, however far behind
+/// its peers it happens to be.
+///
+/// The control that keeps the deadline from becoming a different bug. Catching up from genesis is
+/// a legitimate state in which the replica trails its peers by millions of blocks for a long time,
+/// and tearing that session down would restart the very work it is doing.
+#[tokio::test]
+async fn an_advancing_replica_is_never_declared_stalled() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::ahead_of_an_advancing_replica(
+            PEERS_PEAK, db,
+        )),
+    )
+    .await;
+
+    harness.settle().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        script.connects.load(Ordering::SeqCst),
+        1,
+        "a replica that is visibly catching up was torn down as stalled"
+    );
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** an UNOBSERVABLE peers' peak never declares a stall.
+///
+/// A missing measurement must not be spent as evidence against the replica. A node whose chain
+/// transport has not been built genuinely reports `None` here, and reading that as "the chain
+/// advanced past us" would end a perfectly good session every 90 seconds for ever.
+#[tokio::test]
+async fn an_unobservable_peers_peak_is_never_an_accusation() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::unobservable()),
+    )
+    .await;
+
+    harness.settle().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        script.connects.load(Ordering::SeqCst),
+        1,
+        "a session was ended on the strength of a height nobody measured"
+    );
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** a replica LEVEL with its peers is never declared stalled.
+///
+/// A quiet chain produces exactly this: nothing moves, on either side, for as long as no block is
+/// found. Standing still is only evidence of a stall when something else demonstrably moved.
+///
+/// The peers are pinned at [`CATCH_UP_HEIGHT`] rather than at the incident's numbers because that
+/// is the height the scripted catch-up actually leaves in the replica — a fixture whose two sides
+/// were never level would exercise the stalled path and prove nothing about this one.
+#[tokio::test]
+async fn a_replica_level_with_its_peers_is_never_declared_stalled() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::at(CATCH_UP_HEIGHT)),
+    )
+    .await;
+
+    harness.settle().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        script.connects.load(Ordering::SeqCst),
+        1,
+        "a quiet chain was mistaken for a frozen replica"
+    );
+
+    harness.stop().await;
+}
+
+/// **REGRESSION (dig_ecosystem#2827, guarded here for #2851):** a REFUSED session still ends by
+/// itself, with a chain-tip observer attached.
+///
+/// The stall arm is armed only for authoritative sessions, and #2827's exit is armed only for
+/// refused ones — mutually exclusive by construction. This pins that the new arm did not disturb
+/// the old exit on the very path where both are present in the same `select!`. A refused session
+/// writes nothing and so can NEVER advance the replica, which is exactly why arming the stall check
+/// there would fire every time and fight this timer.
+#[tokio::test]
+async fn a_refused_session_still_ends_with_a_chain_tip_observer_attached() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+    let corroborator = ScriptedCorroborator::new(Verdict::Split {
+        tallies: vec![2, 2],
+    });
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(corroborator.clone()),
+        Some(ScriptedChainTip::at(PEERS_PEAK)),
+    )
+    .await;
+
+    harness
+        .until("a refused session to end and reconnect", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+    assert!(
+        corroborator.rounds.load(Ordering::SeqCst) >= 2,
+        "the refused session's re-corroboration exit was disturbed by the stall arm"
+    );
+
+    harness.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Session rotation (dig_ecosystem#2851)
+// ---------------------------------------------------------------------------
+
+/// **Proves (dig_ecosystem#2851):** a session is RETIRED at its lifetime and a fresh peer is
+/// dialled, even though nothing about it failed.
+///
+/// Holding one peer for the life of the process makes that peer the single point of both failure
+/// and observation, which is how a silent peer went unnoticed for two hours.
+///
+/// FIXTURE DESIGN — the peer is perfectly healthy and never disconnects (`disconnect_all` is never
+/// called), so a reconnect can only come from the rotation timer. This is the ONE test family that
+/// lets that timer fire; every other test passes [`NO_ROTATION`], because a clock that returns
+/// instantly fires every timer at once and a rotation would otherwise answer for whatever property
+/// the test believed it was proving.
+#[tokio::test]
+async fn a_healthy_session_is_retired_at_its_lifetime() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_with_lifetime(
+        db,
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        SESSION_MAX_LIFETIME,
+    )
+    .await;
+
+    harness
+        .until("the session to be retired and replaced", |s| {
+            s.connects.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** rotation does NOT climb the backoff ladder.
+///
+/// A rotation is a planned end, not a failure. If it fed the ladder, a node would rotate itself
+/// onto a 60-second reconnect delay within minutes and spend most of its life holding no
+/// subscription at all — strictly worse than never rotating.
+///
+/// The assertion reads the delays the supervisor actually waited: every one must stay at the
+/// ladder's first rung. `HEALTHY_SESSION` is deliberately NOT relied on to produce that: it would
+/// currently agree, since a 600-second session clears its 60-second threshold, but that is
+/// arithmetic between two constants either of which is free to move, and the property under test is
+/// that a PLANNED end resets the ladder — not that a long one happens to.
+#[tokio::test]
+async fn rotation_does_not_climb_the_backoff_ladder() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_with_lifetime(
+        db,
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        SESSION_MAX_LIFETIME,
+    )
+    .await;
+
+    harness
+        .until("several rotations", |s| {
+            s.connects.load(Ordering::SeqCst) >= 5
+        })
+        .await;
+
+    let waited: Vec<Duration> = script
+        .slept
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|d| *d != SESSION_MAX_LIFETIME)
+        .collect();
+    harness.stop().await;
+    // NO backoff wait at all, which is strictly stronger than "the delays stayed small" — and it is
+    // the only form of this assertion that can FAIL. A rotation falling through to the ordinary
+    // `Ended` path would reset the ladder anyway via `HEALTHY_SESSION`, because a 600-second session
+    // is trivially older than 60 — so an assertion about the SIZE of the delays passes against both
+    // implementations and proves nothing. Only the immediate `continue` produces none.
+    assert!(
+        waited.is_empty(),
+        "a rotation went through the backoff path instead of reconnecting at once: {waited:?}"
+    );
+}
+
+/// **Proves (dig_ecosystem#2851):** stall evidence SURVIVES the end of a session, so a replica that
+/// freezes across several short sessions is still detected.
+///
+/// The property that makes the watch's placement load-bearing. Sessions end for many reasons —
+/// a rotation, a disconnect, a refusal — and a stall clock scoped to ONE session restarts at every
+/// one of them. A replica that is frozen the whole time would then never reach [`STALL_AFTER`], the
+/// detector would be dead code that reads as a working guard, and every freeze would be cleared
+/// silently with nothing logged. This test is what stops a future refactor from scoping the watch
+/// back down into the session.
+///
+/// FIXTURE DESIGN — the chain-tip double drops the peer after every SECOND observation, so no
+/// session can gather more than 30 seconds of the 90 the deadline needs. That bound is the whole
+/// fixture: with a per-session clock the stall is UNREACHABLE here, and with the shared one it
+/// arrives after a few sessions. The peer is dropped rather than rotated because the property is
+/// "the watch outlives a SESSION", and which mechanism ended the session is immaterial to it —
+/// while [`Script`]'s instantly-returning clock cannot order a rotation against a poll at all.
+#[tokio::test]
+async fn stall_evidence_survives_the_end_of_a_session() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let capture = Capture::default();
+    let guard = capture.install();
+
+    let harness = Harness::start_everything(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::ahead_and_dropping_the_peer(
+            PEERS_PEAK,
+            script.clone(),
+        )),
+    )
+    .await;
+
+    harness
+        .until(
+            "the stall to be named despite the sessions turning over",
+            |_| capture.contents().contains("has not advanced"),
+        )
+        .await;
+
+    harness.stop().await;
+    capture.assert_saw_the_supervisor();
+    let log = capture.contents();
+    drop(guard);
+    assert!(
+        script.connects.load(Ordering::SeqCst) >= 3,
+        "the fixture must actually turn sessions over, or it proves nothing about surviving one"
+    );
+    assert!(
+        log.contains("has not advanced"),
+        "a freeze spanning several sessions went unreported: {log}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The phase must be about NOW (dig_ecosystem#2851)
+// ---------------------------------------------------------------------------
+
+/// A peer tier reporting five peers at `peak` — the shape the live incident reported.
+fn tier_at(peak: u32) -> ChainPeerTier {
+    ChainPeerTier {
+        peer_count: Some(5),
+        peak_height: Some(peak),
+    }
+}
+
+/// **Proves (dig_ecosystem#2851):** a completed catch-up whose replica has fallen behind its own
+/// peers reports `Syncing`, not `Synced`.
+///
+/// Pinned with the REAL measured numbers. `initial_sync_complete` is a latched flag about the past
+/// and a peer count says only that a socket exists; neither is about NOW, so both were satisfied by
+/// a frozen replica and the node told every client that a 57-block-stale balance was settled.
+#[tokio::test]
+async fn a_replica_behind_its_peers_is_not_reported_as_synced() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_initial_sync_complete(true).await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(1, true);
+
+    let status = handle.status(&db, tier_at(PEERS_PEAK)).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::Syncing,
+        "a replica 57 blocks behind its own peers was reported as settled"
+    );
+    // The measurements themselves are unchanged — only the claim made about them.
+    assert_eq!(status.peak_height, Some(FROZEN_REPLICA_PEAK));
+    assert_eq!(status.chia_peer_peak_height, Some(PEERS_PEAK));
+    assert_eq!(status.watched_addresses, Some(1));
+}
+
+/// **Proves (dig_ecosystem#2851):** the tolerance boundary, from BOTH sides.
+///
+/// A bound tested only from below can only confirm itself. Exactly at
+/// [`FOLLOWING_TOLERANCE`] the node is still following the chain; one block beyond it is not.
+#[tokio::test]
+async fn the_following_tolerance_holds_at_the_bound_and_fails_one_beyond_it() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_initial_sync_complete(true).await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(1, true);
+
+    let at_bound = FROZEN_REPLICA_PEAK + FOLLOWING_TOLERANCE;
+    assert_eq!(
+        handle.status(&db, tier_at(at_bound)).await.unwrap().phase,
+        SyncPhase::Synced,
+        "a node within the tolerance was reported as still syncing"
+    );
+    assert_eq!(
+        handle
+            .status(&db, tier_at(at_bound + 1))
+            .await
+            .unwrap()
+            .phase,
+        SyncPhase::Syncing,
+        "a node one block past the tolerance was still reported as settled"
+    );
+}
+
+/// **Proves (dig_ecosystem#2851):** an unmeasured height on EITHER side leaves the phase exactly as
+/// it was.
+///
+/// The Option-honesty guard. `None` is unobservable, never a zero, and an unobservable gap is not
+/// an accusation — a node with no chain transport must not be reported as behind a chain it cannot
+/// see.
+#[tokio::test]
+async fn an_unmeasured_height_leaves_the_phase_unchanged() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_initial_sync_complete(true).await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(1, true);
+
+    // The replica's own peak is unknown; the peers' is far ahead.
+    assert_eq!(
+        handle.status(&db, tier_at(PEERS_PEAK)).await.unwrap().phase,
+        SyncPhase::Synced,
+        "an unknown replica peak was read as evidence of being behind"
+    );
+
+    // The replica's peak is known; nobody has measured the peers'.
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    assert_eq!(
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
+        SyncPhase::Synced,
+        "an unobservable peer tier was read as evidence against the replica"
+    );
+}
+
 /// **Proves:** the CORROBORATED read is what reaches spend-path coin selection — there is no
 /// second, uncorroborated path underneath it.
 ///
 /// Coin selection reads the replica, and [`routing::route`] is the gate that decides whether the
 /// replica answers for money at all. That gate turns on `initial_sync_complete`, which
-/// `initial_sync_with` is the only peer-reachable writer of, and which is now reachable only
+/// `initial_sync_with_authority` is the only peer-reachable writer of, and which is now reachable only
 /// through corroboration. So the property is expressible as: the SAME wallet, same peer, same
 /// data, routes to the fallback tier when the peer was not corroborated and to the replica when it
 /// was.
@@ -2345,5 +3335,234 @@ fn an_enrolled_but_unreachable_custody_is_not_an_all_clear_through_the_union() {
         union.any_wallet(),
         "a wallet IS enrolled — its coins are simply not being followed, which must never read \
          as the no-wallet all-clear"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A catch-up is bounded and interruptible (dig_ecosystem#2851)
+// ---------------------------------------------------------------------------
+
+/// **Proves (dig_ecosystem#2851):** a catch-up that never returns is ABANDONED on a total deadline,
+/// so the supervisor gets back to the reconnect path instead of holding one peer for ever.
+///
+/// The per-round-trip `PEER_REQUEST_TIMEOUT` bounds one answer, not the sequence of them. A peer
+/// that answers each round trip just inside the bound satisfies it indefinitely, and the catch-up
+/// runs OUTSIDE the supervisor's `select!` — so rotation, stall detection and shutdown are all
+/// disarmed for the whole of it. At 60 seconds across up to 1024 batches that is about seventeen
+/// hours in which nothing can end the session.
+///
+/// FIXTURE DESIGN — the double PARKS rather than erroring, because an erroring catch-up takes the
+/// path that already worked and would pass against the defect. The deadline is the only timer this
+/// test un-silences, so a reconnect can have come from nothing else; with the deadline removed the
+/// supervisor stays on its first session and `until` fails LOUDLY on its own bound rather than
+/// hanging.
+#[tokio::test]
+async fn a_catch_up_that_never_returns_is_abandoned_on_its_own_deadline() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    script.park_the_catch_up();
+    script.allow(CATCH_UP_DEADLINE);
+
+    let harness = Harness::start(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+
+    harness
+        .until(
+            "the parked catch-up to be abandoned and a fresh peer dialled",
+            |s| s.connects.load(Ordering::SeqCst) >= 2,
+        )
+        .await;
+
+    assert!(
+        script.catch_up_count() >= 2,
+        "the supervisor reconnected without re-entering the catch-up, so the deadline is not what \
+         ended the session"
+    );
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** the node can be SHUT DOWN while a catch-up is running.
+///
+/// The half of the defect that is not about liveness at all. A catch-up sitting outside the
+/// `select!` takes the shutdown signal with it, so `dig-node stop` — and every service manager that
+/// wraps it — waits on a peer that has no reason to answer. A node that cannot be stopped for
+/// seventeen hours is its own defect, whatever the sync eventually does.
+///
+/// FIXTURE DESIGN — the deadline stays SILENCED here, deliberately. It would otherwise end the
+/// session on its own and the test would pass against a supervisor that still ignores shutdown
+/// during a catch-up, which is the whole property. So the ONLY thing that can end this task is the
+/// shutdown arm, and `Harness::stop`'s own five-second bound makes a regression fail loudly instead
+/// of hanging the suite.
+#[tokio::test]
+async fn a_shutdown_is_honoured_while_a_catch_up_is_running() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    script.park_the_catch_up();
+
+    let harness = Harness::start(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+
+    harness
+        .until("the catch-up to be entered", |s| s.catch_up_count() >= 1)
+        .await;
+
+    // `stop` asserts the task actually ends; it is the assertion, not the teardown.
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851, A3):** the catch-up deadline is a duration a human waits.
+///
+/// The deadline's own test drives the scripted clock with `script.allow(CATCH_UP_DEADLINE)` — it
+/// identifies the timer BY ITS DURATION, so it proves a timer with that identity exists and can
+/// never disagree with whatever the constant says. Multiplying the constant by a million (~114
+/// years) left it green. This is the circular-assertion shape: an expectation read from the
+/// production value confirms only itself.
+///
+/// So the bound is asserted against LITERALS, from both sides. Too loose and the deadline is not a
+/// deadline; too tight and a legitimate catch-up is aborted, which restarts it from genesis and
+/// produces the never-finishing replica this ticket is about.
+#[test]
+fn the_catch_up_deadline_is_a_duration_a_human_waits() {
+    assert!(
+        CATCH_UP_DEADLINE <= Duration::from_secs(4 * 60 * 60),
+        "a deadline longer than an afternoon cannot end a parked catch-up in any useful sense:          {CATCH_UP_DEADLINE:?}"
+    );
+    assert!(
+        CATCH_UP_DEADLINE >= Duration::from_secs(5 * 60),
+        "measured catch-ups take tens of milliseconds, but a deadline under five minutes leaves          no room for a slow first sync — and aborting one restarts it from genesis:          {CATCH_UP_DEADLINE:?}"
+    );
+}
+
+/// **Proves (dig_ecosystem#2851, A2 + F3):** the ceiling the ONE production construction site
+/// builds is anchored on the QUORUM-settled height and scaled by the lifetime the supervisor was
+/// actually given.
+///
+/// `trust_for_session` is the only place a `PeakCeiling` exists in production, and every other
+/// ceiling test hand-constructs its authority — so the bound was pinned solely against itself.
+/// Mutating the anchor to `round.height + 1_000_000`, or scaling by the `SESSION_MAX_LIFETIME`
+/// constant instead of the injected lifetime, both left the whole suite green.
+///
+/// FIXTURE DESIGN — the injected lifetime is deliberately NOT the shipped constant. A test run at
+/// `SESSION_MAX_LIFETIME` cannot tell the derived allowance from the hardcoded one, because the two
+/// agree numerically at exactly that value; doubling it makes them disagree by 66 blocks. And the
+/// anchor is asserted BOTH as an equality and as a refusal one million blocks up, because the
+/// equality alone would still pass a ceiling that was merely wide.
+#[tokio::test]
+async fn the_ceiling_derives_from_the_quorum_height_and_the_injected_lifetime() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    // Twice the shipped value, so a ceiling scaled by the constant is a DIFFERENT number here.
+    let lifetime = SESSION_MAX_LIFETIME * 2;
+
+    let harness = Harness::start_with_lifetime(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(ScriptedCorroborator::new(unanimous(HONEST_HASH))),
+        None,
+        lifetime,
+    )
+    .await;
+    harness
+        .until("the corroborated session to catch up", |s| {
+            s.catch_up_count() >= 1
+        })
+        .await;
+    harness.stop().await;
+
+    let authority = script.authorities.lock().unwrap()[0];
+    let sync::WriteAuthority::Corroborated(ceiling) = authority else {
+        panic!("a corroborated peer must be elevated WITH a ceiling, got {authority:?}");
+    };
+    assert_eq!(
+        ceiling.anchor(),
+        SETTLED_HEIGHT,
+        "the ceiling must be anchored on the height the quorum settled, which the writer cannot          inflate — not on anything the writer said"
+    );
+    assert_eq!(
+        ceiling.limit(),
+        SETTLED_HEIGHT + sync::peak_allowance(lifetime),
+        "the allowance must be derived from the lifetime this supervisor runs sessions for; a          hardcoded one silently becomes too tight when that value moves UP"
+    );
+    assert!(
+        !ceiling.admits(SETTLED_HEIGHT + 1_000_000),
+        "an anchor a million blocks above the settled height is not a bound at all"
+    );
+}
+
+/// **Proves (dig_ecosystem#2851):** write authority is earned PER SESSION and is never inherited
+/// from the session before it.
+///
+/// SPEC 18.6a states that a new session earns its authority from a freshly drawn quorum and that a
+/// verdict MUST NOT be carried across sessions — and until this test, nothing pinned it. Every
+/// rotation and stall test used a `PeerTrust::Operator` peer, which SHORT-CIRCUITS corroboration
+/// before it runs, so hoisting the trust resolution out of the reconnect loop — the obvious
+/// optimisation once someone reads the 144-corroborations-per-day cost this change documents —
+/// left the entire suite green while handing every later session an authority it never earned.
+///
+/// FIXTURE DESIGN — exactly one thing varies, and it varies BETWEEN sessions rather than within
+/// one. The peer is `Discovered`, so corroboration actually runs; the writer's answer never
+/// changes, so the writer is not what differs; and the quorum corroborates the FIRST round and
+/// splits on every later sample, which is precisely a verdict that must not be reusable. A double
+/// that answered the same way for ever could not exhibit the difference at all.
+///
+/// The two assertions catch the hoist from opposite sides. A quorum drawn once shows up as a round
+/// count that stops climbing while sessions keep turning over; an authority reused shows up as a
+/// second catch-up, because a REFUSED session subscribes nothing and therefore never catches up.
+#[tokio::test]
+async fn a_session_earns_its_own_authority_and_never_inherits_one() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    let corroborator = ScriptedCorroborator::corroborating_once_then_splitting(HONEST_HASH);
+
+    let harness = Harness::start_with_lifetime(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(corroborator.clone()),
+        None,
+        SESSION_MAX_LIFETIME,
+    )
+    .await;
+
+    // Sessions turn over on their own here — the first on rotation, the refused ones on the
+    // re-corroboration timer — and WHICH one ends a session is immaterial to the property, which is
+    // only that each successor must ask again.
+    harness
+        .until("the session to be replaced by a successor", |s| {
+            s.connects.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+    harness.stop().await;
+
+    let sessions = script.connects.load(Ordering::SeqCst);
+    assert!(
+        corroborator.rounds() >= sessions,
+        "corroboration ran {} times across {sessions} sessions, so a quorum was drawn once and \
+         reused rather than redrawn per session",
+        corroborator.rounds()
+    );
+    assert_eq!(
+        script.catch_up_count(),
+        1,
+        "a session after the first caught up, so it wrote the replica on an authority the quorum \
+         refused it — a verdict was carried across the session boundary"
     );
 }

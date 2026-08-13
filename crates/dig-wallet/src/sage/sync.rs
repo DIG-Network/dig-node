@@ -14,6 +14,7 @@
 //! spends (this PR has none).
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use chia::protocol::{
     Coin, CoinState, CoinStateFilters, CoinStateUpdate, Message, NewPeakWallet,
@@ -25,6 +26,21 @@ use chia_wallet_sdk::client::Peer;
 use super::db::{CatchUpReplay, CoinRow, WalletDb};
 use super::events::{EventBus, SyncEvent};
 use super::singleton::{self, LineageSource};
+#[cfg(doc)]
+use super::sync_supervisor::SESSION_MAX_LIFETIME;
+
+/// How long ONE puzzle-state round trip may take before the peer is treated as gone
+/// (dig_ecosystem#2851).
+///
+/// The dial already had a deadline — `sync_supervisor`'s `DIAL_TIMEOUT`, ten seconds — and the
+/// request leg simply never got the same treatment. It is not given the same VALUE, because the two
+/// are different work: a dial is a handshake, whereas a puzzle-state batch is a real query over a
+/// possibly slow link, and one minute is generous for that while still being finite.
+///
+/// Finite is the whole point. Without it, a peer that goes quiet on a live, ESTABLISHED socket
+/// parks the catch-up on a bare `.await` for ever, which is how a supervisor logged "it may now
+/// write" and then said nothing at all for two hours.
+const PEER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// A sync error (peer/protocol/db).
 #[derive(Debug)]
@@ -37,7 +53,7 @@ pub enum SyncError {
     Db(sqlx::Error),
     /// A CAT/singleton attribution error (parent-spend read / uncurry).
     Attribution(String),
-    /// [`initial_sync`] was asked to catch up over an EMPTY puzzle-hash set.
+    /// [`initial_sync_with_authority`] was asked to catch up over an EMPTY puzzle-hash set.
     ///
     /// Refused rather than performed. Subscribing nothing makes a peer answer
     /// `is_finished` on the first response, which would mark the DB
@@ -84,6 +100,14 @@ pub enum SyncError {
         spent: u32,
         /// The bound that was exceeded.
         max: u32,
+    },
+    /// A writer claimed a peak above the height an independent quorum settled this session
+    /// (see [`PeakCeiling`]).
+    PeakAboveCeiling {
+        /// The height the writer asked the replica to record.
+        claimed: u32,
+        /// The highest height this session's writer was entitled to claim.
+        ceiling: u32,
     },
 }
 
@@ -199,7 +223,146 @@ pub const MAX_REORG_DEPTH: u32 = 128;
 /// session; the supervisor reconnects and a fresh catch-up settles the fork properly.
 pub const MAX_SESSION_ROLLBACK: u32 = MAX_REORG_DEPTH;
 
-/// The most catch-up round trips one [`initial_sync_with`] may make.
+/// The block interval the peak allowance budgets for — deliberately about HALF Chia's ~18.75s
+/// target, so the allowance is a burst headroom rather than a point estimate.
+const FAST_BLOCK_SECS: u64 = 9;
+
+/// The over-ceiling `new_peak_wallet` frames one session may send before it is retired.
+///
+/// The first refusals drop the FRAME only: a single wildly-ahead claim can be a peer mid-reorg or
+/// mid-restart, and NC-12 makes corroboration a confidence gradient rather than a ban. Reaching
+/// this count is no longer explicable that way, so the session ends and the supervisor redraws a
+/// fresh quorum. Nobody is banned; the same peer may be drawn again.
+pub const MAX_REFUSED_PEAK_CLAIMS: u32 = 3;
+
+/// Blocks of chain a session may legitimately gain on the height its corroboration round settled.
+///
+/// Derived from `session_lifetime` rather than hardcoded, because [`SESSION_MAX_LIFETIME`]'s own
+/// doc calls its value an overridable operating assumption that may move UP, and a hardcoded
+/// ceiling would silently become too tight when it does.
+///
+/// # Where the two terms come from
+///
+/// - The anchor is already BEHIND the tip by construction: `quorum::common_height` subtracts
+///   `SETTLED_LAG` (2) from the slowest eligible peer, which may itself sit `PEAK_LAG_TOLERANCE`
+///   (3) below the best claim — 5 blocks of built-in lag.
+/// - Chain progress during a session: 600s at the ~18.75s target is 32 blocks expected;
+///   [`FAST_BLOCK_SECS`] yields 66, i.e. 2x burst headroom.
+/// - [`MAX_REORG_DEPTH`] is REUSED deliberately, not a new number. It is this crate's existing
+///   statement of how far chain state may legitimately move within one session in the OTHER
+///   direction ([`MAX_SESSION_ROLLBACK`] is the same value). The bound becomes symmetric: at most
+///   128 blocks down cumulatively, at most 128 + elapsed-chain up. Matching an established concept
+///   beats inventing a second policy number.
+///
+/// At the shipped lifetime that totals 194 blocks, about an hour of chain.
+pub fn peak_allowance(session_lifetime: Duration) -> u32 {
+    MAX_REORG_DEPTH + (session_lifetime.as_secs() / FAST_BLOCK_SECS) as u32
+}
+
+/// The highest peak this session's writer may claim.
+///
+/// `peak_height` is what a caller divides into a CONFIRMATION COUNT, so an unbounded writer can
+/// make unconfirmed money read as confirmed — and an inflated peak is effectively permanent,
+/// because backwards recovery is capped at [`MAX_SESSION_ROLLBACK`]. Worse, it permanently
+/// disables the two liveness guards that would otherwise notice: a saturating "how far behind are
+/// we" reads zero for ever, and a stall detector comparing peers against the replica never fires
+/// again. So the ceiling is what keeps those guards honest, not merely a second opinion on the
+/// peak.
+///
+/// # Why the anchor is a corroboration round's height
+///
+/// A quorum-settled height is independent of the writer by construction: elevation requires the
+/// writer to AGREE with it, so it is a floor the writer cannot inflate.
+///
+/// Two alternatives were considered and rejected; the reasons are kept here because they are the
+/// reason this shape looks heavier than a one-line delta cap.
+///
+/// - **A per-frame delta cap** is anchored on the *replica's own* peak, so it cannot distinguish a
+///   fresh genesis sync or a three-day-downtime catch-up from an inflation attack. It would need
+///   `initial_sync_complete` as a discriminator, and that flag is attacker-clearable —
+///   [`handle_coin_state_update`] clears it on any accepted reorg, so a writer that drives one
+///   reorg re-opens the very window the bound closes. An absolute anchor needs no discriminator.
+/// - **Anchoring on the supervisor's `chia_peer_peak_height`** would import the vulnerability being
+///   fixed: it is a monotone MAX over unverified claims, and `quorum::eligible` anchors on the
+///   MEDIAN precisely because a max is one-frame-pinnable.
+///
+/// # It never ratchets
+///
+/// The ceiling is fixed for the life of the session. Refreshing it is exactly what session
+/// rotation already does: every session re-corroborates and gets a new anchor. That is the one
+/// place rotation REDUCES exposure rather than raising it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeakCeiling {
+    limit: u32,
+    anchor: u32,
+}
+
+impl PeakCeiling {
+    /// The ceiling a session elevated at `anchor` by a corroboration round carries.
+    pub fn from_corroborated(anchor: u32, session_lifetime: Duration) -> Self {
+        Self {
+            limit: anchor.saturating_add(peak_allowance(session_lifetime)),
+            anchor,
+        }
+    }
+
+    /// Whether `claimed` is a height this session's writer is entitled to claim.
+    pub fn admits(self, claimed: u32) -> bool {
+        claimed <= self.limit
+    }
+
+    /// The highest claimable height.
+    pub fn limit(self) -> u32 {
+        self.limit
+    }
+
+    /// The quorum-settled height the ceiling was built on.
+    pub fn anchor(self) -> u32 {
+        self.anchor
+    }
+}
+
+/// What a session is entitled to write — [`PeerTrust`] plus, for the elevated-stranger tier, the
+/// ceiling that tier is only ever granted WITH.
+///
+/// `Corroborated` cannot be constructed without a [`PeakCeiling`], and that is the whole point:
+/// the previous shape carried a bare trust label, so "elevated but unbounded" was a representable
+/// state one refactor could reintroduce. [`PeerTrust`] stays the wire-facing enum that
+/// [`PeerTrust::is_authoritative`] answers for; `WriteAuthority` is what SESSIONS carry.
+///
+/// `Operator` is deliberately unbounded: the operator hand-configured that address, corroboration
+/// only runs on the discovery path so no independent anchor exists for such a session, and
+/// inventing one would second-guess an explicit configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAuthority {
+    /// An operator-chosen peer. Full authority, no ceiling.
+    Operator,
+    /// A discovered peer a quorum agreed with, bounded by the height that quorum settled.
+    Corroborated(PeakCeiling),
+    /// A discovered peer. Writes nothing.
+    Discovered,
+}
+
+impl WriteAuthority {
+    /// The trust tier this authority carries.
+    pub fn trust(self) -> PeerTrust {
+        match self {
+            WriteAuthority::Operator => PeerTrust::Operator,
+            WriteAuthority::Corroborated(_) => PeerTrust::Corroborated,
+            WriteAuthority::Discovered => PeerTrust::Discovered,
+        }
+    }
+
+    /// The ceiling every peak claim of this session is checked against, if it has one.
+    pub fn ceiling(self) -> Option<PeakCeiling> {
+        match self {
+            WriteAuthority::Corroborated(ceiling) => Some(ceiling),
+            WriteAuthority::Operator | WriteAuthority::Discovered => None,
+        }
+    }
+}
+
+/// The most catch-up round trips one [`initial_sync_with_authority`] may make.
 ///
 /// The loop continues while the peer answers `is_finished: false`, and the peer chooses that
 /// bit. Combined with the strict height-monotonicity check below this is belt and braces: the
@@ -207,7 +370,7 @@ pub const MAX_SESSION_ROLLBACK: u32 = MAX_REORG_DEPTH;
 /// catch-up needs a handful of batches even for a heavily-used wallet.
 pub const MAX_CATCH_UP_BATCHES: u32 = 1_024;
 
-/// The most coin states one [`initial_sync_with`] may write, summed across its batches.
+/// The most coin states one [`initial_sync_with_authority`] may write, summed across its batches.
 ///
 /// A peer answering a subscription decides how many rows it hands back and can repeat them
 /// with fresh coin ids forever; without this, `wallet.sqlite` grows for as long as the peer
@@ -251,6 +414,11 @@ impl std::fmt::Display for SyncError {
                 f,
                 "session walked the replica peak back {spent} blocks in total (bound {max}); \
                  dropping the session"
+            ),
+            SyncError::PeakAboveCeiling { claimed, ceiling } => write!(
+                f,
+                "a writer claimed a peak of {claimed} above the height an independent quorum \
+                 settled this session (ceiling {ceiling}); dropping the session"
             ),
         }
     }
@@ -305,21 +473,102 @@ pub type SubscribedHashes = HashSet<Bytes32>;
 pub struct SessionState<'a> {
     /// The puzzle hashes this session subscribed. Empty when the session subscribes nothing.
     pub subscribed: &'a SubscribedHashes,
-    /// How far this session's peer is trusted.
-    pub trust: PeerTrust,
+    /// What this session's peer is entitled to write, and up to what height.
+    pub authority: WriteAuthority,
     /// The session's remaining allowance for walking the peak backwards.
     pub rollback: RollbackBudget,
+    /// How many peak claims above the ceiling this session has already had refused.
+    pub refused_peaks: u32,
 }
 
 impl<'a> SessionState<'a> {
-    /// A session over `subscribed` whose peer is trusted to the degree `trust` says.
-    pub fn new(subscribed: &'a SubscribedHashes, trust: PeerTrust) -> Self {
+    /// A session over `subscribed` entitled to write exactly what `authority` says.
+    pub fn with_authority(subscribed: &'a SubscribedHashes, authority: WriteAuthority) -> Self {
         Self {
             subscribed,
-            trust,
+            authority,
             rollback: RollbackBudget::new(),
+            refused_peaks: 0,
         }
     }
+
+    /// Check `claimed` against this session's [`PeakCeiling`], charging a strike if it is refused.
+    ///
+    /// THE ONE PLACE a live peer frame's height is judged. Both frame types that carry a peak
+    /// ([`handle_coin_state_update`] and the `new_peak_wallet` arm of [`run_update_loop`]) route
+    /// through here, and neither can write a peak without the [`AdmittedPeak`] it returns.
+    ///
+    /// The third peak-carrying write, a catch-up terminal, is guarded by
+    /// [`CatchUpReplay::finished_at`] instead and deliberately not by this: that value arms
+    /// `initial_sync_complete` and the arrival baseline in the same statement, so it gets none of
+    /// the three-strike tolerance below — there is no benign reading of it.
+    ///
+    /// # Why refusals are tolerated before they are fatal
+    ///
+    /// A single wildly-ahead claim can be a peer mid-reorg or mid-restart, and NC-12 makes
+    /// corroboration a confidence gradient rather than a ban. Reaching
+    /// [`MAX_REFUSED_PEAK_CLAIMS`] is no longer explicable that way, so the session ends and the
+    /// supervisor redraws a fresh quorum. Nobody is banned; the same peer may be drawn again.
+    pub fn admit_peak(&mut self, claimed: u32) -> Result<PeakClaim, SyncError> {
+        let Some(ceiling) = self.authority.ceiling() else {
+            return Ok(PeakClaim::Admitted(AdmittedPeak { height: claimed }));
+        };
+        if ceiling.admits(claimed) {
+            return Ok(PeakClaim::Admitted(AdmittedPeak { height: claimed }));
+        }
+        tracing::warn!(
+            claimed,
+            ceiling = ceiling.limit(),
+            anchor = ceiling.anchor(),
+            trust = ?self.authority.trust(),
+            "wallet sync: refusing a peak above the session's corroborated ceiling"
+        );
+        self.refused_peaks = self.refused_peaks.saturating_add(1);
+        if self.refused_peaks >= MAX_REFUSED_PEAK_CLAIMS {
+            tracing::warn!(
+                refused = self.refused_peaks,
+                "wallet sync: retiring the session after repeated over-ceiling peak claims; a \
+                 fresh quorum will be redrawn"
+            );
+            return Err(SyncError::PeakAboveCeiling {
+                claimed,
+                ceiling: ceiling.limit(),
+            });
+        }
+        Ok(PeakClaim::Refused)
+    }
+}
+
+/// A peak height the session's [`WriteAuthority`] has already been checked against.
+///
+/// [`WalletDb::record_peak`] takes one of these and [`SessionState::admit_peak`] is the only thing
+/// that builds one, so "write a peak without consulting the ceiling" is not a state production code
+/// can express — the same trick [`CatchUpReplay`] plays for the routing gate.
+///
+/// This shape exists because the ENUMERATION is what failed once already (dig_ecosystem#2851): the
+/// bound was written as a check repeated at each known write site, the set was believed to be two,
+/// and the third site — [`handle_coin_state_update`] — silenced both liveness guards through a
+/// frame nobody had enumerated. A checked value cannot be forgotten by the next site added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmittedPeak {
+    height: u32,
+}
+
+impl AdmittedPeak {
+    /// The admitted height.
+    pub fn height(self) -> u32 {
+        self.height
+    }
+}
+
+/// What [`SessionState::admit_peak`] concluded about one claimed height.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a refused peak claim means the FRAME must be dropped, not merely not written"]
+pub enum PeakClaim {
+    /// The claim is within this session's authority; write it.
+    Admitted(AdmittedPeak),
+    /// The claim was above the ceiling and a strike was charged. Drop the frame, keep the session.
+    Refused,
 }
 
 /// The cumulative descent one session is allowed to drive, bounded by [`MAX_SESSION_ROLLBACK`].
@@ -354,10 +603,50 @@ impl RollbackBudget {
     }
 }
 
+impl CatchUpReplay {
+    /// The replay that ended at `peak_height` / `header_hash` — the terminal `is_finished`
+    /// puzzle-state response's own values, never a height borrowed from somewhere else — or
+    /// [`SyncError::PeakAboveCeiling`] when `ceiling` does not admit that height.
+    ///
+    /// The check belongs on the CONSTRUCTOR rather than in [`WalletDb::complete_catch_up`],
+    /// extending the trick that already protects that call: the value is hard to construct, so a
+    /// caller with nothing legitimate to build one out of cannot arm the flag by accident.
+    ///
+    /// A refusal here ends the session immediately, with none of the three-strike tolerance the
+    /// stray `new_peak_wallet` frame gets. Unlike a peak frame, this value arms
+    /// `initial_sync_complete` AND the arrival baseline in the same statement, so there is no
+    /// benign reading of it.
+    pub fn finished_at(
+        ceiling: Option<PeakCeiling>,
+        peak_height: u32,
+        header_hash: impl Into<String>,
+    ) -> Result<Self, SyncError> {
+        if let Some(ceiling) = ceiling {
+            if !ceiling.admits(peak_height) {
+                tracing::warn!(
+                    claimed = peak_height,
+                    ceiling = ceiling.limit(),
+                    anchor = ceiling.anchor(),
+                    "wallet sync: refusing a catch-up terminal above the session's corroborated \
+                     ceiling; retiring the session so a fresh quorum is redrawn"
+                );
+                return Err(SyncError::PeakAboveCeiling {
+                    claimed: peak_height,
+                    ceiling: ceiling.limit(),
+                });
+            }
+        }
+        Ok(Self {
+            peak_height,
+            header_hash: header_hash.into(),
+        })
+    }
+}
+
 /// The running cost of one catch-up, bounded by [`MAX_CATCH_UP_BATCHES`] and
 /// [`MAX_CATCH_UP_COINS`].
 ///
-/// Split out of [`initial_sync_with`] as a small value with no I/O so both bounds can be pinned
+/// Split out of [`initial_sync_with_authority`] as a small value with no I/O so both bounds can be pinned
 /// from ABOVE and BELOW in a unit test — a cap tested only from one side confirms only itself,
 /// and driving 250,000 rows through SQLite to prove the at-bound case would be a test nobody
 /// runs.
@@ -475,7 +764,7 @@ impl CatAttributor<'_> {
 ///
 /// # A discovered peer's frame is dropped whole
 ///
-/// When `session.trust` is [`PeerTrust::Discovered`] this returns without touching the database:
+/// When `session.authority` is [`PeerTrust::Discovered`] this returns without touching the database:
 /// no rollback, no coin write, no routing flag, and no peak (see [`PeerTrust`] for why the peak
 /// is not the harmless half). Dropping the frame is not an error — the session stays up, because
 /// the peer still counts toward `subscription_peer_count`.
@@ -485,13 +774,22 @@ pub async fn handle_coin_state_update(
     events: &EventBus,
     session: &mut SessionState<'_>,
 ) -> Result<(), SyncError> {
-    if !session.trust.is_authoritative() {
+    if !session.authority.trust().is_authoritative() {
         tracing::debug!(
             claimed_height = update.height,
             "wallet sync: dropping a coin_state_update from a discovered peer"
         );
         return Ok(());
     }
+    // Judged BEFORE the frame acts, not at the write. A guard sitting on the `set_peak` call would
+    // satisfy "the peak is unchanged" identically while the rollback below had already deleted
+    // coins and cleared the routing gate on the strength of a height about to be rejected. A frame
+    // whose height is a lie is suspect in its entirety, so a refusal drops the whole frame — its
+    // coins included, which is also the conservative reading of coins offered alongside one.
+    let admitted = match session.admit_peak(update.height)? {
+        PeakClaim::Admitted(peak) => peak,
+        PeakClaim::Refused => return Ok(()),
+    };
     let current_peak = db.sync_state().await?.peak_height;
     let mut moved_backwards = false;
     if let Some(peak) = current_peak {
@@ -520,7 +818,7 @@ pub async fn handle_coin_state_update(
         db.set_initial_sync_complete(false).await?;
     }
     apply_coin_states(db, &update.items, session.subscribed).await?;
-    db.set_peak(update.height, &hex::encode(update.peak_hash))
+    db.record_peak(admitted, &hex::encode(update.peak_hash))
         .await?;
     // Incoming-funds arrivals (dig_ecosystem#2548), recorded AFTER the batch has committed and
     // the peak has advanced — never during the write. A parent and its change coin arrive in the
@@ -547,37 +845,7 @@ pub async fn handle_coin_state_update(
     Ok(())
 }
 
-/// Perform the initial puzzle-state catch-up: subscribe the wallet's puzzle hashes and
-/// apply the returned coin states, batching through `RespondPuzzleState.next` until the
-/// peer reports it is caught up. Marks the DB initial-sync-complete so
-/// [`crate::sage::routing`] flips reads from the fallback to the DB.
-///
-/// Publishes the sync lifecycle on `events` (design A.9): [`SyncEvent::Start`] once (the
-/// caller supplies `peer_ip` — whatever address it dialed to obtain `peer`),
-/// [`SyncEvent::Subscribed`] after the first successful puzzle-state response, and
-/// [`SyncEvent::PuzzleBatchSynced`] once per batch applied.
-pub async fn initial_sync(
-    peer: &Peer,
-    db: &WalletDb,
-    puzzle_hashes: Vec<Bytes32>,
-    genesis_challenge: Bytes32,
-    peer_ip: &str,
-    events: &EventBus,
-    trust: PeerTrust,
-) -> Result<(), SyncError> {
-    initial_sync_with(
-        peer,
-        db,
-        puzzle_hashes,
-        genesis_challenge,
-        peer_ip,
-        events,
-        trust,
-    )
-    .await
-}
-
-/// The one peer call [`initial_sync`] makes, behind a trait.
+/// The one peer call [`initial_sync_with_authority`] makes, behind a trait.
 ///
 /// `chia_wallet_sdk::client::Peer` can only exist on top of a live socket, so the catch-up
 /// loop — including the empty-set refusal that protects `initial_sync_complete` — would
@@ -619,16 +887,21 @@ impl PuzzleStateSource for Peer {
     }
 }
 
-/// [`initial_sync`] over any [`PuzzleStateSource`]. Production passes a `Peer`.
-pub async fn initial_sync_with(
+/// The catch-up itself, for a session that already knows what it is entitled to write.
+///
+/// This is where the terminal height meets the session's [`PeakCeiling`] — see
+/// [`CatchUpReplay::finished_at`], which refuses an over-ceiling terminal rather than arming
+/// `initial_sync_complete` over it.
+pub async fn initial_sync_with_authority(
     peer: &dyn PuzzleStateSource,
     db: &WalletDb,
     puzzle_hashes: Vec<Bytes32>,
     genesis_challenge: Bytes32,
     peer_ip: &str,
     events: &EventBus,
-    trust: PeerTrust,
+    authority: WriteAuthority,
 ) -> Result<(), SyncError> {
+    let trust = authority.trust();
     // THE TRUST BOUNDARY. This is the only place a PEER can set `initial_sync_complete`, and
     // that flag is what `routing::route` turns into "the local replica answers for money". So
     // the check belongs HERE, at the floor, rather than only in
@@ -663,9 +936,30 @@ pub async fn initial_sync_with(
     let mut first_batch = true;
     let mut budget = CatchUpBudget::new();
     loop {
-        let respond = peer
-            .request_puzzle_state(puzzle_hashes.clone(), previous_height, header_hash)
-            .await?;
+        // Bounded per ROUND TRIP, never over the catch-up as a whole (dig_ecosystem#2851). A first
+        // catch-up runs from genesis over many batches and legitimately takes a long time, so a
+        // total deadline would kill a healthy long sync — a worse failure than the one being fixed.
+        // A single request/response has no such excuse: a peer that has not answered one batch in
+        // a minute has gone quiet, and without a deadline here this `.await` parks the whole
+        // supervisor for the life of the process on a socket that stays ESTABLISHED. A supervisor
+        // logged "it may now write" and then said nothing at all for two hours.
+        //
+        // Placed at the LOOP rather than inside the production `Peer` impl deliberately: here it
+        // covers every `PuzzleStateSource`, and it is reachable by a test double — a deadline that
+        // only exists on the one implementation no test can construct is a deadline nothing can
+        // prove. Recovery is already wired: this error reaches the supervisor's `catch-up failed`
+        // path, which drops the peer and backs off.
+        let respond = tokio::time::timeout(
+            PEER_REQUEST_TIMEOUT,
+            peer.request_puzzle_state(puzzle_hashes.clone(), previous_height, header_hash),
+        )
+        .await
+        .map_err(|_| {
+            SyncError::Peer(format!(
+                "the peer did not answer a puzzle-state request within {}s",
+                PEER_REQUEST_TIMEOUT.as_secs()
+            ))
+        })??;
         if first_batch {
             events.publish(SyncEvent::Subscribed);
             first_batch = false;
@@ -696,9 +990,10 @@ pub async fn initial_sync_with(
             // the baseline came to be armable by a caller that had replayed nothing
             // (dig_ecosystem#2548) -- see `WalletDb::complete_catch_up`.
             db.complete_catch_up(&CatchUpReplay::finished_at(
+                authority.ceiling(),
                 respond.height,
                 hex::encode(respond.header_hash),
-            ))
+            )?)
             .await?;
             return Ok(());
         }
@@ -712,7 +1007,7 @@ pub async fn initial_sync_with(
 /// [`handle_coin_state_update`]; `new_peak_wallet` → advance the peak, but ONLY from an
 /// authoritative peer — a [`PeerTrust::Discovered`] peer's height is dropped here, for the same
 /// reason its coins are (see [`PeerTrust`]). This is the production loop run after
-/// [`initial_sync`]; it returns when the peer disconnects, at which point it publishes
+/// [`initial_sync_with_authority`]; it returns when the peer disconnects, at which point it publishes
 /// [`SyncEvent::Stop`] on `events`.
 ///
 /// When `attributor` is `Some`, each applied `coin_state_update` is followed by a CAT/
@@ -746,13 +1041,23 @@ pub async fn run_update_loop(
                     // are not: `new_peak_wallet` is the CHEAPEST frame on the wire to lie in,
                     // and the value it would land in is the one a caller divides into a
                     // confirmation count (see [`PeerTrust`]).
-                    if !session.trust.is_authoritative() {
+                    if !session.authority.trust().is_authoritative() {
                         tracing::debug!(
                             claimed = peak.height,
                             "wallet sync: dropping a new_peak_wallet from a discovered peer"
                         );
                         continue;
                     }
+                    // Checked BEFORE the backwards check, so a refused claim is never also
+                    // evaluated as a retreat. A refusal deliberately leaves the replica peak
+                    // STILL, which is the correct observable: the phase report then shows the real
+                    // gap and the stall detector accumulates toward its deadline. The bound and
+                    // those two guards COMPOSE rather than masking each other — which is the point,
+                    // because an inflated peak is what would permanently silence both.
+                    let admitted = match session.admit_peak(peak.height)? {
+                        PeakClaim::Admitted(admitted) => admitted,
+                        PeakClaim::Refused => continue,
+                    };
                     let state = db.sync_state().await?;
                     // The recorded peak only ever ADVANCES here. This value is served on OPEN
                     // reads and is what a caller bounding a claimed confirmation reads, so a
@@ -772,7 +1077,7 @@ pub async fn run_update_loop(
                         );
                         continue;
                     }
-                    db.set_peak(peak.height, state.header_hash.as_deref().unwrap_or(""))
+                    db.record_peak(admitted, state.header_hash.as_deref().unwrap_or(""))
                         .await?;
                 }
             }
@@ -791,6 +1096,9 @@ fn decode<T: chia::traits::Streamable>(message: &Message) -> Result<T, SyncError
 mod tests {
     use super::*;
     use crate::sage::db::WalletDb;
+    use crate::sage::sync_supervisor::{
+        is_following, StallVerdict, StallWatch, SESSION_MAX_LIFETIME, STALL_AFTER,
+    };
 
     fn coin(parent: u8, ph: u8, amount: u64) -> Coin {
         Coin {
@@ -810,7 +1118,7 @@ mod tests {
 
     /// A session over `subscribed` whose peer the OPERATOR chose — full authority.
     fn operator(subscribed: &SubscribedHashes) -> SessionState<'_> {
-        SessionState::new(subscribed, PeerTrust::Operator)
+        SessionState::with_authority(subscribed, WriteAuthority::Operator)
     }
 
     /// A `new_peak_wallet` frame claiming `height`, exactly as it arrives on the wire.
@@ -830,7 +1138,42 @@ mod tests {
 
     /// A session over a peer this node merely DISCOVERED — writes nothing.
     fn discovered(subscribed: &SubscribedHashes) -> SessionState<'_> {
-        SessionState::new(subscribed, PeerTrust::Discovered)
+        SessionState::with_authority(subscribed, WriteAuthority::Discovered)
+    }
+
+    /// A session over a DISCOVERED peer a quorum settled at `anchor` — full authority, bounded.
+    fn corroborated(subscribed: &SubscribedHashes, anchor: u32) -> SessionState<'_> {
+        SessionState::with_authority(
+            subscribed,
+            WriteAuthority::Corroborated(PeakCeiling::from_corroborated(
+                anchor,
+                SESSION_MAX_LIFETIME,
+            )),
+        )
+    }
+
+    /// The ceiling a session elevated at `anchor` carries, at the shipped session lifetime.
+    fn ceiling_at(anchor: u32) -> PeakCeiling {
+        PeakCeiling::from_corroborated(anchor, SESSION_MAX_LIFETIME)
+    }
+
+    /// Feed `frames` through [`run_update_loop`] on `session` and return what it concluded.
+    ///
+    /// The channel is closed before the loop starts, so the loop always terminates on its own: a
+    /// regression here fails LOUDLY rather than hanging, and a hanging test in this crate is
+    /// indistinguishable from a dead agent.
+    async fn feed(
+        db: &WalletDb,
+        session: &mut SessionState<'_>,
+        frames: Vec<Message>,
+    ) -> Result<(), SyncError> {
+        let events = EventBus::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        for frame in frames {
+            tx.send(frame).await.unwrap();
+        }
+        drop(tx);
+        run_update_loop(db, rx, &events, None, session).await
     }
 
     fn state(c: Coin, created: Option<u32>, spent: Option<u32>) -> CoinState {
@@ -891,7 +1234,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(20, "aa"))
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 20, "aa").unwrap())
             .await
             .unwrap();
 
@@ -951,7 +1294,7 @@ mod tests {
     async fn change_arriving_in_the_same_frame_as_its_parent_is_not_announced() {
         let db = WalletDb::open_in_memory().await.unwrap();
         let subscribed = subscribed_owned();
-        db.complete_catch_up(&CatchUpReplay::finished_at(100, "aa"))
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "aa").unwrap())
             .await
             .unwrap();
 
@@ -1320,7 +1663,74 @@ mod tests {
         }
     }
 
-    /// **Proves (T1, #2501):** [`initial_sync_with`] REFUSES an empty puzzle-hash set, and
+    /// A peer that accepts the request and then never answers — the live incident's shape, and the
+    /// one a socket-level check cannot see. The connection stays ESTABLISHED throughout.
+    struct SilentPeer;
+
+    #[async_trait::async_trait]
+    impl PuzzleStateSource for SilentPeer {
+        async fn request_puzzle_state(
+            &self,
+            _puzzle_hashes: Vec<Bytes32>,
+            _previous_height: Option<u32>,
+            _header_hash: Bytes32,
+        ) -> Result<RespondPuzzleState, SyncError> {
+            std::future::pending().await
+        }
+    }
+
+    /// **Proves (dig_ecosystem#2851):** a peer that goes SILENT mid-catch-up ends the catch-up with
+    /// an error instead of parking the supervisor for ever.
+    ///
+    /// THE BUG THIS PINS. `request_puzzle_state` was awaited bare, so one unanswered round trip
+    /// parked `initial_sync_with_authority` — which runs BEFORE the supervisor's `select!` and is therefore
+    /// outside every exit the supervisor has. The observed result was a node that logged "it may now
+    /// write" and then said nothing for two hours, with the peer's socket still ESTABLISHED.
+    ///
+    /// FIXTURE DESIGN — the double parks rather than erroring, because an erroring peer takes the
+    /// path that already worked and would pass against the defect. The clock is PAUSED, so the
+    /// assertion is "a deadline exists", not "sixty seconds elapsed", and the outer bound is what
+    /// makes a regression fail LOUDLY: with no deadline the only timer left is that bound, the
+    /// paused clock jumps straight to it, and the test fails instead of hanging like a dead process.
+    #[tokio::test]
+    async fn a_silent_peer_times_out_instead_of_parking_the_catch_up() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let events = EventBus::default();
+        // Paused only AFTER the DB is open: the sqlite pool has acquisition timers of its own, and
+        // a virtual clock running while it connects auto-advances straight through them.
+        tokio::time::pause();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            initial_sync_with_authority(
+                &SilentPeer,
+                &db,
+                vec![Bytes32::new([7; 32])],
+                Bytes32::new([0; 32]),
+                "127.0.0.1",
+                &events,
+                WriteAuthority::Operator,
+            ),
+        )
+        .await
+        .expect("the catch-up never returned: a silent peer still parks the supervisor for ever");
+
+        let err = outcome.expect_err("a peer that never answered must not report success");
+        assert!(
+            matches!(&err, SyncError::Peer(m) if m.contains("did not answer")),
+            "the failure must name the timeout as the reason; got {err:?}"
+        );
+        // Back to the real clock before touching the DB again: a pool acquisition under a virtual
+        // one auto-advances straight through its own timeout, which fails as `PoolTimedOut` on a
+        // cold connection and passes on a warm one — green locally, red in CI.
+        tokio::time::resume();
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "a timed-out catch-up must not latch initial_sync_complete"
+        );
+    }
+
+    /// **Proves (T1, #2501):** [`initial_sync_with_authority`] REFUSES an empty puzzle-hash set, and
     /// the DB is left un-synced.
     ///
     /// The peer double here would happily report `is_finished` on the first response, so
@@ -1332,14 +1742,14 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         let events = EventBus::default();
 
-        let err = initial_sync_with(
+        let err = initial_sync_with_authority(
             &CaughtUpAtOnce,
             &db,
             vec![],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Operator,
+            WriteAuthority::Operator,
         )
         .await
         .expect_err("an empty subscription set must be refused, not performed");
@@ -1402,14 +1812,14 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         let events = EventBus::default();
 
-        initial_sync_with(
+        initial_sync_with_authority(
             &AnswersSubscriptionAndSlipsOneIn,
             &db,
             vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Operator,
+            WriteAuthority::Operator,
         )
         .await
         .expect("a non-empty subscription set catches up normally");
@@ -1508,14 +1918,14 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         let events = EventBus::default();
 
-        let err = initial_sync_with(
+        let err = initial_sync_with_authority(
             &AnswersSubscriptionAndSlipsOneIn,
             &db,
             vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Discovered,
+            WriteAuthority::Discovered,
         )
         .await
         .expect_err("a discovered peer must not be allowed to run a catch-up");
@@ -1578,14 +1988,14 @@ mod tests {
 
         // The attacker closes the socket; the supervisor reconnects to it and the catch-up that
         // re-latched over an empty response last round is now refused at the floor.
-        let err = initial_sync_with(
+        let err = initial_sync_with_authority(
             &CaughtUpAtOnce,
             &db,
             vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Discovered,
+            WriteAuthority::Discovered,
         )
         .await
         .expect_err("the reconnect must not buy a fresh catch-up");
@@ -1668,9 +2078,9 @@ mod tests {
     /// this test is satisfied by a `run_update_loop` that ignores `new_peak_wallet` entirely.
     #[tokio::test]
     async fn a_discovered_peer_new_peak_wallet_is_dropped_while_an_operators_still_lands() {
-        for (trust, claimed, expected) in [
-            (PeerTrust::Discovered, u32::MAX, 6_000_000u32),
-            (PeerTrust::Operator, 6_000_010, 6_000_010),
+        for (authority, claimed, expected) in [
+            (WriteAuthority::Discovered, u32::MAX, 6_000_000u32),
+            (WriteAuthority::Operator, 6_000_010, 6_000_010),
         ] {
             let db = WalletDb::open_in_memory().await.unwrap();
             db.set_peak(6_000_000, "aa").await.unwrap();
@@ -1685,7 +2095,7 @@ mod tests {
                 rx,
                 &events,
                 None,
-                &mut SessionState::new(&subscribed, trust),
+                &mut SessionState::with_authority(&subscribed, authority),
             )
             .await
             .unwrap();
@@ -1693,7 +2103,7 @@ mod tests {
             assert_eq!(
                 db.sync_state().await.unwrap().peak_height,
                 Some(expected),
-                "{trust:?} peer claiming height {claimed}"
+                "{authority:?} peer claiming height {claimed}"
             );
         }
     }
@@ -1883,14 +2293,14 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let err = initial_sync_with(
+        let err = initial_sync_with_authority(
             &peer,
             &db,
             vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Operator,
+            WriteAuthority::Operator,
         )
         .await
         .expect_err("a non-advancing catch-up must be refused");
@@ -1976,6 +2386,566 @@ mod tests {
             hits.load(Ordering::SeqCst),
             1,
             "attributor fetched the candidate coin's parent spend"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The corroborated peak ceiling (dig_ecosystem#2851).
+    // ---------------------------------------------------------------------------------------
+
+    /// A peer that answers one batch and reports it is caught up at a height IT chooses — which
+    /// is the whole point, because the terminal height is a value a hostile writer picks freely.
+    struct FinishesAt(u32);
+
+    #[async_trait::async_trait]
+    impl PuzzleStateSource for FinishesAt {
+        async fn request_puzzle_state(
+            &self,
+            _puzzle_hashes: Vec<Bytes32>,
+            _previous_height: Option<u32>,
+            _header_hash: Bytes32,
+        ) -> Result<RespondPuzzleState, SyncError> {
+            Ok(RespondPuzzleState {
+                puzzle_hashes: vec![],
+                coin_states: vec![],
+                height: self.0,
+                header_hash: Bytes32::new([9; 32]),
+                is_finished: true,
+            })
+        }
+    }
+
+    /// Run a catch-up over a peer that finishes at `terminal`, for a session holding `authority`.
+    async fn catch_up_finishing_at(
+        db: &WalletDb,
+        authority: WriteAuthority,
+        terminal: u32,
+    ) -> Result<(), SyncError> {
+        let events = EventBus::default();
+        initial_sync_with_authority(
+            &FinishesAt(terminal),
+            db,
+            vec![Bytes32::new([OWNED; 32])],
+            Bytes32::new([1; 32]),
+            "1.2.3.4",
+            &events,
+            authority,
+        )
+        .await
+    }
+
+    /// **Proves (the named attack):** an elevated writer cannot claim `u32::MAX`.
+    ///
+    /// `peak_height` is what a caller divides into a confirmation count, so one accepted frame
+    /// here reads as ~4.29e9 confirmations for a spend that never landed.
+    #[tokio::test]
+    async fn corroborated_writer_cannot_claim_u32_max() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(1000, "aa").await.unwrap();
+        let subscribed = subscribed_owned();
+
+        feed(
+            &db,
+            &mut corroborated(&subscribed, 1000),
+            vec![new_peak_message(u32::MAX)],
+        )
+        .await
+        .expect("one over-ceiling frame is dropped, not fatal");
+
+        assert_eq!(
+            db.sync_state().await.unwrap().peak_height,
+            Some(1000),
+            "the replica peak must be left exactly where the quorum settled it"
+        );
+    }
+
+    /// **Proves (the 3-strike shape, both halves):** the first two over-ceiling frames drop the
+    /// FRAME only and write nothing, and the third retires the session.
+    ///
+    /// Both halves matter. Asserting only the error would be satisfied by a bound that kills the
+    /// session on the FIRST frame, which NC-12 forbids — corroboration is a confidence gradient,
+    /// and a single wildly-ahead claim can be a peer mid-reorg or mid-restart. Asserting only the
+    /// tolerance would be satisfied by a bound that never ends the session at all.
+    #[tokio::test]
+    async fn three_over_ceiling_claims_retire_the_session() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(1000, "aa").await.unwrap();
+        let subscribed = subscribed_owned();
+        let mut session = corroborated(&subscribed, 1000);
+
+        for frame in 1..=2 {
+            feed(&db, &mut session, vec![new_peak_message(u32::MAX)])
+                .await
+                .unwrap_or_else(|e| panic!("frame {frame} must be tolerated, got {e}"));
+            assert_eq!(
+                db.sync_state().await.unwrap().peak_height,
+                Some(1000),
+                "frame {frame} must write nothing"
+            );
+        }
+
+        let err = feed(&db, &mut session, vec![new_peak_message(u32::MAX)])
+            .await
+            .expect_err("the third must retire the session");
+        assert!(
+            matches!(err, SyncError::PeakAboveCeiling { claimed, .. } if claimed == u32::MAX),
+            "got {err:?}"
+        );
+        assert_eq!(
+            db.sync_state().await.unwrap().peak_height,
+            Some(1000),
+            "and still write nothing on the way out"
+        );
+    }
+
+    /// **Proves (both sides of the bound):** the ceiling admits exactly its limit and refuses one
+    /// above it. A bound tested only from below can only confirm itself.
+    #[tokio::test]
+    async fn peak_ceiling_boundary() {
+        let anchor = 6_000_000u32;
+        let at_bound = anchor + peak_allowance(SESSION_MAX_LIFETIME);
+
+        for (claimed, expected) in [(at_bound, at_bound), (at_bound + 1, anchor)] {
+            let db = WalletDb::open_in_memory().await.unwrap();
+            db.set_peak(anchor, "aa").await.unwrap();
+            let subscribed = subscribed_owned();
+
+            feed(
+                &db,
+                &mut corroborated(&subscribed, anchor),
+                vec![new_peak_message(claimed)],
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                db.sync_state().await.unwrap().peak_height,
+                Some(expected),
+                "a claim of {claimed} against a ceiling of {at_bound}"
+            );
+        }
+    }
+
+    /// **Proves (the reason this bound ships WITH the other two guards):** after a refused
+    /// inflation, both guards added on this branch still work.
+    ///
+    /// This is the test the whole change exists for. An accepted `u32::MAX` does not merely
+    /// misreport the peak — it permanently DISABLES both of them, and silently:
+    /// [`is_following`]'s `peers.saturating_sub(replica)` is `0` for ever, so the phase reports
+    /// `Synced` however far behind the replica really is; and [`StallWatch`]'s
+    /// `behind = peers > replica` is false for ever, so the stall clock never starts.
+    ///
+    /// So the fixture keeps an HONEST observer — peers genuinely 50 blocks ahead of a replica that
+    /// is not moving — and asserts both guards still see it. With the bound removed the replica
+    /// peak is `u32::MAX`, both go quiet, and both assertions below fail.
+    #[tokio::test]
+    async fn the_guards_still_function_after_a_refused_inflation() {
+        let anchor = 1000u32;
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_peak(anchor, "aa").await.unwrap();
+        let subscribed = subscribed_owned();
+
+        feed(
+            &db,
+            &mut corroborated(&subscribed, anchor),
+            vec![new_peak_message(u32::MAX)],
+        )
+        .await
+        .unwrap();
+
+        let replica = db.sync_state().await.unwrap().peak_height;
+        let peers = Some(anchor + 50);
+
+        assert!(
+            !is_following(replica, peers),
+            "the phase must still be able to see a replica {replica:?} behind peers {peers:?}"
+        );
+
+        let t0 = std::time::Instant::now();
+        let mut watch = StallWatch::default();
+        assert_eq!(
+            watch.observe(replica, peers, t0),
+            StallVerdict::Following,
+            "the first observation only starts the clock"
+        );
+        assert!(
+            matches!(
+                watch.observe(replica, peers, t0 + STALL_AFTER),
+                StallVerdict::Stalled { .. }
+            ),
+            "the stall clock must still reach its deadline"
+        );
+    }
+
+    /// **Proves (write site 2):** an over-ceiling catch-up TERMINAL is refused, and neither the
+    /// routing gate nor the arrival baseline is armed over it.
+    ///
+    /// This site gets no three-strike tolerance, because the value arms `initial_sync_complete`
+    /// AND the baseline in one statement — there is no benign reading of it.
+    #[tokio::test]
+    async fn catch_up_terminal_above_ceiling_never_arms_the_flag() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 6_000_000u32;
+
+        let err = catch_up_finishing_at(
+            &db,
+            WriteAuthority::Corroborated(ceiling_at(anchor)),
+            u32::MAX,
+        )
+        .await
+        .expect_err("an over-ceiling terminal must end the session");
+
+        assert!(
+            matches!(err, SyncError::PeakAboveCeiling { .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !db.sync_state().await.unwrap().initial_sync_complete,
+            "the routing gate must not be armed over a refused terminal"
+        );
+        assert_eq!(
+            db.arrival_baseline().await.unwrap(),
+            None,
+            "nor the arrival baseline"
+        );
+    }
+
+    /// **Proves (the fresh-install case a delta cap would have broken):** a first catch-up from
+    /// genesis, with NO replica peak at all, is accepted.
+    ///
+    /// An absolute anchor needs no `initial_sync_complete` discriminator to tell this apart from
+    /// an attack — which matters, because that flag is attacker-clearable.
+    #[tokio::test]
+    async fn fresh_install_catch_up_from_genesis_is_accepted() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 9_142_918u32;
+        assert_eq!(db.sync_state().await.unwrap().peak_height, None);
+
+        catch_up_finishing_at(
+            &db,
+            WriteAuthority::Corroborated(ceiling_at(anchor)),
+            anchor + 2,
+        )
+        .await
+        .expect("a fresh install must still be able to catch up");
+
+        assert_eq!(db.sync_state().await.unwrap().peak_height, Some(anchor + 2));
+    }
+
+    /// **Proves (why a per-frame delta cap was rejected):** a replica 500,000 blocks behind
+    /// catches up to the anchor in one step.
+    ///
+    /// A cap anchored on the replica's OWN peak cannot tell this from an inflation attack; an
+    /// absolute one does not need to.
+    #[tokio::test]
+    async fn long_downtime_catch_up_is_accepted() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 6_000_000u32;
+        db.set_peak(anchor - 500_000, "aa").await.unwrap();
+
+        catch_up_finishing_at(
+            &db,
+            WriteAuthority::Corroborated(ceiling_at(anchor)),
+            anchor,
+        )
+        .await
+        .expect("a long-downtime catch-up must still be accepted");
+
+        assert_eq!(db.sync_state().await.unwrap().peak_height, Some(anchor));
+    }
+
+    /// **Proves (the tier difference, as behaviour rather than prose):** an OPERATOR session has
+    /// no ceiling.
+    ///
+    /// The operator hand-configured that address and corroboration never runs on that path, so
+    /// there is no independent anchor to build a ceiling from — and inventing one would
+    /// second-guess an explicit configuration.
+    #[tokio::test]
+    async fn operator_session_has_no_ceiling() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 6_000_000u32;
+        db.set_peak(anchor, "aa").await.unwrap();
+        let subscribed = subscribed_owned();
+
+        feed(
+            &db,
+            &mut operator(&subscribed),
+            vec![new_peak_message(anchor + 1_000_000)],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.sync_state().await.unwrap().peak_height,
+            Some(anchor + 1_000_000)
+        );
+    }
+
+    /// **Proves (the regression guard for the discriminator deliberately NOT used):** driving a
+    /// reorg — which clears `initial_sync_complete` — does not widen the ceiling.
+    ///
+    /// A delta-cap design would have keyed on that flag, and this is the frame that clears it, so
+    /// a writer could re-open the window on demand by driving one reorg.
+    #[tokio::test]
+    async fn a_reorg_that_clears_initial_sync_complete_does_not_widen_the_ceiling() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 1000u32;
+        db.set_peak(anchor, "aa").await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let events = EventBus::default();
+        let subscribed = subscribed_owned();
+        let mut session = corroborated(&subscribed, anchor);
+
+        handle_coin_state_update(
+            &db,
+            &CoinStateUpdate {
+                height: anchor - 10,
+                fork_height: anchor - 10,
+                peak_hash: Bytes32::new([7; 32]),
+                items: vec![],
+            },
+            &events,
+            &mut session,
+        )
+        .await
+        .expect("an ordinary shallow reorg is accepted");
+        assert!(
+            !db.sync_state().await.unwrap().initial_sync_complete,
+            "the reorg must have cleared the flag, or this test guards nothing"
+        );
+
+        feed(&db, &mut session, vec![new_peak_message(u32::MAX)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.sync_state().await.unwrap().peak_height,
+            Some(anchor - 10),
+            "the ceiling is anchored on the quorum, not on the flag the writer just cleared"
+        );
+    }
+
+    // ---- write site 3: the coin-state update (dig_ecosystem#2851, F1) -------
+
+    /// A `coin_state_update` push, exactly as it arrives on the wire.
+    fn coin_state_update(height: u32, fork_height: u32, items: Vec<CoinState>) -> CoinStateUpdate {
+        CoinStateUpdate {
+            height,
+            fork_height,
+            peak_hash: Bytes32::new([7; 32]),
+            items,
+        }
+    }
+
+    /// Push one `coin_state_update` through the production handler.
+    async fn push(
+        db: &WalletDb,
+        session: &mut SessionState<'_>,
+        update: CoinStateUpdate,
+    ) -> Result<(), SyncError> {
+        handle_coin_state_update(db, &update, &EventBus::default(), session).await
+    }
+
+    /// **Proves (the named attack, by execution):** a `coin_state_update` cannot inflate the peak
+    /// past the session's ceiling either.
+    ///
+    /// The frame is chosen to slip every OTHER guard on this branch simultaneously:
+    /// `fork_height == peak` means no rollback and no backwards move, so
+    /// `initial_sync_complete` is never cleared, and the height lands straight in the value a
+    /// caller divides into a confirmation count — ~4.29e9 confirmations for a spend that never
+    /// landed.
+    #[tokio::test]
+    async fn corroborated_coin_state_update_cannot_inflate_the_peak() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 1000u32;
+        db.set_peak(anchor, "aa").await.unwrap();
+        let subscribed = subscribed_owned();
+
+        push(
+            &db,
+            &mut corroborated(&subscribed, anchor),
+            coin_state_update(u32::MAX, anchor, vec![]),
+        )
+        .await
+        .expect("one over-ceiling frame is dropped, not fatal");
+
+        assert_eq!(
+            db.sync_state().await.unwrap().peak_height,
+            Some(anchor),
+            "the replica peak must be left exactly where the quorum settled it"
+        );
+    }
+
+    /// **Proves (why the third site mattered):** the two liveness guards survive the refusal.
+    ///
+    /// An accepted `u32::MAX` does not merely misreport the peak — it permanently silences both
+    /// guards, and does so through THIS frame type just as through `new_peak_wallet`. The fixture
+    /// keeps an honest observer (peers genuinely 50 blocks ahead of a replica that is not moving)
+    /// so a regression is visible rather than merely unasserted.
+    #[tokio::test]
+    async fn the_guards_still_function_after_a_refused_coin_state_inflation() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 1000u32;
+        db.set_peak(anchor, "aa").await.unwrap();
+        let subscribed = subscribed_owned();
+
+        push(
+            &db,
+            &mut corroborated(&subscribed, anchor),
+            coin_state_update(u32::MAX, anchor, vec![]),
+        )
+        .await
+        .unwrap();
+
+        let replica = db.sync_state().await.unwrap().peak_height;
+        let peers = Some(anchor + 50);
+
+        assert!(
+            !is_following(replica, peers),
+            "the phase must still see a replica {replica:?} behind peers {peers:?}"
+        );
+
+        let t0 = std::time::Instant::now();
+        let mut watch = StallWatch::default();
+        assert_eq!(
+            watch.observe(replica, peers, t0),
+            StallVerdict::Following,
+            "the first observation only starts the clock"
+        );
+        assert!(
+            matches!(
+                watch.observe(replica, peers, t0 + STALL_AFTER),
+                StallVerdict::Stalled { .. }
+            ),
+            "the stall clock must still reach its deadline"
+        );
+    }
+
+    /// **Proves (the strike counter reaches this site too):** the first two over-ceiling
+    /// `coin_state_update`s drop the FRAME only, and the third retires the session.
+    ///
+    /// Without the counter here an attacker re-inflates on every frame for ever, because
+    /// [`MAX_REFUSED_PEAK_CLAIMS`] never retires a session that is never charged.
+    #[tokio::test]
+    async fn three_over_ceiling_coin_state_updates_retire_the_session() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 1000u32;
+        db.set_peak(anchor, "aa").await.unwrap();
+        let subscribed = subscribed_owned();
+        let mut session = corroborated(&subscribed, anchor);
+
+        for frame in 1..=2 {
+            push(
+                &db,
+                &mut session,
+                coin_state_update(u32::MAX, anchor, vec![]),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("frame {frame} must be tolerated, got {e}"));
+            assert_eq!(
+                db.sync_state().await.unwrap().peak_height,
+                Some(anchor),
+                "frame {frame} must write nothing"
+            );
+        }
+
+        let err = push(
+            &db,
+            &mut session,
+            coin_state_update(u32::MAX, anchor, vec![]),
+        )
+        .await
+        .expect_err("the third must retire the session");
+        assert!(
+            matches!(err, SyncError::PeakAboveCeiling { claimed, .. } if claimed == u32::MAX),
+            "got {err:?}"
+        );
+    }
+
+    /// **Proves (the PLACEMENT, not merely the outcome):** the refusal happens BEFORE the frame's
+    /// destructive half runs.
+    ///
+    /// The fixture pairs the inflated height with a genuine reorg (`fork_height` ten blocks below
+    /// the peak) and a coin the wallet owns. A guard placed at the write — which satisfies "the
+    /// peak is unchanged" identically — would still have rolled the replica back, deleted the coin
+    /// and cleared the routing gate on the strength of a height it was about to reject. So the
+    /// assertions are on the three things a late guard would have already destroyed.
+    #[tokio::test]
+    async fn a_refused_coin_state_update_leaves_the_replica_untouched() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 1000u32;
+        apply_coin_states(
+            &db,
+            &[state(coin(1, OWNED, 5_000), Some(anchor - 5), None)],
+            &subscribed_owned(),
+        )
+        .await
+        .unwrap();
+        db.set_peak(anchor, "aa").await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let subscribed = subscribed_owned();
+
+        push(
+            &db,
+            &mut corroborated(&subscribed, anchor),
+            coin_state_update(u32::MAX, anchor - 10, vec![]),
+        )
+        .await
+        .expect("one over-ceiling frame is dropped, not fatal");
+
+        let sync_state = db.sync_state().await.unwrap();
+        assert_eq!(sync_state.peak_height, Some(anchor), "no peak was written");
+        assert!(
+            sync_state.initial_sync_complete,
+            "a frame refused before it acted must not clear the routing gate"
+        );
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            5_000,
+            "nor roll the replica back over a height it then rejected"
+        );
+    }
+
+    /// **Proves (the negative control):** an in-ceiling `coin_state_update` still advances the
+    /// peak and writes its coins, so the fix is not "refuse everything".
+    #[tokio::test]
+    async fn an_in_ceiling_coin_state_update_still_writes_peak_and_coins() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let anchor = 1000u32;
+        db.set_peak(anchor, "aa").await.unwrap();
+        let subscribed = subscribed_owned();
+        let claimed = anchor + peak_allowance(SESSION_MAX_LIFETIME);
+
+        push(
+            &db,
+            &mut corroborated(&subscribed, anchor),
+            coin_state_update(
+                claimed,
+                anchor,
+                vec![state(coin(1, OWNED, 4_200), Some(claimed), None)],
+            ),
+        )
+        .await
+        .expect("a claim at the ceiling is admitted");
+
+        assert_eq!(db.sync_state().await.unwrap().peak_height, Some(claimed));
+        assert_eq!(db.balance(None).await.unwrap(), 4_200);
+    }
+
+    /// **Proves (the hidden coupling):** the allowance is DERIVED from the session lifetime.
+    ///
+    /// [`SESSION_MAX_LIFETIME`]'s own doc calls its value an overridable operating assumption that
+    /// may move UP, and a hardcoded ceiling would silently become too tight when it does.
+    #[test]
+    fn peak_allowance_tracks_the_session_lifetime() {
+        assert_eq!(
+            peak_allowance(SESSION_MAX_LIFETIME),
+            194,
+            "128 blocks of reorg allowance plus 66 of chain progress at the shipped lifetime"
+        );
+        assert!(
+            peak_allowance(Duration::from_secs(3600)) > peak_allowance(SESSION_MAX_LIFETIME),
+            "a longer session must be allowed to gain more chain"
         );
     }
 }

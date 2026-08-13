@@ -3782,6 +3782,62 @@ least every 5 seconds, so a wallet created after boot is picked up without a res
 for the peer to drop. A newly non-empty set ends the peak-only session and reconnects immediately, since
 the subscription is per-connection state. No seed is read and nothing on this path can sign (§908).
 
+**A session MUST have a deadline on every wait, because a peer can go silent on a live socket.** Two
+waits carry one:
+
+- ONE puzzle-state round trip during a catch-up MUST complete within 60 seconds, or the catch-up fails
+  and the peer is dropped and re-dialled. The bound is PER ROUND TRIP: a catch-up runs from genesis
+  over many batches, so a total deadline tight enough to bound a batch would abort a healthy long sync
+  and restart it from the beginning for ever.
+- A catch-up as a WHOLE MUST also carry a total deadline, because a per-round-trip bound bounds one
+  answer and not the sequence of them: a peer answering each round trip just inside 60 seconds
+  satisfies it indefinitely. The total deadline MUST be generous — an hour, against catch-ups measured
+  in tens of milliseconds — since the two errors are not symmetric: too loose merely leaves a
+  pathological peer holding a session, whereas too tight produces a replica that never finishes. It
+  MUST be a single budget and MUST NOT be selected by whether a catch-up is the first one: every
+  catch-up runs from genesis, so the two describe the same work, and `initial_sync_complete` in
+  particular MUST NOT be the discriminator because an accepted reorg clears it and an untrusted peer
+  would then choose which budget applies.
+- A catch-up MUST NOT disarm SHUTDOWN. It is the one long-running step in the session lifecycle, and
+  a node that cannot be stopped while it runs is a defect independent of what the sync eventually
+  does. Shutdown MUST end the catch-up promptly, without backing off or reconnecting on the way out.
+- An AUTHORITATIVE subscribed session that holds the replica STILL for 90 seconds while the node's own
+  Chia peers are observed to be strictly ahead of it MUST be ENDED, so the ordinary reconnect path
+  dials a fresh peer. The node MUST log the reason with both heights, AND MUST log the RECOVERY when
+  the replica advances again — a stall that is logged and a recovery that is not leaves the operator
+  with a failure followed by silence, which is indistinguishable from the failure continuing. Stall
+  detection is armed for authoritative sessions only: a `Discovered` session never advances the peak
+  by design, and its exit is the re-corroboration timer instead.
+
+Stall evidence MUST accumulate across sessions, not within one. Sessions end for many reasons, and a
+clock that restarts at every session boundary can never reach the deadline while a replica stays
+frozen — the detector would be present and unreachable.
+
+**A session MUST NOT be held indefinitely.** One subscription session runs for at most 600 seconds and
+is then retired, so a hostile or merely unlucky peer set cannot be held for the life of the process.
+A retirement is a PLANNED end: it reconnects at once and MUST NOT advance the reconnect backoff. The
+new session earns its write authority from a freshly drawn quorum like any other; a verdict MUST NOT
+be carried across sessions.
+
+**Rotation does NOT subsume the staleness detector, and MUST NOT be used to justify removing it.**
+The two answer different questions on different timescales: rotation bounds how long a bad situation
+can last, and detection is what makes it DIAGNOSABLE. A fast rotation would have hidden this defect
+entirely — the replica would have recovered on its own every cycle, and nobody would ever have learned
+that a session can go silent while the node reports `synced` for hours. A node that recovers silently
+from a fault it cannot name has not fixed the fault.
+
+The three session timescales form a deliberate ladder — 45s re-corroboration (a session that CANNOT
+write) < 90s stall (a session that has STOPPED writing) < 600s rotation (a session that is merely
+HELD). Each governs a different concern; collapsing any two silently retires one of them.
+
+Ending a session on a stall does NOT lower the corroboration bar (§18.6d): the reconnect draws an
+independent sample and re-runs the quorum exactly as any reconnect does. A stall MUST be declared only
+on POSITIVE evidence — a replica that advanced, an unobservable height on either side, and a replica
+merely level with its peers each reset the clock, because an unmeasured or level reading is not
+evidence of a freeze. Without these deadlines a half-open connection parks the session for the life of
+the process: a replica froze at height 9,142,861 while its peers announced 9,142,918 and the gap grew
+without bound, reported throughout as `synced`.
+
 18.6f. **Externally-registered addresses (the §908 install).** A node MAY be asked to FOLLOW addresses it
 does not custody. `control.wallet.watch` registers G1 public keys, `control.wallet.unwatch` deregisters
 them, and `control.wallet.watched` lists what is currently registered. All three are MUTATIONS and
@@ -4057,14 +4113,44 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
 * **A monotonic replica peak.** `new_peak_wallet` MUST only ADVANCE `sync_state.peak_height`; a backwards
   claim is refused. That height bounds a claimed confirmation on an OPEN read, so a peer able to lower it
   can make settled money read unconfirmed.
+* **A bounded replica peak.** A CORROBORATED writer MUST NOT raise `sync_state.peak_height` above an
+  absolute per-session ceiling, anchored on the height its corroboration round settled (a height that
+  writer cannot inflate, because elevation requires it to AGREE with that height). The allowance above the
+  anchor is `128 + session_lifetime / 9s` blocks — the same 128 the rollback bound uses, making the bound
+  symmetric, plus chain progress budgeted at about half the target block time so a burst still fits. The
+  ceiling is FIXED for the session and MUST NOT ratchet; session rotation refreshes it by re-corroborating.
+  An OPERATOR session has NO ceiling: the operator chose that address by hand and no independent anchor
+  exists on that path. ALL THREE peak-carrying writes are bound by it — a `new_peak_wallet`
+  frame, a `coin_state_update` frame, and the terminal height of a catch-up. An over-ceiling
+  `new_peak_wallet` or `coin_state_update` MUST drop the whole FRAME before it acts (leaving the replica
+  peak still, so the sync phase and the stall detector both keep seeing the real gap, and leaving any
+  rollback the frame asked for undone, because a frame whose height is a lie is suspect in its entirety);
+  the third such frame in one session MUST end the session so a fresh quorum is drawn. An over-ceiling catch-up TERMINAL MUST
+  end the session immediately and MUST NOT arm `initial_sync_complete` or the arrival baseline. Without
+  this bound one accepted frame makes unconfirmed money read as confirmed for the life of the process, and
+  permanently disables both the sync-phase gap check and the stall detector, which saturate into agreement
+  with an inflated peak.
 
 18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
 chia_peer_count, subscription_peer_count, chia_peer_peak_height, watched_addresses}`. `phase` is `not_started` (no peer has ever attached), `syncing`,
-`synced`, `no_wallet_enrolled` or `wallet_not_unlocked` — and `synced` requires BOTH a completed catch-up AND a live
-SUBSCRIPTION peer (`subscription_peer_count >= 1`, NOT `chia_peer_count`), so a replica that caught up and then went
+`synced`, `no_wallet_enrolled` or `wallet_not_unlocked` — and `synced` requires a completed catch-up, a live
+SUBSCRIPTION peer (`subscription_peer_count >= 1`, NOT `chia_peer_count`), AND the replica actually
+FOLLOWING the chain, so a replica that caught up and then went
 offline reports `syncing`. The phase describes the REPLICA, so it keys off the session that writes the replica; held
-read-serving peers do not make a stale replica current. It is not a freshness
-guarantee: a live connection to a stalled peer satisfies it. `peak_height` is the REPLICA's own height read
+read-serving peers do not make a stale replica current.
+
+**`synced` MUST be a claim about NOW.** A completed catch-up is a latched fact about the past and a peer
+count says only that a socket exists, so a node MUST additionally require that `peak_height` trails
+`chia_peer_peak_height` by AT MOST 4 blocks (about 75 seconds of chain); beyond that it reports `syncing`.
+A `null` on EITHER height is unobservable and MUST NOT be read as evidence of a gap — the phase is then
+exactly what it would have been without this rule. The tolerance is deliberately strict, because the two
+failure directions are not symmetric: reporting `syncing` on a healthy node understates confidence
+harmlessly, whereas reporting `synced` over a frozen replica tells a client that a stale balance is
+settled. It is deliberately NOT the same threshold as the 90-second stall deadline of §18.6a: that one
+decides whether to pay for a catch-up from genesis, this one decides what may be claimed about a number
+already being served.
+
+`peak_height` is the REPLICA's own height read
 from `sync_state`; it MUST NOT fall back to the coinset oracle (unlike `control.wallet.peak`, which answers
 a different question), and `null` means unknown, never height zero.
 
@@ -4085,6 +4171,23 @@ the peer tier MUST NOT itself dial: a status call cannot be the act that makes t
 `peak_height` (the replica's own progress) and from any oracle reading, and it MUST NOT be sourced from
 one: a peak fetched from a public HTTP oracle evidences nothing about the node's peers. `null` means no
 peer has announced one yet, never height zero.
+
+**`chia_peer_peak_height` is UNVALIDATED EVIDENCE, and both readers of it MUST treat it as such.** It is
+a monotone MAXIMUM over unverified `NewPeakWallet` claims: no quorum settles it, no peer is corroborated
+before contributing to it, and it never falls, so ANY single peer in the pool pins it arbitrarily high
+with one frame. Anchoring on a maximum is exactly what §18.6d's peer selection REFUSES to do — a single
+peer claiming `u32::MAX` would otherwise become the reference point and put every honest peer outside
+the credibility band — and this figure is deliberately NOT the anchor for the §18.6a peak ceiling, which
+is anchored on a corroborated settled height precisely because that one cannot be inflated by the peer
+it bounds.
+
+It is used only where an inflated value costs a NEEDLESS RECONNECT and never a money claim. An
+over-stated peers' peak can make a healthy replica report `syncing` instead of `synced`, and can end an
+otherwise healthy session as stalled so a fresh peer is dialled; both understate confidence and cost
+work, and neither writes the replica, raises a peak, or makes unconfirmed money read as confirmed. A
+node MUST NOT extend this figure to any use where being wrong in the inflating direction would be
+believed — in particular it MUST NOT bound a claimed confirmation, for which `peak_height` is the only
+admissible height.
 
 `control.peerCounts` reports `{dig_peer_count, chia_peer_count,
 known_dig_peer_count}`, and its `chia_peer_count` MUST be the SAME observation this method reports.

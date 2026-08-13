@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -135,6 +135,9 @@ chia-traits = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
+# `start_paused` — a virtual clock, so the peer-request deadline (#2851) is asserted to EXIST
+# without a test that actually waits sixty seconds for it.
+tokio = { version = "1", features = ["test-util"] }
 # Capture emitted `tracing` events in-process so a test can assert a diagnostic actually
 # reaches the log sink, rather than trusting that it was written at all (#2210).
 # The SAME 0.3 line dig-logging builds on, so one tracing-subscriber resolves.
