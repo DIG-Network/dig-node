@@ -1326,6 +1326,44 @@ async fn both_peer_counts_distinguish_observed_zero_from_unobservable() {
     assert_eq!(transport_only.subscription_peer_count, None);
 }
 
+/// **Proves (#2827):** `chia_peer_count` is what the node HOLDS at that moment, never a target it
+/// is aiming at. A user reading it is reading a measurement.
+///
+/// Corroboration now dials up to `QUORUM_DIAL_WIDE` and asks `QUORUM_HOLD`, and neither number
+/// may leak into this figure — reporting an intention as a holding is the exact defect #2806
+/// corrected, and widening the dial is a fresh chance to reintroduce it.
+///
+/// FIXTURE DESIGN: the held count is THREE — distinct from the floor, the hold, the dial width and
+/// the old sample size — so any implementation that substituted a constant for the measurement is
+/// caught whichever constant it chose.
+#[tokio::test]
+async fn the_reported_chia_peer_count_is_the_held_pool_never_a_dial_target() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let held_three = ChainPeerTier {
+        peer_count: Some(3),
+        peak_height: Some(9_141_711),
+    };
+
+    let status = status_without_supervisor(&db, held_three).await.unwrap();
+
+    assert_eq!(
+        status.chia_peer_count,
+        Some(3),
+        "the reported peer count was not the measured holding"
+    );
+    for target in [
+        quorum::CORROBORATION_FLOOR,
+        quorum::QUORUM_HOLD,
+        quorum::QUORUM_DIAL_WIDE,
+    ] {
+        assert_ne!(
+            status.chia_peer_count,
+            Some(target as u32),
+            "a corroboration target ({target}) was reported as a holding"
+        );
+    }
+}
+
 /// **Proves (#2501, and the `control.wallet.syncStatus` contract):** the reported peak is the
 /// REPLICA's own, and an unknown peak stays unknown.
 ///
@@ -1680,6 +1718,17 @@ const LIARS_HASH: Bytes32 = Bytes32::new([0x22; 32]);
 /// The settled height a scripted corroboration round lands on.
 const SETTLED_HEIGHT: u32 = 5_999_998;
 
+/// A FULL round in which every peer asked agreed — the ordinary healthy case.
+///
+/// The `agreed` count is the whole hold, so a thin round (`agreed: CORROBORATION_FLOOR`) is a
+/// visibly different fixture rather than the same one under another name.
+fn unanimous(answer: Bytes32) -> Verdict<Bytes32> {
+    Verdict::Unanimous {
+        answer,
+        agreed: quorum::QUORUM_HOLD,
+    }
+}
+
 /// A corroborator returning a scripted round, recording how many rounds were run.
 ///
 /// Deliberately able to express EVERY verdict rather than just pass/fail: a double that can only
@@ -1752,8 +1801,7 @@ async fn run_discovered_session(
 /// a window in which its answers are already landing.
 #[tokio::test]
 async fn a_single_lying_writer_cannot_move_the_replica() {
-    let (db, script) =
-        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
+    let (db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
 
     assert_eq!(
         script.catch_up_count(),
@@ -1779,8 +1827,7 @@ async fn a_single_lying_writer_cannot_move_the_replica() {
 /// peak.
 #[tokio::test]
 async fn a_corroborated_discovered_peer_syncs_a_default_install() {
-    let (db, script) =
-        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+    let (db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
 
     assert!(
         script.catch_up_count() >= 1,
@@ -1828,11 +1875,46 @@ async fn a_split_quorum_writes_nothing() {
 /// NEAREST WRONG IMPLEMENTATION: treating `Insufficient` as "nobody objected". An attacker who
 /// can make peers unreachable — trivial on a hostile network — would otherwise get the replica
 /// by silencing the witnesses rather than by out-voting them.
+/// **Proves (#2827):** a round only two peers answered still syncs the replica, so the wallet
+/// does not freeze because one peer of five was slow.
+///
+/// This is the user-visible defect: a replica held at height 9,139,211 for hours, five peers
+/// connected, the chain ~2,500 blocks ahead. The datum carries its own confidence (`agreed: 2`)
+/// instead of being discarded for arriving with less of it.
+///
+/// FIXTURE DESIGN: identical in every respect to `a_corroborated_discovered_peer_syncs_a_default
+/// _install` EXCEPT the answer count, so a failure here can only be the count. The writer agrees,
+/// so the round's only unusual property is its thinness.
+///
+/// NEAREST WRONG IMPLEMENTATION: a second confidence gate at the supervisor —
+/// `round.verdict.agreed() >= QUORUM_SAMPLE` — which would leave `tally` correct and the wallet
+/// frozen exactly as before. Only a fixture whose `agreed` is BELOW that and whose verdict is
+/// nonetheless authoritative can see it.
+#[tokio::test]
+async fn a_round_only_two_peers_answered_still_syncs_the_replica() {
+    let thin = Verdict::Unanimous {
+        answer: HONEST_HASH,
+        agreed: quorum::CORROBORATION_FLOOR,
+    };
+    let (db, script) = run_discovered_session(thin, Some(HONEST_HASH)).await;
+
+    assert!(
+        script.catch_up_count() >= 1,
+        "a round corroborated by two peers ran no catch-up, so the replica stays frozen"
+    );
+    let state = db.sync_state().await.unwrap();
+    assert!(
+        state.initial_sync_complete,
+        "initial_sync_complete stayed false for a thin but corroborated round"
+    );
+    assert_eq!(state.peak_height, Some(CATCH_UP_HEIGHT));
+}
+
 #[tokio::test]
 async fn an_unreachable_quorum_refuses_rather_than_defaulting_to_allow() {
     let thin = Verdict::Insufficient {
         answered: 1,
-        required: quorum::QUORUM_SAMPLE,
+        required: quorum::CORROBORATION_FLOOR,
     };
     let (db, script) = run_discovered_session(thin, Some(HONEST_HASH)).await;
 
@@ -1847,8 +1929,7 @@ async fn an_unreachable_quorum_refuses_rather_than_defaulting_to_allow() {
 /// asked at exactly the round's height and nowhere else.
 #[tokio::test]
 async fn the_writer_is_examined_at_a_height_it_did_not_choose() {
-    let (_db, script) =
-        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+    let (_db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
 
     let asked = script.writer_asked_at.lock().unwrap().clone();
     assert!(!asked.is_empty(), "the writer was never examined at all");
@@ -1865,7 +1946,7 @@ async fn the_writer_is_examined_at_a_height_it_did_not_choose() {
 /// or any `if let Some(..)` whose else-branch falls through to elevation.
 #[tokio::test]
 async fn a_writer_that_declines_the_question_is_not_elevated() {
-    let (db, script) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), None).await;
+    let (db, script) = run_discovered_session(unanimous(HONEST_HASH), None).await;
 
     assert_eq!(script.catch_up_count(), 0);
     assert_eq!(db.sync_state().await.unwrap().peak_height, None);
@@ -2015,7 +2096,7 @@ async fn an_authoritative_session_is_not_ended_by_the_recorroboration_timer() {
 #[tokio::test]
 async fn only_a_corroborated_read_reaches_coin_selection() {
     // Uncorroborated: coin selection must NOT read the replica.
-    let (db, _) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
+    let (db, _) = run_discovered_session(unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
     assert_eq!(
         routing::route(db.is_synced().await.unwrap(), true),
         Source::Fallback,
@@ -2023,7 +2104,7 @@ async fn only_a_corroborated_read_reaches_coin_selection() {
     );
 
     // Corroborated: the same read now comes from the replica the quorum vouched for.
-    let (db, _) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+    let (db, _) = run_discovered_session(unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
     assert_eq!(
         routing::route(db.is_synced().await.unwrap(), true),
         Source::Db,
@@ -2041,7 +2122,7 @@ async fn only_a_corroborated_read_reaches_coin_selection() {
 fn elevation_requires_both_a_verdict_and_the_writers_agreement() {
     let reached = CorroborationRound {
         height: SETTLED_HEIGHT,
-        verdict: Verdict::Unanimous(HONEST_HASH),
+        verdict: unanimous(HONEST_HASH),
     };
     let split = CorroborationRound {
         height: SETTLED_HEIGHT,

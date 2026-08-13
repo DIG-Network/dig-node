@@ -95,7 +95,14 @@ use chia_protocol::Bytes32;
 // The tunable policy, and why each number is what it is
 // ---------------------------------------------------------------------------
 
-/// How many independently-chosen peers are asked each question.
+/// The sample size the agreement RATIO is expressed against (see [`required_agreement`]).
+///
+/// Until dig_ecosystem#2827 this was also the number of ANSWERS a round had to collect before it
+/// counted for anything, and that second job is what froze a user's replica at height 9,139,211
+/// for hours while five peers were held and the chain moved ~2,500 blocks: one slow or
+/// unreachable member discarded the whole round, every round. A round now proceeds on the peers
+/// that ANSWERED (see [`CORROBORATION_FLOOR`]) and this constant keeps only its first job —
+/// naming, with [`QUORUM_AGREEMENT`], how strongly those answers must agree.
 ///
 /// Four is the smallest sample that makes every outcome in [`Verdict`] distinguishable while
 /// staying inside a light client's normal connection budget:
@@ -138,6 +145,68 @@ const _: () = assert!(
     QUORUM_AGREEMENT <= QUORUM_SAMPLE,
     "the agreement threshold cannot exceed the sample size"
 );
+
+/// The fewest answers that can corroborate anything (dig_ecosystem#2827).
+///
+/// Two, and the reason is definitional rather than statistical: **a single source is never
+/// corroboration.** One peer agreeing with itself is one peer, and admitting it would reinstate
+/// the single-untrusted-source problem this whole module exists to remove — a discovered peer
+/// would once again be able to move the replica on nobody's word but its own.
+///
+/// It is the floor UNDER the ratio, not a replacement for it: a round of two must be unanimous
+/// (`required_agreement(2) == 2`), so the floor buys a thin round no leniency about agreeing.
+///
+/// This is recorded in `SPEC.md` §18.6 as an ASSUMPTION rather than a derived constant, because
+/// it encodes a judgement about what the word "corroborated" is allowed to mean, and the operator
+/// of this node may reasonably overturn it in either direction.
+pub const CORROBORATION_FLOOR: usize = 2;
+
+/// How many distinct peers one round DIALS before narrowing (dig_ecosystem#2827).
+///
+/// Over-subscribing then pulling back is what makes a round resilient to the ordinary case that
+/// froze this wallet: some of the peers dialled will be slow, mid-reorg, or gone by the time the
+/// question is asked, and a round that dials exactly as many as it needs has no margin for any of
+/// them. Dialling ten to hold [`QUORUM_HOLD`] leaves the round whole when half the dials are
+/// useless.
+///
+/// It is not larger because every extra dial is a TCP+TLS handshake to a full node this node does
+/// not otherwise need, and because the marginal certainty falls away fast — see
+/// [`sybil_success_probability`], where the gap between a five-answer round and a ten-answer one
+/// is much smaller than the gap between two and five.
+pub const QUORUM_DIAL_WIDE: usize = 10;
+
+/// How many of the [`QUORUM_DIAL_WIDE`] dialled peers a round actually ASKS.
+///
+/// Five, which is Sage's shipped `target_peers` for the same reason it is shipped there: it is a
+/// load a light client on a home connection can carry indefinitely. The round is narrowed to it by
+/// [`hold_best`].
+///
+/// This is a QUESTION budget, never a claim about what the node holds. The peer count a user sees
+/// (`chia_peer_count`) is the transport's HELD pool and is measured, not targeted — a node holding
+/// three peers reports three however wide this is set.
+pub const QUORUM_HOLD: usize = 5;
+
+/// How many of `answered` peers must give the SAME answer for it to be authoritative.
+///
+/// The shipped ratio, [`QUORUM_AGREEMENT`] of [`QUORUM_SAMPLE`], applied to the peers that
+/// actually answered, with [`CORROBORATION_FLOOR`] underneath it. `required_agreement(4)` is
+/// exactly [`QUORUM_AGREEMENT`], so at the sample size this module was built around the rule is
+/// unchanged.
+///
+/// # The knob that moved, and the one that did not
+///
+/// dig_ecosystem#2827 relaxed **how many answers a round needs**; it did not relax **how strongly
+/// those answers must agree**. Those are different knobs and only the first was the defect.
+/// Lowering agreement — to a bare majority, say — would make the wallet believe a disagreeing
+/// minority, which is the opposite of the goal: rounding UP (`div_ceil`) keeps the ratio at or
+/// above three-quarters at every size, so 3-of-5 and 2-of-3 stay refused.
+///
+/// Note the direction the requirement moves as a round widens: more answers demand more agreement,
+/// so dialling wide never makes a verdict cheaper to obtain.
+pub fn required_agreement(answered: usize) -> usize {
+    let by_ratio = (answered * QUORUM_AGREEMENT).div_ceil(QUORUM_SAMPLE);
+    by_ratio.max(CORROBORATION_FLOOR)
+}
 
 /// How far below the best claimed peak a peer may sit and still be asked (in blocks).
 ///
@@ -345,6 +414,48 @@ pub fn eligible(candidates: &[Candidate], tolerance: u32) -> Vec<Candidate> {
         .collect()
 }
 
+/// Narrow a wide dial down to the peers this round will actually ASK (dig_ecosystem#2827).
+///
+/// The node over-subscribes — [`QUORUM_DIAL_WIDE`] dials — and then pulls back to `hold`, so that
+/// slow, stale and vanished dials are absorbed before the question is asked rather than after.
+///
+/// # What "best" means here, and what it deliberately does NOT mean
+///
+/// "Best" is **membership of the credibility band** ([`eligible`]), and nothing else. Among the
+/// peers inside that band the choice is made at random, which is not indecision — it is the same
+/// property [`select_sample`] exists to provide, and it is load-bearing.
+///
+/// The tempting alternative is to rank by RESPONSIVENESS and keep the fastest. That would reverse
+/// a defence this module already paid for. [`OsEntropy`] and `ChiaQuorumCorroborator` both record
+/// the reason in their own words: latency is a channel an attacker CONTROLS — a fast, always-up
+/// node is cheap to run — so preferring the quickest answerers is preferring the peers an attacker
+/// is best placed to supply. Ranking by claimed height is no better: it hands selection to
+/// whoever claims the top of the band, and claiming is free.
+///
+/// So the observable this narrowing uses is the only one a peer cannot cheaply steer: whether its
+/// claim sits within [`PEAK_LAG_TOLERANCE`] of the MEDIAN claim, which one outlier cannot move.
+/// A per-peer history of agreeing with the rest would be a genuinely better criterion and is NOT
+/// implemented — this corroborator is round-scoped and keeps no state between rounds, and
+/// inventing a history it does not have would be worse than admitting it has none.
+///
+/// A dial that came back with `hold` or fewer credible peers keeps all of them: the round proceeds
+/// on the peers that answered.
+pub fn hold_best(
+    entropy: &dyn EntropySource,
+    candidates: &[Candidate],
+    tolerance: u32,
+    hold: usize,
+) -> Vec<Candidate> {
+    let credible = eligible(candidates, tolerance);
+    if credible.len() <= hold {
+        return credible;
+    }
+    select_sample(entropy, credible.len(), hold)
+        .into_iter()
+        .map(|index| credible[index].clone())
+        .collect()
+}
+
 /// The settled height every question in this round is asked at: the sample's LOWEST claimed peak,
 /// less [`SETTLED_LAG`].
 ///
@@ -377,10 +488,22 @@ pub fn common_height(sample: &[Candidate], lag: u32) -> Option<u32> {
 /// no "take the most popular answer" arm. A split at a settled height means the truth is UNKNOWN,
 /// and the honest response to not knowing is to write nothing — quietly adopting a plurality
 /// would hide a partition and an attack behind a replica that looks synced.
+///
+/// # Corroboration is a gradient, not a gate (dig_ecosystem#2827)
+///
+/// Every authoritative arm carries `agreed`, the number of independent peers that gave the answer,
+/// so the CONFIDENCE travels with the datum instead of being spent deciding whether to keep it.
+/// Two agreeing peers and eight agreeing peers both produce a usable verdict; they do not produce
+/// an equally well-attested one, and [`Verdict::agreed`] is how a caller can tell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict<A> {
     /// Every peer that answered gave the same answer. Authoritative.
-    Unanimous(A),
+    Unanimous {
+        /// The corroborated answer.
+        answer: A,
+        /// How many peers gave it — the round's whole answer set.
+        agreed: usize,
+    },
     /// At least [`QUORUM_AGREEMENT`] peers agreed and at least one did not. Authoritative — one
     /// dissenter is expected without an attacker — but the dissent is EVIDENCE and is surfaced:
     /// at a settled height, past the lag filter, a peer contradicting the supermajority is not
@@ -393,20 +516,21 @@ pub enum Verdict<A> {
         /// The peers that gave something else, by [`Candidate::id`].
         dissenters: Vec<String>,
     },
-    /// No answer reached [`QUORUM_AGREEMENT`]. **Nothing is written.** The caller re-draws a
-    /// fresh sample and asks again; a run of these is surfaced (see
+    /// No answer reached [`required_agreement`] for this round's size. **Nothing is written.**
+    /// The caller re-draws a fresh sample and asks again; a run of these is surfaced (see
     /// [`PERSISTENT_DISAGREEMENT_ROUNDS`]).
     Split {
         /// The distinct answers seen, with their counts, for the diagnostic.
         tallies: Vec<usize>,
     },
-    /// Fewer than [`QUORUM_SAMPLE`] peers answered at all, so no quorum was possible. **Nothing
-    /// is written.** Distinguished from [`Verdict::Split`] because it is a reachability problem,
-    /// not a disagreement — a node with three reachable peers is not under attack.
+    /// Fewer than [`CORROBORATION_FLOOR`] peers answered at all, so nothing could corroborate
+    /// anything. **Nothing is written.** Distinguished from [`Verdict::Split`] because it is a
+    /// reachability problem, not a disagreement — a node that reached one peer is not under
+    /// attack, it is alone.
     Insufficient {
         /// How many peers answered.
         answered: usize,
-        /// How many were required.
+        /// How many were required — [`CORROBORATION_FLOOR`].
         required: usize,
     },
 }
@@ -416,8 +540,23 @@ impl<A> Verdict<A> {
     /// outcome — the single place callers should ask "may I write?".
     pub fn corroborated(&self) -> Option<&A> {
         match self {
-            Verdict::Unanimous(a) | Verdict::MajorityWithDissent { answer: a, .. } => Some(a),
+            Verdict::Unanimous { answer, .. } | Verdict::MajorityWithDissent { answer, .. } => {
+                Some(answer)
+            }
             Verdict::Split { .. } | Verdict::Insufficient { .. } => None,
+        }
+    }
+
+    /// How many independent peers corroborated the answer — the round's confidence.
+    ///
+    /// Zero for every non-authoritative outcome, so a caller cannot read a refused round's answer
+    /// count as evidence for anything.
+    pub fn agreed(&self) -> usize {
+        match self {
+            Verdict::Unanimous { agreed, .. } | Verdict::MajorityWithDissent { agreed, .. } => {
+                *agreed
+            }
+            Verdict::Split { .. } | Verdict::Insufficient { .. } => 0,
         }
     }
 }
@@ -437,20 +576,28 @@ pub struct Response<A> {
 /// settled height, a canonical digest of a coin set — rather than each read growing its own
 /// slightly different notion of agreement.
 ///
-/// `required` is [`QUORUM_AGREEMENT`] in production and a parameter only so the threshold can be
-/// pinned from BOTH sides in a test: one below must fail and at-bound must pass, or the bound has
-/// only confirmed itself.
-pub fn tally<A: Clone + Eq + Hash>(
-    responses: &[Response<A>],
-    sample_size: usize,
-    required: usize,
-) -> Verdict<A> {
-    if responses.len() < sample_size {
+/// # The round proceeds on the peers that ANSWERED (dig_ecosystem#2827)
+///
+/// It used to require a fixed number of answers before it would decide anything, and that is what
+/// froze a user's replica for hours: the node held five peers, one of them was slow, and every
+/// round was discarded whole. Waiting for a fixed count is not a security property — it is a
+/// liveness cost paid in the hope of one, and the hope is unfounded, because an attacker who can
+/// silence a peer can force the wait forever.
+///
+/// What IS a security property is [`CORROBORATION_FLOOR`] (never one source) and
+/// [`required_agreement`] (the shipped agreement ratio, applied to whoever answered). Both are
+/// kept. The residual cost is real and stated rather than hidden: a round with fewer answers is
+/// cheaper for an attacker to capture, and [`sybil_success_probability`] will tell you by how
+/// much.
+pub fn tally<A: Clone + Eq + Hash>(responses: &[Response<A>]) -> Verdict<A> {
+    let answered = responses.len();
+    if answered < CORROBORATION_FLOOR {
         return Verdict::Insufficient {
-            answered: responses.len(),
-            required: sample_size,
+            answered,
+            required: CORROBORATION_FLOOR,
         };
     }
+    let required = required_agreement(answered);
 
     let mut counts: HashMap<&A, usize> = HashMap::new();
     for r in responses {
@@ -476,7 +623,10 @@ pub fn tally<A: Clone + Eq + Hash>(
         .collect();
 
     if dissenters.is_empty() {
-        Verdict::Unanimous(winner.clone())
+        Verdict::Unanimous {
+            answer: winner.clone(),
+            agreed: votes,
+        }
     } else {
         Verdict::MajorityWithDissent {
             answer: winner.clone(),
@@ -582,26 +732,35 @@ impl SpentEvidence {
 // ---------------------------------------------------------------------------
 
 /// The probability that an attacker controlling `hostile_fraction` of the discoverable peer set
-/// lands enough members in one [`QUORUM_SAMPLE`] to carry a [`QUORUM_AGREEMENT`] vote.
+/// carries a round in which `answered` peers replied.
 ///
 /// Provided as a function, not a paragraph, because the honest version of this claim is a number
 /// that gets worse as the attacker grows and a reader deserves to see it move. Modelled as
 /// independent draws (sampling with replacement), which slightly OVERSTATES the attacker's
 /// difficulty for a small candidate set — the real risk is never lower than this returns.
 ///
-/// The shape of the answer, for the shipped 3-of-4: at a 10% hostile set an attacker carries a
-/// round about 0.4% of the time; at 30%, about 8%; at 50%, about 31%. Random selection is a cost
-/// multiplier, not a barrier, and `SPEC.md` says so in the same words.
+/// The shape of the answer at the shipped ratio, for a four-answer round: at a 10% hostile set an
+/// attacker carries it about 0.4% of the time; at 30%, about 8%; at 50%, about 31%. Random
+/// selection is a cost multiplier, not a barrier, and `SPEC.md` says so in the same words.
 ///
-/// Note the separate, cheaper attack this number does NOT describe: an attacker needs only TWO of
-/// four to force a [`Verdict::Split`] and stall the write. Denial is materially easier than
-/// forgery here, and that asymmetry is deliberate — a stalled sync is a visible, recoverable
-/// condition, while a forged one is neither.
-pub fn sybil_success_probability(hostile_fraction: f64) -> f64 {
+/// # Why `answered` is a parameter (dig_ecosystem#2827)
+///
+/// Because a round no longer has a fixed size, and pretending otherwise would publish the wide
+/// round's comfortable number for a thin round's risk. A round at [`CORROBORATION_FLOOR`] needs
+/// only both answerers hostile — 9% at a 30% hostile set, against 8% at four and 3% at five — so
+/// an attacker who can make witnesses UNREACHABLE now has a cheaper path than out-voting them.
+/// That is the price of not freezing, it is why [`QUORUM_DIAL_WIDE`] over-subscribes to keep
+/// rounds wide, and it is stated in `SPEC.md` rather than left for a reader to derive.
+///
+/// Note the separate, cheaper attack this number does NOT describe: an attacker needs only to
+/// dissent past [`required_agreement`] to force a [`Verdict::Split`] and stall the write. Denial
+/// is materially easier than forgery here, and that asymmetry is deliberate — a stalled sync is a
+/// visible, recoverable condition, while a forged one is neither.
+pub fn sybil_success_probability(hostile_fraction: f64, answered: usize) -> f64 {
     let f = hostile_fraction.clamp(0.0, 1.0);
-    let n = QUORUM_SAMPLE as u32;
-    // P(at least QUORUM_AGREEMENT of n draws are hostile).
-    (QUORUM_AGREEMENT as u32..=n)
+    let n = answered as u32;
+    // P(at least `required_agreement(answered)` of n draws are hostile).
+    (required_agreement(answered) as u32..=n)
         .map(|k| binomial(n, k) * f.powi(k as i32) * (1.0 - f).powi((n - k) as i32))
         .sum()
 }

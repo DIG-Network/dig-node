@@ -298,7 +298,7 @@ fn an_inflated_claim_cannot_evict_the_honest_peers_from_the_pool() {
 
     // The liar is admitted — being outvoted is what happens to it, not exclusion — but its
     // inflated height is never adopted as the reference.
-    let verdict = tally(&responses(&[("liar", 1)]), QUORUM_SAMPLE, QUORUM_AGREEMENT);
+    let verdict = tally(&responses(&[("liar", 1)]));
     assert!(
         verdict.corroborated().is_none(),
         "a lone peer's answer was treated as authoritative"
@@ -392,16 +392,12 @@ fn a_chain_younger_than_the_settle_margin_has_no_settled_height() {
 /// honest control to be overruled.
 #[test]
 fn a_single_lying_peer_cannot_move_the_replica() {
-    let verdict = tally(
-        &responses(&[
-            ("honest-a", 1),
-            ("honest-b", 1),
-            ("honest-c", 1),
-            ("liar", 9),
-        ]),
-        QUORUM_SAMPLE,
-        QUORUM_AGREEMENT,
-    );
+    let verdict = tally(&responses(&[
+        ("honest-a", 1),
+        ("honest-b", 1),
+        ("honest-c", 1),
+        ("liar", 9),
+    ]));
 
     match verdict {
         Verdict::MajorityWithDissent {
@@ -433,11 +429,7 @@ fn a_single_lying_peer_cannot_move_the_replica() {
 /// plurality, so declining it can only be the threshold doing its job.
 #[test]
 fn a_split_answer_writes_nothing_and_does_not_take_the_plurality() {
-    let verdict = tally(
-        &responses(&[("a", 1), ("b", 1), ("c", 2), ("d", 3)]),
-        QUORUM_SAMPLE,
-        QUORUM_AGREEMENT,
-    );
+    let verdict = tally(&responses(&[("a", 1), ("b", 1), ("c", 2), ("d", 3)]));
 
     assert!(
         verdict.corroborated().is_none(),
@@ -449,11 +441,7 @@ fn a_split_answer_writes_nothing_and_does_not_take_the_plurality() {
     }
 
     // The even split too, for completeness — it must also write nothing.
-    let even = tally(
-        &responses(&[("a", 1), ("b", 1), ("c", 2), ("d", 2)]),
-        QUORUM_SAMPLE,
-        QUORUM_AGREEMENT,
-    );
+    let even = tally(&responses(&[("a", 1), ("b", 1), ("c", 2), ("d", 2)]));
     assert!(even.corroborated().is_none());
 }
 
@@ -462,17 +450,13 @@ fn a_split_answer_writes_nothing_and_does_not_take_the_plurality() {
 fn the_agreement_threshold_is_pinned_from_both_sides() {
     let at_bound = responses(&[("a", 1), ("b", 1), ("c", 1), ("d", 9)]);
     assert!(
-        tally(&at_bound, QUORUM_SAMPLE, QUORUM_AGREEMENT)
-            .corroborated()
-            .is_some(),
-        "exactly QUORUM_AGREEMENT agreeing peers were refused"
+        tally(&at_bound).corroborated().is_some(),
+        "exactly the required number of agreeing peers were refused"
     );
 
     let one_under = responses(&[("a", 1), ("b", 1), ("c", 8), ("d", 9)]);
     assert!(
-        tally(&one_under, QUORUM_SAMPLE, QUORUM_AGREEMENT)
-            .corroborated()
-            .is_none(),
+        tally(&one_under).corroborated().is_none(),
         "one peer short of the threshold was accepted"
     );
 }
@@ -483,40 +467,188 @@ fn the_agreement_threshold_is_pinned_from_both_sides() {
 /// them would make "was anyone lying?" unanswerable.
 #[test]
 fn unanimity_is_distinguished_from_a_majority_with_dissent() {
-    let verdict = tally(
-        &responses(&[("a", 1), ("b", 1), ("c", 1), ("d", 1)]),
-        QUORUM_SAMPLE,
-        QUORUM_AGREEMENT,
-    );
-    assert_eq!(verdict, Verdict::Unanimous(Bytes32::new([1; 32])));
-}
-
-/// PROPERTY: too few answers is `Insufficient`, NOT a quorum among whoever replied.
-///
-/// FIXTURE DESIGN: three peers UNANIMOUSLY agree — which clears `QUORUM_AGREEMENT` on its own.
-/// An implementation that tallied against the responders rather than against the sample size
-/// would corroborate this happily, and a fixture with disagreeing responders could not tell the
-/// two apart. Reachability is not consensus: an attacker who can make one peer unreachable must
-/// not thereby shrink the quorum he has to capture.
-#[test]
-fn too_few_answers_is_insufficient_and_not_a_quorum_among_the_responders() {
-    let verdict = tally(
-        &responses(&[("a", 1), ("b", 1), ("c", 1)]),
-        QUORUM_SAMPLE,
-        QUORUM_AGREEMENT,
-    );
-
-    assert!(
-        verdict.corroborated().is_none(),
-        "three unanimous responders were allowed to form a quorum of four"
-    );
+    let verdict = tally(&responses(&[("a", 1), ("b", 1), ("c", 1), ("d", 1)]));
     assert_eq!(
         verdict,
-        Verdict::Insufficient {
-            answered: 3,
-            required: QUORUM_SAMPLE
+        Verdict::Unanimous {
+            answer: Bytes32::new([1; 32]),
+            agreed: 4
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Confidence as a gradient rather than a gate (dig_ecosystem#2827)
+// ---------------------------------------------------------------------------
+
+/// PROPERTY: a round only two peers answered, where those two AGREE, produces a USABLE verdict
+/// that carries how many corroborated it.
+///
+/// This is the freeze this ticket exists to end. A wallet held five peers and stalled at height
+/// 9,139,211 for hours while the chain moved ~2,500 blocks, because a round that did not collect
+/// a fixed number of ANSWERS was thrown away whole — one slow or unreachable peer was enough.
+///
+/// FIXTURE DESIGN: the two answers AGREE, so the round's only deficiency is the answer COUNT.
+/// A fixture whose two answers disagreed could not distinguish "the count no longer gates" from
+/// "the round was discarded for disagreeing", which is a different rule that must stay.
+///
+/// NEAREST WRONG IMPLEMENTATION: `responses.len() < QUORUM_SAMPLE => Insufficient`, which is
+/// exactly what shipped, and which discards this round.
+#[test]
+fn two_agreeing_answers_are_usable_and_carry_their_own_confidence() {
+    let verdict = tally(&responses(&[("a", 1), ("b", 1)]));
+
+    assert_eq!(
+        verdict.corroborated(),
+        Some(&Bytes32::new([1; 32])),
+        "two independent peers agreeing produced no usable answer, so the round was discarded"
+    );
+    assert_eq!(
+        verdict.agreed(),
+        2,
+        "the confidence did not travel with the datum"
+    );
+}
+
+/// PROPERTY: one answer is never corroboration. A peer agreeing with itself is one peer.
+///
+/// This is the FLOOR, and it is the whole difference between "relax the answer count" and
+/// "accept a single untrusted source" — the problem NC-12 exists to prevent.
+///
+/// FIXTURE DESIGN: a POSITIVE CONTROL follows, identical but for one additional agreeing peer.
+/// Without it, an implementation that refuses everything would pass the refusal assertion.
+#[test]
+fn a_single_answer_never_corroborates_itself() {
+    let alone = tally(&responses(&[("a", 1)]));
+
+    assert!(
+        alone.corroborated().is_none(),
+        "one peer was treated as its own corroboration"
+    );
+    assert_eq!(
+        alone,
+        Verdict::Insufficient {
+            answered: 1,
+            required: CORROBORATION_FLOOR
+        }
+    );
+    assert_eq!(alone.agreed(), 0, "a refused round reported confidence");
+
+    // POSITIVE CONTROL: the same answer, once a SECOND independent peer gives it, is usable.
+    assert!(tally(&responses(&[("a", 1), ("b", 1)]))
+        .corroborated()
+        .is_some());
+}
+
+/// PROPERTY: agreement is still required. Relaxing how many answers a round needs must not
+/// relax how strongly those answers must agree — they are different knobs and only one moved.
+///
+/// FIXTURE DESIGN: two cases, because one cannot see both failure directions.
+///
+/// * TWO answers that DISAGREE. The floor is met, so an implementation that only checks the
+///   answer count corroborates it.
+/// * FIVE answers splitting 3-2. Comfortably past the floor AND holding a strict plurality, so
+///   an implementation that kept the floor but dropped the agreement ratio takes the 3. Under
+///   the shipped ratio a five-answer round needs four.
+#[test]
+fn answers_that_disagree_do_not_corroborate_however_many_answered() {
+    let two_ways = tally(&responses(&[("a", 1), ("b", 2)]));
+    assert!(
+        two_ways.corroborated().is_none(),
+        "two peers that contradicted each other produced an authoritative answer"
+    );
+
+    let three_of_five = tally(&responses(&[
+        ("a", 1),
+        ("b", 1),
+        ("c", 1),
+        ("d", 2),
+        ("e", 2),
+    ]));
+    assert!(
+        three_of_five.corroborated().is_none(),
+        "a 3-2 plurality was adopted, so the agreement ratio was lowered rather than the answer \
+         count relaxed"
+    );
+    assert!(matches!(three_of_five, Verdict::Split { .. }));
+}
+
+/// PROPERTY: the agreement RATIO is never lowered by widening or narrowing the round. It is
+/// pinned from both sides at every round size the node can actually produce.
+///
+/// The ratio is the shipped 3-of-4 (`QUORUM_AGREEMENT : QUORUM_SAMPLE`), applied to whoever
+/// answered rather than to a fixed sample, with [`CORROBORATION_FLOOR`] underneath it.
+///
+/// NEAREST WRONG IMPLEMENTATION: a bare majority (`agreed * 2 > answered`), which would admit
+/// 3-of-5 and 2-of-3 — a genuine weakening of agreement dressed up as the same change.
+#[test]
+fn the_agreement_ratio_is_never_lowered_by_the_size_of_the_round() {
+    // At the shipped sample size the rule is the shipped threshold, unchanged.
+    assert_eq!(required_agreement(QUORUM_SAMPLE), QUORUM_AGREEMENT);
+
+    for (answered, required) in [(2, 2), (3, 3), (4, 3), (5, 4), (8, 6), (10, 8)] {
+        assert_eq!(
+            required_agreement(answered),
+            required,
+            "a round of {answered} answers required the wrong number to agree"
+        );
+        // A bare majority would be strictly less at 3, 5 and 10 — the sizes that catch it.
+        assert!(
+            required * 4 >= answered * QUORUM_AGREEMENT,
+            "the agreement ratio dropped below the shipped 3-of-4 at {answered} answers"
+        );
+    }
+
+    // Both sides, at a size only reachable after this change: four of five passes, three fails.
+    let four_of_five = responses(&[("a", 1), ("b", 1), ("c", 1), ("d", 1), ("e", 9)]);
+    assert!(tally(&four_of_five).corroborated().is_some());
+    let three_of_five = responses(&[("a", 1), ("b", 1), ("c", 1), ("d", 8), ("e", 9)]);
+    assert!(tally(&three_of_five).corroborated().is_none());
+}
+
+/// PROPERTY: a wide dial is narrowed to the peers actually asked, and the narrowing drops the
+/// badly-lagged rather than a slice of the credible ones.
+///
+/// FIXTURE DESIGN: ten candidates, two of them far off the median in OPPOSITE directions. A
+/// fixture with only lagging outliers cannot see a one-sided band, and one with fewer than
+/// `hold + 1` credible members cannot see whether the narrowing happens at all.
+///
+/// NEAREST WRONG IMPLEMENTATION: returning the credible set unnarrowed (the round then asks
+/// every peer it dialled, which is the cost this exists to bound), or truncating the head of the
+/// list (which hands the choice to whoever controls the order the addresses arrive in).
+#[test]
+fn a_wide_dial_is_held_back_to_the_credible_few() {
+    let mut candidates: Vec<Candidate> = (0..8)
+        .map(|i| candidate(&format!("honest-{i}"), 1_000))
+        .collect();
+    candidates.push(candidate("stale", 1_000 - PEAK_LAG_TOLERANCE - 1));
+    candidates.push(candidate("inflated", 1_000 + PEAK_LAG_TOLERANCE + 1));
+
+    // Draws land on distinct offsets; the values are arbitrary because `select_sample` is
+    // order-blind — what is asserted is the OUTCOME, not which five were picked.
+    let entropy = ScriptedEntropy::new(&[0, 1, 2, 3, 4]);
+    let held = hold_best(&entropy, &candidates, PEAK_LAG_TOLERANCE, QUORUM_HOLD);
+
+    assert_eq!(
+        held.len(),
+        QUORUM_HOLD,
+        "ten dialled candidates were not narrowed to the {QUORUM_HOLD} the round asks"
+    );
+    for excluded in ["stale", "inflated"] {
+        assert!(
+            !held.iter().any(|c| c.id == excluded),
+            "a candidate outside the credibility band was asked: {excluded}"
+        );
+    }
+    let mut ids: Vec<&str> = held.iter().map(|c| c.id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), QUORUM_HOLD, "the same peer was held twice");
+
+    // A dial that came back with FEWER than the hold keeps everything it has — the round
+    // proceeds on the peers that answered, which is the whole of this ticket.
+    let thin = hold_best(&entropy, &candidates[..3], PEAK_LAG_TOLERANCE, QUORUM_HOLD);
+    assert_eq!(thin.len(), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -614,12 +746,12 @@ fn an_unanswered_peer_leaves_unspentness_unproven_rather_than_assumed() {
 /// guarantee the model cannot make ends up published.
 #[test]
 fn the_sybil_numbers_match_what_spec_md_publishes() {
-    assert!((sybil_success_probability(0.0) - 0.0).abs() < 1e-12);
-    assert!((sybil_success_probability(1.0) - 1.0).abs() < 1e-12);
+    assert!((sybil_success_probability(0.0, QUORUM_SAMPLE) - 0.0).abs() < 1e-12);
+    assert!((sybil_success_probability(1.0, QUORUM_SAMPLE) - 1.0).abs() < 1e-12);
 
-    let ten = sybil_success_probability(0.10);
-    let thirty = sybil_success_probability(0.30);
-    let half = sybil_success_probability(0.50);
+    let ten = sybil_success_probability(0.10, QUORUM_SAMPLE);
+    let thirty = sybil_success_probability(0.30, QUORUM_SAMPLE);
+    let half = sybil_success_probability(0.50, QUORUM_SAMPLE);
 
     assert!((ten - 0.0037).abs() < 0.0005, "10% hostile: {ten}");
     assert!((thirty - 0.0837).abs() < 0.0005, "30% hostile: {thirty}");
@@ -628,5 +760,29 @@ fn the_sybil_numbers_match_what_spec_md_publishes() {
     assert!(
         ten < thirty && thirty < half,
         "not monotone in the attacker's share"
+    );
+}
+
+/// PROPERTY: a THIN round is easier to capture than a full one, and the published number says so
+/// rather than quoting the full round's odds for every round.
+///
+/// This is the honest price of proceeding on the peers that answered: an attacker who can make
+/// witnesses unreachable no longer has to out-vote them, only to outlast them down to the floor.
+/// `SPEC.md` states it in these terms, and this pins the figure it states.
+///
+/// FIXTURE DESIGN: the same hostile fraction across three round sizes. Comparing one size against
+/// itself could not show the gradient, which IS the finding.
+#[test]
+fn a_thinner_round_is_measurably_easier_to_capture() {
+    let at_floor = sybil_success_probability(0.30, CORROBORATION_FLOOR);
+    let at_sample = sybil_success_probability(0.30, QUORUM_SAMPLE);
+    let at_hold = sybil_success_probability(0.30, QUORUM_HOLD);
+
+    // Two hostile draws out of two: 0.30^2.
+    assert!((at_floor - 0.09).abs() < 0.0005, "at the floor: {at_floor}");
+    assert!(
+        at_floor > at_sample && at_sample > at_hold,
+        "a thin round was not reported as easier to capture than a wide one: \
+         floor={at_floor} sample={at_sample} hold={at_hold}"
     );
 }

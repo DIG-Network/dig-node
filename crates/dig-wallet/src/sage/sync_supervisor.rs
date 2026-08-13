@@ -1208,9 +1208,16 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
 ///
 /// The compensation is DISTINCTNESS: an address already in this round's sample is discarded and
 /// re-drawn, within [`MAX_PROBE_ATTEMPTS`]. That is not a tidiness rule — it is the difference
-/// between four opinions and one opinion counted four times. Failing to assemble
-/// [`quorum::QUORUM_SAMPLE`] distinct peers inside the budget yields [`Verdict::Insufficient`],
-/// which writes nothing.
+/// between four opinions and one opinion counted four times. A round that assembles fewer than
+/// [`quorum::CORROBORATION_FLOOR`] answers yields [`Verdict::Insufficient`], which writes nothing.
+///
+/// # Over-subscribe, then pull back (dig_ecosystem#2827)
+///
+/// The round dials up to [`quorum::QUORUM_DIAL_WIDE`] distinct peers and asks
+/// [`quorum::QUORUM_HOLD`] of them, chosen by [`quorum::hold_best`]. Dialling exactly as many as
+/// the round needs leaves it no margin for a dial that is stale, slow, or gone by the time the
+/// question is put — and having no margin is how a round that could have been answered was
+/// discarded instead.
 ///
 /// The residual bias is real and `SPEC.md` says so: a peer that is fast and always up remains
 /// over-represented among the probes. This raises an attacker's cost; it does not remove the
@@ -1222,15 +1229,19 @@ pub struct ChiaQuorumCorroborator {
     timeout: Duration,
 }
 
-/// How many dial attempts one round may make while assembling [`quorum::QUORUM_SAMPLE`] DISTINCT
-/// peers.
+/// How many dial attempts one round may make while assembling [`quorum::QUORUM_DIAL_WIDE`]
+/// DISTINCT peers.
 ///
 /// Bounded because the distinctness compensation is a retry loop over a helper that may keep
 /// returning the same address — a host with a co-resident full node returns localhost every single
-/// time — and an unbounded retry there is a hang, not a defence. Three attempts per required
-/// member is generous on a healthy network and short enough that a degenerate or hostile one
-/// degrades to "no quorum, nothing written" in seconds.
-const MAX_PROBE_ATTEMPTS: usize = quorum::QUORUM_SAMPLE * 3;
+/// time — and an unbounded retry there is a hang, not a defence.
+///
+/// Two attempts per dial rather than the three it was when the target was four: widening the
+/// target to ten already multiplies the worst-case dial count, and a round that spends longer
+/// failing is a round the replica spends longer not being written. A degenerate or hostile network
+/// still degrades to "no corroboration, nothing written" rather than to a hang, which is the
+/// property this bound exists for.
+const MAX_PROBE_ATTEMPTS: usize = quorum::QUORUM_DIAL_WIDE * 2;
 
 impl ChiaQuorumCorroborator {
     /// A mainnet corroborator.
@@ -1241,7 +1252,7 @@ impl ChiaQuorumCorroborator {
         }
     }
 
-    /// Dial repeatedly, keeping the first [`quorum::QUORUM_SAMPLE`] DISTINCT addresses together
+    /// Dial repeatedly, keeping the first [`quorum::QUORUM_DIAL_WIDE`] DISTINCT addresses together
     /// with each one's claimed peak.
     async fn probe(&self) -> Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> {
         let Ok(tls) = chia_query::peer::connect::create_generated_tls() else {
@@ -1250,7 +1261,7 @@ impl ChiaQuorumCorroborator {
         let mut sample: Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> = Vec::new();
 
         for _ in 0..MAX_PROBE_ATTEMPTS {
-            if sample.len() >= quorum::QUORUM_SAMPLE {
+            if sample.len() >= quorum::QUORUM_DIAL_WIDE {
                 break;
             }
             let Ok((peer, addr, receiver)) =
@@ -1316,8 +1327,16 @@ impl Corroborator for ChiaQuorumCorroborator {
         // a height every survivor passed some blocks ago — where a lagging-but-honest peer and a
         // fully caught-up one hold the SAME answer, so a disagreement can no longer be explained
         // by lag. That is the whole behind-versus-lying discriminator.
+        //
+        // Then PULL BACK: the dial was deliberately wide, and asking every peer it happened to
+        // reach would spend the margin the wide dial exists to provide.
         let candidates: Vec<quorum::Candidate> = probes.iter().map(|(c, _)| c.clone()).collect();
-        let eligible = quorum::eligible(&candidates, quorum::PEAK_LAG_TOLERANCE);
+        let eligible = quorum::hold_best(
+            &quorum::OsEntropy,
+            &candidates,
+            quorum::PEAK_LAG_TOLERANCE,
+            quorum::QUORUM_HOLD,
+        );
         let Some(height) = quorum::common_height(&eligible, quorum::SETTLED_LAG) else {
             return Err(SyncError::Peer(
                 "no settled height: too few reachable peers agreed on a credible chain tip".into(),
@@ -1329,8 +1348,10 @@ impl Corroborator for ChiaQuorumCorroborator {
             if !eligible.iter().any(|e| e.id == candidate.id) {
                 continue;
             }
-            // A probe that will not answer is simply ABSENT from the tally, which counts against
-            // reaching the quorum rather than for it.
+            // A probe that will not answer is simply ABSENT from the tally. It lowers the round's
+            // confidence — `Verdict::agreed` is smaller — and it no longer discards the round,
+            // which is what left a replica frozen while peers that HAD answered were ignored
+            // (dig_ecosystem#2827).
             if let Ok(Some(answer)) = header_hash_from(peer, height).await {
                 responses.push(quorum::Response {
                     peer: candidate.id.clone(),
@@ -1341,7 +1362,7 @@ impl Corroborator for ChiaQuorumCorroborator {
 
         Ok(CorroborationRound {
             height,
-            verdict: quorum::tally(&responses, quorum::QUORUM_SAMPLE, quorum::QUORUM_AGREEMENT),
+            verdict: quorum::tally(&responses),
         })
     }
 }
