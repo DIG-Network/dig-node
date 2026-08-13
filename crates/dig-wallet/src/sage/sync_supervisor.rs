@@ -705,19 +705,23 @@ pub trait SyncSession: Send + Sync {
     /// Subscribe `puzzle_hashes` and catch the replica up, under the EFFECTIVE trust the
     /// supervisor resolved for this session.
     ///
-    /// `trust` is passed in rather than read from [`SyncSession::trust`] because the two can
+    /// `authority` is passed in rather than read from [`SyncSession::trust`] because the two can
     /// legitimately differ: a discovered peer that cleared corroboration runs as
     /// [`PeerTrust::Corroborated`] while its dial source is still discovery. The floor check that
-    /// actually guards `initial_sync_complete` lives down in [`sync::initial_sync_with`] — where
-    /// the previous audit deliberately put it, so no caller-side refactor can walk around it —
-    /// and it can only see the trust it is handed.
+    /// actually guards `initial_sync_complete` lives down in
+    /// [`sync::initial_sync_with_authority`] — where the previous audit deliberately put it, so no
+    /// caller-side refactor can walk around it — and it can only see what it is handed.
+    ///
+    /// It carries the session's [`sync::PeakCeiling`] as well as its trust, because the catch-up
+    /// TERMINAL is a peak claim like any other and is checked against the same bound
+    /// (dig_ecosystem#2851).
     async fn catch_up(
         &self,
         db: &WalletDb,
         puzzle_hashes: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
-        trust: PeerTrust,
+        authority: sync::WriteAuthority,
     ) -> Result<(), SyncError>;
 
     /// Consume peer pushes until the peer disconnects. Consumes the session.
@@ -1076,7 +1080,8 @@ impl Supervisor {
             // higher peak would inflate apparent confirmation counts (see [`sync::PeerTrust`]
             // for the inversion that made this the vulnerability). It runs as a write-free
             // session, which is what powers the live sync status.
-            let trust = self.trust_for_session(&*session, &mut splits).await;
+            let authority = self.trust_for_session(&*session, &mut splits).await;
+            let trust = authority.trust();
             // Publish the trust the INSTANT it is settled, before a subscription set is resolved
             // for it — the order the supervisor genuinely learns the two facts. Until
             // `set_watched` lands just below, the count is honestly unknown.
@@ -1113,7 +1118,7 @@ impl Supervisor {
                         puzzle_hashes,
                         self.genesis_challenge,
                         &self.events,
-                        trust,
+                        authority,
                     )
                     .await
                 {
@@ -1138,7 +1143,7 @@ impl Supervisor {
             // Taken before the session is moved into `run` below, so the stall and recovery lines
             // can both name the peer the episode was about.
             let peer_ip = session.peer_ip();
-            let mut state = sync::SessionState::new(&subscribed, trust);
+            let mut state = sync::SessionState::with_authority(&subscribed, authority);
             let outcome = tokio::select! {
                 result = session.run(&self.db, &self.events, &mut state) => {
                     if let Err(e) = result {
@@ -1216,28 +1221,47 @@ impl Supervisor {
         tracing::debug!("wallet sync: supervisor stopped");
     }
 
-    /// The trust this session actually runs under: its dial-source trust, plus one chance to be
-    /// elevated by corroboration (dig_ecosystem#2568).
+    /// What this session is actually entitled to write: its dial-source trust, plus one chance to
+    /// be elevated by corroboration (dig_ecosystem#2568) — and, when it is, the
+    /// [`sync::PeakCeiling`] that elevation is only ever granted WITH (dig_ecosystem#2851).
     ///
     /// Ordering is the point. This runs BEFORE the catch-up and before any frame is handled, so a
     /// peer that fails corroboration never had a window in which its answers were already
     /// landing. Every refusal path returns [`PeerTrust::Discovered`], which writes nothing — a
     /// probe error, an unreachable quorum, a split, a writer that disagrees, and corroboration
     /// being switched off all fail the same, closed way.
-    async fn trust_for_session(&self, session: &dyn SyncSession, splits: &mut u32) -> PeerTrust {
+    ///
+    /// The ceiling is anchored on the round's own settled height, which is independent of the
+    /// writer by construction: [`may_elevate`] requires the writer to AGREE with that height, so
+    /// it is a floor the writer cannot inflate. It is fixed for the session and never ratchets —
+    /// refreshing it is exactly what [`SESSION_MAX_LIFETIME`] rotation already does, which is the
+    /// one place rotation REDUCES exposure rather than raising it.
+    async fn trust_for_session(
+        &self,
+        session: &dyn SyncSession,
+        splits: &mut u32,
+    ) -> sync::WriteAuthority {
         let dialed = session.trust();
         if dialed != PeerTrust::Discovered {
-            return dialed;
+            return match dialed {
+                // The operator hand-configured this address, and corroboration only runs on the
+                // discovery path below — so there is no independent anchor to build a ceiling
+                // from, and inventing one would second-guess an explicit configuration.
+                PeerTrust::Operator => sync::WriteAuthority::Operator,
+                // Unreachable in practice: `trust()` reports the DIAL source, which is never
+                // already-corroborated. Elevation is this function's own output.
+                PeerTrust::Corroborated | PeerTrust::Discovered => sync::WriteAuthority::Discovered,
+            };
         }
         let Some(corroborator) = self.corroborator.as_ref() else {
-            return PeerTrust::Discovered;
+            return sync::WriteAuthority::Discovered;
         };
 
         let round = match corroborator.corroborate().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(error = %e, "wallet sync: corroboration probe failed; the peer                      stays uncorroborated and writes nothing");
-                return PeerTrust::Discovered;
+                return sync::WriteAuthority::Discovered;
             }
         };
 
@@ -1273,7 +1297,7 @@ impl Supervisor {
                     "wallet sync: no corroborated answer this round; re-drawing a fresh sample"
                 );
             }
-            return PeerTrust::Discovered;
+            return sync::WriteAuthority::Discovered;
         }
 
         *splits = 0;
@@ -1289,9 +1313,13 @@ impl Supervisor {
         tracing::info!(
             height = round.height,
             peer = %session.peer_ip(),
+            ceiling = round.height.saturating_add(sync::peak_allowance(SESSION_MAX_LIFETIME)),
             "wallet sync: discovered peer corroborated by an independent quorum; it may now write"
         );
-        PeerTrust::Corroborated
+        sync::WriteAuthority::Corroborated(sync::PeakCeiling::from_corroborated(
+            round.height,
+            SESSION_MAX_LIFETIME,
+        ))
     }
 
     /// Resolve once the subscription set stops being empty.
@@ -1783,18 +1811,18 @@ impl SyncSession for ChiaPeerSession {
         puzzle_hashes: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
-        trust: PeerTrust,
+        authority: sync::WriteAuthority,
     ) -> Result<(), SyncError> {
-        // The EFFECTIVE trust, not `self.trust`: a corroborated discovered peer must reach the
+        // The EFFECTIVE authority, not `self.trust`: a corroborated discovered peer must reach the
         // floor check as corroborated, or clearing the quorum would buy it nothing.
-        sync::initial_sync(
+        sync::initial_sync_with_authority(
             &self.peer,
             db,
             puzzle_hashes,
             genesis_challenge,
             &self.ip,
             events,
-            trust,
+            authority,
         )
         .await
     }

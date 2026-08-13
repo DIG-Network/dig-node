@@ -211,7 +211,7 @@ impl SyncSession for ScriptedSession {
         puzzle_hashes: Vec<Bytes32>,
         genesis_challenge: Bytes32,
         events: &EventBus,
-        trust: PeerTrust,
+        authority: sync::WriteAuthority,
     ) -> Result<(), SyncError> {
         self.script
             .catch_ups
@@ -220,17 +220,17 @@ impl SyncSession for ScriptedSession {
             .push(puzzle_hashes.clone());
         // The REAL catch-up, so the empty-set guard and the completion-flag write are both
         // exercised exactly as production would exercise them.
-        sync::initial_sync_with(
+        sync::initial_sync_with_authority(
             &CaughtUpAtOnce,
             db,
             puzzle_hashes,
             genesis_challenge,
             &self.peer_ip(),
             events,
-            // The EFFECTIVE trust the supervisor resolved, exactly as production passes it --
+            // The EFFECTIVE authority the supervisor resolved, exactly as production passes it --
             // reading `self.trust` here would make the elevation invisible to the floor check and
             // quietly re-create the bug this suite exists to exclude.
-            trust,
+            authority,
         )
         .await
     }

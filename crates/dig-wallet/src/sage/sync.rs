@@ -491,24 +491,6 @@ impl<'a> SessionState<'a> {
             refused_peaks: 0,
         }
     }
-
-    /// A session over `subscribed` whose peer is trusted to the degree `trust` says.
-    ///
-    /// TEMPORARY ADAPTER (dig_ecosystem#2851): a bare [`PeerTrust`] carries no anchor, so a
-    /// `Corroborated` session built this way is UNBOUNDED — the very state [`WriteAuthority`]
-    /// exists to make unrepresentable. It survives only until the supervisor threads a
-    /// [`WriteAuthority`] through from the corroboration round it already has; use
-    /// [`SessionState::with_authority`] everywhere else.
-    pub fn new(subscribed: &'a SubscribedHashes, trust: PeerTrust) -> Self {
-        let authority = match trust {
-            PeerTrust::Operator => WriteAuthority::Operator,
-            PeerTrust::Discovered => WriteAuthority::Discovered,
-            PeerTrust::Corroborated => WriteAuthority::Corroborated(
-                PeakCeiling::from_corroborated(u32::MAX, Duration::ZERO),
-            ),
-        };
-        Self::with_authority(subscribed, authority)
-    }
 }
 
 /// The cumulative descent one session is allowed to drive, bounded by [`MAX_SESSION_ROLLBACK`].
@@ -776,42 +758,6 @@ pub async fn handle_coin_state_update(
     Ok(())
 }
 
-/// Perform the initial puzzle-state catch-up: subscribe the wallet's puzzle hashes and
-/// apply the returned coin states, batching through `RespondPuzzleState.next` until the
-/// peer reports it is caught up. Marks the DB initial-sync-complete so
-/// [`crate::sage::routing`] flips reads from the fallback to the DB.
-///
-/// Publishes the sync lifecycle on `events` (design A.9): [`SyncEvent::Start`] once (the
-/// caller supplies `peer_ip` — whatever address it dialed to obtain `peer`),
-/// [`SyncEvent::Subscribed`] after the first successful puzzle-state response, and
-/// [`SyncEvent::PuzzleBatchSynced`] once per batch applied.
-pub async fn initial_sync(
-    peer: &Peer,
-    db: &WalletDb,
-    puzzle_hashes: Vec<Bytes32>,
-    genesis_challenge: Bytes32,
-    peer_ip: &str,
-    events: &EventBus,
-    trust: PeerTrust,
-) -> Result<(), SyncError> {
-    initial_sync_with(
-        peer,
-        db,
-        puzzle_hashes,
-        genesis_challenge,
-        peer_ip,
-        events,
-        trust,
-    )
-    .await
-}
-
-/// [`initial_sync`] for a session that already knows what it is entitled to write.
-///
-/// TEMPORARY SPLIT (dig_ecosystem#2851): this is the real entry point, and
-/// [`initial_sync`]/[`initial_sync_with`] are adapters that widen a bare [`PeerTrust`] into an
-/// UNBOUNDED [`WriteAuthority`]. They exist only until the supervisor threads the authority it
-/// already has through from the corroboration round, at which point both adapters go.
 /// The one peer call [`initial_sync`] makes, behind a trait.
 ///
 /// `chia_wallet_sdk::client::Peer` can only exist on top of a live socket, so the catch-up
@@ -852,38 +798,6 @@ impl PuzzleStateSource for Peer {
             Err(reject) => Err(SyncError::Rejected(format!("{reject:?}"))),
         }
     }
-}
-
-/// [`initial_sync`] over any [`PuzzleStateSource`]. Production passes a `Peer`.
-///
-/// TEMPORARY ADAPTER (dig_ecosystem#2851) — see [`initial_sync_with_authority`], which this
-/// delegates to with an UNBOUNDED authority.
-pub async fn initial_sync_with(
-    peer: &dyn PuzzleStateSource,
-    db: &WalletDb,
-    puzzle_hashes: Vec<Bytes32>,
-    genesis_challenge: Bytes32,
-    peer_ip: &str,
-    events: &EventBus,
-    trust: PeerTrust,
-) -> Result<(), SyncError> {
-    let authority = match trust {
-        PeerTrust::Operator => WriteAuthority::Operator,
-        PeerTrust::Discovered => WriteAuthority::Discovered,
-        PeerTrust::Corroborated => {
-            WriteAuthority::Corroborated(PeakCeiling::from_corroborated(u32::MAX, Duration::ZERO))
-        }
-    };
-    initial_sync_with_authority(
-        peer,
-        db,
-        puzzle_hashes,
-        genesis_challenge,
-        peer_ip,
-        events,
-        authority,
-    )
-    .await
 }
 
 /// The catch-up itself, for a session that already knows what it is entitled to write.
@@ -1138,7 +1052,7 @@ mod tests {
 
     /// A session over `subscribed` whose peer the OPERATOR chose — full authority.
     fn operator(subscribed: &SubscribedHashes) -> SessionState<'_> {
-        SessionState::new(subscribed, PeerTrust::Operator)
+        SessionState::with_authority(subscribed, WriteAuthority::Operator)
     }
 
     /// A `new_peak_wallet` frame claiming `height`, exactly as it arrives on the wire.
@@ -1158,7 +1072,7 @@ mod tests {
 
     /// A session over a peer this node merely DISCOVERED — writes nothing.
     fn discovered(subscribed: &SubscribedHashes) -> SessionState<'_> {
-        SessionState::new(subscribed, PeerTrust::Discovered)
+        SessionState::with_authority(subscribed, WriteAuthority::Discovered)
     }
 
     /// A session over a DISCOVERED peer a quorum settled at `anchor` — full authority, bounded.
@@ -1722,14 +1636,14 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(600),
-            initial_sync_with(
+            initial_sync_with_authority(
                 &SilentPeer,
                 &db,
                 vec![Bytes32::new([7; 32])],
                 Bytes32::new([0; 32]),
                 "127.0.0.1",
                 &events,
-                PeerTrust::Operator,
+                WriteAuthority::Operator,
             ),
         )
         .await
@@ -1762,14 +1676,14 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         let events = EventBus::default();
 
-        let err = initial_sync_with(
+        let err = initial_sync_with_authority(
             &CaughtUpAtOnce,
             &db,
             vec![],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Operator,
+            WriteAuthority::Operator,
         )
         .await
         .expect_err("an empty subscription set must be refused, not performed");
@@ -1832,14 +1746,14 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         let events = EventBus::default();
 
-        initial_sync_with(
+        initial_sync_with_authority(
             &AnswersSubscriptionAndSlipsOneIn,
             &db,
             vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Operator,
+            WriteAuthority::Operator,
         )
         .await
         .expect("a non-empty subscription set catches up normally");
@@ -1938,14 +1852,14 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
         let events = EventBus::default();
 
-        let err = initial_sync_with(
+        let err = initial_sync_with_authority(
             &AnswersSubscriptionAndSlipsOneIn,
             &db,
             vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Discovered,
+            WriteAuthority::Discovered,
         )
         .await
         .expect_err("a discovered peer must not be allowed to run a catch-up");
@@ -2008,14 +1922,14 @@ mod tests {
 
         // The attacker closes the socket; the supervisor reconnects to it and the catch-up that
         // re-latched over an empty response last round is now refused at the floor.
-        let err = initial_sync_with(
+        let err = initial_sync_with_authority(
             &CaughtUpAtOnce,
             &db,
             vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Discovered,
+            WriteAuthority::Discovered,
         )
         .await
         .expect_err("the reconnect must not buy a fresh catch-up");
@@ -2098,9 +2012,9 @@ mod tests {
     /// this test is satisfied by a `run_update_loop` that ignores `new_peak_wallet` entirely.
     #[tokio::test]
     async fn a_discovered_peer_new_peak_wallet_is_dropped_while_an_operators_still_lands() {
-        for (trust, claimed, expected) in [
-            (PeerTrust::Discovered, u32::MAX, 6_000_000u32),
-            (PeerTrust::Operator, 6_000_010, 6_000_010),
+        for (authority, claimed, expected) in [
+            (WriteAuthority::Discovered, u32::MAX, 6_000_000u32),
+            (WriteAuthority::Operator, 6_000_010, 6_000_010),
         ] {
             let db = WalletDb::open_in_memory().await.unwrap();
             db.set_peak(6_000_000, "aa").await.unwrap();
@@ -2115,7 +2029,7 @@ mod tests {
                 rx,
                 &events,
                 None,
-                &mut SessionState::new(&subscribed, trust),
+                &mut SessionState::with_authority(&subscribed, authority),
             )
             .await
             .unwrap();
@@ -2123,7 +2037,7 @@ mod tests {
             assert_eq!(
                 db.sync_state().await.unwrap().peak_height,
                 Some(expected),
-                "{trust:?} peer claiming height {claimed}"
+                "{authority:?} peer claiming height {claimed}"
             );
         }
     }
@@ -2313,14 +2227,14 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let err = initial_sync_with(
+        let err = initial_sync_with_authority(
             &peer,
             &db,
             vec![Bytes32::new([OWNED; 32])],
             Bytes32::new([0; 32]),
             "127.0.0.1",
             &events,
-            PeerTrust::Operator,
+            WriteAuthority::Operator,
         )
         .await
         .expect_err("a non-advancing catch-up must be refused");
