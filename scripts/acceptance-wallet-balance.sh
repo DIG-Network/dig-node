@@ -8,7 +8,7 @@
 #
 #   1. does the node hold Chia peers?                      (dig_ecosystem#2806)
 #   2. does it FOLLOW this address?                        (#2823 enrolment, #2848 app-side)
-#   3. does the replica keep up once it has caught up?     (#2851 froze for hours)
+#   3. does the replica hold data it can date?             (#2851 froze for hours; #2869 honesty)
 #   4. does a read actually ROUTE to the replica?          (#2866 / #2234)
 #
 # Every one of those shipped with green unit tests while the wallet was unusable end to end. Gate 4
@@ -47,11 +47,15 @@ tip=$(field chia_peer_peak_height)
 # GATE 2 — addresses followed. A measured zero here means nothing was ever enrolled.
 [ "$watched" != "None" ] && [ "${watched:-0}" -ge 1 ] || fail 2 "the node follows no addresses (watched_addresses=$watched)"
 
-# GATE 3 — the replica is keeping up, not merely once-caught-up. A frozen replica reported `synced`
-# for three hours across a 312-block drift, so the phase alone is not the test: the DISTANCE is.
-[ "$replica" != "None" ] && [ "$tip" != "None" ] || fail 3 "a height is unobservable (replica=$replica tip=$tip)"
-behind=$(( tip - replica ))
-[ "$behind" -le 50 ] || fail 3 "the replica is $behind blocks behind the chain tip"
+# GATE 3 — the replica HAS DATA and can say what it is as of.
+#
+# This gate used to require the replica to be within 50 blocks of the tip, and that was wrong for the
+# reason dig_ecosystem#2869 makes explicit: a behind replica MUST still serve, and it now says so
+# honestly (`synced: false` WITH its real `peak_height`). Failing the run on the distance would fail
+# the correct behaviour. So the distance is reported as CONTEXT below, never as a pass condition;
+# what is actually required is that the replica has a height to answer as of at all.
+[ "$replica" != "None" ] || fail 3 "the replica reports no height, so it has nothing to answer as of"
+if [ "$tip" != "None" ]; then behind=$(( tip - replica )); else behind="unknown"; fi
 
 # GATE 4 — the read reaches the replica. This is the one that cannot be faked by a layer test.
 bal_json=$(dign wallet balance "$ADDRESS" --json 2>/dev/null) || fail 4 "the balance read failed"
@@ -67,6 +71,16 @@ if [ "$source" != "db" ]; then
     fi
     fail 4 "the balance was answered by '$source'. This address is not among the ones the node follows, so the replica holds no coins for it — enrol it, or pass an address that is enrolled"
 fi
-[ "$synced" = "True" ] || fail 4 "a db-tier answer reported synced=$synced; only a replica read may claim a synced view"
+# A db answer must say what it is AS OF. `synced` is now measured rather than asserted, so
+# `synced=False` is a legitimate answer from a behind replica and is NOT a failure — but a figure
+# with no height attached is unusable either way.
+peak=$(printf '%s' "$bal_json" | python -c "import json,sys;print(json.load(sys.stdin).get('peak_height'))")
+[ "$peak" != "None" ] || fail 4 "a db-tier answer carried no peak_height, so nothing says what it is as of"
 
-echo "PASS: peers=$peers watched=$watched behind=$behind source=$source synced=$synced"
+# The falsehood dig_ecosystem#2869 removed, asserted directly: a replica far behind the tip may serve,
+# but it may NEVER present its figure as current.
+if [ "$behind" != "unknown" ] && [ "$behind" -gt 50 ] && [ "$synced" = "True" ]; then
+    fail 4 "the replica is $behind blocks behind and still reported synced=True; a stale figure was presented as settled"
+fi
+
+echo "PASS: peers=$peers watched=$watched behind=$behind source=$source synced=$synced peak=$peak"

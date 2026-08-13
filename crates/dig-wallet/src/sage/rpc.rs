@@ -5925,9 +5925,15 @@ mod tests {
     #[tokio::test]
     async fn a_behind_replica_serves_its_figure_and_says_it_is_not_current() {
         let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
-        db.upsert_coin(&coin_at_ph("aa", &owned_ph(), 1_599_179_999_973, Some(1), None))
-            .await
-            .unwrap();
+        db.upsert_coin(&coin_at_ph(
+            "aa",
+            &owned_ph(),
+            1_599_179_999_973,
+            Some(1),
+            None,
+        ))
+        .await
+        .unwrap();
         let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
             .with_chain_peer_tier_for_tests(peers_ahead_of_the_replica());
 
@@ -5995,7 +6001,10 @@ mod tests {
         assert_eq!(coins.source, Source::Db);
         assert_eq!(coins.coins.len(), 1, "the coin set was withheld");
         assert_eq!(coins.peak_height, Some(REPLICA_PEAK));
-        assert!(!coins.synced, "the spend path was told a stale coin set was current");
+        assert!(
+            !coins.synced,
+            "the spend path was told a stale coin set was current"
+        );
     }
 
     /// **Proves:** a fallback answer is unchanged — it never borrows the replica's freshness or
@@ -6005,8 +6014,12 @@ mod tests {
         let db = db_with_owned_derivation(false, Some(REPLICA_PEAK)).await;
         // A LIVE fallback: an unreachable one errors before it can construct an answer, and this
         // test is about the answer's fields.
-        let be = WalletBackend::new(db, Arc::new(MockFallback::default()), WalletConfig::default())
-            .with_chain_peer_tier_for_tests(peers_ahead_of_the_replica());
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_chain_peer_tier_for_tests(peers_ahead_of_the_replica());
 
         let result = be
             .balance_for_address(&owned_address(), BalanceAsset::Xch)

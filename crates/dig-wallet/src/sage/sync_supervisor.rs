@@ -923,7 +923,10 @@ impl RefusalReason {
 /// writer to have contradicted, so an implementation that compared answers first would report a
 /// perfectly honest writer as a liar on every split — and the caller replaces a contradicting
 /// writer promptly, so that mistake is a re-dial on every split rather than a mere mislabel.
-pub fn refusal(round: &CorroborationRound, writer_answer: Option<Bytes32>) -> Option<RefusalReason> {
+pub fn refusal(
+    round: &CorroborationRound,
+    writer_answer: Option<Bytes32>,
+) -> Option<RefusalReason> {
     let Some(agreed) = round.verdict.corroborated() else {
         return Some(RefusalReason::Undecided);
     };
@@ -1476,11 +1479,7 @@ impl Supervisor {
     /// it is a floor the writer cannot inflate. It is fixed for the session and never ratchets —
     /// refreshing it is exactly what [`SESSION_MAX_LIFETIME`] rotation already does, which is the
     /// one place rotation REDUCES exposure rather than raising it.
-    async fn trust_for_session(
-        &self,
-        session: &dyn SyncSession,
-        splits: &mut u32,
-    ) -> SessionTrust {
+    async fn trust_for_session(&self, session: &dyn SyncSession, splits: &mut u32) -> SessionTrust {
         let dialed = session.trust();
         if dialed != PeerTrust::Discovered {
             return SessionTrust::elevated(match dialed {
