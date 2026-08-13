@@ -950,7 +950,10 @@ mod tests {
                 vec!["dig-node", "wallet", "unwatch", A_PUBLIC_KEY],
                 "control.wallet.unwatch",
             ),
-            (vec!["dig-node", "wallet", "watched"], "control.wallet.watched"),
+            (
+                vec!["dig-node", "wallet", "watched"],
+                "control.wallet.watched",
+            ),
         ]
     }
 

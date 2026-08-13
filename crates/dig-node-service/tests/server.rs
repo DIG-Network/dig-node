@@ -3124,7 +3124,11 @@ async fn a_client_can_register_and_deregister_the_addresses_the_node_follows() {
     fn key_hex(tag: u8) -> String {
         let mut seed = [0u8; 64];
         seed[0] = tag;
-        hex::encode(chia::bls::SecretKey::from_seed(&seed).public_key().to_bytes())
+        hex::encode(
+            chia::bls::SecretKey::from_seed(&seed)
+                .public_key()
+                .to_bytes(),
+        )
     }
 
     let (upstream, _calls) = start_mock_upstream().await;
@@ -3169,7 +3173,11 @@ async fn a_client_can_register_and_deregister_the_addresses_the_node_follows() {
         Some(&token),
     )
     .await;
-    assert_eq!(again["result"]["added"], json!(0), "re-enrolment adds nothing");
+    assert_eq!(
+        again["result"]["added"],
+        json!(0),
+        "re-enrolment adds nothing"
+    );
     assert_eq!(
         again["result"]["watched"],
         json!(2),

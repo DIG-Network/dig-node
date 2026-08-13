@@ -2072,7 +2072,6 @@ async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // The externally-registered watch list (SPEC §18.6f, dig_ecosystem#2823)
 // ---------------------------------------------------------------------------
@@ -2433,7 +2432,11 @@ mod tests {
             .map(|t| {
                 let mut seed = [0u8; 64];
                 seed[0] = *t;
-                hex::encode(chia::bls::SecretKey::from_seed(&seed).public_key().to_bytes())
+                hex::encode(
+                    chia::bls::SecretKey::from_seed(&seed)
+                        .public_key()
+                        .to_bytes(),
+                )
             })
             .collect();
 
