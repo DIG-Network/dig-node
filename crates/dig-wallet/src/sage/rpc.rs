@@ -678,6 +678,64 @@ impl WalletBackend {
         self.watchlist.as_ref()
     }
 
+    /// Enrol `keys` to be followed, and INVALIDATE the completed catch-up that did not cover them.
+    ///
+    /// The single door onto [`super::watchlist::WatchRegistry::watch`]. Enrolment is not merely a
+    /// registry write: it WIDENS the set of addresses reads treat as replica-backed, and the
+    /// replica's completed catch-up covered the OLD set. Leaving `initial_sync_complete` latched
+    /// across that widening is how a funded, newly-enrolled address was answered
+    /// `balance: 0, synced: true, source: "db"` — the DB was queried for a scope it had never
+    /// been asked to follow (dig_ecosystem#2871).
+    ///
+    /// So the flag is cleared, and reads for EVERY address fall to the chain tier until the next
+    /// catch-up completes over the widened set. That costs up to one session lifetime of oracle
+    /// reads, and the oracle answers truthfully; the alternative answers falsely from the replica.
+    /// Failing to the oracle is the correct direction, and it matches the fail-closed posture
+    /// `handle_coin_state_update` already takes on a backwards chain move.
+    ///
+    /// # Only a real widening invalidates anything
+    ///
+    /// `watch` is idempotent, and clients re-announce their whole account on every unlock. Clearing
+    /// the flag on a re-announcement that added nothing would hold a healthy node in permanent
+    /// fallback for as long as the client kept saying hello — a self-inflicted outage where there
+    /// was no defect. Nothing new enrolled means the catch-up still covers the set.
+    ///
+    /// Returns how many keys were newly enrolled, or `None` where no registry is attached — which
+    /// a caller MUST surface as a refusal rather than as a registration that went nowhere.
+    pub async fn watch_keys(&self, keys: &[PublicKey]) -> sqlx::Result<Option<usize>> {
+        let Some(registry) = self.watchlist.as_ref() else {
+            return Ok(None);
+        };
+        let added = registry.watch(keys);
+        if added > 0 {
+            self.db.set_initial_sync_complete(false).await?;
+            tracing::info!(
+                added,
+                "wallet watch: newly enrolled keys widened the followed set; the replica is no \
+                 longer authoritative until the next catch-up covers them"
+            );
+        }
+        Ok(Some(added))
+    }
+
+    /// Does `phs` cover every externally enrolled address — so a sync over `phs` alone may declare
+    /// the whole replica authoritative?
+    ///
+    /// A registry that is absent or empty is trivially covered: there is no enrolled address to
+    /// leave behind. Comparison is on normalised puzzle hashes, the same spelling
+    /// [`Self::watchlist_follows`] compares on, so the two cannot disagree about the same key.
+    fn watchlist_is_covered_by(&self, phs: &[String]) -> bool {
+        let Some(registry) = self.watchlist.as_ref() else {
+            return true;
+        };
+        let covered: HashSet<String> = phs.iter().map(|p| normalize_ph(p)).collect();
+        registry.registered().iter().all(|pk| {
+            covered.contains(&normalize_ph(&hex::encode(
+                super::sync_supervisor::puzzle_hash_for(pk),
+            )))
+        })
+    }
+
     /// Does this replica FOLLOW `puzzle_hash` because an enrolled key controls it?
     ///
     /// This is the second half of the "is this address ours" question, and without it the first
@@ -2430,7 +2488,22 @@ impl WalletBackend {
         // update after the real catch-up would announce the wallet's entire receive history as
         // incoming payments. Arming requires a `CatchUpReplay`, which only the completed
         // address-history catch-up produces; see `WalletDb::complete_catch_up`.
-        self.db.set_initial_sync_complete(true).await?;
+        //
+        // It may only latch over the addresses it ACTUALLY FETCHED. `phs` is custody's own set; an
+        // externally enrolled key (`control.wallet.watch`) is not in it, so its coins were never
+        // requested here — yet the flag is global, and setting it would declare the replica
+        // authoritative for those addresses too. That is dig_ecosystem#2871's variant 1b, and it is
+        // the PERMANENT form of it: nothing later clears the flag, so a funded enrolled address
+        // would answer `balance: 0, synced: true, source: "db"` for the life of the install.
+        if self.watchlist_is_covered_by(&phs) {
+            self.db.set_initial_sync_complete(true).await?;
+        } else {
+            tracing::info!(
+                "wallet sync: a point-read refresh covered only this node's own custody, so the \
+                 replica stays non-authoritative for the externally enrolled addresses it did not \
+                 fetch"
+            );
+        }
         // Incoming-funds arrivals (dig_ecosystem#2548). Run AFTER attribution, so a CAT coin this
         // pass fetched is announced with its asset id rather than held as indeterminate — the
         // direct-peer sync path cannot see CAT coins at all (they sit at a curried puzzle hash,
@@ -4593,6 +4666,186 @@ mod tests {
         );
         assert!(r.synced, "only a Db answer may report itself synced");
         assert_eq!(r.balance, 700, "the figure the replica holds");
+    }
+
+    // -----------------------------------------------------------------------
+    // Enrolment widens the scope the catch-up covered (dig_ecosystem#2871)
+    // -----------------------------------------------------------------------
+
+    /// A second enrollable key, distinct from [`enrolled_key`] — the K2 of the ticket's sequence.
+    fn second_enrolled_key() -> chia::bls::PublicKey {
+        let mut seed = [0u8; 64];
+        seed[0] = 91;
+        chia::bls::SecretKey::from_seed(&seed).public_key()
+    }
+
+    fn address_of(key: &chia::bls::PublicKey) -> String {
+        let ph = normalize_ph(&hex::encode(super::super::sync_supervisor::puzzle_hash_for(
+            key,
+        )));
+        encode_address(&ph, "xch").unwrap()
+    }
+
+    /// **Proves (dig_ecosystem#2871):** a key enrolled AFTER the catch-up completed is not answered
+    /// from a replica that never followed it.
+    ///
+    /// THE DEFECT THIS PINS. `initial_sync_complete` means "a catch-up finished over the set
+    /// resolved at session start"; `watchlist_follows` asks "is this key registered right now".
+    /// Nothing ordered the two, so the first read of a newly enrolled address found
+    /// `db_synced = true` and `scoped = true`, queried the DB for a scope it had never followed,
+    /// and answered `balance: 0, synced: true, source: "db"` for a funded wallet. `coins_for_address`
+    /// answered `coins: []` the same way — and its own doc reads that as "a chain WAS consulted",
+    /// so a spend refuses with a shortfall that is not real. No attacker and no configuration:
+    /// enrolling a second profile is enough.
+    ///
+    /// FIXTURE DESIGN — THE ORDER IS THE TEST. K1 is enrolled and the catch-up is completed FIRST,
+    /// exactly as a running node reaches this state; only then is K2 enrolled. A fixture that
+    /// enrols both keys before completing the catch-up describes a node that never had the bug and
+    /// passes against the broken implementation.
+    #[tokio::test]
+    async fn a_key_enrolled_after_the_catch_up_is_not_answered_from_the_replica() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+        let db = WalletDb::open_in_memory().await.unwrap();
+        // The state a node reaches legitimately: K1's catch-up finished, and it latched.
+        db.set_initial_sync_complete(true).await.unwrap();
+        db.set_peak(500, &"cc".repeat(32)).await.unwrap();
+
+        let be = WalletBackend::new(
+            db.clone(),
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_watchlist(registry);
+
+        // K2 arrives afterwards — a second profile, or any additional key.
+        assert_eq!(
+            be.watch_keys(&[second_enrolled_key()]).await.unwrap(),
+            Some(1),
+            "the fixture must actually enrol a NEW key"
+        );
+
+        let result = be
+            .balance_for_address(&address_of(&second_enrolled_key()), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.source,
+            Source::Fallback,
+            "a replica whose catch-up never covered this address answered for it anyway; it holds \
+             nothing, so that answer is `balance 0` for a funded wallet"
+        );
+        assert!(!result.synced);
+    }
+
+    /// **Proves:** the invalidation is on WIDENING, not on being spoken to.
+    ///
+    /// `control.wallet.watch` is idempotent and dig-app re-announces its whole account on every
+    /// unlock. NEAREST WRONG IMPLEMENTATION: clearing the flag on every call — which holds a
+    /// perfectly healthy node in permanent fallback for as long as its client keeps saying hello,
+    /// an outage invented by the fix rather than found by it.
+    #[tokio::test]
+    async fn re_announcing_a_known_key_leaves_the_replica_authoritative() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+
+        let be = WalletBackend::new(
+            db.clone(),
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_watchlist(registry);
+
+        assert_eq!(
+            be.watch_keys(&[enrolled_key()]).await.unwrap(),
+            Some(0),
+            "re-announcing a known key must enrol nothing"
+        );
+        assert!(
+            db.is_synced().await.unwrap(),
+            "a re-announcement that widened nothing invalidated the catch-up anyway"
+        );
+    }
+
+    /// **Proves (variant 1b):** the point-read refresh may not declare the replica authoritative
+    /// for addresses it never fetched.
+    ///
+    /// `refresh_tracked_coins` reads coins for CUSTODY's puzzle hashes only, then latches the
+    /// global `initial_sync_complete`. An externally enrolled address is not in that set, so its
+    /// coins were never requested — and the flag would make the replica authoritative for it
+    /// PERMANENTLY, since nothing later clears it.
+    ///
+    /// FIXTURE DESIGN — the enrolled key is deliberately NOT one of custody's, which is the whole
+    /// condition. A fixture enrolling custody's own key is covered by definition and would pass
+    /// against the unfixed code.
+    #[tokio::test]
+    async fn a_custody_only_refresh_does_not_vouch_for_enrolled_addresses() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+        let pair = BlsPair::new(2);
+        let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
+        let custody_ph = hex::encode(signer.puzzle_hashes().iter().next().unwrap());
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(
+            db.clone(),
+            Arc::new(MockFallback::with_coins(vec![FallbackCoin {
+                coin_id: "aa".repeat(32),
+                parent_coin_info: "11".repeat(32),
+                puzzle_hash: custody_ph.clone(),
+                amount: 7_000,
+                created_height: Some(5),
+                spent_height: None,
+                created_timestamp: Some(1),
+                spent_timestamp: None,
+            }])),
+            WalletConfig {
+                puzzle_hashes: vec![custody_ph],
+                ..Default::default()
+            },
+        )
+        .with_signer(signer)
+        .with_watchlist(registry);
+
+        assert_eq!(
+            be.refresh_tracked_coins().await.unwrap(),
+            1,
+            "the fixture must actually sync custody's own coin"
+        );
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "a refresh that fetched only custody's addresses declared the replica authoritative \
+             for an enrolled address whose coins it never requested — permanently, since nothing \
+             clears the flag"
+        );
+
+        // The CONTROL: the same refresh on a node with nothing externally enrolled still latches,
+        // so the guard did not simply switch the point-read path off.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let pair = BlsPair::new(2);
+        let signer = Arc::new(WalletSigner::new(vec![pair.sk], Bytes32::new([0u8; 32])));
+        let custody_ph = hex::encode(signer.puzzle_hashes().iter().next().unwrap());
+        let be = WalletBackend::new(
+            db.clone(),
+            Arc::new(MockFallback::with_coins(vec![FallbackCoin {
+                coin_id: "bb".repeat(32),
+                parent_coin_info: "11".repeat(32),
+                puzzle_hash: custody_ph.clone(),
+                amount: 7_000,
+                created_height: Some(5),
+                spent_height: None,
+                created_timestamp: Some(1),
+                spent_timestamp: None,
+            }])),
+            WalletConfig {
+                puzzle_hashes: vec![custody_ph],
+                ..Default::default()
+            },
+        )
+        .with_signer(signer);
+        assert_eq!(be.refresh_tracked_coins().await.unwrap(), 1);
+        assert!(
+            db.is_synced().await.unwrap(),
+            "a node with nothing externally enrolled stopped latching its own refresh"
+        );
     }
 
     /// The CONTROL, and the reason the predicate is membership rather than "a registry exists".
