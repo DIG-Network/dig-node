@@ -616,10 +616,15 @@ impl CatchUpReplay {
     /// stray `new_peak_wallet` frame gets. Unlike a peak frame, this value arms
     /// `initial_sync_complete` AND the arrival baseline in the same statement, so there is no
     /// benign reading of it.
+    /// `covered` is the puzzle-hash set the catch-up SUBSCRIBED — the same vector the request
+    /// loop sent — and it is a required argument for the same reason the header hash is: the
+    /// completion write records which addresses it covered, and a set passed alongside the write
+    /// rather than carried by the evidence could describe a different one (dig_ecosystem#2871).
     pub fn finished_at(
         ceiling: Option<PeakCeiling>,
         peak_height: u32,
         header_hash: impl Into<String>,
+        covered: &[Bytes32],
     ) -> Result<Self, SyncError> {
         if let Some(ceiling) = ceiling {
             if !ceiling.admits(peak_height) {
@@ -639,6 +644,7 @@ impl CatchUpReplay {
         Ok(Self {
             peak_height,
             header_hash: header_hash.into(),
+            covered: crate::sage::coverage::CoveredSet::from_hashes(covered),
         })
     }
 }
@@ -993,6 +999,7 @@ pub async fn initial_sync_with_authority(
                 authority.ceiling(),
                 respond.height,
                 hex::encode(respond.header_hash),
+                &puzzle_hashes,
             )?)
             .await?;
             return Ok(());

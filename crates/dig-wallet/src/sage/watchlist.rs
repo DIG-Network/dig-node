@@ -91,7 +91,13 @@ impl WatchRegistry {
     ///
     /// Idempotent: re-registering a known key changes nothing and reports 0 added, so a client may
     /// safely re-announce its account on every unlock.
-    pub fn watch(&self, keys: &[PublicKey]) -> usize {
+    ///
+    /// `pub(crate)`, not `pub`, so the SINGLE DOOR onto enrolment
+    /// ([`super::rpc::WalletBackend::watch_keys`]) is a guarantee the compiler holds rather than a
+    /// convention a future caller can walk around: widening the followed set is what invalidates
+    /// the replica's coverage, and a widening that happened outside that door would be invisible to
+    /// every reviewer who checked the door (dig_ecosystem#2871).
+    pub(crate) fn watch(&self, keys: &[PublicKey]) -> usize {
         let added = {
             let mut set = self.keys.write().unwrap();
             let before = set.len();

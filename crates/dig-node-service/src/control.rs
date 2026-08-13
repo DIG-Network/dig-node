@@ -2093,20 +2093,12 @@ async fn wallet_watch(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
         Ok(k) => k,
         Err(e) => return e,
     };
-    // Routed through the backend rather than straight at the registry: enrolment widens the set of
-    // addresses reads treat as replica-backed, and the replica's completed catch-up covered the old
-    // one. `watch_keys` is the single door that keeps those two facts in step
-    // (dig_ecosystem#2871).
-    let added = match ctx.wallet.watch_keys(&keys).await {
-        Ok(Some(added)) => added,
-        Ok(None) => return no_watchlist(id),
-        Err(e) => {
-            return control_error(
-                id,
-                ErrorCode::WalletReadFailed,
-                format!("the keys were enrolled but the replica could not be marked stale: {e}"),
-            )
-        }
+    // Routed through the backend rather than straight at the registry, and the registry's own
+    // `watch` is `pub(crate)` so this is the only door there is. Enrolment widens the set of
+    // addresses reads treat as replica-backed; the replica answers for that widened set only once a
+    // sync records covering it (dig_ecosystem#2871).
+    let Some(added) = ctx.wallet.watch_keys(&keys) else {
+        return no_watchlist(id);
     };
     let watched = ctx
         .wallet

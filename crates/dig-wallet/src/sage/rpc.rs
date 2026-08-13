@@ -25,6 +25,7 @@ use chia_wallet_sdk::types::{MAINNET_CONSTANTS, TESTNET11_CONSTANTS};
 
 use super::auth::{AuthMethod, Credential, UnlockAuth, UnlockMode};
 use super::chain::PushOutcome;
+use super::coverage::CoveredSet;
 use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
@@ -678,44 +679,69 @@ impl WalletBackend {
         self.watchlist.as_ref()
     }
 
-    /// Enrol `keys` to be followed, and INVALIDATE the completed catch-up that did not cover them.
+    /// Enrol `keys` to be followed.
     ///
-    /// The single door onto [`super::watchlist::WatchRegistry::watch`]. Enrolment is not merely a
-    /// registry write: it WIDENS the set of addresses reads treat as replica-backed, and the
-    /// replica's completed catch-up covered the OLD set. Leaving `initial_sync_complete` latched
-    /// across that widening is how a funded, newly-enrolled address was answered
-    /// `balance: 0, synced: true, source: "db"` — the DB was queried for a scope it had never
-    /// been asked to follow (dig_ecosystem#2871).
+    /// The single door onto [`super::watchlist::WatchRegistry::watch`], and now a thin one: it
+    /// registers, and nothing else. Enrolment WIDENS the set of addresses reads treat as
+    /// replica-backed, and the replica's completed catch-up covered the OLD set — but that is no
+    /// longer this method's problem to remember. The completed catch-up records the set it actually
+    /// ran over ([`super::coverage`]), and [`Self::replica_is_authoritative`] compares it against
+    /// the set this node follows RIGHT NOW, so a widening invalidates coverage by arithmetic rather
+    /// than by a second write landing in the right order (dig_ecosystem#2871).
     ///
-    /// So the flag is cleared, and reads for EVERY address fall to the chain tier until the next
-    /// catch-up completes over the widened set. That costs up to one session lifetime of oracle
-    /// reads, and the oracle answers truthfully; the alternative answers falsely from the replica.
-    /// Failing to the oracle is the correct direction, and it matches the fail-closed posture
-    /// `handle_coin_state_update` already takes on a backwards chain move.
-    ///
-    /// # Only a real widening invalidates anything
-    ///
-    /// `watch` is idempotent, and clients re-announce their whole account on every unlock. Clearing
-    /// the flag on a re-announcement that added nothing would hold a healthy node in permanent
-    /// fallback for as long as the client kept saying hello — a self-inflicted outage where there
-    /// was no defect. Nothing new enrolled means the catch-up still covers the set.
+    /// That matters because ordering was never achievable here. Registration persists before any
+    /// follow-up could run, so a failed or interrupted invalidation left the widened set latched —
+    /// and `watch` is idempotent, so the client's retry enrolled nothing and would have invalidated
+    /// nothing. Deleting the second write deletes the window.
     ///
     /// Returns how many keys were newly enrolled, or `None` where no registry is attached — which
     /// a caller MUST surface as a refusal rather than as a registration that went nowhere.
-    pub async fn watch_keys(&self, keys: &[PublicKey]) -> sqlx::Result<Option<usize>> {
-        let Some(registry) = self.watchlist.as_ref() else {
-            return Ok(None);
-        };
+    pub fn watch_keys(&self, keys: &[PublicKey]) -> Option<usize> {
+        let registry = self.watchlist.as_ref()?;
         let added = registry.watch(keys);
         if added > 0 {
-            self.db.set_initial_sync_complete(false).await?;
             tracing::info!(
                 added,
-                "wallet watch: newly enrolled keys widened the followed set; the replica is no \
-                 longer authoritative until the next catch-up covers them"
+                "wallet watch: newly enrolled keys widened the followed set; the replica answers                  for none of it until a catch-up covers the widened set"
             );
         }
-        Ok(Some(added))
+        Some(added)
+    }
+
+    /// The puzzle-hash set this backend FOLLOWS right now — its custody's addresses plus every
+    /// externally enrolled key's.
+    ///
+    /// Delegates to [`super::sync_supervisor::followed_puzzle_hashes`], the SAME union the
+    /// supervisor subscribes, so "did the sync cover what we follow?" is asked about one set rather
+    /// than two spellings of it.
+    fn followed_set(&self) -> CoveredSet {
+        CoveredSet::from_hashes(&super::sync_supervisor::followed_puzzle_hashes(
+            self.custody.as_ref(),
+            self.watchlist.as_ref(),
+        ))
+    }
+
+    /// May the local replica answer for money?
+    ///
+    /// TWO facts, not one. `initial_sync_complete` says a catch-up FINISHED; the recorded covered
+    /// set says which addresses it finished OVER. Routing on the flag alone is what answered a
+    /// funded, newly-enrolled address `balance: 0, synced: true, source: "db"` — the DB was queried
+    /// for a scope it had never been asked to follow (dig_ecosystem#2871).
+    ///
+    /// Asked as CONTAINMENT: a widened followed set is no longer covered and every read falls to
+    /// the chain oracle until a catch-up covers it, while a NARROWED one (an `unwatch`) stays
+    /// covered, because a sync over the wider set genuinely covered what remains. An absent
+    /// recording — a pre-#2871 replica, or the oracle refresh declining to claim coverage — covers
+    /// nothing.
+    ///
+    /// Both money reads ([`Self::balance_for_address`], [`Self::coins_for_address`]) call this and
+    /// nothing else, so the two cannot come to differ about when the replica is trusted.
+    async fn replica_is_authoritative(&self) -> sqlx::Result<bool> {
+        let state = self.db.sync_state().await?;
+        Ok(state.initial_sync_complete
+            && state
+                .covered
+                .is_some_and(|covered| covered.covers(&self.followed_set())))
     }
 
     /// Does `phs` cover every externally enrolled address — so a sync over `phs` alone may declare
@@ -992,7 +1018,12 @@ impl WalletBackend {
         let asset_id = asset.asset_id_hex();
 
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
-        let db_synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        // NOT `is_synced()`. The flag alone says a catch-up finished, never over WHICH addresses;
+        // routing on it answered a newly-enrolled funded address a dated zero (dig_ecosystem#2871).
+        let db_synced = self
+            .replica_is_authoritative()
+            .await
+            .map_err(|e| read_err(e.into()))?;
         // An address is IN SCOPE when this replica follows it: either this node derived it, or an
         // enrolled key controls it. Enrolment never writes a derivation row, so the first test
         // alone was false forever for every registered address (dig_ecosystem#2866).
@@ -1133,7 +1164,12 @@ impl WalletBackend {
         let asset_id = asset.asset_id_hex();
 
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
-        let db_synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        // NOT `is_synced()`. The flag alone says a catch-up finished, never over WHICH addresses;
+        // routing on it answered a newly-enrolled funded address a dated zero (dig_ecosystem#2871).
+        let db_synced = self
+            .replica_is_authoritative()
+            .await
+            .map_err(|e| read_err(e.into()))?;
         // An address is IN SCOPE when this replica follows it: either this node derived it, or an
         // enrolled key controls it. Enrolment never writes a derivation row, so the first test
         // alone was false forever for every registered address (dig_ecosystem#2866).
@@ -2496,6 +2532,15 @@ impl WalletBackend {
         // the PERMANENT form of it: nothing later clears the flag, so a funded enrolled address
         // would answer `balance: 0, synced: true, source: "db"` for the life of the install.
         if self.watchlist_is_covered_by(&phs) {
+            // The flag AND the set it was earned over. Latching the flag alone would leave the
+            // recorded coverage stale — describing whatever the LAST catch-up ran over, or nothing
+            // at all on a replica that never had one — and the read router asks about coverage, so
+            // a flag with no matching recording buys this path nothing (dig_ecosystem#2871).
+            //
+            // `phs` is what this pass actually fetched, so recording it is the honest claim: it
+            // covers custody's own addresses, and `watchlist_is_covered_by` above has already
+            // established that it covers every enrolled one too.
+            self.db.record_coverage(&CoveredSet::from_hex(&phs)).await?;
             self.db.set_initial_sync_complete(true).await?;
         } else {
             tracing::info!(
@@ -4221,7 +4266,7 @@ fn encode_address(puzzle_hash_hex: &str, prefix: &str) -> Option<String> {
 
 /// Normalize a puzzle-hash hex for identity scoping (#407): strip an optional `0x` prefix
 /// and lowercase, so client-supplied hashes match the DB's `hex::encode` form.
-fn normalize_ph(ph: &str) -> String {
+pub(super) fn normalize_ph(ph: &str) -> String {
     ph.strip_prefix("0x").unwrap_or(ph).to_ascii_lowercase()
 }
 

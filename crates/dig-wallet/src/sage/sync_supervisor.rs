@@ -680,15 +680,36 @@ impl UnionPuzzleHashSource {
     }
 }
 
+/// The addresses a node FOLLOWS: its own custody's, plus every externally enrolled key's.
+///
+/// The one definition of that union, shared by the two sides that must never disagree about it —
+/// [`UnionPuzzleHashSource`], which is what the supervisor SUBSCRIBES, and
+/// [`crate::sage::rpc::WalletBackend`], which asks whether the last completed catch-up still covers
+/// it before treating the replica as authoritative (dig_ecosystem#2871). A second copy of this
+/// union would let the router believe a set the subscriber never followed.
+///
+/// Either side may be absent: a §908 install custodies nothing, and a backend wired without a
+/// registry follows only its own addresses.
+pub(crate) fn followed_puzzle_hashes(
+    custody: Option<&WalletCustody>,
+    registry: Option<&WatchRegistry>,
+) -> Vec<Bytes32> {
+    let mut hashes: BTreeSet<Bytes32> = custody
+        .map(PuzzleHashSource::puzzle_hashes)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if let Some(registry) = registry {
+        hashes.extend(registry.registered().iter().map(puzzle_hash_for));
+    }
+    // Sorted + deduplicated by construction, so a subscription (and a test asserting one) is
+    // reproducible regardless of which side contributed a hash.
+    hashes.into_iter().collect()
+}
+
 impl PuzzleHashSource for UnionPuzzleHashSource {
     fn puzzle_hashes(&self) -> Vec<Bytes32> {
-        let mut hashes: BTreeSet<Bytes32> = PuzzleHashSource::puzzle_hashes(&self.custody)
-            .into_iter()
-            .collect();
-        hashes.extend(self.registry.registered().iter().map(puzzle_hash_for));
-        // Sorted + deduplicated by construction, so a subscription (and a test asserting one) is
-        // reproducible regardless of which side contributed a hash.
-        hashes.into_iter().collect()
+        followed_puzzle_hashes(Some(&self.custody), Some(&self.registry))
     }
 
     /// A node with registered keys and NO custody genuinely has a wallet enrolled, so it must not
