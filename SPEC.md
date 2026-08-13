@@ -3873,13 +3873,14 @@ answered "finished" immediately, so completing it would mark an un-queried DB au
 report a funded wallet as empty. A node with no wallet therefore stays unsynced, and — where its only
 peer is a discovered one — writes nothing at all.
 
-**Invariant — the replica MUST answer only for addresses a sync actually COVERED.** A completed sync MUST
-record the puzzle-hash SET it ran over, in the SAME write that marks the replica authoritative, and a read
-MUST be served from the local replica only while that recording CONTAINS the set the node currently
-follows. `initial_sync_complete` alone MUST NOT decide it: that flag records THAT a sync finished, never
-WHICH addresses it covered, so a set that WIDENS after a completed sync — an enrolment — would otherwise
-make the replica authoritative for an address it never followed and answer a funded wallet
-`balance: 0, synced: true, source: "db"`.
+**Invariant — the replica MUST answer only for addresses a sync actually COVERED on the address-scoped money
+reads.** A completed sync MUST record the puzzle-hash SET it ran over, in the SAME write that marks the
+replica authoritative, and an address-scoped money read (`balance_for_address` / `coins_for_address`;
+`control.wallet.balance` / `control.wallet.coins`) MUST be served from the local replica only while that
+recording CONTAINS the set the node currently follows. `initial_sync_complete` alone MUST NOT decide those
+reads: that flag records THAT a sync finished, never WHICH addresses it covered, so a set that WIDENS after
+a completed sync — an enrolment — would otherwise make the replica authoritative for an address it never
+followed and answer a funded wallet `balance: 0, synced: true, source: "db"`.
 
 The question MUST be asked as CONTAINMENT, not equality: a set that has NARROWED (an `unwatch`) is still
 covered by the wider sync that ran over it, and invalidating on a narrowing forces a needless full resync.
@@ -3887,7 +3888,8 @@ Coverage MUST NOT be inferred from a second write ordered against the first: an 
 any follow-up can run, and `watch` is idempotent, so an interrupted or failed invalidation would latch the
 widened set permanently while the client's retry enrolled nothing and invalidated nothing. A missing
 recording (a replica synced before this rule) covers NOTHING — reads fall to the chain tier, which answers
-truthfully.
+truthfully. The identity-scoped Sage-parity reads `get_sync_status` and `wallet_coins` still route on
+`initial_sync_complete` alone for the connected client's scoped identity and are tracked separately.
 
 **Invariant.** A catch-up MUST NOT run over an UNCORROBORATED peer, and `initial_sync_complete` MUST NOT
 be set as a result of one. `initial_sync` itself refuses with `UntrustedPeer`, and it decides on the
