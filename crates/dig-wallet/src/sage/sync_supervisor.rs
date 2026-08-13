@@ -132,7 +132,7 @@ const STALL_POLL: Duration = Duration::from_secs(15);
 /// It exceeds [`HEALTHY_SESSION`], so a session ended this way still counts as healthy at
 /// [`Supervisor::run`]'s ladder reset and reconnects promptly instead of climbing the backoff
 /// ladder toward [`BACKOFF_MAX`].
-const STALL_AFTER: Duration = Duration::from_secs(90);
+pub(crate) const STALL_AFTER: Duration = Duration::from_secs(90);
 /// How long ONE subscription session runs before it is retired and a fresh peer is dialled.
 ///
 /// AN ANTI-CAPTURE BOUND, NOT A LIVENESS MECHANISM. Liveness belongs to [`STALL_AFTER`], which
@@ -529,7 +529,7 @@ impl SyncHandle {
 /// missing measurement must not be spent as evidence against the replica.
 ///
 /// See [`FOLLOWING_TOLERANCE`] for why the slack is small and which way it is allowed to be wrong.
-fn is_following(replica: Option<u32>, peers: Option<u32>) -> bool {
+pub(crate) fn is_following(replica: Option<u32>, peers: Option<u32>) -> bool {
     match (replica, peers) {
         (Some(replica), Some(peers)) => peers.saturating_sub(replica) <= FOLLOWING_TOLERANCE,
         _ => true,
@@ -916,7 +916,7 @@ enum SessionOutcome {
 
 /// What one stall observation concluded.
 #[derive(Debug, PartialEq, Eq)]
-enum StallVerdict {
+pub(crate) enum StallVerdict {
     /// The replica is following the chain, or nothing can be said about it.
     Following,
     /// It is following again, and the last thing the log said was that it had stopped.
@@ -936,7 +936,7 @@ enum StallVerdict {
 /// Split out as a pure state machine with no I/O so every branch — including the ones that must NOT
 /// accuse — is directly testable.
 #[derive(Debug, Default)]
-struct StallWatch {
+pub(crate) struct StallWatch {
     /// The replica peak at the previous observation, so "advanced" is a comparison rather than a
     /// guess.
     last_replica: Option<u32>,
@@ -952,7 +952,12 @@ impl StallWatch {
     /// Only POSITIVE evidence accuses: an unobservable height on either side, and a replica merely
     /// LEVEL with its peers, both reset the clock. A quiet chain and a node that cannot see the
     /// chain are ordinary, and neither is grounds for tearing down a working session.
-    fn observe(&mut self, replica: Option<u32>, peers: Option<u32>, now: Instant) -> StallVerdict {
+    pub(crate) fn observe(
+        &mut self,
+        replica: Option<u32>,
+        peers: Option<u32>,
+        now: Instant,
+    ) -> StallVerdict {
         let advanced =
             matches!((replica, self.last_replica), (Some(now), Some(before)) if now > before);
         self.last_replica = replica.or(self.last_replica);
