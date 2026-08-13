@@ -2342,18 +2342,102 @@ async fn a_stalled_authoritative_session_is_ended_and_reconnects() {
 
 /// Collects everything logged on the calling thread, so a test can assert a diagnostic actually
 /// reached the sink rather than trusting that it was written.
+///
+/// # Why ONE process-wide subscriber, and not a scoped one per test
+///
+/// The obvious fixture — `tracing::subscriber::set_default` per test — LOSES LINES, and loses them
+/// one callsite at a time. A callsite's [`tracing::subscriber::Interest`] is resolved the first time
+/// that source line executes and is then cached PROCESS-WIDE. Scoped subscribers do not participate
+/// in that resolution, so whichever test reaches `warn!("… has not advanced …")` first — and
+/// several stall tests reach it with no subscriber installed — cached that ONE line as disabled for
+/// the rest of the binary, while every other line kept working.
+///
+/// That is not a theory. Under the scoped fixture, a capture was observed holding the recovery
+/// `INFO` while MISSING the stall `WARN` that the same task had emitted microseconds earlier on the
+/// same thread — three failures in ten full-module runs, always on a `warn!` assertion. A fixture
+/// that can miss a line production really wrote can equally pass while production wrote nothing, so
+/// it was unsound in both directions and no amount of retrying would have fixed it.
+///
+/// Installing one real subscriber for the whole binary means interest is always resolved against a
+/// subscriber that says yes, and [`tracing::callsite::rebuild_interest_cache`] repairs any callsite
+/// that was already cached off before the first capture test ran. Isolation then comes from the
+/// SINK rather than from the dispatcher: events land in the calling thread's installed buffer, and
+/// a thread that installed none discards them, so concurrent tests cannot write into each other.
 #[derive(Clone, Default)]
 struct Capture(Arc<Mutex<Vec<u8>>>);
 
+thread_local! {
+    /// The buffer this thread's events are appended to, if it installed one.
+    static CAPTURE_SINK: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 impl Capture {
+    /// Route this thread's log events into this capture until the returned guard is dropped.
+    ///
+    /// Installs the process-wide subscriber on first use. A test's supervisor task must be polled
+    /// on the installing thread for its lines to land here — which `#[tokio::test]`'s
+    /// current-thread runtime guarantees, and which every caller then CHECKS rather than assumes
+    /// via [`Capture::assert_saw_the_supervisor`].
+    fn install(&self) -> CaptureGuard {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(ThreadSink)
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::TRACE)
+                    .finish(),
+            );
+            // Repairs every callsite that was already resolved — against no subscriber, and so as
+            // disabled — by a test that ran before this one.
+            tracing::callsite::rebuild_interest_cache();
+        });
+        CAPTURE_SINK.with(|sink| *sink.borrow_mut() = Some(Arc::clone(&self.0)));
+        CaptureGuard
+    }
+
     fn contents(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
     }
+
+    /// Fail LOUDLY if the supervisor's own lines never reached this capture.
+    ///
+    /// The positive control for the one assumption the fixture still makes — that the supervisor
+    /// task is polled on the installing thread. Without it, a future runtime-flavour change would
+    /// turn every assertion here into a claim about an empty buffer, which is the failure mode this
+    /// fixture was rewritten to abolish rather than to relocate.
+    fn assert_saw_the_supervisor(&self) {
+        let log = self.contents();
+        assert!(
+            log.contains("wallet sync:"),
+            "the capture saw NOTHING from the supervisor, so every assertion below would be about \
+             an empty buffer rather than about production: {log}"
+        );
+    }
 }
 
-impl std::io::Write for Capture {
+/// Detaches the calling thread's capture on drop.
+struct CaptureGuard;
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURE_SINK.with(|sink| *sink.borrow_mut() = None);
+    }
+}
+
+/// The process-wide writer: appends to whatever buffer the emitting thread installed.
+struct ThreadSink;
+
+/// A borrowed handle on one thread's capture buffer. `None` discards, so a thread with no capture
+/// installed logs into nothing instead of into somebody else's assertions.
+struct ThreadWriter(Option<Arc<Mutex<Vec<u8>>>>);
+
+impl std::io::Write for ThreadWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        if let Some(buffer) = &self.0 {
+            buffer.lock().unwrap().extend_from_slice(buf);
+        }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -2361,10 +2445,10 @@ impl std::io::Write for Capture {
     }
 }
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
-    type Writer = Self;
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadSink {
+    type Writer = ThreadWriter;
     fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+        ThreadWriter(CAPTURE_SINK.with(|sink| sink.borrow().clone()))
     }
 }
 
@@ -2380,17 +2464,17 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
 /// FIXTURE DESIGN — the chain-tip double holds the replica still until a SECOND session exists, so
 /// the first session genuinely stalls on positive evidence and the recovery genuinely belongs to
 /// its successor. A double that advanced from the start would log a recovery that was never owed.
-/// The subscriber is thread-local and this runtime is single-threaded, so a line written by the
-/// supervisor task is captured; if it were not, the assertions would fail rather than pass empty.
+///
+/// The two lines are awaited and asserted SEPARATELY, in the order production emits them. Awaiting
+/// only the recovery and then asserting the stall reads as one check but is two, and the wait can
+/// be satisfied while the stall line is absent — which is exactly how a lost line surfaced as a
+/// baffling assertion failure instead of as a named instrument fault. The stall line needs no wait
+/// of its own: `await_stall` emits it synchronously BEFORE returning, so a second connect already
+/// implies it.
 #[tokio::test]
 async fn a_stall_and_its_recovery_are_both_named_in_the_log() {
     let capture = Capture::default();
-    let guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish(),
-    );
+    let guard = capture.install();
 
     let db = WalletDb::open_in_memory().await.unwrap();
     let script = Script::new();
@@ -2422,6 +2506,16 @@ async fn a_stall_and_its_recovery_are_both_named_in_the_log() {
             s.connects.load(Ordering::SeqCst) >= 2
         })
         .await;
+    // Checked HERE, before anything else is awaited: the session ended, so the warning that ends it
+    // has already been written, and a capture missing it is an instrument fault rather than a
+    // production one. Asserting it after the recovery wait would have blamed the wrong thing.
+    capture.assert_saw_the_supervisor();
+    assert!(
+        capture.contents().contains("has not advanced"),
+        "the stall itself must be named: {}",
+        capture.contents()
+    );
+
     harness
         .until(
             "the successor session to observe the replica advancing",
@@ -2734,12 +2828,7 @@ async fn stall_evidence_survives_the_end_of_a_session() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let script = Script::new();
     let capture = Capture::default();
-    let guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .finish(),
-    );
+    let guard = capture.install();
 
     let harness = Harness::start_everything(
         db,
@@ -2763,6 +2852,7 @@ async fn stall_evidence_survives_the_end_of_a_session() {
         .await;
 
     harness.stop().await;
+    capture.assert_saw_the_supervisor();
     let log = capture.contents();
     drop(guard);
     assert!(
