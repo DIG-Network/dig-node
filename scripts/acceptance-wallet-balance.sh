@@ -20,7 +20,7 @@
 # method, a balance read must be answered BY THE REPLICA. `source: "db"` is only reachable when all
 # four gates hold, and no layer-level test can pass in its place.
 #
-# Usage:  scripts/acceptance-wallet-balance.sh <xch-address> [--port 9778]
+# Usage:  scripts/acceptance-wallet-balance.sh <xch-address> [port]     # port defaults to 9778
 # Exit:   0 = the whole path works; 1 = a named gate failed; 2 = usage/environment error.
 set -uo pipefail
 
