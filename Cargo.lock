@@ -2237,9 +2237,9 @@ dependencies = [
 
 [[package]]
 name = "dig-node-control-interface"
-version = "0.11.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "751932b3273bda90c0cdf1e1116afb7db7e2645c84341d9e6824e329a845ace9"
+checksum = "86e047496591c00027d843bf9bd27c858fcd27035e0020eed9a8b2b0d64c87cc"
 dependencies = [
  "async-trait",
  "semver",
@@ -2313,6 +2313,7 @@ dependencies = [
  "axum",
  "axum-server",
  "base64",
+ "chia",
  "clap",
  "dig-cert",
  "dig-constants 0.9.0",
@@ -2328,6 +2329,7 @@ dependencies = [
  "digstore-stage",
  "futures-util",
  "getrandom 0.2.17",
+ "hex",
  "libc",
  "reqwest",
  "rustls",

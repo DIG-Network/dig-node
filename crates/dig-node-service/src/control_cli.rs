@@ -80,6 +80,13 @@ pub enum ControlAction {
     WalletPeak,
     /// `control.wallet.broadcast` — push an ALREADY-SIGNED spend bundle. The node signs nothing.
     WalletBroadcast { signed_bundle_hex: String },
+    /// `control.wallet.watch` — register PUBLIC keys whose addresses this node should follow.
+    /// Public keys only: no seed crosses and nothing here gains a signing capability (§908).
+    WalletWatch { public_keys: Vec<String> },
+    /// `control.wallet.unwatch` — stop following the addresses of these public keys.
+    WalletUnwatch { public_keys: Vec<String> },
+    /// `control.wallet.watched` — the public keys this node is currently following.
+    WalletWatched,
     /// `control.updater.status` — the DIG auto-update beacon's status.
     UpdaterStatus,
     /// `control.updater.setChannel` — set the beacon channel (`nightly` | `stable`).
@@ -124,6 +131,9 @@ impl ControlAction {
             ControlAction::WalletPeak => "control.wallet.peak",
             ControlAction::WalletSyncStatus => "control.wallet.syncStatus",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
+            ControlAction::WalletWatch { .. } => "control.wallet.watch",
+            ControlAction::WalletUnwatch { .. } => "control.wallet.unwatch",
+            ControlAction::WalletWatched => "control.wallet.watched",
             ControlAction::UpdaterStatus => "control.updater.status",
             ControlAction::UpdaterSetChannel { .. } => "control.updater.setChannel",
             ControlAction::UpdaterPause { .. } => "control.updater.pause",
@@ -265,6 +275,15 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
             signed_bundle_hex: String::new(),
         }
         .method(),
+        ControlAction::WalletWatch {
+            public_keys: Vec::new(),
+        }
+        .method(),
+        ControlAction::WalletUnwatch {
+            public_keys: Vec::new(),
+        }
+        .method(),
+        ControlAction::WalletWatched.method(),
         ControlAction::UpdaterStatus.method(),
         ControlAction::UpdaterSetChannel {
             channel: String::new(),

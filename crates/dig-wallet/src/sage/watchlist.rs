@@ -39,6 +39,12 @@ use std::sync::{Arc, RwLock};
 
 use chia::bls::PublicKey;
 
+/// A key this node can be asked to follow: a BLS G1 public key.
+///
+/// Re-exported under a name that says what the key is FOR, so a caller at the control-plane
+/// boundary can speak this API without taking a direct dependency on the BLS crate.
+pub type WatchKey = PublicKey;
+
 /// The registry file, under the node config dir.
 const WATCHLIST_FILE: &str = "watched-keys.json";
 
@@ -122,6 +128,12 @@ impl WatchRegistry {
             // becomes possible.
             .filter_map(|b| PublicKey::from_bytes(b).ok())
             .collect()
+    }
+
+    /// Every registered key as lowercase hex — the form the control surface reports, and the same
+    /// spelling a client passes to register it.
+    pub fn registered_hex(&self) -> Vec<String> {
+        self.keys.read().unwrap().iter().map(hex::encode).collect()
     }
 
     /// Whether anything at all is registered — the "is a wallet enrolled here" question for a node
@@ -209,12 +221,16 @@ fn load(path: &Path) -> BTreeSet<[u8; 48]> {
     set
 }
 
-/// Parse one 48-byte G1 public key from lowercase hex.
+/// Parse one 48-byte G1 public key from hex.
+///
+/// A `0x` prefix is tolerated and normalized away, matching the published contract's rule for coin
+/// ids, so a client that spells its keys either way is understood rather than silently rejected.
 ///
 /// Public so the RPC boundary refuses a malformed request outright rather than registering the
 /// subset that happened to parse.
 pub fn decode_key(hex_key: &str) -> Option<PublicKey> {
-    let bytes: [u8; 48] = hex::decode(hex_key).ok()?.try_into().ok()?;
+    let unprefixed = hex_key.strip_prefix("0x").unwrap_or(hex_key);
+    let bytes: [u8; 48] = hex::decode(unprefixed).ok()?.try_into().ok()?;
     PublicKey::from_bytes(&bytes).ok()
 }
 
@@ -323,6 +339,17 @@ mod tests {
         handler.watch(&[key(3)]);
 
         assert_eq!(supervisor.registered(), vec![key(3)]);
+    }
+
+    /// The published contract tolerates a `0x` prefix and normalizes it away, so both spellings
+    /// must name the SAME key — a client that prefixes must not enrol a duplicate.
+    #[test]
+    fn a_0x_prefixed_key_is_the_same_key() {
+        let plain = hex::encode(key(5).to_bytes());
+        let prefixed = format!("0x{plain}");
+
+        assert_eq!(decode_key(&prefixed), decode_key(&plain));
+        assert_eq!(decode_key(&prefixed), Some(key(5)));
     }
 
     /// A corrupt file follows NOTHING rather than silently following a partial set.
