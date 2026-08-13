@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.116.0] - 2026-08-13
+
+### Features
+- **wallet:** Follow externally-registered addresses and keep the replica syncing (#219)
+
 ## [0.115.1] - 2026-08-12
 
 ### Documentation
