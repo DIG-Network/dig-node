@@ -83,6 +83,7 @@ pub mod themes;
 pub mod tipping;
 pub mod transport;
 pub mod types;
+pub mod watchlist;
 
 use std::fmt;
 

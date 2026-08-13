@@ -1944,3 +1944,199 @@ fn elevation_requires_both_a_verdict_and_the_writers_agreement() {
     assert!(!may_elevate(&split, Some(HONEST_HASH)));
     assert!(!may_elevate(&split, None));
 }
+
+// ---------------------------------------------------------------------------
+// The union source (dig_ecosystem#2823) — custody ∪ externally-registered keys
+// ---------------------------------------------------------------------------
+
+/// A distinct, valid G1 key per `tag`, standing in for a key dig-app registered.
+fn registered_key(tag: u8) -> chia::bls::PublicKey {
+    let mut seed = [0u8; 64];
+    seed[0] = tag;
+    chia::bls::SecretKey::from_seed(&seed).public_key()
+}
+
+/// **Proves (#2823):** the §908 install — an account in dig-app, NO seed on the node — reaches a
+/// non-empty subscription set through a registration alone.
+///
+/// This is the whole blocker: `watched_addresses` was permanently 0 there, `initial_sync` refused
+/// the empty set by design, and the replica's peak never advanced.
+///
+/// `any_wallet()` is asserted separately because the two facts are independent: a source that
+/// derived enrolment from the address set would pass the first assertion and still be the
+/// implementation #2609 exists to forbid.
+#[test]
+fn a_node_with_no_custody_follows_registered_keys() {
+    let dir = scratch();
+    std::fs::create_dir_all(&dir).unwrap();
+    let custody = WalletCustody::mainnet(dir.clone());
+    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    assert!(
+        PuzzleHashSource::puzzle_hashes(&custody).is_empty(),
+        "the premise: the node custodies nothing"
+    );
+    registry.watch(&[registered_key(1)]);
+
+    let union = UnionPuzzleHashSource::new(custody, registry);
+
+    assert_eq!(
+        union.puzzle_hashes(),
+        vec![puzzle_hash_for(&registered_key(1))],
+        "a registered key must be followed even with no custody at all"
+    );
+    assert!(
+        union.any_wallet(),
+        "a node asked to follow an account HAS a wallet enrolled — reporting the \
+         no-wallet-enrolled all-clear here would deny the user's coins are being tracked"
+    );
+}
+
+/// **Proves (#2823, the under-report defect class #2762):** the union follows BOTH sides.
+///
+/// Custody holds one key and the registry a DIFFERENT one, which is what makes this test able to
+/// see the two nearest wrong implementations — returning only custody's set, or only the
+/// registry's. A fixture where the two sides overlap would pass under both.
+#[test]
+fn the_union_follows_custody_and_registered_keys_together() {
+    let dir = scratch();
+    let custody = WalletCustody::mainnet(dir.clone());
+    custody
+        .create(&test_custody_password(), None)
+        .expect("create a custodied wallet");
+    let custodied: Vec<Bytes32> = PuzzleHashSource::puzzle_hashes(&custody);
+    assert!(!custodied.is_empty(), "a created wallet has public keys");
+
+    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    registry.watch(&[registered_key(2)]);
+    let registered = puzzle_hash_for(&registered_key(2));
+    assert!(
+        !custodied.contains(&registered),
+        "the fixture must keep the two sides disjoint, or it cannot see a dropped side"
+    );
+
+    let union = UnionPuzzleHashSource::new(custody, registry);
+    let watched = union.puzzle_hashes();
+
+    for ph in &custodied {
+        assert!(
+            watched.contains(ph),
+            "dropping custody's own addresses would under-report the NODE's balance"
+        );
+    }
+    assert!(
+        watched.contains(&registered),
+        "dropping the registered address would under-report the USER's balance"
+    );
+    assert_eq!(watched.len(), custodied.len() + 1);
+}
+
+/// **Proves (#2823):** `unwatch` genuinely stops the following.
+///
+/// A second registered key stays enrolled as an honest control, so an implementation that clears
+/// the whole registry — or that removes from the file while the live set keeps serving the
+/// supervisor — is visible rather than passing.
+#[test]
+fn unwatch_removes_the_address_from_the_subscription_set() {
+    let dir = scratch();
+    std::fs::create_dir_all(&dir).unwrap();
+    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    registry.watch(&[registered_key(3), registered_key(4)]);
+    let union = UnionPuzzleHashSource::new(WalletCustody::mainnet(dir.clone()), registry.clone());
+    assert_eq!(union.puzzle_hashes().len(), 2);
+
+    registry.unwatch(&[registered_key(3)]);
+
+    assert_eq!(
+        union.puzzle_hashes(),
+        vec![puzzle_hash_for(&registered_key(4))],
+        "the deregistered address must leave the set the supervisor re-reads, and only it"
+    );
+    let after_restart =
+        UnionPuzzleHashSource::new(WalletCustody::mainnet(dir.clone()), crate::sage::watchlist::WatchRegistry::new(&dir));
+    assert_eq!(
+        after_restart.puzzle_hashes(),
+        vec![puzzle_hash_for(&registered_key(4))],
+        "and a restart must not resurrect it"
+    );
+}
+
+/// **Proves (#2823):** a key present on BOTH sides yields ONE puzzle hash.
+///
+/// dig-app registering an account the node also custodies is an ordinary state, and a duplicated
+/// hash would be sent to the peer twice.
+#[test]
+fn a_key_held_by_both_sides_is_watched_once() {
+    let dir = scratch();
+    let custody = WalletCustody::mainnet(dir.clone());
+    custody
+        .create(&test_custody_password(), None)
+        .expect("create a custodied wallet");
+    let shared = *custody
+        .custodied_public_keys()
+        .iter()
+        .next()
+        .expect("a created wallet has public keys");
+
+    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    registry.watch(&[shared]);
+
+    let watched = UnionPuzzleHashSource::new(custody.clone(), registry).puzzle_hashes();
+
+    assert_eq!(
+        watched,
+        PuzzleHashSource::puzzle_hashes(&custody),
+        "re-registering a custodied key must not change the set at all"
+    );
+}
+
+/// **Proves (#2823 × #2609):** the two empty-set states stay distinguishable through the union.
+///
+/// With nothing custodied and nothing registered the node genuinely has no wallet, and that must
+/// still read as the honest all-clear rather than as "enrolled but unwatched".
+#[test]
+fn an_empty_union_still_reports_the_honest_no_wallet_state() {
+    let dir = scratch();
+    std::fs::create_dir_all(&dir).unwrap();
+    let union = UnionPuzzleHashSource::new(
+        WalletCustody::mainnet(dir.clone()),
+        crate::sage::watchlist::WatchRegistry::new(&dir),
+    );
+
+    assert!(union.puzzle_hashes().is_empty());
+    assert!(
+        !union.any_wallet(),
+        "no custody and no registration is the genuine no-wallet install"
+    );
+}
+
+/// **Proves (#2823 × #2609):** the union keeps the OTHER empty-set state honest too.
+///
+/// A node whose own wallet is enrolled but not unlocked derives no address and has registered
+/// nothing, so the union's address set is empty while a wallet plainly exists. Computing enrolment
+/// as `!puzzle_hashes().is_empty()` — the forbidden implementation, and the one nearest to hand
+/// once two sources are being combined — passes every other test in this group and turns this red.
+#[test]
+fn an_enrolled_but_unreachable_custody_is_not_an_all_clear_through_the_union() {
+    let dir = scratch();
+    let custody = WalletCustody::mainnet(dir.clone());
+    custody
+        .create(&test_custody_password(), None)
+        .expect("create a custodied wallet");
+    // Drop the manifest so it is rebuilt from the seed file alone, without public keys — one of the
+    // four reachable states where an enrolled wallet derives no address.
+    std::fs::remove_file(dir.join("wallets").join("index.json")).expect("remove the manifest");
+    let healed = WalletCustody::mainnet(dir.clone());
+
+    let union =
+        UnionPuzzleHashSource::new(healed, crate::sage::watchlist::WatchRegistry::new(&dir));
+
+    assert!(
+        union.puzzle_hashes().is_empty(),
+        "the premise: no address is derivable and nothing is registered"
+    );
+    assert!(
+        union.any_wallet(),
+        "a wallet IS enrolled — its coins are simply not being followed, which must never read \
+         as the no-wallet all-clear"
+    );
+}

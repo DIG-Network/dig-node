@@ -41,6 +41,7 @@
 //! from custody's persisted PUBLIC keys, which are readable while every wallet is locked. No
 //! seed is touched and nothing here can sign.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -53,6 +54,7 @@ use super::db::WalletDb;
 use super::events::EventBus;
 use super::quorum::{self, Verdict};
 use super::sync::{self, PeerTrust, SyncError};
+use super::watchlist::WatchRegistry;
 
 /// The initial reconnect delay.
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -482,6 +484,57 @@ impl PuzzleHashSource for WalletCustody {
     /// that has no wallet at all.
     fn any_wallet(&self) -> bool {
         WalletCustody::any_wallet(self)
+    }
+}
+
+/// Custody's own addresses PLUS the ones an external client registered
+/// ([`super::watchlist::WatchRegistry`], dig_ecosystem#2823).
+///
+/// # Why the union, and not a replacement
+///
+/// The two sets answer different questions and both must be followed. Custody's set is the coins
+/// the NODE holds; the registry's set is the coins the node was ASKED to follow for a user whose
+/// account lives in dig-app (§908 — the node holds no seed on that install, so custody contributes
+/// nothing at all). Serving either alone silently follows fewer addresses than the operator
+/// arranged, and a too-narrow watch set under-reports a BALANCE — a wrong number that looks like a
+/// working feature (dig_ecosystem#2762). The union is the only answer that cannot do that.
+///
+/// Both sides map through the SAME `StandardArgs::curry_tree_hash` derivation
+/// ([`puzzle_hash_for`]), so there is exactly one public-key → puzzle-hash mapping in the
+/// ecosystem and no app/node byte-drift (§4.1). A key present on both sides yields ONE hash.
+pub struct UnionPuzzleHashSource {
+    /// The node's own custody.
+    custody: WalletCustody,
+    /// Keys registered over `control.wallet.watch`.
+    registry: WatchRegistry,
+}
+
+impl UnionPuzzleHashSource {
+    /// Compose the node's custody with its watch registry.
+    pub fn new(custody: WalletCustody, registry: WatchRegistry) -> Self {
+        Self { custody, registry }
+    }
+}
+
+impl PuzzleHashSource for UnionPuzzleHashSource {
+    fn puzzle_hashes(&self) -> Vec<Bytes32> {
+        let mut hashes: BTreeSet<Bytes32> =
+            PuzzleHashSource::puzzle_hashes(&self.custody).into_iter().collect();
+        hashes.extend(self.registry.registered().iter().map(puzzle_hash_for));
+        // Sorted + deduplicated by construction, so a subscription (and a test asserting one) is
+        // reproducible regardless of which side contributed a hash.
+        hashes.into_iter().collect()
+    }
+
+    /// A node with registered keys and NO custody genuinely has a wallet enrolled, so it must not
+    /// report the `NoWalletEnrolled` all-clear — that is the §908 install, and on it the registry
+    /// is the only evidence a wallet exists at all.
+    ///
+    /// Asked separately from [`Self::puzzle_hashes`] for the reason the trait documents: an empty
+    /// address set means *nothing to do* or *something to do that is not being done*, and only this
+    /// distinguishes them (dig_ecosystem#2609).
+    fn any_wallet(&self) -> bool {
+        PuzzleHashSource::any_wallet(&self.custody) || !self.registry.is_empty()
     }
 }
 
