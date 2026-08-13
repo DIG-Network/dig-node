@@ -156,6 +156,16 @@ const _: () = assert!(
 /// It is the floor UNDER the ratio, not a replacement for it: a round of two must be unanimous
 /// (`required_agreement(2) == 2`), so the floor buys a thin round no leniency about agreeing.
 ///
+/// # Why it is TWO and not three, from the measurement rather than from taste
+///
+/// Raising it to three is the intuitive hardening and it would re-create the incident. The round
+/// that froze the user's installed node reported `Insufficient { answered: 2, required: 4 }` —
+/// **two peers answered**, not four. A floor of three refuses that round for as long as the
+/// network stays that thin, which is the frozen replica again, arrived at by a different route.
+/// The strength a thin round lacks is bought by [`required_agreement`] (two of two must agree)
+/// and by [`band_kept_a_majority`] (a round whose CLAIMS are split is refused outright), never by
+/// demanding more peers answer than the network is currently offering.
+///
 /// This is recorded in `SPEC.md` §18.6 as an ASSUMPTION rather than a derived constant, because
 /// it encodes a judgement about what the word "corroborated" is allowed to mean, and the operator
 /// of this node may reasonably overturn it in either direction.
@@ -389,6 +399,12 @@ pub struct Candidate {
 /// outlier: the liar is admitted, drawn no more often than anyone else, and outvoted at the
 /// settled height, which is what the rest of this module is for.
 ///
+/// **A median CAN be moved by a coordinated half**, and this filter does not pretend otherwise.
+/// Half the claimants announcing a plausible lag place the median on themselves and the band off
+/// the honest set entirely. Nothing here detects that — the detection is
+/// [`band_kept_a_majority`], applied by [`hold_best`], which refuses a round the band split rather
+/// than proceeding on whichever side survived.
+///
 /// The filter is symmetric for the same reason. A claim far ABOVE the median is no more credible
 /// than one far below it — nothing here can verify either — and admitting the high outlier while
 /// excluding the low one would rebuild max-wins by the back door.
@@ -432,28 +448,80 @@ pub fn eligible(candidates: &[Candidate], tolerance: u32) -> Vec<Candidate> {
 /// is best placed to supply. Ranking by claimed height is no better: it hands selection to
 /// whoever claims the top of the band, and claiming is free.
 ///
-/// So the observable this narrowing uses is the only one a peer cannot cheaply steer: whether its
-/// claim sits within [`PEAK_LAG_TOLERANCE`] of the MEDIAN claim, which one outlier cannot move.
+/// So the observable this narrowing uses is the median-relative one: whether the peer's claim sits
+/// within [`PEAK_LAG_TOLERANCE`] of the MEDIAN claim. That is cheap for ONE peer to lie about and
+/// useless to it — a single outlier cannot move a median, so inflating or deflating a lone claim
+/// buys admission and never authority. It is **not** unsteerable against a COORDINATED HALF, and
+/// pretending otherwise is what made this narrowing dangerous once it became a SELECTION rather
+/// than merely a filter: peers holding half the claims own the median, and can therefore place the
+/// band where the honest peers are not. [`band_kept_a_majority`] is the guard that restores the
+/// property, and it is enforced here rather than left to the caller.
+///
 /// A per-peer history of agreeing with the rest would be a genuinely better criterion and is NOT
 /// implemented — this corroborator is round-scoped and keeps no state between rounds, and
 /// inventing a history it does not have would be worse than admitting it has none.
 ///
 /// A dial that came back with `hold` or fewer credible peers keeps all of them: the round proceeds
 /// on the peers that answered.
+///
+/// Returns `None` — refuse the round, write nothing — when the band excluded half or more of the
+/// peers that made a claim. See [`band_kept_a_majority`] for why that is a refusal and not a
+/// narrowing.
 pub fn hold_best(
     entropy: &dyn EntropySource,
     candidates: &[Candidate],
     tolerance: u32,
     hold: usize,
-) -> Vec<Candidate> {
+) -> Option<Vec<Candidate>> {
     let credible = eligible(candidates, tolerance);
-    if credible.len() <= hold {
-        return credible;
+    if !band_kept_a_majority(candidates.len(), credible.len()) {
+        return None;
     }
-    select_sample(entropy, credible.len(), hold)
-        .into_iter()
-        .map(|index| credible[index].clone())
-        .collect()
+    if credible.len() <= hold {
+        return Some(credible);
+    }
+    Some(
+        select_sample(entropy, credible.len(), hold)
+            .into_iter()
+            .map(|index| credible[index].clone())
+            .collect(),
+    )
+}
+
+/// Did the credibility band keep a STRICT MAJORITY of the peers that made a claim?
+///
+/// The guard on [`hold_best`], and the reason the median narrowing is safe to select with.
+///
+/// # The attack it refuses, which needs no implausible claim
+///
+/// A round dials [`QUORUM_DIAL_WIDE`] peers; five honest ones announce the real tip `H` and five
+/// hostile ones announce `H − 4` — an ordinary "four blocks behind", one block past
+/// [`PEAK_LAG_TOLERANCE`], not a number anything could call a lie. The sorted heights are
+/// `[H−4 ×5, H ×5]`, so the lower median is `H − 4`, the band is `[H−7, H−1]`, and **every honest
+/// peer falls outside it**. The survivors are exactly the attacker's five, they agree with each
+/// other by construction, and the round returns `Unanimous` on a hash nobody honest ever saw —
+/// which then feeds the balance, the confirmation counts and spend-path coin selection. Measured
+/// against real [`OsEntropy`], this took forgery at f=0.3 from 8.4% to 15.0%, and at f=0.5 from
+/// 31.3% to 62.3%.
+///
+/// Requiring the band to keep a strict majority makes the attacker buy the median outright: six of
+/// ten rather than five, strictly more than the old fixed-sample bar of three of four.
+///
+/// # The denominator, which is the whole risk in this guard
+///
+/// `claimants` is the number of dialled peers that **supplied a `new_peak_wallet` claim** — the
+/// input set to [`eligible`]. It is deliberately NOT the dial target, and deliberately NOT the
+/// number of peers that later answered the header-hash question. A guard keyed on either of those
+/// refuses a round merely because peers were slow or unreachable, which is precisely the freeze
+/// dig_ecosystem#2827 exists to end: a user's replica sat still for hours on a round that reported
+/// `answered: 2`. This guard is indifferent to that round — two claimants who agree about the tip
+/// keep the whole set (`2 * 2 > 2`) and the round proceeds.
+///
+/// So a thin honest round is never refused by this. What is refused is a round whose claims are
+/// SPLIT, because a split set of claims is the one shape in which the median stops being a
+/// property of the honest majority.
+pub const fn band_kept_a_majority(claimants: usize, credible: usize) -> bool {
+    credible * 2 > claimants
 }
 
 /// The settled height every question in this round is asked at: the sample's LOWEST claimed peak,

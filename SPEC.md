@@ -3887,17 +3887,28 @@ trust MUST instead be established by AGREEMENT among randomly selected discovere
    cached fastest-peer list, and any explicit index selection MUST use a cryptographically secure random
    source (the OS CSPRNG) with rejection sampling rather than modulo reduction.
 
-   The narrowing MUST use only observables a peer cannot cheaply steer. Membership of the credibility
-   band of step 2 is such an observable; RESPONSIVENESS and CLAIMED HEIGHT are NOT, because a fast
-   always-up node is cheap to run and a claim is free, so ranking by either hands the choice to an
-   attacker. Where more band members survive than are to be held, the choice among them MUST be random.
+   The narrowing MUST NOT rank by RESPONSIVENESS or by CLAIMED HEIGHT, because a fast always-up node is
+   cheap to run and a claim is free, so ranking by either hands the choice to an attacker. Membership of
+   the credibility band of step 2 is the criterion, and where more band members survive than are to be
+   held, the choice among them MUST be random.
+
+   Band membership is unsteerable by ONE peer and steerable by a COORDINATED HALF, and the implementation
+   MUST NOT be written as though the first property were the whole of it. The band is anchored on the
+   median claim, so peers holding half or more of the claims own the median and can place the band away
+   from the honest set entirely while claiming nothing more implausible than being four blocks behind.
+   Therefore: **a round in which the band excluded HALF OR MORE of the peers that supplied a peak claim
+   MUST be refused, and MUST NOT proceed on the peers that survived the band.** The denominator is the
+   peers that CLAIMED a peak — it MUST NOT be the dial target, and it MUST NOT be the number of peers
+   that answered the settled-height question, because keying on either refuses a thin honest round and
+   re-creates the frozen replica described below.
 
    Over-subscribing is a LIVENESS measure: dialling exactly as many peers as a round needs leaves it no
    margin for a dial that is stale, slow, or gone by the time the question is put.
 2. Compare their claimed peaks and EXCLUDE any peer whose claim is further than `PEAK_LAG_TOLERANCE` =
    **3** blocks from the MEDIAN claim, in either direction. The median is REQUIRED: anchoring on the
    maximum lets a single peer claiming `u32::MAX` place every honest peer outside the band and be left
-   alone in the pool.
+   alone in the pool. A median is immune to ONE outlier and not to a coordinated half; the refusal
+   required in step 1 is what covers the remainder.
 3. NORMALISE the question to a settled height `H = min(claimed peaks of the sample) − SETTLED_LAG`, with
    `SETTLED_LAG` = **2**. Every quorum question MUST be asked as of `H`, never as of the tip.
 4. Ask every held peer, and the would-be writer, the same question at `H`. The writer MUST NOT choose
@@ -3921,6 +3932,12 @@ never corroboration: one peer agreeing with itself is one peer, and accepting it
 the single-untrusted-source problem this section exists to remove. This floor is recorded as an
 assumption rather than a derived constant — it encodes a judgement about what the word "corroborated" is
 allowed to mean, and the operator of a node may reasonably overturn it in either direction.
+
+It MUST NOT be raised to 3 in the name of hardening. The round that froze a user's installed node
+reported `Insufficient { answered: 2, required: 4 }` — **two** peers answered, not four — so a floor of 3
+refuses that round for as long as the network stays that thin, which is the same freeze reached by
+another route. A thin round's strength comes from the agreement ratio (two of two must agree) and from
+the band refusal of step 1, never from demanding more answers than the network is offering.
 
 **The AGREEMENT threshold MUST NOT be lowered to admit thinner rounds.** These are two different knobs and
 only one of them was the defect. `required_agreement(answered)` = `max(CORROBORATION_FLOOR,
@@ -3994,6 +4011,15 @@ Three further limits are part of the honest statement:
 * **Denial is cheaper than forgery.** Dissenting past `required_agreement(answered)` forces a Split and
   stalls the write, which needs fewer hostile peers than forging a verdict. This asymmetry is deliberate:
   a stalled sync is visible and recoverable, a forged one is neither.
+* **A round can be made thin ON PURPOSE, and that is not the same risk as a round that is thin by
+  accident.** The figures above model BENIGN shrinkage — peers that were slow or gone. An attacker who
+  supplies half the claims does not have to wait for that: because the credibility band is anchored on
+  the median claim, half the claimants announcing an ordinary lag place every honest peer outside the
+  band, leaving a round composed entirely of the attacker's peers, unanimous by construction. Measured
+  against the shipped selection, this took forgery from about **8.4% to 15.0%** at `f = 0.3` and from
+  about **31.3% to 62.3%** at `f = 0.5`, with the crossover at `f ≈ 0.17`. The refusal required in step 1
+  is what removes this path: it raises the attacker's bar to a strict majority of the claimants — 6 of a
+  10-peer dial — which is strictly above the 3-of-4 the fixed-sample design required.
 * **Discovery selection is imperfectly random.** `connect_random_peer` tries `127.0.0.1` before any
   introducer and then returns the first address that connects, so a co-resident process and a fast,
   always-up node are both over-represented among probes. Requiring DISTINCT addresses within a round

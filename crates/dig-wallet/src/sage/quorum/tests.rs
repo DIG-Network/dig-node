@@ -627,7 +627,8 @@ fn a_wide_dial_is_held_back_to_the_credible_few() {
     // Draws land on distinct offsets; the values are arbitrary because `select_sample` is
     // order-blind — what is asserted is the OUTCOME, not which five were picked.
     let entropy = ScriptedEntropy::new(&[0, 1, 2, 3, 4]);
-    let held = hold_best(&entropy, &candidates, PEAK_LAG_TOLERANCE, QUORUM_HOLD);
+    let held = hold_best(&entropy, &candidates, PEAK_LAG_TOLERANCE, QUORUM_HOLD)
+        .expect("eight of ten claimants are credible, so the band kept a majority");
 
     assert_eq!(
         held.len(),
@@ -647,8 +648,147 @@ fn a_wide_dial_is_held_back_to_the_credible_few() {
 
     // A dial that came back with FEWER than the hold keeps everything it has — the round
     // proceeds on the peers that answered, which is the whole of this ticket.
-    let thin = hold_best(&entropy, &candidates[..3], PEAK_LAG_TOLERANCE, QUORUM_HOLD);
+    let thin = hold_best(&entropy, &candidates[..3], PEAK_LAG_TOLERANCE, QUORUM_HOLD)
+        .expect("three honest claimants at the same height are all credible");
     assert_eq!(thin.len(), 3);
+}
+
+/// PROPERTY: a round whose credibility band discarded HALF OR MORE of the peers that claimed a
+/// peak is REFUSED, not run on whichever side of the band survived.
+///
+/// FIXTURE DESIGN: the exploit exactly as measured — ten dialled peers, five honest at the real
+/// tip `H`, five hostile claiming `H - PEAK_LAG_TOLERANCE - 1`, which is an ordinary "four blocks
+/// behind" and not a claim anything could call implausible. Sorted, the lower median lands on the
+/// hostile height, so the band is `[H-7, H-1]` and every honest peer sits OUTSIDE it. The
+/// asserted-first half of this test proves the fixture genuinely exhibits the attack rather than
+/// merely being lopsided: the band alone keeps precisely the attacker's five, and those five,
+/// agreeing with each other by construction, tally to `Unanimous` on a hash nobody honest ever
+/// saw. Everything downstream of that verdict — balance, confirmation counts, spend-path coin
+/// selection — is written from it.
+///
+/// A 9-1 or 8-2 fixture cannot see this: one or two outliers cannot move a median, which is the
+/// property the old rationale claimed and which holds against every attacker EXCEPT the
+/// coordinated half. Fifty-fifty is the smallest split that owns the lower median.
+///
+/// NEAREST WRONG IMPLEMENTATION: the shipped narrowing, which treats the band as a selection and
+/// returns the survivors. It is indistinguishable from correct on every fixture where the honest
+/// peers happen to be the survivors, so the honest side must be the EXCLUDED one here.
+#[test]
+fn a_band_that_splits_the_claimants_in_half_refuses_the_round() {
+    const HONEST_TIP: u32 = 1_000_000;
+    const HOSTILE_CLAIM: u32 = HONEST_TIP - PEAK_LAG_TOLERANCE - 1;
+
+    let mut candidates: Vec<Candidate> = (0..5)
+        .map(|i| candidate(&format!("honest-{i}"), HONEST_TIP))
+        .collect();
+    candidates.extend((0..5).map(|i| candidate(&format!("hostile-{i}"), HOSTILE_CLAIM)));
+
+    // The fixture really does exhibit the attack: the band keeps the attacker's five and nobody
+    // else. If this ever stops holding, the test below is passing for the wrong reason.
+    let credible = eligible(&candidates, PEAK_LAG_TOLERANCE);
+    let credible_ids: Vec<&str> = credible.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        credible_ids,
+        [
+            "hostile-0",
+            "hostile-1",
+            "hostile-2",
+            "hostile-3",
+            "hostile-4"
+        ],
+        "the fixture no longer places the honest peers outside the median-anchored band"
+    );
+
+    // ...and those survivors would have carried the round outright: they are exactly QUORUM_HOLD,
+    // so no sampling even thins them, and they agree with each other by construction.
+    let forged = Bytes32::new([0xEE; 32]);
+    let attacker_answers: Vec<Response<Bytes32>> = credible
+        .iter()
+        .map(|c| Response {
+            peer: c.id.clone(),
+            answer: forged,
+        })
+        .collect();
+    assert_eq!(
+        tally(&attacker_answers),
+        Verdict::Unanimous {
+            answer: forged,
+            agreed: 5
+        },
+        "the fixture's surviving set no longer produces an authoritative verdict, so refusing it \
+         would prove nothing"
+    );
+
+    // THE GUARD. Real entropy, because the refusal must not depend on how the draw falls.
+    assert_eq!(
+        hold_best(&OsEntropy, &candidates, PEAK_LAG_TOLERANCE, QUORUM_HOLD),
+        None,
+        "a round in which the band excluded half the claimants was allowed to proceed on the \
+         survivors"
+    );
+}
+
+/// PROPERTY: a thin, slow, honest round still SUCCEEDS. This is the anti-refreeze pin — the guard
+/// above must key on BAND EXCLUSION among claimants, never on how few peers the node reached.
+///
+/// FIXTURE DESIGN: the incident's own shape. The user's frozen node reported
+/// `Insufficient { answered: 2, required: 4 }`, so the control is two claimants — and they are one
+/// block apart rather than identical, because two identical claims cannot distinguish "kept a
+/// majority of claimants" from "kept every claimant", and an implementation demanding the latter
+/// would refuse ordinary propagation lag. The three-peer case adds a member who is genuinely
+/// outside the band, pinning that a MINORITY exclusion is still a narrowing rather than a refusal.
+///
+/// NEAREST WRONG IMPLEMENTATION: a guard whose denominator is the dial target
+/// (`QUORUM_DIAL_WIDE`) or the count of peers that answered the later header-hash question. Either
+/// refuses this round and re-creates the hours-long freeze this PR exists to end.
+#[test]
+fn a_thin_honest_round_is_never_refused_by_the_band_guard() {
+    let entropy = ScriptedEntropy::new(&[0, 1, 0]);
+
+    // Two claimants, one block apart: the exact width the incident round had.
+    let two = [candidate("slow", 999_999), candidate("fresh", 1_000_000)];
+    let held = hold_best(&entropy, &two, PEAK_LAG_TOLERANCE, QUORUM_HOLD)
+        .expect("a two-peer round of agreeing honest claims must still corroborate");
+    assert_eq!(held.len(), 2, "a thin honest round lost a peer");
+
+    // A MINORITY outside the band is a narrowing, not a refusal.
+    let three = [
+        candidate("honest-a", 1_000_000),
+        candidate("honest-b", 1_000_000),
+        candidate("stale", 1_000_000 - PEAK_LAG_TOLERANCE - 1),
+    ];
+    let held = hold_best(&entropy, &three, PEAK_LAG_TOLERANCE, QUORUM_HOLD)
+        .expect("one stale peer in three is a minority exclusion and must not refuse the round");
+    assert_eq!(
+        held.len(),
+        2,
+        "the stale peer was asked, or the round collapsed"
+    );
+}
+
+/// PROPERTY: the majority bound holds from BOTH sides — one peer over the line must refuse, and
+/// the line itself must pass. A bound tested only from below can only confirm itself.
+///
+/// FIXTURE DESIGN: exhaustive over the shipped dial width, comparing against the independently
+/// stated rule "strictly more than half". `6 of 10` passes and `5 of 10` refuses, which is the
+/// attacker's new bar; `2 of 2` passes, which is the incident round.
+#[test]
+fn the_band_majority_bound_is_pinned_from_both_sides() {
+    for claimants in 0..=QUORUM_DIAL_WIDE {
+        for credible in 0..=claimants {
+            assert_eq!(
+                band_kept_a_majority(claimants, credible),
+                credible > claimants / 2,
+                "wrong verdict for {credible} credible of {claimants} claimants"
+            );
+        }
+    }
+    assert!(band_kept_a_majority(10, 6), "the attacker's new bar moved");
+    assert!(!band_kept_a_majority(10, 5), "an even split was accepted");
+    assert!(
+        band_kept_a_majority(2, 2),
+        "the incident's two-peer round was refused"
+    );
 }
 
 // ---------------------------------------------------------------------------

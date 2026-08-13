@@ -1331,12 +1331,26 @@ impl Corroborator for ChiaQuorumCorroborator {
         // Then PULL BACK: the dial was deliberately wide, and asking every peer it happened to
         // reach would spend the margin the wide dial exists to provide.
         let candidates: Vec<quorum::Candidate> = probes.iter().map(|(c, _)| c.clone()).collect();
-        let eligible = quorum::hold_best(
+        // REFUSED, not narrowed, when the credibility band discarded half or more of the peers
+        // that made a claim: the band is median-anchored, so a coordinated half owns it and can
+        // place it off the honest set entirely. The denominator is the peers that CLAIMED a peak,
+        // never the dial target and never the peers that later answered — keying it on either of
+        // those would refuse a thin honest round and freeze the replica again (#2827).
+        let Some(eligible) = quorum::hold_best(
             &quorum::OsEntropy,
             &candidates,
             quorum::PEAK_LAG_TOLERANCE,
             quorum::QUORUM_HOLD,
-        );
+        ) else {
+            tracing::warn!(
+                claimants = candidates.len(),
+                "wallet sync: the credibility band excluded half or more of the peers that                  claimed a peak; the round is refused rather than run on the surviving side. A                  split claim set is what a coordinated peer group looks like from a light client."
+            );
+            return Err(SyncError::Peer(
+                "credibility band split the claimants: refusing to corroborate from the                  surviving side"
+                    .into(),
+            ));
+        };
         let Some(height) = quorum::common_height(&eligible, quorum::SETTLED_LAG) else {
             return Err(SyncError::Peer(
                 "no settled height: too few reachable peers agreed on a credible chain tip".into(),
