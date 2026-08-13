@@ -1336,6 +1336,11 @@ async fn both_peer_counts_distinguish_observed_zero_from_unobservable() {
 /// FIXTURE DESIGN: the held count is THREE — distinct from the floor, the hold, the dial width and
 /// the old sample size — so any implementation that substituted a constant for the measurement is
 /// caught whichever constant it chose.
+///
+/// BOTH status paths are exercised, and that is not thoroughness for its own sake. The field is
+/// populated in TWO places — `SyncHandle::status` and `status_without_supervisor` — so a test
+/// through one of them cannot see a target substituted in the other. A mutation proved it: quoting
+/// `QUORUM_HOLD` in the with-supervisor path left this test green while it covered only the other.
 #[tokio::test]
 async fn the_reported_chia_peer_count_is_the_held_pool_never_a_dial_target() {
     let db = WalletDb::open_in_memory().await.unwrap();
@@ -1344,23 +1349,27 @@ async fn the_reported_chia_peer_count_is_the_held_pool_never_a_dial_target() {
         peak_height: Some(9_141_711),
     };
 
-    let status = status_without_supervisor(&db, held_three).await.unwrap();
+    let (handle, _rx) = SyncHandle::new();
+    let attached = handle.status(&db, held_three).await.unwrap();
+    let detached = status_without_supervisor(&db, held_three).await.unwrap();
 
-    assert_eq!(
-        status.chia_peer_count,
-        Some(3),
-        "the reported peer count was not the measured holding"
-    );
-    for target in [
-        quorum::CORROBORATION_FLOOR,
-        quorum::QUORUM_HOLD,
-        quorum::QUORUM_DIAL_WIDE,
-    ] {
-        assert_ne!(
+    for (path, status) in [("with a supervisor", attached), ("without one", detached)] {
+        assert_eq!(
             status.chia_peer_count,
-            Some(target as u32),
-            "a corroboration target ({target}) was reported as a holding"
+            Some(3),
+            "{path}: the reported peer count was not the measured holding"
         );
+        for target in [
+            quorum::CORROBORATION_FLOOR,
+            quorum::QUORUM_HOLD,
+            quorum::QUORUM_DIAL_WIDE,
+        ] {
+            assert_ne!(
+                status.chia_peer_count,
+                Some(target as u32),
+                "{path}: a corroboration target ({target}) was reported as a holding"
+            );
+        }
     }
 }
 

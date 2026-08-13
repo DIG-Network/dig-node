@@ -3881,20 +3881,54 @@ trust MUST instead be established by AGREEMENT among randomly selected discovere
 
 **The rule.** Before a discovered peer's session performs any write, the implementation MUST:
 
-1. Draw a sample of `QUORUM_SAMPLE` = **4** peers by repeated independent discovery dials, keeping only
-   DISTINCT peer addresses. Selection MUST NOT be biased by peer ordering, by first-responder-wins, or by
-   a cached fastest-peer list, and any explicit index selection MUST use a cryptographically secure
-   random source (the OS CSPRNG) with rejection sampling rather than modulo reduction.
+1. **Dial wide, then hold back.** Dial up to `QUORUM_DIAL_WIDE` = **10** peers by repeated independent
+   discovery dials, keeping only DISTINCT peer addresses, then narrow that set to at most `QUORUM_HOLD` =
+   **5** peers to ASK. Selection MUST NOT be biased by peer ordering, by first-responder-wins, or by a
+   cached fastest-peer list, and any explicit index selection MUST use a cryptographically secure random
+   source (the OS CSPRNG) with rejection sampling rather than modulo reduction.
+
+   The narrowing MUST use only observables a peer cannot cheaply steer. Membership of the credibility
+   band of step 2 is such an observable; RESPONSIVENESS and CLAIMED HEIGHT are NOT, because a fast
+   always-up node is cheap to run and a claim is free, so ranking by either hands the choice to an
+   attacker. Where more band members survive than are to be held, the choice among them MUST be random.
+
+   Over-subscribing is a LIVENESS measure: dialling exactly as many peers as a round needs leaves it no
+   margin for a dial that is stale, slow, or gone by the time the question is put.
 2. Compare their claimed peaks and EXCLUDE any peer whose claim is further than `PEAK_LAG_TOLERANCE` =
    **3** blocks from the MEDIAN claim, in either direction. The median is REQUIRED: anchoring on the
    maximum lets a single peer claiming `u32::MAX` place every honest peer outside the band and be left
    alone in the pool.
 3. NORMALISE the question to a settled height `H = min(claimed peaks of the sample) − SETTLED_LAG`, with
    `SETTLED_LAG` = **2**. Every quorum question MUST be asked as of `H`, never as of the tip.
-4. Ask every remaining sampled peer, and the would-be writer, the same question at `H`. The writer MUST
-   NOT choose `H`.
-5. Elevate the writer to **corroborated** if and only if at least `QUORUM_AGREEMENT` = **3** of the 4
-   sampled peers returned the SAME answer AND the writer's own answer equals it.
+4. Ask every held peer, and the would-be writer, the same question at `H`. The writer MUST NOT choose
+   `H`.
+5. Elevate the writer to **corroborated** if and only if the round reached a verdict AND the writer's own
+   answer equals it. A round reaches a verdict when at least `required_agreement(answered)` of the peers
+   that ANSWERED returned the same answer.
+
+**A round proceeds on the peers that ANSWERED; it MUST NOT wait for a fixed number of answers.** An
+implementation MUST NOT discard a round because fewer peers replied than were asked. Requiring a fixed
+answer count is not a security property — an attacker who can silence a peer can force the wait
+indefinitely — and it is a liveness defect with a measured cost: a replica held at height 9,139,211 for
+hours, five peers connected, the chain ~2,500 blocks ahead, because one peer of five was slow.
+
+**Corroboration is a CONFIDENCE GRADIENT, not a gate.** Every verdict MUST carry `agreed`, the number of
+independent peers that gave the answer, so the confidence travels WITH the datum. More agreeing peers
+means a better-attested datum; it MUST NOT mean the difference between a datum and nothing.
+
+**Two answers is the FLOOR, and this is an ASSUMPTION.** `CORROBORATION_FLOOR` = **2**. A single source is
+never corroboration: one peer agreeing with itself is one peer, and accepting it would reinstate exactly
+the single-untrusted-source problem this section exists to remove. This floor is recorded as an
+assumption rather than a derived constant — it encodes a judgement about what the word "corroborated" is
+allowed to mean, and the operator of a node may reasonably overturn it in either direction.
+
+**The AGREEMENT threshold MUST NOT be lowered to admit thinner rounds.** These are two different knobs and
+only one of them was the defect. `required_agreement(answered)` = `max(CORROBORATION_FLOOR,
+ceil(answered × QUORUM_AGREEMENT ÷ QUORUM_SAMPLE))` — the shipped three-quarters ratio, ROUNDED UP,
+applied to whoever answered. `required_agreement(4)` is therefore exactly `QUORUM_AGREEMENT` = **3**, and
+3-of-5 and 2-of-3 remain REFUSED. An implementation MUST NOT substitute a bare majority. Note the
+direction: a wider round demands MORE agreement, so dialling wide never makes a verdict cheaper to
+obtain.
 
 **Behind versus lying.** Steps 2 and 3 exist because a peer that is merely BEHIND and a peer that is
 LYING are indistinguishable in any single answer, and treating ordinary propagation lag as an attack is
@@ -3906,10 +3940,14 @@ height it claims to have passed, is lying, partitioned, or forked — never mere
 
 | Outcome | Meaning | Required behaviour |
 |---|---|---|
-| **Unanimous** — all 4 agree | Corroborated | Elevate; the session may write. |
-| **Majority with dissent** — ≥3 agree, ≥1 does not | Corroborated, with evidence | Elevate, AND surface the dissenting peers. At a settled height a dissenter is not merely behind. |
-| **Split** — no answer reaches 3 | Truth UNKNOWN | Write NOTHING. Re-draw a FRESH random sample and retry. MUST NOT take the plurality. After `PERSISTENT_DISAGREEMENT_ROUNDS` = **3** consecutive splits, surface the standing disagreement as evidence of a partition or an attack. |
-| **Insufficient** — fewer than 4 answered | Unreachable, not consensus | Write NOTHING. MUST NOT form a quorum among whoever replied; an attacker who can silence witnesses must not thereby shrink the quorum he has to capture. |
+| **Unanimous** — every peer that answered agrees | Corroborated | Elevate; the session may write. Carries `agreed`. |
+| **Majority with dissent** — `required_agreement(answered)` agree, ≥1 does not | Corroborated, with evidence | Elevate, AND surface the dissenting peers. At a settled height a dissenter is not merely behind. Carries `agreed`. |
+| **Split** — no answer reaches `required_agreement(answered)` | Truth UNKNOWN | Write NOTHING. Re-draw a FRESH random sample and retry. MUST NOT take the plurality. After `PERSISTENT_DISAGREEMENT_ROUNDS` = **3** consecutive splits, surface the standing disagreement as evidence of a partition or an attack. |
+| **Insufficient** — fewer than `CORROBORATION_FLOOR` = 2 answered | Alone, not outvoted | Write NOTHING. A single answer MUST NOT corroborate itself. |
+
+The retry obligation on a Split is discharged by ENDING the refused session: corroboration runs once per
+session, so a refused session that is never ended is a refusal that never expires and no fresh sample is
+ever drawn. An implementation MUST end a session that failed corroboration rather than holding it.
 
 **Reads that MUST be verified rather than voted on.** Voting on a locally decidable fact wastes round
 trips and, worse, lets a majority overrule arithmetic. The following are SELF-VERIFYING and MUST be
@@ -3943,11 +3981,19 @@ probability `P(≥3 hostile of 4)`: about **0.4%** at `f = 0.1`, about **8%** at
 **31%** at `f = 0.5`. As `f` approaches 1, agreement degrades to agreement among the attacker's own
 peers and the model provides no protection whatever.
 
+**A THIN round is easier to capture, and the published figure MUST say which round size it describes.**
+Because a round now proceeds on the peers that answered, its size varies, and quoting a wide round's
+comfortable number for every round would hide the difference. At `f = 0.3`: a round at
+`CORROBORATION_FLOOR` = 2 is carried about **9%** of the time (both answerers hostile), a 4-answer round
+about **8%**, a 5-answer round about **3%**. So an attacker who can make witnesses UNREACHABLE has a
+cheaper path than out-voting them — that is the accepted price of not freezing, and `QUORUM_DIAL_WIDE`
+over-subscribing to keep rounds wide is the mitigation, not a cure.
+
 Three further limits are part of the honest statement:
 
-* **Denial is cheaper than forgery.** Two hostile peers of four suffice to force a Split and stall the
-  write, where three are needed to forge one. This asymmetry is deliberate: a stalled sync is visible and
-  recoverable, a forged one is neither.
+* **Denial is cheaper than forgery.** Dissenting past `required_agreement(answered)` forces a Split and
+  stalls the write, which needs fewer hostile peers than forging a verdict. This asymmetry is deliberate:
+  a stalled sync is visible and recoverable, a forged one is neither.
 * **Discovery selection is imperfectly random.** `connect_random_peer` tries `127.0.0.1` before any
   introducer and then returns the first address that connects, so a co-resident process and a fast,
   always-up node are both over-represented among probes. Requiring DISTINCT addresses within a round
