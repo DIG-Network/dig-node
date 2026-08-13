@@ -704,7 +704,11 @@ impl PuzzleHashSource for UnionPuzzleHashSource {
 }
 
 /// The p2 puzzle hash a public key controls.
-fn puzzle_hash_for(pk: &PublicKey) -> Bytes32 {
+///
+/// `pub(crate)` because the read router needs the SAME mapping to decide whether an address is
+/// one this replica follows (dig_ecosystem#2866). A second copy of this derivation is exactly the
+/// byte-drift class this ecosystem keeps paying for: it must stay one definition.
+pub(crate) fn puzzle_hash_for(pk: &PublicKey) -> Bytes32 {
     Bytes32::from(StandardArgs::curry_tree_hash(*pk).to_bytes())
 }
 
