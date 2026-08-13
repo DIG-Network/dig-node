@@ -657,6 +657,25 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
 /// no `syncing` phase, and would fail here. It replaces the peak assertion this test used to
 /// carry — the third audit round established that the peak was never the harmless half (see
 /// [`sync::PeerTrust`]), so the peak is now asserted to stay UNKNOWN instead.
+/// Deliver `message` to whichever session is live RIGHT NOW, retrying while sessions turn over.
+///
+/// A refused session is now short-lived by design (dig_ecosystem#2827), so the sender captured a
+/// moment ago may already belong to a closed session. Panicking on the first closed channel would
+/// make this suite flaky about a fact it is not testing; failing after the bounded retry still
+/// catches a supervisor that never consumes peer pushes at all.
+async fn push_peak_to_a_live_session(h: &Harness, message: Message) {
+    for _ in 0..2_000 {
+        let sender = h.script.senders.lock().unwrap().last().cloned();
+        if let Some(sender) = sender {
+            if sender.send(message.clone()).await.is_ok() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("no live session ever accepted a peer push");
+}
+
 #[tokio::test]
 async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnects() {
     let db = WalletDb::open_in_memory().await.unwrap();
@@ -683,22 +702,17 @@ async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnec
         );
         h.until("a live session", |s| !s.senders.lock().unwrap().is_empty())
             .await;
-        assert!(
-            h.handle
-                .status(&db, ChainPeerTier::UNOBSERVABLE)
-                .await
-                .unwrap()
-                .subscription_peer_count
-                .is_some_and(|n| n >= 1),
-            "cycle {cycle}: the session must still COUNT — liveness is the whole of what a \
-             discovered peer contributes, so a supervisor that simply refuses to dial one fails \
-             here"
-        );
-        let sender = h.script.senders.lock().unwrap().last().unwrap().clone();
-        sender
-            .send(peak_message(6_000_000 + cycle))
-            .await
-            .expect("the session consumes peer pushes");
+        // POLLED, not sampled once. Since dig_ecosystem#2827 a refused session is deliberately
+        // ended after `RECORROBORATE_AFTER` so a fresh sample can be drawn, and this suite's clock
+        // returns from every sleep instantly — so the supervisor cycles connect/refuse/reconnect
+        // and a single-instant read can legitimately land in a between-sessions gap. The property
+        // being proven is unchanged and still load-bearing: a supervisor that refused to dial a
+        // discovered peer at all would never reach a count of one, however long this polled.
+        h.until_status(&format!("cycle {cycle}: the session to COUNT"), |s| {
+            s.subscription_peer_count.is_some_and(|n| n >= 1)
+        })
+        .await;
+        push_peak_to_a_live_session(&h, peak_message(6_000_000 + cycle)).await;
         // The attacker hangs up, buying itself a reconnect. Observing the NEXT connect (the top
         // of the following iteration) is what proves the frame above was consumed first: the
         // loop only returns once its receiver closes, which happens here.
@@ -1882,6 +1896,107 @@ async fn corroboration_switched_off_leaves_a_discovered_peer_writing_nothing() {
 
     assert_eq!(script.catch_up_count(), 0);
     assert_eq!(db.sync_state().await.unwrap().peak_height, None);
+}
+
+/// **Proves (dig_ecosystem#2827):** a REFUSED session ends by itself, so the reconnect path draws
+/// a fresh corroboration sample — WITHOUT the peer ever disconnecting.
+///
+/// THE BUG THIS PINS. Corroboration ran exactly once, at session start. A round that did not
+/// elevate left the session `Discovered`, which forced an EMPTY subscription set, which made
+/// `await_puzzle_hashes`'s poll condition false, which left `std::future::pending()` in that
+/// `select!` arm. The only remaining exit was the peer disconnecting — and a stable peer never
+/// does. A node therefore parked on a peer it could never write from for the life of the process:
+/// the user's replica sat at height 9,139,211 for hours while the chain moved ~2,500 blocks and
+/// their wallet showed no balance. Its own log line promised "re-drawing a fresh sample" while no
+/// second sample was ever drawn.
+///
+/// FIXTURE DESIGN — the peer is deliberately HEALTHY and stays connected for the whole test.
+/// `disconnect_all` is never called, because the disconnect is the one exit the broken code
+/// already had: a fixture that dropped the peer would pass against the defect and prove nothing.
+/// The only variable is the passage of time on the injected clock, which is exactly the mechanism
+/// under test. Corroboration is scripted to SPLIT — a refusal that is not the writer's fault and
+/// that a fresh sample could plausibly resolve, which is the real shape of the user's incident.
+///
+/// The clock is a double whose `sleep` returns at once, so the assertion is "a second session was
+/// opened", never "45 seconds elapsed" — this is a state-machine test, not a network test.
+#[tokio::test]
+async fn a_refused_session_ends_so_a_fresh_sample_is_drawn_without_a_disconnect() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    // The writer agrees with nothing in particular; the round SPLITS, so nobody is elevated.
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+    let corroborator = ScriptedCorroborator::new(Verdict::Split {
+        tallies: vec![2, 2],
+    });
+
+    let harness = Harness::start_full(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(corroborator.clone()),
+    )
+    .await;
+
+    // TWO facts, and the second is the one that matters. A second CONNECT proves the refused
+    // session ended on its own; a second corroboration ROUND proves the retry actually re-ran the
+    // check rather than reconnecting into the same settled verdict.
+    harness
+        .until("a refused session to end and reconnect", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+    assert!(
+        corroborator.rounds.load(Ordering::SeqCst) >= 2,
+        "the session reconnected without re-running corroboration, so the promised fresh sample is \
+         still never drawn"
+    );
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2827):** the re-corroboration timer does NOT touch an AUTHORITATIVE
+/// session — the control that keeps the fix from becoming a different bug.
+///
+/// An elevated session holds a live subscription, and a subscription is per-connection state.
+/// Ending one on a timer would throw away a working writer every 45 seconds and re-run a catch-up
+/// from genesis each time, which is a worse failure than the one being fixed.
+///
+/// FIXTURE DESIGN — this is the SAME harness as the test above with ONE variable changed: the peer
+/// is operator-chosen, so it is authoritative and subscribes a non-empty set. The injected clock
+/// returns from every sleep immediately, so an implementation that armed the timer regardless of
+/// trust would reconnect in a tight loop and be caught here within milliseconds; nothing in this
+/// test depends on 45 seconds being long.
+#[tokio::test]
+async fn an_authoritative_session_is_not_ended_by_the_recorroboration_timer() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_with_trust(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+    )
+    .await;
+
+    harness.settle().await;
+    // Give the (instant) clock ample opportunity to fire a timer that should not exist.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        script.connects.load(Ordering::SeqCst),
+        1,
+        "an authoritative session was torn down by the re-corroboration timer, discarding a live \
+         subscription and forcing a catch-up from genesis"
+    );
+
+    harness.stop().await;
 }
 
 /// **Proves:** the CORROBORATED read is what reaches spend-path coin selection — there is no

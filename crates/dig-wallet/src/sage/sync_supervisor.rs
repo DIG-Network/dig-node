@@ -16,7 +16,10 @@
 //!
 //! When corroboration is unavailable, splits, or catches the writer out, the session stays
 //! [`PeerTrust::Discovered`] and its whole contribution is liveness: `chia_peer_count` stays
-//! non-null so the phase advances from `not_started` to `syncing`, and nothing is written.
+//! non-null so the phase advances from `not_started` to `syncing`, and nothing is written. Such a
+//! session is HELD FOR [`RECORROBORATE_AFTER`] AND THEN ENDED, so the ordinary reconnect path draws
+//! an independent sample and asks again — corroboration runs once per session, so a refused session
+//! that is never ended is a refusal that never expires (dig_ecosystem#2827).
 //!
 //! # What the DB cannot say
 //!
@@ -75,6 +78,23 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// creating the wallet and is a local read of already-loaded public keys, so it costs nothing on
 /// the wire.
 const PUZZLE_HASH_POLL: Duration = Duration::from_secs(5);
+/// How long a REFUSED session is held before it is ended so a fresh corroboration sample is drawn
+/// (dig_ecosystem#2827).
+///
+/// Corroboration runs once, at session start. Without this, a single non-elevating round parked the
+/// node on a peer it could never write from for the LIFE OF THE PROCESS: the refused session
+/// subscribes nothing, so the resubscribe poll is disarmed too, and the only remaining exit was the
+/// peer disconnecting — which a healthy peer never does. A user's replica sat at height 9,139,211
+/// for hours, five peers held, while the chain moved on and their wallet reported no balance.
+///
+/// FORTY-FIVE SECONDS BALANCES THE TWO FAILURES EITHER SIDE OF IT. Shorter, and a genuinely
+/// partitioned network is re-dialled in a near-tight loop across the same four DNS introducers that
+/// [`BACKOFF_MAX`] exists to protect. Longer, and a transient shortfall — one slow round, a
+/// momentarily thin peer set — costs the user minutes of a visibly frozen balance for no reason.
+/// It sits just below [`BACKOFF_MAX`], so a persistently refusing network converges on the backoff
+/// ladder's own ceiling rather than out-pacing it, and it is short enough that the cost of a
+/// transient refusal is under a minute instead of unbounded.
+const RECORROBORATE_AFTER: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
 // The observable state
@@ -887,6 +907,13 @@ impl Supervisor {
                 // wallets appear.
                 () = self.await_puzzle_hashes(nothing_subscribed && trust.is_authoritative())
                     => SessionOutcome::Resubscribe,
+                // This session was REFUSED, and corroboration only runs at session start — so the
+                // refusal is permanent for as long as the session lives. Ending it hands the
+                // decision back to the reconnect path, which draws an independent sample and runs
+                // the `Corroborator` again. That is what makes the "re-drawing a fresh sample" log
+                // line above TRUE; no new retry mechanism is introduced (dig_ecosystem#2827).
+                () = self.await_recorroboration(!trust.is_authoritative())
+                    => SessionOutcome::Ended,
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
                 _ = shutdown.changed() => SessionOutcome::Stop,
@@ -1008,6 +1035,19 @@ impl Supervisor {
                 return;
             }
         }
+    }
+
+    /// Resolve once a REFUSED session has been held long enough to be worth re-corroborating.
+    ///
+    /// Returns a future that NEVER resolves when `retry` is false. An authoritative session has
+    /// nothing to re-corroborate — it already cleared the quorum — and ending it would discard a
+    /// live subscription and force a fresh catch-up from genesis, which is a worse failure than the
+    /// one this exists to fix.
+    async fn await_recorroboration(&self, retry: bool) {
+        if !retry {
+            std::future::pending::<()>().await;
+        }
+        self.time.sleep(RECORROBORATE_AFTER).await;
     }
 
     /// Wait out the next backoff delay. Returns `false` if shutdown arrived meanwhile.

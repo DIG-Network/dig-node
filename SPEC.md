@@ -3827,6 +3827,13 @@ A discovered peer that has NOT been corroborated runs as a WRITE-FREE session wh
 it subscribes nothing and persists nothing. Corroboration MUST be attempted BEFORE the catch-up, so a peer
 that fails it never has a window in which its answers are already landing.
 
+**A refusal MUST expire.** Corroboration is decided ONCE per session, so an uncorroborated session MUST
+be ENDED after `RECORROBORATE_AFTER` = **45 s** and reconnected, which re-runs the corroborator against a
+freshly drawn sample. A refused session MUST NOT be held until the peer happens to disconnect: a healthy
+peer never does, so a single non-elevating round would otherwise freeze the replica for the life of the
+process while the chain moves on. The timer MUST NOT apply to an operator or corroborated session —
+ending one discards a live per-connection subscription and forces a fresh catch-up from genesis.
+
 **Bounded catch-up.** One catch-up MUST make at most 1,024 round trips and write at most 250,000 coin
 states in total, and a response carrying `is_finished: false` MUST report a height strictly greater than
 the previous response's, or the catch-up is abandoned. `is_finished` is a bit the peer chooses, so
