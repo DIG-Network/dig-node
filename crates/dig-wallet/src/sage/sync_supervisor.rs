@@ -1344,10 +1344,13 @@ impl Corroborator for ChiaQuorumCorroborator {
         ) else {
             tracing::warn!(
                 claimants = candidates.len(),
-                "wallet sync: the credibility band excluded half or more of the peers that                  claimed a peak; the round is refused rather than run on the surviving side. A                  split claim set is what a coordinated peer group looks like from a light client."
+                "wallet sync: the credibility band excluded half or more of the peers that \
+claimed a peak; the round is refused rather than run on the surviving side. A \
+split claim set is what a coordinated peer group looks like from a light client."
             );
             return Err(SyncError::Peer(
-                "credibility band split the claimants: refusing to corroborate from the                  surviving side"
+                "credibility band split the claimants: refusing to corroborate from the \
+surviving side"
                     .into(),
             ));
         };
