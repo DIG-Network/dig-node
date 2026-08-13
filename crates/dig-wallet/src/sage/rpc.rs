@@ -4433,6 +4433,14 @@ mod tests {
         })
         .await
         .unwrap();
+        if synced {
+            // A sync that COVERED this address, not merely a flag saying one finished: the read
+            // router asks about coverage, and a flag with no covered set is exactly the state that
+            // answered a newly enrolled address a dated zero (dig_ecosystem#2871).
+            db.record_coverage(&CoveredSet::from_hex([owned_ph()]))
+                .await
+                .unwrap();
+        }
         db.set_initial_sync_complete(synced).await.unwrap();
         if let Some(h) = peak {
             db.set_peak(h, &"cc".repeat(32)).await.unwrap();
@@ -4743,7 +4751,9 @@ mod tests {
             .iter()
             .map(super::super::sync_supervisor::puzzle_hash_for)
             .collect();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 500, "cc".repeat(32), &phs).unwrap())
+        db.complete_catch_up(
+            &super::super::db::CatchUpReplay::finished_at(None, 500, "cc".repeat(32), &phs).unwrap(),
+        )
             .await
             .unwrap();
     }

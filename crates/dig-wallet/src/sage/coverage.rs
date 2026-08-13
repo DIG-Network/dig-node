@@ -33,7 +33,7 @@
 //! Coverage is still asked as ONE question about the WHOLE followed set: an address that is
 //! followed but uncovered blinds every read, not only its own. Narrowing that to per-address
 //! coverage — so enrolling `K2` need not also send `K1`'s reads to the oracle — is tracked
-//! separately (dig_ecosystem#2874).
+//! separately (dig_ecosystem#2876).
 
 use chia_protocol::Bytes32;
 
