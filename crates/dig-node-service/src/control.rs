@@ -2166,7 +2166,8 @@ fn parse_watch_keys(
                     id.clone(),
                     ErrorCode::InvalidParams,
                     format!(
-                        "{method} received an entry in params.public_keys that is not a 48-byte                          G1 public key as hex; no key was registered"
+                        "{method} received an entry in params.public_keys that is not a 48-byte \
+                         G1 public key as hex; no key was registered"
                     ),
                 ))
             }
@@ -2183,7 +2184,8 @@ fn no_watchlist(id: Value) -> Value {
     control_error(
         id,
         ErrorCode::WalletNoChainSource,
-        "this node has no wallet watch registry, so it cannot follow externally-registered          addresses",
+        "this node has no wallet watch registry, so it cannot follow externally-registered \
+         addresses",
     )
 }
 

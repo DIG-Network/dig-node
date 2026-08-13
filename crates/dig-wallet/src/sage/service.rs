@@ -116,8 +116,10 @@ pub struct WalletService {
     /// this node to follow, unioned with custody's own set to form the subscription set.
     ///
     /// Exposed so a control-plane handler can register/deregister keys. It shares state with the
-    /// clone the supervisor holds, so a registration takes effect within one puzzle-hash poll
-    /// rather than at the next restart.
+    /// clone the supervisor holds, so the supervisor re-reads registrations on each connect
+    /// attempt. While a session is running with nothing subscribed, a registration is picked up
+    /// within one puzzle-hash poll; when addresses are already subscribed, additional
+    /// registrations take effect at the next reconnect (dig_ecosystem#2826).
     pub watchlist: WatchRegistry,
 }
 

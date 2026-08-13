@@ -61,9 +61,11 @@ struct WatchlistFile {
 /// Public keys an external client asked this node to follow.
 ///
 /// Cloning shares the inner state (an `Arc`), matching
-/// [`super::custody::WalletCustody`] — a clone handed to the supervisor sees a registration made
-/// through the RPC handler's clone immediately, which is what makes an enrolment take effect
-/// within one [`super::sync_supervisor::PUZZLE_HASH_POLL`] rather than at the next restart.
+/// [`super::custody::WalletCustody`], so a clone handed to the supervisor re-reads registrations
+/// made through the RPC handler's clone on each connect attempt. While a session is running with
+/// nothing subscribed, a first enrolment is picked up within one
+/// [`super::sync_supervisor::PUZZLE_HASH_POLL`]; when addresses are already subscribed, additional
+/// enrolments take effect at the next reconnect or restart (dig_ecosystem#2826).
 #[derive(Debug, Clone)]
 pub struct WatchRegistry {
     path: PathBuf,
