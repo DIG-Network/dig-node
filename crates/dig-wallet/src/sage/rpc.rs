@@ -678,6 +678,35 @@ impl WalletBackend {
         self.watchlist.as_ref()
     }
 
+    /// Does this replica FOLLOW `puzzle_hash` because an enrolled key controls it?
+    ///
+    /// This is the second half of the "is this address ours" question, and without it the first
+    /// half answers for both. `derivation_exists` looks in the `derivations` table, which only
+    /// this node's own custody writes; an externally enrolled key
+    /// ([`super::watchlist::WatchRegistry`]) joins the subscription set and its coins ARE synced
+    /// into the replica, but it never becomes a derivation row. So a node that had enrolled the
+    /// user's account, caught up, and was tracking the chain still routed every balance read to
+    /// the third-party oracle — the replica held the coins and the router could not see that it
+    /// did (dig_ecosystem#2866).
+    ///
+    /// FOLLOWED, not merely KNOWN. The predicate must stay a membership test over the registry:
+    /// answering `true` for an arbitrary address would route a puzzle hash this replica does not
+    /// subscribe to at the local DB, which holds no coins for it, and report a funded wallet as
+    /// EMPTY. That is the falsehood [`super::sync::initial_sync`]'s `NoPuzzleHashes` refusal
+    /// exists to prevent, arriving through a different door.
+    ///
+    /// The mapping comes from [`super::sync_supervisor::puzzle_hash_for`] — the SAME function the
+    /// supervisor uses to build the subscription set, so the router and the subscriber cannot
+    /// disagree about which address a key controls.
+    fn watchlist_follows(&self, puzzle_hash: &str) -> bool {
+        let Some(registry) = self.watchlist.as_ref() else {
+            return false;
+        };
+        registry.registered().iter().any(|pk| {
+            normalize_ph(&hex::encode(super::sync_supervisor::puzzle_hash_for(pk))) == puzzle_hash
+        })
+    }
+
     /// Report a FIXED Chia peer tier instead of the chain transport's — TESTS ONLY.
     ///
     /// The counterpart of [`super::sync_supervisor::SyncHandle::detached_for_tests`], and for the
@@ -906,11 +935,15 @@ impl WalletBackend {
 
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
         let db_synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        // An address is IN SCOPE when this replica follows it: either this node derived it, or an
+        // enrolled key controls it. Enrolment never writes a derivation row, so the first test
+        // alone was false forever for every registered address (dig_ecosystem#2866).
         let scoped = self
             .db
             .derivation_exists(&puzzle_hash)
             .await
-            .map_err(|e| read_err(e.into()))?;
+            .map_err(|e| read_err(e.into()))?
+            || self.watchlist_follows(&puzzle_hash);
 
         let source = routing::route(db_synced, scoped);
         // Disclose the tier in the node log as well as on the wire, so an operator reading
@@ -1043,11 +1076,15 @@ impl WalletBackend {
 
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
         let db_synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
+        // An address is IN SCOPE when this replica follows it: either this node derived it, or an
+        // enrolled key controls it. Enrolment never writes a derivation row, so the first test
+        // alone was false forever for every registered address (dig_ecosystem#2866).
         let scoped = self
             .db
             .derivation_exists(&puzzle_hash)
             .await
-            .map_err(|e| read_err(e.into()))?;
+            .map_err(|e| read_err(e.into()))?
+            || self.watchlist_follows(&puzzle_hash);
 
         let source = routing::route(db_synced, scoped);
         match source {
@@ -4240,6 +4277,27 @@ mod tests {
         encode_address(&owned_ph(), "xch").unwrap()
     }
 
+    /// A public key standing in for an account enrolled through `control.wallet.watch`.
+    ///
+    /// Deliberately NOT `owned_ph`'s key: the enrolled address and the derivation-backed address
+    /// must never coincide, or the control test below could pass for the wrong reason.
+    fn enrolled_key() -> chia::bls::PublicKey {
+        let mut seed = [0u8; 64];
+        seed[0] = 77;
+        chia::bls::SecretKey::from_seed(&seed).public_key()
+    }
+
+    /// A registry holding exactly `key`, backed by a temp dir the caller must keep alive — the
+    /// registry persists to a file, so a dropped dir would take the registration with it.
+    fn registry_with_key(
+        key: &chia::bls::PublicKey,
+    ) -> (super::super::watchlist::WatchRegistry, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = super::super::watchlist::WatchRegistry::new(dir.path());
+        assert_eq!(registry.watch(&[*key]), 1, "the fixture must actually register");
+        (registry, dir)
+    }
+
     /// A DB with `owned_ph` registered as a real HD derivation (the `scoped_to_wallet` axis),
     /// its sync flag set, and an optional peak — the fixture for the DB-path reads.
     async fn db_with_owned_derivation(synced: bool, peak: Option<u32>) -> WalletDb {
@@ -4485,6 +4543,86 @@ mod tests {
         assert_eq!(r.source, Source::Db, "the tier that answered");
         assert!(r.synced);
         assert_eq!(r.peak_height, Some(500), "the replica's own peak");
+    }
+
+    /// An ENROLLED address reads from the replica, not from the third-party oracle.
+    ///
+    /// This is the production path `a_db_served_read_reports_the_db_tier_and_the_replicas_peak`
+    /// could only reach through a hand-written fixture: `upsert_derivation` has no production
+    /// caller, so on a shipped node the `derivations` table is empty and `scoped` was false
+    /// forever. An externally enrolled key IS subscribed and its coins ARE synced into the
+    /// replica, so the replica is authoritative for it (dig_ecosystem#2866, #2234).
+    ///
+    /// Measured before the fix on a real node: a fully synced replica following the user's own
+    /// account still logged `wallet balance read routed to the third-party chain oracle` on every
+    /// read.
+    #[tokio::test]
+    async fn an_enrolled_address_reads_from_the_replica_not_the_oracle() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+        let ph = normalize_ph(&hex::encode(super::super::sync_supervisor::puzzle_hash_for(
+            &enrolled_key(),
+        )));
+
+        // NO derivation row for this address: the registry is the ONLY reason it is in scope.
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        db.set_peak(500, &"cc".repeat(32)).await.unwrap();
+        db.upsert_coins(&[coin_at_ph("enrolled", &ph, 700, Some(10), None)])
+            .await
+            .unwrap();
+
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_watchlist(registry);
+
+        let r = be
+            .balance_for_address(&encode_address(&ph, "xch").unwrap(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.source,
+            Source::Db,
+            "an address the replica follows must be answered by the replica"
+        );
+        assert!(r.synced, "only a Db answer may report itself synced");
+        assert_eq!(r.balance, 700, "the figure the replica holds");
+    }
+
+    /// The CONTROL, and the reason the predicate is membership rather than "a registry exists".
+    ///
+    /// Widening `scoped` to any address would route a puzzle hash this replica does not subscribe
+    /// to at the local DB — which holds no coins for it — and report a FUNDED wallet as EMPTY.
+    /// That is the falsehood `initial_sync`'s `NoPuzzleHashes` refusal exists to prevent, arriving
+    /// through a different door. A registry that follows one address must not vouch for another.
+    #[tokio::test]
+    async fn an_unfollowed_address_still_falls_back_even_with_a_registry_present() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        db.set_peak(500, &"cc".repeat(32)).await.unwrap();
+
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_watchlist(registry);
+
+        // `owned_ph` is a DIFFERENT address, in neither the derivations table nor the registry.
+        let r = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.source,
+            Source::Fallback,
+            "an address the replica does not follow has no coins in the replica"
+        );
+        assert!(!r.synced, "a fallback answer is never a synced local view");
     }
 
     /// A synced, wallet-owned, EMPTY address is a SUCCESS with a zero figure — never an error.
