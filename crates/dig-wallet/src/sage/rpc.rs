@@ -4294,7 +4294,11 @@ mod tests {
     ) -> (super::super::watchlist::WatchRegistry, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let registry = super::super::watchlist::WatchRegistry::new(dir.path());
-        assert_eq!(registry.watch(&[*key]), 1, "the fixture must actually register");
+        assert_eq!(
+            registry.watch(&[*key]),
+            1,
+            "the fixture must actually register"
+        );
         (registry, dir)
     }
 
@@ -4559,9 +4563,9 @@ mod tests {
     #[tokio::test]
     async fn an_enrolled_address_reads_from_the_replica_not_the_oracle() {
         let (registry, _dir) = registry_with_key(&enrolled_key());
-        let ph = normalize_ph(&hex::encode(super::super::sync_supervisor::puzzle_hash_for(
-            &enrolled_key(),
-        )));
+        let ph = normalize_ph(&hex::encode(
+            super::super::sync_supervisor::puzzle_hash_for(&enrolled_key()),
+        ));
 
         // NO derivation row for this address: the registry is the ONLY reason it is in scope.
         let db = WalletDb::open_in_memory().await.unwrap();
