@@ -26,6 +26,19 @@ use super::db::{CatchUpReplay, CoinRow, WalletDb};
 use super::events::{EventBus, SyncEvent};
 use super::singleton::{self, LineageSource};
 
+/// How long ONE puzzle-state round trip may take before the peer is treated as gone
+/// (dig_ecosystem#2851).
+///
+/// The dial already had a deadline — `sync_supervisor`'s `DIAL_TIMEOUT`, ten seconds — and the
+/// request leg simply never got the same treatment. It is not given the same VALUE, because the two
+/// are different work: a dial is a handshake, whereas a puzzle-state batch is a real query over a
+/// possibly slow link, and one minute is generous for that while still being finite.
+///
+/// Finite is the whole point. Without it, a peer that goes quiet on a live, ESTABLISHED socket
+/// parks the catch-up on a bare `.await` for ever, which is how a supervisor logged "it may now
+/// write" and then said nothing at all for two hours.
+const PEER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A sync error (peer/protocol/db).
 #[derive(Debug)]
 pub enum SyncError {
@@ -663,9 +676,30 @@ pub async fn initial_sync_with(
     let mut first_batch = true;
     let mut budget = CatchUpBudget::new();
     loop {
-        let respond = peer
-            .request_puzzle_state(puzzle_hashes.clone(), previous_height, header_hash)
-            .await?;
+        // Bounded per ROUND TRIP, never over the catch-up as a whole (dig_ecosystem#2851). A first
+        // catch-up runs from genesis over many batches and legitimately takes a long time, so a
+        // total deadline would kill a healthy long sync — a worse failure than the one being fixed.
+        // A single request/response has no such excuse: a peer that has not answered one batch in
+        // a minute has gone quiet, and without a deadline here this `.await` parks the whole
+        // supervisor for the life of the process on a socket that stays ESTABLISHED. A supervisor
+        // logged "it may now write" and then said nothing at all for two hours.
+        //
+        // Placed at the LOOP rather than inside the production `Peer` impl deliberately: here it
+        // covers every `PuzzleStateSource`, and it is reachable by a test double — a deadline that
+        // only exists on the one implementation no test can construct is a deadline nothing can
+        // prove. Recovery is already wired: this error reaches the supervisor's `catch-up failed`
+        // path, which drops the peer and backs off.
+        let respond = tokio::time::timeout(
+            PEER_REQUEST_TIMEOUT,
+            peer.request_puzzle_state(puzzle_hashes.clone(), previous_height, header_hash),
+        )
+        .await
+        .map_err(|_| {
+            SyncError::Peer(format!(
+                "the peer did not answer a puzzle-state request within {}s",
+                PEER_REQUEST_TIMEOUT.as_secs()
+            ))
+        })??;
         if first_batch {
             events.publish(SyncEvent::Subscribed);
             first_batch = false;
@@ -1318,6 +1352,69 @@ mod tests {
                 is_finished: true,
             })
         }
+    }
+
+    /// A peer that accepts the request and then never answers — the live incident's shape, and the
+    /// one a socket-level check cannot see. The connection stays ESTABLISHED throughout.
+    struct SilentPeer;
+
+    #[async_trait::async_trait]
+    impl PuzzleStateSource for SilentPeer {
+        async fn request_puzzle_state(
+            &self,
+            _puzzle_hashes: Vec<Bytes32>,
+            _previous_height: Option<u32>,
+            _header_hash: Bytes32,
+        ) -> Result<RespondPuzzleState, SyncError> {
+            std::future::pending().await
+        }
+    }
+
+    /// **Proves (dig_ecosystem#2851):** a peer that goes SILENT mid-catch-up ends the catch-up with
+    /// an error instead of parking the supervisor for ever.
+    ///
+    /// THE BUG THIS PINS. `request_puzzle_state` was awaited bare, so one unanswered round trip
+    /// parked `initial_sync_with` — which runs BEFORE the supervisor's `select!` and is therefore
+    /// outside every exit the supervisor has. The observed result was a node that logged "it may now
+    /// write" and then said nothing for two hours, with the peer's socket still ESTABLISHED.
+    ///
+    /// FIXTURE DESIGN — the double parks rather than erroring, because an erroring peer takes the
+    /// path that already worked and would pass against the defect. The clock is PAUSED, so the
+    /// assertion is "a deadline exists", not "sixty seconds elapsed", and the outer bound is what
+    /// makes a regression fail LOUDLY: with no deadline the only timer left is that bound, the
+    /// paused clock jumps straight to it, and the test fails instead of hanging like a dead process.
+    #[tokio::test]
+    async fn a_silent_peer_times_out_instead_of_parking_the_catch_up() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let events = EventBus::default();
+        // Paused only AFTER the DB is open: the sqlite pool has acquisition timers of its own, and
+        // a virtual clock running while it connects auto-advances straight through them.
+        tokio::time::pause();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(600),
+            initial_sync_with(
+                &SilentPeer,
+                &db,
+                vec![Bytes32::new([7; 32])],
+                Bytes32::new([0; 32]),
+                "127.0.0.1",
+                &events,
+                PeerTrust::Operator,
+            ),
+        )
+        .await
+        .expect("the catch-up never returned: a silent peer still parks the supervisor for ever");
+
+        let err = outcome.expect_err("a peer that never answered must not report success");
+        assert!(
+            matches!(&err, SyncError::Peer(m) if m.contains("did not answer")),
+            "the failure must name the timeout as the reason; got {err:?}"
+        );
+        assert!(
+            !db.is_synced().await.unwrap(),
+            "a timed-out catch-up must not latch initial_sync_complete"
+        );
     }
 
     /// **Proves (T1, #2501):** [`initial_sync_with`] REFUSES an empty puzzle-hash set, and
