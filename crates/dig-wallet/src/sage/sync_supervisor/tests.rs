@@ -1,7 +1,7 @@
 //! Supervisor tests (dig_ecosystem#2501).
 //!
 //! The doubles here stop at the PEER boundary and nowhere else: `catch_up` runs the real
-//! [`sync::initial_sync_with`] (so the empty-set guard is genuinely in the path) and `run` runs
+//! [`sync::initial_sync_with_authority`] (so the empty-set guard is genuinely in the path) and `run` runs
 //! the real [`sync::run_update_loop`] (so a peak advance is a real decode + a real DB write).
 //! Only the socket is fake.
 
@@ -89,7 +89,7 @@ struct Script {
     /// This clock returns from every sleep immediately, which is what makes the backoff ladder
     /// testable in milliseconds — and which also means EVERY timer in the supervisor's `select!`
     /// fires at once. A test observing one timer must therefore silence the others, or it proves
-    /// only that *something* ended the session. [`SESSION_MAX_LIFETIME`] is silenced by default
+    /// only that *something* ended the session. [`NO_ROTATION`] is silenced by default
     /// (dig_ecosystem#2851): rotation ends every session on its own, so without this the stall
     /// tests would pass against a supervisor with no stall detection at all.
     suppressed: Mutex<Vec<Duration>>,
@@ -2054,7 +2054,7 @@ async fn run_discovered_session(
 /// contradicting.
 ///
 /// TWO HOPS, because the fix is a PLACEMENT. Asserting only "the replica is empty" would be
-/// satisfied identically by a guard left down inside `initial_sync_with` — the pre-#2568
+/// satisfied identically by a guard left down inside `initial_sync_with_authority` — the pre-#2568
 /// placement — and a later refactor moving the check would keep such a test green. So this also
 /// asserts `catch_up` was never CALLED. Only a guard that runs BEFORE the catch-up can satisfy
 /// both, which is the property that actually matters: a peer that fails corroboration never gets
@@ -3034,7 +3034,7 @@ async fn an_unmeasured_height_leaves_the_phase_unchanged() {
 ///
 /// Coin selection reads the replica, and [`routing::route`] is the gate that decides whether the
 /// replica answers for money at all. That gate turns on `initial_sync_complete`, which
-/// `initial_sync_with` is the only peer-reachable writer of, and which is now reachable only
+/// `initial_sync_with_authority` is the only peer-reachable writer of, and which is now reachable only
 /// through corroboration. So the property is expressible as: the SAME wallet, same peer, same
 /// data, routes to the fallback tier when the peer was not corroborated and to the replica when it
 /// was.

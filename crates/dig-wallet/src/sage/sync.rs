@@ -53,7 +53,7 @@ pub enum SyncError {
     Db(sqlx::Error),
     /// A CAT/singleton attribution error (parent-spend read / uncurry).
     Attribution(String),
-    /// [`initial_sync`] was asked to catch up over an EMPTY puzzle-hash set.
+    /// [`initial_sync_with_authority`] was asked to catch up over an EMPTY puzzle-hash set.
     ///
     /// Refused rather than performed. Subscribing nothing makes a peer answer
     /// `is_finished` on the first response, which would mark the DB
@@ -362,7 +362,7 @@ impl WriteAuthority {
     }
 }
 
-/// The most catch-up round trips one [`initial_sync_with`] may make.
+/// The most catch-up round trips one [`initial_sync_with_authority`] may make.
 ///
 /// The loop continues while the peer answers `is_finished: false`, and the peer chooses that
 /// bit. Combined with the strict height-monotonicity check below this is belt and braces: the
@@ -370,7 +370,7 @@ impl WriteAuthority {
 /// catch-up needs a handful of batches even for a heavily-used wallet.
 pub const MAX_CATCH_UP_BATCHES: u32 = 1_024;
 
-/// The most coin states one [`initial_sync_with`] may write, summed across its batches.
+/// The most coin states one [`initial_sync_with_authority`] may write, summed across its batches.
 ///
 /// A peer answering a subscription decides how many rows it hands back and can repeat them
 /// with fresh coin ids forever; without this, `wallet.sqlite` grows for as long as the peer
@@ -568,7 +568,7 @@ impl CatchUpReplay {
 /// The running cost of one catch-up, bounded by [`MAX_CATCH_UP_BATCHES`] and
 /// [`MAX_CATCH_UP_COINS`].
 ///
-/// Split out of [`initial_sync_with`] as a small value with no I/O so both bounds can be pinned
+/// Split out of [`initial_sync_with_authority`] as a small value with no I/O so both bounds can be pinned
 /// from ABOVE and BELOW in a unit test — a cap tested only from one side confirms only itself,
 /// and driving 250,000 rows through SQLite to prove the at-bound case would be a test nobody
 /// runs.
@@ -758,7 +758,7 @@ pub async fn handle_coin_state_update(
     Ok(())
 }
 
-/// The one peer call [`initial_sync`] makes, behind a trait.
+/// The one peer call [`initial_sync_with_authority`] makes, behind a trait.
 ///
 /// `chia_wallet_sdk::client::Peer` can only exist on top of a live socket, so the catch-up
 /// loop — including the empty-set refusal that protects `initial_sync_complete` — would
@@ -920,7 +920,7 @@ pub async fn initial_sync_with_authority(
 /// [`handle_coin_state_update`]; `new_peak_wallet` → advance the peak, but ONLY from an
 /// authoritative peer — a [`PeerTrust::Discovered`] peer's height is dropped here, for the same
 /// reason its coins are (see [`PeerTrust`]). This is the production loop run after
-/// [`initial_sync`]; it returns when the peer disconnects, at which point it publishes
+/// [`initial_sync_with_authority`]; it returns when the peer disconnects, at which point it publishes
 /// [`SyncEvent::Stop`] on `events`.
 ///
 /// When `attributor` is `Some`, each applied `coin_state_update` is followed by a CAT/
@@ -1617,7 +1617,7 @@ mod tests {
     /// an error instead of parking the supervisor for ever.
     ///
     /// THE BUG THIS PINS. `request_puzzle_state` was awaited bare, so one unanswered round trip
-    /// parked `initial_sync_with` — which runs BEFORE the supervisor's `select!` and is therefore
+    /// parked `initial_sync_with_authority` — which runs BEFORE the supervisor's `select!` and is therefore
     /// outside every exit the supervisor has. The observed result was a node that logged "it may now
     /// write" and then said nothing for two hours, with the peer's socket still ESTABLISHED.
     ///
@@ -1664,7 +1664,7 @@ mod tests {
         );
     }
 
-    /// **Proves (T1, #2501):** [`initial_sync_with`] REFUSES an empty puzzle-hash set, and
+    /// **Proves (T1, #2501):** [`initial_sync_with_authority`] REFUSES an empty puzzle-hash set, and
     /// the DB is left un-synced.
     ///
     /// The peer double here would happily report `is_finished` on the first response, so

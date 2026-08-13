@@ -32,7 +32,7 @@
 //! # The invariant this module exists to respect
 //!
 //! **A catch-up is never run over an empty puzzle-hash set.** The floor of that rule is in
-//! [`crate::sage::sync::initial_sync`] itself, which refuses with
+//! [`crate::sage::sync::initial_sync_with_authority`] itself, which refuses with
 //! [`SyncError::NoPuzzleHashes`]; the supervisor additionally does not ask. Both, deliberately:
 //! marking an un-queried DB initial-sync-complete flips
 //! [`crate::sage::routing::route`] to `Source::Db`, at which point a funded wallet reads as
@@ -279,7 +279,7 @@ declare_sync_phases! {
     /// sync has nothing to do.
     ///
     /// This is the DEFAULT-INSTALL state, not an edge (dig_ecosystem#2609). With zero puzzle
-    /// hashes [`crate::sage::sync::initial_sync`] refuses to run, so `initial_sync_complete` never
+    /// hashes [`crate::sage::sync::initial_sync_with_authority`] refuses to run, so `initial_sync_complete` never
     /// latches — while `new_peak_wallet` keeps the replica's peak advancing with the chain.
     /// Reported as `Syncing`, that made every consumer say "your node is still catching up" for
     /// ever about a node sitting at the tip.

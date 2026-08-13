@@ -2376,7 +2376,7 @@ impl WalletBackend {
         // Mark the DB synced so wallet-data reads flip from the fallback to the local DB (routing).
         //
         // This is the OTHER writer of `initial_sync_complete` besides
-        // [`super::sync::initial_sync_with`] — worth stating, because that function's own note
+        // [`super::sync::initial_sync_with_authority`] — worth stating, because that function's own note
         // claimed to be the only one. It is outside the peer trust boundary: its rows come from
         // the coinset ORACLE, never from a peer, and its only caller returns early unless
         // live-broadcast is on.
