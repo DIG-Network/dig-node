@@ -23,9 +23,11 @@ use crate::sage::sync::PuzzleStateSource;
 /// so a timer is identifiable ONLY by the duration it asked for, and suppressing a duration
 /// silences every timer that asks for it. The real lifetime once shared `BACKOFF_MAX`'s 60 seconds,
 /// so suppressing it silenced backoff waits too — one in forty-one, whenever jitter landed on
-/// exactly 100% — and wedged the supervisor for good. The lifetime is 600 seconds now and no longer
-/// collides, but a value of its own is what keeps that true independently of either constant.
-const NO_ROTATION: Duration = Duration::from_secs(3_600);
+/// exactly 100% — and wedged the supervisor for good. A DAY is chosen now because no production
+/// timer will ever ask for one, which keeps the suppression unambiguous however the real constants
+/// move; 3600s was given up because `CATCH_UP_DEADLINE` came to share it, re-creating exactly that
+/// collision.
+const NO_ROTATION: Duration = Duration::from_secs(86_400);
 
 /// The height a scripted catch-up reports as the chain tip.
 const CATCH_UP_HEIGHT: u32 = 6_000_000;
@@ -94,15 +96,34 @@ struct Script {
     /// Suppressed timers that were nonetheless ARMED, so a test can still prove the supervisor
     /// asked to wait even though the wait was never allowed to finish.
     suppressed_waits: Mutex<Vec<Duration>>,
+    /// When set, `catch_up` records its call and then NEVER returns — a peer that keeps a catch-up
+    /// alive on a live socket, which is the state the per-round-trip timeout cannot end
+    /// (dig_ecosystem#2851).
+    catch_up_parks: std::sync::atomic::AtomicBool,
 }
 
 impl Script {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             now: Mutex::new(Some(Instant::now())),
-            suppressed: Mutex::new(vec![NO_ROTATION]),
+            // Both of the supervisor's long timers are silenced by default, for the same reason:
+            // this clock returns instantly, so an unsilenced timer fires the moment it is armed and
+            // every test would prove only that *something* ended the session. A test that is ABOUT
+            // one of them lifts its own suppression.
+            suppressed: Mutex::new(vec![NO_ROTATION, CATCH_UP_DEADLINE]),
             ..Self::default()
         })
+    }
+
+    /// Let a timer that is silenced by default actually fire — for the test that is about it.
+    fn allow(&self, duration: Duration) {
+        self.suppressed.lock().unwrap().retain(|d| *d != duration);
+    }
+
+    /// Make every `catch_up` hang instead of completing, modelling a peer that answers each round
+    /// trip just inside its timeout and so never trips the per-round-trip bound.
+    fn park_the_catch_up(&self) {
+        self.catch_up_parks.store(true, Ordering::SeqCst);
     }
 
     fn catch_up_count(&self) -> usize {
@@ -220,6 +241,10 @@ impl SyncSession for ScriptedSession {
             .lock()
             .unwrap()
             .push(puzzle_hashes.clone());
+        if self.script.catch_up_parks.load(Ordering::SeqCst) {
+            // Recorded FIRST, so a test can still prove the catch-up was entered.
+            std::future::pending::<()>().await;
+        }
         // The REAL catch-up, so the empty-set guard and the completion-flag write are both
         // exercised exactly as production would exercise them.
         sync::initial_sync_with_authority(
@@ -3235,4 +3260,87 @@ fn an_enrolled_but_unreachable_custody_is_not_an_all_clear_through_the_union() {
         "a wallet IS enrolled — its coins are simply not being followed, which must never read \
          as the no-wallet all-clear"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A catch-up is bounded and interruptible (dig_ecosystem#2851)
+// ---------------------------------------------------------------------------
+
+/// **Proves (dig_ecosystem#2851):** a catch-up that never returns is ABANDONED on a total deadline,
+/// so the supervisor gets back to the reconnect path instead of holding one peer for ever.
+///
+/// The per-round-trip `PEER_REQUEST_TIMEOUT` bounds one answer, not the sequence of them. A peer
+/// that answers each round trip just inside the bound satisfies it indefinitely, and the catch-up
+/// runs OUTSIDE the supervisor's `select!` — so rotation, stall detection and shutdown are all
+/// disarmed for the whole of it. At 60 seconds across up to 1024 batches that is about seventeen
+/// hours in which nothing can end the session.
+///
+/// FIXTURE DESIGN — the double PARKS rather than erroring, because an erroring catch-up takes the
+/// path that already worked and would pass against the defect. The deadline is the only timer this
+/// test un-silences, so a reconnect can have come from nothing else; with the deadline removed the
+/// supervisor stays on its first session and `until` fails LOUDLY on its own bound rather than
+/// hanging.
+#[tokio::test]
+async fn a_catch_up_that_never_returns_is_abandoned_on_its_own_deadline() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    script.park_the_catch_up();
+    script.allow(CATCH_UP_DEADLINE);
+
+    let harness = Harness::start(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+
+    harness
+        .until(
+            "the parked catch-up to be abandoned and a fresh peer dialled",
+            |s| s.connects.load(Ordering::SeqCst) >= 2,
+        )
+        .await;
+
+    assert!(
+        script.catch_up_count() >= 2,
+        "the supervisor reconnected without re-entering the catch-up, so the deadline is not what \
+         ended the session"
+    );
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** the node can be SHUT DOWN while a catch-up is running.
+///
+/// The half of the defect that is not about liveness at all. A catch-up sitting outside the
+/// `select!` takes the shutdown signal with it, so `dig-node stop` — and every service manager that
+/// wraps it — waits on a peer that has no reason to answer. A node that cannot be stopped for
+/// seventeen hours is its own defect, whatever the sync eventually does.
+///
+/// FIXTURE DESIGN — the deadline stays SILENCED here, deliberately. It would otherwise end the
+/// session on its own and the test would pass against a supervisor that still ignores shutdown
+/// during a catch-up, which is the whole property. So the ONLY thing that can end this task is the
+/// shutdown arm, and `Harness::stop`'s own five-second bound makes a regression fail loudly instead
+/// of hanging the suite.
+#[tokio::test]
+async fn a_shutdown_is_honoured_while_a_catch_up_is_running() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    script.park_the_catch_up();
+
+    let harness = Harness::start(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+    )
+    .await;
+
+    harness
+        .until("the catch-up to be entered", |s| s.catch_up_count() >= 1)
+        .await;
+
+    // `stop` asserts the task actually ends; it is the assertion, not the teardown.
+    harness.stop().await;
 }

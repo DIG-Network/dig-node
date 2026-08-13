@@ -102,6 +102,36 @@ const RECORROBORATE_AFTER: Duration = Duration::from_secs(45);
 /// block interval (~19s), so a healthy replica advances within a poll or two and the stall clock is
 /// reset by evidence rather than by luck.
 const STALL_POLL: Duration = Duration::from_secs(15);
+/// The TOTAL time one catch-up may take before the session is abandoned (dig_ecosystem#2851).
+///
+/// `sync::PEER_REQUEST_TIMEOUT` bounds ONE round trip, and deliberately so: a catch-up runs from
+/// genesis over many batches, and a total deadline tight enough to be interesting would abort a
+/// healthy long sync and restart it from the beginning for ever. But a per-round-trip bound is not
+/// a bound on the SEQUENCE — a peer answering each round trip just inside 60 seconds satisfies it
+/// indefinitely, which across the batch limit is about seventeen hours with rotation, stall
+/// detection and shutdown all disarmed, because the catch-up runs outside the supervisor's
+/// `select!`.
+///
+/// # Why ONE deadline, and not a shorter one for a re-catch-up
+///
+/// A first catch-up on a fresh install and a re-catch-up on a warm DB were both candidates for
+/// separate budgets, and separating them was considered and rejected: EVERY catch-up here runs from
+/// genesis. A reconnecting peer has no memory of the previous subscription and resuming from the
+/// stored `(height, header_hash)` is not safe, so "first" and "subsequent" describe the same work.
+/// What differs is how much coin state comes back, which is a property of the WALLET's history and
+/// not of whether this process has synced before — so a discriminator would have split the budget
+/// along an axis that does not predict the cost. (`initial_sync_complete` would have been the wrong
+/// one twice over: it is cleared on any accepted reorg, so an untrusted peer can choose which
+/// budget applies.)
+///
+/// AN HOUR IS DELIBERATELY GENEROUS, and the asymmetry is why. Both catch-ups measured on the live
+/// host completed in 54-81 MILLISECONDS, so this is four orders of magnitude above anything
+/// observed, while still being a twentieth of the unbounded worst case. Too tight is the far worse
+/// error: an aborted catch-up restarts from genesis, so a deadline a legitimate sync cannot meet
+/// produces a replica that never finishes — the failure this whole ticket is about. Too loose
+/// merely leaves a pathological peer holding a session it cannot usefully do anything with, and
+/// SHUTDOWN is no longer among the things it holds.
+const CATCH_UP_DEADLINE: Duration = Duration::from_secs(3_600);
 /// How long a session may hold the replica STILL, while the chain demonstrably advances, before it
 /// is ended (dig_ecosystem#2851).
 ///
@@ -925,6 +955,21 @@ enum SessionOutcome {
     Rotate,
 }
 
+/// Why a catch-up did not complete (dig_ecosystem#2851).
+///
+/// The three endings are kept apart because they mean different things to an operator and lead to
+/// different places in the loop: a peer that REFUSED, a peer that never finished, and a node that
+/// was asked to stop. Folding the middle one into the first would report a peer error that never
+/// happened; folding the last into either would back off and reconnect on the way out.
+enum CatchUpFailure {
+    /// The peer refused, or the catch-up errored.
+    Failed(SyncError),
+    /// [`CATCH_UP_DEADLINE`] elapsed with the catch-up still running.
+    TimedOut,
+    /// Shutdown was requested; the supervisor exits without reconnecting.
+    Stopped,
+}
+
 /// What one stall observation concluded.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StallVerdict {
@@ -1130,22 +1175,57 @@ impl Supervisor {
                 tracing::debug!("wallet sync: no custodied puzzle hashes; nothing subscribed");
             } else {
                 let began = self.time.now();
-                if let Err(e) = session
-                    .catch_up(
+                // A catch-up is the one long-running step the supervisor takes, and until
+                // dig_ecosystem#2851 it took the whole loop with it: sitting outside this `select!`
+                // it disarmed rotation, stall detection AND shutdown for its entire duration, which
+                // a peer answering each round trip just inside its timeout could stretch to about
+                // seventeen hours. Rotation and stall detection cannot meaningfully run here — both
+                // end the session, and ending a session mid-catch-up discards the work — but a
+                // TOTAL deadline and shutdown both can, and shutdown is not optional at any
+                // duration.
+                let catch_up = tokio::select! {
+                    result = session.catch_up(
                         &self.db,
                         puzzle_hashes,
                         self.genesis_challenge,
                         &self.events,
                         authority,
-                    )
-                    .await
-                {
-                    tracing::warn!(error = %e, "wallet sync: catch-up failed");
-                    handle.set_connected(0);
-                    if !self.wait(&mut backoff, &mut shutdown).await {
+                    ) => result.map_err(CatchUpFailure::Failed),
+                    () = self.time.sleep(CATCH_UP_DEADLINE) => Err(CatchUpFailure::TimedOut),
+                    // Dropping the `catch_up` future closes the peer. Nothing is aborted mid-write:
+                    // the future is only dropped at an await point, and a DB write already in
+                    // flight is not one.
+                    _ = shutdown.changed() => Err(CatchUpFailure::Stopped),
+                };
+                match catch_up {
+                    Ok(()) => {}
+                    Err(CatchUpFailure::Stopped) => {
+                        handle.set_connected(0);
                         break;
                     }
-                    continue;
+                    Err(failure) => {
+                        match failure {
+                            CatchUpFailure::Failed(e) => {
+                                tracing::warn!(error = %e, "wallet sync: catch-up failed");
+                            }
+                            // Named as its own line because it is diagnostically nothing like a
+                            // failed catch-up: the peer never refused anything, it simply never
+                            // finished, and an operator seeing only "catch-up failed" would look
+                            // for an error that does not exist.
+                            CatchUpFailure::TimedOut => tracing::warn!(
+                                peer = %session.peer_ip(),
+                                deadline_secs = CATCH_UP_DEADLINE.as_secs(),
+                                "wallet sync: the catch-up did not finish within its total \
+                                 deadline; abandoning the session so a fresh peer is dialled"
+                            ),
+                            CatchUpFailure::Stopped => unreachable!("handled above"),
+                        }
+                        handle.set_connected(0);
+                        if !self.wait(&mut backoff, &mut shutdown).await {
+                            break;
+                        }
+                        continue;
+                    }
                 }
                 // Reported on EVERY session, because it is the number that decides whether
                 // [`SESSION_MAX_LIFETIME`] is affordable. A reconnect re-runs the catch-up from

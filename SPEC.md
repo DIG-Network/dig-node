@@ -3786,9 +3786,21 @@ the subscription is per-connection state. No seed is read and nothing on this pa
 waits carry one:
 
 - ONE puzzle-state round trip during a catch-up MUST complete within 60 seconds, or the catch-up fails
-  and the peer is dropped and re-dialled. The bound is PER ROUND TRIP and MUST NOT be a bound on the
-  catch-up as a whole — a first catch-up runs from genesis over many batches and legitimately takes a
-  long time, so a total deadline would abort a healthy long sync.
+  and the peer is dropped and re-dialled. The bound is PER ROUND TRIP: a catch-up runs from genesis
+  over many batches, so a total deadline tight enough to bound a batch would abort a healthy long sync
+  and restart it from the beginning for ever.
+- A catch-up as a WHOLE MUST also carry a total deadline, because a per-round-trip bound bounds one
+  answer and not the sequence of them: a peer answering each round trip just inside 60 seconds
+  satisfies it indefinitely. The total deadline MUST be generous — an hour, against catch-ups measured
+  in tens of milliseconds — since the two errors are not symmetric: too loose merely leaves a
+  pathological peer holding a session, whereas too tight produces a replica that never finishes. It
+  MUST be a single budget and MUST NOT be selected by whether a catch-up is the first one: every
+  catch-up runs from genesis, so the two describe the same work, and `initial_sync_complete` in
+  particular MUST NOT be the discriminator because an accepted reorg clears it and an untrusted peer
+  would then choose which budget applies.
+- A catch-up MUST NOT disarm SHUTDOWN. It is the one long-running step in the session lifecycle, and
+  a node that cannot be stopped while it runs is a defect independent of what the sync eventually
+  does. Shutdown MUST end the catch-up promptly, without backing off or reconnecting on the way out.
 - An AUTHORITATIVE subscribed session that holds the replica STILL for 90 seconds while the node's own
   Chia peers are observed to be strictly ahead of it MUST be ENDED, so the ordinary reconnect path
   dials a fresh peer. The node MUST log the reason with both heights, AND MUST log the RECOVERY when
