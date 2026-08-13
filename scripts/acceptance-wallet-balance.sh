@@ -58,7 +58,15 @@ bal_json=$(dign wallet balance "$ADDRESS" --json 2>/dev/null) || fail 4 "the bal
 source=$(printf '%s' "$bal_json" | python -c "import json,sys;print(json.load(sys.stdin).get('source'))")
 synced=$(printf '%s' "$bal_json" | python -c "import json,sys;print(json.load(sys.stdin).get('synced'))")
 
-[ "$source" = "db" ] || fail 4 "the balance was answered by '$source', not the replica — the address is followed but the read did not route to the local DB"
+if [ "$source" != "db" ]; then
+    # Two very different causes land here, and naming the wrong one sends the next person to the
+    # wrong layer — which is how this defect family stayed alive for two days. Ask the node which
+    # addresses it follows and say which case this is.
+    if dign wallet watched --json 2>/dev/null | grep -qi "$(printf '%s' "$ADDRESS" | tail -c 12)"; then
+        fail 4 "'$ADDRESS' is followed, yet the balance was answered by '$source' — the read did not route to the replica"
+    fi
+    fail 4 "the balance was answered by '$source'. This address is not among the ones the node follows, so the replica holds no coins for it — enrol it, or pass an address that is enrolled"
+fi
 [ "$synced" = "True" ] || fail 4 "a db-tier answer reported synced=$synced; only a replica read may claim a synced view"
 
 echo "PASS: peers=$peers watched=$watched behind=$behind source=$source synced=$synced"
