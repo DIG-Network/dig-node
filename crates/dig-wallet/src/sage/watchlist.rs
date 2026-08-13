@@ -137,13 +137,7 @@ impl WatchRegistry {
     /// under-report this module refuses to produce quietly.
     fn persist(&self) {
         let file = WatchlistFile {
-            keys: self
-                .keys
-                .read()
-                .unwrap()
-                .iter()
-                .map(hex::encode)
-                .collect(),
+            keys: self.keys.read().unwrap().iter().map(hex::encode).collect(),
         };
         let json = match serde_json::to_vec_pretty(&file) {
             Ok(j) => j,
@@ -154,7 +148,9 @@ impl WatchRegistry {
         };
         if let Some(dir) = self.path.parent() {
             if let Err(e) = std::fs::create_dir_all(dir) {
-                eprintln!("dig-wallet: ERROR could not create the config dir for the watch list: {e}");
+                eprintln!(
+                    "dig-wallet: ERROR could not create the config dir for the watch list: {e}"
+                );
                 return;
             }
         }
@@ -292,7 +288,11 @@ mod tests {
         r.watch(&[key(1), key(2)]);
 
         assert_eq!(r.unwatch(&[key(1)]), 1);
-        assert_eq!(r.registered(), vec![key(2)], "the live set drops only key 1");
+        assert_eq!(
+            r.registered(),
+            vec![key(2)],
+            "the live set drops only key 1"
+        );
         assert_eq!(
             WatchRegistry::new(&d).registered(),
             vec![key(2)],

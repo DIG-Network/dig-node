@@ -249,7 +249,8 @@ impl WalletService {
             .with_auth(auth)
             .with_tip_events(tip_events.clone())
             .with_pusher(chain.clone())
-            .with_node_custodied_spending(cfg.enable_live_broadcast);
+            .with_node_custodied_spending(cfg.enable_live_broadcast)
+            .with_watchlist(watchlist.clone());
         if let Some(h) = &sync {
             base = base.with_sync_handle(h.clone());
         }

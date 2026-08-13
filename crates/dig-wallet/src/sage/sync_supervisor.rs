@@ -518,8 +518,9 @@ impl UnionPuzzleHashSource {
 
 impl PuzzleHashSource for UnionPuzzleHashSource {
     fn puzzle_hashes(&self) -> Vec<Bytes32> {
-        let mut hashes: BTreeSet<Bytes32> =
-            PuzzleHashSource::puzzle_hashes(&self.custody).into_iter().collect();
+        let mut hashes: BTreeSet<Bytes32> = PuzzleHashSource::puzzle_hashes(&self.custody)
+            .into_iter()
+            .collect();
         hashes.extend(self.registry.registered().iter().map(puzzle_hash_for));
         // Sorted + deduplicated by construction, so a subscription (and a test asserting one) is
         // reproducible regardless of which side contributed a hash.

@@ -2051,8 +2051,10 @@ fn unwatch_removes_the_address_from_the_subscription_set() {
         vec![puzzle_hash_for(&registered_key(4))],
         "the deregistered address must leave the set the supervisor re-reads, and only it"
     );
-    let after_restart =
-        UnionPuzzleHashSource::new(WalletCustody::mainnet(dir.clone()), crate::sage::watchlist::WatchRegistry::new(&dir));
+    let after_restart = UnionPuzzleHashSource::new(
+        WalletCustody::mainnet(dir.clone()),
+        crate::sage::watchlist::WatchRegistry::new(&dir),
+    );
     assert_eq!(
         after_restart.puzzle_hashes(),
         vec![puzzle_hash_for(&registered_key(4))],

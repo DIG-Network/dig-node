@@ -440,6 +440,12 @@ pub struct WalletBackend {
     /// persisted sync state. `None` where no supervisor runs (tests, and any bring-up that
     /// disables chain sync), and that is reported as an UNOBSERVABLE peer count, never zero.
     sync_handle: Option<super::sync_supervisor::SyncHandle>,
+    /// The externally-registered watch list (§18.6f, dig_ecosystem#2823), attached at bring-up
+    /// ([`Self::with_watchlist`]) so the control plane can register/deregister the addresses this
+    /// node follows without reaching past the backend. `None` where no registry exists (tests, and
+    /// any bring-up assembling a bare backend), and a registration attempt there is refused rather
+    /// than silently accepted and dropped.
+    watchlist: Option<super::watchlist::WatchRegistry>,
     /// A fixed Chia peer tier standing in for the chain transport's, for tests only.
     ///
     /// The integration harness runs with the transport deliberately never built (nothing may dial
@@ -516,6 +522,7 @@ impl WalletBackend {
             lineage: None,
             events: Arc::new(EventBus::default()),
             sync_handle: None,
+            watchlist: None,
             chain_peer_tier_override: None,
             identity: Arc::new(RwLock::new(None)),
             custody: None,
@@ -653,6 +660,22 @@ impl WalletBackend {
     pub fn with_sync_handle(mut self, handle: super::sync_supervisor::SyncHandle) -> Self {
         self.sync_handle = Some(handle);
         self
+    }
+
+    /// Attach the externally-registered watch list (§18.6f, #2823), so the control plane can aim
+    /// this node's chain subscriptions at an account it does not custody.
+    pub fn with_watchlist(mut self, watchlist: super::watchlist::WatchRegistry) -> Self {
+        self.watchlist = Some(watchlist);
+        self
+    }
+
+    /// The attached watch list, or `None` where this backend has none.
+    ///
+    /// A caller MUST surface the `None` as a refusal rather than reporting a registration that
+    /// went nowhere: a client told its account is being followed when nothing is watching it reads
+    /// a balance of zero as the truth.
+    pub fn watchlist(&self) -> Option<&super::watchlist::WatchRegistry> {
+        self.watchlist.as_ref()
     }
 
     /// Report a FIXED Chia peer tier instead of the chain transport's — TESTS ONLY.
