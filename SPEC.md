@@ -3775,11 +3775,41 @@ interleaved reorg rollbacks into a DB with a single writer. A reconnect re-runs 
 genesis challenge, because a fresh peer has no memory of the previous subscription. Sync is a chain READ
 plus a write to the node's own replica, so it MUST NOT be gated on the live-broadcast (spend) flag.
 
-The subscription set is derived from the node's custodied PUBLIC keys via `StandardArgs::curry_tree_hash`,
-re-read on every connect attempt AND — while a session is running with nothing subscribed — re-polled at
+The subscription set is the UNION of two sources, both mapped through the SAME
+`StandardArgs::curry_tree_hash` derivation: the node's own custodied PUBLIC keys, and the public keys an
+external client registered under §18.6f. It is re-read on every connect attempt AND — while a session is running with nothing subscribed — re-polled at
 least every 5 seconds, so a wallet created after boot is picked up without a restart and without waiting
 for the peer to drop. A newly non-empty set ends the peak-only session and reconnects immediately, since
 the subscription is per-connection state. No seed is read and nothing on this path can sign (§908).
+
+18.6f. **Externally-registered addresses (the §908 install).** A node MAY be asked to FOLLOW addresses it
+does not custody. `control.wallet.watch` registers G1 public keys, `control.wallet.unwatch` deregisters
+them, and `control.wallet.watched` lists what is currently registered. All three are MUTATIONS and
+therefore require authorization; none is an open read.
+
+This exists because the correct install has no seed on the node at all: under §908 the user's account
+lives in dig-app, so custody contributes zero puzzle hashes, §18.6a refuses a catch-up over the empty set,
+and the replica's peak never advances. Registration is the only way such a node can watch its user's
+coins.
+
+**Invariant.** Registration MUST be persisted and MUST survive a restart, and `unwatch` MUST remove the
+key from the set the supervisor reads AND from the persisted set — a deregistered address stops being
+followed on both paths.
+
+**Invariant.** The subscription set MUST be the UNION of custody's set and the registered set, never
+either alone. Following a strict subset of the addresses the operator arranged under-reports a BALANCE,
+which is a wrong number that presents as a working feature.
+
+**Invariant.** A node with registered keys and no custody HAS a wallet enrolled: it MUST NOT report the
+`no_wallet_enrolled` all-clear of §18.6b. Enrolment is sourced from custody's manifest OR a non-empty
+registry, never from whether the address set happens to be non-empty.
+
+**§908.** A public key is public. Registration conveys no seed and no signing capability; it aims the
+node's chain subscriptions and nothing else.
+
+**Privacy.** Following an address makes it observable to the node's Chia peers that this machine cares
+about that address. This is already true of the node's own custodied addresses; registering an account
+extends the same exposure to it. A client SHOULD state this where a user enrols an account.
 
 **Invariant.** A catch-up MUST NOT run over an empty puzzle-hash set, and `initial_sync_complete` MUST NOT
 be set as a result of one. `initial_sync` itself refuses with `NoPuzzleHashes`. An empty subscription is

@@ -34,10 +34,11 @@ use super::spend::{
 };
 use super::sync_supervisor::{
     spawn_supervisor, ChiaPeerSessionFactory, ChiaQuorumCorroborator, Supervisor, SyncHandle,
-    TokioTime,
+    TokioTime, UnionPuzzleHashSource,
 };
 use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
+use super::watchlist::WatchRegistry;
 
 /// Bring-up configuration for the served wallet (§18.12).
 #[derive(Debug, Clone)]
@@ -111,6 +112,13 @@ pub struct WalletService {
     /// disabled. Also attached to [`Self::backend`], so a control-plane handler holding only
     /// the backend can still report the live sync phase.
     pub sync: Option<SyncHandle>,
+    /// The externally-registered watch list (dig_ecosystem#2823) — the public keys a client asked
+    /// this node to follow, unioned with custody's own set to form the subscription set.
+    ///
+    /// Exposed so a control-plane handler can register/deregister keys. It shares state with the
+    /// clone the supervisor holds, so a registration takes effect within one puzzle-hash poll
+    /// rather than at the next restart.
+    pub watchlist: WatchRegistry,
 }
 
 impl WalletService {
@@ -141,6 +149,11 @@ impl WalletService {
         // signatures). It shares the SAME custody state (a `WalletCustody` clone shares its inner
         // Arcs), so decrypting a seed for a one-shot sign always uses the on-disk seed + password.
         let auth = Arc::new(UnlockAuth::new(custody.clone(), config_dir.to_path_buf()));
+        // The addresses this node was ASKED to follow, alongside the ones it custodies. On a
+        // §908-correct install (the account lives in dig-app, the node holds no seed) this is the
+        // ONLY source of a subscription set, so without it the replica can never sync
+        // (dig_ecosystem#2823).
+        let watchlist = WatchRegistry::new(config_dir);
         let tip_events = Arc::new(TipEventBus::default());
 
         // Live-broadcast wiring (§18.12), gated on the config flag. A construction failure (no peer
@@ -215,7 +228,10 @@ impl WalletService {
         let sync = if cfg.enable_chain_sync {
             Some(spawn_supervisor(Supervisor {
                 db: db.clone(),
-                puzzle_hashes: Arc::new(custody.clone()),
+                puzzle_hashes: Arc::new(UnionPuzzleHashSource::new(
+                    custody.clone(),
+                    watchlist.clone(),
+                )),
                 factory: Arc::new(ChiaPeerSessionFactory::mainnet(db.clone())),
                 events: events.clone(),
                 genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
@@ -274,6 +290,7 @@ impl WalletService {
             events,
             cert,
             sync,
+            watchlist,
         }
     }
 }
