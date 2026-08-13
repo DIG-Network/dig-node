@@ -4752,10 +4752,11 @@ mod tests {
             .map(super::super::sync_supervisor::puzzle_hash_for)
             .collect();
         db.complete_catch_up(
-            &super::super::db::CatchUpReplay::finished_at(None, 500, "cc".repeat(32), &phs).unwrap(),
+            &super::super::db::CatchUpReplay::finished_at(None, 500, "cc".repeat(32), &phs)
+                .unwrap(),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
     }
 
     /// **Proves (dig_ecosystem#2871):** a key enrolled AFTER the catch-up completed is not answered
