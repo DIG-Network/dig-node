@@ -19,6 +19,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use super::arrivals::{classify, Arrival, ArrivalBaseline, Verdict};
+use super::sync::AdmittedPeak;
 
 /// A handle to the local wallet database.
 #[derive(Clone)]
@@ -478,7 +479,22 @@ impl WalletDb {
         Ok(self.sync_state().await?.initial_sync_complete)
     }
 
-    /// Advance the synced peak.
+    /// Advance the synced peak to a height the session's writer is entitled to claim.
+    ///
+    /// The only way production code writes this column. [`AdmittedPeak`] is built solely by
+    /// [`super::sync::SessionState::admit_peak`], so a new peak-carrying frame cannot reach the
+    /// database without meeting the [`super::sync::PeakCeiling`] — which is what the raw setter
+    /// below allowed, and what dig_ecosystem#2851 exploited.
+    pub async fn record_peak(&self, peak: AdmittedPeak, header_hash: &str) -> sqlx::Result<()> {
+        self.set_peak(peak.height(), header_hash).await
+    }
+
+    /// Advance the synced peak to an arbitrary height, checked against nothing.
+    ///
+    /// Test-only on purpose: a fixture needs to place the replica at a height directly, and
+    /// production must not be able to. Reach for [`Self::record_peak`] instead — if you have no
+    /// [`AdmittedPeak`] to pass it, the height has not been judged yet.
+    #[cfg(test)]
     pub async fn set_peak(&self, height: u32, header_hash: &str) -> sqlx::Result<()> {
         sqlx::query("UPDATE sync_state SET peak_height = ?, header_hash = ? WHERE id = 0")
             .bind(i64::from(height))
