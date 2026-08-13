@@ -4101,6 +4101,21 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
 * **A monotonic replica peak.** `new_peak_wallet` MUST only ADVANCE `sync_state.peak_height`; a backwards
   claim is refused. That height bounds a claimed confirmation on an OPEN read, so a peer able to lower it
   can make settled money read unconfirmed.
+* **A bounded replica peak.** A CORROBORATED writer MUST NOT raise `sync_state.peak_height` above an
+  absolute per-session ceiling, anchored on the height its corroboration round settled (a height that
+  writer cannot inflate, because elevation requires it to AGREE with that height). The allowance above the
+  anchor is `128 + session_lifetime / 9s` blocks — the same 128 the rollback bound uses, making the bound
+  symmetric, plus chain progress budgeted at about half the target block time so a burst still fits. The
+  ceiling is FIXED for the session and MUST NOT ratchet; session rotation refreshes it by re-corroborating.
+  An OPERATOR session has NO ceiling: the operator chose that address by hand and no independent anchor
+  exists on that path. Both peak-carrying writes are bound by it — a `new_peak_wallet` frame, and the
+  terminal height of a catch-up. An over-ceiling `new_peak_wallet` MUST drop the FRAME (leaving the replica
+  peak still, so the sync phase and the stall detector both keep seeing the real gap); the third such frame
+  in one session MUST end the session so a fresh quorum is drawn. An over-ceiling catch-up TERMINAL MUST
+  end the session immediately and MUST NOT arm `initial_sync_complete` or the arrival baseline. Without
+  this bound one accepted frame makes unconfirmed money read as confirmed for the life of the process, and
+  permanently disables both the sync-phase gap check and the stall detector, which saturate into agreement
+  with an inflated peak.
 
 18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
 chia_peer_count, subscription_peer_count, chia_peer_peak_height, watched_addresses}`. `phase` is `not_started` (no peer has ever attached), `syncing`,
