@@ -1414,12 +1414,16 @@ impl Supervisor {
         tracing::info!(
             height = round.height,
             peer = %session.peer_ip(),
-            ceiling = round.height.saturating_add(sync::peak_allowance(SESSION_MAX_LIFETIME)),
+            ceiling = round.height.saturating_add(sync::peak_allowance(self.session_lifetime)),
             "wallet sync: discovered peer corroborated by an independent quorum; it may now write"
         );
+        // The allowance is derived from the lifetime this supervisor actually runs sessions for,
+        // never the constant: `PeakCeiling`'s own doc says a hardcoded ceiling would silently
+        // become too tight if the lifetime moved UP, and reading the constant here is exactly the
+        // hardcoding it warns about (dig_ecosystem#2851, F3).
         sync::WriteAuthority::Corroborated(sync::PeakCeiling::from_corroborated(
             round.height,
-            SESSION_MAX_LIFETIME,
+            self.session_lifetime,
         ))
     }
 

@@ -486,7 +486,7 @@ impl WalletDb {
     /// database without meeting the [`super::sync::PeakCeiling`] — which is what the raw setter
     /// below allowed, and what dig_ecosystem#2851 exploited.
     pub async fn record_peak(&self, peak: AdmittedPeak, header_hash: &str) -> sqlx::Result<()> {
-        self.set_peak(peak.height(), header_hash).await
+        self.write_peak(peak.height(), header_hash).await
     }
 
     /// Advance the synced peak to an arbitrary height, checked against nothing.
@@ -496,6 +496,12 @@ impl WalletDb {
     /// [`AdmittedPeak`] to pass it, the height has not been judged yet.
     #[cfg(test)]
     pub async fn set_peak(&self, height: u32, header_hash: &str) -> sqlx::Result<()> {
+        self.write_peak(height, header_hash).await
+    }
+
+    /// The one statement that moves the peak column forward, private to the persistence layer so
+    /// the judgement above cannot be routed around from outside it.
+    async fn write_peak(&self, height: u32, header_hash: &str) -> sqlx::Result<()> {
         sqlx::query("UPDATE sync_state SET peak_height = ?, header_hash = ? WHERE id = 0")
             .bind(i64::from(height))
             .bind(header_hash)

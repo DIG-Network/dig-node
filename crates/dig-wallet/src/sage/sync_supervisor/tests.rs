@@ -63,6 +63,12 @@ impl PuzzleStateSource for CaughtUpAtOnce {
 struct Script {
     /// One entry per `catch_up`, holding the exact set that was subscribed.
     catch_ups: Mutex<Vec<Vec<Bytes32>>>,
+    /// One entry per `catch_up`, holding the EFFECTIVE authority the supervisor resolved.
+    ///
+    /// The ceiling has exactly one production construction site (`trust_for_session`), and until
+    /// this was recorded nothing in this suite could see what it built — so mutating its anchor
+    /// left every test green (dig_ecosystem#2851, A2).
+    authorities: Mutex<Vec<sync::WriteAuthority>>,
     /// Successful `connect` calls.
     connects: AtomicUsize,
     /// Addresses `connect` dialed, in order.
@@ -241,6 +247,7 @@ impl SyncSession for ScriptedSession {
             .lock()
             .unwrap()
             .push(puzzle_hashes.clone());
+        self.script.authorities.lock().unwrap().push(authority);
         if self.script.catch_up_parks.load(Ordering::SeqCst) {
             // Recorded FIRST, so a test can still prove the catch-up was entered.
             std::future::pending::<()>().await;
@@ -3369,6 +3376,66 @@ async fn a_shutdown_is_honoured_while_a_catch_up_is_running() {
 
     // `stop` asserts the task actually ends; it is the assertion, not the teardown.
     harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851, A2 + F3):** the ceiling the ONE production construction site
+/// builds is anchored on the QUORUM-settled height and scaled by the lifetime the supervisor was
+/// actually given.
+///
+/// `trust_for_session` is the only place a `PeakCeiling` exists in production, and every other
+/// ceiling test hand-constructs its authority — so the bound was pinned solely against itself.
+/// Mutating the anchor to `round.height + 1_000_000`, or scaling by the `SESSION_MAX_LIFETIME`
+/// constant instead of the injected lifetime, both left the whole suite green.
+///
+/// FIXTURE DESIGN — the injected lifetime is deliberately NOT the shipped constant. A test run at
+/// `SESSION_MAX_LIFETIME` cannot tell the derived allowance from the hardcoded one, because the two
+/// agree numerically at exactly that value; doubling it makes them disagree by 66 blocks. And the
+/// anchor is asserted BOTH as an equality and as a refusal one million blocks up, because the
+/// equality alone would still pass a ceiling that was merely wide.
+#[tokio::test]
+async fn the_ceiling_derives_from_the_quorum_height_and_the_injected_lifetime() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    // Twice the shipped value, so a ceiling scaled by the constant is a DIFFERENT number here.
+    let lifetime = SESSION_MAX_LIFETIME * 2;
+
+    let harness = Harness::start_with_lifetime(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(ScriptedCorroborator::new(unanimous(HONEST_HASH))),
+        None,
+        lifetime,
+    )
+    .await;
+    harness
+        .until("the corroborated session to catch up", |s| {
+            s.catch_up_count() >= 1
+        })
+        .await;
+    harness.stop().await;
+
+    let authority = script.authorities.lock().unwrap()[0];
+    let sync::WriteAuthority::Corroborated(ceiling) = authority else {
+        panic!("a corroborated peer must be elevated WITH a ceiling, got {authority:?}");
+    };
+    assert_eq!(
+        ceiling.anchor(),
+        SETTLED_HEIGHT,
+        "the ceiling must be anchored on the height the quorum settled, which the writer cannot          inflate — not on anything the writer said"
+    );
+    assert_eq!(
+        ceiling.limit(),
+        SETTLED_HEIGHT + sync::peak_allowance(lifetime),
+        "the allowance must be derived from the lifetime this supervisor runs sessions for; a          hardcoded one silently becomes too tight when that value moves UP"
+    );
+    assert!(
+        !ceiling.admits(SETTLED_HEIGHT + 1_000_000),
+        "an anchor a million blocks above the settled height is not a bound at all"
+    );
 }
 
 /// **Proves (dig_ecosystem#2851):** write authority is earned PER SESSION and is never inherited

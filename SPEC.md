@@ -4120,10 +4120,12 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
   symmetric, plus chain progress budgeted at about half the target block time so a burst still fits. The
   ceiling is FIXED for the session and MUST NOT ratchet; session rotation refreshes it by re-corroborating.
   An OPERATOR session has NO ceiling: the operator chose that address by hand and no independent anchor
-  exists on that path. Both peak-carrying writes are bound by it — a `new_peak_wallet` frame, and the
-  terminal height of a catch-up. An over-ceiling `new_peak_wallet` MUST drop the FRAME (leaving the replica
-  peak still, so the sync phase and the stall detector both keep seeing the real gap); the third such frame
-  in one session MUST end the session so a fresh quorum is drawn. An over-ceiling catch-up TERMINAL MUST
+  exists on that path. ALL THREE peak-carrying writes are bound by it — a `new_peak_wallet`
+  frame, a `coin_state_update` frame, and the terminal height of a catch-up. An over-ceiling
+  `new_peak_wallet` or `coin_state_update` MUST drop the whole FRAME before it acts (leaving the replica
+  peak still, so the sync phase and the stall detector both keep seeing the real gap, and leaving any
+  rollback the frame asked for undone, because a frame whose height is a lie is suspect in its entirety);
+  the third such frame in one session MUST end the session so a fresh quorum is drawn. An over-ceiling catch-up TERMINAL MUST
   end the session immediately and MUST NOT arm `initial_sync_complete` or the arrival baseline. Without
   this bound one accepted frame makes unconfirmed money read as confirmed for the life of the process, and
   permanently disables both the sync-phase gap check and the stall detector, which saturate into agreement
