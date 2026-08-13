@@ -505,7 +505,35 @@ pub fn hold_best(
 /// 31.3% to 62.3%.
 ///
 /// Requiring the band to keep a strict majority makes the attacker buy the median outright: six of
-/// ten rather than five, strictly more than the old fixed-sample bar of three of four.
+/// the ten dialled rather than five — **60% of the round**, against the old fixed-sample bar of
+/// three of four, which was **75%**. The COUNT rose and the FRACTION fell, so this guard is not
+/// uniformly stricter than the design it replaces, and quoting the counts alone would flatter it.
+///
+/// # Whether that is stricter depends on `f`, so both numbers are published
+///
+/// An attacker's capability here is a fraction `f` of the reachable peer population, so the
+/// fraction is what decides the comparison. Old bar: `P(X ≥ 3)`, `X ~ Binom(4, f)`. New bar:
+/// `P(X ≥ 6)`, `X ~ Binom(10, f)`.
+///
+/// | `f` | 3-of-4 (pre-change) | 6-of-10 (this guard) |
+/// |-----|--------------------:|---------------------:|
+/// | 0.1 |               0.37% |                0.01% |
+/// | 0.2 |               2.72% |                0.64% |
+/// | 0.3 |               8.37% |                4.74% |
+/// | 0.4 |              17.92% |               16.62% |
+/// | 0.5 |              31.25% |               37.70% |
+///
+/// The guard is therefore SAFER in the healthy regime and WORSE once the attacker approaches half
+/// the population, crossing over at **`f ≈ 0.42`**. That is a DIFFERENT crossover from the
+/// `f ≈ 0.17` in `SPEC.md` §18.6e, which compares the pre-change design against the post-change
+/// design with this guard ABSENT; the two must not be read as the same number.
+///
+/// Six of ten is the whole composite bar, not a lower bound on it. An attacker holding six
+/// claimants sets the median, the band excludes the four honest peers, `band_kept_a_majority`
+/// passes (`6 * 2 > 10`), the narrowing to [`QUORUM_HOLD`] draws five peers from a credible set
+/// that is entirely his, and [`required_agreement`] is met by construction. At five he is refused
+/// (`5 * 2 > 10` is false). No later stage adds a further hurdle, so nothing stricter may be
+/// claimed here.
 ///
 /// # The denominator, which is the whole risk in this guard
 ///

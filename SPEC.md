@@ -4017,9 +4017,19 @@ Three further limits are part of the honest statement:
   the median claim, half the claimants announcing an ordinary lag place every honest peer outside the
   band, leaving a round composed entirely of the attacker's peers, unanimous by construction. Measured
   against the shipped selection, this took forgery from about **8.4% to 15.0%** at `f = 0.3` and from
-  about **31.3% to 62.3%** at `f = 0.5`, with the crossover at `f ≈ 0.17`. The refusal required in step 1
-  is what removes this path: it raises the attacker's bar to a strict majority of the claimants — 6 of a
-  10-peer dial — which is strictly above the 3-of-4 the fixed-sample design required.
+  about **31.3% to 62.3%** at `f = 0.5`, with the crossover at `f ≈ 0.17` (that crossover compares the
+  pre-change fixed-sample design against the post-change design with the step-1 refusal ABSENT).
+  The refusal required in step 1 is what removes this path: it raises the attacker's bar to a strict
+  majority of the claimants — 6 of a 10-peer dial, which is **60%** of the round, against the **75%**
+  the 3-of-4 fixed-sample design required. The COUNT rose and the FRACTION fell, so an implementation
+  MUST NOT state the counts alone or describe the refusal as uniformly stricter. Comparing
+  `P(X ≥ 3)`, `X ~ Binom(4, f)` against `P(X ≥ 6)`, `X ~ Binom(10, f)`: **0.37% → 0.01%** at `f = 0.1`,
+  **8.4% → 4.7%** at `f = 0.3`, **17.9% → 16.6%** at `f = 0.4`, and **31.3% → 37.7%** at `f = 0.5`.
+  The refusal is therefore safer in the healthy regime and worse as the attacker approaches half the
+  population, with its own crossover at **`f ≈ 0.42`** — a DIFFERENT number from the `f ≈ 0.17` above,
+  and the two MUST NOT be conflated. Six of ten is the whole composite bar: a six-claimant attacker
+  sets the median, survives the majority check, supplies the entire narrowed sample and meets
+  `required_agreement` by construction, so no later stage adds a further hurdle.
 * **Discovery selection is imperfectly random.** `connect_random_peer` tries `127.0.0.1` before any
   introducer and then returns the first address that connects, so a co-resident process and a fast,
   always-up node are both over-represented among probes. Requiring DISTINCT addresses within a round
