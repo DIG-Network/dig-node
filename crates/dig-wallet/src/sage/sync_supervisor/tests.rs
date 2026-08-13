@@ -299,6 +299,9 @@ struct ScriptedChainTip {
     /// heights TOGETHER, so "the replica advanced between polls" is only expressible by moving it
     /// in step with the observation.
     healthy_replica: Option<WalletDb>,
+    /// When set, the replica only starts advancing once a SECOND session has been opened — so the
+    /// first session genuinely stalls and the recovery genuinely belongs to its successor.
+    advance_from_connect: Option<Arc<Script>>,
 }
 
 impl ScriptedChainTip {
@@ -307,6 +310,7 @@ impl ScriptedChainTip {
         Arc::new(Self {
             peak: Mutex::new(Some(peak)),
             healthy_replica: None,
+            advance_from_connect: None,
         })
     }
 
@@ -315,6 +319,7 @@ impl ScriptedChainTip {
         Arc::new(Self {
             peak: Mutex::new(None),
             healthy_replica: None,
+            advance_from_connect: None,
         })
     }
 
@@ -323,6 +328,17 @@ impl ScriptedChainTip {
         Arc::new(Self {
             peak: Mutex::new(Some(peak)),
             healthy_replica: Some(db),
+            advance_from_connect: None,
+        })
+    }
+
+    /// A replica frozen under the FIRST session and advancing again under the second — the whole
+    /// episode: stall, end, reconnect, recover.
+    fn recovers_on_reconnect(peak: u32, db: WalletDb, script: Arc<Script>) -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(Some(peak)),
+            healthy_replica: Some(db),
+            advance_from_connect: Some(script),
         })
     }
 }
@@ -330,9 +346,13 @@ impl ScriptedChainTip {
 #[async_trait::async_trait]
 impl ChainTipObserver for ScriptedChainTip {
     async fn peers_peak(&self) -> Option<u32> {
+        let held_back = self
+            .advance_from_connect
+            .as_ref()
+            .is_some_and(|s| s.connects.load(Ordering::SeqCst) < 2);
         let replica_now = {
             let mut peak = self.peak.lock().unwrap();
-            if self.healthy_replica.is_none() {
+            if self.healthy_replica.is_none() || held_back {
                 return *peak;
             }
             let replica = peak.unwrap_or(1).saturating_sub(1);
@@ -2222,6 +2242,113 @@ async fn a_stalled_authoritative_session_is_ended_and_reconnects() {
         .await;
 
     harness.stop().await;
+}
+
+/// Collects everything logged on the calling thread, so a test can assert a diagnostic actually
+/// reached the sink rather than trusting that it was written.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// **Proves (dig_ecosystem#2851):** the WHOLE episode is greppable from the log in one pass — the
+/// stall names its reason and both heights, and the RECOVERY says the replica is moving again.
+///
+/// This is the on-host acceptance evidence, not decoration. An operator who blackholes the peer's
+/// traffic sees a warning and then, without the second line, silence — which is indistinguishable
+/// from the failure itself, because silence is exactly what this defect hid behind for two hours.
+/// The recovery is deliberately reported by the SUCCESSOR session: the session that stalls cannot
+/// observe its own recovery, so the fact has to survive its end.
+///
+/// FIXTURE DESIGN — the chain-tip double holds the replica still until a SECOND session exists, so
+/// the first session genuinely stalls on positive evidence and the recovery genuinely belongs to
+/// its successor. A double that advanced from the start would log a recovery that was never owed.
+/// The subscriber is thread-local and this runtime is single-threaded, so a line written by the
+/// supervisor task is captured; if it were not, the assertions would fail rather than pass empty.
+#[tokio::test]
+async fn a_stall_and_its_recovery_are_both_named_in_the_log() {
+    let capture = Capture::default();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::recovers_on_reconnect(
+            PEERS_PEAK,
+            db,
+            script.clone(),
+        )),
+    )
+    .await;
+
+    harness
+        .until("the stall to be logged", |_| {
+            capture.contents().contains("has not advanced")
+        })
+        .await;
+    harness
+        .until("the recovery to be logged", |_| {
+            capture.contents().contains("advancing again")
+        })
+        .await;
+
+    let log = capture.contents();
+    harness.stop().await;
+    drop(guard);
+
+    // Both heights and the elapsed stall, because "the replica is behind" without numbers cannot
+    // be checked against the chain by the operator reading it.
+    assert!(
+        log.contains("replica_peak"),
+        "the stall must name the replica's peak: {log}"
+    );
+    assert!(
+        log.contains("peers_peak"),
+        "the stall must name the peers' peak: {log}"
+    );
+    assert!(
+        log.contains("stalled_for_secs"),
+        "the stall must say how long it lasted: {log}"
+    );
+    assert!(
+        log.contains("203.0.113.1:8444"),
+        "both lines must name the peer the episode was about: {log}"
+    );
 }
 
 /// **Proves (dig_ecosystem#2851):** a replica that is ADVANCING is never ended, however far behind

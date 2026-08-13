@@ -870,6 +870,10 @@ enum SessionOutcome {
     Resubscribe,
     /// The peer disconnected (or the loop errored); back off and retry.
     Ended,
+    /// The session held the replica still while the chain advanced past it, and was ended for it
+    /// (dig_ecosystem#2851). Handled exactly as [`Self::Ended`] apart from leaving a recovery owed:
+    /// the session that stalls cannot observe its own recovery, so the fact has to outlive it.
+    Stalled,
 }
 
 /// Everything the supervisor loop needs. Assembled by [`spawn_supervisor`].
@@ -925,6 +929,13 @@ impl Supervisor {
         // Consecutive rounds that failed to reach a quorum. Reset by any round that does, so this
         // counts a STANDING disagreement rather than a lifetime total.
         let mut splits: u32 = 0;
+        // Whether the LAST session was ended for stalling, and so a recovery is still unreported.
+        //
+        // It outlives the session deliberately: the stall is logged by the session that failed, and
+        // the recovery can only be observed by the NEXT one. Without carrying the fact across, an
+        // operator reading the log sees a failure followed by silence — and silence is precisely
+        // the cover this defect hid behind (dig_ecosystem#2851).
+        let recovery_unreported = std::sync::atomic::AtomicBool::new(false);
 
         while !*shutdown.borrow() {
             let session = match self.factory.connect().await {
@@ -1000,6 +1011,9 @@ impl Supervisor {
                 continue;
             }
 
+            // Taken before the session is moved into `run` below, so the stall and recovery lines
+            // can both name the peer the episode was about.
+            let peer_ip = session.peer_ip();
             let mut state = sync::SessionState::new(&subscribed, trust);
             let outcome = tokio::select! {
                 result = session.run(&self.db, &self.events, &mut state) => {
@@ -1027,7 +1041,8 @@ impl Supervisor {
                 // other arm here is disarmed by construction — so without this one the only exit
                 // is a disconnect that a half-open connection never delivers
                 // (dig_ecosystem#2851).
-                () = self.await_stall(trust.is_authoritative()) => SessionOutcome::Ended,
+                () = self.await_stall(trust.is_authoritative(), &recovery_unreported, &peer_ip)
+                    => SessionOutcome::Stalled,
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
                 _ = shutdown.changed() => SessionOutcome::Stop,
@@ -1045,6 +1060,11 @@ impl Supervisor {
                     continue;
                 }
                 SessionOutcome::Ended => {}
+                // Remember that a recovery is now owed, so the NEXT session reports the episode's
+                // ending rather than leaving the log at a failure followed by silence.
+                SessionOutcome::Stalled => {
+                    recovery_unreported.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
 
             if self.time.now().duration_since(started) >= HEALTHY_SESSION {
@@ -1181,7 +1201,12 @@ impl Supervisor {
     /// to the ordinary reconnect path, which draws an independent sample and re-runs the
     /// [`Corroborator`] exactly as it always did (NC-12: peers stay untrusted, corroboration stays a
     /// confidence gradient, nothing blocks on N-of-N). §908: it reads two heights and signs nothing.
-    async fn await_stall(&self, armed: bool) {
+    async fn await_stall(
+        &self,
+        armed: bool,
+        recovery_unreported: &std::sync::atomic::AtomicBool,
+        peer_ip: &str,
+    ) {
         let Some(chain_tip) = self.chain_tip.as_ref().filter(|_| armed) else {
             std::future::pending::<()>().await;
             // `pending` never returns; this is unreachable and exists only to satisfy the type.
@@ -1199,6 +1224,18 @@ impl Supervisor {
                 matches!((replica, last_replica), (Some(now), Some(before)) if now > before);
             last_replica = replica.or(last_replica);
 
+            // The other half of the episode. The session that stalled logged a failure and then
+            // ended; without this, the log goes quiet again and "did it recover?" is answerable
+            // only by polling the RPC — and silence is what let this defect hide for hours.
+            if advanced && recovery_unreported.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                tracing::info!(
+                    peer = %peer_ip,
+                    replica_peak = ?replica,
+                    peers_peak = ?peers,
+                    "wallet sync: the replica is advancing again after a stalled session was ended"
+                );
+            }
+
             let behind = matches!((replica, peers), (Some(r), Some(p)) if p > r);
             if advanced || !behind {
                 stalled_since = None;
@@ -1209,6 +1246,7 @@ impl Supervisor {
             let elapsed = self.time.now().duration_since(since);
             if elapsed >= STALL_AFTER {
                 tracing::warn!(
+                    peer = %peer_ip,
                     replica_peak = ?replica,
                     peers_peak = ?peers,
                     stalled_for_secs = elapsed.as_secs(),
