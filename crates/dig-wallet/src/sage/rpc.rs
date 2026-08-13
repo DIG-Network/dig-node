@@ -4687,8 +4687,9 @@ mod tests {
 
         // NO derivation row for this address: the registry is the ONLY reason it is in scope.
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
-        db.set_peak(500, &"cc".repeat(32)).await.unwrap();
+        // A catch-up that actually COVERED this key -- the state a running node reaches, and the
+        // only state in which the replica may answer for it (dig_ecosystem#2871).
+        complete_catch_up_over(&db, &[enrolled_key()]).await;
         db.upsert_coins(&[coin_at_ph("enrolled", &ph, 700, Some(10), None)])
             .await
             .unwrap();
@@ -4731,6 +4732,22 @@ mod tests {
         encode_address(&ph, "xch").unwrap()
     }
 
+    /// Complete a catch-up over EXACTLY `covered`, the way a real session does: ONE write carrying
+    /// the peak, the flag, and the set it ran over.
+    ///
+    /// There is deliberately no helper that latches the flag WITHOUT a covered set. That
+    /// combination is the defect, and a fixture able to express it invites a test that pins the old
+    /// behaviour back into place.
+    async fn complete_catch_up_over(db: &WalletDb, covered: &[chia::bls::PublicKey]) {
+        let phs: Vec<_> = covered
+            .iter()
+            .map(super::super::sync_supervisor::puzzle_hash_for)
+            .collect();
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 500, "cc".repeat(32), &phs).unwrap())
+            .await
+            .unwrap();
+    }
+
     /// **Proves (dig_ecosystem#2871):** a key enrolled AFTER the catch-up completed is not answered
     /// from a replica that never followed it.
     ///
@@ -4738,10 +4755,10 @@ mod tests {
     /// resolved at session start"; `watchlist_follows` asks "is this key registered right now".
     /// Nothing ordered the two, so the first read of a newly enrolled address found
     /// `db_synced = true` and `scoped = true`, queried the DB for a scope it had never followed,
-    /// and answered `balance: 0, synced: true, source: "db"` for a funded wallet. `coins_for_address`
-    /// answered `coins: []` the same way — and its own doc reads that as "a chain WAS consulted",
-    /// so a spend refuses with a shortfall that is not real. No attacker and no configuration:
-    /// enrolling a second profile is enough.
+    /// and answered `balance: 0, synced: true, source: "db"` for a funded wallet.
+    /// `coins_for_address` answered `coins: []` the same way — and its own doc reads that as "a
+    /// chain WAS consulted", so a spend refuses with a shortfall that is not real. No attacker and
+    /// no configuration: enrolling a second profile is enough.
     ///
     /// FIXTURE DESIGN — THE ORDER IS THE TEST. K1 is enrolled and the catch-up is completed FIRST,
     /// exactly as a running node reaches this state; only then is K2 enrolled. A fixture that
@@ -4751,9 +4768,8 @@ mod tests {
     async fn a_key_enrolled_after_the_catch_up_is_not_answered_from_the_replica() {
         let (registry, _dir) = registry_with_key(&enrolled_key());
         let db = WalletDb::open_in_memory().await.unwrap();
-        // The state a node reaches legitimately: K1's catch-up finished, and it latched.
-        db.set_initial_sync_complete(true).await.unwrap();
-        db.set_peak(500, &"cc".repeat(32)).await.unwrap();
+        // The state a node reaches legitimately: K1's catch-up finished, over K1.
+        complete_catch_up_over(&db, &[enrolled_key()]).await;
 
         let be = WalletBackend::new(
             db.clone(),
@@ -4764,7 +4780,7 @@ mod tests {
 
         // K2 arrives afterwards — a second profile, or any additional key.
         assert_eq!(
-            be.watch_keys(&[second_enrolled_key()]).await.unwrap(),
+            be.watch_keys(&[second_enrolled_key()]),
             Some(1),
             "the fixture must actually enrol a NEW key"
         );
@@ -4782,17 +4798,103 @@ mod tests {
         assert!(!result.synced);
     }
 
-    /// **Proves:** the invalidation is on WIDENING, not on being spoken to.
+    /// **Proves (F1):** a catch-up that STARTED before an enrolment cannot vouch for the key that
+    /// arrived while it was still running.
+    ///
+    /// NEAREST WRONG IMPLEMENTATION: any fix that keeps a bare flag and clears it at the enrolment
+    /// boundary — INCLUDING "clear it again once the catch-up returns". The supervisor resolves the
+    /// subscription set BEFORE the catch-up starts, and a first catch-up replays from genesis over
+    /// many batches, so an enrolment lands squarely inside that window; the completion then writes
+    /// `initial_sync_complete = 1` over a set that never contained K2, and nothing repairs it.
+    ///
+    /// FIXTURE DESIGN — THE ORDER IS THE WHOLE TEST, and it is the REVERSE of the test above: K2 is
+    /// enrolled BEFORE the completion lands, so the completion is the LAST writer. A fixture that
+    /// completes the catch-up first passes against that wrong implementation and proves nothing.
+    #[tokio::test]
+    async fn a_catch_up_in_flight_cannot_vouch_for_a_key_enrolled_while_it_ran() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(
+            db.clone(),
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_watchlist(registry);
+
+        // A catch-up is already running over {K1} — its subscription set is fixed. K2 enrols
+        // mid-flight...
+        assert_eq!(be.watch_keys(&[second_enrolled_key()]), Some(1));
+        // ...and only NOW does that catch-up finish, over the set it actually ran over.
+        complete_catch_up_over(&db, &[enrolled_key()]).await;
+
+        let result = be
+            .balance_for_address(&address_of(&second_enrolled_key()), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.source,
+            Source::Fallback,
+            "a completion that landed after the enrolment declared the replica authoritative for a \
+             key its own subscription never contained"
+        );
+        assert!(!result.synced);
+    }
+
+    /// **Proves (F2):** enrolment does not depend on a SECOND write landing.
+    ///
+    /// NEAREST WRONG IMPLEMENTATION: enrol, then invalidate — the shape this change removes.
+    /// Registration persists first and `watch` is idempotent, so a failed or interrupted
+    /// invalidation left the widened set latched permanently: the client's retry enrolled nothing,
+    /// an `added > 0` guard was therefore false, and the invalidation never ran at all. A second
+    /// `watch` call IS that retry.
+    ///
+    /// FIXTURE DESIGN — the second call is the one under test and it must add ZERO. A test that
+    /// calls `watch` once cannot distinguish "invalidated on the first call" from "no invalidation
+    /// is needed", which is precisely the distinction that failed in the field.
+    #[tokio::test]
+    async fn a_repeated_enrolment_that_adds_nothing_still_leaves_the_new_key_uncovered() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+        let db = WalletDb::open_in_memory().await.unwrap();
+        complete_catch_up_over(&db, &[enrolled_key()]).await;
+        let be = WalletBackend::new(
+            db.clone(),
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_watchlist(registry);
+
+        assert_eq!(be.watch_keys(&[second_enrolled_key()]), Some(1));
+        assert_eq!(
+            be.watch_keys(&[second_enrolled_key()]),
+            Some(0),
+            "the retry must add nothing — that is the condition under test"
+        );
+
+        let result = be
+            .balance_for_address(&address_of(&second_enrolled_key()), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.source,
+            Source::Fallback,
+            "the replica answered for a key it never covered because the retry reported \
+             `added = 0` and was read as nothing having changed"
+        );
+    }
+
+    /// **Proves:** a re-announcement leaves the replica AUTHORITATIVE.
     ///
     /// `control.wallet.watch` is idempotent and dig-app re-announces its whole account on every
-    /// unlock. NEAREST WRONG IMPLEMENTATION: clearing the flag on every call — which holds a
-    /// perfectly healthy node in permanent fallback for as long as its client keeps saying hello,
+    /// unlock. NEAREST WRONG IMPLEMENTATION: treating any `watch` call as a widening — which holds
+    /// a perfectly healthy node in permanent fallback for as long as its client keeps saying hello,
     /// an outage invented by the fix rather than found by it.
+    ///
+    /// Asserted on the ROUTING rather than on a flag, because routing is what a user feels.
     #[tokio::test]
     async fn re_announcing_a_known_key_leaves_the_replica_authoritative() {
         let (registry, _dir) = registry_with_key(&enrolled_key());
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.set_initial_sync_complete(true).await.unwrap();
+        complete_catch_up_over(&db, &[enrolled_key()]).await;
 
         let be = WalletBackend::new(
             db.clone(),
@@ -4802,13 +4904,52 @@ mod tests {
         .with_watchlist(registry);
 
         assert_eq!(
-            be.watch_keys(&[enrolled_key()]).await.unwrap(),
+            be.watch_keys(&[enrolled_key()]),
             Some(0),
             "re-announcing a known key must enrol nothing"
         );
-        assert!(
-            db.is_synced().await.unwrap(),
-            "a re-announcement that widened nothing invalidated the catch-up anyway"
+        let result = be
+            .balance_for_address(&address_of(&enrolled_key()), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.source,
+            Source::Db,
+            "a re-announcement that widened nothing sent a healthy replica to the oracle"
+        );
+    }
+
+    /// **Proves:** NARROWING the followed set keeps the replica authoritative.
+    ///
+    /// NEAREST WRONG IMPLEMENTATION: comparing a whole-set FINGERPRINT for equality. Under it
+    /// `control.wallet.unwatch` — a correct operation that REMOVES an address — would stop matching
+    /// the recording and force a full resync, sending every read to the oracle for its duration. A
+    /// catch-up over the wider set genuinely covered everything that remains, so the question has
+    /// to be containment.
+    #[tokio::test]
+    async fn deregistering_a_key_leaves_the_remaining_ones_covered() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let be = WalletBackend::new(
+            db.clone(),
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        )
+        .with_watchlist(registry.clone());
+
+        assert_eq!(be.watch_keys(&[second_enrolled_key()]), Some(1));
+        // The catch-up covers BOTH keys, which is the state an `unwatch` starts from.
+        complete_catch_up_over(&db, &[enrolled_key(), second_enrolled_key()]).await;
+        registry.unwatch(&[second_enrolled_key()]);
+
+        let result = be
+            .balance_for_address(&address_of(&enrolled_key()), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.source,
+            Source::Db,
+            "removing an address invalidated a catch-up that still covers every address left"
         );
     }
 

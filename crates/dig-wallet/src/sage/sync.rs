@@ -1241,7 +1241,7 @@ mod tests {
         )
         .await
         .unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 20, "aa").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 20, "aa", &[]).unwrap())
             .await
             .unwrap();
 
@@ -1301,7 +1301,7 @@ mod tests {
     async fn change_arriving_in_the_same_frame_as_its_parent_is_not_announced() {
         let db = WalletDb::open_in_memory().await.unwrap();
         let subscribed = subscribed_owned();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "aa").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "aa", &[]).unwrap())
             .await
             .unwrap();
 

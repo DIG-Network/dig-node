@@ -2204,7 +2204,7 @@ mod tests {
         assert_eq!(db.record_arrivals(&watched(), 30).await.unwrap(), 0);
 
         // Completing the catch-up arms the baseline at the history it just wrote...
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 30, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 30, "hh", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(30));
@@ -2223,7 +2223,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_replaying_the_same_coins_re_announces_nothing() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
         db.upsert_coin(&incoming("paid", 500, 101)).await.unwrap();
@@ -2231,7 +2231,7 @@ mod tests {
 
         // A restart: the catch-up replays from the genesis challenge and re-upserts everything.
         db.upsert_coin(&incoming("paid", 500, 101)).await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 101, "hh2").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 101, "hh2", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
@@ -2250,7 +2250,7 @@ mod tests {
     #[tokio::test]
     async fn an_unconfirmed_coin_is_never_recorded_as_an_arrival() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2272,7 +2272,7 @@ mod tests {
     #[tokio::test]
     async fn our_own_change_is_not_announced_as_an_arrival() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2300,7 +2300,7 @@ mod tests {
     #[tokio::test]
     async fn change_is_refused_even_when_it_is_written_before_its_parent() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2328,7 +2328,7 @@ mod tests {
     #[tokio::test]
     async fn a_cat_arrival_carries_its_asset_id_and_waits_until_attributed() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2357,7 +2357,7 @@ mod tests {
     #[tokio::test]
     async fn a_reorg_unmakes_the_arrivals_it_unmakes_the_coins_for() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
         db.upsert_coins(&[incoming("kept", 1, 101), incoming("orphaned", 2, 110)])
@@ -2382,7 +2382,7 @@ mod tests {
     #[tokio::test]
     async fn the_arrival_cursor_is_monotonic_and_never_reused() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
         db.upsert_coin(&incoming("a", 1, 101)).await.unwrap();
@@ -2406,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn funds_received_while_offline_are_announced_once_on_the_next_sync() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(100));
@@ -2415,7 +2415,7 @@ mod tests {
         db.upsert_coins(&[incoming("old", 1, 50), incoming("missed", 9, 150)])
             .await
             .unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 150, "hh2").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 150, "hh2", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(100));
@@ -2467,7 +2467,7 @@ mod tests {
             .map(|i| incoming(&format!("hist{i}"), 100, i * 1_000))
             .collect();
         db.upsert_coins(&history).await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 8_000, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 8_000, "hh", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(8_000));
@@ -2497,7 +2497,7 @@ mod tests {
     async fn completing_a_catch_up_arms_the_baseline_over_everything_it_wrote() {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coin(&incoming("high", 1, 220)).await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 200, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 200, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2544,7 +2544,7 @@ mod tests {
     #[tokio::test]
     async fn peak_and_sync_flag_round_trip() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 500, "deadbeef").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 500, "deadbeef", &[]).unwrap())
             .await
             .unwrap();
         let s = db.sync_state().await.unwrap();
