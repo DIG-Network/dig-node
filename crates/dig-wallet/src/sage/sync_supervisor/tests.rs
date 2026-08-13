@@ -1971,6 +1971,12 @@ fn unanimous(answer: Bytes32) -> Verdict<Bytes32> {
 struct ScriptedCorroborator {
     round: Mutex<CorroborationRound>,
     rounds: AtomicUsize,
+    /// The verdict every round AFTER the first returns, when it differs from the first.
+    ///
+    /// A double that can only answer the same way for ever cannot express the one property that
+    /// distinguishes per-session corroboration from a verdict resolved once and reused: a quorum
+    /// that agreed and then, on an independently drawn sample, did not.
+    subsequent: Mutex<Option<Verdict<Bytes32>>>,
 }
 
 impl ScriptedCorroborator {
@@ -1981,15 +1987,35 @@ impl ScriptedCorroborator {
                 verdict,
             }),
             rounds: AtomicUsize::new(0),
+            subsequent: Mutex::new(None),
         })
+    }
+
+    /// A quorum that corroborates the writer once and then splits on every later sample.
+    fn corroborating_once_then_splitting(answer: Bytes32) -> Arc<Self> {
+        let corroborator = Self::new(unanimous(answer));
+        *corroborator.subsequent.lock().unwrap() = Some(Verdict::Split {
+            tallies: vec![2, 2],
+        });
+        corroborator
+    }
+
+    fn rounds(&self) -> usize {
+        self.rounds.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait::async_trait]
 impl Corroborator for ScriptedCorroborator {
     async fn corroborate(&self) -> Result<CorroborationRound, SyncError> {
-        self.rounds.fetch_add(1, Ordering::SeqCst);
-        Ok(self.round.lock().unwrap().clone())
+        let previous = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let mut round = self.round.lock().unwrap().clone();
+        if previous > 0 {
+            if let Some(later) = self.subsequent.lock().unwrap().clone() {
+                round.verdict = later;
+            }
+        }
+        Ok(round)
     }
 }
 
@@ -3343,4 +3369,67 @@ async fn a_shutdown_is_honoured_while_a_catch_up_is_running() {
 
     // `stop` asserts the task actually ends; it is the assertion, not the teardown.
     harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** write authority is earned PER SESSION and is never inherited
+/// from the session before it.
+///
+/// SPEC 18.6a states that a new session earns its authority from a freshly drawn quorum and that a
+/// verdict MUST NOT be carried across sessions — and until this test, nothing pinned it. Every
+/// rotation and stall test used a `PeerTrust::Operator` peer, which SHORT-CIRCUITS corroboration
+/// before it runs, so hoisting the trust resolution out of the reconnect loop — the obvious
+/// optimisation once someone reads the 144-corroborations-per-day cost this change documents —
+/// left the entire suite green while handing every later session an authority it never earned.
+///
+/// FIXTURE DESIGN — exactly one thing varies, and it varies BETWEEN sessions rather than within
+/// one. The peer is `Discovered`, so corroboration actually runs; the writer's answer never
+/// changes, so the writer is not what differs; and the quorum corroborates the FIRST round and
+/// splits on every later sample, which is precisely a verdict that must not be reusable. A double
+/// that answered the same way for ever could not exhibit the difference at all.
+///
+/// The two assertions catch the hoist from opposite sides. A quorum drawn once shows up as a round
+/// count that stops climbing while sessions keep turning over; an authority reused shows up as a
+/// second catch-up, because a REFUSED session subscribes nothing and therefore never catches up.
+#[tokio::test]
+async fn a_session_earns_its_own_authority_and_never_inherits_one() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    let corroborator = ScriptedCorroborator::corroborating_once_then_splitting(HONEST_HASH);
+
+    let harness = Harness::start_with_lifetime(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(corroborator.clone()),
+        None,
+        SESSION_MAX_LIFETIME,
+    )
+    .await;
+
+    // Sessions turn over on their own here — the first on rotation, the refused ones on the
+    // re-corroboration timer — and WHICH one ends a session is immaterial to the property, which is
+    // only that each successor must ask again.
+    harness
+        .until("the session to be replaced by a successor", |s| {
+            s.connects.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+    harness.stop().await;
+
+    let sessions = script.connects.load(Ordering::SeqCst);
+    assert!(
+        corroborator.rounds() >= sessions,
+        "corroboration ran {} times across {sessions} sessions, so a quorum was drawn once and \
+         reused rather than redrawn per session",
+        corroborator.rounds()
+    );
+    assert_eq!(
+        script.catch_up_count(),
+        1,
+        "a session after the first caught up, so it wrote the replica on an authority the quorum \
+         refused it — a verdict was carried across the session boundary"
+    );
 }
