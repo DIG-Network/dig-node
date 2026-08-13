@@ -95,14 +95,6 @@ const PUZZLE_HASH_POLL: Duration = Duration::from_secs(5);
 /// ladder's own ceiling rather than out-pacing it, and it is short enough that the cost of a
 /// transient refusal is under a minute instead of unbounded.
 const RECORROBORATE_AFTER: Duration = Duration::from_secs(45);
-/// # The three session timescales, and why none of them collapses into another
-///
-/// [`RECORROBORATE_AFTER`] (45s) < [`STALL_AFTER`] (90s) < [`SESSION_MAX_LIFETIME`] (600s). Each
-/// governs a DIFFERENT concern, and the ordering is deliberate: a session that CANNOT write is
-/// dropped soonest, one that has STOPPED writing next, and a perfectly healthy one is held until
-/// the anti-capture bound. Collapsing any two of them would silently retire one of the three
-/// concerns.
-///
 /// How often a stalled-session check re-measures the replica against the chain.
 ///
 /// Two local reads — one DB row and the chain transport's last-heard peak — so the poll costs
@@ -112,6 +104,21 @@ const RECORROBORATE_AFTER: Duration = Duration::from_secs(45);
 const STALL_POLL: Duration = Duration::from_secs(15);
 /// How long a session may hold the replica STILL, while the chain demonstrably advances, before it
 /// is ended (dig_ecosystem#2851).
+///
+/// # The three session timescales, and why none of them collapses into another
+///
+/// THE ONE PLACE THE LADDER IS STATED, so it cannot be half-updated:
+///
+/// [`RECORROBORATE_AFTER`] (45s) < `STALL_AFTER` (90s) < [`SESSION_MAX_LIFETIME`] (600s)
+///
+/// Each governs a DIFFERENT concern, and the ORDERING IS DELIBERATE: a session that CANNOT write is
+/// dropped soonest, one that has STOPPED writing next, and a perfectly healthy one is held longest,
+/// until the anti-capture bound. Collapsing any two of them would silently retire one of the three
+/// concerns — and the widest gap, between this deadline and rotation, is the load-bearing one:
+/// rotation is nearly seven times slower, so it can neither substitute for this detector nor be
+/// relied on to end a freeze in time.
+///
+/// The ladder is restated normatively in SPEC §18.6a and nowhere else in this crate.
 ///
 /// A half-open peer connection parks [`crate::sage::sync::run_update_loop`] on a `recv()` that has
 /// no deadline. For an AUTHORITATIVE subscribed session that was the last exit: the resubscribe
@@ -932,10 +939,19 @@ pub(crate) enum StallVerdict {
 /// The replica's freeze, tracked ACROSS sessions (dig_ecosystem#2851).
 ///
 /// It deliberately outlives any one session, and that is not an optimisation — it is what keeps the
-/// deadline reachable at all. [`SESSION_MAX_LIFETIME`] retires a session every 60 seconds, so state
-/// scoped to a session could never accumulate the [`STALL_AFTER`] evidence, and the detector would
-/// be dead code that reads as a working guard. A frozen replica is a property of the REPLICA
-/// anyway; which peer happened to be attached while it froze is incidental to whether it moved.
+/// deadline reachable at all.
+///
+/// NOT because rotation is fast. [`SESSION_MAX_LIFETIME`] is 600s against [`STALL_AFTER`]'s 90s, so
+/// a session retired ON SCHEDULE has ample room to reach the deadline by itself. The reason is that
+/// scheduled retirement is the one ending a session is LEAST likely to get: a session ends on a
+/// disconnect, a failed catch-up, a refusal, a resubscribe or a rotation, and the first four arrive
+/// on no schedule at all. A clock scoped to a session restarts at EVERY one of them, so a replica
+/// frozen across a run of short sessions would never accumulate 90 seconds anywhere, and the
+/// detector would be dead code that reads as a working guard — which is the state
+/// [`tests::stall_evidence_survives_the_end_of_a_session`] exists to make unreachable.
+///
+/// A frozen replica is a property of the REPLICA anyway; which peer happened to be attached while
+/// it froze is incidental to whether it moved.
 ///
 /// Split out as a pure state machine with no I/O so every branch — including the ones that must NOT
 /// accuse — is directly testable.
@@ -1022,10 +1038,12 @@ pub struct Supervisor {
     /// [`SESSION_MAX_LIFETIME`]; see that constant for the costs the number trades.
     ///
     /// Injected rather than read from the constant so a test can give rotation a DISTINCTIVE
-    /// duration. The test clock returns from every sleep instantly, so a timer is identified only
-    /// by the duration it asked for — and [`SESSION_MAX_LIFETIME`] shares its value with
-    /// [`BACKOFF_MAX`], which made the two indistinguishable and wedged a backoff wait that a test
-    /// meant to silence rotation.
+    /// duration. The test clock returns from every sleep instantly, so a timer is identified ONLY
+    /// by the duration it asked for, and a test that silences rotation by suppressing its duration
+    /// silences every other timer asking for the same one. That collision was live while the
+    /// lifetime was 60 seconds — [`BACKOFF_MAX`]'s value — and wedged a backoff wait; the lifetime
+    /// has since moved to 600 seconds, so the two no longer collide, but the injection stays
+    /// because the hazard belongs to the technique rather than to either number.
     pub session_lifetime: Duration,
 }
 
@@ -1196,9 +1214,12 @@ impl Supervisor {
                 }
                 SessionOutcome::Ended => {}
                 // A planned retirement, so it reconnects at once and the ladder is reset
-                // EXPLICITLY. Leaning on the `HEALTHY_SESSION` check below instead would be a
-                // coin-flip rather than a rule: that threshold is also 60 seconds, so a rotation
-                // would land exactly on its boundary.
+                // EXPLICITLY rather than left to the `HEALTHY_SESSION` check below. That check
+                // would currently agree — a 600-second session comfortably clears a 60-second
+                // threshold — but it is a threshold on how long a session HAPPENED to last, and
+                // this is a statement that a planned end is not a failure. Deriving the second from
+                // the first makes the rule true by arithmetic that either constant is free to
+                // break.
                 SessionOutcome::Rotate => {
                     tracing::info!(
                         peer = %peer_ip,

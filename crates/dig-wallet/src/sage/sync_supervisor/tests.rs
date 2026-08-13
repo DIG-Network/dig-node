@@ -20,9 +20,11 @@ use crate::sage::sync::PuzzleStateSource;
 /// The session lifetime a test passes when it is NOT testing rotation.
 ///
 /// A DISTINCTIVE value, not `SESSION_MAX_LIFETIME`: this clock returns from every sleep instantly,
-/// so a timer is identifiable only by the duration it asked for, and the real lifetime shares its
-/// 60 seconds with `BACKOFF_MAX`. Suppressing by that value silenced backoff waits too — one in
-/// forty-one, whenever jitter landed on exactly 100% — and wedged the supervisor for good.
+/// so a timer is identifiable ONLY by the duration it asked for, and suppressing a duration
+/// silences every timer that asks for it. The real lifetime once shared `BACKOFF_MAX`'s 60 seconds,
+/// so suppressing it silenced backoff waits too — one in forty-one, whenever jitter landed on
+/// exactly 100% — and wedged the supervisor for good. The lifetime is 600 seconds now and no longer
+/// collides, but a value of its own is what keeps that true independently of either constant.
 const NO_ROTATION: Duration = Duration::from_secs(3_600);
 
 /// The height a scripted catch-up reports as the chain tip.
@@ -372,9 +374,9 @@ impl ScriptedChainTip {
 
     /// Peers ahead of a frozen replica, dropping the peer after every SECOND observation.
     ///
-    /// Bounds how much stall evidence any ONE session can gather: two polls is 60 seconds of the
-    /// 180 the deadline needs, so a stall clock scoped to a session could never fire, and only a
-    /// watch that survives the session boundary reaches the deadline.
+    /// Bounds how much stall evidence any ONE session can gather: at a 15-second poll, two polls
+    /// is 30 seconds of the 90 `STALL_AFTER` needs, so a stall clock scoped to a session could
+    /// never fire, and only a watch that survives the session boundary reaches the deadline.
     fn ahead_and_dropping_the_peer(peak: u32, script: Arc<Script>) -> Arc<Self> {
         Arc::new(Self {
             peak: Mutex::new(Some(peak)),
@@ -2598,7 +2600,7 @@ async fn an_advancing_replica_is_never_declared_stalled() {
 ///
 /// A missing measurement must not be spent as evidence against the replica. A node whose chain
 /// transport has not been built genuinely reports `None` here, and reading that as "the chain
-/// advanced past us" would end a perfectly good session every three minutes for ever.
+/// advanced past us" would end a perfectly good session every 90 seconds for ever.
 #[tokio::test]
 async fn an_unobservable_peers_peak_is_never_an_accusation() {
     let db = WalletDb::open_in_memory().await.unwrap();
@@ -2760,8 +2762,10 @@ async fn a_healthy_session_is_retired_at_its_lifetime() {
 /// subscription at all — strictly worse than never rotating.
 ///
 /// The assertion reads the delays the supervisor actually waited: every one must stay at the
-/// ladder's first rung. `HEALTHY_SESSION` is deliberately NOT relied on to produce that, because
-/// it is also 60 seconds and a rotation lands exactly on its boundary — a coin-flip, not a rule.
+/// ladder's first rung. `HEALTHY_SESSION` is deliberately NOT relied on to produce that: it would
+/// currently agree, since a 600-second session clears its 60-second threshold, but that is
+/// arithmetic between two constants either of which is free to move, and the property under test is
+/// that a PLANNED end resets the ladder — not that a long one happens to.
 #[tokio::test]
 async fn rotation_does_not_climb_the_backoff_ladder() {
     let db = WalletDb::open_in_memory().await.unwrap();
