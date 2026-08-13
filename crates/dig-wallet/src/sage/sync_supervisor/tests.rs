@@ -642,21 +642,6 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
 // F1 - the trust boundary, driven through the REAL supervisor
 // ---------------------------------------------------------------------------
 
-/// **Proves (F1c, the auditor's backoff-cycle exploit):** a DISCOVERED peer never marks the
-/// replica authoritative, however many times it drops the connection and is reconnected to.
-///
-/// This is the exploit the previous round could not close: the attacker empties the table, the
-/// per-frame latch fires correctly, the attacker then simply CLOSES THE SOCKET, the supervisor
-/// backs off ~1s, reconnects to the same attacker, and the fresh catch-up re-sets the flag over
-/// whatever it answers. Here the supervisor is driven through three full connect cycles against
-/// a wallet that HAS puzzle hashes - so there is a real subscription to run and the test cannot
-/// pass by the empty-set guard - and no catch-up is ever attempted.
-///
-/// The LIVENESS assertion is the control: a supervisor that satisfied the trust boundary by
-/// refusing to dial discovered peers at all would leave a default install with no peer count and
-/// no `syncing` phase, and would fail here. It replaces the peak assertion this test used to
-/// carry — the third audit round established that the peak was never the harmless half (see
-/// [`sync::PeerTrust`]), so the peak is now asserted to stay UNKNOWN instead.
 /// Deliver `message` to whichever session is live RIGHT NOW, retrying while sessions turn over.
 ///
 /// A refused session is now short-lived by design (dig_ecosystem#2827), so the sender captured a
@@ -676,6 +661,21 @@ async fn push_peak_to_a_live_session(h: &Harness, message: Message) {
     panic!("no live session ever accepted a peer push");
 }
 
+/// **Proves (F1c, the auditor's backoff-cycle exploit):** a DISCOVERED peer never marks the
+/// replica authoritative, however many times it drops the connection and is reconnected to.
+///
+/// This is the exploit the previous round could not close: the attacker empties the table, the
+/// per-frame latch fires correctly, the attacker then simply CLOSES THE SOCKET, the supervisor
+/// backs off ~1s, reconnects to the same attacker, and the fresh catch-up re-sets the flag over
+/// whatever it answers. Here the supervisor is driven through three full connect cycles against
+/// a wallet that HAS puzzle hashes - so there is a real subscription to run and the test cannot
+/// pass by the empty-set guard - and no catch-up is ever attempted.
+///
+/// The LIVENESS assertion is the control: a supervisor that satisfied the trust boundary by
+/// refusing to dial discovered peers at all would leave a default install with no peer count and
+/// no `syncing` phase, and would fail here. It replaces the peak assertion this test used to
+/// carry — the third audit round established that the peak was never the harmless half (see
+/// [`sync::PeerTrust`]), so the peak is now asserted to stay UNKNOWN instead.
 #[tokio::test]
 async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnects() {
     let db = WalletDb::open_in_memory().await.unwrap();
@@ -1879,11 +1879,6 @@ async fn a_split_quorum_writes_nothing() {
     assert_eq!(db.sync_state().await.unwrap().peak_height, None);
 }
 
-/// **Proves:** an unreachable quorum is a refusal, not a default-allow.
-///
-/// NEAREST WRONG IMPLEMENTATION: treating `Insufficient` as "nobody objected". An attacker who
-/// can make peers unreachable — trivial on a hostile network — would otherwise get the replica
-/// by silencing the witnesses rather than by out-voting them.
 /// **Proves (#2827):** a round only two peers answered still syncs the replica, so the wallet
 /// does not freeze because one peer of five was slow.
 ///
@@ -1919,6 +1914,11 @@ async fn a_round_only_two_peers_answered_still_syncs_the_replica() {
     assert_eq!(state.peak_height, Some(CATCH_UP_HEIGHT));
 }
 
+/// **Proves:** an unreachable quorum is a refusal, not a default-allow.
+///
+/// NEAREST WRONG IMPLEMENTATION: treating `Insufficient` as "nobody objected". An attacker who
+/// can make peers unreachable — trivial on a hostile network — would otherwise get the replica
+/// by silencing the witnesses rather than by out-voting them.
 #[tokio::test]
 async fn an_unreachable_quorum_refuses_rather_than_defaulting_to_allow() {
     let thin = Verdict::Insufficient {
