@@ -4680,9 +4680,9 @@ mod tests {
     }
 
     fn address_of(key: &chia::bls::PublicKey) -> String {
-        let ph = normalize_ph(&hex::encode(super::super::sync_supervisor::puzzle_hash_for(
-            key,
-        )));
+        let ph = normalize_ph(&hex::encode(
+            super::super::sync_supervisor::puzzle_hash_for(key),
+        ));
         encode_address(&ph, "xch").unwrap()
     }
 
