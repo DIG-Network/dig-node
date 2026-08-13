@@ -190,6 +190,13 @@ impl ControlAction {
             ControlAction::WalletBroadcast { signed_bundle_hex } => {
                 json!({ "signed_bundle_hex": signed_bundle_hex })
             }
+            // Without these two arms the keys the user typed are dropped by the `_` fall-through
+            // below and the node is asked to follow nothing, which it refuses as a missing
+            // `params.public_keys`. The refusal is correct and the command is unusable.
+            ControlAction::WalletWatch { public_keys }
+            | ControlAction::WalletUnwatch { public_keys } => {
+                json!({ "public_keys": public_keys })
+            }
             ControlAction::UpdaterSetChannel { channel } => json!({ "channel": channel }),
             ControlAction::UpdaterPause { until: Some(u) } => json!({ "until": u }),
             ControlAction::SubsAdd { store_id } | ControlAction::SubsRemove { store_id } => {
@@ -584,6 +591,23 @@ mod tests {
         assert_eq!(
             ControlAction::UpdaterPause { until: Some(99) }.wire_params(),
             json!({ "until": 99 })
+        );
+        // Enrolment carries the keys the user typed. Measured against a running node before this
+        // arm existed: the `_` fall-through sent `{}`, the node answered "requires
+        // params.public_keys", and `dign wallet watch <key>` could not follow anything at all.
+        assert_eq!(
+            ControlAction::WalletWatch {
+                public_keys: vec!["aa".into(), "bb".into()],
+            }
+            .wire_params(),
+            json!({ "public_keys": ["aa", "bb"] })
+        );
+        assert_eq!(
+            ControlAction::WalletUnwatch {
+                public_keys: vec!["cc".into()],
+            }
+            .wire_params(),
+            json!({ "public_keys": ["cc"] })
         );
         // A pause with no deadline sends an empty object (indefinite pause).
         assert_eq!(
