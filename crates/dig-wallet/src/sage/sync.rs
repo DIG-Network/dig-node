@@ -2835,9 +2835,13 @@ mod tests {
         let mut session = corroborated(&subscribed, anchor);
 
         for frame in 1..=2 {
-            push(&db, &mut session, coin_state_update(u32::MAX, anchor, vec![]))
-                .await
-                .unwrap_or_else(|e| panic!("frame {frame} must be tolerated, got {e}"));
+            push(
+                &db,
+                &mut session,
+                coin_state_update(u32::MAX, anchor, vec![]),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("frame {frame} must be tolerated, got {e}"));
             assert_eq!(
                 db.sync_state().await.unwrap().peak_height,
                 Some(anchor),
@@ -2845,9 +2849,13 @@ mod tests {
             );
         }
 
-        let err = push(&db, &mut session, coin_state_update(u32::MAX, anchor, vec![]))
-            .await
-            .expect_err("the third must retire the session");
+        let err = push(
+            &db,
+            &mut session,
+            coin_state_update(u32::MAX, anchor, vec![]),
+        )
+        .await
+        .expect_err("the third must retire the session");
         assert!(
             matches!(err, SyncError::PeakAboveCeiling { claimed, .. } if claimed == u32::MAX),
             "got {err:?}"

@@ -166,6 +166,12 @@ const CATCH_UP_DEADLINE: Duration = Duration::from_secs(3_600);
 /// seconds is about FIVE consecutive missed peaks *while the peers' peak demonstrably advanced*,
 /// which no healthy session produces.
 ///
+/// NINETY SECONDS IS THE ACCUMULATOR, NOT THE DETECTION LATENCY. [`Supervisor::await_stall`]
+/// sleeps [`STALL_POLL`] BEFORE its first observation and the clock starts at the first
+/// behind-and-still observation, so the earliest a stall can be declared is `STALL_POLL +
+/// STALL_AFTER` = 105s, and a freeze that begins just after a poll is caught nearer 120s. Quoting
+/// 90s as a time-to-detect overstates what this mechanism knows.
+///
 /// It exceeds [`HEALTHY_SESSION`], so a session ended this way still counts as healthy at
 /// [`Supervisor::run`]'s ladder reset and reconnects promptly instead of climbing the backoff
 /// ladder toward [`BACKOFF_MAX`].
@@ -1507,7 +1513,12 @@ impl Supervisor {
                         peer = %peer_ip,
                         replica_peak = ?replica,
                         peers_peak = ?peers,
-                        stalled_for_secs = elapsed.as_secs(),
+                        // NAMED FOR WHAT IT MEASURES: time since the replica was first OBSERVED
+                        // behind and still, not time since it actually froze. The freeze may
+                        // predate the first observation by any amount, and a field called
+                        // `stalled_for_secs` invited exactly that misreading in an incident report
+                        // (dig_ecosystem#2851, A5).
+                        observed_behind_for_secs = elapsed.as_secs(),
                         "wallet sync: the replica has not advanced while this node's own peers \
                          moved ahead of it; ending the session so a fresh peer is dialled"
                     );

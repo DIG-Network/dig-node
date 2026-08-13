@@ -577,18 +577,20 @@ impl Harness {
     /// Poll `predicate` until it holds, or fail. Bounded in real time so a wedged supervisor
     /// fails the test instead of hanging the suite.
     ///
-    /// The budget is three times the original 2,000, because that one was tripped by a loaded
-    /// machine rather than by a real defect — and an intermittent proof is not a proof. It is not
-    /// larger still because it is also the time a genuinely broken supervisor takes to FAIL, and a
-    /// revert-proof that runs for seven minutes stops being run.
+    /// # It is a DEADLINE, not an iteration count (dig_ecosystem#2851, C2)
+    ///
+    /// These helpers used to loop a fixed number of times around a 1ms sleep and describe the
+    /// product as a duration. Windows' timer granularity is ~15ms, so the real budget was neither
+    /// the stated one nor a constant: it was an iteration count wearing a duration's clothing, and
+    /// under parallel load — where the sleeps get longer and the supervisor task gets less CPU —
+    /// it shortened exactly when tests needed it most. That produced a ~5% flake in the two
+    /// log-capture tests that survived the `tracing` interest-cache fix. Measure the thing you are
+    /// bounding.
     async fn until(&self, what: &str, mut predicate: impl FnMut(&Script) -> bool) {
-        for _ in 0..6_000 {
-            if predicate(&self.script) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let deadline = Deadline::start();
+        while !predicate(&self.script) {
+            deadline.tick(what).await;
         }
-        panic!("timed out waiting for: {what}");
     }
 
     /// Poll the DB until `predicate` holds, or fail. The supervisor records a call before it
@@ -598,31 +600,27 @@ impl Harness {
         what: &str,
         mut predicate: impl FnMut(&super::super::db::SyncState) -> bool,
     ) {
-        for _ in 0..2_000 {
-            if predicate(&self.db.sync_state().await.unwrap()) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        let deadline = Deadline::start();
+        while !predicate(&self.db.sync_state().await.unwrap()) {
+            deadline.tick(what).await;
         }
-        panic!("timed out waiting for: {what}");
     }
 
     /// Poll the COMPOSED status until `predicate` holds, or fail. The phase depends on live
     /// session facts that no DB row carries, so it can only be awaited through the handle.
     async fn until_status(&self, what: &str, mut predicate: impl FnMut(&WalletSyncStatus) -> bool) {
-        for _ in 0..2_000 {
-            if predicate(
-                &self
-                    .handle
-                    .status(&self.db, ChainPeerTier::UNOBSERVABLE)
-                    .await
-                    .unwrap(),
-            ) {
+        let deadline = Deadline::start();
+        loop {
+            let status = self
+                .handle
+                .status(&self.db, ChainPeerTier::UNOBSERVABLE)
+                .await
+                .unwrap();
+            if predicate(&status) {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            deadline.tick(what).await;
         }
-        panic!("timed out waiting for: {what}");
     }
 
     /// Wait until the supervisor has connected AND finished deciding what that session may do.
@@ -1954,6 +1952,47 @@ fn the_trust_label_is_fixed_by_the_dial_source() {
 
 /// The header hash an honest quorum agrees on at the settled height.
 const HONEST_HASH: Bytes32 = Bytes32::new([0x11; 32]);
+/// How long a `Harness` poll helper waits for a predicate before failing the test.
+///
+/// Generous, because it is also how long a genuinely BROKEN supervisor takes to fail, and a
+/// revert-proof nobody waits for stops being run.
+const WAIT_BUDGET: Duration = Duration::from_secs(120);
+
+/// How often those helpers re-check. Comfortably above the ~15ms Windows timer floor, so the
+/// number of checks is roughly what it looks like.
+const WAIT_POLL: Duration = Duration::from_millis(20);
+
+/// A real wall-clock deadline for the `Harness` poll helpers.
+///
+/// # It is a DEADLINE, not an iteration count (dig_ecosystem#2851, C2)
+///
+/// Those helpers used to loop a fixed number of times around a 1ms sleep and describe the product
+/// as a duration. Windows' timer granularity is ~15ms, so the real budget was neither the stated
+/// one nor a constant: it was an iteration count wearing a duration's clothing, and under parallel
+/// load — where each sleep stretches and the supervisor task gets less CPU — it shortened exactly
+/// when the tests needed it most. That is the ~5% flake in the two log-capture tests which survived
+/// the `tracing` interest-cache fix. Measure the thing you are bounding.
+struct Deadline {
+    expires_at: std::time::Instant,
+}
+
+impl Deadline {
+    fn start() -> Self {
+        Self {
+            expires_at: std::time::Instant::now() + WAIT_BUDGET,
+        }
+    }
+
+    /// Sleep one poll interval, or panic naming `what` once the budget is spent.
+    async fn tick(&self, what: &str) {
+        assert!(
+            std::time::Instant::now() < self.expires_at,
+            "timed out after {WAIT_BUDGET:?} waiting for: {what}"
+        );
+        tokio::time::sleep(WAIT_POLL).await;
+    }
+}
+
 /// A different hash — what a lying writer answers instead.
 const LIARS_HASH: Bytes32 = Bytes32::new([0x22; 32]);
 /// The settled height a scripted corroboration round lands on.
@@ -2607,8 +2646,12 @@ async fn a_stall_and_its_recovery_are_both_named_in_the_log() {
         "the stall must name the peers' peak: {log}"
     );
     assert!(
-        log.contains("stalled_for_secs"),
-        "the stall must say how long it lasted: {log}"
+        log.contains("observed_behind_for_secs"),
+        "the stall must say how long it was OBSERVED behind — and say only that, because the          freeze may predate the first observation by any amount: {log}"
+    );
+    assert!(
+        !log.contains("stalled_for_secs"),
+        "the old field name claimed time-since-freeze, which this value is not: {log}"
     );
     assert!(
         log.contains("203.0.113.1:8444"),
@@ -3376,6 +3419,29 @@ async fn a_shutdown_is_honoured_while_a_catch_up_is_running() {
 
     // `stop` asserts the task actually ends; it is the assertion, not the teardown.
     harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851, A3):** the catch-up deadline is a duration a human waits.
+///
+/// The deadline's own test drives the scripted clock with `script.allow(CATCH_UP_DEADLINE)` — it
+/// identifies the timer BY ITS DURATION, so it proves a timer with that identity exists and can
+/// never disagree with whatever the constant says. Multiplying the constant by a million (~114
+/// years) left it green. This is the circular-assertion shape: an expectation read from the
+/// production value confirms only itself.
+///
+/// So the bound is asserted against LITERALS, from both sides. Too loose and the deadline is not a
+/// deadline; too tight and a legitimate catch-up is aborted, which restarts it from genesis and
+/// produces the never-finishing replica this ticket is about.
+#[test]
+fn the_catch_up_deadline_is_a_duration_a_human_waits() {
+    assert!(
+        CATCH_UP_DEADLINE <= Duration::from_secs(4 * 60 * 60),
+        "a deadline longer than an afternoon cannot end a parked catch-up in any useful sense:          {CATCH_UP_DEADLINE:?}"
+    );
+    assert!(
+        CATCH_UP_DEADLINE >= Duration::from_secs(5 * 60),
+        "measured catch-ups take tens of milliseconds, but a deadline under five minutes leaves          no room for a slow first sync — and aborting one restarts it from genesis:          {CATCH_UP_DEADLINE:?}"
+    );
 }
 
 /// **Proves (dig_ecosystem#2851, A2 + F3):** the ceiling the ONE production construction site
