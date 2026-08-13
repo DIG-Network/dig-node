@@ -183,6 +183,9 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.arrivals",
     "control.wallet.peak",
     "control.wallet.syncStatus",
+    "control.wallet.watch",
+    "control.wallet.unwatch",
+    "control.wallet.watched",
     "control.wallet.broadcast",
     "control.updater.status",
     "control.updater.setChannel",
@@ -230,6 +233,9 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.arrivals",
     "control.wallet.peak",
     "control.wallet.syncStatus",
+    "control.wallet.watch",
+    "control.wallet.unwatch",
+    "control.wallet.watched",
     "control.wallet.broadcast",
     "control.updater.status",
     "control.updater.setChannel",
@@ -805,6 +811,9 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
+        "control.wallet.watch" => wallet_watch(ctx, id, params),
+        "control.wallet.unwatch" => wallet_unwatch(ctx, id, params),
+        "control.wallet.watched" => wallet_watched(ctx, id),
         "control.peerCounts" => peer_counts(ctx, id).await,
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
@@ -2063,6 +2072,123 @@ async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
     }
 }
 
+// ---------------------------------------------------------------------------
+// The externally-registered watch list (SPEC §18.6f, dig_ecosystem#2823)
+// ---------------------------------------------------------------------------
+
+/// The three watch methods are MUTATIONS: they aim this node's chain subscriptions, so they are
+/// deliberately absent from [`is_open_control_read`] and therefore require the control token.
+///
+/// # What they are for
+///
+/// Under §908 the user's account lives in dig-app and the node custodies no seed, so custody
+/// contributes no puzzle hashes at all, the sync supervisor refuses a catch-up over the empty set,
+/// and the replica never advances. Registering the account's PUBLIC keys is the only way such a
+/// node can follow its user's coins. No seed crosses and nothing here can sign.
+///
+/// `control.wallet.watch` — register G1 public keys to follow. Idempotent, so a client may
+/// re-announce its account on every unlock.
+fn wallet_watch(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let keys = match parse_watch_keys("control.wallet.watch", &id, params) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let Some(registry) = ctx.wallet.watchlist() else {
+        return no_watchlist(id);
+    };
+    let added = registry.watch(&keys);
+    control_ok(
+        id,
+        json!({ "added": added, "watched": registry.registered().len() }),
+    )
+}
+
+/// `control.wallet.unwatch` — deregister keys, which genuinely stops the following: they leave the
+/// set the supervisor re-reads AND the persisted set a restart would load.
+fn wallet_unwatch(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let keys = match parse_watch_keys("control.wallet.unwatch", &id, params) {
+        Ok(k) => k,
+        Err(e) => return e,
+    };
+    let Some(registry) = ctx.wallet.watchlist() else {
+        return no_watchlist(id);
+    };
+    let removed = registry.unwatch(&keys);
+    control_ok(
+        id,
+        json!({ "removed": removed, "watched": registry.registered().len() }),
+    )
+}
+
+/// `control.wallet.watched` — the keys currently registered, so a client can reconcile what it
+/// asked for against what the node is actually following.
+fn wallet_watched(ctx: &ControlCtx, id: Value) -> Value {
+    let Some(registry) = ctx.wallet.watchlist() else {
+        return no_watchlist(id);
+    };
+    control_ok(id, json!({ "public_keys": registry.registered_hex() }))
+}
+
+/// Parse `params.public_keys` — a non-empty array of 48-byte G1 keys as hex.
+///
+/// ALL-OR-NOTHING, deliberately: registering only the entries that happened to parse would leave
+/// the node following a strict subset of the account and reporting a balance that is too small
+/// rather than obviously broken (dig_ecosystem#2762). A malformed request is refused whole, so the
+/// client learns immediately instead of reading a quiet under-report as the truth.
+fn parse_watch_keys(
+    method: &str,
+    id: &Value,
+    params: &Value,
+) -> std::result::Result<Vec<dig_wallet::sage::watchlist::WatchKey>, Value> {
+    let Some(entries) = params.get("public_keys").and_then(|v| v.as_array()) else {
+        return Err(control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{method} requires params.public_keys (an array of 48-byte G1 keys as hex)"),
+        ));
+    };
+    if entries.is_empty() {
+        return Err(control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{method} requires at least one key in params.public_keys"),
+        ));
+    }
+    let mut keys = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let parsed = entry
+            .as_str()
+            .and_then(dig_wallet::sage::watchlist::decode_key);
+        match parsed {
+            Some(k) => keys.push(k),
+            None => {
+                return Err(control_error(
+                    id.clone(),
+                    ErrorCode::InvalidParams,
+                    format!(
+                        "{method} received an entry in params.public_keys that is not a 48-byte \
+                         G1 public key as hex; no key was registered"
+                    ),
+                ))
+            }
+        }
+    }
+    Ok(keys)
+}
+
+/// This node has no watch registry attached, so it cannot follow anything on request.
+///
+/// Refused rather than answered with a cheerful zero: a client told its account is being followed
+/// while nothing watches it reads the resulting empty balance as the truth.
+fn no_watchlist(id: Value) -> Value {
+    control_error(
+        id,
+        ErrorCode::WalletNoChainSource,
+        "this node has no wallet watch registry, so it cannot follow externally-registered \
+         addresses",
+    )
+}
+
 /// Map a coin read onto the wire contract published by `dig-node-control-interface`.
 ///
 /// The `asset` is echoed onto every coin because dig-app's frozen `CoinRecord` carries one and
@@ -2236,6 +2362,94 @@ mod tests {
             !is_open_control_read("control.wallet.arrivals"),
             "the arrival cursor names this node's own watched puzzle hashes to a caller that              supplied nothing, so it must stay behind the control token"
         );
+    }
+
+    /// **The watch methods stay GATED (§18.6f, #2823).**
+    ///
+    /// They aim this node's chain subscriptions, so they are mutations. Opening one would let any
+    /// local process decide which addresses this machine associates itself with to its Chia peers.
+    #[test]
+    fn the_watch_methods_require_the_control_token() {
+        for method in [
+            "control.wallet.watch",
+            "control.wallet.unwatch",
+            "control.wallet.watched",
+        ] {
+            assert!(
+                CONTROL_METHODS.contains(&method),
+                "{method} must be a declared control method"
+            );
+            assert!(
+                !is_open_control_read(method),
+                "{method} aims this node's subscriptions and must stay behind the control token"
+            );
+        }
+    }
+
+    /// **A malformed key list registers NOTHING (§18.6f, #2823).**
+    ///
+    /// The fixture puts a VALID key beside the malformed one, which is what makes the test able to
+    /// see the nearest wrong implementation — registering the entries that happened to parse. A
+    /// partially-registered account is followed at fewer addresses than the client asked for, and
+    /// that under-reports a balance quietly rather than failing visibly (dig_ecosystem#2762).
+    #[test]
+    fn a_malformed_key_refuses_the_whole_registration() {
+        let valid = hex::encode(
+            chia::bls::SecretKey::from_seed(&[7u8; 64])
+                .public_key()
+                .to_bytes(),
+        );
+
+        let err = parse_watch_keys(
+            "control.wallet.watch",
+            &json!(1),
+            &json!({ "public_keys": [valid, "not-a-key"] }),
+        )
+        .expect_err("a malformed entry must refuse the request");
+
+        assert_eq!(
+            err["error"]["code"],
+            json!(ErrorCode::InvalidParams.code()),
+            "the refusal must be an invalid-params error, not a partial success"
+        );
+    }
+
+    /// An empty list is refused rather than treated as a successful no-op, so a client that built
+    /// its key list wrongly learns immediately instead of waiting for a balance that never arrives.
+    #[test]
+    fn an_empty_key_list_is_refused() {
+        assert!(parse_watch_keys(
+            "control.wallet.watch",
+            &json!(1),
+            &json!({ "public_keys": [] })
+        )
+        .is_err());
+    }
+
+    /// A well-formed list parses to exactly the keys given.
+    #[test]
+    fn a_well_formed_key_list_parses() {
+        let keys: Vec<String> = [1u8, 2]
+            .iter()
+            .map(|t| {
+                let mut seed = [0u8; 64];
+                seed[0] = *t;
+                hex::encode(
+                    chia::bls::SecretKey::from_seed(&seed)
+                        .public_key()
+                        .to_bytes(),
+                )
+            })
+            .collect();
+
+        let parsed = parse_watch_keys(
+            "control.wallet.watch",
+            &json!(1),
+            &json!({ "public_keys": keys }),
+        )
+        .expect("a well-formed list parses");
+
+        assert_eq!(parsed.len(), 2);
     }
 
     /// `coins_wire` emits the contract shape: the requested asset echoed onto every coin, an

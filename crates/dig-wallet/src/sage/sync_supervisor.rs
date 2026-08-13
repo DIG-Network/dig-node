@@ -16,7 +16,10 @@
 //!
 //! When corroboration is unavailable, splits, or catches the writer out, the session stays
 //! [`PeerTrust::Discovered`] and its whole contribution is liveness: `chia_peer_count` stays
-//! non-null so the phase advances from `not_started` to `syncing`, and nothing is written.
+//! non-null so the phase advances from `not_started` to `syncing`, and nothing is written. Such a
+//! session is HELD FOR [`RECORROBORATE_AFTER`] AND THEN ENDED, so the ordinary reconnect path draws
+//! an independent sample and asks again — corroboration runs once per session, so a refused session
+//! that is never ended is a refusal that never expires (dig_ecosystem#2827).
 //!
 //! # What the DB cannot say
 //!
@@ -41,6 +44,7 @@
 //! from custody's persisted PUBLIC keys, which are readable while every wallet is locked. No
 //! seed is touched and nothing here can sign.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -53,6 +57,7 @@ use super::db::WalletDb;
 use super::events::EventBus;
 use super::quorum::{self, Verdict};
 use super::sync::{self, PeerTrust, SyncError};
+use super::watchlist::WatchRegistry;
 
 /// The initial reconnect delay.
 const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
@@ -73,6 +78,23 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// creating the wallet and is a local read of already-loaded public keys, so it costs nothing on
 /// the wire.
 const PUZZLE_HASH_POLL: Duration = Duration::from_secs(5);
+/// How long a REFUSED session is held before it is ended so a fresh corroboration sample is drawn
+/// (dig_ecosystem#2827).
+///
+/// Corroboration runs once, at session start. Without this, a single non-elevating round parked the
+/// node on a peer it could never write from for the LIFE OF THE PROCESS: the refused session
+/// subscribes nothing, so the resubscribe poll is disarmed too, and the only remaining exit was the
+/// peer disconnecting — which a healthy peer never does. A user's replica sat at height 9,139,211
+/// for hours, five peers held, while the chain moved on and their wallet reported no balance.
+///
+/// FORTY-FIVE SECONDS BALANCES THE TWO FAILURES EITHER SIDE OF IT. Shorter, and a genuinely
+/// partitioned network is re-dialled in a near-tight loop across the same four DNS introducers that
+/// [`BACKOFF_MAX`] exists to protect. Longer, and a transient shortfall — one slow round, a
+/// momentarily thin peer set — costs the user minutes of a visibly frozen balance for no reason.
+/// It sits just below [`BACKOFF_MAX`], so a persistently refusing network converges on the backoff
+/// ladder's own ceiling rather than out-pacing it, and it is short enough that the cost of a
+/// transient refusal is under a minute instead of unbounded.
+const RECORROBORATE_AFTER: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
 // The observable state
@@ -485,6 +507,58 @@ impl PuzzleHashSource for WalletCustody {
     }
 }
 
+/// Custody's own addresses PLUS the ones an external client registered
+/// ([`super::watchlist::WatchRegistry`], dig_ecosystem#2823).
+///
+/// # Why the union, and not a replacement
+///
+/// The two sets answer different questions and both must be followed. Custody's set is the coins
+/// the NODE holds; the registry's set is the coins the node was ASKED to follow for a user whose
+/// account lives in dig-app (§908 — the node holds no seed on that install, so custody contributes
+/// nothing at all). Serving either alone silently follows fewer addresses than the operator
+/// arranged, and a too-narrow watch set under-reports a BALANCE — a wrong number that looks like a
+/// working feature (dig_ecosystem#2762). The union is the only answer that cannot do that.
+///
+/// Both sides map through the SAME `StandardArgs::curry_tree_hash` derivation
+/// ([`puzzle_hash_for`]), so there is exactly one public-key → puzzle-hash mapping in the
+/// ecosystem and no app/node byte-drift (§4.1). A key present on both sides yields ONE hash.
+pub struct UnionPuzzleHashSource {
+    /// The node's own custody.
+    custody: WalletCustody,
+    /// Keys registered over `control.wallet.watch`.
+    registry: WatchRegistry,
+}
+
+impl UnionPuzzleHashSource {
+    /// Compose the node's custody with its watch registry.
+    pub fn new(custody: WalletCustody, registry: WatchRegistry) -> Self {
+        Self { custody, registry }
+    }
+}
+
+impl PuzzleHashSource for UnionPuzzleHashSource {
+    fn puzzle_hashes(&self) -> Vec<Bytes32> {
+        let mut hashes: BTreeSet<Bytes32> = PuzzleHashSource::puzzle_hashes(&self.custody)
+            .into_iter()
+            .collect();
+        hashes.extend(self.registry.registered().iter().map(puzzle_hash_for));
+        // Sorted + deduplicated by construction, so a subscription (and a test asserting one) is
+        // reproducible regardless of which side contributed a hash.
+        hashes.into_iter().collect()
+    }
+
+    /// A node with registered keys and NO custody genuinely has a wallet enrolled, so it must not
+    /// report the `NoWalletEnrolled` all-clear — that is the §908 install, and on it the registry
+    /// is the only evidence a wallet exists at all.
+    ///
+    /// Asked separately from [`Self::puzzle_hashes`] for the reason the trait documents: an empty
+    /// address set means *nothing to do* or *something to do that is not being done*, and only this
+    /// distinguishes them (dig_ecosystem#2609).
+    fn any_wallet(&self) -> bool {
+        PuzzleHashSource::any_wallet(&self.custody) || !self.registry.is_empty()
+    }
+}
+
 /// The p2 puzzle hash a public key controls.
 fn puzzle_hash_for(pk: &PublicKey) -> Bytes32 {
     Bytes32::from(StandardArgs::curry_tree_hash(*pk).to_bytes())
@@ -833,6 +907,13 @@ impl Supervisor {
                 // wallets appear.
                 () = self.await_puzzle_hashes(nothing_subscribed && trust.is_authoritative())
                     => SessionOutcome::Resubscribe,
+                // This session was REFUSED, and corroboration only runs at session start — so the
+                // refusal is permanent for as long as the session lives. Ending it hands the
+                // decision back to the reconnect path, which draws an independent sample and runs
+                // the `Corroborator` again. That is what makes the "re-drawing a fresh sample" log
+                // line above TRUE; no new retry mechanism is introduced (dig_ecosystem#2827).
+                () = self.await_recorroboration(!trust.is_authoritative())
+                    => SessionOutcome::Ended,
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
                 _ = shutdown.changed() => SessionOutcome::Stop,
@@ -954,6 +1035,19 @@ impl Supervisor {
                 return;
             }
         }
+    }
+
+    /// Resolve once a REFUSED session has been held long enough to be worth re-corroborating.
+    ///
+    /// Returns a future that NEVER resolves when `retry` is false. An authoritative session has
+    /// nothing to re-corroborate — it already cleared the quorum — and ending it would discard a
+    /// live subscription and force a fresh catch-up from genesis, which is a worse failure than the
+    /// one this exists to fix.
+    async fn await_recorroboration(&self, retry: bool) {
+        if !retry {
+            std::future::pending::<()>().await;
+        }
+        self.time.sleep(RECORROBORATE_AFTER).await;
     }
 
     /// Wait out the next backoff delay. Returns `false` if shutdown arrived meanwhile.
@@ -1114,9 +1208,16 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
 ///
 /// The compensation is DISTINCTNESS: an address already in this round's sample is discarded and
 /// re-drawn, within [`MAX_PROBE_ATTEMPTS`]. That is not a tidiness rule — it is the difference
-/// between four opinions and one opinion counted four times. Failing to assemble
-/// [`quorum::QUORUM_SAMPLE`] distinct peers inside the budget yields [`Verdict::Insufficient`],
-/// which writes nothing.
+/// between four opinions and one opinion counted four times. A round that assembles fewer than
+/// [`quorum::CORROBORATION_FLOOR`] answers yields [`Verdict::Insufficient`], which writes nothing.
+///
+/// # Over-subscribe, then pull back (dig_ecosystem#2827)
+///
+/// The round dials up to [`quorum::QUORUM_DIAL_WIDE`] distinct peers and asks
+/// [`quorum::QUORUM_HOLD`] of them, chosen by [`quorum::hold_best`]. Dialling exactly as many as
+/// the round needs leaves it no margin for a dial that is stale, slow, or gone by the time the
+/// question is put — and having no margin is how a round that could have been answered was
+/// discarded instead.
 ///
 /// The residual bias is real and `SPEC.md` says so: a peer that is fast and always up remains
 /// over-represented among the probes. This raises an attacker's cost; it does not remove the
@@ -1128,15 +1229,19 @@ pub struct ChiaQuorumCorroborator {
     timeout: Duration,
 }
 
-/// How many dial attempts one round may make while assembling [`quorum::QUORUM_SAMPLE`] DISTINCT
-/// peers.
+/// How many dial attempts one round may make while assembling [`quorum::QUORUM_DIAL_WIDE`]
+/// DISTINCT peers.
 ///
 /// Bounded because the distinctness compensation is a retry loop over a helper that may keep
 /// returning the same address — a host with a co-resident full node returns localhost every single
-/// time — and an unbounded retry there is a hang, not a defence. Three attempts per required
-/// member is generous on a healthy network and short enough that a degenerate or hostile one
-/// degrades to "no quorum, nothing written" in seconds.
-const MAX_PROBE_ATTEMPTS: usize = quorum::QUORUM_SAMPLE * 3;
+/// time — and an unbounded retry there is a hang, not a defence.
+///
+/// Two attempts per dial rather than the three it was when the target was four: widening the
+/// target to ten already multiplies the worst-case dial count, and a round that spends longer
+/// failing is a round the replica spends longer not being written. A degenerate or hostile network
+/// still degrades to "no corroboration, nothing written" rather than to a hang, which is the
+/// property this bound exists for.
+const MAX_PROBE_ATTEMPTS: usize = quorum::QUORUM_DIAL_WIDE * 2;
 
 impl ChiaQuorumCorroborator {
     /// A mainnet corroborator.
@@ -1147,7 +1252,7 @@ impl ChiaQuorumCorroborator {
         }
     }
 
-    /// Dial repeatedly, keeping the first [`quorum::QUORUM_SAMPLE`] DISTINCT addresses together
+    /// Dial repeatedly, keeping the first [`quorum::QUORUM_DIAL_WIDE`] DISTINCT addresses together
     /// with each one's claimed peak.
     async fn probe(&self) -> Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> {
         let Ok(tls) = chia_query::peer::connect::create_generated_tls() else {
@@ -1156,7 +1261,7 @@ impl ChiaQuorumCorroborator {
         let mut sample: Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> = Vec::new();
 
         for _ in 0..MAX_PROBE_ATTEMPTS {
-            if sample.len() >= quorum::QUORUM_SAMPLE {
+            if sample.len() >= quorum::QUORUM_DIAL_WIDE {
                 break;
             }
             let Ok((peer, addr, receiver)) =
@@ -1222,8 +1327,33 @@ impl Corroborator for ChiaQuorumCorroborator {
         // a height every survivor passed some blocks ago — where a lagging-but-honest peer and a
         // fully caught-up one hold the SAME answer, so a disagreement can no longer be explained
         // by lag. That is the whole behind-versus-lying discriminator.
+        //
+        // Then PULL BACK: the dial was deliberately wide, and asking every peer it happened to
+        // reach would spend the margin the wide dial exists to provide.
         let candidates: Vec<quorum::Candidate> = probes.iter().map(|(c, _)| c.clone()).collect();
-        let eligible = quorum::eligible(&candidates, quorum::PEAK_LAG_TOLERANCE);
+        // REFUSED, not narrowed, when the credibility band discarded half or more of the peers
+        // that made a claim: the band is median-anchored, so a coordinated half owns it and can
+        // place it off the honest set entirely. The denominator is the peers that CLAIMED a peak,
+        // never the dial target and never the peers that later answered — keying it on either of
+        // those would refuse a thin honest round and freeze the replica again (#2827).
+        let Some(eligible) = quorum::hold_best(
+            &quorum::OsEntropy,
+            &candidates,
+            quorum::PEAK_LAG_TOLERANCE,
+            quorum::QUORUM_HOLD,
+        ) else {
+            tracing::warn!(
+                claimants = candidates.len(),
+                "wallet sync: the credibility band excluded half or more of the peers that \
+claimed a peak; the round is refused rather than run on the surviving side. A \
+split claim set is what a coordinated peer group looks like from a light client."
+            );
+            return Err(SyncError::Peer(
+                "credibility band split the claimants: refusing to corroborate from the \
+surviving side"
+                    .into(),
+            ));
+        };
         let Some(height) = quorum::common_height(&eligible, quorum::SETTLED_LAG) else {
             return Err(SyncError::Peer(
                 "no settled height: too few reachable peers agreed on a credible chain tip".into(),
@@ -1235,8 +1365,10 @@ impl Corroborator for ChiaQuorumCorroborator {
             if !eligible.iter().any(|e| e.id == candidate.id) {
                 continue;
             }
-            // A probe that will not answer is simply ABSENT from the tally, which counts against
-            // reaching the quorum rather than for it.
+            // A probe that will not answer is simply ABSENT from the tally. It lowers the round's
+            // confidence — `Verdict::agreed` is smaller — and it no longer discards the round,
+            // which is what left a replica frozen while peers that HAD answered were ignored
+            // (dig_ecosystem#2827).
             if let Ok(Some(answer)) = header_hash_from(peer, height).await {
                 responses.push(quorum::Response {
                     peer: candidate.id.clone(),
@@ -1247,7 +1379,7 @@ impl Corroborator for ChiaQuorumCorroborator {
 
         Ok(CorroborationRound {
             height,
-            verdict: quorum::tally(&responses, quorum::QUORUM_SAMPLE, quorum::QUORUM_AGREEMENT),
+            verdict: quorum::tally(&responses),
         })
     }
 }

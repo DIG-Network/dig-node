@@ -3103,3 +3103,127 @@ async fn ws_wallet_rejects_a_disallowed_origin() {
         other => panic!("expected an HTTP 403 rejection, got {other:?}"),
     }
 }
+
+/// **Proves (SPEC §18.6f, dig_ecosystem#2823):** a client can make this node follow an account it
+/// does not custody, over the real control plane, and can stop it again.
+///
+/// This is the blocker the ticket exists to clear: on a §908-correct install the account lives in
+/// dig-app and the node holds no seed, so custody contributes no puzzle hashes, the sync supervisor
+/// refuses a catch-up over the empty set, and `watched_addresses` is permanently 0. Registration is
+/// the only way the node can watch the user's coins.
+///
+/// Two keys are registered and only ONE is deregistered, so an implementation that clears the whole
+/// registry — or that never persisted the removal — is visible rather than passing. The token is
+/// required on all three calls, which is asserted first: these are mutations, and an open
+/// registration would let any local process decide which addresses this machine associates itself
+/// with to its Chia peers.
+#[tokio::test]
+async fn a_client_can_register_and_deregister_the_addresses_the_node_follows() {
+    /// Two distinct, well-formed BLS G1 public keys as the contract spells them: lowercase, 96 hex
+    /// characters, unprefixed.
+    fn key_hex(tag: u8) -> String {
+        let mut seed = [0u8; 64];
+        seed[0] = tag;
+        hex::encode(
+            chia::bls::SecretKey::from_seed(&seed)
+                .public_key()
+                .to_bytes(),
+        )
+    }
+
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _hold) = start_companion_full(&upstream).await;
+    let (first, second) = (key_hex(11), key_hex(12));
+
+    let watch = |keys: Vec<String>, method: &str| {
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": method,
+            "params": { "public_keys": keys },
+        })
+    };
+    let watched = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "control.wallet.watched", "params": {},
+    });
+
+    let unauthorized = post_rpc(
+        &addr,
+        watch(vec![first.clone()], "control.wallet.watch"),
+        None,
+    )
+    .await;
+    assert!(
+        !unauthorized["error"].is_null(),
+        "registering an address is a MUTATION and must require the control token: got \
+         {unauthorized:?}"
+    );
+
+    let registered = post_rpc(
+        &addr,
+        watch(vec![first.clone(), second.clone()], "control.wallet.watch"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(registered["result"]["added"], json!(2));
+    assert_eq!(registered["result"]["watched"], json!(2));
+
+    // Re-registering is a no-op reported honestly, so a client may re-announce on every unlock.
+    let again = post_rpc(
+        &addr,
+        watch(vec![first.clone()], "control.wallet.watch"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(
+        again["result"]["added"],
+        json!(0),
+        "re-enrolment adds nothing"
+    );
+    assert_eq!(
+        again["result"]["watched"],
+        json!(2),
+        "the second counter is the POST-operation size, so a client can tell its own duplicate \
+         call from another client's concurrent enrolment"
+    );
+
+    // A malformed key refuses the WHOLE request: a partially-enrolled account is followed at fewer
+    // addresses than asked and under-reports a balance quietly (dig_ecosystem#2762).
+    let third = key_hex(13);
+    let refused = post_rpc(
+        &addr,
+        watch(
+            vec![third.clone(), "not-a-key".to_string()],
+            "control.wallet.watch",
+        ),
+        Some(&token),
+    )
+    .await;
+    assert!(!refused["error"].is_null(), "a malformed key must refuse");
+    let after_refusal = post_rpc(&addr, watched.clone(), Some(&token)).await;
+    let keys: Vec<&str> = after_refusal["result"]["public_keys"]
+        .as_array()
+        .expect("watched lists the registered keys")
+        .iter()
+        .map(|k| k.as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !keys.contains(&third.as_str()),
+        "the well-formed key in a refused request must NOT have been enrolled: got {keys:?}"
+    );
+    assert_eq!(keys.len(), 2);
+
+    let dropped = post_rpc(
+        &addr,
+        watch(vec![first.clone()], "control.wallet.unwatch"),
+        Some(&token),
+    )
+    .await;
+    assert_eq!(dropped["result"]["removed"], json!(1));
+    assert_eq!(dropped["result"]["watched"], json!(1));
+
+    let remaining = post_rpc(&addr, watched, Some(&token)).await;
+    assert_eq!(
+        remaining["result"]["public_keys"],
+        json!([second]),
+        "deregistering one key must stop following exactly it, and leave the other followed"
+    );
+}

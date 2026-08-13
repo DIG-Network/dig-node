@@ -80,6 +80,13 @@ pub enum ControlAction {
     WalletPeak,
     /// `control.wallet.broadcast` — push an ALREADY-SIGNED spend bundle. The node signs nothing.
     WalletBroadcast { signed_bundle_hex: String },
+    /// `control.wallet.watch` — register PUBLIC keys whose addresses this node should follow.
+    /// Public keys only: no seed crosses and nothing here gains a signing capability (§908).
+    WalletWatch { public_keys: Vec<String> },
+    /// `control.wallet.unwatch` — stop following the addresses of these public keys.
+    WalletUnwatch { public_keys: Vec<String> },
+    /// `control.wallet.watched` — the public keys this node is currently following.
+    WalletWatched,
     /// `control.updater.status` — the DIG auto-update beacon's status.
     UpdaterStatus,
     /// `control.updater.setChannel` — set the beacon channel (`nightly` | `stable`).
@@ -124,6 +131,9 @@ impl ControlAction {
             ControlAction::WalletPeak => "control.wallet.peak",
             ControlAction::WalletSyncStatus => "control.wallet.syncStatus",
             ControlAction::WalletBroadcast { .. } => "control.wallet.broadcast",
+            ControlAction::WalletWatch { .. } => "control.wallet.watch",
+            ControlAction::WalletUnwatch { .. } => "control.wallet.unwatch",
+            ControlAction::WalletWatched => "control.wallet.watched",
             ControlAction::UpdaterStatus => "control.updater.status",
             ControlAction::UpdaterSetChannel { .. } => "control.updater.setChannel",
             ControlAction::UpdaterPause { .. } => "control.updater.pause",
@@ -179,6 +189,13 @@ impl ControlAction {
             }
             ControlAction::WalletBroadcast { signed_bundle_hex } => {
                 json!({ "signed_bundle_hex": signed_bundle_hex })
+            }
+            // Without these two arms the keys the user typed are dropped by the `_` fall-through
+            // below and the node is asked to follow nothing, which it refuses as a missing
+            // `params.public_keys`. The refusal is correct and the command is unusable.
+            ControlAction::WalletWatch { public_keys }
+            | ControlAction::WalletUnwatch { public_keys } => {
+                json!({ "public_keys": public_keys })
             }
             ControlAction::UpdaterSetChannel { channel } => json!({ "channel": channel }),
             ControlAction::UpdaterPause { until: Some(u) } => json!({ "until": u }),
@@ -265,6 +282,15 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
             signed_bundle_hex: String::new(),
         }
         .method(),
+        ControlAction::WalletWatch {
+            public_keys: Vec::new(),
+        }
+        .method(),
+        ControlAction::WalletUnwatch {
+            public_keys: Vec::new(),
+        }
+        .method(),
+        ControlAction::WalletWatched.method(),
         ControlAction::UpdaterStatus.method(),
         ControlAction::UpdaterSetChannel {
             channel: String::new(),
@@ -565,6 +591,23 @@ mod tests {
         assert_eq!(
             ControlAction::UpdaterPause { until: Some(99) }.wire_params(),
             json!({ "until": 99 })
+        );
+        // Enrolment carries the keys the user typed. Measured against a running node before this
+        // arm existed: the `_` fall-through sent `{}`, the node answered "requires
+        // params.public_keys", and `dign wallet watch <key>` could not follow anything at all.
+        assert_eq!(
+            ControlAction::WalletWatch {
+                public_keys: vec!["aa".into(), "bb".into()],
+            }
+            .wire_params(),
+            json!({ "public_keys": ["aa", "bb"] })
+        );
+        assert_eq!(
+            ControlAction::WalletUnwatch {
+                public_keys: vec!["cc".into()],
+            }
+            .wire_params(),
+            json!({ "public_keys": ["cc"] })
         );
         // A pause with no deadline sends an empty object (indefinite pause).
         assert_eq!(

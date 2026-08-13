@@ -642,6 +642,25 @@ async fn supervisor_runs_catch_up_once_custody_has_keys() {
 // F1 - the trust boundary, driven through the REAL supervisor
 // ---------------------------------------------------------------------------
 
+/// Deliver `message` to whichever session is live RIGHT NOW, retrying while sessions turn over.
+///
+/// A refused session is now short-lived by design (dig_ecosystem#2827), so the sender captured a
+/// moment ago may already belong to a closed session. Panicking on the first closed channel would
+/// make this suite flaky about a fact it is not testing; failing after the bounded retry still
+/// catches a supervisor that never consumes peer pushes at all.
+async fn push_peak_to_a_live_session(h: &Harness, message: Message) {
+    for _ in 0..2_000 {
+        let sender = h.script.senders.lock().unwrap().last().cloned();
+        if let Some(sender) = sender {
+            if sender.send(message.clone()).await.is_ok() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("no live session ever accepted a peer push");
+}
+
 /// **Proves (F1c, the auditor's backoff-cycle exploit):** a DISCOVERED peer never marks the
 /// replica authoritative, however many times it drops the connection and is reconnected to.
 ///
@@ -683,22 +702,17 @@ async fn a_discovered_peer_never_marks_the_replica_authoritative_across_reconnec
         );
         h.until("a live session", |s| !s.senders.lock().unwrap().is_empty())
             .await;
-        assert!(
-            h.handle
-                .status(&db, ChainPeerTier::UNOBSERVABLE)
-                .await
-                .unwrap()
-                .subscription_peer_count
-                .is_some_and(|n| n >= 1),
-            "cycle {cycle}: the session must still COUNT — liveness is the whole of what a \
-             discovered peer contributes, so a supervisor that simply refuses to dial one fails \
-             here"
-        );
-        let sender = h.script.senders.lock().unwrap().last().unwrap().clone();
-        sender
-            .send(peak_message(6_000_000 + cycle))
-            .await
-            .expect("the session consumes peer pushes");
+        // POLLED, not sampled once. Since dig_ecosystem#2827 a refused session is deliberately
+        // ended after `RECORROBORATE_AFTER` so a fresh sample can be drawn, and this suite's clock
+        // returns from every sleep instantly — so the supervisor cycles connect/refuse/reconnect
+        // and a single-instant read can legitimately land in a between-sessions gap. The property
+        // being proven is unchanged and still load-bearing: a supervisor that refused to dial a
+        // discovered peer at all would never reach a count of one, however long this polled.
+        h.until_status(&format!("cycle {cycle}: the session to COUNT"), |s| {
+            s.subscription_peer_count.is_some_and(|n| n >= 1)
+        })
+        .await;
+        push_peak_to_a_live_session(&h, peak_message(6_000_000 + cycle)).await;
         // The attacker hangs up, buying itself a reconnect. Observing the NEXT connect (the top
         // of the following iteration) is what proves the frame above was consumed first: the
         // loop only returns once its receiver closes, which happens here.
@@ -1312,6 +1326,53 @@ async fn both_peer_counts_distinguish_observed_zero_from_unobservable() {
     assert_eq!(transport_only.subscription_peer_count, None);
 }
 
+/// **Proves (#2827):** `chia_peer_count` is what the node HOLDS at that moment, never a target it
+/// is aiming at. A user reading it is reading a measurement.
+///
+/// Corroboration now dials up to `QUORUM_DIAL_WIDE` and asks `QUORUM_HOLD`, and neither number
+/// may leak into this figure — reporting an intention as a holding is the exact defect #2806
+/// corrected, and widening the dial is a fresh chance to reintroduce it.
+///
+/// FIXTURE DESIGN: the held count is THREE — distinct from the floor, the hold, the dial width and
+/// the old sample size — so any implementation that substituted a constant for the measurement is
+/// caught whichever constant it chose.
+///
+/// BOTH status paths are exercised, and that is not thoroughness for its own sake. The field is
+/// populated in TWO places — `SyncHandle::status` and `status_without_supervisor` — so a test
+/// through one of them cannot see a target substituted in the other. A mutation proved it: quoting
+/// `QUORUM_HOLD` in the with-supervisor path left this test green while it covered only the other.
+#[tokio::test]
+async fn the_reported_chia_peer_count_is_the_held_pool_never_a_dial_target() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let held_three = ChainPeerTier {
+        peer_count: Some(3),
+        peak_height: Some(9_141_711),
+    };
+
+    let (handle, _rx) = SyncHandle::new();
+    let attached = handle.status(&db, held_three).await.unwrap();
+    let detached = status_without_supervisor(&db, held_three).await.unwrap();
+
+    for (path, status) in [("with a supervisor", attached), ("without one", detached)] {
+        assert_eq!(
+            status.chia_peer_count,
+            Some(3),
+            "{path}: the reported peer count was not the measured holding"
+        );
+        for target in [
+            quorum::CORROBORATION_FLOOR,
+            quorum::QUORUM_HOLD,
+            quorum::QUORUM_DIAL_WIDE,
+        ] {
+            assert_ne!(
+                status.chia_peer_count,
+                Some(target as u32),
+                "{path}: a corroboration target ({target}) was reported as a holding"
+            );
+        }
+    }
+}
+
 /// **Proves (#2501, and the `control.wallet.syncStatus` contract):** the reported peak is the
 /// REPLICA's own, and an unknown peak stays unknown.
 ///
@@ -1666,6 +1727,17 @@ const LIARS_HASH: Bytes32 = Bytes32::new([0x22; 32]);
 /// The settled height a scripted corroboration round lands on.
 const SETTLED_HEIGHT: u32 = 5_999_998;
 
+/// A FULL round in which every peer asked agreed — the ordinary healthy case.
+///
+/// The `agreed` count is the whole hold, so a thin round (`agreed: CORROBORATION_FLOOR`) is a
+/// visibly different fixture rather than the same one under another name.
+fn unanimous(answer: Bytes32) -> Verdict<Bytes32> {
+    Verdict::Unanimous {
+        answer,
+        agreed: quorum::QUORUM_HOLD,
+    }
+}
+
 /// A corroborator returning a scripted round, recording how many rounds were run.
 ///
 /// Deliberately able to express EVERY verdict rather than just pass/fail: a double that can only
@@ -1738,8 +1810,7 @@ async fn run_discovered_session(
 /// a window in which its answers are already landing.
 #[tokio::test]
 async fn a_single_lying_writer_cannot_move_the_replica() {
-    let (db, script) =
-        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
+    let (db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
 
     assert_eq!(
         script.catch_up_count(),
@@ -1765,8 +1836,7 @@ async fn a_single_lying_writer_cannot_move_the_replica() {
 /// peak.
 #[tokio::test]
 async fn a_corroborated_discovered_peer_syncs_a_default_install() {
-    let (db, script) =
-        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+    let (db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
 
     assert!(
         script.catch_up_count() >= 1,
@@ -1809,6 +1879,41 @@ async fn a_split_quorum_writes_nothing() {
     assert_eq!(db.sync_state().await.unwrap().peak_height, None);
 }
 
+/// **Proves (#2827):** a round only two peers answered still syncs the replica, so the wallet
+/// does not freeze because one peer of five was slow.
+///
+/// This is the user-visible defect: a replica held at height 9,139,211 for hours, five peers
+/// connected, the chain ~2,500 blocks ahead. The datum carries its own confidence (`agreed: 2`)
+/// instead of being discarded for arriving with less of it.
+///
+/// FIXTURE DESIGN: identical in every respect to `a_corroborated_discovered_peer_syncs_a_default
+/// _install` EXCEPT the answer count, so a failure here can only be the count. The writer agrees,
+/// so the round's only unusual property is its thinness.
+///
+/// NEAREST WRONG IMPLEMENTATION: a second confidence gate at the supervisor —
+/// `round.verdict.agreed() >= QUORUM_SAMPLE` — which would leave `tally` correct and the wallet
+/// frozen exactly as before. Only a fixture whose `agreed` is BELOW that and whose verdict is
+/// nonetheless authoritative can see it.
+#[tokio::test]
+async fn a_round_only_two_peers_answered_still_syncs_the_replica() {
+    let thin = Verdict::Unanimous {
+        answer: HONEST_HASH,
+        agreed: quorum::CORROBORATION_FLOOR,
+    };
+    let (db, script) = run_discovered_session(thin, Some(HONEST_HASH)).await;
+
+    assert!(
+        script.catch_up_count() >= 1,
+        "a round corroborated by two peers ran no catch-up, so the replica stays frozen"
+    );
+    let state = db.sync_state().await.unwrap();
+    assert!(
+        state.initial_sync_complete,
+        "initial_sync_complete stayed false for a thin but corroborated round"
+    );
+    assert_eq!(state.peak_height, Some(CATCH_UP_HEIGHT));
+}
+
 /// **Proves:** an unreachable quorum is a refusal, not a default-allow.
 ///
 /// NEAREST WRONG IMPLEMENTATION: treating `Insufficient` as "nobody objected". An attacker who
@@ -1818,7 +1923,7 @@ async fn a_split_quorum_writes_nothing() {
 async fn an_unreachable_quorum_refuses_rather_than_defaulting_to_allow() {
     let thin = Verdict::Insufficient {
         answered: 1,
-        required: quorum::QUORUM_SAMPLE,
+        required: quorum::CORROBORATION_FLOOR,
     };
     let (db, script) = run_discovered_session(thin, Some(HONEST_HASH)).await;
 
@@ -1833,8 +1938,7 @@ async fn an_unreachable_quorum_refuses_rather_than_defaulting_to_allow() {
 /// asked at exactly the round's height and nowhere else.
 #[tokio::test]
 async fn the_writer_is_examined_at_a_height_it_did_not_choose() {
-    let (_db, script) =
-        run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+    let (_db, script) = run_discovered_session(unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
 
     let asked = script.writer_asked_at.lock().unwrap().clone();
     assert!(!asked.is_empty(), "the writer was never examined at all");
@@ -1851,7 +1955,7 @@ async fn the_writer_is_examined_at_a_height_it_did_not_choose() {
 /// or any `if let Some(..)` whose else-branch falls through to elevation.
 #[tokio::test]
 async fn a_writer_that_declines_the_question_is_not_elevated() {
-    let (db, script) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), None).await;
+    let (db, script) = run_discovered_session(unanimous(HONEST_HASH), None).await;
 
     assert_eq!(script.catch_up_count(), 0);
     assert_eq!(db.sync_state().await.unwrap().peak_height, None);
@@ -1884,6 +1988,107 @@ async fn corroboration_switched_off_leaves_a_discovered_peer_writing_nothing() {
     assert_eq!(db.sync_state().await.unwrap().peak_height, None);
 }
 
+/// **Proves (dig_ecosystem#2827):** a REFUSED session ends by itself, so the reconnect path draws
+/// a fresh corroboration sample — WITHOUT the peer ever disconnecting.
+///
+/// THE BUG THIS PINS. Corroboration ran exactly once, at session start. A round that did not
+/// elevate left the session `Discovered`, which forced an EMPTY subscription set, which made
+/// `await_puzzle_hashes`'s poll condition false, which left `std::future::pending()` in that
+/// `select!` arm. The only remaining exit was the peer disconnecting — and a stable peer never
+/// does. A node therefore parked on a peer it could never write from for the life of the process:
+/// the user's replica sat at height 9,139,211 for hours while the chain moved ~2,500 blocks and
+/// their wallet showed no balance. Its own log line promised "re-drawing a fresh sample" while no
+/// second sample was ever drawn.
+///
+/// FIXTURE DESIGN — the peer is deliberately HEALTHY and stays connected for the whole test.
+/// `disconnect_all` is never called, because the disconnect is the one exit the broken code
+/// already had: a fixture that dropped the peer would pass against the defect and prove nothing.
+/// The only variable is the passage of time on the injected clock, which is exactly the mechanism
+/// under test. Corroboration is scripted to SPLIT — a refusal that is not the writer's fault and
+/// that a fresh sample could plausibly resolve, which is the real shape of the user's incident.
+///
+/// The clock is a double whose `sleep` returns at once, so the assertion is "a second session was
+/// opened", never "45 seconds elapsed" — this is a state-machine test, not a network test.
+#[tokio::test]
+async fn a_refused_session_ends_so_a_fresh_sample_is_drawn_without_a_disconnect() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    // The writer agrees with nothing in particular; the round SPLITS, so nobody is elevated.
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+    let corroborator = ScriptedCorroborator::new(Verdict::Split {
+        tallies: vec![2, 2],
+    });
+
+    let harness = Harness::start_full(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(corroborator.clone()),
+    )
+    .await;
+
+    // TWO facts, and the second is the one that matters. A second CONNECT proves the refused
+    // session ended on its own; a second corroboration ROUND proves the retry actually re-ran the
+    // check rather than reconnecting into the same settled verdict.
+    harness
+        .until("a refused session to end and reconnect", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+    assert!(
+        corroborator.rounds.load(Ordering::SeqCst) >= 2,
+        "the session reconnected without re-running corroboration, so the promised fresh sample is \
+         still never drawn"
+    );
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2827):** the re-corroboration timer does NOT touch an AUTHORITATIVE
+/// session — the control that keeps the fix from becoming a different bug.
+///
+/// An elevated session holds a live subscription, and a subscription is per-connection state.
+/// Ending one on a timer would throw away a working writer every 45 seconds and re-run a catch-up
+/// from genesis each time, which is a worse failure than the one being fixed.
+///
+/// FIXTURE DESIGN — this is the SAME harness as the test above with ONE variable changed: the peer
+/// is operator-chosen, so it is authoritative and subscribes a non-empty set. The injected clock
+/// returns from every sleep immediately, so an implementation that armed the timer regardless of
+/// trust would reconnect in a tight loop and be caught here within milliseconds; nothing in this
+/// test depends on 45 seconds being long.
+#[tokio::test]
+async fn an_authoritative_session_is_not_ended_by_the_recorroboration_timer() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_with_trust(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+    )
+    .await;
+
+    harness.settle().await;
+    // Give the (instant) clock ample opportunity to fire a timer that should not exist.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        script.connects.load(Ordering::SeqCst),
+        1,
+        "an authoritative session was torn down by the re-corroboration timer, discarding a live \
+         subscription and forcing a catch-up from genesis"
+    );
+
+    harness.stop().await;
+}
+
 /// **Proves:** the CORROBORATED read is what reaches spend-path coin selection — there is no
 /// second, uncorroborated path underneath it.
 ///
@@ -1900,7 +2105,7 @@ async fn corroboration_switched_off_leaves_a_discovered_peer_writing_nothing() {
 #[tokio::test]
 async fn only_a_corroborated_read_reaches_coin_selection() {
     // Uncorroborated: coin selection must NOT read the replica.
-    let (db, _) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
+    let (db, _) = run_discovered_session(unanimous(HONEST_HASH), Some(LIARS_HASH)).await;
     assert_eq!(
         routing::route(db.is_synced().await.unwrap(), true),
         Source::Fallback,
@@ -1908,7 +2113,7 @@ async fn only_a_corroborated_read_reaches_coin_selection() {
     );
 
     // Corroborated: the same read now comes from the replica the quorum vouched for.
-    let (db, _) = run_discovered_session(Verdict::Unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
+    let (db, _) = run_discovered_session(unanimous(HONEST_HASH), Some(HONEST_HASH)).await;
     assert_eq!(
         routing::route(db.is_synced().await.unwrap(), true),
         Source::Db,
@@ -1926,7 +2131,7 @@ async fn only_a_corroborated_read_reaches_coin_selection() {
 fn elevation_requires_both_a_verdict_and_the_writers_agreement() {
     let reached = CorroborationRound {
         height: SETTLED_HEIGHT,
-        verdict: Verdict::Unanimous(HONEST_HASH),
+        verdict: unanimous(HONEST_HASH),
     };
     let split = CorroborationRound {
         height: SETTLED_HEIGHT,
@@ -1943,4 +2148,202 @@ fn elevation_requires_both_a_verdict_and_the_writers_agreement() {
     assert!(!may_elevate(&reached, None));
     assert!(!may_elevate(&split, Some(HONEST_HASH)));
     assert!(!may_elevate(&split, None));
+}
+
+// ---------------------------------------------------------------------------
+// The union source (dig_ecosystem#2823) — custody ∪ externally-registered keys
+// ---------------------------------------------------------------------------
+
+/// A distinct, valid G1 key per `tag`, standing in for a key dig-app registered.
+fn registered_key(tag: u8) -> chia::bls::PublicKey {
+    let mut seed = [0u8; 64];
+    seed[0] = tag;
+    chia::bls::SecretKey::from_seed(&seed).public_key()
+}
+
+/// **Proves (#2823):** the §908 install — an account in dig-app, NO seed on the node — reaches a
+/// non-empty subscription set through a registration alone.
+///
+/// This is the whole blocker: `watched_addresses` was permanently 0 there, `initial_sync` refused
+/// the empty set by design, and the replica's peak never advanced.
+///
+/// `any_wallet()` is asserted separately because the two facts are independent: a source that
+/// derived enrolment from the address set would pass the first assertion and still be the
+/// implementation #2609 exists to forbid.
+#[test]
+fn a_node_with_no_custody_follows_registered_keys() {
+    let dir = scratch();
+    std::fs::create_dir_all(&dir).unwrap();
+    let custody = WalletCustody::mainnet(dir.clone());
+    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    assert!(
+        PuzzleHashSource::puzzle_hashes(&custody).is_empty(),
+        "the premise: the node custodies nothing"
+    );
+    registry.watch(&[registered_key(1)]);
+
+    let union = UnionPuzzleHashSource::new(custody, registry);
+
+    assert_eq!(
+        union.puzzle_hashes(),
+        vec![puzzle_hash_for(&registered_key(1))],
+        "a registered key must be followed even with no custody at all"
+    );
+    assert!(
+        union.any_wallet(),
+        "a node asked to follow an account HAS a wallet enrolled — reporting the \
+         no-wallet-enrolled all-clear here would deny the user's coins are being tracked"
+    );
+}
+
+/// **Proves (#2823, the under-report defect class #2762):** the union follows BOTH sides.
+///
+/// Custody holds one key and the registry a DIFFERENT one, which is what makes this test able to
+/// see the two nearest wrong implementations — returning only custody's set, or only the
+/// registry's. A fixture where the two sides overlap would pass under both.
+#[test]
+fn the_union_follows_custody_and_registered_keys_together() {
+    let dir = scratch();
+    let custody = WalletCustody::mainnet(dir.clone());
+    custody
+        .create(&test_custody_password(), None)
+        .expect("create a custodied wallet");
+    let custodied: Vec<Bytes32> = PuzzleHashSource::puzzle_hashes(&custody);
+    assert!(!custodied.is_empty(), "a created wallet has public keys");
+
+    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    registry.watch(&[registered_key(2)]);
+    let registered = puzzle_hash_for(&registered_key(2));
+    assert!(
+        !custodied.contains(&registered),
+        "the fixture must keep the two sides disjoint, or it cannot see a dropped side"
+    );
+
+    let union = UnionPuzzleHashSource::new(custody, registry);
+    let watched = union.puzzle_hashes();
+
+    for ph in &custodied {
+        assert!(
+            watched.contains(ph),
+            "dropping custody's own addresses would under-report the NODE's balance"
+        );
+    }
+    assert!(
+        watched.contains(&registered),
+        "dropping the registered address would under-report the USER's balance"
+    );
+    assert_eq!(watched.len(), custodied.len() + 1);
+}
+
+/// **Proves (#2823):** `unwatch` genuinely stops the following.
+///
+/// A second registered key stays enrolled as an honest control, so an implementation that clears
+/// the whole registry — or that removes from the file while the live set keeps serving the
+/// supervisor — is visible rather than passing.
+#[test]
+fn unwatch_removes_the_address_from_the_subscription_set() {
+    let dir = scratch();
+    std::fs::create_dir_all(&dir).unwrap();
+    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    registry.watch(&[registered_key(3), registered_key(4)]);
+    let union = UnionPuzzleHashSource::new(WalletCustody::mainnet(dir.clone()), registry.clone());
+    assert_eq!(union.puzzle_hashes().len(), 2);
+
+    registry.unwatch(&[registered_key(3)]);
+
+    assert_eq!(
+        union.puzzle_hashes(),
+        vec![puzzle_hash_for(&registered_key(4))],
+        "the deregistered address must leave the set the supervisor re-reads, and only it"
+    );
+    let after_restart = UnionPuzzleHashSource::new(
+        WalletCustody::mainnet(dir.clone()),
+        crate::sage::watchlist::WatchRegistry::new(&dir),
+    );
+    assert_eq!(
+        after_restart.puzzle_hashes(),
+        vec![puzzle_hash_for(&registered_key(4))],
+        "and a restart must not resurrect it"
+    );
+}
+
+/// **Proves (#2823):** a key present on BOTH sides yields ONE puzzle hash.
+///
+/// dig-app registering an account the node also custodies is an ordinary state, and a duplicated
+/// hash would be sent to the peer twice.
+#[test]
+fn a_key_held_by_both_sides_is_watched_once() {
+    let dir = scratch();
+    let custody = WalletCustody::mainnet(dir.clone());
+    custody
+        .create(&test_custody_password(), None)
+        .expect("create a custodied wallet");
+    let shared = *custody
+        .custodied_public_keys()
+        .iter()
+        .next()
+        .expect("a created wallet has public keys");
+
+    let registry = crate::sage::watchlist::WatchRegistry::new(&dir);
+    registry.watch(&[shared]);
+
+    let watched = UnionPuzzleHashSource::new(custody.clone(), registry).puzzle_hashes();
+
+    assert_eq!(
+        watched,
+        PuzzleHashSource::puzzle_hashes(&custody),
+        "re-registering a custodied key must not change the set at all"
+    );
+}
+
+/// **Proves (#2823 × #2609):** the two empty-set states stay distinguishable through the union.
+///
+/// With nothing custodied and nothing registered the node genuinely has no wallet, and that must
+/// still read as the honest all-clear rather than as "enrolled but unwatched".
+#[test]
+fn an_empty_union_still_reports_the_honest_no_wallet_state() {
+    let dir = scratch();
+    std::fs::create_dir_all(&dir).unwrap();
+    let union = UnionPuzzleHashSource::new(
+        WalletCustody::mainnet(dir.clone()),
+        crate::sage::watchlist::WatchRegistry::new(&dir),
+    );
+
+    assert!(union.puzzle_hashes().is_empty());
+    assert!(
+        !union.any_wallet(),
+        "no custody and no registration is the genuine no-wallet install"
+    );
+}
+
+/// **Proves (#2823 × #2609):** the union keeps the OTHER empty-set state honest too.
+///
+/// A node whose own wallet is enrolled but not unlocked derives no address and has registered
+/// nothing, so the union's address set is empty while a wallet plainly exists. Computing enrolment
+/// as `!puzzle_hashes().is_empty()` — the forbidden implementation, and the one nearest to hand
+/// once two sources are being combined — passes every other test in this group and turns this red.
+#[test]
+fn an_enrolled_but_unreachable_custody_is_not_an_all_clear_through_the_union() {
+    let dir = scratch();
+    let custody = WalletCustody::mainnet(dir.clone());
+    custody
+        .create(&test_custody_password(), None)
+        .expect("create a custodied wallet");
+    // Drop the manifest so it is rebuilt from the seed file alone, without public keys — one of the
+    // four reachable states where an enrolled wallet derives no address.
+    std::fs::remove_file(dir.join("wallets").join("index.json")).expect("remove the manifest");
+    let healed = WalletCustody::mainnet(dir.clone());
+
+    let union =
+        UnionPuzzleHashSource::new(healed, crate::sage::watchlist::WatchRegistry::new(&dir));
+
+    assert!(
+        union.puzzle_hashes().is_empty(),
+        "the premise: no address is derivable and nothing is registered"
+    );
+    assert!(
+        union.any_wallet(),
+        "a wallet IS enrolled — its coins are simply not being followed, which must never read \
+         as the no-wallet all-clear"
+    );
 }

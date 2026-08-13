@@ -84,7 +84,7 @@ dig-node-core = { path = "../dig-node-core" }
 # "0.6.0" the suite went green over a `control.wallet.coinById` the contract had never heard of --
 # it checked nothing about the very method the change added. A caret range keeps the pin moving
 # with the published catalog instead of silently narrowing what CI can see.
-dig-node-control-interface = "0.11"
+dig-node-control-interface = "0.15"
 
 # The OS CSPRNG for all authorization material — the control token, pairing ids/tokens
 # (§7), and the relay loop-probe id (`control::fill_random`). Wraps `getrandom(2)` /
@@ -214,6 +214,11 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
+# The watch-list control tests (SPEC §18.6f, dig_ecosystem#2823) build real BLS G1 keys and spell
+# them the way a client would. Pinned to the same lines `dig-wallet` builds on so exactly one of
+# each resolves.
+chia = "0.26"
+hex = "0.4"
 # The crate's own integration tests need its test-construction seams (the `testkit` feature above).
 # Depending on self with the feature on is what keeps those seams available to `tests/` while staying
 # absent from any production build of this crate.

@@ -309,6 +309,25 @@ enum WalletCommand {
         /// Hex of the signed `SpendBundle` to relay.
         signed_bundle_hex: String,
     },
+    /// Follow the addresses of these PUBLIC keys, so this node syncs coins it does not custody.
+    ///
+    /// The install where this matters holds no seed at all: the account lives in dig-app, so
+    /// without a registration the node has nothing to subscribe and its replica never advances.
+    /// A public key is public — nothing here conveys a seed or a signing capability (§908) — but
+    /// following an address does tell this node's Chia peers that this machine cares about it.
+    Watch {
+        /// Hex of each 48-byte BLS G1 public key to follow.
+        #[arg(required = true)]
+        public_keys: Vec<String>,
+    },
+    /// Stop following the addresses of these public keys.
+    Unwatch {
+        /// Hex of each 48-byte BLS G1 public key to stop following.
+        #[arg(required = true)]
+        public_keys: Vec<String>,
+    },
+    /// Print the public keys this node is currently following (READ-ONLY).
+    Watched,
 }
 
 /// `dig-node updater` sub-actions. With none, prints the beacon status.
@@ -616,6 +635,9 @@ fn wallet_action(cmd: WalletCommand) -> ControlAction {
         WalletCommand::Broadcast { signed_bundle_hex } => {
             ControlAction::WalletBroadcast { signed_bundle_hex }
         }
+        WalletCommand::Watch { public_keys } => ControlAction::WalletWatch { public_keys },
+        WalletCommand::Unwatch { public_keys } => ControlAction::WalletUnwatch { public_keys },
+        WalletCommand::Watched => ControlAction::WalletWatched,
     }
 }
 
@@ -873,6 +895,11 @@ mod tests {
     /// silently turn these into parse failures.
     const A_COIN_ID: &str = "abababababababababababababababababababababababababababababababab";
 
+    /// A well-formed 48-byte BLS G1 public key as hex, for the watch verbs. Same rule as
+    /// [`A_COIN_ID`]: the parser does not inspect it, but a malformed value would make these
+    /// command lines fail for the wrong reason if a clap-level validator ever lands.
+    const A_PUBLIC_KEY: &str = "97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb";
+
     /// Every wallet verb as a REAL command line, paired with the method it must dispatch.
     ///
     /// Hoisted out of the test so a second test can assert the table is COMPLETE
@@ -914,6 +941,18 @@ mod tests {
             (
                 vec!["dig-node", "wallet", "sync-status"],
                 "control.wallet.syncStatus",
+            ),
+            (
+                vec!["dig-node", "wallet", "watch", A_PUBLIC_KEY],
+                "control.wallet.watch",
+            ),
+            (
+                vec!["dig-node", "wallet", "unwatch", A_PUBLIC_KEY],
+                "control.wallet.unwatch",
+            ),
+            (
+                vec!["dig-node", "wallet", "watched"],
+                "control.wallet.watched",
             ),
         ]
     }
