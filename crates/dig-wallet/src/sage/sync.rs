@@ -1411,6 +1411,10 @@ mod tests {
             matches!(&err, SyncError::Peer(m) if m.contains("did not answer")),
             "the failure must name the timeout as the reason; got {err:?}"
         );
+        // Back to the real clock before touching the DB again: a pool acquisition under a virtual
+        // one auto-advances straight through its own timeout, which fails as `PoolTimedOut` on a
+        // cold connection and passes on a warm one — green locally, red in CI.
+        tokio::time::resume();
         assert!(
             !db.is_synced().await.unwrap(),
             "a timed-out catch-up must not latch initial_sync_complete"
