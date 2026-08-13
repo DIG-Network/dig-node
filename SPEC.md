@@ -3782,6 +3782,27 @@ least every 5 seconds, so a wallet created after boot is picked up without a res
 for the peer to drop. A newly non-empty set ends the peak-only session and reconnects immediately, since
 the subscription is per-connection state. No seed is read and nothing on this path can sign (§908).
 
+**A session MUST have a deadline on every wait, because a peer can go silent on a live socket.** Two
+waits carry one:
+
+- ONE puzzle-state round trip during a catch-up MUST complete within 60 seconds, or the catch-up fails
+  and the peer is dropped and re-dialled. The bound is PER ROUND TRIP and MUST NOT be a bound on the
+  catch-up as a whole — a first catch-up runs from genesis over many batches and legitimately takes a
+  long time, so a total deadline would abort a healthy long sync.
+- An AUTHORITATIVE subscribed session that holds the replica STILL for 180 seconds while the node's own
+  Chia peers are observed to be strictly ahead of it MUST be ENDED, so the ordinary reconnect path
+  dials a fresh peer. The node MUST log the reason with both heights. Stall detection is armed for
+  authoritative sessions only: a `Discovered` session never advances the peak by design, and its exit
+  is the re-corroboration timer instead.
+
+Ending a session on a stall does NOT lower the corroboration bar (§18.6d): the reconnect draws an
+independent sample and re-runs the quorum exactly as any reconnect does. A stall MUST be declared only
+on POSITIVE evidence — a replica that advanced, an unobservable height on either side, and a replica
+merely level with its peers each reset the clock, because an unmeasured or level reading is not
+evidence of a freeze. Without these deadlines a half-open connection parks the session for the life of
+the process: a replica froze at height 9,142,861 while its peers announced 9,142,918 and the gap grew
+without bound, reported throughout as `synced`.
+
 18.6f. **Externally-registered addresses (the §908 install).** A node MAY be asked to FOLLOW addresses it
 does not custody. `control.wallet.watch` registers G1 public keys, `control.wallet.unwatch` deregisters
 them, and `control.wallet.watched` lists what is currently registered. All three are MUTATIONS and
@@ -4060,11 +4081,24 @@ Beyond the boundary, the supervisor MUST hold all four of the following for an o
 
 18.6b. **The observable sync status.** `control.wallet.syncStatus` reports `{phase, peak_height,
 chia_peer_count, subscription_peer_count, chia_peer_peak_height, watched_addresses}`. `phase` is `not_started` (no peer has ever attached), `syncing`,
-`synced`, `no_wallet_enrolled` or `wallet_not_unlocked` — and `synced` requires BOTH a completed catch-up AND a live
-SUBSCRIPTION peer (`subscription_peer_count >= 1`, NOT `chia_peer_count`), so a replica that caught up and then went
+`synced`, `no_wallet_enrolled` or `wallet_not_unlocked` — and `synced` requires a completed catch-up, a live
+SUBSCRIPTION peer (`subscription_peer_count >= 1`, NOT `chia_peer_count`), AND the replica actually
+FOLLOWING the chain, so a replica that caught up and then went
 offline reports `syncing`. The phase describes the REPLICA, so it keys off the session that writes the replica; held
-read-serving peers do not make a stale replica current. It is not a freshness
-guarantee: a live connection to a stalled peer satisfies it. `peak_height` is the REPLICA's own height read
+read-serving peers do not make a stale replica current.
+
+**`synced` MUST be a claim about NOW.** A completed catch-up is a latched fact about the past and a peer
+count says only that a socket exists, so a node MUST additionally require that `peak_height` trails
+`chia_peer_peak_height` by AT MOST 4 blocks (about 75 seconds of chain); beyond that it reports `syncing`.
+A `null` on EITHER height is unobservable and MUST NOT be read as evidence of a gap — the phase is then
+exactly what it would have been without this rule. The tolerance is deliberately strict, because the two
+failure directions are not symmetric: reporting `syncing` on a healthy node understates confidence
+harmlessly, whereas reporting `synced` over a frozen replica tells a client that a stale balance is
+settled. It is deliberately NOT the same threshold as the 180-second stall deadline of §18.6a: that one
+decides whether to pay for a catch-up from genesis, this one decides what may be claimed about a number
+already being served.
+
+`peak_height` is the REPLICA's own height read
 from `sync_state`; it MUST NOT fall back to the coinset oracle (unlike `control.wallet.peak`, which answers
 a different question), and `null` means unknown, never height zero.
 

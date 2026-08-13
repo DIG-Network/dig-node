@@ -1195,7 +1195,8 @@ impl Supervisor {
 
             let replica = self.db.sync_state().await.ok().and_then(|s| s.peak_height);
             let peers = chain_tip.peers_peak().await;
-            let advanced = matches!((replica, last_replica), (Some(now), Some(before)) if now > before);
+            let advanced =
+                matches!((replica, last_replica), (Some(now), Some(before)) if now > before);
             last_replica = replica.or(last_replica);
 
             let behind = matches!((replica, peers), (Some(r), Some(p)) if p > r);
