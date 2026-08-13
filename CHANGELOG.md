@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.116.1] - 2026-08-13
+
+### Bug Fixes
+- **wallet:** End a stalled sync session and stop reporting a frozen replica as synced (#220)
+
 ## [0.116.0] - 2026-08-13
 
 ### Features
