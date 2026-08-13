@@ -95,6 +95,46 @@ const PUZZLE_HASH_POLL: Duration = Duration::from_secs(5);
 /// ladder's own ceiling rather than out-pacing it, and it is short enough that the cost of a
 /// transient refusal is under a minute instead of unbounded.
 const RECORROBORATE_AFTER: Duration = Duration::from_secs(45);
+/// How often a stalled-session check re-measures the replica against the chain.
+///
+/// Two local reads — one DB row and the chain transport's last-heard peak — so the poll costs
+/// nothing on the wire and cannot itself keep a peer busy. Thirty seconds is longer than a mainnet
+/// block interval (~19s), so a healthy replica advances between consecutive polls and the stall
+/// clock is reset by evidence rather than by luck.
+const STALL_POLL: Duration = Duration::from_secs(30);
+/// How long a session may hold the replica STILL, while the chain demonstrably advances, before it
+/// is ended (dig_ecosystem#2851).
+///
+/// A half-open peer connection parks [`crate::sage::sync::run_update_loop`] on a `recv()` that has
+/// no deadline. For an AUTHORITATIVE subscribed session that was the last exit: the resubscribe
+/// poll is armed only while nothing is subscribed, [`RECORROBORATE_AFTER`] is armed only for a
+/// refused session, and the peer never disconnects. A user's replica froze at height 9,142,861
+/// while their peers announced 9,142,918 and the gap grew without bound — reported, throughout, as
+/// `synced`.
+///
+/// THREE MINUTES IS SET BY WHAT ENDING A SESSION COSTS. A reconnect re-runs the catch-up FROM
+/// GENESIS (see the comment in [`Supervisor::run`] on why resuming is not safe), which is genuinely
+/// expensive, so the deadline must sit well clear of ordinary jitter — a slow peer, a momentary
+/// pause — rather than at the edge of it. Mainnet peaks arrive roughly every 19 seconds, so 180s is
+/// about NINE consecutive missed peaks *while the chain was observed to move*, which no healthy
+/// session produces. And it exceeds [`HEALTHY_SESSION`], so a session ended this way still counts as
+/// healthy at [`Supervisor::run`]'s ladder reset and reconnects promptly instead of climbing the
+/// backoff ladder toward [`BACKOFF_MAX`].
+const STALL_AFTER: Duration = Duration::from_secs(180);
+/// How far the replica may trail the node's own peers and still be called
+/// [`SyncPhase::Synced`] — about 75 seconds of chain at a ~19s block interval.
+///
+/// THE TWO FAILURE DIRECTIONS ARE NOT SYMMETRIC, which is what fixes the number. Too tight and a
+/// healthy node reports `syncing` for a block or two around every peak — conservative, visible, and
+/// harmless. Too loose and the node keeps telling a client that a stale balance is SETTLED, which
+/// is the money-adjacent falsehood dig_ecosystem#2851 exists to remove. Four blocks absorbs the
+/// ordinary skew between hearing a peak and writing it without absorbing a freeze.
+///
+/// It is deliberately NOT [`STALL_AFTER`]'s threshold. The two answer different questions at
+/// different costs: this one asks *what may I claim about the number I am serving right now*, and
+/// is free to be strict because being wrong only understates confidence; that one asks *should I
+/// pay for a catch-up from genesis*, and must be slack because being wrong burns real work.
+const FOLLOWING_TOLERANCE: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // The observable state
@@ -297,9 +337,12 @@ impl SyncHandle {
 
     /// Compose the live counters with the DB's persisted sync state.
     ///
-    /// `Synced` requires BOTH a completed catch-up and a peer attached now: an offline
-    /// replica is stale, however complete its last catch-up was, and reporting it synced is
-    /// the shape that makes a client trust a day-old balance.
+    /// `Synced` requires a completed catch-up, a peer attached now, AND the replica actually
+    /// following the chain ([`is_following`]): an offline replica is stale, however complete its
+    /// last catch-up was, and reporting it synced is the shape that makes a client trust a day-old
+    /// balance. Neither of the first two clauses is about the PRESENT — one is a latched flag, the
+    /// other says a socket exists — so a replica frozen behind a half-open peer satisfied both and
+    /// reported `synced` for as long as the process lived (dig_ecosystem#2851).
     ///
     /// `tier` is the node's own Chia peer tier, measured by the caller (which holds the chain
     /// transport; the supervisor does not). It is passed IN rather than defaulted so the status
@@ -351,7 +394,10 @@ impl SyncHandle {
             } else {
                 SyncPhase::NoWalletEnrolled
             }
-        } else if state.initial_sync_complete && observed.peers >= 1 {
+        } else if state.initial_sync_complete
+            && observed.peers >= 1
+            && is_following(state.peak_height, tier.peak_height)
+        {
             SyncPhase::Synced
         } else {
             SyncPhase::Syncing
@@ -432,6 +478,23 @@ impl SyncHandle {
         let mut o = self.inner.observed.write().expect("observed lock poisoned");
         o.watched = Some(watched);
         o.wallet_enrolled = wallet_enrolled;
+    }
+}
+
+/// Whether the replica is following the chain RIGHT NOW, judged by the only evidence the status
+/// payload already carries: the gap between the replica's own peak and what the node's OWN peers
+/// announced.
+///
+/// `None` on either side is UNOBSERVABLE, and an unobservable gap is never an accusation — it
+/// answers `true` and leaves the phase exactly as it was before this existed. That matters because
+/// the peer tier is genuinely unmeasured on a node whose chain transport has not been built, and a
+/// missing measurement must not be spent as evidence against the replica.
+///
+/// See [`FOLLOWING_TOLERANCE`] for why the slack is small and which way it is allowed to be wrong.
+fn is_following(replica: Option<u32>, peers: Option<u32>) -> bool {
+    match (replica, peers) {
+        (Some(replica), Some(peers)) => peers.saturating_sub(replica) <= FOLLOWING_TOLERANCE,
+        _ => true,
     }
 }
 
@@ -691,6 +754,43 @@ pub fn may_elevate(round: &CorroborationRound, writer_answer: Option<Bytes32>) -
     }
 }
 
+/// Evidence that the CHAIN advanced, drawn independently of the subscription session
+/// (dig_ecosystem#2851).
+///
+/// The stall check needs a second opinion about time passing, and it must not come from the session
+/// being judged: a parked session reports nothing, and nothing is not an accusation. The node's own
+/// Chia peers — a different peer set, a different transport — are that second opinion.
+///
+/// It is a NARROW seam on purpose. [`super::fallback::ChainFallback`] can answer this question and
+/// is the production implementation, but it also carries a dozen unrelated, non-defaulted methods,
+/// so making the supervisor depend on it directly would make every test double heavy enough that
+/// nobody writes one.
+#[async_trait::async_trait]
+pub trait ChainTipObserver: Send + Sync {
+    /// The peak the node's OWN chia peers announced.
+    ///
+    /// `None` is UNOBSERVABLE — no transport, or no peer has said anything yet — and never a zero,
+    /// which every block is trivially above.
+    async fn peers_peak(&self) -> Option<u32>;
+}
+
+/// The production observer: the node's chain transport, asked for its peer tier.
+pub struct FallbackChainTip(Arc<dyn super::fallback::ChainFallback>);
+
+impl FallbackChainTip {
+    /// Observe the chain tip through an existing chain-fallback transport.
+    pub fn new(fallback: Arc<dyn super::fallback::ChainFallback>) -> Self {
+        Self(fallback)
+    }
+}
+
+#[async_trait::async_trait]
+impl ChainTipObserver for FallbackChainTip {
+    async fn peers_peak(&self) -> Option<u32> {
+        self.0.peer_tier().await.peak_height
+    }
+}
+
 /// Waiting and the passage of time, injectable so the backoff ladder is testable without a
 /// test that actually sleeps for minutes.
 #[async_trait::async_trait]
@@ -795,6 +895,14 @@ pub struct Supervisor {
     /// no-op implementation — "corroboration is switched off" and "corroboration ran and refused"
     /// must not look the same in a stack trace.
     pub corroborator: Option<Arc<dyn Corroborator>>,
+    /// Independent evidence that the chain advanced, used to end a session whose replica has
+    /// stopped moving (dig_ecosystem#2851).
+    ///
+    /// `None` means NO STALL DETECTION AT ALL — stated as plainly as [`Self::corroborator`]'s
+    /// `None` means no corroboration, and for the same reason: "the check is switched off" and
+    /// "the check ran and found nothing" must not look the same. A supervisor built without one
+    /// behaves exactly as it did before this field existed.
+    pub chain_tip: Option<Arc<dyn ChainTipObserver>>,
 }
 
 /// Spawn the supervisor on the current runtime.
@@ -914,6 +1022,12 @@ impl Supervisor {
                 // line above TRUE; no new retry mechanism is introduced (dig_ecosystem#2827).
                 () = self.await_recorroboration(!trust.is_authoritative())
                     => SessionOutcome::Ended,
+                // The peer went silent while the chain kept moving. `run` above is parked on a
+                // `recv()` with no deadline, and for an AUTHORITATIVE subscribed session every
+                // other arm here is disarmed by construction — so without this one the only exit
+                // is a disconnect that a half-open connection never delivers
+                // (dig_ecosystem#2851).
+                () = self.await_stall(trust.is_authoritative()) => SessionOutcome::Ended,
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
                 _ = shutdown.changed() => SessionOutcome::Stop,
@@ -1048,6 +1162,61 @@ impl Supervisor {
             std::future::pending::<()>().await;
         }
         self.time.sleep(RECORROBORATE_AFTER).await;
+    }
+
+    /// Resolve once this session has held the replica STILL for [`STALL_AFTER`] while the chain
+    /// was observed to advance past it (dig_ecosystem#2851).
+    ///
+    /// Returns a future that NEVER resolves when `armed` is false, or when no
+    /// [`ChainTipObserver`] was supplied. It is armed for AUTHORITATIVE sessions only: a
+    /// [`PeerTrust::Discovered`] session never advances the peak BY DESIGN (it writes nothing), so
+    /// arming it there would fire on every refused session and fight
+    /// [`Self::await_recorroboration`], which already owns that exit.
+    ///
+    /// Every branch that is not POSITIVE evidence of a stall resets the clock. An unobservable
+    /// height and a chain that is merely level with the replica are both perfectly ordinary, and
+    /// neither is an accusation.
+    ///
+    /// This does NOT lower the corroboration bar. It only ENDS a session, handing the decision back
+    /// to the ordinary reconnect path, which draws an independent sample and re-runs the
+    /// [`Corroborator`] exactly as it always did (NC-12: peers stay untrusted, corroboration stays a
+    /// confidence gradient, nothing blocks on N-of-N). §908: it reads two heights and signs nothing.
+    async fn await_stall(&self, armed: bool) {
+        let Some(chain_tip) = self.chain_tip.as_ref().filter(|_| armed) else {
+            std::future::pending::<()>().await;
+            // `pending` never returns; this is unreachable and exists only to satisfy the type.
+            return;
+        };
+
+        let mut last_replica: Option<u32> = None;
+        let mut stalled_since: Option<Instant> = None;
+        loop {
+            self.time.sleep(STALL_POLL).await;
+
+            let replica = self.db.sync_state().await.ok().and_then(|s| s.peak_height);
+            let peers = chain_tip.peers_peak().await;
+            let advanced = matches!((replica, last_replica), (Some(now), Some(before)) if now > before);
+            last_replica = replica.or(last_replica);
+
+            let behind = matches!((replica, peers), (Some(r), Some(p)) if p > r);
+            if advanced || !behind {
+                stalled_since = None;
+                continue;
+            }
+
+            let since = *stalled_since.get_or_insert_with(|| self.time.now());
+            let elapsed = self.time.now().duration_since(since);
+            if elapsed >= STALL_AFTER {
+                tracing::warn!(
+                    replica_peak = ?replica,
+                    peers_peak = ?peers,
+                    stalled_for_secs = elapsed.as_secs(),
+                    "wallet sync: the replica has not advanced while this node's own peers moved \
+                     ahead of it; ending the session so a fresh peer is dialled"
+                );
+                return;
+            }
+        }
     }
 
     /// Wait out the next backoff delay. Returns `false` if shutdown arrived meanwhile.

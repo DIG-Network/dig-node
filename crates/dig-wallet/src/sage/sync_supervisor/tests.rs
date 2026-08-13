@@ -287,6 +287,67 @@ impl PuzzleHashSource for FixedHashes {
     }
 }
 
+/// A chain tip the TEST moves — the node's own peers, seen independently of the session.
+///
+/// The peak is settable rather than fixed because the property under test is a RELATIONSHIP over
+/// time (the chain moved, the replica did not), and a double that could only report one height
+/// could not express the healthy case that must NOT trip the deadline.
+struct ScriptedChainTip {
+    peak: Mutex<Option<u32>>,
+    /// When set, the replica is written one block forward on every observation — a session that is
+    /// genuinely keeping up. Wired through this double because the stall check samples the two
+    /// heights TOGETHER, so "the replica advanced between polls" is only expressible by moving it
+    /// in step with the observation.
+    healthy_replica: Option<WalletDb>,
+}
+
+impl ScriptedChainTip {
+    /// Peers announcing `peak`, with a replica that never moves.
+    fn at(peak: u32) -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(Some(peak)),
+            healthy_replica: None,
+        })
+    }
+
+    /// Peers that have said nothing — unobservable, which is not zero.
+    fn unobservable() -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(None),
+            healthy_replica: None,
+        })
+    }
+
+    /// Peers ahead of a replica that is ADVANCING — the healthy control.
+    fn ahead_of_an_advancing_replica(peak: u32, db: WalletDb) -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(Some(peak)),
+            healthy_replica: Some(db),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ChainTipObserver for ScriptedChainTip {
+    async fn peers_peak(&self) -> Option<u32> {
+        let replica_now = {
+            let mut peak = self.peak.lock().unwrap();
+            if self.healthy_replica.is_none() {
+                return *peak;
+            }
+            let replica = peak.unwrap_or(1).saturating_sub(1);
+            // The chain keeps moving too, so the replica stays BEHIND throughout: this control
+            // isolates the advance-resets-the-clock rule from the level-heights rule beside it.
+            *peak = Some(peak.unwrap_or(1) + 1);
+            replica
+        };
+        if let Some(db) = &self.healthy_replica {
+            db.set_peak(replica_now, "aa").await.unwrap();
+        }
+        *self.peak.lock().unwrap()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -329,6 +390,23 @@ impl Harness {
         trust: PeerTrust,
         corroborator: Option<Arc<dyn Corroborator>>,
     ) -> Self {
+        // No chain-tip observer: stall detection off, which is exactly how every test written
+        // before dig_ecosystem#2851 expects the supervisor to behave.
+        Self::start_everything(db, hashes, script, addrs, trust, corroborator, None).await
+    }
+
+    /// Start a supervisor with stall detection attached, so a frozen replica can be observed
+    /// (dig_ecosystem#2851).
+    #[allow(clippy::too_many_arguments)]
+    async fn start_everything(
+        db: WalletDb,
+        hashes: Arc<dyn PuzzleHashSource>,
+        script: Arc<Script>,
+        addrs: Vec<String>,
+        trust: PeerTrust,
+        corroborator: Option<Arc<dyn Corroborator>>,
+        chain_tip: Option<Arc<dyn ChainTipObserver>>,
+    ) -> Self {
         let factory = Arc::new(ScriptedFactory {
             script: script.clone(),
             addrs,
@@ -342,6 +420,7 @@ impl Harness {
             genesis_challenge: Bytes32::new([0; 32]),
             time: script.clone(),
             corroborator: corroborator.clone(),
+            chain_tip,
         });
         Self {
             db,
@@ -1631,6 +1710,9 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
         genesis_challenge: chia_wallet_sdk::types::MAINNET_CONSTANTS.genesis_challenge,
         time: Arc::new(TokioTime),
         corroborator: Some(Arc::new(ChiaQuorumCorroborator::mainnet())),
+        // The acceptance step watches a REAL peer follow mainnet; a stall deadline would only
+        // add a second reason for the session to end and blur what the run proves.
+        chain_tip: None,
     });
 
     // A mainnet block lands roughly every 19s. Corroboration itself needs several sequential
@@ -2087,6 +2169,322 @@ async fn an_authoritative_session_is_not_ended_by_the_recorroboration_timer() {
     );
 
     harness.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The stall deadline (dig_ecosystem#2851)
+// ---------------------------------------------------------------------------
+
+/// The replica peak measured on the live 0.116.0 service while it reported `synced`.
+const FROZEN_REPLICA_PEAK: u32 = 9_142_861;
+/// What that node's OWN five peers announced at the same moment — 57 blocks ahead, and growing.
+const PEERS_PEAK: u32 = 9_142_918;
+
+/// **Proves (dig_ecosystem#2851):** an AUTHORITATIVE session whose peer goes silent while the chain
+/// advances is ENDED, and the supervisor reconnects.
+///
+/// THE BUG THIS PINS. `run_update_loop` waits on `recv()` with no deadline, so a half-open peer
+/// connection parks it for ever. For an authoritative subscribed session every other arm of the
+/// supervisor's `select!` is disarmed by construction — the resubscribe poll is armed only while
+/// nothing is subscribed, `await_recorroboration` only for a refused session — leaving a disconnect
+/// that never comes as the sole exit. The measured result was a replica frozen at
+/// [`FROZEN_REPLICA_PEAK`] while peers advanced past [`PEERS_PEAK`].
+///
+/// FIXTURE DESIGN — the peer is HEALTHY at the socket level and stays connected for the whole test:
+/// `disconnect_all` is never called, because a disconnect is the one exit the broken code already
+/// had, and a fixture that dropped the peer would pass against the defect. The single variable is
+/// that the chain is observed to move while the replica does not. Bounded by `until`'s real-time
+/// budget so the pre-fix failure is a LOUD timeout rather than a hang indistinguishable from a dead
+/// process.
+#[tokio::test]
+async fn a_stalled_authoritative_session_is_ended_and_reconnects() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::at(PEERS_PEAK)),
+    )
+    .await;
+
+    harness
+        .until("the stalled session to end and reconnect", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** a replica that is ADVANCING is never ended, however far behind
+/// its peers it happens to be.
+///
+/// The control that keeps the deadline from becoming a different bug. Catching up from genesis is
+/// a legitimate state in which the replica trails its peers by millions of blocks for a long time,
+/// and tearing that session down would restart the very work it is doing.
+#[tokio::test]
+async fn an_advancing_replica_is_never_declared_stalled() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::ahead_of_an_advancing_replica(
+            PEERS_PEAK, db,
+        )),
+    )
+    .await;
+
+    harness.settle().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        script.connects.load(Ordering::SeqCst),
+        1,
+        "a replica that is visibly catching up was torn down as stalled"
+    );
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** an UNOBSERVABLE peers' peak never declares a stall.
+///
+/// A missing measurement must not be spent as evidence against the replica. A node whose chain
+/// transport has not been built genuinely reports `None` here, and reading that as "the chain
+/// advanced past us" would end a perfectly good session every three minutes for ever.
+#[tokio::test]
+async fn an_unobservable_peers_peak_is_never_an_accusation() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::unobservable()),
+    )
+    .await;
+
+    harness.settle().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        script.connects.load(Ordering::SeqCst),
+        1,
+        "a session was ended on the strength of a height nobody measured"
+    );
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** a replica LEVEL with its peers is never declared stalled.
+///
+/// A quiet chain produces exactly this: nothing moves, on either side, for as long as no block is
+/// found. Standing still is only evidence of a stall when something else demonstrably moved.
+///
+/// The peers are pinned at [`CATCH_UP_HEIGHT`] rather than at the incident's numbers because that
+/// is the height the scripted catch-up actually leaves in the replica — a fixture whose two sides
+/// were never level would exercise the stalled path and prove nothing about this one.
+#[tokio::test]
+async fn a_replica_level_with_its_peers_is_never_declared_stalled() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::at(CATCH_UP_HEIGHT)),
+    )
+    .await;
+
+    harness.settle().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        script.connects.load(Ordering::SeqCst),
+        1,
+        "a quiet chain was mistaken for a frozen replica"
+    );
+
+    harness.stop().await;
+}
+
+/// **REGRESSION (dig_ecosystem#2827, guarded here for #2851):** a REFUSED session still ends by
+/// itself, with a chain-tip observer attached.
+///
+/// The stall arm is armed only for authoritative sessions, and #2827's exit is armed only for
+/// refused ones — mutually exclusive by construction. This pins that the new arm did not disturb
+/// the old exit on the very path where both are present in the same `select!`. A refused session
+/// writes nothing and so can NEVER advance the replica, which is exactly why arming the stall check
+/// there would fire every time and fight this timer.
+#[tokio::test]
+async fn a_refused_session_still_ends_with_a_chain_tip_observer_attached() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = Some(HONEST_HASH);
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+    let corroborator = ScriptedCorroborator::new(Verdict::Split {
+        tallies: vec![2, 2],
+    });
+
+    let harness = Harness::start_everything(
+        db.clone(),
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(corroborator.clone()),
+        Some(ScriptedChainTip::at(PEERS_PEAK)),
+    )
+    .await;
+
+    harness
+        .until("a refused session to end and reconnect", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+    assert!(
+        corroborator.rounds.load(Ordering::SeqCst) >= 2,
+        "the refused session's re-corroboration exit was disturbed by the stall arm"
+    );
+
+    harness.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// The phase must be about NOW (dig_ecosystem#2851)
+// ---------------------------------------------------------------------------
+
+/// A peer tier reporting five peers at `peak` — the shape the live incident reported.
+fn tier_at(peak: u32) -> ChainPeerTier {
+    ChainPeerTier {
+        peer_count: Some(5),
+        peak_height: Some(peak),
+    }
+}
+
+/// **Proves (dig_ecosystem#2851):** a completed catch-up whose replica has fallen behind its own
+/// peers reports `Syncing`, not `Synced`.
+///
+/// Pinned with the REAL measured numbers. `initial_sync_complete` is a latched flag about the past
+/// and a peer count says only that a socket exists; neither is about NOW, so both were satisfied by
+/// a frozen replica and the node told every client that a 57-block-stale balance was settled.
+#[tokio::test]
+async fn a_replica_behind_its_peers_is_not_reported_as_synced() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_initial_sync_complete(true).await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(1, true);
+
+    let status = handle.status(&db, tier_at(PEERS_PEAK)).await.unwrap();
+    assert_eq!(
+        status.phase,
+        SyncPhase::Syncing,
+        "a replica 57 blocks behind its own peers was reported as settled"
+    );
+    // The measurements themselves are unchanged — only the claim made about them.
+    assert_eq!(status.peak_height, Some(FROZEN_REPLICA_PEAK));
+    assert_eq!(status.chia_peer_peak_height, Some(PEERS_PEAK));
+    assert_eq!(status.watched_addresses, Some(1));
+}
+
+/// **Proves (dig_ecosystem#2851):** the tolerance boundary, from BOTH sides.
+///
+/// A bound tested only from below can only confirm itself. Exactly at
+/// [`FOLLOWING_TOLERANCE`] the node is still following the chain; one block beyond it is not.
+#[tokio::test]
+async fn the_following_tolerance_holds_at_the_bound_and_fails_one_beyond_it() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_initial_sync_complete(true).await.unwrap();
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(1, true);
+
+    let at_bound = FROZEN_REPLICA_PEAK + FOLLOWING_TOLERANCE;
+    assert_eq!(
+        handle.status(&db, tier_at(at_bound)).await.unwrap().phase,
+        SyncPhase::Synced,
+        "a node within the tolerance was reported as still syncing"
+    );
+    assert_eq!(
+        handle
+            .status(&db, tier_at(at_bound + 1))
+            .await
+            .unwrap()
+            .phase,
+        SyncPhase::Syncing,
+        "a node one block past the tolerance was still reported as settled"
+    );
+}
+
+/// **Proves (dig_ecosystem#2851):** an unmeasured height on EITHER side leaves the phase exactly as
+/// it was.
+///
+/// The Option-honesty guard. `None` is unobservable, never a zero, and an unobservable gap is not
+/// an accusation — a node with no chain transport must not be reported as behind a chain it cannot
+/// see.
+#[tokio::test]
+async fn an_unmeasured_height_leaves_the_phase_unchanged() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    db.set_initial_sync_complete(true).await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    handle.set_trust(true);
+    handle.set_watched(1, true);
+
+    // The replica's own peak is unknown; the peers' is far ahead.
+    assert_eq!(
+        handle.status(&db, tier_at(PEERS_PEAK)).await.unwrap().phase,
+        SyncPhase::Synced,
+        "an unknown replica peak was read as evidence of being behind"
+    );
+
+    // The replica's peak is known; nobody has measured the peers'.
+    db.set_peak(FROZEN_REPLICA_PEAK, "aa").await.unwrap();
+    assert_eq!(
+        handle
+            .status(&db, ChainPeerTier::UNOBSERVABLE)
+            .await
+            .unwrap()
+            .phase,
+        SyncPhase::Synced,
+        "an unobservable peer tier was read as evidence against the replica"
+    );
 }
 
 /// **Proves:** the CORROBORATED read is what reaches spend-path coin selection — there is no
