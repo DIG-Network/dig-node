@@ -4170,6 +4170,23 @@ the peer tier MUST NOT itself dial: a status call cannot be the act that makes t
 one: a peak fetched from a public HTTP oracle evidences nothing about the node's peers. `null` means no
 peer has announced one yet, never height zero.
 
+**`chia_peer_peak_height` is UNVALIDATED EVIDENCE, and both readers of it MUST treat it as such.** It is
+a monotone MAXIMUM over unverified `NewPeakWallet` claims: no quorum settles it, no peer is corroborated
+before contributing to it, and it never falls, so ANY single peer in the pool pins it arbitrarily high
+with one frame. Anchoring on a maximum is exactly what §18.6d's peer selection REFUSES to do — a single
+peer claiming `u32::MAX` would otherwise become the reference point and put every honest peer outside
+the credibility band — and this figure is deliberately NOT the anchor for the §18.6a peak ceiling, which
+is anchored on a corroborated settled height precisely because that one cannot be inflated by the peer
+it bounds.
+
+It is used only where an inflated value costs a NEEDLESS RECONNECT and never a money claim. An
+over-stated peers' peak can make a healthy replica report `syncing` instead of `synced`, and can end an
+otherwise healthy session as stalled so a fresh peer is dialled; both understate confidence and cost
+work, and neither writes the replica, raises a peak, or makes unconfirmed money read as confirmed. A
+node MUST NOT extend this figure to any use where being wrong in the inflating direction would be
+believed — in particular it MUST NOT bound a claimed confirmation, for which `peak_height` is the only
+admissible height.
+
 `control.peerCounts` reports `{dig_peer_count, chia_peer_count,
 known_dig_peer_count}`, and its `chia_peer_count` MUST be the SAME observation this method reports.
 
