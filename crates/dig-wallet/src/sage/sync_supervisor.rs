@@ -45,7 +45,7 @@
 //! seed is touched and nothing here can sign.
 
 use std::collections::BTreeSet;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use chia::bls::PublicKey;
@@ -95,13 +95,21 @@ const PUZZLE_HASH_POLL: Duration = Duration::from_secs(5);
 /// ladder's own ceiling rather than out-pacing it, and it is short enough that the cost of a
 /// transient refusal is under a minute instead of unbounded.
 const RECORROBORATE_AFTER: Duration = Duration::from_secs(45);
+/// # The three session timescales, and why none of them collapses into another
+///
+/// [`RECORROBORATE_AFTER`] (45s) < [`STALL_AFTER`] (90s) < [`SESSION_MAX_LIFETIME`] (600s). Each
+/// governs a DIFFERENT concern, and the ordering is deliberate: a session that CANNOT write is
+/// dropped soonest, one that has STOPPED writing next, and a perfectly healthy one is held until
+/// the anti-capture bound. Collapsing any two of them would silently retire one of the three
+/// concerns.
+///
 /// How often a stalled-session check re-measures the replica against the chain.
 ///
 /// Two local reads — one DB row and the chain transport's last-heard peak — so the poll costs
-/// nothing on the wire and cannot itself keep a peer busy. Thirty seconds is longer than a mainnet
-/// block interval (~19s), so a healthy replica advances between consecutive polls and the stall
-/// clock is reset by evidence rather than by luck.
-const STALL_POLL: Duration = Duration::from_secs(30);
+/// nothing on the wire and cannot itself keep a peer busy. Fifteen seconds is just under a mainnet
+/// block interval (~19s), so a healthy replica advances within a poll or two and the stall clock is
+/// reset by evidence rather than by luck.
+const STALL_POLL: Duration = Duration::from_secs(15);
 /// How long a session may hold the replica STILL, while the chain demonstrably advances, before it
 /// is ended (dig_ecosystem#2851).
 ///
@@ -112,15 +120,45 @@ const STALL_POLL: Duration = Duration::from_secs(30);
 /// while their peers announced 9,142,918 and the gap grew without bound — reported, throughout, as
 /// `synced`.
 ///
-/// THREE MINUTES IS SET BY WHAT ENDING A SESSION COSTS. A reconnect re-runs the catch-up FROM
-/// GENESIS (see the comment in [`Supervisor::run`] on why resuming is not safe), which is genuinely
-/// expensive, so the deadline must sit well clear of ordinary jitter — a slow peer, a momentary
-/// pause — rather than at the edge of it. Mainnet peaks arrive roughly every 19 seconds, so 180s is
-/// about NINE consecutive missed peaks *while the chain was observed to move*, which no healthy
-/// session produces. And it exceeds [`HEALTHY_SESSION`], so a session ended this way still counts as
-/// healthy at [`Supervisor::run`]'s ladder reset and reconnects promptly instead of climbing the
-/// backoff ladder toward [`BACKOFF_MAX`].
-const STALL_AFTER: Duration = Duration::from_secs(180);
+/// THIS IS THE ONLY FAST PATH, so it is biased FAST, and the bias is justified by what being wrong
+/// costs in each direction. A needless reconnect costs a catch-up — measured at 54 MILLISECONDS on
+/// the live host (corroboration logged at 08:34:21.495, the update loop already handling frames at
+/// 08:34:21.549), because `request_puzzle_state` is indexed by puzzle hash rather than walking
+/// blocks — plus ONE corroboration round of up to `quorum::QUORUM_DIAL_WIDE` dials. Being wrong the
+/// other way costs a user staring at a stale balance while their node calls it settled. Ninety
+/// seconds is about FIVE consecutive missed peaks *while the peers' peak demonstrably advanced*,
+/// which no healthy session produces.
+///
+/// It exceeds [`HEALTHY_SESSION`], so a session ended this way still counts as healthy at
+/// [`Supervisor::run`]'s ladder reset and reconnects promptly instead of climbing the backoff
+/// ladder toward [`BACKOFF_MAX`].
+const STALL_AFTER: Duration = Duration::from_secs(90);
+/// How long ONE subscription session runs before it is retired and a fresh peer is dialled.
+///
+/// AN ANTI-CAPTURE BOUND, NOT A LIVENESS MECHANISM. Liveness belongs to [`STALL_AFTER`], which
+/// compares two numbers that are already on one status payload; this exists only so that a hostile
+/// or merely unlucky peer set cannot be HELD indefinitely. Once the detector exists, nothing about
+/// rotation needs to be quick — the connection is HELD, not churned.
+///
+/// TEN MINUTES IS AN OPERATING ASSUMPTION, overridable, not a derived constant. What it trades:
+///
+/// * The CATCH-UP is not the cost — 54 ms, measured above.
+/// * CORROBORATION is. `quorum::QUORUM_DIAL_WIDE` peers are dialled once per session, so the
+///   cadence is a sustained dial rate for the life of the process. [`BACKOFF_MAX`]'s own doc
+///   records that four DNS introducers serve the whole network and that a tight loop across many
+///   nodes is the failure it exists to bound. One node is nothing; the aggregate is the risk, which
+///   is why this number moves UP rather than down.
+///
+/// The corroboration bar MUST NOT be weakened to pay for it: every new session is a NEW peer and
+/// re-earns its write authority from a freshly drawn quorum. Carrying a verdict across sessions
+/// would hand the replica to an uncorroborated writer, which is the vulnerability the mechanism
+/// exists to close (NC-12).
+///
+/// Nothing is staggered here, because this is a set of ONE session. Staggering is load-bearing only
+/// for `chia-query`'s peer POOL (dig_ecosystem#2791/#2836), where a simultaneous turnover would
+/// empty the corroboration pool exactly when a round needs it. That is a different repo and is
+/// deliberately not solved here.
+pub const SESSION_MAX_LIFETIME: Duration = Duration::from_secs(600);
 /// How far the replica may trail the node's own peers and still be called
 /// [`SyncPhase::Synced`] — about 75 seconds of chain at a ~19s block interval.
 ///
@@ -870,10 +908,74 @@ enum SessionOutcome {
     Resubscribe,
     /// The peer disconnected (or the loop errored); back off and retry.
     Ended,
-    /// The session held the replica still while the chain advanced past it, and was ended for it
-    /// (dig_ecosystem#2851). Handled exactly as [`Self::Ended`] apart from leaving a recovery owed:
-    /// the session that stalls cannot observe its own recovery, so the fact has to outlive it.
-    Stalled,
+    /// The session reached [`SESSION_MAX_LIFETIME`] (dig_ecosystem#2851). A PLANNED end, so — like
+    /// [`Self::Resubscribe`] — it reconnects at once and the backoff ladder has nothing to say
+    /// about it.
+    Rotate,
+}
+
+/// What one stall observation concluded.
+#[derive(Debug, PartialEq, Eq)]
+enum StallVerdict {
+    /// The replica is following the chain, or nothing can be said about it.
+    Following,
+    /// It is following again, and the last thing the log said was that it had stopped.
+    Recovered,
+    /// It has been provably behind and still for `elapsed`, which is long enough to act on.
+    Stalled { elapsed: Duration },
+}
+
+/// The replica's freeze, tracked ACROSS sessions (dig_ecosystem#2851).
+///
+/// It deliberately outlives any one session, and that is not an optimisation — it is what keeps the
+/// deadline reachable at all. [`SESSION_MAX_LIFETIME`] retires a session every 60 seconds, so state
+/// scoped to a session could never accumulate the [`STALL_AFTER`] evidence, and the detector would
+/// be dead code that reads as a working guard. A frozen replica is a property of the REPLICA
+/// anyway; which peer happened to be attached while it froze is incidental to whether it moved.
+///
+/// Split out as a pure state machine with no I/O so every branch — including the ones that must NOT
+/// accuse — is directly testable.
+#[derive(Debug, Default)]
+struct StallWatch {
+    /// The replica peak at the previous observation, so "advanced" is a comparison rather than a
+    /// guess.
+    last_replica: Option<u32>,
+    /// When the replica was first seen behind AND still. `None` means the clock is not running.
+    stalled_since: Option<Instant>,
+    /// Whether a stall was declared and its recovery has not yet been reported.
+    recovery_unreported: bool,
+}
+
+impl StallWatch {
+    /// Fold one observation in, and say what it means.
+    ///
+    /// Only POSITIVE evidence accuses: an unobservable height on either side, and a replica merely
+    /// LEVEL with its peers, both reset the clock. A quiet chain and a node that cannot see the
+    /// chain are ordinary, and neither is grounds for tearing down a working session.
+    fn observe(&mut self, replica: Option<u32>, peers: Option<u32>, now: Instant) -> StallVerdict {
+        let advanced =
+            matches!((replica, self.last_replica), (Some(now), Some(before)) if now > before);
+        self.last_replica = replica.or(self.last_replica);
+
+        let behind = matches!((replica, peers), (Some(r), Some(p)) if p > r);
+        if advanced || !behind {
+            self.stalled_since = None;
+            if advanced && std::mem::take(&mut self.recovery_unreported) {
+                return StallVerdict::Recovered;
+            }
+            return StallVerdict::Following;
+        }
+
+        let since = *self.stalled_since.get_or_insert(now);
+        let elapsed = now.duration_since(since);
+        if elapsed >= STALL_AFTER {
+            // Re-armed for the next episode: the clock restarts, and a recovery is now owed.
+            self.stalled_since = None;
+            self.recovery_unreported = true;
+            return StallVerdict::Stalled { elapsed };
+        }
+        StallVerdict::Following
+    }
 }
 
 /// Everything the supervisor loop needs. Assembled by [`spawn_supervisor`].
@@ -907,6 +1009,15 @@ pub struct Supervisor {
     /// "the check ran and found nothing" must not look the same. A supervisor built without one
     /// behaves exactly as it did before this field existed.
     pub chain_tip: Option<Arc<dyn ChainTipObserver>>,
+    /// How long one session runs before it is retired. Production passes
+    /// [`SESSION_MAX_LIFETIME`]; see that constant for the costs the number trades.
+    ///
+    /// Injected rather than read from the constant so a test can give rotation a DISTINCTIVE
+    /// duration. The test clock returns from every sleep instantly, so a timer is identified only
+    /// by the duration it asked for — and [`SESSION_MAX_LIFETIME`] shares its value with
+    /// [`BACKOFF_MAX`], which made the two indistinguishable and wedged a backoff wait that a test
+    /// meant to silence rotation.
+    pub session_lifetime: Duration,
 }
 
 /// Spawn the supervisor on the current runtime.
@@ -929,13 +1040,9 @@ impl Supervisor {
         // Consecutive rounds that failed to reach a quorum. Reset by any round that does, so this
         // counts a STANDING disagreement rather than a lifetime total.
         let mut splits: u32 = 0;
-        // Whether the LAST session was ended for stalling, and so a recovery is still unreported.
-        //
-        // It outlives the session deliberately: the stall is logged by the session that failed, and
-        // the recovery can only be observed by the NEXT one. Without carrying the fact across, an
-        // operator reading the log sees a failure followed by silence — and silence is precisely
-        // the cover this defect hid behind (dig_ecosystem#2851).
-        let recovery_unreported = std::sync::atomic::AtomicBool::new(false);
+        // The replica's freeze, tracked across sessions rather than within one — see
+        // [`StallWatch`] for why that is required rather than merely tidy.
+        let stall_watch = Mutex::new(StallWatch::default());
 
         while !*shutdown.borrow() {
             let session = match self.factory.connect().await {
@@ -993,22 +1100,34 @@ impl Supervisor {
                 // the fallback tier. The session is also re-polled below, so a wallet created
                 // after boot is subscribed within seconds rather than at the next disconnect.
                 tracing::debug!("wallet sync: no custodied puzzle hashes; nothing subscribed");
-            } else if let Err(e) = session
-                .catch_up(
-                    &self.db,
-                    puzzle_hashes,
-                    self.genesis_challenge,
-                    &self.events,
-                    trust,
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "wallet sync: catch-up failed");
-                handle.set_connected(0);
-                if !self.wait(&mut backoff, &mut shutdown).await {
-                    break;
+            } else {
+                let began = self.time.now();
+                if let Err(e) = session
+                    .catch_up(
+                        &self.db,
+                        puzzle_hashes,
+                        self.genesis_challenge,
+                        &self.events,
+                        trust,
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, "wallet sync: catch-up failed");
+                    handle.set_connected(0);
+                    if !self.wait(&mut backoff, &mut shutdown).await {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                // Reported on EVERY session, because it is the number that decides whether
+                // [`SESSION_MAX_LIFETIME`] is affordable. A reconnect re-runs the catch-up from
+                // genesis, which sounds expensive; measuring it turns the rotation cadence into a
+                // question with an answer instead of an argument.
+                tracing::info!(
+                    peer = %session.peer_ip(),
+                    catch_up_ms = self.time.now().duration_since(began).as_millis(),
+                    "wallet sync: catch-up complete"
+                );
             }
 
             // Taken before the session is moved into `run` below, so the stall and recovery lines
@@ -1041,8 +1160,14 @@ impl Supervisor {
                 // other arm here is disarmed by construction — so without this one the only exit
                 // is a disconnect that a half-open connection never delivers
                 // (dig_ecosystem#2851).
-                () = self.await_stall(trust.is_authoritative(), &recovery_unreported, &peer_ip)
-                    => SessionOutcome::Stalled,
+                () = self.await_stall(trust.is_authoritative(), &stall_watch, &peer_ip)
+                    => SessionOutcome::Ended,
+                // Every session is retired on a schedule, so no single peer becomes both the only
+                // thing writing the replica and the only thing watching it. The timer necessarily
+                // starts HERE, after the catch-up returned: truncating a legitimately long first
+                // catch-up would guarantee a replica that never finishes, which is the failure this
+                // whole ticket is about.
+                () = self.await_session_rotation() => SessionOutcome::Rotate,
                 // Dropping the `run` future drops the receiver, which closes the peer. No
                 // abort, so any DB write already in flight completes first.
                 _ = shutdown.changed() => SessionOutcome::Stop,
@@ -1060,10 +1185,19 @@ impl Supervisor {
                     continue;
                 }
                 SessionOutcome::Ended => {}
-                // Remember that a recovery is now owed, so the NEXT session reports the episode's
-                // ending rather than leaving the log at a failure followed by silence.
-                SessionOutcome::Stalled => {
-                    recovery_unreported.store(true, std::sync::atomic::Ordering::SeqCst);
+                // A planned retirement, so it reconnects at once and the ladder is reset
+                // EXPLICITLY. Leaning on the `HEALTHY_SESSION` check below instead would be a
+                // coin-flip rather than a rule: that threshold is also 60 seconds, so a rotation
+                // would land exactly on its boundary.
+                SessionOutcome::Rotate => {
+                    tracing::info!(
+                        peer = %peer_ip,
+                        age_secs = self.time.now().duration_since(started).as_secs(),
+                        "wallet sync: retiring the subscription session on schedule; dialling a \
+                         fresh peer"
+                    );
+                    backoff.reset();
+                    continue;
                 }
             }
 
@@ -1201,61 +1335,58 @@ impl Supervisor {
     /// to the ordinary reconnect path, which draws an independent sample and re-runs the
     /// [`Corroborator`] exactly as it always did (NC-12: peers stay untrusted, corroboration stays a
     /// confidence gradient, nothing blocks on N-of-N). §908: it reads two heights and signs nothing.
-    async fn await_stall(
-        &self,
-        armed: bool,
-        recovery_unreported: &std::sync::atomic::AtomicBool,
-        peer_ip: &str,
-    ) {
+    async fn await_stall(&self, armed: bool, watch: &Mutex<StallWatch>, peer_ip: &str) {
         let Some(chain_tip) = self.chain_tip.as_ref().filter(|_| armed) else {
             std::future::pending::<()>().await;
             // `pending` never returns; this is unreachable and exists only to satisfy the type.
             return;
         };
 
-        let mut last_replica: Option<u32> = None;
-        let mut stalled_since: Option<Instant> = None;
         loop {
             self.time.sleep(STALL_POLL).await;
 
             let replica = self.db.sync_state().await.ok().and_then(|s| s.peak_height);
             let peers = chain_tip.peers_peak().await;
-            let advanced =
-                matches!((replica, last_replica), (Some(now), Some(before)) if now > before);
-            last_replica = replica.or(last_replica);
+            let now = self.time.now();
 
-            // The other half of the episode. The session that stalled logged a failure and then
-            // ended; without this, the log goes quiet again and "did it recover?" is answerable
-            // only by polling the RPC — and silence is what let this defect hide for hours.
-            if advanced && recovery_unreported.swap(false, std::sync::atomic::Ordering::SeqCst) {
-                tracing::info!(
+            let verdict = {
+                let mut watch = watch.lock().expect("stall watch poisoned");
+                watch.observe(replica, peers, now)
+            };
+            match verdict {
+                // The other half of the episode. The session that stalled logged a failure and then
+                // ended; without this the log goes quiet again and "did it recover?" is answerable
+                // only by polling the RPC — and silence is what let this defect hide for hours.
+                StallVerdict::Recovered => tracing::info!(
                     peer = %peer_ip,
                     replica_peak = ?replica,
                     peers_peak = ?peers,
                     "wallet sync: the replica is advancing again after a stalled session was ended"
-                );
-            }
-
-            let behind = matches!((replica, peers), (Some(r), Some(p)) if p > r);
-            if advanced || !behind {
-                stalled_since = None;
-                continue;
-            }
-
-            let since = *stalled_since.get_or_insert_with(|| self.time.now());
-            let elapsed = self.time.now().duration_since(since);
-            if elapsed >= STALL_AFTER {
-                tracing::warn!(
-                    peer = %peer_ip,
-                    replica_peak = ?replica,
-                    peers_peak = ?peers,
-                    stalled_for_secs = elapsed.as_secs(),
-                    "wallet sync: the replica has not advanced while this node's own peers moved \
-                     ahead of it; ending the session so a fresh peer is dialled"
-                );
-                return;
+                ),
+                StallVerdict::Following => {}
+                StallVerdict::Stalled { elapsed } => {
+                    tracing::warn!(
+                        peer = %peer_ip,
+                        replica_peak = ?replica,
+                        peers_peak = ?peers,
+                        stalled_for_secs = elapsed.as_secs(),
+                        "wallet sync: the replica has not advanced while this node's own peers \
+                         moved ahead of it; ending the session so a fresh peer is dialled"
+                    );
+                    return;
+                }
             }
         }
+    }
+
+    /// Resolve once this session has lived its full [`SESSION_MAX_LIFETIME`].
+    ///
+    /// Armed for EVERY session, whatever its trust: this is a planned lifetime, not a failure
+    /// detector, and a session that is behaving perfectly is exactly the one rotation exists to
+    /// retire. It waits on the injected clock, so the cadence is testable without a test that
+    /// actually sits for a minute.
+    async fn await_session_rotation(&self) {
+        self.time.sleep(self.session_lifetime).await;
     }
 
     /// Wait out the next backoff delay. Returns `false` if shutdown arrived meanwhile.

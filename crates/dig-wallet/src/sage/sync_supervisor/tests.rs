@@ -17,6 +17,14 @@ use crate::sage::fallback::ChainPeerTier;
 use crate::sage::routing::{self, Source};
 use crate::sage::sync::PuzzleStateSource;
 
+/// The session lifetime a test passes when it is NOT testing rotation.
+///
+/// A DISTINCTIVE value, not `SESSION_MAX_LIFETIME`: this clock returns from every sleep instantly,
+/// so a timer is identifiable only by the duration it asked for, and the real lifetime shares its
+/// 60 seconds with `BACKOFF_MAX`. Suppressing by that value silenced backoff waits too — one in
+/// forty-one, whenever jitter landed on exactly 100% — and wedged the supervisor for good.
+const NO_ROTATION: Duration = Duration::from_secs(3_600);
+
 /// The height a scripted catch-up reports as the chain tip.
 const CATCH_UP_HEIGHT: u32 = 6_000_000;
 
@@ -72,12 +80,25 @@ struct Script {
     /// Heights the writer was asked about, in order, so a test can prove the writer never chose
     /// its own exam height.
     writer_asked_at: Mutex<Vec<u32>>,
+    /// Sleep durations that NEVER return, so the timer they belong to cannot fire.
+    ///
+    /// This clock returns from every sleep immediately, which is what makes the backoff ladder
+    /// testable in milliseconds — and which also means EVERY timer in the supervisor's `select!`
+    /// fires at once. A test observing one timer must therefore silence the others, or it proves
+    /// only that *something* ended the session. [`SESSION_MAX_LIFETIME`] is silenced by default
+    /// (dig_ecosystem#2851): rotation ends every session on its own, so without this the stall
+    /// tests would pass against a supervisor with no stall detection at all.
+    suppressed: Mutex<Vec<Duration>>,
+    /// Suppressed timers that were nonetheless ARMED, so a test can still prove the supervisor
+    /// asked to wait even though the wait was never allowed to finish.
+    suppressed_waits: Mutex<Vec<Duration>>,
 }
 
 impl Script {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             now: Mutex::new(Some(Instant::now())),
+            suppressed: Mutex::new(vec![NO_ROTATION]),
             ..Self::default()
         })
     }
@@ -101,6 +122,17 @@ impl Script {
 #[async_trait::async_trait]
 impl TimeSource for Script {
     async fn sleep(&self, duration: Duration) {
+        // Bound BEFORE the `if`: a guard created in the condition lives to the end of the whole
+        // statement, so testing it inline would hold the lock across the `.await` below and wedge
+        // every later sleep in the process.
+        let suppressed = self.suppressed.lock().unwrap().contains(&duration);
+        if suppressed {
+            // Recorded SEPARATELY — `slept` is read positionally by the backoff-ladder test, and a
+            // suppressed timer never elapses, so counting it there would insert a rung that no
+            // backoff ever waited.
+            self.suppressed_waits.lock().unwrap().push(duration);
+            std::future::pending::<()>().await;
+        }
         self.slept.lock().unwrap().push(duration);
         self.advance(duration);
         // Yield rather than sleep: the ladder is asserted from `slept`, so a test must not
@@ -302,6 +334,9 @@ struct ScriptedChainTip {
     /// When set, the replica only starts advancing once a SECOND session has been opened — so the
     /// first session genuinely stalls and the recovery genuinely belongs to its successor.
     advance_from_connect: Option<Arc<Script>>,
+    /// Closes the live session after every second observation, so no single session can gather
+    /// enough stall evidence on its own.
+    drop_peer_every: Option<(Arc<Script>, Mutex<usize>)>,
 }
 
 impl ScriptedChainTip {
@@ -311,6 +346,7 @@ impl ScriptedChainTip {
             peak: Mutex::new(Some(peak)),
             healthy_replica: None,
             advance_from_connect: None,
+            drop_peer_every: None,
         })
     }
 
@@ -320,6 +356,7 @@ impl ScriptedChainTip {
             peak: Mutex::new(None),
             healthy_replica: None,
             advance_from_connect: None,
+            drop_peer_every: None,
         })
     }
 
@@ -329,6 +366,21 @@ impl ScriptedChainTip {
             peak: Mutex::new(Some(peak)),
             healthy_replica: Some(db),
             advance_from_connect: None,
+            drop_peer_every: None,
+        })
+    }
+
+    /// Peers ahead of a frozen replica, dropping the peer after every SECOND observation.
+    ///
+    /// Bounds how much stall evidence any ONE session can gather: two polls is 60 seconds of the
+    /// 180 the deadline needs, so a stall clock scoped to a session could never fire, and only a
+    /// watch that survives the session boundary reaches the deadline.
+    fn ahead_and_dropping_the_peer(peak: u32, script: Arc<Script>) -> Arc<Self> {
+        Arc::new(Self {
+            peak: Mutex::new(Some(peak)),
+            healthy_replica: None,
+            advance_from_connect: None,
+            drop_peer_every: Some((script, Mutex::new(0))),
         })
     }
 
@@ -339,6 +391,7 @@ impl ScriptedChainTip {
             peak: Mutex::new(Some(peak)),
             healthy_replica: Some(db),
             advance_from_connect: Some(script),
+            drop_peer_every: None,
         })
     }
 }
@@ -346,6 +399,16 @@ impl ScriptedChainTip {
 #[async_trait::async_trait]
 impl ChainTipObserver for ScriptedChainTip {
     async fn peers_peak(&self) -> Option<u32> {
+        if let Some((script, seen)) = &self.drop_peer_every {
+            let drop_now = {
+                let mut seen = seen.lock().unwrap();
+                *seen += 1;
+                *seen % 2 == 0
+            };
+            if drop_now {
+                script.disconnect_all();
+            }
+        }
         let held_back = self
             .advance_from_connect
             .as_ref()
@@ -427,6 +490,32 @@ impl Harness {
         corroborator: Option<Arc<dyn Corroborator>>,
         chain_tip: Option<Arc<dyn ChainTipObserver>>,
     ) -> Self {
+        Self::start_with_lifetime(
+            db,
+            hashes,
+            script,
+            addrs,
+            trust,
+            corroborator,
+            chain_tip,
+            NO_ROTATION,
+        )
+        .await
+    }
+
+    /// Start a supervisor with an explicit session lifetime — for the tests that are ABOUT
+    /// rotation (dig_ecosystem#2851).
+    #[allow(clippy::too_many_arguments)]
+    async fn start_with_lifetime(
+        db: WalletDb,
+        hashes: Arc<dyn PuzzleHashSource>,
+        script: Arc<Script>,
+        addrs: Vec<String>,
+        trust: PeerTrust,
+        corroborator: Option<Arc<dyn Corroborator>>,
+        chain_tip: Option<Arc<dyn ChainTipObserver>>,
+        session_lifetime: Duration,
+    ) -> Self {
         let factory = Arc::new(ScriptedFactory {
             script: script.clone(),
             addrs,
@@ -441,6 +530,7 @@ impl Harness {
             time: script.clone(),
             corroborator: corroborator.clone(),
             chain_tip,
+            session_lifetime,
         });
         Self {
             db,
@@ -452,8 +542,12 @@ impl Harness {
 
     /// Poll `predicate` until it holds, or fail. Bounded in real time so a wedged supervisor
     /// fails the test instead of hanging the suite.
+    ///
+    /// The budget is deliberately generous. It is spent ONLY when a test is failing, whereas a
+    /// budget tight enough to be tripped by a loaded machine turns a real proof into an
+    /// intermittent one — and the supervisor tests share a runtime with five hundred others.
     async fn until(&self, what: &str, mut predicate: impl FnMut(&Script) -> bool) {
-        for _ in 0..2_000 {
+        for _ in 0..20_000 {
             if predicate(&self.script) {
                 return;
             }
@@ -1733,6 +1827,7 @@ async fn live_mainnet_default_install_corroborates_and_follows_the_chain() {
         // The acceptance step watches a REAL peer follow mainnet; a stall deadline would only
         // add a second reason for the session to end and blur what the run proves.
         chain_tip: None,
+        session_lifetime: SESSION_MAX_LIFETIME,
     });
 
     // A mainnet block lands roughly every 19s. Corroboration itself needs several sequential
@@ -2316,20 +2411,35 @@ async fn a_stall_and_its_recovery_are_both_named_in_the_log() {
     )
     .await;
 
+    // Waited on OBSERVABLE STATE, not on the log. With rotation silenced and the peer never
+    // disconnected, a second connect can only come from the stall arm, and a third only after the
+    // successor session has been observing long enough to see the replica move again. Polling the
+    // log text instead makes the wait depend on how promptly a writer flushes under load, which is
+    // not the property and turns a real proof into an intermittent one.
     harness
-        .until("the stall to be logged", |_| {
-            capture.contents().contains("has not advanced")
+        .until("the stalled session to end", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
         })
         .await;
     harness
-        .until("the recovery to be logged", |_| {
-            capture.contents().contains("advancing again")
-        })
+        .until(
+            "the successor session to observe the replica advancing",
+            |_| capture.contents().contains("advancing again"),
+        )
         .await;
 
     let log = capture.contents();
     harness.stop().await;
     drop(guard);
+
+    assert!(
+        log.contains("has not advanced"),
+        "the stall itself must be named: {log}"
+    );
+    assert!(
+        log.contains("advancing again"),
+        "the recovery must be named, or the log shows a failure and then silence: {log}"
+    );
 
     // Both heights and the elapsed stall, because "the replica is behind" without numbers cannot
     // be checked against the chain by the operator reading it.
@@ -2503,6 +2613,161 @@ async fn a_refused_session_still_ends_with_a_chain_tip_observer_attached() {
     );
 
     harness.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Session rotation (dig_ecosystem#2851)
+// ---------------------------------------------------------------------------
+
+/// **Proves (dig_ecosystem#2851):** a session is RETIRED at its lifetime and a fresh peer is
+/// dialled, even though nothing about it failed.
+///
+/// Holding one peer for the life of the process makes that peer the single point of both failure
+/// and observation, which is how a silent peer went unnoticed for two hours.
+///
+/// FIXTURE DESIGN — the peer is perfectly healthy and never disconnects (`disconnect_all` is never
+/// called), so a reconnect can only come from the rotation timer. This is the ONE test family that
+/// lets that timer fire; every other test passes [`NO_ROTATION`], because a clock that returns
+/// instantly fires every timer at once and a rotation would otherwise answer for whatever property
+/// the test believed it was proving.
+#[tokio::test]
+async fn a_healthy_session_is_retired_at_its_lifetime() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_with_lifetime(
+        db,
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        SESSION_MAX_LIFETIME,
+    )
+    .await;
+
+    harness
+        .until("the session to be retired and replaced", |s| {
+            s.connects.load(Ordering::SeqCst) >= 3
+        })
+        .await;
+
+    harness.stop().await;
+}
+
+/// **Proves (dig_ecosystem#2851):** rotation does NOT climb the backoff ladder.
+///
+/// A rotation is a planned end, not a failure. If it fed the ladder, a node would rotate itself
+/// onto a 60-second reconnect delay within minutes and spend most of its life holding no
+/// subscription at all — strictly worse than never rotating.
+///
+/// The assertion reads the delays the supervisor actually waited: every one must stay at the
+/// ladder's first rung. `HEALTHY_SESSION` is deliberately NOT relied on to produce that, because
+/// it is also 60 seconds and a rotation lands exactly on its boundary — a coin-flip, not a rule.
+#[tokio::test]
+async fn rotation_does_not_climb_the_backoff_ladder() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_with_lifetime(
+        db,
+        hashes,
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        None,
+        SESSION_MAX_LIFETIME,
+    )
+    .await;
+
+    harness
+        .until("several rotations", |s| {
+            s.connects.load(Ordering::SeqCst) >= 5
+        })
+        .await;
+
+    let waited: Vec<Duration> = script
+        .slept
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .filter(|d| *d != SESSION_MAX_LIFETIME)
+        .collect();
+    harness.stop().await;
+    assert!(
+        waited.iter().all(|d| *d <= Duration::from_millis(1_200)),
+        "a rotation fed the backoff ladder, so a rotating node backs off further every cycle: \
+         {waited:?}"
+    );
+}
+
+/// **Proves (dig_ecosystem#2851):** stall evidence SURVIVES the end of a session, so a replica that
+/// freezes across several short sessions is still detected.
+///
+/// The property that makes the watch's placement load-bearing. Sessions end for many reasons —
+/// a rotation, a disconnect, a refusal — and a stall clock scoped to ONE session restarts at every
+/// one of them. A replica that is frozen the whole time would then never reach [`STALL_AFTER`], the
+/// detector would be dead code that reads as a working guard, and every freeze would be cleared
+/// silently with nothing logged. This test is what stops a future refactor from scoping the watch
+/// back down into the session.
+///
+/// FIXTURE DESIGN — the chain-tip double drops the peer after every SECOND observation, so no
+/// session can gather more than 30 seconds of the 90 the deadline needs. That bound is the whole
+/// fixture: with a per-session clock the stall is UNREACHABLE here, and with the shared one it
+/// arrives after a few sessions. The peer is dropped rather than rotated because the property is
+/// "the watch outlives a SESSION", and which mechanism ended the session is immaterial to it —
+/// while [`Script`]'s instantly-returning clock cannot order a rotation against a poll at all.
+#[tokio::test]
+async fn stall_evidence_survives_the_end_of_a_session() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    let capture = Capture::default();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+
+    let harness = Harness::start_everything(
+        db,
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])])),
+        script.clone(),
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Operator,
+        None,
+        Some(ScriptedChainTip::ahead_and_dropping_the_peer(
+            PEERS_PEAK,
+            script.clone(),
+        )),
+    )
+    .await;
+
+    harness
+        .until(
+            "the stall to be named despite the sessions turning over",
+            |_| capture.contents().contains("has not advanced"),
+        )
+        .await;
+
+    harness.stop().await;
+    let log = capture.contents();
+    drop(guard);
+    assert!(
+        script.connects.load(Ordering::SeqCst) >= 3,
+        "the fixture must actually turn sessions over, or it proves nothing about surviving one"
+    );
+    assert!(
+        log.contains("has not advanced"),
+        "a freeze spanning several sessions went unreported: {log}"
+    );
 }
 
 // ---------------------------------------------------------------------------

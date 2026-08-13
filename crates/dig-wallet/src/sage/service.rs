@@ -34,7 +34,7 @@ use super::spend::{
 };
 use super::sync_supervisor::{
     spawn_supervisor, ChiaPeerSessionFactory, ChiaQuorumCorroborator, FallbackChainTip, Supervisor,
-    SyncHandle, TokioTime, UnionPuzzleHashSource,
+    SyncHandle, TokioTime, UnionPuzzleHashSource, SESSION_MAX_LIFETIME,
 };
 use super::tipping::{ChainOwnerResolver, NodeTipSpender, SystemClock, TipEventBus, TippingEngine};
 use super::transport::SharedCert;
@@ -243,6 +243,7 @@ impl WalletService {
                 // which is what lets a session parked on a half-open peer be ended rather than
                 // held for the life of the process (dig_ecosystem#2851).
                 chain_tip: Some(Arc::new(FallbackChainTip::new(fallback.clone()))),
+                session_lifetime: SESSION_MAX_LIFETIME,
             }))
         } else {
             None

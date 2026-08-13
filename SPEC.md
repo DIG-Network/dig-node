@@ -3789,11 +3789,34 @@ waits carry one:
   and the peer is dropped and re-dialled. The bound is PER ROUND TRIP and MUST NOT be a bound on the
   catch-up as a whole — a first catch-up runs from genesis over many batches and legitimately takes a
   long time, so a total deadline would abort a healthy long sync.
-- An AUTHORITATIVE subscribed session that holds the replica STILL for 180 seconds while the node's own
+- An AUTHORITATIVE subscribed session that holds the replica STILL for 90 seconds while the node's own
   Chia peers are observed to be strictly ahead of it MUST be ENDED, so the ordinary reconnect path
-  dials a fresh peer. The node MUST log the reason with both heights. Stall detection is armed for
-  authoritative sessions only: a `Discovered` session never advances the peak by design, and its exit
-  is the re-corroboration timer instead.
+  dials a fresh peer. The node MUST log the reason with both heights, AND MUST log the RECOVERY when
+  the replica advances again — a stall that is logged and a recovery that is not leaves the operator
+  with a failure followed by silence, which is indistinguishable from the failure continuing. Stall
+  detection is armed for authoritative sessions only: a `Discovered` session never advances the peak
+  by design, and its exit is the re-corroboration timer instead.
+
+Stall evidence MUST accumulate across sessions, not within one. Sessions end for many reasons, and a
+clock that restarts at every session boundary can never reach the deadline while a replica stays
+frozen — the detector would be present and unreachable.
+
+**A session MUST NOT be held indefinitely.** One subscription session runs for at most 600 seconds and
+is then retired, so a hostile or merely unlucky peer set cannot be held for the life of the process.
+A retirement is a PLANNED end: it reconnects at once and MUST NOT advance the reconnect backoff. The
+new session earns its write authority from a freshly drawn quorum like any other; a verdict MUST NOT
+be carried across sessions.
+
+**Rotation does NOT subsume the staleness detector, and MUST NOT be used to justify removing it.**
+The two answer different questions on different timescales: rotation bounds how long a bad situation
+can last, and detection is what makes it DIAGNOSABLE. A fast rotation would have hidden this defect
+entirely — the replica would have recovered on its own every cycle, and nobody would ever have learned
+that a session can go silent while the node reports `synced` for hours. A node that recovers silently
+from a fault it cannot name has not fixed the fault.
+
+The three session timescales form a deliberate ladder — 45s re-corroboration (a session that CANNOT
+write) < 90s stall (a session that has STOPPED writing) < 600s rotation (a session that is merely
+HELD). Each governs a different concern; collapsing any two silently retires one of them.
 
 Ending a session on a stall does NOT lower the corroboration bar (§18.6d): the reconnect draws an
 independent sample and re-runs the quorum exactly as any reconnect does. A stall MUST be declared only
@@ -4094,7 +4117,7 @@ A `null` on EITHER height is unobservable and MUST NOT be read as evidence of a 
 exactly what it would have been without this rule. The tolerance is deliberately strict, because the two
 failure directions are not symmetric: reporting `syncing` on a healthy node understates confidence
 harmlessly, whereas reporting `synced` over a frozen replica tells a client that a stale balance is
-settled. It is deliberately NOT the same threshold as the 180-second stall deadline of §18.6a: that one
+settled. It is deliberately NOT the same threshold as the 90-second stall deadline of §18.6a: that one
 decides whether to pay for a catch-up from genesis, this one decides what may be claimed about a number
 already being served.
 
