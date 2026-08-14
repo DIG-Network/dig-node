@@ -3899,3 +3899,157 @@ async fn a_session_earns_its_own_authority_and_never_inherits_one() {
          refused it — a verdict was carried across the session boundary"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Drawing a distinct, independent sample (chia-query 0.6.2 adoption, dig_ecosystem#2904)
+// ---------------------------------------------------------------------------
+
+/// The address every un-excluded dial would prefer: the co-resident node chia-query tries first.
+fn local_addr() -> std::net::SocketAddr {
+    "127.0.0.1:8444".parse().expect("a literal socket address")
+}
+
+/// A discovered peer's address, one per `octet`.
+fn discovered_addr(octet: u8) -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([10, 0, 0, octet], 8444))
+}
+
+/// A dialler shaped like chia-query on a host with a co-resident full node: the local address wins
+/// every call it is allowed to return, and only once excluded does discovery get a turn.
+///
+/// `attempts` counts calls, so a round that made progress is distinguishable from one that merely
+/// returned quickly — a loop that finishes faster than the work reads as a passing control
+/// otherwise.
+struct CoResidentDialler {
+    /// Priority addresses tried, in order, ahead of discovery.
+    priority: Vec<std::net::SocketAddr>,
+    /// Distinct addresses discovery can offer, in order.
+    discovered: Vec<std::net::SocketAddr>,
+    attempts: std::cell::Cell<usize>,
+}
+
+impl CoResidentDialler {
+    fn draw(&self, exclude: &[std::net::SocketAddr]) -> Option<super::Draw<()>> {
+        use chia_query::peer::connect::PeerOrigin;
+        self.attempts.set(self.attempts.get() + 1);
+        if let Some(&addr) = self.priority.iter().find(|a| !exclude.contains(a)) {
+            return Some(super::Draw {
+                addr,
+                origin: PeerOrigin::Priority,
+                member: (),
+            });
+        }
+        let &addr = self.discovered.iter().find(|a| !exclude.contains(a))?;
+        Some(super::Draw {
+            addr,
+            origin: PeerOrigin::Discovered,
+            member: (),
+        })
+    }
+}
+
+/// The defect dig_ecosystem#2648 left in production: with the dial un-excluded, the co-resident node
+/// is returned on every attempt, so a round spends its whole budget on one peer. The property is
+/// that the round now REACHES the discovered peers — asserted on the set of addresses, not on a
+/// count or a success flag, because a wrong implementation can produce either of those from a
+/// sample of one.
+#[tokio::test]
+async fn a_co_resident_node_no_longer_consumes_the_probe_budget() {
+    let target = quorum::QUORUM_DIAL_WIDE;
+    let expected: Vec<_> = (1..=target as u8).map(discovered_addr).collect();
+    let dialler = CoResidentDialler {
+        priority: vec![local_addr()],
+        discovered: expected.clone(),
+        attempts: std::cell::Cell::new(0),
+    };
+    let dialler = &dialler;
+
+    let sample =
+        super::assemble_distinct_sample(target, super::MAX_PROBE_ATTEMPTS, |exclude| async move {
+            dialler.draw(&exclude)
+        })
+        .await;
+
+    let reached: Vec<_> = sample.iter().map(|(addr, ())| *addr).collect();
+    assert_eq!(
+        reached, expected,
+        "the round reached {reached:?}; excluding what it holds is what lets discovery past the \
+         co-resident node at all"
+    );
+    assert!(
+        !reached.contains(&local_addr()),
+        "the co-resident node was counted as an independent voice"
+    );
+    // One attempt is spent ruling the local peer out; the rest each yield a distinct peer. Pinned
+    // exactly so an implementation that re-draws a ruled-out address cannot pass by being lucky.
+    assert_eq!(
+        dialler.attempts.get(),
+        target + 1,
+        "the round spent {} of its {} attempts",
+        dialler.attempts.get(),
+        super::MAX_PROBE_ATTEMPTS
+    );
+}
+
+/// A priority peer is preferred for SPEED, never counted as an independent opinion — so several of
+/// them in front of discovery must shift the sample's contents, not just its size.
+#[tokio::test]
+async fn priority_peers_are_never_counted_as_independent_voices() {
+    let discovered = vec![discovered_addr(1), discovered_addr(2)];
+    let dialler = CoResidentDialler {
+        // A configured `TRUSTED_FULLNODE` as well as the loopback probe: two preferred sources, both
+        // of which a local attacker can supply.
+        priority: vec![local_addr(), "192.168.1.9:8444".parse().expect("literal")],
+        discovered: discovered.clone(),
+        attempts: std::cell::Cell::new(0),
+    };
+    let dialler = &dialler;
+
+    let sample =
+        super::assemble_distinct_sample(4, super::MAX_PROBE_ATTEMPTS, |exclude| async move {
+            dialler.draw(&exclude)
+        })
+        .await;
+
+    let reached: Vec<_> = sample.iter().map(|(addr, ())| *addr).collect();
+    assert_eq!(
+        reached, discovered,
+        "the sample was {reached:?}; a priority draw must be ruled out of the round, not tallied"
+    );
+}
+
+/// The bound still exists for what exclusion cannot fix: a dialler that ignores its exclusions
+/// degrades to "too few peers, nothing written" rather than to a hang.
+#[tokio::test]
+async fn a_dialler_that_ignores_exclusions_exhausts_the_bound_without_hanging() {
+    use chia_query::peer::connect::PeerOrigin;
+    let attempts = std::cell::Cell::new(0);
+
+    let sample = super::assemble_distinct_sample(
+        quorum::QUORUM_DIAL_WIDE,
+        super::MAX_PROBE_ATTEMPTS,
+        |_| {
+            attempts.set(attempts.get() + 1);
+            async {
+                Some(super::Draw {
+                    addr: discovered_addr(7),
+                    origin: PeerOrigin::Discovered,
+                    member: (),
+                })
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(
+        sample.len(),
+        1,
+        "one address answered every dial, so the round holds one opinion — never the same opinion \
+         counted repeatedly"
+    );
+    assert_eq!(
+        attempts.get(),
+        super::MAX_PROBE_ATTEMPTS,
+        "the round terminated on its attempt bound"
+    );
+}
