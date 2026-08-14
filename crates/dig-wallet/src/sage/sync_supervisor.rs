@@ -1879,23 +1879,34 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
 ///
 /// # How a sample is drawn
 ///
-/// Each member comes from calling `chia_query`'s `connect_random_peer` again — a fresh discovery
-/// per member rather than one list carved up — so no single resolution step decides the whole
-/// sample.
+/// Each member comes from calling `chia_query`'s `connect_random_peer_excluding` again — a fresh
+/// discovery per member rather than one list carved up — so no single resolution step decides the
+/// whole sample. (The session factory above still draws un-excluded, and correctly so: it wants ONE
+/// peer and counts no opinions, so "try the local node first" is the whole point there.)
 ///
-/// Two properties of that helper have to be compensated for HERE, because they would otherwise
-/// silently collapse the quorum, and neither is hypothetical:
+/// The round draws through `connect_random_peer_excluding` (chia-query 0.6.2), telling the helper
+/// which addresses it already holds. That matters because the helper tries the priority addresses —
+/// `TRUSTED_FULLNODE`, then `127.0.0.1` — ahead of discovery on EVERY call: un-excluded, a host with
+/// any co-resident process on `8444` is handed the same local address as many times as it asks, so a
+/// round burned its whole [`MAX_PROBE_ATTEMPTS`] budget re-drawing one peer and yielded
+/// [`Verdict::Insufficient`] — on exactly the machines a normal user runs (dig_ecosystem#2648).
+/// Excluding what the round holds turns "try the local node first" back into what it was meant to
+/// be, rather than "try only the local node".
 ///
-/// * **It tries `127.0.0.1` before anything else, unconditionally.** Any unprivileged co-resident
-///   process that binds `8444` first is therefore the peer EVERY call returns — the loopback-probe
-///   hazard [`PeerTrust`] already names. Four calls would yield four connections to one attacker
-///   and a "unanimous" verdict from a sample of one.
+/// Two properties of that helper still have to be compensated for HERE:
+///
+/// * **Being reachable is not being independent.** A priority peer is preferred because it is fast
+///   and operator-controlled, which makes it a good peer to ASK — but a co-resident process is
+///   precisely a source a local attacker can supply, so it is not an independent voice. The round
+///   counts agreeing opinions, so it admits [`chia_query::peer::connect::PeerOrigin::Discovered`]
+///   draws ONLY. Priority draws are ruled out of the round (and excluded from re-drawing) rather
+///   than tallied.
 /// * **It returns the FIRST address that connects** out of a concurrent batch. That is
 ///   latency-biased selection, and latency is something an attacker running a fast, always-up node
 ///   controls.
 ///
-/// The compensation is DISTINCTNESS: an address already in this round's sample is discarded and
-/// re-drawn, within [`MAX_PROBE_ATTEMPTS`]. That is not a tidiness rule — it is the difference
+/// The remaining compensation is DISTINCTNESS: an address already ruled out this round is never
+/// admitted twice, within [`MAX_PROBE_ATTEMPTS`]. That is not a tidiness rule — it is the difference
 /// between four opinions and one opinion counted four times. A round that assembles fewer than
 /// [`quorum::CORROBORATION_FLOOR`] answers yields [`Verdict::Insufficient`], which writes nothing.
 ///
@@ -1921,8 +1932,10 @@ pub struct ChiaQuorumCorroborator {
 /// DISTINCT peers.
 ///
 /// Bounded because the distinctness compensation is a retry loop over a helper that may keep
-/// returning the same address — a host with a co-resident full node returns localhost every single
-/// time — and an unbounded retry there is a hang, not a defence.
+/// returning the same address, and an unbounded retry there is a hang, not a defence. Since
+/// chia-query 0.6.2 the round can EXCLUDE what it holds, so the ordinary co-resident-node case no
+/// longer eats the budget; the bound remains for the cases exclusion cannot fix — a helper that
+/// ignores it, and a network that simply has too few reachable peers.
 ///
 /// Two attempts per dial rather than the three it was when the target was four: widening the
 /// target to ten already multiplies the worst-case dial count, and a round that spends longer
@@ -1940,37 +1953,104 @@ impl ChiaQuorumCorroborator {
         }
     }
 
-    /// Dial repeatedly, keeping the first [`quorum::QUORUM_DIAL_WIDE`] DISTINCT addresses together
-    /// with each one's claimed peak.
+    /// Dial repeatedly, keeping the first [`quorum::QUORUM_DIAL_WIDE`] DISTINCT, independently
+    /// discovered addresses together with each one's claimed peak.
     async fn probe(&self) -> Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> {
         let Ok(tls) = chia_query::peer::connect::create_generated_tls() else {
             return Vec::new();
         };
-        let mut sample: Vec<(quorum::Candidate, chia_wallet_sdk::client::Peer)> = Vec::new();
+        let tls = &tls;
 
-        for _ in 0..MAX_PROBE_ATTEMPTS {
-            if sample.len() >= quorum::QUORUM_DIAL_WIDE {
-                break;
-            }
-            let Ok((peer, addr, receiver)) =
-                chia_query::peer::connect::connect_random_peer(self.network, &tls, self.timeout)
+        let sample = assemble_distinct_sample(
+            quorum::QUORUM_DIAL_WIDE,
+            MAX_PROBE_ATTEMPTS,
+            |exclude: Vec<std::net::SocketAddr>| async move {
+                let (peer, addr, receiver, origin) =
+                    chia_query::peer::connect::connect_random_peer_excluding(
+                        self.network,
+                        tls,
+                        self.timeout,
+                        &exclude,
+                    )
                     .await
-            else {
-                continue;
-            };
-            let id = addr.to_string();
-            if sample.iter().any(|(c, _)| c.id == id) {
-                // The same peer again. Counting it twice would let one node supply an entire
-                // "independent" quorum, so it is discarded rather than admitted.
-                continue;
-            }
-            let Some(claim) = await_peak(receiver, self.timeout).await else {
-                continue;
-            };
-            sample.push((quorum::Candidate { id, claim }, peer));
-        }
+                    .ok()?;
+                let claim = await_peak(receiver, self.timeout).await?;
+                Some(Draw {
+                    addr,
+                    origin,
+                    member: (claim, peer),
+                })
+            },
+        )
+        .await;
+
         sample
+            .into_iter()
+            .map(|(addr, (claim, peer))| {
+                (
+                    quorum::Candidate {
+                        id: addr.to_string(),
+                        claim,
+                    },
+                    peer,
+                )
+            })
+            .collect()
     }
+}
+
+/// One completed dial, reduced to the three facts sample assembly decides on.
+struct Draw<T> {
+    /// The address reached — the round's identity for this peer, and what it excludes next.
+    addr: std::net::SocketAddr,
+    /// How it was reached, which decides whether it counts as an independent opinion.
+    origin: chia_query::peer::connect::PeerOrigin,
+    /// Whatever the caller needs to keep from the connection.
+    member: T,
+}
+
+/// Draw up to `target` DISTINCT, independently discovered peers, spending at most `max_attempts`
+/// dials.
+///
+/// Split out from [`ChiaQuorumCorroborator::probe`] with `dial` as a seam because the two rules it
+/// enforces are the quorum's independence guarantee, and neither is observable through a real dial:
+/// that the addresses already ruled out are handed to the dialler as exclusions (so a preferred
+/// local peer cannot be re-drawn until the budget is gone), and that a
+/// [`chia_query::peer::connect::PeerOrigin::Priority`] draw never becomes a counted voice.
+///
+/// A ruled-out address is remembered whether or not it was admitted, so a rejected priority peer is
+/// not offered again either.
+async fn assemble_distinct_sample<T, D, Fut>(
+    target: usize,
+    max_attempts: usize,
+    dial: D,
+) -> Vec<(std::net::SocketAddr, T)>
+where
+    D: Fn(Vec<std::net::SocketAddr>) -> Fut,
+    Fut: std::future::Future<Output = Option<Draw<T>>>,
+{
+    let mut ruled_out: Vec<std::net::SocketAddr> = Vec::new();
+    let mut sample: Vec<(std::net::SocketAddr, T)> = Vec::new();
+
+    for _ in 0..max_attempts {
+        if sample.len() >= target {
+            break;
+        }
+        let Some(draw) = dial(ruled_out.clone()).await else {
+            continue;
+        };
+        // Defensive, not redundant: `ruled_out` is an ASK of remote code, and admitting one address
+        // twice is precisely how one node supplies a whole "independent" quorum.
+        if ruled_out.contains(&draw.addr) {
+            continue;
+        }
+        ruled_out.push(draw.addr);
+        if draw.origin != chia_query::peer::connect::PeerOrigin::Discovered {
+            continue;
+        }
+        sample.push((draw.addr, draw.member));
+    }
+    sample
 }
 
 /// Read a peer's claimed tip from the `new_peak_wallet` it announces after the handshake.
