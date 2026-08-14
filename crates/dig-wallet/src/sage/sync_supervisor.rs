@@ -1879,9 +1879,10 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
 ///
 /// # How a sample is drawn
 ///
-/// Each member comes from calling `chia_query`'s `connect_random_peer` again — a fresh discovery
-/// per member rather than one list carved up — so no single resolution step decides the whole
-/// sample.
+/// Each member comes from calling `chia_query`'s `connect_random_peer_excluding` again — a fresh
+/// discovery per member rather than one list carved up — so no single resolution step decides the
+/// whole sample. (The session factory above still draws un-excluded, and correctly so: it wants ONE
+/// peer and counts no opinions, so "try the local node first" is the whole point there.)
 ///
 /// The round draws through `connect_random_peer_excluding` (chia-query 0.6.2), telling the helper
 /// which addresses it already holds. That matters because the helper tries the priority addresses —
