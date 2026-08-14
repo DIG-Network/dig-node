@@ -3888,8 +3888,10 @@ Coverage MUST NOT be inferred from a second write ordered against the first: an 
 any follow-up can run, and `watch` is idempotent, so an interrupted or failed invalidation would latch the
 widened set permanently while the client's retry enrolled nothing and invalidated nothing. A missing
 recording (a replica synced before this rule) covers NOTHING — reads fall to the chain tier, which answers
-truthfully. The identity-scoped Sage-parity reads `get_sync_status` and `wallet_coins` still route on
-`initial_sync_complete` alone for the connected client's scoped identity and are tracked separately.
+truthfully. The identity-scoped Sage-parity reads `get_sync_status` (`crates/dig-wallet/src/sage/rpc.rs`,
+`get_sync_status`) and `wallet_coins` (same file, `wallet_coins`) still route on `initial_sync_complete`
+alone for the connected client's scoped identity, so this invariant does NOT yet hold on that surface;
+they are tracked as DIG-Network/dig_ecosystem#2878.
 
 **Invariant.** A catch-up MUST NOT run over an UNCORROBORATED peer, and `initial_sync_complete` MUST NOT
 be set as a result of one. `initial_sync` itself refuses with `UntrustedPeer`, and it decides on the
