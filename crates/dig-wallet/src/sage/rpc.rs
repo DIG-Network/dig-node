@@ -1132,7 +1132,10 @@ impl WalletBackend {
         puzzle_hashes: &[String],
     ) -> Result<Vec<super::fallback::FallbackCoin>> {
         let Some(_) = asset.cat_asset_id() else {
-            return self.fallback.coin_records_by_puzzle_hashes(puzzle_hashes).await;
+            return self
+                .fallback
+                .coin_records_by_puzzle_hashes(puzzle_hashes)
+                .await;
         };
         // Every puzzle hash the caller asked about, rendered as the place this asset's coins for
         // it would sit. A coin outside this set is hinted to us but belongs to something else.

@@ -116,7 +116,23 @@ pub trait ChainFallback: Send + Sync {
 
     /// Coins currently at the given puzzle hashes (unspent + recently spent).
     async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>>;
-    /// Coins hinted to the given hints (CAT association).
+    /// Coins hinted to the given hints — how a wallet FINDS its CAT coins, since a CAT does not
+    /// sit at its owner's puzzle hash.
+    ///
+    /// # A hint is not an asset (dig_ecosystem#2879)
+    ///
+    /// This read is asset-BLIND by construction: it takes no asset id, and the chain answers with
+    /// every coin hinted to the address — any CAT of any TAIL, and any plain XCH coin whose spend
+    /// carried a hint memo. It reads like "the CAT read" and is not one.
+    ///
+    /// So a caller that wants ONE asset's coins MUST filter the answer itself, by keeping only the
+    /// coins whose [`FallbackCoin::puzzle_hash`] is the CAT puzzle hash currying that asset's TAIL
+    /// around the owner's p2 hash (`digstore_chain::cat::cat_puzzle_hash`). Treating the raw answer
+    /// as one asset's coins reported a `$DIG` balance the user did not hold, at `$DIG`'s scale
+    /// rather than the coin's own.
+    ///
+    /// A caller that wants coins of ANY asset — a sync pass that stores them and attributes their
+    /// TAILs afterwards — uses the answer whole, which is the other legitimate shape.
     async fn coin_records_by_hints(&self, hints: &[String]) -> Result<Vec<FallbackCoin>>;
     /// A single coin by id (out-of-DB / arbitrary lookup).
     async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>>;
