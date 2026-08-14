@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.117.1] - 2026-08-14
+
+### Bug Fixes
+- **wallet:** Route an enrolled address to the replica, not the oracle (#221)- **wallet:** A key enrolled after catch-up no longer reads an empty replica (#223)
+
 ## [0.116.1] - 2026-08-13
 
 ### Bug Fixes
