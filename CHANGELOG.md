@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.118.0] - 2026-08-14
+
+### Bug Fixes
+- **wallet:** Replace a contradicted writer instead of discarding the quorum (#222)
+
 ## [0.117.1] - 2026-08-14
 
 ### Bug Fixes
