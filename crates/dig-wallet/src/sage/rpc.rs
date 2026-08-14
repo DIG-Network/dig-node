@@ -1083,27 +1083,6 @@ impl WalletBackend {
         Ok(self.db.is_synced().await?)
     }
 
-    /// The confirmed + pending balance held at ONE address, for XCH or $DIG (#1851).
-    ///
-    /// A READ-ONLY chain view — it needs only a public address, never a seed or signing key,
-    /// so it carries zero custody risk and answers the `control.wallet.balance` control read.
-    /// It reuses the EXISTING B.6 routing ([`routing::route`]):
-    ///
-    /// - **Wallet-owned address, DB synced** → the local DB is authoritative:
-    ///   [`db::WalletDb::balance_scoped`] (confirmed) + [`db::WalletDb::pending_scoped`]
-    ///   (unconfirmed); `source = "db"`, `synced = true`, `peak_height` = the node's own peak.
-    /// - **Otherwise** → the fallback (coinset) tier answers; `source = "fallback"`,
-    ///   `synced = false`, `peak_height = null`. If no LIVE fallback is attached, the read
-    ///   cannot honestly answer, so it returns a DISTINCT error rather than a fabricated `0`:
-    ///   [`BalanceError::NotSynced`] for the wallet's own address (the DB would answer once
-    ///   synced), [`BalanceError::NoChainSource`] for an arbitrary address (only a chain
-    ///   source could).
-    ///
-    /// **Every reported state field describes the tier that answered** (#2233). Reading the
-    /// DB's `synced` / `peak_height` on a coinset-served answer would describe the local
-    /// replica rather than the figure returned — so once a sync loop flips that flag, a
-    /// third-party oracle read would report itself as a synced local read. Those two fields
-    /// are therefore produced INSIDE the tier arms, never before the decision.
     /// The chain-fallback coins of ONE asset held at `puzzle_hashes` — the fallback tier's
     /// answer, scoped to the asset that was asked for.
     ///
@@ -1152,6 +1131,27 @@ impl WalletBackend {
             .collect())
     }
 
+    /// The confirmed + pending balance held at ONE address, for XCH or $DIG (#1851).
+    ///
+    /// A READ-ONLY chain view — it needs only a public address, never a seed or signing key,
+    /// so it carries zero custody risk and answers the `control.wallet.balance` control read.
+    /// It reuses the EXISTING B.6 routing ([`routing::route`]):
+    ///
+    /// - **Wallet-owned address, DB synced** → the local DB is authoritative:
+    ///   [`db::WalletDb::balance_scoped`] (confirmed) + [`db::WalletDb::pending_scoped`]
+    ///   (unconfirmed); `source = "db"`, `synced = true`, `peak_height` = the node's own peak.
+    /// - **Otherwise** → the fallback (coinset) tier answers; `source = "fallback"`,
+    ///   `synced = false`, `peak_height = null`. If no LIVE fallback is attached, the read
+    ///   cannot honestly answer, so it returns a DISTINCT error rather than a fabricated `0`:
+    ///   [`BalanceError::NotSynced`] for the wallet's own address (the DB would answer once
+    ///   synced), [`BalanceError::NoChainSource`] for an arbitrary address (only a chain
+    ///   source could).
+    ///
+    /// **Every reported state field describes the tier that answered** (#2233). Reading the
+    /// DB's `synced` / `peak_height` on a coinset-served answer would describe the local
+    /// replica rather than the figure returned — so once a sync loop flips that flag, a
+    /// third-party oracle read would report itself as a synced local read. Those two fields
+    /// are therefore produced INSIDE the tier arms, never before the decision.
     pub async fn balance_for_address(
         &self,
         address: &str,
