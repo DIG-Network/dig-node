@@ -82,5 +82,11 @@ peak=$(printf '%s' "$bal_json" | python -c "import json,sys;print(json.load(sys.
 if [ "$behind" != "unknown" ] && [ "$behind" -gt 50 ] && [ "$synced" = "True" ]; then
     fail 4 "the replica is $behind blocks behind and still reported synced=True; a stale figure was presented as settled"
 fi
+# The same falsehood in the state the check above CANNOT see. `behind` is "unknown" exactly when no
+# peer height is observable — which is precisely when nothing has corroborated the replica's figure,
+# so the guard would otherwise skip in the one case the node is most able to lie about.
+if [ "$behind" = "unknown" ] && [ "$synced" = "True" ]; then
+    fail 4 "no peer height is observable, yet the replica reported synced=True; nothing corroborated that figure"
+fi
 
 echo "PASS: peers=$peers watched=$watched behind=$behind source=$source synced=$synced peak=$peak"

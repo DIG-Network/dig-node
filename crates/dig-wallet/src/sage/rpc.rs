@@ -837,10 +837,21 @@ impl WalletBackend {
     ///
     /// It reuses [`super::sync_supervisor::is_following`] — the SAME predicate
     /// `control.wallet.syncStatus` reports its phase from — so a client cannot be told `synced` by
-    /// one endpoint and `syncing` by the other about the same moment. An unobservable peer tier is
-    /// never an accusation there and is not one here.
+    /// one endpoint and `syncing` by the other about the same moment.
+    ///
+    /// It narrows that predicate in ONE direction, and only here: `is_following` answers `true` on
+    /// an UNOBSERVABLE peer tier, because on a status endpoint an absent second opinion is not an
+    /// accusation. On a money read it is the opposite — with no peer height to compare against,
+    /// nothing has established that the replica's figure is current, and `synced: true` would then
+    /// rest on the latched `initial_sync_complete` this method exists to stop trusting. So an
+    /// unobservable tier answers `false`: the figure is still SERVED, with its real `peak_height`,
+    /// labelled stale. `is_following` itself is deliberately left alone so the two endpoints keep
+    /// agreeing wherever a peer height exists.
     async fn replica_answer_is_current(&self, peak_height: Option<u32>) -> bool {
-        super::sync_supervisor::is_following(peak_height, self.chain_peer_tier().await.peak_height)
+        let Some(peer_peak) = self.chain_peer_tier().await.peak_height else {
+            return false;
+        };
+        super::sync_supervisor::is_following(peak_height, Some(peer_peak))
     }
 
     /// The chain-sync supervisor's handle, if one is running.
@@ -4565,7 +4576,8 @@ mod tests {
             Some(1),
             None,
         )]));
-        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(500));
 
         let r = be
             .balance_for_address(&owned_address(), BalanceAsset::Xch)
@@ -4708,7 +4720,8 @@ mod tests {
             db,
             Arc::new(MockFallback::default()),
             WalletConfig::default(),
-        );
+        )
+        .with_chain_peer_tier_for_tests(peers_level_at(500));
 
         let r = be
             .balance_for_address(&owned_address(), BalanceAsset::Xch)
@@ -4751,7 +4764,8 @@ mod tests {
             Arc::new(MockFallback::default()),
             WalletConfig::default(),
         )
-        .with_watchlist(registry);
+        .with_watchlist(registry)
+        .with_chain_peer_tier_for_tests(peers_level_at(500));
 
         let r = be
             .balance_for_address(&encode_address(&ph, "xch").unwrap(), BalanceAsset::Xch)
@@ -5131,7 +5145,8 @@ mod tests {
             db,
             Arc::new(MockFallback::default()),
             WalletConfig::default(),
-        );
+        )
+        .with_chain_peer_tier_for_tests(peers_level_at(500));
         let r = be
             .balance_for_address(&owned_address(), BalanceAsset::Xch)
             .await
@@ -5791,7 +5806,8 @@ mod tests {
             Some(1),
             None,
         )]));
-        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(500));
 
         let r = be
             .coins_for_address(&owned_address(), BalanceAsset::Xch)
@@ -5902,6 +5918,19 @@ mod tests {
     const PEERS_AHEAD_BY: u32 = 530;
 
     /// A tier whose peers announced a peak `PEERS_AHEAD_BY` blocks past the replica's.
+    /// An OBSERVABLE peer tier level with a replica at `peak`.
+    ///
+    /// Tests whose subject is routing or coin content still read `synced`, and
+    /// [`WalletBackend::replica_answer_is_current`] refuses to claim currency with no peer height
+    /// to compare against. Without this the fixture would answer `synced: false` for a reason
+    /// unrelated to what those tests exist to pin.
+    fn peers_level_at(peak: u32) -> super::super::fallback::ChainPeerTier {
+        super::super::fallback::ChainPeerTier {
+            peer_count: Some(5),
+            peak_height: Some(peak),
+        }
+    }
+
     fn peers_ahead_of_the_replica() -> super::super::fallback::ChainPeerTier {
         super::super::fallback::ChainPeerTier {
             peer_count: Some(5),
@@ -5978,6 +6007,55 @@ mod tests {
             .unwrap();
         assert!(result.synced, "a replica at the tip was reported as stale");
         assert_eq!(result.peak_height, Some(REPLICA_PEAK));
+    }
+
+    /// **Proves:** an UNOBSERVABLE peer tier is not a licence to claim currency — a node with no
+    /// chain peer that has announced a height serves its figure labelled stale.
+    ///
+    /// This is the state a freshly-started node sits in, and the one a node with no reachable chain
+    /// peer sits in indefinitely. [`super::sync_supervisor::is_following`] answers `true` there by
+    /// design (an absent second opinion is not an accusation on a status endpoint), so a money read
+    /// delegating to it unnarrowed pairs `synced: true` with an arbitrarily old `peak_height` — the
+    /// stale-presented-as-current claim this PR exists to remove.
+    ///
+    /// FIXTURE DESIGN — `peak_height: None` is what makes the tier unobservable, and it is the only
+    /// axis varied from [`a_replica_level_with_its_peers_still_reports_synced`], which stays green
+    /// as the honest control. The replica is deliberately CAUGHT UP (`initial_sync_complete`, a
+    /// present peak, a real coin), so nothing but the missing peer height can explain a `false`;
+    /// asserting the balance and the peak alongside pins "stale but served" over "withheld".
+    #[tokio::test]
+    async fn an_unobservable_peer_tier_is_never_reported_as_current() {
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        db.upsert_coin(&coin_at_ph(
+            "aa",
+            &owned_ph(),
+            1_599_179_999_973,
+            Some(1),
+            None,
+        ))
+        .await
+        .unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(super::super::fallback::ChainPeerTier {
+                peer_count: None,
+                peak_height: None,
+            });
+
+        let result = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(result.source, Source::Db, "the replica stopped serving");
+        assert_eq!(result.balance, 1_599_179_999_973, "the figure was withheld");
+        assert_eq!(
+            result.peak_height,
+            Some(REPLICA_PEAK),
+            "a stale answer must still say WHAT it is as of"
+        );
+        assert!(
+            !result.synced,
+            "a figure no peer height could corroborate was reported as current"
+        );
     }
 
     /// **Proves:** the coin read makes the SAME claim as the balance read about the same replica.
@@ -6060,8 +6138,13 @@ mod tests {
             "the fixture must carry a peak; without one it proves nothing"
         );
 
+        // Anchored to `replica_is_authoritative`, NOT to `db.is_synced()`: dig_ecosystem#2871
+        // replaced the latter at both production call sites feeding `route`, so a test still asking
+        // `is_synced` would describe a predicate no money read consults — green even if
+        // `replica_is_authoritative` started trusting a never-caught-up replica.
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
         assert_eq!(
-            routing::route(db.is_synced().await.unwrap(), true),
+            routing::route(be.replica_is_authoritative().await.unwrap(), true),
             Source::Fallback,
             "a replica with a peak but no completed catch-up was served as authoritative; it holds \
              no coins, so that answer is a dated zero for a funded wallet"
