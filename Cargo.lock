@@ -856,9 +856,9 @@ dependencies = [
 
 [[package]]
 name = "chia-query"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc05aab60f4b981bf8a0ecf2277f9c1547991134ef426a660dc9ed44a78db192"
+checksum = "f0edb60efb90cf0cf3238773489049828b85cb0f7d5e82b8ee1ec6b72084b3d6"
 dependencies = [
  "chia",
  "chia-protocol",
@@ -2493,7 +2493,7 @@ dependencies = [
  "bip39",
  "chia",
  "chia-protocol",
- "chia-query 0.6.1",
+ "chia-query 0.6.2",
  "chia-sdk-test",
  "chia-traits 0.26.0",
  "chia-wallet-sdk",
