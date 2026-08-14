@@ -864,6 +864,113 @@ pub fn may_elevate(round: &CorroborationRound, writer_answer: Option<Bytes32>) -
     }
 }
 
+/// WHY a round refused to elevate its writer — the three refusals [`may_elevate`] deliberately
+/// does not distinguish (dig_ecosystem#2868).
+///
+/// [`may_elevate`] answers a WRITE question and answers it closed: every one of these means
+/// "nothing may be written". This answers a different, purely diagnostic question — *which party
+/// is the anomaly* — because the two refusals point at opposite culprits and deserve opposite
+/// responses. It grants nothing; a caller can only ever use it to decide how quickly to give up on
+/// the peer, never to let the peer write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalReason {
+    /// The QUORUM reached no answer — a [`Verdict::Split`] or a [`Verdict::Insufficient`].
+    ///
+    /// The truth is unknown, so nothing whatsoever is known about the writer either. Accusing it
+    /// here would re-dial on every split, which is a dial loop dressed as a defence.
+    Undecided,
+    /// The quorum was decisive and the writer did not answer at all — a probe error, or an honest
+    /// `None`.
+    ///
+    /// Silence is not a contradiction. This is what a slow or busy peer looks like, and it is the
+    /// one refusal that is not evidence of anything.
+    WriterSilent,
+    /// The quorum was decisive and the writer answered something ELSE at the same settled height.
+    ///
+    /// This is the only refusal that names a culprit: past the lag filter, at a height the writer
+    /// did not choose, disagreeing with an independently drawn quorum is a lie, a partition, or a
+    /// fork — never ordinary lag.
+    WriterContradicted,
+}
+
+impl RefusalReason {
+    /// Whether this refusal is EVIDENCE that peers disagree about settled chain state — the thing
+    /// `splits` counts and [`quorum::PERSISTENT_DISAGREEMENT_ROUNDS`] escalates on.
+    ///
+    /// [`Self::WriterSilent`] is the one that is not. A peer that did not answer has contradicted
+    /// nothing, and counting it would walk a node with one slow peer toward a partition warning it
+    /// has no evidence for — a diagnostic that cries wolf is worse than no diagnostic, because the
+    /// real thing then reads as more of the same.
+    pub fn counts_as_disagreement(self) -> bool {
+        match self {
+            Self::Undecided | Self::WriterContradicted => true,
+            Self::WriterSilent => false,
+        }
+    }
+}
+
+/// Classify a refusal, or `None` when the round elevates its writer.
+///
+/// Kept BESIDE [`may_elevate`] rather than replacing it, and deliberately not consulted by it: the
+/// write gate stays one unchanged expression, so "a contradicting writer still may not write"
+/// remains true by construction rather than by review of this richer function.
+/// `refusal_agrees_with_may_elevate_on_every_input` pins the two together over the whole input
+/// space.
+///
+/// # The arm order is load-bearing
+///
+/// [`RefusalReason::Undecided`] is tested FIRST. Without a decisive quorum there is nothing for the
+/// writer to have contradicted, so an implementation that compared answers first would report a
+/// perfectly honest writer as a liar on every split — and the caller replaces a contradicting
+/// writer promptly, so that mistake is a re-dial on every split rather than a mere mislabel.
+pub fn refusal(
+    round: &CorroborationRound,
+    writer_answer: Option<Bytes32>,
+) -> Option<RefusalReason> {
+    let Some(agreed) = round.verdict.corroborated() else {
+        return Some(RefusalReason::Undecided);
+    };
+    match writer_answer {
+        None => Some(RefusalReason::WriterSilent),
+        Some(mine) if &mine != agreed => Some(RefusalReason::WriterContradicted),
+        Some(_) => None,
+    }
+}
+
+/// What a session may write, together with WHY it may not — the pair
+/// [`Supervisor::trust_for_session`] settles in one step.
+///
+/// The two travel together because a refusal decides both the authority (always
+/// [`sync::WriteAuthority::Discovered`]) and how long the session is worth holding, and a caller
+/// that received only the first would have to re-derive the second from `is_authoritative()` —
+/// which cannot tell the three refusals apart, and is exactly the fold this replaced.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTrust {
+    /// What this session may write.
+    pub authority: sync::WriteAuthority,
+    /// Why it was refused, or `None` when it was not.
+    pub refusal: Option<RefusalReason>,
+}
+
+impl SessionTrust {
+    /// A session that may write: there is no refusal to explain.
+    fn elevated(authority: sync::WriteAuthority) -> Self {
+        Self {
+            authority,
+            refusal: None,
+        }
+    }
+
+    /// A refused session. Every refusal path returns [`sync::WriteAuthority::Discovered`], which
+    /// writes nothing — the reason changes only how promptly the peer is replaced.
+    fn refused(reason: RefusalReason) -> Self {
+        Self {
+            authority: sync::WriteAuthority::Discovered,
+            refusal: Some(reason),
+        }
+    }
+}
+
 /// Evidence that the CHAIN advanced, drawn independently of the subscription session
 /// (dig_ecosystem#2851).
 ///
@@ -1174,7 +1281,8 @@ impl Supervisor {
             // higher peak would inflate apparent confirmation counts (see [`sync::PeerTrust`]
             // for the inversion that made this the vulnerability). It runs as a write-free
             // session, which is what powers the live sync status.
-            let authority = self.trust_for_session(&*session, &mut splits).await;
+            let SessionTrust { authority, refusal } =
+                self.trust_for_session(&*session, &mut splits).await;
             let trust = authority.trust();
             // Publish the trust the INSTANT it is settled, before a subscription set is resolved
             // for it — the order the supervisor genuinely learns the two facts. Until
@@ -1292,7 +1400,10 @@ impl Supervisor {
                 // decision back to the reconnect path, which draws an independent sample and runs
                 // the `Corroborator` again. That is what makes the "re-drawing a fresh sample" log
                 // line above TRUE; no new retry mechanism is introduced (dig_ecosystem#2827).
-                () = self.await_recorroboration(!trust.is_authoritative())
+                // HOW LONG it is held depends on which party the round accused: a writer caught
+                // contradicting a decisive quorum is replaced at once, rather than kept for another
+                // `RECORROBORATE_AFTER` while the replica goes unwritten (dig_ecosystem#2868).
+                () = self.await_recorroboration(refusal)
                     => SessionOutcome::Ended,
                 // The peer went silent while the chain kept moving. `run` above is parked on a
                 // `recv()` with no deadline, and for an AUTHORITATIVE subscribed session every
@@ -1368,14 +1479,10 @@ impl Supervisor {
     /// it is a floor the writer cannot inflate. It is fixed for the session and never ratchets —
     /// refreshing it is exactly what [`SESSION_MAX_LIFETIME`] rotation already does, which is the
     /// one place rotation REDUCES exposure rather than raising it.
-    async fn trust_for_session(
-        &self,
-        session: &dyn SyncSession,
-        splits: &mut u32,
-    ) -> sync::WriteAuthority {
+    async fn trust_for_session(&self, session: &dyn SyncSession, splits: &mut u32) -> SessionTrust {
         let dialed = session.trust();
         if dialed != PeerTrust::Discovered {
-            return match dialed {
+            return SessionTrust::elevated(match dialed {
                 // The operator hand-configured this address, and corroboration only runs on the
                 // discovery path below — so there is no independent anchor to build a ceiling
                 // from, and inventing one would second-guess an explicit configuration.
@@ -1383,17 +1490,20 @@ impl Supervisor {
                 // Unreachable in practice: `trust()` reports the DIAL source, which is never
                 // already-corroborated. Elevation is this function's own output.
                 PeerTrust::Corroborated | PeerTrust::Discovered => sync::WriteAuthority::Discovered,
-            };
+            });
         }
+        // Corroboration switched off, and a probe that reached nobody, are both rounds that reached
+        // no answer — `Undecided`, which accuses no one and holds the session for the unchanged
+        // `RECORROBORATE_AFTER`.
         let Some(corroborator) = self.corroborator.as_ref() else {
-            return sync::WriteAuthority::Discovered;
+            return SessionTrust::refused(RefusalReason::Undecided);
         };
 
         let round = match corroborator.corroborate().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::debug!(error = %e, "wallet sync: corroboration probe failed; the peer                      stays uncorroborated and writes nothing");
-                return sync::WriteAuthority::Discovered;
+                return SessionTrust::refused(RefusalReason::Undecided);
             }
         };
 
@@ -1406,30 +1516,42 @@ impl Supervisor {
             }
         };
 
-        if !may_elevate(&round, writer_answer) {
-            *splits = splits.saturating_add(1);
-            let persistent = *splits >= quorum::PERSISTENT_DISAGREEMENT_ROUNDS;
-            // A run of failures is not "the network is slow". A fresh random sample failing to
-            // agree, repeatedly, is what a partition and a sustained attack both look like from a
-            // light client, and retrying quietly forever would present both as a node that merely
-            // never finishes syncing.
-            if persistent {
-                tracing::warn!(
-                    consecutive = *splits,
-                    height = round.height,
-                    peer = %session.peer_ip(),
-                    verdict = ?round.verdict,
-                    "wallet sync: peers persistently disagree about settled chain state; the                      replica is deliberately NOT being written. This is evidence of a network                      partition or a hostile peer set, not of a slow connection."
-                );
-            } else {
-                tracing::info!(
-                    consecutive = *splits,
-                    height = round.height,
-                    verdict = ?round.verdict,
-                    "wallet sync: no corroborated answer this round; re-drawing a fresh sample"
-                );
+        // The write gate is still `may_elevate` and nothing else; this only names the refusal.
+        if let Some(reason) = refusal(&round, writer_answer) {
+            if reason.counts_as_disagreement() {
+                *splits = splits.saturating_add(1);
             }
-            return sync::WriteAuthority::Discovered;
+            // The escalation speaks for a STANDING condition and outranks the per-round lines
+            // below, which describe a single transient round. Emitting both would make an operator
+            // count one round twice.
+            if !Self::report_persistent_disagreement(&round, session, *splits) {
+                match reason {
+                    RefusalReason::Undecided => tracing::info!(
+                        consecutive = *splits,
+                        height = round.height,
+                        verdict = ?round.verdict,
+                        "wallet sync: no corroborated answer this round; re-drawing a fresh sample"
+                    ),
+                    // Named separately from the line above because this round knows WHICH peer to
+                    // be suspicious of, and "no corroborated answer" is not even true here: the
+                    // quorum answered, and the writer is the one who did not match it.
+                    RefusalReason::WriterContradicted => tracing::info!(
+                        consecutive = *splits,
+                        height = round.height,
+                        peer = %session.peer_ip(),
+                        verdict = ?round.verdict,
+                        "wallet sync: the writer contradicted an independent quorum about settled \
+                         chain state; replacing the writer rather than the round"
+                    ),
+                    RefusalReason::WriterSilent => tracing::info!(
+                        height = round.height,
+                        peer = %session.peer_ip(),
+                        "wallet sync: the writer could not answer the corroboration question; it \
+                         stays uncorroborated and writes nothing"
+                    ),
+                }
+            }
+            return SessionTrust::refused(reason);
         }
 
         *splits = 0;
@@ -1452,10 +1574,37 @@ impl Supervisor {
         // never the constant: `PeakCeiling`'s own doc says a hardcoded ceiling would silently
         // become too tight if the lifetime moved UP, and reading the constant here is exactly the
         // hardcoding it warns about (dig_ecosystem#2851, F3).
-        sync::WriteAuthority::Corroborated(sync::PeakCeiling::from_corroborated(
-            round.height,
-            self.session_lifetime,
+        SessionTrust::elevated(sync::WriteAuthority::Corroborated(
+            sync::PeakCeiling::from_corroborated(round.height, self.session_lifetime),
         ))
+    }
+
+    /// Surface a STANDING disagreement, and report whether it did.
+    ///
+    /// A run of refusals is not "the network is slow". Fresh random samples failing to agree, or a
+    /// writer contradicting them, repeatedly, is what a partition and a sustained attack both look
+    /// like from a light client, and retrying quietly forever would present both as a node that
+    /// merely never finishes syncing.
+    ///
+    /// Returns `true` when it warned, so each caller can emit its own — more specific, and
+    /// different per refusal — line only while the condition is still transient. Two lines about
+    /// one round would make an operator count one event twice.
+    fn report_persistent_disagreement(
+        round: &CorroborationRound,
+        session: &dyn SyncSession,
+        splits: u32,
+    ) -> bool {
+        if splits < quorum::PERSISTENT_DISAGREEMENT_ROUNDS {
+            return false;
+        }
+        tracing::warn!(
+            consecutive = splits,
+            height = round.height,
+            peer = %session.peer_ip(),
+            verdict = ?round.verdict,
+            "wallet sync: peers persistently disagree about settled chain state; the                      replica is deliberately NOT being written. This is evidence of a network                      partition or a hostile peer set, not of a slow connection."
+        );
+        true
     }
 
     /// Resolve once the subscription set stops being empty.
@@ -1474,17 +1623,43 @@ impl Supervisor {
         }
     }
 
-    /// Resolve once a REFUSED session has been held long enough to be worth re-corroborating.
+    /// Resolve once a REFUSED session has been held long enough to be worth replacing.
     ///
-    /// Returns a future that NEVER resolves when `retry` is false. An authoritative session has
+    /// Returns a future that NEVER resolves for `None`, which is an ELEVATED session. It has
     /// nothing to re-corroborate — it already cleared the quorum — and ending it would discard a
     /// live subscription and force a fresh catch-up from genesis, which is a worse failure than the
     /// one this exists to fix.
-    async fn await_recorroboration(&self, retry: bool) {
-        if !retry {
+    ///
+    /// # How long to hold a refused session depends on WHO the round accused
+    ///
+    /// A [`RefusalReason::WriterContradicted`] round has already identified the writer as the
+    /// anomaly: four independently drawn peers agreed and it said something else at a height it did
+    /// not choose. There is nothing to wait for — a re-corroboration puts the same question to the
+    /// same writer — so the session ends at once and the ordinary reconnect path dials a different
+    /// peer. Nothing is discarded by ending it: a refused session subscribes nothing and wrote
+    /// nothing.
+    ///
+    /// Every other refusal waits [`RECORROBORATE_AFTER`], unchanged. A split says nothing about
+    /// this writer, and silence says nothing about anything — replacing a peer on either would
+    /// re-dial on a condition the peer may not be the cause of.
+    ///
+    /// This introduces no new constant and no new dial rate. The replacement is bounded by the
+    /// EXISTING ladder: an ended session shorter than [`HEALTHY_SESSION`] does not reset backoff,
+    /// so a permanent, locally-caused mismatch converges on one dial per [`BACKOFF_MAX`].
+    async fn await_recorroboration(&self, refusal: Option<RefusalReason>) {
+        let Some(refusal) = refusal else {
             std::future::pending::<()>().await;
+            // `pending` never returns; this is unreachable and exists only to satisfy the type.
+            return;
+        };
+        match refusal {
+            // Not `sleep(ZERO)`: a zero rung in the sleep record is a wait that was never taken,
+            // and the ladder is read positionally.
+            RefusalReason::WriterContradicted => {}
+            RefusalReason::Undecided | RefusalReason::WriterSilent => {
+                self.time.sleep(RECORROBORATE_AFTER).await;
+            }
         }
-        self.time.sleep(RECORROBORATE_AFTER).await;
     }
 
     /// Resolve once this session has held the replica STILL for [`STALL_AFTER`] while the chain

@@ -90,6 +90,13 @@ struct Script {
     /// Heights the writer was asked about, in order, so a test can prove the writer never chose
     /// its own exam height.
     writer_asked_at: Mutex<Vec<u32>>,
+    /// When set, the writer's `header_hash_at` FAILS instead of answering.
+    ///
+    /// A separate knob from `writer_answer`, because a probe that errored and a peer that honestly
+    /// answered `None` reach `trust_for_session` by different routes, and a double that could only
+    /// express one of them could not show that both are treated as silence rather than as a lie
+    /// (dig_ecosystem#2868).
+    writer_errors: std::sync::atomic::AtomicBool,
     /// Sleep durations that NEVER return, so the timer they belong to cannot fire.
     ///
     /// This clock returns from every sleep immediately, which is what makes the backoff ladder
@@ -231,6 +238,9 @@ impl SyncSession for ScriptedSession {
 
     async fn header_hash_at(&self, height: u32) -> Result<Option<Bytes32>, SyncError> {
         self.script.writer_asked_at.lock().unwrap().push(height);
+        if self.script.writer_errors.load(Ordering::SeqCst) {
+            return Err(SyncError::Peer("scripted header_hash_at failure".into()));
+        }
         Ok(*self.script.writer_answer.lock().unwrap())
     }
 
@@ -3138,6 +3148,329 @@ fn elevation_requires_both_a_verdict_and_the_writers_agreement() {
     assert!(!may_elevate(&reached, None));
     assert!(!may_elevate(&split, Some(HONEST_HASH)));
     assert!(!may_elevate(&split, None));
+}
+
+// ---------------------------------------------------------------------------
+// Naming the refusal (dig_ecosystem#2868) — WHICH party the round accused
+// ---------------------------------------------------------------------------
+
+/// Every verdict a round can reach, so the table below is exhaustive rather than representative.
+fn every_verdict() -> Vec<Verdict<Bytes32>> {
+    vec![
+        unanimous(HONEST_HASH),
+        Verdict::MajorityWithDissent {
+            answer: HONEST_HASH,
+            agreed: quorum::QUORUM_HOLD - 1,
+            dissenters: vec!["203.0.113.9".into()],
+        },
+        Verdict::Split {
+            tallies: vec![2, 2],
+        },
+        Verdict::Insufficient {
+            answered: 1,
+            required: quorum::CORROBORATION_FLOOR,
+        },
+    ]
+}
+
+/// **Proves:** naming the refusal did not WIDEN the write gate by one input.
+///
+/// [`refusal`] is a richer function than [`may_elevate`] and sits beside it, so the risk it
+/// introduces is not that it mislabels something — it is that the two drift and some input becomes
+/// elevatable through the new door. This pins them together over the WHOLE input space: every
+/// verdict crossed with agreeing / contradicting / silent.
+///
+/// NEAREST WRONG IMPLEMENTATION: a `refusal` that returns `None` for a contradicting writer on a
+/// unanimous round — i.e. option (a), the quorum's answer being taken as the session's — which the
+/// supervisor would then read as "elevated" and hand the replica to a peer that just lied.
+#[test]
+fn refusal_agrees_with_may_elevate_on_every_input() {
+    for verdict in every_verdict() {
+        let round = CorroborationRound {
+            height: SETTLED_HEIGHT,
+            verdict,
+        };
+        for answer in [Some(HONEST_HASH), Some(LIARS_HASH), None] {
+            assert_eq!(
+                refusal(&round, answer).is_none(),
+                may_elevate(&round, answer),
+                "the refusal classifier and the write gate disagreed about {round:?} / {answer:?}"
+            );
+        }
+    }
+}
+
+/// **Proves:** a round the QUORUM could not decide never accuses the writer, whatever the writer
+/// said.
+///
+/// FIXTURE DESIGN — the writer answers something DIFFERENT from every peer's answer. That is the
+/// input that separates arm order from luck: a classifier comparing answers before checking the
+/// verdict returns `WriterContradicted` here, and a fixture in which the writer happened to agree
+/// would pass against it.
+///
+/// NEAREST WRONG IMPLEMENTATION: matching on `(corroborated, writer_answer)` and testing the
+/// answers first. It costs a re-dial on every split — the disagreement is with an undecided
+/// quorum, not with the peer — which is the dial loop this ticket's third constraint forbids.
+#[test]
+fn an_undecided_round_never_accuses_the_writer() {
+    for verdict in [
+        Verdict::Split {
+            tallies: vec![2, 2],
+        },
+        Verdict::Insufficient {
+            answered: 1,
+            required: quorum::CORROBORATION_FLOOR,
+        },
+    ] {
+        let round = CorroborationRound {
+            height: SETTLED_HEIGHT,
+            verdict,
+        };
+        for answer in [Some(HONEST_HASH), Some(LIARS_HASH), None] {
+            assert_eq!(
+                refusal(&round, answer),
+                Some(RefusalReason::Undecided),
+                "an undecided round blamed the writer for answering {answer:?}"
+            );
+        }
+    }
+    // The control: with a decisive quorum, the SAME contradicting answer is an accusation. Without
+    // this, the assertions above would also pass against a classifier that never accuses anyone.
+    let decisive = CorroborationRound {
+        height: SETTLED_HEIGHT,
+        verdict: unanimous(HONEST_HASH),
+    };
+    assert_eq!(
+        refusal(&decisive, Some(LIARS_HASH)),
+        Some(RefusalReason::WriterContradicted)
+    );
+}
+
+/// **Proves:** silence is not a contradiction, and it is not counted as one.
+///
+/// Both routes to silence are covered — an honest `Ok(None)` and a probe that errored — because
+/// production folds the error into `None` at the call site, and a test exercising only the honest
+/// route would not notice the fold being removed.
+///
+/// NEAREST WRONG IMPLEMENTATION: `writer_answer != Some(agreed)` as the contradiction test, which
+/// is true for `None` and so reports every slow peer as a liar. Its cost is not cosmetic: a liar is
+/// replaced at once AND counted toward [`quorum::PERSISTENT_DISAGREEMENT_ROUNDS`], so a merely busy
+/// peer would walk the node into a partition warning it has no evidence for.
+#[test]
+fn a_writer_that_could_not_answer_is_not_a_liar() {
+    let decisive = CorroborationRound {
+        height: SETTLED_HEIGHT,
+        verdict: unanimous(HONEST_HASH),
+    };
+    assert_eq!(
+        refusal(&decisive, None),
+        Some(RefusalReason::WriterSilent),
+        "a writer that did not answer was treated as having disagreed"
+    );
+    assert!(
+        !RefusalReason::WriterSilent.counts_as_disagreement(),
+        "silence was spent as evidence of peers disagreeing about settled chain state"
+    );
+    // The control: the two refusals that ARE evidence still count, so the assertion above cannot
+    // be satisfied by a predicate that counts nothing and thereby disarms the partition warning.
+    assert!(RefusalReason::Undecided.counts_as_disagreement());
+    assert!(RefusalReason::WriterContradicted.counts_as_disagreement());
+}
+
+/// Run one discovered-peer session against a scripted round, keeping the harness so the test can
+/// read the supervisor's timers rather than only the replica.
+///
+/// `writer_errors` makes the writer's probe FAIL rather than answer, which is the second route to
+/// [`RefusalReason::WriterSilent`].
+async fn refused_sessions(
+    verdict: Verdict<Bytes32>,
+    writer_answer: Option<Bytes32>,
+    writer_errors: bool,
+) -> (WalletDb, Harness) {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let script = Script::new();
+    *script.writer_answer.lock().unwrap() = writer_answer;
+    script.writer_errors.store(writer_errors, Ordering::SeqCst);
+    let hashes: Arc<dyn PuzzleHashSource> =
+        Arc::new(FixedHashes::unlocked(vec![Bytes32::new([7; 32])]));
+
+    let harness = Harness::start_full(
+        db.clone(),
+        hashes,
+        script,
+        vec!["203.0.113.1:8444".into()],
+        PeerTrust::Discovered,
+        Some(ScriptedCorroborator::new(verdict)),
+    )
+    .await;
+    // Two connects means the first session ENDED and the reconnect path ran — the state this
+    // ticket is about — rather than the supervisor merely having started.
+    harness
+        .until("a replacement session", |s| {
+            s.connects.load(Ordering::SeqCst) >= 2
+        })
+        .await;
+    (db, harness)
+}
+
+/// **Proves:** a writer caught contradicting a decisive quorum is replaced WITHOUT the
+/// [`RECORROBORATE_AFTER`] hold, and the quorum's answer still does not become a write.
+///
+/// FIXTURE DESIGN — exactly ONE actor varies from the healthy case: the quorum is honest and
+/// unanimous, and only the writer disagrees. An all-hostile fixture cannot see this property at
+/// all, because there would be no decisive quorum for the writer to be the odd one out of.
+///
+/// THE SECOND ASSERTION IS THE POINT, and it is about a PLACEMENT rather than an outcome. "The
+/// session ended" is satisfied identically by the pre-existing 45-second path, so a test asserting
+/// only that would pin a coincidence and stay green if the change were reverted. The observable
+/// that separates them is which duration the supervisor asked its clock for.
+///
+/// NEAREST WRONG IMPLEMENTATIONS: (a) taking the quorum's answer as the session's — caught by the
+/// replica staying empty and `catch_up` never being called; (b) leaving the hold at
+/// [`RECORROBORATE_AFTER`] for every refusal — caught by the sleep record.
+#[tokio::test]
+async fn a_contradicted_writer_ends_the_session_at_once_and_writes_nothing() {
+    let (db, harness) = refused_sessions(unanimous(HONEST_HASH), Some(LIARS_HASH), false).await;
+
+    assert!(
+        !harness
+            .script
+            .slept
+            .lock()
+            .unwrap()
+            .contains(&RECORROBORATE_AFTER),
+        "a writer already caught contradicting the quorum was still held for the \
+         re-corroboration interval"
+    );
+    // Nothing was written, and nothing was even attempted: a refused session subscribes nothing,
+    // so the catch-up is never entered. Option (a) would fail both.
+    assert_eq!(harness.script.catch_up_count(), 0);
+    harness.stop().await;
+    assert_eq!(db.sync_state().await.unwrap().peak_height, None);
+}
+
+/// **Proves:** the UNDECIDED round's behaviour is unchanged — it still waits
+/// [`RECORROBORATE_AFTER`] before drawing a fresh sample.
+///
+/// The control for the test above. Without it, "a contradicted session does not sleep" would also
+/// pass against a supervisor that stopped waiting for ANY refusal, which would turn every split
+/// into an immediate re-dial.
+#[tokio::test]
+async fn a_non_decisive_quorum_still_changes_nothing() {
+    let (db, harness) = refused_sessions(
+        Verdict::Split {
+            tallies: vec![2, 2],
+        },
+        Some(HONEST_HASH),
+        false,
+    )
+    .await;
+
+    assert!(
+        harness
+            .script
+            .slept
+            .lock()
+            .unwrap()
+            .contains(&RECORROBORATE_AFTER),
+        "a split round stopped holding the session for the re-corroboration interval"
+    );
+    assert_eq!(harness.script.catch_up_count(), 0);
+    harness.stop().await;
+    assert_eq!(db.sync_state().await.unwrap().peak_height, None);
+}
+
+/// **Proves:** a writer whose probe FAILED is held for the unchanged interval, not replaced at
+/// once — the supervisor-level half of `a_writer_that_could_not_answer_is_not_a_liar`.
+///
+/// FIXTURE DESIGN — the quorum is DECISIVE, so the round has every ingredient of an accusation
+/// except an answer to accuse. A split fixture would reach the same wait through
+/// [`RefusalReason::Undecided`] and prove nothing about how silence is treated.
+#[tokio::test]
+async fn a_writer_whose_probe_failed_is_not_replaced_at_once() {
+    let (_db, harness) = refused_sessions(unanimous(HONEST_HASH), Some(LIARS_HASH), true).await;
+
+    assert!(
+        harness
+            .script
+            .slept
+            .lock()
+            .unwrap()
+            .contains(&RECORROBORATE_AFTER),
+        "a writer that could not answer was replaced as though it had lied"
+    );
+    harness.stop().await;
+}
+
+/// **Proves:** a STANDING contradiction still reaches the partition warning — replacing the writer
+/// promptly did not disarm the escalation that says a light client is looking at a fork or a
+/// hostile peer set.
+///
+/// The warning is asserted from the LOG, because that is the only place it exists: `splits` is the
+/// supervisor's own local, and a test asserting on a counter it could reach would be asserting
+/// against the production predicate rather than against the operator-visible outcome.
+///
+/// NEAREST WRONG IMPLEMENTATION: not counting a contradiction toward the escalation — the tempting
+/// simplification, since the writer is being replaced anyway. It would mean a node whose every
+/// dialled peer contradicts the quorum reports nothing at all, which is precisely the silent
+/// never-finishes-syncing failure the escalation exists to break.
+#[tokio::test]
+async fn persistent_contradiction_still_reaches_the_partition_warning() {
+    let capture = Capture::default();
+    let guard = capture.install();
+
+    let (_db, harness) = refused_sessions(unanimous(HONEST_HASH), Some(LIARS_HASH), false).await;
+    let rounds = usize::try_from(quorum::PERSISTENT_DISAGREEMENT_ROUNDS).unwrap() + 1;
+    harness
+        .until("enough contradicted rounds to escalate", move |s| {
+            s.connects.load(Ordering::SeqCst) > rounds
+        })
+        .await;
+    harness.stop().await;
+
+    capture.assert_saw_the_supervisor();
+    let log = capture.contents();
+    assert!(
+        log.contains("peers persistently disagree about settled chain state"),
+        "a standing contradiction never escalated to the partition warning: {log}"
+    );
+    // The specific line is emitted too, so an operator can tell WHICH party the node suspects —
+    // the diagnostic the two-way fold could not give them.
+    assert!(
+        log.contains("the writer contradicted an independent quorum"),
+        "the log never named the writer as the anomaly: {log}"
+    );
+    drop(guard);
+}
+
+/// **Proves:** a permanently contradicting peer set converges on the EXISTING backoff ladder, and
+/// no new constant was introduced to bound the replacement.
+///
+/// This is the ticket's third constraint. Replacing a writer immediately is a dial loop unless
+/// something bounds it, and the something must be the ladder that is already there: a refused
+/// session is far shorter than [`HEALTHY_SESSION`], so backoff is not reset and doubles toward
+/// [`BACKOFF_MAX`].
+///
+/// NEAREST WRONG IMPLEMENTATION: resetting the ladder on a refused session, or ending it through a
+/// path that counts as healthy — either produces a sustained one-dial-per-second rate against the
+/// introducers for as long as the condition lasts.
+#[tokio::test]
+async fn repeated_contradiction_climbs_the_existing_backoff() {
+    let (_db, harness) = refused_sessions(unanimous(HONEST_HASH), Some(LIARS_HASH), false).await;
+    harness
+        .until("four backoff rungs", |s| s.slept.lock().unwrap().len() >= 4)
+        .await;
+    let delays = harness.script.slept.lock().unwrap().clone();
+    harness.stop().await;
+
+    for (i, base) in [1u64, 2, 4, 8].iter().enumerate() {
+        let d = delays[i];
+        assert!(
+            d >= Duration::from_millis(base * 800) && d <= Duration::from_millis(base * 1200),
+            "rung {i} should be the EXISTING ladder's ~{base}s (+/-20%), got {d:?} — a new \
+             constant, or a reset ladder, would show up here"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
