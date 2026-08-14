@@ -74,16 +74,63 @@ impl BalanceAsset {
         }
     }
 
-    /// The CAT asset id (bare lowercase hex) this asset scopes to, or `None` for native XCH
-    /// — the `asset_id` argument the DB / fallback reads take. Sourced from
-    /// `digstore_chain::dig::DIG_ASSET_ID` so the $DIG TAIL never drifts from the canonical
-    /// definition.
-    fn asset_id_hex(self) -> Option<String> {
+    /// The CAT TAIL this asset scopes to, or `None` for native XCH.
+    ///
+    /// The single spelling of $DIG's TAIL in this module, sourced from
+    /// `digstore_chain::dig::DIG_ASSET_ID` so it never drifts from the canonical definition.
+    /// [`Self::asset_id_hex`] is its hex rendering and [`Self::cat_coin_puzzle_hash`] its
+    /// puzzle-hash rendering; all three must name the same asset or a read can scope its two
+    /// tiers to different ones.
+    fn cat_asset_id(self) -> Option<Bytes32> {
         match self {
             Self::Xch => None,
-            Self::Dig => Some(hex::encode(digstore_chain::dig::DIG_ASSET_ID)),
+            Self::Dig => Some(digstore_chain::dig::DIG_ASSET_ID),
         }
     }
+
+    /// The CAT asset id (bare lowercase hex) this asset scopes to, or `None` for native XCH
+    /// — the `asset_id` argument the DB reads take.
+    fn asset_id_hex(self) -> Option<String> {
+        self.cat_asset_id().map(hex::encode)
+    }
+
+    /// The puzzle hash this asset's coins sit at when owned by `owner_puzzle_hash`, or `None`
+    /// for native XCH (whose coins sit at the owner hash itself).
+    ///
+    /// A CAT coin does NOT live at its owner's p2 puzzle hash: it lives at the OUTER hash that
+    /// curries the asset id (TAIL) around that p2 hash, and is merely HINTED to the p2 hash so a
+    /// wallet can find it. So this hash is what identifies a coin as belonging to this asset —
+    /// the exact fallback-tier equivalent of the DB tier's `hint IN (…) AND asset_id = ?`.
+    ///
+    /// Built from `digstore_chain::cat::cat_puzzle_hash`, the canonical construction the wallet's
+    /// CAT balance, coin reconstruction and send paths all already use. Never hand-rolled here: a
+    /// second spelling of a curry is a future byte-drift bug, and this one decides whether money
+    /// is counted.
+    ///
+    /// Fails on an owner hash that is not 32 bytes of hex rather than degrading to "no filter" —
+    /// an unusable scoping hash must fail the read, because the alternative is reporting every
+    /// hinted coin as this asset (dig_ecosystem#2879).
+    fn cat_coin_puzzle_hash(self, owner_puzzle_hash: &str) -> Result<Option<String>> {
+        let Some(asset_id) = self.cat_asset_id() else {
+            return Ok(None);
+        };
+        let owner = parse_puzzle_hash(owner_puzzle_hash)?;
+        Ok(Some(hex::encode(digstore_chain::cat::cat_puzzle_hash(
+            owner, asset_id,
+        ))))
+    }
+}
+
+/// A bare-or-`0x` puzzle-hash hex string as the 32 bytes it denotes.
+///
+/// An `Err` rather than an `Option` because every caller is inside a read that must FAIL on an
+/// unparseable hash: silently treating one as absent would drop the scoping it was needed for.
+fn parse_puzzle_hash(ph: &str) -> Result<Bytes32> {
+    let bytes = hex::decode(normalize_ph(ph))
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| Error::internal(format!("{ph:?} is not a 32-byte puzzle hash")))?;
+    Ok(Bytes32::from(bytes))
 }
 
 /// A DB coin row as a [`WalletCoin`].
@@ -1057,6 +1104,51 @@ impl WalletBackend {
     /// replica rather than the figure returned — so once a sync loop flips that flag, a
     /// third-party oracle read would report itself as a synced local read. Those two fields
     /// are therefore produced INSIDE the tier arms, never before the decision.
+    /// The chain-fallback coins of ONE asset held at `puzzle_hashes` — the fallback tier's
+    /// answer, scoped to the asset that was asked for.
+    ///
+    /// Shared verbatim by [`Self::balance_for_address`] and [`Self::coins_for_address`], which are
+    /// the same read reduced and unreduced. It lives here because the scoping is the subtle part:
+    /// duplicating it is how one copy came to be missing (dig_ecosystem#2879).
+    ///
+    /// # A hint is not an asset
+    ///
+    /// XCH coins sit AT the puzzle hash, so that read is asset-scoped by construction — nothing
+    /// but native XCH can be there, since a CAT lives at the outer hash currying its TAIL.
+    ///
+    /// CAT coins are HINTED to the puzzle hash, and `coin_records_by_hints` takes no asset
+    /// argument: it answers with EVERY coin hinted to the address — any CAT, and any plain XCH
+    /// coin whose spend carried a hint memo. Summing that answer as one asset reported a `$DIG`
+    /// balance nobody held, and reported it at `$DIG`'s scale rather than the coin's own: one
+    /// hinted XCH coin of 10^8 mojos (`0.0001 XCH`) rendered as `100000 $DIG`.
+    ///
+    /// So a hint read is FILTERED to the coins that live where this asset's coins live. Filtering
+    /// too hard is the same lie mirrored — a real `$DIG` holder shown a zero — so the filter keys
+    /// on the canonical CAT puzzle hash for the asset ([`BalanceAsset::cat_coin_puzzle_hash`])
+    /// rather than on anything heuristic.
+    async fn asset_scoped_fallback_coins(
+        &self,
+        asset: BalanceAsset,
+        puzzle_hashes: &[String],
+    ) -> Result<Vec<super::fallback::FallbackCoin>> {
+        let Some(_) = asset.cat_asset_id() else {
+            return self.fallback.coin_records_by_puzzle_hashes(puzzle_hashes).await;
+        };
+        // Every puzzle hash the caller asked about, rendered as the place this asset's coins for
+        // it would sit. A coin outside this set is hinted to us but belongs to something else.
+        let mut asset_hashes = HashSet::with_capacity(puzzle_hashes.len());
+        for ph in puzzle_hashes {
+            if let Some(h) = asset.cat_coin_puzzle_hash(ph)? {
+                asset_hashes.insert(h);
+            }
+        }
+        let hinted = self.fallback.coin_records_by_hints(puzzle_hashes).await?;
+        Ok(hinted
+            .into_iter()
+            .filter(|c| asset_hashes.contains(&normalize_ph(&c.puzzle_hash)))
+            .collect())
+    }
+
     pub async fn balance_for_address(
         &self,
         address: &str,
@@ -1157,12 +1249,10 @@ impl WalletBackend {
                     return Err(BalanceError::RateLimited);
                 }
                 let phs = [puzzle_hash];
-                // XCH coins sit AT the puzzle hash; CAT coins are HINTED to it.
-                let coins = match asset {
-                    BalanceAsset::Xch => self.fallback.coin_records_by_puzzle_hashes(&phs).await,
-                    BalanceAsset::Dig => self.fallback.coin_records_by_hints(&phs).await,
-                }
-                .map_err(read_err)?;
+                let coins = self
+                    .asset_scoped_fallback_coins(asset, &phs)
+                    .await
+                    .map_err(read_err)?;
                 let (mut balance, mut pending) = (0u128, 0u128);
                 for c in &coins {
                     if c.spent_height.is_some() {
@@ -1285,12 +1375,10 @@ impl WalletBackend {
                     return Err(BalanceError::RateLimited);
                 }
                 let phs = [puzzle_hash];
-                // XCH coins sit AT the puzzle hash; CAT coins are HINTED to it.
-                let coins = match asset {
-                    BalanceAsset::Xch => self.fallback.coin_records_by_puzzle_hashes(&phs).await,
-                    BalanceAsset::Dig => self.fallback.coin_records_by_hints(&phs).await,
-                }
-                .map_err(read_err)?;
+                let coins = self
+                    .asset_scoped_fallback_coins(asset, &phs)
+                    .await
+                    .map_err(read_err)?;
                 Ok(WalletCoinsResult {
                     coins: coins
                         .iter()
@@ -4450,6 +4538,12 @@ mod tests {
         encode_address(&owned_ph(), "xch").unwrap()
     }
 
+    /// A puzzle-hash hex string as the bytes the CAT curry takes. Panics on a bad fixture, which
+    /// is the right outcome for a test constant.
+    fn ph_bytes(ph: &str) -> Bytes32 {
+        parse_puzzle_hash(ph).unwrap()
+    }
+
     /// A public key standing in for an account enrolled through `control.wallet.watch`.
     ///
     /// Deliberately NOT `owned_ph`'s key: the enrolled address and the derivation-backed address
@@ -4657,6 +4751,153 @@ mod tests {
         assert_eq!(r.balance, 42, "confirmed fallback coin");
         assert_eq!(r.pending, 5, "unconfirmed fallback coin");
         assert_eq!(r.source, Source::Fallback);
+    }
+
+    /// A chain fallback that answers a HINT read the way the real one does: with EVERY coin
+    /// hinted to the address, whatever asset it belongs to.
+    ///
+    /// `get_coin_records_by_hints` has no asset parameter, so this is not a pessimistic double —
+    /// it is the shape of the tier. [`super::super::fallback::mock::MockFallback`] answers hint
+    /// reads with an empty list, which cannot express a multi-asset hint set at all and so cannot
+    /// see dig_ecosystem#2879.
+    struct EveryHintedCoin(Vec<FallbackCoin>);
+
+    #[async_trait::async_trait]
+    impl ChainFallback for EveryHintedCoin {
+        fn is_live(&self) -> bool {
+            true
+        }
+        async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {
+            Ok(self
+                .0
+                .iter()
+                .filter(|c| phs.contains(&c.puzzle_hash))
+                .cloned()
+                .collect())
+        }
+        async fn coin_records_by_hints(&self, _hints: &[String]) -> Result<Vec<FallbackCoin>> {
+            Ok(self.0.clone())
+        }
+        async fn coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
+            Ok(None)
+        }
+        async fn coin_spend(&self, _coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+            Ok(None)
+        }
+        async fn coin_records_by_parent(&self, _parent: &str) -> Result<Vec<FallbackCoin>> {
+            Ok(vec![])
+        }
+    }
+
+    /// The hinted-coin set every asset-scoping test below reads, and the truth about it.
+    ///
+    /// Returns `(fallback, owner_address)`. Every coin in it is hinted to the owner, so an
+    /// asset-blind read returns all of them:
+    ///
+    /// * a plain **XCH** coin at the owner's own p2 hash, `100_000_000` mojos — the reported case
+    ///   (dig_ecosystem#2879). `0.0001 XCH` is 10^8 mojos, and 10^8 base units rendered at
+    ///   `$DIG`'s 3 decimals is exactly `100000`, which is the figure the user was shown. It must
+    ///   NOT count toward `$DIG`.
+    /// * a genuine **`$DIG`** CAT coin, `12_345` base units — it MUST still count. The value
+    ///   carries significant digits low down on purpose: a round fixture passes under several
+    ///   scales, and this defect IS a scale confusion.
+    /// * a **foreign CAT** coin, `7_000_000` — a second asset hinted to the same address, so a
+    ///   filter applied at the wrong layer changes the answer instead of preserving it.
+    /// * a genuine **pending** `$DIG` coin, `678` — the pending figure must be asset-scoped too,
+    ///   not only the confirmed sum.
+    ///
+    /// So the truth is `balance == 12_345`, `pending == 678`, over exactly one coin each.
+    /// Summing the whole hint set answers `107_012_345`; discarding it answers `0`. Both are
+    /// wrong, and in opposite directions — an over-filtered read tells a real `$DIG` holder they
+    /// hold nothing, which is the same money lie mirrored.
+    fn hinted_multi_asset_fixture() -> (Arc<dyn ChainFallback>, String) {
+        let owner = ph_bytes(&owned_ph());
+        let dig_ph = hex::encode(digstore_chain::cat::cat_puzzle_hash(
+            owner,
+            digstore_chain::dig::DIG_ASSET_ID,
+        ));
+        let foreign_ph = hex::encode(digstore_chain::cat::cat_puzzle_hash(
+            owner,
+            Bytes32::from([0x33u8; 32]),
+        ));
+        let coins = vec![
+            fallback_coin("hinted-xch", &owned_ph(), 100_000_000, Some(10), None),
+            fallback_coin("real-dig", &dig_ph, 12_345, Some(10), None),
+            fallback_coin("foreign-cat", &foreign_ph, 7_000_000, Some(10), None),
+            fallback_coin("pending-dig", &dig_ph, 678, None, None),
+        ];
+        (
+            Arc::new(EveryHintedCoin(coins)),
+            encode_address(&owned_ph(), "xch").unwrap(),
+        )
+    }
+
+    /// **dig_ecosystem#2879 — a hint is not an asset.** A `$DIG` balance served by the chain
+    /// fallback counts ONLY `$DIG` coins.
+    ///
+    /// The fallback tier reads CAT coins by HINT, and a hint read is asset-blind by construction.
+    /// The pre-fix code computed the CAT asset id, applied it in the DB branch, dropped it in the
+    /// fallback branch, and summed every hinted coin as `$DIG` — reporting a holding the user does
+    /// not have. See [`hinted_multi_asset_fixture`] for why each coin in the fixture is there.
+    #[tokio::test]
+    async fn a_fallback_dig_balance_counts_only_dig_coins() {
+        let (fb, address) = hinted_multi_asset_fixture();
+        let be = backend_over(fb).await;
+
+        let r = be
+            .balance_for_address(&address, BalanceAsset::Dig)
+            .await
+            .unwrap();
+        assert_eq!(r.source, Source::Fallback, "the tier under test");
+        assert_eq!(
+            r.balance, 12_345,
+            "only the genuine $DIG coin — not the hinted XCH coin, not the foreign CAT"
+        );
+        assert_eq!(r.pending, 678, "the pending figure is asset-scoped too");
+    }
+
+    /// The other direction of the same read: an XCH balance is unaffected by the hinted CATs.
+    ///
+    /// Kept separate rather than folded above, because it is the control that proves the filter
+    /// did not simply suppress the fallback tier: the same fixture, the same address, a real
+    /// non-zero answer.
+    #[tokio::test]
+    async fn a_fallback_xch_balance_counts_only_the_coin_at_the_address() {
+        let (fb, address) = hinted_multi_asset_fixture();
+        let be = backend_over(fb).await;
+
+        let r = be
+            .balance_for_address(&address, BalanceAsset::Xch)
+            .await
+            .unwrap();
+        assert_eq!(
+            r.balance, 100_000_000,
+            "the coin AT the p2 hash; a CAT never sits there"
+        );
+    }
+
+    /// **The same defect in the coin LIST (dig_ecosystem#2879).** `coins_for_address` is the
+    /// balance read unreduced and shares its fallback branch verbatim, so it handed a caller
+    /// building a `$DIG` spend a set of XCH and foreign-CAT coins.
+    ///
+    /// Asserting the coin IDS, not the count: a count would pass for an implementation that kept
+    /// the wrong single coin.
+    #[tokio::test]
+    async fn a_fallback_dig_coin_list_contains_only_dig_coins() {
+        let (fb, address) = hinted_multi_asset_fixture();
+        let be = backend_over(fb).await;
+
+        let r = be
+            .coins_for_address(&address, BalanceAsset::Dig)
+            .await
+            .unwrap();
+        let mut ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["pending-dig", "real-dig"],
+            "the $DIG coins only — a spend built on the others would be built on foreign inputs"
+        );
     }
 
     /// **The instrument (#2233).** A coinset-served answer reports the FALLBACK tier and
