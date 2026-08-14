@@ -702,7 +702,10 @@ impl WalletBackend {
         if added > 0 {
             tracing::info!(
                 added,
-                "wallet watch: newly enrolled keys widened the followed set; the replica answers                  for none of it until a catch-up covers the widened set"
+                concat!(
+                    "wallet watch: newly enrolled keys widened the followed set; ",
+                    "the replica answers for none of it until a catch-up covers the widened set",
+                )
             );
         }
         Some(added)
