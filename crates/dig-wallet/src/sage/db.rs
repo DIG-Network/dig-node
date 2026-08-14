@@ -19,6 +19,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 use super::arrivals::{classify, Arrival, ArrivalBaseline, Verdict};
+use super::coverage::CoveredSet;
 use super::sync::AdmittedPeak;
 
 /// A handle to the local wallet database.
@@ -37,6 +38,13 @@ pub struct SyncState {
     /// Whether the initial puzzle-state catch-up has completed. Until this is `true`,
     /// wallet-data reads route to the coinset fallback so the caller never waits.
     pub initial_sync_complete: bool,
+    /// The puzzle-hash set the completed catch-up actually COVERED
+    /// ([`crate::sage::coverage::CoveredSet`]), or `None` where no sync has recorded one.
+    ///
+    /// `initial_sync_complete` says a catch-up finished; this says over WHICH addresses. The read
+    /// router needs both, because the followed set can widen after a catch-up completes
+    /// (dig_ecosystem#2871). `None` — a pre-#2871 replica — covers nothing: fail closed.
+    pub covered: Option<CoveredSet>,
 }
 
 /// A coin row (chain state for one coin the wallet tracks).
@@ -225,7 +233,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
     peak_height INTEGER,
     header_hash TEXT,
     initial_sync_complete INTEGER NOT NULL DEFAULT 0,
-    arrival_baseline_height INTEGER
+    arrival_baseline_height INTEGER,
+    covered_puzzle_hashes TEXT
 );
 INSERT OR IGNORE INTO sync_state (id, peak_height, header_hash, initial_sync_complete)
     VALUES (0, NULL, NULL, 0);
@@ -375,6 +384,11 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // arrives NULL — which is exactly right: an existing replica has never established a line
     // between history and news, so it records nothing until the next completed catch-up arms it.
     "ALTER TABLE sync_state ADD COLUMN arrival_baseline_height INTEGER",
+    // dig_ecosystem#2871. A pre-#2871 wallet DB may hold `initial_sync_complete = 1` from a
+    // catch-up whose covered set was never recorded, and the column arrives NULL. That is the
+    // fail-closed answer: coverage is unknown, so no address is treated as replica-backed until
+    // the next catch-up records the set it ran over.
+    "ALTER TABLE sync_state ADD COLUMN covered_puzzle_hashes TEXT",
 ];
 
 /// Evidence that a full address-history catch-up ran to COMPLETION.
@@ -396,6 +410,12 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
 pub struct CatchUpReplay {
     pub(super) peak_height: u32,
     pub(super) header_hash: String,
+    /// The puzzle-hash set this replay actually ran over.
+    ///
+    /// Carried on the replay rather than passed beside it so the completion write cannot describe
+    /// addresses the catch-up did not cover: the value is built from the subscription itself, and
+    /// there is no way to record a completion without one (dig_ecosystem#2871).
+    pub(super) covered: CoveredSet,
 }
 
 impl CatchUpReplay {
@@ -407,6 +427,11 @@ impl CatchUpReplay {
     /// The header hash of the block it finished at.
     pub fn header_hash(&self) -> &str {
         &self.header_hash
+    }
+
+    /// The puzzle-hash set this replay covered.
+    pub fn covered(&self) -> &CoveredSet {
+        &self.covered
     }
 }
 
@@ -463,7 +488,7 @@ impl WalletDb {
     /// Read the current sync state.
     pub async fn sync_state(&self) -> sqlx::Result<SyncState> {
         let row = sqlx::query(
-            "SELECT peak_height, header_hash, initial_sync_complete FROM sync_state WHERE id = 0",
+            "SELECT peak_height, header_hash, initial_sync_complete, covered_puzzle_hashes              FROM sync_state WHERE id = 0",
         )
         .fetch_one(&self.pool)
         .await?;
@@ -471,6 +496,9 @@ impl WalletDb {
             peak_height: row.get::<Option<i64>, _>("peak_height").map(|h| h as u32),
             header_hash: row.get::<Option<String>, _>("header_hash"),
             initial_sync_complete: row.get::<i64, _>("initial_sync_complete") != 0,
+            covered: row
+                .get::<Option<String>, _>("covered_puzzle_hashes")
+                .map(|stored| CoveredSet::from_storage(&stored)),
         })
     }
 
@@ -534,6 +562,22 @@ impl WalletDb {
         Ok(())
     }
 
+    /// Record the puzzle-hash set a NON-catch-up sync path covered — the oracle-tier refresh
+    /// ([`crate::sage::rpc::WalletBackend::refresh_tracked_coins`]), which fetches coins for a set
+    /// of addresses by point read and latches `initial_sync_complete` without replaying history.
+    ///
+    /// Deliberately separate from [`Self::complete_catch_up`], which is the only thing that may arm
+    /// the arrival baseline and the only thing that takes a [`CatchUpReplay`]. This path has
+    /// replayed nothing and has no terminal height to offer; what it CAN say honestly is which
+    /// addresses it fetched, and that is all this records.
+    pub async fn record_coverage(&self, covered: &CoveredSet) -> sqlx::Result<()> {
+        sqlx::query("UPDATE sync_state SET covered_puzzle_hashes = ? WHERE id = 0")
+            .bind(covered.to_storage())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Record that a full address-history catch-up finished: advance the peak, mark the replica
     /// authoritative, and ARM the arrival baseline — all in one transaction.
     ///
@@ -565,6 +609,7 @@ impl WalletDb {
                  peak_height = ?,
                  header_hash = ?,
                  initial_sync_complete = 1,
+                 covered_puzzle_hashes = ?,
                  arrival_baseline_height = COALESCE(
                      arrival_baseline_height,
                      MAX(?, COALESCE((SELECT MAX(created_height) FROM coins), 0))
@@ -573,6 +618,7 @@ impl WalletDb {
         )
         .bind(i64::from(replay.peak_height()))
         .bind(replay.header_hash())
+        .bind(replay.covered().to_storage())
         .bind(i64::from(replay.peak_height()))
         .execute(&mut *tx)
         .await?;
@@ -2158,7 +2204,7 @@ mod tests {
         assert_eq!(db.record_arrivals(&watched(), 30).await.unwrap(), 0);
 
         // Completing the catch-up arms the baseline at the history it just wrote...
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 30, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 30, "hh", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(30));
@@ -2177,7 +2223,7 @@ mod tests {
     #[tokio::test]
     async fn a_restart_replaying_the_same_coins_re_announces_nothing() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
         db.upsert_coin(&incoming("paid", 500, 101)).await.unwrap();
@@ -2185,7 +2231,7 @@ mod tests {
 
         // A restart: the catch-up replays from the genesis challenge and re-upserts everything.
         db.upsert_coin(&incoming("paid", 500, 101)).await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 101, "hh2").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 101, "hh2", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.record_arrivals(&watched(), 101).await.unwrap(), 0);
@@ -2204,7 +2250,7 @@ mod tests {
     #[tokio::test]
     async fn an_unconfirmed_coin_is_never_recorded_as_an_arrival() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2226,7 +2272,7 @@ mod tests {
     #[tokio::test]
     async fn our_own_change_is_not_announced_as_an_arrival() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2254,7 +2300,7 @@ mod tests {
     #[tokio::test]
     async fn change_is_refused_even_when_it_is_written_before_its_parent() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2282,7 +2328,7 @@ mod tests {
     #[tokio::test]
     async fn a_cat_arrival_carries_its_asset_id_and_waits_until_attributed() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2311,7 +2357,7 @@ mod tests {
     #[tokio::test]
     async fn a_reorg_unmakes_the_arrivals_it_unmakes_the_coins_for() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
         db.upsert_coins(&[incoming("kept", 1, 101), incoming("orphaned", 2, 110)])
@@ -2336,7 +2382,7 @@ mod tests {
     #[tokio::test]
     async fn the_arrival_cursor_is_monotonic_and_never_reused() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
         db.upsert_coin(&incoming("a", 1, 101)).await.unwrap();
@@ -2360,7 +2406,7 @@ mod tests {
     #[tokio::test]
     async fn funds_received_while_offline_are_announced_once_on_the_next_sync() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(100));
@@ -2369,7 +2415,7 @@ mod tests {
         db.upsert_coins(&[incoming("old", 1, 50), incoming("missed", 9, 150)])
             .await
             .unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 150, "hh2").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 150, "hh2", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(100));
@@ -2421,7 +2467,7 @@ mod tests {
             .map(|i| incoming(&format!("hist{i}"), 100, i * 1_000))
             .collect();
         db.upsert_coins(&history).await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 8_000, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 8_000, "hh", &[]).unwrap())
             .await
             .unwrap();
         assert_eq!(db.arrival_baseline().await.unwrap(), Some(8_000));
@@ -2451,7 +2497,7 @@ mod tests {
     async fn completing_a_catch_up_arms_the_baseline_over_everything_it_wrote() {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coin(&incoming("high", 1, 220)).await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 200, "hh").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 200, "hh", &[]).unwrap())
             .await
             .unwrap();
 
@@ -2498,7 +2544,7 @@ mod tests {
     #[tokio::test]
     async fn peak_and_sync_flag_round_trip() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        db.complete_catch_up(&CatchUpReplay::finished_at(None, 500, "deadbeef").unwrap())
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 500, "deadbeef", &[]).unwrap())
             .await
             .unwrap();
         let s = db.sync_state().await.unwrap();

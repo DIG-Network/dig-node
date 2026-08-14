@@ -811,7 +811,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.arrivals" => wallet_arrivals(ctx, id, params).await,
         "control.wallet.peak" => wallet_peak(ctx, id).await,
         "control.wallet.syncStatus" => wallet_sync_status(ctx, id).await,
-        "control.wallet.watch" => wallet_watch(ctx, id, params),
+        "control.wallet.watch" => wallet_watch(ctx, id, params).await,
         "control.wallet.unwatch" => wallet_unwatch(ctx, id, params),
         "control.wallet.watched" => wallet_watched(ctx, id),
         "control.peerCounts" => peer_counts(ctx, id).await,
@@ -2088,19 +2088,23 @@ async fn wallet_broadcast(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
 ///
 /// `control.wallet.watch` — register G1 public keys to follow. Idempotent, so a client may
 /// re-announce its account on every unlock.
-fn wallet_watch(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+async fn wallet_watch(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
     let keys = match parse_watch_keys("control.wallet.watch", &id, params) {
         Ok(k) => k,
         Err(e) => return e,
     };
-    let Some(registry) = ctx.wallet.watchlist() else {
+    // Routed through the backend rather than straight at the registry, and the registry's own
+    // `watch` is `pub(crate)` so this is the only door there is. Enrolment widens the set of
+    // addresses reads treat as replica-backed; the replica answers for that widened set only once a
+    // sync records covering it (dig_ecosystem#2871).
+    let Some(added) = ctx.wallet.watch_keys(&keys) else {
         return no_watchlist(id);
     };
-    let added = registry.watch(&keys);
-    control_ok(
-        id,
-        json!({ "added": added, "watched": registry.registered().len() }),
-    )
+    let watched = ctx
+        .wallet
+        .watchlist()
+        .map_or(0, |registry| registry.registered().len());
+    control_ok(id, json!({ "added": added, "watched": watched }))
 }
 
 /// `control.wallet.unwatch` — deregister keys, which genuinely stops the following: they leave the
