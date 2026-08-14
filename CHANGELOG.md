@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.119.0] - 2026-08-14
+
+### Features
+- **wallet:** Draw corroboration peers with exclusion instead of dial-and-discard (#226)
+
 ## [0.118.1] - 2026-08-14
 
 ### Bug Fixes
