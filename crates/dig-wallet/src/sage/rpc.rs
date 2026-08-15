@@ -255,8 +255,9 @@ pub struct WalletCoinByIdResult {
     /// The coin, or `None` when a chain source reported none (see the type doc for what that does
     /// and does not prove).
     pub coin: Option<WalletCoin>,
-    /// Which tier produced this answer. Always [`Source::Fallback`]: see
-    /// [`WalletBackend::coin_by_id`].
+    /// Which tier produced this answer — [`Source::Db`] where the node's own replica held the coin
+    /// and was authoritative for it, [`Source::Fallback`] otherwise. See
+    /// [`WalletBackend::coin_by_id`] for why a replica MISS is never an answer.
     ///
     /// [`Source::Fallback`] covers BOTH chain sub-tiers — a directly held peer and the coinset
     /// oracle — and this field does not say which one answered THIS read, because the tier
@@ -264,9 +265,13 @@ pub struct WalletCoinByIdResult {
     /// position to use: `chia_peer_count` on `control.wallet.syncStatus` (dig_ecosystem#2806).
     /// Naming the sub-tier per read would be a wire-contract change and is not made here.
     pub source: Source,
-    /// Always `false` — no local replica produced this answer.
+    /// Whether THIS answer is current: measured against the peers' announced peak on a
+    /// [`Source::Db`] answer, and always `false` on a [`Source::Fallback`] one, which the replica
+    /// neither produced nor bounds the freshness of.
     pub synced: bool,
-    /// Always `None` — a caller bounding confirmations reads `control.wallet.peak` instead.
+    /// The height this answer is as of — the replica's own peak on a [`Source::Db`] answer, and
+    /// `None` on a [`Source::Fallback`] one, where a caller bounding confirmations reads
+    /// `control.wallet.peak` instead.
     pub peak_height: Option<u32>,
 }
 
@@ -1427,15 +1432,34 @@ impl WalletBackend {
     /// that never landed and pass the binding check. Corroboration (dig_ecosystem#2456) must cover
     /// positive state, not only absence.
     ///
-    /// # The FALLBACK tier only, deliberately
+    /// # A HIT in the replica is answered from it; a MISS is not an answer at all
     ///
     /// This read does NOT go through [`routing::route`]. That router keys on whether the coin's
-    /// puzzle hash is one the node derives — which is not known until AFTER the coin is read — and,
-    /// more importantly, the local `coins` replica is populated only from the node's own
-    /// subscriptions. A miss there means "this node does not watch that coin", which is NOT
-    /// absence; serving it as absence would declare a live mint dead. So the answer always comes
-    /// from the chain tier, and says so: `source: fallback`, `synced: false`, `peak_height: null`.
-    /// A caller bounding confirmations reads [`chain_peak`](Self::chain_peak).
+    /// puzzle hash is one the node derives — which is not known until AFTER the coin is read — and
+    /// the local `coins` replica is populated only from the node's own subscriptions, so a MISS
+    /// there means "this node does not watch that coin", which is NOT absence; serving it as
+    /// absence would declare a live mint dead. So a miss falls through to the chain tier, always.
+    ///
+    /// A HIT is different, and reporting it as `source: fallback, synced: false` was
+    /// dig_ecosystem#2938: the node held the coin, knew the height it held it as of, and told every
+    /// caller it knew nothing. A warrant no read can ever carry is not strictness — it turns every
+    /// consumer-side guard built on it into an unconditional refusal, which is how a guarded mint
+    /// poll came to end in "the chain could not be reached" on a healthy node.
+    ///
+    /// So the three fields describe WHAT ANSWERED THIS READ, exactly as the address-scoped reads
+    /// do:
+    ///
+    /// - the replica HOLDS the coin and is authoritative
+    ///   ([`replica_is_authoritative`](Self::replica_is_authoritative)) — `source: db`, the
+    ///   replica's own `peak_height`, and `synced` measured by
+    ///   [`replica_answer_is_current`](Self::replica_answer_is_current) rather than assumed;
+    /// - anything else — the chain tier answers, and says so: `source: fallback`, `synced: false`,
+    ///   `peak_height: null`. A caller bounding confirmations reads [`chain_peak`](Self::chain_peak).
+    ///
+    /// The eligibility test is the SAME one the money reads use, not a second spelling of it, so
+    /// the replica cannot be trusted here at a moment it is distrusted there. The wrong answer this
+    /// ordering can produce is `fallback` for a coin the replica could have served — a read that is
+    /// merely more expensive. The opposite mistake would report an unwatched coin as proven absent.
     ///
     /// # The custody boundary (§908)
     ///
@@ -1445,6 +1469,12 @@ impl WalletBackend {
         &self,
         coin_id: &str,
     ) -> std::result::Result<WalletCoinByIdResult, BalanceError> {
+        // A coin the replica holds is served from the replica, ahead of the liveness check and the
+        // rate limiter: neither guards an egress this arm opens, and gating a purely local answer
+        // on a third party's reachability is the falsehood #2938 removes.
+        if let Some(answer) = self.replica_coin_by_id(coin_id).await? {
+            return Ok(answer);
+        }
         // No live source means the answer is UNKNOWN, never "no such coin" (#1851).
         if !self.fallback.is_live() {
             return Err(BalanceError::NoChainSource);
@@ -1470,6 +1500,49 @@ impl WalletBackend {
             synced: false,
             peak_height: None,
         })
+    }
+
+    /// The replica's own answer for `coin_id`, or `None` where it has none to give.
+    ///
+    /// `None` is deliberately the SAME value for both ways of having nothing to say — the replica
+    /// is not authoritative, or it is and simply does not hold this coin — because the caller does
+    /// the same thing with either: ask the chain. Distinguishing them here would invite a future
+    /// caller to treat the second as proven absence, which for a replica populated only from this
+    /// node's own subscriptions it never is.
+    ///
+    /// Freshness is MEASURED, not inherited from eligibility. `replica_is_authoritative` says the
+    /// replica may answer for a scope; `replica_answer_is_current` says whether what it answered is
+    /// at the tip. A replica that completed a catch-up and then fell behind still answers here, with
+    /// its real peak, labelled stale (dig_ecosystem#2869).
+    async fn replica_coin_by_id(
+        &self,
+        coin_id: &str,
+    ) -> std::result::Result<Option<WalletCoinByIdResult>, BalanceError> {
+        let db_err = |e: sqlx::Error| BalanceError::ReadFailed(e.to_string());
+        if !self.replica_is_authoritative().await.map_err(db_err)? {
+            return Ok(None);
+        }
+        let ids = [normalize_hex_id(coin_id)];
+        let Some(row) = self
+            .db
+            .coins_by_ids(&ids)
+            .await
+            .map_err(db_err)?
+            .into_iter()
+            .next()
+        else {
+            return Ok(None);
+        };
+        let coin = coin_from_row(&row).map_err(|e| BalanceError::ReadFailed(e.to_string()))?;
+        // The peak is read HERE, inside the arm, because it describes the replica this answer came
+        // from — it is not context for an answer taken elsewhere.
+        let peak_height = self.db.sync_state().await.map_err(db_err)?.peak_height;
+        Ok(Some(WalletCoinByIdResult {
+            coin: Some(coin),
+            source: Source::Db,
+            synced: self.replica_answer_is_current(peak_height).await,
+            peak_height,
+        }))
     }
 
     /// The SPEND that spent one coin (dig_ecosystem#2572).
@@ -4416,6 +4489,16 @@ pub(super) fn normalize_ph(ph: &str) -> String {
     ph.strip_prefix("0x").unwrap_or(ph).to_ascii_lowercase()
 }
 
+/// A hex identifier in the spelling the DB stores: bare, lowercase.
+///
+/// The `coins` table is written with `hex::encode`, so a lookup key must be reduced to that same
+/// spelling or a coin the replica holds reads as a miss. `control.wallet.coinById` already
+/// canonicalises its argument, but a direct Rust caller does not, and a normalisation applied only
+/// at the wire edge is one the library cannot rely on.
+fn normalize_hex_id(id: &str) -> String {
+    normalize_ph(id)
+}
+
 /// Decode a bech32m address into its puzzle-hash hex (any valid prefix).
 fn decode_address(address: &str) -> Option<String> {
     chia_wallet_sdk::utils::Address::decode(address)
@@ -5506,36 +5589,123 @@ mod tests {
         );
     }
 
-    /// **The by-id read never consults the local replica — pinned so an "optimisation" cannot
-    /// reintroduce the Db-miss-as-absence trap.**
+    /// A backend whose replica is authoritative at [`REPLICA_PEAK`], holds `held` and nothing else,
+    /// and whose chain tier holds `on_chain` — so every test below varies ONE actor against the
+    /// same truthful control.
     ///
-    /// The fixture is chosen to distinguish this from the nearest wrong implementation: the DB is
-    /// fully synced, holds a peak, AND holds the very coin being asked for, so a routed
-    /// implementation would answer `source: db, synced: true, peak_height: Some(500)` here. It
-    /// would also, on a coin the DB did NOT hold, report absence — which for a replica populated
-    /// only from this node's own subscriptions means "not watched", not "does not exist", and would
-    /// declare a live mint dead.
+    /// The two tiers deliberately report DIFFERENT amounts for the same coin id. That is what makes
+    /// "which tier answered" observable in the returned value rather than only in a flag, so a fix
+    /// that set the flags without moving the read fails here.
+    async fn by_id_backend(
+        held: &[CoinRow],
+        on_chain: Vec<FallbackCoin>,
+        peers: super::super::fallback::ChainPeerTier,
+    ) -> (WalletBackend, Arc<MockFallback>) {
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        db.upsert_coins(held).await.unwrap();
+        let fb = Arc::new(MockFallback::with_coins(on_chain));
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers);
+        (be, fb)
+    }
+
+    /// The replica's figure for the shared fixture coin, and the chain tier's. Unequal by
+    /// construction: an answer of `REPLICA_AMOUNT` could only have come from the replica.
+    const REPLICA_AMOUNT: u64 = 100;
+    const ORACLE_AMOUNT: u64 = 7;
+
+    /// **Proves:** a coin the replica HOLDS, on a replica that is authoritative and level with its
+    /// peers, is answered from the replica and SAYS SO — `source: db`, `synced: true`, and the
+    /// replica's real peak (dig_ecosystem#2938).
+    ///
+    /// THE DEFECT THIS PINS. All three fields were unconditional literals — `Fallback`, `false`,
+    /// `None` — emitted after an oracle read that ran whatever the node already knew. A consumer
+    /// guarding on that warrant could never obtain one, so the guard degenerated into an
+    /// unconditional refusal and ended every mint watch in "the chain could not be reached".
+    ///
+    /// FIXTURE DESIGN — the flags alone would not catch it. The two tiers report different amounts
+    /// for the same id, so this asserts the read actually MOVED, not merely that its labels
+    /// changed; and `call_count` pins that no oracle egress happened for a purely local answer.
     #[tokio::test]
-    async fn the_by_id_read_never_consults_the_local_replica() {
-        let db = db_with_owned_derivation(true, Some(500)).await;
-        db.upsert_coins(&[coin_at_ph("watched", &owned_ph(), 100, Some(10), None)])
-            .await
-            .unwrap();
-        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
-            "watched",
-            &owned_ph(),
-            7,
-            Some(11),
-            None,
-        )]));
-        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+    async fn a_coin_the_replica_holds_is_answered_from_the_replica_and_says_so() {
+        let (be, fb) = by_id_backend(
+            &[coin_at_ph(
+                "watched",
+                &owned_ph(),
+                REPLICA_AMOUNT,
+                Some(10),
+                None,
+            )],
+            vec![fallback_coin(
+                "watched",
+                &owned_ph(),
+                ORACLE_AMOUNT,
+                Some(11),
+                None,
+            )],
+            peers_level_at(REPLICA_PEAK),
+        )
+        .await;
 
         let r = be.coin_by_id("watched").await.unwrap();
 
         assert_eq!(
             r.coin.unwrap().amount,
-            7,
-            "the chain tier's figure, not the replica's"
+            REPLICA_AMOUNT,
+            "the replica's own figure, not the oracle's"
+        );
+        assert_eq!(r.source, Source::Db, "the tier that answered");
+        assert!(
+            r.synced,
+            "the node held the coin and reported knowing nothing"
+        );
+        assert_eq!(
+            r.peak_height,
+            Some(REPLICA_PEAK),
+            "the height this answer is as of"
+        );
+        assert_eq!(
+            fb.call_count(),
+            0,
+            "a local answer disclosed the coin id to the oracle"
+        );
+    }
+
+    /// **Proves:** a coin the replica does NOT hold still falls through to the chain tier, and is
+    /// never reported as an authoritative absence.
+    ///
+    /// The control that keeps the test above from being satisfied by "if authoritative, answer from
+    /// the DB". The replica here is authoritative and holds a DIFFERENT coin, so the wrong
+    /// implementation returns `coin: None, source: db, synced: true` — proven absence for a coin
+    /// this node merely does not watch, which would declare a live mint dead. Varying one actor
+    /// (which coin is asked for) keeps the rest of the fixture truthful.
+    #[tokio::test]
+    async fn a_coin_the_replica_does_not_hold_still_falls_through_to_the_chain() {
+        let (be, fb) = by_id_backend(
+            &[coin_at_ph(
+                "watched",
+                &owned_ph(),
+                REPLICA_AMOUNT,
+                Some(10),
+                None,
+            )],
+            vec![fallback_coin(
+                "unwatched",
+                &owned_ph(),
+                ORACLE_AMOUNT,
+                Some(11),
+                None,
+            )],
+            peers_level_at(REPLICA_PEAK),
+        )
+        .await;
+
+        let r = be.coin_by_id("unwatched").await.unwrap();
+
+        assert_eq!(
+            r.coin.expect("a replica miss is not an absence").amount,
+            ORACLE_AMOUNT,
+            "the chain tier's figure"
         );
         assert_eq!(fb.call_count(), 1, "the chain tier really ran");
         assert_eq!(r.source, Source::Fallback);
@@ -5543,6 +5713,91 @@ mod tests {
         assert_eq!(
             r.peak_height, None,
             "a caller bounding confirmations reads control.wallet.peak"
+        );
+    }
+
+    /// **Proves:** holding the coin is not enough — a replica that is NOT authoritative for the set
+    /// it follows falls through to the chain tier for a coin it holds.
+    ///
+    /// The second control, and the one that keeps the eligibility test from being dropped as
+    /// redundant. The fixture varies ONE thing from the passing case: a key is enrolled that the
+    /// completed catch-up never covered, so the followed set outgrows the covered one (the #2871
+    /// widening), while the coin, the peak and the peer tier are unchanged. An implementation that
+    /// keys only on "is the coin in the DB" answers `REPLICA_AMOUNT` here — serving money from a
+    /// replica that was never asked to follow it.
+    #[tokio::test]
+    async fn a_coin_held_by_a_non_authoritative_replica_is_not_served_from_it() {
+        let (registry, _dir) = registry_with_key(&enrolled_key());
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        db.upsert_coins(&[coin_at_ph(
+            "watched",
+            &owned_ph(),
+            REPLICA_AMOUNT,
+            Some(10),
+            None,
+        )])
+        .await
+        .unwrap();
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "watched",
+            &owned_ph(),
+            ORACLE_AMOUNT,
+            Some(11),
+            None,
+        )]));
+        let widened = WalletBackend::new(db, fb, WalletConfig::default())
+            .with_watchlist(registry)
+            .with_chain_peer_tier_for_tests(peers_level_at(REPLICA_PEAK));
+
+        let r = widened.coin_by_id("watched").await.unwrap();
+
+        assert_eq!(
+            r.coin.unwrap().amount,
+            ORACLE_AMOUNT,
+            "a replica that does not cover what it follows served money anyway"
+        );
+        assert_eq!(r.source, Source::Fallback);
+        assert!(!r.synced);
+    }
+
+    /// **Proves:** the replica-served answer's `synced` is MEASURED, not a literal — a replica that
+    /// fell behind its peers serves the coin it holds, with its real peak, labelled stale.
+    ///
+    /// Without this, the passing case above is satisfied by `synced: true` hardcoded in the new
+    /// arm, which is the #2869 defect reintroduced one read over. Varying only the peer tier keeps
+    /// every other actor honest, and asserting the coin AND the peak pins "stale but still served"
+    /// rather than "withheld".
+    #[tokio::test]
+    async fn a_behind_replica_serves_the_coin_it_holds_and_says_it_is_not_current() {
+        let (be, _fb) = by_id_backend(
+            &[coin_at_ph(
+                "watched",
+                &owned_ph(),
+                REPLICA_AMOUNT,
+                Some(10),
+                None,
+            )],
+            vec![],
+            peers_ahead_of_the_replica(),
+        )
+        .await;
+
+        let r = be.coin_by_id("watched").await.unwrap();
+
+        assert_eq!(r.source, Source::Db, "the replica stopped serving");
+        assert_eq!(
+            r.coin.unwrap().amount,
+            REPLICA_AMOUNT,
+            "the figure was withheld"
+        );
+        assert_eq!(
+            r.peak_height,
+            Some(REPLICA_PEAK),
+            "a stale answer must still say WHAT it is as of"
+        );
+        assert!(
+            !r.synced,
+            "a replica {PEERS_AHEAD_BY} blocks behind reported its answer as current"
         );
     }
 
