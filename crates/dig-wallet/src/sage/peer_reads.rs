@@ -212,8 +212,25 @@ impl PeerCorroboratedReads {
         };
 
         if let Some(coin) = answer {
+            // **The answer must be about the coin that was ASKED for.** A vote settles which answer
+            // the peers agree on; it cannot settle whether they answered the right question, and
+            // `quorum.rs` says so directly: a majority "would let a majority of peers overrule a
+            // check that cannot be wrong."
+            //
+            // Without this, two colluding peers — a full quorum, since `required_agreement(2) == 2`
+            // — answer a request for X with a `CoinState` for any coin Y they choose, agree with
+            // each other, and the walk continues down a substituted lineage. Recomputing the id
+            // from the coin the peer sent does NOT catch it: that binds the coin to itself, which
+            // every coin satisfies.
+            //
+            // Cheap and absolute, because a coin id IS the coin's hash — arithmetic no vote can
+            // outrank.
+            bind_to_request(coin, &id, "coin record")?;
             self.db
-                .put_chain_read(&cache_row(coin, self.clock.now_unix()))
+                // Keyed on the REQUESTED id, never the answer's: a row written under the answer's
+                // id would be a permanent entry for a question nobody asked, served later without
+                // corroboration.
+                .put_chain_read(&cache_row(coin, &id, self.clock.now_unix()))
                 .await
                 .map_err(|e| Error::internal(format!("chain-read cache write failed: {e}")))?;
         }
@@ -237,7 +254,14 @@ impl PeerCorroboratedReads {
             .await
             .map_err(|e| Error::internal(format!("chain-spend cache read failed: {e}")))?
         {
-            return Ok(Some(spend_from_cache(&row)?));
+            let spend = spend_from_cache(&row)?;
+            // The cached path re-runs the SAME reveal check the live path applies per peer. A check
+            // that only guards the wire is a check an attacker routes around by getting one row
+            // written — and spend rows never expire, so a bad row would be served, uncorroborated,
+            // forever. Cheap: a hash of bytes already in hand.
+            super::fallback::verified_reveal_hex(&spend.puzzle_reveal, &spend.puzzle_hash)?;
+            bind_spend_to_request(&spend, &id)?;
+            return Ok(Some(spend));
         }
 
         let peers = self.sample.draw().await;
@@ -257,8 +281,13 @@ impl PeerCorroboratedReads {
         };
 
         if let Some(spend) = answer {
+            // The same binding, and it matters more here: `verified_reveal_hex` ties the puzzle
+            // reveal to a puzzle hash, but **the solution is bound by nothing**. So a spend accepted
+            // for the wrong coin persists a forged solution indefinitely — the spend rows have no
+            // TTL, because a spend is immutable once it exists.
+            bind_spend_to_request(spend, &id)?;
             self.db
-                .put_chain_spend(&spend_row(spend))
+                .put_chain_spend(&spend_row(spend, &id))
                 .await
                 .map_err(|e| Error::internal(format!("chain-spend cache write failed: {e}")))?;
         }
@@ -306,10 +335,48 @@ fn parse_coin_id(id: &str) -> Result<Bytes32> {
     Ok(Bytes32::from(array))
 }
 
+/// Refuse an answer that is not about the coin that was asked for.
+///
+/// # Why a vote cannot cover this
+///
+/// `quorum::tally` settles which answer the peers agree on. It cannot settle whether they answered
+/// the right question — and `quorum.rs` names that hazard outright: a majority "would let a majority
+/// of peers overrule a check that cannot be wrong."
+///
+/// A coin id IS the coin's hash, so this is arithmetic. Two colluding peers are a full quorum
+/// (`required_agreement(2) == 2`), so without it they can answer a request for X with a coin of
+/// their choosing and be believed unanimously.
+///
+/// Note what does NOT work: recomputing the id from the coin the peer sent. That binds the coin to
+/// itself, which every coin satisfies. The comparison has to be against the REQUESTED id.
+fn bind_to_request(coin: &FallbackCoin, requested: &str, what: &str) -> Result<()> {
+    if normalized(&coin.coin_id) == requested {
+        return Ok(());
+    }
+    Err(Error::internal(format!(
+        "{what}: peers agreed on a coin that is not the one asked for (requested {requested}, \
+         answered {})",
+        normalized(&coin.coin_id)
+    )))
+}
+
+/// The same binding for a spend.
+fn bind_spend_to_request(spend: &FallbackCoinSpend, requested: &str) -> Result<()> {
+    if normalized(&spend.coin_id) == requested {
+        return Ok(());
+    }
+    Err(Error::internal(format!(
+        "coin spend: peers agreed on a spend of a coin that is not the one asked for (requested \
+         {requested}, answered {})",
+        normalized(&spend.coin_id)
+    )))
+}
+
 /// A corroborated coin, as the cache stores it.
-fn cache_row(coin: &FallbackCoin, now: i64) -> ChainReadCacheRow {
+fn cache_row(coin: &FallbackCoin, requested: &str, now: i64) -> ChainReadCacheRow {
     ChainReadCacheRow {
-        coin_id: coin.coin_id.clone(),
+        // The REQUESTED id, so a row can only ever answer the question it was asked.
+        coin_id: requested.to_string(),
         parent_coin_info: coin.parent_coin_info.clone(),
         puzzle_hash: coin.puzzle_hash.clone(),
         // Decimal string, matching `coins.amount`: SQLite's INTEGER is signed, so a mojo count
@@ -341,9 +408,10 @@ fn coin_from_cache(row: &ChainReadCacheRow) -> Result<FallbackCoin> {
 }
 
 /// A corroborated spend, as the cache stores it.
-fn spend_row(spend: &FallbackCoinSpend) -> ChainSpendCacheRow {
+fn spend_row(spend: &FallbackCoinSpend, requested: &str) -> ChainSpendCacheRow {
     ChainSpendCacheRow {
-        coin_id: spend.coin_id.clone(),
+        // The REQUESTED id. Spend rows have no TTL, so a row under the wrong key is permanent.
+        coin_id: requested.to_string(),
         parent_coin_info: spend.parent_coin_info.clone(),
         puzzle_hash: spend.puzzle_hash.clone(),
         amount: spend.amount.to_string(),

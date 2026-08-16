@@ -186,15 +186,29 @@ impl DialedPeerSample {
         }
     }
 
-    /// Whether the held sample may still be used: young enough, and still wide enough to
-    /// corroborate anything.
+    /// Whether the held sample may still be used: young enough, and **not narrowed at all**.
+    ///
+    /// # Why any attrition forces a redraw, rather than attrition down to the floor
+    ///
+    /// `failed` is sticky and monotone, so within one [`SAMPLE_LIFETIME`] a sample only ever loses
+    /// members. Tolerating loss down to [`quorum::CORROBORATION_FLOOR`] lets an attacker CHOOSE the
+    /// quorum: honest peers that hiccup once are dropped permanently while peers that always answer
+    /// never are, so a four-peer sample ratchets to the two peers most eager to reply — and two is a
+    /// full quorum, since `required_agreement(2) == 2`. Forcing that attrition is cheap, because the
+    /// endpoint feeding these reads is token-less.
+    ///
+    /// So the bar is the size the sample was DRAWN at. Losing a peer costs a redraw, which is a few
+    /// dials; the alternative costs the property the whole module exists for. A narrowing sample is
+    /// exactly when fresh peers are most needed, and the old rule kept them out at that moment.
     fn still_usable(held: &Held) -> bool {
         let live = held
             .peers
             .iter()
             .filter(|p| !p.failed.load(Ordering::Relaxed))
             .count();
-        held.drawn_at.elapsed() < SAMPLE_LIFETIME && live >= quorum::CORROBORATION_FLOOR
+        held.drawn_at.elapsed() < SAMPLE_LIFETIME
+            && live >= held.peers.len()
+            && live >= quorum::CORROBORATION_FLOOR
     }
 
     /// Dial up to [`quorum::QUORUM_SAMPLE`] distinct, independently discovered peers.

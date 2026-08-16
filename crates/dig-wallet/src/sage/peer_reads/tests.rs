@@ -56,11 +56,29 @@ fn spend(solution: &str) -> FallbackCoinSpend {
     FallbackCoinSpend {
         coin_id: COIN_ID.to_string(),
         parent_coin_info: "bb".repeat(32),
-        puzzle_hash: "cc".repeat(32),
+        puzzle_hash: reveal_tree_hash(REVEAL),
         amount: 1,
-        puzzle_reveal: "ff01".to_string(),
+        puzzle_reveal: REVEAL.to_string(),
         solution: solution.to_string(),
     }
+}
+
+/// A real, minimal CLVM program: the nil atom.
+///
+/// It has to be a program that actually parses, because the reveal check tree-hashes it. The
+/// previous fixture used `ff01` — a truncated cons — with an unrelated `cc..` puzzle hash, and only
+/// passed because the cached read path skipped the verification the live path applies. A fixture
+/// that cannot survive the real check is a fixture that hides the check going missing.
+const REVEAL: &str = "80";
+
+/// The puzzle hash `REVEAL` actually tree-hashes to, computed rather than pasted.
+///
+/// Derived so the fixture is self-consistent by construction: a hard-coded pair drifts the moment
+/// either half is edited, and the drift shows up as an unrelated-looking parse failure.
+fn reveal_tree_hash(reveal: &str) -> String {
+    let bytes = hex::decode(reveal).expect("the fixture reveal is hex");
+    let hash = chia::clvm_utils::tree_hash_from_bytes(&bytes).expect("the fixture reveal is CLVM");
+    hex::encode(hash.to_bytes())
 }
 
 /// What one peer will say, including refusing to say anything.
@@ -454,6 +472,78 @@ async fn a_dissenting_peer_cannot_decide_what_a_coin_became() {
         reads.coin_spend(COIN_ID).await.unwrap(),
         Some(spend("80")),
         "the majority's spend must win"
+    );
+}
+
+/// **A unanimous quorum cannot answer a question nobody asked.**
+///
+/// The attack the vote structurally cannot see: every peer in the sample agrees, so `tally` returns
+/// `Unanimous` — but they agree about a DIFFERENT coin than the one requested. Two colluding peers
+/// are already a full quorum (`required_agreement(2) == 2`), so this needs no majority of the
+/// network.
+///
+/// Recomputing the id from the coin the peer sent does not catch it, which is why the check has to
+/// compare against the REQUESTED id: a coin's id is the hash of its own fields, so deriving it from
+/// the answer binds the coin to itself, and every coin satisfies that.
+///
+/// The harm is not only the wrong answer. The walk continues down a substituted lineage — rendering
+/// someone else's profile as the user's — and the round writes a cache row that outlives it.
+#[tokio::test]
+async fn a_unanimous_sample_cannot_substitute_a_different_coin() {
+    let other = FallbackCoin {
+        coin_id: "ee".repeat(32),
+        ..coin(1, Some(100))
+    };
+    assert_ne!(other.coin_id, COIN_ID, "the fixture must substitute");
+
+    // EVERY peer agrees — this is not a dissent case. The tally is unanimous and still wrong.
+    let voices: Vec<Voice> = (0..4).map(|_| Voice::Record(Some(other.clone()))).collect();
+    let (reads, db, _) = reads_over(voices).await;
+
+    let outcome = reads.coin_record_by_id(COIN_ID).await;
+    assert!(
+        outcome.is_err(),
+        "a unanimous answer about another coin was accepted: {outcome:?}"
+    );
+
+    // And nothing was written. A row keyed on the answer's id would be a permanent entry for a
+    // question nobody asked, later served with no corroboration at all.
+    assert!(
+        db.cached_chain_read(&other.coin_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "the substituted coin was cached"
+    );
+    assert!(
+        db.cached_chain_read(COIN_ID).await.unwrap().is_none(),
+        "a row was written for the requested id from a substituted answer"
+    );
+}
+
+/// The same binding for a spend, where the stakes are higher.
+///
+/// `verified_reveal_hex` ties the puzzle reveal to a puzzle hash, but the SOLUTION is bound by
+/// nothing — and the solution is the half that says what the coin became. Spend rows also have no
+/// TTL, because a spend is immutable once it exists, so a row accepted here is permanent.
+#[tokio::test]
+async fn a_unanimous_sample_cannot_substitute_a_different_spend() {
+    let other = FallbackCoinSpend {
+        coin_id: "ee".repeat(32),
+        ..spend("80")
+    };
+
+    let voices: Vec<Voice> = (0..4).map(|_| Voice::Spend(Some(other.clone()))).collect();
+    let (reads, db, _) = reads_over(voices).await;
+
+    let outcome = reads.coin_spend(COIN_ID).await;
+    assert!(
+        outcome.is_err(),
+        "a unanimous spend of another coin was accepted: {outcome:?}"
+    );
+    assert!(
+        db.cached_chain_spend(COIN_ID).await.unwrap().is_none(),
+        "a permanent spend row was written from a substituted answer"
     );
 }
 
