@@ -925,6 +925,49 @@ mod tests {
         }
     }
 
+    /// **Both `profile` verbs parse from a real command line AND carry their operands.**
+    ///
+    /// The enforcing lists (`cli_covered_control_methods`, `CONTROL_METHODS`) are satisfied by an
+    /// ACTION VARIANT merely existing — which is exactly how `control.wallet.coinById` once shipped
+    /// with no clap subcommand behind it while every gate stayed green (dig_ecosystem#2376). So
+    /// this drives the actual parser and then asserts the parsed operands reach `wire_params`: a
+    /// verb that parsed but dropped its body would leave the node refusing every call for a
+    /// missing `body_b64`, and a method-name-only assertion could not see that.
+    #[test]
+    fn the_profile_verbs_parse_and_carry_their_operands() {
+        const STORE: &str =
+            "1111111111111111111111111111111111111111111111111111111111111111";
+        const ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+        const BODY: &str = "RElHUAE=";
+
+        let put = Cli::try_parse_from([
+            "dig-node", "profile", "put-body", STORE, ROOT, BODY,
+        ])
+        .expect("`profile put-body` parses");
+        let Some(Command::Profile { action }) = put.command else {
+            panic!("parsed to something other than `profile`");
+        };
+        let put = profile_action(action);
+        assert_eq!(put.method(), "control.profile.putBody");
+        assert_eq!(
+            put.wire_params(),
+            serde_json::json!({ "store_id": STORE, "root": ROOT, "body_b64": BODY }),
+            "the operands the user typed must reach the wire"
+        );
+
+        let get = Cli::try_parse_from(["dig-node", "profile", "get-body", STORE, ROOT])
+            .expect("`profile get-body` parses");
+        let Some(Command::Profile { action }) = get.command else {
+            panic!("parsed to something other than `profile`");
+        };
+        let get = profile_action(action);
+        assert_eq!(get.method(), "control.profile.getBody");
+        assert_eq!(
+            get.wire_params(),
+            serde_json::json!({ "store_id": STORE, "root": ROOT })
+        );
+    }
+
     /// **Every wallet control method is reachable from an argv a user can actually type.**
     ///
     /// `control_cli::cli_covered_control_methods` is the drift gate that claims each `control.*`
