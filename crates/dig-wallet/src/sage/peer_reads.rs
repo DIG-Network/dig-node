@@ -182,14 +182,32 @@ impl PeerCorroboratedReads {
         let id = normalized(coin_id);
         let parsed = parse_coin_id(&id)?;
 
+        let now = self.clock.now_unix();
         if let Some(row) = self
             .db
-            .cached_chain_read(&id)
+            .cached_chain_read(&id, now)
             .await
             .map_err(|e| Error::internal(format!("chain-read cache read failed: {e}")))?
         {
-            if cache_entry_is_usable(row.spent_height, row.cached_at, self.clock.now_unix()) {
-                return Ok(Some(coin_from_cache(&row)?));
+            if cache_entry_is_usable(row.spent_height, row.cached_at, now) {
+                let coin = coin_from_cache(&row)?;
+                // The row is re-checked on the way OUT, not merely on the way in
+                // (dig_ecosystem#3035). Today the only production writer of this table binds at
+                // write time, so the row cannot be foreign — but that is a property of the current
+                // call graph, not of this read, and a second writer would arrive silently.
+                // Recomputing the id from the row's own three fields is arithmetic no writer can
+                // outrank, and it costs one hash of bytes already in hand.
+                //
+                // What it does NOT cover is deliberate: `spent_height` and `cached_at` are outside
+                // the id, and they are exactly the fields [`cache_entry_is_usable`] governs above.
+                bind_fields_to_key(
+                    &coin.parent_coin_info,
+                    &coin.puzzle_hash,
+                    coin.amount,
+                    &id,
+                    "cached coin record",
+                )?;
+                return Ok(Some(coin));
             }
         }
 
@@ -230,7 +248,7 @@ impl PeerCorroboratedReads {
                 // Keyed on the REQUESTED id, never the answer's: a row written under the answer's
                 // id would be a permanent entry for a question nobody asked, served later without
                 // corroboration.
-                .put_chain_read(&cache_row(coin, &id, self.clock.now_unix()))
+                .put_chain_read(&cache_row(coin, &id, now), now)
                 .await
                 .map_err(|e| Error::internal(format!("chain-read cache write failed: {e}")))?;
         }
@@ -247,10 +265,11 @@ impl PeerCorroboratedReads {
         let id = normalized(coin_id);
         let parsed = parse_coin_id(&id)?;
 
+        let now = self.clock.now_unix();
         // No freshness test: a cached spend is immutable by construction.
         if let Some(row) = self
             .db
-            .cached_chain_spend(&id)
+            .cached_chain_spend(&id, now)
             .await
             .map_err(|e| Error::internal(format!("chain-spend cache read failed: {e}")))?
         {
@@ -260,7 +279,18 @@ impl PeerCorroboratedReads {
             // written — and spend rows never expire, so a bad row would be served, uncorroborated,
             // forever. Cheap: a hash of bytes already in hand.
             super::fallback::verified_reveal_hex(&spend.puzzle_reveal, &spend.puzzle_hash)?;
-            bind_spend_to_request(&spend, &id)?;
+            // And the coin's own three fields must hash to the key the row was found under
+            // (dig_ecosystem#3035). Note what this REPLACES: comparing `row.coin_id` to the lookup
+            // key, which is what the live path does, cannot fail here — the row's `coin_id` IS the
+            // key it was selected by, so that comparison read as a guard while being none. This one
+            // can fail, and it is the same arithmetic the live binding relies on.
+            bind_fields_to_key(
+                &spend.parent_coin_info,
+                &spend.puzzle_hash,
+                spend.amount,
+                &id,
+                "cached coin spend",
+            )?;
             return Ok(Some(spend));
         }
 
@@ -287,7 +317,7 @@ impl PeerCorroboratedReads {
             // TTL, because a spend is immutable once it exists.
             bind_spend_to_request(spend, &id)?;
             self.db
-                .put_chain_spend(&spend_row(spend, &id))
+                .put_chain_spend(&spend_row(spend, &id), now)
                 .await
                 .map_err(|e| Error::internal(format!("chain-spend cache write failed: {e}")))?;
         }
@@ -369,6 +399,37 @@ fn bind_spend_to_request(spend: &FallbackCoinSpend, requested: &str) -> Result<(
         "coin spend: peers agreed on a spend of a coin that is not the one asked for (requested \
          {requested}, answered {})",
         normalized(&spend.coin_id)
+    )))
+}
+
+/// Refuse a CACHED row whose own fields do not hash to the key it was stored under.
+///
+/// The cached counterpart of [`bind_to_request`], and it has to be spelled differently. A cached
+/// row's `coin_id` column is the key the row was SELECTed by, so comparing the two is a tautology;
+/// what can still be checked is the coin id's definition —
+/// `SHA256(parent ‖ puzzle_hash ‖ amount)` — against that key. Any row whose fields were altered,
+/// or written under someone else's id, fails it.
+///
+/// This is what stands in for the write-time binding on the read path, so a second writer of either
+/// cache table cannot appear unnoticed and be believed (dig_ecosystem#3035).
+fn bind_fields_to_key(
+    parent_coin_info: &str,
+    puzzle_hash: &str,
+    amount: u64,
+    key: &str,
+    what: &str,
+) -> Result<()> {
+    let coin = chia::protocol::Coin {
+        parent_coin_info: parse_coin_id(&normalized(parent_coin_info))?,
+        puzzle_hash: parse_coin_id(&normalized(puzzle_hash))?,
+        amount,
+    };
+    let computed = hex::encode(coin.coin_id());
+    if computed == key {
+        return Ok(());
+    }
+    Err(Error::internal(format!(
+        "{what}: the cached row's fields hash to {computed}, not to the coin id {key} it is stored          under"
     )))
 }
 

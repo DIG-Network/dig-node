@@ -2030,6 +2030,12 @@ where
     Fut: std::future::Future<Output = Option<Draw<T>>>,
 {
     let mut ruled_out: Vec<std::net::SocketAddr> = Vec::new();
+    // Distinctness is by HOST, not by address (dig_ecosystem#3035). A `SocketAddr` carries a port,
+    // so one machine listening on several ports would otherwise be admitted several times and
+    // counted as several independent voices — which is exactly the "one opinion counted four
+    // times" this assembly exists to prevent. The exclusion list handed to the dialler stays
+    // address-shaped because that is what it can act on; the admission rule is stricter.
+    let mut ruled_out_hosts: Vec<std::net::IpAddr> = Vec::new();
     let mut sample: Vec<(std::net::SocketAddr, T)> = Vec::new();
 
     for _ in 0..max_attempts {
@@ -2041,10 +2047,12 @@ where
         };
         // Defensive, not redundant: `ruled_out` is an ASK of remote code, and admitting one address
         // twice is precisely how one node supplies a whole "independent" quorum.
-        if ruled_out.contains(&draw.addr) {
+        if ruled_out_hosts.contains(&draw.addr.ip()) {
+            ruled_out.push(draw.addr);
             continue;
         }
         ruled_out.push(draw.addr);
+        ruled_out_hosts.push(draw.addr.ip());
         if draw.origin != chia_query::peer::connect::PeerOrigin::Discovered {
             continue;
         }

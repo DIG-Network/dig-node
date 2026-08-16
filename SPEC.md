@@ -4367,6 +4367,23 @@ Corroborated answers MUST be cached in the wallet database, keyed on the coin id
 while an UNSPENT record MUST expire, since caching "unspent" forever would make a profile look permanently
 stale. A corroborated ABSENCE MUST NOT be cached: a coin that does not exist yet may exist in a minute.
 
+Each cache MUST be BOUNDED and MUST evict by recency of USE (dig_ecosystem#3035). `control.wallet.coinById`
+is an OPEN read, so every distinct coin id an unauthenticated caller asks for writes a row, and the rate
+bound limits the RATE, never the TOTAL; a cache that is mostly permanent by design is therefore a
+disk-exhaustion path unless its SIZE is bounded. The node MUST NOT bound it by shortening the permanent
+entries' lifetime instead: a lineage walk touches a SPENT coin at every generation but the last, and that
+permanence is what makes the walk affordable. Eviction MUST rank by when an entry was last USED rather than
+when it was written, because the entries worth keeping are the ones a walk re-reads. The shipped budgets are
+50 000 coin records and 10 000 spends — together roughly 60 MiB, deliberately small beside the capsule cache
+(1 GiB) and the content cache (256 MiB), since every evicted answer can be re-asked in one round.
+
+A CACHED row MUST be re-verified on the way OUT, not only on the way in. A served spend's `puzzle_reveal`
+MUST tree-hash to its `puzzle_hash`, and for both caches the row's own `parent_coin_info`, `puzzle_hash` and
+`amount` MUST hash to the coin id the row is stored under. Comparing a row's `coin_id` COLUMN to the lookup
+key does NOT satisfy this — that column is the key the row was selected by, so the comparison cannot fail.
+The rows never expire, so a check applied only at write time is a check that a second writer of either
+table, present or future, silently bypasses.
+
 18.7a. **Identity-scoped reads + honest sync state (#407).** The dig-node answers wallet-data reads for
 the CLIENT's connected self-custody wallet, scoped by that wallet's PUBLIC identity — NEVER the node's
 own coins, and NEVER holding the client's private key (the node receives only public puzzle
