@@ -73,9 +73,18 @@ use std::time::{Duration, Instant};
 
 use dig_gossip::service::profile_sync::{
     frame_profile_body, frame_profile_body_request, frame_profile_root_announce, ProfileBody,
-    ProfileRootRef, MAX_PROFILE_BODY_BYTES,
+    ProfileRootRef,
 };
 use dig_gossip::{Bytes32, PeerId};
+
+/// The largest body a 225 frame can carry, re-exported so a consumer bounding a body does not need
+/// a dig-gossip dependency of its own to name the ceiling it must respect.
+///
+/// The control plane needs exactly this number: its own `MAX_BODY_BYTES` is the larger contract cap
+/// (4 MiB), and bounding an accepted body on that would persist something no 224 could ever be
+/// answered with.
+pub use dig_gossip::service::profile_sync::MAX_PROFILE_BODY_BYTES;
+
 use dig_social_profile::{AnchoredRoot, VerifiedBody};
 
 use crate::AnchoredRootResolver;
@@ -334,6 +343,33 @@ impl Solicitations {
                 .iter()
                 .any(|(p, at)| p == peer && at.elapsed() < SOLICITATION_TTL)
         })
+    }
+
+    /// Whether ANY peer currently has an unexpired outstanding request for `(store_id, root)`.
+    ///
+    /// # Why a repeated announce must not repeat the work
+    ///
+    /// 223 is a broadcast, so the same `(store_id, root)` arrives from every peer that holds it —
+    /// once in the ordinary Plumtree flood, and as often as an attacker likes on purpose. Nothing
+    /// upstream dedupes: the gossip bridge publishes every rate-limiter-approved frame verbatim,
+    /// with no seen-set.
+    ///
+    /// Left unchecked, each duplicate costs one uncached chain lineage walk AND one directed 224
+    /// frame at the same peer. That second cost is the dangerous one: 224 is not a public-flood
+    /// opcode, so exceeding its 60/min row at the receiver charges 15 points against a 100
+    /// threshold with no decay — **seven excess frames ban the sender for an hour**. An attacker
+    /// with a few cheap connections can therefore make one honest node get banned by another, and
+    /// roll that through its peer set. That is progressive eclipse reached from the opposite
+    /// direction to the one §22.6 guards.
+    ///
+    /// Today the emission rate happens to be capped by the serial ingest loop times chain latency.
+    /// **That is an accident, not a bound** — it inverts the moment anyone caches the chain read,
+    /// which is the obvious next optimization. A latency is not a security parameter.
+    #[must_use]
+    pub fn is_outstanding(&self, store_id: &[u8; 32], root: &[u8; 32]) -> bool {
+        self.locked()
+            .get(&(*store_id, *root))
+            .is_some_and(|asked| asked.iter().any(|(_, at)| at.elapsed() < SOLICITATION_TTL))
     }
 
     /// Forget every request for `(store_id, root)` — called once the body is accepted.
@@ -722,6 +758,18 @@ pub async fn handle_root_announce(
     if store.has(&store_id, &announced_root) {
         return None;
     }
+    // BEFORE the chain read, deliberately. This is the cheapest of the three checks and it guards
+    // the two most expensive things a duplicate announce would buy: an uncached lineage walk, and a
+    // directed 224 frame that counts against the recipient's rate limiter. See
+    // [`Solicitations::is_outstanding`] for why the second one is a peer-banning primitive.
+    //
+    // Keyed on the ANNOUNCED root rather than the chain-resolved one, because the whole point is to
+    // answer before the chain is consulted. A duplicate announce naming a root we are already
+    // chasing is exactly the frame to drop; an announce naming a DIFFERENT root is not suppressed
+    // by this and still gets its own chain read.
+    if solicitations.is_outstanding(&store_id, &announced_root) {
+        return None;
+    }
     let chain_root = chain_root_for(resolver, &store_id).await.ok()?;
     if chain_root != announced_root {
         return None;
@@ -1093,6 +1141,37 @@ mod tests {
             self.0.clone()
         }
     }
+    /// A chain view that COUNTS how often it was consulted.
+    ///
+    /// The plain `Chain` double answers correctly but silently, so a test using it cannot tell one
+    /// lineage walk from eight — and the count is half of what the duplicate-announce guard exists
+    /// to bound.
+    struct CountingChain {
+        root: [u8; 32],
+        reads: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingChain {
+        fn at(root: [u8; 32]) -> Self {
+            Self {
+                root,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+    #[async_trait::async_trait]
+    impl AnchoredRootResolver for CountingChain {
+        async fn anchored_root(
+            &self,
+            _store_id: &[u8; 32],
+        ) -> Result<Option<crate::Bytes32>, String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(crate::Bytes32(self.root)))
+        }
+    }
+
     fn chain_at(root: [u8; 32]) -> Chain {
         Chain(Ok(Some(crate::Bytes32(root))))
     }
@@ -1650,6 +1729,94 @@ mod tests {
 
         assert_eq!(asked, None);
         assert!(tx.sent_requests.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// **A repeated announce buys the attacker nothing, and costs this node nothing.**
+    ///
+    /// 223 is a broadcast, so the same `(store_id, root)` arrives from every peer holding it — once
+    /// in the ordinary flood, and as often as an attacker likes on purpose. Nothing upstream dedupes:
+    /// the gossip bridge publishes every rate-limiter-approved frame verbatim.
+    ///
+    /// Both counters matter, and the second is the security one. The chain read is merely expensive.
+    /// The 224 frame is a **peer-banning primitive**: 224 is not a public-flood opcode, so exceeding
+    /// its 60/min row at the receiver charges 15 points against a 100 threshold with no decay, and
+    /// seven excess frames ban the sender for an hour. Left unchecked, an attacker with a few cheap
+    /// connections makes one honest node get banned by another and rolls it through the peer set.
+    #[tokio::test]
+    async fn a_repeated_announce_neither_re_reads_the_chain_nor_re_asks_a_peer() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (_, root) = dpb("Ada");
+        let sid = store_id(1);
+        let tx = Transport::with_peers(vec![peer(9)]);
+        let sol = Solicitations::new();
+        let chain = CountingChain::at(root);
+
+        for _ in 0..8 {
+            handle_root_announce(
+                &store,
+                &Subs(vec![sid]),
+                &chain,
+                &tx,
+                &sol,
+                &root_ref(sid, root),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            tx.sent_requests.lock().unwrap().len(),
+            1,
+            "eight announces produced more than one directed 224 frame"
+        );
+        assert_eq!(
+            chain.reads(),
+            1,
+            "eight announces produced more than one chain lineage walk"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A DIFFERENT root is still chased — the dedupe must not swallow a genuine new generation.
+    ///
+    /// Without this, an implementation that suppressed every announce after the first would pass the
+    /// test above and silently stop syncing the moment a profile was edited twice.
+    #[tokio::test]
+    async fn a_second_root_for_the_same_store_is_still_chased() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (_, first) = dpb("Ada");
+        let (_, second) = dpb("Grace");
+        assert_ne!(first, second, "the fixture roots must differ");
+        let sid = store_id(1);
+        let tx = Transport::with_peers(vec![peer(9)]);
+        let sol = Solicitations::new();
+
+        handle_root_announce(
+            &store,
+            &Subs(vec![sid]),
+            &chain_at(first),
+            &tx,
+            &sol,
+            &root_ref(sid, first),
+        )
+        .await;
+        handle_root_announce(
+            &store,
+            &Subs(vec![sid]),
+            &chain_at(second),
+            &tx,
+            &sol,
+            &root_ref(sid, second),
+        )
+        .await;
+
+        assert_eq!(
+            tx.sent_requests.lock().unwrap().len(),
+            2,
+            "a new generation was suppressed by the duplicate-announce guard"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

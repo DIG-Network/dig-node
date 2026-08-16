@@ -2334,7 +2334,7 @@ fn distinct_store_count(cached: &[dig_node_core::CachedCapsule]) -> usize {
 /// The maximum DECODED body size, taken from the control interface rather than restated, so this
 /// node and every client agree on the bound by construction.
 use base64::Engine as _;
-use dig_node_control_interface::params::MAX_BODY_BYTES;
+use dig_node_core::seams::dig_peer::profile_sync::MAX_PROFILE_BODY_BYTES;
 
 /// Parse a lowercase, unprefixed 64-hex field into its 32 raw bytes.
 ///
@@ -2407,13 +2407,20 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
     // Bounded on the DECODED length, BEFORE anything is persisted: a body past this cannot be
     // served to a peer inside the gossip frame ceiling, so storing one would put something
     // permanently unsyncable on disk.
-    if bytes.len() > MAX_BODY_BYTES {
+    //
+    // The ceiling is the SERVABLE one, not the control interface's `MAX_BODY_BYTES`. Those two
+    // differ — the contract's cap is 4 MiB (half dig-gossip's 8 MiB websocket message ceiling),
+    // while a 225 frame can carry only `MAX_PROFILE_BODY_BYTES`. Bounding on the larger number
+    // accepts a 1-4 MiB body, persists it, and then can never answer a single 224 for it: exactly
+    // the permanently-unsyncable artifact this check says it prevents, produced by the check
+    // itself. Refusing at the smaller number is what makes the comment true.
+    if bytes.len() > MAX_PROFILE_BODY_BYTES {
         return control_error(
             id,
             ErrorCode::InvalidParams,
             format!(
-                "{METHOD}: body is {} bytes, above the {MAX_BODY_BYTES}-byte maximum a profile \
-                 body may be",
+                "{METHOD}: body is {} bytes, above the {MAX_PROFILE_BODY_BYTES}-byte maximum a \
+                 profile body may be if it is to be servable to peers",
                 bytes.len()
             ),
         );
