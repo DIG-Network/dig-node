@@ -274,9 +274,9 @@ impl PeerCorroboratedReads {
 /// disagreed (which at a coin id, whose fields are its own hash, is not ordinary lag).
 fn no_corroboration<A>(read: &str, coin_id: &str, verdict: &quorum::Verdict<A>) -> Error {
     let why = match verdict {
-        quorum::Verdict::Insufficient { answered, required } => format!(
-            "only {answered} of the required {required} peers answered at all"
-        ),
+        quorum::Verdict::Insufficient { answered, required } => {
+            format!("only {answered} of the required {required} peers answered at all")
+        }
         quorum::Verdict::Split { tallies } => format!(
             "the peers that answered disagreed (vote counts {tallies:?}); a coin id is the hash \
              of the coin's own fields, so this is not ordinary lag"
@@ -366,6 +366,10 @@ fn spend_from_cache(row: &ChainSpendCacheRow) -> Result<FallbackCoinSpend> {
         solution: row.solution.clone(),
     })
 }
+
+pub mod dialed;
+
+pub use dialed::DialedPeerSample;
 
 #[cfg(test)]
 mod tests;

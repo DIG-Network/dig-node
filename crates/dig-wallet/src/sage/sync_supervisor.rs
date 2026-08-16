@@ -2000,13 +2000,13 @@ impl ChiaQuorumCorroborator {
 }
 
 /// One completed dial, reduced to the three facts sample assembly decides on.
-struct Draw<T> {
+pub(crate) struct Draw<T> {
     /// The address reached — the round's identity for this peer, and what it excludes next.
-    addr: std::net::SocketAddr,
+    pub(crate) addr: std::net::SocketAddr,
     /// How it was reached, which decides whether it counts as an independent opinion.
-    origin: chia_query::peer::connect::PeerOrigin,
+    pub(crate) origin: chia_query::peer::connect::PeerOrigin,
     /// Whatever the caller needs to keep from the connection.
-    member: T,
+    pub(crate) member: T,
 }
 
 /// Draw up to `target` DISTINCT, independently discovered peers, spending at most `max_attempts`
@@ -2020,7 +2020,7 @@ struct Draw<T> {
 ///
 /// A ruled-out address is remembered whether or not it was admitted, so a rejected priority peer is
 /// not offered again either.
-async fn assemble_distinct_sample<T, D, Fut>(
+pub(crate) async fn assemble_distinct_sample<T, D, Fut>(
     target: usize,
     max_attempts: usize,
     dial: D,

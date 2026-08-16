@@ -17,6 +17,40 @@ use async_trait::async_trait;
 
 use super::{Error, Result};
 
+/// Verify a puzzle reveal against the puzzle hash it claims to be, returning it in canonical bare
+/// hex.
+///
+/// A free function rather than a method because EVERY source of a spend owes this check, not only
+/// the HTTP one: [`super::peer_reads`] takes spends straight off a dialled peer, and a second
+/// implementation of a fail-closed check is a second chance to get it subtly different.
+///
+/// The check is purely local because a puzzle hash IS the reveal's CLVM tree hash: a substituted
+/// program cannot hash to the coin's own puzzle hash. Skipping it would let one peer dictate what a
+/// caller believes a coin's puzzle was — and a caller reconstructing a singleton lineage curries
+/// that program forward, so the forgery propagates into the spend it builds.
+///
+/// Fails CLOSED on both a mismatch and an unparseable reveal, because "I could not check it" and
+/// "it failed the check" oblige the same refusal.
+pub(crate) fn verified_reveal_hex(puzzle_reveal: &str, puzzle_hash: &str) -> Result<String> {
+    let norm = |s: &str| s.strip_prefix("0x").unwrap_or(s).to_ascii_lowercase();
+    let reveal_hex = norm(puzzle_reveal);
+    let bytes = hex::decode(&reveal_hex)
+        .map_err(|e| Error::internal(format!("spend read: puzzle_reveal hex: {e}")))?;
+    let tree_hash = chia::clvm_utils::tree_hash_from_bytes(&bytes).map_err(|e| {
+        Error::internal(format!(
+            "spend read: puzzle_reveal is not a parseable CLVM program: {e}"
+        ))
+    })?;
+    let claimed = norm(puzzle_hash);
+    let actual = hex::encode(tree_hash.to_bytes());
+    if actual != claimed {
+        return Err(Error::internal(format!(
+            "spend read: the puzzle reveal tree-hashes to {actual}, not to the spent coin's puzzle hash {claimed}"
+        )));
+    }
+    Ok(reveal_hex)
+}
+
 /// A blockchain coin normalized from the fallback source into the shape the RPC layer
 /// maps to a Sage `CoinRecord`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -260,23 +294,7 @@ impl CoinsetFallback {
     /// Fails CLOSED on both a mismatch and an unparseable reveal, because "I could not check it" and
     /// "it failed the check" oblige the same refusal.
     fn verified_reveal(puzzle_reveal: &str, puzzle_hash: &str) -> Result<String> {
-        let reveal_hex = Self::norm_hex(puzzle_reveal);
-        let bytes = hex::decode(&reveal_hex)
-            .map_err(|e| Error::internal(format!("fallback spend read: puzzle_reveal hex: {e}")))?;
-        let tree_hash = chia::clvm_utils::tree_hash_from_bytes(&bytes).map_err(|e| {
-            Error::internal(format!(
-                "fallback spend read: puzzle_reveal is not a parseable CLVM program: {e}"
-            ))
-        })?;
-        let claimed = Self::norm_hex(puzzle_hash);
-        let actual = hex::encode(tree_hash.to_bytes());
-        if actual != claimed {
-            return Err(Error::internal(format!(
-                "fallback spend read: the puzzle reveal tree-hashes to {actual}, not to the spent \
-                 coin's puzzle hash {claimed}"
-            )));
-        }
-        Ok(reveal_hex)
+        verified_reveal_hex(puzzle_reveal, puzzle_hash)
     }
 
     fn map_record(r: &chia_query::CoinRecord) -> Result<FallbackCoin> {

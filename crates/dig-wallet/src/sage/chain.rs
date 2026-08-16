@@ -79,6 +79,15 @@ pub struct ChainTransport {
     /// `None` until the first use builds it. Behind a `Mutex` rather than a `OnceCell` because a
     /// FAILED build must not be remembered as the answer forever (see the module docs).
     client: Mutex<Option<Arc<chia_query::ChiaQuery>>>,
+    /// ARBITRARY coin reads, served by this node's own peers and believed only on agreement
+    /// (dig_ecosystem#3032).
+    ///
+    /// `None` only where no wallet database exists to cache into — a bare transport built by a
+    /// test. Where it is attached it REPLACES the third-party oracle for the two reads a lineage
+    /// walk composes, rather than sitting in front of it: falling back to the oracle after a
+    /// refused quorum would let one endpoint overrule the peers whenever they failed to agree,
+    /// which is the trusted-peer dependency this exists to remove.
+    peer_reads: Option<Arc<super::peer_reads::PeerCorroboratedReads>>,
 }
 
 impl Default for ChainTransport {
@@ -92,7 +101,22 @@ impl ChainTransport {
     pub fn new() -> Self {
         Self {
             client: Mutex::new(None),
+            peer_reads: None,
         }
+    }
+
+    /// Serve arbitrary coin reads from this node's OWN peers, corroborated and cached in `db`.
+    ///
+    /// Without this the two arbitrary reads fall through to the third-party oracle, which a node
+    /// with no upstream configured cannot reach at all — the state that made a fully-synced node
+    /// with five peers report that it could not read its owner's profile.
+    #[must_use]
+    pub fn with_peer_reads(mut self, db: super::db::WalletDb) -> Self {
+        self.peer_reads = Some(Arc::new(super::peer_reads::PeerCorroboratedReads::new(
+            Arc::new(super::peer_reads::DialedPeerSample::mainnet()),
+            db,
+        )));
+        self
     }
 
     /// The shared client, building it on first use.
@@ -261,12 +285,18 @@ impl ChainFallback for ChainTransport {
     }
 
     async fn coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
+        if let Some(peers) = &self.peer_reads {
+            return peers.coin_record_by_id(coin_id).await;
+        }
         CoinsetFallback::new(self.client().await?)
             .coin_record_by_id(coin_id)
             .await
     }
 
     async fn coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+        if let Some(peers) = &self.peer_reads {
+            return peers.coin_spend(coin_id).await;
+        }
         CoinsetFallback::new(self.client().await?)
             .coin_spend(coin_id)
             .await
@@ -399,6 +429,47 @@ mod tests {
         assert!(
             transport.client.lock().await.is_none(),
             "asking for the peer tier must not be what makes the node hold peers"
+        );
+    }
+
+    /// An arbitrary coin read served from the peer-read cache dials NOTHING (dig_ecosystem#3032).
+    ///
+    /// The assertion that carries the weight is the second one. "The read returned the coin" is
+    /// satisfied identically by a transport that consulted the third-party oracle first and only
+    /// then reached the cache — so the test also asserts that no chain client was ever built.
+    /// That is what makes the ORDERING observable rather than inferred from an equal value, and it
+    /// is the whole point of the change: the oracle is replaced, not merely preceded.
+    #[tokio::test]
+    async fn a_cached_arbitrary_coin_read_is_served_without_building_a_chain_client() {
+        let db = crate::sage::db::WalletDb::open_in_memory().await.unwrap();
+        let coin_id = "ab".repeat(32);
+        db.put_chain_read(&crate::sage::db::ChainReadCacheRow {
+            coin_id: coin_id.clone(),
+            parent_coin_info: "cd".repeat(32),
+            puzzle_hash: "ef".repeat(32),
+            amount: "1234".into(),
+            created_height: Some(9_000_000),
+            // SPENT, so the entry is immutable and usable however long ago it was written — the
+            // test therefore does not depend on when it runs.
+            spent_height: Some(9_000_050),
+            created_timestamp: None,
+            spent_timestamp: None,
+            cached_at: 0,
+        })
+        .await
+        .unwrap();
+
+        let transport = ChainTransport::new().with_peer_reads(db);
+        let answer = ChainFallback::coin_record_by_id(&transport, &coin_id)
+            .await
+            .unwrap()
+            .expect("the cached coin must be served");
+
+        assert_eq!(answer.amount, 1234);
+        assert_eq!(answer.spent_height, Some(9_000_050));
+        assert!(
+            transport.client.lock().await.is_none(),
+            "an arbitrary coin read must no longer route through the third-party oracle"
         );
     }
 

@@ -867,4 +867,3 @@ fn binomial(n: u32, k: u32) -> f64 {
 
 #[cfg(test)]
 mod tests;
-

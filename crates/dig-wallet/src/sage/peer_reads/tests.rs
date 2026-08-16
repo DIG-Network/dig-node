@@ -141,8 +141,8 @@ async fn reads_over(voices: Vec<Voice>) -> (PeerCorroboratedReads, WalletDb, Arc
     let db = WalletDb::open_in_memory().await.unwrap();
     let sample = Arc::new(ScriptedSample::new(voices));
     let asked = sample.asked.clone();
-    let reads = PeerCorroboratedReads::new(sample, db.clone())
-        .with_clock(Arc::new(FixedClock(NOW)));
+    let reads =
+        PeerCorroboratedReads::new(sample, db.clone()).with_clock(Arc::new(FixedClock(NOW)));
     (reads, db, asked)
 }
 
@@ -280,7 +280,11 @@ async fn a_corroborated_record_is_cached_and_served_without_peers() {
     let clock: Arc<dyn Clock> = Arc::new(FixedClock(NOW));
 
     let live = PeerCorroboratedReads::new(
-        Arc::new(ScriptedSample::new(agreeing_records(2, 55, Some(9_000_100)))),
+        Arc::new(ScriptedSample::new(agreeing_records(
+            2,
+            55,
+            Some(9_000_100),
+        ))),
         db.clone(),
     )
     .with_clock(clock.clone());
@@ -289,8 +293,8 @@ async fn a_corroborated_record_is_cached_and_served_without_peers() {
         Some(coin(55, Some(9_000_100)))
     );
 
-    let peerless = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
-        .with_clock(clock);
+    let peerless =
+        PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db).with_clock(clock);
     assert_eq!(
         peerless.coin_record_by_id(COIN_ID).await.unwrap(),
         Some(coin(55, Some(9_000_100))),
@@ -413,8 +417,7 @@ async fn a_cache_hit_asks_no_peer() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let sample = Arc::new(ScriptedSample::new(agreeing_records(2, 3, Some(9_000_300))));
     let asked = sample.asked.clone();
-    let reads = PeerCorroboratedReads::new(sample, db)
-        .with_clock(Arc::new(FixedClock(NOW)));
+    let reads = PeerCorroboratedReads::new(sample, db).with_clock(Arc::new(FixedClock(NOW)));
 
     reads.coin_record_by_id(COIN_ID).await.unwrap();
     let after_first = asked.load(Ordering::SeqCst);
@@ -438,9 +441,7 @@ async fn a_cache_hit_asks_no_peer() {
 /// generation: believing the dissenter would hand a walk a forged branch.
 #[tokio::test]
 async fn a_dissenting_peer_cannot_decide_what_a_coin_became() {
-    let mut voices: Vec<Voice> = (0..3)
-        .map(|_| Voice::Spend(Some(spend("80"))))
-        .collect();
+    let mut voices: Vec<Voice> = (0..3).map(|_| Voice::Spend(Some(spend("80")))).collect();
     voices.push(Voice::Spend(Some(spend("ff"))));
     let (reads, _db, _) = reads_over(voices).await;
 
@@ -505,8 +506,7 @@ async fn the_cache_key_is_spelling_insensitive() {
     let db = WalletDb::open_in_memory().await.unwrap();
     let sample = Arc::new(ScriptedSample::new(agreeing_records(2, 3, Some(9_000_400))));
     let asked = sample.asked.clone();
-    let reads = PeerCorroboratedReads::new(sample, db)
-        .with_clock(Arc::new(FixedClock(NOW)));
+    let reads = PeerCorroboratedReads::new(sample, db).with_clock(Arc::new(FixedClock(NOW)));
 
     reads.coin_record_by_id(COIN_ID).await.unwrap();
     let after_first = asked.load(Ordering::SeqCst);
