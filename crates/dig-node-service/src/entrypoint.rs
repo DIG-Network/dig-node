@@ -142,6 +142,14 @@ enum Command {
         #[command(subcommand)]
         action: Option<SyncCommand>,
     },
+    /// Persist or read a dig-profile body (the `control.profile.*` surface, SPEC §22).
+    ///
+    /// The node checks every body against the root it resolves on chain itself, so a body it
+    /// cannot confirm is refused rather than stored. Nothing here holds a key or signs (§908).
+    Profile {
+        #[command(subcommand)]
+        action: ProfileCommand,
+    },
     /// Read a public address's balance (the OPEN `control.wallet.balance` read, #1851).
     Wallet {
         #[command(subcommand)]
@@ -330,6 +338,34 @@ enum WalletCommand {
     Watched,
 }
 
+/// `dig-node profile` sub-actions — the two halves of profile-body custody on this node.
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// Hand this node a profile body to persist and serve to peers.
+    ///
+    /// `root` is a CLAIM. The node resolves the store's root on chain itself and refuses the body
+    /// unless the chain confirms exactly that root AND the bytes hash to it, so a body this node
+    /// accepts is one the network can verify (SPEC §22.3).
+    PutBody {
+        /// The profile's store id, lowercase 64-hex.
+        store_id: String,
+        /// The root the body is claimed to hash to, lowercase 64-hex.
+        root: String,
+        /// The body, standard padded base64 of its DPB serialization.
+        body_b64: String,
+    },
+    /// Print the profile body this node holds at a store id + root (READ-ONLY).
+    ///
+    /// A `null` body means this node was consulted and holds nothing; a read that FAILED is an
+    /// error instead, because the two need opposite remedies.
+    GetBody {
+        /// The profile's store id, lowercase 64-hex.
+        store_id: String,
+        /// The root to read at, lowercase 64-hex.
+        root: String,
+    },
+}
+
 /// `dig-node updater` sub-actions. With none, prints the beacon status.
 #[derive(Subcommand)]
 enum UpdaterCommand {
@@ -446,6 +482,7 @@ impl Command {
             Command::Cache { .. } => "cache",
             Command::Stores { .. } => "stores",
             Command::Sync { .. } => "sync",
+            Command::Profile { .. } => "profile",
             Command::Wallet { .. } => "wallet",
             Command::Updater { .. } => "updater",
             Command::Subscriptions { .. } => "subscriptions",
@@ -557,6 +594,9 @@ pub fn run() -> std::process::ExitCode {
         Command::Wallet { action: cmd } => {
             render(control_cli::run(&config, wallet_action(cmd)), action, json)
         }
+        Command::Profile { action: cmd } => {
+            render(control_cli::run(&config, profile_action(cmd)), action, json)
+        }
         Command::Updater { action: cmd } => {
             render(control_cli::run(&config, updater_action(cmd)), action, json)
         }
@@ -638,6 +678,24 @@ fn wallet_action(cmd: WalletCommand) -> ControlAction {
         WalletCommand::Watch { public_keys } => ControlAction::WalletWatch { public_keys },
         WalletCommand::Unwatch { public_keys } => ControlAction::WalletUnwatch { public_keys },
         WalletCommand::Watched => ControlAction::WalletWatched,
+    }
+}
+
+/// Map the `profile` subcommand to its [`ControlAction`].
+fn profile_action(cmd: ProfileCommand) -> ControlAction {
+    match cmd {
+        ProfileCommand::PutBody {
+            store_id,
+            root,
+            body_b64,
+        } => ControlAction::ProfilePutBody {
+            store_id,
+            root,
+            body_b64,
+        },
+        ProfileCommand::GetBody { store_id, root } => {
+            ControlAction::ProfileGetBody { store_id, root }
+        }
     }
 }
 

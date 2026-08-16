@@ -87,6 +87,25 @@ pub enum ControlAction {
     WalletUnwatch { public_keys: Vec<String> },
     /// `control.wallet.watched` — the public keys this node is currently following.
     WalletWatched,
+    /// `control.profile.putBody` — hand this node a profile body to persist and serve.
+    ///
+    /// The node checks the root on chain and refuses a body it cannot confirm (SPEC §22.3); this
+    /// verb carries no key and signs nothing (§908).
+    ProfilePutBody {
+        /// The profile's store id, lowercase 64-hex.
+        store_id: String,
+        /// The root the body is claimed to hash to, lowercase 64-hex. Checked, never trusted.
+        root: String,
+        /// The body itself, standard padded base64 of its DPB serialization.
+        body_b64: String,
+    },
+    /// `control.profile.getBody` — read the profile body this node holds at a store id + root.
+    ProfileGetBody {
+        /// The profile's store id, lowercase 64-hex.
+        store_id: String,
+        /// The root to read at, lowercase 64-hex.
+        root: String,
+    },
     /// `control.updater.status` — the DIG auto-update beacon's status.
     UpdaterStatus,
     /// `control.updater.setChannel` — set the beacon channel (`nightly` | `stable`).
@@ -134,6 +153,8 @@ impl ControlAction {
             ControlAction::WalletWatch { .. } => "control.wallet.watch",
             ControlAction::WalletUnwatch { .. } => "control.wallet.unwatch",
             ControlAction::WalletWatched => "control.wallet.watched",
+            ControlAction::ProfilePutBody { .. } => "control.profile.putBody",
+            ControlAction::ProfileGetBody { .. } => "control.profile.getBody",
             ControlAction::UpdaterStatus => "control.updater.status",
             ControlAction::UpdaterSetChannel { .. } => "control.updater.setChannel",
             ControlAction::UpdaterPause { .. } => "control.updater.pause",
@@ -196,6 +217,14 @@ impl ControlAction {
             ControlAction::WalletWatch { public_keys }
             | ControlAction::WalletUnwatch { public_keys } => {
                 json!({ "public_keys": public_keys })
+            }
+            ControlAction::ProfilePutBody {
+                store_id,
+                root,
+                body_b64,
+            } => json!({ "store_id": store_id, "root": root, "body_b64": body_b64 }),
+            ControlAction::ProfileGetBody { store_id, root } => {
+                json!({ "store_id": store_id, "root": root })
             }
             ControlAction::UpdaterSetChannel { channel } => json!({ "channel": channel }),
             ControlAction::UpdaterPause { until: Some(u) } => json!({ "until": u }),
@@ -291,6 +320,17 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
         }
         .method(),
         ControlAction::WalletWatched.method(),
+        ControlAction::ProfilePutBody {
+            store_id: String::new(),
+            root: String::new(),
+            body_b64: String::new(),
+        }
+        .method(),
+        ControlAction::ProfileGetBody {
+            store_id: String::new(),
+            root: String::new(),
+        }
+        .method(),
         ControlAction::UpdaterStatus.method(),
         ControlAction::UpdaterSetChannel {
             channel: String::new(),
