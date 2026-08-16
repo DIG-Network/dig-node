@@ -19,7 +19,7 @@ use super::{Error, Result};
 
 /// A blockchain coin normalized from the fallback source into the shape the RPC layer
 /// maps to a Sage `CoinRecord`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FallbackCoin {
     /// The coin id (hex, no `0x`).
     pub coin_id: String,
@@ -48,7 +48,7 @@ pub struct FallbackCoin {
 /// and a caller to read that as "unconfirmed", when the truth is "this read never asked". The
 /// heights come from a SEPARATE coin-record read, composed one layer up
 /// ([`super::rpc::WalletBackend::coin_spend`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FallbackCoinSpend {
     /// The spent coin's id (hex, no `0x`), RECOMPUTED from the returned coin rather than echoed
     /// from the request — see [`ChainFallback::coin_spend`] for why that distinction is the whole
