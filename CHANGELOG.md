@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.119.1] - 2026-08-16
+
+### Bug Fixes
+- **wallet:** Report honest sync state for coin_by_id reads (#227)
+
 ## [0.119.0] - 2026-08-14
 
 ### Features
