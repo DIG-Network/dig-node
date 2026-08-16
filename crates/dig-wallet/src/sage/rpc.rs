@@ -439,15 +439,28 @@ impl Default for WalletConfig {
     }
 }
 
-/// Default burst allowance for the open-balance coinset fallback (#1957): a single caller may
-/// hit the expensive fallback this many times in a burst before the rate bound engages. Sized
-/// generously so no realistic legitimate use (a handful of address lookups) is ever refused —
-/// only a rapid sweep of many arbitrary addresses trips it.
-const DEFAULT_FALLBACK_BURST: f64 = 64.0;
+/// Default burst allowance for the open chain-read fallback (#1957): a single caller may hit the
+/// expensive tier this many times in a burst before the rate bound engages.
+///
+/// **Re-calibrated for what a token now BUYS (dig_ecosystem#3035).** When this bound was set, one
+/// token bought one HTTP call to a third-party oracle. Since #3032 the arbitrary chain reads are
+/// served by the node's own peers, so one token buys a whole corroborated ROUND — up to
+/// [`super::peer_reads::dialed`]'s dial budget of `QUORUM_SAMPLE * 3` = 12 dials, then one request
+/// to each of [`super::quorum::QUORUM_SAMPLE`] peers, and `control.wallet.coinSpend` spends its
+/// single token on two such reads. A token that costs an order of magnitude more work has to be
+/// issued an order of magnitude less freely, or the bound is nominal.
+///
+/// Still sized so no realistic legitimate use is refused: a burst of 16 covers a profile read and
+/// the lineage walk behind it, and a replica-served answer never reaches this gate at all.
+const DEFAULT_FALLBACK_BURST: f64 = 16.0;
 
-/// Default sustained refill rate (tokens per second) for the open-balance coinset fallback
-/// (#1957): once the burst is spent, fallback reads are admitted at this steady rate.
-const DEFAULT_FALLBACK_REFILL_PER_SEC: f64 = 8.0;
+/// Default sustained refill rate (tokens per second) for the open chain-read fallback (#1957):
+/// once the burst is spent, fallback reads are admitted at this steady rate.
+///
+/// Two per second rather than eight, for the reason [`DEFAULT_FALLBACK_BURST`] gives: at up to a
+/// dozen peer messages per token, eight tokens a second is a peer-egress amplifier pointed at the
+/// node's own quorum. Two sustains a walk without sustaining a sweep.
+const DEFAULT_FALLBACK_REFILL_PER_SEC: f64 = 2.0;
 
 /// The Sage-parity wallet backend.
 #[derive(Clone)]
@@ -4577,6 +4590,24 @@ mod tests {
     use super::super::fallback::EmptyFallback;
     use super::super::fallback::FallbackCoin;
     use super::*;
+
+    /// The open-read rate bound is calibrated for what ONE TOKEN NOW BUYS (dig_ecosystem#3035).
+    ///
+    /// Since #3032 a token no longer buys one HTTP call to an oracle: it buys a corroborated peer
+    /// ROUND — up to a dozen dials, then one request to each held peer. The numbers below are
+    /// pinned so a future edit to either is a deliberate change to a test that says what they mean,
+    /// and the ratio is asserted rather than only the values, because the calibration is the claim
+    /// that a token costs roughly an order of magnitude more work than it used to.
+    #[test]
+    fn the_open_read_rate_bound_is_calibrated_for_a_peer_round() {
+        assert_eq!(DEFAULT_FALLBACK_BURST, 16.0);
+        assert_eq!(DEFAULT_FALLBACK_REFILL_PER_SEC, 2.0);
+        assert!(
+            DEFAULT_FALLBACK_BURST
+                <= f64::from(u32::try_from(super::super::quorum::QUORUM_SAMPLE).unwrap()) * 4.0,
+            "a burst that dwarfs the quorum a token pays for is a nominal bound"
+        );
+    }
 
     /// The puzzle hash every `xch_coin` test coin sits at — the identity reads scope to.
     fn test_ph() -> String {

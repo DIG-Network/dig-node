@@ -26,6 +26,12 @@ use super::sync::AdmittedPeak;
 #[derive(Clone)]
 pub struct WalletDb {
     pool: SqlitePool,
+    /// The row budgets the two chain caches are evicted back to on every write
+    /// (dig_ecosystem#3035). A field rather than a constant read at the call site so a test can
+    /// pin a SMALL budget and prove both sides of the bound — at budget nothing is evicted, one
+    /// over evicts exactly the least-recently-used row — without writing fifty thousand rows to
+    /// find out.
+    chain_cache_budgets: ChainCacheBudgets,
 }
 
 /// The synced chain state gating [`crate::sage::routing`].
@@ -440,7 +446,8 @@ CREATE TABLE IF NOT EXISTS chain_read_cache (
     spent_height INTEGER,
     created_timestamp INTEGER,
     spent_timestamp INTEGER,
-    cached_at INTEGER NOT NULL
+    cached_at INTEGER NOT NULL,
+    last_used_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS chain_spend_cache (
@@ -449,7 +456,8 @@ CREATE TABLE IF NOT EXISTS chain_spend_cache (
     puzzle_hash TEXT NOT NULL,
     amount TEXT NOT NULL,
     puzzle_reveal TEXT NOT NULL,
-    solution TEXT NOT NULL
+    solution TEXT NOT NULL,
+    last_used_at INTEGER NOT NULL DEFAULT 0
 );
 "#;
 
@@ -471,7 +479,124 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // fail-closed answer: coverage is unknown, so no address is treated as replica-backed until
     // the next catch-up records the set it ran over.
     "ALTER TABLE sync_state ADD COLUMN covered_puzzle_hashes TEXT",
+    // dig_ecosystem#3035. A wallet DB written by #3032 has cache rows but no record of when each
+    // was last USED, and the column arrives at its `0` default — the oldest possible last-use, so
+    // pre-existing rows are the first evicted. That is the right direction: nothing in the old
+    // shape tells us which of them a lineage walk still re-reads, and re-asking the peers costs a
+    // round trip while keeping the wrong rows costs the budget.
+    "ALTER TABLE chain_read_cache ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE chain_spend_cache ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0",
 ];
+
+/// Indexes that depend on a column [`ADD_COLUMN_MIGRATIONS`] may only just have added, so they
+/// cannot live in [`SCHEMA`]: on a legacy DB the index would be created against a column that does
+/// not exist yet, and `SCHEMA` is executed strictly, before the migrations.
+const POST_MIGRATION_INDEXES: &[&str] = &[
+    // The eviction order is `ORDER BY last_used_at`, run on every cache write (dig_ecosystem#3035).
+    "CREATE INDEX IF NOT EXISTS idx_chain_read_cache_last_used ON chain_read_cache (last_used_at)",
+    "CREATE INDEX IF NOT EXISTS idx_chain_spend_cache_last_used ON chain_spend_cache (last_used_at)",
+];
+
+// ---- chain-read cache budget (dig_ecosystem#3035) -------------------------
+//
+// `control.wallet.coinById` is an OPEN, token-less method — remotely reachable under
+// `DIG_NODE_ALLOW_REMOTE` — and every distinct coin id it is asked for writes a cache row. The rate
+// limiter bounds the RATE, never the TOTAL, so without a budget sustained querying grows the wallet
+// DB without limit on a node that is otherwise careful about disk.
+//
+// Shortening the TTLs is the wrong lever and is deliberately not used: a lineage walk touches a
+// SPENT coin at every generation but the last, and the permanence of those rows is the property
+// that makes the walk affordable. The budget bounds the SIZE instead, and evicts by recency of
+// USE — the rows worth keeping are the ones a walk re-reads, not the ones most recently written.
+
+/// How many coin RECORDS the chain-read cache keeps.
+///
+/// A row is a handful of hex fields and two integers — call it 400 bytes with SQLite's overhead —
+/// so 50 000 rows is roughly **20 MiB**. Deliberately small beside the node's other on-disk caches
+/// so the three read together: the capsule cache defaults to 1 GiB (`DIG_NODE_CACHE_CAP`) and the
+/// content cache to 256 MiB. This cache stores answers that can always be re-asked in one round
+/// trip, so it gets the smallest share.
+pub const CHAIN_READ_CACHE_MAX_ROWS: i64 = 50_000;
+
+/// How many SPENDS the chain-spend cache keeps.
+///
+/// A fifth of the record budget for the same total, because a spend row is dominated by its puzzle
+/// reveal and solution — CLVM programs in hex, commonly a few KiB — so 10 000 rows is roughly
+/// **40 MiB**. Together the two tables are bounded by about **60 MiB**, a quarter of the content
+/// cache and a sixteenth of the capsule cache.
+pub const CHAIN_SPEND_CACHE_MAX_ROWS: i64 = 10_000;
+
+/// The row budgets the two chain caches are held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainCacheBudgets {
+    /// Rows kept in `chain_read_cache`.
+    pub reads: i64,
+    /// Rows kept in `chain_spend_cache`.
+    pub spends: i64,
+}
+
+impl Default for ChainCacheBudgets {
+    fn default() -> Self {
+        Self {
+            reads: CHAIN_READ_CACHE_MAX_ROWS,
+            spends: CHAIN_SPEND_CACHE_MAX_ROWS,
+        }
+    }
+}
+
+/// Which of the two chain caches a size question is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainCacheTable {
+    /// `chain_read_cache` — coin records.
+    Reads,
+    /// `chain_spend_cache` — coin spends.
+    Spends,
+}
+
+/// Mark a cache row as used NOW, so eviction ranks it by recency of USE rather than of insertion.
+///
+/// `table` is one of two literals chosen by this module, never caller input: the column set differs
+/// between the two tables, so they cannot share a prepared statement, and a table name cannot be
+/// bound as a parameter.
+async fn touch(
+    pool: &sqlx::SqlitePool,
+    table: &'static str,
+    coin_id: &str,
+    now: i64,
+) -> sqlx::Result<()> {
+    let sql = match table {
+        "chain_read_cache" => "UPDATE chain_read_cache SET last_used_at = ? WHERE coin_id = ?",
+        _ => "UPDATE chain_spend_cache SET last_used_at = ? WHERE coin_id = ?",
+    };
+    sqlx::query(sql)
+        .bind(now)
+        .bind(coin_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Drop the least-recently-USED rows until `table` holds at most `budget` of them.
+///
+/// Run on every write rather than on a timer: the growth this bounds is driven by writes, so the
+/// write is exactly where the budget can never be outrun. `LIMIT` is computed by SQLite from the
+/// table's own count, so a table already inside its budget deletes nothing.
+async fn evict_to_budget(
+    pool: &sqlx::SqlitePool,
+    table: &'static str,
+    budget: i64,
+) -> sqlx::Result<()> {
+    let sql = match table {
+        "chain_read_cache" => {
+            "DELETE FROM chain_read_cache WHERE coin_id IN (SELECT coin_id FROM chain_read_cache              ORDER BY last_used_at ASC, coin_id ASC LIMIT MAX(0, (SELECT COUNT(*) FROM              chain_read_cache) - ?))"
+        }
+        _ => {
+            "DELETE FROM chain_spend_cache WHERE coin_id IN (SELECT coin_id FROM chain_spend_cache              ORDER BY last_used_at ASC, coin_id ASC LIMIT MAX(0, (SELECT COUNT(*) FROM              chain_spend_cache) - ?))"
+        }
+    };
+    sqlx::query(sql).bind(budget).execute(pool).await?;
+    Ok(())
+}
 
 /// Evidence that a full address-history catch-up ran to COMPLETION.
 ///
@@ -536,14 +661,20 @@ impl WalletDb {
             .max_connections(1)
             .connect_with(opts)
             .await?;
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            chain_cache_budgets: ChainCacheBudgets::default(),
+        };
         db.migrate().await?;
         Ok(db)
     }
 
     async fn from_options(opts: SqliteConnectOptions) -> sqlx::Result<Self> {
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            chain_cache_budgets: ChainCacheBudgets::default(),
+        };
         db.migrate().await?;
         Ok(db)
     }
@@ -561,6 +692,10 @@ impl WalletDb {
         // updated CREATE TABLE already covers (a fresh DB, or one already migrated).
         for stmt in ADD_COLUMN_MIGRATIONS {
             let _ = sqlx::query(stmt).execute(&mut *conn).await;
+        }
+        // Only now can an index name a migrated column.
+        for stmt in POST_MIGRATION_INDEXES {
+            sqlx::query(stmt).execute(&mut *conn).await?;
         }
         Ok(())
     }
@@ -997,6 +1132,7 @@ impl WalletDb {
     pub async fn cached_chain_read(
         &self,
         coin_id: &str,
+        now: i64,
     ) -> sqlx::Result<Option<ChainReadCacheRow>> {
         let Some(r) = sqlx::query("SELECT * FROM chain_read_cache WHERE coin_id = ?")
             .bind(coin_id)
@@ -1005,6 +1141,7 @@ impl WalletDb {
         else {
             return Ok(None);
         };
+        touch(&self.pool, "chain_read_cache", coin_id, now).await?;
         Ok(Some(ChainReadCacheRow {
             coin_id: r.get("coin_id"),
             parent_coin_info: r.get("parent_coin_info"),
@@ -1027,6 +1164,7 @@ impl WalletDb {
     pub async fn cached_chain_spend(
         &self,
         coin_id: &str,
+        now: i64,
     ) -> sqlx::Result<Option<ChainSpendCacheRow>> {
         let Some(r) = sqlx::query("SELECT * FROM chain_spend_cache WHERE coin_id = ?")
             .bind(coin_id)
@@ -1035,6 +1173,7 @@ impl WalletDb {
         else {
             return Ok(None);
         };
+        touch(&self.pool, "chain_spend_cache", coin_id, now).await?;
         Ok(Some(ChainSpendCacheRow {
             coin_id: r.get("coin_id"),
             parent_coin_info: r.get("parent_coin_info"),
@@ -1045,11 +1184,11 @@ impl WalletDb {
         }))
     }
 
-    /// Record one coin's SPEND.
-    pub async fn put_chain_spend(&self, row: &ChainSpendCacheRow) -> sqlx::Result<()> {
+    /// Record one coin's SPEND, then evict back to [`CHAIN_SPEND_CACHE_MAX_ROWS`].
+    pub async fn put_chain_spend(&self, row: &ChainSpendCacheRow, now: i64) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO chain_spend_cache (coin_id, parent_coin_info, puzzle_hash, \
-             amount, puzzle_reveal, solution) VALUES (?,?,?,?,?,?)",
+             amount, puzzle_reveal, solution, last_used_at) VALUES (?,?,?,?,?,?,?)",
         )
         .bind(&row.coin_id)
         .bind(&row.parent_coin_info)
@@ -1057,7 +1196,14 @@ impl WalletDb {
         .bind(&row.amount)
         .bind(&row.puzzle_reveal)
         .bind(&row.solution)
+        .bind(now)
         .execute(&self.pool)
+        .await?;
+        evict_to_budget(
+            &self.pool,
+            "chain_spend_cache",
+            self.chain_cache_budgets.spends,
+        )
         .await?;
         Ok(())
     }
@@ -1067,11 +1213,11 @@ impl WalletDb {
     /// A REPLACE rather than an insert-if-absent: the one thing that legitimately changes about a
     /// coin is that it becomes spent, and re-learning that is the entire reason an unspent entry
     /// is allowed to expire.
-    pub async fn put_chain_read(&self, row: &ChainReadCacheRow) -> sqlx::Result<()> {
+    pub async fn put_chain_read(&self, row: &ChainReadCacheRow, now: i64) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO chain_read_cache (coin_id, parent_coin_info, puzzle_hash, \
              amount, created_height, spent_height, created_timestamp, spent_timestamp, \
-             cached_at) VALUES (?,?,?,?,?,?,?,?,?)",
+             cached_at, last_used_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&row.coin_id)
         .bind(&row.parent_coin_info)
@@ -1082,9 +1228,37 @@ impl WalletDb {
         .bind(row.created_timestamp)
         .bind(row.spent_timestamp)
         .bind(row.cached_at)
+        .bind(now)
         .execute(&self.pool)
         .await?;
+        evict_to_budget(
+            &self.pool,
+            "chain_read_cache",
+            self.chain_cache_budgets.reads,
+        )
+        .await?;
         Ok(())
+    }
+
+    /// The same DB held to SMALLER chain-cache budgets — the seam the eviction tests pin.
+    #[must_use]
+    pub fn with_chain_cache_budgets(mut self, budgets: ChainCacheBudgets) -> Self {
+        self.chain_cache_budgets = budgets;
+        self
+    }
+
+    /// How many rows one of the two chain-cache tables currently holds.
+    ///
+    /// Public because a budget is only a budget if a test can watch it hold under a flood of
+    /// distinct coin ids, which is the evidence dig_ecosystem#3035 asks for.
+    pub async fn chain_cache_len(&self, table: ChainCacheTable) -> sqlx::Result<i64> {
+        let row = sqlx::query(match table {
+            ChainCacheTable::Reads => "SELECT COUNT(*) AS n FROM chain_read_cache",
+            ChainCacheTable::Spends => "SELECT COUNT(*) AS n FROM chain_spend_cache",
+        })
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get("n"))
     }
 
     // ---- arrivals (dig_ecosystem#2548) ------------------------------------

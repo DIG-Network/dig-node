@@ -22,8 +22,50 @@ use super::*;
 /// A fixed instant every cache test is written against, so no test depends on when it runs.
 const NOW: i64 = 1_700_000_000;
 
-/// A coin id spelled as the reads take it: 64 lowercase hex characters.
-const COIN_ID: &str = "aa00000000000000000000000000000000000000000000000000000000000001";
+/// The parent every fixture coin is created by.
+const FIXTURE_PARENT: &str = "bb";
+
+/// The puzzle hash every fixture coin record carries.
+const FIXTURE_PUZZLE_HASH: &str = "cc";
+
+/// The coin id the fixture record with `amount` genuinely has.
+///
+/// DERIVED, never pasted, because a coin id IS `SHA256(parent | puzzle_hash | amount)` and the
+/// cached read path now checks exactly that (dig_ecosystem#3035). A hand-picked constant would
+/// make every cache fixture a row that could not exist on chain, and a fixture that cannot survive
+/// the real check is a fixture that hides the check going missing.
+fn coin_id_for(amount: u64) -> String {
+    hex::encode(
+        chia::protocol::Coin {
+            parent_coin_info: hex32(&FIXTURE_PARENT.repeat(32)),
+            puzzle_hash: hex32(&FIXTURE_PUZZLE_HASH.repeat(32)),
+            amount,
+        }
+        .coin_id(),
+    )
+}
+
+/// The coin id the fixture SPEND is a spend of. Its puzzle hash is the reveal's tree hash, not the
+/// records' `cc..`, so it is a different coin.
+fn spend_coin_id() -> String {
+    hex::encode(
+        chia::protocol::Coin {
+            parent_coin_info: hex32(&FIXTURE_PARENT.repeat(32)),
+            puzzle_hash: hex32(&reveal_tree_hash(REVEAL)),
+            amount: 1,
+        }
+        .coin_id(),
+    )
+}
+
+/// 64 hex characters as the 32 bytes a coin is made of.
+fn hex32(hex_str: &str) -> Bytes32 {
+    let bytes: [u8; 32] = hex::decode(hex_str)
+        .expect("a fixture hash is hex")
+        .try_into()
+        .expect("a fixture hash is 32 bytes");
+    Bytes32::from(bytes)
+}
 
 /// A clock pinned to one instant.
 struct FixedClock(i64);
@@ -39,9 +81,9 @@ impl Clock for FixedClock {
 /// is exactly the contradiction a quorum exists to catch.
 fn coin(amount: u64, spent_height: Option<u32>) -> FallbackCoin {
     FallbackCoin {
-        coin_id: COIN_ID.to_string(),
-        parent_coin_info: "bb".repeat(32),
-        puzzle_hash: "cc".repeat(32),
+        coin_id: coin_id_for(amount),
+        parent_coin_info: FIXTURE_PARENT.repeat(32),
+        puzzle_hash: FIXTURE_PUZZLE_HASH.repeat(32),
         amount,
         created_height: Some(9_000_000),
         spent_height,
@@ -54,8 +96,8 @@ fn coin(amount: u64, spent_height: Option<u32>) -> FallbackCoin {
 /// what the coin BECAME, so two peers differing in it disagree about the next lineage generation.
 fn spend(solution: &str) -> FallbackCoinSpend {
     FallbackCoinSpend {
-        coin_id: COIN_ID.to_string(),
-        parent_coin_info: "bb".repeat(32),
+        coin_id: spend_coin_id(),
+        parent_coin_info: FIXTURE_PARENT.repeat(32),
         puzzle_hash: reveal_tree_hash(REVEAL),
         amount: 1,
         puzzle_reveal: REVEAL.to_string(),
@@ -183,7 +225,7 @@ fn agreeing_records(n: usize, amount: u64, spent: Option<u32>) -> Vec<Voice> {
 #[tokio::test]
 async fn a_single_peer_never_decides_a_coin_record() {
     let (reads, _db, _) = reads_over(agreeing_records(1, 42, None)).await;
-    let err = reads.coin_record_by_id(COIN_ID).await.unwrap_err();
+    let err = reads.coin_record_by_id(&coin_id_for(42)).await.unwrap_err();
     assert!(
         err.message.contains("could not be corroborated"),
         "a lone peer must produce UNKNOWN, got: {}",
@@ -195,7 +237,7 @@ async fn a_single_peer_never_decides_a_coin_record() {
 #[tokio::test]
 async fn two_agreeing_peers_are_authoritative() {
     let (reads, _db, _) = reads_over(agreeing_records(2, 42, None)).await;
-    let answer = reads.coin_record_by_id(COIN_ID).await.unwrap();
+    let answer = reads.coin_record_by_id(&coin_id_for(42)).await.unwrap();
     assert_eq!(answer, Some(coin(42, None)));
 }
 
@@ -210,7 +252,7 @@ async fn a_silent_peer_does_not_discard_the_round() {
     voices.push(Voice::Silent);
     let (reads, _db, _) = reads_over(voices).await;
     assert_eq!(
-        reads.coin_record_by_id(COIN_ID).await.unwrap(),
+        reads.coin_record_by_id(&coin_id_for(7)).await.unwrap(),
         Some(coin(7, None))
     );
 }
@@ -233,7 +275,7 @@ async fn one_dissenting_peer_is_outvoted_not_believed() {
     voices.extend(agreeing_records(3, 100, None));
     let (reads, _db, _) = reads_over(voices).await;
 
-    let answer = reads.coin_record_by_id(COIN_ID).await.unwrap();
+    let answer = reads.coin_record_by_id(&coin_id_for(100)).await.unwrap();
     assert_eq!(
         answer,
         Some(coin(100, None)),
@@ -254,7 +296,7 @@ async fn a_split_round_is_unknown_and_never_absence() {
     voices.extend(agreeing_records(2, 2, None));
     let (reads, _db, _) = reads_over(voices).await;
 
-    let result = reads.coin_record_by_id(COIN_ID).await;
+    let result = reads.coin_record_by_id(&coin_id_for(1)).await;
     assert!(result.is_err(), "a split must not resolve to an answer");
     let message = result.unwrap_err().message;
     assert!(
@@ -272,7 +314,11 @@ async fn a_split_round_is_unknown_and_never_absence() {
 #[tokio::test]
 async fn too_few_answers_is_reported_as_reachability() {
     let (reads, _db, _) = reads_over(vec![Voice::Silent, Voice::Silent, Voice::Silent]).await;
-    let message = reads.coin_record_by_id(COIN_ID).await.unwrap_err().message;
+    let message = reads
+        .coin_record_by_id(&coin_id_for(1))
+        .await
+        .unwrap_err()
+        .message;
     assert!(
         message.contains("answered at all"),
         "an unanswered round must be reported as reachability: {message}"
@@ -283,7 +329,10 @@ async fn too_few_answers_is_reported_as_reachability() {
 #[tokio::test]
 async fn a_corroborated_absence_is_ok_none() {
     let (reads, _db, _) = reads_over(vec![Voice::Record(None), Voice::Record(None)]).await;
-    assert_eq!(reads.coin_record_by_id(COIN_ID).await.unwrap(), None);
+    assert_eq!(
+        reads.coin_record_by_id(&coin_id_for(1)).await.unwrap(),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -310,14 +359,14 @@ async fn a_corroborated_record_is_cached_and_served_without_peers() {
     )
     .with_clock(clock.clone());
     assert_eq!(
-        live.coin_record_by_id(COIN_ID).await.unwrap(),
+        live.coin_record_by_id(&coin_id_for(55)).await.unwrap(),
         Some(coin(55, Some(9_000_100)))
     );
 
     let peerless =
         PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db).with_clock(clock);
     assert_eq!(
-        peerless.coin_record_by_id(COIN_ID).await.unwrap(),
+        peerless.coin_record_by_id(&coin_id_for(55)).await.unwrap(),
         Some(coin(55, Some(9_000_100))),
         "a cached spent record must be served with no peers at all"
     );
@@ -335,12 +384,15 @@ async fn a_spent_record_is_cached_forever() {
         db.clone(),
     )
     .with_clock(Arc::new(FixedClock(NOW)));
-    live.coin_record_by_id(COIN_ID).await.unwrap();
+    live.coin_record_by_id(&coin_id_for(3)).await.unwrap();
 
     let a_decade_later = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
         .with_clock(Arc::new(FixedClock(NOW + 10 * 365 * 24 * 3600)));
     assert_eq!(
-        a_decade_later.coin_record_by_id(COIN_ID).await.unwrap(),
+        a_decade_later
+            .coin_record_by_id(&coin_id_for(3))
+            .await
+            .unwrap(),
         Some(coin(3, Some(9_000_200)))
     );
 }
@@ -358,12 +410,12 @@ async fn an_unspent_record_expires_and_is_re_asked() {
         db.clone(),
     )
     .with_clock(Arc::new(FixedClock(NOW)));
-    live.coin_record_by_id(COIN_ID).await.unwrap();
+    live.coin_record_by_id(&coin_id_for(3)).await.unwrap();
 
     let later = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
         .with_clock(Arc::new(FixedClock(NOW + UNSPENT_CACHE_TTL_SECS)));
     assert!(
-        later.coin_record_by_id(COIN_ID).await.is_err(),
+        later.coin_record_by_id(&coin_id_for(3)).await.is_err(),
         "an expired unspent entry must be re-asked, not served"
     );
 }
@@ -421,12 +473,12 @@ async fn a_corroborated_absence_is_not_cached() {
         db.clone(),
     )
     .with_clock(Arc::new(FixedClock(NOW)));
-    assert_eq!(live.coin_record_by_id(COIN_ID).await.unwrap(), None);
+    assert_eq!(live.coin_record_by_id(&coin_id_for(1)).await.unwrap(), None);
 
     let peerless = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
         .with_clock(Arc::new(FixedClock(NOW)));
     assert!(
-        peerless.coin_record_by_id(COIN_ID).await.is_err(),
+        peerless.coin_record_by_id(&coin_id_for(1)).await.is_err(),
         "an absence must not be cached: the second read must ask again, not answer None"
     );
 }
@@ -440,11 +492,11 @@ async fn a_cache_hit_asks_no_peer() {
     let asked = sample.asked.clone();
     let reads = PeerCorroboratedReads::new(sample, db).with_clock(Arc::new(FixedClock(NOW)));
 
-    reads.coin_record_by_id(COIN_ID).await.unwrap();
+    reads.coin_record_by_id(&coin_id_for(3)).await.unwrap();
     let after_first = asked.load(Ordering::SeqCst);
     assert_eq!(after_first, 2, "the first read must ask both peers");
 
-    reads.coin_record_by_id(COIN_ID).await.unwrap();
+    reads.coin_record_by_id(&coin_id_for(3)).await.unwrap();
     assert_eq!(
         asked.load(Ordering::SeqCst),
         after_first,
@@ -469,7 +521,7 @@ async fn a_dissenting_peer_cannot_decide_what_a_coin_became() {
     let (reads, _db, _) = reads_over(voices).await;
 
     assert_eq!(
-        reads.coin_spend(COIN_ID).await.unwrap(),
+        reads.coin_spend(&spend_coin_id()).await.unwrap(),
         Some(spend("80")),
         "the majority's spend must win"
     );
@@ -494,13 +546,13 @@ async fn a_unanimous_sample_cannot_substitute_a_different_coin() {
         coin_id: "ee".repeat(32),
         ..coin(1, Some(100))
     };
-    assert_ne!(other.coin_id, COIN_ID, "the fixture must substitute");
+    assert_ne!(other.coin_id, coin_id_for(1), "the fixture must substitute");
 
     // EVERY peer agrees — this is not a dissent case. The tally is unanimous and still wrong.
     let voices: Vec<Voice> = (0..4).map(|_| Voice::Record(Some(other.clone()))).collect();
     let (reads, db, _) = reads_over(voices).await;
 
-    let outcome = reads.coin_record_by_id(COIN_ID).await;
+    let outcome = reads.coin_record_by_id(&coin_id_for(1)).await;
     assert!(
         outcome.is_err(),
         "a unanimous answer about another coin was accepted: {outcome:?}"
@@ -509,14 +561,17 @@ async fn a_unanimous_sample_cannot_substitute_a_different_coin() {
     // And nothing was written. A row keyed on the answer's id would be a permanent entry for a
     // question nobody asked, later served with no corroboration at all.
     assert!(
-        db.cached_chain_read(&other.coin_id)
+        db.cached_chain_read(&other.coin_id, NOW)
             .await
             .unwrap()
             .is_none(),
         "the substituted coin was cached"
     );
     assert!(
-        db.cached_chain_read(COIN_ID).await.unwrap().is_none(),
+        db.cached_chain_read(&coin_id_for(1), NOW)
+            .await
+            .unwrap()
+            .is_none(),
         "a row was written for the requested id from a substituted answer"
     );
 }
@@ -536,13 +591,16 @@ async fn a_unanimous_sample_cannot_substitute_a_different_spend() {
     let voices: Vec<Voice> = (0..4).map(|_| Voice::Spend(Some(other.clone()))).collect();
     let (reads, db, _) = reads_over(voices).await;
 
-    let outcome = reads.coin_spend(COIN_ID).await;
+    let outcome = reads.coin_spend(&spend_coin_id()).await;
     assert!(
         outcome.is_err(),
         "a unanimous spend of another coin was accepted: {outcome:?}"
     );
     assert!(
-        db.cached_chain_spend(COIN_ID).await.unwrap().is_none(),
+        db.cached_chain_spend(&spend_coin_id(), NOW)
+            .await
+            .unwrap()
+            .is_none(),
         "a permanent spend row was written from a substituted answer"
     );
 }
@@ -555,7 +613,7 @@ async fn a_unanimous_sample_cannot_substitute_a_different_spend() {
 #[tokio::test]
 async fn an_uncorroborated_spend_is_unknown_never_unspent() {
     let (reads, _db, _) = reads_over(vec![Voice::Spend(Some(spend("80")))]).await;
-    let result = reads.coin_spend(COIN_ID).await;
+    let result = reads.coin_spend(&spend_coin_id()).await;
     assert!(
         result.is_err(),
         "one peer's spend claim must not become an answer"
@@ -575,12 +633,12 @@ async fn a_cached_spend_is_permanent() {
         db.clone(),
     )
     .with_clock(Arc::new(FixedClock(NOW)));
-    live.coin_spend(COIN_ID).await.unwrap();
+    live.coin_spend(&spend_coin_id()).await.unwrap();
 
     let a_decade_later = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
         .with_clock(Arc::new(FixedClock(NOW + 10 * 365 * 24 * 3600)));
     assert_eq!(
-        a_decade_later.coin_spend(COIN_ID).await.unwrap(),
+        a_decade_later.coin_spend(&spend_coin_id()).await.unwrap(),
         Some(spend("80"))
     );
 }
@@ -603,13 +661,274 @@ async fn the_cache_key_is_spelling_insensitive() {
     let asked = sample.asked.clone();
     let reads = PeerCorroboratedReads::new(sample, db).with_clock(Arc::new(FixedClock(NOW)));
 
-    reads.coin_record_by_id(COIN_ID).await.unwrap();
+    reads.coin_record_by_id(&coin_id_for(3)).await.unwrap();
     let after_first = asked.load(Ordering::SeqCst);
 
-    let shouted = format!("0x{}", COIN_ID.to_ascii_uppercase());
+    let shouted = format!("0x{}", coin_id_for(3).to_ascii_uppercase());
     assert_eq!(
         reads.coin_record_by_id(&shouted).await.unwrap(),
         Some(coin(3, Some(9_000_400)))
     );
     assert_eq!(asked.load(Ordering::SeqCst), after_first);
+}
+
+// ---------------------------------------------------------------------------
+// What a cached row must survive on the way OUT (dig_ecosystem#3035)
+// ---------------------------------------------------------------------------
+//
+// Every test below writes its row STRAIGHT TO THE TABLE. That is the whole point: before this,
+// no test seeded a cache row directly, so every check on the cached path was reachable only
+// through the write path that had already validated the same facts — and deleting one of those
+// checks failed nothing. A check no test can kill is a check that disappears in the next
+// refactor, and these rows never expire.
+
+use super::super::db::{ChainCacheBudgets, ChainCacheTable};
+
+/// A spend row whose puzzle reveal does not tree-hash to its puzzle hash is REFUSED, not served.
+///
+/// The row is otherwise impeccable — its parent, puzzle hash and amount hash to exactly the key it
+/// is stored under — so the ONLY thing that can refuse it is the reveal check on the cached branch.
+/// That is what makes this test load-bearing for that one line rather than for the read in general.
+///
+/// The draw is peerless, so a `Some` could only have come from the cache and an `Err` could only
+/// have come from the check.
+#[tokio::test]
+async fn a_cached_spend_whose_reveal_does_not_hash_to_its_puzzle_hash_is_refused() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let key = coin_id_for(1);
+    db.put_chain_spend(
+        &ChainSpendCacheRow {
+            coin_id: key.clone(),
+            parent_coin_info: FIXTURE_PARENT.repeat(32),
+            // The RECORD puzzle hash, which `REVEAL` does not tree-hash to — and the field the key
+            // is derived from, so the row is self-consistent in every way except this one.
+            puzzle_hash: FIXTURE_PUZZLE_HASH.repeat(32),
+            amount: "1".into(),
+            puzzle_reveal: REVEAL.to_string(),
+            solution: "80".into(),
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    let peerless = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
+        .with_clock(Arc::new(FixedClock(NOW)));
+    let outcome = peerless.coin_spend(&key).await;
+    assert!(
+        outcome.is_err(),
+        "a cached spend whose reveal does not match its puzzle hash was served: {outcome:?}"
+    );
+    assert!(
+        outcome.unwrap_err().message.contains("tree-hashes to"),
+        "the refusal must name the reveal check that produced it"
+    );
+}
+
+/// A spend row filed under a coin id its own fields do not hash to is REFUSED.
+///
+/// This is the check that replaced comparing the row's `coin_id` to the lookup key — a comparison
+/// that could not fail, because the row's `coin_id` IS the key it was selected by. This one can:
+/// the fixture's reveal matches its puzzle hash (so the reveal check passes and cannot be what
+/// refuses it), and only the coin id's own arithmetic separates the row from the question asked.
+#[tokio::test]
+async fn a_cached_spend_filed_under_a_foreign_coin_id_is_refused() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    // Some OTHER coin's id — the key a second writer, or a keying change, could file a row under.
+    let foreign_key = coin_id_for(999);
+    db.put_chain_spend(
+        &ChainSpendCacheRow {
+            coin_id: foreign_key.clone(),
+            parent_coin_info: FIXTURE_PARENT.repeat(32),
+            puzzle_hash: reveal_tree_hash(REVEAL),
+            amount: "1".into(),
+            puzzle_reveal: REVEAL.to_string(),
+            solution: "80".into(),
+        },
+        NOW,
+    )
+    .await
+    .unwrap();
+
+    let peerless = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
+        .with_clock(Arc::new(FixedClock(NOW)));
+    let outcome = peerless.coin_spend(&foreign_key).await;
+    assert!(
+        outcome.is_err(),
+        "a spend row whose fields hash to another coin was served: {outcome:?}"
+    );
+    assert!(
+        outcome.unwrap_err().message.contains("hash to"),
+        "the refusal must name the binding that produced it"
+    );
+}
+
+/// The same for a coin RECORD: a row whose three fields do not hash to its key is refused.
+///
+/// The honest control sits in the same test — the identical fields under the key they really hash
+/// to — so this separates "refuses a foreign row" from "refuses everything cached".
+#[tokio::test]
+async fn a_cached_record_whose_fields_do_not_hash_to_its_key_is_refused() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    let honest = coin_id_for(7);
+    let foreign = coin_id_for(8);
+
+    // The row's fields are those of the amount-7 coin; the key says amount 8.
+    let mut foreign_row = read_row(7, NOW);
+    foreign_row.coin_id = foreign.clone();
+    db.put_chain_read(&foreign_row, NOW).await.unwrap();
+    db.put_chain_read(&read_row(7, NOW), NOW).await.unwrap();
+
+    let peerless = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
+        .with_clock(Arc::new(FixedClock(NOW)));
+    assert!(
+        peerless.coin_record_by_id(&foreign).await.is_err(),
+        "a record row whose fields hash to another coin was served"
+    );
+    assert!(
+        peerless.coin_record_by_id(&honest).await.unwrap().is_some(),
+        "the honest control row must still be served"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The budget (dig_ecosystem#3035)
+// ---------------------------------------------------------------------------
+
+/// A record row for the coin of `amount`, ready to write.
+fn read_row(amount: u64, now: i64) -> ChainReadCacheRow {
+    ChainReadCacheRow {
+        coin_id: coin_id_for(amount),
+        parent_coin_info: FIXTURE_PARENT.repeat(32),
+        puzzle_hash: FIXTURE_PUZZLE_HASH.repeat(32),
+        amount: amount.to_string(),
+        created_height: Some(9_000_000),
+        // SPENT, so the row is usable however long ago it was written and no test here depends on
+        // the TTL.
+        spent_height: Some(9_000_050),
+        created_timestamp: None,
+        spent_timestamp: None,
+        cached_at: now,
+    }
+}
+
+/// The record cache stops growing at its budget, pinned from BOTH sides: exactly at the budget
+/// nothing is evicted, one over evicts exactly one row.
+///
+/// A budget tested only by over-filling it is satisfied identically by an implementation that
+/// evicts eagerly and keeps far less than it promises.
+#[tokio::test]
+async fn the_record_cache_holds_exactly_its_budget() {
+    let db = WalletDb::open_in_memory()
+        .await
+        .unwrap()
+        .with_chain_cache_budgets(ChainCacheBudgets {
+            reads: 3,
+            spends: 3,
+        });
+
+    for amount in 1..=3u64 {
+        db.put_chain_read(&read_row(amount, NOW), NOW + amount as i64)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        db.chain_cache_len(ChainCacheTable::Reads).await.unwrap(),
+        3,
+        "at the budget nothing may be evicted"
+    );
+
+    db.put_chain_read(&read_row(4, NOW), NOW + 4).await.unwrap();
+    assert_eq!(
+        db.chain_cache_len(ChainCacheTable::Reads).await.unwrap(),
+        3,
+        "one row over the budget must evict exactly one row"
+    );
+}
+
+/// Eviction ranks by recency of USE, not of insertion — the property the whole budget turns on.
+///
+/// The fixture separates the two orders deliberately: the OLDEST-written row is the one re-read,
+/// so a cache that evicted by insertion order would drop exactly the row a lineage walk is still
+/// walking. That is the nearest wrong implementation, and it is the one this test kills.
+#[tokio::test]
+async fn a_re_read_row_outlives_a_newer_one_that_was_never_used_again() {
+    let db = WalletDb::open_in_memory()
+        .await
+        .unwrap()
+        .with_chain_cache_budgets(ChainCacheBudgets {
+            reads: 2,
+            spends: 2,
+        });
+
+    db.put_chain_read(&read_row(1, NOW), NOW).await.unwrap();
+    db.put_chain_read(&read_row(2, NOW), NOW + 1).await.unwrap();
+
+    // The walk comes back to the FIRST row. Reading it is what marks it used.
+    assert!(db
+        .cached_chain_read(&coin_id_for(1), NOW + 2)
+        .await
+        .unwrap()
+        .is_some());
+
+    // A third row pushes the table over its budget.
+    db.put_chain_read(&read_row(3, NOW), NOW + 3).await.unwrap();
+
+    assert!(
+        db.cached_chain_read(&coin_id_for(1), NOW + 4)
+            .await
+            .unwrap()
+            .is_some(),
+        "the re-read row must survive: it is the one a walk is still using"
+    );
+    assert!(
+        db.cached_chain_read(&coin_id_for(2), NOW + 4)
+            .await
+            .unwrap()
+            .is_none(),
+        "the row nobody came back to must be the one evicted"
+    );
+}
+
+/// The spend cache is bounded the same way, and a flood of DISTINCT coin ids — the shape
+/// `control.wallet.coinById` hands an unauthenticated caller — cannot push it past its budget.
+#[tokio::test]
+async fn a_flood_of_distinct_ids_cannot_grow_the_spend_cache_past_its_budget() {
+    let db = WalletDb::open_in_memory()
+        .await
+        .unwrap()
+        .with_chain_cache_budgets(ChainCacheBudgets {
+            reads: 5,
+            spends: 5,
+        });
+
+    for amount in 1..=200u64 {
+        db.put_chain_spend(
+            &ChainSpendCacheRow {
+                coin_id: coin_id_for(amount),
+                parent_coin_info: FIXTURE_PARENT.repeat(32),
+                puzzle_hash: reveal_tree_hash(REVEAL),
+                amount: amount.to_string(),
+                puzzle_reveal: REVEAL.to_string(),
+                solution: "80".into(),
+            },
+            NOW + amount as i64,
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(
+        db.chain_cache_len(ChainCacheTable::Spends).await.unwrap(),
+        5,
+        "the spend cache must stay at its budget however many distinct ids are asked for"
+    );
+}
+
+/// The shipped budgets, stated so a change to either is a deliberate edit to a test that says what
+/// the number means (roughly 20 MiB of records and 40 MiB of spends — see their doc comments).
+#[test]
+fn the_shipped_budgets_are_what_the_docs_claim() {
+    assert_eq!(super::super::db::CHAIN_READ_CACHE_MAX_ROWS, 50_000);
+    assert_eq!(super::super::db::CHAIN_SPEND_CACHE_MAX_ROWS, 10_000);
 }

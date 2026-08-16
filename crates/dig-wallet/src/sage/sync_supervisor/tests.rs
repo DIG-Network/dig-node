@@ -4053,3 +4053,41 @@ async fn a_dialler_that_ignores_exclusions_exhausts_the_bound_without_hanging() 
         "the round terminated on its attempt bound"
     );
 }
+
+/// ONE HOST is ONE VOICE, however many ports it answers on (dig_ecosystem#3035).
+///
+/// Distinctness used to be by `SocketAddr`, which carries a port — so a single machine listening on
+/// four ports supplied four "independent" opinions, which is precisely the concentration the sample
+/// assembly exists to prevent. The fixture offers the same IP on four ports FIRST and two genuinely
+/// different hosts after, and the assertion is on the ADDRESSES admitted rather than on the count:
+/// a count of three is satisfied identically by an implementation that admitted two of the crowded
+/// host's ports and one real peer.
+#[tokio::test]
+async fn one_host_is_one_voice_however_many_ports_it_answers_on() {
+    let crowded: Vec<std::net::SocketAddr> = (8444..8448)
+        .map(|port| std::net::SocketAddr::from(([10, 0, 0, 9], port)))
+        .collect();
+    let mut offered = crowded.clone();
+    offered.push(discovered_addr(1));
+    offered.push(discovered_addr(2));
+
+    let dialler = CoResidentDialler {
+        priority: Vec::new(),
+        discovered: offered,
+        attempts: std::cell::Cell::new(0),
+    };
+    let dialler = &dialler;
+
+    let sample =
+        super::assemble_distinct_sample(3, super::MAX_PROBE_ATTEMPTS, |exclude| async move {
+            dialler.draw(&exclude)
+        })
+        .await;
+
+    let reached: Vec<_> = sample.iter().map(|(addr, ())| *addr).collect();
+    assert_eq!(
+        reached,
+        vec![crowded[0], discovered_addr(1), discovered_addr(2)],
+        "one host answered on four ports and was counted more than once: {reached:?}"
+    );
+}

@@ -442,20 +442,37 @@ mod tests {
     #[tokio::test]
     async fn a_cached_arbitrary_coin_read_is_served_without_building_a_chain_client() {
         let db = crate::sage::db::WalletDb::open_in_memory().await.unwrap();
-        let coin_id = "ab".repeat(32);
-        db.put_chain_read(&crate::sage::db::ChainReadCacheRow {
-            coin_id: coin_id.clone(),
-            parent_coin_info: "cd".repeat(32),
-            puzzle_hash: "ef".repeat(32),
-            amount: "1234".into(),
-            created_height: Some(9_000_000),
-            // SPENT, so the entry is immutable and usable however long ago it was written — the
-            // test therefore does not depend on when it runs.
-            spent_height: Some(9_000_050),
-            created_timestamp: None,
-            spent_timestamp: None,
-            cached_at: 0,
-        })
+        // The id is DERIVED from the three fields below rather than picked, because the cached
+        // read path re-checks that a row's fields hash to the key it is stored under
+        // (dig_ecosystem#3035). A picked id would make this a row that could not exist on chain.
+        let hex32 = |h: &str| -> chia::protocol::Bytes32 {
+            let bytes: [u8; 32] = hex::decode(h).unwrap().try_into().unwrap();
+            chia::protocol::Bytes32::from(bytes)
+        };
+        let coin_id = hex::encode(
+            chia::protocol::Coin {
+                parent_coin_info: hex32(&"cd".repeat(32)),
+                puzzle_hash: hex32(&"ef".repeat(32)),
+                amount: 1234,
+            }
+            .coin_id(),
+        );
+        db.put_chain_read(
+            &crate::sage::db::ChainReadCacheRow {
+                coin_id: coin_id.clone(),
+                parent_coin_info: "cd".repeat(32),
+                puzzle_hash: "ef".repeat(32),
+                amount: "1234".into(),
+                created_height: Some(9_000_000),
+                // SPENT, so the entry is immutable and usable however long ago it was written — the
+                // test therefore does not depend on when it runs.
+                spent_height: Some(9_000_050),
+                created_timestamp: None,
+                spent_timestamp: None,
+                cached_at: 0,
+            },
+            0,
+        )
         .await
         .unwrap();
 
