@@ -428,8 +428,12 @@ fn bind_fields_to_key(
     if computed == key {
         return Ok(());
     }
+    // Written as one unbroken literal deliberately: a backslash continuation here gets collapsed
+    // into a run of spaces by `cargo fmt`, which has corrupted user-visible copy in this ecosystem
+    // several times — including this very message, which reached the security gate reading
+    // "it is stored          under".
     Err(Error::internal(format!(
-        "{what}: the cached row's fields hash to {computed}, not to the coin id {key} it is stored          under"
+        "{what}: the cached row's fields hash to {computed}, not to the coin id {key} it is stored under"
     )))
 }
 
