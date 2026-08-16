@@ -841,3 +841,705 @@ pub fn request_frame(store_id: [u8; 32], root: [u8; 32]) -> dig_gossip::DigMessa
         root: Bytes32::from(root),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dig_social_profile::slot::standard::DISPLAY_NAME;
+    use dig_social_profile::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // -- Fixtures ----------------------------------------------------------------------------------
+
+    /// A real DPB artifact and the root it hashes to.
+    ///
+    /// Built through `VerifiedBody::from_pairs` — the SAME code path a publisher uses — so these
+    /// tests exercise genuine format bytes rather than a mock the accept gate could never see in
+    /// production.
+    fn dpb(display_name: &str) -> (Vec<u8>, [u8; 32]) {
+        let body = VerifiedBody::from_pairs([(
+            DISPLAY_NAME,
+            Value::Utf8(display_name.to_string()),
+        )])
+        .expect("a one-slot profile is a valid body");
+        (body.as_bytes().to_vec(), body.root())
+    }
+
+    fn store_id(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn peer(byte: u8) -> PeerId {
+        Bytes32::from([byte; 32])
+    }
+
+    fn root_ref(store: [u8; 32], root: [u8; 32]) -> ProfileRootRef {
+        ProfileRootRef {
+            store_id: Bytes32::from(store),
+            root: Bytes32::from(root),
+        }
+    }
+
+    fn frame(store: [u8; 32], root: [u8; 32], bytes: &[u8]) -> ProfileBody {
+        ProfileBody {
+            store_id: Bytes32::from(store),
+            root: Bytes32::from(root),
+            body: bytes.to_vec(),
+        }
+    }
+
+    fn tempdir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dig-profile-sync-test-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    // -- Spies -------------------------------------------------------------------------------------
+
+    struct Subs(Vec<[u8; 32]>);
+    impl SubscriptionView for Subs {
+        fn is_subscribed(&self, store_id: &[u8; 32]) -> bool {
+            self.0.contains(store_id)
+        }
+    }
+
+    #[derive(Default)]
+    struct Transport {
+        announces: Mutex<Vec<(ProfileRootRef, Option<PeerId>)>>,
+        sent_bodies: Mutex<Vec<(PeerId, usize)>>,
+        sent_requests: Mutex<Vec<(PeerId, ProfileRootRef)>>,
+        peers: Vec<PeerId>,
+    }
+    #[async_trait::async_trait]
+    impl ProfileTransport for Transport {
+        async fn announce_root(&self, root_ref: &ProfileRootRef, exclude: Option<PeerId>) -> usize {
+            self.announces.lock().unwrap().push((*root_ref, exclude));
+            1
+        }
+        async fn send_body(&self, peer: PeerId, body: &ProfileBody) {
+            self.sent_bodies
+                .lock()
+                .unwrap()
+                .push((peer, body.body.len()));
+        }
+        async fn send_request(&self, peer: PeerId, root_ref: &ProfileRootRef) -> bool {
+            self.sent_requests.lock().unwrap().push((peer, *root_ref));
+            true
+        }
+        fn live_peers(&self) -> Vec<PeerId> {
+            self.peers.clone()
+        }
+    }
+    impl Transport {
+        fn with_peers(peers: Vec<PeerId>) -> Self {
+            Self {
+                peers,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Penalty(AtomicUsize);
+    #[async_trait::async_trait]
+    impl PeerPenalty for Penalty {
+        async fn penalize(&self, _peer: PeerId, _reason: &str) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Penalty {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A chain view scripted with one answer — the node's sole root authority, stubbed.
+    struct Chain(Result<Option<crate::Bytes32>, String>);
+    #[async_trait::async_trait]
+    impl AnchoredRootResolver for Chain {
+        async fn anchored_root(
+            &self,
+            _store_id: &[u8; 32],
+        ) -> Result<Option<crate::Bytes32>, String> {
+            self.0.clone()
+        }
+    }
+    fn chain_at(root: [u8; 32]) -> Chain {
+        Chain(Ok(Some(crate::Bytes32(root))))
+    }
+    fn chain_unreachable() -> Chain {
+        Chain(Err("coinset unreachable".into()))
+    }
+
+    /// The four collaborators every accept-gate test needs, for a node subscribed to `sid`.
+    fn gate_fixtures(sid: [u8; 32]) -> (Subs, Solicitations, Transport, Penalty) {
+        (
+            Subs(vec![sid]),
+            Solicitations::new(),
+            Transport::default(),
+            Penalty::default(),
+        )
+    }
+
+    // -- ProfileBodyStore ---------------------------------------------------------------------------
+
+    #[test]
+    fn stored_bytes_are_returned_byte_identical() {
+        // The whole portability claim: what one machine writes, another reads unchanged.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        store.put(&store_id(1), &root, &bytes).unwrap();
+        assert_eq!(store.get(&store_id(1), &root).unwrap(), Some(bytes));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_missing_body_is_none_not_an_error() {
+        // "Consulted, holds nothing" and "the read failed" need opposite remedies from a caller.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        assert_eq!(store.get(&store_id(1), &[9u8; 32]).unwrap(), None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retention_keeps_the_new_body_and_exactly_one_predecessor() {
+        // Pins the bound from BOTH sides: three writes leave TWO artifacts — not one (which a
+        // delete-every-other implementation would leave) and not three (which no pruning would).
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let sid = store_id(7);
+        let mut roots = Vec::new();
+        for name in ["gen1", "gen2", "gen3"] {
+            let (bytes, root) = dpb(name);
+            store.put(&sid, &root, &bytes).unwrap();
+            // Distinguishable mtimes: retention keeps the most recent predecessor, and tied
+            // timestamps would make that choice arbitrary rather than wrong.
+            std::thread::sleep(Duration::from_millis(20));
+            roots.push(root);
+        }
+        let held = store.roots_for_store(&sid);
+        assert_eq!(held.len(), 2, "current-plus-one, got {held:?}");
+        assert!(store.has(&sid, &roots[2]), "the newest must survive");
+        assert!(store.has(&sid, &roots[1]), "so must its predecessor");
+        assert!(!store.has(&sid, &roots[0]), "the oldest must be pruned");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bodies_live_outside_the_capsule_modules_tree() {
+        // A PLACEMENT property, asserted on the path relationship rather than on an outcome a
+        // differently-placed store would satisfy identically.
+        let cache = tempdir();
+        let store = ProfileBodyStore::under_cache_dir(&cache);
+        let path = store.path(&store_id(1), &[2u8; 32]);
+        assert!(path.starts_with(cache.join(PROFILES_DIR)));
+        assert!(
+            !path.starts_with(cache.join("modules")),
+            "a profile under modules/ would become a phantom DHT provider record"
+        );
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[test]
+    fn only_dpb_artifacts_are_recognised_as_bodies() {
+        // Retention enumerates this predicate, so anything it wrongly accepts is something prune
+        // could delete — including another writer in-flight temp file.
+        assert!(root_from_file_name(&format!("{}.dpb", hex::encode([3u8; 32]))).is_some());
+        assert!(root_from_file_name(".abc.1234.0.tmp").is_none());
+        assert!(root_from_file_name("short.dpb").is_none());
+        assert!(root_from_file_name(&format!("{}.dpb", "A".repeat(64))).is_none());
+        assert!(root_from_file_name(&hex::encode([3u8; 32])).is_none());
+    }
+
+    // -- The accept gate ----------------------------------------------------------------------------
+
+    /// The happy path, and the control every rejection test below is measured against.
+    #[tokio::test]
+    async fn a_solicited_body_matching_the_requested_root_is_accepted_and_re_announced() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let sid = store_id(1);
+        let (subs, sol, tx, pen) = gate_fixtures(sid);
+        sol.record(sid, root, peer(9));
+
+        let outcome = accept_body(
+            &store,
+            &subs,
+            &sol,
+            &tx,
+            &pen,
+            peer(9),
+            &frame(sid, root, &bytes),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            AcceptOutcome::Accepted {
+                bytes: bytes.len(),
+                announced: 1
+            }
+        );
+        assert_eq!(store.get(&sid, &root).unwrap(), Some(bytes));
+        assert_eq!(pen.count(), 0);
+        let announces = tx.announces.lock().unwrap();
+        assert_eq!(announces.len(), 1, "announce exactly once");
+        assert_eq!(
+            announces[0].1,
+            Some(peer(9)),
+            "the announce must exclude the peer that supplied the body"
+        );
+        drop(announces);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_unsolicited_but_perfectly_valid_body_is_dropped_and_never_penalized() {
+        // The eclipse guard. The fixture varies ONE thing — WHICH peer answers — and keeps a
+        // truthful control: peer 9 was asked, peer 8 was not, and the body peer 8 sends is
+        // genuinely well-formed and genuinely hashes to the root. So the ONLY reason to refuse it
+        // is that it was unsolicited, and the only reason not to penalize is that being
+        // unsolicited is not evidence of lying. An implementation that penalized everything it
+        // refuses fails here.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let sid = store_id(1);
+        let (subs, sol, tx, pen) = gate_fixtures(sid);
+        sol.record(sid, root, peer(9));
+
+        let outcome = accept_body(
+            &store,
+            &subs,
+            &sol,
+            &tx,
+            &pen,
+            peer(8),
+            &frame(sid, root, &bytes),
+        )
+        .await;
+
+        assert_eq!(outcome, AcceptOutcome::Unsolicited);
+        assert_eq!(pen.count(), 0, "a late or forged answer must never cost a peer");
+        assert!(!store.has(&sid, &root));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_solicited_body_that_does_not_hash_to_the_requested_root_penalizes_once() {
+        // The single penalizing case. `wrong` is a REAL, well-formed DPB — just of a different
+        // profile — so the failure is precisely "does not hash to the root you were asked for" and
+        // not "unparseable bytes", which a weaker fixture would conflate.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (_, requested_root) = dpb("Ada");
+        let (wrong, _) = dpb("Mallory");
+        let sid = store_id(1);
+        let (subs, sol, tx, pen) = gate_fixtures(sid);
+        sol.record(sid, requested_root, peer(9));
+
+        let outcome = accept_body(
+            &store,
+            &subs,
+            &sol,
+            &tx,
+            &pen,
+            peer(9),
+            &frame(sid, requested_root, &wrong),
+        )
+        .await;
+
+        assert_eq!(outcome, AcceptOutcome::RootMismatch);
+        assert_eq!(pen.count(), 1);
+        assert!(!store.has(&sid, &requested_root));
+        assert!(tx.announces.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_fan_out_stays_answerable_by_every_peer_that_was_asked() {
+        // Solicitation is a READ, not a take. Two hops are needed to see it: peer 9 answers first
+        // and wrongly, then peer 8 answers correctly. An implementation that consumed the record on
+        // the first answer would read peer 8 as unsolicited and lose the honest body — and a
+        // single-peer fixture could not tell the two apart.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let (wrong, _) = dpb("Mallory");
+        let sid = store_id(1);
+        let (subs, sol, tx, pen) = gate_fixtures(sid);
+        sol.record(sid, root, peer(9));
+        sol.record(sid, root, peer(8));
+
+        let first = accept_body(
+            &store,
+            &subs,
+            &sol,
+            &tx,
+            &pen,
+            peer(9),
+            &frame(sid, root, &wrong),
+        )
+        .await;
+        let second = accept_body(
+            &store,
+            &subs,
+            &sol,
+            &tx,
+            &pen,
+            peer(8),
+            &frame(sid, root, &bytes),
+        )
+        .await;
+
+        assert_eq!(first, AcceptOutcome::RootMismatch);
+        assert!(matches!(second, AcceptOutcome::Accepted { .. }));
+        assert_eq!(pen.count(), 1, "only the peer that lied is demoted");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_body_for_an_unsubscribed_store_is_refused() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let sid = store_id(1);
+        let (_, sol, tx, pen) = gate_fixtures(sid);
+        let subs = Subs(vec![store_id(2)]);
+        sol.record(sid, root, peer(9));
+
+        let outcome = accept_body(
+            &store,
+            &subs,
+            &sol,
+            &tx,
+            &pen,
+            peer(9),
+            &frame(sid, root, &bytes),
+        )
+        .await;
+
+        assert_eq!(outcome, AcceptOutcome::NotSubscribed);
+        assert_eq!(pen.count(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_over_cap_body_is_refused_before_it_is_parsed() {
+        // The bound comes from the protocol own frame ceiling, not from feel: one byte past
+        // `MAX_PROFILE_BODY_BYTES` is exactly the largest body a 225 frame could carry.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let sid = store_id(1);
+        let root = [4u8; 32];
+        let (subs, sol, tx, pen) = gate_fixtures(sid);
+        sol.record(sid, root, peer(9));
+
+        let oversized = vec![0u8; MAX_PROFILE_BODY_BYTES + 1];
+        let outcome = accept_body(
+            &store,
+            &subs,
+            &sol,
+            &tx,
+            &pen,
+            peer(9),
+            &frame(sid, root, &oversized),
+        )
+        .await;
+
+        assert_eq!(outcome, AcceptOutcome::TooLarge);
+        assert_eq!(pen.count(), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn re_receiving_a_held_body_is_idempotent_and_does_not_re_announce() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let sid = store_id(1);
+        let (subs, sol, tx, pen) = gate_fixtures(sid);
+        store.put(&sid, &root, &bytes).unwrap();
+        sol.record(sid, root, peer(9));
+
+        let outcome = accept_body(
+            &store,
+            &subs,
+            &sol,
+            &tx,
+            &pen,
+            peer(9),
+            &frame(sid, root, &bytes),
+        )
+        .await;
+
+        assert_eq!(outcome, AcceptOutcome::AlreadyHeld);
+        assert!(tx.announces.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -- The local (control-plane) entry point ------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_local_body_matching_the_confirmed_chain_root_is_stored() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let path = accept_local_body(&store, &chain_at(root), store_id(1), root, &bytes)
+            .await
+            .expect("chain confirms this exact root");
+        assert!(path.is_file());
+        assert_eq!(store.get(&store_id(1), &root).unwrap(), Some(bytes));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_local_body_whose_root_the_chain_does_not_confirm_is_refused() {
+        // The load-bearing fixture: `bytes` GENUINELY hash to `declared`, so a self-consistent
+        // implementation that verified the body against its own declared root would accept. Only
+        // comparing against the INDEPENDENTLY resolved chain root refuses it. The chain is pinned
+        // to a different generation, which is what a stale or forged publish looks like.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, declared) = dpb("Ada");
+        let (_, on_chain) = dpb("the real current generation");
+        assert_ne!(declared, on_chain);
+
+        let err = accept_local_body(&store, &chain_at(on_chain), store_id(1), declared, &bytes)
+            .await
+            .expect_err("refusal is an error, never a success with a flag");
+
+        assert!(matches!(err, LocalAcceptError::RootNotConfirmed(_)));
+        assert!(!store.has(&store_id(1), &declared));
+        assert!(!store.has(&store_id(1), &on_chain));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_chain_accepts_nothing() {
+        // Fail closed. Again the body is genuinely valid for its declared root, so the ONLY thing
+        // standing between it and disk is the missing chain answer.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let err = accept_local_body(&store, &chain_unreachable(), store_id(1), root, &bytes)
+            .await
+            .expect_err("no root means nothing to compare against");
+        assert!(matches!(err, LocalAcceptError::RootNotConfirmed(_)));
+        assert!(!store.has(&store_id(1), &root));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_store_with_no_confirmed_generation_accepts_nothing() {
+        // `Ok(None)` is a DIFFERENT chain answer from `Err`, and an implementation that only
+        // guarded the error path would accept here.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let err = accept_local_body(&store, &Chain(Ok(None)), store_id(1), root, &bytes)
+            .await
+            .expect_err("an unminted store confirms nothing");
+        assert!(matches!(err, LocalAcceptError::RootNotConfirmed(_)));
+        assert!(!store.has(&store_id(1), &root));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn malformed_bytes_are_reported_separately_from_an_unconfirmed_root() {
+        // The two need OPPOSITE remedies — retry versus re-encode — so collapsing them would make
+        // the control-plane error uninterpretable. The chain here confirms the declared root,
+        // isolating the failure to the bytes.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (_, root) = dpb("Ada");
+        let err = accept_local_body(&store, &chain_at(root), store_id(1), root, b"not a DPB")
+            .await
+            .expect_err("garbage is not a body");
+        assert!(matches!(err, LocalAcceptError::Malformed(_)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -- The 224 responder --------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_held_body_is_served_and_an_unheld_one_is_not() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let sid = store_id(1);
+        store.put(&sid, &root, &bytes).unwrap();
+        let tx = Transport::default();
+        let budget = OutboundBudget::default();
+
+        let served =
+            serve_body_request(&store, &tx, &budget, peer(9), &root_ref(sid, root)).await;
+        let missing =
+            serve_body_request(&store, &tx, &budget, peer(9), &root_ref(sid, [0xAA; 32])).await;
+
+        assert_eq!(served, ServeOutcome::Served(bytes.len()));
+        assert_eq!(missing, ServeOutcome::NotHeld);
+        assert_eq!(tx.sent_bodies.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn the_outbound_budget_binds_at_capacity_and_refuses_one_over() {
+        // Pinned from BOTH sides: the second answer within a capacity-2 window must succeed (a
+        // bound tested only from above would pass for an off-by-one that throttles too early), and
+        // the third must not.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let sid = store_id(1);
+        store.put(&sid, &root, &bytes).unwrap();
+        let tx = Transport::default();
+        let budget = OutboundBudget::new(2, Duration::from_secs(60));
+        let req = root_ref(sid, root);
+
+        let a = serve_body_request(&store, &tx, &budget, peer(9), &req).await;
+        let b = serve_body_request(&store, &tx, &budget, peer(9), &req).await;
+        let c = serve_body_request(&store, &tx, &budget, peer(9), &req).await;
+
+        assert_eq!(a, ServeOutcome::Served(bytes.len()));
+        assert_eq!(b, ServeOutcome::Served(bytes.len()), "at capacity must pass");
+        assert_eq!(c, ServeOutcome::Throttled, "one over must fail");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn requests_for_content_we_do_not_hold_cannot_starve_the_budget() {
+        // The ORDERING inside `serve_body_request` is the property: the budget is taken only AFTER
+        // the artifact is known to exist. A capacity of ONE makes the difference observable — under
+        // the wrong ordering the single token is spent on a miss and the real request throttles.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (bytes, root) = dpb("Ada");
+        let sid = store_id(1);
+        store.put(&sid, &root, &bytes).unwrap();
+        let tx = Transport::default();
+        let budget = OutboundBudget::new(1, Duration::from_secs(60));
+
+        for i in 0..5u8 {
+            let miss =
+                serve_body_request(&store, &tx, &budget, peer(9), &root_ref(sid, [i; 32])).await;
+            assert_eq!(miss, ServeOutcome::NotHeld);
+        }
+        let real = serve_body_request(&store, &tx, &budget, peer(9), &root_ref(sid, root)).await;
+
+        assert_eq!(real, ServeOutcome::Served(bytes.len()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -- The 223-driven fetch -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn an_announce_the_chain_confirms_solicits_the_body_under_the_chain_root() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (_, root) = dpb("Ada");
+        let sid = store_id(1);
+        let tx = Transport::with_peers(vec![peer(9)]);
+        let sol = Solicitations::new();
+
+        let asked = handle_root_announce(
+            &store,
+            &Subs(vec![sid]),
+            &chain_at(root),
+            &tx,
+            &sol,
+            &root_ref(sid, root),
+        )
+        .await;
+
+        assert_eq!(asked, Some(peer(9)));
+        assert!(
+            sol.is_solicited(&sid, &root, &peer(9)),
+            "the solicitation must be recorded under the CHAIN-resolved root"
+        );
+        assert_eq!(tx.sent_requests.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_announce_the_chain_contradicts_solicits_nothing() {
+        // A forged 223 naming a root the chain does not confirm costs one bounded chain read and
+        // nothing else — in particular it must not produce a solicitation, because a solicitation
+        // is exactly what would later make an attacker body acceptable.
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (_, forged) = dpb("Mallory");
+        let (_, on_chain) = dpb("Ada");
+        let sid = store_id(1);
+        let tx = Transport::with_peers(vec![peer(9)]);
+        let sol = Solicitations::new();
+
+        let asked = handle_root_announce(
+            &store,
+            &Subs(vec![sid]),
+            &chain_at(on_chain),
+            &tx,
+            &sol,
+            &root_ref(sid, forged),
+        )
+        .await;
+
+        assert_eq!(asked, None);
+        assert!(!sol.is_solicited(&sid, &forged, &peer(9)));
+        assert!(tx.sent_requests.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_announce_is_not_chased_while_the_chain_is_unreachable() {
+        let dir = tempdir();
+        let store = ProfileBodyStore::new(dir.clone());
+        let (_, root) = dpb("Ada");
+        let sid = store_id(1);
+        let tx = Transport::with_peers(vec![peer(9)]);
+        let sol = Solicitations::new();
+
+        let asked = handle_root_announce(
+            &store,
+            &Subs(vec![sid]),
+            &chain_unreachable(),
+            &tx,
+            &sol,
+            &root_ref(sid, root),
+        )
+        .await;
+
+        assert_eq!(asked, None);
+        assert!(tx.sent_requests.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -- The kill switch ----------------------------------------------------------------------------
+
+    #[test]
+    fn the_kill_switch_defaults_on_and_the_off_words_disable_it() {
+        let _guard = env_lock();
+        std::env::remove_var(PROFILE_SYNC_ENV);
+        assert!(profile_sync_enabled(), "absent must mean ON");
+        for off in ["0", "false", "OFF", "no"] {
+            std::env::set_var(PROFILE_SYNC_ENV, off);
+            assert!(!profile_sync_enabled(), "{off} must disable profile sync");
+        }
+        std::env::set_var(PROFILE_SYNC_ENV, "1");
+        assert!(profile_sync_enabled());
+        std::env::remove_var(PROFILE_SYNC_ENV);
+    }
+
+    /// Serialises the env-mutating tests; `std::env` is process-wide and cargo runs tests threaded.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
