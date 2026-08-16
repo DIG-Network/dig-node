@@ -29,12 +29,7 @@ use super::coverage::CoveredSet;
 use super::custody::WalletCustody;
 use super::db::{CoinRow, OfferDbRow, OptionDbRow, WalletDb};
 use super::events::EventBus;
-use super::fallback::{ChainFallback, FallbackCoin};
-// Test-only: `WalletBackend` never names a `FallbackCoinSpend` directly -- it consumes one through
-// the trait and immediately composes it with a coin record -- so only the doubles below spell the
-// type. Ungated, this is an unused import in a release build, and clippy runs with `-D warnings`.
-#[cfg(test)]
-use super::fallback::FallbackCoinSpend;
+use super::fallback::{ChainFallback, FallbackCoin, FallbackCoinSpend};
 use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
 use super::spend::{self, required_public_keys, Broadcaster, WalletSigner};
@@ -165,6 +160,32 @@ fn coin_from_fallback(coin: &FallbackCoin) -> WalletCoin {
         created_height: coin.created_height,
         spent_height: coin.spent_height,
     }
+}
+
+/// A spend and the coin record that carries its heights, composed into one answer — and checked
+/// against each other on the way ([`WalletBackend::coin_spend`]).
+///
+/// A record calling the coin UNSPENT while a spend of it exists is a source contradicting itself,
+/// so this fails closed rather than emit a spend with an absent or invented `spent_height`. A
+/// caller cannot tell an invented height from a real one, so it must never be handed either.
+///
+/// One function because BOTH the cached and the networked path compose the same pair, and a second
+/// spelling of a fail-closed check is a second chance to get it subtly different.
+fn composed_spend(
+    spend: &FallbackCoinSpend,
+    record: &FallbackCoin,
+    coin_id: &str,
+) -> std::result::Result<WalletCoinSpend, BalanceError> {
+    if record.spent_height.is_none() {
+        return Err(BalanceError::ReadFailed(format!(
+            "chain source reported a spend of {coin_id} while its record calls the coin unspent"
+        )));
+    }
+    Ok(WalletCoinSpend {
+        coin: coin_from_fallback(record),
+        puzzle_reveal: spend.puzzle_reveal.clone(),
+        solution: spend.solution.clone(),
+    })
 }
 
 /// Why a [`WalletBackend::push_signed_bundle`] could not report a mempool verdict.
@@ -1492,6 +1513,28 @@ impl WalletBackend {
         if !self.fallback.is_live() {
             return Err(BalanceError::NoChainSource);
         }
+        // A coin the chain tier already holds cached is answered from that cache, ahead of the rate
+        // limiter (dig_ecosystem#3044). The limiter bounds EGRESS amplification against the
+        // third-party oracle; a cache hit sends nothing, so charging it a token bounds nothing and
+        // spends the budget the misses need. Gating it made the bucket unable to refill under a
+        // polling client — a stable equilibrium in which a profile read could never succeed while
+        // the app that needed it was open.
+        //
+        // The amplification bound is UNCHANGED: only a miss reaches a peer, and only misses are
+        // charged.
+        if let Some(coin) = self
+            .fallback
+            .cached_coin_record_by_id(coin_id)
+            .await
+            .map_err(|e| BalanceError::ReadFailed(e.to_string()))?
+        {
+            return Ok(WalletCoinByIdResult {
+                coin: Some(coin_from_fallback(&coin)),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            });
+        }
         // The same global bound the other open chain reads carry (#1957): this is an
         // unauthenticated loopback endpoint, so without it a local process could loop it into
         // egress amplification against the third-party oracle.
@@ -1596,6 +1639,28 @@ impl WalletBackend {
         if !self.fallback.is_live() {
             return Err(BalanceError::NoChainSource);
         }
+        let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
+        // Both halves of the composed answer, from the cache, before any token is spent
+        // (dig_ecosystem#3044) — see `coin_by_id` for why a cache hit is not what the limiter
+        // bounds. BOTH must be cached: a cached spend whose record is not cached still has to
+        // reach a peer for the heights, and that read is egress like any other.
+        if let (Some(spend), Some(record)) = (
+            self.fallback
+                .cached_coin_spend(coin_id)
+                .await
+                .map_err(read_err)?,
+            self.fallback
+                .cached_coin_record_by_id(coin_id)
+                .await
+                .map_err(read_err)?,
+        ) {
+            return Ok(WalletCoinSpendResult {
+                spend: Some(composed_spend(&spend, &record, coin_id)?),
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            });
+        }
         if !self.fallback_rate.try_acquire() {
             return Err(BalanceError::RateLimited);
         }
@@ -1603,7 +1668,6 @@ impl WalletBackend {
             tier = Source::Fallback.as_wire(),
             "coin-spend read routed to the third-party chain oracle"
         );
-        let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
         let spend = self
             .fallback
             .coin_spend(coin_id)
@@ -1622,17 +1686,7 @@ impl WalletBackend {
                             "chain source reported a spend of {coin_id} and no record of that coin"
                         ))
                     })?;
-                if record.spent_height.is_none() {
-                    return Err(BalanceError::ReadFailed(format!(
-                        "chain source reported a spend of {coin_id} while its record calls the \
-                         coin unspent"
-                    )));
-                }
-                Some(WalletCoinSpend {
-                    coin: coin_from_fallback(&record),
-                    puzzle_reveal: spend.puzzle_reveal,
-                    solution: spend.solution,
-                })
+                Some(composed_spend(&spend, &record, coin_id)?)
             }
         };
         Ok(WalletCoinSpendResult {
@@ -7383,6 +7437,141 @@ mod tests {
                 .await
                 .expect("the DB fast path is never throttled");
             assert_eq!(r.balance, 100);
+        }
+    }
+
+    // ---- the limiter sits BELOW the chain-read cache (dig_ecosystem#3044) -------------
+
+    /// One generation of a lineage: a coin, spent, plus the spend that spent it.
+    fn generation(id: &str, spent_at: u32) -> (FallbackCoin, FallbackCoinSpend) {
+        (
+            fallback_coin(id, &owned_ph(), 100, Some(spent_at - 1), Some(spent_at)),
+            fallback_spend(id),
+        )
+    }
+
+    /// **A lineage walk served entirely from cache spends ZERO rate-limit tokens.**
+    ///
+    /// The bucket here is EMPTY and never refills, so every token the walk might take is a token it
+    /// cannot have: the walk completes only if it takes none. That is what pins the ORDERING rather
+    /// than the tuning — a limiter left above the cache with a larger burst passes a
+    /// "more reads succeed now" test and fails this one, at any capacity.
+    ///
+    /// The network side of the double is EMPTY and its call counter is asserted at zero, so a read
+    /// that reached past the cache could not have produced these answers.
+    ///
+    /// **Catches** the shipped defect: with the gate above the cache, a client polling the same
+    /// coins drains the bucket with reads that send nothing, and the profile read it is polling FOR
+    /// can never be afforded again (the measured equilibrium on dig_ecosystem#3044).
+    #[tokio::test]
+    async fn a_walk_served_entirely_from_cache_spends_no_rate_limit_tokens() {
+        let (g0, s0) = generation("gen-0", 40);
+        let (g1, s1) = generation("gen-1", 41);
+        let (g2, s2) = generation("gen-2", 42);
+        let fb = Arc::new(MockFallback::default().with_cached(vec![g0, g1, g2], vec![s0, s1, s2]));
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb.clone(),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(0.0, 0.0);
+
+        for id in ["gen-0", "gen-1", "gen-2"] {
+            let coin = be
+                .coin_by_id(id)
+                .await
+                .unwrap_or_else(|e| panic!("the cached record for {id} needs no token: {e:?}"));
+            assert_eq!(coin.coin.expect("the cached coin is served").coin_id, id);
+            let spend = be
+                .coin_spend(id)
+                .await
+                .unwrap_or_else(|e| panic!("the cached spend for {id} needs no token: {e:?}"));
+            assert_eq!(
+                spend
+                    .spend
+                    .expect("the cached spend is served")
+                    .coin
+                    .coin_id,
+                id
+            );
+        }
+        assert_eq!(
+            fb.call_count(),
+            0,
+            "a cache-served walk reaches the network zero times — so it bounds no egress"
+        );
+    }
+
+    /// **The bound it exists for is UNCHANGED: a cache MISS still costs a token.**
+    ///
+    /// The control for the test above, and the one that would catch "the fix" implemented as
+    /// deleting the gate. One token, two misses: the first is admitted, the second refused.
+    #[tokio::test]
+    async fn a_cache_miss_still_spends_a_token_and_is_refused_once_the_bucket_is_empty() {
+        let (g0, _) = generation("miss-0", 40);
+        let (g1, _) = generation("miss-1", 41);
+        let fb = Arc::new(MockFallback::with_coins(vec![g0, g1]));
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb.clone(),
+            WalletConfig::default(),
+        )
+        .with_fallback_rate_limit(1.0, 0.0);
+
+        assert!(
+            be.coin_by_id("miss-0").await.is_ok(),
+            "the first miss is admitted and spends the one token"
+        );
+        assert_eq!(
+            be.coin_by_id("miss-1").await,
+            Err(BalanceError::RateLimited),
+            "the second miss finds the bucket empty: egress is still bounded"
+        );
+        assert_eq!(
+            fb.call_count(),
+            1,
+            "exactly the admitted miss reached the network"
+        );
+    }
+
+    /// **A COLD multi-generation walk completes on the default bound.**
+    ///
+    /// Six generations is eleven reads — six records and five spends — against the shipped burst of
+    /// [`DEFAULT_FALLBACK_BURST`]. Nothing is cached, so every read is a real one, and none may be
+    /// refused: a lineage walk that cannot afford its own first pass never populates the cache the
+    /// test above then serves from.
+    #[tokio::test]
+    async fn a_cold_multi_generation_walk_completes_without_a_rate_limit_refusal() {
+        const GENERATIONS: u32 = 6;
+        let mut coins = Vec::new();
+        let mut spends = Vec::new();
+        for i in 0..GENERATIONS {
+            let (coin, spend) = generation(&format!("cold-{i}"), 40 + i);
+            coins.push(coin);
+            // The last generation is the TIP: it is spent nowhere, so no spend is read for it.
+            if i + 1 < GENERATIONS {
+                spends.push(spend);
+            }
+        }
+        let fb = Arc::new(MockFallback::with_coins(coins).with_spends(spends));
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb.clone(),
+            WalletConfig::default(),
+        );
+
+        for i in 0..GENERATIONS {
+            let id = format!("cold-{i}");
+            assert!(
+                be.coin_by_id(&id).await.is_ok(),
+                "generation {i}'s record is affordable on the default bound"
+            );
+            if i + 1 < GENERATIONS {
+                assert!(
+                    be.coin_spend(&id).await.is_ok(),
+                    "generation {i}'s spend is affordable on the default bound"
+                );
+            }
         }
     }
 

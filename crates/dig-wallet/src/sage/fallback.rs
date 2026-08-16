@@ -206,6 +206,30 @@ pub trait ChainFallback: Send + Sync {
     /// forged branch of somebody's lineage.
     async fn coin_records_by_parent(&self, parent_coin_id: &str) -> Result<Vec<FallbackCoin>>;
 
+    /// The coin record this tier can answer for `coin_id` WITHOUT touching the network, or
+    /// `Ok(None)` when serving it would require reaching a peer (dig_ecosystem#3044).
+    ///
+    /// This exists so the caller's egress rate limit can be spent on the thing it bounds. The
+    /// limiter guards amplification against third parties; a locally-cached answer produces no
+    /// egress at all, so charging it a token bounds nothing and starves the reads that matter. With
+    /// this seam the caller consults the cache first and takes a token only on a MISS.
+    ///
+    /// Implementations MUST apply every check the networked read applies to a cached row —
+    /// freshness, request binding, reveal verification. A cheap path is not a lax one.
+    ///
+    /// The default `Ok(None)` is truthful for any tier holding no cache: it simply reports that
+    /// nothing can be served for free, and the caller proceeds exactly as before.
+    async fn cached_coin_record_by_id(&self, _coin_id: &str) -> Result<Option<FallbackCoin>> {
+        Ok(None)
+    }
+
+    /// The SPEND this tier can answer for `coin_id` without touching the network, or `Ok(None)`
+    /// when it cannot (dig_ecosystem#3044). The spend-side counterpart of
+    /// [`Self::cached_coin_record_by_id`], with the same contract and the same reason.
+    async fn cached_coin_spend(&self, _coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+        Ok(None)
+    }
+
     /// Whether this fallback can actually reach a chain source. `true` for a live tier
     /// ([`CoinsetFallback`]); `false` for the graceful no-network [`EmptyFallback`], whose
     /// every read is a silent empty. A read that MUST consult the chain (an arbitrary,
@@ -1077,6 +1101,17 @@ pub(crate) mod mock {
         pub coins: Vec<FallbackCoin>,
         /// The spends this double knows, keyed by their spent coin's id (dig_ecosystem#2572).
         pub spends: Vec<FallbackCoinSpend>,
+        /// What this double can answer for FREE, without a network call (dig_ecosystem#3044).
+        ///
+        /// Deliberately a SEPARATE set from `coins`/`spends` rather than a flag over them: the
+        /// whole question a rate-limit test asks is which answers cost egress and which do not, and
+        /// a double that cannot express "cached but not reachable" cannot distinguish a read served
+        /// from cache from a read served over the wire.
+        pub cached_coins: Vec<FallbackCoin>,
+        /// The spend half of the same distinction.
+        pub cached_spends: Vec<FallbackCoinSpend>,
+        /// Counts NETWORKED calls only. A cached answer leaves it untouched — that is the
+        /// measurement.
         pub calls: Arc<AtomicUsize>,
     }
 
@@ -1084,9 +1119,18 @@ pub(crate) mod mock {
         pub fn with_coins(coins: Vec<FallbackCoin>) -> Self {
             Self {
                 coins,
-                spends: Vec::new(),
-                calls: Arc::new(AtomicUsize::new(0)),
+                ..Self::default()
             }
+        }
+        /// Coins this double serves from its cache, at no egress cost (dig_ecosystem#3044).
+        pub fn with_cached(
+            mut self,
+            coins: Vec<FallbackCoin>,
+            spends: Vec<FallbackCoinSpend>,
+        ) -> Self {
+            self.cached_coins = coins;
+            self.cached_spends = spends;
+            self
         }
         /// Add the spends this double will answer with. Kept SEPARATE from `coins` so a fixture can
         /// express a coin that exists with no spend, and a spend whose coin record is missing —
@@ -1128,6 +1172,20 @@ pub(crate) mod mock {
         async fn coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.spends.iter().find(|s| s.coin_id == coin_id).cloned())
+        }
+        async fn cached_coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
+            Ok(self
+                .cached_coins
+                .iter()
+                .find(|c| c.coin_id == coin_id)
+                .cloned())
+        }
+        async fn cached_coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+            Ok(self
+                .cached_spends
+                .iter()
+                .find(|s| s.coin_id == coin_id)
+                .cloned())
         }
         async fn coin_records_by_parent(&self, parent_coin_id: &str) -> Result<Vec<FallbackCoin>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
