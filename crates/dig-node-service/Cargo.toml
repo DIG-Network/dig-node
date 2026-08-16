@@ -193,6 +193,11 @@ dig-constants = "0.9"
 # a BARE program name through `$PATH` while running as root under `sudo` (whose default
 # `secure_path` puts a group-writable `/usr/local/bin` first on Debian, and which macOS does not set
 # at all) — a local privilege-escalation vector on the very command the docs tell operators to run.
+# Hex + base64 for the control plane: `control.profile.putBody`/`getBody` speak 64-hex ids and
+# standard padded base64 bodies, both fixed by dig-node-control-interface.
+hex = "0.4"
+base64 = "0.22"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
