@@ -174,6 +174,46 @@ impl PeerCorroboratedReads {
         self
     }
 
+    /// The coin record the CACHE can serve for `coin_id`, dialling nothing (dig_ecosystem#3044).
+    ///
+    /// `Ok(None)` means the cache holds no usable entry — never that the coin does not exist. Only
+    /// [`Self::coin_record_by_id`] can say that, and only after a corroborated peer round.
+    ///
+    /// Separate from that method so a caller can find out whether an answer is free BEFORE it
+    /// spends an egress rate-limit token on a read that may open no egress at all.
+    pub async fn cached_coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
+        let id = normalized(coin_id);
+        let now = self.clock.now_unix();
+        let Some(row) = self
+            .db
+            .cached_chain_read(&id, now)
+            .await
+            .map_err(|e| Error::internal(format!("chain-read cache read failed: {e}")))?
+        else {
+            return Ok(None);
+        };
+        if !cache_entry_is_usable(row.spent_height, row.cached_at, now) {
+            return Ok(None);
+        }
+        let coin = coin_from_cache(&row)?;
+        // The row is re-checked on the way OUT, not merely on the way in (dig_ecosystem#3035).
+        // Today the only production writer of this table binds at write time, so the row cannot be
+        // foreign — but that is a property of the current call graph, not of this read, and a
+        // second writer would arrive silently. Recomputing the id from the row's own three fields
+        // is arithmetic no writer can outrank, and it costs one hash of bytes already in hand.
+        //
+        // What it does NOT cover is deliberate: `spent_height` and `cached_at` are outside the id,
+        // and they are exactly the fields [`cache_entry_is_usable`] governs above.
+        bind_fields_to_key(
+            &coin.parent_coin_info,
+            &coin.puzzle_hash,
+            coin.amount,
+            &id,
+            "cached coin record",
+        )?;
+        Ok(Some(coin))
+    }
+
     /// One coin by id: the cache if it holds a usable entry, else a corroborated peer round.
     ///
     /// `Ok(None)` means the peers AGREED there is no such coin. Failing to assemble agreement is
@@ -183,32 +223,8 @@ impl PeerCorroboratedReads {
         let parsed = parse_coin_id(&id)?;
 
         let now = self.clock.now_unix();
-        if let Some(row) = self
-            .db
-            .cached_chain_read(&id, now)
-            .await
-            .map_err(|e| Error::internal(format!("chain-read cache read failed: {e}")))?
-        {
-            if cache_entry_is_usable(row.spent_height, row.cached_at, now) {
-                let coin = coin_from_cache(&row)?;
-                // The row is re-checked on the way OUT, not merely on the way in
-                // (dig_ecosystem#3035). Today the only production writer of this table binds at
-                // write time, so the row cannot be foreign — but that is a property of the current
-                // call graph, not of this read, and a second writer would arrive silently.
-                // Recomputing the id from the row's own three fields is arithmetic no writer can
-                // outrank, and it costs one hash of bytes already in hand.
-                //
-                // What it does NOT cover is deliberate: `spent_height` and `cached_at` are outside
-                // the id, and they are exactly the fields [`cache_entry_is_usable`] governs above.
-                bind_fields_to_key(
-                    &coin.parent_coin_info,
-                    &coin.puzzle_hash,
-                    coin.amount,
-                    &id,
-                    "cached coin record",
-                )?;
-                return Ok(Some(coin));
-            }
+        if let Some(coin) = self.cached_coin_record_by_id(coin_id).await? {
+            return Ok(Some(coin));
         }
 
         let peers = self.sample.draw().await;
@@ -257,6 +273,44 @@ impl PeerCorroboratedReads {
         Ok(answer.clone())
     }
 
+    /// The spend the CACHE can serve for `coin_id`, dialling nothing (dig_ecosystem#3044).
+    ///
+    /// `Ok(None)` means the cache holds no such spend — never that the coin is unspent. The
+    /// cache-vs-network distinction this draws is the one an egress rate limiter needs to charge
+    /// only the reads that actually leave the machine.
+    pub async fn cached_coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+        let id = normalized(coin_id);
+        let now = self.clock.now_unix();
+        // No freshness test: a cached spend is immutable by construction.
+        let Some(row) = self
+            .db
+            .cached_chain_spend(&id, now)
+            .await
+            .map_err(|e| Error::internal(format!("chain-spend cache read failed: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let spend = spend_from_cache(&row)?;
+        // The cached path re-runs the SAME reveal check the live path applies per peer. A check
+        // that only guards the wire is a check an attacker routes around by getting one row
+        // written — and spend rows never expire, so a bad row would be served, uncorroborated,
+        // forever. Cheap: a hash of bytes already in hand.
+        super::fallback::verified_reveal_hex(&spend.puzzle_reveal, &spend.puzzle_hash)?;
+        // And the coin's own three fields must hash to the key the row was found under
+        // (dig_ecosystem#3035). Note what this REPLACES: comparing `row.coin_id` to the lookup key,
+        // which is what the live path does, cannot fail here — the row's `coin_id` IS the key it
+        // was selected by, so that comparison read as a guard while being none. This one can fail,
+        // and it is the same arithmetic the live binding relies on.
+        bind_fields_to_key(
+            &spend.parent_coin_info,
+            &spend.puzzle_hash,
+            spend.amount,
+            &id,
+            "cached coin spend",
+        )?;
+        Ok(Some(spend))
+    }
+
     /// The spend that spent one coin: the cache, else a corroborated peer round.
     ///
     /// `Ok(None)` means the peers AGREED the coin is unspent or unknown. Failing to assemble
@@ -266,31 +320,7 @@ impl PeerCorroboratedReads {
         let parsed = parse_coin_id(&id)?;
 
         let now = self.clock.now_unix();
-        // No freshness test: a cached spend is immutable by construction.
-        if let Some(row) = self
-            .db
-            .cached_chain_spend(&id, now)
-            .await
-            .map_err(|e| Error::internal(format!("chain-spend cache read failed: {e}")))?
-        {
-            let spend = spend_from_cache(&row)?;
-            // The cached path re-runs the SAME reveal check the live path applies per peer. A check
-            // that only guards the wire is a check an attacker routes around by getting one row
-            // written — and spend rows never expire, so a bad row would be served, uncorroborated,
-            // forever. Cheap: a hash of bytes already in hand.
-            super::fallback::verified_reveal_hex(&spend.puzzle_reveal, &spend.puzzle_hash)?;
-            // And the coin's own three fields must hash to the key the row was found under
-            // (dig_ecosystem#3035). Note what this REPLACES: comparing `row.coin_id` to the lookup
-            // key, which is what the live path does, cannot fail here — the row's `coin_id` IS the
-            // key it was selected by, so that comparison read as a guard while being none. This one
-            // can fail, and it is the same arithmetic the live binding relies on.
-            bind_fields_to_key(
-                &spend.parent_coin_info,
-                &spend.puzzle_hash,
-                spend.amount,
-                &id,
-                "cached coin spend",
-            )?;
+        if let Some(spend) = self.cached_coin_spend(coin_id).await? {
             return Ok(Some(spend));
         }
 

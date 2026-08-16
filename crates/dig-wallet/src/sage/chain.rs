@@ -302,6 +302,23 @@ impl ChainFallback for ChainTransport {
             .await
     }
 
+    /// Served by the peer-read cache when there is one; a transport without peer reads holds no
+    /// cache and truthfully offers nothing for free (dig_ecosystem#3044).
+    async fn cached_coin_record_by_id(&self, coin_id: &str) -> Result<Option<FallbackCoin>> {
+        match &self.peer_reads {
+            Some(peers) => peers.cached_coin_record_by_id(coin_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The spend-side counterpart, on the same terms.
+    async fn cached_coin_spend(&self, coin_id: &str) -> Result<Option<FallbackCoinSpend>> {
+        match &self.peer_reads {
+            Some(peers) => peers.cached_coin_spend(coin_id).await,
+            None => Ok(None),
+        }
+    }
+
     async fn coin_records_by_parent(&self, parent_coin_id: &str) -> Result<Vec<FallbackCoin>> {
         CoinsetFallback::new(self.client().await?)
             .coin_records_by_parent(parent_coin_id)
