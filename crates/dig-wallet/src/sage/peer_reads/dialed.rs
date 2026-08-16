@@ -143,9 +143,11 @@ impl CoinPeer for ChiaCoinPeer {
         // program must be excluded from the round — folding it in as a voter would let three
         // honest peers carry a forged fourth answer into a majority.
         let puzzle_hash = hex::encode(state.coin.puzzle_hash);
-        let puzzle_reveal =
-            super::super::fallback::verified_reveal_hex(&hex::encode(response.puzzle), &puzzle_hash)
-                .map_err(|e| self.fail(&e.message))?;
+        let puzzle_reveal = super::super::fallback::verified_reveal_hex(
+            &hex::encode(response.puzzle),
+            &puzzle_hash,
+        )
+        .map_err(|e| self.fail(&e.message))?;
 
         // The COIN comes from the coin-state read, not from the puzzle response: the peer's
         // `PuzzleSolutionResponse` carries only a coin name, so a spend built from it alone would
