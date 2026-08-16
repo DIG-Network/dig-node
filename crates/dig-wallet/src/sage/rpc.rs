@@ -1645,7 +1645,10 @@ impl WalletBackend {
         // bounds. BOTH must be cached: a cached spend whose record is not cached still has to
         // reach a peer for the heights, and that read is egress like any other.
         if let (Some(spend), Some(record)) = (
-            self.fallback.cached_coin_spend(coin_id).await.map_err(read_err)?,
+            self.fallback
+                .cached_coin_spend(coin_id)
+                .await
+                .map_err(read_err)?,
             self.fallback
                 .cached_coin_record_by_id(coin_id)
                 .await
@@ -7465,10 +7468,7 @@ mod tests {
         let (g0, s0) = generation("gen-0", 40);
         let (g1, s1) = generation("gen-1", 41);
         let (g2, s2) = generation("gen-2", 42);
-        let fb = Arc::new(
-            MockFallback::default()
-                .with_cached(vec![g0, g1, g2], vec![s0, s1, s2]),
-        );
+        let fb = Arc::new(MockFallback::default().with_cached(vec![g0, g1, g2], vec![s0, s1, s2]));
         let be = WalletBackend::new(
             WalletDb::open_in_memory().await.unwrap(),
             fb.clone(),
@@ -7486,7 +7486,14 @@ mod tests {
                 .coin_spend(id)
                 .await
                 .unwrap_or_else(|e| panic!("the cached spend for {id} needs no token: {e:?}"));
-            assert_eq!(spend.spend.expect("the cached spend is served").coin.coin_id, id);
+            assert_eq!(
+                spend
+                    .spend
+                    .expect("the cached spend is served")
+                    .coin
+                    .coin_id,
+                id
+            );
         }
         assert_eq!(
             fb.call_count(),
@@ -7520,7 +7527,11 @@ mod tests {
             Err(BalanceError::RateLimited),
             "the second miss finds the bucket empty: egress is still bounded"
         );
-        assert_eq!(fb.call_count(), 1, "exactly the admitted miss reached the network");
+        assert_eq!(
+            fb.call_count(),
+            1,
+            "exactly the admitted miss reached the network"
+        );
     }
 
     /// **A COLD multi-generation walk completes on the default bound.**

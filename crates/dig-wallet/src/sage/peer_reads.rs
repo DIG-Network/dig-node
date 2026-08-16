@@ -536,4 +536,3 @@ pub use dialed::DialedPeerSample;
 
 #[cfg(test)]
 mod tests;
-
