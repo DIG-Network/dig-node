@@ -253,7 +253,7 @@ impl ProfileBodyStore {
             })
             .collect();
         // Newest first, so `skip(1)` retains exactly the single most recent predecessor.
-        others.sort_by(|a, b| b.0.cmp(&a.0));
+        others.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
         for (_, path) in others.into_iter().skip(1) {
             let _ = std::fs::remove_file(path);
         }
@@ -291,6 +291,9 @@ fn unique_suffix() -> u64 {
 // Solicitation ledger
 // ---------------------------------------------------------------------------------------------
 
+/// Which peers were asked for each outstanding `(store_id, root)`, and when.
+type AskedPeers = HashMap<([u8; 32], [u8; 32]), Vec<(PeerId, Instant)>>;
+
 /// The set of `(store_id, root)` requests this node has outstanding, and which peers were asked.
 ///
 /// A recorded root is **always** one this node resolved from chain before asking — that invariant is
@@ -298,7 +301,7 @@ fn unique_suffix() -> u64 {
 /// requested root" equivalent to "verify against chain".
 #[derive(Clone, Default)]
 pub struct Solicitations {
-    inner: Arc<Mutex<HashMap<([u8; 32], [u8; 32]), Vec<(PeerId, Instant)>>>>,
+    inner: Arc<Mutex<AskedPeers>>,
 }
 
 impl Solicitations {
@@ -340,7 +343,7 @@ impl Solicitations {
     /// holding this guard is map access, so a poisoned lock cannot mean a half-applied mutation.
     fn locked(
         &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<([u8; 32], [u8; 32]), Vec<(PeerId, Instant)>>> {
+    ) -> std::sync::MutexGuard<'_, AskedPeers> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

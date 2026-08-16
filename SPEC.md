@@ -175,6 +175,7 @@ ARE `DIG_NODE_*`, full stop.
 | `DIG_RPC_UPSTREAM` | upstream DIG RPC base URL for passthrough + miss-proxy | *(unset — NO default upstream)* | Normalized (§3.3); highest precedence (§3.4). Unset ⇒ passthrough is OFF and an unimplemented method answers a local `-32601` (§5.4). A value naming THIS node is REFUSED (§3.4.1). |
 | `DIG_NODE_CACHE` | explicit on-disk `.dig` cache dir | *(unset)* | Blank/whitespace ⇒ unset. Unset ⇒ shared canonical default (§3.5). |
 | `DIG_NODE_DIGLOCAL` | toggle for the bare `dig.local` listeners (`http://dig.local` on `127.0.0.2:80` AND, when a dig-cert leaf is present, `https://dig.local` on `127.0.0.2:443` — §4.1a) | `true` | Falsy = `0`/`false`/`no`/`off`; truthy = `1`/`true`/`yes`/`on`; case/whitespace-insensitive; unset or unrecognized ⇒ **default true**. |
+| `DIG_NODE_PROFILE_SYNC` | operator kill switch for profile-body sync (opcodes 223/224/225, §22) | `true` | Falsy = `0`/`false`/`no`/`off`, case- and whitespace-insensitive; unset or unrecognized ⇒ **default true**. Off means the node neither fetches nor serves profile bodies; nothing else depends on it, so it is a clean degradation. |
 
 The default port is the UNCOMMON high port **`9778`** (not `80`/`8080`). Port 80 requires elevation
 on most OSes, and both `80` and `8080` are the collision-prone common-dev ports most likely already
@@ -1497,6 +1498,8 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.config.setUpstream` | `upstream` (URL string; blank clears) | `upstream` (normalized), `requires_restart: true` — persisted, effective on next start (§3.4) |
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `capsule_bytes`, `response_bytes`, `dir`, `shared` |
+| `control.profile.putBody` | `store_id`, `root` (64-hex), `body_b64` (standard padded base64 of the DPB bytes) | `stored: true`, `store_id`, `root`, `body_bytes`. The node MUST independently resolve the root on chain and refuse unless the chain confirms exactly that root AND the bytes hash to it (§22.3). A refusal is an ERROR, never an `Ok` carrying `stored: false`. A decoded body above `MAX_BODY_BYTES` (4 MiB) is `INVALID_PARAMS` before anything is persisted. |
+| `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. |
 | `control.cache.setCap` | `cap_bytes` (number) | `cap_bytes` (floored at 64 MiB) |
 | `control.cache.clear` | — | `cleared: true` |
 | `control.hostedStores.list` | — | `stores[]`: `store_id`, `pinned`, `capsule_count`, `total_bytes`, `capsules[]` (capsule, root, size_bytes, last_used_unix_ms) — cached stores ∪ pinned stores |
@@ -5842,3 +5845,112 @@ would need a future explicit trusted-proxy configuration — an allowlist of pro
 authenticated proxy-supplied client-address header — before any forwarded address could be believed. No
 such configuration exists today; running the node behind an untrusted-header proxy forfeits the origin
 gate.
+
+---
+
+## 22. Profile-body sync — the portable DPB on disk, and across the network (epic #3008, W6)
+
+A **dig-profile** is a DID singleton plus a dig-store whose contents are summarised by a
+sparse-merkle-tree **root**. Its readable content is a **DPB artifact**, the portable byte format
+`dig-social-profile` defines: `magic "DIGP" ‖ version 0x01 ‖ record*`, records ascending and unique,
+each `slot_id:u16be ‖ value_len:u32be ‖ value_bytes`.
+
+This section is the node's contract for **holding** a DPB and **propagating** it.
+
+### 22.1. ONE encoding, at every boundary (MUST)
+
+The bytes written to disk, the bytes carried in an opcode-225 frame, and the bytes hashed to the
+on-chain root MUST be the **same bytes**. A node MUST NOT re-encode a body at any boundary.
+
+This is what makes the format portable: a body written by one machine is byte-identical to the body
+another machine reads, so any node can serve any profile it holds without knowing anything about the
+publisher. Re-encoding anywhere would produce a different root and silently break sync.
+
+### 22.2. On disk (MUST)
+
+Bodies live at `<cache>/profiles/<store_hex>/<root_hex>.dpb`, keyed by `(store_id, root)`.
+
+- Writes are temp-file plus atomic rename, so a concurrent reader sees a whole artifact or none.
+- Retention is **current plus one**: the body just written plus the most recently modified other.
+- The tree is **explicitly OUTSIDE `<cache>/modules/`**. `refresh_inventory` enumerates
+  `<cache>/modules/` to build this node's DHT provider records (§19.3); a profile under that tree
+  would become a phantom capsule provider record and perturb the reshare flywheel (§21).
+
+### 22.3. The on-chain root is the ONLY authority (MUST)
+
+A node MUST NOT accept a profile body except against a root it resolved from chain **itself**,
+through the same anchored-root resolver the read path uses (§14.4). Acceptance is by
+`dig_social_profile::VerifiedBody::open`; a node MUST NOT hand-roll the root comparison.
+
+The gate **fails closed**: a chain that cannot be read yields no root, and with no root there is
+nothing to compare against, so **nothing is accepted**. A store with no confirmed generation is
+likewise a refusal, not a permission.
+
+The same rule binds BOTH entry points. A body offered through `control.profile.putBody` is checked
+exactly as a peer's body is: the node resolves the root on chain, requires the caller's claimed root
+to BE that root, and only then verifies the bytes against it. **dig-app gets no exemption** — it
+holds the key and signs the root (§908), but the bytes reach the node the same way a peer's do.
+
+### 22.4. Verify against the REQUESTED root, never a re-read tip (MUST)
+
+A node MUST only ever request a root it has already resolved from chain, and MUST store the answer
+under **that** root.
+
+Re-reading the tip when an answer lands would create two false branches at once: an honest peer
+penalized because the chain advanced mid-window, and an ambiguity between a rollback and a race.
+Pinning the requested root removes both.
+
+### 22.5. The accept gate, in order (MUST)
+
+Each gate is strictly cheaper than the next, so a flood costs the least possible work:
+
+1. **solicited?** — `(store_id, root, sender)` must be an outstanding request of this node's own.
+2. **subscribed?** — the node must want this store (§14.1).
+3. **bounded?** — the body must fit `MAX_PROFILE_BODY_BYTES`, checked before any parse.
+4. **matches the chain-resolved root?** — §22.3.
+5. **persist** the verified bytes verbatim, then **announce once** (opcode 223), excluding the sender.
+
+Re-receiving a body already held is idempotent: no rewrite and no re-announce, so the epidemic
+quiesces.
+
+### 22.6. Penalization is narrow (MUST NOT widen)
+
+A node MUST penalize a peer in exactly ONE case: a body that fails to hash to the root **that peer
+was asked for**. A late, duplicate, or unsolicited answer MUST be dropped **silently**.
+
+Widening this turns a multi-peer fan-out into an eclipse primitive: an attacker who can make honest
+peers answer late — or who forges an unsolicited frame on a link — could evict every honest peer
+from the pool while doing nothing but being slow.
+
+For the same reason a solicitation is a **read, not a take**: a fan-out to several peers stays
+answerable by each of them, so a slower honest peer is never reclassified as unsolicited.
+
+### 22.7. Serving (MUST)
+
+An inbound opcode-224 request is answered from disk within an **outbound budget**, because a request
+is cheap to send and expensive to answer. The budget MUST be taken only AFTER the artifact is known
+to be held, so a flood of requests for content the node does not hold cannot starve the budget for
+peers asking about content it does. A held body too large to frame is not sent, and the failure is
+visible at the sender rather than silent at every receiver.
+
+### 22.8. Slice 1 binds content to a STORE, never to a DID (MUST)
+
+Nothing in the 223/224/225 frames carries a DID↔store pairing proof, and store descriptions are
+forgeable. Therefore:
+
+- the cache is keyed `(store_id, root)` with **no DID index**, and no `by_did` accessor;
+- `BLS_G1_PUBLIC_KEY` (0x0010), `PEER_ID` (0x0012) and `KEY_EPOCH` (0x0013) **MUST NOT** be resolved
+  out of this cache by any resolver.
+
+Key resolution continues to go through `dig_social_profile::resolve`, which performs the pairing on
+chain.
+
+### 22.9. Kill switch
+
+The subsystem is behind `DIG_NODE_PROFILE_SYNC` (default ON, §3.2). Off means the node neither
+fetches nor serves profile bodies. Nothing else depends on it having run.
+
+### 22.10. §908 boundary
+
+The node **persists, serves and fetches**. It never signs a profile and never edits one. There is no
+seed, private key, signature or unsigned-spend field on any profile method, and there never may be.
