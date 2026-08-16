@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.122.1] - 2026-08-16
+
+### Bug Fixes
+- **wallet:** Cap and evict the chain-read caches, anchor the cached-spend check (#231)- **wallet:** Spend a rate-limit token only on a cache MISS (#232)
+
+### CI
+- Enforce the coverage floor instead of only measuring it (#230)
+
 ## [0.121.0] - 2026-08-16
 
 ### Bug Fixes
