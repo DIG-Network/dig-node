@@ -842,6 +842,129 @@ pub fn request_frame(store_id: [u8; 32], root: [u8; 32]) -> dig_gossip::DigMessa
     })
 }
 
+// ---------------------------------------------------------------------------------------------
+// Production seams — the live gossip handle and the node's own subscription file.
+// ---------------------------------------------------------------------------------------------
+
+/// [`SubscriptionView`] over `<cache>/subscriptions.json`.
+///
+/// Reads the file on each query rather than caching it, so a subscription added through the control
+/// plane takes effect on the very next inbound frame without a restart. The file is small and the
+/// read happens only after a frame has already passed the transport, so the cost is bounded by the
+/// inbound rate limiter rather than by anything an attacker controls directly.
+pub struct CacheDirSubscriptions {
+    cache_dir: std::path::PathBuf,
+}
+
+impl CacheDirSubscriptions {
+    /// A view over the subscriptions file beside `cache_dir`.
+    #[must_use]
+    pub fn new(cache_dir: std::path::PathBuf) -> Self {
+        Self { cache_dir }
+    }
+}
+
+impl SubscriptionView for CacheDirSubscriptions {
+    fn is_subscribed(&self, store_id: &[u8; 32]) -> bool {
+        crate::subscription::load(&self.cache_dir).contains(&hex::encode(store_id))
+    }
+}
+
+/// [`ProfileTransport`] over the live dig-gossip handle: 223 broadcast, 224/225 directed.
+pub struct GossipProfileTransport {
+    handle: dig_gossip::GossipHandle,
+}
+
+impl GossipProfileTransport {
+    /// Bind the transport to `handle`.
+    #[must_use]
+    pub fn new(handle: dig_gossip::GossipHandle) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait::async_trait]
+impl ProfileTransport for GossipProfileTransport {
+    async fn announce_root(&self, root_ref: &ProfileRootRef, exclude: Option<PeerId>) -> usize {
+        self.handle
+            .broadcast(frame_profile_root_announce(root_ref), exclude)
+            .await
+            .unwrap_or(0)
+    }
+
+    async fn send_body(&self, peer: PeerId, body: &ProfileBody) {
+        // `frame_profile_body` returns `None` for a body no 225 frame can carry. The caller has
+        // already checked that, so reaching here with `None` means the artifact grew between the
+        // check and the send — drop it rather than emit a frame every receiver would hard-drop.
+        let Some(msg) = frame_profile_body(body) else {
+            return;
+        };
+        if let Err(e) = self.handle.send_frame(peer, msg).await {
+            tracing::debug!(error = %e, "profile body send failed (peer dropped mid-exchange)");
+        }
+    }
+
+    async fn send_request(&self, peer: PeerId, root_ref: &ProfileRootRef) -> bool {
+        self.handle
+            .send_frame(peer, frame_profile_body_request(root_ref))
+            .await
+            .is_ok()
+    }
+
+    fn live_peers(&self) -> Vec<PeerId> {
+        self.handle.live_peer_ids()
+    }
+}
+
+/// [`PeerPenalty`] over the live pool: disconnect the link that answered with a body which does not
+/// hash to the root it was asked for.
+///
+/// Disconnection is the whole penalty — there is no durable ban list here. A peer that lies once is
+/// dropped and may reconnect; a peer that lies repeatedly is dropped repeatedly, which costs it far
+/// more than it costs this node. A durable demotion would be a much sharper instrument than the
+/// evidence justifies, and the module docs explain why sharpening it is dangerous.
+pub struct GossipPeerPenalty {
+    handle: dig_gossip::GossipHandle,
+}
+
+impl GossipPeerPenalty {
+    /// Bind the penalty to `handle`.
+    #[must_use]
+    pub fn new(handle: dig_gossip::GossipHandle) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait::async_trait]
+impl PeerPenalty for GossipPeerPenalty {
+    async fn penalize(&self, peer: PeerId, reason: &str) {
+        tracing::warn!(peer = %peer.to_string(), reason, "profile-sync: disconnecting a peer that answered with a body that does not hash to the root it was asked for");
+        let _ = self.handle.disconnect(&peer).await;
+    }
+}
+
+/// Assemble the live [`ProfileSyncContext`] from the node's cache dir, chain resolver and pool.
+///
+/// One constructor so the ingest task, the control-plane handlers and any future caller all see the
+/// SAME store, the same solicitation ledger and the same budget — two ledgers would let a body
+/// solicited by one path be rejected as unsolicited by the other.
+#[must_use]
+pub fn context_from_node(
+    cache_dir: std::path::PathBuf,
+    resolver: Arc<dyn AnchoredRootResolver>,
+    handle: dig_gossip::GossipHandle,
+) -> ProfileSyncContext {
+    ProfileSyncContext {
+        store: ProfileBodyStore::under_cache_dir(&cache_dir),
+        subs: Arc::new(CacheDirSubscriptions::new(cache_dir)),
+        resolver,
+        transport: Arc::new(GossipProfileTransport::new(handle.clone())),
+        penalty: Arc::new(GossipPeerPenalty::new(handle)),
+        solicitations: Solicitations::new(),
+        budget: OutboundBudget::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
