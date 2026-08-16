@@ -59,13 +59,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use dig_node_control_interface::params::{
+    WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
+};
 use dig_node_core::seams::dig_peer::profile_sync::{
     accept_local_body, LocalAcceptError, ProfileBodyStore,
 };
 use dig_node_core::ChainSource as _;
-use dig_node_control_interface::params::{
-    WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
-};
 use dig_node_core::{CapsuleStore, Node};
 use serde_json::{json, Value};
 
@@ -2397,8 +2397,7 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
             format!("{METHOD} requires params.body_b64 (standard base64, padded)"),
         );
     };
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body_b64)
-    else {
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body_b64) else {
         return control_error(
             id,
             ErrorCode::InvalidParams,

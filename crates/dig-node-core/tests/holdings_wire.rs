@@ -244,7 +244,7 @@ async fn a_signed_announcement_crosses_the_real_wire_and_becomes_discoverable() 
         loop {
             let (sender, msg) = inbound.recv().await.expect("inbound channel stays open");
             assert_eq!(
-                msg.msg_type as u8, HOLDINGS_ANNOUNCE,
+                msg.msg_type, HOLDINGS_ANNOUNCE,
                 "only the holdings frame was sent on this link"
             );
             if let Some(a) = holdings_announce_payload(&msg) {

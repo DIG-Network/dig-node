@@ -3075,7 +3075,7 @@ async fn bring_up_dht(
     // stop syncing and nothing else changes -- a clean degradation, not an outage.
     if !crate::seams::dig_peer::profile_sync::profile_sync_enabled() {
         println!(
-            "dig-node peer network: profile-body sync DISABLED (DIG_NODE_PROFILE_SYNC) -- this              node will neither fetch nor serve profile bodies"
+            "dig-node peer network: profile-body sync DISABLED (DIG_NODE_PROFILE_SYNC) -- this node will neither fetch nor serve profile bodies"
         );
     } else {
         match pool.inbound_receiver() {
@@ -3093,7 +3093,7 @@ async fn bring_up_dht(
             }
             Err(e) => tracing::warn!(
                 error = %e,
-                "profile-body sync: no inbound receiver; this node holds and serves profile bodies                  through the control plane only"
+                "profile-body sync: no inbound receiver; this node holds and serves profile bodies through the control plane only"
             ),
         }
     }

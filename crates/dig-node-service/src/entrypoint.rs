@@ -935,15 +935,12 @@ mod tests {
     /// missing `body_b64`, and a method-name-only assertion could not see that.
     #[test]
     fn the_profile_verbs_parse_and_carry_their_operands() {
-        const STORE: &str =
-            "1111111111111111111111111111111111111111111111111111111111111111";
+        const STORE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
         const ROOT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
         const BODY: &str = "RElHUAE=";
 
-        let put = Cli::try_parse_from([
-            "dig-node", "profile", "put-body", STORE, ROOT, BODY,
-        ])
-        .expect("`profile put-body` parses");
+        let put = Cli::try_parse_from(["dig-node", "profile", "put-body", STORE, ROOT, BODY])
+            .expect("`profile put-body` parses");
         let Some(Command::Profile { action }) = put.command else {
             panic!("parsed to something other than `profile`");
         };

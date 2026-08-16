@@ -273,7 +273,11 @@ fn file_name_of(path: &Path) -> String {
 /// so retention and enumeration never act on a file this module did not write.
 fn root_from_file_name(name: &str) -> Option<[u8; 32]> {
     let stem = name.strip_suffix(&format!(".{DPB_EXTENSION}"))?;
-    if stem.len() != 64 || !stem.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()) {
+    if stem.len() != 64
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    {
         return None;
     }
     let raw = hex::decode(stem).ok()?;
@@ -325,13 +329,11 @@ impl Solicitations {
     /// consuming the record on first answer would make every slower honest peer look unsolicited.
     #[must_use]
     pub fn is_solicited(&self, store_id: &[u8; 32], root: &[u8; 32], peer: &PeerId) -> bool {
-        self.locked()
-            .get(&(*store_id, *root))
-            .is_some_and(|asked| {
-                asked
-                    .iter()
-                    .any(|(p, at)| p == peer && at.elapsed() < SOLICITATION_TTL)
-            })
+        self.locked().get(&(*store_id, *root)).is_some_and(|asked| {
+            asked
+                .iter()
+                .any(|(p, at)| p == peer && at.elapsed() < SOLICITATION_TTL)
+        })
     }
 
     /// Forget every request for `(store_id, root)` — called once the body is accepted.
@@ -341,9 +343,7 @@ impl Solicitations {
 
     /// The guarded map, recovering from poisoning rather than propagating a panic: the only code
     /// holding this guard is map access, so a poisoned lock cannot mean a half-applied mutation.
-    fn locked(
-        &self,
-    ) -> std::sync::MutexGuard<'_, AskedPeers> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, AskedPeers> {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -795,7 +795,8 @@ pub async fn run_profile_sync_ingest(
         } else if let Some(request) = profile_body_request_payload(&msg) {
             let ctx = ctx.clone();
             let _ = crate::shared::catch_iteration("profile_body_request", async move {
-                serve_body_request(&ctx.store, &*ctx.transport, &ctx.budget, sender, &request).await;
+                serve_body_request(&ctx.store, &*ctx.transport, &ctx.budget, sender, &request)
+                    .await;
             })
             .await;
         } else if let Some(body) = profile_body_payload(&msg) {
@@ -983,11 +984,9 @@ mod tests {
     /// tests exercise genuine format bytes rather than a mock the accept gate could never see in
     /// production.
     fn dpb(display_name: &str) -> (Vec<u8>, [u8; 32]) {
-        let body = VerifiedBody::from_pairs([(
-            DISPLAY_NAME,
-            Value::Utf8(display_name.to_string()),
-        )])
-        .expect("a one-slot profile is a valid body");
+        let body =
+            VerifiedBody::from_pairs([(DISPLAY_NAME, Value::Utf8(display_name.to_string()))])
+                .expect("a one-slot profile is a valid body");
         (body.as_bytes().to_vec(), body.root())
     }
 
@@ -1253,7 +1252,11 @@ mod tests {
         .await;
 
         assert_eq!(outcome, AcceptOutcome::Unsolicited);
-        assert_eq!(pen.count(), 0, "a late or forged answer must never cost a peer");
+        assert_eq!(
+            pen.count(),
+            0,
+            "a late or forged answer must never cost a peer"
+        );
         assert!(!store.has(&sid, &root));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1505,8 +1508,7 @@ mod tests {
         let tx = Transport::default();
         let budget = OutboundBudget::default();
 
-        let served =
-            serve_body_request(&store, &tx, &budget, peer(9), &root_ref(sid, root)).await;
+        let served = serve_body_request(&store, &tx, &budget, peer(9), &root_ref(sid, root)).await;
         let missing =
             serve_body_request(&store, &tx, &budget, peer(9), &root_ref(sid, [0xAA; 32])).await;
 
@@ -1535,7 +1537,11 @@ mod tests {
         let c = serve_body_request(&store, &tx, &budget, peer(9), &req).await;
 
         assert_eq!(a, ServeOutcome::Served(bytes.len()));
-        assert_eq!(b, ServeOutcome::Served(bytes.len()), "at capacity must pass");
+        assert_eq!(
+            b,
+            ServeOutcome::Served(bytes.len()),
+            "at capacity must pass"
+        );
         assert_eq!(c, ServeOutcome::Throttled, "one over must fail");
         let _ = std::fs::remove_dir_all(dir);
     }
