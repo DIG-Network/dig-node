@@ -208,8 +208,11 @@ async fn a_silent_peer_does_not_discard_the_round() {
 /// returning the liar's coin and returning nothing are indistinguishable.
 #[tokio::test]
 async fn one_dissenting_peer_is_outvoted_not_believed() {
-    let mut voices = agreeing_records(3, 100, None);
-    voices.push(Voice::Record(Some(coin(999_999, None))));
+    // The dissenter is drawn FIRST, deliberately. With it last, an implementation that simply
+    // believed whichever peer answered first would still return the honest coin and this test
+    // would pass while proving nothing about the tally.
+    let mut voices = vec![Voice::Record(Some(coin(999_999, None)))];
+    voices.extend(agreeing_records(3, 100, None));
     let (reads, _db, _) = reads_over(voices).await;
 
     let answer = reads.coin_record_by_id(COIN_ID).await.unwrap();
@@ -441,8 +444,10 @@ async fn a_cache_hit_asks_no_peer() {
 /// generation: believing the dissenter would hand a walk a forged branch.
 #[tokio::test]
 async fn a_dissenting_peer_cannot_decide_what_a_coin_became() {
-    let mut voices: Vec<Voice> = (0..3).map(|_| Voice::Spend(Some(spend("80")))).collect();
-    voices.push(Voice::Spend(Some(spend("ff"))));
+    // The dissenter first, for the same reason as the record case: a fixture whose first voice is
+    // honest cannot tell a tally from "believe whoever answered first".
+    let mut voices: Vec<Voice> = vec![Voice::Spend(Some(spend("ff")))];
+    voices.extend((0..3).map(|_| Voice::Spend(Some(spend("80")))));
     let (reads, _db, _) = reads_over(voices).await;
 
     assert_eq!(
