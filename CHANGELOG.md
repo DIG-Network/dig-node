@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.121.0] - 2026-08-16
+
+### Bug Fixes
+- **wallet:** Serve arbitrary coin reads from the peer pool with quorum corroboration (#229)
+
 ## [0.120.0] - 2026-08-16
 
 ### Features
