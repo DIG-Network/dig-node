@@ -4591,6 +4591,23 @@ mod tests {
     use super::super::fallback::FallbackCoin;
     use super::*;
 
+    /// The open-read rate bound is calibrated for what ONE TOKEN NOW BUYS (dig_ecosystem#3035).
+    ///
+    /// Since #3032 a token no longer buys one HTTP call to an oracle: it buys a corroborated peer
+    /// ROUND — up to a dozen dials, then one request to each held peer. The numbers below are
+    /// pinned so a future edit to either is a deliberate change to a test that says what they mean,
+    /// and the ratio is asserted rather than only the values, because the calibration is the claim
+    /// that a token costs roughly an order of magnitude more work than it used to.
+    #[test]
+    fn the_open_read_rate_bound_is_calibrated_for_a_peer_round() {
+        assert_eq!(DEFAULT_FALLBACK_BURST, 16.0);
+        assert_eq!(DEFAULT_FALLBACK_REFILL_PER_SEC, 2.0);
+        assert!(
+            DEFAULT_FALLBACK_BURST <= f64::from(u32::try_from(super::super::quorum::QUORUM_SAMPLE).unwrap()) * 4.0,
+            "a burst that dwarfs the quorum a token pays for is a nominal bound"
+        );
+    }
+
     /// The puzzle hash every `xch_coin` test coin sits at — the identity reads scope to.
     fn test_ph() -> String {
         "00".repeat(32)
