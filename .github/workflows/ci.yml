@@ -114,23 +114,28 @@ jobs:
       # (flaky, not a silent pass) in its run summary. `cargo llvm-cov nextest` runs nextest
       # itself through the SAME instrumented build so coverage is still collected —
       # running nextest and llvm-cov as two separate steps collects NO coverage at all, so
-      # this must stay one combined invocation. Coverage is measure-only for now (reported,
-      # NOT gated) — the ≥80% floor across the whole workspace (CLI/service-shell files in
-      # particular) is tracked separately; raising the gate here is a one-line addition of
-      # `--fail-under-lines 80`.
-      - name: cargo llvm-cov nextest (test + coverage, flaky-retried)
+      # this must stay one combined invocation.
+      #
+      # `--fail-under-lines 80` ENFORCES the CLAUDE.md §2.3 floor: a run below 80% line
+      # coverage across the whole workspace exits non-zero and fails this required check.
+      # It was previously carried here as prose, which made the job report a real number
+      # and act on none of it — a gate that cannot fail reads as enforcement to every
+      # reviewer downstream (dig_ecosystem#3033). Measured 87.67% lines / 82.00% functions
+      # / 86.46% regions at the time it was turned on, so the floor is the contract's 80
+      # rather than a number tuned to whatever passes today, and needs no exclusions.
+      - name: cargo llvm-cov nextest (test + coverage, flaky-retried, ≥80% gated)
         run: |
           # pipefail is load-bearing, not boilerplate: the Actions default `run:` shell is
           # `bash -e {0}` WITHOUT it, so this step's status would be `tee`'s. A run that died
           # with `exit status: 102` reported this REQUIRED check green in 29s.
           set -euo pipefail
-          cargo llvm-cov nextest --workspace --locked --retries 2 --summary-only | tee coverage-summary.txt
+          cargo llvm-cov nextest --workspace --locked --retries 2 --fail-under-lines 80 --summary-only | tee coverage-summary.txt
 
       - name: Coverage summary to job summary
         if: always()
         run: |
           {
-            echo '### dig-node coverage (measure-only)'
+            echo '### dig-node coverage (gated at ≥80% lines)'
             echo '```'
             cat coverage-summary.txt 2>/dev/null || echo 'no coverage output'
             echo '```'
