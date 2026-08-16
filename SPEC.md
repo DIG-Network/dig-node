@@ -4340,6 +4340,33 @@ not a substitute — the fallback tier can confirm that a coin exists, but the S
 exactly what an unsynced replica cannot claim. The remedy available to a caller is to complete an
 authoritative sync (an operator peer, or the point-read refresh of §18.12).
 
+18.7aa. **ARBITRARY coin reads are served by the node's OWN peers, corroborated (dig_ecosystem#3032).**
+`control.wallet.coinById` and `control.wallet.coinSpend` name coins that are not the wallet's own, so the
+replica structurally cannot answer them — a lineage walk, which is how a dig-profile is resolved, touches
+coins at nobody's watched address. Those two reads MUST be served, after the replica miss of §18.7, by
+asking the node's OWN dialled Chia full nodes; they MUST NOT be routed to a configured upstream endpoint.
+A single endpoint answering arbitrary chain reads is a trusted peer under another name, and a node that
+has none configured could otherwise not read its owner's profile at all while holding five peers that
+could have answered.
+
+Every such peer is UNTRUSTED (NC-12) and the node MUST NOT grant one a trusted/local-node classification.
+An answer is authoritative ONLY when it is given by at least `CORROBORATION_FLOOR` independently drawn
+peers and reaches the same agreement threshold every other quorum'd read uses; the peers asked MUST be
+distinct addresses, MUST be independently discovered (a preferred or co-resident address is a good peer to
+ask and not an independent voice), and MUST be periodically redrawn rather than held for the life of the
+process. A round that cannot assemble agreement is UNKNOWN — a DISTINCT error, NEVER `null` — because a
+caller walking a lineage reads absence as *this is the tip* and stops. Each peer's answer MUST be bound to
+the question locally BEFORE it is counted: the coin id is recomputed from the coin the peer sent, and a
+spend's `puzzle_reveal` MUST tree-hash to the spent coin's `puzzle_hash`. Both checks are per-peer, not
+post-tally, so a peer sending an unverifiable program is excluded from the round rather than carried into
+a majority by honest peers.
+
+Corroborated answers MUST be cached in the wallet database, keyed on the coin id. Because a coin id is
+`SHA256(parent ‖ puzzle_hash ‖ amount)`, an entry cannot be wrong for its key; it can only go stale in
+`spent_height`. So a SPENT coin record and a SPEND are cached indefinitely (a spend cannot un-happen),
+while an UNSPENT record MUST expire, since caching "unspent" forever would make a profile look permanently
+stale. A corroborated ABSENCE MUST NOT be cached: a coin that does not exist yet may exist in a minute.
+
 18.7a. **Identity-scoped reads + honest sync state (#407).** The dig-node answers wallet-data reads for
 the CLIENT's connected self-custody wallet, scoped by that wallet's PUBLIC identity — NEVER the node's
 own coins, and NEVER holding the client's private key (the node receives only public puzzle

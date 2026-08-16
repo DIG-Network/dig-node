@@ -72,6 +72,67 @@ pub struct CoinRow {
     pub spent_timestamp: Option<i64>,
 }
 
+/// One coin's cached ARBITRARY chain read: the record, and the spend if the coin is spent
+/// (dig_ecosystem#3032).
+///
+/// Separate from [`CoinRow`] on purpose. `coins` is the wallet's REPLICA — coins at the addresses
+/// this node subscribes to, maintained by the sync supervisor, and authoritative for balances.
+/// This table is a cache of coins the node does NOT watch, learned by asking peers, and it must
+/// never be mistaken for the replica: a lineage walk reaches strangers' coins, and a balance
+/// computed over them would be somebody else's money.
+///
+/// # Keyed on the coin id, which is the coin's own hash
+///
+/// `SHA256(parent ‖ puzzle_hash ‖ amount)`. So an entry cannot be WRONG for its key — those three
+/// fields are the key — it can only be absent, or stale in the two fields the key does not cover:
+/// `spent_height` and `spent_timestamp`. That is why freshness is judged on spentness alone; see
+/// [`super::peer_reads::cache_entry_is_usable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainReadCacheRow {
+    /// The coin id (lowercase hex, no `0x`) — the cache key.
+    pub coin_id: String,
+    /// The parent coin id (hex).
+    pub parent_coin_info: String,
+    /// The puzzle hash (hex).
+    pub puzzle_hash: String,
+    /// The amount, decimal string (as `coins.amount`, so a u64 near the ceiling survives SQLite).
+    pub amount: String,
+    /// The created block height, if confirmed.
+    pub created_height: Option<i64>,
+    /// The spent block height, if spent. `None` is what makes this entry perishable.
+    pub spent_height: Option<i64>,
+    /// The created timestamp.
+    pub created_timestamp: Option<i64>,
+    /// The spent timestamp.
+    pub spent_timestamp: Option<i64>,
+    /// Unix seconds at which this entry was written — the input to the perishable-entry rule.
+    pub cached_at: i64,
+}
+
+/// One coin's cached SPEND: the coin that was consumed and the two programs that consumed it
+/// (dig_ecosystem#3032).
+///
+/// It carries NO timestamp because it needs none. A spend is immutable — the coin is gone, and the
+/// puzzle and solution that spent it are fixed forever — so unlike [`ChainReadCacheRow`] there is
+/// nothing here that can become stale. This is the asymmetry the ticket turns on: a lineage walk
+/// touches a spent coin at every generation but the last, so almost the whole walk is permanently
+/// cacheable and only its tip must be re-asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainSpendCacheRow {
+    /// The spent coin's id (lowercase hex, no `0x`) — the cache key.
+    pub coin_id: String,
+    /// The spent coin's parent coin id (hex).
+    pub parent_coin_info: String,
+    /// The spent coin's puzzle hash (hex).
+    pub puzzle_hash: String,
+    /// The spent coin's amount, decimal string.
+    pub amount: String,
+    /// The puzzle reveal: hex of the serialized CLVM program, no `0x`.
+    pub puzzle_reveal: String,
+    /// The solution the puzzle ran with: hex of the serialized CLVM, no `0x`.
+    pub solution: String,
+}
+
 /// A CAT metadata row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatRow {
@@ -369,6 +430,27 @@ CREATE TABLE IF NOT EXISTS network_settings (
     derivation_floor_unhardened INTEGER NOT NULL DEFAULT 0
 );
 INSERT OR IGNORE INTO network_settings (id) VALUES (0);
+
+CREATE TABLE IF NOT EXISTS chain_read_cache (
+    coin_id TEXT PRIMARY KEY,
+    parent_coin_info TEXT NOT NULL,
+    puzzle_hash TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    created_height INTEGER,
+    spent_height INTEGER,
+    created_timestamp INTEGER,
+    spent_timestamp INTEGER,
+    cached_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chain_spend_cache (
+    coin_id TEXT PRIMARY KEY,
+    parent_coin_info TEXT NOT NULL,
+    puzzle_hash TEXT NOT NULL,
+    amount TEXT NOT NULL,
+    puzzle_reveal TEXT NOT NULL,
+    solution TEXT NOT NULL
+);
 "#;
 
 /// Additive column migrations for wallet DBs created before #216 (§5.1 additive-only): the
@@ -903,6 +985,106 @@ impl WalletDb {
             }
         }
         Ok(out)
+    }
+
+    // ---- arbitrary-chain-read cache (dig_ecosystem#3032) ------------------
+
+    /// The cached arbitrary chain read for `coin_id`, or `None` where nothing is cached.
+    ///
+    /// Deliberately returns the row WITHOUT judging its freshness: whether an entry may be used is
+    /// a rule about spentness ([`super::peer_reads::cache_entry_is_usable`]) that a caller needs
+    /// to be able to test without a database.
+    pub async fn cached_chain_read(
+        &self,
+        coin_id: &str,
+    ) -> sqlx::Result<Option<ChainReadCacheRow>> {
+        let Some(r) = sqlx::query("SELECT * FROM chain_read_cache WHERE coin_id = ?")
+            .bind(coin_id)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ChainReadCacheRow {
+            coin_id: r.get("coin_id"),
+            parent_coin_info: r.get("parent_coin_info"),
+            puzzle_hash: r.get("puzzle_hash"),
+            amount: r.get("amount"),
+            created_height: r.get("created_height"),
+            spent_height: r.get("spent_height"),
+            created_timestamp: r.get("created_timestamp"),
+            spent_timestamp: r.get("spent_timestamp"),
+            cached_at: r.get("cached_at"),
+        }))
+    }
+
+    /// The cached SPEND of `coin_id`, or `None` where none is cached.
+    ///
+    /// It carries no `cached_at` and needs none: a spend that happened cannot un-happen, and the
+    /// four fields it records are bound to the coin id by the coin id's own definition. This is
+    /// the half of the lineage walk that is permanently cacheable, and a walk visits a spent coin
+    /// at every hop but the last.
+    pub async fn cached_chain_spend(
+        &self,
+        coin_id: &str,
+    ) -> sqlx::Result<Option<ChainSpendCacheRow>> {
+        let Some(r) = sqlx::query("SELECT * FROM chain_spend_cache WHERE coin_id = ?")
+            .bind(coin_id)
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ChainSpendCacheRow {
+            coin_id: r.get("coin_id"),
+            parent_coin_info: r.get("parent_coin_info"),
+            puzzle_hash: r.get("puzzle_hash"),
+            amount: r.get("amount"),
+            puzzle_reveal: r.get("puzzle_reveal"),
+            solution: r.get("solution"),
+        }))
+    }
+
+    /// Record one coin's SPEND.
+    pub async fn put_chain_spend(&self, row: &ChainSpendCacheRow) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO chain_spend_cache (coin_id, parent_coin_info, puzzle_hash, \
+             amount, puzzle_reveal, solution) VALUES (?,?,?,?,?,?)",
+        )
+        .bind(&row.coin_id)
+        .bind(&row.parent_coin_info)
+        .bind(&row.puzzle_hash)
+        .bind(&row.amount)
+        .bind(&row.puzzle_reveal)
+        .bind(&row.solution)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record (or replace) one coin's cached arbitrary chain read.
+    ///
+    /// A REPLACE rather than an insert-if-absent: the one thing that legitimately changes about a
+    /// coin is that it becomes spent, and re-learning that is the entire reason an unspent entry
+    /// is allowed to expire.
+    pub async fn put_chain_read(&self, row: &ChainReadCacheRow) -> sqlx::Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO chain_read_cache (coin_id, parent_coin_info, puzzle_hash, \
+             amount, created_height, spent_height, created_timestamp, spent_timestamp, \
+             cached_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&row.coin_id)
+        .bind(&row.parent_coin_info)
+        .bind(&row.puzzle_hash)
+        .bind(&row.amount)
+        .bind(row.created_height)
+        .bind(row.spent_height)
+        .bind(row.created_timestamp)
+        .bind(row.spent_timestamp)
+        .bind(row.cached_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ---- arrivals (dig_ecosystem#2548) ------------------------------------

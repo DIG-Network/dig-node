@@ -180,7 +180,11 @@ impl WalletService {
         // own money onto mainnet with the flag off. The backend refuses exactly that bundle.
         //
         // It dials nothing until something asks it to, so an idle node still makes no chain call.
-        let chain = Arc::new(ChainTransport::new());
+        // The arbitrary coin reads a lineage walk composes are served by this node's OWN Chia
+        // peers, corroborated across them and cached in the wallet DB (dig_ecosystem#3032). Before
+        // this they went to a third-party oracle, so a node with no upstream configured could not
+        // read a profile at all — while holding five peers that could have answered.
+        let chain = Arc::new(ChainTransport::new().with_peer_reads(db.clone()));
         let fallback: Arc<dyn ChainFallback> = chain.clone();
 
         // Hold Chia peers because the node is RUNNING, not because somebody asked

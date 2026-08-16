@@ -71,6 +71,7 @@ pub mod mint;
 pub mod network;
 pub mod offers;
 pub mod options;
+pub mod peer_reads;
 pub mod quorum;
 pub mod rate_limit;
 pub mod routing;
