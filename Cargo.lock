@@ -787,7 +787,8 @@ dependencies = [
 [[package]]
 name = "chia-protocol"
 version = "0.26.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=6d458974522cdada1f9b09469d7709e08036a800#6d458974522cdada1f9b09469d7709e08036a800"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9256179e4c912313532d7a47a50f67f6128313ee86a3798e54050afb73d6042"
 dependencies = [
  "chia-bls 0.26.0",
  "chia-serde",
@@ -884,7 +885,8 @@ dependencies = [
 [[package]]
 name = "chia-sdk-client"
 version = "0.28.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=6d458974522cdada1f9b09469d7709e08036a800#6d458974522cdada1f9b09469d7709e08036a800"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bc22c29cc7562e9b65bf4d02bd0881657f1628dca84ad5b40d87a912e8a0f5d"
 dependencies = [
  "aws-lc-rs",
  "chia-protocol",
@@ -2057,8 +2059,8 @@ dependencies = [
 
 [[package]]
 name = "dig-gossip"
-version = "0.19.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=06bd79fb359834b416c466eca770d4a3c3f71aa1#06bd79fb359834b416c466eca770d4a3c3f71aa1"
+version = "0.24.0"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=c75e2028871d384c7bf1b4a4bfb54ad257dfc9cc#c75e2028871d384c7bf1b4a4bfb54ad257dfc9cc"
 dependencies = [
  "bincode",
  "chia-protocol",
@@ -2237,9 +2239,9 @@ dependencies = [
 
 [[package]]
 name = "dig-node-control-interface"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86e047496591c00027d843bf9bd27c858fcd27035e0020eed9a8b2b0d64c87cc"
+checksum = "f9717baa676e3a55c097fdc7dba6793824fdf4b1801fe115bc7820e3f19b3241"
 dependencies = [
  "async-trait",
  "semver",
@@ -2275,6 +2277,7 @@ dependencies = [
  "dig-peer-selector",
  "dig-pex",
  "dig-rpc-protocol",
+ "dig-social-profile",
  "dig-tls",
  "digstore-chain",
  "digstore-compiler",
@@ -2369,9 +2372,9 @@ dependencies = [
 
 [[package]]
 name = "dig-peer-protocol"
-version = "0.2.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "114832cad5ae6b8adfd319e8480d1eed0ffb8bc77e41b9d3f7fb4ce9ef6219ee"
+checksum = "74638139daa4f8932be56a29897ad88a4582676f8bcefe931393df399b3cf8f9"
 dependencies = [
  "chia-protocol",
  "chia-sdk-client 0.28.0",
@@ -2379,7 +2382,13 @@ dependencies = [
  "chia-ssl",
  "chia-traits 0.26.0",
  "chia_streamable_macro 0.26.0",
+ "futures-util",
  "serde",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "tungstenite",
 ]
 
 [[package]]
@@ -2429,6 +2438,28 @@ dependencies = [
  "hex",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "dig-smt"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "263eb6dbee54b80023f5a95bfd8293b43787c60222d4dc0147d418be5b1417f8"
+dependencies = [
+ "sha2 0.10.9",
+ "sparse-merkle-tree",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "dig-social-profile"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80244160b8e00e8c3362773e3b0f5732de527aef4d361470f10d17fd50a09588"
+dependencies = [
+ "dig-smt",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

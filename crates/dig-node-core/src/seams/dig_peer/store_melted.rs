@@ -649,7 +649,7 @@ fn parse_hex32(hex_str: &str) -> Option<[u8; 32]> {
 /// hot-spinning. A caught panic ABANDONS that frame — fail-closed, since every delete is gated behind
 /// the on-chain check that the abandoned iteration never completed.
 pub async fn run_store_melted_ingest(
-    mut inbound: tokio::sync::broadcast::Receiver<(PeerId, dig_gossip::Message)>,
+    mut inbound: tokio::sync::broadcast::Receiver<(PeerId, dig_gossip::DigMessage)>,
     chain: Arc<dyn MeltChain>,
     cache: Arc<dyn MeltCache>,
     broadcaster: Arc<dyn MeltBroadcast>,
