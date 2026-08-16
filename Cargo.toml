@@ -32,7 +32,7 @@ edition = "2021"
 # the ROOT manifest (`[workspace.package].version`), so it MUST be set here for a
 # release to fire (§3.6). The library crates (dig-node-core/dig-runtime/dig-wallet)
 # keep their own independent versions — only the released binary tracks the workspace version.
-version = "0.119.1"
+version = "0.120.0"
 
 # Release hardening, matching digstore: keep integer-overflow checks ON in release.
 # The node parses untrusted serialized input and does offset/length arithmetic over
@@ -40,23 +40,17 @@ version = "0.119.1"
 [profile.release]
 overflow-checks = true
 
-# -- dig-gossip vendored-fork patches (L7 peer network) -----------------------------------------------
+# -- Retired: the dig-gossip vendored-fork patches (L7 peer network) ----------------------------------
 #
-# The node's P2P stack (dig-nat/dig-gossip/dig-dht/dig-pex/dig-download/dig-peer-selector) builds against
-# ADDITIVE forks of `chia-protocol` + `chia-sdk-client` that dig-gossip vendors: the DIG introducer
-# opcodes `RegisterPeer=218`/`RegisterAck=219` on `ProtocolMessageTypes`, plus `Peer::send_protocol_message`
-# + `RateLimits.dig_wire`. Those forks are the SAME upstream versions (`chia-protocol` 0.26,
-# `chia-sdk-client` 0.28) with additive DIG extensions, so patching the whole workspace to them is safe
-# for the store-format crates too (they simply gain unused enum variants).
+# This workspace used to re-declare `[patch.crates-io]` entries redirecting `chia-protocol` and
+# `chia-sdk-client` to the ADDITIVE forks dig-gossip vendored, because a git dependency's own patches
+# do not apply transitively (cargo honours patches only from the ROOT manifest being built).
 #
-# dig-gossip's own `[patch.crates-io]` does NOT apply transitively when it is a git DEPENDENCY (cargo
-# applies patches only from the ROOT manifest being built), so this workspace re-declares them, resolving
-# the vendored packages from the SAME pinned dig-gossip git rev — CI-safe when the repo is checked out
-# standalone. `native-tls` is NOT patched: dig-gossip is pulled with
-# `default-features = false, features = ["rustls", "relay"]`, so the OpenSSL/native-tls path is off.
-[patch.crates-io]
-chia-protocol = { git = "https://github.com/DIG-Network/dig-gossip", rev = "6d458974522cdada1f9b09469d7709e08036a800" }
-chia-sdk-client = { git = "https://github.com/DIG-Network/dig-gossip", rev = "6d458974522cdada1f9b09469d7709e08036a800" }
+# dig-gossip 0.23.0 DELETED both forks (dig_ecosystem#2228). The DIG introducer opcodes
+# (`RegisterPeer=218` / `RegisterAck=219`), `send_protocol_message` and the DIG rate-limit rows now
+# live in the crates.io crate `dig-peer-protocol` 0.6, a superset of plain upstream `chia-protocol`,
+# which dig-gossip depends on directly. There is nothing left at that rev to patch to, so the patch
+# section — and the #1529 three-rev lockstep it forced — is retired rather than re-pointed.
 
 # The dig-nat unification patch is RETIRED (#1280 crates.io cascade): dig-nat 0.7 is on crates.io and
 # the ENTIRE peer stack (dig-gossip 0.7.1, dig-dht 0.2.2, dig-download 0.2.1, dig-peer-selector 0.2.1,

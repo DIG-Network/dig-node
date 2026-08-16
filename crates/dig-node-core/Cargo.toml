@@ -16,7 +16,7 @@ name = "dig-node-core"
 # 0.31.0 adds cache observability to `cache.stats` (§7.10e) — `refetch_count` + per-tier `tiers`
 # occupancy fields, and makes `InboundDemand::entry_count` a real (no-longer-`#[cfg(test)]`) public
 # API — a new, backwards-compatible surface (dig_ecosystem#1991), hence a MINOR bump.
-version = "0.44.1"
+version = "0.45.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -214,7 +214,7 @@ dig-nat = "0.18"
 # graph still unifies to ONE of each. The vendored chia-protocol/chia-sdk-client forks it path-patches
 # are re-declared at this SAME rev in the workspace `[patch.crates-io]` (a git dep's own patches do not
 # apply transitively — the #1529 3-rev lockstep: this dep rev + the two patch revs move together).
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "06bd79fb359834b416c466eca770d4a3c3f71aa1", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "c75e2028871d384c7bf1b4a4bfb54ad257dfc9cc", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope.
 #
 # 0.9 is the TIP OF DIG-NODE'S CHIA LINE, and that — not 0.10 — is the correct target here (#2072).
@@ -234,6 +234,18 @@ dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "06bd79f
 # the release-first cascade on #2072. Do NOT pin this BACK to widen a window: the fix is upstream
 # moving forward, never dig-node drifting backward.
 dig-constants = "0.9"
+# -- Portable profile body format (DPB) — epic #3008 W6 -----------------------------------------------
+#
+# `default-features = false` deliberately: the default `chia` feature pulls dig-did/dig-store/
+# chia-protocol 0.36.1, which is a DIFFERENT chia line from the 0.26 this workspace builds against, so
+# the default surface would put a SECOND chia-protocol into the always-running service. Without the
+# feature the crate is a pure BYTE CORE (`dig-smt + sha2 + thiserror`) exposing exactly what the node
+# needs: the DPB container, `AnchoredRoot` and `VerifiedBody`.
+#
+# Consequence to keep in mind: `dig_social_profile::resolve` is NOT available here. The node resolves
+# a store's on-chain root through its OWN `AnchoredRootResolver` (the coinset lineage walk), which is
+# the same authority, reached by the node's existing seam.
+dig-social-profile = { version = "0.6", default-features = false }
 # -- L7 content-location DHT (PHASE-B, #163) ---------------------------------------------------------
 # The Kademlia DHT that maps DIG content (store / capsule / root / resource) to the peer_ids holding
 # it. The node LOCATES content it lacks via `find_providers`, and keeps its OWN held-inventory provider

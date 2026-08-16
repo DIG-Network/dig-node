@@ -968,7 +968,7 @@ async fn restate_holdings(
 /// iteration holds no lock across the catch boundary (the ingress's `state` is a tokio `Mutex` taken +
 /// released INSIDE `accept`, never held by the loop), so asserting its unwind-safety is sound.
 pub async fn run_holdings_ingest(
-    mut inbound: tokio::sync::broadcast::Receiver<(dig_gossip::PeerId, dig_gossip::Message)>,
+    mut inbound: tokio::sync::broadcast::Receiver<(dig_gossip::PeerId, dig_gossip::DigMessage)>,
     ingress: Arc<HoldingsIngress>,
     sink: Arc<dig_dht::DhtService>,
 ) {

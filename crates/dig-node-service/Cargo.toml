@@ -84,7 +84,7 @@ dig-node-core = { path = "../dig-node-core" }
 # "0.6.0" the suite went green over a `control.wallet.coinById` the contract had never heard of --
 # it checked nothing about the very method the change added. A caret range keeps the pin moving
 # with the published catalog instead of silently narrowing what CI can see.
-dig-node-control-interface = "0.15"
+dig-node-control-interface = "0.16"
 
 # The OS CSPRNG for all authorization material — the control token, pairing ids/tokens
 # (§7), and the relay loop-probe id (`control::fill_random`). Wraps `getrandom(2)` /
@@ -193,6 +193,11 @@ dig-constants = "0.9"
 # a BARE program name through `$PATH` while running as root under `sudo` (whose default
 # `secure_path` puts a group-writable `/usr/local/bin` first on Debian, and which macOS does not set
 # at all) — a local privilege-escalation vector on the very command the docs tell operators to run.
+# Hex + base64 for the control plane: `control.profile.putBody`/`getBody` speak 64-hex ids and
+# standard padded base64 bodies, both fixed by dig-node-control-interface.
+hex = "0.4"
+base64 = "0.22"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

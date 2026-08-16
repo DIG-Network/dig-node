@@ -62,6 +62,10 @@ use std::sync::Arc;
 use dig_node_control_interface::params::{
     WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
 };
+use dig_node_core::seams::dig_peer::profile_sync::{
+    accept_local_body, LocalAcceptError, ProfileBodyStore,
+};
+use dig_node_core::ChainSource as _;
 use dig_node_core::{CapsuleStore, Node};
 use serde_json::{json, Value};
 
@@ -187,6 +191,8 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.wallet.unwatch",
     "control.wallet.watched",
     "control.wallet.broadcast",
+    "control.profile.putBody",
+    "control.profile.getBody",
     "control.updater.status",
     "control.updater.setChannel",
     "control.updater.pause",
@@ -237,6 +243,8 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.wallet.unwatch",
     "control.wallet.watched",
     "control.wallet.broadcast",
+    "control.profile.putBody",
+    "control.profile.getBody",
     "control.updater.status",
     "control.updater.setChannel",
     "control.updater.pause",
@@ -814,6 +822,8 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.wallet.watch" => wallet_watch(ctx, id, params).await,
         "control.wallet.unwatch" => wallet_unwatch(ctx, id, params),
         "control.wallet.watched" => wallet_watched(ctx, id),
+        "control.profile.putBody" => profile_put_body(ctx, id, params).await,
+        "control.profile.getBody" => profile_get_body(ctx, id, params).await,
         "control.peerCounts" => peer_counts(ctx, id).await,
         "control.wallet.broadcast" => wallet_broadcast(ctx, id, params).await,
         // The DIG auto-update beacon proxy (#515) — a THIN passthrough to `dig-updater`'s
@@ -2305,6 +2315,182 @@ fn distinct_store_count(cached: &[dig_node_core::CachedCapsule]) -> usize {
         .map(|c| c.store_id.as_str())
         .collect::<std::collections::HashSet<_>>()
         .len()
+}
+
+// -- Profile bodies (epic #3008, W6) -----------------------------------------------------------
+//
+// `control.profile.putBody` / `control.profile.getBody`. Both TOKEN-GATED by the default rule
+// (only the explicit OPEN set skips the token), because a `putBody` decides what this node will
+// serve to the whole network under a profile id.
+//
+// The trust boundary is the point of these two handlers: **dig-app gets no exemption.** It holds
+// the key and signs the root (§908), but the bytes reach the node exactly as a peer's bytes do, so
+// the SAME check binds both entry points —
+// [`profile_sync::accept_local_body`](dig_node_core::seams::dig_peer::profile_sync::accept_local_body)
+// independently resolves the root on chain, requires the caller's claimed root to BE that root, and
+// only then verifies the bytes against it. One implementation of the check serves the gossip gate
+// and the control plane alike; a second one would be a second place for it to be wrong.
+
+/// The maximum DECODED body size, taken from the control interface rather than restated, so this
+/// node and every client agree on the bound by construction.
+use base64::Engine as _;
+use dig_node_core::seams::dig_peer::profile_sync::MAX_PROFILE_BODY_BYTES;
+
+/// Parse a lowercase, unprefixed 64-hex field into its 32 raw bytes.
+///
+/// Strict about case and length: every downstream comparison is over `[u8; 32]`, and a
+/// case-forgiving text parse is exactly the kind of slack that turns a byte comparison back into a
+/// text one somewhere further down.
+fn parse_hex32_param(
+    method: &str,
+    field: &str,
+    id: &Value,
+    params: &Value,
+) -> std::result::Result<[u8; 32], Value> {
+    let invalid = |detail: &str| {
+        control_error(
+            id.clone(),
+            ErrorCode::InvalidParams,
+            format!("{method} requires params.{field} as lowercase 64-hex ({detail})"),
+        )
+    };
+    let text = params
+        .get(field)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid("missing or not a string"))?;
+    if text.len() != 64 || text.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(invalid("wrong length or not lowercase"));
+    }
+    let raw = hex::decode(text).map_err(|_| invalid("not hex"))?;
+    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| invalid("not 32 bytes"))
+}
+
+/// The profile-body store this node persists to and serves from.
+fn profile_body_store(ctx: &ControlCtx) -> ProfileBodyStore {
+    ProfileBodyStore::under_cache_dir(ctx.node.cache_dir_path())
+}
+
+/// `control.profile.putBody` — persist a profile body, but ONLY once the chain confirms its root.
+///
+/// Refusal is always an error, never an `Ok` carrying `stored: false`: a caller that reads a
+/// success flag would have to remember to check it, and the one that forgets believes the network
+/// is serving bytes that were rejected.
+///
+/// There are no profile-specific error codes yet, so a root that is not confirmed and a body that
+/// is malformed both surface as `INVALID_PARAMS`. They need OPPOSITE remedies from the caller —
+/// wait and retry versus re-encode — so the distinction is carried in the message text until the
+/// codes exist (tracked as a follow-up).
+async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    const METHOD: &str = "control.profile.putBody";
+    let store_id = match parse_hex32_param(METHOD, "store_id", &id, params) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let root = match parse_hex32_param(METHOD, "root", &id, params) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let Some(body_b64) = params.get("body_b64").and_then(|v| v.as_str()) else {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!("{METHOD} requires params.body_b64 (standard base64, padded)"),
+        );
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(body_b64) else {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!("{METHOD}: params.body_b64 is not standard padded base64"),
+        );
+    };
+    // Bounded on the DECODED length, BEFORE anything is persisted: a body past this cannot be
+    // served to a peer inside the gossip frame ceiling, so storing one would put something
+    // permanently unsyncable on disk.
+    //
+    // The ceiling is the SERVABLE one, not the control interface's `MAX_BODY_BYTES`. Those two
+    // differ — the contract's cap is 4 MiB (half dig-gossip's 8 MiB websocket message ceiling),
+    // while a 225 frame can carry only `MAX_PROFILE_BODY_BYTES`. Bounding on the larger number
+    // accepts a 1-4 MiB body, persists it, and then can never answer a single 224 for it: exactly
+    // the permanently-unsyncable artifact this check says it prevents, produced by the check
+    // itself. Refusing at the smaller number is what makes the comment true.
+    if bytes.len() > MAX_PROFILE_BODY_BYTES {
+        return control_error(
+            id,
+            ErrorCode::InvalidParams,
+            format!(
+                "{METHOD}: body is {} bytes, above the {MAX_PROFILE_BODY_BYTES}-byte maximum a \
+                 profile body may be if it is to be servable to peers",
+                bytes.len()
+            ),
+        );
+    }
+
+    match accept_local_body(
+        &profile_body_store(ctx),
+        &*ctx.node.anchored_root_resolver_arc(),
+        store_id,
+        root,
+        &bytes,
+    )
+    .await
+    {
+        Ok(_) => control_ok(
+            id,
+            json!({
+                "stored": true,
+                "store_id": hex::encode(store_id),
+                "root": hex::encode(root),
+                "body_bytes": bytes.len() as u64,
+            }),
+        ),
+        Err(e @ (LocalAcceptError::RootNotConfirmed(_) | LocalAcceptError::Malformed(_))) => {
+            control_error(id, ErrorCode::InvalidParams, format!("{METHOD}: {e}"))
+        }
+        // A write failure is this node's fault, not the caller's input, so it must not read as
+        // "your parameters were wrong" — the remedy is on this machine.
+        Err(e @ LocalAcceptError::Persist(_)) => {
+            control_error(id, ErrorCode::ControlError, format!("{METHOD}: {e}"))
+        }
+    }
+}
+
+/// `control.profile.getBody` — the body this node holds at `(store_id, root)`, if it holds one.
+///
+/// `body_b64: null` means "consulted, holds nothing". A read that FAILED is an error instead: a
+/// caller that cannot tell the two apart renders an existing profile as an empty one, and the
+/// remedies are opposite (publish it versus fix this node's disk).
+///
+/// The echoed `root` is always the root the caller asked for — this node never substitutes a newer
+/// body it happens to hold.
+async fn profile_get_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    const METHOD: &str = "control.profile.getBody";
+    let store_id = match parse_hex32_param(METHOD, "store_id", &id, params) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let root = match parse_hex32_param(METHOD, "root", &id, params) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    match profile_body_store(ctx).get(&store_id, &root) {
+        Ok(held) => control_ok(
+            id,
+            json!({
+                "store_id": hex::encode(store_id),
+                "root": hex::encode(root),
+                "body_b64": held.as_ref().map(|b| {
+                    base64::engine::general_purpose::STANDARD.encode(b)
+                }),
+                "body_bytes": held.map_or(0u64, |b| b.len() as u64),
+            }),
+        ),
+        Err(e) => control_error(
+            id,
+            ErrorCode::ControlError,
+            format!("{METHOD}: the profile body could not be read from disk: {e}"),
+        ),
+    }
 }
 
 #[cfg(test)]

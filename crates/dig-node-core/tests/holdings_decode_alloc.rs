@@ -23,8 +23,10 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use chia_protocol::{Bytes, Message, ProtocolMessageTypes};
-use dig_gossip::holdings_announce_payload;
+// The DIG opcodes moved out of the vendored `chia-protocol` fork into `dig-peer-protocol`, which
+// dig-gossip re-exports as `DigMessage` (dig_ecosystem#2228). The frame under test is the SAME
+// bytes; only the type carrying them and the home of the opcode constant changed.
+use dig_gossip::{holdings_announce_payload, Bytes, DigMessage, HOLDINGS_ANNOUNCE};
 
 // ============================================================================
 // Allocation instrumentation
@@ -138,12 +140,8 @@ fn frame_declaring_an_impossible_address_count() -> Vec<u8> {
 }
 
 /// Wraps `payload` in the opcode-222 message the inbound peer path actually receives.
-fn holdings_message(payload: Vec<u8>) -> Message {
-    Message {
-        msg_type: ProtocolMessageTypes::HoldingsAnnounce,
-        id: None,
-        data: Bytes::new(payload),
-    }
+fn holdings_message(payload: Vec<u8>) -> DigMessage {
+    DigMessage::new(HOLDINGS_ANNOUNCE, None, Bytes::new(payload))
 }
 
 // ============================================================================

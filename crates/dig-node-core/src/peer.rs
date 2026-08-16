@@ -3063,6 +3063,41 @@ async fn bring_up_dht(
         }
     }
 
+    // Profile-body sync (epic #3008, W6): a THIRD inbound receiver drives the 223 announce ->
+    // chain-confirm -> 224 request -> 225 accept -> persist -> re-announce exchange, and answers
+    // peers' 224 requests from disk within an outbound budget.
+    //
+    // Wired exactly like holdings and store-melt above: one `inbound_receiver()`, one spawned task.
+    // Bodies land in `<cache>/profiles/`, deliberately OUTSIDE `<cache>/modules/`, so
+    // `refresh_inventory` never turns a profile into a DHT provider record.
+    //
+    // Behind ONE operator kill switch (`DIG_NODE_PROFILE_SYNC`, default ON). Off means profiles
+    // stop syncing and nothing else changes -- a clean degradation, not an outage.
+    if !crate::seams::dig_peer::profile_sync::profile_sync_enabled() {
+        println!(
+            "dig-node peer network: profile-body sync DISABLED (DIG_NODE_PROFILE_SYNC) -- this node will neither fetch nor serve profile bodies"
+        );
+    } else {
+        match pool.inbound_receiver() {
+            Ok(inbound) => {
+                use crate::ChainSource as _;
+                let ctx = crate::seams::dig_peer::profile_sync::context_from_node(
+                    node.cache_dir_path().to_path_buf(),
+                    node.anchored_root_resolver_arc(),
+                    pool.clone(),
+                );
+                tokio::spawn(
+                    crate::seams::dig_peer::profile_sync::run_profile_sync_ingest(inbound, ctx),
+                );
+                println!("dig-node peer network: profile-body sync (opcodes 223/224/225) up");
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "profile-body sync: no inbound receiver; this node holds and serves profile bodies through the control plane only"
+            ),
+        }
+    }
+
     // Spawn the maintenance loop: republish (records never lapse) + refresh buckets + gc, well inside
     // the provider TTL.
     {
