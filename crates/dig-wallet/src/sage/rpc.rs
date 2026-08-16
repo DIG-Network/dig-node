@@ -4603,7 +4603,8 @@ mod tests {
         assert_eq!(DEFAULT_FALLBACK_BURST, 16.0);
         assert_eq!(DEFAULT_FALLBACK_REFILL_PER_SEC, 2.0);
         assert!(
-            DEFAULT_FALLBACK_BURST <= f64::from(u32::try_from(super::super::quorum::QUORUM_SAMPLE).unwrap()) * 4.0,
+            DEFAULT_FALLBACK_BURST
+                <= f64::from(u32::try_from(super::super::quorum::QUORUM_SAMPLE).unwrap()) * 4.0,
             "a burst that dwarfs the quorum a token pays for is a nominal bound"
         );
     }

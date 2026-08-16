@@ -314,7 +314,11 @@ async fn a_split_round_is_unknown_and_never_absence() {
 #[tokio::test]
 async fn too_few_answers_is_reported_as_reachability() {
     let (reads, _db, _) = reads_over(vec![Voice::Silent, Voice::Silent, Voice::Silent]).await;
-    let message = reads.coin_record_by_id(&coin_id_for(1)).await.unwrap_err().message;
+    let message = reads
+        .coin_record_by_id(&coin_id_for(1))
+        .await
+        .unwrap_err()
+        .message;
     assert!(
         message.contains("answered at all"),
         "an unanswered round must be reported as reachability: {message}"
@@ -325,7 +329,10 @@ async fn too_few_answers_is_reported_as_reachability() {
 #[tokio::test]
 async fn a_corroborated_absence_is_ok_none() {
     let (reads, _db, _) = reads_over(vec![Voice::Record(None), Voice::Record(None)]).await;
-    assert_eq!(reads.coin_record_by_id(&coin_id_for(1)).await.unwrap(), None);
+    assert_eq!(
+        reads.coin_record_by_id(&coin_id_for(1)).await.unwrap(),
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -382,7 +389,10 @@ async fn a_spent_record_is_cached_forever() {
     let a_decade_later = PeerCorroboratedReads::new(Arc::new(ScriptedSample::new(vec![])), db)
         .with_clock(Arc::new(FixedClock(NOW + 10 * 365 * 24 * 3600)));
     assert_eq!(
-        a_decade_later.coin_record_by_id(&coin_id_for(3)).await.unwrap(),
+        a_decade_later
+            .coin_record_by_id(&coin_id_for(3))
+            .await
+            .unwrap(),
         Some(coin(3, Some(9_000_200)))
     );
 }
@@ -558,7 +568,10 @@ async fn a_unanimous_sample_cannot_substitute_a_different_coin() {
         "the substituted coin was cached"
     );
     assert!(
-        db.cached_chain_read(&coin_id_for(1), NOW).await.unwrap().is_none(),
+        db.cached_chain_read(&coin_id_for(1), NOW)
+            .await
+            .unwrap()
+            .is_none(),
         "a row was written for the requested id from a substituted answer"
     );
 }
@@ -584,7 +597,10 @@ async fn a_unanimous_sample_cannot_substitute_a_different_spend() {
         "a unanimous spend of another coin was accepted: {outcome:?}"
     );
     assert!(
-        db.cached_chain_spend(&spend_coin_id(), NOW).await.unwrap().is_none(),
+        db.cached_chain_spend(&spend_coin_id(), NOW)
+            .await
+            .unwrap()
+            .is_none(),
         "a permanent spend row was written from a substituted answer"
     );
 }
@@ -648,7 +664,7 @@ async fn the_cache_key_is_spelling_insensitive() {
     reads.coin_record_by_id(&coin_id_for(3)).await.unwrap();
     let after_first = asked.load(Ordering::SeqCst);
 
-    let shouted = format!("0x{}", &coin_id_for(3).to_ascii_uppercase());
+    let shouted = format!("0x{}", coin_id_for(3).to_ascii_uppercase());
     assert_eq!(
         reads.coin_record_by_id(&shouted).await.unwrap(),
         Some(coin(3, Some(9_000_400)))

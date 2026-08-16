@@ -457,19 +457,22 @@ mod tests {
             }
             .coin_id(),
         );
-        db.put_chain_read(&crate::sage::db::ChainReadCacheRow {
-            coin_id: coin_id.clone(),
-            parent_coin_info: "cd".repeat(32),
-            puzzle_hash: "ef".repeat(32),
-            amount: "1234".into(),
-            created_height: Some(9_000_000),
-            // SPENT, so the entry is immutable and usable however long ago it was written — the
-            // test therefore does not depend on when it runs.
-            spent_height: Some(9_000_050),
-            created_timestamp: None,
-            spent_timestamp: None,
-            cached_at: 0,
-        }, 0)
+        db.put_chain_read(
+            &crate::sage::db::ChainReadCacheRow {
+                coin_id: coin_id.clone(),
+                parent_coin_info: "cd".repeat(32),
+                puzzle_hash: "ef".repeat(32),
+                amount: "1234".into(),
+                created_height: Some(9_000_000),
+                // SPENT, so the entry is immutable and usable however long ago it was written — the
+                // test therefore does not depend on when it runs.
+                spent_height: Some(9_000_050),
+                created_timestamp: None,
+                spent_timestamp: None,
+                cached_at: 0,
+            },
+            0,
+        )
         .await
         .unwrap();
 

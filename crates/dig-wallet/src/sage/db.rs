@@ -1199,7 +1199,12 @@ impl WalletDb {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        evict_to_budget(&self.pool, "chain_spend_cache", self.chain_cache_budgets.spends).await?;
+        evict_to_budget(
+            &self.pool,
+            "chain_spend_cache",
+            self.chain_cache_budgets.spends,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1226,7 +1231,12 @@ impl WalletDb {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        evict_to_budget(&self.pool, "chain_read_cache", self.chain_cache_budgets.reads).await?;
+        evict_to_budget(
+            &self.pool,
+            "chain_read_cache",
+            self.chain_cache_budgets.reads,
+        )
+        .await?;
         Ok(())
     }
 
