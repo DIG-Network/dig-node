@@ -875,6 +875,14 @@ async fn status(ctx: &ControlCtx) -> Value {
         "sync": {
             "available": ctx.sync_available,
         },
+        // #553/dig-logging 0.2.0: a degraded file sink no longer fails `init`, so the node can be
+        // serving and logging to the console while writing nothing to disk. Report that here
+        // rather than letting an operator infer healthy logging from a healthy node.
+        "logging": crate::logging::health(
+            crate::logging::initialized(),
+            crate::logging::log_dir().as_deref(),
+            crate::logging::file_error().as_deref(),
+        ),
     })
 }
 
