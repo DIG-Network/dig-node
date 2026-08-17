@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.124.0] - 2026-08-17
+
+### Features
+- **gossip:** Route locally-originated announces through broadcast_local (dig-gossip 0.25.0) (#234)
+
 ## [0.123.0] - 2026-08-17
 
 ### Features
