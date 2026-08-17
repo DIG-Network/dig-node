@@ -295,6 +295,14 @@ impl PeerCorroboratedReads {
         // that only guards the wire is a check an attacker routes around by getting one row
         // written — and spend rows never expire, so a bad row would be served, uncorroborated,
         // forever. Cheap: a hash of bytes already in hand.
+        //
+        // DO NOT move, defer, or skip this to make the fast path faster (dig_ecosystem#3051). Since
+        // the limiter moved below the cache (dig_ecosystem#3044) and the liveness check followed it
+        // (dig_ecosystem#3050), this hash is the most conspicuous CPU on a read that is otherwise
+        // pure SQLite — so it is exactly what a profile of this path will point at, and it will
+        // look like free savings. It is not: it is the ONLY thing standing between one written row
+        // and that row being served as truth forever. The bound that belongs on this path is an
+        // INGRESS limit on requests (dig_ecosystem#3051), not the removal of a correctness check.
         super::fallback::verified_reveal_hex(&spend.puzzle_reveal, &spend.puzzle_hash)?;
         // And the coin's own three fields must hash to the key the row was found under
         // (dig_ecosystem#3035). Note what this REPLACES: comparing `row.coin_id` to the lookup key,

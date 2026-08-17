@@ -100,7 +100,40 @@ pub struct AppState {
     /// The shared self-signed cert the mTLS `9257` listener presents (Sage byte-parity, node-class
     /// clients). Held so [`serve_with_shutdown`] can bring up that sibling listener.
     wallet_cert: SharedCert,
+    /// The per-source INGRESS bound on OPEN, token-less `control.*` reads (dig_ecosystem#3051).
+    ///
+    /// The open reads present no credential, so before this existed an anonymous caller could
+    /// drive unbounded SQLite work — `control.wallet.coinById`/`.coinSpend` each run up to two
+    /// lookups plus an LRU `UPDATE` — simply by asking, repeatedly, for free.
+    ///
+    /// Shared across every request so the bound is per SOURCE and not per connection: reconnecting
+    /// must not mint a fresh budget, or the bound is decorative against exactly the caller it is
+    /// for. [`MissRateLimiter`](dig_node_core::rate_limit::MissRateLimiter) is reused rather than
+    /// re-implemented — it is already a per-[`RequestorId`] token-bucket registry with the
+    /// identity-cycling table bound this needs.
+    control_ingress: Arc<dig_node_core::rate_limit::MissRateLimiter>,
 }
+
+/// Per-source burst for OPEN control reads (dig_ecosystem#3051): how many token-less reads one
+/// source may fire back-to-back before [`CONTROL_INGRESS_REFILL_PER_SEC`] governs. Sized for a UI
+/// that opens a pane and issues a handful of reads at once — a lineage walk of a few generations is
+/// a couple of dozen — while a flood is capped within a second.
+const CONTROL_INGRESS_BURST: f64 = 32.0;
+
+/// Sustained per-source rate for OPEN control reads once the burst is spent. Comfortably above any
+/// human-driven refresh and far below what it takes to make the SQLite work matter.
+const CONTROL_INGRESS_REFILL_PER_SEC: f64 = 8.0;
+
+/// The burst MUST absorb an ordinary lineage walk back-to-back.
+///
+/// Resolving a dig-profile follows a DID singleton forward at two reads per generation
+/// (`.coinById` + `.coinSpend`), so a six-generation walk is twelve reads with no pause between
+/// them. A burst below that would refuse an ORDINARY profile read, which arrives as "the profile
+/// pane is broken" rather than as a rate-limit report.
+///
+/// Asserted at COMPILE TIME rather than in a test: the relationship is between two constants, so
+/// lowering the burst should fail the BUILD, not wait for someone to run the right test.
+const _: () = assert!(CONTROL_INGRESS_BURST >= 12.0);
 
 /// dig-node's "method not found" error code. `handle_rpc` resolves only
 /// `dig.getContent` / `dig.getAnchoredRoot` / `cache.*` and returns this for
@@ -457,6 +490,10 @@ pub async fn build_state(config: &Config) -> AppState {
         )),
         wallet: wallet_service.backend,
         wallet_cert: wallet_service.cert,
+        control_ingress: Arc::new(dig_node_core::rate_limit::MissRateLimiter::new(
+            CONTROL_INGRESS_BURST,
+            CONTROL_INGRESS_REFILL_PER_SEC,
+        )),
     }
 }
 
@@ -796,6 +833,41 @@ fn requestor_for(peer_addr: &SocketAddr) -> dig_node_core::rate_limit::Requestor
     }
 }
 
+/// Whether an OPEN, token-less `control.*` read is admitted at INGRESS for `requestor`
+/// (dig_ecosystem#3051).
+///
+/// # The operator is exempt, and that is the whole design
+///
+/// [`RequestorId::Local`](dig_node_core::rate_limit::RequestorId::Local) — the node's own loopback
+/// operator — is admitted unconditionally, mirroring the PROXY fetch-through limiter's documented
+/// rationale (`download.rs`: the bound targets the REMOTE amplification vector; the operator is
+/// trusted). Two reasons, and the second is the load-bearing one:
+///
+/// 1. The exposure dig_ecosystem#3051 names is the ANONYMOUS caller — a control surface made
+///    network-reachable and unauthenticated by `DIG_NODE_ALLOW_REMOTE=1`. That caller presents no
+///    credential, so nothing else bounds it. It arrives here as
+///    [`Anonymous`](dig_node_core::rate_limit::RequestorId::Anonymous), keyed by connection IP.
+/// 2. Throttling the operator would REINTRODUCE the failure this whole family exists to fix. A
+///    polling dig-app already drained the wallet's egress limiter and left a user's own profile
+///    read refused for days; the remedy was to stop charging reads that cost nothing. An ingress
+///    bound on loopback would produce the same user-visible refusal from the other side, and a
+///    per-frame poller sits exactly at the edge of any burst small enough to be worth setting.
+///
+/// # State plainly what this does NOT bound
+///
+/// Under the DEFAULT posture the bind is loopback-only, so every caller is `Local` and this gate
+/// admits everything. That is intended — it is the `DIG_NODE_ALLOW_REMOTE` exposure being bounded,
+/// exactly as dig_ecosystem#3051 scoped it ("size the work accordingly") — but it means a RUNAWAY
+/// LOCAL client is still unbounded here, and remains so deliberately. Bounding it is a UX decision
+/// about the operator's own software, not a defense against an untrusted party, and it is the
+/// decision that just cost a user several days.
+fn control_ingress_admits(
+    limiter: &dig_node_core::rate_limit::MissRateLimiter,
+    requestor: &dig_node_core::rate_limit::RequestorId,
+) -> bool {
+    requestor.is_local() || limiter.check(requestor)
+}
+
 /// Classify a request's landing PROVENANCE (#1654/#1956) from its `Sec-Fetch-Site` header — the
 /// second landing axis over [`read_origin_for`], applied identically to the `/s/` plaintext serve
 /// path AND the `POST /` JSON-RPC path (`dig.getContent`/`dig.fetchRange`). A loopback address proves
@@ -938,7 +1010,31 @@ async fn rpc(
         // An OPEN control READ (`control.wallet.balance`, #1851) is a public-address chain read
         // with no custody — served WITHOUT the control token, like the other reads, while still
         // routing through the control dispatcher below. Every other control method is token-gated.
-        if !control::is_open_control_read(&method) {
+        // An open read presents NO credential, so nothing above this point has cost the caller
+        // anything — and `control.wallet.coinById`/`.coinSpend` each run up to two SQLite lookups
+        // (plus an LRU `UPDATE` on a hit) inside the dispatch below. That work is unbounded per
+        // request, so it is bounded HERE, at ingress, before the dispatcher is entered
+        // (dig_ecosystem#3051).
+        //
+        // This is a SEPARATE bound from the wallet's coinset-fallback limiter, on purpose. That one
+        // bounds EGRESS and exists to protect the third-party oracle; this one bounds REQUESTS and
+        // exists to protect this process. They fire for different reasons, so they refuse with
+        // different codes (`CONTROL_INGRESS_LIMITED` vs `WALLET_RATE_LIMITED`) — conflating them is
+        // what would leave the next person debugging a refusal unable to tell which one fired.
+        if control::is_open_control_read(&method) {
+            if !control_ingress_admits(&state.control_ingress, &requestor) {
+                return (
+                    StatusCode::OK,
+                    Json(control::control_error(
+                        id,
+                        ErrorCode::ControlIngressLimited,
+                        "open control reads are rate-limited per source; back off and retry. \
+                         This is the INGRESS bound on requests to this node, not the chain-egress \
+                         bound (WALLET_RATE_LIMITED).",
+                    )),
+                );
+            }
+        } else {
             let header_tok = headers
                 .get(control::CONTROL_TOKEN_HEADER)
                 .and_then(|v| v.to_str().ok());
@@ -2245,15 +2341,147 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_call_authorized, is_allowed_origin, is_app_origin, is_gated_chat_method,
-        is_local_origin, peer_tier_status, provenance_for, read_origin_for, served_response,
-        ws_token, ServeProvenance, StorePath, APP_ORIGINS_ENV, EXPOSED_DIG_HEADERS,
+        chat_call_authorized, control_ingress_admits, is_allowed_origin, is_app_origin,
+        is_gated_chat_method, is_local_origin, peer_tier_status, provenance_for, read_origin_for,
+        requestor_for, served_response, ws_token, ServeProvenance, StorePath, APP_ORIGINS_ENV,
+        EXPOSED_DIG_HEADERS,
     };
     use axum::http::HeaderMap;
     use dig_node_core::content_serve::{PeerTier, ServeSource};
     use dig_node_core::download::{ReadOrigin, RequestProvenance};
+    use dig_node_core::rate_limit::{MissRateLimiter, RequestorId};
     use serde_json::{json, Value};
     use std::net::{Ipv4Addr, SocketAddr};
+
+    // ---- the INGRESS bound on open, token-less control reads (dig_ecosystem#3051) ----------
+
+    /// An anonymous caller at some IP — what a remote reader looks like once an operator has set
+    /// `DIG_NODE_ALLOW_REMOTE=1` and the open control reads became network-reachable.
+    fn anon(ip: &str) -> RequestorId {
+        RequestorId::Anonymous(ip.to_string())
+    }
+
+    /// **An anonymous flood is refused AT INGRESS once its burst is spent.**
+    ///
+    /// The bound the ticket exists for: the open reads carry no token, so before this gate an
+    /// unauthenticated caller could drive unbounded SQLite work — two lookups plus an LRU `UPDATE`
+    /// per `coinById` — for free, simply by asking repeatedly.
+    ///
+    /// The pool never refills (`refill_per_sec = 0.0`), so the boundary is exact rather than timing
+    /// dependent: three admitted, the fourth refused.
+    #[test]
+    fn an_anonymous_flood_is_refused_at_ingress_once_its_burst_is_spent() {
+        let limiter = MissRateLimiter::new(3.0, 0.0);
+        let caller = anon("203.0.113.7");
+
+        for i in 0..3 {
+            assert!(
+                control_ingress_admits(&limiter, &caller),
+                "read {i} is within the burst and must be admitted"
+            );
+        }
+        assert!(
+            !control_ingress_admits(&limiter, &caller),
+            "the burst is spent: further token-less reads are refused BEFORE any SQLite work"
+        );
+    }
+
+    /// **One flooding source never refuses a different one.**
+    ///
+    /// The property that makes the bound usable rather than a shared fuse: a single abusive IP
+    /// exhausts only ITS OWN budget. Without it the gate becomes a denial-of-service primitive
+    /// pointed at every other reader.
+    #[test]
+    fn one_flooding_source_never_refuses_another() {
+        let limiter = MissRateLimiter::new(1.0, 0.0);
+        let abuser = anon("203.0.113.7");
+        let bystander = anon("198.51.100.4");
+
+        assert!(control_ingress_admits(&limiter, &abuser));
+        assert!(
+            !control_ingress_admits(&limiter, &abuser),
+            "the abuser's own budget is spent"
+        );
+        assert!(
+            control_ingress_admits(&limiter, &bystander),
+            "a different source draws from its own bucket and is untouched"
+        );
+    }
+
+    /// **The node's OWN operator is NEVER refused at ingress — deliberately.**
+    ///
+    /// The limiter here has ZERO capacity, so it refuses every requestor it is actually consulted
+    /// for. `Local` is admitted anyway, which is the only way this passes: the exemption is real,
+    /// not an artifact of a generous bound.
+    ///
+    /// This test exists to FAIL if someone later "tightens" the gate onto loopback. Throttling the
+    /// operator here would reproduce, from the ingress side, exactly the failure this family was
+    /// opened to fix — a polling dig-app draining a bound until the user's own profile read was
+    /// refused for days. See `control_ingress_admits` for the full rationale.
+    #[test]
+    fn the_operator_is_never_refused_at_ingress() {
+        let refuses_everything = MissRateLimiter::new(0.0, 0.0);
+
+        for i in 0..64 {
+            assert!(
+                control_ingress_admits(&refuses_everything, &RequestorId::Local),
+                "the trusted operator's read {i} must never be throttled at ingress"
+            );
+        }
+        assert!(
+            !control_ingress_admits(&refuses_everything, &anon("203.0.113.7")),
+            "the same limiter DOES refuse an anonymous caller — so the exemption above is the \
+             reason Local passed, not a limiter that admits everyone"
+        );
+    }
+
+    /// **A loopback caller resolves to the exempt identity, and a remote one does not.**
+    ///
+    /// Joins `requestor_for` to the gate above: the exemption is only correct if the thing it
+    /// exempts really is the operator. A remote caller must never be classified `Local` and so can
+    /// never inherit the exemption.
+    #[test]
+    fn loopback_is_the_operator_and_a_remote_caller_is_not() {
+        assert!(
+            requestor_for(&SocketAddr::from((Ipv4Addr::LOCALHOST, 9778))).is_local(),
+            "a loopback caller is the operator"
+        );
+        let remote = requestor_for(&SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 9444)));
+        assert!(
+            !remote.is_local(),
+            "a remote caller is NOT the operator and is subject to the ingress bound"
+        );
+        assert_eq!(
+            remote,
+            anon("203.0.113.7"),
+            "and is keyed by its own address"
+        );
+    }
+
+    /// **The ingress bound and the chain-egress bound are INDEPENDENTLY OBSERVABLE.**
+    ///
+    /// The ticket's stated bar. The two limits protect different things — this process versus the
+    /// third-party oracle — and have different remedies, so a caller (and the next person debugging
+    /// a refusal) must be able to tell which one fired without reading the message prose.
+    #[test]
+    fn the_ingress_and_egress_bounds_refuse_with_distinct_codes() {
+        use crate::meta::ErrorCode;
+        assert_ne!(
+            ErrorCode::ControlIngressLimited.code(),
+            ErrorCode::WalletRateLimited.code(),
+            "a shared numeric code would make the two bounds indistinguishable on the wire"
+        );
+        assert_ne!(
+            ErrorCode::ControlIngressLimited.name(),
+            ErrorCode::WalletRateLimited.name(),
+            "and the stable symbol a client branches on must differ too"
+        );
+        assert_eq!(ErrorCode::ControlIngressLimited.code(), -32033);
+        assert_eq!(
+            ErrorCode::ControlIngressLimited.name(),
+            "CONTROL_INGRESS_LIMITED"
+        );
+    }
 
     /// **Regression (#1763):** the `X-Dig-Peer-Tier` wire value for BOTH tiers, asserted on the real
     /// response builder rather than on the enum alone.
