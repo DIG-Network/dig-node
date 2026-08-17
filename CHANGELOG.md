@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.123.0] - 2026-08-17
+
+### Features
+- **profile-sync:** Originate 223 announces so node-to-node profile sync works (#233)
+
 ## [0.122.1] - 2026-08-16
 
 ### Bug Fixes
