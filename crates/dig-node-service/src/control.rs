@@ -62,10 +62,10 @@ use std::sync::Arc;
 use dig_node_control_interface::params::{
     WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
 };
+use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
 use dig_node_core::seams::dig_peer::profile_sync::{
     accept_local_body, announce_frame, LocalAcceptError, ProfileBodyStore,
 };
-use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
 use dig_node_core::ChainSource as _;
 use dig_node_core::{CapsuleStore, Node};
 use serde_json::{json, Value};

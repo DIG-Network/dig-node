@@ -836,7 +836,9 @@ pub async fn handle_root_announce(
             peer = %peer.to_string(),
             "profile-sync: chain confirmed the announced root; requesting the body (opcode 224)"
         ),
-        None => tracing::debug!(store = %hex::encode(store_id), "profile-sync: no live peer to ask for the body"),
+        None => {
+            tracing::debug!(store = %hex::encode(store_id), "profile-sync: no live peer to ask for the body")
+        }
     }
     asked
 }
@@ -2017,7 +2019,8 @@ mod tests {
         // A short name, an uppercase-hex name of the right length, and a loose file at the top of
         // the tree — each is 64-hex-adjacent and none of them is a store id.
         std::fs::create_dir_all(root_dir.join("not-a-store-id")).expect("dir");
-        std::fs::create_dir_all(root_dir.join(hex::encode(store_id(9)).to_uppercase())).expect("dir");
+        std::fs::create_dir_all(root_dir.join(hex::encode(store_id(9)).to_uppercase()))
+            .expect("dir");
         std::fs::write(root_dir.join("README.txt"), b"not a store").expect("file");
 
         assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
