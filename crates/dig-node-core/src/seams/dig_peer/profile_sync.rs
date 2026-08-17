@@ -1979,4 +1979,64 @@ mod tests {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    // -- The announce originator -------------------------------------------------------------------
+
+    /// TWO stores, each holding TWO generations, so an implementation that enumerates only the
+    /// first store directory (or only one root inside it) is visibly wrong rather than accidentally
+    /// right. Retention keeps current-plus-one, so two roots per store is the real maximum.
+    #[test]
+    fn held_pairs_enumerates_every_store_and_every_root() {
+        let store = ProfileBodyStore::new(tempdir());
+        let (alice, alice_root) = dpb("alice");
+        let (bob, bob_root) = dpb("bob");
+        store.put(&store_id(1), &alice_root, &alice).expect("put");
+        store.put(&store_id(1), &bob_root, &bob).expect("put");
+        store.put(&store_id(2), &alice_root, &alice).expect("put");
+
+        let mut held = store.held_pairs();
+        held.sort();
+        let mut expected = vec![
+            (store_id(1), alice_root),
+            (store_id(1), bob_root),
+            (store_id(2), alice_root),
+        ];
+        expected.sort();
+        assert_eq!(held, expected);
+    }
+
+    /// A directory this module did not write must never become an announced store id. Announcing a
+    /// phantom root costs every subscribed peer a chain read, so the filter is the bound.
+    #[test]
+    fn held_pairs_skips_names_this_module_did_not_write() {
+        let root_dir = tempdir();
+        let store = ProfileBodyStore::new(root_dir.clone());
+        let (bytes, root) = dpb("alice");
+        store.put(&store_id(1), &root, &bytes).expect("put");
+
+        // A short name, an uppercase-hex name of the right length, and a loose file at the top of
+        // the tree — each is 64-hex-adjacent and none of them is a store id.
+        std::fs::create_dir_all(root_dir.join("not-a-store-id")).expect("dir");
+        std::fs::create_dir_all(root_dir.join(hex::encode(store_id(9)).to_uppercase())).expect("dir");
+        std::fs::write(root_dir.join("README.txt"), b"not a store").expect("file");
+
+        assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
+    }
+
+    /// An originated announce goes to EVERY peer — there is no sender to exclude, unlike the
+    /// follow-on announce `accept_body` emits. Passing an exclusion here would silently skip a peer.
+    #[tokio::test]
+    async fn announcing_a_held_root_excludes_nobody() {
+        let transport = Transport::default();
+        let (_, root) = dpb("alice");
+
+        let reached = announce_held_root(&transport, store_id(1), root).await;
+
+        assert_eq!(reached, 1);
+        let announces = transport.announces.lock().unwrap();
+        let (root_ref, exclude) = announces.first().expect("one announce");
+        assert_eq!(<[u8; 32]>::from(root_ref.store_id), store_id(1));
+        assert_eq!(<[u8; 32]>::from(root_ref.root), root);
+        assert_eq!(*exclude, None);
+    }
 }
