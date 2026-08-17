@@ -28,7 +28,7 @@
 use std::sync::OnceLock;
 
 use dig_logging::{LogGuard, RunContext, Service};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::meta::{SERVICE_NAME, VERSION};
 
