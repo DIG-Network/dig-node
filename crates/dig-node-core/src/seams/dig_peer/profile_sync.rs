@@ -783,10 +783,20 @@ pub async fn handle_root_announce(
 ) -> Option<PeerId> {
     let store_id: [u8; 32] = announce.store_id.into();
     let announced_root: [u8; 32] = announce.root.into();
+    // Each early return below is a DIFFERENT reason to do nothing, and from the outside they are
+    // indistinguishable — a silent announce path is why this exchange was unobservable. Naming each
+    // one costs a debug line and turns "nothing happened" into a diagnosis.
+    tracing::debug!(
+        store = %hex::encode(store_id),
+        root = %hex::encode(announced_root),
+        "profile-sync: heard a root announce (opcode 223)"
+    );
     if !subs.is_subscribed(&store_id) {
+        tracing::debug!(store = %hex::encode(store_id), "profile-sync: not subscribed; ignoring announce");
         return None;
     }
     if store.has(&store_id, &announced_root) {
+        tracing::debug!(store = %hex::encode(store_id), "profile-sync: already hold this root; ignoring announce");
         return None;
     }
     // BEFORE the chain read, deliberately. This is the cheapest of the three checks and it guards
@@ -799,13 +809,36 @@ pub async fn handle_root_announce(
     // chasing is exactly the frame to drop; an announce naming a DIFFERENT root is not suppressed
     // by this and still gets its own chain read.
     if solicitations.is_outstanding(&store_id, &announced_root) {
+        tracing::debug!(store = %hex::encode(store_id), "profile-sync: already chasing this root; ignoring duplicate announce");
         return None;
     }
-    let chain_root = chain_root_for(resolver, &store_id).await.ok()?;
+    let chain_root = match chain_root_for(resolver, &store_id).await {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::debug!(store = %hex::encode(store_id), reason = %e, "profile-sync: no chain-confirmed root, so nothing may be requested (fail closed)");
+            return None;
+        }
+    };
     if chain_root != announced_root {
+        tracing::debug!(
+            store = %hex::encode(store_id),
+            announced = %hex::encode(announced_root),
+            on_chain = %hex::encode(chain_root),
+            "profile-sync: announced root is not the chain's root; ignoring announce"
+        );
         return None;
     }
-    request_body(transport, solicitations, store_id, chain_root).await
+    let asked = request_body(transport, solicitations, store_id, chain_root).await;
+    match asked {
+        Some(peer) => tracing::info!(
+            store = %hex::encode(store_id),
+            root = %hex::encode(chain_root),
+            peer = %peer.to_string(),
+            "profile-sync: chain confirmed the announced root; requesting the body (opcode 224)"
+        ),
+        None => tracing::debug!(store = %hex::encode(store_id), "profile-sync: no live peer to ask for the body"),
+    }
+    asked
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -874,8 +907,16 @@ pub async fn run_profile_sync_ingest(
         } else if let Some(request) = profile_body_request_payload(&msg) {
             let ctx = ctx.clone();
             let _ = crate::shared::catch_iteration("profile_body_request", async move {
-                serve_body_request(&ctx.store, &*ctx.transport, &ctx.budget, sender, &request)
-                    .await;
+                let outcome =
+                    serve_body_request(&ctx.store, &*ctx.transport, &ctx.budget, sender, &request)
+                        .await;
+                tracing::info!(
+                    store = %request.store_id.to_string(),
+                    root = %request.root.to_string(),
+                    peer = %sender.to_string(),
+                    ?outcome,
+                    "profile-sync: answered a body request (opcode 224)"
+                );
             })
             .await;
         } else if let Some(body) = profile_body_payload(&msg) {
@@ -891,14 +932,24 @@ pub async fn run_profile_sync_ingest(
                     &body,
                 )
                 .await;
-                if let AcceptOutcome::Accepted { bytes, announced } = outcome {
-                    tracing::info!(
+                // Every outcome is logged, not only acceptance: a REFUSAL is the security-relevant
+                // event, and one that leaves no trace is indistinguishable from a frame that never
+                // arrived.
+                match outcome {
+                    AcceptOutcome::Accepted { bytes, announced } => tracing::info!(
                         store = %body.store_id.to_string(),
                         root = %body.root.to_string(),
                         bytes,
                         announced,
                         "profile-sync: chain-anchored body accepted and re-announced"
-                    );
+                    ),
+                    other => tracing::info!(
+                        store = %body.store_id.to_string(),
+                        root = %body.root.to_string(),
+                        peer = %sender.to_string(),
+                        outcome = ?other,
+                        "profile-sync: REFUSED an inbound profile body (opcode 225)"
+                    ),
                 }
             })
             .await;
