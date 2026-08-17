@@ -28,6 +28,7 @@
 use std::sync::OnceLock;
 
 use dig_logging::{LogGuard, RunContext, Service};
+use serde_json::{Value, json};
 
 use crate::meta::{SERVICE_NAME, VERSION};
 
@@ -61,9 +62,20 @@ pub fn run_context() -> RunContext {
 
 /// Install the shared logging stack for a SERVE run (SPEC §1) and hold the guard for the
 /// process lifetime. Idempotent + best-effort: a second call (e.g. a test that serves twice
-/// in one process) is a silent no-op, and a failure to install — the log dir is unwritable,
-/// or a subscriber is already set — is reported on stderr and swallowed, because a logging
-/// problem must NEVER stop the node from serving.
+/// in one process) is a silent no-op.
+///
+/// Since `dig-logging` 0.2.0 an unwritable log directory is NO LONGER an `init` failure: the
+/// crate degrades to console-only logging and reports the reason via
+/// [`dig_logging::LogGuard::file_error`], which this module re-exports as [`file_error`] and
+/// `control.status` surfaces. That is the whole point of the uplift — under 0.1.x the same
+/// condition returned `Err`, the stderr layer was never installed, and an interactive
+/// `dig-node run` on a host whose machine log dir belongs to the service account ran with NO
+/// subscriber at all, i.e. completely silent.
+///
+/// The remaining `Err` arm is therefore narrow — a subscriber is already installed by this
+/// process, or (per the crate's docs, not reachable in practice) an unparseable filter. It is
+/// still reported on stderr and swallowed, because a logging problem must NEVER stop the node
+/// from serving.
 pub fn init(run_context: RunContext) {
     if GUARD.get().is_some() {
         return;
@@ -78,10 +90,46 @@ pub fn init(run_context: RunContext) {
         Err(e) => {
             eprintln!(
                 "dig-node: WARN could not install structured logging ({e}); \
-                 continuing without a log file"
+                 continuing without a subscriber"
             );
         }
     }
+}
+
+/// Why the rolling JSONL file sink is disabled for this process, or `None` when it is live (or
+/// when this process never installed logging at all — see [`initialized`]).
+///
+/// Console logging is installed either way, so this is a health signal, not a failure: a node
+/// that reported healthy logging while writing to nothing would be the exact untruth the
+/// `dig-logging` 0.2.0 uplift exists to remove.
+pub fn file_error() -> Option<String> {
+    GUARD.get()?.file_error().map(str::to_owned)
+}
+
+/// The log directory this process resolved. When [`file_error`] is set, NOTHING is being written
+/// there — it is the directory that could not be opened, which is what makes it worth reporting.
+pub fn log_dir() -> Option<std::path::PathBuf> {
+    GUARD.get().map(|g| g.log_dir().to_path_buf())
+}
+
+/// Whether a serve path installed the logging stack in this process.
+pub fn initialized() -> bool {
+    GUARD.get().is_some()
+}
+
+/// The node's own logging health, as reported by `control.status`. Pure in its inputs so both
+/// arms are testable without a process-global subscriber: `file_error` is
+/// [`dig_logging::LogGuard::file_error`], `dir` the resolved directory.
+///
+/// The nearest wrong implementation reports `file_logging: true` whenever logging initialised —
+/// which is precisely the lie a degraded file sink makes possible.
+pub fn health(initialized: bool, dir: Option<&std::path::Path>, file_error: Option<&str>) -> Value {
+    json!({
+        "initialized": initialized,
+        "dir": dir.map(|d| d.display().to_string()),
+        "file_logging": initialized && file_error.is_none(),
+        "file_error": file_error,
+    })
 }
 
 /// Record one JSON-RPC dispatch for per-request diagnosis (SPEC §6), at `DEBUG` so it stays off
@@ -124,5 +172,35 @@ mod tests {
         // change reports the actionable reason rather than panicking. (This also documents that
         // `control.log.setLevel` on a non-serving process fails cleanly.)
         assert!(set_level("debug").is_err());
+    }
+
+    #[test]
+    fn health_reports_file_logging_off_and_names_the_reason() {
+        // The degraded case the 0.2.0 uplift exists for: the subscriber IS installed (console
+        // logging works) but nothing reaches the file. A surface that reported `file_logging:
+        // true` here would be the untruth being removed.
+        let dir = std::path::Path::new("/var/log/dig-node");
+        let value = health(true, Some(dir), Some("permission denied"));
+        assert_eq!(value["initialized"], true);
+        assert_eq!(value["file_logging"], false);
+        assert_eq!(value["file_error"], "permission denied");
+        assert_eq!(value["dir"], dir.display().to_string());
+    }
+
+    #[test]
+    fn health_reports_file_logging_on_when_the_sink_is_live() {
+        // The honest control for the test above: same shape, no error, so a `file_logging: false`
+        // constant would fail here and a `true` constant fails there.
+        let value = health(true, Some(std::path::Path::new("/tmp/logs")), None);
+        assert_eq!(value["file_logging"], true);
+        assert_eq!(value["file_error"], Value::Null);
+    }
+
+    #[test]
+    fn health_never_claims_file_logging_when_logging_was_never_installed() {
+        let value = health(false, None, None);
+        assert_eq!(value["initialized"], false);
+        assert_eq!(value["file_logging"], false);
+        assert_eq!(value["dir"], Value::Null);
     }
 }

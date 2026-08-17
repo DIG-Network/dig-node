@@ -146,7 +146,7 @@ serde_json = "1"
 # reusable `logs` CLI verbs + the bundle-time redaction engine. Every DIG service binary
 # gets logging from HERE rather than hand-rolling a subscriber. Sourced from crates.io (no
 # git/path dep) per the ecosystem crates.io policy (#681).
-dig-logging = "0.1"
+dig-logging = "0.2"
 # The logging facade the shell emits through. dig-node-core already depends on `tracing`;
 # the service shell now emits its own bring-up/lifecycle events through it, captured by the
 # `dig-logging` subscriber installed at the serve entrypoints.

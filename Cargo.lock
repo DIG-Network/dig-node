@@ -2168,9 +2168,9 @@ dependencies = [
 
 [[package]]
 name = "dig-logging"
-version = "0.1.4"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9c3a71bbd1b2784c5d7e2eea47edb57785a97da17fbcc9cd4f8339c9978cbf7"
+checksum = "9c9f4a20dafd185b1b4a80eb7330765de129d7e188a5d19954d509030ef0b27c"
 dependencies = [
  "bip39",
  "clap",
