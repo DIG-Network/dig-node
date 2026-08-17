@@ -1113,6 +1113,12 @@ pub(crate) mod mock {
         /// Counts NETWORKED calls only. A cached answer leaves it untouched — that is the
         /// measurement.
         pub calls: Arc<AtomicUsize>,
+        /// Whether this double has NO live chain source (dig_ecosystem#3050).
+        ///
+        /// Phrased as `offline` rather than `live` so [`Default`] stays derivable AND keeps meaning
+        /// the live source every other test assumes — a `live: bool` would default to `false` and
+        /// silently flip every existing fixture onto the no-chain-source path.
+        pub offline: bool,
     }
 
     impl MockFallback {
@@ -1139,6 +1145,13 @@ pub(crate) mod mock {
             self.spends = spends;
             self
         }
+        /// The same double with its chain tier UNREACHABLE (dig_ecosystem#3050) — the cache it was
+        /// built with stays intact, which is exactly the state a transient outage produces and the
+        /// one a cached read must still be served in.
+        pub fn offline(mut self) -> Self {
+            self.offline = true;
+            self
+        }
         pub fn call_count(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
         }
@@ -1146,10 +1159,10 @@ pub(crate) mod mock {
 
     #[async_trait]
     impl ChainFallback for MockFallback {
-        /// The test double stands in for a genuinely live chain source (unit tests that want
-        /// the "no chain source" path use a dedicated non-live double instead, #1851).
+        /// The test double stands in for a genuinely live chain source unless a fixture asks for
+        /// the opposite via [`MockFallback::offline`] (dig_ecosystem#3050).
         fn is_live(&self) -> bool {
-            true
+            !self.offline
         }
 
         async fn coin_records_by_puzzle_hashes(&self, phs: &[String]) -> Result<Vec<FallbackCoin>> {

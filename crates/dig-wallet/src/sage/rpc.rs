@@ -1509,16 +1509,20 @@ impl WalletBackend {
         if let Some(answer) = self.replica_coin_by_id(coin_id).await? {
             return Ok(answer);
         }
-        // No live source means the answer is UNKNOWN, never "no such coin" (#1851).
-        if !self.fallback.is_live() {
-            return Err(BalanceError::NoChainSource);
-        }
-        // A coin the chain tier already holds cached is answered from that cache, ahead of the rate
-        // limiter (dig_ecosystem#3044). The limiter bounds EGRESS amplification against the
-        // third-party oracle; a cache hit sends nothing, so charging it a token bounds nothing and
-        // spends the budget the misses need. Gating it made the bucket unable to refill under a
-        // polling client — a stable equilibrium in which a profile read could never succeed while
-        // the app that needed it was open.
+        // A coin the chain tier already holds cached is answered from that cache, ahead of BOTH the
+        // liveness check and the rate limiter (dig_ecosystem#3044, dig_ecosystem#3050).
+        //
+        // The limiter bounds EGRESS amplification against the third-party oracle; a cache hit sends
+        // nothing, so charging it a token bounds nothing and spends the budget the misses need.
+        // Gating it made the bucket unable to refill under a polling client — a stable equilibrium
+        // in which a profile read could never succeed while the app that needed it was open.
+        //
+        // `is_live()` is the SAME reasoning one step over (dig_ecosystem#3050): a cached answer
+        // needs no live source either, because the answer is already in hand. Consulting a third
+        // party's reachability before serving bytes this node already holds gives availability away
+        // for nothing, and does it on the reads a lineage walk re-reads most — a spent coin's record
+        // is immutable, so the cached rows are permanent by design. It also compounds: a refusal
+        // becomes a retry, and retries are what exhausted the limiter in the first place.
         //
         // The amplification bound is UNCHANGED: only a miss reaches a peer, and only misses are
         // charged.
@@ -1534,6 +1538,13 @@ impl WalletBackend {
                 synced: false,
                 peak_height: None,
             });
+        }
+        // A MISS, however, still needs a live source, and the refusal here STAYS (#1851): no live
+        // source means the answer is UNKNOWN, never "no such coin". `Ok(None)` would collapse "I
+        // could not check" into "it does not exist", which on a lineage walk reads as *this coin is
+        // the tip*.
+        if !self.fallback.is_live() {
+            return Err(BalanceError::NoChainSource);
         }
         // The same global bound the other open chain reads carry (#1957): this is an
         // unauthenticated loopback endpoint, so without it a local process could loop it into
@@ -1636,14 +1647,14 @@ impl WalletBackend {
         &self,
         coin_id: &str,
     ) -> std::result::Result<WalletCoinSpendResult, BalanceError> {
-        if !self.fallback.is_live() {
-            return Err(BalanceError::NoChainSource);
-        }
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
-        // Both halves of the composed answer, from the cache, before any token is spent
-        // (dig_ecosystem#3044) — see `coin_by_id` for why a cache hit is not what the limiter
-        // bounds. BOTH must be cached: a cached spend whose record is not cached still has to
-        // reach a peer for the heights, and that read is egress like any other.
+        // Both halves of the composed answer, from the cache, before any token is spent AND before
+        // the liveness check (dig_ecosystem#3044, dig_ecosystem#3050) — see `coin_by_id` for why a
+        // cache hit is neither what the limiter bounds nor something a live source is needed for.
+        //
+        // BOTH must be cached: a cached spend whose record is not cached still has to reach a peer
+        // for the heights, and that read is egress like any other. So the partially-cached case is a
+        // genuine MISS and keeps both the liveness check and the token below.
         if let (Some(spend), Some(record)) = (
             self.fallback
                 .cached_coin_spend(coin_id)
@@ -1660,6 +1671,12 @@ impl WalletBackend {
                 synced: false,
                 peak_height: None,
             });
+        }
+        // A miss still needs a live source: `spend: None` must mean a source ANSWERED and holds no
+        // spend, never that none could be reached — a lineage walk reads absence as *this is the
+        // tip* and stops.
+        if !self.fallback.is_live() {
+            return Err(BalanceError::NoChainSource);
         }
         if !self.fallback_rate.try_acquire() {
             return Err(BalanceError::RateLimited);
@@ -7573,6 +7590,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- a cache HIT needs no live fallback either (dig_ecosystem#3050) --------------
+
+    /// A double whose chain tier is DOWN but whose cache holds one full generation — the state a
+    /// transient outage produces on a node that has already walked this lineage.
+    fn offline_with_cached_generation(id: &str) -> Arc<MockFallback> {
+        let (coin, spend) = generation(id, 40);
+        Arc::new(
+            MockFallback::default()
+                .with_cached(vec![coin], vec![spend])
+                .offline(),
+        )
+    }
+
+    /// **`coin_by_id` serves a cached record while the chain tier is unreachable.**
+    ///
+    /// The double is `offline()` — `is_live()` is false, so nothing networked can answer — and its
+    /// cache is populated. The read succeeds only if the cached arm never consults liveness.
+    ///
+    /// **Catches** the shipped ordering: with `is_live()` above the cache, a node holding every
+    /// byte of the answer refuses it because a third party is momentarily unreachable. Measured
+    /// under revert: `NoChainSource`.
+    ///
+    /// Deliberately SEPARATE from the `coin_spend` test below rather than two assertions in one
+    /// body: the first `expect` to fire ends the test, so a combined test would prove only whichever
+    /// arm it probed first and pass the other for free.
+    #[tokio::test]
+    async fn coin_by_id_serves_a_cached_record_while_the_chain_tier_is_unreachable() {
+        let fb = offline_with_cached_generation("down-0");
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb.clone(),
+            WalletConfig::default(),
+        );
+
+        let coin = be
+            .coin_by_id("down-0")
+            .await
+            .expect("a cached record needs no live source: the answer is already in hand");
+        assert_eq!(
+            coin.coin.expect("the cached coin is served").coin_id,
+            "down-0"
+        );
+        assert_eq!(
+            fb.call_count(),
+            0,
+            "an offline double could not have answered this over the wire"
+        );
+    }
+
+    /// **`coin_spend` serves a fully-cached spend while the chain tier is unreachable.**
+    ///
+    /// The `coin_spend` half of the arm above, pinned independently for the reason stated there.
+    /// BOTH halves of the composition are cached here, so this is a true hit; the partially-cached
+    /// case is a miss and is pinned separately below.
+    ///
+    /// Measured under revert: `NoChainSource`.
+    #[tokio::test]
+    async fn coin_spend_serves_a_cached_spend_while_the_chain_tier_is_unreachable() {
+        let fb = offline_with_cached_generation("down-1");
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb.clone(),
+            WalletConfig::default(),
+        );
+
+        let spend = be
+            .coin_spend("down-1")
+            .await
+            .expect("a cached spend needs no live source either");
+        assert_eq!(
+            spend
+                .spend
+                .expect("the cached spend is served")
+                .coin
+                .coin_id,
+            "down-1"
+        );
+        assert_eq!(
+            fb.call_count(),
+            0,
+            "an offline double could not have answered this over the wire"
+        );
+    }
+
+    /// **A cache MISS with no live source is still an ERROR, never an absence.**
+    ///
+    /// The control for the test above, and the one that catches "the fix" implemented as deleting
+    /// the liveness check. `Ok(None)` here would collapse "I could not check" into "it does not
+    /// exist" — which a lineage walk reads as *this coin is the tip*.
+    #[tokio::test]
+    async fn a_cache_miss_with_no_live_source_is_refused_rather_than_answered_empty() {
+        let fb = Arc::new(MockFallback::default().offline());
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb.clone(),
+            WalletConfig::default(),
+        );
+
+        assert_eq!(
+            be.coin_by_id("absent").await,
+            Err(BalanceError::NoChainSource),
+            "an uncached coin with nothing to ask is UNKNOWN, not absent"
+        );
+        assert_eq!(
+            be.coin_spend("absent").await,
+            Err(BalanceError::NoChainSource),
+            "an uncached spend with nothing to ask is UNKNOWN, not unspent"
+        );
+    }
+
+    /// **A PARTIALLY cached spend is a genuine miss: it keeps the liveness check.**
+    ///
+    /// The composition the #3044 lane documented, pinned. The spend is cached; its coin RECORD is
+    /// not — and the record is where the heights come from, so answering still requires reaching a
+    /// peer. That makes this case a miss, and a miss with no live source must refuse rather than
+    /// emit a spend with an absent `spent_height`.
+    ///
+    /// Without this the obvious over-correction — hoisting the whole cached arm above `is_live()`
+    /// and treating a half-hit as a hit — passes the test above and ships an invented height.
+    #[tokio::test]
+    async fn a_spend_cached_without_its_record_still_requires_a_live_source() {
+        let (_, s0) = generation("half-0", 40);
+        let fb = Arc::new(
+            MockFallback::default()
+                .with_cached(vec![], vec![s0])
+                .offline(),
+        );
+        let be = WalletBackend::new(
+            WalletDb::open_in_memory().await.unwrap(),
+            fb.clone(),
+            WalletConfig::default(),
+        );
+
+        assert_eq!(
+            be.coin_spend("half-0").await,
+            Err(BalanceError::NoChainSource),
+            "the heights live in the record, which is NOT cached: this read still needs a peer"
+        );
+        assert_eq!(fb.call_count(), 0, "and it never reached one");
     }
 
     #[tokio::test]
