@@ -138,6 +138,20 @@ say "B -> A connect: $CONNECT"
 CONNECT_BACK=$(ctl a "$A_CTRL" control.peers.connect "{\"peer\":\"127.0.0.1:$B_GOSSIP\"}")
 say "A -> B connect: $CONNECT_BACK"
 
+# A's peer registration read from the CONTROL PLANE, independently of any announce line, recorded
+# so a failing run can be told apart from a broken one. Read it for what it is: `known_dig_peer_
+# count` counts peers A has REGISTERED, while `dig_peer_count` reports the dig-peer pool, which is
+# a different pool from the gossip one this run exercises and reads 0 even on a converged run — so
+# this probe evidences the dial, not the gossip session.
+#
+# What actually disambiguates `peers=0` between "the seen set suppressed the send" (the defect) and
+# "no peer was there" (a broken harness) is running this script UNCHANGED against two builds that
+# differ only in the fix: same ports, same dials, same probe output. The fix build reaches
+# `peers=1` and B logs the receipt; the reverted build reports `peers=0` forever. Identical setup
+# with a diverging delivery count can only be the fix.
+PEERS_A=$(ctl a "$A_CTRL" control.peerCounts '{}')
+say "A peer counts before the re-announce tick: $PEERS_A"
+
 # --- Step 3: the re-announce must cross the socket ----------------------------------------------
 BEFORE=$(announce_lines | wc -l)
 say "=== step 3: waiting up to $((INTERVAL + 30))s for A's next re-announce tick"
@@ -158,8 +172,8 @@ ALL_PEERS=$(announce_lines | grep -oE 'peers[=:"]+[0-9]+' | grep -oE '[0-9]+$' |
 if [ -n "$HEARD" ]; then VERDICT="CONVERGED"; RC=0; else VERDICT="DID_NOT_CONVERGE"; RC=1; fi
 
 if [ "$JSON" = 1 ]; then
-  printf '{"verdict":"%s","store_id":"%s","root":"%s","announce_peer_counts":"%s","seconds_to_converge":%s,"a_first_announce":%s,"a_last_announce":%s,"b_heard":%s,"work_dir":"%s"}\n' \
-    "$VERDICT" "$STORE_ID" "$ROOT" "$(echo "$ALL_PEERS" | sed 's/ *$//')" "$WAITED" \
+  printf '{"verdict":"%s","store_id":"%s","root":"%s","announce_peer_counts":"%s","a_control_peer_counts":%s,"seconds_to_converge":%s,"a_first_announce":%s,"a_last_announce":%s,"b_heard":%s,"work_dir":"%s"}\n' \
+    "$VERDICT" "$STORE_ID" "$ROOT" "$(echo "$ALL_PEERS" | sed 's/ *$//')" "${PEERS_A:-null}" "$WAITED" \
     "$(printf '%s' "$FIRST_ANNOUNCE" | python -c 'import json,sys;print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')" \
     "$(printf '%s' "$REACHED_LINE" | python -c 'import json,sys;print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')" \
     "$(printf '%s' "$HEARD" | python -c 'import json,sys;print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')" \
@@ -168,6 +182,7 @@ else
   echo
   echo "=== verdict: $VERDICT (after ${WAITED}s)"
   echo "A announce peers= sequence: $ALL_PEERS"
+  echo "A control-plane peer counts: $PEERS_A"
   echo "A last announce: $REACHED_LINE"
   echo "B heard:         ${HEARD:-<nothing — B never received a 223>}"
   echo "logs: $WORK/a/stderr.log  $WORK/b/stderr.log"
