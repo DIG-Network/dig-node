@@ -62,8 +62,9 @@ use std::sync::Arc;
 use dig_node_control_interface::params::{
     WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
 };
+use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
 use dig_node_core::seams::dig_peer::profile_sync::{
-    accept_local_body, LocalAcceptError, ProfileBodyStore,
+    accept_local_body, announce_frame, LocalAcceptError, ProfileBodyStore,
 };
 use dig_node_core::ChainSource as _;
 use dig_node_core::{CapsuleStore, Node};
@@ -2370,6 +2371,21 @@ fn profile_body_store(ctx: &ControlCtx) -> ProfileBodyStore {
     ProfileBodyStore::under_cache_dir(ctx.node.cache_dir_path())
 }
 
+/// Flood one 223 announce for a body this node has just persisted, returning peers reached.
+///
+/// Zero is an honest answer with two causes — no peer network on this node, or no peers connected —
+/// and neither is an error: the body is on disk either way, and the periodic re-announce loop tells
+/// whoever connects next.
+async fn announce_now(ctx: &ControlCtx, store_id: [u8; 32], root: [u8; 32]) -> usize {
+    let Some(handle) = ctx.node.gossip_handle() else {
+        return 0;
+    };
+    handle
+        .broadcast(announce_frame(store_id, root), None)
+        .await
+        .unwrap_or(0)
+}
+
 /// `control.profile.putBody` — persist a profile body, but ONLY once the chain confirms its root.
 ///
 /// Refusal is always an error, never an `Ok` carrying `stored: false`: a caller that reads a
@@ -2435,15 +2451,23 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
     )
     .await
     {
-        Ok(_) => control_ok(
-            id,
-            json!({
-                "stored": true,
-                "store_id": hex::encode(store_id),
-                "root": hex::encode(root),
-                "body_bytes": bytes.len() as u64,
-            }),
-        ),
+        Ok(_) => {
+            // Tell the network immediately, rather than waiting up to `ANNOUNCE_INTERVAL` for the
+            // re-announce loop. Peers reached is REPORTED, never a failure: a node with no peer
+            // network still persisted and still serves the body over the control plane, and the
+            // periodic loop covers every peer that connects later.
+            let announced = announce_now(ctx, store_id, root).await;
+            control_ok(
+                id,
+                json!({
+                    "stored": true,
+                    "store_id": hex::encode(store_id),
+                    "root": hex::encode(root),
+                    "body_bytes": bytes.len() as u64,
+                    "announced_to_peers": announced as u64,
+                }),
+            )
+        }
         Err(e @ (LocalAcceptError::RootNotConfirmed(_) | LocalAcceptError::Malformed(_))) => {
             control_error(id, ErrorCode::InvalidParams, format!("{METHOD}: {e}"))
         }

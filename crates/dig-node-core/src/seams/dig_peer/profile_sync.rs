@@ -242,6 +242,30 @@ impl ProfileBodyStore {
             .collect()
     }
 
+    /// Every `(store_id, root)` this node holds a body for, in unspecified order.
+    ///
+    /// The re-announce loop's input. Both components are parsed back out of the path with the same
+    /// strict 64-lowercase-hex rule that named them, so a stray file, a temp artifact, or a
+    /// directory this module did not create is skipped rather than announced as a phantom root.
+    #[must_use]
+    pub fn held_pairs(&self) -> Vec<([u8; 32], [u8; 32])> {
+        let Ok(stores) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        stores
+            .flatten()
+            .filter_map(|entry| {
+                let store_id = hex32_from_name(&entry.file_name().to_string_lossy())?;
+                Some(
+                    self.roots_for_store(&store_id)
+                        .into_iter()
+                        .map(move |root| (store_id, root)),
+                )
+            })
+            .flatten()
+            .collect()
+    }
+
     /// Delete every artifact in `dir` except `keep` and the most recently modified other.
     ///
     /// Best-effort: a failure to enumerate or unlink leaves extra bodies on disk, which costs disk
@@ -281,16 +305,23 @@ fn file_name_of(path: &Path) -> String {
 /// Deliberately strict: a temp file, a stray artifact, or a differently-cased name is NOT a body,
 /// so retention and enumeration never act on a file this module did not write.
 fn root_from_file_name(name: &str) -> Option<[u8; 32]> {
-    let stem = name.strip_suffix(&format!(".{DPB_EXTENSION}"))?;
-    if stem.len() != 64
-        || !stem
+    hex32_from_name(name.strip_suffix(&format!(".{DPB_EXTENSION}"))?)
+}
+
+/// Parse exactly 64 lowercase hex characters into the 32 bytes they name, or `None`.
+///
+/// Deliberately strict about case and length: this module writes every name it owns with
+/// `hex::encode`, so anything else in the tree was written by something else and must not be
+/// mistaken for a store id or a root.
+fn hex32_from_name(name: &str) -> Option<[u8; 32]> {
+    if name.len() != 64
+        || !name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
     {
         return None;
     }
-    let raw = hex::decode(stem).ok()?;
-    <[u8; 32]>::try_from(raw.as_slice()).ok()
+    <[u8; 32]>::try_from(hex::decode(name).ok()?.as_slice()).ok()
 }
 
 /// A monotonic-ish suffix distinguishing two temp files written in the same process.
@@ -752,10 +783,20 @@ pub async fn handle_root_announce(
 ) -> Option<PeerId> {
     let store_id: [u8; 32] = announce.store_id.into();
     let announced_root: [u8; 32] = announce.root.into();
+    // Each early return below is a DIFFERENT reason to do nothing, and from the outside they are
+    // indistinguishable — a silent announce path is why this exchange was unobservable. Naming each
+    // one costs a debug line and turns "nothing happened" into a diagnosis.
+    tracing::debug!(
+        store = %hex::encode(store_id),
+        root = %hex::encode(announced_root),
+        "profile-sync: heard a root announce (opcode 223)"
+    );
     if !subs.is_subscribed(&store_id) {
+        tracing::debug!(store = %hex::encode(store_id), "profile-sync: not subscribed; ignoring announce");
         return None;
     }
     if store.has(&store_id, &announced_root) {
+        tracing::debug!(store = %hex::encode(store_id), "profile-sync: already hold this root; ignoring announce");
         return None;
     }
     // BEFORE the chain read, deliberately. This is the cheapest of the three checks and it guards
@@ -768,13 +809,38 @@ pub async fn handle_root_announce(
     // chasing is exactly the frame to drop; an announce naming a DIFFERENT root is not suppressed
     // by this and still gets its own chain read.
     if solicitations.is_outstanding(&store_id, &announced_root) {
+        tracing::debug!(store = %hex::encode(store_id), "profile-sync: already chasing this root; ignoring duplicate announce");
         return None;
     }
-    let chain_root = chain_root_for(resolver, &store_id).await.ok()?;
+    let chain_root = match chain_root_for(resolver, &store_id).await {
+        Ok(root) => root,
+        Err(e) => {
+            tracing::debug!(store = %hex::encode(store_id), reason = %e, "profile-sync: no chain-confirmed root, so nothing may be requested (fail closed)");
+            return None;
+        }
+    };
     if chain_root != announced_root {
+        tracing::debug!(
+            store = %hex::encode(store_id),
+            announced = %hex::encode(announced_root),
+            on_chain = %hex::encode(chain_root),
+            "profile-sync: announced root is not the chain's root; ignoring announce"
+        );
         return None;
     }
-    request_body(transport, solicitations, store_id, chain_root).await
+    let asked = request_body(transport, solicitations, store_id, chain_root).await;
+    match asked {
+        Some(peer) => tracing::info!(
+            store = %hex::encode(store_id),
+            root = %hex::encode(chain_root),
+            peer = %peer.to_string(),
+            "profile-sync: chain confirmed the announced root; requesting the body (opcode 224)"
+        ),
+        None => {
+            tracing::debug!(store = %hex::encode(store_id), "profile-sync: no live peer to ask for the body")
+        }
+    }
+    asked
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -843,8 +909,16 @@ pub async fn run_profile_sync_ingest(
         } else if let Some(request) = profile_body_request_payload(&msg) {
             let ctx = ctx.clone();
             let _ = crate::shared::catch_iteration("profile_body_request", async move {
-                serve_body_request(&ctx.store, &*ctx.transport, &ctx.budget, sender, &request)
-                    .await;
+                let outcome =
+                    serve_body_request(&ctx.store, &*ctx.transport, &ctx.budget, sender, &request)
+                        .await;
+                tracing::info!(
+                    store = %request.store_id.to_string(),
+                    root = %request.root.to_string(),
+                    peer = %sender.to_string(),
+                    ?outcome,
+                    "profile-sync: answered a body request (opcode 224)"
+                );
             })
             .await;
         } else if let Some(body) = profile_body_payload(&msg) {
@@ -860,14 +934,24 @@ pub async fn run_profile_sync_ingest(
                     &body,
                 )
                 .await;
-                if let AcceptOutcome::Accepted { bytes, announced } = outcome {
-                    tracing::info!(
+                // Every outcome is logged, not only acceptance: a REFUSAL is the security-relevant
+                // event, and one that leaves no trace is indistinguishable from a frame that never
+                // arrived.
+                match outcome {
+                    AcceptOutcome::Accepted { bytes, announced } => tracing::info!(
                         store = %body.store_id.to_string(),
                         root = %body.root.to_string(),
                         bytes,
                         announced,
                         "profile-sync: chain-anchored body accepted and re-announced"
-                    );
+                    ),
+                    other => tracing::info!(
+                        store = %body.store_id.to_string(),
+                        root = %body.root.to_string(),
+                        peer = %sender.to_string(),
+                        outcome = ?other,
+                        "profile-sync: REFUSED an inbound profile body (opcode 225)"
+                    ),
                 }
             })
             .await;
@@ -883,6 +967,62 @@ pub fn announce_frame(store_id: [u8; 32], root: [u8; 32]) -> dig_gossip::DigMess
         store_id: Bytes32::from(store_id),
         root: Bytes32::from(root),
     })
+}
+
+/// How often a node re-announces every profile body it holds.
+///
+/// Without a periodic announce the 223/224/225 exchange can only ever be STARTED by a node that has
+/// itself just accepted a body — so a node holding a body from before its peers connected would
+/// hold it silently forever, and two freshly-started nodes would never sync at all. A re-announce is
+/// one fixed 64-byte flood per held body, which is why the interval can be short enough to make a
+/// newly-connected peer converge within a minute.
+pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Flood one 223 announce for `(store_id, root)` to every peer, returning peers reached.
+///
+/// The one entry point for ORIGINATING an announce about a body this node already holds — the
+/// counterpart to the re-announce [`accept_body`] performs after ingesting one from a peer.
+pub async fn announce_held_root(
+    transport: &dyn ProfileTransport,
+    store_id: [u8; 32],
+    root: [u8; 32],
+) -> usize {
+    transport
+        .announce_root(
+            &ProfileRootRef {
+                store_id: Bytes32::from(store_id),
+                root: Bytes32::from(root),
+            },
+            None,
+        )
+        .await
+}
+
+/// Periodically announce every profile body on disk, so a peer that connects later still learns
+/// about it.
+///
+/// Announcing carries no authority and costs a receiver nothing it does not choose to spend: a
+/// receiver ignores a store it is not subscribed to, and confirms the root on chain itself before
+/// asking for anything. So this loop is safe to run unconditionally on every node that holds a body.
+pub async fn run_profile_announce_loop(
+    store: ProfileBodyStore,
+    transport: Arc<dyn ProfileTransport>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        for (store_id, root) in store.held_pairs() {
+            let reached = announce_held_root(&*transport, store_id, root).await;
+            tracing::info!(
+                store = %hex::encode(store_id),
+                root = %hex::encode(root),
+                peers = reached,
+                "profile-sync: announced a held profile root (opcode 223)"
+            );
+        }
+    }
 }
 
 /// Build the outbound 224 frame for `(store_id, root)`.
@@ -1840,5 +1980,66 @@ mod tests {
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    // -- The announce originator -------------------------------------------------------------------
+
+    /// TWO stores, each holding TWO generations, so an implementation that enumerates only the
+    /// first store directory (or only one root inside it) is visibly wrong rather than accidentally
+    /// right. Retention keeps current-plus-one, so two roots per store is the real maximum.
+    #[test]
+    fn held_pairs_enumerates_every_store_and_every_root() {
+        let store = ProfileBodyStore::new(tempdir());
+        let (alice, alice_root) = dpb("alice");
+        let (bob, bob_root) = dpb("bob");
+        store.put(&store_id(1), &alice_root, &alice).expect("put");
+        store.put(&store_id(1), &bob_root, &bob).expect("put");
+        store.put(&store_id(2), &alice_root, &alice).expect("put");
+
+        let mut held = store.held_pairs();
+        held.sort();
+        let mut expected = vec![
+            (store_id(1), alice_root),
+            (store_id(1), bob_root),
+            (store_id(2), alice_root),
+        ];
+        expected.sort();
+        assert_eq!(held, expected);
+    }
+
+    /// A directory this module did not write must never become an announced store id. Announcing a
+    /// phantom root costs every subscribed peer a chain read, so the filter is the bound.
+    #[test]
+    fn held_pairs_skips_names_this_module_did_not_write() {
+        let root_dir = tempdir();
+        let store = ProfileBodyStore::new(root_dir.clone());
+        let (bytes, root) = dpb("alice");
+        store.put(&store_id(1), &root, &bytes).expect("put");
+
+        // A short name, an uppercase-hex name of the right length, and a loose file at the top of
+        // the tree — each is 64-hex-adjacent and none of them is a store id.
+        std::fs::create_dir_all(root_dir.join("not-a-store-id")).expect("dir");
+        std::fs::create_dir_all(root_dir.join(hex::encode(store_id(9)).to_uppercase()))
+            .expect("dir");
+        std::fs::write(root_dir.join("README.txt"), b"not a store").expect("file");
+
+        assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
+    }
+
+    /// An originated announce goes to EVERY peer — there is no sender to exclude, unlike the
+    /// follow-on announce `accept_body` emits. Passing an exclusion here would silently skip a peer.
+    #[tokio::test]
+    async fn announcing_a_held_root_excludes_nobody() {
+        let transport = Transport::default();
+        let (_, root) = dpb("alice");
+
+        let reached = announce_held_root(&transport, store_id(1), root).await;
+
+        assert_eq!(reached, 1);
+        let announces = transport.announces.lock().unwrap();
+        let (root_ref, exclude) = announces.first().expect("one announce");
+        assert_eq!(<[u8; 32]>::from(root_ref.store_id), store_id(1));
+        assert_eq!(<[u8; 32]>::from(root_ref.root), root);
+        assert_eq!(*exclude, None);
     }
 }

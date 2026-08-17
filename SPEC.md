@@ -5957,6 +5957,21 @@ Each gate is strictly cheaper than the next, so a flood costs the least possible
 Re-receiving a body already held is idempotent: no rewrite and no re-announce, so the epidemic
 quiesces.
 
+### 22.5b. Originating an announce (MUST)
+
+A node MUST announce (opcode 223) every profile body it holds, both **immediately** when it accepts
+one from a local caller (`control.profile.putBody`) and **periodically** thereafter, to every peer
+with no exclusion.
+
+The follow-on announce of §22.5 step 5 fires only for a body ingested FROM a peer, so a node whose
+only announces were re-announces could never START the exchange: a body handed to it locally, or
+held from before its peers connected, would sit on disk unadvertised forever. The periodic announce
+is also what makes a peer that connects LATER converge, since the announce it missed is never
+replayed to it.
+
+An announce carries no authority, so originating one is safe unconditionally: a receiver ignores a
+store it is not subscribed to and resolves the root on chain itself before requesting anything.
+
 ### 22.6. Penalization is narrow (MUST NOT widen)
 
 A node MUST penalize a peer in exactly ONE case: a body that fails to hash to the root **that peer

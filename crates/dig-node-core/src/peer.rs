@@ -3086,6 +3086,17 @@ async fn bring_up_dht(
                     node.anchored_root_resolver_arc(),
                     pool.clone(),
                 );
+                // The re-announce loop is what lets this exchange START. `accept_body`'s follow-on
+                // announce only ever fires for a body ingested FROM a peer, so without this a node
+                // holding a body from the control plane (or from before its peers connected) would
+                // hold it silently and no peer could ever learn the root to ask for.
+                tokio::spawn(
+                    crate::seams::dig_peer::profile_sync::run_profile_announce_loop(
+                        ctx.store.clone(),
+                        ctx.transport.clone(),
+                        crate::seams::dig_peer::profile_sync::ANNOUNCE_INTERVAL,
+                    ),
+                );
                 tokio::spawn(
                     crate::seams::dig_peer::profile_sync::run_profile_sync_ingest(inbound, ctx),
                 );
