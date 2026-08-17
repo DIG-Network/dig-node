@@ -45,6 +45,10 @@ clvmr = "0.14"
 indexmap = "2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 axum = "0.7"
+# The PUBLISHED control-plane contract. `BalanceAsset` is re-exported from it rather than
+# restated here: the wire spelling of an asset and the asset a read scopes to must be the same
+# value, and two enums naming the same tokens agree only until one of them gains a variant.
+dig-node-control-interface = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
