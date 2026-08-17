@@ -474,8 +474,25 @@ pub trait SubscriptionView: Send + Sync {
 /// The gossip transport this module drives: one broadcast and one directed send.
 #[async_trait::async_trait]
 pub trait ProfileTransport: Send + Sync {
-    /// Flood a 223 announce to every peer except `exclude`. Returns peers reached.
+    /// Relay a 223 announce this node RECEIVED onward, skipping the peer it came from. Returns
+    /// peers reached.
+    ///
+    /// Seen-set deduplicated by dig-gossip, which is what keeps a relayed announce from looping.
+    /// A re-announce this node originates must use [`announce_root_local`](Self::announce_root_local)
+    /// instead.
     async fn announce_root(&self, root_ref: &ProfileRootRef, exclude: Option<PeerId>) -> usize;
+    /// Flood a 223 announce this node ORIGINATES to every peer. Returns peers reached.
+    ///
+    /// Separate from [`announce_root`](Self::announce_root) because a locally-originated announce is
+    /// byte-identical on every repeat, so dig-gossip's seen set — correct as a loop suppressor for
+    /// relayed gossip — suppressed every re-announce for the life of the process, and a peer that
+    /// connected after the first one could never learn the root (dig_ecosystem#3061). This path maps
+    /// to `GossipHandle::broadcast_local`, which records the hash but is not suppressed by it.
+    ///
+    /// It takes no `exclude` on purpose: an originating announce has no sender to skip, and the
+    /// absent parameter is what makes it unusable from a relay path, where routing a received
+    /// message through the dedup-exempt call would turn one echo into a storm.
+    async fn announce_root_local(&self, root_ref: &ProfileRootRef) -> usize;
     /// Send one directed frame to `peer`. Best-effort.
     async fn send_body(&self, peer: PeerId, body: &ProfileBody);
     /// Send one directed 224 request to `peer`. Best-effort; `false` if it could not be sent.
@@ -981,20 +998,22 @@ pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 /// Flood one 223 announce for `(store_id, root)` to every peer, returning peers reached.
 ///
 /// The one entry point for ORIGINATING an announce about a body this node already holds — the
-/// counterpart to the re-announce [`accept_body`] performs after ingesting one from a peer.
+/// counterpart to the relay [`accept_body`] performs after ingesting one from a peer.
+///
+/// Originating, so it takes the dedup-exempt
+/// [`announce_root_local`](ProfileTransport::announce_root_local): the announce for an unchanged
+/// `(store_id, root)` is byte-identical every interval, and the forwarding path would suppress
+/// every repeat after the first (dig_ecosystem#3061).
 pub async fn announce_held_root(
     transport: &dyn ProfileTransport,
     store_id: [u8; 32],
     root: [u8; 32],
 ) -> usize {
     transport
-        .announce_root(
-            &ProfileRootRef {
-                store_id: Bytes32::from(store_id),
-                root: Bytes32::from(root),
-            },
-            None,
-        )
+        .announce_root_local(&ProfileRootRef {
+            store_id: Bytes32::from(store_id),
+            root: Bytes32::from(root),
+        })
         .await
 }
 
@@ -1080,6 +1099,13 @@ impl ProfileTransport for GossipProfileTransport {
     async fn announce_root(&self, root_ref: &ProfileRootRef, exclude: Option<PeerId>) -> usize {
         self.handle
             .broadcast(frame_profile_root_announce(root_ref), exclude)
+            .await
+            .unwrap_or(0)
+    }
+
+    async fn announce_root_local(&self, root_ref: &ProfileRootRef) -> usize {
+        self.handle
+            .broadcast_local(frame_profile_root_announce(root_ref), None)
             .await
             .unwrap_or(0)
     }
@@ -1220,9 +1246,24 @@ mod tests {
         }
     }
 
+    /// Which [`ProfileTransport`] announce path a call took.
+    ///
+    /// The spy records this because the two paths are otherwise indistinguishable from their
+    /// arguments alone: a relay to a single peer and a local flood both carry the same
+    /// `ProfileRootRef`, and only the ORIGIN decides whether dig-gossip's seen set may suppress a
+    /// repeat (dig_ecosystem#3061). A spy that recorded only the ref could not tell a correct
+    /// routing from one that sent every announce down the dedup-exempt path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum AnnouncePath {
+        /// `announce_root` — the seen-set-deduplicated relay of a received announce.
+        Forwarded(Option<PeerId>),
+        /// `announce_root_local` — the dedup-exempt flood of an announce this node originates.
+        Local,
+    }
+
     #[derive(Default)]
     struct Transport {
-        announces: Mutex<Vec<(ProfileRootRef, Option<PeerId>)>>,
+        announces: Mutex<Vec<(ProfileRootRef, AnnouncePath)>>,
         sent_bodies: Mutex<Vec<(PeerId, usize)>>,
         sent_requests: Mutex<Vec<(PeerId, ProfileRootRef)>>,
         peers: Vec<PeerId>,
@@ -1230,7 +1271,17 @@ mod tests {
     #[async_trait::async_trait]
     impl ProfileTransport for Transport {
         async fn announce_root(&self, root_ref: &ProfileRootRef, exclude: Option<PeerId>) -> usize {
-            self.announces.lock().unwrap().push((*root_ref, exclude));
+            self.announces
+                .lock()
+                .unwrap()
+                .push((*root_ref, AnnouncePath::Forwarded(exclude)));
+            1
+        }
+        async fn announce_root_local(&self, root_ref: &ProfileRootRef) -> usize {
+            self.announces
+                .lock()
+                .unwrap()
+                .push((*root_ref, AnnouncePath::Local));
             1
         }
         async fn send_body(&self, peer: PeerId, body: &ProfileBody) {
@@ -1437,8 +1488,9 @@ mod tests {
         assert_eq!(announces.len(), 1, "announce exactly once");
         assert_eq!(
             announces[0].1,
-            Some(peer(9)),
-            "the announce must exclude the peer that supplied the body"
+            AnnouncePath::Forwarded(Some(peer(9))),
+            "a body ingested from a peer is RELAYED onward — the seen-set-deduplicated path, \
+             excluding the peer that supplied it"
         );
         drop(announces);
         let _ = std::fs::remove_dir_all(dir);
@@ -2026,10 +2078,10 @@ mod tests {
         assert_eq!(store.held_pairs(), vec![(store_id(1), root)]);
     }
 
-    /// An originated announce goes to EVERY peer — there is no sender to exclude, unlike the
-    /// follow-on announce `accept_body` emits. Passing an exclusion here would silently skip a peer.
+    /// An originated announce takes the dedup-exempt LOCAL path and goes to every peer — there is
+    /// no sender to exclude, unlike the relay `accept_body` emits.
     #[tokio::test]
-    async fn announcing_a_held_root_excludes_nobody() {
+    async fn announcing_a_held_root_takes_the_local_path() {
         let transport = Transport::default();
         let (_, root) = dpb("alice");
 
@@ -2037,9 +2089,36 @@ mod tests {
 
         assert_eq!(reached, 1);
         let announces = transport.announces.lock().unwrap();
-        let (root_ref, exclude) = announces.first().expect("one announce");
+        let (root_ref, path) = announces.first().expect("one announce");
         assert_eq!(<[u8; 32]>::from(root_ref.store_id), store_id(1));
         assert_eq!(<[u8; 32]>::from(root_ref.root), root);
-        assert_eq!(*exclude, None);
+        assert_eq!(*path, AnnouncePath::Local);
+    }
+
+    /// The periodic re-announce of an UNCHANGED root reaches the transport on every tick.
+    ///
+    /// This is dig_ecosystem#3061 stated at the node's own seam. The frame for an unchanged
+    /// `(store_id, root)` is byte-identical every interval, so under the forwarding broadcast
+    /// dig-gossip's seen set returned `Ok(0)` for every repeat after the first — for the life of the
+    /// process — and a peer that connected later could never learn the root.
+    ///
+    /// The fixture repeats the SAME pair deliberately: a test that announced a different root each
+    /// tick would pass identically against the broken routing, because distinct roots produce
+    /// distinct frames that the seen set never suppressed in the first place.
+    #[tokio::test]
+    async fn repeated_announces_of_an_unchanged_root_all_take_the_local_path() {
+        let transport = Transport::default();
+        let (_, root) = dpb("alice");
+
+        for _ in 0..3 {
+            announce_held_root(&transport, store_id(1), root).await;
+        }
+
+        let announces = transport.announces.lock().unwrap();
+        assert_eq!(announces.len(), 3, "every tick must reach the transport");
+        assert!(
+            announces.iter().all(|(_, path)| *path == AnnouncePath::Local),
+            "a re-announce this node originates must never take the deduplicated relay path: {announces:?}"
+        );
     }
 }

@@ -2371,19 +2371,31 @@ fn profile_body_store(ctx: &ControlCtx) -> ProfileBodyStore {
     ProfileBodyStore::under_cache_dir(ctx.node.cache_dir_path())
 }
 
-/// Flood one 223 announce for a body this node has just persisted, returning peers reached.
+/// Flood one 223 announce for a body this node has just persisted, returning
+/// `(peers reached, peers connected but unreachable)`.
 ///
-/// Zero is an honest answer with two causes — no peer network on this node, or no peers connected —
-/// and neither is an error: the body is on disk either way, and the periodic re-announce loop tells
-/// whoever connects next.
-async fn announce_now(ctx: &ControlCtx, store_id: [u8; 32], root: [u8; 32]) -> usize {
+/// Zero reached is an honest answer with THREE causes — no peer network on this node, no peers
+/// connected, or peers connected that this node cannot push to (lazy or NAT-bound) — and none is an
+/// error: the body is on disk either way, and the periodic re-announce loop tells whoever connects
+/// next.
+///
+/// The unreachable count is reported beside it because dig-gossip 0.25.0 made the reach count a TRUE
+/// delivery count (dig_ecosystem#3063): peers it previously counted as delivered-to are now excluded,
+/// so `0` alone can no longer distinguish "nobody is out there" from "peers are out there and none
+/// could be pushed to". Reporting one number without the other would move that ambiguity onto the
+/// caller.
+async fn announce_now(ctx: &ControlCtx, store_id: [u8; 32], root: [u8; 32]) -> (usize, usize) {
     let Some(handle) = ctx.node.gossip_handle() else {
-        return 0;
+        return (0, 0);
     };
-    handle
-        .broadcast(announce_frame(store_id, root), None)
+    // Originated by this node (it just persisted the body), so the dedup-exempt path: re-putting an
+    // unchanged `(store_id, root)` produces a byte-identical frame, and under the forwarding
+    // broadcast every announce after the first was silently dropped (dig_ecosystem#3061).
+    let reached = handle
+        .broadcast_local(announce_frame(store_id, root), None)
         .await
-        .unwrap_or(0)
+        .unwrap_or(0);
+    (reached, handle.unreachable_peer_count())
 }
 
 /// `control.profile.putBody` — persist a profile body, but ONLY once the chain confirms its root.
@@ -2456,7 +2468,7 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
             // re-announce loop. Peers reached is REPORTED, never a failure: a node with no peer
             // network still persisted and still serves the body over the control plane, and the
             // periodic loop covers every peer that connects later.
-            let announced = announce_now(ctx, store_id, root).await;
+            let (announced, unreachable) = announce_now(ctx, store_id, root).await;
             control_ok(
                 id,
                 json!({
@@ -2465,6 +2477,7 @@ async fn profile_put_body(ctx: &ControlCtx, id: Value, params: &Value) -> Value 
                     "root": hex::encode(root),
                     "body_bytes": bytes.len() as u64,
                     "announced_to_peers": announced as u64,
+                    "unreachable_peers": unreachable as u64,
                 }),
             )
         }

@@ -16,7 +16,14 @@ name = "dig-node-core"
 # 0.31.0 adds cache observability to `cache.stats` (§7.10e) — `refetch_count` + per-tier `tiers`
 # occupancy fields, and makes `InboundDemand::entry_count` a real (no-longer-`#[cfg(test)]`) public
 # API — a new, backwards-compatible surface (dig_ecosystem#1991), hence a MINOR bump.
-version = "0.46.0"
+# 0.47.0 adopts dig-gossip 0.25.0 and splits the announce seams by ORIGIN: `ProfileTransport` gains a
+# required `announce_root_local` and `MeltBroadcast` a required `broadcast_local`, so a locally
+# originated announce takes dig-gossip's dedup-exempt path and a re-announce of an unchanged root is
+# no longer suppressed forever (dig_ecosystem#3061). Adding a required trait method is BREAKING for an
+# out-of-workspace implementor; this crate is consumed in-workspace only and is pre-1.0, so it is a
+# MINOR bump under SemVer's 0.x rule -- recorded here rather than letting the number imply the trait
+# surface held still.
+version = "0.47.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -214,7 +221,7 @@ dig-nat = "0.18"
 # graph still unifies to ONE of each. The vendored chia-protocol/chia-sdk-client forks it path-patches
 # are re-declared at this SAME rev in the workspace `[patch.crates-io]` (a git dep's own patches do not
 # apply transitively — the #1529 3-rev lockstep: this dep rev + the two patch revs move together).
-dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "c75e2028871d384c7bf1b4a4bfb54ad257dfc9cc", default-features = false, features = ["rustls", "relay"] }
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4132ee51b7cee2cba1768b75ade5360f9c", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope.
 #
 # 0.9 is the TIP OF DIG-NODE'S CHIA LINE, and that — not 0.10 — is the correct target here (#2072).
@@ -354,6 +361,12 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 
 [dev-dependencies]
 tempfile = "3"
+# Same git rev as the normal dependency above, with dig-gossip's `test-util` feature added. That
+# feature gates `__connect_stub_peer_with_direction`, which registers a connected peer without real
+# TLS — the only way to assert what a broadcast ACTUALLY put on the wire from a test. Declared here
+# rather than on the normal dependency so the shipped binary never carries the test hook: cargo
+# unifies the feature into test builds only, since dev-dependencies are not built for `cargo build`.
+dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4132ee51b7cee2cba1768b75ade5360f9c", default-features = false, features = ["rustls", "relay", "test-util"] }
 # Generates the P-256 leaf key pairs the opcode-222 holdings tests sign with: `public_key_der()` IS the
 # leaf `SubjectPublicKeyInfo` DER the wire carries as `provider_spki`, and whose SHA-256 is the
 # announcing peer_id — so a test signer is a real §5.2 identity rather than a stand-in that could hide
