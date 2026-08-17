@@ -62,6 +62,10 @@ printf 'dig_ecosystem#3091 two-node re-announce witness body' > "$WORK/a/cache/p
 say "work dir: $WORK"
 say "seeded A: profiles/$STORE_ID/$ROOT.dpb"
 
+# NB: `dig_node_core=debug` is REQUIRED, not verbosity for its own sake. A's announce line is
+# `info!`, but B's receipt line (`profile_sync::handle_root_announce`) is `debug!` — at `info` the
+# observation this whole run exists to capture is filtered out before it is written, and the run
+# would report DID_NOT_CONVERGE against a working node.
 start_node() {  # start_node <a|b> <ctrl-port> <gossip-port>
   local n="$1" ctrl="$2" gossip="$3"
   DIG_NODE_PORT="$ctrl" \
@@ -73,7 +77,8 @@ start_node() {  # start_node <a|b> <ctrl-port> <gossip-port>
   DIG_NODE_ADVERTISE_LOOPBACK=1 \
   DIG_NODE_DIGLOCAL=0 \
   DIG_WALLET_ENABLE_CHAIN_SYNC=0 \
-  DIG_LOG="info,dig_node_core=info,dig_gossip=info" \
+  DIG_NODE_PROFILE_SYNC=1 \
+  DIG_LOG="info,dig_node_core=debug,dig_gossip=debug" \
     "$BIN" run > "$WORK/$n/stdout.log" 2> "$WORK/$n/stderr.log" &
   echo $!
 }
@@ -96,8 +101,12 @@ wait_up() {  # wait_up <a|b> <ctrl-port>; returns 0 once control.status answers
 }
 
 # Every announce line A emits, with its `peers=` count. This is the discriminator.
-announce_lines() { grep -h 'announced a held profile root' "$WORK/a/stderr.log" 2>/dev/null; }
-heard_lines()    { grep -h 'heard a root announce'         "$WORK/b/stderr.log" 2>/dev/null; }
+# dig-logging writes to BOTH the console and a rotating file under DIG_LOG_DIR, and which stream
+# carries a given line depends on the subscriber layers in force — so scan every sink this node
+# owns rather than betting on one.
+node_log() { grep -rh "$2" "$WORK/$1/stdout.log" "$WORK/$1/stderr.log" "$WORK/$1/logs" 2>/dev/null; }
+announce_lines() { node_log a 'announced a held profile root'; }
+heard_lines()    { node_log b 'heard a root announce'; }
 
 cleanup() { [ -n "${A_PID:-}" ] && kill "$A_PID" 2>/dev/null; [ -n "${B_PID:-}" ] && kill "$B_PID" 2>/dev/null; }
 trap cleanup EXIT
@@ -120,6 +129,14 @@ wait_up b "$B_CTRL" || { echo "B never came up; see $WORK/b/stderr.log" >&2; exi
 say "B up (pid $B_PID)"
 CONNECT=$(ctl b "$B_CTRL" control.peers.connect "{\"peer\":\"127.0.0.1:$A_GOSSIP\"}")
 say "B -> A connect: $CONNECT"
+# A dials B as well. Measured on run 1: with only B->A, A's re-announce reported
+# `unreachable_lazy=1` — A held B as a Live peer that its Plumtree membership had never registered,
+# and `GossipHandle::broadcast` sends NOTHING to a peer outside the eager set
+# (`gossip_handle.rs:352`, `TODO(INT-001)`). So the inbound half of the connection cannot carry a
+# broadcast; the announcing side needs its OWN outbound dial for the frame to be pushed. Filed
+# separately — it is a dig-gossip gap, not this fix's.
+CONNECT_BACK=$(ctl a "$A_CTRL" control.peers.connect "{\"peer\":\"127.0.0.1:$B_GOSSIP\"}")
+say "A -> B connect: $CONNECT_BACK"
 
 # --- Step 3: the re-announce must cross the socket ----------------------------------------------
 BEFORE=$(announce_lines | wc -l)
@@ -132,7 +149,11 @@ WAITED=$i
 
 REACHED_LINE=$(announce_lines | tail -1)
 HEARD=$(heard_lines | head -1)
-ALL_PEERS=$(announce_lines | grep -o 'peers=[0-9]*' | tr '\n' ' ')
+# dig-logging emits the SAME event in two encodings — `peers=1` to the human console layer and
+# `"peers":1` to the JSON file layer — so the peer count must be read from either spelling. Reading
+# only the console form printed an EMPTY sequence on a converged run, hiding the 0 -> 1 transition
+# that is the whole discriminator.
+ALL_PEERS=$(announce_lines | grep -oE 'peers[=:"]+[0-9]+' | grep -oE '[0-9]+$' | tr '\n' ' ')
 
 if [ -n "$HEARD" ]; then VERDICT="CONVERGED"; RC=0; else VERDICT="DID_NOT_CONVERGE"; RC=1; fi
 
