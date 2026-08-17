@@ -242,6 +242,30 @@ impl ProfileBodyStore {
             .collect()
     }
 
+    /// Every `(store_id, root)` this node holds a body for, in unspecified order.
+    ///
+    /// The re-announce loop's input. Both components are parsed back out of the path with the same
+    /// strict 64-lowercase-hex rule that named them, so a stray file, a temp artifact, or a
+    /// directory this module did not create is skipped rather than announced as a phantom root.
+    #[must_use]
+    pub fn held_pairs(&self) -> Vec<([u8; 32], [u8; 32])> {
+        let Ok(stores) = std::fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        stores
+            .flatten()
+            .filter_map(|entry| {
+                let store_id = hex32_from_name(&entry.file_name().to_string_lossy())?;
+                Some(
+                    self.roots_for_store(&store_id)
+                        .into_iter()
+                        .map(move |root| (store_id, root)),
+                )
+            })
+            .flatten()
+            .collect()
+    }
+
     /// Delete every artifact in `dir` except `keep` and the most recently modified other.
     ///
     /// Best-effort: a failure to enumerate or unlink leaves extra bodies on disk, which costs disk
@@ -281,16 +305,23 @@ fn file_name_of(path: &Path) -> String {
 /// Deliberately strict: a temp file, a stray artifact, or a differently-cased name is NOT a body,
 /// so retention and enumeration never act on a file this module did not write.
 fn root_from_file_name(name: &str) -> Option<[u8; 32]> {
-    let stem = name.strip_suffix(&format!(".{DPB_EXTENSION}"))?;
-    if stem.len() != 64
-        || !stem
+    hex32_from_name(name.strip_suffix(&format!(".{DPB_EXTENSION}"))?)
+}
+
+/// Parse exactly 64 lowercase hex characters into the 32 bytes they name, or `None`.
+///
+/// Deliberately strict about case and length: this module writes every name it owns with
+/// `hex::encode`, so anything else in the tree was written by something else and must not be
+/// mistaken for a store id or a root.
+fn hex32_from_name(name: &str) -> Option<[u8; 32]> {
+    if name.len() != 64
+        || !name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
     {
         return None;
     }
-    let raw = hex::decode(stem).ok()?;
-    <[u8; 32]>::try_from(raw.as_slice()).ok()
+    <[u8; 32]>::try_from(hex::decode(name).ok()?.as_slice()).ok()
 }
 
 /// A monotonic-ish suffix distinguishing two temp files written in the same process.
@@ -883,6 +914,62 @@ pub fn announce_frame(store_id: [u8; 32], root: [u8; 32]) -> dig_gossip::DigMess
         store_id: Bytes32::from(store_id),
         root: Bytes32::from(root),
     })
+}
+
+/// How often a node re-announces every profile body it holds.
+///
+/// Without a periodic announce the 223/224/225 exchange can only ever be STARTED by a node that has
+/// itself just accepted a body — so a node holding a body from before its peers connected would
+/// hold it silently forever, and two freshly-started nodes would never sync at all. A re-announce is
+/// one fixed 64-byte flood per held body, which is why the interval can be short enough to make a
+/// newly-connected peer converge within a minute.
+pub const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Flood one 223 announce for `(store_id, root)` to every peer, returning peers reached.
+///
+/// The one entry point for ORIGINATING an announce about a body this node already holds — the
+/// counterpart to the re-announce [`accept_body`] performs after ingesting one from a peer.
+pub async fn announce_held_root(
+    transport: &dyn ProfileTransport,
+    store_id: [u8; 32],
+    root: [u8; 32],
+) -> usize {
+    transport
+        .announce_root(
+            &ProfileRootRef {
+                store_id: Bytes32::from(store_id),
+                root: Bytes32::from(root),
+            },
+            None,
+        )
+        .await
+}
+
+/// Periodically announce every profile body on disk, so a peer that connects later still learns
+/// about it.
+///
+/// Announcing carries no authority and costs a receiver nothing it does not choose to spend: a
+/// receiver ignores a store it is not subscribed to, and confirms the root on chain itself before
+/// asking for anything. So this loop is safe to run unconditionally on every node that holds a body.
+pub async fn run_profile_announce_loop(
+    store: ProfileBodyStore,
+    transport: Arc<dyn ProfileTransport>,
+    interval: Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        for (store_id, root) in store.held_pairs() {
+            let reached = announce_held_root(&*transport, store_id, root).await;
+            tracing::info!(
+                store = %hex::encode(store_id),
+                root = %hex::encode(root),
+                peers = reached,
+                "profile-sync: announced a held profile root (opcode 223)"
+            );
+        }
+    }
 }
 
 /// Build the outbound 224 frame for `(store_id, root)`.
