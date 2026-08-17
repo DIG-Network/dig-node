@@ -697,14 +697,21 @@ fn bounded_dht_addresses(addresses: &[GossipAddr]) -> Vec<DhtAddr> {
 /// broadcaster's sequencing + batching are testable without a live pool.
 #[async_trait::async_trait]
 pub trait AnnounceTransport: Send + Sync {
-    /// Flood one opcode-222 frame to every connected peer. Returns how many peers it reached.
+    /// Flood one opcode-222 frame this node ORIGINATES to every connected peer. Returns how many
+    /// peers it reached.
+    ///
+    /// Always locally originated — the announcement describes THIS node's inventory — so it takes
+    /// dig-gossip's dedup-exempt `broadcast_local`. Under the forwarding path a re-announce of an
+    /// unchanged inventory is byte-identical to its predecessor and was suppressed for the life of
+    /// the process, so a peer connecting later never learned what this node holds
+    /// (dig_ecosystem#3061).
     async fn flood(&self, announce: &HoldingsAnnounce) -> usize;
 }
 
 #[async_trait::async_trait]
 impl AnnounceTransport for dig_gossip::GossipHandle {
     async fn flood(&self, announce: &HoldingsAnnounce) -> usize {
-        self.broadcast(dig_gossip::frame_holdings_announce(announce), None)
+        self.broadcast_local(dig_gossip::frame_holdings_announce(announce), None)
             .await
             .unwrap_or(0)
     }

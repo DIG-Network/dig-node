@@ -159,8 +159,16 @@ pub trait MeltCache: Send + Sync {
 /// Flood a `store-melted` announcement to the pool, optionally excluding the peer it arrived from.
 #[async_trait::async_trait]
 pub trait MeltBroadcast: Send + Sync {
-    /// Broadcast `announce` to every connected peer except `exclude`. Returns peers reached.
+    /// Relay a RECEIVED `announce` onward to every connected peer except `exclude`, seen-set
+    /// deduplicated so a relayed announcement cannot loop. Returns peers reached.
     async fn broadcast(&self, announce: &StoreMeltedAnnounce, exclude: Option<PeerId>) -> usize;
+    /// Broadcast an `announce` this node ORIGINATES — the melting holder's own, freshly signed.
+    /// Returns peers reached.
+    ///
+    /// Dedup-exempt (`GossipHandle::broadcast_local`) so a re-signed announcement for the same
+    /// store is not suppressed by an earlier byte-identical one, and takes no `exclude` so a relay
+    /// path cannot reach it (dig_ecosystem#3061).
+    async fn broadcast_local(&self, announce: &StoreMeltedAnnounce) -> usize;
 }
 
 /// This node's `store-melted` signer: its BLS identity key + its `peer_id` for attribution.
@@ -287,7 +295,8 @@ pub async fn process_holder_store(
     }
     let generations = cache.delete_all_generations(&store_id).await;
     let announce = signer.sign_announce(Bytes32::from(store_id), melt_height);
-    let broadcasts = broadcaster.broadcast(&announce, None).await;
+    // Originated here, not relayed — the dedup-exempt path (#3061).
+    let broadcasts = broadcaster.broadcast_local(&announce).await;
     PropagateOutcome::Propagated {
         generations,
         broadcasts,
@@ -621,9 +630,19 @@ impl MeltCache for Arc<crate::Node> {
 #[async_trait::async_trait]
 impl MeltBroadcast for dig_gossip::GossipHandle {
     async fn broadcast(&self, announce: &StoreMeltedAnnounce, exclude: Option<PeerId>) -> usize {
-        self.broadcast(dig_gossip::frame_store_melted(announce), exclude)
+        dig_gossip::GossipHandle::broadcast(self, dig_gossip::frame_store_melted(announce), exclude)
             .await
             .unwrap_or(0)
+    }
+
+    async fn broadcast_local(&self, announce: &StoreMeltedAnnounce) -> usize {
+        dig_gossip::GossipHandle::broadcast_local(
+            self,
+            dig_gossip::frame_store_melted(announce),
+            None,
+        )
+        .await
+        .unwrap_or(0)
     }
 }
 
@@ -782,10 +801,21 @@ mod tests {
         }
     }
 
-    /// A broadcast spy recording every (announce store_id, exclude) it was asked to send.
+    /// Which [`MeltBroadcast`] path a call took. Recorded because the two are indistinguishable
+    /// from the announcement alone, and only the origin decides whether dig-gossip's seen set may
+    /// suppress a repeat (dig_ecosystem#3061).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MeltPath {
+        /// `broadcast` — the deduplicated relay of a received announcement.
+        Forwarded(Option<PeerId>),
+        /// `broadcast_local` — the dedup-exempt flood of this holder's own announcement.
+        Local,
+    }
+
+    /// A broadcast spy recording every (announce store_id, path) it was asked to send.
     #[derive(Default)]
     struct BroadcastSpy {
-        sent: Mutex<Vec<([u8; 32], Option<PeerId>)>>,
+        sent: Mutex<Vec<([u8; 32], MeltPath)>>,
     }
     #[async_trait::async_trait]
     impl MeltBroadcast for BroadcastSpy {
@@ -797,7 +827,14 @@ mod tests {
             self.sent
                 .lock()
                 .unwrap()
-                .push((announce.store_id.into(), exclude));
+                .push((announce.store_id.into(), MeltPath::Forwarded(exclude)));
+            1
+        }
+        async fn broadcast_local(&self, announce: &StoreMeltedAnnounce) -> usize {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((announce.store_id.into(), MeltPath::Local));
             1
         }
     }
@@ -924,8 +961,8 @@ mod tests {
         assert_eq!(sent.len(), 1, "rebroadcast EXACTLY once");
         assert_eq!(
             sent[0],
-            (store(1), Some(sender)),
-            "rebroadcast excludes the sender"
+            (store(1), MeltPath::Forwarded(Some(sender))),
+            "a RECEIVED announcement is relayed on the deduplicated path, excluding the sender"
         );
         assert!(
             tomb.contains(&store(1)),
@@ -1082,8 +1119,8 @@ mod tests {
         assert_eq!(sent.len(), 1, "the holder broadcasts its own melt once");
         assert_eq!(
             sent[0],
-            (store(4), None),
-            "the holder's own broadcast has no exclude"
+            (store(4), MeltPath::Local),
+            "the melting holder ORIGINATES its announcement, so it takes the dedup-exempt path \n             (#3061) and has no sender to exclude"
         );
     }
 

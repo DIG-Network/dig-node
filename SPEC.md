@@ -1498,7 +1498,7 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.config.setUpstream` | `upstream` (URL string; blank clears) | `upstream` (normalized), `requires_restart: true` — persisted, effective on next start (§3.4) |
 | `control.log.setLevel` | `filter` (an `EnvFilter` directive, e.g. `debug` or `info,dig_node_core=debug`) | `filter` (echoed) — live-applied via the `dig-logging` reload handle, effective immediately, NOT persisted (§11); `INVALID_PARAMS` on a missing/malformed directive, `CONTROL_ERROR` when logging is not installed in the process |
 | `control.cache.get` | — | `cap_bytes`, `used_bytes`, `capsule_bytes`, `response_bytes`, `dir`, `shared` |
-| `control.profile.putBody` | `store_id`, `root` (64-hex), `body_b64` (standard padded base64 of the DPB bytes) | `stored: true`, `store_id`, `root`, `body_bytes`. The node MUST independently resolve the root on chain and refuse unless the chain confirms exactly that root AND the bytes hash to it (§22.3). A refusal is an ERROR, never an `Ok` carrying `stored: false`. A decoded body above `MAX_BODY_BYTES` (4 MiB) is `INVALID_PARAMS` before anything is persisted. |
+| `control.profile.putBody` | `store_id`, `root` (64-hex), `body_b64` (standard padded base64 of the DPB bytes) | `stored: true`, `store_id`, `root`, `body_bytes`, `announced_to_peers`, `unreachable_peers`. `announced_to_peers` is a TRUE delivery count — peers the 223 announce was actually sent to, excluding lazy and NAT-bound peers that are connected but cannot be pushed to — so `0` does NOT mean failure and MUST NOT be treated as one: the body is persisted either way and the periodic re-announce reaches whoever connects later. `unreachable_peers` reports that connected-but-unreachable remainder, so a caller can distinguish "no peers exist" from "peers exist and none could be reached". The node MUST independently resolve the root on chain and refuse unless the chain confirms exactly that root AND the bytes hash to it (§22.3). A refusal is an ERROR, never an `Ok` carrying `stored: false`. A decoded body above `MAX_BODY_BYTES` (4 MiB) is `INVALID_PARAMS` before anything is persisted. |
 | `control.profile.getBody` | `store_id`, `root` (64-hex) | `store_id`, `root` (always the root ASKED for — never a substituted newer one), `body_b64` (`null` ⇔ consulted and holds nothing), `body_bytes`. A read that FAILED is `CONTROL_ERROR`, never a `null` body. |
 | `control.cache.setCap` | `cap_bytes` (number) | `cap_bytes` (floored at 64 MiB) |
 | `control.cache.clear` | — | `cleared: true` |
@@ -5341,6 +5341,16 @@ retracts and leave this node advertising content it does not hold.
 held content id as an `Add`, with no diff — whenever its connected peer pool rises from ZERO peers to one
 or more, including the first such observation after bring-up. It MUST NOT re-announce merely because an
 already-peered pool grew.
+
+A re-announce MUST be broadcast on the LOCALLY-ORIGINATED path (`GossipHandle::broadcast_local`),
+never the forwarding one. The announcement for an unchanged inventory is byte-identical to its
+predecessor, so the seen-set deduplication that correctly suppresses a relayed message loop also
+suppressed every repeat of this node's OWN announcement for the life of the process — which made the
+MUST above unimplementable in practice, since the startup announce at zero peers poisoned the entry and
+no later re-announce reached the wire (dig_ecosystem#3061). The hash is still RECORDED, so the same
+announcement arriving back from a peer and offered to the forwarding path is still dropped: the
+exemption is one-directional, and a RECEIVED message MUST NOT be relayed on the local path, which would
+turn one echo into a broadcast storm.
 
 The reconcile delta above is computed against this node's OWN local provider records, so it answers "what
 changed here", never "what do my peers know". Those two diverge silently as soon as an inventory change

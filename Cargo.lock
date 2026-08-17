@@ -2059,8 +2059,8 @@ dependencies = [
 
 [[package]]
 name = "dig-gossip"
-version = "0.24.0"
-source = "git+https://github.com/DIG-Network/dig-gossip?rev=c75e2028871d384c7bf1b4a4bfb54ad257dfc9cc#c75e2028871d384c7bf1b4a4bfb54ad257dfc9cc"
+version = "0.25.0"
+source = "git+https://github.com/DIG-Network/dig-gossip?rev=51054a4132ee51b7cee2cba1768b75ade5360f9c#51054a4132ee51b7cee2cba1768b75ade5360f9c"
 dependencies = [
  "bincode",
  "chia-protocol",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.46.0"
+version = "0.47.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2310,7 +2310,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.123.0"
+version = "0.124.0"
 dependencies = [
  "async-trait",
  "axum",
