@@ -2824,14 +2824,17 @@ MUST match that crate exactly. `origin` distinguishes who minted the error: `she
 `node` (the node library), `upstream` (relayed from the upstream DIG RPC), `boundary` (the
 method-not-found cue).
 
-**Canonical control-code assignment.** The control-plane errors are `-32030`/`-32031`/`-32032`.
+**Canonical control-code assignment.** The control-plane errors are `-32030`/`-32031`/`-32032`/`-32033`.
 `-32020`/`-32021`/`-32022` are RESERVED for onion-routing errors (`onion_circuit_unavailable` /
 `privacy_requires_local_node` / `onion_hops_out_of_range`) — the published normative contract on
 docs.dig.net — and MUST NOT be used for control. (`dig-rpc-protocol` is the source of this resolution;
 any client that branched on the old control numbers keys on the symbolic `data.code`, not the
 number.) The wallet-read errors occupy `-3204x` (`WALLET_NO_CHAIN_SOURCE` / `WALLET_NOT_SYNCED` /
 `WALLET_READ_FAILED` / `WALLET_RATE_LIMITED`); `-3205x` is owned by the chat plane (§ chat) and MUST
-NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
+NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`). The ingress bound on the
+OPEN control reads is `-32033` (`CONTROL_INGRESS_LIMITED`) and sits in the control range rather
+than `-3204x` BECAUSE it is not a wallet fact: it is refused by the control server before any
+method runs, and it MUST NOT be conflated with the wallet's own `-32043` egress bound.
 
 | Code | Name | Origin | Meaning |
 |---|---|---|---|
@@ -2853,7 +2856,8 @@ NOT collide; `-3206x` is owned by the peer plane (`PEER_PING_REFUSED`).
 | -32030 | `UNAUTHORIZED` | shell | `control.*` called without a valid local control token. |
 | -32031 | `NOT_SUPPORTED` | shell | A control operation this build/pin cannot perform (e.g. §21 sync without an identity). |
 | -32032 | `CONTROL_ERROR` | shell | A control operation failed at runtime (distinct from bad input / absent capability). |
-| -32040 | `WALLET_NO_CHAIN_SOURCE` | node | a wallet chain read (`control.wallet.balance`/`.coins`/`.coinById`/`.coinSpend`/`.coinsByParent`/`.peak`) or `control.wallet.broadcast` had NO live chain source able to answer an arbitrary (non-wallet) address. Distinct from a truthful `0`. |
+| -32033 | `CONTROL_INGRESS_LIMITED` | shell | An OPEN, token-less `control.*` read was refused AT INGRESS, before the request reached the dispatcher and before any DB work was done for it: this SOURCE's request bound is exhausted. The open reads present no credential, so without this bound an unauthenticated caller can drive unbounded SQLite work (`.coinById`/`.coinSpend` each run up to two lookups plus an LRU `UPDATE`) simply by asking repeatedly. The bound is PER SOURCE — one flooding source MUST NOT refuse another — and the node's OWN loopback operator is EXEMPT, so this code is only ever seen by a non-loopback caller (i.e. under `DIG_NODE_ALLOW_REMOTE=1`). It MUST stay DISTINCT from `-32043 WALLET_RATE_LIMITED`: that bound is on chain EGRESS and protects the third-party oracle, this one is on REQUESTS and protects this process. They fire for different reasons and have different remedies, so collapsing them would leave a caller unable to tell which bound it hit. Back off and retry. |
+| -32040 | `WALLET_NO_CHAIN_SOURCE` | node | a wallet chain read (`control.wallet.balance`/`.coins`/`.coinById`/`.coinSpend`/`.coinsByParent`/`.peak`) or `control.wallet.broadcast` had NO live chain source able to answer an arbitrary (non-wallet) address. Distinct from a truthful `0`. A read the node can answer WITHOUT a chain source MUST NOT be refused with this code: the replica fast path and the node own chain-read cache both answer from bytes already in hand, so on `.coinById`/`.coinSpend` liveness is consulted only on a cache MISS. Refusing a cached answer because a third party is momentarily unreachable gives availability away for nothing on exactly the rows a lineage walk re-reads (a spent coin record is immutable), and the refusal then cascades into the retries that exhaust the `-32043` bound. The refusal MUST stay for a miss, and `.coinSpend` MUST treat a PARTIAL cache hit (spend cached, coin record not) as a miss, because the heights come from the record. |
 | -32041 | `WALLET_NOT_SYNCED` | node | `control.wallet.balance` of the wallet's OWN address while the local DB is still syncing and no live fallback is attached (nothing can answer yet). |
 | -32042 | `WALLET_READ_FAILED` | node | `control.wallet.balance`/`.coins`/`.coinById`/`.coinSpend`/`.coinsByParent`/`.peak` failed at the underlying DB / chain-source layer. On `.coinById` this INCLUDES a chain source that answered with a record for a DIFFERENT coin than the id asked for: a coin id is self-certifying (`SHA256(parent ‖ puzzle_hash ‖ amount)`), so a substituted record is a failed READ -- never that coin's record, and never `coin: null`. On `.coinSpend` it likewise INCLUDES a source that answered with another coin's spend, a puzzle reveal that does not tree-hash to the spent coin's own `puzzle_hash` (or will not parse), and a spend the coin record contradicts (no record, or a record calling the coin unspent) -- each fails CLOSED rather than being served unverified. On `.coinsByParent` it INCLUDES a source that returned a child naming a different parent, which fails the WHOLE page rather than being silently filtered (a filtered page is a lineage with an invisible hole). Distinct from `WALLET_NO_CHAIN_SOURCE` and `WALLET_NOT_SYNCED`. |
 | -32043 | `WALLET_RATE_LIMITED` | node | `control.wallet.balance`/`.coins`/`.coinById`/`.coinSpend`/`.coinsByParent` refused: the GLOBAL coinset-fallback rate bound is exhausted (too many arbitrary-address reads hit the expensive fallback in a short window). Defense-in-depth against an open-read amplification/oracle sweep; back off and retry. The bound charges only reads that actually REACH a chain source: the cheap local-DB fast path is never gated, and neither is an answer served from the node's own chain-read cache, which sends nothing and so amplifies nothing. Charging a cached answer bounds no egress and starves the misses the bound exists for -- a client polling one coin drains the bucket with reads that never leave the machine, and the bucket then cannot refill while that client runs. |
@@ -6023,3 +6027,4 @@ fetches nor serves profile bodies. Nothing else depends on it having run.
 
 The node **persists, serves and fetches**. It never signs a profile and never edits one. There is no
 seed, private key, signature or unsigned-spend field on any profile method, and there never may be.
+

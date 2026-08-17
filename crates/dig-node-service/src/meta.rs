@@ -718,6 +718,17 @@ pub enum ErrorCode {
     /// abandon an in-flight push and back off; abandoned partials free their slot after the push TTL.
     /// Node error. (Bounded/resource cluster.)
     PushPendingLimited,
+    /// `-32033` — an OPEN, token-less `control.*` READ was refused AT INGRESS, before any work was
+    /// done for it (dig_ecosystem#3051). The open reads are answered without a control token, so a
+    /// caller that presents no credential can otherwise drive unbounded SQLite lookups; this bounds
+    /// the REQUESTS reaching the node, per source.
+    ///
+    /// Deliberately DISTINCT from `-32043 WALLET_RATE_LIMITED`, which bounds EGRESS to the
+    /// third-party chain oracle and exists to protect that third party rather than this process.
+    /// The two fire for different reasons and have different remedies, and collapsing them would
+    /// leave the next person debugging a refusal unable to tell which bound they hit. Retriable:
+    /// the caller should back off. Shell error (minted before dispatch). (Control range `-3203x`.)
+    ControlIngressLimited,
 }
 
 impl ErrorCode {
@@ -741,6 +752,7 @@ impl ErrorCode {
             ErrorCode::WalletNodeSpendDisabled => -32044,
             ErrorCode::PeerPingRefused => -32060,
             ErrorCode::PushPendingLimited => -32016,
+            ErrorCode::ControlIngressLimited => -32033,
         }
     }
 
@@ -765,6 +777,7 @@ impl ErrorCode {
             ErrorCode::WalletNodeSpendDisabled => "WALLET_NODE_SPEND_DISABLED",
             ErrorCode::PeerPingRefused => "PEER_PING_REFUSED",
             ErrorCode::PushPendingLimited => "PUSH_PENDING_LIMITED",
+            ErrorCode::ControlIngressLimited => "CONTROL_INGRESS_LIMITED",
         }
     }
 
@@ -780,6 +793,8 @@ impl ErrorCode {
             | ErrorCode::Unauthorized
             | ErrorCode::NotSupported
             | ErrorCode::ControlError
+            // Minted by the control SERVER at ingress, before the request reaches the node.
+            | ErrorCode::ControlIngressLimited
             | ErrorCode::ParseError => "shell",
             ErrorCode::MethodNotFound => "boundary",
             // The wallet balance read (#1851) is served by the node-custodied wallet backend.
@@ -846,6 +861,10 @@ impl ErrorCode {
                 "A cache.pushCapsule window was refused: accepting it would exceed an in-flight \
                  push-reassembly bound (per-requestor cap, global cap, or pending-bytes budget)."
             }
+            ErrorCode::ControlIngressLimited => {
+                "An open, token-less control read was refused at ingress: this source's request \
+                 bound is exhausted. Distinct from WALLET_RATE_LIMITED, which bounds chain egress."
+            }
         }
     }
 
@@ -869,6 +888,7 @@ impl ErrorCode {
             ErrorCode::WalletNodeSpendDisabled,
             ErrorCode::PeerPingRefused,
             ErrorCode::PushPendingLimited,
+            ErrorCode::ControlIngressLimited,
         ]
     }
 }
