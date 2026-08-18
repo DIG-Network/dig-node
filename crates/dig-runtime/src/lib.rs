@@ -982,3 +982,13 @@ mod tests {
         assert!(env["body"]["error"].is_string(), "carries an error: {resp}");
     }
 }
+
+#[cfg(test)]
+mod pipefail_probe_dig_ecosystem_2513 {
+    /// TEMPORARY probe: proves the required "Test + coverage" check can actually report RED.
+    /// Deleted the moment the red is observed. Never merged.
+    #[test]
+    fn deliberately_failing_probe() {
+        panic!("dig_ecosystem#2513 probe: this failure MUST turn the required check red");
+    }
+}
