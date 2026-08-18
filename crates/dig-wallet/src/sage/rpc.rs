@@ -36,50 +36,64 @@ use super::spend::{self, required_public_keys, Broadcaster, WalletSigner};
 use super::types::*;
 use super::{actions, mint, network, offers, options, themes};
 use super::{Error, Result};
+use dig_node_control_interface::params::{Asset as ControlAsset, AssetId as ControlAssetId};
 
-/// Which asset a [`WalletBackend::balance_for_address`] read totals (#1851). The wire form
-/// is the lowercase token (`xch` / `dig`); the CAT asset id for `Dig` is sourced from
-/// `digstore_chain::dig::DIG_ASSET_ID` (canonical, never hardcoded).
+/// Which asset a [`WalletBackend::balance_for_address`] read totals (#1851), widened from the
+/// original XCH-or-$DIG pair to ANY CAT (dig_ecosystem#3077).
+///
+/// The wire form is [`dig_node_control_interface::params::Asset`]'s — `"xch"`, `"dig"`, or
+/// `{"cat":"<64-hex>"}` — and the two types convert into each other rather than each spelling it,
+/// so the node cannot parse an asset the published contract does not describe.
+///
+/// # Why the asset id is CARRIED, not looked up
+///
+/// Every scoping decision in a read ([`Self::asset_id_hex`] for the DB tier,
+/// [`Self::cat_coin_puzzle_hash`] for the hint-blind fallback tier) is derived from this id. A
+/// variant that merely NAMED a token would force each derivation to resolve the name to an id
+/// separately, and the read would answer a confident empty list for any token a derivation had
+/// not been taught about — the silent-wrong-answer this widening exists to remove.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BalanceAsset {
     /// Native chia (XCH) — no CAT asset id.
     Xch,
-    /// The $DIG CAT.
-    Dig,
+    /// A CAT, named by its asset id (TAIL hash).
+    Cat(Bytes32),
+}
+
+impl From<ControlAsset> for BalanceAsset {
+    fn from(asset: ControlAsset) -> Self {
+        match asset.asset_id() {
+            None => Self::Xch,
+            Some(id) => Self::Cat(Bytes32::from(*id.as_bytes())),
+        }
+    }
+}
+
+impl From<BalanceAsset> for ControlAsset {
+    fn from(asset: BalanceAsset) -> Self {
+        match asset {
+            BalanceAsset::Xch => Self::Xch,
+            BalanceAsset::Cat(id) => Self::Cat(ControlAssetId::new(id.to_bytes())),
+        }
+    }
 }
 
 impl BalanceAsset {
-    /// Parse the lowercase wire token. Returns `None` for any other value.
-    pub fn from_wire(s: &str) -> Option<Self> {
-        match s {
-            "xch" => Some(Self::Xch),
-            "dig" => Some(Self::Dig),
-            _ => None,
-        }
-    }
-
-    /// The lowercase wire token this asset spells itself as — the SAME string [`from_wire`]
-    /// parses, so a result can echo the asset it was asked for without a second spelling of it.
-    ///
-    /// [`from_wire`]: BalanceAsset::from_wire
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            Self::Xch => "xch",
-            Self::Dig => "dig",
-        }
-    }
-
-    /// The CAT TAIL this asset scopes to, or `None` for native XCH.
+    /// The $DIG CAT.
     ///
     /// The single spelling of $DIG's TAIL in this module, sourced from
     /// `digstore_chain::dig::DIG_ASSET_ID` so it never drifts from the canonical definition.
+    pub const DIG: Self = Self::Cat(digstore_chain::dig::DIG_ASSET_ID);
+
+    /// The CAT TAIL this asset scopes to, or `None` for native XCH.
+    ///
     /// [`Self::asset_id_hex`] is its hex rendering and [`Self::cat_coin_puzzle_hash`] its
     /// puzzle-hash rendering; all three must name the same asset or a read can scope its two
     /// tiers to different ones.
     fn cat_asset_id(self) -> Option<Bytes32> {
         match self {
             Self::Xch => None,
-            Self::Dig => Some(digstore_chain::dig::DIG_ASSET_ID),
+            Self::Cat(id) => Some(id),
         }
     }
 
@@ -4903,7 +4917,7 @@ mod tests {
         );
 
         let dig_bal = be
-            .balance_for_address(&owned_address(), BalanceAsset::Dig)
+            .balance_for_address(&owned_address(), BalanceAsset::DIG)
             .await
             .unwrap();
         assert_eq!(
@@ -5033,7 +5047,7 @@ mod tests {
         let be = backend_over(fb).await;
 
         let r = be
-            .balance_for_address(&address, BalanceAsset::Dig)
+            .balance_for_address(&address, BalanceAsset::DIG)
             .await
             .unwrap();
         assert_eq!(r.source, Source::Fallback, "the tier under test");
@@ -5076,7 +5090,7 @@ mod tests {
         let be = backend_over(fb).await;
 
         let r = be
-            .coins_for_address(&address, BalanceAsset::Dig)
+            .coins_for_address(&address, BalanceAsset::DIG)
             .await
             .unwrap();
         let mut ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
@@ -5085,6 +5099,97 @@ mod tests {
             ids,
             ["pending-dig", "real-dig"],
             "the $DIG coins only — a spend built on the others would be built on foreign inputs"
+        );
+    }
+
+    /// The asset id of the fixture's non-$DIG CAT — the "foreign-cat" coin's TAIL.
+    ///
+    /// Named rather than inlined because the point of the widening test below is that a caller can
+    /// ask for THIS id, and the fixture and the request must be provably the same asset.
+    fn foreign_asset_id() -> Bytes32 {
+        Bytes32::from([0x33u8; 32])
+    }
+
+    /// **dig_ecosystem#3077 — a read for an ARBITRARY CAT returns that CAT's coins.**
+    ///
+    /// The load-bearing test of the widening. Before it, the asset type could name only XCH and
+    /// $DIG, so this request was inexpressible; the nearest wrong implementation — one that
+    /// widens the type but leaves the puzzle-hash filter derived from $DIG's id — answers this
+    /// with an EMPTY list, which is indistinguishable from "you hold none of that CAT". No error,
+    /// no warning, nothing red.
+    ///
+    /// A single-CAT fixture cannot see that defect, because $DIG's own read stays correct under
+    /// it. So this asks for the SECOND CAT, on a fixture where $DIG is also present and hinted to
+    /// the same address: a filter keyed on the wrong asset returns `[]` or returns `real-dig`, and
+    /// both differ from the truth.
+    #[tokio::test]
+    async fn a_fallback_read_for_an_arbitrary_cat_returns_that_cats_coins() {
+        let (fb, address) = hinted_multi_asset_fixture();
+        let be = backend_over(fb).await;
+
+        let r = be
+            .coins_for_address(&address, BalanceAsset::Cat(foreign_asset_id()))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = r.coins.iter().map(|c| c.coin_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["foreign-cat"],
+            "the requested CAT's coin, and ONLY it — not $DIG's, not the hinted XCH coin"
+        );
+        assert_eq!(r.source, Source::Fallback, "the tier under test");
+    }
+
+    /// The honesty half of the same widening: a read for a CAT the address genuinely holds none of
+    /// answers an EMPTY list from a real chain consultation — it does not fail, and it does not
+    /// borrow another asset's coins.
+    ///
+    /// Paired with the test above deliberately. That one alone passes for an implementation that
+    /// filters nothing and happens to return one coin; this one alone passes for an implementation
+    /// that returns `[]` for every CAT. Together they pin the filter to the requested id: the same
+    /// fixture and the same address answer differently for two different asset ids.
+    #[tokio::test]
+    async fn a_fallback_read_for_an_unheld_cat_answers_an_honest_empty_list() {
+        let (fb, address) = hinted_multi_asset_fixture();
+        let be = backend_over(fb).await;
+
+        let r = be
+            .coins_for_address(&address, BalanceAsset::Cat(Bytes32::from([0x77u8; 32])))
+            .await
+            .unwrap();
+        assert!(
+            r.coins.is_empty(),
+            "the address holds no coin of this CAT, got {:?}",
+            r.coins.iter().map(|c| &c.coin_id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            r.source,
+            Source::Fallback,
+            "an empty list is an ANSWER from a consulted chain, not a suppressed read"
+        );
+    }
+
+    /// The wire form the widened asset travels as is the PUBLISHED one, in both directions.
+    ///
+    /// Round-tripping through `dig-node-control-interface`'s `Asset` rather than asserting
+    /// strings: the node must not acquire a second spelling of the contract it serves. $DIG is
+    /// checked explicitly because it is the one value whose two representations
+    /// (`BalanceAsset::DIG` and `Cat(<the canonical id>)`) must be the SAME value — if they were
+    /// not, a `"dig"` request and a `{"cat":"a406…"}` request would scope to different assets.
+    #[test]
+    fn the_asset_type_round_trips_through_the_published_wire_type() {
+        for asset in [
+            BalanceAsset::Xch,
+            BalanceAsset::DIG,
+            BalanceAsset::Cat(foreign_asset_id()),
+        ] {
+            let wire: ControlAsset = asset.into();
+            assert_eq!(BalanceAsset::from(wire), asset, "round trip of {asset:?}");
+        }
+        assert_eq!(
+            BalanceAsset::from(ControlAsset::DIG),
+            BalanceAsset::DIG,
+            "the published $DIG id and this module's must be the same asset"
         );
     }
 
