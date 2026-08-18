@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.126.0] - 2026-08-18
+
+### Features
+- **wallet:** Scope coin reads by requested CAT asset id (#3077) (#238)
+
+### Bug Fixes
+- **wallet,control:** Serve cached reads without a live fallback; bound open reads at ingress (#236)
+
 ## [0.124.1] - 2026-08-17
 
 ### Documentation
