@@ -171,6 +171,25 @@ impl ControlAction {
     /// Public so a test can assert that a parsed command line's operands actually reach the wire,
     /// not merely that it selected the right method (see `entrypoint`'s parser tests).
     pub fn wire_params(&self) -> Value {
+        /// A `--asset` operand as the wire form the control plane parses (dig_ecosystem#3077).
+        ///
+        /// `xch` and `dig` travel as themselves. A bare 64-hex asset id becomes the tagged
+        /// `{"cat":"<hex>"}` form, so a person can read an ARBITRARY CAT from the command line —
+        /// without that, the widened wire would be reachable only by a program.
+        ///
+        /// Anything else is forwarded UNCHANGED, to be refused by the node's own parser. This CLI
+        /// deliberately does not decide what an asset is: a second, laxer opinion here is how a
+        /// typo becomes a read of the wrong token.
+        fn asset_to_wire(asset: &str) -> Value {
+            let looks_like_an_asset_id =
+                asset.len() == 64 && asset.bytes().all(|b| b.is_ascii_hexdigit());
+            if looks_like_an_asset_id {
+                json!({ "cat": asset })
+            } else {
+                Value::String(asset.to_string())
+            }
+        }
+
         match self {
             ControlAction::ConfigSetUpstream { url } => json!({ "upstream": url }),
             ControlAction::CacheSetCap { bytes } => json!({ "cap_bytes": bytes }),
@@ -180,7 +199,7 @@ impl ControlAction {
             | ControlAction::SyncTrigger { store } => json!({ "store": store }),
             ControlAction::WalletBalance { address, asset }
             | ControlAction::WalletCoins { address, asset } => {
-                json!({ "address": address, "asset": asset })
+                json!({ "address": address, "asset": asset_to_wire(asset) })
             }
             ControlAction::WalletCoinById { coin_id }
             | ControlAction::WalletCoinSpend { coin_id } => json!({ "coin_id": coin_id }),

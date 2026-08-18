@@ -1383,7 +1383,11 @@ use dig_wallet::sage::rpc::{BalanceAsset, BalanceError};
 /// asset, which the contract has always said is native XCH. A field that is present and does not
 /// name an asset is a caller asking for something this node cannot scope a read to — and defaulting
 /// THAT to XCH is how a mistyped asset id becomes a confident balance for the wrong token.
-fn parse_asset_param(method: &str, id: &Value, params: &Value) -> std::result::Result<BalanceAsset, Value> {
+fn parse_asset_param(
+    method: &str,
+    id: &Value,
+    params: &Value,
+) -> std::result::Result<BalanceAsset, Value> {
     let Some(raw) = params.get("asset") else {
         return Ok(BalanceAsset::Xch);
     };
@@ -1393,7 +1397,9 @@ fn parse_asset_param(method: &str, id: &Value, params: &Value) -> std::result::R
             control_error(
                 id.clone(),
                 ErrorCode::InvalidParams,
-                format!("{method} asset must be \"xch\", \"dig\", or {{\"cat\":\"<64-hex>\"}}: {e}"),
+                format!(
+                    "{method} asset must be \"xch\", \"dig\", or {{\"cat\":\"<64-hex>\"}}: {e}"
+                ),
             )
         })
 }
@@ -2749,6 +2755,73 @@ mod tests {
                 ],
                 "source": "db", "synced": true, "peak_height": 5_000_000
             })
+        );
+    }
+
+    /// **dig_ecosystem#3077 — the control plane accepts an ARBITRARY CAT and ECHOES it back.**
+    ///
+    /// Two properties in one test because they are one contract: the tagged request form must
+    /// PARSE, and the answer must name the CAT it was scoped to rather than falling back to a
+    /// token the node happens to know. The echo is the only place a caller can see WHICH asset the
+    /// node read, so a `"dig"` or a `null` here would make an arbitrary-CAT read unverifiable.
+    ///
+    /// Uses a non-$DIG id deliberately: $DIG round-trips through a legacy token and so exercises
+    /// neither the tagged parse nor the tagged emission.
+    #[test]
+    fn an_arbitrary_cat_parses_from_the_wire_and_is_echoed_onto_every_coin() {
+        use dig_wallet::sage::routing::Source;
+        use dig_wallet::sage::rpc::{WalletCoin, WalletCoinsResult};
+
+        let id = "11".repeat(32);
+        let asset = parse_asset_param(
+            "control.wallet.coins",
+            &json!(1),
+            &json!({ "address": "xch1…", "asset": { "cat": id } }),
+        )
+        .expect("the published tagged form parses");
+        assert_ne!(asset, BalanceAsset::DIG, "a CAT that is not $DIG");
+
+        let wire = coins_wire(
+            &WalletCoinsResult {
+                coins: vec![WalletCoin {
+                    coin_id: "aa".repeat(32),
+                    parent_coin_info: "bb".repeat(32),
+                    puzzle_hash: "cc".repeat(32),
+                    amount: 1,
+                    created_height: Some(1),
+                    spent_height: None,
+                }],
+                source: Source::Fallback,
+                synced: false,
+                peak_height: None,
+            },
+            asset,
+        );
+        assert_eq!(
+            wire["coins"][0]["asset"],
+            json!({ "cat": id }),
+            "the coin names the CAT the read was scoped to"
+        );
+    }
+
+    /// An `asset` that is PRESENT and names nothing is refused; an ABSENT one defaults to XCH.
+    ///
+    /// The pair matters more than either half. A parser that defaulted an unparseable asset to XCH
+    /// would satisfy the absent case identically, and would turn a mistyped asset id into a
+    /// confident balance for the wrong token — so the control is the omitted field, not a second
+    /// bad value.
+    #[test]
+    fn an_unparseable_asset_is_refused_while_an_absent_one_defaults_to_xch() {
+        for bad in [json!("dgi"), json!({ "cat": "nope" }), json!(7)] {
+            assert!(
+                parse_asset_param("m", &json!(1), &json!({ "asset": bad })).is_err(),
+                "{bad} must not name an asset"
+            );
+        }
+        assert_eq!(
+            parse_asset_param("m", &json!(1), &json!({ "address": "xch1…" })),
+            Ok(BalanceAsset::Xch),
+            "an omitted asset is the documented XCH default"
         );
     }
 

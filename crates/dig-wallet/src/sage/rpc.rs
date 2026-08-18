@@ -34,9 +34,9 @@ use super::routing::{self, Source};
 use super::singleton::{self, LineageSource, ParentSpend};
 use super::spend::{self, required_public_keys, Broadcaster, WalletSigner};
 use super::types::*;
-use dig_node_control_interface::params::{Asset as ControlAsset, AssetId as ControlAssetId};
 use super::{actions, mint, network, offers, options, themes};
 use super::{Error, Result};
+use dig_node_control_interface::params::{Asset as ControlAsset, AssetId as ControlAssetId};
 
 /// Which asset a [`WalletBackend::balance_for_address`] read totals (#1851), widened from the
 /// original XCH-or-$DIG pair to ANY CAT (dig_ecosystem#3077).
