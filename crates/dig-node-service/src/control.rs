@@ -1333,16 +1333,9 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
             "control.wallet.balance requires params.address (a bech32m address string)",
         );
     };
-    let asset_str = params
-        .get("asset")
-        .and_then(|v| v.as_str())
-        .unwrap_or("xch");
-    let Some(asset) = BalanceAsset::from_wire(asset_str) else {
-        return control_error(
-            id,
-            ErrorCode::InvalidParams,
-            format!("control.wallet.balance asset must be \"xch\" or \"dig\", got {asset_str:?}"),
-        );
+    let asset = match parse_asset_param("control.wallet.balance", &id, params) {
+        Ok(a) => a,
+        Err(e) => return e,
     };
 
     match ctx.wallet.balance_for_address(address, asset).await {
@@ -1377,6 +1370,36 @@ async fn wallet_balance(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 
 use dig_wallet::sage::rpc::{BalanceAsset, BalanceError};
 
+/// Parse `params.asset` using the PUBLISHED wire form — `"xch"`, `"dig"`, or
+/// `{"cat":"<64-hex asset id>"}` (dig_ecosystem#3077).
+///
+/// Deserializing `dig-node-control-interface`'s own `Asset` rather than matching tokens here keeps
+/// exactly one spelling of the contract in the ecosystem: a shape the crate accepts is a shape the
+/// node accepts, automatically.
+///
+/// # An absent asset means XCH; an UNPARSEABLE one is an error
+///
+/// Those two are deliberately different. Omitting the field is a caller asking for the default
+/// asset, which the contract has always said is native XCH. A field that is present and does not
+/// name an asset is a caller asking for something this node cannot scope a read to — and defaulting
+/// THAT to XCH is how a mistyped asset id becomes a confident balance for the wrong token.
+fn parse_asset_param(method: &str, id: &Value, params: &Value) -> std::result::Result<BalanceAsset, Value> {
+    let Some(raw) = params.get("asset") else {
+        return Ok(BalanceAsset::Xch);
+    };
+    serde_json::from_value::<ControlAsset>(raw.clone())
+        .map(BalanceAsset::from)
+        .map_err(|e| {
+            control_error(
+                id.clone(),
+                ErrorCode::InvalidParams,
+                format!("{method} asset must be \"xch\", \"dig\", or {{\"cat\":\"<64-hex>\"}}: {e}"),
+            )
+        })
+}
+
+use dig_node_control_interface::params::Asset as ControlAsset;
+
 /// The address + asset params shared by `control.wallet.balance` and `control.wallet.coins` — a
 /// balance is a coins read reduced to a sum, so the two take the SAME shape (and dig-app's frozen
 /// `CoinsRequest` doubles as its balance request for the same reason).
@@ -1394,17 +1417,7 @@ fn wallet_address_params(
             format!("{method} requires params.address (a bech32m address string)"),
         ));
     };
-    let asset_str = params
-        .get("asset")
-        .and_then(|v| v.as_str())
-        .unwrap_or("xch");
-    let Some(asset) = BalanceAsset::from_wire(asset_str) else {
-        return Err(control_error(
-            id.clone(),
-            ErrorCode::InvalidParams,
-            format!("{method} asset must be \"xch\" or \"dig\", got {asset_str:?}"),
-        ));
-    };
+    let asset = parse_asset_param(method, id, params)?;
     Ok((address.to_string(), asset))
 }
 
@@ -2210,7 +2223,10 @@ fn no_watchlist(id: Value) -> Value {
 /// filters by it; the read is already scoped to a single asset, so echoing the REQUESTED one is
 /// exactly what the coins are.
 fn coins_wire(r: &dig_wallet::sage::rpc::WalletCoinsResult, asset: BalanceAsset) -> Value {
-    let asset = asset.as_wire();
+    // Serialized through the published `Asset`, so the echo is spelled exactly as the contract
+    // spells it — `"dig"` for $DIG, `{"cat":"<hex>"}` for any other CAT — and never `null`.
+    let asset = serde_json::to_value(ControlAsset::from(asset))
+        .expect("an Asset always serializes to a token or a one-key map");
     json!({
         "coins": r.coins.iter().map(|c| json!({
             "coin_id": c.coin_id,
@@ -2713,7 +2729,7 @@ mod tests {
                 synced: true,
                 peak_height: Some(5_000_000),
             },
-            BalanceAsset::Dig,
+            BalanceAsset::DIG,
         );
 
         assert_eq!(
