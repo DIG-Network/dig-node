@@ -41,6 +41,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # A workflow whose piped step discards the real command's exit code makes a REQUIRED check
+      # unable to fail (dig_ecosystem#2513). Gate the workflows themselves, not just the code.
+      - name: Workflow pipefail gate
+        shell: bash
+        run: ./scripts/check-workflow-pipefail.sh
+
       - name: scripts/tests
         run: |
           set -eu
