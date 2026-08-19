@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.126.1] - 2026-08-19
+
+### CI
+- Guard every workflow pipe against a swallowed exit code (#243)
+
 ## [0.126.0] - 2026-08-18
 
 ### Features
