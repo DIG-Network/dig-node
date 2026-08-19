@@ -849,11 +849,37 @@ impl WalletBackend {
     /// Both money reads ([`Self::balance_for_address`], [`Self::coins_for_address`]) call this and
     /// nothing else, so the two cannot come to differ about when the replica is trusted.
     async fn replica_is_authoritative(&self) -> sqlx::Result<bool> {
+        self.replica_covers(&self.followed_set()).await
+    }
+
+    /// May the local replica answer for `scope` — the puzzle-hash set ONE read is scoped to?
+    ///
+    /// The containment question [`Self::replica_is_authoritative`] asks, with the scope made an
+    /// argument, because the ecosystem has two of them and they are not the same question.
+    /// An ADDRESS-scoped read is answerable when the catch-up covered everything this node
+    /// follows; an IDENTITY-scoped read is answerable when it covered the puzzle hashes the
+    /// CONNECTED CLIENT supplied, which arrive per-connection and need not be followed at all.
+    ///
+    /// Routing the identity-scoped reads through the followed set would be vacuous rather than
+    /// wrong-in-a-visible-way: a node with no custody and no watchlist follows nothing, every
+    /// recording covers the empty set, and the uncovered client would be served a synced zero
+    /// exactly as before (dig_ecosystem#2878).
+    ///
+    /// An absent recording covers nothing, so a replica that latched the flag without recording
+    /// what it ran over fails closed for every scope.
+    async fn replica_covers(&self, scope: &CoveredSet) -> sqlx::Result<bool> {
         let state = self.db.sync_state().await?;
         Ok(state.initial_sync_complete
-            && state
-                .covered
-                .is_some_and(|covered| covered.covers(&self.followed_set())))
+            && state.covered.is_some_and(|covered| covered.covers(scope)))
+    }
+
+    /// May the replica answer for the CONNECTED CLIENT's identity?
+    ///
+    /// The gate for every identity-scoped Sage-parity read. Phrased over
+    /// [`Self::scoped_identity`] so the set that is checked is byte-for-byte the set that is
+    /// queried — a gate asked about a different spelling of the scope is not a gate.
+    async fn replica_covers_client_scope(&self, identity: &[String]) -> sqlx::Result<bool> {
+        self.replica_covers(&CoveredSet::from_hex(identity)).await
     }
 
     /// Does `phs` cover every externally enrolled address — so a sync over `phs` alone may declare
@@ -2017,7 +2043,12 @@ impl WalletBackend {
         // Scope EVERY wallet-data read to the connected client's PUBLIC identity (#407) —
         // never the node's own coins. An empty identity ⇒ not tracking ⇒ no coins.
         let identity = self.scoped_identity();
-        match routing::route(self.synced().await?, true) {
+        // Coverage of the CLIENT's scope, never the bare `initial_sync_complete` flag: the DB was
+        // only ever asked to follow the addresses a catch-up ran over, so querying it for an
+        // uncovered identity returns `[]` — which downstream reads as "a chain was consulted and
+        // this wallet is empty" (dig_ecosystem#2878).
+        let covered = self.replica_covers_client_scope(&identity).await?;
+        match routing::route(covered, true) {
             Source::Db => {
                 let rows = self.db.coins_scoped(asset_id, &identity).await?;
                 Ok(rows
@@ -2068,7 +2099,9 @@ impl WalletBackend {
     async fn get_sync_status(&self) -> Result<GetSyncStatusResponse> {
         let identity = self.scoped_identity();
         let tracking = !identity.is_empty();
-        let db_synced = self.db.is_synced().await?;
+        // The SAME predicate `wallet_coins` routes on, so the coin list and the completeness
+        // claim about it cannot come to disagree (dig_ecosystem#2878).
+        let db_synced = self.replica_covers_client_scope(&identity).await?;
         let balance = if tracking {
             self.db.balance_scoped(None, &identity).await?
         } else {
@@ -7856,6 +7889,11 @@ mod tests {
         ])
         .await
         .unwrap();
+        // A catch-up that COVERED the scope these reads use, not merely a flag saying one
+        // finished — the identity-scoped router asks about coverage (dig_ecosystem#2878).
+        db.record_coverage(&CoveredSet::from_hex([test_ph()]))
+            .await
+            .unwrap();
         db.set_initial_sync_complete(true).await.unwrap();
         // Reads scope to the wallet's identity (#407); the test coins sit at `test_ph()`.
         let cfg = WalletConfig {
@@ -8800,6 +8838,14 @@ mod tests {
         ])
         .await
         .unwrap();
+        // The catch-up covered BOTH wallets' addresses, so the scoping assertions below measure
+        // scoping and not coverage (dig_ecosystem#2878).
+        db.record_coverage(&CoveredSet::from_hex([
+            client_ph.as_str(),
+            other_ph.as_str(),
+        ]))
+        .await
+        .unwrap();
         db.set_initial_sync_complete(true).await.unwrap();
         // Identity comes ONLY from the client's login — the node has no own wallet config.
         let be = WalletBackend::new(
@@ -9580,5 +9626,140 @@ mod tests {
         let s = be.sync_status().await.unwrap();
         assert_eq!(s.state, SyncLifecycle::Synced);
         assert_eq!(s.peak_height, Some(123));
+    }
+
+    // ---- dig_ecosystem#2878: identity-scoped reads must not answer from an uncovered scope ----
+
+    /// A client identity the completed catch-up never covered, that GENUINELY HOLDS FUNDS on chain.
+    ///
+    /// FIXTURE DESIGN — this is the only shape that can see the defect, and it needs THREE
+    /// properties at once:
+    ///
+    /// 1. **The catch-up completed**, so `db.is_synced()` is `true`. Without it the pre-fix code
+    ///    already reports not-synced and the fixture proves nothing.
+    /// 2. **The recorded coverage names a DIFFERENT address** (`covered_ph`) that the replica
+    ///    really did sync. A fixture recording NO coverage would also be caught by an
+    ///    implementation that merely demanded *some* coverage exist, so the honest control is what
+    ///    forces the containment question to be asked about the CLIENT's scope.
+    /// 3. **The money is on the CHAIN, not in the replica.** The replica's coin table is empty for
+    ///    the client, which is exactly the uncovered state — the DB was never asked to follow that
+    ///    address. An unfunded fixture cannot tell "zero because unscoped" from "zero because
+    ///    empty", which is the whole defect.
+    ///
+    /// It also distinguishes the fix's PLACEMENT. Routing these reads through
+    /// [`WalletBackend::replica_is_authoritative`] — the address-scoped predicate — would pass a
+    /// weaker fixture: with no custody and no watchlist the followed set is EMPTY, every recording
+    /// covers it, and the uncovered client scope would still be served a synced zero. Only asking
+    /// containment against `scoped_identity()` answers this fixture correctly.
+    async fn uncovered_but_funded_client(client_ph: &str) -> (WalletBackend, Arc<MockFallback>) {
+        let covered_ph = "bb".repeat(32);
+        let db = WalletDb::open_in_memory().await.unwrap();
+        // A real, completed catch-up — over an address that is NOT the client's.
+        db.record_coverage(&CoveredSet::from_hex([covered_ph.as_str()]))
+            .await
+            .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        db.set_peak(REPLICA_PEAK, &"cc".repeat(32)).await.unwrap();
+        assert!(
+            db.is_synced().await.unwrap(),
+            "the fixture must satisfy the bare sync flag, or it cannot see the defect"
+        );
+        let fb = Arc::new(MockFallback::with_coins(vec![fallback_coin(
+            "onchain1",
+            client_ph,
+            1_599_000_000_000,
+            Some(REPLICA_PEAK),
+            None,
+        )]));
+        let be = WalletBackend::new(db, fb.clone(), WalletConfig::default());
+        let addr = encode_address(client_ph, "xch").unwrap();
+        be.dispatch(
+            "login",
+            &format!(r#"{{"fingerprint":1,"addresses":["{addr}"]}}"#),
+        )
+        .await;
+        (be, fb)
+    }
+
+    /// **Regression (dig_ecosystem#2878): `get_sync_status` must not report a complete, synced,
+    /// zero view for a scope the catch-up never covered.**
+    ///
+    /// Before the fix a client holding 1.599 XCH was answered `selectable_balance: 0` with
+    /// `synced_coins == total_coins == 0`, which every client renders as *"synced, balance 0"*.
+    #[tokio::test]
+    async fn an_uncovered_client_scope_is_never_reported_as_a_synced_zero() {
+        let client_ph = "aa".repeat(32);
+        let (be, _fb) = uncovered_but_funded_client(&client_ph).await;
+
+        let (_s, body) = be.dispatch("get_sync_status", "{}").await;
+        let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
+        assert!(
+            r.total_coins > r.synced_coins,
+            "an uncovered scope was reported fully synced (synced={} total={}); the replica was \
+             never asked to follow this client's addresses, so it cannot say the view is complete",
+            r.synced_coins,
+            r.total_coins
+        );
+    }
+
+    /// **Regression (dig_ecosystem#2878): the coin read falls to the chain for an uncovered scope.**
+    ///
+    /// The companion to the status assertion above, and the one that shows the user's money. An
+    /// empty list from the replica reads downstream as *"a chain was consulted and this wallet is
+    /// empty"*.
+    #[tokio::test]
+    async fn an_uncovered_client_scope_reads_its_coins_from_the_chain() {
+        let client_ph = "aa".repeat(32);
+        let (be, _fb) = uncovered_but_funded_client(&client_ph).await;
+
+        let (_s, body) = be
+            .dispatch("get_coins", r#"{"offset":0,"limit":100}"#)
+            .await;
+        let r: GetCoinsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            r.coins
+                .iter()
+                .map(|c| c.amount.to_u64().unwrap())
+                .sum::<u64>(),
+            1_599_000_000_000,
+            "an uncovered scope was served the replica's empty coin set instead of the chain's"
+        );
+    }
+
+    /// **The control: a COVERED client scope still reads from the replica and still says synced.**
+    ///
+    /// Without this, the two assertions above are satisfied by an implementation that simply never
+    /// reports synced — which would be honest and useless.
+    #[tokio::test]
+    async fn a_covered_client_scope_still_reads_from_the_replica_and_reports_synced() {
+        let client_ph = "aa".repeat(32);
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[coin_at("c1", &client_ph, 4_200)])
+            .await
+            .unwrap();
+        db.record_coverage(&CoveredSet::from_hex([client_ph.as_str()]))
+            .await
+            .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+        let addr = encode_address(&client_ph, "xch").unwrap();
+        be.dispatch(
+            "login",
+            &format!(r#"{{"fingerprint":1,"addresses":["{addr}"]}}"#),
+        )
+        .await;
+
+        let (_s, body) = be.dispatch("get_sync_status", "{}").await;
+        let r: GetSyncStatusResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(r.selectable_balance.to_u64(), Some(4_200));
+        assert_eq!(
+            (r.synced_coins, r.total_coins),
+            (1, 1),
+            "a covered scope must still report a complete view"
+        );
     }
 }

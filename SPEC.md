@@ -3895,10 +3895,19 @@ Coverage MUST NOT be inferred from a second write ordered against the first: an 
 any follow-up can run, and `watch` is idempotent, so an interrupted or failed invalidation would latch the
 widened set permanently while the client's retry enrolled nothing and invalidated nothing. A missing
 recording (a replica synced before this rule) covers NOTHING — reads fall to the chain tier, which answers
-truthfully. The identity-scoped Sage-parity reads `get_sync_status` (`crates/dig-wallet/src/sage/rpc.rs`,
-`get_sync_status`) and `wallet_coins` (same file, `wallet_coins`) still route on `initial_sync_complete`
-alone for the connected client's scoped identity, so this invariant does NOT yet hold on that surface;
-they are tracked as DIG-Network/dig_ecosystem#2878.
+truthfully.
+
+**Invariant — the IDENTITY-scoped reads MUST ask the same containment question about the CLIENT's scope.**
+`get_sync_status` and `wallet_coins` are scoped to the puzzle hashes the connected client supplied at
+`login`, which arrive per-connection and need not be followed by this node at all. Both MUST be served
+from the local replica only while the recorded coverage CONTAINS that client scope, and MUST NOT route on
+`initial_sync_complete` alone. Where the scope is NOT covered, `wallet_coins` MUST fall to the chain tier
+and `get_sync_status` MUST report `synced_coins < total_coins` — never a complete, synced, zero view.
+
+The scope MUST be the client's identity and MUST NOT be the node's followed set. A node under §908 holds
+no custody and may hold no registrations, so its followed set is EMPTY and every recording trivially
+contains it; routing the identity-scoped reads through that predicate would be vacuous and would serve an
+uncovered client a synced zero exactly as before.
 
 **Invariant.** A catch-up MUST NOT run over an UNCORROBORATED peer, and `initial_sync_complete` MUST NOT
 be set as a result of one. `initial_sync` itself refuses with `UntrustedPeer`, and it decides on the
@@ -3907,7 +3916,12 @@ EFFECTIVE trust it is handed — which for a discovered peer is the trust resolv
 caller-side check is one refactor, or one reconnect after a hostile disconnect, away from gone.
 
 A discovered peer that has NOT been corroborated runs as a WRITE-FREE session whatever the wallet holds:
-it subscribes nothing and persists nothing. Corroboration MUST be attempted BEFORE the catch-up, so a peer
+it subscribes nothing and persists nothing. **A node whose attached session MAY NOT WRITE therefore MUST
+NOT report `synced`, however long ago a catch-up completed.** `initial_sync_complete` is persistent and a
+refused writer's frames — including the peak — are dropped before any DB write, so the replica falls
+behind by an unbounded, invisible amount while the flag still says a catch-up finished. `synced` is
+specified as caught up AND in a position to be kept current, and a node holding a connection it may not
+trust is not in that position; it MUST report `syncing`. Corroboration MUST be attempted BEFORE the catch-up, so a peer
 that fails it never has a window in which its answers are already landing.
 
 **A refusal MUST expire.** Corroboration is decided ONCE per session, so an uncorroborated session MUST
