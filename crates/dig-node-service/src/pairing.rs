@@ -406,11 +406,19 @@ fn append_paired_token(path: &Path, record: &PairedToken) -> std::io::Result<()>
 /// produce one; it does not try to chase them afterwards. Concretely: this must NOT strip
 /// user-managed Chia peers. A compromised app's "cleanup" would then silently un-trust the nodes
 /// an operator deliberately configured, which is a worse failure than the one it would be
-/// papering over — the escalation is made unreachable at the gates instead, on EVERY plane that
-/// reaches the writer: the `control.*` gate ([`crate::control::requires_master_token`]) and the
-/// Sage-parity wallet gate ([`crate::wallet_authz`]), over both HTTP and WS. That qualifier is the
-/// load-bearing part of the sentence: this claim was once true of the control plane alone while
-/// `POST /add_peer` granted a paired token the same row.
+/// papering over — the escalation is made unreachable at the gates instead, on every plane a PAIRED
+/// TOKEN can present itself on: the `control.*` gate ([`crate::control::requires_master_token`]) and
+/// the Sage-parity wallet gate ([`crate::wallet_authz`]), each over both `POST /{method}` and `/ws`.
+/// The enumeration is the load-bearing part of the sentence, not decoration: this claim was once
+/// made of the control plane alone while `POST /add_peer` handed a paired token the same row, and a
+/// sentence that says "unreachable" without naming the routes is what stopped the next reader
+/// checking the second one.
+///
+/// The loopback mTLS `9257` listener (`dig_wallet::sage::transport`) dispatches the parity surface
+/// with NO token gate; it is outside this claim because its credential is a different one (the
+/// shared client cert), which a paired token cannot supply. That plane is currently unreachable by
+/// anything — the cert is generated per run and never persisted — but persisting it, which its own
+/// comment anticipates, would make an ungated wallet surface live.
 fn revoke_paired_token(path: &Path, token_id: &str) -> std::io::Result<bool> {
     let mut tokens = load_paired_tokens(path);
     let before = tokens.len();
