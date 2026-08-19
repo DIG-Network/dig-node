@@ -105,13 +105,13 @@ enum Command {
     },
     /// Report whether the node is serving (probes /health).
     Status,
-    /// Pair a browser controller (the DIG Chrome extension) with this node (#280):
+    /// Pair a browser controller (the DIG Chrome extension) with this node:
     /// grant it a scoped, revocable control token after local confirmation.
     Pair {
         #[command(subcommand)]
         action: Option<PairCommand>,
     },
-    /// Open a DIG link in the default browser (#389). The OS scheme-handler target the
+    /// Open a DIG link in the default browser. The OS scheme-handler target the
     /// installer registers for `chia://` + `urn:dig:chia:`. Accepts ONLY those two schemes,
     /// resolves via the local node's serve URL, and never invokes a shell.
     Open {
@@ -150,7 +150,7 @@ enum Command {
         #[command(subcommand)]
         action: ProfileCommand,
     },
-    /// Read a public address's balance (the OPEN `control.wallet.balance` read, #1851).
+    /// Read a public address's balance (the OPEN `control.wallet.balance` read).
     Wallet {
         #[command(subcommand)]
         action: WalletCommand,
@@ -166,14 +166,14 @@ enum Command {
         #[command(subcommand)]
         action: Option<SubscriptionsCommand>,
     },
-    /// View + manage the node's peer connections (#559) — parity with the extension's peer surface.
+    /// View + manage the node's peer connections — parity with the extension's peer surface.
     /// With no sub-action, lists the live peer status (running flag, connected count, relay, and —
     /// on a newer node — the per-peer list with addresses shown IPv6-first per §5.2).
     Peers {
         #[command(subcommand)]
         action: Option<PeersCommand>,
     },
-    /// Add, list and remove a TRUSTED Chia full-node peer (dig_ecosystem#2870).
+    /// Add, list and remove a TRUSTED Chia full-node peer.
     ///
     /// A different network from `peers`, which manages DIG gossip peers. Trusting a Chia peer
     /// grants it authority over this node's wallet replica without corroboration — see
@@ -182,7 +182,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<ChiaPeersCommand>,
     },
-    /// Internal: idempotently register the `dig.local` → `127.0.0.2` OS hosts entry (#91/#503),
+    /// Internal: idempotently register the `dig.local` → `127.0.0.2` OS hosts entry,
     /// so `http://dig.local` resolves to the node. Invoked by the native install packages;
     /// requires write access to the hosts file (run elevated). Not meant to be run by hand.
     #[command(hide = true)]
@@ -458,6 +458,10 @@ enum PeersCommand {
 }
 
 /// `dig-node chia-peers` sub-actions (dig_ecosystem#2870). With none, lists the tracked peers.
+///
+/// The ticket reference above is a Rust doc comment on the enum, NOT on a clap `#[derive]` field,
+/// so it never reaches `--help`. Doc comments on the VARIANTS below are user-facing help text and
+/// must stay free of internal task numbers (contract §4.3).
 #[derive(Subcommand)]
 enum ChiaPeersCommand {
     /// List the tracked Chia full-node peers, marking which are trusted.
@@ -967,6 +971,71 @@ mod tests {
     fn cli_definition_is_valid() {
         // clap's derived command builds without a malformed-definition panic.
         Cli::command().debug_assert();
+    }
+
+    /// Render a subcommand's long help exactly as a person sees it.
+    fn long_help_for(path: &[&str]) -> String {
+        let mut cmd = Cli::command();
+        for name in path {
+            cmd = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("no `{name}` subcommand"))
+                .clone();
+        }
+        cmd.render_long_help().to_string()
+    }
+
+    /// **`chia-peers add` tells the person the corroboration it costs, in its own help.**
+    ///
+    /// This is the ONE place the grant is explained before it is made — the ticket's whole point is
+    /// that a trusted peer reaches `PeerTrust::Operator` and moves the wallet replica with no
+    /// quorum. `remove` is asserted alongside as the escape hatch, so a person who reads `add` can
+    /// see the undo without leaving the page.
+    #[test]
+    fn the_add_help_states_what_trusting_a_chia_peer_costs() {
+        let help = long_help_for(&["chia-peers", "add"]);
+        for phrase in [
+            "independently-chosen peers agree",
+            "advance, roll back, or complete",
+            "false view of the chain",
+            "chia-peers remove",
+        ] {
+            assert!(help.contains(phrase), "`add` help is missing {phrase:?}:
+{help}");
+        }
+    }
+
+    /// **No user-facing help text leaks an internal ticket number** (contract §4.3).
+    ///
+    /// Regression: the first draft of this command shipped `(dig_ecosystem#2870)` in the
+    /// `chia-peers` summary, which clap renders straight into `--help`. Asserted over the whole
+    /// rendered tree rather than the one command that was wrong, because the mistake is a category
+    /// -- a doc comment on a clap type is user-facing prose and reads exactly like an internal one.
+    #[test]
+    fn no_help_text_exposes_an_internal_ticket_number() {
+        let mut pages = vec![Cli::command().render_long_help().to_string()];
+        for sub in Cli::command().get_subcommands() {
+            pages.push(sub.clone().render_long_help().to_string());
+            for inner in sub.get_subcommands() {
+                pages.push(inner.clone().render_long_help().to_string());
+            }
+        }
+        for page in pages {
+            // Any `#<digits>` in rendered help is an issue reference: no user-facing option,
+            // scheme or value in this CLI has that shape, so the pattern needs no allow-list.
+            let leaked: Vec<&str> = page
+                .split_whitespace()
+                .filter(|w| {
+                    w.split_once('#')
+                        .is_some_and(|(_, rest)| rest.starts_with(|c: char| c.is_ascii_digit()))
+                })
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "help text exposes internal issue references {leaked:?}:
+{page}"
+            );
+        }
     }
 
     /// The `control.*` method a real argv reaches, or `None` if the parser rejects it.
