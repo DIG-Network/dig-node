@@ -965,7 +965,9 @@ mod tests {
             .expect("add is a chia-peers subcommand")
             .write_long_help(&mut help)
             .expect("clap renders help");
-        let help = String::from_utf8(help).expect("help is utf-8").to_lowercase();
+        let help = String::from_utf8(help)
+            .expect("help is utf-8")
+            .to_lowercase();
 
         assert!(
             help.contains("a node you run yourself"),

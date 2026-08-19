@@ -3495,7 +3495,10 @@ mod tests {
         let db = WalletDb::open_in_memory().await.unwrap();
 
         let fresh = db.add_peer("1.1.1.1", 8444).await.unwrap();
-        assert!(fresh, "an ordinary add DOES confer the corroboration bypass");
+        assert!(
+            fresh,
+            "an ordinary add DOES confer the corroboration bypass"
+        );
 
         db.remove_peer("2.2.2.2", true).await.unwrap();
         let unbanned = db.add_peer("2.2.2.2", 8444).await.unwrap();
@@ -3508,7 +3511,10 @@ mod tests {
 
         // And the un-ban really happened: the peer is dialable again, just not trusted.
         let rows = db.unbanned_peers().await.unwrap();
-        let row = rows.iter().find(|p| p.ip_addr == "2.2.2.2").expect("unbanned");
+        let row = rows
+            .iter()
+            .find(|p| p.ip_addr == "2.2.2.2")
+            .expect("unbanned");
         assert!(!row.banned && !row.user_managed);
     }
 

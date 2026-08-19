@@ -1570,7 +1570,14 @@ async fn removing_a_chia_peer_the_node_never_had_is_not_reported_as_a_removal() 
     const HELD: &str = "203.0.113.7";
     const NEVER_HELD: &str = "198.51.100.4";
 
-    call(&mut ws, "h0", "control.chiaPeers.add", &token, json!({ "ip": HELD })).await;
+    call(
+        &mut ws,
+        "h0",
+        "control.chiaPeers.add",
+        &token,
+        json!({ "ip": HELD }),
+    )
+    .await;
 
     let hit = call(
         &mut ws,
@@ -1590,7 +1597,11 @@ async fn removing_a_chia_peer_the_node_never_had_is_not_reported_as_a_removal() 
         json!({ "ip": NEVER_HELD }),
     )
     .await;
-    assert_eq!(miss["ok"], json!(true), "the call itself succeeds: {miss:?}");
+    assert_eq!(
+        miss["ok"],
+        json!(true),
+        "the call itself succeeds: {miss:?}"
+    );
     assert_eq!(
         miss["result"]["outcome"],
         json!("no_such_peer"),

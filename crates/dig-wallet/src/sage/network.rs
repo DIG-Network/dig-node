@@ -4,10 +4,10 @@
 //! `set_delta_sync_override`, `set_change_address`.
 //!
 //! Peers are DB-backed (§18.16): `add_peer` persists a user-managed entry (mirroring Sage,
-//! which keeps manually-added peers across restarts); `peak_height` reports `0` until this
-//! node's live per-peer telemetry is wired to the sync loop — never fabricated. The known
-//! network list is the two DIG/Chia networks this wallet backend can sync against (design
-//! Part B): mainnet and testnet11.
+//! which keeps manually-added peers across restarts); `peak_height` reports `None` —
+//! UNOBSERVED — until this node's live per-peer telemetry is wired to the sync loop, and is
+//! never fabricated. The known network list is the two DIG/Chia networks this wallet backend
+//! can sync against (design Part B): mainnet and testnet11.
 
 use super::db::WalletDb;
 use super::types::{Network, NetworkKind, NetworkList, PeerRecord};
@@ -37,7 +37,7 @@ pub async fn get_peers(db: &WalletDb) -> Result<Vec<PeerRecord>> {
         .map(|r| PeerRecord {
             ip_addr: r.ip_addr,
             port: r.port as u16,
-            peak_height: (r.peak_height > 0).then(|| r.peak_height as u32),
+            peak_height: (r.peak_height > 0).then_some(r.peak_height as u32),
             user_managed: r.user_managed,
             banned: r.banned,
         })
