@@ -484,9 +484,8 @@ fn summarize(method: &str, result: &Value) -> String {
         // CLI quotes it rather than keeping a second copy that can drift; the fallback exists only
         // for an older node that does not send one, and says the same thing in fewer words.
         "control.chiaPeers.add" => format!(
-            "trusting Chia peer {}:{}\n{}",
-            result["ip"].as_str().unwrap_or("?"),
-            result["port"].as_u64().unwrap_or(0),
+            "trusting Chia peer {}\n{}",
+            endpoint(&result["ip"], &result["port"]),
             result["notice"].as_str().unwrap_or(
                 "This peer is now TRUSTED: its answers can update this node's wallet replica on their own, without being agreed by other peers."
             ),
@@ -627,9 +626,8 @@ fn summarize_chia_peers(result: &Value) -> String {
     );
     for p in peers {
         out.push_str(&format!(
-            "\n  {}:{} · peak {} · {}",
-            p["ip"].as_str().unwrap_or("?"),
-            p["port"].as_u64().unwrap_or(0),
+            "\n  {} · peak {} · {}",
+            endpoint(&p["ip"], &p["port"]),
             p["peak_height"].as_u64().unwrap_or(0),
             if p["user_managed"].as_bool().unwrap_or(false) {
                 "trusted (you added it)"
@@ -639,6 +637,27 @@ fn summarize_chia_peers(result: &Value) -> String {
         ));
     }
     out
+}
+
+/// A peer endpoint for a human line, built through [`std::net::SocketAddr`] rather than by pasting
+/// a colon between two fields.
+///
+/// Concatenating is wrong for every IPv6 literal: `::1` and `8444` pasted together read as
+/// `::1:8444`, which is itself a valid IPv6 address naming a DIFFERENT host — so the line would not
+/// merely look odd, it would identify the wrong peer. DIG is IPv6-first (§5.2), so this is the
+/// common case rather than an edge one. `SocketAddr`'s own `Display` brackets v6 and leaves v4
+/// alone, which is exactly the rule, so it is borrowed rather than reimplemented.
+///
+/// An address the node sent that does not parse is shown VERBATIM with the port named in words,
+/// never re-punctuated into something that looks canonical: a CLI that tidied an unparseable
+/// address would assert a shape the node never claimed.
+fn endpoint(ip: &Value, port: &Value) -> String {
+    let text = ip.as_str().unwrap_or("?");
+    let port = u16::try_from(port.as_u64().unwrap_or(0)).unwrap_or(0);
+    match text.parse::<std::net::IpAddr>() {
+        Ok(addr) => std::net::SocketAddr::new(addr, port).to_string(),
+        Err(_) => format!("{text} (port {port})"),
+    }
 }
 
 /// "available" / "unavailable" for a boolean sync/availability flag.
@@ -787,7 +806,10 @@ mod tests {
             }),
         );
         assert!(s.contains("203.0.113.7"), "the address must be echoed: {s}");
-        assert!(s.contains("8444"), "the port must be echoed: {s}");
+        assert!(
+            s.contains("203.0.113.7:8444"),
+            "the endpoint must be echoed: {s}"
+        );
         assert!(s.contains("TRUSTED"), "the grant must be named: {s}");
         assert!(
             s.contains("without being agreed by other peers"),
@@ -832,6 +854,49 @@ mod tests {
             s.contains("discovered (must be corroborated)"),
             "a discovered peer must NOT read as trusted: {s}"
         );
+    }
+
+    /// **An IPv6 peer renders as a real socket address, not two fields pasted together.**
+    ///
+    /// `::1` and `8444` concatenated read as `::1:8444`, which is a VALID IPv6 address naming a
+    /// different host — so the wrong form does not look broken, it looks fine and identifies the
+    /// wrong peer. DIG is IPv6-first (§5.2). The v4 peer beside it is the control: it must NOT
+    /// acquire brackets, or the "fix" would just be a different misrendering.
+    #[test]
+    fn an_ipv6_chia_peer_is_bracketed_and_an_ipv4_one_is_not() {
+        let s = summarize(
+            "control.chiaPeers.list",
+            &json!({ "peers": [
+                { "ip": "::1", "port": 8444, "peak_height": 1, "user_managed": true },
+                { "ip": "203.0.113.7", "port": 8444, "peak_height": 1, "user_managed": false },
+            ] }),
+        );
+        assert!(
+            s.contains("[::1]:8444"),
+            "an IPv6 peer must be bracketed: {s}"
+        );
+        assert!(
+            !s.contains(" ::1:8444"),
+            "the ambiguous form must not appear: {s}"
+        );
+        assert!(
+            s.contains("203.0.113.7:8444"),
+            "IPv4 must stay unbracketed: {s}"
+        );
+    }
+
+    /// An address the node sent that does not parse is shown verbatim, with the port in words
+    /// rather than re-punctuated into a shape the node never claimed.
+    #[test]
+    fn an_unparseable_peer_address_is_not_tidied_into_a_socket_address() {
+        let s = summarize(
+            "control.chiaPeers.list",
+            &json!({ "peers": [
+                { "ip": "not-an-ip", "port": 8444, "peak_height": 0, "user_managed": true },
+            ] }),
+        );
+        assert!(s.contains("not-an-ip (port 8444)"), "{s}");
+        assert!(!s.contains("not-an-ip:8444"), "{s}");
     }
 
     /// An empty list SAYS it is empty and names the verb that fills it. Printing nothing reads as
