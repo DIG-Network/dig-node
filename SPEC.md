@@ -2118,6 +2118,17 @@ These methods are NEVER relayed upstream — a signing/custody request must neve
 an authorized call is served locally by the node-custodied wallet (or, until the wallet surface is served
 on a given transport, returns a catalogued error — it is never proxied to the public gateway).
 
+**Master-token-tier wallet methods (a paired token MUST be refused).** A Sage-parity method name that
+is an ALIAS for a master-tier `control.*` capability inherits that tier: `add_peer` is
+`control.chiaPeers.add` and `remove_peer` is `control.chiaPeers.remove` — the same writer, the same
+`user_managed` row, the same authority surviving `pairing.revoke`. A node MUST resolve the tier from the
+CAPABILITY and not from the plane a caller reached it on, on EVERY transport (`POST /{method}` and
+`/ws`); it MUST NOT enforce the tier on the `control.*` plane alone, which enforces nothing, since the
+parity name reaches the identical writer one URL away. A node MUST derive both answers from the one
+published predicate (`ControlMethod::requires_master_token`) rather than restating the tier per plane,
+and MUST pin the two planes' answers for a capability in a SINGLE conformance assertion — a per-plane
+test set cannot observe them diverging.
+
 **Open wallet methods (no token).** Wallet READ methods (`get_*`) follow the read plane (§7.2): open to
 local consumers. The recommendation of epic #365 is that the whole wallet WS session be paired-gated once
 the bidirectional WS transport (#369) carries it; the security-critical MUST is that no mutation or
@@ -2128,9 +2139,10 @@ the node-local self-origin surface (§16.3) / a `dig-node wallet backup` CLI —
 boundary, so key material never crosses to a paired caller even with a valid token.
 
 **Classification is pure + tested.** `wallet_authz::classify` maps a method to its class
-(read | mutation | custody | pairing-admin | non-wallet) and `wallet_authz::authorize` decides allow/deny,
+(read | mutation | master-only | custody | non-wallet) and `wallet_authz::authorize` decides allow/deny,
 unit-tested exhaustively: an unpaired caller is denied on every mutation/custody method; a paired token
-authorizes a mutation but NOT pairing administration; a revoked token is denied on the next request.
+authorizes a mutation but NOT a master-tier capability under either of its names; a revoked token is
+denied on the next request.
 
 ### 7.13. DIG auto-update beacon proxy (`control.updater.*`, #515)
 
@@ -4743,8 +4755,12 @@ just not a real color scheme; real derivation is a tracked follow-on.
 18.17. **Network / peer / sync settings (design A.5, #205 PR4).** `get_peers`/`add_peer`/`remove_peer`
 are DB-backed: `add_peer` persists a user-managed entry at the standard Chia full-node port (design
 B.1, `8444`) surviving restarts (mirroring Sage); `remove_peer{ban:true}` keeps the row but excludes it
-from `get_peers`; `peak_height` reports `0` until live per-peer telemetry is wired to the sync loop —
-never fabricated. `set_discover_peers`/`set_target_peers`/`set_delta_sync`/`set_delta_sync_override`/
+from the DIALLING read (`get_peers` still enumerates it, flagged); `peak_height` reports `0` until live
+per-peer telemetry is wired to the sync loop -- never fabricated, and reported as the INTEGER Sage sends
+so a strict parity client keeps parsing. The unobserved-vs-genesis distinction is drawn at the control
+boundary instead (`control.chiaPeers.list` maps `0` to `null`), which is this node's own surface.
+`add_peer`/`remove_peer` are MASTER-TOKEN TIER on this surface too (§7.12): they are the parity aliases
+of `control.chiaPeers.add`/`.remove` and reach the identical writer. `set_discover_peers`/`set_target_peers`/`set_delta_sync`/`set_delta_sync_override`/
 `set_change_address` persist to a `network_settings` row. `set_network`/`set_network_override` both set
 the same stored network override (this backend tracks one active wallet key; a genuine per-fingerprint
 override is a follow-on for multi-key support). `get_networks`/`get_network` report the two networks
