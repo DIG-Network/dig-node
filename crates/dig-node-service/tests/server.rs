@@ -1397,6 +1397,179 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     );
 }
 
+/// **A person can add, list and remove a trusted Chia peer, end to end over the REAL control plane.**
+///
+/// The whole round trip through the real server, the real token gate, the real wallet backend and
+/// the real `peers` table on disk (dig_ecosystem#2870). Nothing here is mocked below the control
+/// method, which is the point: the ticket exists because the WRITER was already there and no
+/// user-facing route reached it, so a test that stubbed the writer would prove nothing new.
+///
+/// It is written as ONE sequence rather than three tests because the properties that matter are
+/// relational -- that `list` sees what `add` wrote, that the entry comes back `user_managed: true`
+/// (the flag that grants `PeerTrust::Operator`), and that `remove` actually un-does it. Three
+/// isolated tests could each pass against a surface that wrote to a list nobody reads.
+#[tokio::test]
+async fn a_trusted_chia_peer_can_be_added_listed_and_removed_over_the_control_plane() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await; // drain the initial sync_status snapshot
+
+    /// Send one control request and return its response frame.
+    async fn call<S>(ws: &mut S, id: &str, method: &str, token: &str, params: Value) -> Value
+    where
+        S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+            + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        ws.send(Message::Text(
+            json!({
+                "id": id, "type": "request", "method": method,
+                "token": token, "params": params,
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        next_ws_json(ws).await
+    }
+
+    // A peer address from TEST-NET-3 (RFC 5737), so nothing here can name a real host.
+    const IP: &str = "203.0.113.7";
+
+    // Nothing is trusted before the person asks for it. Measured rather than assumed, so that a
+    // later assertion of `user_managed: true` cannot be satisfied by a row that was always there.
+    let before = call(&mut ws, "p0", "control.chiaPeers.list", &token, json!({})).await;
+    assert_eq!(before["ok"], json!(true), "list failed: {before:?}");
+    let trusted_before = before["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .filter(|p| p["ip"] == json!(IP))
+        .count();
+    assert_eq!(
+        trusted_before, 0,
+        "the fixture already knew {IP}: {before:?}"
+    );
+
+    // ADD — and the node states the cost in its own answer.
+    let added = call(
+        &mut ws,
+        "p1",
+        "control.chiaPeers.add",
+        &token,
+        json!({ "ip": IP }),
+    )
+    .await;
+    assert_eq!(added["ok"], json!(true), "add failed: {added:?}");
+    assert_eq!(added["result"]["ip"], json!(IP));
+    assert_eq!(
+        added["result"]["corroboration_bypassed"],
+        json!(true),
+        "the add result MUST state the bypass: {added:?}"
+    );
+    let notice = added["result"]["notice"]
+        .as_str()
+        .expect("the node sends the cost as a sentence");
+    assert!(
+        notice.to_lowercase().contains("trusted")
+            && notice.contains("without being agreed by other peers"),
+        "the notice must name the cost, got: {notice}"
+    );
+
+    // LIST — the peer is there, and it is flagged as the operator-chosen kind. `user_managed` is
+    // the ONE field that separates `PeerTrust::Operator` from `Discovered`, so it is asserted
+    // explicitly rather than inferred from the row's presence.
+    let listed = call(&mut ws, "p2", "control.chiaPeers.list", &token, json!({})).await;
+    let entry = listed["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .find(|p| p["ip"] == json!(IP))
+        .unwrap_or_else(|| panic!("the added peer is not in the list: {listed:?}"));
+    assert_eq!(
+        entry["user_managed"],
+        json!(true),
+        "an added peer MUST be user_managed, or it never reaches PeerTrust::Operator: {entry:?}"
+    );
+    assert_eq!(entry["port"], json!(8444), "the standard full-node port");
+
+    // REMOVE — and the trust is genuinely gone, not merely reported as gone.
+    let removed = call(
+        &mut ws,
+        "p3",
+        "control.chiaPeers.remove",
+        &token,
+        json!({ "ip": IP }),
+    )
+    .await;
+    assert_eq!(removed["ok"], json!(true), "remove failed: {removed:?}");
+    let after = call(&mut ws, "p4", "control.chiaPeers.list", &token, json!({})).await;
+    let still_there = after["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .any(|p| p["ip"] == json!(IP));
+    assert!(!still_there, "the peer survived removal: {after:?}");
+}
+
+/// **A blank address is REFUSED, not stored.**
+///
+/// An empty string is a perfectly storable row, so a tolerant parser would create a trusted peer
+/// that cannot be dialled and — because `remove` matches on the address — cannot be deleted either.
+/// The refusal has to happen before the write, which is why the list is checked afterwards rather
+/// than the error message alone.
+#[tokio::test]
+async fn a_blank_chia_peer_address_is_refused_before_anything_is_written() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await;
+
+    ws.send(Message::Text(
+        json!({
+            "id": "b1", "type": "request", "method": "control.chiaPeers.add",
+            "token": token, "params": { "ip": "   " },
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let resp = next_ws_json(&mut ws).await;
+    assert_eq!(
+        resp["ok"],
+        json!(false),
+        "a blank ip must be refused: {resp:?}"
+    );
+
+    ws.send(Message::Text(
+        json!({ "id": "b2", "type": "request", "method": "control.chiaPeers.list",
+                "token": token, "params": {} })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let listed = next_ws_json(&mut ws).await;
+    let blank_rows = listed["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .filter(|p| p["ip"].as_str().is_some_and(|ip| ip.trim().is_empty()))
+        .count();
+    assert_eq!(
+        blank_rows, 0,
+        "a blank peer row was written anyway: {listed:?}"
+    );
+}
+
 /// **The money push AND the arrival cursor are behind the token, over the REAL server gate**
 /// (dig_ecosystem#2376, dig_ecosystem#2548).
 ///

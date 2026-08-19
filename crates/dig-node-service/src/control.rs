@@ -2003,6 +2003,30 @@ async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
 /// `null` means UNOBSERVABLE, never zero: a count nobody could take is not a count of none.
 /// `chia_peer_count` is taken from the SAME accessor `control.wallet.syncStatus` uses, so the two
 /// methods cannot disagree.
+async fn peer_counts(ctx: &ControlCtx, id: Value) -> Value {
+    let chia_peer_count = ctx
+        .wallet
+        .wallet_sync_status()
+        .await
+        .ok()
+        .and_then(|s| s.chia_peer_count);
+    let dig_peer_status = dig_peer_status(ctx).await;
+    let count = |key: &str| {
+        dig_peer_status
+            .as_ref()
+            .and_then(|status| status[key].as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    control_ok(
+        id,
+        json!({
+            "dig_peer_count": count("connected_peers"),
+            "chia_peer_count": chia_peer_count,
+            "known_dig_peer_count": count("known_peers"),
+        }),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Trusted CHIA full-node peers (dig_ecosystem#2870)
 // ---------------------------------------------------------------------------
@@ -2016,7 +2040,12 @@ async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
 ///
 /// Stated here, once, and returned by `control.chiaPeers.add` so that a client renders the cost
 /// from the node's own answer instead of restating it locally and drifting away from it.
-const CORROBORATION_BYPASS_NOTICE: &str = "This peer is now TRUSTED: its answers can update this      node's wallet replica on their own, without being agreed by other peers. A wrong or hostile      trusted peer can give this node a false view of the chain. Trust only a node you run or      otherwise vouch for yourself.";
+const CORROBORATION_BYPASS_NOTICE: &str = concat!(
+    "This peer is now TRUSTED: its answers can update this node's wallet replica on their ",
+    "own, without being agreed by other peers. A wrong or hostile trusted peer can give ",
+    "this node a false view of the chain. Trust only a node you run or otherwise vouch ",
+    "for yourself."
+);
 
 /// `control.chiaPeers.add` — start trusting a Chia full node.
 ///
@@ -2067,7 +2096,11 @@ async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
                 .collect();
             control_ok(id, json!({ "peers": peers }))
         }
-        Err(e) => control_error(id, ErrorCode::ControlError, format!("get_peers failed: {e}")),
+        Err(e) => control_error(
+            id,
+            ErrorCode::ControlError,
+            format!("get_peers failed: {e}"),
+        ),
     }
 }
 
@@ -2109,30 +2142,6 @@ fn missing_ip(id: Value, method: &str) -> Value {
         id,
         ErrorCode::InvalidParams,
         format!("{method} requires params.ip (the peer's IP address)"),
-    )
-}
-
-async fn peer_counts(ctx: &ControlCtx, id: Value) -> Value {
-    let chia_peer_count = ctx
-        .wallet
-        .wallet_sync_status()
-        .await
-        .ok()
-        .and_then(|s| s.chia_peer_count);
-    let dig_peer_status = dig_peer_status(ctx).await;
-    let count = |key: &str| {
-        dig_peer_status
-            .as_ref()
-            .and_then(|status| status[key].as_u64())
-            .and_then(|n| u32::try_from(n).ok())
-    };
-    control_ok(
-        id,
-        json!({
-            "dig_peer_count": count("connected_peers"),
-            "chia_peer_count": chia_peer_count,
-            "known_dig_peer_count": count("known_peers"),
-        }),
     )
 }
 

@@ -484,12 +484,11 @@ fn summarize(method: &str, result: &Value) -> String {
         // CLI quotes it rather than keeping a second copy that can drift; the fallback exists only
         // for an older node that does not send one, and says the same thing in fewer words.
         "control.chiaPeers.add" => format!(
-            "trusting Chia peer {}:{}
-{}",
+            "trusting Chia peer {}:{}\n{}",
             result["ip"].as_str().unwrap_or("?"),
             result["port"].as_u64().unwrap_or(0),
             result["notice"].as_str().unwrap_or(
-                "This peer is now TRUSTED: its answers can update this node's wallet replica on                  their own, without being agreed by other peers."
+                "This peer is now TRUSTED: its answers can update this node's wallet replica on their own, without being agreed by other peers."
             ),
         ),
         "control.chiaPeers.list" => summarize_chia_peers(result),
@@ -628,8 +627,7 @@ fn summarize_chia_peers(result: &Value) -> String {
     );
     for p in peers {
         out.push_str(&format!(
-            "
-  {}:{} · peak {} · {}",
+            "\n  {}:{} · peak {} · {}",
             p["ip"].as_str().unwrap_or("?"),
             p["port"].as_u64().unwrap_or(0),
             p["peak_height"].as_u64().unwrap_or(0),
@@ -785,7 +783,7 @@ mod tests {
                 "ip": "203.0.113.7",
                 "port": 8444,
                 "corroboration_bypassed": true,
-                "notice": "This peer is now TRUSTED: its answers can update this node's wallet                            replica on their own, without being agreed by other peers.",
+                "notice": "This peer is now TRUSTED: its answers can update this node's wallet replica on their own, without being agreed by other peers.",
             }),
         );
         assert!(s.contains("203.0.113.7"), "the address must be echoed: {s}");
@@ -824,7 +822,10 @@ mod tests {
             ] }),
         );
         assert!(s.contains("2 Chia peer(s)"), "{s}");
-        assert!(s.contains("1 trusted"), "the trusted COUNT is the one that matters: {s}");
+        assert!(
+            s.contains("1 trusted"),
+            "the trusted COUNT is the one that matters: {s}"
+        );
         assert!(s.contains("203.0.113.7"), "{s}");
         assert!(s.contains("trusted (you added it)"), "{s}");
         assert!(
@@ -866,11 +867,18 @@ mod tests {
     #[test]
     fn the_chia_peer_verbs_carry_their_params() {
         assert_eq!(
-            ControlAction::ChiaPeersAdd { ip: "203.0.113.7".into() }.wire_params(),
+            ControlAction::ChiaPeersAdd {
+                ip: "203.0.113.7".into()
+            }
+            .wire_params(),
             json!({ "ip": "203.0.113.7" })
         );
         assert_eq!(
-            ControlAction::ChiaPeersRemove { ip: "203.0.113.7".into(), ban: true }.wire_params(),
+            ControlAction::ChiaPeersRemove {
+                ip: "203.0.113.7".into(),
+                ban: true
+            }
+            .wire_params(),
             json!({ "ip": "203.0.113.7", "ban": true })
         );
         assert_eq!(ControlAction::ChiaPeersList.wire_params(), json!({}));

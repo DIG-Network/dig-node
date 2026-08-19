@@ -1000,8 +1000,11 @@ mod tests {
             "false view of the chain",
             "chia-peers remove",
         ] {
-            assert!(help.contains(phrase), "`add` help is missing {phrase:?}:
-{help}");
+            assert!(
+                help.contains(phrase),
+                "`add` help is missing {phrase:?}:
+{help}"
+            );
         }
     }
 
