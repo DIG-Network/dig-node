@@ -1041,6 +1041,9 @@ async fn phase_is_syncing_when_caught_up_but_no_peer() {
 
     let (handle, _rx) = SyncHandle::new();
     handle.set_connected(1);
+    // A peer whose trust is unresolved may not write, and a non-writing session cannot be synced
+    // (dig_ecosystem#2666). This fixture is about the PEER COUNT, so give it a corroborated peer.
+    handle.set_trust(true);
     assert_eq!(
         handle
             .status(&db, ChainPeerTier::UNOBSERVABLE)
@@ -1080,6 +1083,7 @@ async fn phase_ladder_not_started_syncing_synced() {
     );
 
     handle.set_connected(1);
+    handle.set_trust(true);
     assert_eq!(
         handle
             .status(&db, ChainPeerTier::UNOBSERVABLE)
@@ -4090,4 +4094,50 @@ async fn one_host_is_one_voice_however_many_ports_it_answers_on() {
         vec![crowded[0], discovered_addr(1), discovered_addr(2)],
         "one host answered on four ports and was counted more than once: {reached:?}"
     );
+}
+
+/// **Regression (dig_ecosystem#2666):** a peer that was REFUSED write authority must not be
+/// reported as `Synced`, however long ago a catch-up completed.
+///
+/// FIXTURE DESIGN — this is
+/// [`a_completed_catch_up_still_reports_synced_while_watching_addresses`] with exactly ONE input
+/// varied: `set_trust(false)`. That control is the honest case and stays green, so the pair
+/// isolates the refusal itself rather than any of the four other facts the ladder reads.
+///
+/// The watched set is deliberately NON-empty. A refused writer watching zero addresses would also
+/// be caught here, but only because the empty-set arm's own reasoning happens to apply — and that
+/// arm is guarded by `session_may_write`, so it can never fire for a refused writer anyway. Three
+/// watched addresses put the fixture squarely on the path that actually reaches `Synced`, which is
+/// the only path this ticket is about.
+///
+/// The peer tier is `UNOBSERVABLE` so [`is_following`] answers `true` and cannot be the thing that
+/// fails the assertion: an unmeasured chain peak already returns the phase unchanged, so a fixture
+/// carrying a lagging tier peak would go green against a node that never learned about refusal.
+///
+/// What the user saw before: `{phase: "synced", peak_height: <frozen>}` on a node whose every
+/// frame is dropped before any DB write — unbounded, invisible staleness reported as settled.
+#[tokio::test]
+async fn a_refused_writer_is_not_reported_as_synced() {
+    let db = WalletDb::open_in_memory().await.unwrap();
+    // The catch-up genuinely completed in an earlier run; the flag is persistent.
+    db.set_initial_sync_complete(true).await.unwrap();
+
+    let (handle, _rx) = SyncHandle::new();
+    handle.set_connected(1);
+    // Corroboration refused this session: it is `PeerTrust::Discovered`, and every frame it sends
+    // — including the peak — is dropped before any DB write.
+    handle.set_trust(false);
+    handle.set_watched(3, true);
+
+    let status = handle
+        .status(&db, ChainPeerTier::UNOBSERVABLE)
+        .await
+        .unwrap();
+    assert_ne!(
+        status.phase,
+        SyncPhase::Synced,
+        "a node holding a connection it may not trust is not in a position to be kept current; \
+         reporting synced tells the user a partition or a hostile peer set is fine"
+    );
+    assert_eq!(status.phase, SyncPhase::Syncing);
 }

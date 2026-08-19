@@ -459,11 +459,12 @@ impl SyncHandle {
             // peer may write.
             //
             // THAT QUALIFIER IS LOAD-BEARING, NOT PEDANTRY. A REFUSED writer skips this arm
-            // entirely, because `session_may_write` is false, and falls through to `Synced` with a
-            // MEASURED zero watched set — `{phase: synced, watched_addresses: 0}`, the exact pair
-            // this arm exists to abolish, reached through the `PeerTrust::Discovered` door. This
-            // commit SHRINKS the set of states that can tell that lie; it does not empty it.
-            // The residue is #2666 and is not closed here.
+            // entirely, because `session_may_write` is false. It used to fall through to `Synced`
+            // with a MEASURED zero watched set — `{phase: synced, watched_addresses: 0}`, the exact
+            // pair this arm exists to abolish, reached through the `PeerTrust::Discovered` door.
+            // The `Synced` arm now demands `session_may_write` too (dig_ecosystem#2666), so that
+            // door is shut; this arm still owns the distinction between the two nothing-to-watch
+            // states, which trust alone cannot tell apart.
             //
             // A FOURTH fact then decides WHICH nothing-to-watch this is, and the two mean opposite
             // things: no wallet at all is the honest all-clear, whereas an enrolled wallet whose
@@ -477,6 +478,7 @@ impl SyncHandle {
             }
         } else if state.initial_sync_complete
             && observed.peers >= 1
+            && observed.session_may_write
             && is_following(state.peak_height, tier.peak_height)
         {
             SyncPhase::Synced
