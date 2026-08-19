@@ -2154,8 +2154,9 @@ mod tests {
             peers: vec![PeerRecord {
                 ip_addr: "1.2.3.4".into(),
                 port: 8444,
-                peak_height: 0,
+                peak_height: None,
                 user_managed: true,
+                banned: false,
             }],
         };
         let json = serde_json::to_string(&resp).unwrap();

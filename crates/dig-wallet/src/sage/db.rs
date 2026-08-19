@@ -3462,10 +3462,10 @@ mod tests {
     #[tokio::test]
     async fn add_remove_and_ban_peer() {
         let db = WalletDb::open_in_memory().await.unwrap();
-        assert!(db.all_peers().await.unwrap().is_empty());
+        assert!(db.unbanned_peers().await.unwrap().is_empty());
 
         db.add_peer("1.2.3.4", 8444).await.unwrap();
-        let peers = db.all_peers().await.unwrap();
+        let peers = db.unbanned_peers().await.unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].ip_addr, "1.2.3.4");
         assert_eq!(peers[0].port, 8444);
@@ -3473,14 +3473,134 @@ mod tests {
 
         // Removing without ban deletes it outright.
         db.remove_peer("1.2.3.4", false).await.unwrap();
-        assert!(db.all_peers().await.unwrap().is_empty());
+        assert!(db.unbanned_peers().await.unwrap().is_empty());
 
         // Adding then banning excludes it from the list (but a subsequent add un-bans it).
         db.add_peer("5.6.7.8", 8444).await.unwrap();
         db.remove_peer("5.6.7.8", true).await.unwrap();
-        assert!(db.all_peers().await.unwrap().is_empty());
+        assert!(db.unbanned_peers().await.unwrap().is_empty());
         db.add_peer("5.6.7.8", 8444).await.unwrap();
-        assert_eq!(db.all_peers().await.unwrap().len(), 1);
+        assert_eq!(db.unbanned_peers().await.unwrap().len(), 1);
+    }
+
+    /// **Adding a BANNED peer un-bans it and does NOT grant trust, and says so (#254 item 4).**
+    ///
+    /// The fixture varies ONE thing — whether the address was already held as banned — and keeps
+    /// an honest control (`fresh`) in the same test, because a test that only exercised the banned
+    /// path could not tell "always reports false" from "reports the truth". Both calls SUCCEED;
+    /// what differs is the trust that resulted, which is exactly the distinction a constant `true`
+    /// used to erase.
+    #[tokio::test]
+    async fn adding_a_banned_peer_unbans_it_without_granting_trust() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+
+        let fresh = db.add_peer("1.1.1.1", 8444).await.unwrap();
+        assert!(fresh, "an ordinary add DOES confer the corroboration bypass");
+
+        db.remove_peer("2.2.2.2", true).await.unwrap();
+        let unbanned = db.add_peer("2.2.2.2", 8444).await.unwrap();
+        assert!(
+            !unbanned,
+            "add cleared the ban but left user_managed alone, so the peer is NOT trusted -- \
+             reporting otherwise tells an operator they configured a trusted node while they are \
+             still depending on corroboration they were told they had bypassed"
+        );
+
+        // And the un-ban really happened: the peer is dialable again, just not trusted.
+        let rows = db.unbanned_peers().await.unwrap();
+        let row = rows.iter().find(|p| p.ip_addr == "2.2.2.2").expect("unbanned");
+        assert!(!row.banned && !row.user_managed);
+    }
+
+    /// **The control-plane list shows banned peers; the dialling read never does (#254 item 5).**
+    ///
+    /// Two reads, one fixture, and the difference between them is the whole point: `list` is the
+    /// ONLY enumeration of the ban set, so hiding bans there leaves a blocklist a person cannot
+    /// correct — while surfacing them in the DIALLING read would hand the dialler the very peer
+    /// the operator banned. A single relaxed query cannot satisfy both, which is why they are
+    /// separate functions and why this test asserts them together.
+    #[tokio::test]
+    async fn banned_peers_are_listed_for_the_operator_but_never_dialled() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.add_peer("3.3.3.3", 8444).await.unwrap();
+        db.add_peer("4.4.4.4", 8444).await.unwrap();
+        db.remove_peer("4.4.4.4", true).await.unwrap();
+
+        let dialable: Vec<String> = db
+            .unbanned_peers()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.ip_addr)
+            .collect();
+        assert_eq!(dialable, ["3.3.3.3"], "a banned peer reached the dialler");
+
+        let listed = db.all_peers_including_banned().await.unwrap();
+        assert_eq!(listed.len(), 2, "the ban list must be enumerable");
+        let banned = listed.iter().find(|p| p.ip_addr == "4.4.4.4").expect("row");
+        assert!(banned.banned, "the entry must say WHY it is excluded");
+
+        // Un-banning via `remove { ban: false }` restores dialability and grants no trust.
+        db.remove_peer("4.4.4.4", false).await.unwrap();
+        assert!(db
+            .all_peers_including_banned()
+            .await
+            .unwrap()
+            .iter()
+            .all(|p| p.ip_addr != "4.4.4.4"));
+    }
+
+    /// **The ban list is bounded, and it forgets its OLDEST entry rather than refusing the newest
+    /// (#254 item 9).**
+    ///
+    /// The bound is pinned from BOTH sides: at exactly `MAX_BANNED_CHIA_PEERS` nothing is evicted,
+    /// and one over evicts exactly one. A test that only filled past the cap could not tell a
+    /// correct bound from one that is off by one or that truncates aggressively.
+    ///
+    /// The DIRECTION is asserted too, and it is the half that matters: a full list that refused
+    /// the newest ban would turn the ceiling into a denial of the ban facility itself, precisely
+    /// when an operator is trying to exclude a peer that is misbehaving right now.
+    #[tokio::test]
+    async fn the_ban_list_is_bounded_and_evicts_the_oldest_ban() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        async fn banned_count(db: &WalletDb) -> usize {
+            db.all_peers_including_banned()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|p| p.banned)
+                .count()
+        }
+
+        for i in 0..MAX_BANNED_CHIA_PEERS {
+            db.remove_peer(&format!("10.0.{}.{}", i / 256, i % 256), true)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            banned_count(&db).await,
+            MAX_BANNED_CHIA_PEERS,
+            "at the cap nothing may be evicted"
+        );
+
+        let oldest = "10.0.0.0";
+        db.remove_peer("198.51.100.1", true).await.unwrap();
+        assert_eq!(
+            banned_count(&db).await,
+            MAX_BANNED_CHIA_PEERS,
+            "one over the cap must evict exactly one"
+        );
+
+        let rows = db.all_peers_including_banned().await.unwrap();
+        assert!(
+            rows.iter().any(|p| p.ip_addr == "198.51.100.1" && p.banned),
+            "the NEWEST ban must survive -- refusing it would deny the ban facility when it is \
+             most needed"
+        );
+        assert!(
+            !rows.iter().any(|p| p.ip_addr == oldest),
+            "the OLDEST ban is the one that gets forgotten"
+        );
     }
 
     // ---- network / sync settings (#205 PR4) ------------------------------------

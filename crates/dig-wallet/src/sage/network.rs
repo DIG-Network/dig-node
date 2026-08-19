@@ -168,7 +168,11 @@ mod tests {
         assert_eq!(peers[0].ip_addr, "9.9.9.9");
         assert_eq!(peers[0].port, DEFAULT_PEER_PORT as u16);
         assert!(peers[0].user_managed);
-        assert_eq!(peers[0].peak_height, 0, "no fabricated telemetry");
+        assert_eq!(
+            peers[0].peak_height, None,
+            "nobody has polled this peer, so its peak is UNOBSERVED -- reporting 0 would show a \
+             peer the operator trusts without corroboration as stalled at genesis"
+        );
 
         remove_peer(&db, "9.9.9.9", false).await.unwrap();
         assert!(get_peers(&db).await.unwrap().is_empty());

@@ -1779,7 +1779,7 @@ async fn user_managed_peers_are_tried_before_discovery() {
     let db = WalletDb::open_in_memory().await.unwrap();
     db.add_peer("198.51.100.7", 8444).await.unwrap();
 
-    let peers = db.all_peers().await.unwrap();
+    let peers = db.unbanned_peers().await.unwrap();
     assert_eq!(peers.len(), 1);
     assert!(
         peers[0].user_managed,
