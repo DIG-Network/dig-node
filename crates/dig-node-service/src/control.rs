@@ -2165,24 +2165,7 @@ async fn chia_peers_add(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
 async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.get_peers().await {
         Ok(resp) => {
-            let peers: Vec<Value> = resp
-                .peers
-                .into_iter()
-                .map(|p| {
-                    json!({
-                        "ip": p.ip_addr,
-                        "port": p.port,
-                        // `null`, never 0: an unpolled peer must not read as one stalled at
-                        // genesis, because this is the operator's only signal that a peer they
-                        // trust WITHOUT corroboration has gone stale. The mapping lives HERE and
-                        // not in the wallet type, so the Sage-parity `get_peers` wire keeps the
-                        // integer a strict third-party client expects to deserialize.
-                        "peak_height": (p.peak_height > 0).then_some(p.peak_height),
-                        "user_managed": p.user_managed,
-                        "banned": p.banned,
-                    })
-                })
-                .collect();
+            let peers: Vec<Value> = resp.peers.iter().map(chia_peer_wire).collect();
             control_ok(id, json!({ "peers": peers }))
         }
         Err(e) => control_error(
@@ -2191,6 +2174,29 @@ async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
             format!("get_peers failed: {e}"),
         ),
     }
+}
+
+/// One tracked Chia peer, as `control.chiaPeers.list` reports it. PURE.
+///
+/// This is where `peak_height` becomes `null`: the wallet DB column is `NOT NULL DEFAULT 0` and no
+/// writer sets it yet, so a `0` means "nobody has polled this peer" rather than "this peer is at
+/// genesis". Those must not read the same — a stale peer the operator believes WITHOUT
+/// corroboration is exactly what this field exists to reveal.
+///
+/// The mapping lives HERE rather than in `PeerRecord`, so the Sage-parity `get_peers` body keeps
+/// the integer a strict third-party client deserializes into a non-optional field. One honest shape
+/// on this node's own surface, one unchanged parity shape, no divergent internal type.
+///
+/// When per-peer telemetry lands, the column must become nullable and this `> 0` test must go with
+/// it, or a genuine genesis height will be reported as unobserved.
+fn chia_peer_wire(p: &dig_wallet::sage::types::PeerRecord) -> Value {
+    json!({
+        "ip": p.ip_addr,
+        "port": p.port,
+        "peak_height": (p.peak_height > 0).then_some(p.peak_height),
+        "user_managed": p.user_managed,
+        "banned": p.banned,
+    })
 }
 
 /// `control.chiaPeers.remove` — stop trusting a Chia full node, optionally banning it.
@@ -3942,6 +3948,34 @@ mod tests {
         for exempt in KNOWN_UNPUBLISHED_CONTROL_METHODS {
             assert!(!requires_master_token(exempt), "{exempt}");
         }
+    }
+
+    /// The control boundary reports an UNOBSERVED peak as `null` and an observed one verbatim.
+    ///
+    /// Both directions matter and only one of them is the fix: asserting `null` for `0` alone would
+    /// also pass if the field were hard-wired to `null`, which would hide every real height the
+    /// moment telemetry lands. The observed case is the control that rules that out.
+    #[test]
+    fn the_control_list_reports_an_unpolled_peak_as_null_and_a_real_one_verbatim() {
+        let peer = |peak: u32| dig_wallet::sage::types::PeerRecord {
+            ip_addr: "1.2.3.4".into(),
+            port: 8444,
+            peak_height: peak,
+            user_managed: true,
+            banned: false,
+        };
+
+        let unpolled = chia_peer_wire(&peer(0));
+        assert_eq!(
+            unpolled["peak_height"],
+            json!(null),
+            "a peer nobody has polled must not read as one stalled at genesis: {unpolled}"
+        );
+
+        let observed = chia_peer_wire(&peer(6_000_000));
+        assert_eq!(observed["peak_height"], json!(6_000_000));
+        assert_eq!(observed["ip"], json!("1.2.3.4"));
+        assert_eq!(observed["banned"], json!(false));
     }
 
     #[test]
