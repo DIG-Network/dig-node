@@ -3777,18 +3777,24 @@ impl WalletBackend {
 
     // ---- network / peers / settings (#205 PR4) -------------------------------
 
-    async fn get_peers(&self) -> Result<GetPeersResponse> {
+    /// Public so the node's `control.chiaPeers.*` surface reads the SAME peer store the wallet
+    /// replica consults. A second reader would let the trusted set and the consulted set drift.
+    pub async fn get_peers(&self) -> Result<GetPeersResponse> {
         Ok(GetPeersResponse {
             peers: network::get_peers(&self.db).await?,
         })
     }
 
-    async fn add_peer(&self, req: &AddPeer) -> Result<ActionResponse> {
+    /// The ONE writer of the trusted-peer set, and the only way to reach
+    /// [`crate::sage::sync::PeerTrust::Operator`]. Public so `control.chiaPeers.add` dispatches
+    /// here rather than growing a second implementation of the same behaviour.
+    pub async fn add_peer(&self, req: &AddPeer) -> Result<ActionResponse> {
         network::add_peer(&self.db, &req.ip).await?;
         Ok(ActionResponse {})
     }
 
-    async fn remove_peer(&self, req: &RemovePeer) -> Result<ActionResponse> {
+    /// The ONE remover of the trusted-peer set — see [`WalletBackend::add_peer`].
+    pub async fn remove_peer(&self, req: &RemovePeer) -> Result<ActionResponse> {
         network::remove_peer(&self.db, &req.ip, req.ban).await?;
         Ok(ActionResponse {})
     }

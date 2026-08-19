@@ -122,6 +122,17 @@ pub enum ControlAction {
     SubsAdd { store_id: String },
     /// `control.unsubscribe` — remove a store subscription.
     SubsRemove { store_id: String },
+    /// `control.chiaPeers.add` — start TRUSTING a Chia full node.
+    ///
+    /// A different network from `control.peers.*`, which are DIG gossip peers, and a different
+    /// kind of act: this one grants authority. See [`ControlAction::ChiaPeersList`].
+    ChiaPeersAdd { ip: String },
+    /// `control.chiaPeers.list` — the tracked Chia full-node peers, with the `user_managed` flag
+    /// that says which of them are trusted without corroboration.
+    ChiaPeersList,
+    /// `control.chiaPeers.remove` — stop trusting a Chia full node (`ban` keeps it excluded so
+    /// discovery cannot re-add it).
+    ChiaPeersRemove { ip: String, ban: bool },
 }
 
 impl ControlAction {
@@ -163,6 +174,9 @@ impl ControlAction {
             ControlAction::SubsList => "control.listSubscriptions",
             ControlAction::SubsAdd { .. } => "control.subscribe",
             ControlAction::SubsRemove { .. } => "control.unsubscribe",
+            ControlAction::ChiaPeersAdd { .. } => "control.chiaPeers.add",
+            ControlAction::ChiaPeersList => "control.chiaPeers.list",
+            ControlAction::ChiaPeersRemove { .. } => "control.chiaPeers.remove",
         }
     }
 
@@ -250,6 +264,8 @@ impl ControlAction {
             ControlAction::SubsAdd { store_id } | ControlAction::SubsRemove { store_id } => {
                 json!({ "store_id": store_id })
             }
+            ControlAction::ChiaPeersAdd { ip } => json!({ "ip": ip }),
+            ControlAction::ChiaPeersRemove { ip, ban } => json!({ "ip": ip, "ban": ban }),
             _ => json!({}),
         }
     }
@@ -367,6 +383,15 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
             store_id: String::new(),
         }
         .method(),
+        // `dign chia-peers add|list|remove` drives the trusted-Chia-peer surface
+        // (dig_ecosystem#2870).
+        ControlAction::ChiaPeersAdd { ip: String::new() }.method(),
+        ControlAction::ChiaPeersList.method(),
+        ControlAction::ChiaPeersRemove {
+            ip: String::new(),
+            ban: false,
+        }
+        .method(),
         // `dig-node peers counts` reports both networks' peer counts (dig_ecosystem#2501); it
         // lives beside the other peer verbs rather than under `wallet`, because only one of the
         // two numbers it reports is the wallet's.
@@ -454,6 +479,29 @@ fn summarize(method: &str, result: &Value) -> String {
                 .unwrap_or_else(|| result["count"].as_u64().unwrap_or(0) as usize);
             format!("{count} subscription(s)")
         }
+        // The ADD line carries the cost, because this is the moment a person grants authority and
+        // it is the last moment they can decline. The node returns the sentence (`notice`) so the
+        // CLI quotes it rather than keeping a second copy that can drift; the fallback exists only
+        // for an older node that does not send one, and says the same thing in fewer words.
+        "control.chiaPeers.add" => format!(
+            "trusting Chia peer {}:{}
+{}",
+            result["ip"].as_str().unwrap_or("?"),
+            result["port"].as_u64().unwrap_or(0),
+            result["notice"].as_str().unwrap_or(
+                "This peer is now TRUSTED: its answers can update this node's wallet replica on                  their own, without being agreed by other peers."
+            ),
+        ),
+        "control.chiaPeers.list" => summarize_chia_peers(result),
+        "control.chiaPeers.remove" => format!(
+            "no longer trusting Chia peer {}{}",
+            result["ip"].as_str().unwrap_or("?"),
+            if result["banned"].as_bool().unwrap_or(false) {
+                " (banned — discovery cannot re-add it)"
+            } else {
+                ""
+            },
+        ),
         "control.subscribe" => format!(
             "subscribed to {}",
             result["store_id"].as_str().unwrap_or("?"),
@@ -555,6 +603,44 @@ fn summarize_updater_status(result: &Value) -> String {
             None => String::new(),
         },
     )
+}
+
+/// The `chia-peers list` human view: one line per peer, trusted ones marked.
+///
+/// The count of TRUSTED peers is stated separately from the total because those are the only ones
+/// that can move the replica on their own word — a bare total would hide the number that actually
+/// matters. An empty list says so in words rather than printing nothing, which reads as a failure.
+fn summarize_chia_peers(result: &Value) -> String {
+    let peers = match result["peers"].as_array() {
+        Some(peers) if !peers.is_empty() => peers,
+        _ => {
+            return "no Chia peers tracked yet — `dign chia-peers add <ip>` trusts one by hand"
+                .to_string()
+        }
+    };
+    let trusted = peers
+        .iter()
+        .filter(|p| p["user_managed"].as_bool().unwrap_or(false))
+        .count();
+    let mut out = format!(
+        "{} Chia peer(s) · {trusted} trusted (believed without corroboration)",
+        peers.len(),
+    );
+    for p in peers {
+        out.push_str(&format!(
+            "
+  {}:{} · peak {} · {}",
+            p["ip"].as_str().unwrap_or("?"),
+            p["port"].as_u64().unwrap_or(0),
+            p["peak_height"].as_u64().unwrap_or(0),
+            if p["user_managed"].as_bool().unwrap_or(false) {
+                "trusted (you added it)"
+            } else {
+                "discovered (must be corroborated)"
+            },
+        ));
+    }
+    out
 }
 
 /// "available" / "unavailable" for a boolean sync/availability flag.
@@ -680,6 +766,114 @@ mod tests {
             .wire_params(),
             json!({ "store_id": "s" })
         );
+    }
+
+    /// **Adding a trusted Chia peer TELLS the person what it costs, on the add line itself.**
+    ///
+    /// The cost is the whole point of the ticket: a `user_managed` peer reaches
+    /// `PeerTrust::Operator` and may move the wallet replica with no quorum at all. A summary that
+    /// only confirmed the address would be a surface hiding a cost it imposes.
+    ///
+    /// The fixture supplies the node's OWN `notice`, because that is the path a current node takes
+    /// and a test that only exercised the fallback would leave the quoting path unproven.
+    #[test]
+    fn adding_a_trusted_chia_peer_states_the_corroboration_bypass() {
+        let s = summarize(
+            "control.chiaPeers.add",
+            &json!({
+                "added": true,
+                "ip": "203.0.113.7",
+                "port": 8444,
+                "corroboration_bypassed": true,
+                "notice": "This peer is now TRUSTED: its answers can update this node's wallet                            replica on their own, without being agreed by other peers.",
+            }),
+        );
+        assert!(s.contains("203.0.113.7"), "the address must be echoed: {s}");
+        assert!(s.contains("8444"), "the port must be echoed: {s}");
+        assert!(s.contains("TRUSTED"), "the grant must be named: {s}");
+        assert!(
+            s.contains("without being agreed by other peers"),
+            "the corroboration bypass must be stated: {s}"
+        );
+    }
+
+    /// An OLDER node sends no `notice`. The fallback must still name the cost — otherwise the
+    /// warning silently disappears against exactly the nodes least likely to have it documented.
+    #[test]
+    fn the_add_line_still_warns_when_the_node_sends_no_notice() {
+        let s = summarize(
+            "control.chiaPeers.add",
+            &json!({ "added": true, "ip": "203.0.113.7", "port": 8444 }),
+        );
+        assert!(s.contains("TRUSTED"), "{s}");
+        assert!(s.contains("without being agreed by other peers"), "{s}");
+    }
+
+    /// **The list distinguishes the trusted peers from the discovered ones, and counts them.**
+    ///
+    /// The fixture carries ONE of each. A list of only-trusted peers would pass a test that merely
+    /// looked for the word "trusted" while a renderer that labelled everything trusted stayed
+    /// undetected — so the discovered peer is the control that makes the label load-bearing.
+    #[test]
+    fn the_chia_peer_list_separates_trusted_peers_from_discovered_ones() {
+        let s = summarize(
+            "control.chiaPeers.list",
+            &json!({ "peers": [
+                { "ip": "203.0.113.7", "port": 8444, "peak_height": 100, "user_managed": true },
+                { "ip": "198.51.100.4", "port": 8444, "peak_height": 99, "user_managed": false },
+            ] }),
+        );
+        assert!(s.contains("2 Chia peer(s)"), "{s}");
+        assert!(s.contains("1 trusted"), "the trusted COUNT is the one that matters: {s}");
+        assert!(s.contains("203.0.113.7"), "{s}");
+        assert!(s.contains("trusted (you added it)"), "{s}");
+        assert!(
+            s.contains("discovered (must be corroborated)"),
+            "a discovered peer must NOT read as trusted: {s}"
+        );
+    }
+
+    /// An empty list SAYS it is empty and names the verb that fills it. Printing nothing reads as
+    /// a broken command.
+    #[test]
+    fn an_empty_chia_peer_list_explains_itself() {
+        let s = summarize("control.chiaPeers.list", &json!({ "peers": [] }));
+        assert!(s.contains("no Chia peers tracked"), "{s}");
+        assert!(s.contains("chia-peers add"), "{s}");
+    }
+
+    /// Removal reports the ban distinctly, because forgetting and banning differ in whether
+    /// discovery can bring the peer back.
+    #[test]
+    fn removing_a_trusted_chia_peer_distinguishes_forgetting_from_banning() {
+        let forgotten = summarize(
+            "control.chiaPeers.remove",
+            &json!({ "removed": true, "ip": "203.0.113.7", "banned": false }),
+        );
+        assert!(forgotten.contains("no longer trusting"), "{forgotten}");
+        assert!(!forgotten.contains("banned"), "{forgotten}");
+
+        let banned = summarize(
+            "control.chiaPeers.remove",
+            &json!({ "removed": true, "ip": "203.0.113.7", "banned": true }),
+        );
+        assert!(banned.contains("banned"), "{banned}");
+        assert!(banned.contains("discovery cannot re-add it"), "{banned}");
+    }
+
+    /// The three verbs send the params the node requires. Without these arms the `_`
+    /// fall-through sends `{}` and every command is refused for a missing `params.ip`.
+    #[test]
+    fn the_chia_peer_verbs_carry_their_params() {
+        assert_eq!(
+            ControlAction::ChiaPeersAdd { ip: "203.0.113.7".into() }.wire_params(),
+            json!({ "ip": "203.0.113.7" })
+        );
+        assert_eq!(
+            ControlAction::ChiaPeersRemove { ip: "203.0.113.7".into(), ban: true }.wire_params(),
+            json!({ "ip": "203.0.113.7", "ban": true })
+        );
+        assert_eq!(ControlAction::ChiaPeersList.wire_params(), json!({}));
     }
 
     #[test]

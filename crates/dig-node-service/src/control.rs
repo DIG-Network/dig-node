@@ -204,6 +204,9 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.pairing.revoke",
     "control.peers.ping",
     "control.peerCounts",
+    "control.chiaPeers.add",
+    "control.chiaPeers.list",
+    "control.chiaPeers.remove",
     // Delegated to the embedded node's own control surface.
     "control.peerStatus",
     "control.peers.connect",
@@ -256,6 +259,9 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.pairing.revoke",
     "control.peers.ping",
     "control.peerCounts",
+    "control.chiaPeers.add",
+    "control.chiaPeers.list",
+    "control.chiaPeers.remove",
 ];
 
 /// The control methods [`dispatch_control`] DELEGATES to the embedded node's own control surface
@@ -845,6 +851,11 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         // The connection-ladder diagnostic (dig_ecosystem#1985) — shell-owned so it needs no
         // `dig-rpc-protocol` release; see `crate::peer_ping` for why.
         "control.peers.ping" => crate::peer_ping::ping(ctx, id, params).await,
+        // The trusted-CHIA-peer surface (dig_ecosystem#2870) — a different network from
+        // `control.peers.*` above, and a THIN dispatch to the wallet backend's one peer writer.
+        "control.chiaPeers.add" => chia_peers_add(ctx, id, params).await,
+        "control.chiaPeers.list" => chia_peers_list(ctx, id).await,
+        "control.chiaPeers.remove" => chia_peers_remove(ctx, id, params).await,
         // Unreachable: `dispatch_control` only routes here for `OWNED_CONTROL_METHODS` members.
         // Reaching this arm means the routing const and these arms have drifted.
         _ => unreachable!(
@@ -1992,6 +2003,115 @@ async fn wallet_sync_status(ctx: &ControlCtx, id: Value) -> Value {
 /// `null` means UNOBSERVABLE, never zero: a count nobody could take is not a count of none.
 /// `chia_peer_count` is taken from the SAME accessor `control.wallet.syncStatus` uses, so the two
 /// methods cannot disagree.
+// ---------------------------------------------------------------------------
+// Trusted CHIA full-node peers (dig_ecosystem#2870)
+// ---------------------------------------------------------------------------
+
+/// What a trusted Chia peer costs, in one sentence, on the wire.
+///
+/// A `user_managed` peer row is the ONLY way to reach
+/// [`dig_wallet::sage::sync::PeerTrust::Operator`], which is authoritative for money WITHOUT a
+/// quorum: it may drive catch-up, rollback and the `initial_sync_complete` flag on its own word.
+/// Every other peer is `Discovered` and must be agreed with by independently chosen peers first.
+///
+/// Stated here, once, and returned by `control.chiaPeers.add` so that a client renders the cost
+/// from the node's own answer instead of restating it locally and drifting away from it.
+const CORROBORATION_BYPASS_NOTICE: &str = "This peer is now TRUSTED: its answers can update this      node's wallet replica on their own, without being agreed by other peers. A wrong or hostile      trusted peer can give this node a false view of the chain. Trust only a node you run or      otherwise vouch for yourself.";
+
+/// `control.chiaPeers.add` — start trusting a Chia full node.
+///
+/// A THIN dispatch to [`dig_wallet::sage::rpc::WalletBackend::add_peer`], the one writer of the
+/// `peers` table. Nothing here decides what a peer is, and nothing here writes a second list.
+async fn chia_peers_add(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let Some(ip) = trimmed_ip(params) else {
+        return missing_ip(id, "control.chiaPeers.add");
+    };
+    match ctx
+        .wallet
+        .add_peer(&dig_wallet::sage::types::AddPeer { ip: ip.clone() })
+        .await
+    {
+        Ok(_) => control_ok(
+            id,
+            json!({
+                "added": true,
+                "ip": ip,
+                "port": dig_wallet::sage::network::DEFAULT_PEER_PORT,
+                "corroboration_bypassed": true,
+                "notice": CORROBORATION_BYPASS_NOTICE,
+            }),
+        ),
+        Err(e) => control_error(id, ErrorCode::ControlError, format!("add_peer failed: {e}")),
+    }
+}
+
+/// `control.chiaPeers.list` — the tracked Chia peers, trusted and discovered alike.
+///
+/// `user_managed` is the field that tells them apart, and it is reported rather than filtered:
+/// a list that showed only the trusted set would let a person conclude their node talks to
+/// nobody else, which is the opposite of true.
+async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
+    match ctx.wallet.get_peers().await {
+        Ok(resp) => {
+            let peers: Vec<Value> = resp
+                .peers
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "ip": p.ip_addr,
+                        "port": p.port,
+                        "peak_height": p.peak_height,
+                        "user_managed": p.user_managed,
+                    })
+                })
+                .collect();
+            control_ok(id, json!({ "peers": peers }))
+        }
+        Err(e) => control_error(id, ErrorCode::ControlError, format!("get_peers failed: {e}")),
+    }
+}
+
+/// `control.chiaPeers.remove` — stop trusting a Chia full node, optionally banning it.
+async fn chia_peers_remove(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let Some(ip) = trimmed_ip(params) else {
+        return missing_ip(id, "control.chiaPeers.remove");
+    };
+    let ban = params.get("ban").and_then(Value::as_bool).unwrap_or(false);
+    match ctx
+        .wallet
+        .remove_peer(&dig_wallet::sage::types::RemovePeer {
+            ip: ip.clone(),
+            ban,
+        })
+        .await
+    {
+        Ok(_) => control_ok(id, json!({ "removed": true, "ip": ip, "banned": ban })),
+        Err(e) => control_error(
+            id,
+            ErrorCode::ControlError,
+            format!("remove_peer failed: {e}"),
+        ),
+    }
+}
+
+/// `params.ip`, trimmed, or `None` when absent or blank.
+///
+/// Blank is rejected rather than forwarded: an empty string is a perfectly storable row, so a
+/// tolerant parser here would silently create a trusted peer nobody can dial or delete.
+fn trimmed_ip(params: &Value) -> Option<String> {
+    let ip = params.get("ip")?.as_str()?.trim();
+    (!ip.is_empty()).then(|| ip.to_string())
+}
+
+/// The refusal for a missing or blank `params.ip`.
+fn missing_ip(id: Value, method: &str) -> Value {
+    control_error(
+        id,
+        ErrorCode::InvalidParams,
+        format!("{method} requires params.ip (the peer's IP address)"),
+    )
+}
+
 async fn peer_counts(ctx: &ControlCtx, id: Value) -> Value {
     let chia_peer_count = ctx
         .wallet

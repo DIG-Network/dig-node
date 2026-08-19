@@ -173,6 +173,15 @@ enum Command {
         #[command(subcommand)]
         action: Option<PeersCommand>,
     },
+    /// Add, list and remove a TRUSTED Chia full-node peer (dig_ecosystem#2870).
+    ///
+    /// A different network from `peers`, which manages DIG gossip peers. Trusting a Chia peer
+    /// grants it authority over this node's wallet replica without corroboration — see
+    /// `chia-peers add --help`.
+    ChiaPeers {
+        #[command(subcommand)]
+        action: Option<ChiaPeersCommand>,
+    },
     /// Internal: idempotently register the `dig.local` → `127.0.0.2` OS hosts entry (#91/#503),
     /// so `http://dig.local` resolves to the node. Invoked by the native install packages;
     /// requires write access to the hosts file (run elevated). Not meant to be run by hand.
@@ -448,6 +457,33 @@ enum PeersCommand {
     },
 }
 
+/// `dig-node chia-peers` sub-actions (dig_ecosystem#2870). With none, lists the tracked peers.
+#[derive(Subcommand)]
+enum ChiaPeersCommand {
+    /// List the tracked Chia full-node peers, marking which are trusted.
+    List,
+    /// TRUST a Chia full node by IP.
+    ///
+    /// This node normally believes a chain answer only once several independently-chosen peers
+    /// agree on it. A peer added here is exempt: its answers alone can advance, roll back, or
+    /// complete this node's wallet replica, so a wrong or hostile one can give this node a false
+    /// view of the chain — and of your money. Trust only a node you run or otherwise vouch for.
+    ///
+    /// Undo with `chia-peers remove <ip>`.
+    Add {
+        /// The peer's IP address (the standard full-node port is assumed).
+        ip: String,
+    },
+    /// Stop trusting a Chia full node, restoring corroboration for it.
+    Remove {
+        /// The peer's IP address.
+        ip: String,
+        /// Ban rather than forget: keep the peer excluded so discovery cannot re-add it.
+        #[arg(long)]
+        ban: bool,
+    },
+}
+
 /// `dig-node pair` sub-actions. With none, lists pending requests + issued tokens.
 #[derive(Subcommand)]
 enum PairCommand {
@@ -487,6 +523,7 @@ impl Command {
             Command::Updater { .. } => "updater",
             Command::Subscriptions { .. } => "subscriptions",
             Command::Peers { .. } => "peers",
+            Command::ChiaPeers { .. } => "chia-peers",
             Command::EnsureHosts => "ensure-hosts",
         }
     }
@@ -609,6 +646,11 @@ pub fn run() -> std::process::ExitCode {
             Ok(a) => render(peers::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
         },
+        Command::ChiaPeers { action: cmd } => render(
+            control_cli::run(&config, chia_peers_action(cmd)),
+            action,
+            json,
+        ),
         Command::EnsureHosts => render(crate::hosts::run(), action, json),
     };
     std::process::ExitCode::from(exit.code())
@@ -718,6 +760,19 @@ fn subscriptions_action(cmd: Option<SubscriptionsCommand>) -> ControlAction {
         None | Some(SubscriptionsCommand::List) => ControlAction::SubsList,
         Some(SubscriptionsCommand::Add { store_id }) => ControlAction::SubsAdd { store_id },
         Some(SubscriptionsCommand::Remove { store_id }) => ControlAction::SubsRemove { store_id },
+    }
+}
+
+/// Map the `chia-peers` subcommand to its [`ControlAction`] (no sub-action → list the peers).
+///
+/// Listing is the default because it is the only harmless one of the three: defaulting to `add`
+/// would make a bare `dign chia-peers` grant trust, and a default must never be the act that
+/// costs something.
+fn chia_peers_action(cmd: Option<ChiaPeersCommand>) -> ControlAction {
+    match cmd {
+        None | Some(ChiaPeersCommand::List) => ControlAction::ChiaPeersList,
+        Some(ChiaPeersCommand::Add { ip }) => ControlAction::ChiaPeersAdd { ip },
+        Some(ChiaPeersCommand::Remove { ip, ban }) => ControlAction::ChiaPeersRemove { ip, ban },
     }
 }
 
