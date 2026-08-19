@@ -488,14 +488,21 @@ fn summarize(method: &str, result: &Value) -> String {
         // trust, and a fixed "trusting ..." line would assert a bypass nothing conferred.
         "control.chiaPeers.add" => format!(
             "{} Chia peer {}\n{}",
-            if result["corroboration_bypassed"].as_bool().unwrap_or(false) {
+            // ABSENT means trust WAS granted: a node too old to send the field is one that always
+            // granted it, so defaulting to `false` would report a peer as untrusted while the node
+            // believes it without corroboration. Only an explicit `false` -- the un-banned-without-
+            // trust case a 0.18 node reports -- says the bypass was withheld.
+            if result["corroboration_bypassed"].as_bool().unwrap_or(true) {
                 "trusting"
             } else {
                 "un-banned (NOT trusted)"
             },
             endpoint(&result["ip"], &result["port"]),
+            // An older node sends no `notice`. The fallback must still name the cost, or the
+            // warning disappears against exactly the nodes least likely to have it documented.
             result["notice"].as_str().unwrap_or(
-                "This peer's trust state changed; re-run `dign chia-peers list` to see it."
+                "This peer is now TRUSTED: its answers can update this node's wallet replica on \
+                 their own, without being agreed by other peers. Add only a node you run yourself."
             ),
         ),
         "control.chiaPeers.list" => summarize_chia_peers(result),
@@ -858,6 +865,124 @@ mod tests {
         );
         assert!(s.contains("TRUSTED"), "{s}");
         assert!(s.contains("without being agreed by other peers"), "{s}");
+    }
+
+    /// **The add line follows the RESULTING trust state, and quotes the node's own words (#254).**
+    ///
+    /// The fixture varies ONE field — `corroboration_bypassed` — across two otherwise-identical
+    /// results, and the un-banned case is the real one: an upsert clears the ban and leaves the
+    /// trusted flag alone, so the peer ends up UNTRUSTED while the call succeeds. A renderer with a
+    /// fixed "trusting ..." headline passes the granted case and fails here, which is the point;
+    /// asserting only the granted case would pin a coincidence.
+    #[test]
+    fn the_add_line_does_not_claim_a_bypass_the_node_withheld() {
+        let granted = summarize(
+            "control.chiaPeers.add",
+            &json!({ "added": true, "ip": "203.0.113.7", "port": 8444,
+                     "corroboration_bypassed": true, "notice": "NOTICE-GRANTED" }),
+        );
+        assert!(granted.contains("trusting"), "{granted}");
+        assert!(
+            granted.contains("NOTICE-GRANTED"),
+            "the node's own sentence must be quoted verbatim: {granted}"
+        );
+
+        let withheld = summarize(
+            "control.chiaPeers.add",
+            &json!({ "added": true, "ip": "203.0.113.7", "port": 8444,
+                     "corroboration_bypassed": false, "notice": "NOTICE-WITHHELD" }),
+        );
+        assert!(
+            withheld.contains("NOT trusted"),
+            "an un-banned-without-trust result must not read as a grant: {withheld}"
+        );
+        assert!(withheld.contains("NOTICE-WITHHELD"), "{withheld}");
+        assert!(
+            !withheld.contains("NOTICE-GRANTED"),
+            "the two cases must be distinguishable: {withheld}"
+        );
+    }
+
+    /// An ABSENT `corroboration_bypassed` means the bypass WAS granted, not that it was withheld.
+    ///
+    /// Only a node too old to send the field omits it, and such a node always granted trust.
+    /// Defaulting to `false` would report a peer as untrusted while the node believes it without
+    /// corroboration — understating authority the operator actually conferred.
+    #[test]
+    fn an_absent_bypass_flag_reads_as_granted_not_withheld() {
+        let s = summarize(
+            "control.chiaPeers.add",
+            &json!({ "added": true, "ip": "203.0.113.7", "port": 8444 }),
+        );
+        assert!(s.contains("trusting"), "{s}");
+        assert!(!s.contains("NOT trusted"), "{s}");
+    }
+
+    /// **The remove line reports a miss as having removed NOTHING (#254 item 2).**
+    ///
+    /// Both outcomes in one test, because the property is relational: a renderer that printed the
+    /// success line unconditionally passes the `removed` case and fails here. `remove` is the only
+    /// way to un-trust a peer believed without corroboration, so a miss rendered as success leaves
+    /// an operator believing they revoked custody-grade trust they still grant.
+    #[test]
+    fn the_remove_line_reports_a_miss_as_a_failure_to_act() {
+        let hit = summarize(
+            "control.chiaPeers.remove",
+            &json!({ "outcome": "removed", "ip": "203.0.113.7", "banned": false }),
+        );
+        assert!(hit.contains("no longer trusting"), "{hit}");
+
+        let miss = summarize(
+            "control.chiaPeers.remove",
+            &json!({ "outcome": "no_such_peer", "ip": "198.51.100.4", "banned": false }),
+        );
+        assert!(
+            miss.contains("NOTHING removed") && miss.contains("still"),
+            "a miss must say nothing was un-trusted: {miss}"
+        );
+        assert!(
+            !miss.contains("no longer trusting"),
+            "a miss must NOT read as a successful un-trust: {miss}"
+        );
+    }
+
+    /// **A banned peer is listed and labelled, and an unpolled peak reads as unobserved (#254).**
+    #[test]
+    fn the_chia_peer_list_shows_banned_rows_and_never_prints_a_fabricated_peak() {
+        let s = summarize(
+            "control.chiaPeers.list",
+            &json!({ "peers": [
+                { "ip": "203.0.113.7", "port": 8444, "peak_height": null,
+                  "user_managed": true, "banned": false },
+                { "ip": "198.51.100.4", "port": 8444, "peak_height": null,
+                  "user_managed": false, "banned": true },
+            ] }),
+        );
+        assert!(s.contains("1 banned"), "the ban count must be stated: {s}");
+        assert!(s.contains("BANNED"), "the banned row must be labelled: {s}");
+        assert!(
+            s.contains("unobserved"),
+            "an unpolled peak must not print as a height: {s}"
+        );
+        assert!(
+            !s.contains("peak 0"),
+            "printing 0 would read as a trusted peer stalled at genesis: {s}"
+        );
+    }
+
+    /// An IPv6 endpoint is BRACKETED, because `::1` + `8444` pasted together is a DIFFERENT
+    /// valid address rather than a malformed string a parser would reject (#254 item 8).
+    #[test]
+    fn an_ipv6_peer_endpoint_is_bracketed_not_concatenated() {
+        let s = summarize(
+            "control.chiaPeers.list",
+            &json!({ "peers": [
+                { "ip": "::1", "port": 8444, "peak_height": null,
+                  "user_managed": true, "banned": false },
+            ] }),
+        );
+        assert!(s.contains("[::1]:8444"), "{s}");
+        assert!(!s.contains("::1:8444\n") && !s.ends_with("::1:8444"), "{s}");
     }
 
     /// **The list distinguishes the trusted peers from the discovered ones, and counts them.**
