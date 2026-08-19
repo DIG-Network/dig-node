@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.126.2] - 2026-08-19
+
+### Bug Fixes
+- **wallet:** Stop reporting confident answers the replica has not earned (#246)
+
 ## [0.126.1] - 2026-08-19
 
 ### CI
