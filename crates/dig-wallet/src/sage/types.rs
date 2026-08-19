@@ -414,10 +414,17 @@ pub struct PeerRecord {
     pub ip_addr: String,
     /// The peer port.
     pub port: u16,
-    /// The peer's reported peak height.
-    pub peak_height: u32,
-    /// Whether the peer was added manually by the user.
+    /// The peak height this peer last reported, or `None` where this node has NO telemetry for it.
+    ///
+    /// `None` means UNOBSERVED, never zero. A reported height is that peer's CLAIM, never a fact
+    /// this node verified, and it must never be aggregated into a chain position — a maximum over
+    /// claimed peaks is whatever the most dishonest peer says (NC-12).
+    pub peak_height: Option<u32>,
+    /// Whether the peer was added manually by the user — exactly the set trusted WITHOUT
+    /// corroboration. Discovered peers are `false` and stay subject to agreement.
     pub user_managed: bool,
+    /// Whether this peer is BANNED: kept so discovery cannot re-add it, and excluded from dialling.
+    pub banned: bool,
 }
 
 // =============================================================================

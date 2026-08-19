@@ -15,6 +15,7 @@
 
 use std::str::FromStr;
 
+use dig_node_control_interface::params::MAX_BANNED_CHIA_PEERS;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
@@ -421,7 +422,8 @@ CREATE TABLE IF NOT EXISTS peers (
     port INTEGER NOT NULL,
     peak_height INTEGER NOT NULL DEFAULT 0,
     user_managed INTEGER NOT NULL DEFAULT 0,
-    banned INTEGER NOT NULL DEFAULT 0
+    banned INTEGER NOT NULL DEFAULT 0,
+    banned_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS network_settings (
@@ -486,6 +488,11 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     // round trip while keeping the wrong rows costs the budget.
     "ALTER TABLE chain_read_cache ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE chain_spend_cache ADD COLUMN last_used_at INTEGER NOT NULL DEFAULT 0",
+    // When a ban was recorded, so the bounded ban list (dig-node-control-interface's
+    // `MAX_BANNED_CHIA_PEERS`) can evict its OLDEST entry rather than refuse the newest. NULL on
+    // rows banned before this column existed, which sorts them first and so evicts them first --
+    // the right order, since they are by definition the oldest bans on the machine.
+    "ALTER TABLE peers ADD COLUMN banned_at INTEGER",
 ];
 
 /// Indexes that depend on a column [`ADD_COLUMN_MIGRATIONS`] may only just have added, so they
@@ -2353,12 +2360,36 @@ impl WalletDb {
 
     // ---- peers (#205 PR4, `sage::network`) ---------------------------------
 
-    /// Every non-banned tracked peer (`get_peers`). `peak_height` is 0 until live per-peer
-    /// telemetry is wired (SPEC §18.16) — never fabricated.
-    pub async fn all_peers(&self) -> sqlx::Result<Vec<PeerRow>> {
+    /// Every tracked peer that is NOT banned — the set this node may actually talk to.
+    ///
+    /// This is the DIALLING read: the sync supervisor walks it to choose a full node. A banned
+    /// peer must never appear here, and the exclusion has to happen in the query rather than at a
+    /// caller, because a ban applied to a peer that was previously `user_managed` leaves that flag
+    /// set — so a filter on `user_managed` alone would dial the very peer an operator banned.
+    ///
+    /// `peak_height` is 0 until live per-peer telemetry is wired (SPEC §18.16) — never fabricated.
+    /// See [`super::network::get_peers`] for why that 0 is reported as "unobserved".
+    pub async fn unbanned_peers(&self) -> sqlx::Result<Vec<PeerRow>> {
         let rows = sqlx::query(
             "SELECT ip_addr, port, peak_height, user_managed, banned FROM peers
              WHERE banned = 0 ORDER BY ip_addr",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(Self::peer_from_row).collect())
+    }
+
+    /// Every tracked peer INCLUDING the banned ones — the control-plane enumeration.
+    ///
+    /// Separate from [`Self::unbanned_peers`] on purpose, and the separation is the point:
+    /// `control.chiaPeers.list` MUST show banned entries because it is the only way to enumerate
+    /// them, and a blocklist a person cannot read is a blocklist they cannot correct. Serving that
+    /// requirement by relaxing [`Self::unbanned_peers`] would have fed banned peers straight to
+    /// the dialler, so the two reads stay distinct and only the control plane calls this one.
+    pub async fn all_peers_including_banned(&self) -> sqlx::Result<Vec<PeerRow>> {
+        let rows = sqlx::query(
+            "SELECT ip_addr, port, peak_height, user_managed, banned FROM peers
+             ORDER BY ip_addr",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -2376,38 +2407,102 @@ impl WalletDb {
     }
 
     /// Add (or un-ban + refresh the port of) a user-managed peer (`add_peer`).
-    pub async fn add_peer(&self, ip_addr: &str, port: i64) -> sqlx::Result<()> {
+    ///
+    /// Returns whether the entry ENDED UP trusted — read back from the row, not assumed from the
+    /// request. The two differ in a case that really occurs: the upsert clears `banned` and
+    /// refreshes the port but deliberately leaves `user_managed` alone, so adding a peer that was
+    /// previously BANNED un-bans it WITHOUT granting the corroboration bypass. `add` is not
+    /// allowed to launder a ban into trust — un-banning is `remove { ban: false }`, which grants
+    /// nothing — and the caller must be told the trust it asked for was not conferred, because
+    /// otherwise an operator believes they configured a trusted node and is silently still
+    /// depending on corroboration they were told they had bypassed.
+    pub async fn add_peer(&self, ip_addr: &str, port: i64) -> sqlx::Result<bool> {
         sqlx::query(
-            "INSERT INTO peers (ip_addr, port, peak_height, user_managed, banned)
-             VALUES (?, ?, 0, 1, 0)
-             ON CONFLICT(ip_addr) DO UPDATE SET port = excluded.port, banned = 0",
+            "INSERT INTO peers (ip_addr, port, peak_height, user_managed, banned, banned_at)
+             VALUES (?, ?, 0, 1, 0, NULL)
+             ON CONFLICT(ip_addr) DO UPDATE SET
+                 port = excluded.port, banned = 0, banned_at = NULL",
         )
         .bind(ip_addr)
         .bind(port)
         .execute(&self.pool)
         .await?;
-        Ok(())
+
+        let trusted: i64 = sqlx::query_scalar("SELECT user_managed FROM peers WHERE ip_addr = ?")
+            .bind(ip_addr)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(0);
+        Ok(trusted != 0)
     }
 
     /// Remove a peer (`remove_peer { ban: false }`, deletes the row) or ban it
-    /// (`remove_peer { ban: true }`, kept but excluded from [`Self::all_peers`]).
-    pub async fn remove_peer(&self, ip_addr: &str, ban: bool) -> sqlx::Result<()> {
+    /// (`remove_peer { ban: true }`, kept but excluded from [`Self::unbanned_peers`]).
+    ///
+    /// Returns whether an entry MATCHED the address. `remove` is the only way to un-trust a peer
+    /// that is believed without corroboration, so a remedy that cannot report its own failure is
+    /// worse than no remedy — an operator who is told "removed" when nothing matched believes
+    /// they revoked custody-grade trust and did not. The usual cause is an address spelled
+    /// differently from the stored one, which is why callers canonicalise first.
+    ///
+    /// Banning is still permitted for an address this node does not hold (a pre-emptive ban is a
+    /// legitimate operator act), and the return value stays honest about it: nothing matched, so
+    /// nothing was un-trusted, even though a ban row now exists.
+    pub async fn remove_peer(&self, ip_addr: &str, ban: bool) -> sqlx::Result<bool> {
+        let existed: Option<i64> = sqlx::query_scalar("SELECT 1 FROM peers WHERE ip_addr = ?")
+            .bind(ip_addr)
+            .fetch_optional(&self.pool)
+            .await?;
+
         if ban {
             sqlx::query(
-                "INSERT INTO peers (ip_addr, port, peak_height, user_managed, banned)
-                 VALUES (?, 0, 0, 0, 1)
-                 ON CONFLICT(ip_addr) DO UPDATE SET banned = 1",
+                "INSERT INTO peers (ip_addr, port, peak_height, user_managed, banned, banned_at)
+                 VALUES (?, 0, 0, 0, 1, ?)
+                 ON CONFLICT(ip_addr) DO UPDATE SET
+                     banned = 1, user_managed = 0, banned_at = excluded.banned_at",
             )
             .bind(ip_addr)
+            .bind(Self::now_millis())
             .execute(&self.pool)
             .await?;
+            self.evict_oldest_bans_beyond_cap().await?;
         } else {
             sqlx::query("DELETE FROM peers WHERE ip_addr = ?")
                 .bind(ip_addr)
                 .execute(&self.pool)
                 .await?;
         }
+        Ok(existed.is_some())
+    }
+
+    /// Hold the ban list to [`MAX_BANNED_CHIA_PEERS`], discarding the OLDEST bans first.
+    ///
+    /// A ban is a row written at the request of one small control call and kept across restarts,
+    /// so without a ceiling the blocklist is at-rest state a caller can grow for free. The
+    /// direction matters as much as the bound: a full list that REFUSED the newest ban would turn
+    /// the ceiling into a denial of the ban facility itself, exactly when an operator is trying to
+    /// exclude a peer that is misbehaving now. Forgetting the oldest is recoverable; refusing the
+    /// newest is not.
+    async fn evict_oldest_bans_beyond_cap(&self) -> sqlx::Result<()> {
+        sqlx::query(
+            "DELETE FROM peers WHERE ip_addr IN (
+                 SELECT ip_addr FROM peers WHERE banned = 1
+                 ORDER BY banned_at IS NOT NULL, banned_at, ip_addr
+                 LIMIT MAX(0, (SELECT COUNT(*) FROM peers WHERE banned = 1) - ?)
+             )",
+        )
+        .bind(i64::try_from(MAX_BANNED_CHIA_PEERS).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?;
         Ok(())
+    }
+
+    /// Wall-clock milliseconds, used only to ORDER bans against each other for eviction.
+    fn now_millis() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
     }
 
     // ---- network / sync settings (#205 PR4, `sage::network`) ---------------

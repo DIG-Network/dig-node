@@ -1819,7 +1819,7 @@ impl SyncSessionFactory for ChiaPeerSessionFactory {
         // The user's own peers come first, in order. That is what the `peers` table is FOR;
         // an operator who pointed the wallet at their own full node must not be quietly
         // routed onto a stranger's.
-        let user_peers = self.db.all_peers().await.unwrap_or_default();
+        let user_peers = self.db.unbanned_peers().await.unwrap_or_default();
         for row in user_peers.iter().filter(|p| p.user_managed) {
             let Ok(ip) = row.ip_addr.parse::<std::net::IpAddr>() else {
                 continue;

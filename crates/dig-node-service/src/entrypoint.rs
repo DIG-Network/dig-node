@@ -471,7 +471,7 @@ enum ChiaPeersCommand {
     /// This node normally believes a chain answer only once several independently-chosen peers
     /// agree on it. A peer added here is exempt: its answers alone can advance, roll back, or
     /// complete this node's wallet replica, so a wrong or hostile one can give this node a false
-    /// view of the chain — and of your money. Trust only a node you run or otherwise vouch for.
+    /// view of the chain — and of your money. Add only a node you run yourself.
     ///
     /// Undo with `chia-peers remove <ip>`.
     Add {

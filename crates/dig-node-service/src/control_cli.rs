@@ -483,14 +483,30 @@ fn summarize(method: &str, result: &Value) -> String {
         // it is the last moment they can decline. The node returns the sentence (`notice`) so the
         // CLI quotes it rather than keeping a second copy that can drift; the fallback exists only
         // for an older node that does not send one, and says the same thing in fewer words.
+        // The headline follows the RESULTING trust state, and the node's own `notice` is quoted
+        // verbatim rather than paraphrased: adding a banned peer un-bans it WITHOUT granting
+        // trust, and a fixed "trusting ..." line would assert a bypass nothing conferred.
         "control.chiaPeers.add" => format!(
-            "trusting Chia peer {}\n{}",
+            "{} Chia peer {}\n{}",
+            if result["corroboration_bypassed"].as_bool().unwrap_or(false) {
+                "trusting"
+            } else {
+                "un-banned (NOT trusted)"
+            },
             endpoint(&result["ip"], &result["port"]),
             result["notice"].as_str().unwrap_or(
-                "This peer is now TRUSTED: its answers can update this node's wallet replica on their own, without being agreed by other peers."
+                "This peer's trust state changed; re-run `dign chia-peers list` to see it."
             ),
         ),
         "control.chiaPeers.list" => summarize_chia_peers(result),
+        // MATCHED on the outcome, never on a boolean: "no_such_peer" means the peer the operator
+        // meant to un-trust is STILL trusted, and reporting that as success is the failure the
+        // enum exists to prevent.
+        "control.chiaPeers.remove" if result["outcome"] == "no_such_peer" => format!(
+            "NOTHING removed — no Chia peer matches {}. Any peer you meant to un-trust is still \
+             trusted; check `dign chia-peers list` for how the address is stored.",
+            result["ip"].as_str().unwrap_or("?"),
+        ),
         "control.chiaPeers.remove" => format!(
             "no longer trusting Chia peer {}{}",
             result["ip"].as_str().unwrap_or("?"),
@@ -620,16 +636,28 @@ fn summarize_chia_peers(result: &Value) -> String {
         .iter()
         .filter(|p| p["user_managed"].as_bool().unwrap_or(false))
         .count();
+    let banned = peers
+        .iter()
+        .filter(|p| p["banned"].as_bool().unwrap_or(false))
+        .count();
     let mut out = format!(
-        "{} Chia peer(s) · {trusted} trusted (believed without corroboration)",
+        "{} Chia peer(s) · {trusted} trusted (believed without corroboration) · {banned} banned",
         peers.len(),
     );
     for p in peers {
         out.push_str(&format!(
             "\n  {} · peak {} · {}",
             endpoint(&p["ip"], &p["port"]),
-            p["peak_height"].as_u64().unwrap_or(0),
-            if p["user_managed"].as_bool().unwrap_or(false) {
+            // A peer nobody has polled reads as "unobserved", never as height 0. Printing 0 would
+            // show every such peer stalled at genesis, and this line is the operator's only signal
+            // that a peer they trust WITHOUT corroboration has gone stale.
+            match p["peak_height"].as_u64() {
+                Some(h) => h.to_string(),
+                None => "unobserved".to_string(),
+            },
+            if p["banned"].as_bool().unwrap_or(false) {
+                "BANNED (excluded; `remove --no-ban` clears it, granting no trust)"
+            } else if p["user_managed"].as_bool().unwrap_or(false) {
                 "trusted (you added it)"
             } else {
                 "discovered (must be corroborated)"
@@ -639,14 +667,16 @@ fn summarize_chia_peers(result: &Value) -> String {
     out
 }
 
-/// A peer endpoint for a human line, built through [`std::net::SocketAddr`] rather than by pasting
-/// a colon between two fields.
+/// A peer endpoint for a human line, joined by the CONTRACT's
+/// [`dig_node_control_interface::params::chia_peer_endpoint`] rather than by pasting a colon
+/// between two fields.
 ///
 /// Concatenating is wrong for every IPv6 literal: `::1` and `8444` pasted together read as
 /// `::1:8444`, which is itself a valid IPv6 address naming a DIFFERENT host — so the line would not
-/// merely look odd, it would identify the wrong peer. DIG is IPv6-first (§5.2), so this is the
-/// common case rather than an edge one. `SocketAddr`'s own `Display` brackets v6 and leaves v4
-/// alone, which is exactly the rule, so it is borrowed rather than reimplemented.
+/// merely look odd, it would identify the wrong peer, and the mistake survives validation because
+/// the result is well-formed. DIG is IPv6-first (§5.2), so this is the common case rather than an
+/// edge one. The join is the contract's single sanctioned one, not a local reimplementation of the
+/// same rule, so the two cannot drift.
 ///
 /// An address the node sent that does not parse is shown VERBATIM with the port named in words,
 /// never re-punctuated into something that looks canonical: a CLI that tidied an unparseable
@@ -654,9 +684,10 @@ fn summarize_chia_peers(result: &Value) -> String {
 fn endpoint(ip: &Value, port: &Value) -> String {
     let text = ip.as_str().unwrap_or("?");
     let port = u16::try_from(port.as_u64().unwrap_or(0)).unwrap_or(0);
-    match text.parse::<std::net::IpAddr>() {
-        Ok(addr) => std::net::SocketAddr::new(addr, port).to_string(),
-        Err(_) => format!("{text} (port {port})"),
+    if text.parse::<std::net::IpAddr>().is_ok() {
+        dig_node_control_interface::params::chia_peer_endpoint(text, port)
+    } else {
+        format!("{text} (port {port})")
     }
 }
 

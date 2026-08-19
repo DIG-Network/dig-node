@@ -3786,16 +3786,36 @@ impl WalletBackend {
     }
 
     /// The ONE writer of the trusted-peer set, and the only way to reach
-    /// [`crate::sage::sync::PeerTrust::Operator`]. Public so `control.chiaPeers.add` dispatches
-    /// here rather than growing a second implementation of the same behaviour.
+    /// [`crate::sage::sync::PeerTrust::Operator`].
+    ///
+    /// Returns whether the peer ended up TRUSTED, which is not the same as whether the call
+    /// succeeded: adding a peer that was BANNED un-bans it without conferring the corroboration
+    /// bypass. `control.chiaPeers.add` reports that distinction, so it dispatches here rather than
+    /// through the Sage-parity wrapper below, which can only say "it worked".
+    pub async fn add_peer_reporting_trust(&self, req: &AddPeer) -> Result<bool> {
+        network::add_peer(&self.db, &req.ip).await
+    }
+
+    /// The ONE remover of the trusted-peer set — see [`WalletBackend::add_peer_reporting_trust`].
+    ///
+    /// Returns whether an entry MATCHED the address. This is the only way to un-trust a peer that
+    /// is believed without corroboration, so the caller must be able to distinguish "it is gone"
+    /// from "nothing was there and your peer is still trusted".
+    pub async fn remove_peer_reporting_match(&self, req: &RemovePeer) -> Result<bool> {
+        network::remove_peer(&self.db, &req.ip, req.ban).await
+    }
+
+    /// `add_peer` in the Sage-parity shape, which carries no detail. Prefer
+    /// [`WalletBackend::add_peer_reporting_trust`] anywhere the resulting trust state matters.
     pub async fn add_peer(&self, req: &AddPeer) -> Result<ActionResponse> {
-        network::add_peer(&self.db, &req.ip).await?;
+        self.add_peer_reporting_trust(req).await?;
         Ok(ActionResponse {})
     }
 
-    /// The ONE remover of the trusted-peer set — see [`WalletBackend::add_peer`].
+    /// `remove_peer` in the Sage-parity shape, which carries no detail. Prefer
+    /// [`WalletBackend::remove_peer_reporting_match`] anywhere the outcome matters.
     pub async fn remove_peer(&self, req: &RemovePeer) -> Result<ActionResponse> {
-        network::remove_peer(&self.db, &req.ip, req.ban).await?;
+        self.remove_peer_reporting_match(req).await?;
         Ok(ActionResponse {})
     }
 

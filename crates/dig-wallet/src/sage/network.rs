@@ -17,30 +17,48 @@ use super::Result;
 /// caller supplies only an IP (Sage's `add_peer` request shape carries no port either).
 pub const DEFAULT_PEER_PORT: i64 = 8444;
 
-/// `get_peers` — every tracked, non-banned peer.
+/// `get_peers` — EVERY tracked peer: trusted, discovered and banned alike.
+///
+/// Banned entries are included because this is the only enumeration of them, and a blocklist a
+/// person cannot read is a blocklist they cannot correct. Read `banned` to tell them apart; the
+/// DIALLING path is [`super::db::WalletDb::unbanned_peers`] and is deliberately a different read.
+///
+/// `peak_height` is reported as `None` — UNOBSERVED — rather than as the `0` the column holds. No
+/// writer sets a peak height yet (SPEC §18.16: never fabricated), so `0` here means "nobody has
+/// polled this peer", and rendering that as a height would show every trusted peer stalled at
+/// genesis. That is the one signal an operator has for judging whether a peer they believe
+/// WITHOUT corroboration is current, so a stuck-looking peer and an unpolled one must not read the
+/// same. When telemetry is wired, the column has to become nullable so a genuine genesis height
+/// stays distinguishable from an absent one.
 pub async fn get_peers(db: &WalletDb) -> Result<Vec<PeerRecord>> {
-    let rows = db.all_peers().await?;
+    let rows = db.all_peers_including_banned().await?;
     Ok(rows
         .into_iter()
         .map(|r| PeerRecord {
             ip_addr: r.ip_addr,
             port: r.port as u16,
-            peak_height: r.peak_height as u32,
+            peak_height: (r.peak_height > 0).then(|| r.peak_height as u32),
             user_managed: r.user_managed,
+            banned: r.banned,
         })
         .collect())
 }
 
 /// `add_peer` — add (or un-ban) a user-managed peer at the standard full-node port.
-pub async fn add_peer(db: &WalletDb, ip: &str) -> Result<()> {
-    db.add_peer(ip, DEFAULT_PEER_PORT).await?;
-    Ok(())
+///
+/// Returns whether the peer ended up TRUSTED, which is not the same as whether the call succeeded:
+/// adding a peer that was banned un-bans it without granting the corroboration bypass. See
+/// [`super::db::WalletDb::add_peer`].
+pub async fn add_peer(db: &WalletDb, ip: &str) -> Result<bool> {
+    Ok(db.add_peer(ip, DEFAULT_PEER_PORT).await?)
 }
 
-/// `remove_peer` — remove a peer, or ban it (excluded from `get_peers` but not forgotten).
-pub async fn remove_peer(db: &WalletDb, ip: &str, ban: bool) -> Result<()> {
-    db.remove_peer(ip, ban).await?;
-    Ok(())
+/// `remove_peer` — remove a peer, or ban it (excluded from dialling but not forgotten).
+///
+/// Returns whether an entry MATCHED, so the caller can report un-trusting nothing as the failure
+/// to act that it is.
+pub async fn remove_peer(db: &WalletDb, ip: &str, ban: bool) -> Result<bool> {
+    Ok(db.remove_peer(ip, ban).await?)
 }
 
 /// `set_discover_peers`.

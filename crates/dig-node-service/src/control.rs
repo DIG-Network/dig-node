@@ -2065,11 +2065,28 @@ async fn peer_counts(ctx: &ControlCtx, id: Value) -> Value {
 ///
 /// Stated here, once, and returned by `control.chiaPeers.add` so that a client renders the cost
 /// from the node's own answer instead of restating it locally and drifting away from it.
+///
+/// The authorising scope is deliberately narrow: **a node you run yourself**. NC-12 permits the
+/// operator to declare a node THEIR OWN, and that is what justifies the unbounded authority the
+/// entry carries. Widening it to vouching or recommending moves the case outside the
+/// justification, and "a node you vouch for" is a phrase somebody can be talked into applying to
+/// a stranger's address. [`the_trust_wording_authorises_only_a_node_the_operator_runs`] holds the
+/// line here and in the CLI help.
 const CORROBORATION_BYPASS_NOTICE: &str = concat!(
-    "This peer is now TRUSTED: its answers can update this node's wallet replica on their ",
-    "own, without being agreed by other peers. A wrong or hostile trusted peer can give ",
-    "this node a false view of the chain. Trust only a node you run or otherwise vouch ",
-    "for yourself."
+    "This peer is now TRUSTED: chain answers from it are accepted on their own, with no ",
+    "corroboration from other peers. A wrong or hostile trusted peer can give this node a ",
+    "false view of the chain, and of your money. Add only a node you run yourself."
+);
+
+/// What `control.chiaPeers.add` says when the entry was un-banned but NOT granted trust.
+///
+/// The call succeeded and the person still needs to be told what actually happened: the peer is
+/// dialable again, and it is still subject to corroboration. Reporting the bypass notice here
+/// instead would be a claim about custody-grade authority that nothing granted.
+const UNBANNED_WITHOUT_TRUST_NOTICE: &str = concat!(
+    "This peer is no longer banned, but it was NOT granted trust: chain answers from it still ",
+    "require corroboration from other peers. `dign chia-peers remove <ip>` then ",
+    "`dign chia-peers add <ip>` if you meant to trust it."
 );
 
 /// `control.chiaPeers.add` — start trusting a Chia full node.
@@ -2077,33 +2094,44 @@ const CORROBORATION_BYPASS_NOTICE: &str = concat!(
 /// A THIN dispatch to [`dig_wallet::sage::rpc::WalletBackend::add_peer`], the one writer of the
 /// `peers` table. Nothing here decides what a peer is, and nothing here writes a second list.
 async fn chia_peers_add(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
-    let Some(ip) = trimmed_ip(params) else {
-        return missing_ip(id, "control.chiaPeers.add");
+    let ip = match canonical_ip(params, "control.chiaPeers.add") {
+        Ok(ip) => ip,
+        Err(refusal) => return refusal(id),
     };
     match ctx
         .wallet
-        .add_peer(&dig_wallet::sage::types::AddPeer { ip: ip.clone() })
+        .add_peer_reporting_trust(&dig_wallet::sage::types::AddPeer { ip: ip.clone() })
         .await
     {
-        Ok(_) => control_ok(
+        // `trusted` is the RESULTING state, read back from the row -- not a restatement of what
+        // was asked for. Adding a peer that was BANNED un-bans it and grants no bypass, so a
+        // constant `true` here would tell an operator they had configured a trusted node while
+        // they were still silently depending on the corroboration they were told they bypassed.
+        Ok(trusted) => control_ok(
             id,
             json!({
                 "added": true,
                 "ip": ip,
                 "port": dig_wallet::sage::network::DEFAULT_PEER_PORT,
-                "corroboration_bypassed": true,
-                "notice": CORROBORATION_BYPASS_NOTICE,
+                "corroboration_bypassed": trusted,
+                "notice": if trusted {
+                    CORROBORATION_BYPASS_NOTICE
+                } else {
+                    UNBANNED_WITHOUT_TRUST_NOTICE
+                },
             }),
         ),
         Err(e) => control_error(id, ErrorCode::ControlError, format!("add_peer failed: {e}")),
     }
 }
 
-/// `control.chiaPeers.list` — the tracked Chia peers, trusted and discovered alike.
+/// `control.chiaPeers.list` — the tracked Chia peers: trusted, discovered and BANNED alike.
 ///
-/// `user_managed` is the field that tells them apart, and it is reported rather than filtered:
-/// a list that showed only the trusted set would let a person conclude their node talks to
-/// nobody else, which is the opposite of true.
+/// Nothing is filtered out, and each exclusion is reported as a flag instead. `user_managed` tells
+/// the trusted set from the discovered one; a list that showed only the trusted set would let a
+/// person conclude their node talks to nobody else, which is the opposite of true. `banned` is
+/// reported for the same reason turned around: this is the ONLY enumeration of the ban list, and a
+/// blocklist a person cannot read is a blocklist they cannot correct.
 async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
     match ctx.wallet.get_peers().await {
         Ok(resp) => {
@@ -2114,8 +2142,12 @@ async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
                     json!({
                         "ip": p.ip_addr,
                         "port": p.port,
+                        // `null`, never 0: an unpolled peer must not read as one stalled at
+                        // genesis, because this is the operator's only signal that a peer they
+                        // trust WITHOUT corroboration has gone stale.
                         "peak_height": p.peak_height,
                         "user_managed": p.user_managed,
+                        "banned": p.banned,
                     })
                 })
                 .collect();
@@ -2131,19 +2163,33 @@ async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
 
 /// `control.chiaPeers.remove` — stop trusting a Chia full node, optionally banning it.
 async fn chia_peers_remove(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
-    let Some(ip) = trimmed_ip(params) else {
-        return missing_ip(id, "control.chiaPeers.remove");
+    let ip = match canonical_ip(params, "control.chiaPeers.remove") {
+        Ok(ip) => ip,
+        Err(refusal) => return refusal(id),
     };
     let ban = params.get("ban").and_then(Value::as_bool).unwrap_or(false);
     match ctx
         .wallet
-        .remove_peer(&dig_wallet::sage::types::RemovePeer {
+        .remove_peer_reporting_match(&dig_wallet::sage::types::RemovePeer {
             ip: ip.clone(),
             ban,
         })
         .await
     {
-        Ok(_) => control_ok(id, json!({ "removed": true, "ip": ip, "banned": ban })),
+        // `outcome`, and NO `removed: true` companion, so a consumer has to MATCH and cannot
+        // render "nothing was there" as "it is gone". This is the only way to un-trust a peer
+        // holding unbounded authority over the wallet replica, so a remedy that cannot report its
+        // own failure would leave an operator believing they revoked trust they still grant. The
+        // usual cause of a miss is an address spelled differently from the stored one -- which is
+        // why both sides canonicalise.
+        Ok(matched) => control_ok(
+            id,
+            json!({
+                "outcome": if matched { "removed" } else { "no_such_peer" },
+                "ip": ip,
+                "banned": ban,
+            }),
+        ),
         Err(e) => control_error(
             id,
             ErrorCode::ControlError,
@@ -2152,22 +2198,36 @@ async fn chia_peers_remove(ctx: &ControlCtx, id: Value, params: &Value) -> Value
     }
 }
 
-/// `params.ip`, trimmed, or `None` when absent or blank.
+/// `params.ip` in the CONTRACT's canonical form, or a ready-made refusal.
 ///
-/// Blank is rejected rather than forwarded: an empty string is a perfectly storable row, so a
-/// tolerant parser here would silently create a trusted peer nobody can dial or delete.
-fn trimmed_ip(params: &Value) -> Option<String> {
-    let ip = params.get("ip")?.as_str()?.trim();
-    (!ip.is_empty()).then(|| ip.to_string())
-}
-
-/// The refusal for a missing or blank `params.ip`.
-fn missing_ip(id: Value, method: &str) -> Value {
-    control_error(
-        id,
-        ErrorCode::InvalidParams,
-        format!("{method} requires params.ip (the peer's IP address)"),
-    )
+/// Canonicalising on the way IN is what makes one peer one key. `2001:0DB8:0000::1` and
+/// `2001:db8::1` are the same host typed two ways, and stored verbatim they become two rows: the
+/// operator adds trust under one spelling, tries to remove it under the other, is told nothing
+/// matched, and the peer they meant to un-trust is still believed WITHOUT corroboration. That is
+/// an un-trust that silently does not happen, so both handlers canonicalise through the same
+/// function the contract defines rather than trimming and hoping.
+///
+/// Rejecting a non-literal also BOUNDS the ban list: `remove { ban: true }` persists a row keyed
+/// by this string, so an unvalidated key is unbounded at-rest growth driven by one small call.
+/// A hostname, a bracketed form, an `ip:port` and a blank string are all refused here rather than
+/// stored — a blank in particular is a perfectly storable row, and a tolerant parser would create
+/// a trusted peer nobody can dial or delete.
+fn canonical_ip(params: &Value, method: &str) -> Result<String, Box<dyn FnOnce(Value) -> Value>> {
+    let Some(raw) = params.get("ip").and_then(Value::as_str) else {
+        let method = method.to_string();
+        return Err(Box::new(move |id| {
+            control_error(
+                id,
+                ErrorCode::InvalidParams,
+                format!("{method} requires params.ip (the peer's IP address)"),
+            )
+        }));
+    };
+    dig_node_control_interface::params::canonical_peer_ip(raw).map_err(|e| {
+        let message = e.message;
+        Box::new(move |id| control_error(id, ErrorCode::InvalidParams, message))
+            as Box<dyn FnOnce(Value) -> Value>
+    })
 }
 
 /// The node's own `control.peerStatus` snapshot, or `None` when the peer network is not running.
