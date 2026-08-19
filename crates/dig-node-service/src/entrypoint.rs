@@ -945,6 +945,40 @@ fn run_service(config: Config) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// **`chia-peers add --help` authorises only a node the operator RUNS (#254 item 7).**
+    ///
+    /// The same NC-12 boundary the wire notice holds, checked on the OTHER surface that states it.
+    /// The help text is where an operator decides whether to run the command at all, so a widened
+    /// phrase here reaches them BEFORE the notice does — and "a node you vouch for" is a phrase
+    /// somebody can be talked into applying to a stranger's address.
+    ///
+    /// Rendered through clap rather than read off the constant, because the doc comment only
+    /// becomes user-facing text once clap formats it: asserting the source string would pass even
+    /// if the help were suppressed or overridden.
+    #[test]
+    fn the_chia_peers_add_help_authorises_only_a_node_the_operator_runs() {
+        let mut help = Vec::new();
+        Cli::command()
+            .find_subcommand_mut("chia-peers")
+            .expect("chia-peers is a subcommand")
+            .find_subcommand_mut("add")
+            .expect("add is a chia-peers subcommand")
+            .write_long_help(&mut help)
+            .expect("clap renders help");
+        let help = String::from_utf8(help).expect("help is utf-8").to_lowercase();
+
+        assert!(
+            help.contains("a node you run yourself"),
+            "the help must name the operator-run scope, got: {help}"
+        );
+        for widened in ["vouch", "otherwise trust", "trust yourself", "recommend"] {
+            assert!(
+                !help.contains(widened),
+                "the help widens operator trust past NC-12 with {widened:?}: {help}"
+            );
+        }
+    }
+
     #[test]
     fn bin_name_prefers_arg0_file_stem() {
         // A full path resolves to the bare stem; the `.exe` suffix is stripped.

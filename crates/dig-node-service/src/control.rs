@@ -3817,6 +3817,47 @@ mod tests {
         );
     }
 
+    /// **The trust wording stays inside NC-12's authorisation: a node the operator RUNS (#254).**
+    ///
+    /// NC-12 permits trust only from the operator declaring a node THEIR OWN, and that is what
+    /// justifies the unbounded authority the entry carries. Widening it to vouching moves the case
+    /// outside the justification — and "a node you vouch for" is a phrase somebody can be talked
+    /// into applying to a stranger's address, which is precisely how a social-engineering path
+    /// into the wallet replica opens.
+    ///
+    /// The banned list mirrors the contract's own wording test, so the node and the published
+    /// method summary cannot drift into disagreeing about what the operator is being asked to
+    /// certify. The CLI help carries the same sentence and is checked in `entrypoint`.
+    #[test]
+    fn the_trust_wording_authorises_only_a_node_the_operator_runs() {
+        let notice = CORROBORATION_BYPASS_NOTICE.to_lowercase();
+        assert!(
+            notice.contains("a node you run yourself"),
+            "the notice must name the operator-run scope, got: {notice}"
+        );
+        assert!(
+            notice.contains("corroboration"),
+            "the notice must name the cost it exists to disclose, got: {notice}"
+        );
+        for widened in ["vouch", "otherwise trust", "trust yourself", "recommend"] {
+            assert!(
+                !notice.contains(widened),
+                "the notice widens operator trust past NC-12 with {widened:?}: {notice}"
+            );
+        }
+
+        // The un-banned-without-trust notice must NOT imply a bypass it did not grant.
+        let unbanned = UNBANNED_WITHOUT_TRUST_NOTICE.to_lowercase();
+        assert!(
+            unbanned.contains("not granted trust") && unbanned.contains("still"),
+            "the person must be told what actually happened, got: {unbanned}"
+        );
+        assert!(
+            !unbanned.contains("is now trusted"),
+            "un-banning grants no trust and must not claim it: {unbanned}"
+        );
+    }
+
     /// A `control.*` name this node does not serve fails CLOSED — master token required.
     ///
     /// [`is_control_method`] gates on the prefix alone, so these names DO reach the predicate.
