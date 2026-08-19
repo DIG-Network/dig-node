@@ -277,6 +277,21 @@ pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
     "control.listSubscriptions",
 ];
 
+/// Methods this node SERVES that the published contract does not declare yet.
+///
+/// The list is EXPLICIT so it can only shrink. It is read by two places that must agree: the
+/// conformance gate (`tests/control_contract_conformance.rs`) tolerates exactly these as known
+/// drift, and [`requires_master_token`] keeps exactly these on the ordinary tier while every other
+/// unpublished name fails CLOSED.
+///
+/// Naming them one by one is the whole point. The earlier carve-out was "anything in
+/// [`CONTROL_METHODS`] the contract does not know", which widened by itself: adding a served method
+/// without publishing it made it paired-reachable from that moment, and both security lockstep
+/// tests stayed green because a method absent from the contract is absent from both sides of every
+/// comparison they make. Granting the ordinary tier is now a reviewable one-line edit to this list
+/// instead of a side effect of editing an unrelated one.
+pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] = &["control.peers.ping"];
+
 /// Does this control method require the MASTER control token, never a paired one? PURE.
 ///
 /// The master tier is not "pairing administration": it is every method whose effect OUTLIVES the
@@ -304,15 +319,30 @@ pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
 /// answer — the next method to appear is master-only by default rather than paired-reachable by
 /// default.
 ///
-/// A method this node genuinely SERVES but the contract has not published yet keeps the ordinary
-/// tier instead. That set is one diagnostic (`control.peers.ping`), it is tracked as known drift
-/// by `control_contract_conformance`, and promoting it here would silently break paired clients
-/// that call it — a behaviour change unrelated to the escalation this predicate closes. It is
-/// visible rather than hidden: [`master_token_set_matches_the_contract`] asserts it stays ordinary.
+/// The ONE exception is [`KNOWN_UNPUBLISHED_CONTROL_METHODS`] — names this node genuinely serves
+/// that the contract has not published yet (today: one diagnostic, `control.peers.ping`). They keep
+/// the ordinary tier because promoting them would break paired clients that already call them, a
+/// behaviour change unrelated to the escalation this predicate closes.
+///
+/// The exception is bound to that explicit list rather than to "not published but served", because
+/// the latter widened silently: a newly served-but-unpublished method inherited the exemption the
+/// moment it was added to [`CONTROL_METHODS`], and no lockstep test could see it (a method the
+/// contract does not know is absent from both sides of every comparison they make).
 pub fn requires_master_token(method: &str) -> bool {
+    requires_master_token_given(method, KNOWN_UNPUBLISHED_CONTROL_METHODS)
+}
+
+/// [`requires_master_token`] with the exemption list injected, so a test can state what the gate
+/// does for a served-but-unpublished method that is NOT exempt.
+///
+/// That case has no fixture in production today — `control.peers.ping` is the only unpublished
+/// method and it is exempt — and a test written against a merely-unknown name cannot distinguish
+/// this rule from the one it replaces, because both answer "master" there. Injecting the list is
+/// what makes the difference observable.
+fn requires_master_token_given(method: &str, exempt: &[&str]) -> bool {
     match ControlMethod::from_name(method) {
         Some(published) => published.requires_master_token(),
-        None => !CONTROL_METHODS.contains(&method),
+        None => !exempt.contains(&method),
     }
 }
 
@@ -2144,8 +2174,10 @@ async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
                         "port": p.port,
                         // `null`, never 0: an unpolled peer must not read as one stalled at
                         // genesis, because this is the operator's only signal that a peer they
-                        // trust WITHOUT corroboration has gone stale.
-                        "peak_height": p.peak_height,
+                        // trust WITHOUT corroboration has gone stale. The mapping lives HERE and
+                        // not in the wallet type, so the Sage-parity `get_peers` wire keeps the
+                        // integer a strict third-party client expects to deserialize.
+                        "peak_height": (p.peak_height > 0).then_some(p.peak_height),
                         "user_managed": p.user_managed,
                         "banned": p.banned,
                     })
@@ -3861,8 +3893,8 @@ mod tests {
     /// A `control.*` name this node does not serve fails CLOSED — master token required.
     ///
     /// [`is_control_method`] gates on the prefix alone, so these names DO reach the predicate.
-    /// The served-but-unpublished diagnostic is the deliberate exception and is asserted here
-    /// beside them, so the exception cannot quietly widen to cover a future method.
+    /// The served-but-unpublished diagnostic is the deliberate exception, named in
+    /// [`KNOWN_UNPUBLISHED_CONTROL_METHODS`] and asserted here beside them.
     #[test]
     fn an_unserved_control_method_requires_the_master_token() {
         assert!(requires_master_token("control.notAThing"));
@@ -3871,6 +3903,45 @@ mod tests {
             !requires_master_token("control.peers.ping"),
             "a served diagnostic keeps the ordinary tier until the contract publishes it"
         );
+    }
+
+    /// **A served-but-unpublished method is master-tier unless it is NAMED as the exception.**
+    ///
+    /// This is the assertion the old carve-out could not make. When the exemption was "in
+    /// `CONTROL_METHODS` but unknown to the contract", adding a method to the served list made it
+    /// paired-reachable on the spot, and every lockstep test stayed green — a method the contract
+    /// does not publish is absent from BOTH sides of the set comparisons they perform, so it is not
+    /// tested loosely, it is not tested at all.
+    ///
+    /// The fixture must be a name this node SERVES, because that is the only input on which the
+    /// two carve-outs disagree: a merely-unknown name answers "master" under both, so a test using
+    /// one cannot fail on the difference. `control.peers.ping` is the one served-but-unpublished
+    /// method that exists, so it is asserted twice — once WITHOUT the exemption (must be master
+    /// tier: serving a method grants it nothing) and once WITH it (ordinary, as the allowlist says).
+    #[test]
+    fn a_served_but_unpublished_method_is_not_exempt_unless_it_is_named() {
+        let served_unpublished = "control.peers.ping";
+        assert!(
+            ControlMethod::from_name(served_unpublished).is_none()
+                && CONTROL_METHODS.contains(&served_unpublished),
+            "fixture drift: {served_unpublished} must be served here and unpublished by the contract"
+        );
+
+        assert!(
+            requires_master_token_given(served_unpublished, &[]),
+            "being SERVED must grant no exemption: an unpublished method fails CLOSED unless it is \
+             named in KNOWN_UNPUBLISHED_CONTROL_METHODS, so a future method cannot inherit the \
+             ordinary tier as a side effect of being added to CONTROL_METHODS"
+        );
+        assert!(
+            !requires_master_token_given(served_unpublished, KNOWN_UNPUBLISHED_CONTROL_METHODS),
+            "the named exception keeps the ordinary tier"
+        );
+
+        // And the production predicate agrees with the named-exception arm.
+        for exempt in KNOWN_UNPUBLISHED_CONTROL_METHODS {
+            assert!(!requires_master_token(exempt), "{exempt}");
+        }
     }
 
     #[test]

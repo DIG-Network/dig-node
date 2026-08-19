@@ -45,7 +45,10 @@
 //!   tier (see [`crate::control::requires_master_token`]) — pairing administration
 //!   (`list`/`approve`/`revoke`), so it can neither mint more tokens nor hide/revoke
 //!   itself, and `chiaPeers.add`/`.remove`, so it cannot grant itself chain authority
-//!   that SURVIVES the revocation below.
+//!   that SURVIVES the revocation below. The scope is per CAPABILITY, not per plane:
+//!   the Sage-parity aliases of those two methods (`add_peer`/`remove_peer`) resolve the
+//!   same tier through [`crate::wallet_authz`], on both HTTP and WS, because they reach
+//!   the same writer.
 //! - **Revocable.** `dig-node pair revoke <id>` removes it; the gate rejects it at
 //!   once (the paired-token file is consulted per request).
 //! - **Constant-time comparison** for every token check (no timing oracle).
@@ -403,7 +406,11 @@ fn append_paired_token(path: &Path, record: &PairedToken) -> std::io::Result<()>
 /// produce one; it does not try to chase them afterwards. Concretely: this must NOT strip
 /// user-managed Chia peers. A compromised app's "cleanup" would then silently un-trust the nodes
 /// an operator deliberately configured, which is a worse failure than the one it would be
-/// papering over — the escalation is made UNREACHABLE at the gate instead.
+/// papering over — the escalation is made unreachable at the gates instead, on EVERY plane that
+/// reaches the writer: the `control.*` gate ([`crate::control::requires_master_token`]) and the
+/// Sage-parity wallet gate ([`crate::wallet_authz`]), over both HTTP and WS. That qualifier is the
+/// load-bearing part of the sentence: this claim was once true of the control plane alone while
+/// `POST /add_peer` granted a paired token the same row.
 fn revoke_paired_token(path: &Path, token_id: &str) -> std::io::Result<bool> {
     let mut tokens = load_paired_tokens(path);
     let before = tokens.len();

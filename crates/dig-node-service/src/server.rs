@@ -1046,6 +1046,11 @@ async fn rpc(
             // `chiaPeers.add`/`.remove` (so it cannot install a peer that keeps unbounded
             // authority over the wallet replica after revocation). The tier is read from the
             // contract, never restated here — see `control::requires_master_token`.
+            //
+            // This gate covers the `control.*` plane only. The SAME capabilities are reachable by
+            // their Sage-parity names (`add_peer`/`remove_peer`) on the wallet plane below, which
+            // resolves the identical tier through `wallet_authz` — a tier enforced on one plane
+            // and not the other is not enforced.
             let master_ok =
                 control::is_authorized(&method, presented.as_deref(), &state.control_token);
             let paired_ok = !control::requires_master_token(&method)

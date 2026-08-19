@@ -414,12 +414,18 @@ pub struct PeerRecord {
     pub ip_addr: String,
     /// The peer port.
     pub port: u16,
-    /// The peak height this peer last reported, or `None` where this node has NO telemetry for it.
+    /// The peak height this peer last reported; `0` where this node has NO telemetry for it.
     ///
-    /// `None` means UNOBSERVED, never zero. A reported height is that peer's CLAIM, never a fact
-    /// this node verified, and it must never be aggregated into a chain position — a maximum over
-    /// claimed peaks is whatever the most dishonest peer says (NC-12).
-    pub peak_height: Option<u32>,
+    /// The type mirrors Sage's `get_peers` wire exactly, so a Sage-compatible client deserializing
+    /// into a non-optional integer keeps parsing. `0`-as-unobserved is genuinely ambiguous, which
+    /// is why the honest distinction is drawn at the CONTROL boundary instead
+    /// (`control.chiaPeers.list` reports `null`) rather than by changing a parity type out from
+    /// under third-party clients.
+    ///
+    /// A reported height is that peer's CLAIM, never a fact this node verified, and it must never
+    /// be aggregated into a chain position — a maximum over claimed peaks is whatever the most
+    /// dishonest peer says (NC-12).
+    pub peak_height: u32,
     /// Whether the peer was added manually by the user — exactly the set trusted WITHOUT
     /// corroboration. Discovered peers are `false` and stay subject to agreement.
     pub user_managed: bool,
@@ -2148,13 +2154,20 @@ mod tests {
         assert!(!r.ban);
     }
 
+    /// The Sage-parity `get_peers` body keeps `peak_height` as an INTEGER.
+    ///
+    /// A strict Sage-compatible client deserializes this field into a non-optional integer, so
+    /// emitting `null` breaks it at PARSE time — before it ever reads the value, and regardless of
+    /// whether it cares about peaks. `null` is the honest shape for an unobserved peak and it is
+    /// emitted by `control.chiaPeers.list`, which is this node's own surface and has no such
+    /// consumers; the parity surface is not the place to make that improvement.
     #[test]
-    fn get_peers_response_shape() {
+    fn get_peers_response_keeps_the_sage_integer_shape_for_peak_height() {
         let resp = GetPeersResponse {
             peers: vec![PeerRecord {
                 ip_addr: "1.2.3.4".into(),
                 port: 8444,
-                peak_height: None,
+                peak_height: 0,
                 user_managed: true,
                 banned: false,
             }],
@@ -2162,5 +2175,17 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ip_addr\":\"1.2.3.4\""));
         assert!(json.contains("\"user_managed\":true"));
+        assert!(
+            json.contains("\"peak_height\":0"),
+            "an unobserved peak must stay the integer Sage sends, not null: {json}"
+        );
+        // And it round-trips into a client type that does NOT accept null.
+        #[derive(serde::Deserialize)]
+        struct StrictPeer {
+            peak_height: u32,
+        }
+        let strict: Vec<StrictPeer> =
+            serde_json::from_value(serde_json::to_value(&resp.peers).unwrap()).unwrap();
+        assert_eq!(strict[0].peak_height, 0);
     }
 }

@@ -26,7 +26,12 @@ const KNOWN_PREEXISTING_DRIFT: &[&str] = &["control.peers.disconnect"];
 /// Same shape and same reason as [`KNOWN_PREEXISTING_DRIFT`], in the opposite direction: listed
 /// explicitly so the set can only shrink, and publishing them is its own reviewed change rather
 /// than something this gate does blind.
-const KNOWN_UNPUBLISHED: &[&str] = &["control.peers.ping"];
+///
+/// It is the PRODUCTION list, not a copy. The token gate reads the same constant to decide which
+/// unpublished method keeps the ordinary tier, so tolerating drift here and granting a paired token
+/// access to it are one decision recorded once — a second copy would let this gate keep tolerating
+/// a method the gate had stopped exempting, or the reverse.
+const KNOWN_UNPUBLISHED: &[&str] = dig_node_service::control::KNOWN_UNPUBLISHED_CONTROL_METHODS;
 
 /// **Every `control.*` method the contract publishes is actually served.**
 ///

@@ -23,13 +23,15 @@ pub const DEFAULT_PEER_PORT: i64 = 8444;
 /// person cannot read is a blocklist they cannot correct. Read `banned` to tell them apart; the
 /// DIALLING path is [`super::db::WalletDb::unbanned_peers`] and is deliberately a different read.
 ///
-/// `peak_height` is reported as `None` — UNOBSERVED — rather than as the `0` the column holds. No
-/// writer sets a peak height yet (SPEC §18.16: never fabricated), so `0` here means "nobody has
-/// polled this peer", and rendering that as a height would show every trusted peer stalled at
-/// genesis. That is the one signal an operator has for judging whether a peer they believe
-/// WITHOUT corroboration is current, so a stuck-looking peer and an unpolled one must not read the
-/// same. When telemetry is wired, the column has to become nullable so a genuine genesis height
-/// stays distinguishable from an absent one.
+/// `peak_height` is reported verbatim from the column, `0` included, because this is the
+/// Sage-parity shape and a strict Sage-compatible client fails at PARSE time on anything else.
+/// No writer sets a peak height yet (SPEC §18.16: never fabricated), so `0` here means "nobody has
+/// polled this peer" — an ambiguity this surface cannot resolve without breaking parity. The
+/// honest reading is drawn one layer up: `control.chiaPeers.list` maps `0` to `null` so an
+/// unpolled peer never reads as one stalled at genesis, which is the operator's one signal for
+/// judging whether a peer they believe WITHOUT corroboration is current. When telemetry is wired,
+/// the column has to become nullable so a genuine genesis height stays distinguishable from an
+/// absent one, and that mapping is the site to revisit.
 pub async fn get_peers(db: &WalletDb) -> Result<Vec<PeerRecord>> {
     let rows = db.all_peers_including_banned().await?;
     Ok(rows
@@ -37,7 +39,7 @@ pub async fn get_peers(db: &WalletDb) -> Result<Vec<PeerRecord>> {
         .map(|r| PeerRecord {
             ip_addr: r.ip_addr,
             port: r.port as u16,
-            peak_height: (r.peak_height > 0).then_some(r.peak_height as u32),
+            peak_height: r.peak_height as u32,
             user_managed: r.user_managed,
             banned: r.banned,
         })
@@ -169,9 +171,9 @@ mod tests {
         assert_eq!(peers[0].port, DEFAULT_PEER_PORT as u16);
         assert!(peers[0].user_managed);
         assert_eq!(
-            peers[0].peak_height, None,
-            "nobody has polled this peer, so its peak is UNOBSERVED -- reporting 0 would show a \
-             peer the operator trusts without corroboration as stalled at genesis"
+            peers[0].peak_height, 0,
+            "the parity wire keeps Sage's integer shape; the unobserved-vs-genesis distinction is \
+             drawn at the control boundary, which maps this 0 to null"
         );
 
         remove_peer(&db, "9.9.9.9", false).await.unwrap();
