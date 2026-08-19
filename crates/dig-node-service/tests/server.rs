@@ -2286,6 +2286,95 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
     assert_eq!(after_revoke["error"]["data"]["code"], json!("UNAUTHORIZED"));
 }
 
+/// **A PAIRED token cannot install or strip a trusted Chia peer, but can still READ the list.**
+///
+/// The escalation this closes (#254): `chiaPeers.add` writes a peer the wallet replica believes
+/// WITHOUT corroboration, so it can dictate money-bearing chain facts on its own word. The entry
+/// outlives the token that created it — `pairing.revoke` removes a token id and touches no peer
+/// row — so a paired token that could write one has acquired authority the designated remedy
+/// cannot take back.
+///
+/// The fixture varies ONE thing across three otherwise-identical calls on the SAME scoped token:
+/// which `chiaPeers` method is named. `list` is the truthful control, and it is what makes this a
+/// proof of PLACEMENT rather than of outcome — a gate that simply refused the whole namespace, or
+/// a node that had no Chia-peer surface at all, would satisfy "add is refused" while failing here.
+/// Asserting only the two refusals would pin a coincidence that a namespace-shaped fix reproduces.
+#[tokio::test]
+async fn a_paired_token_cannot_grant_itself_a_trusted_chia_peer() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, master, _hold) = start_companion_full(&upstream).await;
+
+    // Pair, exactly as the extension does, to obtain a genuine scoped token.
+    let req = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "pairing.request",
+                "params": { "client_name": "DIG Chrome Extension" } }),
+        None,
+    )
+    .await;
+    let pairing_id = req["result"]["pairing_id"].as_str().unwrap().to_string();
+    let approve = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "control.pairing.approve",
+                "params": { "pairing_id": pairing_id } }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(approve["result"]["approved"], json!(true));
+    let scoped = poll_pairing(&addr, &pairing_id).await["result"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The scoped token is genuinely live: it drives an ordinary control mutation.
+    let live = setupstream_mutation(&addr, Some(&scoped)).await;
+    assert_eq!(
+        live["result"]["upstream"],
+        json!("https://paired.example"),
+        "the token must be VALID, or the refusals below prove nothing"
+    );
+
+    // REFUSED: granting trust.
+    let add = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "control.chiaPeers.add",
+                "params": { "ip": "203.0.113.7" } }),
+        Some(&scoped),
+    )
+    .await;
+    assert_eq!(
+        add["error"]["data"]["code"],
+        json!("UNAUTHORIZED"),
+        "a paired token wrote a trusted Chia peer: {add}"
+    );
+
+    // REFUSED: stripping trust the operator deliberately configured.
+    let remove = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "control.chiaPeers.remove",
+                "params": { "ip": "203.0.113.7" } }),
+        Some(&scoped),
+    )
+    .await;
+    assert_eq!(
+        remove["error"]["data"]["code"],
+        json!("UNAUTHORIZED"),
+        "a paired token un-trusted a peer: {remove}"
+    );
+
+    // ALLOWED: reading the trust state it is subject to.
+    let list = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 5, "method": "control.chiaPeers.list" }),
+        Some(&scoped),
+    )
+    .await;
+    assert!(
+        list.get("error").is_none(),
+        "a paired client must still be able to READ the trusted-peer list: {list}"
+    );
+}
+
 #[tokio::test]
 async fn control_status_with_token_returns_rich_status() {
     let (upstream, _calls) = start_mock_upstream().await;

@@ -62,6 +62,7 @@ use std::sync::Arc;
 use dig_node_control_interface::params::{
     WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
 };
+use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
 use dig_node_core::seams::dig_peer::profile_sync::{
     accept_local_body, announce_frame, LocalAcceptError, ProfileBodyStore,
@@ -276,19 +277,43 @@ pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
     "control.listSubscriptions",
 ];
 
-/// Is this a PAIRING-ADMINISTRATION control method (#280)? PURE.
+/// Does this control method require the MASTER control token, never a paired one? PURE.
 ///
-/// These manage the pairing lifecycle — list pending requests, approve one (minting
-/// a scoped controller token), revoke an issued token — and so MUST require the
-/// MASTER control token (a local file read), NEVER a paired token: a paired
-/// controller can drive `control.*` mutations but can neither mint more tokens nor
-/// hide/revoke itself. The auth gate consults this to decide whether the paired-token
-/// path is even eligible.
-pub fn is_pairing_admin_method(method: &str) -> bool {
-    matches!(
-        method,
-        "control.pairing.list" | "control.pairing.approve" | "control.pairing.revoke"
-    )
+/// The master tier is not "pairing administration": it is every method whose effect OUTLIVES the
+/// token that invoked it. `pairing.revoke` is the designated remedy for a compromised paired app,
+/// so a method that survives revocation has escaped that remedy and a paired token must not reach
+/// it. Pairing administration is one instance of that shape; `control.chiaPeers.add`/`.remove` are
+/// the others, because a trusted Chia peer is believed WITHOUT corroboration, keeps that authority
+/// after the token is gone, and `revoke` touches no peer row.
+///
+/// # This DELEGATES to the contract, and that is the fix, not an implementation detail
+///
+/// The predicate is [`ControlMethod::requires_master_token`], read from
+/// `dig-node-control-interface` rather than restated here. An earlier version of this function
+/// listed the three pairing methods as string literals, and when the contract put `chiaPeers.*` on
+/// the master tier this node kept honouring the old list — so a PAIRED token could install a peer
+/// with unbounded, unrevocable authority over the wallet replica. A security predicate duplicated
+/// across a repo boundary as a string match drifts silently and fails OPEN, which is why the
+/// duplicate is gone instead of merely corrected. [`master_token_set_matches_the_contract`] keeps
+/// it that way.
+///
+/// # A name this node does not serve requires the master token (fail CLOSED)
+///
+/// [`is_control_method`] matches on the `control.` PREFIX, so an arbitrary unrecognised name
+/// reaches this gate. Such a name cannot be judged against the tier rule, so it gets the stricter
+/// answer — the next method to appear is master-only by default rather than paired-reachable by
+/// default.
+///
+/// A method this node genuinely SERVES but the contract has not published yet keeps the ordinary
+/// tier instead. That set is one diagnostic (`control.peers.ping`), it is tracked as known drift
+/// by `control_contract_conformance`, and promoting it here would silently break paired clients
+/// that call it — a behaviour change unrelated to the escalation this predicate closes. It is
+/// visible rather than hidden: [`master_token_set_matches_the_contract`] asserts it stays ordinary.
+pub fn requires_master_token(method: &str) -> bool {
+    match ControlMethod::from_name(method) {
+        Some(published) => published.requires_master_token(),
+        None => !CONTROL_METHODS.contains(&method),
+    }
 }
 
 /// The path to the control-token file: `<state_dir>/control-token`, where the state
@@ -842,7 +867,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.updater.resume" => crate::updater::resume(id).await,
         "control.updater.checkNow" => crate::updater::check_now(id).await,
         // Pairing administration (#280) — reached only with the MASTER token (the
-        // gate blocks a paired token from these, see `is_pairing_admin_method`).
+        // gate blocks a paired token from these, see `requires_master_token`).
         "control.pairing.list" => crate::pairing::list(&ctx.pairings, &ctx.state_dir, id),
         "control.pairing.approve" => {
             crate::pairing::approve(&ctx.pairings, &ctx.state_dir, id, params)
@@ -3661,6 +3686,89 @@ mod tests {
         assert_eq!(
             listed, union,
             "CONTROL_METHODS drifted from dispatch_control's owned+delegated set"
+        );
+    }
+
+    /// LOCKSTEP GATE (#254): the methods this node reserves for the MASTER token are EXACTLY the
+    /// methods the contract puts on the master tier.
+    ///
+    /// This test exists because the two sets already diverged once, silently and in the
+    /// fail-OPEN direction. [`requires_master_token`] used to restate the tier as a match on three
+    /// pairing strings; when the contract moved `chiaPeers.add`/`.remove` to the master tier this
+    /// node went on honouring the old list, so a PAIRED token could install a Chia peer that is
+    /// believed without corroboration and keeps that authority after `pairing.revoke`.
+    ///
+    /// The expectation is written out by NAME rather than derived from the predicate under test:
+    /// a derivation would agree with any implementation, including the one this test was written
+    /// to catch. Reverting to the three-string list drops the two `chiaPeers` entries from
+    /// `actual` and fails on the first assertion, naming them.
+    #[test]
+    fn master_token_set_matches_the_contract() {
+        use std::collections::BTreeSet;
+
+        let actual: BTreeSet<&str> = CONTROL_METHODS
+            .iter()
+            .copied()
+            .filter(|m| requires_master_token(m))
+            .collect();
+
+        let expected: BTreeSet<&str> = [
+            "control.pairing.list",
+            "control.pairing.approve",
+            "control.pairing.revoke",
+            "control.chiaPeers.add",
+            "control.chiaPeers.remove",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            actual, expected,
+            "the master-token tier drifted from the set this node means to reserve"
+        );
+
+        // And it tracks the CONTRACT, so a method the contract promotes later cannot stay
+        // paired-reachable here just because nobody edited the list above.
+        let contract: BTreeSet<&str> = ControlMethod::ALL
+            .iter()
+            .filter(|m| m.requires_master_token())
+            .map(|m| m.name())
+            .filter(|n| CONTROL_METHODS.contains(n))
+            .collect();
+        assert_eq!(
+            actual, contract,
+            "this node's master tier disagrees with dig-node-control-interface"
+        );
+    }
+
+    /// The tier is per-METHOD, never per-namespace: `chiaPeers.list` stays on the ordinary tier.
+    ///
+    /// The control that keeps [`master_token_set_matches_the_contract`] honest. Gating the whole
+    /// `chiaPeers.*` namespace would also close the escalation, and would ALSO leave a paired
+    /// client unable to show the operator which peers their node trusts — the one disclosure that
+    /// makes the trust state correctable. A read grants nothing that outlives the token, so it is
+    /// not on the master tier and this test fails if a namespace-shaped fix is substituted.
+    #[test]
+    fn reading_the_trusted_peer_list_is_not_master_tier() {
+        assert!(requires_master_token("control.chiaPeers.add"));
+        assert!(requires_master_token("control.chiaPeers.remove"));
+        assert!(
+            !requires_master_token("control.chiaPeers.list"),
+            "a paired client must still be able to SHOW the operator the trust state"
+        );
+    }
+
+    /// A `control.*` name this node does not serve fails CLOSED — master token required.
+    ///
+    /// [`is_control_method`] gates on the prefix alone, so these names DO reach the predicate.
+    /// The served-but-unpublished diagnostic is the deliberate exception and is asserted here
+    /// beside them, so the exception cannot quietly widen to cover a future method.
+    #[test]
+    fn an_unserved_control_method_requires_the_master_token() {
+        assert!(requires_master_token("control.notAThing"));
+        assert!(requires_master_token("control.chiaPeers.addd"));
+        assert!(
+            !requires_master_token("control.peers.ping"),
+            "a served diagnostic keeps the ordinary tier until the contract publishes it"
         );
     }
 

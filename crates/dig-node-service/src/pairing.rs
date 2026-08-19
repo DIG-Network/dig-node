@@ -41,10 +41,11 @@
 //!   the token is readable only by an allowed CORS origin (`chrome-extension://…`); a
 //!   foreign web origin's `fetch` is CORS-blocked from reading it (and blocked at
 //!   preflight from even sending a `control.*` token header).
-//! - **Scoped.** A paired token authorizes `control.*` MUTATIONS but NOT pairing
-//!   administration (`list`/`approve`/`revoke`, see
-//!   [`crate::control::is_pairing_admin_method`]) — so it can neither mint more
-//!   tokens nor hide/revoke itself.
+//! - **Scoped.** A paired token authorizes `control.*` MUTATIONS but NOT the MASTER
+//!   tier (see [`crate::control::requires_master_token`]) — pairing administration
+//!   (`list`/`approve`/`revoke`), so it can neither mint more tokens nor hide/revoke
+//!   itself, and `chiaPeers.add`/`.remove`, so it cannot grant itself chain authority
+//!   that SURVIVES the revocation below.
 //! - **Revocable.** `dig-node pair revoke <id>` removes it; the gate rejects it at
 //!   once (the paired-token file is consulted per request).
 //! - **Constant-time comparison** for every token check (no timing oracle).
@@ -395,6 +396,14 @@ fn append_paired_token(path: &Path, record: &PairedToken) -> std::io::Result<()>
 }
 
 /// Remove a token by id. Returns whether one was removed (idempotent).
+///
+/// This touches the token store and NOTHING else — deliberately. Revocation cannot undo a side
+/// effect that already outlived the token, so the tier rule
+/// ([`crate::control::requires_master_token`]) keeps a paired token away from the methods that
+/// produce one; it does not try to chase them afterwards. Concretely: this must NOT strip
+/// user-managed Chia peers. A compromised app's "cleanup" would then silently un-trust the nodes
+/// an operator deliberately configured, which is a worse failure than the one it would be
+/// papering over — the escalation is made UNREACHABLE at the gate instead.
 fn revoke_paired_token(path: &Path, token_id: &str) -> std::io::Result<bool> {
     let mut tokens = load_paired_tokens(path);
     let before = tokens.len();
