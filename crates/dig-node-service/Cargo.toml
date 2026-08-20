@@ -219,6 +219,10 @@ windows-sys = { version = "0.61", features = [
 # over the wire and reads real frames, mirroring how `tests/server.rs` already
 # exercises the HTTP surface with `reqwest` end-to-end rather than in-process.
 [dev-dependencies]
+# The `never_log` battery (#277) drives the real seed bootstrap against a temp layout so its
+# sentinels are the ACTUAL minted phrase and device key rather than invented strings. Already a
+# normal dependency above; restated here only so the integration-test crate can name it.
+dig-wallet = { path = "../dig-wallet" }
 # The watch-list control tests (SPEC §18.6f, dig_ecosystem#2823) build real BLS G1 keys and spell
 # them the way a client would. Pinned to the same lines `dig-wallet` builds on so exactly one of
 # each resolves.

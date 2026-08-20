@@ -267,6 +267,18 @@ impl WalletMeta {
     }
 }
 
+/// Open a sealed seed under a device key given in the hex form [`password_str`] produces.
+///
+/// The read half of the bootstrap, exposed so a host binary can name the phrase a given run
+/// actually created — which is what lets its never-log battery assert on the REAL material rather
+/// than on an invented sentinel the bootstrap could never have logged.
+pub fn open_sealed_with_device_key(
+    sealed: &[u8],
+    device_key_hex: &str,
+) -> Result<Zeroizing<String>, String> {
+    seed_store::decrypt_seed(sealed, device_key_hex)
+}
+
 /// Read the sidecar, or `None` when it is absent, unreadable or unparsable.
 ///
 /// Callers must treat `None` as "not disposable" rather than as "auto" — an existing seed with no
@@ -885,6 +897,102 @@ mod tests {
             load_device_key(&paths.device_key, false),
             Err(DeviceKeyError::Malformed)
         ));
+    }
+
+    /// **Proves:** on Windows the secrets carry an EXPLICIT owner-only DACL — exactly one ACE,
+    /// granting exactly this user — rather than whatever the parent directory happened to hand
+    /// down.
+    ///
+    /// Written because the Unix `0600` test below cannot run on Windows, which would otherwise
+    /// leave the file-permission property of the whole design asserted by nothing on the platform
+    /// most of these nodes run on. The ACE count is the load-bearing half: an inherited ACL brings
+    /// several ACEs (SYSTEM and Administrators among them), so a single ACE is only possible if
+    /// `PROTECTED_DACL_SECURITY_INFORMATION` really did sever inheritance.
+    #[cfg(windows)]
+    #[test]
+    fn secrets_are_created_with_an_explicit_owner_only_dacl() {
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{
+            GetNamedSecurityInfoW, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{GetAce, ACL, DACL_SECURITY_INFORMATION};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_in(dir.path());
+        ensure_wallet(&paths).expect("bootstrap");
+        let me = current_user_sid_string().expect("current user sid");
+
+        for path in [&paths.seed, &paths.device_key, &paths.meta] {
+            let wide_path = wide(&path.to_string_lossy());
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut descriptor = std::ptr::null_mut();
+            // SAFETY: `wide_path` is a live null-terminated UTF-16 string; the out-params are
+            // null-initialized and written by the OS, which owns the descriptor until LocalFree.
+            let status = unsafe {
+                GetNamedSecurityInfoW(
+                    wide_path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut dacl,
+                    std::ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            assert_eq!(status, ERROR_SUCCESS, "read the DACL of {}", path.display());
+
+            // SAFETY: on ERROR_SUCCESS the DACL points into the live descriptor.
+            let count = unsafe { (*dacl).AceCount };
+            assert_eq!(
+                count,
+                1,
+                "{} must carry exactly one ACE — more means inheritance was not severed",
+                path.display()
+            );
+
+            let mut ace = std::ptr::null_mut();
+            // SAFETY: index 0 exists given the AceCount assertion above.
+            let got = unsafe { GetAce(dacl, 0, &mut ace) };
+            assert_ne!(got, 0, "read the single ACE of {}", path.display());
+            // SAFETY: an allowed ACE's SID begins at the fixed SidStart offset of the standard
+            // (non-object) ACE layout — 8 bytes past the header.
+            let sid = unsafe { ace.cast::<u8>().add(8).cast() };
+            // SAFETY: `sid` is that ACE's SID, live until the free below.
+            let granted = unsafe { sid_to_string(sid) }.expect("render the ACE's SID");
+
+            // SAFETY: the exact LocalAlloc'd block the API returned; not dereferenced again.
+            unsafe { LocalFree(descriptor as _) };
+
+            assert_eq!(
+                granted,
+                me,
+                "{} must grant only this user",
+                path.display()
+            );
+        }
+    }
+
+    /// Render a SID as its string form, for the DACL assertion above.
+    ///
+    /// # Safety
+    /// `sid` must point at a valid SID that outlives the call.
+    #[cfg(windows)]
+    unsafe fn sid_to_string(sid: *mut std::ffi::c_void) -> Option<String> {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        let mut text = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut text) == 0 {
+            return None;
+        }
+        let mut len = 0;
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+        LocalFree(text as _);
+        Some(s)
     }
 
     /// **Proves:** a secret file is created owner-only, not merely moved there afterwards.

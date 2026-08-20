@@ -18,15 +18,23 @@
 //! without the device key". A fallback would quietly become the real design on exactly the
 //! constrained hosts this is meant to serve.
 
-use dig_wallet::autoseed::{self, BootstrapState};
+use dig_wallet::autoseed::{self, BootstrapState, WalletPaths};
 
-/// Ensure a wallet seed exists, logging the outcome.
+/// Ensure a wallet seed exists at the node's real per-user location, logging the outcome.
 ///
 /// Returns the state so a caller can surface it; callers must not treat any outcome as fatal.
 pub fn ensure_wallet_seed() -> Option<BootstrapState> {
-    let paths = autoseed::default_paths();
+    ensure_wallet_seed_at(&autoseed::default_paths())
+}
 
-    match autoseed::ensure_wallet(&paths) {
+/// [`ensure_wallet_seed`] against an explicit layout.
+///
+/// Split out so the narration below — the one place in this feature where a log line sits next to
+/// live key material — can be exercised against a temporary directory. A test that had to point the
+/// real resolver at the real `%LOCALAPPDATA%` would be minting seeds into the developer's own
+/// wallet directory to assert a property about logging.
+pub fn ensure_wallet_seed_at(paths: &WalletPaths) -> Option<BootstrapState> {
+    match autoseed::ensure_wallet(paths) {
         Ok(BootstrapState::Created) => {
             // Deliberately records only that a wallet now exists. The phrase, the seed and the
             // device key never reach a log field — the node's logs are operator-readable and are
