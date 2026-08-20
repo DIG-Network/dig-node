@@ -3762,7 +3762,7 @@ the application layer (method names + JSON request/response shapes); the transpo
 class. Both listeners dispatch the SAME handler set (`WalletBackend::dispatch`), so their bodies are
 byte-identical by construction:
 
-- **mTLS `9257`** (default; configurable). `POST /{method}` over TLS with Sage's shared-self-signed-cert
+- **mTLS `9776`** (default; configurable). `POST /{method}` over TLS with Sage's shared-self-signed-cert
   MUTUAL-TLS model: the server accepts a client cert iff its DER is byte-identical to the server's own
   cert (a local-possession auth model — whoever can read the cert+key is authorized). Loopback only.
 - **Plain-HTTP + CORS** (browser mirror). A browser/MV3 extension cannot present a client cert, so the
@@ -3772,8 +3772,12 @@ On the shipped `dig-node` binary this surface IS served (#368): the service brin
 `WalletBackend` (`sage::service::WalletService` — the wallet DB + a graceful fallback tier + a shared
 `EventBus` + the node custody) and (a) integrates the browser mirror onto the SAME loopback service router
 as `POST /{method}` on the default port `9778` — the exact base the extension's `node-wallet` client
-targets — with the wallet authz gate (§7.12) applied, and (b) brings up the mTLS `9257` sibling listener
-(best-effort, non-fatal) for node-class/Sage-drop-in parity. The bidirectional `/ws` transport (§4.8) also
+targets — with the wallet authz gate (§7.12) applied, and (b) brings up the mTLS `9776` sibling listener
+(best-effort, non-fatal) for node-class/Sage-drop-in parity. The parity port MUST NOT be Sage's own RPC
+port (`9257`): dig-node is an auto-starting OS service and Sage is a desktop app, so binding it makes the
+two race for one socket and a Sage client that reaches this mTLS listener is rejected at the handshake.
+A bind failure remains non-fatal, and MUST be logged and reported on `control.status`
+(`wallet_mtls`: `listening` | `unavailable` | `not_started`) — never silently. The bidirectional `/ws` transport (§4.8) also
 dispatches to this same backend. Wallet methods are NEVER relayed to the upstream gateway.
 
 18.2. **Request/response model.** Every endpoint is `POST /{endpoint}` where `{endpoint}` is the exact
@@ -4900,7 +4904,7 @@ to mainnet — tests drive the `chia-sdk-test` simulator (real consensus incl. B
 
 18.22. **Served on the shipped node + runtime signer load + custody dispatch (#368/#369).** The
 `WalletBackend` is BUILT and SERVED by the shipped `dig-node` (§18.1): the `POST /{method}` HTTP mirror on
-`9778`, the mTLS `9257` sibling listener, and the bidirectional `/ws` transport (§4.8) all dispatch to the
+`9778`, the mTLS `9776` sibling listener, and the bidirectional `/ws` transport (§4.8) all dispatch to the
 one live backend.
 
 - **Runtime signer load.** The served backend resolves its signer from the node custody (§18.20) at
@@ -5104,7 +5108,7 @@ non-retention — the signer allocation is dropped promptly — plus zeroization
 Byte-level scrub of the derived scalar via a key wrapper is a scoped follow-up.)
 
 **WS/RPC surface (paired-token gated, §7.12).** Every `auth.*` method requires the master control token
-OR a valid paired token, on every transport (`POST /{method}`, `/ws`, mTLS `9257`). Methods:
+OR a valid paired token, on every transport (`POST /{method}`, `/ws`, mTLS `9776`). Methods:
 `auth.status` (mode, method, session state, whether a sign-grant is armed) · `auth.get_method` /
 `auth.set_method` (switch active method — `password` resets to password-only) · `auth.set_mode`
 (`per_transaction` | `session_unlock_all`) · `auth.enroll_totp` · `auth.enroll_passkey_begin` /

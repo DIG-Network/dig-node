@@ -448,7 +448,7 @@ pub fn is_loopback_addr(ip: &IpAddr) -> bool {
 /// hard startup error, never a silent LAN exposure. PURE so the policy is unit-testable.
 ///
 /// This governs ONLY the local RPC/content bind ([`Config::bind_addr`]); the peer P2P
-/// wire (mTLS `:9444`, in dig-node-core) and the loopback wallet mTLS `:9257` listener
+/// wire (mTLS `:9444`, in dig-node-core) and the loopback wallet mTLS `:9776` listener
 /// bind independently, so enforcing loopback here never affects peer connectivity.
 pub fn host_override_refusal(host: Option<IpAddr>, allow_remote: bool) -> Option<String> {
     match host {

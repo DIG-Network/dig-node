@@ -29,7 +29,7 @@ use dig_node_core::{cache_cap_bytes, cache_used_bytes, ContentServer, Node};
 use dig_wallet::sage::events::{SyncEvent, SyncLifecycle, SyncStatus};
 use dig_wallet::sage::rpc::WalletBackend;
 use dig_wallet::sage::service::WalletService;
-use dig_wallet::sage::transport::{serve_mtls, SharedCert, DEFAULT_MTLS_PORT};
+use dig_wallet::sage::transport::{SharedCert, DEFAULT_MTLS_PORT};
 use serde_json::{json, Value};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
@@ -97,7 +97,7 @@ pub struct AppState {
     /// `POST /{method}` HTTP mirror the extension targets AND the bidirectional `/ws` wallet+control
     /// transport (#369). Custody-backed, so a paired `wallet.unlock` enables signing at runtime.
     wallet: Arc<WalletBackend>,
-    /// The shared self-signed cert the mTLS `9257` listener presents (Sage byte-parity, node-class
+    /// The shared self-signed cert the wallet mTLS listener presents (Sage byte-parity, node-class
     /// clients). Held so [`serve_with_shutdown`] can bring up that sibling listener.
     wallet_cert: SharedCert,
     /// The per-source INGRESS bound on OPEN, token-less `control.*` reads (dig_ecosystem#3051).
@@ -1984,7 +1984,7 @@ where
     let state = build_state(&config).await;
 
     // Grab the wallet backend + mTLS cert before the router consumes `state` (#368): the served
-    // wallet rides the loopback HTTP surface (`POST /{method}`) AND a sibling mTLS 9257 listener
+    // wallet rides the loopback HTTP surface (`POST /{method}`) AND a sibling wallet mTLS listener
     // for node-class/Sage-drop-in parity (§5.3 transport).
     let wallet_backend = state.wallet.clone();
     let wallet_cert = state.wallet_cert.clone();
@@ -2026,32 +2026,17 @@ where
     // (a tested unit, #1864) so it cannot be silently flipped to always- or never-spawn.
     crate::self_heal::spawn_driver_if_service();
 
-    // Best-effort mTLS `9257` listener (#368, Sage byte-parity, node-class clients, §5.3). Binds
-    // loopback only; a bind failure (port in use) is NON-FATAL — the wallet stays reachable over
-    // the plain-HTTP `POST /{method}` surface + the `/ws` transport, which is what the extension
-    // uses. The listener stops when the process exits with the rest of the node.
-    match std::net::TcpListener::bind(("127.0.0.1", DEFAULT_MTLS_PORT)) {
-        Ok(l) => {
-            let _ = l.set_nonblocking(true);
-            let backend = wallet_backend.clone();
-            let cert = wallet_cert.clone();
-            tokio::spawn(async move {
-                if let Err(e) = serve_mtls(backend, l, &cert).await {
-                    tracing::warn!(error = %e, "wallet mTLS listener exited");
-                }
-            });
-            tracing::info!(
-                addr = %format!("127.0.0.1:{DEFAULT_MTLS_PORT}"),
-                "wallet mTLS (Sage-parity) listening"
-            );
-        }
-        Err(e) => tracing::warn!(
-            error = %e,
-            addr = %format!("127.0.0.1:{DEFAULT_MTLS_PORT}"),
-            "could not bind the wallet mTLS listener; node-class Sage-parity clients unavailable \
-             (non-fatal). The wallet is still served on the loopback HTTP surface + /ws"
-        ),
-    }
+    // Best-effort wallet mTLS listener (#368, Sage byte-parity, node-class clients, §5.3). Binds
+    // loopback only on [`DEFAULT_MTLS_PORT`], which is deliberately NOT Sage's own RPC port
+    // (dig-node#260). A bind failure is NON-FATAL — the wallet stays reachable over the plain-HTTP
+    // `POST /{method}` surface + the `/ws` transport, which is what the extension uses — but it is
+    // no longer SILENT: `crate::wallet_mtls` logs it and publishes it on `control.status`. The
+    // listener stops when the process exits with the rest of the node.
+    crate::wallet_mtls::spawn(
+        DEFAULT_MTLS_PORT,
+        wallet_backend.clone(),
+        wallet_cert.clone(),
+    );
 
     let app = router(state);
 

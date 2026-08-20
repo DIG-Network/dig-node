@@ -419,12 +419,13 @@ pub fn cli_covered_control_methods() -> Vec<&'static str> {
 fn summarize(method: &str, result: &Value) -> String {
     match method {
         "control.status" => format!(
-            "dig-node {} — up {}s · {} hosted store(s) · {} cached capsule(s) · sync {}",
+            "dig-node {} — up {}s · {} hosted store(s) · {} cached capsule(s) · sync {} · {}",
             result["version"].as_str().unwrap_or("?"),
             result["uptime_secs"].as_u64().unwrap_or(0),
             result["hosted_store_count"].as_u64().unwrap_or(0),
             result["cached_capsule_count"].as_u64().unwrap_or(0),
             avail(&result["sync"]["available"]),
+            wallet_mtls_clause(&result["wallet_mtls"]),
         ),
         "control.config.get" => format!(
             "addr {} · upstream {} · cache {}",
@@ -695,6 +696,27 @@ fn endpoint(ip: &Value, port: &Value) -> String {
         dig_node_control_interface::params::chia_peer_endpoint(text, port)
     } else {
         format!("{text} (port {port})")
+    }
+}
+
+/// The `dign info` clause for the Sage-parity wallet mTLS listener (dig-node#260).
+///
+/// The listener's bind is best-effort, and a LOST bind used to be invisible from every
+/// surface — so an operator whose parity client could not connect had nothing to read.
+/// The unavailable case therefore names the contested port and says the wallet is still
+/// reachable, because the failure is a lost port, never a broken wallet.
+fn wallet_mtls_clause(v: &Value) -> String {
+    let port = v["port"].as_u64();
+    match (v["state"].as_str(), port) {
+        (Some("listening"), Some(port)) => format!("wallet mTLS :{port}"),
+        (Some("unavailable"), Some(port)) => format!(
+            "wallet mTLS UNAVAILABLE (port {port} held by another process; wallet still served \
+             over the loopback HTTP surface)"
+        ),
+        (Some("not_started"), _) => "wallet mTLS not started".to_string(),
+        // An older node, or a state this build does not know: say so rather than guess a
+        // listener is healthy.
+        _ => "wallet mTLS state unknown".to_string(),
     }
 }
 
@@ -1137,6 +1159,35 @@ mod tests {
         assert!(s.contains('6'), "got: {s}");
         assert!(!s.contains('?'), "must not fall back to `?`: {s}");
         assert!(s.contains("synced"), "got: {s}");
+    }
+
+    /// REGRESSION (dig-node#260): a wallet mTLS listener that LOST its port must be
+    /// visible in `dign info`, naming the port, and must be distinguishable from a healthy
+    /// one. The listening case is asserted alongside as the control — a clause that says
+    /// "unavailable" unconditionally would pass the first assertion on its own.
+    #[test]
+    fn info_summary_reports_a_lost_wallet_mtls_port() {
+        let lost = summarize(
+            "control.status",
+            &json!({
+                "version": "0.128.0",
+                "sync": { "available": true },
+                "wallet_mtls": { "state": "unavailable", "port": 9776, "reason": "in use" },
+            }),
+        );
+        assert!(lost.contains("UNAVAILABLE"), "got: {lost}");
+        assert!(lost.contains("9776"), "the contested port: {lost}");
+
+        let healthy = summarize(
+            "control.status",
+            &json!({
+                "version": "0.128.0",
+                "sync": { "available": true },
+                "wallet_mtls": { "state": "listening", "port": 9776 },
+            }),
+        );
+        assert!(!healthy.contains("UNAVAILABLE"), "got: {healthy}");
+        assert!(healthy.contains("wallet mTLS :9776"), "got: {healthy}");
     }
 
     #[test]

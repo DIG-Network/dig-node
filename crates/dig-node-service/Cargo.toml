@@ -108,7 +108,7 @@ dig-rpc-protocol = "0.6"
 # The Sage-parity wallet engine (crate `dig_wallet`) — the node-custodied wallet DB + dual-transport
 # dispatch + seed custody. This shell WIRES it into bring-up (#368): it builds one live
 # `WalletBackend` (`sage::service::WalletService`) and serves the Sage method surface on the
-# extension-reachable loopback (`POST /{method}`, 9778) + the mTLS 9257 listener, and bridges the
+# extension-reachable loopback (`POST /{method}`, 9778) + the mTLS 9776 listener, and bridges the
 # bidirectional WS wallet+control transport (#369) onto it.
 dig-wallet = { path = "../dig-wallet" }
 

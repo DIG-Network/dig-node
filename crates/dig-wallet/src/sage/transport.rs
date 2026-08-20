@@ -4,7 +4,7 @@
 //! ([`WalletBackend::dispatch`]), so their JSON bodies are byte-identical by construction
 //! — only the TLS envelope differs:
 //!
-//! 1. **mTLS `9257`** — Sage byte-parity ([`serve_mtls`]). `POST /{method}` over TLS with
+//! 1. **mTLS [`DEFAULT_MTLS_PORT`]** — Sage byte-parity ([`serve_mtls`]). `POST /{method}` over TLS with
 //!    Sage's shared-self-signed-cert **mutual-TLS** model ([`SharedCertVerifier`]): the
 //!    server accepts a client cert iff its DER is byte-identical to the server's own cert
 //!    (design A.2). A drop-in for a Sage RPC client.
@@ -42,8 +42,24 @@ use tower_http::cors::{Any, CorsLayer};
 use super::events::SyncEvent;
 use super::rpc::WalletBackend;
 
-/// The Sage-parity RPC default mTLS port (design C.4). Loopback only.
-pub const DEFAULT_MTLS_PORT: u16 = 9257;
+/// The default loopback port for the Sage-parity wallet mTLS listener (design C.4).
+///
+/// **This is deliberately NOT Sage's own RPC port.** Sage defaults its RPC to `9257`
+/// (`sage-config`'s `RpcConfig::default`), and dig-node binding it made an
+/// auto-starting OS service race a desktop wallet for the same socket: whichever
+/// started first won, and a Sage client that reached OUR listener was rejected by the
+/// mutual-TLS handshake, surfacing as an opaque `handshake_failure` far from its cause
+/// (dig-node#260). The parity here is of the METHOD SURFACE, never of the port.
+///
+/// `9776` sits with the rest of the DIG cluster (`9777` wallet HTTP mirror, `9778`
+/// control RPC, `9779` dig-app identity), so the number reads as ours on sight.
+pub const DEFAULT_MTLS_PORT: u16 = 9776;
+
+/// Sage's own default RPC port, which this node MUST NEVER bind (dig-node#260).
+///
+/// Recorded as a named constant so the prohibition is testable rather than folklore:
+/// see the `default_mtls_port_is_not_sages_rpc_port` test below.
+pub const SAGE_RPC_PORT: u16 = 9257;
 
 /// The shared self-signed certificate that is BOTH the server cert AND the only accepted
 /// client cert (design A.2). Whoever can read the cert+key is authorized — a
@@ -227,7 +243,7 @@ pub fn build_cors_router(backend: Arc<WalletBackend>) -> Router {
     build_router(backend).layer(cors)
 }
 
-/// Serve the mTLS `9257` listener (Sage byte-parity) on a pre-bound std listener.
+/// Serve the wallet mTLS listener (Sage byte-parity) on a pre-bound std listener.
 pub async fn serve_mtls(
     backend: Arc<WalletBackend>,
     listener: std::net::TcpListener,
@@ -248,7 +264,7 @@ pub async fn serve_http(
     axum::serve(listener, build_cors_router(backend)).await
 }
 
-/// Bring up BOTH transports on loopback (design C.3): the mTLS `9257` listener and the
+/// Bring up BOTH transports on loopback (design C.3): the wallet mTLS listener and the
 /// plain-HTTP+CORS browser mirror, each dispatching the shared handler set. Returns once
 /// either listener exits. Both bind `127.0.0.1` only.
 pub async fn serve_dual(
@@ -278,6 +294,37 @@ mod tests {
     use crate::sage::db::WalletDb;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    /// The listener must never sit on a port another wallet or a Chia service owns.
+    ///
+    /// The whole of dig-node#260 was one number in this file, so the prohibition is
+    /// pinned here rather than left to review: `9257` is Sage's RPC (confirmed against
+    /// `sage-config`'s `RpcConfig::default`), and the rest are Chia's published binds.
+    /// A future "just use the parity port" edit fails this test instead of a user's wallet.
+    #[test]
+    fn default_mtls_port_is_not_sages_rpc_port() {
+        /// Ports owned by software a DIG user is likely to run alongside the node:
+        /// Sage's RPC, then Chia's full node, node RPC, wallet RPC, harvester, farmer,
+        /// daemon, introducer, and the testnet variants.
+        const RESERVED: &[u16] = &[
+            SAGE_RPC_PORT,
+            8444,
+            8555,
+            8447,
+            8446,
+            8559,
+            8560,
+            9256,
+            55400,
+            18444,
+            58444,
+        ];
+        assert_eq!(SAGE_RPC_PORT, 9257, "Sage's RPC port is 9257");
+        assert!(
+            !RESERVED.contains(&DEFAULT_MTLS_PORT),
+            "DEFAULT_MTLS_PORT {DEFAULT_MTLS_PORT} is bound by another wallet or Chia service; pick one outside {RESERVED:?}"
+        );
+    }
 
     async fn test_backend() -> Arc<WalletBackend> {
         let db = WalletDb::open_in_memory().await.unwrap();
@@ -345,7 +392,7 @@ mod tests {
 
     #[test]
     fn mtls_server_config_builds_from_shared_cert() {
-        // The 9257 listener's rustls config (shared-cert client-auth verifier + server
+        // The wallet mTLS listener's rustls config (shared-cert client-auth verifier + server
         // cert) is constructible from a generated shared cert.
         let cert = SharedCert::generate().unwrap();
         assert!(build_server_config(&cert).is_ok());

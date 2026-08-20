@@ -1,6 +1,6 @@
 [package]
 name = "dig-wallet"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "DIG Browser built-in Chia wallet sidecar: a local axum server (using digstore-chain + chia-wallet-sdk over coinset.org) that serves a Sage-mirroring wallet UI. Native Rust so BLS signing works; the browser opens it at 127.0.0.1."
@@ -80,7 +80,7 @@ chia-query = "0.6.2"
 # to discard to — an `eprintln!` here reaches nobody, which is why a chain-source failure stayed
 # invisible across three debugging rounds and 8,000 log lines (#2210, #2216).
 tracing = "0.1"
-# Dual transport (C.3): mTLS 9257 (Sage byte-parity) + plain-HTTP+CORS browser mirror.
+# Dual transport (C.3): mTLS 9776 (Sage byte-parity surface) + plain-HTTP+CORS browser mirror.
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"

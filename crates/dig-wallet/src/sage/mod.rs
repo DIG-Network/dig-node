@@ -29,7 +29,7 @@
 //!   `transfer_nfts`, `transfer_dids`.
 //! - [`offers`] — the offer suite builders (#218): `make_offer`, `take_offer`,
 //!   `view_offer`, `combine_offers`, `cancel_offer` (`get_offers`/`get_offer` are DB reads).
-//! - [`transport`] — the dual transport (design C.3): mTLS `9257` (Sage byte-parity)
+//! - [`transport`] — the dual transport (design C.3): mTLS `9776` (Sage byte-parity)
 //!   + the plain-HTTP+CORS browser mirror, both dispatching the SAME handler set.
 //!
 //! - [`events`] — the [`events::SyncEvent`] stream (design A.9, #205 PR4): an in-process
