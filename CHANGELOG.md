@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.130.0] - 2026-08-20
+
+### Features
+- **download:** Forward the availability ask across connected pool peers (#258)- **cache:** Fold the tier/relevance/eviction decisions onto dig-sex 0.2 (#264)
+
 ## [0.128.0] - 2026-08-20
 
 ### Bug Fixes
