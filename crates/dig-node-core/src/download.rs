@@ -55,8 +55,8 @@ use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
 use crate::seams::dig_peer::{
-    CapsuleFallbackLocator, ConnectedPool, EmptyLocator, ForwardedAsk, NatForwardedAsk,
-    PoolProviderLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
+    retain_excluding_self, CapsuleFallbackLocator, ConnectedPool, EmptyLocator, ForwardedAsk,
+    NatForwardedAsk, PoolProviderLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
 };
 pub(crate) use crate::seams::dig_peer::{FORWARDED_ASK_FANOUT, MAX_CONCURRENT_FORWARDED_ASKS};
 
@@ -1293,6 +1293,11 @@ impl NodeContent {
     ) -> Vec<ProviderRecord> {
         let mut providers = self.find_providers(content).await;
         providers.extend(self.forwarded_holders(content, hops_used, requestor).await);
+        // Both sources, one rule (dig-node#261). The DHT leg already excludes self at its own source,
+        // but the FORWARDED leg is an untrusted peer's `Vec` and had no exclusion at all — so the
+        // filter belongs HERE, at the merge, where it covers every source this answer will ever draw
+        // from including any added later. Applying it per-leg is what left one leg uncovered.
+        retain_excluding_self(&mut providers, self.self_peer_id.as_deref());
         dedup_by_peer(&mut providers);
         providers
     }
@@ -1400,13 +1405,9 @@ impl NodeContent {
             .find_providers(content)
             .await
             .unwrap_or_default();
-        match &self.self_peer_id {
-            Some(me) => found
-                .into_iter()
-                .filter(|p| &p.provider_peer_id != me)
-                .collect(),
-            None => found,
-        }
+        let mut found = found;
+        retain_excluding_self(&mut found, self.self_peer_id.as_deref());
+        found
     }
 
     /// The #164 content-acquisition path: multi-source download `content` (locate → confirm → fan

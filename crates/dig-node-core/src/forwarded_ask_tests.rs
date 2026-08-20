@@ -117,12 +117,23 @@ fn engine(
     pool_peers: &[u8],
     ask: Option<Arc<dyn ForwardedAsk>>,
 ) -> (Arc<NodeContent>, tempfile::TempDir) {
+    engine_identified(dht_providers, pool_peers, ask, None)
+}
+
+/// As [`engine`], but the node KNOWS its own `peer_id` — the precondition every self-exclusion
+/// assertion needs, since a node with no resolved identity has nothing to exclude.
+fn engine_identified(
+    dht_providers: Vec<ProviderRecord>,
+    pool_peers: &[u8],
+    ask: Option<Arc<dyn ForwardedAsk>>,
+    self_peer_id: Option<String>,
+) -> (Arc<NodeContent>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let content = NodeContent::new(
         Arc::new(MockProviderLocator::fixed(dht_providers)),
         Arc::new(MockRangeTransport::new(MockContent::even(4, 1))),
         MissMode::Redirect,
-        None,
+        self_peer_id,
         dir.path(),
     );
     {
@@ -494,5 +505,76 @@ async fn a_successful_download_forgets_nothing() {
     assert!(
         cache.forgotten().is_empty(),
         "a working candidate set is kept — forgetting it would undo the lookup cache entirely"
+    );
+}
+
+// -- Self-exclusion: the SPEC states it of EVERY source (#261) -------------------------------------
+
+/// **Proves:** a provider record naming THIS node, arriving by the FORWARDED path, never reaches the
+/// merged answer — the rule `SPEC.md` §19.3 states of every source, honoured on the source that did
+/// not honour it (dig-node#261).
+///
+/// **The fixture distinguishes the property from its nearest wrong implementation.** The peer answers
+/// with TWO records — self and an honest third party — so "self was excluded" cannot be satisfied by
+/// "the forwarded leg returned nothing", which is what a fixture naming only self would have accepted.
+/// The DHT leg answers EMPTY, so the surviving record can only have come through the forwarded path.
+#[tokio::test]
+async fn a_forwarded_record_naming_this_node_never_reaches_the_answer() {
+    let content = content();
+    let me = mock_peer_hex(9);
+    let honest = provider(7, &content);
+    let ask = RecordingAsk::answering(vec![
+        // The hostile half: the peer names US as a holder of content we just missed.
+        ProviderRecord::new(
+            &content.to_key(),
+            &PeerId::from_bytes([9; 32]),
+            vec![CandidateAddr::direct("10.0.0.9", 9444)],
+            u64::MAX,
+        ),
+        honest.clone(),
+    ]);
+    let (pc, _dir) = engine_identified(Vec::new(), &[1], Some(ask), Some(me.clone()));
+
+    let found = pc.locate_holders(&content, 0, &RequestorId::Local).await;
+
+    let ids = peer_ids(&found);
+    assert!(
+        !ids.contains(&me),
+        "a forwarded record naming this node must be dropped, got {ids:?}"
+    );
+    assert_eq!(
+        ids,
+        vec![honest.provider_peer_id.clone()],
+        "and ONLY self is dropped — the honest third party the same answer named survives"
+    );
+}
+
+/// **The control for the test above:** the IDENTICAL record arriving by the DHT leg is dropped too.
+///
+/// Without this, `a_forwarded_record_naming_this_node_never_reaches_the_answer` cannot tell
+/// "self is excluded from every source" apart from "the forwarded leg is broken and drops things", and
+/// it would stay green under a fix that silently disabled forwarding altogether.
+#[tokio::test]
+async fn the_same_record_arriving_by_the_dht_leg_is_dropped_by_the_same_rule() {
+    let content = content();
+    let me = mock_peer_hex(9);
+    let honest = provider(7, &content);
+    let dht = vec![
+        ProviderRecord::new(
+            &content.to_key(),
+            &PeerId::from_bytes([9; 32]),
+            vec![CandidateAddr::direct("10.0.0.9", 9444)],
+            u64::MAX,
+        ),
+        honest.clone(),
+    ];
+    let (pc, _dir) = engine_identified(dht, &[], None, Some(me.clone()));
+
+    let found = pc.locate_holders(&content, 0, &RequestorId::Local).await;
+
+    assert_eq!(
+        peer_ids(&found),
+        vec![honest.provider_peer_id.clone()],
+        "self is excluded on the DHT leg as well, and the honest holder survives"
     );
 }

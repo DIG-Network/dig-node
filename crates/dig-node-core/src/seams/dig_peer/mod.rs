@@ -58,5 +58,5 @@ pub use module_transport::NatModuleTransport;
 pub use peer_network::PeerNetwork;
 pub(crate) use pool_locator::{ConnectedPool, PoolProviderLocator};
 pub(crate) use selector_adapter::SelectorAdapter;
-pub(crate) use self_excluding_locator::SelfExcludingLocator;
+pub(crate) use self_excluding_locator::{retain_excluding_self, SelfExcludingLocator};
 pub(crate) use union_locator::{EmptyLocator, UnionLocator};
