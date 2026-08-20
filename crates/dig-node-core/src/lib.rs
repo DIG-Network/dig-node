@@ -5917,6 +5917,153 @@ mod tests {
         std::env::remove_var("DIG_NODE_CACHE");
     }
 
+    /// Every `<store>/<root>` capsule currently on disk under `<cache>/modules`, sorted.
+    ///
+    /// The eviction-retraction tests need to know what the world looked like AT THE MOMENT the
+    /// advertisement round ran, not merely that one ran — see
+    /// [`an_eviction_advertises_after_the_victim_is_gone`].
+    fn on_disk_capsules(cache_dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(stores) = std::fs::read_dir(cache_dir.join("modules")) else {
+            return out;
+        };
+        for store in stores.flatten() {
+            let Some(store_hex) = store.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(capsules) = std::fs::read_dir(store.path()) else {
+                continue;
+            };
+            for capsule in capsules.flatten() {
+                if let Some(root_hex) = capsule
+                    .file_name()
+                    .to_str()
+                    .and_then(crate::capsule_key::cached_root_stem)
+                {
+                    out.push(format!("{store_hex}/{root_hex}"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Install an inventory refresher that snapshots the on-disk capsule set on every call, so a test
+    /// can assert not just THAT the node re-advertised but WHAT it would have advertised.
+    fn install_inventory_snapshot_spy(
+        node: &Node,
+        rounds: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) {
+        use crate::seams::dig_peer::peer_network::PeerNetwork;
+        let cache_dir = node.cache_dir.clone();
+        node.set_inventory_refresher(Box::new(move || {
+            let rounds = rounds.clone();
+            let snapshot = on_disk_capsules(&cache_dir);
+            Box::pin(async move {
+                rounds.lock().unwrap().push(snapshot);
+            })
+        }));
+    }
+
+    /// Pin a two-capsule cache under a tiny cap so the sweep MUST sacrifice exactly the tier-0 store,
+    /// returning `(node, cache tempdir, config tempdir, victim path, survivor path)`.
+    ///
+    /// `cap` is the caller's lever: a tiny cap forces one eviction, a roomy one forces none, which is
+    /// what lets the two tests below share a fixture and differ in exactly one variable.
+    fn two_capsule_cache(cap: u64) -> (Node, tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let (node, td) = test_node(None);
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+        set_cache_cap_bytes(cap).unwrap();
+
+        let survivor_store = "ab".repeat(32);
+        let victim_store = "ba".repeat(32);
+        let root = "cd".repeat(32);
+        node.note_inbound_demand(&survivor_store, &root); // Tier1Demand — protected
+        crate::tier0_live::mark_tier0_land(&victim_store); // Tier0Precache — sacrificial
+
+        let survivor = module_path(&node.cache_dir, &survivor_store, &root);
+        let victim = module_path(&node.cache_dir, &victim_store, &root);
+        for p in [&survivor, &victim] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; 1_024]).unwrap();
+        }
+        (node, td, cfg, victim, survivor)
+    }
+
+    /// **Proves (#267, dig-sex SPEC §7.1):** a size-cap sweep that deletes a capsule drives an
+    /// advertisement round, and that round sees a world the victim has already left — so the node
+    /// stops claiming to hold it. Before this wiring the sweep deleted the file and told nobody, and
+    /// peers kept dialling this node for content it no longer had.
+    ///
+    /// **Non-vacuous, and deliberately not a "did an announce happen" counter.** The defect has two
+    /// distinct shapes and a counter sees only one of them: (a) no round at all — today's behaviour;
+    /// (b) a round placed BEFORE the delete, which is what the land path did (`refresh` then `evict`)
+    /// and which a counter passes happily while the retraction is still never computed. Snapshotting
+    /// the on-disk set inside the round distinguishes them: an early round still lists the victim.
+    ///
+    /// **Catches:** dropping the retraction entirely, and re-ordering the sweep after the announce.
+    #[test]
+    fn an_eviction_advertises_after_the_victim_is_gone() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        // Two ~1 KiB capsules against a 1,500-byte cap: over by one capsule, so exactly one goes.
+        let (node, _td, _cfg, victim, survivor) = two_capsule_cache(1_500);
+        let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        install_inventory_snapshot_spy(&node, rounds.clone());
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+
+        assert!(!victim.exists(), "the tier-0 capsule was the sacrifice");
+        assert!(survivor.exists(), "the demanded capsule survives");
+
+        let rounds = rounds.lock().unwrap();
+        assert_eq!(
+            rounds.len(),
+            1,
+            "an eviction MUST drive exactly one advertisement round; got {rounds:?}"
+        );
+        let victim_id = format!("{}/{}", "ba".repeat(32), "cd".repeat(32));
+        assert!(
+            !rounds[0].contains(&victim_id),
+            "the advertisement round must run AFTER the delete, so the evicted capsule is no \
+             longer in the set it advertises; saw {:?}",
+            rounds[0]
+        );
+        assert!(
+            rounds[0].contains(&format!("{}/{}", "ab".repeat(32), "cd".repeat(32))),
+            "the surviving capsule must still be advertised — a retraction is not a withdrawal \
+             of everything; saw {:?}",
+            rounds[0]
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// **Proves (#267):** a sweep that evicts NOTHING costs no network round. `HoldingsDelta::is_empty`
+    /// is the gate, and this is the control that keeps the test above honest: without it, "refresh
+    /// unconditionally on every sweep" — a strictly wrong implementation that pays a Kademlia round
+    /// trip per read-path land — would pass.
+    /// **Catches:** wiring the refresh without consulting the delta.
+    #[test]
+    fn a_sweep_that_evicts_nothing_advertises_nothing() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        // Same fixture, one variable changed: a roomy cap, so the sweep finds nothing to sacrifice.
+        let (node, _td, _cfg, victim, survivor) = two_capsule_cache(10_000);
+        let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        install_inventory_snapshot_spy(&node, rounds.clone());
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+
+        assert!(victim.exists() && survivor.exists(), "nothing was evicted");
+        assert!(
+            rounds.lock().unwrap().is_empty(),
+            "a no-op sweep must not spend an advertisement round"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
     /// **Proves (#1990):** the inbound-demand PULL is OFF by default — a peer's request records demand
     /// but spawns NO whole-capsule backfill even with a live peer network + provider. This preserves
     /// the amplification invariant: a stranger cannot drive an uncached pull until an operator opts in.
