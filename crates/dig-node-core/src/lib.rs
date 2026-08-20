@@ -13126,6 +13126,79 @@ mod tests {
         );
     }
 
+    /// A node with a live p2p content engine, so `spawn_capsule_backfill` reaches its DECISION rather
+    /// than short-circuiting on the "nothing to pull from" capability check.
+    ///
+    /// The capability check is why the older held-skip test could not see the held guard at all: it
+    /// used a bare node, so it returned before any policy ran and passed whatever the policy said.
+    fn node_that_can_pull() -> (Arc<Node>, tempfile::TempDir) {
+        let (store, tip, _) = miss_setup();
+        let (node, td) = test_node_with_resolver(None, MockResolver::one(&store.to_hex(), tip));
+        let node = Arc::new(node);
+        node.set_self_ref(Arc::downgrade(&node));
+        let cid = ContentId::resource(store.0, tip.0, [0xcd; 32]);
+        attach_p2p(
+            &node,
+            vec![dig_download::testkit::mock_provider(5, &cid)],
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td,
+        );
+        (node, td)
+    }
+
+    /// **Proves (#270):** the three acquisition guards are `dig_sex::acquisition::decide`'s answer,
+    /// and each one is reached on a node that COULD pull.
+    ///
+    /// Every case runs on its own node with a live content engine, because a node without one returns
+    /// before any decision is taken — which is exactly how a guard can be deleted with every existing
+    /// test still green. The `Acquire` control is what makes the three refusals mean something: the
+    /// same harness, the same call, and a claimed slot.
+    #[tokio::test]
+    async fn every_acquisition_refusal_is_the_crate_decision_and_the_control_still_acquires() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let store_hex = "ab".repeat(32);
+        let root_hex = "cd".repeat(32);
+        let key = format!("{store_hex}:{root_hex}");
+
+        // CONTROL — nothing held, switch unset (default on), nothing in flight → Acquire.
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let (node, _td) = node_that_can_pull();
+        node.maybe_backfill_capsule(&store_hex, &root_hex, crate::download::ReadOrigin::Local);
+        assert!(
+            node.capsule_acquisition.is_warming(&key),
+            "the control must acquire, or the three refusals below prove nothing"
+        );
+
+        // SkipDisabled — the switch off.
+        std::env::set_var("DIG_NODE_BACKFILL_ON_MISS", "off");
+        let (off, _td_off) = node_that_can_pull();
+        off.maybe_backfill_capsule(&store_hex, &root_hex, crate::download::ReadOrigin::Local);
+        assert!(
+            !off.capsule_acquisition.is_warming(&key),
+            "a disabled switch must claim no acquisition slot"
+        );
+
+        // SkipDisabled — and the #282 direction: a value that cannot be READ is also off.
+        std::env::set_var("DIG_NODE_BACKFILL_ON_MISS", "of");
+        let (typo, _td_typo) = node_that_can_pull();
+        typo.maybe_backfill_capsule(&store_hex, &root_hex, crate::download::ReadOrigin::Local);
+        assert!(
+            !typo.capsule_acquisition.is_warming(&key),
+            "an unreadable switch value must fail CLOSED, not acquire"
+        );
+
+        // SkipAlreadyHeld — on a node that could otherwise pull.
+        std::env::remove_var("DIG_NODE_BACKFILL_ON_MISS");
+        let (held, _td_held) = node_that_can_pull();
+        seed_module(&held, &store_hex, &root_hex, b"already-here");
+        held.maybe_backfill_capsule(&store_hex, &root_hex, crate::download::ReadOrigin::Local);
+        assert!(
+            !held.capsule_acquisition.is_warming(&key),
+            "a held capsule must claim no acquisition slot"
+        );
+    }
+
     /// **Proves (#1614):** the §21 backfill leg and the #1576 reshare leg claim the ONE shared gate, so a
     /// read triggers AT MOST ONE whole-capsule pull. Here the reshare leg has already won the race and
     /// holds the capsule's single-flight slot; the §21 backfill for the SAME `(store, root)` must then

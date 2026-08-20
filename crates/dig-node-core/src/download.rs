@@ -51,6 +51,7 @@ use dig_download::{
 use dig_peer_selector::{
     PeerId, PeerSelector, PoolEvent, PoolRemovalReason, SelectorConfig, TraversalKind,
 };
+use dig_sex::BackfillPolicy;
 use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
@@ -153,25 +154,41 @@ fn resolve_miss_mode(v: Option<&str>) -> MissMode {
     }
 }
 
-/// Whether background capsule backfill (§5.6) is enabled: when a resource read is satisfied FROM
+/// The [`BackfillPolicy`] this node acquires under (§5.6): when a resource read is satisfied FROM
 /// ANOTHER NODE (a redirect or a fetch-through miss for a concrete `(store, root)`), the node ALSO
 /// pulls the whole `.dig` capsule for that generation in the background and caches it, so the NEXT
-/// read of that store is served locally. Resolved from `DIG_NODE_BACKFILL_ON_MISS`; **default ON** —
-/// only an explicit `off`/`0`/`false`/`no` disables it. Distinct from `DIG_NODE_ON_MISS` (which
-/// chooses redirect vs. fetch-through for the CURRENT read): backfill is the behind-the-scenes
-/// whole-capsule warm-up that applies under BOTH miss modes.
-pub fn backfill_on_miss_enabled() -> bool {
+/// read of that store is served locally. Resolved from `DIG_NODE_BACKFILL_ON_MISS`.
+///
+/// Distinct from `DIG_NODE_ON_MISS` (which chooses redirect vs. fetch-through for the CURRENT read):
+/// backfill is the behind-the-scenes whole-capsule warm-up that applies under BOTH miss modes.
+pub fn backfill_policy() -> BackfillPolicy {
     resolve_backfill_on_miss(std::env::var("DIG_NODE_BACKFILL_ON_MISS").ok().as_deref())
 }
 
-/// Pure core of [`backfill_on_miss_enabled`]: default ON; only an explicit falsy value
-/// (`off`/`0`/`false`/`no`, case-insensitive) disables it. Pure so the policy is unit-tested without
-/// touching process-global env.
-fn resolve_backfill_on_miss(v: Option<&str>) -> bool {
-    !matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("off") | Some("0") | Some("false") | Some("no")
-    )
+/// Whether background capsule backfill is enabled, for the call sites that only need the boolean.
+pub fn backfill_on_miss_enabled() -> bool {
+    backfill_policy().enabled
+}
+
+/// Pure core of [`backfill_policy`], and the one place the two failure directions are distinguished.
+///
+/// - **absent → ON.** [`BackfillPolicy::default`] is `enabled: true`, because the flywheel is the
+///   point and a node that reads remotely without warming up stays a permanent leech. An operator
+///   who has set nothing has expressed no intent, so the crate's default stands.
+/// - **recognised → as written.** `on`/`1`/`true`/`yes` enable; `off`/`0`/`false`/`no` disable.
+/// - **present but UNRECOGNISED → OFF.** This is the change (#282). A present value is an operator
+///   stating an intent this node could not read, and the safe reading of an unreadable intent is to
+///   do less, not more: backfill spends bandwidth and disk on content nobody asked this node for, so
+///   a typo must not silently leave it running. `DIG_NODE_BACKFILL_ON_MISS=of` used to mean ON.
+///
+/// Pure so the policy is unit-tested without touching process-global env.
+fn resolve_backfill_on_miss(v: Option<&str>) -> BackfillPolicy {
+    let enabled = match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None => BackfillPolicy::default().enabled,
+        Some("on" | "1" | "true" | "yes") => true,
+        _ => false,
+    };
+    BackfillPolicy { enabled }
 }
 
 /// Whether the INBOUND-DEMAND whole-capsule cache trigger (#1990) is enabled: when a remote PEER
@@ -2352,19 +2369,40 @@ pub(crate) mod tests {
         }
     }
 
-    /// **Proves:** capsule backfill (§5.6) defaults ON and only an explicit falsy value disables it.
-    /// **Catches:** a default-off regression (the user wants backfill on by default) or a parser that
-    /// misreads a truthy/absent value as disabled.
+    /// **Proves:** capsule backfill (§5.6) defaults ON when UNSET, honours both recognised
+    /// directions, and — the #282 fix — fails CLOSED on a value it cannot read.
+    /// **Catches:** a default-off regression (an unset variable must still warm the cache), and the
+    /// inverse regression this test was written for: a parser that treats an unrecognised value as
+    /// truthy, so a mistyped opt-out leaves the node acquiring capsules the operator asked it to stop
+    /// acquiring.
+    ///
+    /// The three cases are asserted separately on purpose. A test that only checked `None` and the
+    /// falsy list passes under BOTH parsers — it never presents a value the two disagree about — so
+    /// the unrecognised case, and a plausible TYPO of a real opt-out rather than a nonsense string,
+    /// is where the property actually lives.
     #[test]
-    fn backfill_defaults_on_and_opts_out_only_on_falsy() {
-        assert!(resolve_backfill_on_miss(None), "unset → ON (default)");
-        assert!(resolve_backfill_on_miss(Some("on")));
-        assert!(resolve_backfill_on_miss(Some("1")));
-        assert!(resolve_backfill_on_miss(Some("anything")), "unknown → ON");
+    fn backfill_defaults_on_when_unset_and_fails_closed_on_an_unreadable_value() {
+        assert!(
+            resolve_backfill_on_miss(None).enabled,
+            "unset → ON (BackfillPolicy::default)"
+        );
+        for v in ["on", "1", "true", "yes", " ON ", "True"] {
+            assert!(
+                resolve_backfill_on_miss(Some(v)).enabled,
+                "DIG_NODE_BACKFILL_ON_MISS={v} → enabled"
+            );
+        }
         for v in ["off", "0", "false", "no", "OFF", "False", " no "] {
             assert!(
-                !resolve_backfill_on_miss(Some(v)),
+                !resolve_backfill_on_miss(Some(v)).enabled,
                 "DIG_NODE_BACKFILL_ON_MISS={v} → disabled"
+            );
+        }
+        // A typo of an opt-out, an empty string, and a value from some future config vocabulary.
+        for v in ["of", "fasle", "disabled", "", "2", "maybe"] {
+            assert!(
+                !resolve_backfill_on_miss(Some(v)).enabled,
+                "DIG_NODE_BACKFILL_ON_MISS={v} is unreadable → must fail CLOSED"
             );
         }
     }

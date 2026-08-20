@@ -428,8 +428,9 @@ impl Node {
     /// - **single-flight** — the SHARED `(store, root)` acquisition gate (#1614) both this leg and the
     ///   #1576 reshare warm claim, so a burst of reads across either leg starts exactly ONE pull.
     pub(crate) fn spawn_capsule_backfill(&self, store_hex: &str, root_hex: &str) {
-        // Config gate (default on) + only where a peer network / upstream exists to pull from.
-        if !crate::download::backfill_on_miss_enabled() || self.p2p_content().is_none() {
+        // Only where a peer network / upstream exists to pull from. This is a CAPABILITY check, not a
+        // policy one — there is nothing to decide about on a node with no way to fetch.
+        if self.p2p_content().is_none() {
             return;
         }
         // Need an owned `Arc<Node>` to spawn the detached pull. Installed by the standalone
@@ -438,25 +439,45 @@ impl Node {
         let Some(node) = self.arc_self() else {
             return;
         };
-        // Need a concrete, valid (store, root). `hex64` validates AND decodes; a rootless/`"latest"`
-        // read (no concrete capsule) or a malformed value yields `None` and is skipped — the read
-        // path resolves the tip separately.
+        // Need a concrete, valid (store, root). A rootless/`"latest"` read names no capsule and is
+        // skipped — the read path resolves the tip separately — and `CapsuleKey::parse` is the one
+        // boundary at which untrusted key bytes become a usable capsule identity.
+        let Some(capsule_key) = crate::capsule_key::CapsuleKey::parse(store_hex, root_hex) else {
+            return;
+        };
+        let capsule = capsule_key.identity();
+
+        // THE DECISION (SPEC §5, `dig_sex::acquisition`). The switch, the held check and the
+        // in-flight check used to be three hand-rolled guards here; they are one crate call now, so
+        // this node and every other consumer answer "should a remote read warm the whole capsule?"
+        // the same way, and the reason is reported rather than collapsed into an early return.
+        let decision = dig_sex::acquisition::decide(
+            crate::download::backfill_policy(),
+            &capsule,
+            crate::module_exists(self.cache_dir_path(), store_hex, root_hex),
+            &self.capsule_acquisition.in_flight_capsules(),
+        );
+        if decision != dig_sex::AcquisitionDecision::Acquire {
+            tracing::debug!(
+                store = %store_hex,
+                root = %root_hex,
+                ?decision,
+                "capsule backfill not started"
+            );
+            return;
+        }
+
         let (Some(store_id), Some(root_bytes)) =
             (crate::dht::hex64(store_hex), crate::dht::hex64(root_hex))
         else {
-            return;
+            return; // unreachable: `CapsuleKey::parse` already admitted two canonical 64-hex ids
         };
-        // Already held → nothing to warm up.
-        if crate::module_exists(self.cache_dir_path(), store_hex, root_hex) {
-            return;
-        }
         let key = format!("{store_hex}:{root_hex}");
-        // Single-flight against the SHARED acquisition gate (#1614): this §21 backfill and the #1576
-        // reshare warm are two transports for the SAME capsule, so they claim ONE registry. If the
-        // other leg (or a prior read on this leg) already claimed this capsule, do nothing — a burst of
-        // resource reads for the same not-yet-held store triggers exactly ONE whole-capsule pull across
-        // BOTH legs. The gates ABOVE (config, p2p_content, already-held) all run BEFORE this claim, so a
-        // gated-out read never consumes a concurrency slot (#1576/#1654).
+        // The single-flight CLAIM stays here and stays load-bearing (#1614). `decide` reads the
+        // in-flight set, which is a snapshot; this claim is atomic, and it also enforces the
+        // CONCURRENCY CAP across DISTINCT generations that `dig-sex` has no concept of. The crate
+        // decides whether an acquisition is warranted; the registry decides whether this node has a
+        // slot to run it in, and both answers are required.
         let Some(claim) = self.capsule_acquisition.clone().claim(key.clone()) else {
             return; // an acquisition for this capsule is already in flight on one of the two legs
         };
