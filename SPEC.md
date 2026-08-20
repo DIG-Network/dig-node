@@ -2951,11 +2951,92 @@ fetch-on-miss stays OFF — the caller must ask. The proxy serves bytes but the 
 become a holder (a remote/`Peer`-origin read never triggers reshare/backfill — the reshare
 amplification boundary, §14.3/§19), so proxying cannot be used to plant attacker-chosen inventory.
 
-10.4.4. **Privacy.** A miss discloses the requested `(store_id, root, retrieval_key)` to the middle
+10.4.4. **The forwarded ask (dig_ecosystem#3128).** WHEN ENABLED (§10.4.6 — it is opt-in and defaults
+OFF), a miss MUST also ask this node's CONNECTED POOL peers the same question over the existing
+`dig.getAvailability` verb, and MUST merge the `providers` they name into the answer it was already
+building. Every requirement in this clause is conditional on that gate; a node with the feature
+disabled MUST forward nothing, and its miss answer is the DHT-only one §10.4.1-10.4.3 describe. This
+is what makes discovery recursive:
+a holder reachable through connections this node already holds is named even when no DHT record here
+can point at it. No new verb, address struct or result type is introduced — the hop budget rides
+`params.redirect_depth` and the answer rides the existing `providers` array — and a peer that does not
+return `providers` MUST be read as "found nobody", never as an error.
+
+- **Ordering is normative.** This node's own DHT findings MUST lead the merged list and forwarded
+  records MUST follow, deduplicated by `peer_id` keeping the FIRST occurrence. The requestor dials in
+  list order and the list is truncated at `MAX_REDIRECT_PROVIDERS` (§10.4.2), so appending is what
+  makes that cap non-displacing: a peer answering with a full slate of fabricated holders spends only
+  the tail and can never evict a holder this node found itself.
+- **Depth.** The ask carries `redirect_depth + 1`, and a request at or over `REDIRECT_HOP_CAP` MUST
+  forward nothing (it still answers from the DHT). A request shape that cannot carry a hop counter —
+  the dig-nat mux `AvailabilityRequest`, which has no such field — MUST be treated as having spent the
+  whole budget and MUST NOT forward.
+- **Breadth.** At most `FORWARDED_ASK_FANOUT` (= 4) peers per admitted miss, and at most
+  `MAX_CONCURRENT_FORWARDED_ASKS` (= 32) forwarded asks in flight node-wide. The requestor itself and
+  this node's own `peer_id` MUST be excluded from the fan-out.
+
+  **This exclusion governs who is ASKED, not who may be NAMED.** A peer's answer is not yet filtered
+  against this node's own `peer_id`, so a forwarded record naming THIS node can currently reach the
+  merged answer — narrower than §19.3's "NO source — DHT or pool — can ever offer self on the
+  fetch/dial path", which governs the fetch/dial sources rather than the redirect answer. It is
+  bounded by `REDIRECT_HOP_CAP` and only reachable where the answering peer already
+  controls the answer, so it is defense-in-depth rather than a live hole; it is recorded here because a
+  reader MUST NOT infer the stronger property from the sentence above.
+- **A SEPARATE relay budget.** The outbound fan-out MUST be charged to its own per-requestor bucket
+  (`DEFAULT_RELAY_ASK_BURST` = 4, `DEFAULT_RELAY_ASK_REFILL_PER_SEC` = 1/s), never the §10.4.1 lookup
+  budget. Requestor identity keys the IMMEDIATE caller, so a relaying hop's fan-out is billed to that
+  hop's allowance at its own peers; a shared bucket would let one admitted inbound frame spend a
+  victim's budget across every peer it holds, and would let a caller convert cheap-lookup tokens into
+  fan-out at third parties. Every refusal degrades the answer (fewer named holders) and MUST NOT fail
+  the request.
+- **Forwarded records are HEARSAY.** They are offered as candidates to DIAL, where the whole-resource
+  merkle bind against the chain-anchored root is what admits bytes, so a fabricated holder costs one
+  wasted dial. They MUST NOT be stored, re-served as this node's own authoritative claim, or published.
+
+10.4.5. **Privacy.** A miss discloses the requested `(store_id, root, retrieval_key)` to the middle
 node (it must, to locate holders). The `proxy` path additionally discloses to the serving holder that
-the requestor wanted that resource — the SAME disclosure a direct read from that holder would make.
-No NEW party learns the request beyond those the direct read would already involve (cross-ref
-dig_ecosystem#2006/#1934 on read-path metadata exposure).
+someone wanted that resource — the SAME disclosure a direct read from that holder would make. For the
+redirect and proxy paths alone, no NEW party learns the request beyond those a direct read would
+already involve (cross-ref dig_ecosystem#2006/#1934 on read-path metadata exposure).
+
+**The forwarded ask (§10.4.4) breaks that property deliberately, and it MUST be stated rather than
+inherited.** Enabling it means a miss discloses the requested triple to parties a direct read would
+never have involved:
+
+- Up to `FORWARDED_ASK_FANOUT` (= 4) of this node's connected pool peers learn the triple per admitted
+  miss, and each of them may disclose it to 4 of ITS peers, recursively to `REDIRECT_HOP_CAP`. The
+  disclosure radius of one admitted frame is therefore **up to ~1,360 nodes**, none of which the
+  requestor chose, contacted, or can enumerate.
+- Those peers are selected by THIS node's pool membership, not by the requestor. A requestor cannot
+  predict, restrict, or audit who ends up learning what it asked for.
+- The disclosure happens on a MISS, which is precisely the case where the requestor has not yet
+  decided to contact any holder — so it is not a disclosure a completed direct read would have made
+  anyway.
+
+Two limits are real and MUST NOT be overstated into an anonymity claim:
+
+- **The requestor's identity is not carried past the first hop.** A forwarded ask contains only the
+  content item and `redirect_depth`; each receiver authenticates the FORWARDING node's `peer_id` over
+  mTLS and learns nothing about who originally asked. So downstream nodes learn WHAT was asked, not BY
+  WHOM. This is a property of the message, not a defence against timing or traffic correlation, and it
+  MUST NOT be described as anonymity.
+- **Nothing is retained.** Forwarded records are merged into one answer and never stored, re-served or
+  published (§10.4.4), so the disclosure is to a node's memory for the life of one request — but a
+  peer is free to log what it was asked, and nothing here prevents that.
+
+This is why the forwarded ask is **opt-in** (`DIG_NODE_FORWARD_ON_MISS`, default OFF, §10.4.6):
+widening the disclosure radius of every miss on a node is an operator's decision. A node with the
+feature disabled retains the narrower property stated in the first paragraph.
+
+10.4.6. **The forwarded ask is OPT-IN.** `DIG_NODE_FORWARD_ON_MISS` (default **OFF**; only an explicit
+`on`/`1`/`true`/`yes`, case-insensitive, enables it) governs §10.4.4. It is resolved ONCE at engine
+construction, so a node's amplification posture is fixed for its lifetime. Disabled, a miss answers
+from this node's own DHT lookup and the answer is byte-identical to one produced before the forwarded
+ask existed. The default is OFF because the leg is the most amplifying path the node has — one
+admitted frame at `redirect_depth: 0` fans to roughly 1,360 outbound dials and 1,360 DHT walks (16 →
+64 → 256 → 1024), sustained at about 340 asks/s per requestor identity — and the strictly cheaper,
+node-local `proxy` leg (§10.4.3) is already opt-in. A path that amplifies more than an opt-in path
+MUST NOT be gated less than it.
 
 ---
 

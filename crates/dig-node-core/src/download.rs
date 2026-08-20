@@ -55,9 +55,10 @@ use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
 use crate::seams::dig_peer::{
-    CapsuleFallbackLocator, ConnectedPool, EmptyLocator, PoolProviderLocator, SelectorAdapter,
-    SelfExcludingLocator, UnionLocator,
+    CapsuleFallbackLocator, ConnectedPool, EmptyLocator, ForwardedAsk, NatForwardedAsk,
+    PoolProviderLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
 };
+pub(crate) use crate::seams::dig_peer::{FORWARDED_ASK_FANOUT, MAX_CONCURRENT_FORWARDED_ASKS};
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
 /// hold it — the `error.data.redirect` names them (peer_id + candidate addresses) so the caller
@@ -204,6 +205,45 @@ pub fn inbound_demand_cache_enabled() -> bool {
 /// (`on`/`1`/`true`/`yes`, case-insensitive) enables it. Pure so the policy is unit-tested without
 /// touching process-global env.
 fn resolve_inbound_demand_cache(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("on") | Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Whether the FORWARDED AVAILABILITY ASK (dig_ecosystem#3128) is enabled: on a content miss, ALSO
+/// ask this node's connected pool peers `dig.getAvailability` and merge the holders they name into the
+/// answer. Resolved from `DIG_NODE_FORWARD_ON_MISS`; **default OFF** — only an explicit truthy value
+/// (`on`/`1`/`true`/`yes`, case-insensitive) enables it.
+///
+/// # Why it is OPT-IN, when the capability is the point of the feature
+///
+/// Because it is the most amplifying path this node has, and an operator has to be able to say no.
+///
+/// The relay token is charged on INBOUND admission while one token buys
+/// [`FORWARDED_ASK_FANOUT`](crate::seams::dig_peer::FORWARDED_ASK_FANOUT) OUTBOUND dials, so ONE
+/// admitted frame at `redirect_depth: 0` fans to roughly **1,360 dials and 1,360 DHT walks** across
+/// the network (16 → 64 → 256 → 1024), sustained at about 340 asks/s per attacker identity. The
+/// per-requestor relay bucket and the node-wide semaphore bound what THIS node spends and how much of
+/// it runs at once; neither bounds the aggregate, because every downstream node has its own.
+///
+/// The precedent decides the default rather than taste. The PROXY leg — `DIG_NODE_ON_MISS=fetch` —
+/// is opt-in, and its cost is one capsule fetch by THIS node: expensive in bytes, but LOCAL and
+/// bounded. The forwarded ask recruits other nodes' bandwidth and DHT budget, which is strictly worse
+/// on the amplification axis. **A path that amplifies more than an opt-in path cannot honestly be
+/// gated less than it.** [`inbound_demand_cache_enabled`] defaults OFF on the same reasoning, and this
+/// mirrors its shape exactly rather than inventing a second config idiom.
+///
+/// Off, the miss answers from this node's own DHT lookup — byte-identical to what shipped before the
+/// feature existed, which is what makes enabling it a decision rather than a discovery.
+pub fn forward_on_miss_enabled() -> bool {
+    resolve_forward_on_miss(std::env::var("DIG_NODE_FORWARD_ON_MISS").ok().as_deref())
+}
+
+/// Pure core of [`forward_on_miss_enabled`]: default OFF; only an explicit truthy value
+/// (`on`/`1`/`true`/`yes`, case-insensitive) enables it. Pure so the policy is unit-tested without
+/// touching process-global env.
+fn resolve_forward_on_miss(v: Option<&str>) -> bool {
     matches!(
         v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
         Some("on") | Some("1") | Some("true") | Some("yes")
@@ -650,6 +690,54 @@ pub struct NodeContent {
     /// caller draining expensive proxy egress from the budget calibrated for cheap lookups. See
     /// [`crate::rate_limit::MissRateLimiter::with_proxy_defaults`].
     proxy_rate_limiter: crate::rate_limit::MissRateLimiter,
+    /// The FORWARDED ask (dig_ecosystem#3128): issues `dig.getAvailability` to a connected pool peer
+    /// so a miss can be answered with holders NO DHT walk from here would find. Installed by the
+    /// composition root ([`Self::set_forwarded_ask`]) because it needs the same live identity +
+    /// NAT runtime the other peer legs use; `None` on the FFI/base path, where a miss simply answers
+    /// from the DHT alone exactly as it always did.
+    forwarded_ask: std::sync::OnceLock<Arc<dyn ForwardedAsk>>,
+    /// A THIRD per-requestor limiter, in front of the forwarded ask's OUTBOUND fan-out
+    /// (dig_ecosystem#3128).
+    ///
+    /// It exists because [`RequestorId`](crate::rate_limit::RequestorId) keys by the IMMEDIATE caller,
+    /// so a relaying hop's fan-out is billed to *that hop's* allowance at *its* peers: one admitted
+    /// inbound frame would otherwise spend a victim's budget across every peer it holds. Charging the
+    /// relay leg to its own bucket means an inbound miss can exhaust this node's willingness to
+    /// FORWARD without touching the cheap-lookup allowance an honest local read depends on — the same
+    /// separation [`Self::proxy_rate_limiter`] already draws for the costlier byte-relay leg (#2189).
+    relay_rate_limiter: crate::rate_limit::MissRateLimiter,
+    /// The whole-node ceiling on forwarded asks in flight, across every requestor and every miss.
+    ///
+    /// The per-requestor buckets cannot see this: each requestor can stay inside its own budget while
+    /// their SUM multiplies by [`FORWARDED_ASK_FANOUT`] into hundreds of concurrent dials. Permits are
+    /// taken with `try_acquire`, never awaited — a miss that cannot claim one answers without
+    /// forwarding, which costs a less-enriched answer and never a stalled request.
+    forwarded_ask_slots: Arc<tokio::sync::Semaphore>,
+    /// The escape hatch from a sticky lookup answer, when this engine was built over a discovery
+    /// cache that has one ([`Self::for_dht`]). `None` on the mock/FFI path, where there is no cache to
+    /// forget. See [`DiscoveryCache`].
+    discovery_cache: std::sync::OnceLock<Arc<dyn DiscoveryCache>>,
+}
+
+/// The one operation dig-dht's SPEC §6.8 MUST requires of a CALLER: having reached none of the
+/// candidates a lookup produced, forget the cached answer so the next lookup runs a real walk.
+///
+/// # Why this is a trait and not a direct `DhtService` call
+///
+/// `DhtService::forget_discovered` ships in **dig-dht 0.12**, and this crate cannot resolve it yet:
+/// `dig-download` 0.17.4 and `dig-peer-selector` 0.9.0 both require `dig-dht ^0.11`, and
+/// `tests/dependency_tree.rs` asserts — correctly, and for a trust-boundary reason — that exactly ONE
+/// `dig-dht` resolves in the workspace. Bumping this crate alone would fork the candidate types across
+/// the download engine's own boundary, which is a worse defect than the one being fixed.
+///
+/// So the CALLER is built here, where it was missing, and the binding to the real service is the one
+/// line that lands when the release-first cascade reaches this crate. That is deliberate: the
+/// call SITE — knowing the exact moment "every candidate was unreachable" is true — is the part that
+/// takes judgement and the part dig-dht cannot supply for itself.
+#[async_trait::async_trait]
+pub(crate) trait DiscoveryCache: Send + Sync {
+    /// Drop every cached provider for `content`, returning how many records were dropped.
+    async fn forget_discovered(&self, content: &ContentId) -> usize;
 }
 
 /// A [`StateStore`] wrapper over a [`FileStateStore`] that SNAPSHOTS every saved [`DownloadState`]
@@ -915,7 +1003,41 @@ impl NodeContent {
             capsule_warmer: std::sync::OnceLock::new(),
             miss_rate_limiter: crate::rate_limit::MissRateLimiter::with_defaults(),
             proxy_rate_limiter: crate::rate_limit::MissRateLimiter::with_proxy_defaults(),
+            forwarded_ask: std::sync::OnceLock::new(),
+            relay_rate_limiter: crate::rate_limit::MissRateLimiter::with_relay_defaults(),
+            forwarded_ask_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_FORWARDED_ASKS,
+            )),
+            discovery_cache: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Install the forwarded-ask leg (dig_ecosystem#3128) — the piece only the composition root can
+    /// build, because it needs the live mTLS identity + NAT runtime. Idempotent: a second call is
+    /// ignored, so a re-wire can never swap the leg out from under an in-flight miss.
+    pub(crate) fn set_forwarded_ask(&self, ask: Arc<dyn ForwardedAsk>) {
+        let _ = self.forwarded_ask.set(ask);
+    }
+
+    /// Install the discovery-cache escape hatch, so a fetch that reaches none of its located
+    /// candidates can honour dig-dht SPEC §6.8's MUST ([`Self::forget_stale_discovery`]). Idempotent,
+    /// for the same reason as [`Self::set_forwarded_ask`].
+    ///
+    /// # Unbound in production TODAY, and that is not a gap in this crate
+    ///
+    /// The resolved `dig-dht` here is **0.11.1**, which has no discovery cache at all — so there is
+    /// nothing yet for this node to forget, and the exposure the MUST bounds does not exist in this
+    /// tree. The cache ships in 0.12, which `dig-download` 0.17.4 and `dig-peer-selector` 0.9.0 block
+    /// (both require `^0.11`, and `tests/dependency_tree.rs` correctly forbids two `dig-dht` copies
+    /// across the download engine's trust boundary).
+    ///
+    /// The CALL SITE is what was missing and is what this builds: knowing the exact moment "every
+    /// located candidate was unreachable" is true is judgement dig-dht cannot supply for itself, and it
+    /// is tested here against a double. Binding it is one call from [`Self::for_dht`] the day the
+    /// cascade lands.
+    #[allow(dead_code)]
+    pub(crate) fn set_discovery_cache(&self, cache: Arc<dyn DiscoveryCache>) {
+        let _ = self.discovery_cache.set(cache);
     }
 
     /// Reconfigure the miss-path rate limiter's per-requestor bound. Used by the enforcement tests to
@@ -925,6 +1047,27 @@ impl NodeContent {
     #[cfg(test)]
     pub(crate) fn set_miss_rate_limit(&self, capacity: f64, refill_per_sec: f64) {
         self.miss_rate_limiter.reconfigure(capacity, refill_per_sec);
+    }
+
+    /// Reconfigure the SEPARATE forwarded-ask RELAY limiter's per-requestor bound
+    /// (dig_ecosystem#3128). Test-only: the enforcement test pins a tiny, deterministic (no-refill)
+    /// relay pool so the "relay allowance exhausted → answer without forwarding" bound is exercised
+    /// without a wall-clock refill race.
+    #[cfg(test)]
+    pub(crate) fn set_relay_rate_limit(&self, capacity: f64, refill_per_sec: f64) {
+        self.relay_rate_limiter
+            .reconfigure(capacity, refill_per_sec);
+    }
+
+    /// Take EVERY forwarded-ask slot, returning the permits — while they are held the node-wide
+    /// ceiling refuses any further forward. Test-only: it drives the real semaphore the production
+    /// path drives, so the test pins the ceiling rather than a re-derived copy of it.
+    #[cfg(test)]
+    pub(crate) fn hold_every_forwarded_ask_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.forwarded_ask_slots
+            .clone()
+            .try_acquire_many_owned(MAX_CONCURRENT_FORWARDED_ASKS as u32)
+            .expect("a fresh engine holds every slot")
     }
 
     /// Reconfigure the SEPARATE proxy fetch-through limiter's per-requestor bound (dig_ecosystem#2189).
@@ -967,7 +1110,7 @@ impl NodeContent {
     ) -> Arc<Self> {
         // The provider union: dig-dht is live today; PEX + relay-introducer are wired-but-empty seams
         // (#1443, real sources land in #1440 part B). Best-effort — a dormant source adds nothing.
-        let dht_locator: Arc<dyn ProviderLocator> = Arc::new(DhtProviderLocator::new(dht));
+        let dht_locator: Arc<dyn ProviderLocator> = Arc::new(DhtProviderLocator::new(dht.clone()));
         let union: Arc<dyn ProviderLocator> = UnionLocator::new(vec![
             dht_locator,
             Arc::new(EmptyLocator), // PEX-as-provider-source (dormant)
@@ -990,9 +1133,38 @@ impl NodeContent {
         // The fetch leg composes the SAME NAT ladder as the DHT dial from the shared runtime (#1439):
         // an empty runtime would be Direct-only, silently unable to reach hole-punch/relay holders.
         let transport = Arc::new(NatRangeTransport::new_with_runtime(
-            node, nat_config, network_id, runtime,
+            node.clone(),
+            nat_config,
+            network_id,
+            runtime.clone(),
         ));
-        Self::new(locator, transport, miss_mode, self_peer_id, cache_dir)
+        let content = Self::new(locator, transport, miss_mode, self_peer_id, cache_dir);
+        // The recursive ask (dig_ecosystem#3128) and the discovery-cache escape hatch (dig-dht SPEC
+        // 6.8) are installed HERE and only here: both need the live identity + NAT runtime, which the
+        // mock/FFI constructor deliberately does not have. On that path a miss answers from the DHT
+        // alone, exactly as it always did.
+        //
+        // The forwarded ask is OPT-IN (`DIG_NODE_FORWARD_ON_MISS`, default OFF) — see
+        // [`forward_on_miss_enabled`] for why the most amplifying path this node has cannot be a
+        // default. Resolved ONCE here rather than per miss, matching how `DIG_NODE_ON_MISS` is read
+        // once by the composition root: an amplification posture that could change under a running
+        // node is harder to reason about than one fixed at start-up. Disabled, the leg is never
+        // installed at all, so the refusal costs nothing on the miss path and the answer is the
+        // shipped DHT-only one.
+        if forward_on_miss_enabled() {
+            content.set_forwarded_ask(Arc::new(NatForwardedAsk::new(
+                node,
+                runtime,
+                network_id,
+                stun_server,
+            )));
+        }
+        // The discovery-cache escape hatch stays UNBOUND until the release-first cascade lets this
+        // crate resolve dig-dht 0.12 (see [`DiscoveryCache`]); binding it is one `set_discovery_cache`
+        // call here. Meanwhile a fetch that reaches nobody simply does not forget, which is exactly
+        // today's shipped behaviour.
+        let _ = &dht;
+        content
     }
 
     /// The configured miss behavior (redirect by default; fetch-through when opted in).
@@ -1089,6 +1261,136 @@ impl NodeContent {
         self.selector.on_connection_class(peer, class);
     }
 
+    /// Locate the holders of `content` for a MISS ANSWER: this node's own DHT lookup, then — when the
+    /// hop budget allows it — the holders its connected pool peers name in reply to the SAME question
+    /// (dig_ecosystem#3128).
+    ///
+    /// This is the one place the recursive ask happens, so both miss legs (the `-32008` redirect in
+    /// [`Self::miss_outcome`] and the `dig.getAvailability` enrichment in
+    /// [`crate::Node::availability_answer`]) inherit it identically and cannot drift apart.
+    ///
+    /// # The DHT findings come FIRST, and the forwarded ones are appended
+    ///
+    /// The requestor dials this list IN ORDER, and [`providers_json`] / [`redirect_error_object`]
+    /// truncate it at [`MAX_REDIRECT_PROVIDERS`]. Appending is therefore what makes the cap
+    /// NON-DISPLACING: a peer that answers with a full slate of fabricated holders spends only the
+    /// tail of the answer, and can never evict a holder this node found itself. Prepending would hand
+    /// any single connected peer a free way to bury every genuine candidate.
+    ///
+    /// It also keeps the weaker claim behind the stronger one. A DHT record was announced by the
+    /// holder itself; a forwarded record is a claim relayed by one more untrusted hop. And it makes
+    /// the change purely additive on the wire: with no forwarded answers the list is byte-identical to
+    /// what shipped, so the new behaviour is a strict suffix of the old.
+    ///
+    /// Every candidate here is a candidate to DIAL, never a fact — the whole-resource merkle bind
+    /// against the chain-anchored root is what admits bytes, so a fabricated holder costs the
+    /// requestor one wasted dial (NC-12).
+    pub(crate) async fn locate_holders(
+        &self,
+        content: &ContentId,
+        hops_used: u64,
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Vec<ProviderRecord> {
+        let mut providers = self.find_providers(content).await;
+        providers.extend(self.forwarded_holders(content, hops_used, requestor).await);
+        dedup_by_peer(&mut providers);
+        providers
+    }
+
+    /// Ask up to [`FORWARDED_ASK_FANOUT`] connected pool peers whether they can locate `content`, and
+    /// return every holder they name (dig_ecosystem#3128). Empty whenever any bound refuses.
+    ///
+    /// Four gates stand in front of the outbound work, and each answers a different question:
+    ///
+    /// 1. **Is there a leg at all?** No installed [`ForwardedAsk`] (the FFI/base path) forwards nothing.
+    /// 2. **Is there budget to recurse?** `hops_used >= REDIRECT_HOP_CAP` stops here, exactly as the
+    ///    redirect leg does — this is what stops a ring of nodes circulating one question forever.
+    /// 3. **Has THIS requestor spent its relay allowance?** [`Self::relay_rate_limiter`], a bucket of
+    ///    its own, because `RequestorId` keys by the immediate caller and a relayed fan-out would
+    ///    otherwise be billed to a victim's budget at every peer this node holds.
+    /// 4. **Has the NODE got a slot?** [`Self::forwarded_ask_slots`], the ceiling the per-requestor
+    ///    buckets structurally cannot see, since each requestor may stay inside its own budget while
+    ///    their sum multiplies by the fan-out.
+    ///
+    /// The chosen peers are the fan-out prefix of the connected pool. Self is excluded — asking
+    /// ourselves is a guaranteed miss that spends a slot — and so is the requestor, because forwarding
+    /// a peer's own question straight back to it is the tightest loop this path can form and the hop
+    /// counter alone would let it run to the cap.
+    async fn forwarded_holders(
+        &self,
+        content: &ContentId,
+        hops_used: u64,
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Vec<ProviderRecord> {
+        let Some(ask) = self.forwarded_ask.get() else {
+            return Vec::new();
+        };
+        if hops_used >= REDIRECT_HOP_CAP {
+            return Vec::new();
+        }
+        if !self.relay_rate_limiter.check(requestor) {
+            return Vec::new();
+        }
+        let Ok(_slot) = self.forwarded_ask_slots.clone().try_acquire_owned() else {
+            tracing::debug!("forwarded ask: node-wide concurrency ceiling reached; not forwarding");
+            return Vec::new();
+        };
+
+        let peers = self.forwardable_peers(requestor);
+        let next_depth = hops_used.saturating_add(1);
+        let mut found = Vec::new();
+        for (peer, addrs) in peers {
+            found.extend(ask.ask(&peer, &addrs, content, next_depth).await);
+        }
+        found
+    }
+
+    /// The connected pool peers this node may forward a question to, capped at
+    /// [`FORWARDED_ASK_FANOUT`]: everyone except this node itself and the peer that asked.
+    fn forwardable_peers(
+        &self,
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Vec<(String, Vec<std::net::SocketAddr>)> {
+        let asker = match requestor {
+            crate::rate_limit::RequestorId::Peer(id) => Some(id.as_str()),
+            _ => None,
+        };
+        self.connected_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(peer, _)| Some(peer.as_str()) != asker)
+            .filter(|(peer, _)| Some(*peer) != self.self_peer_id.as_ref())
+            .filter(|(_, addrs)| !addrs.is_empty())
+            .take(FORWARDED_ASK_FANOUT)
+            .map(|(peer, addrs)| (peer.clone(), addrs.clone()))
+            .collect()
+    }
+
+    /// Honour dig-dht SPEC §6.8: having reached NONE of the candidates located for `content`, forget
+    /// the cached lookup answer so the next attempt runs a real walk instead of replaying the same
+    /// unreachable set for the rest of the cache's 15-minute life.
+    ///
+    /// This is the escape from the ONE exposure the discovery cache adds. A lookup early-exits on the
+    /// first on-key answer, so a lying first hop can always return a fabricated provider set; the
+    /// cache is what makes that answer STICKY, and this is what unsticks it. Without a caller, the
+    /// MUST is unwired and a poisoned answer persists for the full TTL.
+    ///
+    /// Touches only this node's own cache: it can neither censor a key this node serves nor be
+    /// observed by any other peer.
+    async fn forget_stale_discovery(&self, content: &ContentId) {
+        let Some(cache) = self.discovery_cache.get() else {
+            return;
+        };
+        let dropped = cache.forget_discovered(content).await;
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "download reached no located candidate; forgot the cached lookup answer (dig-dht SPEC 6.8)"
+            );
+        }
+    }
+
     /// Locate the peers holding `content` via the DHT (best-effort: a locate failure is an empty
     /// set), excluding this node itself — a redirect must never point the caller back at the node
     /// that just missed.
@@ -1166,9 +1468,14 @@ impl NodeContent {
         let handle = self
             .downloader
             .download(*content, sink, DownloadOptions::default());
-        self.drive_download(handle)
-            .await
-            .map_err(|e| format!("download failed: {e}"))?;
+        if let Err(e) = self.drive_download(handle).await {
+            // Every located candidate was tried and none of them delivered. dig-dht SPEC 6.8 makes
+            // asking again the REQUIRED response, and asking again is only meaningful once the cached
+            // answer that produced this candidate set is dropped — otherwise the next attempt replays
+            // the identical unreachable set for the rest of the cache's TTL.
+            self.forget_stale_discovery(content).await;
+            return Err(format!("download failed: {e}"));
+        }
 
         // 5. Read the verified, reassembled bytes back off the finalized staging file …
         let bytes =
@@ -1595,7 +1902,11 @@ impl crate::Node {
         if depth >= REDIRECT_HOP_CAP {
             return MissOutcome::NotFound;
         }
-        let providers = pc.find_providers(content).await;
+        // The recursive ask (dig_ecosystem#3128): the DHT walk PLUS the holders our connected pool
+        // peers name in reply to the same question, so a holder two hops away through connections we
+        // already hold is reachable even when no DHT record here can point at it. `depth` is the
+        // budget the caller echoed, and it bounds the recursion exactly as it bounds the redirect.
+        let providers = pc.locate_holders(content, depth, requestor).await;
         if providers.is_empty() {
             // No provider anywhere → a genuine not-found (the caller's -32004 stands).
             return MissOutcome::NotFound;
@@ -1745,6 +2056,17 @@ pub(crate) fn redirect_error_object(
             "max_redirects": REDIRECT_HOP_CAP,
         }}
     })
+}
+
+/// Drop every repeat of a `peer_id` already present, KEEPING THE FIRST occurrence.
+///
+/// Order is the contract here, not a side effect: the requestor dials in list order and the answer is
+/// truncated at [`MAX_REDIRECT_PROVIDERS`], so keeping the first occurrence is what stops a forwarded
+/// duplicate of a DHT-found holder from displacing the original's position (see
+/// [`NodeContent::locate_holders`]).
+fn dedup_by_peer(providers: &mut Vec<ProviderRecord>) {
+    let mut seen = std::collections::HashSet::new();
+    providers.retain(|p| seen.insert(p.provider_peer_id.clone()));
 }
 
 /// One redirect provider entry: the holder's `peer_id` + its candidate addresses (the dig-dht
@@ -2067,6 +2389,48 @@ pub(crate) mod tests {
                 "DIG_NODE_INBOUND_DEMAND_CACHE={v} → enabled"
             );
         }
+    }
+
+    /// **Proves:** the forwarded ask is OFF unless an operator explicitly turns it on, and that the
+    /// truthy vocabulary matches [`resolve_inbound_demand_cache`]'s exactly.
+    ///
+    /// **Catches:** the default silently inverting. This is the gate on the most amplifying path the
+    /// node has — one admitted frame fans to ~1,360 dials and ~1,360 DHT walks — so "absent config
+    /// means no amplification" is the security-relevant property, and it is decided entirely by this
+    /// function. Unset, empty, garbage and every falsy spelling MUST all read as OFF; a resolver that
+    /// treated an unrecognised value as enabled would turn a typo into a network-wide amplifier.
+    #[test]
+    fn the_forwarded_ask_is_off_unless_explicitly_enabled() {
+        for enabled in ["on", "1", "true", "yes", "ON", " True ", "YES"] {
+            assert!(
+                resolve_forward_on_miss(Some(enabled)),
+                "{enabled:?} should enable the forwarded ask"
+            );
+        }
+        for disabled in [
+            None,
+            Some(""),
+            Some("off"),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+        ] {
+            assert!(
+                !resolve_forward_on_miss(disabled),
+                "{disabled:?} should leave the forwarded ask OFF"
+            );
+        }
+        // The one that matters most, stated on its own so it cannot be lost in a loop: no config at
+        // all means no amplification.
+        assert!(
+            !resolve_forward_on_miss(None),
+            "DEFAULT IS OFF — an unconfigured node must never forward"
+        );
+        // And an unrecognised value is OFF, not on: a typo must fail closed.
+        assert!(
+            !resolve_forward_on_miss(Some("enable")),
+            "an unrecognised value must fail CLOSED"
+        );
     }
 
     // -- redirect shaping --------------------------------------------------------------------------
