@@ -51,29 +51,21 @@ pub struct OfferInputs {
     pub cats: Vec<Cat>,
 }
 
-/// A deterministic, dependency-free offer id: the tree hash of the sorted offered coin ids
-/// (the same value `Offer::nonce` derives), hex-encoded. Stable for the same offered set,
-/// so `get_offer`/`cancel_offer` can look an offer up by it.
-pub fn offer_id_from_coin_ids(offered_coin_ids: Vec<Bytes32>) -> String {
-    hex::encode(Offer::nonce(offered_coin_ids))
-}
-
-/// The offer id of a decoded offer (from its offered coins).
-pub fn offer_id_of(offer: &Offer) -> String {
-    offer_id_from_coin_ids(
-        offer
-            .offered_coins()
-            .flatten()
-            .iter()
-            .map(|c| c.coin_id())
-            .collect(),
-    )
-}
-
-/// The offer id of a bech32m `offer1…` string (decodes it, then derives the id).
-pub fn offer_id_of_str(offer_str: &str) -> Result<String> {
-    let mut ctx = SpendContext::new();
-    Ok(offer_id_of(&decode_offer_in(&mut ctx, offer_str)?))
+/// The canonical id of a bech32m `offer1…` string, hex-encoded.
+///
+/// Delegates to [`dig_offers::offer_id`], the ecosystem's single definition:
+/// `sha256(spend_bundle.to_bytes())` over the decoded, uncompressed bundle — the same value
+/// Chia's `Offer.name()`, Sage and dexie derive, so an id this node reports reconciles against
+/// theirs.
+///
+/// It identifies the OFFER, not the offered coins. That distinction is load-bearing here: this id
+/// is the primary key of the `offers` table, so an id derived only from the offered coin set —
+/// as this crate's own copy once did (#283) — made two offers over the same coins with different
+/// terms overwrite one another silently.
+pub fn offer_id(offer_str: &str) -> Result<String> {
+    let id = dig_offers::offer_id(offer_str)
+        .map_err(|e| Error::api(format!("could not derive the offer id: {e}")))?;
+    Ok(hex::encode(id))
 }
 
 /// Decode a bech32m `offer1…` string into a spendable [`Offer`] in `ctx` (its parsed NFT
@@ -157,7 +149,7 @@ pub fn build_make_offer(
         return Err(Error::api("make_offer selected no offered coins"));
     }
 
-    let nonce = Offer::nonce(offered_coin_ids.clone());
+    let nonce = Offer::nonce(offered_coin_ids);
     let mut requested_payments = RequestedPayments::new();
     let mut requested_asset_info = AssetInfo::new();
     for leg in requested {
@@ -221,7 +213,8 @@ pub fn build_make_offer(
         .map_err(|e| Error::internal(format!("serialize offer: {e:?}")))?;
     let offer_str =
         encode_offer(&bundle).map_err(|e| Error::internal(format!("encode offer: {e:?}")))?;
-    Ok((offer_str, offer_id_from_coin_ids(offered_coin_ids)))
+    let id = offer_id(&offer_str)?;
+    Ok((offer_str, id))
 }
 
 /// Build AND sign the taker side of `offer_str`, funding the maker's requested payments from
@@ -604,5 +597,187 @@ mod tests {
         let sig = signer.sign(&cancel_spends).unwrap();
         sim.new_transaction(SpendBundle::new(cancel_spends, sig))
             .expect("simulator must accept the offer cancel (reclaim)");
+    }
+
+    // ---- the offer id identifies the OFFER, not the offered coins (#283) --------------
+    //
+    // The id was once derived solely from the offered coin set (`Offer::nonce`), so two offers
+    // funded by the same coins collided however far apart their TERMS were. That id is the
+    // primary key of the `offers` table under `ON CONFLICT DO UPDATE`, so the collision was not
+    // an error — it was a silent overwrite, and the surviving row described terms the user never
+    // agreed to for the offer they believed they still held.
+    //
+    // Both tests below vary exactly ONE dimension — the requested amount — while holding the
+    // offered coin set identical, because that is the only input that distinguishes the canonical
+    // id from the coin-set-derived one. Two offers that also differed in their offered coins
+    // would get distinct ids under BOTH implementations and prove nothing.
+
+    /// Two offers over the SAME coin, requesting different amounts, are different offers and so
+    /// must carry different ids.
+    #[test]
+    fn offers_differing_only_in_requested_amount_have_distinct_ids() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(1_000);
+        let signer = signer_for(maker.sk.clone());
+
+        let make = |requested: u64| {
+            build_make_offer(
+                &signer,
+                &OfferInputs {
+                    // The SAME coin funds both offers: the offered set is held constant so the
+                    // requested amount is the only thing that can distinguish the two ids.
+                    xch: vec![maker.coin],
+                    cats: vec![],
+                },
+                &[OfferLeg {
+                    asset_id: None,
+                    amount: 300,
+                }],
+                &[OfferLeg {
+                    asset_id: None,
+                    amount: requested,
+                }],
+                maker.puzzle_hash,
+                maker.puzzle_hash,
+                0,
+            )
+            .unwrap()
+        };
+
+        let (offer_a, id_a) = make(500);
+        let (offer_b, id_b) = make(700);
+
+        // Control: the fixture really does vary the terms, and really does hold the coins fixed.
+        assert_ne!(offer_a, offer_b, "fixture must produce two DIFFERENT offers");
+        assert_eq!(
+            offered_coin_ids_of(&offer_a),
+            offered_coin_ids_of(&offer_b),
+            "fixture must hold the OFFERED COIN SET identical — otherwise a coin-set-derived id \
+             would also differ and the test would prove nothing"
+        );
+
+        assert_ne!(
+            id_a, id_b,
+            "two offers over the same coins requesting different amounts must have distinct ids"
+        );
+    }
+
+    /// …and because the id is the primary key of the offers table, distinct ids are what lets
+    /// both offers SURVIVE. Under the coin-set-derived id the second upsert overwrote the first.
+    #[tokio::test]
+    async fn both_offers_over_the_same_coins_survive_in_the_database() {
+        let mut sim = Simulator::new();
+        let maker = sim.bls(1_000);
+        let signer = signer_for(maker.sk.clone());
+
+        let make = |requested: u64| {
+            build_make_offer(
+                &signer,
+                &OfferInputs {
+                    xch: vec![maker.coin],
+                    cats: vec![],
+                },
+                &[OfferLeg {
+                    asset_id: None,
+                    amount: 300,
+                }],
+                &[OfferLeg {
+                    asset_id: None,
+                    amount: requested,
+                }],
+                maker.puzzle_hash,
+                maker.puzzle_hash,
+                0,
+            )
+            .unwrap()
+        };
+
+        let db = crate::sage::db::WalletDb::open_in_memory().await.unwrap();
+        let mut stored = Vec::new();
+        for requested in [500u64, 700] {
+            let (offer_str, offer_id) = make(requested);
+            db.upsert_offer(&crate::sage::db::OfferDbRow {
+                offer_id: offer_id.clone(),
+                offer: offer_str,
+                status: "active".into(),
+                creation_timestamp: 0,
+                summary_json: format!("{{\"requested\":{requested}}}"),
+            })
+            .await
+            .unwrap();
+            stored.push((requested, offer_id));
+        }
+
+        assert_eq!(
+            db.all_offers().await.unwrap().len(),
+            2,
+            "both offers must survive; a colliding id silently overwrites the first"
+        );
+
+        // …and each id must still resolve to the terms it was stored with, not to the other's.
+        for (requested, offer_id) in stored {
+            let row = db
+                .offer(&offer_id)
+                .await
+                .unwrap()
+                .expect("each stored offer must still be retrievable by its own id");
+            assert_eq!(
+                row.summary_json,
+                format!("{{\"requested\":{requested}}}"),
+                "the row under this id must describe the terms it was stored with"
+            );
+        }
+    }
+
+    /// dig-offers resolves a NEWER chia stack than this crate, so "we both compute
+    /// `sha256(bundle.to_bytes())`" is an assumption about two independent serializers until it is
+    /// measured. Recompute the id with THIS crate's stack and require the same bytes: if a future
+    /// bump ever moved the Streamable encoding under either side, the ids this node reports would
+    /// drift away from Sage and dexie silently, and this is the test that would catch it.
+    #[test]
+    fn offer_id_matches_a_locally_computed_bundle_hash() {
+        use chia_sha2::Sha256;
+        use chia_traits::Streamable;
+
+        let mut sim = Simulator::new();
+        let maker = sim.bls(1_000);
+        let signer = signer_for(maker.sk.clone());
+        let (offer_str, id) = build_make_offer(
+            &signer,
+            &OfferInputs {
+                xch: vec![maker.coin],
+                cats: vec![],
+            },
+            &[OfferLeg {
+                asset_id: None,
+                amount: 300,
+            }],
+            &[OfferLeg {
+                asset_id: None,
+                amount: 500,
+            }],
+            maker.puzzle_hash,
+            maker.puzzle_hash,
+            0,
+        )
+        .unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(decode_offer(&offer_str).unwrap().to_bytes().unwrap());
+        assert_eq!(id, hex::encode(hasher.finalize()));
+    }
+
+    /// The offered coin ids of an encoded offer, sorted — the fixture control above.
+    fn offered_coin_ids_of(offer_str: &str) -> Vec<Bytes32> {
+        let mut ctx = SpendContext::new();
+        let offer = decode_offer_in(&mut ctx, offer_str).unwrap();
+        let mut ids: Vec<Bytes32> = offer
+            .offered_coins()
+            .flatten()
+            .iter()
+            .map(|c| c.coin_id())
+            .collect();
+        ids.sort();
+        ids
     }
 }

@@ -3348,7 +3348,7 @@ impl WalletBackend {
         Ok(TakeOfferResponse {
             summary: tx_summary,
             spend_bundle: spend::spend_bundle_to_json(&bundle)?,
-            transaction_id: offers::offer_id_of_str(&req.offer)?,
+            transaction_id: offers::offer_id(&req.offer)?,
         })
     }
 
@@ -3358,7 +3358,7 @@ impl WalletBackend {
 
     async fn view_offer(&self, req: &ViewOffer) -> Result<ViewOfferResponse> {
         let summary = self.view_offer_summary(req)?;
-        let offer_id = offers::offer_id_of_str(&req.offer)?;
+        let offer_id = offers::offer_id(&req.offer)?;
         let status = match self.db.offer(&offer_id).await? {
             Some(r) => parse_offer_status(&r.status),
             None => OfferRecordStatus::Active,

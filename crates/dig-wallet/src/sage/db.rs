@@ -704,6 +704,44 @@ impl WalletDb {
         for stmt in POST_MIGRATION_INDEXES {
             sqlx::query(stmt).execute(&mut *conn).await?;
         }
+        drop(conn);
+        self.rekey_offers_to_canonical_ids().await?;
+        Ok(())
+    }
+
+    /// Re-key stored offers onto the canonical offer id (dig-node#283).
+    ///
+    /// Offers written before #283 are keyed by a value derived solely from the OFFERED COIN SET,
+    /// which is not the id Sage, dexie, or this node's RPC now report. Left alone, every such row
+    /// would become unreachable: `view_offer`, `get_offer` and `cancel_offer` all look an offer up
+    /// by the canonical id, and none of them would find it.
+    ///
+    /// No data is at risk, because the row stores the full `offer1…` string beside its key — the
+    /// canonical id is recomputable from the row itself, so this is a rename, not a rebuild. That
+    /// matters: an offer the user made is not derivable from chain, so dropping the table would
+    /// genuinely lose it.
+    ///
+    /// Idempotent — a second run recomputes the same id for every row and rewrites nothing. A row
+    /// whose offer string will not decode is left exactly as it is: an oddly-keyed offer is still
+    /// recoverable by the user, and a deleted one is not.
+    async fn rekey_offers_to_canonical_ids(&self) -> sqlx::Result<()> {
+        for row in self.all_offers().await? {
+            let Ok(canonical) = crate::sage::offers::offer_id(&row.offer) else {
+                continue;
+            };
+            if canonical == row.offer_id {
+                continue;
+            }
+            sqlx::query("DELETE FROM offers WHERE offer_id = ?")
+                .bind(&row.offer_id)
+                .execute(&self.pool)
+                .await?;
+            self.upsert_offer(&OfferDbRow {
+                offer_id: canonical,
+                ..row
+            })
+            .await?;
+        }
         Ok(())
     }
 
@@ -3636,5 +3674,124 @@ mod tests {
         assert!(!s2.delta_sync);
         assert_eq!(s2.delta_sync_override, Some(true));
         assert_eq!(s2.change_address.as_deref(), Some("xch1change"));
+    }
+
+    // ---- offers re-keyed onto the canonical id (dig-node#283) --------------
+    //
+    // A wallet DB written before #283 keys its offers by the offered coin set. Every read path
+    // now asks for the canonical id, so without this migration those rows exist but cannot be
+    // found — which is the same thing as losing them, from the user's side.
+
+    /// A real, encoded offer plus its canonical id.
+    fn an_offer() -> (String, String) {
+        use crate::sage::offers::{build_make_offer, OfferInputs, OfferLeg};
+        use crate::sage::spend::WalletSigner;
+        use chia_wallet_sdk::types::TESTNET11_CONSTANTS;
+
+        let mut sim = chia_sdk_test::Simulator::new();
+        let maker = sim.bls(1_000);
+        let signer = WalletSigner::new(
+            vec![maker.sk.clone()],
+            TESTNET11_CONSTANTS.agg_sig_me_additional_data,
+        );
+        build_make_offer(
+            &signer,
+            &OfferInputs {
+                xch: vec![maker.coin],
+                cats: vec![],
+            },
+            &[OfferLeg {
+                asset_id: None,
+                amount: 300,
+            }],
+            &[OfferLeg {
+                asset_id: None,
+                amount: 500,
+            }],
+            maker.puzzle_hash,
+            maker.puzzle_hash,
+            0,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_legacy_keyed_offer_is_rekeyed_onto_its_canonical_id() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let (offer, canonical_id) = an_offer();
+
+        // The shape a pre-#283 node wrote: the same offer under a coin-set-derived key.
+        let legacy_id = "0".repeat(64);
+        assert_ne!(legacy_id, canonical_id, "the fixture must exercise a REKEY");
+        db.upsert_offer(&OfferDbRow {
+            offer_id: legacy_id.clone(),
+            offer: offer.clone(),
+            status: "active".into(),
+            creation_timestamp: 77,
+            summary_json: "{\"legacy\":true}".into(),
+        })
+        .await
+        .unwrap();
+
+        db.migrate().await.unwrap();
+
+        assert!(
+            db.offer(&legacy_id).await.unwrap().is_none(),
+            "the legacy key must not survive, or the offer would exist twice"
+        );
+        let row = db
+            .offer(&canonical_id)
+            .await
+            .unwrap()
+            .expect("the offer must be reachable under its canonical id after migration");
+        // A rename, not a rebuild: every field the user's offer carried is still here.
+        assert_eq!(row.offer, offer);
+        assert_eq!(row.status, "active");
+        assert_eq!(row.creation_timestamp, 77);
+        assert_eq!(row.summary_json, "{\"legacy\":true}");
+        assert_eq!(db.all_offers().await.unwrap().len(), 1);
+    }
+
+    /// The migration runs on EVERY open, so a second pass over already-canonical rows must be a
+    /// no-op rather than churn — and must not lose the row it just re-keyed.
+    #[tokio::test]
+    async fn rekeying_an_already_canonical_offer_is_a_no_op() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let (offer, canonical_id) = an_offer();
+        db.upsert_offer(&OfferDbRow {
+            offer_id: canonical_id.clone(),
+            offer,
+            status: "active".into(),
+            creation_timestamp: 77,
+            summary_json: "{}".into(),
+        })
+        .await
+        .unwrap();
+
+        db.migrate().await.unwrap();
+        db.migrate().await.unwrap();
+
+        assert_eq!(db.all_offers().await.unwrap().len(), 1);
+        assert!(db.offer(&canonical_id).await.unwrap().is_some());
+    }
+
+    /// A row whose offer string will not decode cannot be re-keyed. It must be LEFT, not dropped:
+    /// an oddly-keyed offer is still recoverable by the user; a deleted one is not.
+    #[tokio::test]
+    async fn an_undecodable_offer_row_is_left_untouched() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_offer(&OfferDbRow {
+            offer_id: "1".repeat(64),
+            offer: "not-an-offer".into(),
+            status: "active".into(),
+            creation_timestamp: 1,
+            summary_json: "{}".into(),
+        })
+        .await
+        .unwrap();
+
+        db.migrate().await.unwrap();
+
+        assert!(db.offer(&"1".repeat(64)).await.unwrap().is_some());
     }
 }

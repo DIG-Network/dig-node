@@ -49,6 +49,17 @@ axum = "0.7"
 # restated here: the wire spelling of an asset and the asset a read scopes to must be the same
 # value, and two enums naming the same tokens agree only until one of them gains a variant.
 dig-node-control-interface = "0.18"
+# The ecosystem's single definition of a Chia offer id (dig_ecosystem#3140, #283):
+# `sha256(spend_bundle.to_bytes())`, the value Chia's `Offer.name()`, Sage and dexie use. This
+# crate once derived the id itself from the offered coin set alone, which collided across offers
+# over the same coins and silently overwrote rows in the `offers` table.
+#
+# dig-offers resolves its own (newer) chia stack, so its `Bytes32` is a DIFFERENT type from this
+# crate's. That is deliberately not a problem: `offer_id` is a pure `&str -> hash` function and we
+# consume only its bytes, so nothing crosses the version boundary. `sage::offers::offer_id_matches_
+# a_locally_computed_bundle_hash` pins the two stacks to the same value.
+dig-offers = "0.2"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
@@ -158,6 +169,10 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# Recompute the canonical offer id with THIS crate's chia stack, so the parity test can pin
+# dig-offers' (newer) stack and ours to the same value rather than trusting they agree (#283).
+# Pinned to the 0.26 line the local chia-protocol resolves.
+chia-sha2 = "0.26"
 # `start_paused` — a virtual clock, so the peer-request deadline (#2851) is asserted to EXIST
 # without a test that actually waits sixty seconds for it.
 tokio = { version = "1", features = ["test-util"] }
