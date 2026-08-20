@@ -2252,10 +2252,7 @@ impl Node {
     /// of which sacrifice nothing.
     ///
     /// A no-op on the FFI path, which installs no refresher and advertises nothing.
-    pub(crate) async fn advertise_holdings_change(
-        &self,
-        delta: &dig_sex::holdings::HoldingsDelta,
-    ) {
+    pub(crate) async fn advertise_holdings_change(&self, delta: &dig_sex::holdings::HoldingsDelta) {
         if delta.is_empty() {
             return;
         }
@@ -6012,7 +6009,9 @@ mod tests {
     ///
     /// `cap` is the caller's lever: a tiny cap forces one eviction, a roomy one forces none, which is
     /// what lets the two tests below share a fixture and differ in exactly one variable.
-    fn two_capsule_cache(cap: u64) -> (Node, tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+    fn two_capsule_cache(
+        cap: u64,
+    ) -> (Node, tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
         let (node, td) = test_node(None);
         let cfg = tempfile::tempdir().unwrap();
         std::env::set_var("DIG_NODE_CACHE", cfg.path());
