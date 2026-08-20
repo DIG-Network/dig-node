@@ -4737,7 +4737,19 @@ the per-NFT launcher mojos + the fee from an XCH funding coin (Chia enforces con
 bundle). Every built bundle is validated by `dig-clvm` (`DONT_VALIDATE_SIGNATURE`, as §18.9) before any
 broadcast; `auto_submit` broadcasts only when a broadcaster is attached (never in CI). `make_offer`
 persists the built offer to a local `offers` table when `auto_import` is set; `get_offers`/`get_offer`
-read it back, `cancel_offer` marks it cancelled. Sage's per-endpoint `auto_submit` defaults are matched
+read it back, `cancel_offer` marks it cancelled.
+
+**Offer id.** Every offer id this surface reports or accepts -- `make_offer`'s returned id,
+`take_offer`'s `transaction_id`, `get_offer`/`view_offer`/`cancel_offer`'s `offer_id`, and the primary
+key of the `offers` table -- is `sha256(spend_bundle.to_bytes())` over the offer's DECODED, uncompressed
+spend bundle, lowercase-hex-encoded without a `0x` prefix. This is the value Chia's `Offer.name()`, Sage
+and dexie derive, so an id reported here reconciles against theirs, and it is independent of the bech32m
+compression, so two encodings of one offer share an id. It is derived by `dig_offers::offer_id`, the
+ecosystem's single definition. The id identifies the OFFER and not its offered coins: two offers funded
+by the same coins but requesting different amounts are different offers and MUST carry different ids.
+A wallet database written before this rule keys its offers by a value derived from the offered coin set
+alone; those rows are re-keyed onto the canonical id when the database is opened, recomputed from the
+`offer1...` string stored beside each key. Sage's per-endpoint `auto_submit` defaults are matched
 (offers/mint/transfer default `false`; `make_offer.auto_import` defaults `true`).
 
 18.10. **Signing + custody (C.6).** The node signs with its custodied seed only for node-class /
