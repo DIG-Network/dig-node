@@ -62,6 +62,7 @@ use std::sync::Arc;
 use dig_node_control_interface::params::{
     WalletCoinByIdParams, WalletCoinSpendParams, WalletCoinsByParentParams,
 };
+use dig_node_control_interface::ControlMethod;
 use dig_node_core::seams::dig_peer::peer_network::PeerNetwork as _;
 use dig_node_core::seams::dig_peer::profile_sync::{
     accept_local_body, announce_frame, LocalAcceptError, ProfileBodyStore,
@@ -204,6 +205,9 @@ pub const CONTROL_METHODS: &[&str] = &[
     "control.pairing.revoke",
     "control.peers.ping",
     "control.peerCounts",
+    "control.chiaPeers.add",
+    "control.chiaPeers.list",
+    "control.chiaPeers.remove",
     // Delegated to the embedded node's own control surface.
     "control.peerStatus",
     "control.peers.connect",
@@ -256,6 +260,9 @@ pub const OWNED_CONTROL_METHODS: &[&str] = &[
     "control.pairing.revoke",
     "control.peers.ping",
     "control.peerCounts",
+    "control.chiaPeers.add",
+    "control.chiaPeers.list",
+    "control.chiaPeers.remove",
 ];
 
 /// The control methods [`dispatch_control`] DELEGATES to the embedded node's own control surface
@@ -270,19 +277,73 @@ pub const DELEGATED_CONTROL_METHODS: &[&str] = &[
     "control.listSubscriptions",
 ];
 
-/// Is this a PAIRING-ADMINISTRATION control method (#280)? PURE.
+/// Methods this node SERVES that the published contract does not declare yet.
 ///
-/// These manage the pairing lifecycle — list pending requests, approve one (minting
-/// a scoped controller token), revoke an issued token — and so MUST require the
-/// MASTER control token (a local file read), NEVER a paired token: a paired
-/// controller can drive `control.*` mutations but can neither mint more tokens nor
-/// hide/revoke itself. The auth gate consults this to decide whether the paired-token
-/// path is even eligible.
-pub fn is_pairing_admin_method(method: &str) -> bool {
-    matches!(
-        method,
-        "control.pairing.list" | "control.pairing.approve" | "control.pairing.revoke"
-    )
+/// The list is EXPLICIT so it can only shrink. It is read by two places that must agree: the
+/// conformance gate (`tests/control_contract_conformance.rs`) tolerates exactly these as known
+/// drift, and [`requires_master_token`] keeps exactly these on the ordinary tier while every other
+/// unpublished name fails CLOSED.
+///
+/// Naming them one by one is the whole point. The earlier carve-out was "anything in
+/// [`CONTROL_METHODS`] the contract does not know", which widened by itself: adding a served method
+/// without publishing it made it paired-reachable from that moment, and both security lockstep
+/// tests stayed green because a method absent from the contract is absent from both sides of every
+/// comparison they make. Granting the ordinary tier is now a reviewable one-line edit to this list
+/// instead of a side effect of editing an unrelated one.
+pub const KNOWN_UNPUBLISHED_CONTROL_METHODS: &[&str] = &["control.peers.ping"];
+
+/// Does this control method require the MASTER control token, never a paired one? PURE.
+///
+/// The master tier is not "pairing administration": it is every method whose effect OUTLIVES the
+/// token that invoked it. `pairing.revoke` is the designated remedy for a compromised paired app,
+/// so a method that survives revocation has escaped that remedy and a paired token must not reach
+/// it. Pairing administration is one instance of that shape; `control.chiaPeers.add`/`.remove` are
+/// the others, because a trusted Chia peer is believed WITHOUT corroboration, keeps that authority
+/// after the token is gone, and `revoke` touches no peer row.
+///
+/// # This DELEGATES to the contract, and that is the fix, not an implementation detail
+///
+/// The predicate is [`ControlMethod::requires_master_token`], read from
+/// `dig-node-control-interface` rather than restated here. An earlier version of this function
+/// listed the three pairing methods as string literals, and when the contract put `chiaPeers.*` on
+/// the master tier this node kept honouring the old list — so a PAIRED token could install a peer
+/// with unbounded, unrevocable authority over the wallet replica. A security predicate duplicated
+/// across a repo boundary as a string match drifts silently and fails OPEN, which is why the
+/// duplicate is gone instead of merely corrected. [`master_token_set_matches_the_contract`] keeps
+/// it that way.
+///
+/// # A name this node does not serve requires the master token (fail CLOSED)
+///
+/// [`is_control_method`] matches on the `control.` PREFIX, so an arbitrary unrecognised name
+/// reaches this gate. Such a name cannot be judged against the tier rule, so it gets the stricter
+/// answer — the next method to appear is master-only by default rather than paired-reachable by
+/// default.
+///
+/// The ONE exception is [`KNOWN_UNPUBLISHED_CONTROL_METHODS`] — names this node genuinely serves
+/// that the contract has not published yet (today: one diagnostic, `control.peers.ping`). They keep
+/// the ordinary tier because promoting them would break paired clients that already call them, a
+/// behaviour change unrelated to the escalation this predicate closes.
+///
+/// The exception is bound to that explicit list rather than to "not published but served", because
+/// the latter widened silently: a newly served-but-unpublished method inherited the exemption the
+/// moment it was added to [`CONTROL_METHODS`], and no lockstep test could see it (a method the
+/// contract does not know is absent from both sides of every comparison they make).
+pub fn requires_master_token(method: &str) -> bool {
+    requires_master_token_given(method, KNOWN_UNPUBLISHED_CONTROL_METHODS)
+}
+
+/// [`requires_master_token`] with the exemption list injected, so a test can state what the gate
+/// does for a served-but-unpublished method that is NOT exempt.
+///
+/// That case has no fixture in production today — `control.peers.ping` is the only unpublished
+/// method and it is exempt — and a test written against a merely-unknown name cannot distinguish
+/// this rule from the one it replaces, because both answer "master" there. Injecting the list is
+/// what makes the difference observable.
+fn requires_master_token_given(method: &str, exempt: &[&str]) -> bool {
+    match ControlMethod::from_name(method) {
+        Some(published) => published.requires_master_token(),
+        None => !exempt.contains(&method),
+    }
 }
 
 /// The path to the control-token file: `<state_dir>/control-token`, where the state
@@ -836,7 +897,7 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         "control.updater.resume" => crate::updater::resume(id).await,
         "control.updater.checkNow" => crate::updater::check_now(id).await,
         // Pairing administration (#280) — reached only with the MASTER token (the
-        // gate blocks a paired token from these, see `is_pairing_admin_method`).
+        // gate blocks a paired token from these, see `requires_master_token`).
         "control.pairing.list" => crate::pairing::list(&ctx.pairings, &ctx.state_dir, id),
         "control.pairing.approve" => {
             crate::pairing::approve(&ctx.pairings, &ctx.state_dir, id, params)
@@ -845,6 +906,11 @@ async fn dispatch_owned(ctx: &ControlCtx, id: Value, method: &str, params: &Valu
         // The connection-ladder diagnostic (dig_ecosystem#1985) — shell-owned so it needs no
         // `dig-rpc-protocol` release; see `crate::peer_ping` for why.
         "control.peers.ping" => crate::peer_ping::ping(ctx, id, params).await,
+        // The trusted-CHIA-peer surface (dig_ecosystem#2870) — a different network from
+        // `control.peers.*` above, and a THIN dispatch to the wallet backend's one peer writer.
+        "control.chiaPeers.add" => chia_peers_add(ctx, id, params).await,
+        "control.chiaPeers.list" => chia_peers_list(ctx, id).await,
+        "control.chiaPeers.remove" => chia_peers_remove(ctx, id, params).await,
         // Unreachable: `dispatch_control` only routes here for `OWNED_CONTROL_METHODS` members.
         // Reaching this arm means the routing const and these arms have drifted.
         _ => unreachable!(
@@ -2014,6 +2080,192 @@ async fn peer_counts(ctx: &ControlCtx, id: Value) -> Value {
             "known_dig_peer_count": count("known_peers"),
         }),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Trusted CHIA full-node peers (dig_ecosystem#2870)
+// ---------------------------------------------------------------------------
+
+/// What a trusted Chia peer costs, in one sentence, on the wire.
+///
+/// A `user_managed` peer row is the ONLY way to reach
+/// [`dig_wallet::sage::sync::PeerTrust::Operator`], which is authoritative for money WITHOUT a
+/// quorum: it may drive catch-up, rollback and the `initial_sync_complete` flag on its own word.
+/// Every other peer is `Discovered` and must be agreed with by independently chosen peers first.
+///
+/// Stated here, once, and returned by `control.chiaPeers.add` so that a client renders the cost
+/// from the node's own answer instead of restating it locally and drifting away from it.
+///
+/// The authorising scope is deliberately narrow: **a node you run yourself**. NC-12 permits the
+/// operator to declare a node THEIR OWN, and that is what justifies the unbounded authority the
+/// entry carries. Widening it to vouching or recommending moves the case outside the
+/// justification, and "a node you vouch for" is a phrase somebody can be talked into applying to
+/// a stranger's address. [`the_trust_wording_authorises_only_a_node_the_operator_runs`] holds the
+/// line here and in the CLI help.
+const CORROBORATION_BYPASS_NOTICE: &str = concat!(
+    "This peer is now TRUSTED: chain answers from it are accepted on their own, with no ",
+    "corroboration from other peers. A wrong or hostile trusted peer can give this node a ",
+    "false view of the chain, and of your money. Add only a node you run yourself."
+);
+
+/// What `control.chiaPeers.add` says when the entry was un-banned but NOT granted trust.
+///
+/// The call succeeded and the person still needs to be told what actually happened: the peer is
+/// dialable again, and it is still subject to corroboration. Reporting the bypass notice here
+/// instead would be a claim about custody-grade authority that nothing granted.
+const UNBANNED_WITHOUT_TRUST_NOTICE: &str = concat!(
+    "This peer is no longer banned, but it was NOT granted trust: chain answers from it still ",
+    "require corroboration from other peers. `dign chia-peers remove <ip>` then ",
+    "`dign chia-peers add <ip>` if you meant to trust it."
+);
+
+/// `control.chiaPeers.add` — start trusting a Chia full node.
+///
+/// A THIN dispatch to [`dig_wallet::sage::rpc::WalletBackend::add_peer`], the one writer of the
+/// `peers` table. Nothing here decides what a peer is, and nothing here writes a second list.
+async fn chia_peers_add(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let ip = match canonical_ip(params, "control.chiaPeers.add") {
+        Ok(ip) => ip,
+        Err(refusal) => return refusal(id),
+    };
+    match ctx
+        .wallet
+        .add_peer_reporting_trust(&dig_wallet::sage::types::AddPeer { ip: ip.clone() })
+        .await
+    {
+        // `trusted` is the RESULTING state, read back from the row -- not a restatement of what
+        // was asked for. Adding a peer that was BANNED un-bans it and grants no bypass, so a
+        // constant `true` here would tell an operator they had configured a trusted node while
+        // they were still silently depending on the corroboration they were told they bypassed.
+        Ok(trusted) => control_ok(
+            id,
+            json!({
+                "added": true,
+                "ip": ip,
+                "port": dig_wallet::sage::network::DEFAULT_PEER_PORT,
+                "corroboration_bypassed": trusted,
+                "notice": if trusted {
+                    CORROBORATION_BYPASS_NOTICE
+                } else {
+                    UNBANNED_WITHOUT_TRUST_NOTICE
+                },
+            }),
+        ),
+        Err(e) => control_error(id, ErrorCode::ControlError, format!("add_peer failed: {e}")),
+    }
+}
+
+/// `control.chiaPeers.list` — the tracked Chia peers: trusted, discovered and BANNED alike.
+///
+/// Nothing is filtered out, and each exclusion is reported as a flag instead. `user_managed` tells
+/// the trusted set from the discovered one; a list that showed only the trusted set would let a
+/// person conclude their node talks to nobody else, which is the opposite of true. `banned` is
+/// reported for the same reason turned around: this is the ONLY enumeration of the ban list, and a
+/// blocklist a person cannot read is a blocklist they cannot correct.
+async fn chia_peers_list(ctx: &ControlCtx, id: Value) -> Value {
+    match ctx.wallet.get_peers().await {
+        Ok(resp) => {
+            let peers: Vec<Value> = resp.peers.iter().map(chia_peer_wire).collect();
+            control_ok(id, json!({ "peers": peers }))
+        }
+        Err(e) => control_error(
+            id,
+            ErrorCode::ControlError,
+            format!("get_peers failed: {e}"),
+        ),
+    }
+}
+
+/// One tracked Chia peer, as `control.chiaPeers.list` reports it. PURE.
+///
+/// This is where `peak_height` becomes `null`: the wallet DB column is `NOT NULL DEFAULT 0` and no
+/// writer sets it yet, so a `0` means "nobody has polled this peer" rather than "this peer is at
+/// genesis". Those must not read the same — a stale peer the operator believes WITHOUT
+/// corroboration is exactly what this field exists to reveal.
+///
+/// The mapping lives HERE rather than in `PeerRecord`, so the Sage-parity `get_peers` body keeps
+/// the integer a strict third-party client deserializes into a non-optional field. One honest shape
+/// on this node's own surface, one unchanged parity shape, no divergent internal type.
+///
+/// When per-peer telemetry lands, the column must become nullable and this `> 0` test must go with
+/// it, or a genuine genesis height will be reported as unobserved.
+fn chia_peer_wire(p: &dig_wallet::sage::types::PeerRecord) -> Value {
+    json!({
+        "ip": p.ip_addr,
+        "port": p.port,
+        "peak_height": (p.peak_height > 0).then_some(p.peak_height),
+        "user_managed": p.user_managed,
+        "banned": p.banned,
+    })
+}
+
+/// `control.chiaPeers.remove` — stop trusting a Chia full node, optionally banning it.
+async fn chia_peers_remove(ctx: &ControlCtx, id: Value, params: &Value) -> Value {
+    let ip = match canonical_ip(params, "control.chiaPeers.remove") {
+        Ok(ip) => ip,
+        Err(refusal) => return refusal(id),
+    };
+    let ban = params.get("ban").and_then(Value::as_bool).unwrap_or(false);
+    match ctx
+        .wallet
+        .remove_peer_reporting_match(&dig_wallet::sage::types::RemovePeer {
+            ip: ip.clone(),
+            ban,
+        })
+        .await
+    {
+        // `outcome`, and NO `removed: true` companion, so a consumer has to MATCH and cannot
+        // render "nothing was there" as "it is gone". This is the only way to un-trust a peer
+        // holding unbounded authority over the wallet replica, so a remedy that cannot report its
+        // own failure would leave an operator believing they revoked trust they still grant. The
+        // usual cause of a miss is an address spelled differently from the stored one -- which is
+        // why both sides canonicalise.
+        Ok(matched) => control_ok(
+            id,
+            json!({
+                "outcome": if matched { "removed" } else { "no_such_peer" },
+                "ip": ip,
+                "banned": ban,
+            }),
+        ),
+        Err(e) => control_error(
+            id,
+            ErrorCode::ControlError,
+            format!("remove_peer failed: {e}"),
+        ),
+    }
+}
+
+/// `params.ip` in the CONTRACT's canonical form, or a ready-made refusal.
+///
+/// Canonicalising on the way IN is what makes one peer one key. `2001:0DB8:0000::1` and
+/// `2001:db8::1` are the same host typed two ways, and stored verbatim they become two rows: the
+/// operator adds trust under one spelling, tries to remove it under the other, is told nothing
+/// matched, and the peer they meant to un-trust is still believed WITHOUT corroboration. That is
+/// an un-trust that silently does not happen, so both handlers canonicalise through the same
+/// function the contract defines rather than trimming and hoping.
+///
+/// Rejecting a non-literal also BOUNDS the ban list: `remove { ban: true }` persists a row keyed
+/// by this string, so an unvalidated key is unbounded at-rest growth driven by one small call.
+/// A hostname, a bracketed form, an `ip:port` and a blank string are all refused here rather than
+/// stored — a blank in particular is a perfectly storable row, and a tolerant parser would create
+/// a trusted peer nobody can dial or delete.
+fn canonical_ip(params: &Value, method: &str) -> Result<String, Box<dyn FnOnce(Value) -> Value>> {
+    let Some(raw) = params.get("ip").and_then(Value::as_str) else {
+        let method = method.to_string();
+        return Err(Box::new(move |id| {
+            control_error(
+                id,
+                ErrorCode::InvalidParams,
+                format!("{method} requires params.ip (the peer's IP address)"),
+            )
+        }));
+    };
+    dig_node_control_interface::params::canonical_peer_ip(raw).map_err(|e| {
+        let message = e.message;
+        Box::new(move |id| control_error(id, ErrorCode::InvalidParams, message))
+            as Box<dyn FnOnce(Value) -> Value>
+    })
 }
 
 /// The node's own `control.peerStatus` snapshot, or `None` when the peer network is not running.
@@ -3533,6 +3785,197 @@ mod tests {
             listed, union,
             "CONTROL_METHODS drifted from dispatch_control's owned+delegated set"
         );
+    }
+
+    /// LOCKSTEP GATE (#254): the methods this node reserves for the MASTER token are EXACTLY the
+    /// methods the contract puts on the master tier.
+    ///
+    /// This test exists because the two sets already diverged once, silently and in the
+    /// fail-OPEN direction. [`requires_master_token`] used to restate the tier as a match on three
+    /// pairing strings; when the contract moved `chiaPeers.add`/`.remove` to the master tier this
+    /// node went on honouring the old list, so a PAIRED token could install a Chia peer that is
+    /// believed without corroboration and keeps that authority after `pairing.revoke`.
+    ///
+    /// The expectation is written out by NAME rather than derived from the predicate under test:
+    /// a derivation would agree with any implementation, including the one this test was written
+    /// to catch. Reverting to the three-string list drops the two `chiaPeers` entries from
+    /// `actual` and fails on the first assertion, naming them.
+    #[test]
+    fn master_token_set_matches_the_contract() {
+        use std::collections::BTreeSet;
+
+        let actual: BTreeSet<&str> = CONTROL_METHODS
+            .iter()
+            .copied()
+            .filter(|m| requires_master_token(m))
+            .collect();
+
+        let expected: BTreeSet<&str> = [
+            "control.pairing.list",
+            "control.pairing.approve",
+            "control.pairing.revoke",
+            "control.chiaPeers.add",
+            "control.chiaPeers.remove",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            actual, expected,
+            "the master-token tier drifted from the set this node means to reserve"
+        );
+
+        // And it tracks the CONTRACT, so a method the contract promotes later cannot stay
+        // paired-reachable here just because nobody edited the list above.
+        let contract: BTreeSet<&str> = ControlMethod::ALL
+            .iter()
+            .filter(|m| m.requires_master_token())
+            .map(|m| m.name())
+            .filter(|n| CONTROL_METHODS.contains(n))
+            .collect();
+        assert_eq!(
+            actual, contract,
+            "this node's master tier disagrees with dig-node-control-interface"
+        );
+    }
+
+    /// The tier is per-METHOD, never per-namespace: `chiaPeers.list` stays on the ordinary tier.
+    ///
+    /// The control that keeps [`master_token_set_matches_the_contract`] honest. Gating the whole
+    /// `chiaPeers.*` namespace would also close the escalation, and would ALSO leave a paired
+    /// client unable to show the operator which peers their node trusts — the one disclosure that
+    /// makes the trust state correctable. A read grants nothing that outlives the token, so it is
+    /// not on the master tier and this test fails if a namespace-shaped fix is substituted.
+    #[test]
+    fn reading_the_trusted_peer_list_is_not_master_tier() {
+        assert!(requires_master_token("control.chiaPeers.add"));
+        assert!(requires_master_token("control.chiaPeers.remove"));
+        assert!(
+            !requires_master_token("control.chiaPeers.list"),
+            "a paired client must still be able to SHOW the operator the trust state"
+        );
+    }
+
+    /// **The trust wording stays inside NC-12's authorisation: a node the operator RUNS (#254).**
+    ///
+    /// NC-12 permits trust only from the operator declaring a node THEIR OWN, and that is what
+    /// justifies the unbounded authority the entry carries. Widening it to vouching moves the case
+    /// outside the justification — and "a node you vouch for" is a phrase somebody can be talked
+    /// into applying to a stranger's address, which is precisely how a social-engineering path
+    /// into the wallet replica opens.
+    ///
+    /// The banned list mirrors the contract's own wording test, so the node and the published
+    /// method summary cannot drift into disagreeing about what the operator is being asked to
+    /// certify. The CLI help carries the same sentence and is checked in `entrypoint`.
+    #[test]
+    fn the_trust_wording_authorises_only_a_node_the_operator_runs() {
+        let notice = CORROBORATION_BYPASS_NOTICE.to_lowercase();
+        assert!(
+            notice.contains("a node you run yourself"),
+            "the notice must name the operator-run scope, got: {notice}"
+        );
+        assert!(
+            notice.contains("corroboration"),
+            "the notice must name the cost it exists to disclose, got: {notice}"
+        );
+        for widened in ["vouch", "otherwise trust", "trust yourself", "recommend"] {
+            assert!(
+                !notice.contains(widened),
+                "the notice widens operator trust past NC-12 with {widened:?}: {notice}"
+            );
+        }
+
+        // The un-banned-without-trust notice must NOT imply a bypass it did not grant.
+        let unbanned = UNBANNED_WITHOUT_TRUST_NOTICE.to_lowercase();
+        assert!(
+            unbanned.contains("not granted trust") && unbanned.contains("still"),
+            "the person must be told what actually happened, got: {unbanned}"
+        );
+        assert!(
+            !unbanned.contains("is now trusted"),
+            "un-banning grants no trust and must not claim it: {unbanned}"
+        );
+    }
+
+    /// A `control.*` name this node does not serve fails CLOSED — master token required.
+    ///
+    /// [`is_control_method`] gates on the prefix alone, so these names DO reach the predicate.
+    /// The served-but-unpublished diagnostic is the deliberate exception, named in
+    /// [`KNOWN_UNPUBLISHED_CONTROL_METHODS`] and asserted here beside them.
+    #[test]
+    fn an_unserved_control_method_requires_the_master_token() {
+        assert!(requires_master_token("control.notAThing"));
+        assert!(requires_master_token("control.chiaPeers.addd"));
+        assert!(
+            !requires_master_token("control.peers.ping"),
+            "a served diagnostic keeps the ordinary tier until the contract publishes it"
+        );
+    }
+
+    /// **A served-but-unpublished method is master-tier unless it is NAMED as the exception.**
+    ///
+    /// This is the assertion the old carve-out could not make. When the exemption was "in
+    /// `CONTROL_METHODS` but unknown to the contract", adding a method to the served list made it
+    /// paired-reachable on the spot, and every lockstep test stayed green — a method the contract
+    /// does not publish is absent from BOTH sides of the set comparisons they perform, so it is not
+    /// tested loosely, it is not tested at all.
+    ///
+    /// The fixture must be a name this node SERVES, because that is the only input on which the
+    /// two carve-outs disagree: a merely-unknown name answers "master" under both, so a test using
+    /// one cannot fail on the difference. `control.peers.ping` is the one served-but-unpublished
+    /// method that exists, so it is asserted twice — once WITHOUT the exemption (must be master
+    /// tier: serving a method grants it nothing) and once WITH it (ordinary, as the allowlist says).
+    #[test]
+    fn a_served_but_unpublished_method_is_not_exempt_unless_it_is_named() {
+        let served_unpublished = "control.peers.ping";
+        assert!(
+            ControlMethod::from_name(served_unpublished).is_none()
+                && CONTROL_METHODS.contains(&served_unpublished),
+            "fixture drift: {served_unpublished} must be served here and unpublished by the contract"
+        );
+
+        assert!(
+            requires_master_token_given(served_unpublished, &[]),
+            "being SERVED must grant no exemption: an unpublished method fails CLOSED unless it is \
+             named in KNOWN_UNPUBLISHED_CONTROL_METHODS, so a future method cannot inherit the \
+             ordinary tier as a side effect of being added to CONTROL_METHODS"
+        );
+        assert!(
+            !requires_master_token_given(served_unpublished, KNOWN_UNPUBLISHED_CONTROL_METHODS),
+            "the named exception keeps the ordinary tier"
+        );
+
+        // And the production predicate agrees with the named-exception arm.
+        for exempt in KNOWN_UNPUBLISHED_CONTROL_METHODS {
+            assert!(!requires_master_token(exempt), "{exempt}");
+        }
+    }
+
+    /// The control boundary reports an UNOBSERVED peak as `null` and an observed one verbatim.
+    ///
+    /// Both directions matter and only one of them is the fix: asserting `null` for `0` alone would
+    /// also pass if the field were hard-wired to `null`, which would hide every real height the
+    /// moment telemetry lands. The observed case is the control that rules that out.
+    #[test]
+    fn the_control_list_reports_an_unpolled_peak_as_null_and_a_real_one_verbatim() {
+        let peer = |peak: u32| dig_wallet::sage::types::PeerRecord {
+            ip_addr: "1.2.3.4".into(),
+            port: 8444,
+            peak_height: peak,
+            user_managed: true,
+            banned: false,
+        };
+
+        let unpolled = chia_peer_wire(&peer(0));
+        assert_eq!(
+            unpolled["peak_height"],
+            json!(null),
+            "a peer nobody has polled must not read as one stalled at genesis: {unpolled}"
+        );
+
+        let observed = chia_peer_wire(&peer(6_000_000));
+        assert_eq!(observed["peak_height"], json!(6_000_000));
+        assert_eq!(observed["ip"], json!("1.2.3.4"));
+        assert_eq!(observed["banned"], json!(false));
     }
 
     #[test]

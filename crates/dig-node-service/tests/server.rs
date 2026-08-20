@@ -1397,6 +1397,377 @@ async fn cache_list_cached_is_not_routable_over_ws() {
     );
 }
 
+/// **A person can add, list and remove a trusted Chia peer, end to end over the REAL control plane.**
+///
+/// The whole round trip through the real server, the real token gate, the real wallet backend and
+/// the real `peers` table on disk (dig_ecosystem#2870). Nothing here is mocked below the control
+/// method, which is the point: the ticket exists because the WRITER was already there and no
+/// user-facing route reached it, so a test that stubbed the writer would prove nothing new.
+///
+/// It is written as ONE sequence rather than three tests because the properties that matter are
+/// relational -- that `list` sees what `add` wrote, that the entry comes back `user_managed: true`
+/// (the flag that grants `PeerTrust::Operator`), and that `remove` actually un-does it. Three
+/// isolated tests could each pass against a surface that wrote to a list nobody reads.
+#[tokio::test]
+async fn a_trusted_chia_peer_can_be_added_listed_and_removed_over_the_control_plane() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await; // drain the initial sync_status snapshot
+
+    /// Send one control request and return its response frame.
+    async fn call<S>(ws: &mut S, id: &str, method: &str, token: &str, params: Value) -> Value
+    where
+        S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+            + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        ws.send(Message::Text(
+            json!({
+                "id": id, "type": "request", "method": method,
+                "token": token, "params": params,
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        next_ws_json(ws).await
+    }
+
+    // A peer address from TEST-NET-3 (RFC 5737), so nothing here can name a real host.
+    const IP: &str = "203.0.113.7";
+
+    // Nothing is trusted before the person asks for it. Measured rather than assumed, so that a
+    // later assertion of `user_managed: true` cannot be satisfied by a row that was always there.
+    let before = call(&mut ws, "p0", "control.chiaPeers.list", &token, json!({})).await;
+    assert_eq!(before["ok"], json!(true), "list failed: {before:?}");
+    let trusted_before = before["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .filter(|p| p["ip"] == json!(IP))
+        .count();
+    assert_eq!(
+        trusted_before, 0,
+        "the fixture already knew {IP}: {before:?}"
+    );
+
+    // ADD — and the node states the cost in its own answer.
+    let added = call(
+        &mut ws,
+        "p1",
+        "control.chiaPeers.add",
+        &token,
+        json!({ "ip": IP }),
+    )
+    .await;
+    assert_eq!(added["ok"], json!(true), "add failed: {added:?}");
+    assert_eq!(added["result"]["ip"], json!(IP));
+    assert_eq!(
+        added["result"]["corroboration_bypassed"],
+        json!(true),
+        "the add result MUST state the bypass: {added:?}"
+    );
+    let notice = added["result"]["notice"]
+        .as_str()
+        .expect("the node sends the cost as a sentence");
+    assert!(
+        notice.to_lowercase().contains("trusted")
+            && notice.to_lowercase().contains("corroboration"),
+        "the notice must name the cost it exists to disclose, got: {notice}"
+    );
+
+    // LIST — the peer is there, and it is flagged as the operator-chosen kind. `user_managed` is
+    // the ONE field that separates `PeerTrust::Operator` from `Discovered`, so it is asserted
+    // explicitly rather than inferred from the row's presence.
+    let listed = call(&mut ws, "p2", "control.chiaPeers.list", &token, json!({})).await;
+    let entry = listed["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .find(|p| p["ip"] == json!(IP))
+        .unwrap_or_else(|| panic!("the added peer is not in the list: {listed:?}"));
+    assert_eq!(
+        entry["user_managed"],
+        json!(true),
+        "an added peer MUST be user_managed, or it never reaches PeerTrust::Operator: {entry:?}"
+    );
+    assert_eq!(entry["port"], json!(8444), "the standard full-node port");
+
+    // REMOVE — and the trust is genuinely gone, not merely reported as gone.
+    let removed = call(
+        &mut ws,
+        "p3",
+        "control.chiaPeers.remove",
+        &token,
+        json!({ "ip": IP }),
+    )
+    .await;
+    assert_eq!(removed["ok"], json!(true), "remove failed: {removed:?}");
+    assert_eq!(
+        removed["result"]["outcome"],
+        json!("removed"),
+        "a real removal reports `removed`: {removed:?}"
+    );
+    assert!(
+        removed["result"].get("removed").is_none(),
+        "there must be NO always-true boolean beside the outcome, or a consumer can read that \
+         instead of matching and render 'nothing was there' as 'it is gone': {removed:?}"
+    );
+    let after = call(&mut ws, "p4", "control.chiaPeers.list", &token, json!({})).await;
+    let still_there = after["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .any(|p| p["ip"] == json!(IP));
+    assert!(!still_there, "the peer survived removal: {after:?}");
+}
+
+/// **Removing a peer the node never had reports that it removed NOTHING (#254 item 2).**
+///
+/// The fixture varies ONE actor: the same call twice, once naming a peer the node genuinely holds
+/// and once naming one it does not, everything else identical. The truthful control is what makes
+/// this load-bearing — an implementation that answered "removed" unconditionally passes the first
+/// call and fails here, and without the first call a handler that always said `no_such_peer` would
+/// pass just as well.
+///
+/// It matters because `remove` is the ONLY way to un-trust a peer believed WITHOUT corroboration.
+/// An operator told "removed" when nothing matched believes they revoked custody-grade trust and
+/// did not, and the usual cause — an address spelled differently from the stored one — leaves the
+/// original entry trusted and dialable.
+#[tokio::test]
+async fn removing_a_chia_peer_the_node_never_had_is_not_reported_as_a_removal() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await; // drain the initial sync_status snapshot
+
+    async fn call<S>(ws: &mut S, id: &str, method: &str, token: &str, params: Value) -> Value
+    where
+        S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+            + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        ws.send(Message::Text(
+            json!({ "id": id, "type": "request", "method": method,
+                    "token": token, "params": params })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        next_ws_json(ws).await
+    }
+
+    // Both from TEST-NET-3 (RFC 5737), so nothing here can name a real host.
+    const HELD: &str = "203.0.113.7";
+    const NEVER_HELD: &str = "198.51.100.4";
+
+    call(
+        &mut ws,
+        "h0",
+        "control.chiaPeers.add",
+        &token,
+        json!({ "ip": HELD }),
+    )
+    .await;
+
+    let hit = call(
+        &mut ws,
+        "h1",
+        "control.chiaPeers.remove",
+        &token,
+        json!({ "ip": HELD }),
+    )
+    .await;
+    assert_eq!(hit["result"]["outcome"], json!("removed"), "{hit:?}");
+
+    let miss = call(
+        &mut ws,
+        "h2",
+        "control.chiaPeers.remove",
+        &token,
+        json!({ "ip": NEVER_HELD }),
+    )
+    .await;
+    assert_eq!(
+        miss["ok"],
+        json!(true),
+        "the call itself succeeds: {miss:?}"
+    );
+    assert_eq!(
+        miss["result"]["outcome"],
+        json!("no_such_peer"),
+        "a peer the node never held must not be reported as un-trusted: {miss:?}"
+    );
+    assert_ne!(
+        hit["result"]["outcome"], miss["result"]["outcome"],
+        "the two cases must be distinguishable at the call site"
+    );
+}
+
+/// **An IPv6 peer is canonicalised on the way in, so one host is ONE entry (#254 item 8).**
+///
+/// The address is added in an expanded, upper-case spelling and removed in the compressed one.
+/// Stored verbatim these are two rows: the operator adds trust under one spelling, tries to
+/// un-trust under the other, is told nothing matched, and the peer stays believed WITHOUT
+/// corroboration — an un-trust that silently does not happen.
+///
+/// IPv6 is the case that matters rather than an exotic one: DIG is IPv6-first (§5.2), and the
+/// same field also feeds the endpoint join, where pasting a colon turns `::1` + `8444` into
+/// `::1:8444` — not a malformed string a parser rejects, but a DIFFERENT valid address.
+#[tokio::test]
+async fn an_ipv6_chia_peer_is_stored_canonically_so_a_second_spelling_still_matches() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await; // drain the initial sync_status snapshot
+
+    async fn call<S>(ws: &mut S, id: &str, method: &str, token: &str, params: Value) -> Value
+    where
+        S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error>
+            + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        ws.send(Message::Text(
+            json!({ "id": id, "type": "request", "method": method,
+                    "token": token, "params": params })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+        next_ws_json(ws).await
+    }
+
+    // The same host, spelled two legal ways (RFC 3849 documentation prefix).
+    const EXPANDED: &str = "2001:0DB8:0000:0000:0000:0000:0000:0001";
+    const COMPRESSED: &str = "2001:db8::1";
+
+    let added = call(
+        &mut ws,
+        "v0",
+        "control.chiaPeers.add",
+        &token,
+        json!({ "ip": EXPANDED }),
+    )
+    .await;
+    assert_eq!(added["ok"], json!(true), "add failed: {added:?}");
+    assert_eq!(
+        added["result"]["ip"],
+        json!(COMPRESSED),
+        "the stored address must be the CANONICAL form, or remove and list cannot match it"
+    );
+
+    // The list agrees, and reports a bare literal -- never a bracketed or port-carrying form.
+    let listed = call(&mut ws, "v1", "control.chiaPeers.list", &token, json!({})).await;
+    let entry = listed["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .find(|p| p["ip"] == json!(COMPRESSED))
+        .unwrap_or_else(|| panic!("canonical entry missing: {listed:?}"));
+    assert_eq!(entry["port"], json!(8444));
+    assert!(
+        entry["peak_height"].is_null(),
+        "nobody has polled this peer, so its peak is null -- never 0, which would read as a \
+         trusted peer stalled at genesis: {entry:?}"
+    );
+
+    // The OTHER spelling names the same peer, so the un-trust actually happens.
+    let removed = call(
+        &mut ws,
+        "v2",
+        "control.chiaPeers.remove",
+        &token,
+        json!({ "ip": COMPRESSED }),
+    )
+    .await;
+    assert_eq!(
+        removed["result"]["outcome"],
+        json!("removed"),
+        "the second spelling must name the same peer, or trust cannot be revoked: {removed:?}"
+    );
+
+    // A bracketed form is a different thing entirely and is refused rather than stored.
+    let bracketed = call(
+        &mut ws,
+        "v3",
+        "control.chiaPeers.add",
+        &token,
+        json!({ "ip": "[2001:db8::1]" }),
+    )
+    .await;
+    assert_eq!(
+        bracketed["ok"],
+        json!(false),
+        "a bracketed address is not a bare literal and must be refused: {bracketed:?}"
+    );
+}
+
+/// **A blank address is REFUSED, not stored.**
+///
+/// An empty string is a perfectly storable row, so a tolerant parser would create a trusted peer
+/// that cannot be dialled and — because `remove` matches on the address — cannot be deleted either.
+/// The refusal has to happen before the write, which is why the list is checked afterwards rather
+/// than the error message alone.
+#[tokio::test]
+async fn a_blank_chia_peer_address_is_refused_before_anything_is_written() {
+    use tokio_tungstenite::tungstenite::Message;
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, token, _backend, _hold) = start_companion_wallet(&upstream).await;
+
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+        .await
+        .expect("connect to /ws");
+    let _ = next_ws_json(&mut ws).await;
+
+    ws.send(Message::Text(
+        json!({
+            "id": "b1", "type": "request", "method": "control.chiaPeers.add",
+            "token": token, "params": { "ip": "   " },
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let resp = next_ws_json(&mut ws).await;
+    assert_eq!(
+        resp["ok"],
+        json!(false),
+        "a blank ip must be refused: {resp:?}"
+    );
+
+    ws.send(Message::Text(
+        json!({ "id": "b2", "type": "request", "method": "control.chiaPeers.list",
+                "token": token, "params": {} })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let listed = next_ws_json(&mut ws).await;
+    let blank_rows = listed["result"]["peers"]
+        .as_array()
+        .expect("peers array")
+        .iter()
+        .filter(|p| p["ip"].as_str().is_some_and(|ip| ip.trim().is_empty()))
+        .count();
+    assert_eq!(
+        blank_rows, 0,
+        "a blank peer row was written anyway: {listed:?}"
+    );
+}
+
 /// **The money push AND the arrival cursor are behind the token, over the REAL server gate**
 /// (dig_ecosystem#2376, dig_ecosystem#2548).
 ///
@@ -2111,6 +2482,95 @@ async fn pairing_flow_grants_then_revokes_a_scoped_control_token() {
 
     let after_revoke = setupstream_mutation(&addr, Some(&scoped)).await;
     assert_eq!(after_revoke["error"]["data"]["code"], json!("UNAUTHORIZED"));
+}
+
+/// **A PAIRED token cannot install or strip a trusted Chia peer, but can still READ the list.**
+///
+/// The escalation this closes (#254): `chiaPeers.add` writes a peer the wallet replica believes
+/// WITHOUT corroboration, so it can dictate money-bearing chain facts on its own word. The entry
+/// outlives the token that created it — `pairing.revoke` removes a token id and touches no peer
+/// row — so a paired token that could write one has acquired authority the designated remedy
+/// cannot take back.
+///
+/// The fixture varies ONE thing across three otherwise-identical calls on the SAME scoped token:
+/// which `chiaPeers` method is named. `list` is the truthful control, and it is what makes this a
+/// proof of PLACEMENT rather than of outcome — a gate that simply refused the whole namespace, or
+/// a node that had no Chia-peer surface at all, would satisfy "add is refused" while failing here.
+/// Asserting only the two refusals would pin a coincidence that a namespace-shaped fix reproduces.
+#[tokio::test]
+async fn a_paired_token_cannot_grant_itself_a_trusted_chia_peer() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, master, _hold) = start_companion_full(&upstream).await;
+
+    // Pair, exactly as the extension does, to obtain a genuine scoped token.
+    let req = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "pairing.request",
+                "params": { "client_name": "DIG Chrome Extension" } }),
+        None,
+    )
+    .await;
+    let pairing_id = req["result"]["pairing_id"].as_str().unwrap().to_string();
+    let approve = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "control.pairing.approve",
+                "params": { "pairing_id": pairing_id } }),
+        Some(&master),
+    )
+    .await;
+    assert_eq!(approve["result"]["approved"], json!(true));
+    let scoped = poll_pairing(&addr, &pairing_id).await["result"]["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The scoped token is genuinely live: it drives an ordinary control mutation.
+    let live = setupstream_mutation(&addr, Some(&scoped)).await;
+    assert_eq!(
+        live["result"]["upstream"],
+        json!("https://paired.example"),
+        "the token must be VALID, or the refusals below prove nothing"
+    );
+
+    // REFUSED: granting trust.
+    let add = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 3, "method": "control.chiaPeers.add",
+                "params": { "ip": "203.0.113.7" } }),
+        Some(&scoped),
+    )
+    .await;
+    assert_eq!(
+        add["error"]["data"]["code"],
+        json!("UNAUTHORIZED"),
+        "a paired token wrote a trusted Chia peer: {add}"
+    );
+
+    // REFUSED: stripping trust the operator deliberately configured.
+    let remove = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 4, "method": "control.chiaPeers.remove",
+                "params": { "ip": "203.0.113.7" } }),
+        Some(&scoped),
+    )
+    .await;
+    assert_eq!(
+        remove["error"]["data"]["code"],
+        json!("UNAUTHORIZED"),
+        "a paired token un-trusted a peer: {remove}"
+    );
+
+    // ALLOWED: reading the trust state it is subject to.
+    let list = post_rpc(
+        &addr,
+        json!({ "jsonrpc": "2.0", "id": 5, "method": "control.chiaPeers.list" }),
+        Some(&scoped),
+    )
+    .await;
+    assert!(
+        list.get("error").is_none(),
+        "a paired client must still be able to READ the trusted-peer list: {list}"
+    );
 }
 
 #[tokio::test]

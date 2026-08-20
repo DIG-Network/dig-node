@@ -1516,6 +1516,9 @@ lowercase 64-hex; a capsule reference is `storeId:rootHash`. Malformed refs yiel
 | `control.wallet.arrivals` | `after_seq` (integer ≥ 0, default `0`), `limit` (integer, default `50`, CLAMPED to `1..=500`) | `arrivals` (`[{seq, coin_id, puzzle_hash, amount, asset_id, confirmed_height}]`, oldest first), `cursor` (the RESUME position: the last `seq` actually returned, or the caller's own `after_seq` on an empty page), `latest` (the newest position the ledger holds). A client MUST resume from `cursor` and MUST NOT resume from `latest`: `latest` is read after the page, so an arrival recorded in between sits above the page and below `latest`, and resuming from `latest` would step over it. `latest` exists for the first-run case only — a client with no stored cursor reads it and passes it back as `after_seq` to start from NOW rather than replaying the ledger as a burst of notifications. INCOMING FUNDS the node determined ARRIVED, since a cursor (dig_ecosystem#2548) — the question neither `.balance` (a total the user's own change also moves) nor `.coins` (no notion of "new") can answer. A row is written ONLY for a coin that is (a) CONFIRMED — `confirmed_height` is `NOT NULL` in the store, so a mempool sighting is unwritable, not merely unwritten; (b) confirmed STRICTLY ABOVE the wallet's arrival baseline, which is armed ONLY by the statement that records a COMPLETED address-history catch-up — the one caller that has demonstrably replayed everything — so a first catch-up announces nothing, and a point read against the fallback oracle, which replays nothing, cannot arm a baseline at all; (c) not already recorded, enforced by a `UNIQUE` coin id on disk, so a restart, a reconnect or a rebuilt replica re-announces nothing; and (d) NOT created by spending a coin this wallet holds, so the user's own change is never reported as a receipt. `amount` is a decimal STRING (the full `u64` range; a JSON number would round it). `asset_id` is `null` for native XCH and the CAT's hex TAIL otherwise — NEVER a ticker, because naming an asset the node did not attribute would assert a classification it cannot support; a coin whose asset is not yet determinable is HELD and re-examined, never announced as XCH. A reorg DELETES the arrivals above the fork with the coins they describe, and walks the baseline back; `seq` is `AUTOINCREMENT`, so a deleted row's position is never reused and a stored cursor cannot come to mean a different arrival. `arrivals: []` means the node consulted its OWN replica and nothing arrived since the cursor — it is NOT a claim that the replica is current (ask `control.wallet.syncStatus`), and a node that has never completed a catch-up has no baseline and reports empty forever. OPEN read (no token) and the NARROWEST of the open reads: it touches only the local replica, has no oracle path, and so discloses nothing off-node and cannot amplify a poll into outbound requests. `INVALID_PARAMS` on a negative `after_seq`; `WALLET_READ_FAILED` if the local ledger cannot be read. |
 | `control.wallet.peak` | — | `peak_height` (`u32` or `null`), `synced` (bool). The node's current chain peak, independent of any address. Its OWN method rather than a field on a balance because a balance reports `peak_height: null` on every `"fallback"`-tier answer by design (§18.7b), so a caller bounding a claimed confirmation could not obtain one from the node that most needs to answer. Prefers the node's own replica and falls back to the chain tier. `peak_height: null` means UNKNOWN and MUST NOT be read as height zero, which every block is trivially above. OPEN read. |
 | `control.wallet.broadcast` | `signed_bundle_hex` (lowercase hex, optionally `0x`-prefixed, of a chia `Streamable` `SpendBundle`) | `accepted` (bool), `transaction_id` (lowercase 64-hex or `null`), `rejection` (string or `null`). Pushes an ALREADY-SIGNED bundle. **§908: the node signs nothing and is never given anything it could sign with** — there is no key, seed, phrase or unsigned-plan parameter here and none may be added; the node's role on the money path is to read chain state and relay what somebody else signed. A mempool that examined the bundle and refused it is a SUCCESSFUL call reporting `{accepted:false, rejection}`; failing to REACH a mempool is `WALLET_READ_FAILED`, and a node with no chain source is `WALLET_NO_CHAIN_SOURCE`. These MUST NOT be collapsed: the first says build a different bundle, the second says retry this one. `accepted:true` reports mempool admission ONLY and is NOT evidence anything reached a block — a caller MUST NOT record an outcome from it; only a buried confirmation of the created coin is evidence. `INVALID_PARAMS` on hex that is not a streamable `SpendBundle`, refused BEFORE any network call. A bundle requiring a signature from any key the NODE custodies — whatever puzzle wraps the coin — while `DIG_WALLET_ENABLE_LIVE_BROADCAST` is off is `WALLET_NODE_SPEND_DISABLED`, also refused before any network call — the node relays what somebody ELSE signed, and it signs on request, so whether the node could have signed it is CHECKED rather than assumed. TOKEN-GATED (not an open read). |
+| `control.chiaPeers.add` | `ip` (a bare IPv4/IPv6 literal — no brackets, no port, no hostname; the standard full-node port is assumed) | `{added: true, ip, port, corroboration_bypassed, notice}`. TRUSTS a Chia full node: it writes the `user_managed` peer row that is the ONLY way to reach `PeerTrust::Operator`, the trust level whose answers may drive catch-up, rollback and the `initial_sync_complete` flag WITHOUT a quorum. Every other peer is `Discovered` and must be corroborated by independently chosen peers first (§18.16). `ip` is CANONICALISED on the way in (`IpAddr` display form — RFC 5952 lowercase compressed for v6) and echoed back in that form, so one host is one entry however it was spelled; `INVALID_PARAMS` on anything that is not a bare literal, refused before any write. `corroboration_bypassed` is the RESULTING trust state, NOT a restatement of the request: a node MUST report `false` where the entry did not end up trusted — adding a peer that was BANNED un-bans it and confers no bypass. `notice` carries the cost as a sentence and MUST be non-empty, name the corroboration bypass, and be rendered VERBATIM; a client MUST NOT paraphrase, truncate or suppress it. The wording MUST authorise only **a node the operator runs themselves** — never vouching or recommending, which widen the case past what justifies the entry's unbounded authority. Idempotent — re-adding a known peer succeeds and un-bans it. A node MUST serve this from the SAME peer store its wallet replica consults. **MASTER-TOKEN TIER** (`ControlMethod::requires_master_token`): a paired token MUST be refused, because the entry outlives the token that wrote it and `pairing.revoke` removes no peer row. |
+| `control.chiaPeers.list` | — | `{peers: [{ip, port, peak_height, user_managed, banned}]}` — every tracked Chia peer: TRUSTED, DISCOVERED **AND BANNED** alike. `user_managed` tells the trusted set from the discovered one and MUST be reported rather than filtered on: a list showing only the trusted set would let a person conclude the node talks to nobody else. `banned` MUST likewise be reported and its rows MUST NOT be omitted — this is the ONLY enumeration of the ban set, and a blocklist a person cannot read is a blocklist they cannot correct. This enumeration is DISTINCT from the dialling read, which excludes banned peers; a node MUST NOT serve both from one relaxed query. `peak_height` is `null` where the node holds no telemetry for that peer yet — `null` means UNOBSERVABLE and MUST NEVER be reported as `0`, which would render an unpolled peer as one stalled at genesis. A reported height is that peer's CLAIM, never a verified fact, and MUST NOT be aggregated into a chain position (NC-12). TOKEN-GATED at the ORDINARY tier — a read grants nothing that outlives the token, and a paired client must stay able to show the operator the trust state it is subject to. |
+| `control.chiaPeers.remove` | `ip` (canonicalised as for `add`), optional `ban` (bool, default `false`) | `{outcome, ip, banned}` where `outcome` is `"removed"` or `"no_such_peer"`. Stops trusting a peer, RESTORING corroboration for it. There is deliberately NO `removed: true` companion field: this is the only way to un-trust a peer holding unbounded authority over the wallet replica, so a consumer MUST match on `outcome` and MUST surface `"no_such_peer"` as a failure to act — an operator told "removed" when nothing matched believes they revoked custody-grade trust and did not. Matching is by the canonical form, so an address spelled differently from the stored entry still names the same peer. `ban: true` keeps the peer excluded so discovery cannot re-add it; the banned set is bounded at `MAX_BANNED_CHIA_PEERS` (256) and on overflow a node MUST evict its OLDEST ban rather than refuse the newest. `ban: false` merely forgets the row and is the un-ban path — clearing a ban that way grants NO trust. `INVALID_PARAMS` on a missing or non-literal `ip`. **MASTER-TOKEN TIER** — a paired token MUST be refused, so it cannot strip the peers an operator deliberately trusts. |
 | `control.peers.ping` | `peer` (a 64-hex `peer_id`, or a dialable `host:port` with IPv6 bracketed), `peer_id` (OPTIONAL 64-hex — pins the identity the presented certificate MUST derive) | The connection-ladder report — see §7.4a. `INVALID_PARAMS` on a missing/blank `peer`; `CONTROL_ERROR` when no peer network is running; `PEER_PING_REFUSED` (§10) when the anti-amplification gate refuses before dialing. |
 
 ### 7.4a. `control.peers.ping` — the connection-ladder diagnostic
@@ -2115,6 +2118,17 @@ These methods are NEVER relayed upstream — a signing/custody request must neve
 an authorized call is served locally by the node-custodied wallet (or, until the wallet surface is served
 on a given transport, returns a catalogued error — it is never proxied to the public gateway).
 
+**Master-token-tier wallet methods (a paired token MUST be refused).** A Sage-parity method name that
+is an ALIAS for a master-tier `control.*` capability inherits that tier: `add_peer` is
+`control.chiaPeers.add` and `remove_peer` is `control.chiaPeers.remove` — the same writer, the same
+`user_managed` row, the same authority surviving `pairing.revoke`. A node MUST resolve the tier from the
+CAPABILITY and not from the plane a caller reached it on, on EVERY transport (`POST /{method}` and
+`/ws`); it MUST NOT enforce the tier on the `control.*` plane alone, which enforces nothing, since the
+parity name reaches the identical writer one URL away. A node MUST derive both answers from the one
+published predicate (`ControlMethod::requires_master_token`) rather than restating the tier per plane,
+and MUST pin the two planes' answers for a capability in a SINGLE conformance assertion — a per-plane
+test set cannot observe them diverging.
+
 **Open wallet methods (no token).** Wallet READ methods (`get_*`) follow the read plane (§7.2): open to
 local consumers. The recommendation of epic #365 is that the whole wallet WS session be paired-gated once
 the bidirectional WS transport (#369) carries it; the security-critical MUST is that no mutation or
@@ -2125,9 +2139,10 @@ the node-local self-origin surface (§16.3) / a `dig-node wallet backup` CLI —
 boundary, so key material never crosses to a paired caller even with a valid token.
 
 **Classification is pure + tested.** `wallet_authz::classify` maps a method to its class
-(read | mutation | custody | pairing-admin | non-wallet) and `wallet_authz::authorize` decides allow/deny,
+(read | mutation | master-only | custody | non-wallet) and `wallet_authz::authorize` decides allow/deny,
 unit-tested exhaustively: an unpaired caller is denied on every mutation/custody method; a paired token
-authorizes a mutation but NOT pairing administration; a revoked token is denied on the next request.
+authorizes a mutation but NOT a master-tier capability under either of its names; a revoked token is
+denied on the next request.
 
 ### 7.13. DIG auto-update beacon proxy (`control.updater.*`, #515)
 
@@ -2362,6 +2377,31 @@ which fail unless the parser really accepts the verb and carries its operands th
   an address the node cannot already name an identity for. The human output leads with an
   `[OK]`/`[WARN]`/`[FAIL]` marker matching the graded severity, then one line per rung; `--json`
   emits the §7.4a result verbatim. Read-only and bounded — see §7.4a for the full contract.
+- `chia-peers` / `chia-peers list` → `control.chiaPeers.list` — the tracked CHIA full-node peers (a
+  different network from `peers`, which is DIG gossip). The human view counts the TRUSTED peers and
+  the BANNED ones separately from the total, because the trusted rows are the only ones that can move
+  the replica on their own word and the banned rows are the only record of what the node is
+  excluding. Each row is labelled `trusted (you added it)`, `discovered (must be corroborated)` or
+  `BANNED`, and a peer with no telemetry shows its peak as `unobserved` — never `0`, which would read
+  as a trusted peer stalled at genesis. Endpoints are joined by the contract's own helper, so an IPv6
+  literal is BRACKETED: `::1` + `8444` renders `[::1]:8444`, never `::1:8444`, which is a different
+  valid address. An empty list SAYS so and names the verb that fills it. `--json` emits the result
+  verbatim.
+- `chia-peers add <ip>` → `control.chiaPeers.add` — TRUST a Chia full node. Requires the MASTER
+  control token; a paired controller MUST be refused. The command MUST state the corroboration it
+  costs at the moment it is granted: `--help` explains that this node otherwise believes a chain
+  answer only once several independently-chosen peers agree, that a peer added here can advance, roll
+  back or complete the wallet replica alone, and that the operator should add only **a node they run
+  themselves**. The success line repeats the node's own `notice` verbatim and follows the RESULTING
+  trust state — adding a BANNED peer un-bans it WITHOUT granting trust, and the line says so rather
+  than claiming a bypass nothing conferred. A bare `chia-peers` with no sub-action LISTS rather than
+  adds — a default must never be the act that costs something.
+- `chia-peers remove <ip> [--ban]` → `control.chiaPeers.remove` — stop trusting a peer. Requires the
+  MASTER control token, so a paired controller cannot strip peers the operator deliberately trusts.
+  The output MATCHES on `outcome`: `no_such_peer` is reported as having removed NOTHING, naming that
+  any peer the operator meant to un-trust is STILL trusted, because reporting it as success would
+  leave them believing they revoked custody-grade trust. A real removal distinguishes forgetting from
+  banning, because only the latter stops discovery re-adding it.
 - `peers ban <peer> --state <ban|blacklist|none>` → `control.peers.setBan`; `peers pool-config
   --max-connections <n>` → `control.peers.setPoolConfig` remain a **known node-side gap**: until the
   node ships those RPCs those verbs surface the node's METHOD_NOT_FOUND. The CLI verbs exist now so the
@@ -4715,8 +4755,12 @@ just not a real color scheme; real derivation is a tracked follow-on.
 18.17. **Network / peer / sync settings (design A.5, #205 PR4).** `get_peers`/`add_peer`/`remove_peer`
 are DB-backed: `add_peer` persists a user-managed entry at the standard Chia full-node port (design
 B.1, `8444`) surviving restarts (mirroring Sage); `remove_peer{ban:true}` keeps the row but excludes it
-from `get_peers`; `peak_height` reports `0` until live per-peer telemetry is wired to the sync loop —
-never fabricated. `set_discover_peers`/`set_target_peers`/`set_delta_sync`/`set_delta_sync_override`/
+from the DIALLING read (`get_peers` still enumerates it, flagged); `peak_height` reports `0` until live
+per-peer telemetry is wired to the sync loop -- never fabricated, and reported as the INTEGER Sage sends
+so a strict parity client keeps parsing. The unobserved-vs-genesis distinction is drawn at the control
+boundary instead (`control.chiaPeers.list` maps `0` to `null`), which is this node's own surface.
+`add_peer`/`remove_peer` are MASTER-TOKEN TIER on this surface too (§7.12): they are the parity aliases
+of `control.chiaPeers.add`/`.remove` and reach the identical writer. `set_discover_peers`/`set_target_peers`/`set_delta_sync`/`set_delta_sync_override`/
 `set_change_address` persist to a `network_settings` row. `set_network`/`set_network_override` both set
 the same stored network override (this backend tracks one active wallet key; a genuine per-fingerprint
 override is a follow-on for multi-key support). `get_networks`/`get_network` report the two networks
@@ -6042,3 +6086,5 @@ fetches nor serves profile bodies. Nothing else depends on it having run.
 The node **persists, serves and fetches**. It never signs a profile and never edits one. There is no
 seed, private key, signature or unsigned-spend field on any profile method, and there never may be.
 
+
+<!-- dig_ecosystem#2870: trusted Chia peer add/list/remove (WIP) -->

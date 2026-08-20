@@ -15,7 +15,25 @@
 //! Sage mutation surface (SPEC §18.9/§18.9a/§18.16/§18.17); it is kept in sync by SPEC §7.12 — a
 //! mutation added to the wallet surface is added here.
 
-use crate::control::ct_eq;
+use crate::control::{ct_eq, requires_master_token};
+
+/// Sage-parity method names that are ALIASES for a `control.*` capability, paired with the control
+/// name that describes the same effect on the same writer.
+///
+/// The tier of a capability belongs to the capability, NOT to the plane a caller happened to reach
+/// it through. `POST /add_peer` and `control.chiaPeers.add` both land on
+/// `dig_wallet::sage::network::add_peer`, install the identical `user_managed` row, and grant the
+/// identical corroboration-free authority over the wallet replica — so gating one and not the other
+/// gates nothing at all. That was the live hole this table closes: the control plane refused a
+/// paired token while the parity plane handed it the same writer one URL away.
+///
+/// The tier itself is NOT restated here. [`master_tier_control_equivalent`] resolves the alias and
+/// [`crate::control::requires_master_token`] answers the tier from the published contract, so the
+/// two planes cannot drift into disagreeing — there is one rule and two doors onto it.
+pub const CONTROL_EQUIVALENT_PARITY_METHODS: &[(&str, &str)] = &[
+    ("add_peer", "control.chiaPeers.add"),
+    ("remove_peer", "control.chiaPeers.remove"),
+];
 
 /// The custody-lifecycle namespace prefix (§18.20/§18.20a): `wallet.create`, `wallet.import`,
 /// `wallet.restore`, `wallet.unlock`, `wallet.lock`, `wallet.status`, `wallet.list`,
@@ -67,6 +85,12 @@ const GATED_WALLET_MUTATIONS: &[&str] = &[
     "redownload_nft",
     "increase_derivation_index",
     // network / peer / settings mutations (§18.17).
+    //
+    // `add_peer`/`remove_peer` stay listed here as the FLOOR, not as their tier: they are aliases
+    // for master-tier control capabilities ([`CONTROL_EQUIVALENT_PARITY_METHODS`]) and [`classify`]
+    // answers `MasterOnly` for them. Should the contract ever demote those capabilities, this
+    // membership means they fall back to master-or-paired rather than falling out of the gate
+    // entirely — the demotion path fails toward the stricter answer.
     "add_peer",
     "remove_peer",
     "set_discover_peers",
@@ -93,18 +117,41 @@ pub enum WalletMethodClass {
     /// A custody-lifecycle method (`wallet.*`, §18.20) or a node-managed unlock-auth method
     /// (`auth.*`, §18.24) — GATED.
     Custody,
-    /// A wallet MUTATION (sign/spend/offer/mint/transfer + state-changing actions) — GATED.
+    /// A wallet MUTATION (sign/spend/offer/mint/transfer + state-changing actions) — GATED to the
+    /// master token OR a valid paired token.
     Mutation,
+    /// A parity alias for a MASTER-TIER control capability — GATED to the master token ALONE.
+    ///
+    /// The master tier is every effect that OUTLIVES the token which invoked it, so a paired token
+    /// must not reach it on any plane: `pairing.revoke` is the remedy for a compromised paired app,
+    /// and an effect that survives revocation has escaped that remedy.
+    MasterOnly,
     /// Not a gated wallet method — a wallet READ, a `control.*`/`pairing.*`/`dig.*`/`cache.*`
     /// method, or anything else. This gate leaves it alone (the read plane and the control gate
     /// apply their own policy).
     Other,
 }
 
+/// The `control.*` capability a Sage-parity method name is an alias for, when that capability is
+/// on the MASTER tier. `None` for every other method — including an alias whose capability the
+/// contract puts on the ordinary tier, which then classifies by its wallet-surface membership.
+///
+/// Reading the tier here rather than hard-coding it is what keeps the two planes in lockstep: the
+/// contract is the single rule, and both gates consult it.
+pub fn master_tier_control_equivalent(method: &str) -> Option<&'static str> {
+    CONTROL_EQUIVALENT_PARITY_METHODS
+        .iter()
+        .find(|(parity, _)| *parity == method)
+        .map(|(_, control)| *control)
+        .filter(|control| requires_master_token(control))
+}
+
 /// Classify a method against the wallet-authorization policy. PURE.
 pub fn classify(method: &str) -> WalletMethodClass {
     if method.starts_with(CUSTODY_PREFIX) || method.starts_with(AUTH_PREFIX) {
         WalletMethodClass::Custody
+    } else if master_tier_control_equivalent(method).is_some() {
+        WalletMethodClass::MasterOnly
     } else if GATED_WALLET_MUTATIONS.contains(&method) {
         WalletMethodClass::Mutation
     } else {
@@ -117,7 +164,7 @@ pub fn classify(method: &str) -> WalletMethodClass {
 pub fn requires_authorization(method: &str) -> bool {
     matches!(
         classify(method),
-        WalletMethodClass::Custody | WalletMethodClass::Mutation
+        WalletMethodClass::Custody | WalletMethodClass::Mutation | WalletMethodClass::MasterOnly
     )
 }
 
@@ -127,6 +174,9 @@ pub fn requires_authorization(method: &str) -> bool {
 ///   authorized here — other gates (the read plane, the `control.*` gate) apply their own policy.
 /// - A GATED (custody/mutation) method is authorized ONLY when the presented token is the master
 ///   control token (constant-time) OR a valid paired token (`is_paired`). No token → denied.
+/// - A [`WalletMethodClass::MasterOnly`] method — a parity alias for a master-tier control
+///   capability — is authorized by the MASTER token alone; a paired token is refused here exactly
+///   as `control::requires_master_token` refuses it on the control plane.
 ///
 /// `is_paired` is injected so this stays pure + unit-testable without the on-disk paired-token
 /// store; the server passes [`crate::pairing::is_paired_token`].
@@ -136,7 +186,8 @@ pub fn authorize(
     master: &str,
     is_paired: impl Fn(&str) -> bool,
 ) -> bool {
-    if !requires_authorization(method) {
+    let class = classify(method);
+    if class == WalletMethodClass::Other {
         return true;
     }
     // Fail CLOSED on an unusable master token (empty in-memory fallback after a CSPRNG
@@ -148,6 +199,7 @@ pub fn authorize(
         return false;
     }
     match presented {
+        Some(tok) if class == WalletMethodClass::MasterOnly => ct_eq(tok, master),
         Some(tok) => ct_eq(tok, master) || is_paired(tok),
         None => false,
     }
@@ -330,5 +382,86 @@ mod tests {
         // Reads stay open regardless (no token needed), and a healthy master still works.
         assert!(authorize("get_coins", None, "", is_paired));
         assert!(authorize("send_xch", Some(MASTER), MASTER, is_paired));
+    }
+
+    /// **The master tier is a property of the CAPABILITY, never of the plane it was reached on.**
+    ///
+    /// This asserts BOTH gates in one test, deliberately. A per-plane test set cannot see the
+    /// failure this pins: the control plane refusing a paired token for `control.chiaPeers.add`
+    /// and the wallet plane granting that same token `POST /add_peer` are each individually
+    /// correct-looking, and both suites stayed green while a paired token installed a
+    /// corroboration-free Chia peer that survived `pairing.revoke`. Only an assertion that reads
+    /// both policies for the same capability at once can fail on that divergence.
+    ///
+    /// Divergence output, for the reader who sees this fail: the control-plane assertion names the
+    /// contract's answer and the wallet-plane assertion names this module's, so the failing line
+    /// says which of the two moved.
+    #[test]
+    fn the_master_tier_is_a_property_of_the_capability_not_of_the_plane() {
+        for (parity, control_name) in CONTROL_EQUIVALENT_PARITY_METHODS {
+            // Plane 1 — the control gate, read from the published contract.
+            assert!(
+                crate::control::requires_master_token(control_name),
+                "{control_name} left the master tier: either restore it, or drop {parity} from \
+                 CONTROL_EQUIVALENT_PARITY_METHODS deliberately"
+            );
+            // Plane 2 — the Sage-parity wallet gate, for the SAME capability and the SAME writer.
+            assert_eq!(
+                classify(parity),
+                WalletMethodClass::MasterOnly,
+                "{parity} is an alias for master-tier {control_name}, so the wallet plane must \
+                 refuse a paired token too -- both land on the same writer"
+            );
+            assert!(
+                !authorize(parity, Some(PAIRED), MASTER, is_paired),
+                "a PAIRED token reached {parity}, which is {control_name} by another URL: the \
+                 escalation is closed on the control plane and open on the wallet plane"
+            );
+            assert!(
+                authorize(parity, Some(MASTER), MASTER, is_paired),
+                "{parity}: the master token must still work"
+            );
+            assert!(
+                !authorize(parity, None, MASTER, is_paired),
+                "{parity}: no token is denied"
+            );
+            assert!(
+                !authorize(parity, Some("wrong-token"), MASTER, is_paired),
+                "{parity}: a wrong token is denied"
+            );
+        }
+    }
+
+    /// Every master-tier Chia-peer capability the node serves has its parity alias gated with it.
+    ///
+    /// The table above is a manual mapping, so this is what stops it going stale: a new
+    /// `control.chiaPeers.*` capability on the master tier fails here until its Sage-parity name is
+    /// mapped, rather than shipping master-gated on one plane and paired-reachable on the other.
+    #[test]
+    fn every_master_tier_chia_peer_capability_has_a_gated_parity_alias() {
+        for control_name in crate::control::CONTROL_METHODS
+            .iter()
+            .filter(|m| m.starts_with("control.chiaPeers."))
+            .filter(|m| crate::control::requires_master_token(m))
+        {
+            assert!(
+                CONTROL_EQUIVALENT_PARITY_METHODS
+                    .iter()
+                    .any(|(_, mapped)| mapped == control_name),
+                "{control_name} is master-tier on the control plane with no parity alias mapped -- \
+                 add it to CONTROL_EQUIVALENT_PARITY_METHODS or its wallet-plane twin is open"
+            );
+        }
+    }
+
+    /// The empty-master fail-closed guard covers the master-only class too: with no usable master
+    /// token, `ct_eq("", "")` would otherwise hand a blank caller the strictest capability there is.
+    #[test]
+    fn empty_master_token_authorizes_no_master_only_method() {
+        for (parity, _) in CONTROL_EQUIVALENT_PARITY_METHODS {
+            assert!(!authorize(parity, Some(""), "", is_paired), "{parity}");
+            assert!(!authorize(parity, Some(PAIRED), "", is_paired), "{parity}");
+            assert!(!authorize(parity, None, "", is_paired), "{parity}");
+        }
     }
 }

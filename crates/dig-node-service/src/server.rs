@@ -1039,13 +1039,21 @@ async fn rpc(
                 .get(control::CONTROL_TOKEN_HEADER)
                 .and_then(|v| v.to_str().ok());
             let presented = control::presented_token(header_tok, &req);
-            // Authorization is granted by EITHER the master control token OR — for a
-            // NON-administrative control method — a valid PAIRED token (#280). Pairing
-            // administration (list/approve/revoke) requires the MASTER token only, so a
-            // paired controller can neither mint more tokens nor revoke itself.
+            // Authorization is granted by EITHER the master control token OR — for a method
+            // OUTSIDE the master tier — a valid PAIRED token (#280). The master tier is every
+            // method whose effect outlives the token that invoked it: pairing administration
+            // (so a paired controller can neither mint more tokens nor revoke itself) and
+            // `chiaPeers.add`/`.remove` (so it cannot install a peer that keeps unbounded
+            // authority over the wallet replica after revocation). The tier is read from the
+            // contract, never restated here — see `control::requires_master_token`.
+            //
+            // This gate covers the `control.*` plane only. The SAME capabilities are reachable by
+            // their Sage-parity names (`add_peer`/`remove_peer`) on the wallet plane below, which
+            // resolves the identical tier through `wallet_authz` — a tier enforced on one plane
+            // and not the other is not enforced.
             let master_ok =
                 control::is_authorized(&method, presented.as_deref(), &state.control_token);
-            let paired_ok = !control::is_pairing_admin_method(&method)
+            let paired_ok = !control::requires_master_token(&method)
                 && presented.as_deref().is_some_and(|tok| {
                     pairing::is_paired_token(&pairing::paired_tokens_path(&state.state_dir), tok)
                 });
@@ -1422,7 +1430,7 @@ async fn ws_dispatch(
 ) -> Value {
     if control::is_control_method(method) {
         let master_ok = control::is_authorized(method, token, &state.control_token);
-        let paired_ok = !control::is_pairing_admin_method(method)
+        let paired_ok = !control::requires_master_token(method)
             && token.is_some_and(|t| {
                 pairing::is_paired_token(&pairing::paired_tokens_path(&state.state_dir), t)
             });

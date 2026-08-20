@@ -41,10 +41,14 @@
 //!   the token is readable only by an allowed CORS origin (`chrome-extension://…`); a
 //!   foreign web origin's `fetch` is CORS-blocked from reading it (and blocked at
 //!   preflight from even sending a `control.*` token header).
-//! - **Scoped.** A paired token authorizes `control.*` MUTATIONS but NOT pairing
-//!   administration (`list`/`approve`/`revoke`, see
-//!   [`crate::control::is_pairing_admin_method`]) — so it can neither mint more
-//!   tokens nor hide/revoke itself.
+//! - **Scoped.** A paired token authorizes `control.*` MUTATIONS but NOT the MASTER
+//!   tier (see [`crate::control::requires_master_token`]) — pairing administration
+//!   (`list`/`approve`/`revoke`), so it can neither mint more tokens nor hide/revoke
+//!   itself, and `chiaPeers.add`/`.remove`, so it cannot grant itself chain authority
+//!   that SURVIVES the revocation below. The scope is per CAPABILITY, not per plane:
+//!   the Sage-parity aliases of those two methods (`add_peer`/`remove_peer`) resolve the
+//!   same tier through [`crate::wallet_authz`], on both HTTP and WS, because they reach
+//!   the same writer.
 //! - **Revocable.** `dig-node pair revoke <id>` removes it; the gate rejects it at
 //!   once (the paired-token file is consulted per request).
 //! - **Constant-time comparison** for every token check (no timing oracle).
@@ -395,6 +399,26 @@ fn append_paired_token(path: &Path, record: &PairedToken) -> std::io::Result<()>
 }
 
 /// Remove a token by id. Returns whether one was removed (idempotent).
+///
+/// This touches the token store and NOTHING else — deliberately. Revocation cannot undo a side
+/// effect that already outlived the token, so the tier rule
+/// ([`crate::control::requires_master_token`]) keeps a paired token away from the methods that
+/// produce one; it does not try to chase them afterwards. Concretely: this must NOT strip
+/// user-managed Chia peers. A compromised app's "cleanup" would then silently un-trust the nodes
+/// an operator deliberately configured, which is a worse failure than the one it would be
+/// papering over — the escalation is made unreachable at the gates instead, on every plane a PAIRED
+/// TOKEN can present itself on: the `control.*` gate ([`crate::control::requires_master_token`]) and
+/// the Sage-parity wallet gate ([`crate::wallet_authz`]), each over both `POST /{method}` and `/ws`.
+/// The enumeration is the load-bearing part of the sentence, not decoration: this claim was once
+/// made of the control plane alone while `POST /add_peer` handed a paired token the same row, and a
+/// sentence that says "unreachable" without naming the routes is what stopped the next reader
+/// checking the second one.
+///
+/// The loopback mTLS `9257` listener (`dig_wallet::sage::transport`) dispatches the parity surface
+/// with NO token gate; it is outside this claim because its credential is a different one (the
+/// shared client cert), which a paired token cannot supply. That plane is currently unreachable by
+/// anything — the cert is generated per run and never persisted — but persisting it, which its own
+/// comment anticipates, would make an ungated wallet surface live.
 fn revoke_paired_token(path: &Path, token_id: &str) -> std::io::Result<bool> {
     let mut tokens = load_paired_tokens(path);
     let before = tokens.len();

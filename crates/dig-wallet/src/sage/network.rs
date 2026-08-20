@@ -4,10 +4,10 @@
 //! `set_delta_sync_override`, `set_change_address`.
 //!
 //! Peers are DB-backed (§18.16): `add_peer` persists a user-managed entry (mirroring Sage,
-//! which keeps manually-added peers across restarts); `peak_height` reports `0` until this
-//! node's live per-peer telemetry is wired to the sync loop — never fabricated. The known
-//! network list is the two DIG/Chia networks this wallet backend can sync against (design
-//! Part B): mainnet and testnet11.
+//! which keeps manually-added peers across restarts); `peak_height` reports `None` —
+//! UNOBSERVED — until this node's live per-peer telemetry is wired to the sync loop, and is
+//! never fabricated. The known network list is the two DIG/Chia networks this wallet backend
+//! can sync against (design Part B): mainnet and testnet11.
 
 use super::db::WalletDb;
 use super::types::{Network, NetworkKind, NetworkList, PeerRecord};
@@ -17,9 +17,23 @@ use super::Result;
 /// caller supplies only an IP (Sage's `add_peer` request shape carries no port either).
 pub const DEFAULT_PEER_PORT: i64 = 8444;
 
-/// `get_peers` — every tracked, non-banned peer.
+/// `get_peers` — EVERY tracked peer: trusted, discovered and banned alike.
+///
+/// Banned entries are included because this is the only enumeration of them, and a blocklist a
+/// person cannot read is a blocklist they cannot correct. Read `banned` to tell them apart; the
+/// DIALLING path is [`super::db::WalletDb::unbanned_peers`] and is deliberately a different read.
+///
+/// `peak_height` is reported verbatim from the column, `0` included, because this is the
+/// Sage-parity shape and a strict Sage-compatible client fails at PARSE time on anything else.
+/// No writer sets a peak height yet (SPEC §18.16: never fabricated), so `0` here means "nobody has
+/// polled this peer" — an ambiguity this surface cannot resolve without breaking parity. The
+/// honest reading is drawn one layer up: `control.chiaPeers.list` maps `0` to `null` so an
+/// unpolled peer never reads as one stalled at genesis, which is the operator's one signal for
+/// judging whether a peer they believe WITHOUT corroboration is current. When telemetry is wired,
+/// the column has to become nullable so a genuine genesis height stays distinguishable from an
+/// absent one, and that mapping is the site to revisit.
 pub async fn get_peers(db: &WalletDb) -> Result<Vec<PeerRecord>> {
-    let rows = db.all_peers().await?;
+    let rows = db.all_peers_including_banned().await?;
     Ok(rows
         .into_iter()
         .map(|r| PeerRecord {
@@ -27,20 +41,26 @@ pub async fn get_peers(db: &WalletDb) -> Result<Vec<PeerRecord>> {
             port: r.port as u16,
             peak_height: r.peak_height as u32,
             user_managed: r.user_managed,
+            banned: r.banned,
         })
         .collect())
 }
 
 /// `add_peer` — add (or un-ban) a user-managed peer at the standard full-node port.
-pub async fn add_peer(db: &WalletDb, ip: &str) -> Result<()> {
-    db.add_peer(ip, DEFAULT_PEER_PORT).await?;
-    Ok(())
+///
+/// Returns whether the peer ended up TRUSTED, which is not the same as whether the call succeeded:
+/// adding a peer that was banned un-bans it without granting the corroboration bypass. See
+/// [`super::db::WalletDb::add_peer`].
+pub async fn add_peer(db: &WalletDb, ip: &str) -> Result<bool> {
+    Ok(db.add_peer(ip, DEFAULT_PEER_PORT).await?)
 }
 
-/// `remove_peer` — remove a peer, or ban it (excluded from `get_peers` but not forgotten).
-pub async fn remove_peer(db: &WalletDb, ip: &str, ban: bool) -> Result<()> {
-    db.remove_peer(ip, ban).await?;
-    Ok(())
+/// `remove_peer` — remove a peer, or ban it (excluded from dialling but not forgotten).
+///
+/// Returns whether an entry MATCHED, so the caller can report un-trusting nothing as the failure
+/// to act that it is.
+pub async fn remove_peer(db: &WalletDb, ip: &str, ban: bool) -> Result<bool> {
+    Ok(db.remove_peer(ip, ban).await?)
 }
 
 /// `set_discover_peers`.
@@ -150,7 +170,11 @@ mod tests {
         assert_eq!(peers[0].ip_addr, "9.9.9.9");
         assert_eq!(peers[0].port, DEFAULT_PEER_PORT as u16);
         assert!(peers[0].user_managed);
-        assert_eq!(peers[0].peak_height, 0, "no fabricated telemetry");
+        assert_eq!(
+            peers[0].peak_height, 0,
+            "the parity wire keeps Sage's integer shape; the unobserved-vs-genesis distinction is \
+             drawn at the control boundary, which maps this 0 to null"
+        );
 
         remove_peer(&db, "9.9.9.9", false).await.unwrap();
         assert!(get_peers(&db).await.unwrap().is_empty());

@@ -105,13 +105,13 @@ enum Command {
     },
     /// Report whether the node is serving (probes /health).
     Status,
-    /// Pair a browser controller (the DIG Chrome extension) with this node (#280):
+    /// Pair a browser controller (the DIG Chrome extension) with this node:
     /// grant it a scoped, revocable control token after local confirmation.
     Pair {
         #[command(subcommand)]
         action: Option<PairCommand>,
     },
-    /// Open a DIG link in the default browser (#389). The OS scheme-handler target the
+    /// Open a DIG link in the default browser. The OS scheme-handler target the
     /// installer registers for `chia://` + `urn:dig:chia:`. Accepts ONLY those two schemes,
     /// resolves via the local node's serve URL, and never invokes a shell.
     Open {
@@ -150,7 +150,7 @@ enum Command {
         #[command(subcommand)]
         action: ProfileCommand,
     },
-    /// Read a public address's balance (the OPEN `control.wallet.balance` read, #1851).
+    /// Read a public address's balance (the OPEN `control.wallet.balance` read).
     Wallet {
         #[command(subcommand)]
         action: WalletCommand,
@@ -166,14 +166,23 @@ enum Command {
         #[command(subcommand)]
         action: Option<SubscriptionsCommand>,
     },
-    /// View + manage the node's peer connections (#559) — parity with the extension's peer surface.
+    /// View + manage the node's peer connections — parity with the extension's peer surface.
     /// With no sub-action, lists the live peer status (running flag, connected count, relay, and —
     /// on a newer node — the per-peer list with addresses shown IPv6-first per §5.2).
     Peers {
         #[command(subcommand)]
         action: Option<PeersCommand>,
     },
-    /// Internal: idempotently register the `dig.local` → `127.0.0.2` OS hosts entry (#91/#503),
+    /// Add, list and remove a TRUSTED Chia full-node peer.
+    ///
+    /// A different network from `peers`, which manages DIG gossip peers. Trusting a Chia peer
+    /// grants it authority over this node's wallet replica without corroboration — see
+    /// `chia-peers add --help`.
+    ChiaPeers {
+        #[command(subcommand)]
+        action: Option<ChiaPeersCommand>,
+    },
+    /// Internal: idempotently register the `dig.local` → `127.0.0.2` OS hosts entry,
     /// so `http://dig.local` resolves to the node. Invoked by the native install packages;
     /// requires write access to the hosts file (run elevated). Not meant to be run by hand.
     #[command(hide = true)]
@@ -448,6 +457,37 @@ enum PeersCommand {
     },
 }
 
+/// `dig-node chia-peers` sub-actions (dig_ecosystem#2870). With none, lists the tracked peers.
+///
+/// The ticket reference above is a Rust doc comment on the enum, NOT on a clap `#[derive]` field,
+/// so it never reaches `--help`. Doc comments on the VARIANTS below are user-facing help text and
+/// must stay free of internal task numbers (contract §4.3).
+#[derive(Subcommand)]
+enum ChiaPeersCommand {
+    /// List the tracked Chia full-node peers, marking which are trusted.
+    List,
+    /// TRUST a Chia full node by IP.
+    ///
+    /// This node normally believes a chain answer only once several independently-chosen peers
+    /// agree on it. A peer added here is exempt: its answers alone can advance, roll back, or
+    /// complete this node's wallet replica, so a wrong or hostile one can give this node a false
+    /// view of the chain — and of your money. Add only a node you run yourself.
+    ///
+    /// Undo with `chia-peers remove <ip>`.
+    Add {
+        /// The peer's IP address (the standard full-node port is assumed).
+        ip: String,
+    },
+    /// Stop trusting a Chia full node, restoring corroboration for it.
+    Remove {
+        /// The peer's IP address.
+        ip: String,
+        /// Ban rather than forget: keep the peer excluded so discovery cannot re-add it.
+        #[arg(long)]
+        ban: bool,
+    },
+}
+
 /// `dig-node pair` sub-actions. With none, lists pending requests + issued tokens.
 #[derive(Subcommand)]
 enum PairCommand {
@@ -487,6 +527,7 @@ impl Command {
             Command::Updater { .. } => "updater",
             Command::Subscriptions { .. } => "subscriptions",
             Command::Peers { .. } => "peers",
+            Command::ChiaPeers { .. } => "chia-peers",
             Command::EnsureHosts => "ensure-hosts",
         }
     }
@@ -609,6 +650,11 @@ pub fn run() -> std::process::ExitCode {
             Ok(a) => render(peers::run(&config, a), action, json),
             Err(e) => emit_error(&e, action, json),
         },
+        Command::ChiaPeers { action: cmd } => render(
+            control_cli::run(&config, chia_peers_action(cmd)),
+            action,
+            json,
+        ),
         Command::EnsureHosts => render(crate::hosts::run(), action, json),
     };
     std::process::ExitCode::from(exit.code())
@@ -718,6 +764,19 @@ fn subscriptions_action(cmd: Option<SubscriptionsCommand>) -> ControlAction {
         None | Some(SubscriptionsCommand::List) => ControlAction::SubsList,
         Some(SubscriptionsCommand::Add { store_id }) => ControlAction::SubsAdd { store_id },
         Some(SubscriptionsCommand::Remove { store_id }) => ControlAction::SubsRemove { store_id },
+    }
+}
+
+/// Map the `chia-peers` subcommand to its [`ControlAction`] (no sub-action → list the peers).
+///
+/// Listing is the default because it is the only harmless one of the three: defaulting to `add`
+/// would make a bare `dign chia-peers` grant trust, and a default must never be the act that
+/// costs something.
+fn chia_peers_action(cmd: Option<ChiaPeersCommand>) -> ControlAction {
+    match cmd {
+        None | Some(ChiaPeersCommand::List) => ControlAction::ChiaPeersList,
+        Some(ChiaPeersCommand::Add { ip }) => ControlAction::ChiaPeersAdd { ip },
+        Some(ChiaPeersCommand::Remove { ip, ban }) => ControlAction::ChiaPeersRemove { ip, ban },
     }
 }
 
@@ -886,6 +945,42 @@ fn run_service(config: Config) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// **`chia-peers add --help` authorises only a node the operator RUNS (#254 item 7).**
+    ///
+    /// The same NC-12 boundary the wire notice holds, checked on the OTHER surface that states it.
+    /// The help text is where an operator decides whether to run the command at all, so a widened
+    /// phrase here reaches them BEFORE the notice does — and "a node you vouch for" is a phrase
+    /// somebody can be talked into applying to a stranger's address.
+    ///
+    /// Rendered through clap rather than read off the constant, because the doc comment only
+    /// becomes user-facing text once clap formats it: asserting the source string would pass even
+    /// if the help were suppressed or overridden.
+    #[test]
+    fn the_chia_peers_add_help_authorises_only_a_node_the_operator_runs() {
+        let mut help = Vec::new();
+        Cli::command()
+            .find_subcommand_mut("chia-peers")
+            .expect("chia-peers is a subcommand")
+            .find_subcommand_mut("add")
+            .expect("add is a chia-peers subcommand")
+            .write_long_help(&mut help)
+            .expect("clap renders help");
+        let help = String::from_utf8(help)
+            .expect("help is utf-8")
+            .to_lowercase();
+
+        assert!(
+            help.contains("a node you run yourself"),
+            "the help must name the operator-run scope, got: {help}"
+        );
+        for widened in ["vouch", "otherwise trust", "trust yourself", "recommend"] {
+            assert!(
+                !help.contains(widened),
+                "the help widens operator trust past NC-12 with {widened:?}: {help}"
+            );
+        }
+    }
+
     #[test]
     fn bin_name_prefers_arg0_file_stem() {
         // A full path resolves to the bare stem; the `.exe` suffix is stripped.
@@ -912,6 +1007,74 @@ mod tests {
     fn cli_definition_is_valid() {
         // clap's derived command builds without a malformed-definition panic.
         Cli::command().debug_assert();
+    }
+
+    /// Render a subcommand's long help exactly as a person sees it.
+    fn long_help_for(path: &[&str]) -> String {
+        let mut cmd = Cli::command();
+        for name in path {
+            cmd = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("no `{name}` subcommand"))
+                .clone();
+        }
+        cmd.render_long_help().to_string()
+    }
+
+    /// **`chia-peers add` tells the person the corroboration it costs, in its own help.**
+    ///
+    /// This is the ONE place the grant is explained before it is made — the ticket's whole point is
+    /// that a trusted peer reaches `PeerTrust::Operator` and moves the wallet replica with no
+    /// quorum. `remove` is asserted alongside as the escape hatch, so a person who reads `add` can
+    /// see the undo without leaving the page.
+    #[test]
+    fn the_add_help_states_what_trusting_a_chia_peer_costs() {
+        let help = long_help_for(&["chia-peers", "add"]);
+        for phrase in [
+            "independently-chosen peers agree",
+            "advance, roll back, or complete",
+            "false view of the chain",
+            "chia-peers remove",
+        ] {
+            assert!(
+                help.contains(phrase),
+                "`add` help is missing {phrase:?}:
+{help}"
+            );
+        }
+    }
+
+    /// **No user-facing help text leaks an internal ticket number** (contract §4.3).
+    ///
+    /// Regression: the first draft of this command shipped `(dig_ecosystem#2870)` in the
+    /// `chia-peers` summary, which clap renders straight into `--help`. Asserted over the whole
+    /// rendered tree rather than the one command that was wrong, because the mistake is a category
+    /// -- a doc comment on a clap type is user-facing prose and reads exactly like an internal one.
+    #[test]
+    fn no_help_text_exposes_an_internal_ticket_number() {
+        let mut pages = vec![Cli::command().render_long_help().to_string()];
+        for sub in Cli::command().get_subcommands() {
+            pages.push(sub.clone().render_long_help().to_string());
+            for inner in sub.get_subcommands() {
+                pages.push(inner.clone().render_long_help().to_string());
+            }
+        }
+        for page in pages {
+            // Any `#<digits>` in rendered help is an issue reference: no user-facing option,
+            // scheme or value in this CLI has that shape, so the pattern needs no allow-list.
+            let leaked: Vec<&str> = page
+                .split_whitespace()
+                .filter(|w| {
+                    w.split_once('#')
+                        .is_some_and(|(_, rest)| rest.starts_with(|c: char| c.is_ascii_digit()))
+                })
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "help text exposes internal issue references {leaked:?}:
+{page}"
+            );
+        }
     }
 
     /// The `control.*` method a real argv reaches, or `None` if the parser rejects it.
