@@ -648,7 +648,10 @@ mod tests {
         let (offer_b, id_b) = make(700);
 
         // Control: the fixture really does vary the terms, and really does hold the coins fixed.
-        assert_ne!(offer_a, offer_b, "fixture must produce two DIFFERENT offers");
+        assert_ne!(
+            offer_a, offer_b,
+            "fixture must produce two DIFFERENT offers"
+        );
         assert_eq!(
             offered_coin_ids_of(&offer_a),
             offered_coin_ids_of(&offer_b),
