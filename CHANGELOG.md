@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.127.0] - 2026-08-20
+
+### Bug Fixes
+- **control:** Gate chiaPeers on the master-token tier and adopt dnci 0.18 (#248)
+
 ## [0.126.2] - 2026-08-19
 
 ### Bug Fixes
