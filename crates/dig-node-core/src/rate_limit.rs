@@ -184,6 +184,26 @@ pub const DEFAULT_PROXY_FETCH_BURST: f64 = 4.0;
 /// cost being ~an order of magnitude that of a cheap lookup.
 pub const DEFAULT_PROXY_FETCH_REFILL_PER_SEC: f64 = 1.0;
 
+/// The default per-requestor burst for the FORWARDED-ASK relay leg (dig_ecosystem#3128).
+///
+/// A forwarded ask is not a lookup this node does for itself — it is outbound work this node performs
+/// AT ITS OWN PEERS on an inbound caller's behalf. [`RequestorId`] keys by the IMMEDIATE caller, so
+/// that spend lands on this node's allowance everywhere it forwards: one admitted inbound frame can
+/// consume a victim's budget across every peer it holds. Drawing it from the cheap-lookup allowance
+/// would let a caller convert lookup tokens into fan-out at third parties, which is why the relay leg
+/// gets its own bucket — the same separation the PROXY leg already draws for the costlier byte relay.
+///
+/// A QUARTER the lookup burst, matching [`DEFAULT_PROXY_FETCH_BURST`]: a forwarded ask is a network
+/// round-trip per peer, multiplied by the fan-out, so it sits with the expensive legs rather than the
+/// cheap ones. An honest reader whose content is genuinely two hops away is absorbed by the burst;
+/// sustained relay spam is capped independently of, and far below, the lookup rate.
+pub const DEFAULT_RELAY_ASK_BURST: f64 = 4.0;
+
+/// The default sustained FORWARDED-ASK rate (tokens per second) per requestor once its relay burst is
+/// spent — one forwarded fan-out per second per requestor, a QUARTER of
+/// [`DEFAULT_MISS_LOOKUP_REFILL_PER_SEC`].
+pub const DEFAULT_RELAY_ASK_REFILL_PER_SEC: f64 = 1.0;
+
 /// The most distinct requestors tracked at once. Bounds the bucket map so a caller cycling identities
 /// (fresh mTLS leaves / spoofed source IPs) cannot grow it without bound. When full, only IDLE
 /// (full-bucket) entries are evicted to make room — dropping a full bucket is a no-op for the bound
@@ -240,6 +260,14 @@ impl MissRateLimiter {
             DEFAULT_PROXY_FETCH_BURST,
             DEFAULT_PROXY_FETCH_REFILL_PER_SEC,
         )
+    }
+
+    /// A limiter at the FORWARDED-ASK relay defaults ([`DEFAULT_RELAY_ASK_BURST`] /
+    /// [`DEFAULT_RELAY_ASK_REFILL_PER_SEC`]) — the independent bound on the OUTBOUND fan-out a
+    /// relaying hop performs at its own peers (dig_ecosystem#3128), separate from both the cheap
+    /// lookup budget and the proxy egress budget.
+    pub fn with_relay_defaults() -> Self {
+        Self::new(DEFAULT_RELAY_ASK_BURST, DEFAULT_RELAY_ASK_REFILL_PER_SEC)
     }
 
     /// Reconfigure the per-requestor bound, clearing any existing buckets so the new bound applies

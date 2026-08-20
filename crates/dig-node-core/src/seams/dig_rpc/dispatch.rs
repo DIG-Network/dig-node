@@ -327,7 +327,13 @@ impl RpcDispatch for Node {
                 // Thread the in-scope `requestor` so the not-held → DHT enrichment on this JSON leg is
                 // bounded by the SAME per-requestor miss-lookup budget as the single-item legs
                 // (dig_ecosystem#2007) — a batch is the largest amplification vector on this path.
-                return json!({"jsonrpc":"2.0","id":id,"result": node.availability_batch(&items, &requestor).await});
+                //
+                // `redirect_depth` is the hop budget the caller echoed, read with the SAME parser
+                // every other redirect leg uses so one field expresses one budget across the whole
+                // wire (dig_ecosystem#3128). It bounds how far the not-held enrichment may forward the
+                // question across connected pool peers; absent, this is a fresh question at depth 0.
+                let hops_used = crate::download::redirect_depth(&params);
+                return json!({"jsonrpc":"2.0","id":id,"result": node.availability_batch(&items, &requestor, hops_used).await});
             }
             Some(Method::ListInventory) => {
                 // Enumerate what this node serves: its stores, or the roots it holds for a given store.

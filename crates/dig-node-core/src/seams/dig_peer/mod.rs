@@ -19,6 +19,7 @@ pub mod capsule_fallback;
 #[allow(dead_code)]
 pub mod capsule_resolver;
 pub mod dht;
+pub mod forwarded_ask;
 pub mod holdings;
 pub mod module_anchor;
 pub mod module_reshare;
@@ -44,6 +45,9 @@ pub mod store_melted;
 pub mod union_locator;
 
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;
+pub(crate) use forwarded_ask::{
+    ForwardedAsk, NatForwardedAsk, FORWARDED_ASK_FANOUT, MAX_CONCURRENT_FORWARDED_ASKS,
+};
 pub use module_anchor::ChainAnchoredModuleVerifier;
 pub(crate) use module_reshare::DEFAULT_MAX_CONCURRENT_WARMS;
 pub use module_reshare::{
