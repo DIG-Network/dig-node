@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.132.0] - 2026-08-20
+
+### Features
+- **cache:** Retract evicted capsules through dig_sex::holdings (#280)- **wallet:** Auto-create the mnemonic seed on start, fail closed on an unreadable path (#279)
+
 ## [0.130.0] - 2026-08-20
 
 ### Features
