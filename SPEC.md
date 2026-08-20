@@ -5454,6 +5454,22 @@ capsule-gain path flows), guarded so an already-held capsule is a no-op (unchang
 re-announce). It is best-effort and a no-op on the in-process FFI path (no peer network / inventory
 refresher installed).
 
+**Retract-on-inventory-loss (dig-sex SPEC §7.1).** The converse binds equally: a node that LOSES a
+capsule MUST re-advertise, so it stops naming itself a holder of content it has deleted. A node that
+evicts without retracting spends every reader's dial budget on a guaranteed miss, and does so
+invisibly — the advertiser observes nothing wrong, and only the dialler pays.
+
+- The size-cap sweep (`Node::evict_modules_if_needed`) MUST report the capsules it ACTUALLY deleted,
+  and MUST drive a reconcile from that list. A capsule the policy nominated but whose delete FAILED is
+  still held and MUST still be advertised.
+- The delta is computed by `dig_sex::holdings` — `after_eviction` for a sweep, `after_admission` for a
+  land that sacrificed capsules to make room — and the node performs only the I/O. A delta that changes
+  nothing MUST NOT cost a reconcile, which is a Kademlia round trip per changed id.
+- **Ordering is normative.** On a land that evicts, the sweep MUST run BEFORE the advertisement, so the
+  one reconcile covers both the arrival and its cost. Advertising first and deleting after leaves the
+  node advertising the victim until some unrelated inventory change happens to reconcile it, which on
+  a quiet node is never.
+
 ### 19.3a. Real-time holdings announce — dig-gossip opcode 222 (#1429)
 
 Beside the DURABLE provider records above, the node maintains a REAL-TIME holder signal. The durable
