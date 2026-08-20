@@ -2227,8 +2227,40 @@ impl Node {
     /// ([`dig_sex::TieredPolicy`]). Best-effort + idempotent — nothing to evict is a cheap scan.
     pub(crate) async fn evict_modules_if_needed(&self) {
         // Serialize against this process's other cache writers, exactly like `evict_if_needed`.
-        let _guard = self.cache_lock.lock().await;
-        self.evict_modules_locked();
+        // The guard is dropped before the advertisement round: re-advertising re-reads the cache
+        // directory, and there is no reason to hold every other cache writer off for a network round.
+        let evicted = {
+            let _guard = self.cache_lock.lock().await;
+            self.evict_modules_locked()
+        };
+        self.advertise_holdings_change(&dig_sex::holdings::after_eviction(&evicted))
+            .await;
+    }
+
+    /// Bring this node's advertisements back in line with what it now holds, if `delta` says anything
+    /// moved (dig-sex SPEC §7.1 — **every eviction is an advertising retraction**).
+    ///
+    /// `dig_sex::holdings` decides WHETHER an advertisement is owed; the advertising itself is the
+    /// node's existing one — [`refresh_dht_inventory`](crate::seams::dig_peer::peer_network::PeerNetwork::refresh_dht_inventory),
+    /// which reconciles the DHT provider records against the cache and floods the matching opcode-222
+    /// `Add`/`Remove` deltas from that same reconcile. Routing through it rather than announcing the
+    /// delta directly is deliberate: one advertisement path means a retraction can never disagree with
+    /// the provider record it is retracting.
+    ///
+    /// The emptiness gate is not an optimisation of convenience — a reconcile is a Kademlia round trip
+    /// per changed id, and the read-path sweep runs after every capsule land, the overwhelming majority
+    /// of which sacrifice nothing.
+    ///
+    /// A no-op on the FFI path, which installs no refresher and advertises nothing.
+    pub(crate) async fn advertise_holdings_change(
+        &self,
+        delta: &dig_sex::holdings::HoldingsDelta,
+    ) {
+        if delta.is_empty() {
+            return;
+        }
+        use crate::seams::dig_peer::peer_network::PeerNetwork;
+        self.refresh_dht_inventory().await;
     }
 
     /// Every capsule file under `<cache>/modules`, as the eviction decision needs to see it.
@@ -2301,7 +2333,14 @@ impl Node {
 
     /// The scan→decide→delete core of [`Node::evict_modules_if_needed`], held under the cross-process
     /// advisory lock so two DIG processes sharing the cache cannot double-evict or race a torn scan.
-    fn evict_modules_locked(&self) {
+    ///
+    /// Returns the capsules it ACTUALLY deleted — not the ones the policy nominated. The difference
+    /// matters: a nominated victim whose `remove_file` failed is still held and must still be
+    /// advertised, so retracting it would make this node invisible for content it can serve. The
+    /// caller feeds this list to [`dig_sex::holdings::after_eviction`] and re-advertises
+    /// ([`Node::advertise_holdings_change`]); dropping it on the floor is what left this node
+    /// advertising content it had deleted (#267).
+    fn evict_modules_locked(&self) -> Vec<dig_sex::CapsuleIdentity> {
         let _xproc = acquire_cache_lock();
         let cap = cache_cap_bytes();
         let cached = self.scan_cached_modules();
@@ -2330,6 +2369,7 @@ impl Node {
             incoming_size: 0, // a reconcile sweep: nothing is being admitted right now
         });
 
+        let mut removed = Vec::new();
         for id in victims {
             let Some(module) = cached.iter().find(|m| m.id == id) else {
                 continue;
@@ -2343,8 +2383,10 @@ impl Node {
                 self.invalidate_content_cache(store_hex, &module.root_hex);
                 // Forget the tier-0 tag so the ledger cannot grow unbounded across precache→evict churn.
                 crate::tier0_live::forget_tier0_land(store_hex);
+                removed.push(id);
             }
         }
+        removed
     }
 
     /// Whole-store sync against the configured upstream. Returns `true` when the synced

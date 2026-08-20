@@ -157,6 +157,23 @@ impl CapsuleKey {
         &self.store
     }
 
+    /// This capsule as the identity the cache and advertisement layers decide over.
+    ///
+    /// Infallible by construction: [`parse`](Self::parse) already admitted nothing but two canonical
+    /// 64-hex ids, so the decode below cannot fail — which is exactly why the conversion lives here
+    /// and not at each call site, where it would have to invent a fallback for a case that cannot
+    /// happen.
+    pub(crate) fn identity(&self) -> dig_sex::CapsuleIdentity {
+        let decode = |hex: &str| {
+            crate::dht::hex64(hex)
+                .expect("a CapsuleKey component is canonical 64-hex by construction")
+        };
+        dig_sex::CapsuleIdentity {
+            store_id: decode(&self.store).into(),
+            root_hash: decode(&self.root).into(),
+        }
+    }
+
     /// The cached module path for this capsule: `<cache_dir>/modules/<store>/<root>.dig` (#1896).
     ///
     /// The existence of this file is what makes the node a HOLDER of the capsule, so this is also the
