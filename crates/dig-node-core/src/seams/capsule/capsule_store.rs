@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 
 use digstore_core::Bytes32;
 
-use crate::{module_exists, CachedCapsule, Node, PeerNetwork};
+use crate::{module_exists, CachedCapsule, Node};
 
 /// Walk `<modules_root>/<store_id_hex>/<root_hex>.dig` and describe every capsule this node holds.
 ///
