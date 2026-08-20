@@ -7,7 +7,7 @@
 //! the Sage wire types ([`crate::sage::types`]) so it is byte-compatible with Sage.
 //!
 //! [`WalletBackend::dispatch`] is the ONE handler set both transports call (design C.3):
-//! `method` + JSON body → `(http_status, body)`. Because both the mTLS `9257` listener and
+//! `method` + JSON body → `(http_status, body)`. Because both the wallet mTLS listener and
 //! the plain-HTTP+CORS browser mirror call this same function, their bodies are
 //! byte-identical by construction. Success → `200` + JSON; error → Sage's status (A.3) +
 //! the plain-text message.

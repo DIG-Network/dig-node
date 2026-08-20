@@ -103,6 +103,10 @@ pub mod updater;
 pub mod user_scope;
 pub mod wallet_authz;
 
+/// The Sage-parity wallet mTLS listener: its bring-up and the state `dign info` reports
+/// when it could not take its port (dig-node#260). See [`wallet_mtls`].
+pub mod wallet_mtls;
+
 /// Windows Service Control Protocol entrypoint — only meaningful on Windows, where
 /// the SCM-launched binary must speak the service protocol (see the module docs).
 #[cfg(windows)]

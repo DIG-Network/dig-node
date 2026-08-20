@@ -106,7 +106,7 @@ pub struct WalletService {
     pub backend: Arc<WalletBackend>,
     /// The sync-event bus the (future) live sync loop publishes to and the WS transport reads.
     pub events: Arc<EventBus>,
-    /// The shared self-signed cert the mTLS `9257` listener presents (Sage byte-parity).
+    /// The shared self-signed cert the wallet mTLS listener presents (Sage byte-parity).
     pub cert: SharedCert,
     /// The running chain-sync supervisor (§18.6, #2501), or `None` when chain sync is
     /// disabled. Also attached to [`Self::backend`], so a control-plane handler holding only

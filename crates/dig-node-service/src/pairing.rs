@@ -414,7 +414,7 @@ fn append_paired_token(path: &Path, record: &PairedToken) -> std::io::Result<()>
 /// sentence that says "unreachable" without naming the routes is what stopped the next reader
 /// checking the second one.
 ///
-/// The loopback mTLS `9257` listener (`dig_wallet::sage::transport`) dispatches the parity surface
+/// The loopback wallet mTLS listener (`dig_wallet::sage::transport`) dispatches the parity surface
 /// with NO token gate; it is outside this claim because its credential is a different one (the
 /// shared client cert), which a paired token cannot supply. That plane is currently unreachable by
 /// anything — the cert is generated per run and never persisted — but persisting it, which its own

@@ -941,6 +941,9 @@ async fn status(ctx: &ControlCtx) -> Value {
         "sync": {
             "available": ctx.sync_available,
         },
+        // The Sage-parity wallet mTLS listener (dig-node#260). Its bind is best-effort, so
+        // an operator needs somewhere to SEE that it lost its port — silence was the defect.
+        "wallet_mtls": crate::wallet_mtls::status_json(),
     })
 }
 

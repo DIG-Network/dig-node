@@ -1211,7 +1211,7 @@ flywheel. The shared `is_loopback_addr` helper unwraps the mapping with `to_ipv4
 loopback predicate reused by both the origin label and the `DIG_NODE_HOST` enforcement (and #1646).
 
 Coherence: `DIG_NODE_HOST` governs ONLY the local RPC/content bind; the peer P2P wire (mTLS, in
-dig-node-core) and the loopback wallet mTLS `:9257` listener bind independently, so enforcing
+dig-node-core) and the loopback wallet mTLS `:9776` listener bind independently, so enforcing
 loopback here never breaks peer connectivity. A remote-API test rig (#1062) just sets the flag.
 
 ## Lane anchor — dig_ecosystem#1667 (loopback-enforcement residuals)
@@ -1449,3 +1449,21 @@ where the defect is decided, in `dig-node-core/tests/dependency_tree.rs` against
 a FLOOR (no copy below 0.4.0) rather than an inequality against the one known-bad release — 0.2.x and
 0.3.x carry the same placeholder, so `!= "0.1.0"` would be bypassed by the next one.
 
+## Never bind another wallet's port, and never lose a port silently (dig-node#260)
+
+The Sage-parity wallet mTLS listener defaulted to `9257`, which is Sage's OWN RPC port
+(confirmed in Sage's source: `sage-config`'s `RpcConfig::default` sets `port: 9257`). The
+parity we wanted was of the METHOD SURFACE; taking the port bought nothing and cost a user
+their wallet: dig-node is an auto-starting OS service and Sage is a desktop app, so after a
+reboot dig-node reached the socket first. A Sage client then opened `9257`, met our mutual-TLS
+listener, presented no cert we accept, and OUR SERVER sent `handshake_failure` — which the
+client surfaces as an OpenSSL error, three layers from the cause. The user spent an afternoon
+looking at their system TLS configuration. It is now `9776`, beside the rest of the DIG
+cluster, and the prohibition is a test rather than a comment.
+
+The second half is the one worth generalising: the bind was best-effort AND silent. When two
+processes contend for one port the loser is exactly the party who needs to be told, and a
+`NON-FATAL` log-nothing branch guarantees neither side learns anything. Best-effort means
+"does not stop the node", never "is not reported": the outcome is now logged at WARN and
+published on `control.status`, so `dign info` says `wallet mTLS UNAVAILABLE (port 9776 held by
+another process ...)`. Any other best-effort bind in this repo should be read the same way.
