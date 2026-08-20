@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.133.0] - 2026-08-20
+
+### Bug Fixes
+- **offers:** Adopt dig_offers::offer_id, retiring the coin-set-derived rival (#288)
+
 ## [0.132.0] - 2026-08-20
 
 ### Features
