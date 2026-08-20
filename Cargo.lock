@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.131.0"
+version = "0.132.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2618,6 +2618,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tempfile",
+ "time",
  "tokio",
  "tokio-stream",
  "totp-rs",
@@ -2625,6 +2626,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

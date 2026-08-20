@@ -103,6 +103,10 @@ pub mod updater;
 pub mod user_scope;
 pub mod wallet_authz;
 
+/// The start-up check that a wallet seed exists, minting one if it does not (dig-node#277).
+/// Never fatal, never a fallback. See [`wallet_bootstrap`].
+pub mod wallet_bootstrap;
+
 /// The Sage-parity wallet mTLS listener: its bring-up and the state `dign info` reports
 /// when it could not take its port (dig-node#260). See [`wallet_mtls`].
 pub mod wallet_mtls;

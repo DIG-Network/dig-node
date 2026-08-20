@@ -1,0 +1,87 @@
+//! Start-up wallet bootstrap — make sure a seed exists before the node serves anything (#277).
+//!
+//! The node must be usable the moment it is installed, so this runs on EVERY start: first install,
+//! after an update, and on every ordinary boot. There is no user in this path and no prompt; if a
+//! seed is missing one is minted, and if anything at all is uncertain nothing is written.
+//!
+//! The whole decision lives in [`dig_wallet::autoseed`]. This module exists only to run it at the
+//! right moment and to say — in the operator log, and never with any key material in it — what
+//! happened.
+//!
+//! # Never fatal, and never a fallback either
+//!
+//! A failure here does NOT stop the node. Serving and reading content have never required a wallet,
+//! and refusing to boot a content node because a key file was unreadable would turn a wallet
+//! problem into an availability problem. The node comes up **wallet-less and says so**.
+//!
+//! What it must never do is degrade: there is no plaintext path, no prompt, and no "try again
+//! without the device key". A fallback would quietly become the real design on exactly the
+//! constrained hosts this is meant to serve.
+
+use dig_wallet::autoseed::{self, BootstrapState, WalletPaths};
+
+/// Ensure a wallet seed exists at the node's real per-user location, logging the outcome.
+///
+/// Returns the state so a caller can surface it; callers must not treat any outcome as fatal.
+pub fn ensure_wallet_seed() -> Option<BootstrapState> {
+    ensure_wallet_seed_at(&autoseed::default_paths())
+}
+
+/// [`ensure_wallet_seed`] against an explicit layout.
+///
+/// Split out so the narration below — the one place in this feature where a log line sits next to
+/// live key material — can be exercised against a temporary directory. A test that had to point the
+/// real resolver at the real `%LOCALAPPDATA%` would be minting seeds into the developer's own
+/// wallet directory to assert a property about logging.
+pub fn ensure_wallet_seed_at(paths: &WalletPaths) -> Option<BootstrapState> {
+    match autoseed::ensure_wallet(paths) {
+        Ok(BootstrapState::Created) => {
+            // Deliberately records only that a wallet now exists. The phrase, the seed and the
+            // device key never reach a log field — the node's logs are operator-readable and are
+            // collected into support bundles (SPEC §7, the `never_log` battery).
+            tracing::info!(
+                origin = "auto",
+                "no wallet was present; minted one and sealed it under this machine's device key"
+            );
+            Some(BootstrapState::Created)
+        }
+        Ok(BootstrapState::Opened) => {
+            tracing::debug!("wallet seed present and readable");
+            Some(BootstrapState::Opened)
+        }
+        Ok(BootstrapState::Locked) => {
+            // The ordinary state for an imported wallet: sealed under the user's password, which
+            // this path does not have and must not want.
+            tracing::debug!("wallet seed present; it opens with the owner's password, not here");
+            Some(BootstrapState::Locked)
+        }
+        Ok(BootstrapState::Orphaned) => {
+            // Loud, because it is recoverable ONLY while nothing overwrites it — a wrong mount, a
+            // half-restored backup, a container started without its volume. Restoring the device
+            // key restores the wallet; minting a new one would destroy it silently, so nothing was
+            // minted.
+            //
+            // This arm is reached ONLY for a wallet marked `auto` — one this node minted, which
+            // therefore genuinely should have a key. An imported wallet with no device key is the
+            // ordinary case and takes the quiet `Locked` arm above. That distinction matters more
+            // than it looks: told that their wallet "cannot be opened", a reasonable person goes
+            // looking for a way to start over, and starting over is exactly the destructive act
+            // this refusal exists to prevent. The sentence must therefore be reserved for the
+            // situation that is actually wrong, and must say what to do instead of implying loss.
+            tracing::error!(
+                device_key = %paths.device_key.display(),
+                "this node's auto-created wallet is present but its device key is missing. The \
+                 wallet is INTACT and recoverable: restore the device key file and it opens again. \
+                 Nothing was created, modified or deleted — do not delete the wallet."
+            );
+            Some(BootstrapState::Orphaned)
+        }
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                "could not establish a wallet; the node is running without one. Nothing was written."
+            );
+            None
+        }
+    }
+}

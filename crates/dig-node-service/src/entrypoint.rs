@@ -923,6 +923,17 @@ fn live_apply_level(logs_matches: &clap::ArgMatches) {
 /// dev dir.
 fn block_on_serve(config: Config) -> std::io::Result<()> {
     crate::logging::init(crate::logging::run_context());
+    // A seed must exist before anything can use the wallet, and there is no user here to create
+    // one — so check on EVERY start (first install, post-update, ordinary boot) and mint one when
+    // there is definitely none (#277). Never fatal: a node that cannot establish a wallet still
+    // serves content, and says so in the log.
+    //
+    // Placed on the PROCESS entrypoint rather than inside `serve_with_shutdown`, because that
+    // function is what the HTTP integration tests spin up dozens of times — and it resolves the
+    // real per-user `%LOCALAPPDATA%`, so hooking it there made `cargo test` mint a wallet into the
+    // developer's own profile. Minting is a node-lifecycle concern of the actual service process,
+    // not of the server function. The Windows service has its own entrypoint and calls this too.
+    crate::wallet_bootstrap::ensure_wallet_seed();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

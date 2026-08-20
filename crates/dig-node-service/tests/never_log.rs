@@ -113,3 +113,51 @@ fn emitted_records_never_contain_seed_or_token_sentinels() {
         );
     }
 }
+
+/// The unattended seed bootstrap (#277) mints a real mnemonic and a real device key on a path with
+/// no user watching, and narrates what it did. This test drives that exact path and asserts the
+/// material it produced is absent from everything it logged.
+///
+/// The sentinels here are **read back off disk after the run**, not declared up front like the two
+/// above. That difference is the point: a hardcoded sentinel can only catch a line that logs the
+/// specific string the test invented, and the bootstrap never sees that string. Only the phrase and
+/// key this run actually generated can catch a `tracing::info!(phrase = %m, …)` added later, and a
+/// bare `{:?}` on a state or an error is exactly the shape that would introduce one.
+#[test]
+fn the_seed_bootstrap_never_logs_the_phrase_or_the_device_key_it_created() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let paths = dig_wallet::autoseed::WalletPaths {
+        seed: dir.path().join("DigWallet").join("seed.bin"),
+        device_key: dir.path().join("DigNode").join("device").join("device.key"),
+        meta: dir.path().join("DigWallet").join("wallet.meta.json"),
+    };
+
+    let logged = capture(|| {
+        dig_node_service::wallet_bootstrap::ensure_wallet_seed_at(&paths);
+    });
+
+    let key_bytes = std::fs::read(&paths.device_key).expect("a device key was minted");
+    let key_hex = hex::encode(&key_bytes);
+    let sealed = std::fs::read(&paths.seed).expect("a seed was minted");
+    let phrase = dig_wallet::autoseed::open_sealed_with_device_key(&sealed, &key_hex)
+        .expect("the minted phrase");
+
+    assert!(
+        !logged.is_empty(),
+        "the capture harness must see the bootstrap's own narration"
+    );
+    assert!(
+        !logged.contains(&*phrase),
+        "the minted recovery phrase reached a log record: {logged}"
+    );
+    assert!(
+        !logged.contains(&key_hex),
+        "the device key reached a log record: {logged}"
+    );
+    // Individual words are common English and would false-positive; the seal and the raw key are
+    // the two encodings that could plausibly be formatted into a field by accident.
+    assert!(
+        !logged.contains(&hex::encode(&sealed)),
+        "the sealed seed blob reached a log record: {logged}"
+    );
+}
