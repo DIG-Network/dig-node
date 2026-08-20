@@ -249,20 +249,52 @@ mod tests {
         );
     }
 
-    /// The score is a function of the capsule's distance from OUR peer id and nothing else. Two
-    /// capsules in the same tier, one near our identity and one far, must score in that order — and
-    /// the near one is near by construction (it shares our id) rather than by a chosen constant.
+    /// The XOR distance of a capsule's DHT key from this node's peer id, big-endian.
+    ///
+    /// Computed here by hand rather than via `dig_sex::relevance::xor_proximity`, deliberately: this
+    /// is what CHOOSES the fixtures, and the scoring function is what is under test. Using the same
+    /// function for both would make the test agree with itself no matter what either did.
+    fn key_distance_from(id: &CapsuleIdentity, peer_id: &[u8; 32]) -> [u8; 32] {
+        let key = dig_dht::ContentId::capsule(id.store_id.into(), id.root_hash.into()).to_key();
+        let bytes = *key.as_bytes();
+        let mut distance = [0u8; 32];
+        for (slot, (left, right)) in distance.iter_mut().zip(bytes.iter().zip(peer_id.iter())) {
+            *slot = left ^ right;
+        }
+        distance
+    }
+
+    /// A capsule whose DHT key is nearer this node's peer id scores above one that is further.
+    ///
+    /// The fixtures are FOUND, not assumed. An earlier version of this test built its "near" capsule
+    /// from all-zero bytes against an all-zero peer id and asserted only that the two scores
+    /// differed. That assertion passed while the relationship it was named for did not hold at all:
+    /// `content_id` is `ContentId::capsule(..).to_key()`, a HASH, so a capsule of zero bytes lands at
+    /// an arbitrary point in the keyspace and is no nearer the origin than any other. Tightening the
+    /// assertion to `>` is what exposed it — the far capsule scored 0.936 against the near one's
+    /// 0.658, and the code was right both times.
     #[test]
-    fn a_capsule_near_this_nodes_identity_scores_above_a_far_one() {
+    fn a_capsule_nearer_this_nodes_identity_scores_above_a_further_one() {
         let peer_id = [0x00; 32];
         let score = NeighbourhoodScore::new(Some(peer_id));
 
-        let near = score.of(&capsule(0x00, 0x00));
-        let far = score.of(&capsule(0xFF, 0xFF));
+        // Search a deterministic family for the genuinely nearest and furthest keys.
+        let family: Vec<CapsuleIdentity> = (0u8..=255).map(|tag| capsule(tag, tag)).collect();
+        let nearest = family
+            .iter()
+            .min_by_key(|id| key_distance_from(id, &peer_id))
+            .expect("the family is non-empty");
+        let furthest = family
+            .iter()
+            .max_by_key(|id| key_distance_from(id, &peer_id))
+            .expect("the family is non-empty");
+
+        let near = score.of(nearest);
+        let far = score.of(furthest);
 
         assert!(
             near.get() > far.get(),
-            "a capsule sharing our identity must score ABOVE a distant one, got near={} far={}",
+            "the nearest-key capsule must score above the furthest: near={} far={}",
             near.get(),
             far.get()
         );
