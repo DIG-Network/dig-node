@@ -674,147 +674,277 @@ mod tests {
 
     /// (a) A loopback push lands the capsule — it appears on disk at `module_path` and in the cached
     /// inventory. (b) The push routes through the ONE announce site exactly ONCE per fresh land.
-    #[tokio::test]
-    async fn a_local_push_lands_and_announces_exactly_once() {
-        let (_sk, pk, store) = store_keypair(0x11);
-        let (module, root) = push_module(store, &pk, 0x22, 0);
+    #[test]
+    fn a_local_push_lands_and_announces_exactly_once() {
+        // Serialized against every test that pins the process-global cache cap: a tiny cap set
+        // by a concurrent test would sweep this capsule right back off disk (#267).
+        let _env = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A blocking runtime, not `#[tokio::test]`: `ENV_GUARD` is a std `Mutex` and clippy
+        // `await_holding_lock` (rightly) refuses a guard held across an `.await`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_sk, pk, store) = store_keypair(0x11);
+            let (module, root) = push_module(store, &pk, 0x22, 0);
+            let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+
+            let (node, _td) = crate::test_support::test_node_for_peer_surface();
+            let node = node.as_ref();
+            let announces = Arc::new(AtomicUsize::new(0));
+            install_announce_counter(node, announces.clone());
+
+            let resp = push_one_shot(node, &store_hex, &root_hex, &module, None, local()).await;
+            assert_eq!(resp["result"]["complete"], json!(true), "resp={resp}");
+
+            assert!(
+                crate::module_exists(&node.cache_dir, &store_hex, &root_hex),
+                "the capsule must be on disk at its module_path after a local push"
+            );
+            let listed = crate::seams::capsule::CapsuleStore::cache_list_cached(node).await;
+            assert!(
+                listed
+                    .iter()
+                    .any(|c| c.store_id == store_hex && c.root == root_hex),
+                "the pushed capsule must appear in cache_list_cached"
+            );
+            assert_eq!(
+                announces.load(Ordering::SeqCst),
+                1,
+                "a fresh land announces the holder exactly once"
+            );
+        });
+    }
+
+    /// **Proves (#267, dig-sex SPEC §7.1):** a LAND that sacrifices a capsule to make room advertises
+    /// AFTER the sweep, so the node stops naming itself a holder of what it just deleted.
+    ///
+    /// This drives the real push→land path (`land_capsule_bytes` → `announce_and_bound_after_land`),
+    /// which is where the reported defect actually lived: that tail ran `refresh_dht_inventory()` and
+    /// THEN `evict_modules_locked()`, so the reconcile saw a world the victim had not yet left and the
+    /// retraction was never computed. The capsule stayed advertised until some unrelated inventory
+    /// change happened to reconcile it, which on a quiet node is never.
+    ///
+    /// **Non-vacuous, and deliberately not a call counter.** `install_announce_counter` — used by the
+    /// two tests either side of this one — reports exactly one round under BOTH orderings, because one
+    /// round does happen either way. Only the CONTENT of that round separates them, so the spy
+    /// snapshots the on-disk capsule set inside it: with the sweep second, the snapshot still lists the
+    /// filler that is about to be deleted.
+    /// **Catches:** restoring the advertise-then-sweep order, and dropping the land-path retraction.
+    #[test]
+    fn a_land_that_evicts_advertises_after_the_sweep() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_sk, pk, store) = store_keypair(0x9a);
+        let (module, root) = push_module(store, &pk, 0x9b, 0);
         let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
 
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
         let node = node.as_ref();
-        let announces = Arc::new(AtomicUsize::new(0));
-        install_announce_counter(node, announces.clone());
 
-        let resp = push_one_shot(node, &store_hex, &root_hex, &module, None, local()).await;
+        // Isolate the process-global cap config, then pin a cap the filler ALONE already exceeds, so
+        // the post-land sweep must sacrifice it whatever the pushed capsule weighs.
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(crate::config_path());
+        crate::set_cache_cap_bytes(1_500).unwrap();
+
+        // A tier-0 filler: sacrificial by tier, so the freshly-landed capsule (untagged, and therefore
+        // the protected Tier1Demand default) is never the victim.
+        let filler_store = "ba".repeat(32);
+        let filler_root = "cd".repeat(32);
+        crate::tier0_live::mark_tier0_land(&filler_store);
+        let filler = crate::CapsuleKey::parse(&filler_store, &filler_root)
+            .expect("canonical hex")
+            .module_path(&node.cache_dir);
+        std::fs::create_dir_all(filler.parent().unwrap()).unwrap();
+        std::fs::write(&filler, vec![0u8; 2_048]).unwrap();
+
+        let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::test_support::install_inventory_snapshot_spy(node, rounds.clone());
+
+        // A plain `#[test]` driving its own runtime, not `#[tokio::test]`: `ENV_GUARD` is a std
+        // `Mutex` guarding the process-global cap config and must never be held across an `.await`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resp = rt.block_on(push_one_shot(
+            node,
+            &store_hex,
+            &root_hex,
+            &module,
+            None,
+            local(),
+        ));
         assert_eq!(resp["result"]["complete"], json!(true), "resp={resp}");
 
+        assert!(!filler.exists(), "the tier-0 filler was the sacrifice");
         assert!(
             crate::module_exists(&node.cache_dir, &store_hex, &root_hex),
-            "the capsule must be on disk at its module_path after a local push"
+            "the pushed capsule landed and survived the sweep"
         );
-        let listed = crate::seams::capsule::CapsuleStore::cache_list_cached(node).await;
-        assert!(
-            listed
-                .iter()
-                .any(|c| c.store_id == store_hex && c.root == root_hex),
-            "the pushed capsule must appear in cache_list_cached"
-        );
+
+        let rounds = rounds.lock().unwrap();
         assert_eq!(
-            announces.load(Ordering::SeqCst),
+            rounds.len(),
             1,
-            "a fresh land announces the holder exactly once"
+            "a land advertises exactly once; got {rounds:?}"
         );
+        assert!(
+            !rounds[0].contains(&format!("{filler_store}/{filler_root}")),
+            "the advertisement must run AFTER the sweep, so the evicted filler is no longer in the \
+             set it advertises; saw {:?}",
+            rounds[0]
+        );
+        assert!(
+            rounds[0].contains(&format!("{store_hex}/{root_hex}")),
+            "the capsule that just landed must be advertised; saw {:?}",
+            rounds[0]
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
     }
 
     /// (f) Re-pushing an already-held capsule is idempotent — it reports complete and does NOT fire a
     /// second announce.
-    #[tokio::test]
-    async fn a_repushed_capsule_does_not_announce_twice() {
-        let (_sk, pk, store) = store_keypair(0x33);
-        let (module, root) = push_module(store, &pk, 0x44, 0);
-        let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+    #[test]
+    fn a_repushed_capsule_does_not_announce_twice() {
+        // Serialized against every test that pins the process-global cache cap: a tiny cap set
+        // by a concurrent test would sweep this capsule right back off disk (#267).
+        let _env = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A blocking runtime, not `#[tokio::test]`: `ENV_GUARD` is a std `Mutex` and clippy
+        // `await_holding_lock` (rightly) refuses a guard held across an `.await`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_sk, pk, store) = store_keypair(0x33);
+            let (module, root) = push_module(store, &pk, 0x44, 0);
+            let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
 
-        let (node, _td) = crate::test_support::test_node_for_peer_surface();
-        let node = node.as_ref();
-        let announces = Arc::new(AtomicUsize::new(0));
-        install_announce_counter(node, announces.clone());
+            let (node, _td) = crate::test_support::test_node_for_peer_surface();
+            let node = node.as_ref();
+            let announces = Arc::new(AtomicUsize::new(0));
+            install_announce_counter(node, announces.clone());
 
-        let r1 = push_one_shot(node, &store_hex, &root_hex, &module, None, local()).await;
-        assert_eq!(r1["result"]["complete"], json!(true));
-        let r2 = push_one_shot(node, &store_hex, &root_hex, &module, None, local()).await;
-        assert_eq!(r2["result"]["complete"], json!(true));
-        assert_eq!(
-            r2["result"]["already_cached"],
-            json!(true),
-            "second push is a no-op"
-        );
-        assert_eq!(
-            announces.load(Ordering::SeqCst),
-            1,
-            "re-pushing a held capsule must not double-announce"
-        );
+            let r1 = push_one_shot(node, &store_hex, &root_hex, &module, None, local()).await;
+            assert_eq!(r1["result"]["complete"], json!(true));
+            let r2 = push_one_shot(node, &store_hex, &root_hex, &module, None, local()).await;
+            assert_eq!(r2["result"]["complete"], json!(true));
+            assert_eq!(
+                r2["result"]["already_cached"],
+                json!(true),
+                "second push is a no-op"
+            );
+            assert_eq!(
+                announces.load(Ordering::SeqCst),
+                1,
+                "re-pushing a held capsule must not double-announce"
+            );
+        });
     }
 
     /// (e) Chunked reassembly across ≥2 windows lands the whole capsule; a root-mismatch (bytes that do
     /// not commit the requested root) is rejected BEFORE landing.
-    #[tokio::test]
-    async fn chunked_reassembly_lands_and_root_mismatch_is_rejected() {
-        let (_sk, pk, store) = store_keypair(0x55);
-        // A ~200 KiB module so a small window forces multiple chunks.
-        let (module, root) = push_module(store, &pk, 0x66, 200 * 1024);
-        let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
-        let total = module.len();
-        let win = 64 * 1024;
+    #[test]
+    fn chunked_reassembly_lands_and_root_mismatch_is_rejected() {
+        // Serialized against every test that pins the process-global cache cap: a tiny cap set
+        // by a concurrent test would sweep this capsule right back off disk (#267).
+        let _env = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A blocking runtime, not `#[tokio::test]`: `ENV_GUARD` is a std `Mutex` and clippy
+        // `await_holding_lock` (rightly) refuses a guard held across an `.await`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (_sk, pk, store) = store_keypair(0x55);
+            // A ~200 KiB module so a small window forces multiple chunks.
+            let (module, root) = push_module(store, &pk, 0x66, 200 * 1024);
+            let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+            let total = module.len();
+            let win = 64 * 1024;
 
-        let (node, _td) = crate::test_support::test_node_for_peer_surface();
-        let node = node.as_ref();
-        let announces = Arc::new(AtomicUsize::new(0));
-        install_announce_counter(node, announces.clone());
+            let (node, _td) = crate::test_support::test_node_for_peer_surface();
+            let node = node.as_ref();
+            let announces = Arc::new(AtomicUsize::new(0));
+            install_announce_counter(node, announces.clone());
 
-        let mut offset = 0usize;
-        let mut last = Value::Null;
-        while offset < total {
-            let params = json!({
-                "store_id": store_hex,
-                "root": root_hex,
-                "data": window_b64(&module, offset, win),
-                "offset": offset,
-                "total_length": total,
-            });
-            last = node
-                .push_capsule(
-                    &params,
-                    json!(1),
-                    ReadOrigin::Local,
-                    RequestProvenance::FirstParty,
-                    RequestorId::Local,
-                )
-                .await;
-            offset = last["result"]["next_offset"]
-                .as_u64()
-                .map(|n| n as usize)
-                .unwrap_or(total);
-            if offset < total {
-                assert_eq!(
-                    last["result"]["complete"],
-                    json!(false),
-                    "mid-stream not complete"
-                );
+            let mut offset = 0usize;
+            let mut last = Value::Null;
+            while offset < total {
+                let params = json!({
+                    "store_id": store_hex,
+                    "root": root_hex,
+                    "data": window_b64(&module, offset, win),
+                    "offset": offset,
+                    "total_length": total,
+                });
+                last = node
+                    .push_capsule(
+                        &params,
+                        json!(1),
+                        ReadOrigin::Local,
+                        RequestProvenance::FirstParty,
+                        RequestorId::Local,
+                    )
+                    .await;
+                offset = last["result"]["next_offset"]
+                    .as_u64()
+                    .map(|n| n as usize)
+                    .unwrap_or(total);
+                if offset < total {
+                    assert_eq!(
+                        last["result"]["complete"],
+                        json!(false),
+                        "mid-stream not complete"
+                    );
+                }
             }
-        }
-        assert_eq!(
-            last["result"]["complete"],
-            json!(true),
-            "final window completes: {last}"
-        );
-        assert!(crate::module_exists(&node.cache_dir, &store_hex, &root_hex));
-        assert!(offset >= total, "reassembly needed ≥2 windows");
-        assert_eq!(announces.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                last["result"]["complete"],
+                json!(true),
+                "final window completes: {last}"
+            );
+            assert!(crate::module_exists(&node.cache_dir, &store_hex, &root_hex));
+            assert!(offset >= total, "reassembly needed ≥2 windows");
+            assert_eq!(announces.load(Ordering::SeqCst), 1);
 
-        // Root-mismatch: bytes commit a DIFFERENT root than requested → rejected, nothing lands.
-        let wrong_root = [0x67; 32];
-        let wrong_root_hex = hex::encode(wrong_root);
-        // A faithful capsule committing its OWN content-derived root, pushed under `wrong_root_hex` —
-        // its committed root is neither the requested root nor the chain root, so it is rejected.
-        let (mismatched, _mroot) = push_module(store, &pk, 0x99, 0);
-        let resp = push_one_shot(
-            node,
-            &store_hex,
-            &wrong_root_hex,
-            &mismatched,
-            None,
-            local(),
-        )
-        .await;
-        assert!(
-            resp.get("error").is_some(),
-            "root-mismatch must be rejected: {resp}"
-        );
-        assert!(!crate::module_exists(
-            &node.cache_dir,
-            &store_hex,
-            &wrong_root_hex
-        ));
+            // Root-mismatch: bytes commit a DIFFERENT root than requested → rejected, nothing lands.
+            let wrong_root = [0x67; 32];
+            let wrong_root_hex = hex::encode(wrong_root);
+            // A faithful capsule committing its OWN content-derived root, pushed under `wrong_root_hex` —
+            // its committed root is neither the requested root nor the chain root, so it is rejected.
+            let (mismatched, _mroot) = push_module(store, &pk, 0x99, 0);
+            let resp = push_one_shot(
+                node,
+                &store_hex,
+                &wrong_root_hex,
+                &mismatched,
+                None,
+                local(),
+            )
+            .await;
+            assert!(
+                resp.get("error").is_some(),
+                "root-mismatch must be rejected: {resp}"
+            );
+            assert!(!crate::module_exists(
+                &node.cache_dir,
+                &store_hex,
+                &wrong_root_hex
+            ));
+        });
     }
 
     /// (#2246/#2240) A push whose bytes commit the requested `(store_id, root)` in their HEADER but
@@ -885,63 +1015,76 @@ mod tests {
     /// (d) On the peer/authority path a push signed by a NON-authorized writer is rejected, and one
     /// signed by the store's authorized writer succeeds. This is the load-bearing auth test: neuter
     /// `verify_push_authority` and the reject half goes green (proving it is what rejects).
-    #[tokio::test]
-    async fn open_push_requires_the_authorized_writer_signature() {
-        let (sk, pk, store) = store_keypair(0x77);
-        let (module, root) = push_module(store, &pk, 0x88, 0);
-        let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+    #[test]
+    fn open_push_requires_the_authorized_writer_signature() {
+        // Serialized against every test that pins the process-global cache cap: a tiny cap set
+        // by a concurrent test would sweep this capsule right back off disk (#267).
+        let _env = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // A blocking runtime, not `#[tokio::test]`: `ENV_GUARD` is a std `Mutex` and clippy
+        // `await_holding_lock` (rightly) refuses a guard held across an `.await`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (sk, pk, store) = store_keypair(0x77);
+            let (module, root) = push_module(store, &pk, 0x88, 0);
+            let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
 
-        // A DIFFERENT keypair — an attacker who owns a key, but not THIS store's key.
-        let (attacker_sk, _apk, _astore) = store_keypair(0xEE);
-        let bad_sig = digstore_crypto::sign_push(&attacker_sk, &Bytes32(root), &Bytes32(store));
-        let good_sig = digstore_crypto::sign_push(&sk, &Bytes32(root), &Bytes32(store));
+            // A DIFFERENT keypair — an attacker who owns a key, but not THIS store's key.
+            let (attacker_sk, _apk, _astore) = store_keypair(0xEE);
+            let bad_sig = digstore_crypto::sign_push(&attacker_sk, &Bytes32(root), &Bytes32(store));
+            let good_sig = digstore_crypto::sign_push(&sk, &Bytes32(root), &Bytes32(store));
 
-        let (node, _td) = crate::test_support::test_node_for_peer_surface();
-        let node = node.as_ref();
+            let (node, _td) = crate::test_support::test_node_for_peer_surface();
+            let node = node.as_ref();
 
-        // No signature at all on the peer surface → rejected before any buffering.
-        let none = push_one_shot(node, &store_hex, &root_hex, &module, None, peer()).await;
-        assert!(
-            none.get("error").is_some(),
-            "a peer push with no signature must be rejected: {none}"
-        );
+            // No signature at all on the peer surface → rejected before any buffering.
+            let none = push_one_shot(node, &store_hex, &root_hex, &module, None, peer()).await;
+            assert!(
+                none.get("error").is_some(),
+                "a peer push with no signature must be rejected: {none}"
+            );
 
-        // Wrong writer → rejected, nothing lands.
-        let wrong = push_one_shot(
-            node,
-            &store_hex,
-            &root_hex,
-            &module,
-            Some(&bad_sig.to_hex()),
-            peer(),
-        )
-        .await;
-        assert!(
-            wrong.get("error").is_some(),
-            "a non-authorized signature must be rejected: {wrong}"
-        );
-        assert!(!crate::module_exists(
-            &node.cache_dir,
-            &store_hex,
-            &root_hex
-        ));
+            // Wrong writer → rejected, nothing lands.
+            let wrong = push_one_shot(
+                node,
+                &store_hex,
+                &root_hex,
+                &module,
+                Some(&bad_sig.to_hex()),
+                peer(),
+            )
+            .await;
+            assert!(
+                wrong.get("error").is_some(),
+                "a non-authorized signature must be rejected: {wrong}"
+            );
+            assert!(!crate::module_exists(
+                &node.cache_dir,
+                &store_hex,
+                &root_hex
+            ));
 
-        // Authorized writer → lands.
-        let ok = push_one_shot(
-            node,
-            &store_hex,
-            &root_hex,
-            &module,
-            Some(&good_sig.to_hex()),
-            peer(),
-        )
-        .await;
-        assert_eq!(
-            ok["result"]["complete"],
-            json!(true),
-            "the authorized writer's push must land: {ok}"
-        );
-        assert!(crate::module_exists(&node.cache_dir, &store_hex, &root_hex));
+            // Authorized writer → lands.
+            let ok = push_one_shot(
+                node,
+                &store_hex,
+                &root_hex,
+                &module,
+                Some(&good_sig.to_hex()),
+                peer(),
+            )
+            .await;
+            assert_eq!(
+                ok["result"]["complete"],
+                json!(true),
+                "the authorized writer's push must land: {ok}"
+            );
+            assert!(crate::module_exists(&node.cache_dir, &store_hex, &root_hex));
+        });
     }
 
     // ---- dig_ecosystem#2149: DoS bounds on in-flight pending-reassembly state ----

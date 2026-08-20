@@ -2227,8 +2227,37 @@ impl Node {
     /// ([`dig_sex::TieredPolicy`]). Best-effort + idempotent — nothing to evict is a cheap scan.
     pub(crate) async fn evict_modules_if_needed(&self) {
         // Serialize against this process's other cache writers, exactly like `evict_if_needed`.
-        let _guard = self.cache_lock.lock().await;
-        self.evict_modules_locked();
+        // The guard is dropped before the advertisement round: re-advertising re-reads the cache
+        // directory, and there is no reason to hold every other cache writer off for a network round.
+        let evicted = {
+            let _guard = self.cache_lock.lock().await;
+            self.evict_modules_locked()
+        };
+        self.advertise_holdings_change(&dig_sex::holdings::after_eviction(&evicted))
+            .await;
+    }
+
+    /// Bring this node's advertisements back in line with what it now holds, if `delta` says anything
+    /// moved (dig-sex SPEC §7.1 — **every eviction is an advertising retraction**).
+    ///
+    /// `dig_sex::holdings` decides WHETHER an advertisement is owed; the advertising itself is the
+    /// node's existing one — [`refresh_dht_inventory`](crate::seams::dig_peer::peer_network::PeerNetwork::refresh_dht_inventory),
+    /// which reconciles the DHT provider records against the cache and floods the matching opcode-222
+    /// `Add`/`Remove` deltas from that same reconcile. Routing through it rather than announcing the
+    /// delta directly is deliberate: one advertisement path means a retraction can never disagree with
+    /// the provider record it is retracting.
+    ///
+    /// The emptiness gate is not an optimisation of convenience — a reconcile is a Kademlia round trip
+    /// per changed id, and the read-path sweep runs after every capsule land, the overwhelming majority
+    /// of which sacrifice nothing.
+    ///
+    /// A no-op on the FFI path, which installs no refresher and advertises nothing.
+    pub(crate) async fn advertise_holdings_change(&self, delta: &dig_sex::holdings::HoldingsDelta) {
+        if delta.is_empty() {
+            return;
+        }
+        use crate::seams::dig_peer::peer_network::PeerNetwork;
+        self.refresh_dht_inventory().await;
     }
 
     /// Every capsule file under `<cache>/modules`, as the eviction decision needs to see it.
@@ -2301,7 +2330,14 @@ impl Node {
 
     /// The scan→decide→delete core of [`Node::evict_modules_if_needed`], held under the cross-process
     /// advisory lock so two DIG processes sharing the cache cannot double-evict or race a torn scan.
-    fn evict_modules_locked(&self) {
+    ///
+    /// Returns the capsules it ACTUALLY deleted — not the ones the policy nominated. The difference
+    /// matters: a nominated victim whose `remove_file` failed is still held and must still be
+    /// advertised, so retracting it would make this node invisible for content it can serve. The
+    /// caller feeds this list to [`dig_sex::holdings::after_eviction`] and re-advertises
+    /// ([`Node::advertise_holdings_change`]); dropping it on the floor is what left this node
+    /// advertising content it had deleted (#267).
+    fn evict_modules_locked(&self) -> Vec<dig_sex::CapsuleIdentity> {
         let _xproc = acquire_cache_lock();
         let cap = cache_cap_bytes();
         let cached = self.scan_cached_modules();
@@ -2330,6 +2366,7 @@ impl Node {
             incoming_size: 0, // a reconcile sweep: nothing is being admitted right now
         });
 
+        let mut removed = Vec::new();
         for id in victims {
             let Some(module) = cached.iter().find(|m| m.id == id) else {
                 continue;
@@ -2343,8 +2380,10 @@ impl Node {
                 self.invalidate_content_cache(store_hex, &module.root_hex);
                 // Forget the tier-0 tag so the ledger cannot grow unbounded across precache→evict churn.
                 crate::tier0_live::forget_tier0_land(store_hex);
+                removed.push(id);
             }
         }
+        removed
     }
 
     /// Whole-store sync against the configured upstream. Returns `true` when the synced
@@ -4393,6 +4432,58 @@ pub(crate) mod test_support {
     /// mutex) does not cascade into spurious failures of every other env-touching test.
     pub(crate) static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Every `<store>/<root>` capsule currently on disk under `<cache>/modules`, sorted.
+    ///
+    /// The advertisement tests need to know what the world looked like AT THE MOMENT the node
+    /// re-advertised, not merely that it did — see [`install_inventory_snapshot_spy`].
+    pub(crate) fn on_disk_capsules(cache_dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(stores) = std::fs::read_dir(cache_dir.join("modules")) else {
+            return out;
+        };
+        for store in stores.flatten() {
+            let Some(store_hex) = store.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(capsules) = std::fs::read_dir(store.path()) else {
+                continue;
+            };
+            for capsule in capsules.flatten() {
+                if let Some(root_hex) = capsule
+                    .file_name()
+                    .to_str()
+                    .and_then(crate::capsule_key::cached_root_stem)
+                {
+                    out.push(format!("{store_hex}/{root_hex}"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Install an inventory refresher that snapshots the on-disk capsule set on every call, so a test
+    /// can assert not just THAT the node re-advertised but WHAT it would have advertised.
+    ///
+    /// Deliberately not a call COUNTER. The defect this guards has two shapes — no advertisement at
+    /// all, and an advertisement placed BEFORE the eviction — and a counter is blind to the second: it
+    /// reports one round either way while the retraction is still never computed. Snapshotting inside
+    /// the round separates them, because an early round still lists the capsule that is about to go.
+    pub(crate) fn install_inventory_snapshot_spy(
+        node: &Node,
+        rounds: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) {
+        use crate::seams::dig_peer::peer_network::PeerNetwork;
+        let cache_dir = node.cache_dir.clone();
+        node.set_inventory_refresher(Box::new(move || {
+            let rounds = rounds.clone();
+            let snapshot = on_disk_capsules(&cache_dir);
+            Box::pin(async move {
+                rounds.lock().unwrap().push(snapshot);
+            })
+        }));
+    }
+
     /// A minimal in-memory [`Node`] over a fresh temp cache dir, with an unroutable upstream
     /// and the production anchored-root resolver (peer-surface tests never reach the chain).
     /// Returned with its [`tempfile::TempDir`] so the cache dir outlives the node. Used to
@@ -5912,6 +6003,107 @@ mod tests {
         assert!(
             path.exists(),
             "the untagged module survives a no-pressure sweep"
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// Pin a two-capsule cache under a tiny cap so the sweep MUST sacrifice exactly the tier-0 store,
+    /// returning `(node, cache tempdir, config tempdir, victim path, survivor path)`.
+    ///
+    /// `cap` is the caller's lever: a tiny cap forces one eviction, a roomy one forces none, which is
+    /// what lets the two tests below share a fixture and differ in exactly one variable.
+    fn two_capsule_cache(
+        cap: u64,
+    ) -> (Node, tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let (node, td) = test_node(None);
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(config_path());
+        set_cache_cap_bytes(cap).unwrap();
+
+        let survivor_store = "ab".repeat(32);
+        let victim_store = "ba".repeat(32);
+        let root = "cd".repeat(32);
+        node.note_inbound_demand(&survivor_store, &root); // Tier1Demand — protected
+        crate::tier0_live::mark_tier0_land(&victim_store); // Tier0Precache — sacrificial
+
+        let survivor = module_path(&node.cache_dir, &survivor_store, &root);
+        let victim = module_path(&node.cache_dir, &victim_store, &root);
+        for p in [&survivor, &victim] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, vec![0u8; 1_024]).unwrap();
+        }
+        (node, td, cfg, victim, survivor)
+    }
+
+    /// **Proves (#267, dig-sex SPEC §7.1):** a size-cap sweep that deletes a capsule drives an
+    /// advertisement round, and that round sees a world the victim has already left — so the node
+    /// stops claiming to hold it. Before this wiring the sweep deleted the file and told nobody, and
+    /// peers kept dialling this node for content it no longer had.
+    ///
+    /// **Non-vacuous, and deliberately not a "did an announce happen" counter.** The defect has two
+    /// distinct shapes and a counter sees only one of them: (a) no round at all — today's behaviour;
+    /// (b) a round placed BEFORE the delete, which is what the land path did (`refresh` then `evict`)
+    /// and which a counter passes happily while the retraction is still never computed. Snapshotting
+    /// the on-disk set inside the round distinguishes them: an early round still lists the victim.
+    ///
+    /// **Catches:** dropping the retraction entirely, and re-ordering the sweep after the announce.
+    #[test]
+    fn an_eviction_advertises_after_the_victim_is_gone() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        // Two ~1 KiB capsules against a 1,500-byte cap: over by one capsule, so exactly one goes.
+        let (node, _td, _cfg, victim, survivor) = two_capsule_cache(1_500);
+        let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_support::install_inventory_snapshot_spy(&node, rounds.clone());
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+
+        assert!(!victim.exists(), "the tier-0 capsule was the sacrifice");
+        assert!(survivor.exists(), "the demanded capsule survives");
+
+        let rounds = rounds.lock().unwrap();
+        assert_eq!(
+            rounds.len(),
+            1,
+            "an eviction MUST drive exactly one advertisement round; got {rounds:?}"
+        );
+        let victim_id = format!("{}/{}", "ba".repeat(32), "cd".repeat(32));
+        assert!(
+            !rounds[0].contains(&victim_id),
+            "the advertisement round must run AFTER the delete, so the evicted capsule is no \
+             longer in the set it advertises; saw {:?}",
+            rounds[0]
+        );
+        assert!(
+            rounds[0].contains(&format!("{}/{}", "ab".repeat(32), "cd".repeat(32))),
+            "the surviving capsule must still be advertised — a retraction is not a withdrawal \
+             of everything; saw {:?}",
+            rounds[0]
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
+    /// **Proves (#267):** a sweep that evicts NOTHING costs no network round. `HoldingsDelta::is_empty`
+    /// is the gate, and this is the control that keeps the test above honest: without it, "refresh
+    /// unconditionally on every sweep" — a strictly wrong implementation that pays a Kademlia round
+    /// trip per read-path land — would pass.
+    /// **Catches:** wiring the refresh without consulting the delta.
+    #[test]
+    fn a_sweep_that_evicts_nothing_advertises_nothing() {
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        // Same fixture, one variable changed: a roomy cap, so the sweep finds nothing to sacrifice.
+        let (node, _td, _cfg, victim, survivor) = two_capsule_cache(10_000);
+        let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        test_support::install_inventory_snapshot_spy(&node, rounds.clone());
+
+        pin_test_rt().block_on(node.evict_modules_if_needed());
+
+        assert!(victim.exists() && survivor.exists(), "nothing was evicted");
+        assert!(
+            rounds.lock().unwrap().is_empty(),
+            "a no-op sweep must not spend an advertisement round"
         );
 
         std::env::remove_var("DIG_NODE_CACHE");

@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 
 use digstore_core::Bytes32;
 
-use crate::{module_exists, CachedCapsule, Node, PeerNetwork};
+use crate::{module_exists, CachedCapsule, Node};
 
 /// Walk `<modules_root>/<store_id_hex>/<root_hex>.dig` and describe every capsule this node holds.
 ///
@@ -276,7 +276,7 @@ impl CapsuleStore for Node {
                 // only reach this point on a FRESH land (an already-cached capsule returned at the top
                 // before any network), so the announce fires exactly once per newly-held capsule — no
                 // double-announce. The `_guard` above already holds `cache_lock`.
-                self.announce_and_bound_after_land().await;
+                self.announce_and_bound_after_land(capsule.identity()).await;
                 Ok((md.len(), root_hex.to_string()))
             }
             // No file on disk. The sync's OWN outcome says why — never a list of causes that
@@ -386,7 +386,7 @@ impl Node {
         }
         crate::write_atomic(&path, bytes)
             .map_err(|e| format!("could not write the capsule: {e}"))?;
-        self.announce_and_bound_after_land().await;
+        self.announce_and_bound_after_land(key.identity()).await;
         Ok((bytes.len() as u64, true))
     }
 
@@ -396,9 +396,17 @@ impl Node {
     /// whole-capsule storage stays bounded at the cache cap (#1934). The caller already holds
     /// `cache_lock`, so this calls the LOCKED eviction core directly (the `_if_needed` wrapper re-takes
     /// `cache_lock` and would deadlock).
-    async fn announce_and_bound_after_land(&self) {
-        self.refresh_dht_inventory().await;
-        self.evict_modules_locked();
+    async fn announce_and_bound_after_land(&self, admitted: dig_sex::CapsuleIdentity) {
+        // The sweep runs FIRST, and the ordering is the point. It used to run second, so a land that
+        // sacrificed a capsule to make room announced the arrival and then deleted the victim in
+        // silence — the node advertised content it had just removed until some unrelated inventory
+        // change happened to reconcile it, which on a quiet node is never (#267).
+        let evicted = self.evict_modules_locked();
+        // One delta for the whole event: what arrived, and what it cost. `after_admission` always
+        // announces the admitted capsule, so a land that evicts nothing still advertises exactly as
+        // before — the retraction is additive to that, never a replacement for it.
+        self.advertise_holdings_change(&dig_sex::holdings::after_admission(admitted, &evicted))
+            .await;
     }
 
     /// The SHARED whole-`.dig` backfill pull body: spawn a detached, single-flighted, chain-anchored
