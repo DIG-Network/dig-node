@@ -178,7 +178,7 @@ impl KeyspaceRng for SplitMix64 {
         // Four 64-bit draws fill the 256-bit point; big-endian packing keeps the
         // mapping stable across platforms so a seed replays identically anywhere.
         let mut point = [0u8; 32];
-        for chunk in point.chunks_exact_mut(8) {
+        for chunk in point.as_chunks_mut::<8>().0 {
             chunk.copy_from_slice(&self.next_u64().to_be_bytes());
         }
         point
