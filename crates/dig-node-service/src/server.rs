@@ -1980,6 +1980,13 @@ where
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
     }
 
+    // A seed must exist before anything can use the wallet, and there is no user here to create
+    // one — so check on EVERY start (first install, post-update, ordinary boot) and mint one if
+    // there is definitely none (#277). Deliberately before `build_state`, so the wallet backend is
+    // built against a wallet that already exists rather than one that appears underneath it. Never
+    // fatal: a node that cannot establish a wallet still serves content, and says so in the log.
+    crate::wallet_bootstrap::ensure_wallet_seed();
+
     let addr = config.bind_addr();
     let state = build_state(&config).await;
 

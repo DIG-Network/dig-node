@@ -98,6 +98,14 @@ impl WalletPaths {
     }
 }
 
+/// The production layout, rooted at the wallet's existing seed location.
+///
+/// The one entry point a host binary needs: it keeps the seed's own path a private detail of this
+/// crate, so no caller can drift onto a second spelling of it.
+pub fn default_paths() -> WalletPaths {
+    WalletPaths::resolve(crate::seed_path())
+}
+
 /// The per-user, non-roaming base directory both roots hang off (NC-3's location contract).
 fn user_base() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA")
@@ -467,16 +475,15 @@ fn harden_owner_only(_path: &Path) -> io::Result<()> {
 /// by an administrator or a profile-policy change tomorrow without this code ever running again.
 #[cfg(windows)]
 fn harden_owner_only(path: &Path) -> io::Result<()> {
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SetNamedSecurityInfoW, SE_FILE_OBJECT, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACL,
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+        GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     let sid = current_user_sid_string()?;
     let sddl = wide(&format!("D:P(A;;FA;;;{sid})"));
@@ -533,58 +540,63 @@ fn harden_owner_only(path: &Path) -> io::Result<()> {
         )));
     }
     Ok(())
+}
 
-    /// The current process user's SID in string form, for the SDDL above.
-    #[cfg(windows)]
-    fn current_user_sid_string() -> io::Result<String> {
-        let mut token = std::ptr::null_mut();
-        // SAFETY: `token` is null-initialized and written by the OS on success.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
+/// The current process user's SID in string form, for the SDDL in [`harden_owner_only`].
+#[cfg(windows)]
+fn current_user_sid_string() -> io::Result<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-        let mut needed = 0u32;
-        // SAFETY: a deliberate zero-length probe; the OS writes only `needed` and fails with
-        // ERROR_INSUFFICIENT_BUFFER, which is the expected outcome and not an error here.
-        unsafe {
-            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
-        }
-        let mut buf = vec![0u8; needed.max(1) as usize];
-        // SAFETY: `buf` is at least `needed` bytes and live for the call.
-        let ok = unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                buf.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        };
-        // SAFETY: the token handle from the successful OpenProcessToken; not used again.
-        unsafe { CloseHandle(token) };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // SAFETY: on success the buffer holds a TOKEN_USER whose Sid points inside it.
-        let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-        let mut sid_str = std::ptr::null_mut();
-        // SAFETY: `sid` is the valid SID above; `sid_str` is written by the OS on success.
-        if unsafe { ConvertSidToStringSidW(sid, &mut sid_str) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: a null-terminated UTF-16 string the OS allocated; read fully before the free.
-        let text = unsafe {
-            let mut len = 0;
-            while *sid_str.add(len) != 0 {
-                len += 1;
-            }
-            String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len))
-        };
-        // SAFETY: the exact LocalAlloc'd block returned above; not dereferenced again.
-        unsafe { LocalFree(sid_str as _) };
-        Ok(text)
+    let mut token = std::ptr::null_mut();
+    // SAFETY: `token` is null-initialized and written by the OS on success.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
     }
+
+    let mut needed = 0u32;
+    // SAFETY: a deliberate zero-length probe; the OS writes only `needed` and fails with
+    // ERROR_INSUFFICIENT_BUFFER, which is the expected outcome and not an error here.
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    let mut buf = vec![0u8; needed.max(1) as usize];
+    // SAFETY: `buf` is at least `needed` bytes and live for the call.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    // SAFETY: the token handle from the successful OpenProcessToken; not used again.
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: on success the buffer holds a TOKEN_USER whose Sid points inside it.
+    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut sid_str = std::ptr::null_mut();
+    // SAFETY: `sid` is the valid SID above; `sid_str` is written by the OS on success.
+    if unsafe { ConvertSidToStringSidW(sid, &mut sid_str) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a null-terminated UTF-16 string the OS allocated; read fully before the free.
+    let text = unsafe {
+        let mut len = 0;
+        while *sid_str.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(sid_str, len))
+    };
+    // SAFETY: the exact LocalAlloc'd block returned above; not dereferenced again.
+    unsafe { LocalFree(sid_str as _) };
+    Ok(text)
 }
 
 /// A null-terminated UTF-16 buffer for the Win32 wide-string APIs.
