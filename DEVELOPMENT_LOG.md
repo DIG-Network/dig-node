@@ -1448,3 +1448,4 @@ compared against itself is unguarded no matter how many assertions mention it. T
 where the defect is decided, in `dig-node-core/tests/dependency_tree.rs` against the workspace lock, as
 a FLOOR (no copy below 0.4.0) rather than an inequality against the one known-bad release — 0.2.x and
 0.3.x carry the same placeholder, so `!= "0.1.0"` would be bypassed by the next one.
+
