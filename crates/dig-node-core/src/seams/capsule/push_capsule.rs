@@ -676,6 +676,11 @@ mod tests {
     /// inventory. (b) The push routes through the ONE announce site exactly ONCE per fresh land.
     #[tokio::test]
     async fn a_local_push_lands_and_announces_exactly_once() {
+        // Serialized against every test that pins the process-global cache cap: a tiny cap set
+        // by a concurrent test would sweep this capsule right back off disk (#267).
+        let _env = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let (_sk, pk, store) = store_keypair(0x11);
         let (module, root) = push_module(store, &pk, 0x22, 0);
         let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
@@ -726,8 +731,8 @@ mod tests {
         let _g = crate::test_support::ENV_GUARD
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let (_sk, pk, store) = store_keypair(0x55);
-        let (module, root) = push_module(store, &pk, 0x66, 0);
+        let (_sk, pk, store) = store_keypair(0x9a);
+        let (module, root) = push_module(store, &pk, 0x9b, 0);
         let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
 
         let (node, _td) = crate::test_support::test_node_for_peer_surface();
@@ -796,6 +801,11 @@ mod tests {
     /// second announce.
     #[tokio::test]
     async fn a_repushed_capsule_does_not_announce_twice() {
+        // Serialized against every test that pins the process-global cache cap: a tiny cap set
+        // by a concurrent test would sweep this capsule right back off disk (#267).
+        let _env = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let (_sk, pk, store) = store_keypair(0x33);
         let (module, root) = push_module(store, &pk, 0x44, 0);
         let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
@@ -825,6 +835,11 @@ mod tests {
     /// not commit the requested root) is rejected BEFORE landing.
     #[tokio::test]
     async fn chunked_reassembly_lands_and_root_mismatch_is_rejected() {
+        // Serialized against every test that pins the process-global cache cap: a tiny cap set
+        // by a concurrent test would sweep this capsule right back off disk (#267).
+        let _env = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let (_sk, pk, store) = store_keypair(0x55);
         // A ~200 KiB module so a small window forces multiple chunks.
         let (module, root) = push_module(store, &pk, 0x66, 200 * 1024);
@@ -973,6 +988,11 @@ mod tests {
     /// `verify_push_authority` and the reject half goes green (proving it is what rejects).
     #[tokio::test]
     async fn open_push_requires_the_authorized_writer_signature() {
+        // Serialized against every test that pins the process-global cache cap: a tiny cap set
+        // by a concurrent test would sweep this capsule right back off disk (#267).
+        let _env = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let (sk, pk, store) = store_keypair(0x77);
         let (module, root) = push_module(store, &pk, 0x88, 0);
         let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
