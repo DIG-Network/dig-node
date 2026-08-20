@@ -42,6 +42,9 @@ use digstore_core::codec::{Decode, Encode};
 use digstore_core::Bytes32;
 use digstore_host::{serve_blind, BlindServeConfig};
 use digstore_remote::{identity, DigClient};
+// The eviction seam `dig_sex::TieredPolicy` implements. The TRAIT must be in scope for its
+// `select_evictions` to be callable on the concrete policy.
+use dig_store_cache::EvictionPolicy;
 use fs4::FileExt;
 use serde_json::{json, Value};
 use shared::ContentResponse;
@@ -56,10 +59,10 @@ pub mod inbound_demand;
 mod module_tier_tag;
 pub mod peer;
 pub mod rate_limit;
+pub mod store_exchange;
 
 #[cfg(test)]
 mod forwarded_ask_tests;
-pub mod relevance;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
 /// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep
 /// every existing `crate::net`/`crate::pex`/… reference working unchanged (W1b-0 is a pure
@@ -67,7 +70,6 @@ pub mod relevance;
 pub mod seams;
 pub mod tier0_live;
 pub mod tier0_prefetch;
-pub mod tier0_selector;
 /// The `CapsuleStore` trait is seam 6's public surface (#1285 W1b-4) — bring it into scope to call
 /// `cache_list_cached`/`cache_remove_cached`/`cache_fetch_and_cache`/`gap_fill_generation`/
 /// `maybe_backfill_capsule`/`set_self_ref`/`arc_self` on a `Node`.
@@ -424,7 +426,7 @@ pub struct Node {
     /// `Tier1Demand` tier (via [`Node::module_tier`]) that gives the store eviction precedence over
     /// speculative `Tier0Precache`.
     /// In-memory + process-lifetime; additive over the on-disk cache. See [`inbound_demand`].
-    inbound_demand: inbound_demand::InboundDemand,
+    inbound_demand: Arc<inbound_demand::InboundDemand>,
     /// This node's own 32-byte `peer_id` (= its DHT node id — both are the SHA-256 SPKI value, one
     /// keyspace), the XOR-distance REFERENCE point the inbound-demand pull's proximity admission scores
     /// against (§7.10d, #2014). Installed ONCE by the standalone peer-network bring-up
@@ -1115,38 +1117,6 @@ fn plan_eviction(entries: &[(PathBuf, std::time::SystemTime, u64)], cap: u64) ->
             break;
         }
         victims.push(path.clone());
-        running = running.saturating_sub(*sz);
-    }
-    victims
-}
-
-/// Decide which cached `.dig` MODULES to evict so `<cache>/modules` fits under `cap`, TIER-AWARE.
-///
-/// Unlike [`plan_eviction`] (pure LRU over response windows), whole-capsule modules carry a
-/// [`CacheTier`](crate::relevance::CacheTier): the self-driven tier-0 precache loop (#1934) must be the
-/// SACRIFICIAL tier, so under disk pressure a `Tier0Precache` module is evicted BEFORE a
-/// `Tier1Demand`/pin module — [`evict_key`](crate::relevance::evict_key) gives exactly that order
-/// (tier ascending, then oldest-first within a tier). A demand read that promoted a store to Tier1 thus
-/// survives a tier-0 sweep; a purely-precached store is reclaimed first. Returns the `(path, store_hex)`
-/// victims, oldest-lowest-tier first, stopping as soon as the remaining total is at/under `cap`.
-fn plan_module_eviction(
-    entries: &[(PathBuf, String, crate::relevance::CacheEntry, u64)],
-    cap: u64,
-) -> Vec<(PathBuf, String)> {
-    let total: u64 = entries.iter().map(|(_, _, _, sz)| *sz).sum();
-    if total <= cap {
-        return Vec::new();
-    }
-    let mut sorted: Vec<&(PathBuf, String, crate::relevance::CacheEntry, u64)> =
-        entries.iter().collect();
-    sorted.sort_by_key(|(_, _, entry, _)| crate::relevance::evict_key(entry));
-    let mut running = total;
-    let mut victims = Vec::new();
-    for (path, store_hex, _, sz) in sorted {
-        if running <= cap {
-            break;
-        }
-        victims.push((path.clone(), store_hex.clone()));
         running = running.saturating_sub(*sz);
     }
     victims
@@ -2200,51 +2170,79 @@ impl Node {
         }
     }
 
-    /// The effective [`CacheTier`](crate::relevance::CacheTier) of a cached MODULE for eviction.
+    /// The effective [`dig_sex::CacheTier`] of a whole STORE, composed from this node's three tier
+    /// sources.
     ///
-    /// MAX across the THREE sources that hold an opinion (`effective_tier`): the in-memory inbound-demand
-    /// ledger (a store it tags `Tier1Demand` is protected), the in-memory tier-0 precache ledger (a store
-    /// ONLY there is `Tier0Precache`, sacrificed first), and the PERSISTED on-disk tag
-    /// ([`crate::module_tier_tag`]). A store none of them names (a hosted pin / subscription gap-fill, or
-    /// a legacy cache with no sidecar) defaults to `Tier1Demand` — fail-SAFE, so the tier-0 sweep can
-    /// never evict genuinely-demanded content it simply has not labelled. A precached store later
-    /// demanded is promoted (max) to `Tier1Demand`.
-    ///
-    /// The persisted tag is what makes precedence survive a RESTART (#2015): both in-memory ledgers are
-    /// process-lifetime, so on a fresh node they are empty and this MAX would collapse to the
-    /// `Tier1Demand` default for every on-disk module — losing the tier-0-sacrifice-first order until
-    /// content is re-precached. Folding the on-disk tag in as a third source restores that order the
-    /// moment the node comes back up.
-    fn module_tier(&self, store_hex: &str) -> crate::relevance::CacheTier {
-        let demand = self.inbound_demand.tier(store_hex);
-        let precache = crate::tier0_live::is_tier0_precache(store_hex)
-            .then_some(crate::relevance::CacheTier::Tier0Precache);
-        let persisted = crate::module_tier_tag::read_tier_tag(&self.cache_dir, store_hex);
-        crate::tier0_prefetch::effective_tier(demand.into_iter().chain(precache).chain(persisted))
-            .unwrap_or(crate::relevance::CacheTier::Tier1Demand)
+    /// Every source keys on the store alone — the demand ledger, the tier-0 land ledger and the
+    /// `.tier` sidecar are all per-store — so a store's tier is well-defined without naming any one
+    /// of its capsules. The root hash is therefore a filler here, and the value chosen cannot leak
+    /// into the answer: it reaches only [`dig_sex::StoreFacts::score`], which orders capsules WITHIN
+    /// a tier and is discarded by this method.
+    fn module_tier(&self, store_hex: &str) -> dig_sex::CacheTier {
+        let Some(store_id) = crate::dht::hex64(store_hex) else {
+            return dig_sex::DEFAULT_TIER; // not a store id this node could have written — fail SAFE
+        };
+        self.tier_algorithms()
+            .facts_or_default(&dig_sex::CapsuleIdentity {
+                store_id: store_id.into(),
+                root_hash: [0u8; 32].into(),
+            })
+            .tier
     }
 
-    /// TIER-AWARE size-cap LRU eviction over `<cache>/modules` — the STANDING-OCCUPANCY bound that keeps
+    /// This node's three tier sources ([`crate::store_exchange`]), composed for one sweep.
+    ///
+    /// Rebuilt per sweep rather than held on `Node` because two of the three read live state — the
+    /// in-memory demand ledger and this node's `peer_id`, which arrives at peer-network bring-up
+    /// rather than at construction. A set built once at startup would answer from whatever was known
+    /// then.
+    fn tier_algorithms(&self) -> dig_sex::AlgorithmSet<dig_sex::CapsuleIdentity> {
+        crate::store_exchange::algorithms(
+            Arc::clone(&self.inbound_demand),
+            &self.cache_dir,
+            self.node_peer_id.get().copied(),
+        )
+    }
+
+    /// The node-local selection seed (`dig-sex` SPEC §4.4) — what decorrelates this node's tiebreaks
+    /// from every other node's, so a handful of stores are not mirrored by everyone and the rest by
+    /// nobody.
+    ///
+    /// Derived from THIS node's own `peer_id`, which a peer cannot choose; an attacker able to
+    /// predict the seed could bias which ties this node resolves in their favour, turning
+    /// decorrelation into targeting. Before bring-up there is no identity to derive from, so the seed
+    /// is a fixed node-local constant — deterministic, still not peer-derivable, and reached only
+    /// while ties are the sole remaining ordering signal.
+    fn selection_seed(&self) -> dig_sex::SelectionSeed {
+        self.node_peer_id.get().map_or(
+            UNIDENTIFIED_SELECTION_SEED,
+            dig_sex::SelectionSeed::from_peer_id,
+        )
+    }
+
+    /// TIER-AWARE size-cap eviction over `<cache>/modules` — the STANDING-OCCUPANCY bound that keeps
     /// the self-driven tier-0 precache loop (#1934) from growing whole-capsule storage to disk
     /// exhaustion. Run after a capsule lands so the modules cache plateaus at [`cache_cap_bytes`]:
-    /// `Tier0Precache` modules are sacrificed before `Tier1Demand`/pin modules, oldest-first within a
-    /// tier ([`plan_module_eviction`]). Best-effort + idempotent — nothing to evict is a cheap scan.
+    /// `Tier0Precache` modules are sacrificed before `Tier1Demand`/pin modules
+    /// ([`dig_sex::TieredPolicy`]). Best-effort + idempotent — nothing to evict is a cheap scan.
     pub(crate) async fn evict_modules_if_needed(&self) {
         // Serialize against this process's other cache writers, exactly like `evict_if_needed`.
         let _guard = self.cache_lock.lock().await;
         self.evict_modules_locked();
     }
 
-    /// The scan→plan→delete core of [`Node::evict_modules_if_needed`], held under the cross-process
-    /// advisory lock so two DIG processes sharing the cache cannot double-evict or race a torn scan.
-    fn evict_modules_locked(&self) {
-        let _xproc = acquire_cache_lock();
-        let cap = cache_cap_bytes();
-        let modules_root = self.cache_dir.join("modules");
-        let mut entries = Vec::new();
-        let Ok(stores) = std::fs::read_dir(&modules_root) else {
-            return; // no modules cached yet — nothing to bound
+    /// Every capsule file under `<cache>/modules`, as the eviction decision needs to see it.
+    ///
+    /// Also refreshes each store's persisted `.tier` sidecar from the live composition, so tier
+    /// precedence survives a restart (#2015): a sweep runs after every land, which keeps the on-disk
+    /// tag tracking what the in-memory ledgers currently say.
+    fn scan_cached_modules(&self) -> Vec<CachedModule> {
+        let algorithms = self.tier_algorithms();
+        let Ok(stores) = std::fs::read_dir(self.cache_dir.join("modules")) else {
+            return Vec::new(); // no modules cached yet — nothing to bound
         };
+
+        let mut cached = Vec::new();
         for store_entry in stores.flatten() {
             if !store_entry.path().is_dir() {
                 continue;
@@ -2252,68 +2250,99 @@ impl Node {
             let Some(store_hex) = store_entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            let tier = self.module_tier(&store_hex);
-            // Persist the just-computed tier so tier-aware precedence survives a restart (#2015): a
-            // sweep runs after every land, so this keeps the on-disk tag tracking the in-memory tier.
-            crate::module_tier_tag::write_tier_tag(&self.cache_dir, &store_hex, tier);
+            let Some(store_id) = crate::dht::hex64(&store_hex) else {
+                continue; // not a store directory this node could ever have written
+            };
             let Ok(modules) = std::fs::read_dir(store_entry.path()) else {
                 continue;
             };
+
+            let mut store_tier = None;
             for m in modules.flatten() {
-                let path = m.path();
                 // Only real capsules are eviction candidates — skip the `.tier` sidecar (and any
                 // stray `.tmp-*` write-atomic scratch file), which carry no capsule extension.
-                let is_capsule = m
+                let Some(root_hex) = m
                     .file_name()
                     .to_str()
                     .and_then(crate::capsule_key::cached_root_stem)
-                    .is_some();
-                if !is_capsule {
+                    .map(str::to_string)
+                else {
                     continue;
-                }
+                };
+                let Some(root_hash) = crate::dht::hex64(&root_hex) else {
+                    continue;
+                };
                 let Ok(md) = m.metadata() else { continue };
                 if !md.is_file() {
                     continue;
                 }
-                // mtime-as-ticks: seconds since the epoch, so oldest = smallest = evicted first (LRU
-                // within a tier). `touch` on serve refreshes it, matching the response cache's recency.
-                let last_access_ticks = md
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                entries.push((
-                    path,
-                    store_hex.clone(),
-                    crate::relevance::CacheEntry {
-                        tier,
-                        last_access_ticks,
-                    },
-                    md.len(),
-                ));
+                let id = dig_sex::CapsuleIdentity {
+                    store_id: store_id.into(),
+                    root_hash: root_hash.into(),
+                };
+                // Every tier source keys on the STORE, so each of a store's capsules resolves to the
+                // same tier; taking the first is what the sidecar (a per-store file) can record.
+                store_tier.get_or_insert_with(|| algorithms.facts_or_default(&id).tier);
+                cached.push(CachedModule {
+                    id,
+                    path: m.path(),
+                    store_hex: store_hex.clone(),
+                    root_hex,
+                    size_bytes: md.len(),
+                });
+            }
+
+            if let Some(tier) = store_tier {
+                crate::module_tier_tag::write_tier_tag(&self.cache_dir, &store_hex, tier);
             }
         }
-        for (victim, store_hex) in plan_module_eviction(&entries, cap) {
-            let size = entries
-                .iter()
-                .find(|(p, _, _, _)| *p == victim)
-                .map(|(_, _, _, s)| *s)
-                .unwrap_or(0);
-            if std::fs::remove_file(&victim).is_ok() {
+        cached
+    }
+
+    /// The scan→decide→delete core of [`Node::evict_modules_if_needed`], held under the cross-process
+    /// advisory lock so two DIG processes sharing the cache cannot double-evict or race a torn scan.
+    fn evict_modules_locked(&self) {
+        let _xproc = acquire_cache_lock();
+        let cap = cache_cap_bytes();
+        let cached = self.scan_cached_modules();
+        let total: u64 = cached.iter().map(|m| m.size_bytes).sum();
+
+        // The DECISION — whose capsules to sacrifice, and in what order — belongs to `dig-sex`. This
+        // node supplies only the facts (`tier_algorithms`) and performs only the I/O. Note what is
+        // deliberately NOT supplied: the file mtime. It is bumped by `touch` on the SERVE path, so an
+        // inbound peer's ordinary requests would otherwise let that peer order this node's eviction
+        // (dig-store-cache#3); `TieredPolicy` never reads the field, and nothing here reintroduces it.
+        let policy =
+            dig_sex::TieredPolicy::new(Arc::new(self.tier_algorithms()), self.selection_seed());
+        let entries: Vec<dig_store_cache::EvictionEntry> = cached
+            .iter()
+            .map(|m| dig_store_cache::EvictionEntry {
+                id: m.id,
+                size: m.size_bytes,
+                last_access: 0, // see above: never an input to this policy
+                pinned: false,
+            })
+            .collect();
+        let victims = policy.select_evictions(&dig_store_cache::EvictionContext {
+            entries: &entries,
+            current_bytes: total,
+            capacity: cap,
+            incoming_size: 0, // a reconcile sweep: nothing is being admitted right now
+        });
+
+        for id in victims {
+            let Some(module) = cached.iter().find(|m| m.id == id) else {
+                continue;
+            };
+            let (victim, store_hex, size) = (&module.path, &module.store_hex, module.size_bytes);
+            if std::fs::remove_file(victim).is_ok() {
                 CACHE_EVICTED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 CACHE_EVICTED_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
                 // Drop any decoded content for the evicted generation so a removed module is never
                 // still served from the in-memory content cache (audit #179).
-                if let Some(root_hex) = victim
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .and_then(crate::capsule_key::cached_root_stem)
-                {
-                    self.invalidate_content_cache(&store_hex, root_hex);
-                }
+                self.invalidate_content_cache(store_hex, &module.root_hex);
                 // Forget the tier-0 tag so the ledger cannot grow unbounded across precache→evict churn.
-                crate::tier0_live::forget_tier0_land(&store_hex);
+                crate::tier0_live::forget_tier0_land(store_hex);
             }
         }
     }
@@ -3893,6 +3922,45 @@ fn chunk_count_for(resp: &ContentResponse) -> usize {
     }
 }
 
+/// The [`dig_sex::SelectionSeed`] used before this node knows its own `peer_id`.
+///
+/// The seed decorrelates THIS node's tiebreaks from every other node's, and `peer_id` is the
+/// canonical node-local source for it. Peer-network bring-up is asynchronous, so a sweep can run
+/// while no identity is known yet; that window needs a seed that is still not peer-derivable, which
+/// a fixed node-local constant satisfies.
+///
+/// # What the shared constant actually costs
+///
+/// Be precise about this rather than reassuring. Tier and size still separate first, so the seed is
+/// only ever the LAST word. But a node in this window has no `peer_id`, and the score is a function
+/// of distance from that id — so [`NeighbourhoodScore`] returns `0.0` for every capsule, and score
+/// contributes no separation at all. Among same-tier same-size capsules the shared constant is
+/// therefore the SOLE tiebreak, and every un-brought-up node breaks that tie identically.
+///
+/// The consequence is bounded but real: those nodes agree on which capsule to EVICT. They do not
+/// agree on what to acquire — acquisition happens on the connected path, which by definition has an
+/// identity — so this cannot concentrate the network's mirrors. It ends when `peer_id` arrives.
+const UNIDENTIFIED_SELECTION_SEED: dig_sex::SelectionSeed =
+    dig_sex::SelectionSeed::from_node_local(0x6469_675f_6e6f_6465); // b"dig_node"
+
+/// One cached capsule file under `<cache>/modules`, as the eviction sweep needs to see it.
+///
+/// Distinct from [`CachedCapsule`], the RPC-facing listing type: this one carries the
+/// [`dig_sex::CapsuleIdentity`] the policy decides over plus the paths the sweep deletes and
+/// invalidates, and deliberately carries NO recency stamp — see [`Node::evict_modules_locked`].
+struct CachedModule {
+    /// What the eviction policy matches its verdict on.
+    id: dig_sex::CapsuleIdentity,
+    /// The `<cache>/modules/<store>/<root>.dig` file to delete when this capsule is sacrificed.
+    path: PathBuf,
+    /// Owning store (lowercase 64-hex) — the key both in-memory ledgers and the sidecar use.
+    store_hex: String,
+    /// Generation root (lowercase 64-hex), needed to invalidate the decoded content cache.
+    root_hex: String,
+    /// On-disk size, the budget the count objective spends.
+    size_bytes: u64,
+}
+
 /// One cached capsule, as returned by [`Node::cache_list_cached`]. Identity is the
 /// `(store_id, root)` capsule (`digstore_core::Capsule`, `storeId:rootHash`).
 #[derive(Debug, Clone, serde::Serialize)]
@@ -4163,7 +4231,7 @@ impl Node {
             peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::from_env(),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
         })
     }
@@ -4238,7 +4306,7 @@ impl Node {
     ///
     /// Fails CLOSED: an unknown self-identity (`None` on the FFI/consumer path) or a
     /// non-canonical/malformed `(store, root)` denies the pull. The neighbourhood test itself is
-    /// [`crate::relevance::in_keyspace_neighbourhood`], anchored to the SAME `xor_proximity` primary +
+    /// [`dig_sex::relevance::in_keyspace_neighbourhood`], anchored to the SAME `xor_proximity` primary +
     /// reference `peer_id` the tier-0 precache selector scores against.
     fn inbound_demand_pull_admitted(&self, store_hex: &str, root_hex: &str) -> bool {
         let Some(peer_id) = self.node_peer_id.get() else {
@@ -4250,7 +4318,7 @@ impl Node {
             return false; // a rootless/`"latest"`/malformed key names no concrete capsule to place
         };
         let capsule_key = dig_dht::ContentId::capsule(store_id, root).to_key();
-        crate::relevance::in_keyspace_neighbourhood(capsule_key.as_bytes(), peer_id)
+        dig_sex::relevance::in_keyspace_neighbourhood(capsule_key.as_bytes(), peer_id)
     }
 
     /// Install this node's own `peer_id` — the XOR-distance reference the inbound-demand proximity gate
@@ -4350,7 +4418,7 @@ pub(crate) mod test_support {
             peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
         };
         (Arc::new(node), td)
@@ -4651,70 +4719,141 @@ mod tests {
 
     // -- Tier-aware modules-cache eviction (#1934 disk-exhaustion bound) --------
 
-    /// A module entry for the tier-aware planner: `(path, store_hex, tier, mtime-ticks, size)`.
-    fn module_entry(
-        name: &str,
-        tier: crate::relevance::CacheTier,
-        ticks: u64,
-        size: u64,
-    ) -> (PathBuf, String, crate::relevance::CacheEntry, u64) {
-        (
-            PathBuf::from(name),
-            name.to_string(),
-            crate::relevance::CacheEntry {
-                tier,
-                last_access_ticks: ticks,
-            },
-            size,
-        )
+    /// A capsule identity for the eviction tests, distinct per `tag`.
+    fn test_capsule(tag: u8) -> dig_sex::CapsuleIdentity {
+        dig_sex::CapsuleIdentity {
+            store_id: [tag; 32].into(),
+            root_hash: [tag; 32].into(),
+        }
+    }
+
+    /// A tier source that reports a fixed tier for a known set of capsules and no opinion about
+    /// anything else. Stands in for the three real sources (`store_exchange::algorithms`) so these
+    /// tests exercise the POLICY rather than any one source's bookkeeping.
+    struct FixedTiers(Vec<(dig_sex::CapsuleIdentity, dig_sex::CacheTier)>);
+
+    impl dig_sex::ExchangeAlgorithm<dig_sex::CapsuleIdentity> for FixedTiers {
+        fn facts(&self, id: &dig_sex::CapsuleIdentity) -> Option<dig_sex::StoreFacts> {
+            self.0
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, tier)| dig_sex::StoreFacts {
+                    tier: *tier,
+                    score: dig_sex::RelevanceValue(0.0),
+                })
+        }
+    }
+
+    /// Run the REAL policy the node runs, over `(tag, tier, size)` capsules and a cap.
+    ///
+    /// Deliberately goes through `TieredPolicy` + `select_evictions` rather than any local helper:
+    /// these two tests are the regression for the #1934 disk-exhaustion bound, and a regression test
+    /// that exercises a private copy of the logic stops covering the thing that ships the moment the
+    /// real path moves. It moved -- the decision now lives in `dig-sex`.
+    fn evict_via_policy(capsules: &[(u8, dig_sex::CacheTier, u64)], cap: u64) -> Vec<u8> {
+        use dig_store_cache::EvictionPolicy;
+        let known: Vec<(dig_sex::CapsuleIdentity, dig_sex::CacheTier)> = capsules
+            .iter()
+            .map(|(tag, tier, _)| (test_capsule(*tag), *tier))
+            .collect();
+        let policy = dig_sex::TieredPolicy::new(
+            Arc::new(dig_sex::AlgorithmSet::new().with(Box::new(FixedTiers(known.clone())))),
+            dig_sex::SelectionSeed::from_node_local(0x7465_7374), // b"test"
+        );
+        let entries: Vec<dig_store_cache::EvictionEntry> = capsules
+            .iter()
+            .map(|(tag, _, size)| dig_store_cache::EvictionEntry {
+                id: test_capsule(*tag),
+                size: *size,
+                last_access: 0,
+                pinned: false,
+            })
+            .collect();
+        let total: u64 = capsules.iter().map(|(_, _, size)| *size).sum();
+        let victims = policy.select_evictions(&dig_store_cache::EvictionContext {
+            entries: &entries,
+            current_bytes: total,
+            capacity: cap,
+            incoming_size: 0,
+        });
+        victims
+            .into_iter()
+            .filter_map(|id| {
+                capsules
+                    .iter()
+                    .position(|(tag, _, _)| test_capsule(*tag) == id)
+                    .map(|index| capsules[index].0)
+            })
+            .collect()
     }
 
     #[test]
-    fn a_tier0_land_past_cap_evicts_an_older_tier0_and_stays_under_cap() {
-        use crate::relevance::CacheTier;
-        // Three tier-0 precache modules of 100 each, cap 250: the loop just landed the newest, so the
-        // OLDEST tier-0 is evicted and the modules total plateaus at ≤ cap (the standing-occupancy bound
-        // — the direct regression for the disk-exhaustion finding).
-        let entries = vec![
-            module_entry("newest", CacheTier::Tier0Precache, 3, 100),
-            module_entry("oldest", CacheTier::Tier0Precache, 1, 100),
-            module_entry("middle", CacheTier::Tier0Precache, 2, 100),
+    fn a_tier0_land_past_cap_evicts_a_tier0_and_stays_under_cap() {
+        use dig_sex::CacheTier;
+        // Three tier-0 precache capsules of 100 each, cap 250: exactly one must go, and the modules
+        // total must plateau at or under cap -- the standing-occupancy bound, and the direct
+        // regression for the disk-exhaustion finding.
+        //
+        // NOTE what is deliberately no longer asserted: WHICH tier-0 capsule is sacrificed. The old
+        // planner ordered within a tier by mtime, so the test could name "oldest". The objective is
+        // now the mirror COUNT (dig-sex SPEC 0.1), which orders within a tier by size and then breaks
+        // exact ties with a node-local seeded shuffle. With three equal sizes and equal scores the
+        // victim is seed-dependent by design -- that decorrelation is the point, so pinning a name
+        // here would assert against the specification rather than for it.
+        const CAP: u64 = 250;
+        let capsules = [
+            (1, CacheTier::Tier0Precache, 100u64),
+            (2, CacheTier::Tier0Precache, 100),
+            (3, CacheTier::Tier0Precache, 100),
         ];
-        let victims = plan_module_eviction(&entries, 250);
+        let victims = evict_via_policy(&capsules, CAP);
         assert_eq!(
-            victims,
-            vec![(PathBuf::from("oldest"), "oldest".to_string())],
-            "the oldest tier-0 land is evicted first; the modules cache stays at cap"
+            victims.len(),
+            1,
+            "exactly one tier-0 capsule is sacrificed to get 300 under a cap of {CAP}"
         );
-        // Post-eviction the remaining two (200) are under the 250 cap.
-        let remaining: u64 = 300 - 100;
+
+        // The surviving total is derived from what the policy ACTUALLY returned. Computing it as
+        // `300 - 100` instead would be a statement about integers -- true whatever the policy did,
+        // and therefore not a test of the bound at all.
+        let freed: u64 = victims
+            .iter()
+            .map(|tag| {
+                capsules
+                    .iter()
+                    .find(|(candidate, _, _)| candidate == tag)
+                    .map_or(0, |(_, _, size)| *size)
+            })
+            .sum();
+        let total: u64 = capsules.iter().map(|(_, _, size)| *size).sum();
         assert!(
-            remaining <= 250,
-            "modules cache is bounded at cap after eviction"
+            total - freed <= CAP,
+            "the modules cache is bounded at cap after eviction: {total} - {freed} > {CAP}"
         );
     }
 
     #[test]
     fn a_demand_promoted_entry_survives_while_tier0_entries_remain() {
-        use crate::relevance::CacheTier;
-        // A tier-1 (demand-promoted) module sits alongside tier-0 precache lands, all 100, cap 150.
-        // The tier-0 entries MUST be sacrificed first — the demand content survives (tier integrity).
-        let entries = vec![
-            // The demand entry is the OLDEST by mtime — proving tier precedence beats LRU: a Tier1
-            // module older than a Tier0 module is still protected.
-            module_entry("demand", CacheTier::Tier1Demand, 1, 100),
-            module_entry("precache_a", CacheTier::Tier0Precache, 2, 100),
-            module_entry("precache_b", CacheTier::Tier0Precache, 3, 100),
-        ];
-        let victims = plan_module_eviction(&entries, 150);
-        let victim_names: Vec<String> = victims.into_iter().map(|(_, s)| s).collect();
-        assert!(
-            !victim_names.contains(&"demand".to_string()),
-            "a demand-promoted (tier-1) module must NOT be evicted while tier-0 entries remain"
+        use dig_sex::CacheTier;
+        // A tier-1 (demand-promoted) capsule alongside tier-0 precache lands, all 100, cap 150.
+        // Cross-tier precedence is ABSOLUTE: every tier-0 is sacrificed before any tier-1, whatever
+        // the sizes or scores say. This is the invariant that makes a read the user actually
+        // performed outlive content the node fetched on a hunch.
+        let victims = evict_via_policy(
+            &[
+                (1, CacheTier::Tier1Demand, 100),
+                (2, CacheTier::Tier0Precache, 100),
+                (3, CacheTier::Tier0Precache, 100),
+            ],
+            150,
         );
         assert!(
-            victim_names.contains(&"precache_a".to_string()),
-            "tier-0 precache is the sacrificial tier, evicted first"
+            !victims.contains(&1),
+            "a demand-promoted (tier-1) capsule must NOT be evicted while tier-0 capsules remain"
+        );
+        assert!(
+            !victims.is_empty() && victims.iter().all(|tag| *tag == 2 || *tag == 3),
+            "tier-0 precache is the sacrificial tier and is evicted first, got {victims:?}"
         );
     }
 
@@ -4966,7 +5105,7 @@ mod tests {
             peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
         };
         (node, td)
@@ -5055,7 +5194,7 @@ mod tests {
             peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
         };
 
@@ -5105,7 +5244,7 @@ mod tests {
             peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
         });
 
@@ -5196,7 +5335,7 @@ mod tests {
                 peer_ping: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
                 chat: chat::ChatState::new(),
-                inbound_demand: inbound_demand::InboundDemand::new(),
+                inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
             });
 
@@ -5269,7 +5408,7 @@ mod tests {
                 peer_ping: OnceLock::new(),
                 outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
                 chat: chat::ChatState::new(),
-                inbound_demand: inbound_demand::InboundDemand::new(),
+                inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
                 node_peer_id: OnceLock::new(),
             });
 
@@ -5360,7 +5499,7 @@ mod tests {
         assert_eq!(node.inbound_demand.count(&store_hex), 2, "two requests → 2");
         assert_eq!(
             node.inbound_demand.tier(&store_hex),
-            Some(crate::relevance::CacheTier::Tier1Demand),
+            Some(dig_sex::CacheTier::Tier1Demand),
             "inbound demand tags Tier1Demand"
         );
     }
@@ -5377,7 +5516,7 @@ mod tests {
 
     /// **Proves (#2013, #1990):** an inbound-DEMANDED module survives a size-cap eviction sweep that
     /// sacrifices an OLDER-by-mtime tier-0 precache module — through the LIVE
-    /// `module_tier` → `evict_modules_locked` → `plan_module_eviction` path, not just the pure
+    /// `module_tier` → `evict_modules_locked` → `dig_sex::TieredPolicy` path, not just the pure
     /// `evict_key` unit test. Tier precedence (`Tier0Precache` before `Tier1Demand`) OVERRIDES recency.
     ///
     /// **Non-vacuous:** the demanded store A is made the OLDER file and the tier-0 store B the NEWER
@@ -5469,12 +5608,12 @@ mod tests {
         crate::module_tier_tag::write_tier_tag(
             &node.cache_dir,
             &store_a,
-            crate::relevance::CacheTier::Tier1Demand,
+            dig_sex::CacheTier::Tier1Demand,
         );
         crate::module_tier_tag::write_tier_tag(
             &node.cache_dir,
             &store_b,
-            crate::relevance::CacheTier::Tier0Precache,
+            dig_sex::CacheTier::Tier0Precache,
         );
         // Confirm the ledgers really are empty — the tag is the ONLY tier signal in play.
         assert_eq!(node.inbound_demand.count(&store_a), 0);
@@ -5765,7 +5904,7 @@ mod tests {
 
         assert_eq!(
             node.module_tier(&store),
-            crate::relevance::CacheTier::Tier1Demand,
+            dig_sex::CacheTier::Tier1Demand,
             "an untagged legacy module is the PROTECTED tier, never sacrificial tier-0"
         );
         // The sweep must not error or drop the untagged module (cap is roomy).
@@ -7363,7 +7502,7 @@ mod tests {
             peer_ping: OnceLock::new(),
             outgoing_throttle: bandwidth::OutgoingThrottle::new(0),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
         };
 
@@ -14004,7 +14143,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             ..node
         };
@@ -14054,7 +14193,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             ..node
         };
@@ -14103,7 +14242,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             ..node
         };
@@ -14134,7 +14273,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(1_000_000),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             ..node
         };
@@ -14174,7 +14313,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             ..node
         };
@@ -14216,7 +14355,7 @@ mod tests {
         let node = Node {
             outgoing_throttle: bandwidth::OutgoingThrottle::new(10),
             chat: chat::ChatState::new(),
-            inbound_demand: inbound_demand::InboundDemand::new(),
+            inbound_demand: Arc::new(inbound_demand::InboundDemand::new()),
             node_peer_id: OnceLock::new(),
             ..node
         };

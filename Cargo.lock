@@ -1904,6 +1904,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-capsule"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "710b7a953f37c0fe30e1262c32c8a25f76f06d5cbd668904239d65588bc76645"
+dependencies = [
+ "aes-gcm-siv",
+ "dig-urn-protocol",
+ "hex",
+ "hkdf",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "wasmparser 0.221.3",
+]
+
+[[package]]
 name = "dig-cert"
 version = "0.1.0"
 source = "git+https://github.com/DIG-Network/dig-cert?tag=v0.1.0#408d604ad2fd398c635b9e5759eadeaf9ad4eb11"
@@ -2188,6 +2204,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-merkle"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8129713c49177d3c7b9d397e6350cb79cd0903b46f4e1721e8840329f357fd4"
+dependencies = [
+ "chia-protocol",
+ "chia-puzzle-types",
+ "chia-sha2 0.26.0",
+ "chia-wallet-sdk",
+ "clvm-traits",
+ "dig-chainsource-interface 0.1.0",
+ "hex-literal",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "dig-message"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2277,7 +2309,9 @@ dependencies = [
  "dig-peer-selector",
  "dig-pex",
  "dig-rpc-protocol",
+ "dig-sex",
  "dig-social-profile",
+ "dig-store-cache",
  "dig-tls",
  "digstore-chain",
  "digstore-compiler",
@@ -2310,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.129.0"
+version = "0.130.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -2441,6 +2475,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dig-sex"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2c229026507e54d3a0d28f5d11d3d6c02a604973aec3bbe61b89bbf7fbb07be"
+dependencies = [
+ "dig-store-cache",
+]
+
+[[package]]
 name = "dig-smt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2460,6 +2503,35 @@ dependencies = [
  "dig-smt",
  "sha2 0.10.9",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "dig-store"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c1279f57121406e90b1b439fc79f7816866579788ae56c1586ea11bd7d54eab"
+dependencies = [
+ "dig-capsule",
+ "dig-chainsource-interface 0.1.0",
+ "dig-merkle",
+ "dig-urn-protocol",
+ "serde",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "dig-store-cache"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78faf54663873e91ddebd820b940868381060e080a4f90123628e7359ea637fb"
+dependencies = [
+ "dig-store",
+ "hex",
+ "memmap2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "uuid",
 ]
 
 [[package]]
@@ -4033,6 +4105,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
  "rustix 1.1.4",
+]
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

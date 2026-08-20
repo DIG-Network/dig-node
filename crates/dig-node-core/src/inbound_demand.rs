@@ -1,7 +1,7 @@
 //! Inbound-demand ledger — the live, in-memory tier-tagging of stores a PEER has asked us to serve.
 //!
 //! # Two distinct tier-1 caching triggers
-//! Epic #1934 settles that a store earns [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand)
+//! Epic #1934 settles that a store earns [`Tier1Demand`](dig_sex::CacheTier::Tier1Demand)
 //! from EITHER of two independent kinds of real demand:
 //!
 //! 1. **Fetch-side backfill (SPEC §5.6 / §14.3).** THIS node reads a resource it does not hold, is
@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
-use crate::relevance::CacheTier;
+use dig_sex::CacheTier;
 
 /// The maximum number of distinct stores the inbound-demand ledger retains. On overflow the
 /// least-recently-demanded entry is evicted (LRU).
@@ -159,7 +159,7 @@ impl InboundDemand {
     }
 
     /// The demand count for `store_id_hex` (0 if absent/evicted). Feeds
-    /// [`RelevanceInputs::local_read_count`](crate::relevance::RelevanceInputs::local_read_count) —
+    /// [`RelevanceInputs::local_read_count`](dig_sex::RelevanceInputs::local_read_count) —
     /// inbound peer demand counts toward the same saturating local-demand term as a local read.
     #[must_use]
     pub fn count(&self, store_id_hex: &str) -> u32 {

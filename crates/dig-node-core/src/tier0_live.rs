@@ -49,7 +49,6 @@ use async_trait::async_trait;
 use digstore_core::Bytes32;
 
 use crate::dht_sampling::{NeighbourhoodProbe, SplitMix64};
-use crate::relevance::{NodeContext, RelevanceWeights};
 use crate::seams::dig_peer::capsule_resolver::{CapsuleKeyResolver, MtlsCapsuleResolveClient};
 use crate::seams::dig_peer::neighbourhood_probe::KeyspaceRouter;
 use crate::seams::dig_peer::{CapsuleWarmer, WarmFailure, WarmOutcome};
@@ -58,6 +57,7 @@ use crate::tier0_prefetch::{
     run_round, should_run_loop, tier0_precache_enabled, DiscardReason, FetchOutcome, LoadSignal,
     RoundOutcome, RoundRateLimiter, SizeProbe, Tier0Fetcher,
 };
+use dig_sex::{NodeContext, RelevanceWeights};
 
 // =================================================================================================
 // Process-global telemetry — the wired flag, the load gauge, the tier-0 land counter

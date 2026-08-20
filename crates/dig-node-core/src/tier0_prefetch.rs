@@ -7,8 +7,8 @@
 //! ```text
 //!   sample_candidates (4a probe → quorum-reconciled candidates)      [dht_sampling]
 //!     → size resolution (median size_hint, else ONE bounded probe, else DROP)
-//!     → relevance score under THIS node's NodeContext                [relevance]
-//!     → select_within_budget(tier0_budget_bytes(cache_cap))          [tier0_selector]
+//!     → relevance score under THIS node's NodeContext                [dig-sex]
+//!     → select_within_capacity(tier0_budget_bytes(cache_cap))        [dig-sex]
 //!     → GOVERNED fetch: merkle-verify + hard byte-cap + cache(Tier0Precache) + announce
 //! ```
 //!
@@ -35,7 +35,7 @@
 //! - **Merkle-verify before cache; never execute** — the fetch reuses the existing verified download
 //!   path, so attacker content is verified against the confirmed root before it lands and is never
 //!   opened/executed.
-//! - **Tier precedence** ([`CacheTier::Tier0Precache`], [`effective_tier`]) — precache is tagged
+//! - **Tier precedence** ([`CacheTier::Tier0Precache`], [`dig_sex::effective_tier`]) — precache is tagged
 //!   Tier0 and sacrificed FIRST; a store later demanded by a peer is promoted (tier is
 //!   MAX-across-ledgers), so precache can never evict genuinely-demanded content.
 //!
@@ -50,10 +50,33 @@ use crate::dht_sampling::{
     sample_candidates, Candidate, KeyspaceRng, NeighbourhoodProbe, QuorumPolicy,
     DEFAULT_SAMPLE_POINTS,
 };
-use crate::relevance::{relevance, CacheTier, NodeContext, RelevanceInputs};
-use crate::tier0_selector::{
-    select_within_budget, tier0_budget_bytes, Candidate as SelectorCandidate,
+use dig_sex::{
+    relevance, select_within_capacity, CacheTier, NodeContext, RelevanceInputs, SelectionCandidate,
+    SelectionSeed,
 };
+
+// =================================================================================================
+// The tier-0 sub-budget — node-local cache arithmetic, deliberately NOT a `dig-sex` decision
+// =================================================================================================
+
+/// The fraction of the whole node cache cap set aside for tier-0 speculative precache.
+///
+/// Deliberately small and conservative: tier-0 content is a bet, not a request, and
+/// [`dig_sex::evict_key`] already sacrifices it first under cross-tier pressure — reserving only a
+/// slice of the cap up front keeps that pressure from ever needing to bite in typical operation.
+pub const TIER0_BUDGET_FRACTION: f64 = 0.10;
+
+/// Compute the tier-0 sub-budget (bytes) from the whole node cache cap.
+///
+/// Stayed in this crate when the selector folded onto `dig-sex`: it is this NODE's budgeting policy
+/// over its own disk, not a store-exchange decision, and `dig-sex` takes the capacity as a parameter
+/// precisely so each consumer keeps owning that choice. Pure arithmetic over a caller-supplied cap —
+/// the `DIG_NODE_CACHE_CAP` lookup is I/O and belongs to [`crate::cache_cap_bytes`]. Rounds down, so
+/// the sub-budget never exceeds the intended fraction.
+#[must_use]
+pub fn tier0_budget_bytes(whole_cache_cap_bytes: u64) -> u64 {
+    ((whole_cache_cap_bytes as f64) * TIER0_BUDGET_FRACTION) as u64
+}
 
 // =================================================================================================
 // Off-switch — DEFAULT-ON (the user directive is "eagerly precache")
@@ -261,19 +284,6 @@ pub trait Tier0Fetcher: Send + Sync {
 // Tier tagging — Tier0Precache ledger + MAX-across-ledgers effective tier
 // =================================================================================================
 
-/// The effective cache tier of a store given every ledger that has an opinion about it: the MAXIMUM
-/// tier by eviction rank. A store this loop precached (Tier0) that a peer later demands (Tier1) must
-/// be treated as Tier1 — precache never keeps a store PINNED at the sacrificed-first tier once real
-/// demand appears. Returns `None` only when no ledger holds the store.
-///
-/// This is the "tier is max-across-ledgers" rule stated as a pure function, so the live cache
-/// eviction path derives one authoritative tier from the tier-0 + inbound-demand ledgers without
-/// either ledger being able to demote a store below what another asserts.
-#[must_use]
-pub fn effective_tier(tiers: impl IntoIterator<Item = CacheTier>) -> Option<CacheTier> {
-    tiers.into_iter().max_by_key(|t| t.rank())
-}
-
 // =================================================================================================
 // The governed round
 // =================================================================================================
@@ -382,15 +392,37 @@ pub async fn run_round<R: KeyspaceRng>(
         }
     }
 
-    // -- Score + select: relevance under THIS node's context, greedy within the sub-budget. ----------
-    let selector_cands: Vec<SelectorCandidate> = sized
+    // -- Score + select: relevance under THIS node's context, count-maximising within the sub-budget. -
+    //
+    // This replaces the old density (`relevance / size`) ordering. SPEC §0.1 makes the secondary
+    // objective the NUMBER of mirrors held, not the aggregate relevance retained, so selection is a
+    // knapsack that fills smallest-first within a tier. Tier-0 rounds will therefore choose
+    // genuinely different sets than before: more small stores in preference to one large
+    // high-scoring one. That is the objective function, not a regression.
+    //
+    // The candidate's INDEX is its id, so the retained order maps straight back into `sized` below.
+    // Everything sampled by this loop is speculative precache by construction, hence `Tier0Precache`
+    // for all of them -- promotion to a higher tier happens on demand, elsewhere, and would make a
+    // store no longer a candidate for this round.
+    let selector_cands: Vec<SelectionCandidate<usize>> = sized
         .iter()
-        .map(|sc| SelectorCandidate {
+        .enumerate()
+        .map(|(index, sc)| SelectionCandidate {
+            id: index,
+            tier: CacheTier::Tier0Precache,
             size_bytes: sc.size_bytes,
-            relevance: relevance(&relevance_inputs(sc), node),
+            score: relevance(&relevance_inputs(sc), node),
+            pinned: false,
         })
         .collect();
-    let selected = select_within_budget(&selector_cands, budget);
+    // The tiebreak seed must be node-local and NOT derivable by a peer, or a peer could arrange for
+    // its own store to win every tie on every node at once. This node's own peer id is exactly that.
+    let selected = select_within_capacity(
+        &selector_cands,
+        budget,
+        SelectionSeed::from_peer_id(&node.peer_id),
+    )
+    .retained;
 
     // -- Governed fetch: rate-limit + hard byte-cap each selected store, in selection order. ---------
     let mut remaining = budget;
@@ -466,7 +498,7 @@ async fn resolve_candidate_size(
 mod tests {
     use super::*;
     use crate::dht_sampling::{ObservedCandidate, PeerObservation, SplitMix64};
-    use crate::relevance::{evict_key, CacheEntry, RelevanceWeights};
+    use dig_sex::{evict_key, CacheEntry, RelevanceWeights};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -1019,26 +1051,6 @@ mod tests {
     }
 
     // -- Tier tagging + precedence -----------------------------------------------------------------
-
-    #[test]
-    fn effective_tier_is_the_max_across_ledgers() {
-        // A store precached (Tier0) that a peer later demands (Tier1) is effectively Tier1.
-        assert_eq!(
-            effective_tier([CacheTier::Tier0Precache, CacheTier::Tier1Demand]),
-            Some(CacheTier::Tier1Demand),
-            "demand promotes a precached store above Tier0"
-        );
-        assert_eq!(
-            effective_tier([CacheTier::Tier0Precache]),
-            Some(CacheTier::Tier0Precache),
-            "a purely-precached store stays Tier0"
-        );
-        assert_eq!(
-            effective_tier([CacheTier::Tier1Demand, CacheTier::Tier2Bribed]),
-            Some(CacheTier::Tier2Bribed)
-        );
-        assert_eq!(effective_tier([]), None, "no ledger holds it → no tier");
-    }
 
     #[test]
     fn eviction_sacrifices_tier0_before_tier1_and_tier2() {
