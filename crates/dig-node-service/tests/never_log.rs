@@ -139,7 +139,8 @@ fn the_seed_bootstrap_never_logs_the_phrase_or_the_device_key_it_created() {
     let key_bytes = std::fs::read(&paths.device_key).expect("a device key was minted");
     let key_hex = hex::encode(&key_bytes);
     let sealed = std::fs::read(&paths.seed).expect("a seed was minted");
-    let phrase = dig_wallet::autoseed::open_sealed_with_device_key(&sealed, &key_hex).expect("the minted phrase");
+    let phrase = dig_wallet::autoseed::open_sealed_with_device_key(&sealed, &key_hex)
+        .expect("the minted phrase");
 
     assert!(
         !logged.is_empty(),

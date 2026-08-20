@@ -349,19 +349,11 @@ pub enum BootstrapError {
 pub fn ensure_wallet(paths: &WalletPaths) -> Result<BootstrapState, BootstrapError> {
     let seed_there = presence(&paths.seed).map_err(BootstrapError::SeedPathUnreadable)?;
 
-    let key = load_device_key(&paths.device_key, seed_there == Presence::Absent).map_err(|e| {
-        match e {
-            DeviceKeyError::Orphaned => BootstrapError::DeviceKey(DeviceKeyError::Orphaned),
-            other => BootstrapError::DeviceKey(other),
-        }
-    });
-
-    let key = match key {
-        Ok(k) => k,
-        Err(BootstrapError::DeviceKey(DeviceKeyError::Orphaned)) => {
-            return Ok(BootstrapState::Orphaned)
-        }
-        Err(e) => return Err(e),
+    let key = match load_device_key(&paths.device_key, seed_there == Presence::Absent) {
+        Ok(key) => key,
+        // Not an error: a recoverable operator state the caller must be able to name and act on.
+        Err(DeviceKeyError::Orphaned) => return Ok(BootstrapState::Orphaned),
+        Err(other) => return Err(BootstrapError::DeviceKey(other)),
     };
 
     if seed_there == Presence::Present {
@@ -389,12 +381,8 @@ fn mint_seed(paths: &WalletPaths, key: &DeviceKey) -> Result<BootstrapState, Boo
         .map_err(|e| BootstrapError::NotCreated(format!("generate mnemonic: {e}")))?;
     let phrase = Zeroizing::new(mnemonic.to_string());
 
-    let sealed = opaque::seal(
-        &key.as_password(),
-        phrase.as_bytes(),
-        KdfParams::default(),
-    )
-    .map_err(|e| BootstrapError::NotCreated(format!("seal seed: {e}")))?;
+    let sealed = opaque::seal(&key.as_password(), phrase.as_bytes(), KdfParams::default())
+        .map_err(|e| BootstrapError::NotCreated(format!("seal seed: {e}")))?;
 
     match write_new_owner_only(&paths.seed, &sealed) {
         Ok(()) => {
@@ -506,7 +494,7 @@ fn harden_owner_only(path: &Path) -> io::Result<()> {
     let ok = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl.as_ptr(),
-            SDDL_REVISION_1 as u32,
+            SDDL_REVISION_1,
             &mut descriptor,
             std::ptr::null_mut(),
         )
@@ -520,9 +508,8 @@ fn harden_owner_only(path: &Path) -> io::Result<()> {
     let mut defaulted = 0;
     // SAFETY: `descriptor` is the descriptor just built; `dacl` borrows from it and is used only
     // below, before the single LocalFree.
-    let got = unsafe {
-        GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
-    };
+    let got =
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
 
     let mut wide_path = wide(&path.to_string_lossy());
     let status = if got == 0 || present == 0 {
@@ -665,11 +652,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = paths_in(dir.path());
 
-        assert_eq!(ensure_wallet(&paths).expect("first start"), BootstrapState::Created);
+        assert_eq!(
+            ensure_wallet(&paths).expect("first start"),
+            BootstrapState::Created
+        );
         let first = phrase_on_disk(&paths);
         assert_eq!(first.split_whitespace().count(), MNEMONIC_WORDS);
 
-        assert_eq!(ensure_wallet(&paths).expect("second start"), BootstrapState::Opened);
+        assert_eq!(
+            ensure_wallet(&paths).expect("second start"),
+            BootstrapState::Opened
+        );
         assert_eq!(
             phrase_on_disk(&paths),
             first,
@@ -689,7 +682,10 @@ mod tests {
         // The fixture is only meaningful if the platform really does fail this metadata call, and
         // if the naive predicate really does answer "absent" — pin both, so the test cannot quietly
         // stop testing anything.
-        assert!(!path.exists(), "Path::exists() reports absence for this path");
+        assert!(
+            !path.exists(),
+            "Path::exists() reports absence for this path"
+        );
         assert!(
             presence(&path).is_err(),
             "an unanswerable existence question must surface as Err, never as Absent"
@@ -741,12 +737,16 @@ mod tests {
             abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
             abandon abandon abandon abandon abandon art";
 
-        let users_wallet = seed_store::encrypt_seed(PHRASE, "the-users-own-password").expect("seal");
+        let users_wallet =
+            seed_store::encrypt_seed(PHRASE, "the-users-own-password").expect("seal");
         fs::create_dir_all(paths.seed.parent().unwrap()).expect("wallet dir");
         fs::write(&paths.seed, &users_wallet).expect("write the user's wallet");
         write_new_owner_only(&paths.device_key, &[7u8; DEVICE_KEY_LEN]).expect("device key");
 
-        assert_eq!(ensure_wallet(&paths).expect("bootstrap"), BootstrapState::Locked);
+        assert_eq!(
+            ensure_wallet(&paths).expect("bootstrap"),
+            BootstrapState::Locked
+        );
         assert_eq!(
             fs::read(&paths.seed).expect("seed still there"),
             users_wallet,
@@ -766,9 +766,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = paths_in(dir.path());
         fs::create_dir_all(paths.seed.parent().unwrap()).expect("wallet dir");
-        fs::write(&paths.seed, b"DIGOP1 sealed under a device key that is gone").expect("seed");
+        fs::write(
+            &paths.seed,
+            b"DIGOP1 sealed under a device key that is gone",
+        )
+        .expect("seed");
 
-        assert_eq!(ensure_wallet(&paths).expect("bootstrap"), BootstrapState::Orphaned);
+        assert_eq!(
+            ensure_wallet(&paths).expect("bootstrap"),
+            BootstrapState::Orphaned
+        );
         assert!(
             !paths.device_key.exists(),
             "a device key must never be minted beside a seed it cannot open"
@@ -912,9 +919,7 @@ mod tests {
     #[test]
     fn secrets_are_created_with_an_explicit_owner_only_dacl() {
         use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
-        use windows_sys::Win32::Security::Authorization::{
-            GetNamedSecurityInfoW, SE_FILE_OBJECT,
-        };
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::{GetAce, ACL, DACL_SECURITY_INFORMATION};
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -964,12 +969,7 @@ mod tests {
             // SAFETY: the exact LocalAlloc'd block the API returned; not dereferenced again.
             unsafe { LocalFree(descriptor as _) };
 
-            assert_eq!(
-                granted,
-                me,
-                "{} must grant only this user",
-                path.display()
-            );
+            assert_eq!(granted, me, "{} must grant only this user", path.display());
         }
     }
 
