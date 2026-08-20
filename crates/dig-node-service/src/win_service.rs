@@ -107,6 +107,11 @@ fn run_service() -> std::io::Result<()> {
         .set_service_status(set(ServiceState::Running, ServiceControlAccept::STOP, 0))
         .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+    // Same start-up wallet check the foreground entrypoint runs (#277). The SCM path does not go
+    // through `block_on_serve`, so it needs its own call — a service install is the case where
+    // there is most certainly no user present to create a seed.
+    crate::wallet_bootstrap::ensure_wallet_seed();
+
     // Build the runtime and serve, shutting down when the control handler fires.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
