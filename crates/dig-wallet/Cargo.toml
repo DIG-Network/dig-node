@@ -137,6 +137,25 @@ totp-rs = { version = "5", features = ["otpauth", "gen_secret"] }
 getrandom = "0.2"
 chia-traits = "0.26"
 
+# -- #277 unattended wallet bootstrap (`autoseed`) --------------------------------------
+# The `created_at` stamp on the wallet's origin sidecar, as RFC 3339. Already in the
+# workspace lock via dig-node-service, so this adds a feature rather than a dependency.
+time = { version = "0.3", features = ["formatting"] }
+
+# The auto-created seed and its device key are written with an EXPLICIT owner-only DACL
+# rather than whatever `%LOCALAPPDATA%` happens to inherit: that ACL is per-user by
+# convention, not by guarantee, a Unix 0600 does not translate onto it, and an inherited
+# ACL widened later by an administrator or a profile policy would never re-run this code.
+# Same 0.61 line (and the same GetSecurityDescriptor/SE_FILE_OBJECT surface) that
+# dig-node-service's install-root owner probe already builds on, so one resolves.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile = "3"
 # `start_paused` — a virtual clock, so the peer-request deadline (#2851) is asserted to EXIST

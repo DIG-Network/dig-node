@@ -268,8 +268,19 @@ fn save_wallet_source(source: WalletSource) {
     }
 }
 
+/// Whether a wallet is on disk.
+///
+/// Uses [`autoseed::presence`] rather than `Path::exists()`, and answers `true` when the question
+/// cannot be answered at all. `exists()` reports a metadata failure — permission denied, a locked
+/// file, a transient I/O error, an unmounted volume — as a plain `false`, which here would render
+/// "no wallet on this device" over a wallet that is merely unreadable this second, and invite the
+/// user to create a replacement. Treating the unknown case as "a wallet exists" is the direction
+/// that cannot lose anything.
 fn wallet_exists() -> bool {
-    seed_path().exists()
+    !matches!(
+        autoseed::presence(&seed_path()),
+        Ok(autoseed::Presence::Absent)
+    )
 }
 
 #[derive(Serialize)]
