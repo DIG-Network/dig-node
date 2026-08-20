@@ -706,6 +706,92 @@ mod tests {
         );
     }
 
+    /// **Proves (#267, dig-sex SPEC §7.1):** a LAND that sacrifices a capsule to make room advertises
+    /// AFTER the sweep, so the node stops naming itself a holder of what it just deleted.
+    ///
+    /// This drives the real push→land path (`land_capsule_bytes` → `announce_and_bound_after_land`),
+    /// which is where the reported defect actually lived: that tail ran `refresh_dht_inventory()` and
+    /// THEN `evict_modules_locked()`, so the reconcile saw a world the victim had not yet left and the
+    /// retraction was never computed. The capsule stayed advertised until some unrelated inventory
+    /// change happened to reconcile it, which on a quiet node is never.
+    ///
+    /// **Non-vacuous, and deliberately not a call counter.** `install_announce_counter` — used by the
+    /// two tests either side of this one — reports exactly one round under BOTH orderings, because one
+    /// round does happen either way. Only the CONTENT of that round separates them, so the spy
+    /// snapshots the on-disk capsule set inside it: with the sweep second, the snapshot still lists the
+    /// filler that is about to be deleted.
+    /// **Catches:** restoring the advertise-then-sweep order, and dropping the land-path retraction.
+    #[test]
+    fn a_land_that_evicts_advertises_after_the_sweep() {
+        let _g = crate::test_support::ENV_GUARD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let (_sk, pk, store) = store_keypair(0x55);
+        let (module, root) = push_module(store, &pk, 0x66, 0);
+        let (store_hex, root_hex) = (hex::encode(store), hex::encode(root));
+
+        let (node, _td) = crate::test_support::test_node_for_peer_surface();
+        let node = node.as_ref();
+
+        // Isolate the process-global cap config, then pin a cap the filler ALONE already exceeds, so
+        // the post-land sweep must sacrifice it whatever the pushed capsule weighs.
+        let cfg = tempfile::tempdir().unwrap();
+        std::env::set_var("DIG_NODE_CACHE", cfg.path());
+        let _ = std::fs::remove_file(crate::config_path());
+        crate::set_cache_cap_bytes(1_500).unwrap();
+
+        // A tier-0 filler: sacrificial by tier, so the freshly-landed capsule (untagged, and therefore
+        // the protected Tier1Demand default) is never the victim.
+        let filler_store = "ba".repeat(32);
+        let filler_root = "cd".repeat(32);
+        crate::tier0_live::mark_tier0_land(&filler_store);
+        let filler = crate::CapsuleKey::parse(&filler_store, &filler_root)
+            .expect("canonical hex")
+            .module_path(&node.cache_dir);
+        std::fs::create_dir_all(filler.parent().unwrap()).unwrap();
+        std::fs::write(&filler, vec![0u8; 2_048]).unwrap();
+
+        let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::test_support::install_inventory_snapshot_spy(node, rounds.clone());
+
+        // A plain `#[test]` driving its own runtime, not `#[tokio::test]`: `ENV_GUARD` is a std
+        // `Mutex` guarding the process-global cap config and must never be held across an `.await`.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resp = rt.block_on(push_one_shot(
+            node, &store_hex, &root_hex, &module, None, local(),
+        ));
+        assert_eq!(resp["result"]["complete"], json!(true), "resp={resp}");
+
+        assert!(!filler.exists(), "the tier-0 filler was the sacrifice");
+        assert!(
+            crate::module_exists(&node.cache_dir, &store_hex, &root_hex),
+            "the pushed capsule landed and survived the sweep"
+        );
+
+        let rounds = rounds.lock().unwrap();
+        assert_eq!(
+            rounds.len(),
+            1,
+            "a land advertises exactly once; got {rounds:?}"
+        );
+        assert!(
+            !rounds[0].contains(&format!("{filler_store}/{filler_root}")),
+            "the advertisement must run AFTER the sweep, so the evicted filler is no longer in the \
+             set it advertises; saw {:?}",
+            rounds[0]
+        );
+        assert!(
+            rounds[0].contains(&format!("{store_hex}/{root_hex}")),
+            "the capsule that just landed must be advertised; saw {:?}",
+            rounds[0]
+        );
+
+        std::env::remove_var("DIG_NODE_CACHE");
+    }
+
     /// (f) Re-pushing an already-held capsule is idempotent — it reports complete and does NOT fire a
     /// second announce.
     #[tokio::test]

@@ -4432,6 +4432,58 @@ pub(crate) mod test_support {
     /// mutex) does not cascade into spurious failures of every other env-touching test.
     pub(crate) static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Every `<store>/<root>` capsule currently on disk under `<cache>/modules`, sorted.
+    ///
+    /// The advertisement tests need to know what the world looked like AT THE MOMENT the node
+    /// re-advertised, not merely that it did — see [`install_inventory_snapshot_spy`].
+    pub(crate) fn on_disk_capsules(cache_dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(stores) = std::fs::read_dir(cache_dir.join("modules")) else {
+            return out;
+        };
+        for store in stores.flatten() {
+            let Some(store_hex) = store.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(capsules) = std::fs::read_dir(store.path()) else {
+                continue;
+            };
+            for capsule in capsules.flatten() {
+                if let Some(root_hex) = capsule
+                    .file_name()
+                    .to_str()
+                    .and_then(crate::capsule_key::cached_root_stem)
+                {
+                    out.push(format!("{store_hex}/{root_hex}"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Install an inventory refresher that snapshots the on-disk capsule set on every call, so a test
+    /// can assert not just THAT the node re-advertised but WHAT it would have advertised.
+    ///
+    /// Deliberately not a call COUNTER. The defect this guards has two shapes — no advertisement at
+    /// all, and an advertisement placed BEFORE the eviction — and a counter is blind to the second: it
+    /// reports one round either way while the retraction is still never computed. Snapshotting inside
+    /// the round separates them, because an early round still lists the capsule that is about to go.
+    pub(crate) fn install_inventory_snapshot_spy(
+        node: &Node,
+        rounds: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) {
+        use crate::seams::dig_peer::peer_network::PeerNetwork;
+        let cache_dir = node.cache_dir.clone();
+        node.set_inventory_refresher(Box::new(move || {
+            let rounds = rounds.clone();
+            let snapshot = on_disk_capsules(&cache_dir);
+            Box::pin(async move {
+                rounds.lock().unwrap().push(snapshot);
+            })
+        }));
+    }
+
     /// A minimal in-memory [`Node`] over a fresh temp cache dir, with an unroutable upstream
     /// and the production anchored-root resolver (peer-surface tests never reach the chain).
     /// Returned with its [`tempfile::TempDir`] so the cache dir outlives the node. Used to
@@ -5956,54 +6008,6 @@ mod tests {
         std::env::remove_var("DIG_NODE_CACHE");
     }
 
-    /// Every `<store>/<root>` capsule currently on disk under `<cache>/modules`, sorted.
-    ///
-    /// The eviction-retraction tests need to know what the world looked like AT THE MOMENT the
-    /// advertisement round ran, not merely that one ran — see
-    /// [`an_eviction_advertises_after_the_victim_is_gone`].
-    fn on_disk_capsules(cache_dir: &Path) -> Vec<String> {
-        let mut out = Vec::new();
-        let Ok(stores) = std::fs::read_dir(cache_dir.join("modules")) else {
-            return out;
-        };
-        for store in stores.flatten() {
-            let Some(store_hex) = store.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            let Ok(capsules) = std::fs::read_dir(store.path()) else {
-                continue;
-            };
-            for capsule in capsules.flatten() {
-                if let Some(root_hex) = capsule
-                    .file_name()
-                    .to_str()
-                    .and_then(crate::capsule_key::cached_root_stem)
-                {
-                    out.push(format!("{store_hex}/{root_hex}"));
-                }
-            }
-        }
-        out.sort();
-        out
-    }
-
-    /// Install an inventory refresher that snapshots the on-disk capsule set on every call, so a test
-    /// can assert not just THAT the node re-advertised but WHAT it would have advertised.
-    fn install_inventory_snapshot_spy(
-        node: &Node,
-        rounds: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
-    ) {
-        use crate::seams::dig_peer::peer_network::PeerNetwork;
-        let cache_dir = node.cache_dir.clone();
-        node.set_inventory_refresher(Box::new(move || {
-            let rounds = rounds.clone();
-            let snapshot = on_disk_capsules(&cache_dir);
-            Box::pin(async move {
-                rounds.lock().unwrap().push(snapshot);
-            })
-        }));
-    }
-
     /// Pin a two-capsule cache under a tiny cap so the sweep MUST sacrifice exactly the tier-0 store,
     /// returning `(node, cache tempdir, config tempdir, victim path, survivor path)`.
     ///
@@ -6051,7 +6055,7 @@ mod tests {
         // Two ~1 KiB capsules against a 1,500-byte cap: over by one capsule, so exactly one goes.
         let (node, _td, _cfg, victim, survivor) = two_capsule_cache(1_500);
         let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
-        install_inventory_snapshot_spy(&node, rounds.clone());
+        test_support::install_inventory_snapshot_spy(&node, rounds.clone());
 
         pin_test_rt().block_on(node.evict_modules_if_needed());
 
@@ -6092,7 +6096,7 @@ mod tests {
         // Same fixture, one variable changed: a roomy cap, so the sweep finds nothing to sacrifice.
         let (node, _td, _cfg, victim, survivor) = two_capsule_cache(10_000);
         let rounds = Arc::new(std::sync::Mutex::new(Vec::new()));
-        install_inventory_snapshot_spy(&node, rounds.clone());
+        test_support::install_inventory_snapshot_spy(&node, rounds.clone());
 
         pin_test_rt().block_on(node.evict_modules_if_needed());
 
