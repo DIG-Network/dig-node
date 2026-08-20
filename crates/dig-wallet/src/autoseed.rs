@@ -159,11 +159,26 @@ pub fn presence(path: &Path) -> io::Result<Presence> {
 pub struct DeviceKey(Zeroizing<[u8; DEVICE_KEY_LEN]>);
 
 impl DeviceKey {
+    /// The key as lowercase hex, in a wrapper that wipes on drop.
+    ///
+    /// Returning `Zeroizing<String>` rather than `String` is the whole point: a bare hex copy of
+    /// the device key defeats the property the sibling-file layout exists to buy. This module's own
+    /// threat model names "support archive or diagnostic bundle" as the case being defended, and a
+    /// minidump is exactly that — a plain `String` left on the heap puts the key in the crash dump
+    /// beside the ciphertext it opens.
+    fn hex(&self) -> Zeroizing<String> {
+        Zeroizing::new(hex::encode(&self.0[..]))
+    }
+
     /// The key rendered as the `Password` the `opaque` container seals under: lowercase hex, the
     /// same convention the ecosystem's other machine-key boundary uses. Hex rather than raw bytes
     /// so the value is a well-formed string at every layer it crosses.
+    ///
+    /// The intermediate `Vec` is MOVED into `Password` (which holds `Zeroizing<Vec<u8>>`), so the
+    /// buffer that ends up holding the key is the one that gets wiped. An earlier version called
+    /// `.to_string()` on the wrapper, which CLONES out of it and wipes only the copy nobody used.
     fn as_password(&self) -> Password {
-        Password::from(Zeroizing::new(hex::encode(&self.0[..])).to_string())
+        Password::from(self.hex().as_bytes().to_vec())
     }
 }
 
@@ -267,6 +282,38 @@ impl WalletMeta {
     }
 }
 
+/// Persist the funded latch for the wallet at `paths`, so it survives a restart.
+///
+/// Call on the first observation of a non-zero balance. Idempotent: once latched it rewrites
+/// nothing, so a balance poller may call it on every read.
+///
+/// **Latch on the first OBSERVATION, never on the current balance.** A balance that reads zero
+/// because the node is offline, or is momentarily zero between spends, is not evidence the wallet
+/// never mattered — which is precisely why this is a stored latch rather than a live predicate.
+///
+/// A missing sidecar is recorded as `Imported` rather than `Auto`. The origin is genuinely unknown
+/// at that point, and `Imported` is the reading that cannot make a funded wallet look disposable.
+pub fn latch_ever_funded(paths: &WalletPaths) -> io::Result<()> {
+    let mut meta = read_meta(&paths.meta).unwrap_or_else(|| WalletMeta {
+        origin: SeedOrigin::Imported,
+        created_at: now_rfc3339(),
+        ever_funded: false,
+    });
+    if meta.ever_funded {
+        return Ok(());
+    }
+    meta.mark_ever_funded();
+
+    let json = serde_json::to_vec_pretty(&meta)
+        .map_err(|e| io::Error::other(format!("encode wallet metadata: {e}")))?;
+    if let Some(dir) = paths.meta.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    // A plain overwrite rather than the create-new path used for the secrets: this file already
+    // exists in the ordinary case, holds no key material, and keeps the ACL it was created with.
+    fs::write(&paths.meta, json)
+}
+
 /// Open a sealed seed under a device key given in the hex form [`password_str`] produces.
 ///
 /// The read half of the bootstrap, exposed so a host binary can name the phrase a given run
@@ -351,8 +398,9 @@ pub fn ensure_wallet(paths: &WalletPaths) -> Result<BootstrapState, BootstrapErr
 
     let key = match load_device_key(&paths.device_key, seed_there == Presence::Absent) {
         Ok(key) => key,
-        // Not an error: a recoverable operator state the caller must be able to name and act on.
-        Err(DeviceKeyError::Orphaned) => return Ok(BootstrapState::Orphaned),
+        // A seed with no device key is TWO different situations that look identical on disk. Which
+        // one it is decides whether the operator sees an alarm or nothing at all.
+        Err(DeviceKeyError::Orphaned) => return Ok(classify_keyless_seed(paths)),
         Err(other) => return Err(BootstrapError::DeviceKey(other)),
     };
 
@@ -363,10 +411,42 @@ pub fn ensure_wallet(paths: &WalletPaths) -> Result<BootstrapState, BootstrapErr
     mint_seed(paths, &key)
 }
 
+/// Decide what a seed with no device key actually IS. Writes nothing on either branch.
+///
+/// The two situations are indistinguishable from the seed file alone — both are a `DIGOP1`
+/// container this process cannot open — but they call for opposite reactions:
+///
+/// - **An ordinary imported wallet**, sealed under the user's password. It has no device key
+///   because it never had one, and nothing is wrong. **This is what EVERY installation predating
+///   this feature looks like on its first run of this build**, so it is the common case, not the
+///   edge case.
+/// - **A genuine orphan** — a wallet this node minted, whose device key has since gone missing
+///   (a wrong mount, a half-restored backup, a container started without its volume).
+///
+/// `wallet.meta.json` is what tells them apart, and it is written by the same mint that creates the
+/// device-key dependency in the first place — so an `auto` origin is exactly the marker of a wallet
+/// that SHOULD have a key.
+///
+/// Absent or unreadable metadata resolves to [`BootstrapState::Locked`], the quiet branch, for the
+/// same reason [`is_disposable`] fails closed: an unmarked seed is far more likely to be an
+/// imported wallet older than this file than a minted one, and the expensive direction of the guess
+/// is the one that tells someone their wallet is broken when it is fine. A person told their wallet
+/// cannot be opened goes looking for a way to start over, and starting over is the destructive act
+/// this whole module exists to prevent.
+///
+/// The refusal to mint a key is NOT relaxed by any of this — neither branch creates anything. Only
+/// the name and the narration change.
+fn classify_keyless_seed(paths: &WalletPaths) -> BootstrapState {
+    match read_meta(&paths.meta).map(|meta| meta.origin) {
+        Some(SeedOrigin::Auto) | Some(SeedOrigin::AutoAcknowledged) => BootstrapState::Orphaned,
+        Some(SeedOrigin::Imported) | None => BootstrapState::Locked,
+    }
+}
+
 /// Try the existing seed against the device key, writing nothing either way.
 fn open_existing(paths: &WalletPaths, key: &DeviceKey) -> BootstrapState {
     match fs::read(&paths.seed) {
-        Ok(bytes) => match seed_store::decrypt_seed(&bytes, &password_str(key)) {
+        Ok(bytes) => match seed_store::decrypt_seed(&bytes, password_str(key).as_str()) {
             Ok(_) => BootstrapState::Opened,
             Err(_) => BootstrapState::Locked,
         },
@@ -412,9 +492,11 @@ fn write_meta(paths: &WalletPaths) {
 }
 
 /// The device key in the string form `seed_store` takes. Kept in one place so the hex convention
-/// cannot drift between sealing and opening.
-fn password_str(key: &DeviceKey) -> String {
-    hex::encode(&key.0[..])
+/// cannot drift between sealing and opening — and wrapped, so the OPEN path does not undo the
+/// zeroizing the seal path does. Both directions render the same secret; only one of them being
+/// careful is the same as neither.
+fn password_str(key: &DeviceKey) -> Zeroizing<String> {
+    key.hex()
 }
 
 // -- Owner-only, create-new writes -----------------------------------------------------------
@@ -608,6 +690,11 @@ fn wide(s: &str) -> Vec<u16> {
 mod tests {
     use super::*;
 
+    /// The canonical BIP-39 test vector, for fixtures that need a real, valid phrase.
+    const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon abandon abandon art";
+
     /// A layout under `dir` with every artifact in a writable place. The device-key directory is a
     /// SIBLING of the wallet directory, mirroring production.
     fn paths_in(dir: &Path) -> WalletPaths {
@@ -733,14 +820,7 @@ mod tests {
     fn a_seed_that_does_not_decrypt_is_left_untouched() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = paths_in(dir.path());
-        const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
-            abandon abandon abandon abandon abandon art";
-
-        let users_wallet =
-            seed_store::encrypt_seed(PHRASE, "the-users-own-password").expect("seal");
-        fs::create_dir_all(paths.seed.parent().unwrap()).expect("wallet dir");
-        fs::write(&paths.seed, &users_wallet).expect("write the user's wallet");
+        let users_wallet = install_a_users_imported_wallet(&paths);
         write_new_owner_only(&paths.device_key, &[7u8; DEVICE_KEY_LEN]).expect("device key");
 
         assert_eq!(
@@ -754,23 +834,68 @@ mod tests {
         );
     }
 
-    /// **Proves:** a seed with no device key is reported as `Orphaned` and NO new device key is
-    /// minted.
+    /// A REAL user-password-sealed `DIGOP1` container at `paths.seed`, with no device key and no
+    /// metadata — byte-for-byte what every installation predating this feature looks like on its
+    /// first run of this build.
+    fn install_a_users_imported_wallet(paths: &WalletPaths) -> Vec<u8> {
+        let sealed = seed_store::encrypt_seed(PHRASE, "the-users-own-password").expect("seal");
+        fs::create_dir_all(paths.seed.parent().unwrap()).expect("wallet dir");
+        fs::write(&paths.seed, &sealed).expect("write the user's wallet");
+        sealed
+    }
+
+    /// **Proves:** an ordinary imported wallet with no device key is recognised as imported and
+    /// left alone QUIETLY — not classified as damaged.
     ///
-    /// Minting one here would be silent, permanent loss: the fresh key cannot open the existing
-    /// seed, so the node would come up presenting an empty wallet as though it were the user's. The
-    /// state is recoverable — a wrong mount, a half-restored backup, a container missing a volume —
-    /// but only for as long as nothing overwrites it.
+    /// This is the common case, not an edge case: a password-sealed seed with no device key is what
+    /// **every existing installation** presents on its first run of this build. Reporting it as
+    /// `Orphaned` makes the node log a per-boot error saying the wallet cannot be opened until a key
+    /// is restored — false for those users, and dangerous, because the plausible response to being
+    /// told your wallet is unopenable is to start over.
+    ///
+    /// The fixture is a real sealed container rather than arbitrary bytes. An earlier version of
+    /// this test wrote a non-container string, which could never have exhibited the confusion: the
+    /// realistic input was asserted nowhere.
     #[test]
-    fn a_seed_without_its_device_key_is_orphaned_and_mints_nothing() {
+    fn an_imported_wallet_without_a_device_key_is_not_reported_as_damaged() {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = paths_in(dir.path());
-        fs::create_dir_all(paths.seed.parent().unwrap()).expect("wallet dir");
-        fs::write(
-            &paths.seed,
-            b"DIGOP1 sealed under a device key that is gone",
-        )
-        .expect("seed");
+        let sealed = install_a_users_imported_wallet(&paths);
+
+        assert_eq!(
+            ensure_wallet(&paths).expect("bootstrap"),
+            BootstrapState::Locked,
+            "a password-sealed wallet with no device key is ordinary, not orphaned"
+        );
+        assert!(
+            !paths.device_key.exists(),
+            "a device key must never be minted beside a seed it cannot open"
+        );
+        assert_eq!(
+            fs::read(&paths.seed).expect("seed still there"),
+            sealed,
+            "the user's wallet must be left byte-identical"
+        );
+    }
+
+    /// **Proves:** a wallet THIS node minted, whose device key has since gone, IS reported as
+    /// `Orphaned` — and still nothing is minted.
+    ///
+    /// The `auto` origin is what distinguishes it from the test above: it marks a wallet that
+    /// *should* have a device key, so its absence is genuinely wrong and worth an alarm. Minting a
+    /// replacement would be silent, permanent loss — a fresh key cannot open the existing seed, so
+    /// the node would present an empty wallet as though it were the user's. The state is
+    /// recoverable — a wrong mount, a half-restored backup, a container missing a volume — but only
+    /// for as long as nothing overwrites it.
+    #[test]
+    fn an_auto_created_wallet_that_lost_its_device_key_is_orphaned_and_mints_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_in(dir.path());
+        ensure_wallet(&paths).expect("mint a wallet the ordinary way");
+        let sealed = fs::read(&paths.seed).expect("seed");
+
+        // The device key goes missing — the unmounted-volume / half-restored-backup case.
+        fs::remove_file(&paths.device_key).expect("remove the device key");
 
         assert_eq!(
             ensure_wallet(&paths).expect("bootstrap"),
@@ -779,6 +904,11 @@ mod tests {
         assert!(
             !paths.device_key.exists(),
             "a device key must never be minted beside a seed it cannot open"
+        );
+        assert_eq!(
+            fs::read(&paths.seed).expect("seed still there"),
+            sealed,
+            "the orphaned seed must be left byte-identical — it is recoverable"
         );
     }
 
@@ -806,20 +936,53 @@ mod tests {
     /// money, no surface may call it disposable, whatever its balance reads later.
     #[test]
     fn the_funded_latch_ends_disposability_permanently() {
-        let mut meta = WalletMeta {
-            origin: SeedOrigin::Auto,
-            created_at: "2026-08-20T00:00:00Z".to_string(),
-            ever_funded: false,
-        };
-        assert!(meta.is_disposable());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_in(dir.path());
+        ensure_wallet(&paths).expect("mint an auto wallet");
+        assert!(is_disposable(&paths), "a fresh auto wallet is disposable");
 
-        meta.mark_ever_funded();
-        assert!(!meta.is_disposable());
+        latch_ever_funded(&paths).expect("latch on the first non-zero balance");
 
-        // A later balance read of zero is not evidence the wallet never mattered, and there is no
-        // API that could express it: the latch has no clearing path.
-        meta.mark_ever_funded();
-        assert!(!meta.is_disposable());
+        // Re-read FROM DISK. An in-memory flip would pass against any struct with a bool and an
+        // `&&`; only the stored value proves a restart still knows this wallet has held money.
+        assert!(
+            read_meta(&paths.meta).expect("sidecar").ever_funded,
+            "the latch must persist"
+        );
+        assert!(!is_disposable(&paths));
+
+        // Idempotent, so a balance poller may call it on every read.
+        latch_ever_funded(&paths).expect("second call");
+        assert!(!is_disposable(&paths));
+
+        // And the bootstrap itself must not clear it. `write_meta` runs only on creation; if a
+        // later edit made it run on every boot, a funded wallet would silently become disposable
+        // again at the next restart.
+        assert_eq!(
+            ensure_wallet(&paths).expect("restart"),
+            BootstrapState::Opened
+        );
+        assert!(
+            read_meta(&paths.meta).expect("sidecar").ever_funded,
+            "a restart must not clear the funded latch"
+        );
+        assert!(!is_disposable(&paths));
+    }
+
+    /// **Proves:** the latch persists even when the sidecar is missing entirely, and records the
+    /// origin that cannot make a funded wallet look disposable.
+    #[test]
+    fn latching_a_wallet_with_no_sidecar_records_it_as_not_disposable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = paths_in(dir.path());
+        install_a_users_imported_wallet(&paths);
+
+        latch_ever_funded(&paths).expect("latch");
+
+        let meta = read_meta(&paths.meta).expect("a sidecar is created");
+        assert!(meta.ever_funded);
+        assert_eq!(meta.origin, SeedOrigin::Imported);
+        assert!(!is_disposable(&paths));
     }
 
     /// **Proves:** an absent or unparsable sidecar answers "not disposable".

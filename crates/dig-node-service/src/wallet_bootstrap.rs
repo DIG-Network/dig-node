@@ -60,10 +60,19 @@ pub fn ensure_wallet_seed_at(paths: &WalletPaths) -> Option<BootstrapState> {
             // half-restored backup, a container started without its volume. Restoring the device
             // key restores the wallet; minting a new one would destroy it silently, so nothing was
             // minted.
+            //
+            // This arm is reached ONLY for a wallet marked `auto` — one this node minted, which
+            // therefore genuinely should have a key. An imported wallet with no device key is the
+            // ordinary case and takes the quiet `Locked` arm above. That distinction matters more
+            // than it looks: told that their wallet "cannot be opened", a reasonable person goes
+            // looking for a way to start over, and starting over is exactly the destructive act
+            // this refusal exists to prevent. The sentence must therefore be reserved for the
+            // situation that is actually wrong, and must say what to do instead of implying loss.
             tracing::error!(
                 device_key = %paths.device_key.display(),
-                "a wallet seed exists but its device key is missing — the wallet cannot be opened \
-                 until the key is restored. Nothing was created or modified."
+                "this node's auto-created wallet is present but its device key is missing. The \
+                 wallet is INTACT and recoverable: restore the device key file and it opens again. \
+                 Nothing was created, modified or deleted — do not delete the wallet."
             );
             Some(BootstrapState::Orphaned)
         }
