@@ -1381,7 +1381,15 @@ impl PeerRpcResponder for NodeResponder {
         // The verified mTLS peer_id (`conn_key`) keys the per-requestor miss-lookup budget, identical
         // to the range-stream miss on this same peer surface (dig_ecosystem#2007).
         let requestor = crate::rate_limit::RequestorId::Peer(conn_key.to_string());
-        self.node.availability_batch(&items, &requestor).await
+        // This is the dig-nat MUX shape (`{items}`), and `dig_nat::mux::AvailabilityRequest` carries
+        // NO hop counter — measured, not assumed. A request that cannot carry a budget cannot bound a
+        // recursion, so this leg declares the budget already SPENT and forwards nothing
+        // (dig_ecosystem#3128). Fail-closed on purpose: the alternative is an unbounded recursive ask
+        // on the one shape that has no way to count hops. The JSON-RPC leg
+        // (`seams/dig_rpc/dispatch.rs`) carries `redirect_depth` and is where forwarding happens.
+        self.node
+            .availability_batch(&items, &requestor, crate::download::REDIRECT_HOP_CAP)
+            .await
     }
 
     /// Serve a window of a locally-held whole `.dig` module (#1576, the reshare leg).
@@ -5629,7 +5637,7 @@ pub(crate) mod tests {
 
         let logs = capture_logs(async {
             let answer = node
-                .availability_answer(&held, &[], &crate::rate_limit::RequestorId::Local)
+                .availability_answer(&held, &[], &crate::rate_limit::RequestorId::Local, 0)
                 .await;
             assert_eq!(answer["available"], json!(false));
         })
@@ -5654,7 +5662,7 @@ pub(crate) mod tests {
         });
 
         let logs = capture_logs(async {
-            node.availability_answer(&bogus, &[], &crate::rate_limit::RequestorId::Local)
+            node.availability_answer(&bogus, &[], &crate::rate_limit::RequestorId::Local, 0)
                 .await;
         })
         .await;
@@ -5757,7 +5765,7 @@ pub(crate) mod tests {
         });
 
         let logs = capture_logs(async {
-            node.availability_answer(&item, &[], &crate::rate_limit::RequestorId::Local)
+            node.availability_answer(&item, &[], &crate::rate_limit::RequestorId::Local, 0)
                 .await;
         })
         .await;

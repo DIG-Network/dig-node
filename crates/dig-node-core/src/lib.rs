@@ -56,6 +56,9 @@ pub mod inbound_demand;
 mod module_tier_tag;
 pub mod peer;
 pub mod rate_limit;
+
+#[cfg(test)]
+mod forwarded_ask_tests;
 pub mod relevance;
 /// The 7 architecturally-separated seams (#1285/#1303), populated incrementally across the
 /// W1b sub-PR sequence. Modules re-exported below at their ORIGINAL crate-root path keep
@@ -3608,6 +3611,7 @@ impl Node {
         item: &Value,
         cached: &[CachedCapsule],
         requestor: &crate::rate_limit::RequestorId,
+        hops_used: u64,
     ) -> Value {
         let store = item.get("store_id").and_then(Value::as_str).unwrap_or("");
         let root = item.get("root").and_then(Value::as_str);
@@ -3676,7 +3680,7 @@ impl Node {
             if let Some(pc) = self.p2p_content() {
                 if let Some(content) = download::availability_content_id(store, root, rk) {
                     if pc.allow_miss_lookup(requestor) {
-                        let providers = pc.find_providers(&content).await;
+                        let providers = pc.locate_holders(&content, hops_used, requestor).await;
                         if !providers.is_empty() {
                             if let Some(obj) = answer.as_object_mut() {
                                 obj.insert(
@@ -3710,10 +3714,16 @@ impl Node {
     /// per-requestor miss-lookup budget (dig_ecosystem#2007), so a large batch of not-held items from
     /// one caller cannot amplify into an unbounded lookup rate — the item cap bounds the RESPONSE, the
     /// budget bounds the outbound LOOKUP work.
+    ///
+    /// `hops_used` is the caller's echoed `params.redirect_depth`, and it bounds the RECURSION
+    /// (dig_ecosystem#3128): the not-held enrichment also asks this node's connected pool peers the
+    /// same question, and a request at or over [`REDIRECT_HOP_CAP`](crate::download::REDIRECT_HOP_CAP)
+    /// forwards nothing. A caller that supplies no depth is a fresh question at depth 0.
     pub async fn availability_batch(
         &self,
         items: &[Value],
         requestor: &crate::rate_limit::RequestorId,
+        hops_used: u64,
     ) -> Value {
         let capped = &items[..items.len().min(MAX_AVAILABILITY_ITEMS)];
         // At most one directory walk for the whole batch, and none at all unless some item asks at
@@ -3728,7 +3738,10 @@ impl Node {
         };
         let mut answers = Vec::with_capacity(capped.len());
         for item in capped {
-            answers.push(self.availability_answer(item, &cached, requestor).await);
+            answers.push(
+                self.availability_answer(item, &cached, requestor, hops_used)
+                    .await,
+            );
         }
         json!({ "items": answers })
     }
@@ -8915,7 +8928,7 @@ mod tests {
             json!({ "store_id": "cc".repeat(32), "root": "dd".repeat(32) }), // a miss
         ];
         let resp = node
-            .availability_batch(&items, &crate::rate_limit::RequestorId::Local)
+            .availability_batch(&items, &crate::rate_limit::RequestorId::Local, 0)
             .await;
         let arr = resp["items"].as_array().expect("items array");
         assert_eq!(arr.len(), 3, "positionally aligned with the request");
@@ -8932,7 +8945,7 @@ mod tests {
             .map(|_| json!({ "store_id": "ee".repeat(32) }))
             .collect();
         let resp = node
-            .availability_batch(&items, &crate::rate_limit::RequestorId::Local)
+            .availability_batch(&items, &crate::rate_limit::RequestorId::Local, 0)
             .await;
         assert_eq!(
             resp["items"].as_array().unwrap().len(),
@@ -9137,6 +9150,7 @@ mod tests {
                 &item,
                 &stale_snapshot,
                 &crate::rate_limit::RequestorId::Local,
+                0,
             )
             .await;
         assert_eq!(
@@ -9173,6 +9187,7 @@ mod tests {
                 &item,
                 &stale_snapshot,
                 &crate::rate_limit::RequestorId::Local,
+                0,
             )
             .await;
         assert_eq!(
@@ -9195,6 +9210,7 @@ mod tests {
             .availability_batch(
                 &[item.clone(), never_held.clone()],
                 &crate::rate_limit::RequestorId::Local,
+                0,
             )
             .await;
         assert_eq!(resp["items"][0]["available"], true, "landed → available");
@@ -9207,7 +9223,7 @@ mod tests {
             .await
             .unwrap();
         let resp = node
-            .availability_batch(&[item], &crate::rate_limit::RequestorId::Local)
+            .availability_batch(&[item], &crate::rate_limit::RequestorId::Local, 0)
             .await;
         assert_eq!(
             resp["items"][0]["available"], false,
@@ -9241,6 +9257,7 @@ mod tests {
                     json!({ "store_id": "zz".repeat(32) }),
                 ],
                 &crate::rate_limit::RequestorId::Local,
+                0,
             )
             .await;
         assert_eq!(
@@ -9260,6 +9277,7 @@ mod tests {
             .availability_batch(
                 &[json!({ "store_id": store.to_hex(), "root": root.to_hex() })],
                 &crate::rate_limit::RequestorId::Local,
+                0,
             )
             .await;
         assert_eq!(ok["items"][0]["available"], true);
@@ -9280,7 +9298,7 @@ mod tests {
 
         let null_root = json!({ "store_id": store.to_hex(), "root": Value::Null });
         let resp = node
-            .availability_batch(&[null_root], &crate::rate_limit::RequestorId::Local)
+            .availability_batch(&[null_root], &crate::rate_limit::RequestorId::Local, 0)
             .await;
         assert_eq!(
             resp["items"][0]["available"], true,
@@ -9294,7 +9312,7 @@ mod tests {
 
         let numeric_root = json!({ "store_id": store.to_hex(), "root": 1 });
         let resp = node
-            .availability_batch(&[numeric_root], &crate::rate_limit::RequestorId::Local)
+            .availability_batch(&[numeric_root], &crate::rate_limit::RequestorId::Local, 0)
             .await;
         assert_eq!(
             resp["items"][0]["available"], true,
@@ -13520,7 +13538,7 @@ mod tests {
         let abuser = crate::rate_limit::RequestorId::Peer("aaaa".to_string());
         let control = crate::rate_limit::RequestorId::Peer("bbbb".to_string());
 
-        let abuser_resp = rt.block_on(node.availability_batch(&batch, &abuser));
+        let abuser_resp = rt.block_on(node.availability_batch(&batch, &abuser, 0));
         let items = abuser_resp["items"].as_array().expect("four answers");
         assert_eq!(items.len(), 4, "one answer per item");
         // The ANSWER itself is unchanged for every item — none is held.
@@ -13557,7 +13575,7 @@ mod tests {
 
         // A DIFFERENT requestor draws from its OWN bucket: its first two items are still enriched,
         // proving the budget is keyed per requestor and the abuser never starved the control.
-        let control_resp = rt.block_on(node.availability_batch(&batch, &control));
+        let control_resp = rt.block_on(node.availability_batch(&batch, &control, 0));
         let control_items = control_resp["items"].as_array().expect("four answers");
         assert!(
             control_items[0].get("providers").is_some(),
