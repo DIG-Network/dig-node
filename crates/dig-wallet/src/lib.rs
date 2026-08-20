@@ -57,6 +57,10 @@ pub mod sage;
 // file keeps opening — see the module docs).
 mod seed_store;
 
+// #277: unattended wallet bootstrap — detect a missing seed on start and mint one, sealed
+// under a machine-held device key. Every failure arm is fail-closed and writes nothing.
+pub mod autoseed;
+
 /// In-memory unlocked wallet for the session.
 struct Session {
     mnemonic: Zeroizing<String>,
