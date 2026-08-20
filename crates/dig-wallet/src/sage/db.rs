@@ -495,6 +495,21 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
     "ALTER TABLE peers ADD COLUMN banned_at INTEGER",
 ];
 
+// ---- one-shot data-migration ladder ---------------------------------------
+//
+// [`ADD_COLUMN_MIGRATIONS`] above are idempotent DDL and cost nothing to re-run, so they need no
+// bookkeeping. A DATA migration is different: it reads and rewrites rows, so re-running it on
+// every open is unbounded work on a hot path for a job that only ever needs doing once. The
+// applied level is kept in SQLite's own `PRAGMA user_version` — a database that predates this
+// ladder reads 0, which is exactly right, since nothing has been applied to it.
+
+/// Ladder step 1: the `offers` table is keyed by the canonical offer id (dig-node#283) rather
+/// than by a value derived from the offered coin set.
+const OFFERS_KEYED_BY_CANONICAL_ID: i64 = 1;
+
+/// The highest ladder step this build knows how to apply.
+const SCHEMA_VERSION: i64 = OFFERS_KEYED_BY_CANONICAL_ID;
+
 /// Indexes that depend on a column [`ADD_COLUMN_MIGRATIONS`] may only just have added, so they
 /// cannot live in [`SCHEMA`]: on a legacy DB the index would be created against a column that does
 /// not exist yet, and `SCHEMA` is executed strictly, before the migrations.
@@ -704,8 +719,24 @@ impl WalletDb {
         for stmt in POST_MIGRATION_INDEXES {
             sqlx::query(stmt).execute(&mut *conn).await?;
         }
+        // One-shot data migrations, gated on the ladder so they cost nothing on an opened-again
+        // database. Read the mark before releasing the connection.
+        let applied: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *conn)
+            .await?;
         drop(conn);
-        self.rekey_offers_to_canonical_ids().await?;
+
+        if applied < OFFERS_KEYED_BY_CANONICAL_ID {
+            self.rekey_offers_to_canonical_ids().await?;
+        }
+
+        // Marked only after every step above SUCCEEDED, so a migration that failed part-way is
+        // retried on the next open rather than being recorded as done.
+        if applied < SCHEMA_VERSION {
+            sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
@@ -724,8 +755,19 @@ impl WalletDb {
     /// Idempotent — a second run recomputes the same id for every row and rewrites nothing. A row
     /// whose offer string will not decode is left exactly as it is: an oddly-keyed offer is still
     /// recoverable by the user, and a deleted one is not.
+    ///
+    /// **The whole re-key is ONE transaction**, and that is the load-bearing property rather than
+    /// a tidiness point. Moving a row means deleting it from under its old key and writing it
+    /// under the new one; if those commit separately, a crash, a lock timeout, or any driver error
+    /// in the window between them destroys the offer outright. That would be strictly worse than
+    /// the defect this migration repairs — an unreachable row can be recovered by a later fix, and
+    /// a deleted one cannot, because an offer the user made is not rebuildable from chain. Wrapped
+    /// as one unit, any failure rolls the whole thing back and every row stays under its old key,
+    /// where the next open will find it and try again.
     async fn rekey_offers_to_canonical_ids(&self) -> sqlx::Result<()> {
-        for row in self.all_offers().await? {
+        let rows = self.all_offers().await?;
+        let mut tx = self.pool.begin().await?;
+        for row in rows {
             let Ok(canonical) = crate::sage::offers::offer_id(&row.offer) else {
                 continue;
             };
@@ -734,14 +776,28 @@ impl WalletDb {
             }
             sqlx::query("DELETE FROM offers WHERE offer_id = ?")
                 .bind(&row.offer_id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
-            self.upsert_offer(&OfferDbRow {
-                offer_id: canonical,
-                ..row
-            })
+            // Written through the same transaction as the delete, so `upsert_offer` (which holds
+            // its own pool connection) deliberately is not reused here.
+            sqlx::query(
+                "INSERT INTO offers (offer_id, offer, status, creation_timestamp, summary_json)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(offer_id) DO UPDATE SET
+                    offer = excluded.offer,
+                    status = excluded.status,
+                    creation_timestamp = excluded.creation_timestamp,
+                    summary_json = excluded.summary_json",
+            )
+            .bind(&canonical)
+            .bind(&row.offer)
+            .bind(&row.status)
+            .bind(row.creation_timestamp)
+            .bind(&row.summary_json)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3684,6 +3740,12 @@ mod tests {
 
     /// A real, encoded offer plus its canonical id.
     fn an_offer() -> (String, String) {
+        an_offer_requesting(500)
+    }
+
+    /// As [`an_offer`], but requesting `requested` — so several fixtures can differ in their TERMS
+    /// while the builder stays otherwise identical, which is what makes their ids differ.
+    fn an_offer_requesting(requested: u64) -> (String, String) {
         use crate::sage::offers::{build_make_offer, OfferInputs, OfferLeg};
         use crate::sage::spend::WalletSigner;
         use chia_wallet_sdk::types::TESTNET11_CONSTANTS;
@@ -3706,7 +3768,7 @@ mod tests {
             }],
             &[OfferLeg {
                 asset_id: None,
-                amount: 500,
+                amount: requested,
             }],
             maker.puzzle_hash,
             maker.puzzle_hash,
@@ -3715,9 +3777,20 @@ mod tests {
         .unwrap()
     }
 
+    /// Put a freshly-opened database back into the state a PRE-#283 one is in. `open_in_memory`
+    /// has already run the ladder and marked it, so a fixture that only plants a legacy-keyed row
+    /// would be testing an already-migrated database — which is not the case under test.
+    async fn mark_unmigrated(db: &WalletDb) {
+        sqlx::query("PRAGMA user_version = 0")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn a_legacy_keyed_offer_is_rekeyed_onto_its_canonical_id() {
         let db = WalletDb::open_in_memory().await.unwrap();
+        mark_unmigrated(&db).await;
         let (offer, canonical_id) = an_offer();
 
         // The shape a pre-#283 node wrote: the same offer under a coin-set-derived key.
@@ -3752,11 +3825,17 @@ mod tests {
         assert_eq!(db.all_offers().await.unwrap().len(), 1);
     }
 
-    /// The migration runs on EVERY open, so a second pass over already-canonical rows must be a
-    /// no-op rather than churn — and must not lose the row it just re-keyed.
+    /// A row already under its canonical id must come through the re-key unchanged.
+    ///
+    /// This test does NOT prove the `continue` that skips such a row: a delete-and-reinsert of the
+    /// identical row is indistinguishable from a skip at this seam. It is kept for what it does
+    /// catch — an implementation that drops the row it just re-keyed — and idempotence is carried
+    /// instead by [`the_ladder_mark_stops_the_migration_running_again`], which observes the skip
+    /// directly.
     #[tokio::test]
-    async fn rekeying_an_already_canonical_offer_is_a_no_op() {
+    async fn an_already_canonical_offer_survives_the_rekey_unchanged() {
         let db = WalletDb::open_in_memory().await.unwrap();
+        mark_unmigrated(&db).await;
         let (offer, canonical_id) = an_offer();
         db.upsert_offer(&OfferDbRow {
             offer_id: canonical_id.clone(),
@@ -3780,6 +3859,7 @@ mod tests {
     #[tokio::test]
     async fn an_undecodable_offer_row_is_left_untouched() {
         let db = WalletDb::open_in_memory().await.unwrap();
+        mark_unmigrated(&db).await;
         db.upsert_offer(&OfferDbRow {
             offer_id: "1".repeat(64),
             offer: "not-an-offer".into(),
@@ -3793,5 +3873,84 @@ mod tests {
         db.migrate().await.unwrap();
 
         assert!(db.offer(&"1".repeat(64)).await.unwrap().is_some());
+    }
+
+    /// The ladder mark is what stops a one-shot data migration re-reading and re-decoding every
+    /// stored offer on every open, forever.
+    ///
+    /// Observed directly rather than inferred: plant a legacy-keyed row in an ALREADY-marked
+    /// database and require that a further `migrate()` leaves it exactly where it is. Without a
+    /// mark the row would be re-keyed and this fails — which is the point, since "it did nothing"
+    /// is otherwise indistinguishable from "it did the work again and reached the same answer".
+    #[tokio::test]
+    async fn the_ladder_mark_stops_the_migration_running_again() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        // Deliberately NOT `mark_unmigrated`: opening already ran and marked the ladder.
+        let (offer, canonical_id) = an_offer();
+        let legacy_id = "2".repeat(64);
+        db.upsert_offer(&OfferDbRow {
+            offer_id: legacy_id.clone(),
+            offer,
+            status: "active".into(),
+            creation_timestamp: 5,
+            summary_json: "{}".into(),
+        })
+        .await
+        .unwrap();
+
+        db.migrate().await.unwrap();
+
+        assert!(
+            db.offer(&legacy_id).await.unwrap().is_some(),
+            "a marked database must not run the re-key again"
+        );
+        assert!(db.offer(&canonical_id).await.unwrap().is_none());
+    }
+
+    /// The re-key moves rows by deleting them from under the old key and writing them under the
+    /// new one. Committed separately, a failure between those two steps would DESTROY the offer —
+    /// strictly worse than the unreachable-row defect the migration exists to repair, because an
+    /// offer the user made is not rebuildable from chain. So the whole re-key is one transaction.
+    ///
+    /// What this asserts is the observable half: a multi-row re-key lands completely, with every
+    /// offer accounted for and none lost in the move. The crash-mid-transaction half is a
+    /// structural property of `pool.begin()` / `commit()` and is NOT proven here — forcing a
+    /// driver failure at that instant would need failure injection this seam does not have.
+    #[tokio::test]
+    async fn a_multi_row_rekey_lands_completely_with_no_offer_lost() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        mark_unmigrated(&db).await;
+
+        let mut expected = Vec::new();
+        for (i, requested) in [500u64, 700, 900].iter().enumerate() {
+            let (offer, canonical_id) = an_offer_requesting(*requested);
+            db.upsert_offer(&OfferDbRow {
+                offer_id: format!("{i}").repeat(64),
+                offer,
+                status: "active".into(),
+                creation_timestamp: i as i64,
+                summary_json: format!("{{\"requested\":{requested}}}"),
+            })
+            .await
+            .unwrap();
+            expected.push((canonical_id, *requested));
+        }
+        assert_eq!(db.all_offers().await.unwrap().len(), 3);
+
+        db.migrate().await.unwrap();
+
+        assert_eq!(
+            db.all_offers().await.unwrap().len(),
+            3,
+            "no offer may be lost in the move"
+        );
+        for (canonical_id, requested) in expected {
+            let row = db
+                .offer(&canonical_id)
+                .await
+                .unwrap()
+                .expect("every row must have landed under its canonical id");
+            assert_eq!(row.summary_json, format!("{{\"requested\":{requested}}}"));
+        }
     }
 }
