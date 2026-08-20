@@ -49,13 +49,14 @@ use async_trait::async_trait;
 use digstore_core::Bytes32;
 
 use crate::dht_sampling::{NeighbourhoodProbe, SplitMix64};
+use crate::seams::capsule::CapsuleStore;
 use crate::seams::dig_peer::capsule_resolver::{CapsuleKeyResolver, MtlsCapsuleResolveClient};
 use crate::seams::dig_peer::neighbourhood_probe::KeyspaceRouter;
 use crate::seams::dig_peer::{CapsuleWarmer, WarmFailure, WarmOutcome};
 use crate::shared::AnchoredRootResolver;
 use crate::tier0_prefetch::{
-    run_round, should_run_loop, tier0_precache_enabled, DiscardReason, FetchOutcome, LoadSignal,
-    RoundOutcome, RoundRateLimiter, SizeProbe, Tier0Fetcher,
+    run_round, should_run_loop, tier0_precache_enabled, DiscardReason, FetchOutcome, HeldCapsules,
+    LoadSignal, RoundOutcome, RoundRateLimiter, SizeProbe, Tier0Fetcher,
 };
 use dig_sex::{NodeContext, RelevanceWeights};
 
@@ -405,6 +406,36 @@ impl ModulesCacheEvictor for NoopModulesEvictor {
     async fn evict_if_needed(&self) {}
 }
 
+/// The production [`HeldCapsules`]: enumerate `<cache>/modules` and re-derive each held capsule's DHT
+/// content id.
+///
+/// The derivation is `ContentId::capsule(store, root).to_key()` — byte-for-byte the value the
+/// keyspace sampler yields for the same capsule, and the same one
+/// [`VerifiedCapsuleKey`](crate::seams::dig_peer::capsule_resolver::VerifiedCapsuleKey) proves a
+/// provider's preimage against. Deriving it here rather than storing a second index means residency
+/// can never disagree with what the round is comparing against.
+struct NodeHeldCapsules {
+    node: Arc<crate::Node>,
+}
+
+#[async_trait]
+impl HeldCapsules for NodeHeldCapsules {
+    async fn held_content_ids(&self) -> HashSet<[u8; 32]> {
+        self.node
+            .cache_list_cached()
+            .await
+            .iter()
+            .filter_map(|cached| {
+                // A cache directory name that is not canonical 64-hex cannot have been written by
+                // this node and cannot name real content, so it is skipped rather than guessed at.
+                let store = crate::dht::hex64(&cached.store_id)?;
+                let root = crate::dht::hex64(&cached.root)?;
+                Some(*dig_dht::ContentId::capsule(store, root).to_key().as_bytes())
+            })
+            .collect()
+    }
+}
+
 // =================================================================================================
 // The bring-up spawn
 // =================================================================================================
@@ -430,6 +461,9 @@ pub struct Tier0Runtime {
     probe: Arc<dyn NeighbourhoodProbe>,
     size_probe: Arc<dyn SizeProbe>,
     fetcher: Arc<dyn Tier0Fetcher>,
+    /// What this node already holds, re-read once per round so residency tracks a cache that the
+    /// round itself changes.
+    held: Arc<dyn HeldCapsules>,
     node_ctx: NodeContext,
     cache_cap_bytes: u64,
     seed: u64,
@@ -472,12 +506,16 @@ impl Tier0Runtime {
                 resolver: anchor_resolver,
             }),
             warm: Arc::new(WarmerCappedWarm { warmer }),
-            evictor: Arc::new(NodeModulesEvictor { node }),
+            evictor: Arc::new(NodeModulesEvictor {
+                node: Arc::clone(&node),
+            }),
         });
+        let held: Arc<dyn HeldCapsules> = Arc::new(NodeHeldCapsules { node });
         Self {
             probe,
             size_probe,
             fetcher,
+            held,
             node_ctx: NodeContext {
                 peer_id,
                 weights: RelevanceWeights::default(),
@@ -517,6 +555,10 @@ pub fn spawn_tier0_precache(runtime: Tier0Runtime) -> bool {
             ticker.tick().await;
             tick += 1;
             // `tier0_precache_enabled()` is read HERE, every round, so flipping the env flips the round.
+            // Re-read per round, never once at spawn: a round that lands or evicts capsules changes
+            // the very set the NEXT round measures incumbency from, and a snapshot taken at bring-up
+            // would report the empty cache of a fresh node forever.
+            let held = runtime.held.held_content_ids().await;
             let round = run_round(
                 tier0_precache_enabled(),
                 &*runtime.probe,
@@ -525,6 +567,7 @@ pub fn spawn_tier0_precache(runtime: Tier0Runtime) -> bool {
                 &load,
                 &mut rng,
                 &runtime.node_ctx,
+                &held,
                 runtime.cache_cap_bytes,
                 &mut rate,
                 tick,
@@ -826,6 +869,7 @@ mod tests {
                 lookup: Arc::new(FixedLookup(None)),
             }),
             fetcher: Arc::new(fetcher(None, false, warm)),
+            held: Arc::new(NothingHeld),
             node_ctx: NodeContext {
                 peer_id: [0; 32],
                 weights: RelevanceWeights::default(),
@@ -867,6 +911,16 @@ mod tests {
         }
     }
 
+    /// A node holding nothing — the runtime under test never reaches a round, so residency only has
+    /// to be constructible here, not meaningful.
+    struct NothingHeld;
+    #[async_trait]
+    impl HeldCapsules for NothingHeld {
+        async fn held_content_ids(&self) -> HashSet<[u8; 32]> {
+            HashSet::new()
+        }
+    }
+
     /// A cap whose 10% tier-0 slice clears the useful floor, so a round actually samples (and thus
     /// reaches the panicking probe) rather than short-circuiting on small-disk.
     fn running_cap() -> u64 {
@@ -898,6 +952,7 @@ mod tests {
             weights: RelevanceWeights::default(),
         };
 
+        let nothing_held = HashSet::new();
         let round = run_round(
             true,
             &probe,
@@ -906,6 +961,7 @@ mod tests {
             &load,
             &mut rng,
             &node,
+            &nothing_held,
             running_cap(),
             &mut rate,
             1,
