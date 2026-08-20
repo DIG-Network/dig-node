@@ -345,7 +345,7 @@ dig-tls = "0.3"
 #
 # It also re-exports the ONE `CapsuleIdentity` the ecosystem speaks, so this crate never declares its
 # own and never pulls a second major of `dig-store` into the graph.
-dig-sex = "0.2"
+dig-sex = "0.4"
 # The cache/eviction SEAM `dig_sex::TieredPolicy` implements. Declared DIRECTLY rather than reached
 # through `dig-sex`, which re-exports `CapsuleIdentity` alone — naming `EvictionEntry`,
 # `EvictionContext` and the `EvictionPolicy` trait (whose `select_evictions` must be in scope to call)
