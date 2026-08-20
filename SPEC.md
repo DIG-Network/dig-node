@@ -3773,6 +3773,81 @@ the dapp dispatch surface — they are absent from dispatch (fall to `501`) and 
 forward to a delegated signer. The mnemonic is revealed ONLY through the local, password-gated,
 self-origin `/api/export` UI route, never over the dapp/WC surface.
 
+### 16.4. Unattended wallet bootstrap (`autoseed`)
+
+On EVERY start — first install, post-update, and every ordinary boot — the node MUST determine whether
+a mnemonic seed exists and MUST mint one when there is definitely none. The path requires no user
+interaction: no prompt, no password. A user replacing the minted wallet later goes through the ordinary
+import path, which has no special case for an auto-created wallet.
+
+**At-rest format.** An auto-created seed is sealed in a `dig_keystore::opaque` `DIGOP1` container
+(AES-256-GCM, Argon2id) under a 32-byte CSPRNG **device key**. An imported seed is sealed under the
+user's password. Both are the same container; only the key differs. An existing user-password seed MUST
+be opened with the user's password exactly as before and MUST NEVER be re-sealed to the device key.
+Auto-creation applies only when there is no seed at all. The phrase is 24 words from
+`digstore_chain::seed::generate_mnemonic`, over the canonical `entropy → mnemonic → to_seed("")`
+expansion.
+
+**File layout.** All three files are created owner-only (`0600` at open time on Unix; an explicit
+protected `D:P(A;;FA;;;<user>)` DACL on Windows, never the ACL inherited from `%LOCALAPPDATA%`):
+
+| Path | Contents |
+|---|---|
+| `<wallet_dir>/seed.bin` | the sealed mnemonic — format unchanged |
+| `<device_dir>/device.key` | 32 raw CSPRNG bytes, no header |
+| `<wallet_dir>/wallet.meta.json` | `origin`, `created_at` (RFC 3339), `ever_funded` |
+
+`<device_dir>` is `<user_base>/DigNode/device/` — a **SIBLING** of `<wallet_dir>`
+(`<user_base>/DigWallet/`), never a child. **That separation IS the partial-exfiltration boundary and
+MUST NOT be collapsed.** Placing the key inside the wallet directory degrades the seal to a
+well-known-password seal: a file that still carries the `DIGOP1` magic, still passes any "encrypted at
+rest" check, and protects nothing, because the artifact that opens it travels with every copy.
+
+**The security boundary, stated as a limit.** The device key confers **no** protection against an
+attacker executing code as the node's user, nor against an attacker holding the whole disk — both files
+sit on one volume. It protects the seed against copies of the wallet directory made without the device
+key: backups, snapshots, image layers, sync clients, and diagnostic bundles. No sentence in this repo
+may describe it as protecting the seed from local compromise.
+
+**Relationship to NC-2 / NC-3.** NC-2 ("at-rest data is encrypted to the user's keypair") cannot apply
+to this artifact, for a structural reason rather than an effort one: **the seed IS the root key**, so
+there is nothing to encrypt it to until it exists. This is the bootstrap case that necessarily precedes
+the identity, not an exemption — the same crate, the same container and the same primitives are used,
+under the strongest key available before an identity exists, and the artifact converges onto NC-2's
+shape by re-seal in place once a user password exists. NC-3 is satisfied in full: the files live under
+the per-user, non-roaming base directory and are genuinely encrypted at rest.
+
+**Failure behaviour — every arm fails closed, and none of them writes.** `try_exists()` is used
+throughout; `Path::exists()` MUST NOT appear on this path, because it reports a metadata failure as a
+plain "absent" and would convert a transient read error into an overwritten wallet.
+
+| # | Condition | Behaviour |
+|---|---|---|
+| 1 | the seed path's existence cannot be determined | refuse; create nothing, including the device key |
+| 2 | seed present, device key absent or unreadable | `Orphaned` — **never mint a key**; leave both files untouched |
+| 3 | seed present and opens under the device key | normal start; nothing written |
+| 4 | seed present and does not open | leave it exactly as found; a file that fails to decrypt is still evidence of a wallet |
+| 5 | both absent | create the device key, then the seed, both `create_new`; a lost race adopts the winner and deletes nothing |
+| 6 | permissions cannot be established | remove the partial file and refuse; a secret is never left at an unproven path |
+
+There is deliberately **no fallback**. If the device key cannot be established the node runs
+**wallet-less and says so**; it does not degrade to plaintext and it does not prompt. A bootstrap
+failure is never fatal to the node — serving content has never required a wallet.
+
+**Origin marking and the funded latch.** `origin` is one of `auto` (machine-created, the 24 words never
+shown to a human), `auto-acknowledged` (auto-created and since revealed to the user), or `imported`.
+`ever_funded` is a **monotonic latch** set on the first observation of a non-zero balance and NEVER
+cleared. A wallet may be described as disposable ONLY when `origin` is `auto` AND `ever_funded` is
+false. An absent or unparsable `wallet.meta.json` MUST answer "not disposable". A momentarily-zero or
+unreadable balance is not evidence a wallet never mattered.
+
+**The recovery gap.** An `origin: auto` wallet's recovery phrase has never been displayed to anyone, so
+loss of the disk is loss of the funds — inherent to the no-interaction mandate. Clients MUST surface a
+phrase-reveal/replace affordance for such a wallet; `auto-acknowledged` records that it was shown.
+
+**Secret hygiene.** The mnemonic, the seed, the device key and any derivative MUST NEVER reach a
+`tracing` field or message. `DeviceKey` implements no `Debug`, `Display` or `Serialize`.
+
 ---
 
 ## 17. Outgoing-bandwidth throttle and redirect-on-saturation
