@@ -3824,7 +3824,7 @@ plain "absent" and would convert a transient read error into an overwritten wall
 | # | Condition | Behaviour |
 |---|---|---|
 | 1 | the seed path's existence cannot be determined | refuse; create nothing, including the device key |
-| 2 | seed present, device key absent or unreadable | `Orphaned` — **never mint a key**; leave both files untouched |
+| 2 | seed present, device key absent or unreadable | **never mint a key**; leave both files untouched. Classified by `origin`: `auto`/`auto-acknowledged` → `Orphaned`; `imported` or an absent sidecar → `Locked` |
 | 3 | seed present and opens under the device key | normal start; nothing written |
 | 4 | seed present and does not open | leave it exactly as found; a file that fails to decrypt is still evidence of a wallet |
 | 5 | both absent | create the device key, then the seed, both `create_new`; a lost race adopts the winner and deletes nothing |
@@ -3837,9 +3837,25 @@ failure is never fatal to the node — serving content has never required a wall
 **Origin marking and the funded latch.** `origin` is one of `auto` (machine-created, the 24 words never
 shown to a human), `auto-acknowledged` (auto-created and since revealed to the user), or `imported`.
 `ever_funded` is a **monotonic latch** set on the first observation of a non-zero balance and NEVER
-cleared. A wallet may be described as disposable ONLY when `origin` is `auto` AND `ever_funded` is
-false. An absent or unparsable `wallet.meta.json` MUST answer "not disposable". A momentarily-zero or
-unreadable balance is not evidence a wallet never mattered.
+cleared; `latch_ever_funded` persists it and is idempotent. A wallet may be described as disposable
+ONLY when `origin` is `auto` AND `ever_funded` is false. An absent or unparsable `wallet.meta.json`
+MUST answer "not disposable". A momentarily-zero or unreadable balance is not evidence a wallet never
+mattered, which is why this is a stored latch rather than a live predicate.
+
+> **NOT YET SATISFIED — no balance observer calls `latch_ever_funded` today.** The latch persists
+> correctly when called and is covered against disk, but nothing in the balance-read path calls it, so
+> in the shipped build `ever_funded` remains `false` and a funded auto-created wallet is still reported
+> as disposable. Wiring the balance observer is required before any surface acts on disposability. This
+> paragraph states the intended contract; the sentence above is what is *implemented*, and the two must
+> not be conflated.
+
+**The device key and the wallet directory are a COUPLED PAIR.** `<device_dir>` and `<wallet_dir>` are
+meaningful only together: neither opens the seed alone. Any operation that removes one MUST remove or
+preserve both — an uninstall-with-data path that deletes `<wallet_dir>` and leaves `<device_dir>`
+strands a useless key, and one that deletes `<device_dir>` alone **permanently destroys an
+auto-created wallet whose phrase has never been shown to anyone** (see the recovery gap below). The
+two paths are currently defined locally in `crates/dig-wallet/src/autoseed.rs` and are published by no
+shared constant; a `dig-constants` home for the pair is the correct fix and is not done here.
 
 **The recovery gap.** An `origin: auto` wallet's recovery phrase has never been displayed to anyone, so
 loss of the disk is loss of the funds — inherent to the no-interaction mandate. Clients MUST surface a
