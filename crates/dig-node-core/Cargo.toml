@@ -343,10 +343,17 @@ dig-tls = "0.3"
 # only the facts. The in-tree `relevance` module and `tier0_prefetch::effective_tier` moved there
 # verbatim and are now consumed as `dig_sex::*`.
 #
-# It also brings `dig-store-cache`'s `EvictionPolicy` seam and the ONE `CapsuleIdentity` the ecosystem
-# speaks (re-exported, so this crate declares neither). `dig_sex::TieredPolicy` is the first non-LRU
-# implementation of that seam, and the module sweep here is its first consumer.
+# It also re-exports the ONE `CapsuleIdentity` the ecosystem speaks, so this crate never declares its
+# own and never pulls a second major of `dig-store` into the graph.
 dig-sex = "0.2"
+# The cache/eviction SEAM `dig_sex::TieredPolicy` implements. Declared DIRECTLY rather than reached
+# through `dig-sex`, which re-exports `CapsuleIdentity` alone — naming `EvictionEntry`,
+# `EvictionContext` and the `EvictionPolicy` trait (whose `select_evictions` must be in scope to call)
+# requires the crate itself. The version is pinned to the one `dig-sex` resolves, so the `CapsuleIdentity`
+# this crate builds and the one `TieredPolicy` matches on are the SAME type; a split would silently
+# fail to unify. `dig_sex::TieredPolicy` is the first non-LRU implementation of the seam, and the
+# module sweep here is its first consumer.
+dig-store-cache = "0.1.1"
 # The mTLS peer-RPC LISTENER (server side): present the node cert + REQUIRE a client cert (peer_id
 # enforced). rustls/tokio-rustls with ring only (no OpenSSL/aws-lc for OUR usage), matching dig-nat.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

@@ -37,7 +37,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::relevance::CacheTier;
+use dig_sex::CacheTier;
 
 /// The sidecar file name that holds a store's persisted [`CacheTier`]. A leading dot marks it as
 /// metadata, and its lack of a capsule extension keeps [`crate::capsule_key::cached_root_stem`] from

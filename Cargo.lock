@@ -2311,6 +2311,7 @@ dependencies = [
  "dig-rpc-protocol",
  "dig-sex",
  "dig-social-profile",
+ "dig-store-cache",
  "dig-tls",
  "digstore-chain",
  "digstore-compiler",
@@ -2343,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.129.0"
+version = "0.130.0"
 dependencies = [
  "async-trait",
  "axum",

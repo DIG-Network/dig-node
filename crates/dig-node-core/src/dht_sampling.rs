@@ -3,10 +3,10 @@
 //!
 //! This module answers ONE question: *which `.dig` store keys are worth even
 //! considering for speculative precache?* It produces the CANDIDATE SET that
-//! feeds [`crate::relevance::RelevanceInputs`] (the `content_id` + an untrusted
+//! feeds [`dig_sex::RelevanceInputs`] (the `content_id` + an untrusted
 //! `known_provider_count`); it does NOT score candidates (that is
-//! [`crate::relevance`], child #1) and does NOT select or fetch them (that is
-//! [`crate::tier0_selector`], child #3, and the fetch loop, child #4).
+//! [`dig_sex::relevance`], child #1) and does NOT select or fetch them (that is
+//! [`dig_sex::select_within_capacity`], child #3, and the fetch loop, child #4).
 //!
 //! # The two halves
 //!
@@ -85,7 +85,7 @@ pub const DEFAULT_SAMPLE_POINTS: usize = 8;
 pub struct ObservedCandidate {
     /// The 32-byte content KEY (a point in the DHT keyspace — already the
     /// domain-separated `ContentId::to_key` value). Fed verbatim as
-    /// [`crate::relevance::RelevanceInputs::content_id`] for XOR proximity.
+    /// [`dig_sex::RelevanceInputs::content_id`] for XOR proximity.
     pub content_id: [u8; 32],
     /// How many providers THIS peer claims to know for the key. Untrusted and
     /// individually gameable — reconciled across peers, never taken as-is.
@@ -122,7 +122,7 @@ impl Default for QuorumPolicy {
     }
 }
 
-/// An admitted candidate, ready to become a [`crate::relevance::RelevanceInputs`].
+/// An admitted candidate, ready to become a [`dig_sex::RelevanceInputs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
     /// The content key (keyspace point).

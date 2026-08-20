@@ -177,12 +177,12 @@ fn resolve_backfill_on_miss(v: Option<&str>) -> bool {
 /// Whether the INBOUND-DEMAND whole-capsule cache trigger (#1990) is enabled: when a remote PEER
 /// requests a resource from a store this node does NOT hold, ALSO background-pull the whole `.dig`
 /// so a subsequent request is served locally, tagged
-/// [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand). Resolved from
+/// [`Tier1Demand`](dig_sex::CacheTier::Tier1Demand). Resolved from
 /// `DIG_NODE_INBOUND_DEMAND_CACHE`; **default OFF** — only an explicit truthy value
 /// (`on`/`1`/`true`/`yes`, case-insensitive) enables it.
 ///
 /// # Why the PULL defaults OFF while the demand SIGNAL is always recorded
-/// Recording inbound demand (the count + [`Tier1Demand`](crate::relevance::CacheTier::Tier1Demand)
+/// Recording inbound demand (the count + [`Tier1Demand`](dig_sex::CacheTier::Tier1Demand)
 /// tag that feeds relevance + eviction precedence) is free of the amplification concern — it holds no
 /// content and pulls nothing. The whole-capsule PULL on peer demand is a DIFFERENT matter: a stranger
 /// naming an arbitrary store could otherwise drive this node into pulling + caching + DHT-announcing
