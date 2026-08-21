@@ -724,6 +724,8 @@ pub struct NodeContent {
     /// NAT runtime the other peer legs use; `None` on the FFI/base path, where a miss simply answers
     /// from the DHT alone exactly as it always did.
     forwarded_ask: std::sync::OnceLock<Arc<dyn ForwardedAsk>>,
+    /// The recursion bounds the forwarded ask is decided against, installed with the leg itself.
+    recursion_config: std::sync::OnceLock<dig_sex::discovery::RecursionConfig>,
     /// A THIRD per-requestor limiter, in front of the forwarded ask's OUTBOUND fan-out
     /// (dig_ecosystem#3128).
     ///
@@ -1032,6 +1034,7 @@ impl NodeContent {
             miss_rate_limiter: crate::rate_limit::MissRateLimiter::with_defaults(),
             proxy_rate_limiter: crate::rate_limit::MissRateLimiter::with_proxy_defaults(),
             forwarded_ask: std::sync::OnceLock::new(),
+            recursion_config: std::sync::OnceLock::new(),
             relay_rate_limiter: crate::rate_limit::MissRateLimiter::with_relay_defaults(),
             forwarded_ask_slots: Arc::new(tokio::sync::Semaphore::new(
                 MAX_CONCURRENT_FORWARDED_ASKS,
@@ -1041,9 +1044,19 @@ impl NodeContent {
     }
 
     /// Install the forwarded-ask leg (dig_ecosystem#3128) — the piece only the composition root can
-    /// build, because it needs the live mTLS identity + NAT runtime. Idempotent: a second call is
-    /// ignored, so a re-wire can never swap the leg out from under an in-flight miss.
-    pub(crate) fn set_forwarded_ask(&self, ask: Arc<dyn ForwardedAsk>) {
+    /// build, because it needs the live mTLS identity + NAT runtime — together with the recursion
+    /// bounds it will be decided against. Idempotent: a second call is ignored, so a re-wire can never
+    /// swap the leg out from under an in-flight miss.
+    ///
+    /// The config is passed IN rather than read from the environment at decision time, so the
+    /// amplification posture is fixed once at start-up and cannot change under a running node — and so
+    /// that the decision is exercisable without process-global state.
+    pub(crate) fn set_forwarded_ask(
+        &self,
+        ask: Arc<dyn ForwardedAsk>,
+        config: dig_sex::discovery::RecursionConfig,
+    ) {
+        let _ = self.recursion_config.set(config);
         let _ = self.forwarded_ask.set(ask);
     }
 
@@ -1180,12 +1193,10 @@ impl NodeContent {
         // installed at all, so the refusal costs nothing on the miss path and the answer is the
         // shipped DHT-only one.
         if forward_on_miss_enabled() {
-            content.set_forwarded_ask(Arc::new(NatForwardedAsk::new(
-                node,
-                runtime,
-                network_id,
-                stun_server,
-            )));
+            content.set_forwarded_ask(
+                Arc::new(NatForwardedAsk::new(node, runtime, network_id, stun_server)),
+                recursion_config(),
+            );
         }
         // The discovery-cache escape hatch stays UNBOUND until the release-first cascade lets this
         // crate resolve dig-dht 0.12 (see [`DiscoveryCache`]); binding it is one `set_discovery_cache`
@@ -1364,7 +1375,9 @@ impl NodeContent {
         let Some(ask) = self.forwarded_ask.get() else {
             return Vec::new();
         };
-        let config = recursion_config();
+        // Installed with the leg, so a node that has an asker always has the bounds that asker was
+        // admitted under; the fallback is the crate's DISABLED default, which forwards nothing.
+        let config = self.recursion_config.get().copied().unwrap_or_default();
         let pool = self.dialable_pool();
 
         // `decide_forward` compares peers by identity, and both exclusions are stated over the SAME
@@ -2105,7 +2118,7 @@ pub struct HopBudget(Option<u64>);
 impl HopBudget {
     /// Read the budget out of a request's `params`. `None` inside means the field was PRESENT and
     /// could not be read as a hop count.
-    pub(crate) fn from_params(params: &Value) -> Self {
+    pub fn from_params(params: &Value) -> Self {
         match params.get("redirect_depth") {
             None | Some(Value::Null) => Self(Some(0)),
             Some(value) => Self(value.as_u64()),
@@ -2113,7 +2126,7 @@ impl HopBudget {
     }
 
     /// A question this node is asking for the first time — nothing spent.
-    pub(crate) fn fresh() -> Self {
+    pub fn fresh() -> Self {
         Self(Some(0))
     }
 
@@ -2549,7 +2562,7 @@ pub(crate) mod tests {
     fn the_forwarded_ask_is_off_unless_explicitly_enabled() {
         for enabled in ["on", "1", "true", "yes", "ON", " True ", "YES"] {
             assert!(
-                resolve_forward_on_miss(Some(enabled)),
+                resolve_recursion_config(Some(enabled)).enabled,
                 "{enabled:?} should enable the forwarded ask"
             );
         }
@@ -2562,19 +2575,19 @@ pub(crate) mod tests {
             Some("no"),
         ] {
             assert!(
-                !resolve_forward_on_miss(disabled),
+                !resolve_recursion_config(disabled).enabled,
                 "{disabled:?} should leave the forwarded ask OFF"
             );
         }
         // The one that matters most, stated on its own so it cannot be lost in a loop: no config at
         // all means no amplification.
         assert!(
-            !resolve_forward_on_miss(None),
+            !resolve_recursion_config(None).enabled,
             "DEFAULT IS OFF — an unconfigured node must never forward"
         );
         // And an unrecognised value is OFF, not on: a typo must fail closed.
         assert!(
-            !resolve_forward_on_miss(Some("enable")),
+            !resolve_recursion_config(Some("enable")).enabled,
             "an unrecognised value must fail CLOSED"
         );
     }
