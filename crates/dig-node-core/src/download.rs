@@ -90,7 +90,26 @@ pub const CONTENT_MISS_RATE_LIMITED: i64 = -32003;
 /// not-found means the answer is settled and the caller should stop; this means the answer is
 /// unknown and a retry is meaningful. A caller that cannot tell them apart treats one slow peer as
 /// proof of absence.
-pub const CONTENT_MISS_INCONCLUSIVE: i64 = -32009;
+/// # Why this number, and why it is PROVISIONAL
+///
+/// The taxonomy this code belongs to is owned by `dig-rpc-protocol`, not by this crate
+/// (`SYSTEM.md`: the error-code taxonomy is defined ONCE there, release-first, then adopted). This
+/// const exists only until that crate declares the condition and this node can name
+/// `ErrorCode::ContentMissInconclusive` instead. It is asserted against the canonical taxonomy by
+/// `no_local_wire_code_collides_with_a_different_canonical_code`.
+///
+/// Two numbers were tried and both were already assigned, which is the whole reason the guard test
+/// exists:
+///
+/// * `-32009` is `RangeMetadataUnrepresentable`, which a client MUST treat as holder-fatal. That is
+///   the OPPOSITE instruction to this code, so a client receiving it cannot choose correctly: it
+///   either blacklists a holder that was merely uncertain, or re-asks one that can never serve.
+/// * `-32015` — the code `dig-rpc-protocol` 0.9.0 assigns, reading only its own list — is
+///   `METADATA_TOO_LARGE`, a released, docs.dig.net-catalogued
+///   dig-node code. Same collision, one number to the right.
+///
+/// `-32017` is the first code free in BOTH taxonomies and unused anywhere in the ecosystem.
+pub const CONTENT_MISS_INCONCLUSIVE: i64 = -32017;
 
 /// The hard cap on how many holder candidates a single [`CONTENT_REDIRECT`] names
 /// (dig_ecosystem#2007). A redirect NAMES candidates; this node does NOT dial/probe them

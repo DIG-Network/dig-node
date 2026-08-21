@@ -2961,6 +2961,7 @@ method runs, and it MUST NOT be conflated with the wallet's own `-32043` egress 
 | -32009 | `RANGE_METADATA_UNREPRESENTABLE` | node | A holder cannot frame a conforming range stream for this resource (an inclusion proof over `MAX_INCLUSION_PROOF_B64` is the real case): the resource's own range metadata cannot fit a conforming frame, so this holder can NEVER serve the range. Named explicitly on the peer range-stream serve instead of truncating the stream with a bare `Err`. Matches `dig_rpc_protocol::ErrorCode::RangeMetadataUnrepresentable` (`-32009`). |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32015 | `METADATA_TOO_LARGE` | node | `dig.getMetadata` refused: the publisher metadata section is too large or too complex to render safely. Refused when the ENCODED section exceeds `METADATA_SECTION_MAX_BYTES` (3 MiB) or its `custom` exceeds `MAX_CUSTOM_ENTRIES`/`MAX_CUSTOM_JSON_DEPTH`/`MAX_CUSTOM_JSON_ELEMENTS` (both checked BEFORE decode, #2160), or the RENDERED body exceeds `METADATA_RESPONSE_MAX_BYTES` (3 MiB, #2145). This section is rendered WHOLE — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so an oversized/hostile capsule is refused with this bounded error rather than expanded ~16× in memory or blasted into a ~100 MB response (§5.5.1). A normal (kilobyte) metadata section is served unchanged. |
+| -32017 | `CONTENT_MISS_INCONCLUSIVE` | node | No holder was named AND the search could not establish that there is none: a consulted leg timed out, was unreachable, or refused uninformatively (§10.4.5). The OPPOSITE instruction to a plain not-found — a not-found says stop looking, this says the question was not answered and the request MAY be retried. Collapsing the two let ONE slow peer manufacture an authoritative absence and, since a hop relays its answer, propagate it downwards. Owned by `dig-rpc-protocol`; `-32017` is provisional pending its declaration, and is the first number free of both that taxonomy and this table. |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
 | -32022 | *(reserved: onion `onion_hops_out_of_range`)* | — | Reserved for the onion-routing contract. |
@@ -3098,8 +3099,14 @@ can point at it. No new verb, address struct or result type is introduced — th
 - **A NOT-FOUND MUST cascade; an UNPROVEN absence MUST NOT (dig-node#273).** A node whose search named
   no holder MUST answer:
   - the plain not-found, when every leg it consulted answered — the absence is established; or
-  - `-32009` `CONTENT_MISS_INCONCLUSIVE`, when any consulted leg timed out, refused, or was
+  - `-32017` `CONTENT_MISS_INCONCLUSIVE`, when any consulted leg timed out, refused, or was
     unreachable — the absence is unproven and the request MAY be retried.
+
+  The error-code taxonomy is owned by the `dig-rpc-protocol` crate, not by this document: this repo
+  RESTATES the number for readability and MUST NOT be read as assigning it. `-32017` is provisional
+  until that crate declares the condition, because both numbers proposed before it were already
+  assigned — `-32009` to `RANGE_METADATA_UNREPRESENTABLE` (holder-fatal, the opposite instruction) and
+  `-32015` to this node's own released `METADATA_TOO_LARGE`. `no_local_wire_code_collides_with_a_different_canonical_code` holds the property mechanically.
 
   A node that consulted NO peer (recursion disabled, budget refused, no slot free, a duplicate walk)
   MUST answer the plain not-found: not asking establishes nothing new, so the answer stands on the DHT

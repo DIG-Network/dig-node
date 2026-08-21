@@ -4651,6 +4651,95 @@ mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
 
+    /// Every JSON-RPC error number this node PUTS ON THE WIRE, paired with the condition it names.
+    ///
+    /// Keyed by CONDITION, not by const identifier, so the two spellings of `-32004`
+    /// ([`RESOURCE_UNAVAILABLE`] and [`RESOURCE_NOT_AVAILABLE`]) are correctly read as one condition
+    /// under two names rather than as a collision.
+    ///
+    /// Deliberately NOT exhaustive yet: `content_serve::SERVE_UNREADABLE` (`-32000`) specialises the
+    /// canonical `SERVER_ERROR`, and the chat band (`-32050`..`-32052`) is undeclared upstream
+    /// entirely. Both are pre-existing and out of this change; adding them is a follow-up that has to
+    /// resolve the condition, not the table.
+    const LOCAL_WIRE_CODES: &[(i64, &str)] = &[
+        (crate::download::CONTENT_MISS_RATE_LIMITED, "CONTENT_MISS_RATE_LIMITED"),
+        (crate::download::RESOURCE_UNAVAILABLE, "RESOURCE_UNAVAILABLE"),
+        (RESOURCE_NOT_AVAILABLE, "RESOURCE_UNAVAILABLE"),
+        (ROOT_NOT_ANCHORED, "ROOT_NOT_ANCHORED"),
+        (crate::download::CONTENT_REDIRECT, "CONTENT_REDIRECT"),
+        (METADATA_TOO_LARGE, "METADATA_TOO_LARGE"),
+        (
+            crate::seams::capsule::push_capsule::PUSH_PENDING_LIMITED,
+            "PUSH_PENDING_LIMITED",
+        ),
+        (
+            crate::download::CONTENT_MISS_INCONCLUSIVE,
+            "CONTENT_MISS_INCONCLUSIVE",
+        ),
+        (CONTROL_UNAUTHORIZED, "UNAUTHORIZED"),
+        (CONTROL_NOT_SUPPORTED, "NOT_SUPPORTED"),
+        (CONTROL_ERROR, "CONTROL_ERROR"),
+    ];
+
+    /// **Proves:** no number this node emits is already spoken for — neither by
+    /// `dig_rpc_protocol`'s canonical taxonomy under a DIFFERENT name, nor by a different local
+    /// condition.
+    ///
+    /// **Catches:** the whole defect class that produced this test, twice in one review. The wire
+    /// number is the only thing a remote client sees, so two conditions sharing one number leave it
+    /// unable to choose between opposite instructions, and no retry policy can recover — the
+    /// ambiguity is in the contract. Both instances were found by hand, one number apart:
+    ///
+    /// * `-32009` (`RANGE_METADATA_UNREPRESENTABLE`, holder-fatal) proposed for
+    ///   `CONTENT_MISS_INCONCLUSIVE` (keep looking) — caught by the canonical leg;
+    /// * `-32015` (`METADATA_TOO_LARGE`, released and docs.dig.net-catalogued) is what
+    ///   `dig-rpc-protocol` 0.9.0 assigns `ContentMissInconclusive`, having read only its own list —
+    ///   caught by the local leg, which is why one leg alone is not enough. A test asserting merely
+    ///   `!= -32009` passes on the second bug.
+    ///
+    /// **Fixture note:** the canonical leg compares by `(number, machine_code)` rather than by
+    /// number alone. Comparing numbers only would flag every code this node legitimately SHARES
+    /// with the taxonomy (`-32004`, `-32005`, `-32008`, ...) and the test would have to be weakened
+    /// to a small allowlist — which is how it would stop seeing new entries.
+    #[test]
+    fn no_local_wire_code_collides_with_a_different_canonical_code() {
+        // Side effects first: a table that has silently shrunk to nothing, or lost the code under
+        // review, would make every assertion below vacuously true.
+        assert!(
+            LOCAL_WIRE_CODES.len() >= 11,
+            "the local wire-code table lost entries; a shrinking table makes this guard vacuous"
+        );
+        assert!(
+            LOCAL_WIRE_CODES
+                .iter()
+                .any(|(_, name)| *name == "CONTENT_MISS_INCONCLUSIVE"),
+            "the code this guard exists for is absent from the table"
+        );
+        assert!(
+            dig_rpc_protocol::ErrorCode::ALL.len() >= 20,
+            "the canonical taxonomy read as near-empty; the canonical leg would pass on anything"
+        );
+
+        for (number, condition) in LOCAL_WIRE_CODES {
+            for canonical in dig_rpc_protocol::ErrorCode::ALL {
+                assert!(
+                    i64::from(canonical.code()) != *number || canonical.machine_code() == *condition,
+                    "local {condition} = {number} is already canonically {} — a client cannot tell                      the two apart, and they do not mean the same thing",
+                    canonical.machine_code()
+                );
+            }
+
+            let clashing_local = LOCAL_WIRE_CODES
+                .iter()
+                .find(|(other_number, other)| other_number == number && other != condition);
+            assert!(
+                clashing_local.is_none(),
+                "local {condition} = {number} collides with local {}",
+                clashing_local.map(|(_, name)| *name).unwrap_or_default()
+            );
+        }
+    }
+
     /// A per-THREAD counting allocator, installed process-wide only for the test binary.
     ///
     /// The #2160 acceptance bar is MEASURED, not reasoned: the peak-RSS test drives one cold decode
