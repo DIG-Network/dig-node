@@ -1174,6 +1174,61 @@ fn budget_ms_keeps_absent_distinct_from_zero_and_from_a_granted_value() {
     );
 }
 
+/// **Proves:** `budget_ms: 0` is an INSTRUCTION, not merely a small number — a hop granted no time
+/// asks nobody, and says so by refusing to claim the absence.
+///
+/// **Fixture design — ONE actor varies, and the control is truthful.** Both arms are the same node,
+/// the same content, the same peer, the same identity-free request; the only difference is the
+/// budget on the wire. The granted arm is the control that proves the node WOULD have asked, so the
+/// exhausted arm's silence is a decision rather than a node that never forwards at all — which is
+/// the shape a fixture without a control cannot tell apart, and the stock posture is "never
+/// forwards", so that confusion is the likely one rather than an exotic one.
+///
+/// **Side effects are asserted BEFORE the outcome.** The ask count comes first: an implementation
+/// that asked onward with no time and then reported inconclusive because everything timed out would
+/// satisfy the conclusiveness assertion while doing precisely the thing an exhausted budget forbids
+/// — spending a downstream peer's bandwidth on time it was never granted.
+#[tokio::test]
+async fn an_exhausted_budget_asks_nobody_and_does_not_claim_the_absence() {
+    let cid = content();
+
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+    let exhausted = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "budget_ms": 0,
+    }));
+    let located = pc
+        .locate_holders(&cid, exhausted, &RequestorId::Local)
+        .await;
+
+    assert_eq!(
+        ask.asked().len(),
+        0,
+        "a hop granted zero time must not ask onward - relaying on time it was never given is the          amplification the budget exists to bound"
+    );
+    assert!(
+        !located.establishes_absence(),
+        "and having asked nobody, it has established nothing: reporting a proven absence here turns          one exhausted hop into an authoritative not-found for every reader below it"
+    );
+
+    // CONTROL: the same node, the same everything, a budget that is merely SMALL rather than spent.
+    let control_ask = RecordingAsk::answering(Vec::new());
+    let (control, _dir2) = engine(Vec::new(), &[1], Some(control_ask.clone()));
+    let granted = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "budget_ms": 4_000,
+    }));
+    control
+        .locate_holders(&cid, granted, &RequestorId::Local)
+        .await;
+    assert_eq!(
+        control_ask.asked().len(),
+        1,
+        "the node DOES forward when granted time, so the exhausted arm above measured a decision          and not a node that simply never asks"
+    );
+}
+
 // -- The same ask is walked once (dig-node#273) ----------------------------------------------------
 
 /// **Proves:** the same ask arriving twice by different paths is forwarded only once.
