@@ -3748,14 +3748,24 @@ impl Node {
             if let Some(pc) = self.p2p_content() {
                 if let Some(content) = download::availability_content_id(store, root, rk) {
                     if pc.allow_miss_lookup(requestor) {
-                        let providers = pc.locate_holders(&content, budget, requestor).await;
-                        if !providers.is_empty() {
-                            if let Some(obj) = answer.as_object_mut() {
+                        let located = pc.locate_holders(&content, budget, requestor).await;
+                        if let Some(obj) = answer.as_object_mut() {
+                            if !located.is_empty() {
                                 obj.insert(
                                     "providers".into(),
-                                    download::providers_json(&providers),
+                                    download::providers_json(&located.candidates()),
                                 );
                             }
+                            // Say whether the ABSENCE was established, not merely that no holder was
+                            // named (dig-node#273). A hop reads this to tell "my subtree does not have
+                            // it" from "my subtree did not answer", which is what stops one slow peer
+                            // downstream becoming an authoritative absence upstream. Additive: a peer
+                            // running an older build omits it, and a reader that finds it absent falls
+                            // back to today's tolerant reading.
+                            obj.insert(
+                                "absence_established".into(),
+                                serde_json::Value::Bool(located.establishes_absence()),
+                            );
                         }
                     }
                 }

@@ -23,7 +23,7 @@ name = "dig-node-core"
 # out-of-workspace implementor; this crate is consumed in-workspace only and is pre-1.0, so it is a
 # MINOR bump under SemVer's 0.x rule -- recorded here rather than letting the number imply the trait
 # surface held still.
-version = "0.49.0"
+version = "0.50.0"
 edition = "2021"
 license = "GPL-2.0-only"
 description = "The canonical DIG node ENGINE library (crate `dig_node_core`): the JSON-RPC dispatch (`handle_rpc`, the same contract as rpc.dig.net), local-first content serve/fetch/redirect from LOCAL .dig store modules (via digstore_host::serve_blind), chain-anchored-root resolution, chain-watch + subscriptions + generation gap-fill, the LRU cache, and the full P2P stack. Shared UNCHANGED by both host shells: the `dig-node` OS-service binary (dig-node-service) and the DIG Browser's in-process cdylib (dig-runtime). Native Rust so the compiled-module serve path works."
@@ -299,7 +299,7 @@ dig-pex = "0.1"
 # `seams/dig_peer/module_anchor.rs` (`ChainAnchoredModuleVerifier`). NOTE the `testkit` feature is
 # deliberately NOT enabled: it is what makes the fail-OPEN `AcceptAnyModuleAnchor` nameable, and this
 # crate's anchor gate is the reshare path's ONLY root of trust.
-dig-download = "0.17"
+dig-download = "0.18"
 # -- The shared peer client (#1283/#1576) -------------------------------------------------------------
 # `DigPeer` — the ONE DIG Network peer client: peer_id-pinned mTLS over the full NAT ladder plus typed
 # RPC. Depended on DIRECTLY (not only transitively through dig-download) because dig-node supplies the
@@ -402,7 +402,7 @@ rcgen = "0.13"
 #
 # Pinned by the `the_fail_open_anchor_verifier_is_not_reachable_from_a_production_build` test, which
 # fails if `testkit` ever appears on the production entry.
-dig-download = { version = "0.17", features = ["testkit"] }
+dig-download = { version = "0.18", features = ["testkit"] }
 # Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
 # serve-observability tests (#1595) assert what an operator would actually see in the node log —
 # and that no payload byte or proof ever reaches it.

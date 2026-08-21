@@ -10,13 +10,16 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dig_dht::{CandidateAddr, ContentId, PeerId};
 use dig_download::testkit::{mock_peer_hex, MockContent, MockProviderLocator, MockRangeTransport};
 use dig_download::ProviderRecord;
 
-use crate::download::{DiscoveryCache, HopBudget, MissMode, NodeContent, MAX_REDIRECT_PROVIDERS};
+use crate::download::{
+    DiscoveryCache, HopBudget, MissMode, MissOutcome, NodeContent, MAX_REDIRECT_PROVIDERS,
+};
 use dig_sex::discovery::RecursionConfig;
 
 /// The recursion bounds every test here runs under: the canonical crate's, switched ON.
@@ -32,7 +35,7 @@ pub(crate) fn recursion() -> RecursionConfig {
     }
 }
 use crate::rate_limit::RequestorId;
-use crate::seams::dig_peer::ForwardedAsk;
+use crate::seams::dig_peer::{AskOutcome, ForwardedAsk, MAX_FORWARDED_ASK_BUDGET};
 
 /// A [`ForwardedAsk`] double that answers every peer with `answer`, recording each ask it received.
 ///
@@ -42,6 +45,10 @@ use crate::seams::dig_peer::ForwardedAsk;
 pub(crate) struct RecordingAsk {
     answer: Vec<ProviderRecord>,
     asked: Mutex<Vec<(String, u64)>>,
+    /// The wall-clock budget each ask was granted, in arrival order — so a test can assert the
+    /// budget a hop HANDS DOWN rather than only that it asked. Without this the budget arithmetic
+    /// would rest on a call's absence instead of its content.
+    budgets: Mutex<Vec<Duration>>,
 }
 
 impl RecordingAsk {
@@ -49,6 +56,7 @@ impl RecordingAsk {
         Arc::new(Self {
             answer,
             asked: Mutex::new(Vec::new()),
+            budgets: Mutex::new(Vec::new()),
         })
     }
 
@@ -58,6 +66,11 @@ impl RecordingAsk {
 
     pub(crate) fn asked(&self) -> Vec<(String, u64)> {
         self.asked.lock().expect("recorder lock").clone()
+    }
+
+    /// The budgets granted, in arrival order.
+    fn budgets(&self) -> Vec<Duration> {
+        self.budgets.lock().expect("recorder lock").clone()
     }
 }
 
@@ -69,12 +82,14 @@ impl ForwardedAsk for RecordingAsk {
         _addrs: &[SocketAddr],
         _content: &ContentId,
         next_depth: u64,
-    ) -> Vec<ProviderRecord> {
+        budget: Duration,
+    ) -> AskOutcome {
+        self.budgets.lock().expect("recorder lock").push(budget);
         self.asked
             .lock()
             .expect("recorder lock")
             .push((peer.to_string(), next_depth));
-        self.answer.clone()
+        AskOutcome::Answered(self.answer.clone())
     }
 }
 
@@ -165,6 +180,73 @@ fn engine_identified(
     (content, dir)
 }
 
+/// A [`ProviderLocator`] that answers with a fixed slate and COUNTS how often it was walked.
+///
+/// The stock `MockProviderLocator` cannot report its call count, which is what forced an earlier
+/// version of the cache test onto a proxy assertion. Counting the walk directly is the difference
+/// between proving "rediscovery was skipped" and proving "something was skipped".
+#[derive(Clone)]
+struct CountingLocator {
+    answer: Vec<ProviderRecord>,
+    lookups: Arc<Mutex<usize>>,
+}
+
+impl CountingLocator {
+    fn answering(answer: Vec<ProviderRecord>) -> Self {
+        Self {
+            answer,
+            lookups: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn lookups(&self) -> usize {
+        *self.lookups.lock().expect("counter lock")
+    }
+}
+
+#[async_trait]
+impl dig_download::ProviderLocator for CountingLocator {
+    async fn find_providers(
+        &self,
+        _content: &ContentId,
+    ) -> Result<Vec<ProviderRecord>, dig_download::DownloadError> {
+        *self.lookups.lock().expect("counter lock") += 1;
+        Ok(self.answer.clone())
+    }
+}
+
+/// As [`engine`], but over a caller-supplied locator so the DHT walk itself is observable.
+fn engine_with_locator(
+    locator: CountingLocator,
+    pool_peers: &[u8],
+    ask: Option<Arc<dyn ForwardedAsk>>,
+) -> (Arc<NodeContent>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let content = NodeContent::new(
+        Arc::new(locator),
+        Arc::new(MockRangeTransport::new(MockContent::even(4, 1))),
+        MissMode::Redirect,
+        None,
+        dir.path(),
+    );
+    {
+        let pool = content.connected_pool();
+        let mut guard = pool.lock().expect("pool lock");
+        for n in pool_peers {
+            guard.insert(
+                mock_peer_hex(*n),
+                vec![format!("10.0.0.{n}:9444")
+                    .parse::<SocketAddr>()
+                    .expect("test address")],
+            );
+        }
+    }
+    if let Some(ask) = ask {
+        content.set_forwarded_ask(ask, recursion());
+    }
+    (content, dir)
+}
+
 fn peer_ids(providers: &[ProviderRecord]) -> Vec<String> {
     providers
         .iter()
@@ -187,7 +269,7 @@ async fn a_holder_only_a_peer_knows_about_reaches_the_answer() {
     let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
 
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::fresh(),
             &RequestorId::Peer("caller".into()),
@@ -217,7 +299,7 @@ async fn without_the_leg_the_answer_is_the_shipped_dht_answer() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2, 3], None);
 
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::fresh(),
             &RequestorId::Peer("caller".into()),
@@ -251,7 +333,7 @@ async fn a_hostile_slate_of_forwarded_holders_cannot_displace_our_own() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(ask));
 
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::fresh(),
             &RequestorId::Peer("caller".into()),
@@ -285,7 +367,7 @@ async fn a_forwarded_duplicate_does_not_take_a_second_slot() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(ask));
 
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::fresh(),
             &RequestorId::Peer("caller".into()),
@@ -317,7 +399,7 @@ async fn the_hop_budget_is_pinned_from_both_sides() {
     let at_cap = RecordingAsk::answering(vec![provider(9, &cid)]);
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(at_cap.clone()));
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::at_depth(cap),
             &RequestorId::Peer("caller".into()),
@@ -333,7 +415,7 @@ async fn the_hop_budget_is_pinned_from_both_sides() {
     let under_cap = RecordingAsk::answering(vec![provider(9, &cid)]);
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(under_cap.clone()));
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::at_depth(cap - 1),
             &RequestorId::Peer("caller".into()),
@@ -367,7 +449,7 @@ async fn an_unreadable_hop_budget_forwards_nothing_while_a_readable_one_forwards
     let unreadable = RecordingAsk::answering(vec![provider(9, &cid)]);
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(unreadable.clone()));
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::from_params(&serde_json::json!({"redirect_depth": "0"})),
             &RequestorId::Peer("caller".into()),
@@ -385,7 +467,7 @@ async fn an_unreadable_hop_budget_forwards_nothing_while_a_readable_one_forwards
 
     let readable = RecordingAsk::answering(vec![provider(9, &cid)]);
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(readable.clone()));
-    pc.locate_holders(
+    pc.locate_holder_candidates(
         &cid,
         HopBudget::from_params(&serde_json::json!({"redirect_depth": 0})),
         &RequestorId::Peer("caller".into()),
@@ -413,7 +495,7 @@ async fn the_fan_out_is_capped_regardless_of_pool_size() {
     let pool: Vec<u8> = (1..=20).collect();
     let (pc, _dir) = engine(Vec::new(), &pool, Some(ask.clone()));
 
-    pc.locate_holders(
+    pc.locate_holder_candidates(
         &cid,
         HopBudget::fresh(),
         &RequestorId::Peer("caller".into()),
@@ -441,7 +523,7 @@ async fn the_asking_peer_is_never_asked_back() {
     let ask = RecordingAsk::silent();
     let (pc, _dir) = engine(Vec::new(), &[1, 2], Some(ask.clone()));
 
-    pc.locate_holders(
+    pc.locate_holder_candidates(
         &cid,
         HopBudget::fresh(),
         &RequestorId::Peer(mock_peer_hex(1)),
@@ -479,8 +561,11 @@ async fn the_relay_allowance_is_per_requestor_and_separate_from_the_lookup_budge
     pc.set_relay_rate_limit(1.0, 0.0);
 
     let abuser = RequestorId::Peer("abuser".into());
-    pc.locate_holders(&cid, HopBudget::fresh(), &abuser).await;
-    let second = pc.locate_holders(&cid, HopBudget::fresh(), &abuser).await;
+    pc.locate_holder_candidates(&cid, HopBudget::fresh(), &abuser)
+        .await;
+    let second = pc
+        .locate_holder_candidates(&cid, HopBudget::fresh(), &abuser)
+        .await;
 
     assert_eq!(
         ask.asked().len(),
@@ -494,7 +579,7 @@ async fn the_relay_allowance_is_per_requestor_and_separate_from_the_lookup_budge
     );
 
     let honest = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::fresh(),
             &RequestorId::Peer("honest".into()),
@@ -526,7 +611,7 @@ async fn the_node_wide_ceiling_refuses_a_forward_when_every_slot_is_held() {
     let held = pc.hold_every_forwarded_ask_slot();
 
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::fresh(),
             &RequestorId::Peer("caller".into()),
@@ -537,7 +622,7 @@ async fn the_node_wide_ceiling_refuses_a_forward_when_every_slot_is_held() {
 
     drop(held);
     let found = pc
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::fresh(),
             &RequestorId::Peer("caller".into()),
@@ -637,7 +722,7 @@ async fn a_forwarded_record_naming_this_node_never_reaches_the_answer() {
     let (pc, _dir) = engine_identified(Vec::new(), &[1], Some(ask), Some(me.clone()));
 
     let found = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .locate_holder_candidates(&cid, HopBudget::fresh(), &RequestorId::Local)
         .await;
 
     let ids = peer_ids(&found);
@@ -670,7 +755,7 @@ async fn the_same_record_arriving_by_the_dht_leg_is_dropped_by_the_same_rule() {
     );
 
     let found = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .locate_holder_candidates(&cid, HopBudget::fresh(), &RequestorId::Local)
         .await;
 
     assert_eq!(
@@ -700,16 +785,55 @@ impl ForwardedAsk for ChainedAsk {
         _addrs: &[SocketAddr],
         content: &ContentId,
         next_depth: u64,
-    ) -> Vec<ProviderRecord> {
-        // The wire carries hops CONSUMED, so the receiving node reconstructs its budget from it —
-        // exactly as the real inbound path does via `HopBudget::from_params`.
-        self.next_hop
-            .locate_holders(
-                content,
-                HopBudget::at_depth(next_depth),
-                &RequestorId::Peer("upstream".into()),
-            )
-            .await
+        budget: Duration,
+    ) -> AskOutcome {
+        // The wire carries hops CONSUMED and the time budget separately, so the receiving node
+        // reconstructs both — exactly as the real inbound path does via `HopBudget::from_params`.
+        //
+        // **The timeout is REAL, and that is the point.** This double previously had none, which made
+        // it structurally unable to exhibit the defect dig-node#273 fixed: a child granted less time
+        // than its own subtree needs times out at its parent, and the parent then reports a confident
+        // not-found. A fixture with no clock cannot see that, so the property read as proven while the
+        // arithmetic was wrong. Enforcing the granted budget here is what makes the two-hop tests
+        // evidence.
+        let upstream = RequestorId::Peer("upstream".into());
+        let onward = self.next_hop.locate_holders(
+            content,
+            HopBudget::at_depth(next_depth).with_time(budget),
+            &upstream,
+        );
+        match tokio::time::timeout(budget, onward).await {
+            Ok(located) if located.establishes_absence() => {
+                AskOutcome::Answered(located.into_candidates())
+            }
+            // The subtree answered, but not completely — its own absence is unproven, so this hop must
+            // not launder it into one.
+            Ok(located) if !located.is_empty() => AskOutcome::Answered(located.into_candidates()),
+            Ok(_) => AskOutcome::Unreachable,
+            Err(_) => AskOutcome::TimedOut,
+        }
+    }
+}
+
+/// A [`ForwardedAsk`] double that never answers inside the budget it is granted.
+///
+/// It sleeps for strictly longer than the budget and then reports the truth, so a caller that honours
+/// the budget observes a real [`AskOutcome::TimedOut`] against a real clock rather than a hard-coded
+/// verdict. `tokio`'s test clock makes the sleep instantaneous, so this costs no wall time.
+struct StallingAsk;
+
+#[async_trait]
+impl ForwardedAsk for StallingAsk {
+    async fn ask(
+        &self,
+        _peer: &str,
+        _addrs: &[SocketAddr],
+        _content: &ContentId,
+        _next_depth: u64,
+        budget: Duration,
+    ) -> AskOutcome {
+        tokio::time::sleep(budget + Duration::from_secs(1)).await;
+        AskOutcome::TimedOut
     }
 }
 
@@ -743,7 +867,7 @@ async fn a_holder_two_hops_away_is_reached_through_the_middle_node() {
     );
 
     let found = a
-        .locate_holders(
+        .locate_holder_candidates(
             &cid,
             HopBudget::fresh(),
             &RequestorId::Peer("reader".into()),
@@ -770,9 +894,393 @@ async fn a_holder_two_hops_away_is_reached_through_the_middle_node() {
     );
 
     assert!(
-        a2.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("reader".into()))
+        a2.locate_holder_candidates(&cid, HopBudget::fresh(), &RequestorId::Peer("reader".into()))
             .await
             .is_empty(),
         "CONTROL: without B recursing to C the holder is unreachable, so the test above observed the second hop and not the first"
+    );
+}
+
+// -- What the search ESTABLISHED, not merely what it found (dig-node#273) --------------------------
+
+/// **Proves:** a peer that does not answer inside its budget leaves the answer INCONCLUSIVE, so an
+/// empty result is not reported as an absence.
+///
+/// **Fixture design — the timeout is real and the clock is paused.** `StallingAsk` sleeps past
+/// whatever budget it is granted, so the `TimedOut` comes from the production timeout expiring rather
+/// than from a double asserting its own verdict. `start_paused` makes that instantaneous. A fixture
+/// with no clock — which is what `ChainedAsk` used to be — cannot exhibit this at all, which is
+/// exactly why the collapse survived so long while its tests passed.
+///
+/// **Catches:** the shipped behaviour, in which a timeout became `Vec::new()` and then
+/// `MissOutcome::NotFound`. One slow peer became proof that content does not exist.
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_times_out_leaves_the_absence_unproven() {
+    let cid = content();
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(Arc::new(StallingAsk)));
+
+    let located = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert!(located.is_empty(), "the stalling peer named nobody");
+    assert!(
+        !located.establishes_absence(),
+        "and because it never answered, this node has NOT established that nobody holds it - \
+         reporting a not-found here is the defect dig-node#273 fixes"
+    );
+}
+
+/// **Proves:** a peer that genuinely answers "nobody" DOES establish an absence.
+///
+/// **Fixture design — this is the truthful CONTROL for the test above, and it is load-bearing.**
+/// Without it, an implementation that marked every search inconclusive would pass every other
+/// assertion here while making every miss on the network unanswerable. The two tests differ in
+/// exactly one thing: whether the peer answered.
+#[tokio::test]
+async fn a_peer_that_answers_nobody_does_establish_an_absence() {
+    let cid = content();
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(RecordingAsk::answering(Vec::new())));
+
+    let located = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert!(located.is_empty());
+    assert!(
+        located.establishes_absence(),
+        "the peer looked and reported nobody, which is a real answer"
+    );
+}
+
+/// **Proves:** a node with recursion REFUSED still reports a plain absence, not an inconclusive one.
+///
+/// **Why this is not redundant with the control above:** recursion ships DISABLED, so a refusal is the
+/// ordinary case on almost every node. An implementation that treated "did not ask" as "could not
+/// tell" would turn every miss on every default-configured node into an error, which is a different
+/// lie in the opposite direction and a far more visible regression than the one being fixed.
+#[tokio::test]
+async fn a_node_that_never_asked_still_answers_a_plain_absence() {
+    let cid = content();
+    // No forwarded asker installed at all: the DHT leg is the whole search.
+    let (pc, _dir) = engine(Vec::new(), &[1], None);
+
+    let located = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert!(located.is_empty());
+    assert!(
+        located.establishes_absence(),
+        "not asking establishes nothing new, so the answer stands on the DHT leg exactly as it did \
+         before the recursion existed"
+    );
+}
+
+/// **Proves:** an inconclusive search reaches the WIRE as its own code, distinct from a not-found.
+///
+/// **Catches:** a fix that stops at the internal type. The cascade requirement is that a hop's "I
+/// could not tell" travels back DOWN the hops - so if the outcome learns the difference and the
+/// JSON-RPC envelope discards it, the next hop down is exactly as misled as before.
+///
+/// **Fixture design - a not-found is asserted in the SAME test, from the same function.** Asserting
+/// only that an inconclusive outcome produces an error would pass against an implementation that
+/// errored on every miss, which would break every honest not-found on the network. The pair is what
+/// pins the distinction rather than the presence of a code.
+#[test]
+fn an_inconclusive_outcome_answers_with_its_own_wire_code_and_a_not_found_stays_silent() {
+    let id = serde_json::json!(7);
+
+    let inconclusive = crate::download::miss_refusal_envelope(&id, &MissOutcome::Inconclusive)
+        .expect("an inconclusive miss must be reported, not swallowed");
+    assert_eq!(
+        inconclusive["error"]["code"],
+        serde_json::json!(crate::download::CONTENT_MISS_INCONCLUSIVE),
+        "a caller must be able to tell 'unanswered' from 'not found': the first is worth retrying          and the second is not"
+    );
+
+    assert!(
+        crate::download::miss_refusal_envelope(&id, &MissOutcome::NotFound).is_none(),
+        "a genuine not-found is still silent here, so the caller's own not-found stands"
+    );
+}
+
+// -- The time budget is carried DOWN and decremented (dig-node#273) --------------------------------
+
+/// **Proves:** a hop that may still forward is granted MORE than one leaf timeout - the inequality
+/// whose violation made the recursion depth-1 in practice.
+///
+/// **Fixture design - the numbers are read off the protocol, not restated.** `fan_out` comes from the
+/// live `RecursionConfig`, and the bound is checked against `FORWARDED_ASK_LEAF_TIMEOUT` rather than
+/// against a literal, so this moves with the crate instead of pinning a private copy. The originator
+/// has `hop_cap` hops to spend, so the budget it hands its first peer must cover that peer's own
+/// fan-out.
+#[tokio::test]
+async fn the_budget_handed_to_a_peer_covers_that_peers_own_fan_out() {
+    let cid = content();
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+
+    pc.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    let granted = ask.budgets();
+    assert_eq!(granted.len(), 1, "exactly the one pool peer was asked");
+    let config = recursion();
+    assert!(
+        granted[0]
+            >= crate::seams::dig_peer::forwarded_ask::FORWARDED_ASK_LEAF_TIMEOUT
+                * u32::from(config.fan_out),
+        "a peer that may itself ask {} peers sequentially cannot be given one leaf timeout; it was \
+         granted {:?}",
+        config.fan_out,
+        granted[0],
+    );
+    assert!(
+        granted[0] <= MAX_FORWARDED_ASK_BUDGET,
+        "and it is still clamped, so no configuration buys unbounded wall clock"
+    );
+}
+
+/// **Proves:** the budget a hop hands DOWNWARDS is never larger than the budget it was granted.
+///
+/// **Fixture design:** the inbound budget is set EXPLICITLY and well below what this node would derive
+/// for itself, so a node that restated its own derived budget instead of decrementing the granted one
+/// would hand down more than it had and fail here. A fixture that let the node derive its own budget
+/// could not tell the two apart - it is the gap between granted and derived that makes this visible.
+#[tokio::test]
+async fn a_hop_never_hands_down_more_time_than_it_was_granted() {
+    let cid = content();
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+
+    let granted_to_us = Duration::from_secs(2);
+    pc.locate_holders(
+        &cid,
+        HopBudget::fresh().with_time(granted_to_us),
+        &RequestorId::Local,
+    )
+    .await;
+
+    let handed_on = ask.budgets();
+    assert_eq!(handed_on.len(), 1);
+    assert!(
+        handed_on[0] <= granted_to_us,
+        "this node was given {granted_to_us:?} and handed its peer {:?} - a child must never be \
+         granted more time than its parent has, or the parent times out on work it authorised",
+        handed_on[0],
+    );
+}
+
+/// **Proves:** a budget arriving from a peer is CLAMPED, so one hop cannot hold this node's inbound
+/// request open for as long as it likes.
+///
+/// **Fixture design - pinned from BOTH sides.** An absurd wire value is clamped DOWN to the ceiling,
+/// and a modest value passes through UNCHANGED. Testing only the clamp would pass against an
+/// implementation that ignored the wire field entirely and always used its own derived budget, which
+/// would defeat the decrement this whole mechanism rests on.
+#[test]
+fn a_wire_budget_is_clamped_at_ingress_but_a_modest_one_passes_through() {
+    let absurd = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "budget_ms": 600_000,
+    }));
+    assert_eq!(
+        absurd.time_budget(0, 3),
+        MAX_FORWARDED_ASK_BUDGET,
+        "a ten-minute claim buys the ceiling and no more"
+    );
+
+    let modest = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "budget_ms": 1_500,
+    }));
+    assert_eq!(
+        modest.time_budget(0, 3),
+        Duration::from_millis(1_500),
+        "a budget inside the ceiling is honoured exactly, which is what makes the budget CARRIED \
+         rather than re-derived at every hop"
+    );
+}
+
+// -- The same ask is walked once (dig-node#273) ----------------------------------------------------
+
+/// **Proves:** the same ask arriving twice by different paths is forwarded only once.
+///
+/// **Fixture design - two arrivals of ONE identity, against a node with a peer it would otherwise
+/// ask.** The second call carries the SAME `ask_id`, which is what a diamond in the graph produces.
+/// A second, DIFFERENT identity is then asked to prove the node is not simply refusing everything
+/// after its first forward - without that third call this test would pass against a node that
+/// forwarded exactly once in its lifetime.
+#[tokio::test]
+async fn the_same_ask_arriving_twice_is_forwarded_once() {
+    let cid = content();
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+
+    let diamond = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "ask_id": "0102030405060708090a0b0c0d0e0f10",
+    }));
+    pc.locate_holders(&cid, diamond, &RequestorId::Local).await;
+    pc.locate_holders(&cid, diamond, &RequestorId::Local).await;
+
+    assert_eq!(
+        ask.asked().len(),
+        1,
+        "the second arrival of the same question must not re-walk the graph"
+    );
+
+    let unrelated = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "ask_id": "aabbccddeeff00112233445566778899",
+    }));
+    pc.locate_holders(&cid, unrelated, &RequestorId::Local)
+        .await;
+
+    assert_eq!(
+        ask.asked().len(),
+        2,
+        "a genuinely different question is still answered - the dedup is per-ask, not a one-shot"
+    );
+}
+
+/// **Proves:** a request carrying no identity is treated as a NEW question rather than as a duplicate
+/// of the last one.
+///
+/// **Catches:** a dedup keyed on a defaulted-to-zero identity, which would make every older peer's
+/// request collide with every other older peer's request - a free way to suppress the entire forwarded
+/// leg by simply omitting a field.
+#[tokio::test]
+async fn requests_without_an_identity_do_not_collide_with_each_other() {
+    let cid = content();
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+
+    let anonymous = serde_json::json!({"redirect_depth": 0});
+    pc.locate_holders(
+        &cid,
+        HopBudget::from_params(&anonymous),
+        &RequestorId::Local,
+    )
+    .await;
+    pc.locate_holders(
+        &cid,
+        HopBudget::from_params(&anonymous),
+        &RequestorId::Local,
+    )
+    .await;
+
+    assert_eq!(
+        ask.asked().len(),
+        2,
+        "two separate questions from peers on an older build are two questions"
+    );
+}
+
+// -- The first-hand holder cache (dig-node#275) ----------------------------------------------------
+
+/// **Proves:** a second request inside the TTL reuses the remembered holders instead of re-walking
+/// the DHT - requirement 7's stated acceptance test.
+///
+/// **Fixture design - the DHT LOOKUP is counted directly, which is the thing the requirement is
+/// about.** An earlier version of this test counted FORWARDED asks as a proxy for "discovery ran",
+/// and that proxy was wrong in a way that mattered: it passed against an implementation that
+/// short-circuited the entire search on a cache hit, which silently disabled the recursive
+/// enrichment and made two shipped bounds look as though they latched. Counting the locator is the
+/// only fixture that distinguishes "skipped rediscovery" from "skipped everything".
+#[tokio::test]
+async fn a_second_request_inside_the_ttl_skips_rediscovery() {
+    let cid = content();
+    let locator = CountingLocator::answering(vec![provider(4, &cid)]);
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine_with_locator(locator.clone(), &[1], Some(ask.clone()));
+
+    let first = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(!first.is_empty(), "the first lookup found the holder");
+    assert_eq!(locator.lookups(), 1, "by walking the DHT once");
+
+    let second = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert_eq!(
+        peer_ids(&second.candidates()),
+        peer_ids(&first.candidates()),
+        "the same holder comes back"
+    );
+    assert_eq!(
+        locator.lookups(),
+        1,
+        "and the DHT was NOT walked again - which is the entire point of remembering it"
+    );
+    assert_eq!(
+        ask.asked().len(),
+        2,
+        "while the forwarded leg still ran, because a cache hit is a discovery shortcut and never \
+         a substitute for asking peers"
+    );
+}
+
+/// **Proves:** an unreachable remembered slate is forgotten, so the next request runs a real walk.
+///
+/// **Catches:** a cache with no invalidation, which would replay the exact candidates just proven
+/// unreachable for the rest of the TTL - the sticky-answer exposure the DHT's own SPEC 6.8 caller
+/// exists to close, reintroduced one cache over.
+#[tokio::test]
+async fn a_slate_that_reached_nobody_is_walked_again() {
+    let cid = content();
+    let locator = CountingLocator::answering(vec![provider(4, &cid)]);
+    let (pc, _dir) = engine_with_locator(locator.clone(), &[], None);
+
+    pc.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert_eq!(locator.lookups(), 1);
+
+    pc.forget_stale_discovery_for_test(&cid).await;
+
+    pc.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert_eq!(
+        locator.lookups(),
+        2,
+        "the remembered slate was dropped, so discovery ran again rather than replaying holders \
+         that reached nobody"
+    );
+}
+
+/// **Proves:** HEARSAY is never cached, so a hop cannot plant a holder this node then re-serves as its
+/// own knowledge for the whole TTL.
+///
+/// **Fixture design - the DHT leg answers EMPTY and the forwarded leg answers with a holder.** That
+/// is the only arrangement in which the record under test is unambiguously hearsay: with a first-hand
+/// record present too, a cache that stored everything would look identical to one that stored only
+/// first-hand records. The second lookup then re-runs the forwarded ask, which is the observable proof
+/// that nothing was retained.
+///
+/// **Catches:** the natural implementation - cache the merged answer - which is what would amend SPEC
+/// 10.4.4 by accident and hand one lying hop an hour of laundered authority.
+#[tokio::test]
+async fn hearsay_is_never_remembered() {
+    let cid = content();
+    let ask = RecordingAsk::answering(vec![provider(9, &cid)]);
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+
+    let first = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(!first.is_empty(), "the hop named a holder");
+
+    pc.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert_eq!(
+        ask.asked().len(),
+        2,
+        "the forwarded leg ran AGAIN, proving the hop's claim was not retained between the two \
+         requests (SPEC 10.4.4 - forwarded records MUST NOT be stored)"
     );
 }

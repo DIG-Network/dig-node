@@ -61,10 +61,103 @@ use serde_json::{json, Value};
 /// its own independent 32. Reading this as a cap on the aggregate understates the cost of this path.
 pub(crate) const MAX_CONCURRENT_FORWARDED_ASKS: usize = 32;
 
-/// Bounds one forwarded ask end to end (dial + stream + answer). A peer that is slow or gone must not
-/// hold the inbound request open: the miss answer is enrichment, so a timeout degrades it rather than
-/// failing it. Matches the DHT RPC budget, since the shape of the work is the same.
-pub(crate) const FORWARDED_ASK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds ONE LEAF ask - a peer that will not itself forward - end to end (dial + stream + answer).
+/// Matches the DHT RPC budget, since the shape of the work is the same.
+///
+/// **This is the leaf, not the whole ask.** A peer that WILL forward is doing `fan_out` asks of its
+/// own before it can answer, so granting it this same 5s guarantees it times out. The budget an
+/// intermediate hop is given is [`ask_budget`], and the arithmetic connecting the two is the subject
+/// of that function's docs.
+pub(crate) const FORWARDED_ASK_LEAF_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The ceiling on any forwarded ask's wall-clock budget, applied to BOTH the budget this node derives
+/// for itself and the budget a hop hands it on the wire.
+///
+/// It exists because the wire budget arrives from an untrusted peer (NC-12). Without a clamp, one hop
+/// naming a ten-minute budget holds this node's inbound request - and one of its
+/// [`MAX_CONCURRENT_FORWARDED_ASKS`] slots - open for ten minutes, an amplification achieved with a
+/// single integer. The clamp is applied at ingress in
+/// [`HopBudget::from_params`](crate::download::HopBudget::from_params), so no later reader has to
+/// remember to apply it.
+pub(crate) const MAX_FORWARDED_ASK_BUDGET: Duration = Duration::from_secs(65);
+
+/// The wall-clock budget an ask that may travel `hops_remaining` further hops actually needs, given a
+/// breadth of `fan_out`.
+///
+/// # Why a fixed per-ask timeout makes the recursion depth-1
+///
+/// A hop with `h` hops left asks up to `fan_out` peers SEQUENTIALLY, each of which needs
+/// `ask_budget(h - 1)`. So the work at depth `h` is `leaf + fan_out * work(h - 1)` - it grows with the
+/// same exponent the node count does. A parent that grants every child the LEAF timeout is therefore
+/// granting a child less time than the work it is asking that child to do, and at the `dig-sex`
+/// defaults (`fan_out = 3`, `hop_cap = 2`) the child needs `3 x 5s = 15s` and is given `5s`. It times
+/// out under any load at all, and - before dig-node#273 - a timeout was indistinguishable from an
+/// empty answer, so the parent reported a confident *not found* for content two hops away.
+///
+/// This is the time-domain twin of `RecursionConfig::worst_case_nodes_recruited`: the cost of enabling
+/// recursion is an exponent, and this states it as a number an operator can read rather than leaving
+/// it to be discovered in production. At the defaults it is 65s, which is also why
+/// [`MAX_FORWARDED_ASK_BUDGET`] sits exactly there.
+pub(crate) fn ask_budget(hops_remaining: u8, fan_out: u8) -> Duration {
+    let mut budget = FORWARDED_ASK_LEAF_TIMEOUT;
+    for _ in 0..hops_remaining {
+        budget = FORWARDED_ASK_LEAF_TIMEOUT
+            .saturating_add(budget.saturating_mul(u32::from(fan_out.max(1))));
+        if budget >= MAX_FORWARDED_ASK_BUDGET {
+            return MAX_FORWARDED_ASK_BUDGET;
+        }
+    }
+    budget
+}
+
+/// What ONE forwarded ask actually established - the distinction this node had none of before
+/// (dig-node#273).
+///
+/// # Why an empty `Vec` was not good enough
+///
+/// A timeout, an unreachable peer, a refusal and a genuine "I looked and found nobody" all used to
+/// return `Vec::new()`, and that emptiness then reached `MissOutcome::NotFound` unchanged. Three of
+/// those four establish NOTHING about whether the content exists; only the fourth does. Collapsing
+/// them means one slow peer converts into an authoritative absence - a surface lying to the caller
+/// about what this node knows, and a caller that believes a not-found stops looking.
+///
+/// So the emptiness of the record set and the PROVENNESS of the absence are two facts, and this type
+/// keeps them apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AskOutcome {
+    /// The peer looked and reported these providers. **An empty vec here is a real answer** - that
+    /// peer, and everyone it could reach, found nobody.
+    Answered(Vec<ProviderRecord>),
+    /// The peer answered with a JSON-RPC error frame: it declined to look (its own hop cap, its own
+    /// rate limit, recursion switched off there). Absence unproven.
+    Refused,
+    /// The budget was spent before an answer arrived. Absence unproven - and this is the case the
+    /// arithmetic above exists to stop manufacturing.
+    TimedOut,
+    /// No connection, or the exchange failed mid-stream. Absence unproven.
+    Unreachable,
+}
+
+impl AskOutcome {
+    /// The providers this outcome named - none unless the peer actually answered.
+    ///
+    /// Test-only: production code matches on the variants, because the whole point of the type is
+    /// that a caller cannot read the records without also seeing WHICH outcome produced them.
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> &[ProviderRecord] {
+        match self {
+            Self::Answered(records) => records,
+            _ => &[],
+        }
+    }
+
+    /// True when this outcome establishes that the content was genuinely not found by that peer.
+    /// Every other variant means the peer did not look, or did not finish looking.
+    #[cfg(test)]
+    pub(crate) fn is_conclusive(&self) -> bool {
+        matches!(self, Self::Answered(_))
+    }
+}
 
 /// Issue one `dig.getAvailability` to one connected peer and report the providers it named.
 ///
@@ -73,25 +166,29 @@ pub(crate) const FORWARDED_ASK_TIMEOUT: Duration = Duration::from_secs(5);
 /// from a fixture.
 #[async_trait]
 pub(crate) trait ForwardedAsk: Send + Sync {
-    /// Ask `peer` (reachable at `addrs`) whether it — or anyone it knows — holds `content`, declaring
-    /// `next_depth` as the hop budget already consumed.
+    /// Ask `peer` (reachable at `addrs`) whether it - or anyone it knows - holds `content`, declaring
+    /// `next_depth` as the hop budget already consumed and granting it `budget` of wall clock.
     ///
-    /// Returns the providers the peer named, which may be empty. Never errors: an unreachable or
-    /// silent peer is indistinguishable from one that found nobody, and both mean the same thing to
-    /// the answer being built.
+    /// Returns WHAT WAS ESTABLISHED, not merely what was found: an unreachable, silent or refusing
+    /// peer is reported as such rather than as an answer of "nobody", because those are different
+    /// facts and the caller has to be able to tell them apart (dig-node#273).
+    ///
+    /// `budget` is the time this ask may take IN TOTAL, already decremented by everything the chain
+    /// above has spent. An implementation MUST NOT extend it.
     async fn ask(
         &self,
         peer: &str,
         addrs: &[SocketAddr],
         content: &ContentId,
         next_depth: u64,
-    ) -> Vec<ProviderRecord>;
+        budget: Duration,
+    ) -> AskOutcome;
 }
 
 /// The `dig.getAvailability` request body for `content` at hop budget `next_depth` — the SAME shape
 /// any other caller sends, built from the same [`content_id_json`](crate::download::content_id_json)
 /// item renderer the redirect uses, so the forwarded question is byte-identical to a direct one.
-pub(crate) fn forwarded_request(content: &ContentId, next_depth: u64) -> Value {
+pub(crate) fn forwarded_request(content: &ContentId, next_depth: u64, budget: Duration) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -99,8 +196,61 @@ pub(crate) fn forwarded_request(content: &ContentId, next_depth: u64) -> Value {
         "params": {
             "items": [crate::download::content_id_json(content)],
             "redirect_depth": next_depth,
+            "budget_ms": u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
         },
     })
+}
+
+/// Await one peer exchange under `budget` and classify what it ESTABLISHED.
+///
+/// Split out of the dial so the classification is reachable without a network. `NatForwardedAsk::ask`
+/// delegates its whole tail to this, so there is no second copy of the mapping and no way to bypass it
+/// at the call site — which matters, because a timeout read as an empty answer is exactly the defect
+/// dig-node#273 fixes and it lived in this function.
+pub(crate) async fn awaited_outcome<F>(
+    content: &ContentId,
+    peer: &str,
+    budget: Duration,
+    exchange: F,
+) -> AskOutcome
+where
+    F: std::future::Future<Output = Option<Value>>,
+{
+    match tokio::time::timeout(budget, exchange).await {
+        Ok(Some(response)) => parse_forwarded_answer(content, &response),
+        // Reached, but the exchange failed: a dial refused, a stream that would not open, a frame
+        // that would not read. Nothing was established about the content.
+        Ok(None) => {
+            tracing::debug!(peer = %peer, "forwarded ask: unreachable");
+            AskOutcome::Unreachable
+        }
+        // The budget ran out. Reported as ITSELF rather than as an empty answer, because this is
+        // precisely the case that used to become an authoritative absence (dig-node#273).
+        Err(_) => {
+            tracing::debug!(peer = %peer, ?budget, "forwarded ask: timed out");
+            AskOutcome::TimedOut
+        }
+    }
+}
+
+/// Read a `dig.getAvailability` response as an [`AskOutcome`].
+///
+/// A JSON-RPC **error frame** - what a peer at its hop cap, over its rate limit, or with recursion
+/// switched off returns - is a [`Refused`](AskOutcome::Refused), never an answer of "nobody". A
+/// `result` frame is an [`Answered`](AskOutcome::Answered) even when the provider list is empty,
+/// because there the peer genuinely did look.
+///
+/// A frame that is neither is a peer that did not answer the question it was asked, which establishes
+/// nothing: [`Unreachable`](AskOutcome::Unreachable). Reading it as an empty answer would hand any
+/// peer a one-field way to manufacture an authoritative absence.
+pub(crate) fn parse_forwarded_answer(content: &ContentId, response: &Value) -> AskOutcome {
+    if response.get("error").is_some() {
+        return AskOutcome::Refused;
+    }
+    if response.get("result").is_none() {
+        return AskOutcome::Unreachable;
+    }
+    AskOutcome::Answered(parse_forwarded_providers(content, response))
 }
 
 /// Parse the `providers` a `dig.getAvailability` response named for `content`, into records keyed to
@@ -197,18 +347,23 @@ impl ForwardedAsk for NatForwardedAsk {
         addrs: &[SocketAddr],
         content: &ContentId,
         next_depth: u64,
-    ) -> Vec<ProviderRecord> {
+        budget: Duration,
+    ) -> AskOutcome {
         let Some(peer_id) = PeerId::from_hex(peer) else {
-            return Vec::new();
+            return AskOutcome::Unreachable;
         };
         if addrs.is_empty() {
-            return Vec::new();
+            return AskOutcome::Unreachable;
         }
         // The full candidate list, not one collapsed address: `with_addrs` sorts it IPv6-first (§5.2)
         // and the fallback ladder needs every family to try.
         let target = dig_nat::PeerTarget::with_addrs(peer_id, addrs.to_vec(), &self.network_id);
-        let config = crate::net::full_nat_config(FORWARDED_ASK_TIMEOUT, self.stun_server);
-        let request = forwarded_request(content, next_depth);
+        // The DIAL gets the leaf timeout even when the whole ask gets more: a peer we cannot reach is
+        // unreachable now, and spending a 65s recursive budget on one unanswered handshake would let a
+        // single black-holed address consume the entire question's time.
+        let config =
+            crate::net::full_nat_config(FORWARDED_ASK_LEAF_TIMEOUT.min(budget), self.stun_server);
+        let request = forwarded_request(content, next_depth, budget);
 
         let exchange = async {
             let mut conn =
@@ -222,15 +377,7 @@ impl ForwardedAsk for NatForwardedAsk {
             crate::peer::read_framed(&mut stream).await.ok()?
         };
 
-        match tokio::time::timeout(FORWARDED_ASK_TIMEOUT, exchange).await {
-            Ok(Some(response)) => parse_forwarded_providers(content, &response),
-            // A silent, unreachable or timed-out peer found us nobody. Logged at debug because a
-            // relayed network makes this the ordinary case, not a fault.
-            _ => {
-                tracing::debug!(peer = %peer, "forwarded ask: no answer");
-                Vec::new()
-            }
-        }
+        awaited_outcome(content, peer, budget, exchange).await
     }
 }
 
@@ -258,10 +405,17 @@ mod tests {
     /// see depth 0 forever and the hop cap would stop bounding anything.
     #[test]
     fn the_request_is_the_shipped_verb_carrying_the_shipped_budget_field() {
-        let request = forwarded_request(&content(), 3);
+        let request = forwarded_request(&content(), 3, Duration::from_millis(12_500));
 
         assert_eq!(request["method"], "dig.getAvailability");
         assert_eq!(request["params"]["redirect_depth"], json!(3));
+        assert_eq!(
+            request["params"]["budget_ms"],
+            json!(12_500),
+            "the TIME budget rides its own field, because it is monotone DECREASING while \
+             redirect_depth is monotone increasing - one integer cannot honestly carry both, and \
+             overloading it would let a hop grant itself hops by claiming time"
+        );
         let items = request["params"]["items"].as_array().expect("items array");
         assert_eq!(items.len(), 1, "exactly the one content asked about");
         assert_eq!(items[0]["store_id"], json!(hex::encode([1u8; 32])));
@@ -307,16 +461,173 @@ mod tests {
         assert!(parse_forwarded_providers(&content(), &response).is_empty());
     }
 
-    /// **Proves:** a JSON-RPC error frame — which is what a peer at the hop cap or over its rate limit
-    /// returns — yields no candidates and no panic.
+    /// **Proves:** a JSON-RPC error frame - what a peer at the hop cap or over its rate limit returns
+    /// - is a REFUSAL, and a refusal is not an answer of "nobody".
+    ///
+    /// **This test replaces `an_error_frame_yields_nobody`, which pinned the opposite** (dig-node#273).
+    /// That test asserted a real property of the old code and was the reason the collapse survived: it
+    /// made "an error frame means nobody holds it" look like the intended contract. It is intended
+    /// that it changed.
+    ///
+    /// **Catches:** any implementation that keeps reading an error frame as an empty answer - which is
+    /// a one-field censorship primitive, since a peer that simply refuses every ask suppresses every
+    /// holder downstream of it AND makes the requestor confident about it.
     #[test]
-    fn an_error_frame_yields_nobody() {
+    fn an_error_frame_is_a_refusal_and_not_an_answer_of_nobody() {
         let response = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "error": { "code": -32003, "message": "miss lookup rate limit exceeded" },
         });
-        assert!(parse_forwarded_providers(&content(), &response).is_empty());
+
+        let outcome = parse_forwarded_answer(&content(), &response);
+
+        assert!(
+            outcome.records().is_empty(),
+            "a refusal still names no candidates"
+        );
+        assert!(
+            !outcome.is_conclusive(),
+            "a refusal establishes NOTHING about whether the content exists - reading it as \
+             'nobody holds it' is a censorship primitive costing one field"
+        );
+        assert_eq!(outcome, AskOutcome::Refused);
+    }
+
+    /// **Proves:** a `result` frame naming no providers IS an answer - the one case of the four that
+    /// genuinely establishes an absence.
+    ///
+    /// **Fixture design:** this is the truthful control for the three unproven cases. Without it the
+    /// suite could not distinguish "everything is inconclusive now" from "the right things are", and
+    /// an implementation that marked every ask unproven would pass every other test here while making
+    /// every miss on the network report as inconclusive.
+    #[test]
+    fn a_result_frame_naming_nobody_is_a_conclusive_answer() {
+        let outcome = parse_forwarded_answer(&content(), &answer_with(json!([])));
+
+        assert_eq!(outcome, AskOutcome::Answered(Vec::new()));
+        assert!(
+            outcome.is_conclusive(),
+            "the peer looked, and reported that it found nobody"
+        );
+    }
+
+    /// **Proves:** a frame that is neither a result nor an error - a peer answering something else
+    /// entirely - establishes nothing.
+    ///
+    /// **Catches:** a parser that falls through to `Answered(vec![])`, which would let a peer
+    /// manufacture an authoritative absence by replying with any well-formed JSON object at all.
+    #[test]
+    fn a_frame_that_is_neither_result_nor_error_establishes_nothing() {
+        let outcome = parse_forwarded_answer(&content(), &json!({"jsonrpc": "2.0", "id": 1}));
+
+        assert_eq!(outcome, AskOutcome::Unreachable);
+        assert!(!outcome.is_conclusive());
+    }
+
+    /// **Proves:** an exchange that does not finish inside its budget is a TIMEOUT, in the
+    /// production classifier rather than in a double.
+    ///
+    /// **Fixture design - a real future against a real (paused) clock.** The earlier version of this
+    /// proof used a `ForwardedAsk` double that RETURNED `TimedOut` itself, which meant reverting the
+    /// production mapping to `Answered(vec![])` broke nothing: the double asserted the verdict the
+    /// code was supposed to reach. Measured, that revert came back green. Driving
+    /// [`awaited_outcome`] with a future that outlives its budget is what makes the mapping
+    /// load-bearing. `start_paused` keeps it instantaneous.
+    ///
+    /// **Catches:** the shipped behaviour, in which a timeout became an empty provider list and then
+    /// an authoritative not-found.
+    #[tokio::test(start_paused = true)]
+    async fn an_exchange_that_outlives_its_budget_is_a_timeout_and_not_an_answer() {
+        let slow = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Some(answer_with(json!([])))
+        };
+
+        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), slow).await;
+
+        assert!(
+            !outcome.is_conclusive(),
+            "a peer that never answered establishes nothing, so this must not become a not-found"
+        );
+        assert_eq!(outcome, AskOutcome::TimedOut);
+    }
+
+    /// **Proves:** an exchange that DOES finish inside its budget is classified on its content.
+    ///
+    /// **Fixture design:** the truthful control for the test above. Without it, an implementation that
+    /// reported `TimedOut` unconditionally would pass every timeout assertion here while never
+    /// answering anything - and the same budget is used for both, so the only difference is whether
+    /// the future finished.
+    #[tokio::test(start_paused = true)]
+    async fn an_exchange_that_finishes_inside_its_budget_is_answered_on_its_content() {
+        let prompt = async { Some(answer_with(json!([]))) };
+
+        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), prompt).await;
+
+        assert!(
+            outcome.is_conclusive(),
+            "the peer answered inside its budget, so its answer stands"
+        );
+        assert_eq!(outcome, AskOutcome::Answered(Vec::new()));
+    }
+
+    /// **Proves:** a failed exchange inside the budget is UNREACHABLE, not an answer of nobody.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_exchange_is_unreachable_and_not_an_answer() {
+        let broken = async { None };
+
+        let outcome = awaited_outcome(&content(), "peer", Duration::from_secs(1), broken).await;
+
+        assert!(!outcome.is_conclusive());
+        assert_eq!(outcome, AskOutcome::Unreachable);
+    }
+
+    /// **Proves the arithmetic that makes hop 2 reachable at all** (dig-node#273): a hop that will
+    /// itself fan out is granted at least the work it is being asked to do.
+    ///
+    /// **Fixture design - the numbers come from the protocol, not from taste.** `fan_out` and
+    /// `hop_cap` are read off `RecursionConfig::default()` rather than restated, so this moves with
+    /// the canonical crate instead of pinning a private copy. The bound is checked from BOTH sides:
+    /// a leaf gets exactly the leaf timeout (one over would be slack), and an intermediate hop gets
+    /// at least `fan_out x` the budget of the hop below it (one under is the shipped defect).
+    #[test]
+    fn an_intermediate_hop_is_granted_at_least_the_work_it_must_do() {
+        let config = dig_sex::discovery::RecursionConfig::default();
+        let fan_out = config.fan_out;
+
+        let leaf = ask_budget(0, fan_out);
+        assert_eq!(
+            leaf, FORWARDED_ASK_LEAF_TIMEOUT,
+            "a hop with no hops left does exactly one ask"
+        );
+
+        let one_hop = ask_budget(1, fan_out);
+        assert!(
+            one_hop >= leaf * u32::from(fan_out),
+            "a hop that must ask {fan_out} peers sequentially, each needing {leaf:?}, cannot be \
+             given {one_hop:?} - this is the inequality whose violation made the recursion depth-1"
+        );
+
+        assert!(
+            ask_budget(config.hop_cap, fan_out) >= one_hop * u32::from(fan_out),
+            "and the same inequality holds at the originator, all the way up hop_cap"
+        );
+    }
+
+    /// **Proves:** the budget is CLAMPED, so neither a large local config nor a hop naming an absurd
+    /// budget on the wire can hold an inbound request open indefinitely.
+    ///
+    /// **Fixture design:** the input is chosen to be far past the ceiling rather than one step past
+    /// it, because the failure being excluded is unbounded growth. The at-ceiling side is pinned by
+    /// the default-config case above, which lands exactly on it.
+    #[test]
+    fn the_budget_is_clamped_however_deep_or_wide_the_configuration_claims_to_be() {
+        assert_eq!(
+            ask_budget(u8::MAX, u8::MAX),
+            MAX_FORWARDED_ASK_BUDGET,
+            "an untrusted or misconfigured breadth/depth cannot buy unbounded wall clock"
+        );
     }
 
     /// **Proves:** the parser keeps the well-formed providers out of an answer that also contains
