@@ -1388,7 +1388,7 @@ impl PeerRpcResponder for NodeResponder {
         // on the one shape that has no way to count hops. The JSON-RPC leg
         // (`seams/dig_rpc/dispatch.rs`) carries `redirect_depth` and is where forwarding happens.
         self.node
-            .availability_batch(&items, &requestor, crate::download::REDIRECT_HOP_CAP)
+            .availability_batch(&items, &requestor, crate::download::HopBudget::spent())
             .await
     }
 
@@ -1555,7 +1555,7 @@ impl PeerRpcResponder for NodeResponder {
                 // `data.redirect` shape as the JSON-RPC redirect (the read-tier redirect response).
                 if code == crate::download::RESOURCE_UNAVAILABLE {
                     if let Some(content) = crate::download::range_content_id(&req) {
-                        let depth = crate::download::redirect_depth(&req);
+                        let budget = crate::download::HopBudget::from_params(&req);
                         let proxy = crate::download::proxy_requested(&req);
                         // A remote peer's own fetchRange stream miss (#179/#1576) — never local. The
                         // per-requestor miss-lookup rate limit (dig_ecosystem#2007) is keyed by this
@@ -1566,7 +1566,7 @@ impl PeerRpcResponder for NodeResponder {
                             .node
                             .miss_outcome(
                                 &content,
-                                depth,
+                                budget,
                                 proxy,
                                 crate::download::ReadOrigin::Peer,
                                 &requestor,

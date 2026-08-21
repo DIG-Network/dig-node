@@ -3679,7 +3679,7 @@ impl Node {
         item: &Value,
         cached: &[CachedCapsule],
         requestor: &crate::rate_limit::RequestorId,
-        hops_used: u64,
+        budget: download::HopBudget,
     ) -> Value {
         let store = item.get("store_id").and_then(Value::as_str).unwrap_or("");
         let root = item.get("root").and_then(Value::as_str);
@@ -3748,7 +3748,7 @@ impl Node {
             if let Some(pc) = self.p2p_content() {
                 if let Some(content) = download::availability_content_id(store, root, rk) {
                     if pc.allow_miss_lookup(requestor) {
-                        let providers = pc.locate_holders(&content, hops_used, requestor).await;
+                        let providers = pc.locate_holders(&content, budget, requestor).await;
                         if !providers.is_empty() {
                             if let Some(obj) = answer.as_object_mut() {
                                 obj.insert(
@@ -3791,7 +3791,7 @@ impl Node {
         &self,
         items: &[Value],
         requestor: &crate::rate_limit::RequestorId,
-        hops_used: u64,
+        budget: download::HopBudget,
     ) -> Value {
         let capped = &items[..items.len().min(MAX_AVAILABILITY_ITEMS)];
         // At most one directory walk for the whole batch, and none at all unless some item asks at
@@ -3807,7 +3807,7 @@ impl Node {
         let mut answers = Vec::with_capacity(capped.len());
         for item in capped {
             answers.push(
-                self.availability_answer(item, &cached, requestor, hops_used)
+                self.availability_answer(item, &cached, requestor, budget)
                     .await,
             );
         }
