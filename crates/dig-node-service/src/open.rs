@@ -237,10 +237,53 @@ impl BrowserProbe for HttpProbe {
 const SERVE_MAX_LIFETIME: Duration = Duration::from_secs(12);
 const SERVE_LINGER_AFTER_FIRST: Duration = Duration::from_millis(1200);
 
-/// The real loopback content server. Binds `127.0.0.1:0`, serves the blob over plain HTTP under a
-/// sandboxed `http://127.0.0.1:<port>` origin (with `X-Content-Type-Options: nosniff` and
+/// Bind an ephemeral port on the DIG loopback address, falling back to `127.0.0.1` only when the
+/// DIG address is unavailable on this host.
+///
+/// Returns only the listener: the caller reads the address back off it with `local_addr`, so the
+/// URL cannot name an address we did not actually bind. The candidates are tried in
+/// [`crate::loopback::ephemeral_bind_candidates`] order — DIG address first — so a host that has
+/// the alias gets the rule's benefit and a host without it still opens the content.
+///
+/// A fall-back is LOGGED rather than silent: taking `127.0.0.1` is the condition dig_ecosystem#767
+/// exists to make visible, and a fall-back nobody can see is indistinguishable from the rule not
+/// being applied at all.
+fn bind_ephemeral_on_dig_loopback() -> std::io::Result<TcpListener> {
+    let candidates = crate::loopback::ephemeral_bind_candidates();
+    let mut last_err = None;
+    for host in candidates {
+        match TcpListener::bind((host, 0)) {
+            Ok(listener) => {
+                if host != candidates[0] {
+                    tracing::warn!(
+                        %host,
+                        preferred = %candidates[0],
+                        "the DIG loopback address could not be bound, so the ephemeral content \
+                         server fell back; on macOS create the alias with `sudo ifconfig lo0 \
+                         alias 127.0.0.2`"
+                    );
+                }
+                return Ok(listener);
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::other("no DIG loopback candidate could be bound")))
+}
+
+/// The real loopback content server. Binds an ephemeral port on the DIG loopback address
+/// ([`crate::loopback`], dig_ecosystem#767), serves the blob over plain HTTP under a sandboxed
+/// `http://<dig-loopback>:<port>` origin (with `X-Content-Type-Options: nosniff` and
 /// `Cache-Control: no-store`), and tears down after the content is fetched or the timeout elapses.
 /// The bytes NEVER touch disk, so no Mark-of-the-Web-less executable can be OS-opened.
+///
+/// The address is `127.0.0.2`, not `127.0.0.1`: a DIG service does not take the address the rest
+/// of the machine assumes it can have. It also earns a real property here — the served page gets
+/// a browser ORIGIN distinct from every other local development server, so the sandboxed blob
+/// shares no origin with anything else the user happens to be running. On a macOS host with no
+/// `lo0` alias the DIG address cannot be bound at all, so the bind walks
+/// [`crate::loopback::ephemeral_bind_candidates`] and takes the first that succeeds.
 pub struct RealLocalServer;
 
 impl LocalContentServer for RealLocalServer {
@@ -250,9 +293,14 @@ impl LocalContentServer for RealLocalServer {
         filename: &str,
         on_ready: &dyn Fn(&str) -> std::io::Result<()>,
     ) -> std::io::Result<String> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))?;
-        let port = listener.local_addr()?.port();
-        let url = format!("http://127.0.0.1:{port}/{filename}");
+        let listener = bind_ephemeral_on_dig_loopback()?;
+        // The URL is built from the SocketAddr, never from host-and-port TEXT: text
+        // concatenation is invalid for every IPv6 literal, which needs brackets
+        // (`http://[::1]:9778`). `SocketAddr`'s own Display brackets v6 and leaves v4 alone, so
+        // this stays correct whichever family the bind resolved to. Enforced by
+        // dig-node-core's `banned_address_patterns` guard (#1593), which caught exactly this.
+        let addr = listener.local_addr()?;
+        let url = format!("http://{addr}/{filename}");
         listener.set_nonblocking(true)?;
 
         // Announce the URL (open the browser) only once the port is actually bound.
@@ -1168,7 +1216,27 @@ mod tests {
             })
             .unwrap();
 
-        assert!(url.starts_with("http://127.0.0.1:"));
+        // dig_ecosystem#767: the served URL must name the DIG loopback address, not the
+        // `127.0.0.1` every other program on the machine assumes it can have.
+        //
+        // The expectation is derived from what THIS host can bind rather than hard-coded,
+        // because on macOS `127.0.0.2` does not exist until someone creates the `lo0` alias and
+        // a flat assertion would be a false RED there. Deriving it keeps the test honest in both
+        // directions: where the DIG address is bindable it is REQUIRED (so the pre-fix
+        // `127.0.0.1` bind fails this assertion), and only where it genuinely cannot be bound is
+        // the fall-back accepted.
+        let candidates = crate::loopback::ephemeral_bind_candidates();
+        let dig_addr_is_available = std::net::TcpListener::bind((candidates[0], 0)).is_ok();
+        let expected_host = if dig_addr_is_available {
+            candidates[0]
+        } else {
+            candidates[1]
+        };
+        assert!(
+            url.starts_with(&format!("http://{expected_host}:")),
+            "the ephemeral content server must serve from {expected_host} (DIG loopback \
+             available: {dig_addr_is_available}), got {url}"
+        );
         let resp = response.lock().unwrap().clone();
         let text = String::from_utf8_lossy(&resp);
         assert!(text.contains("200 OK"), "status line present: {text}");

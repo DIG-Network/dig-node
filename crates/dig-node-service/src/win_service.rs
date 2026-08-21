@@ -14,7 +14,6 @@
 //! it exactly.
 
 use std::ffi::OsString;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use windows_service::service::{
@@ -26,6 +25,7 @@ use windows_service::{define_windows_service, service_dispatcher};
 use crate::config::Config;
 use crate::server::serve_with_shutdown;
 use crate::service::SERVICE_LABEL;
+use crate::service_control::{run_until_stopped, StopOutcome, StopSignal, GRACEFUL_STOP_DEADLINE};
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
@@ -73,16 +73,27 @@ fn run_service() -> std::io::Result<()> {
 
     let config = Config::from_env();
 
-    // Channel the control handler signals on `Stop`; the server's graceful-shutdown
-    // future waits on it.
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
+    // The stop signal the control handler raises and the serve path waits on
+    // (dig_ecosystem#2880).
+    //
+    // This was a `std::sync::mpsc` pair whose receiver was awaited via
+    // `spawn_blocking(recv)`, which put the stop path on tokio's BLOCKING POOL — the same
+    // pool the wallet replica's synchronous database work uses. With the pool saturated
+    // the receiving task never ran, so an accepted stop was never acted on and the
+    // service stayed `Running` while still serving HTTP: the 1061 wedge. `StopSignal` is
+    // delivered by the async runtime itself and needs no blocking thread.
+    let stop_signal = StopSignal::new();
 
+    let handler_stop = stop_signal.clone();
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             // The SCM polls for status; always succeed.
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             ServiceControl::Stop => {
-                let _ = shutdown_tx.send(());
+                // Raising a stop neither blocks nor fails, so this handler always answers
+                // the SCM promptly whatever the rest of the process is doing. That is the
+                // property the whole fix rests on.
+                handler_stop.request();
                 ServiceControlHandlerResult::NoError
             }
             _ => ServiceControlHandlerResult::NotImplemented,
@@ -116,22 +127,38 @@ fn run_service() -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let result = rt.block_on(async move {
-        // Bridge the blocking std mpsc into an async shutdown future.
-        let shutdown = async move {
-            // Wait on the channel on a blocking thread so we don't park the runtime.
-            let _ = tokio::task::spawn_blocking(move || shutdown_rx.recv()).await;
-        };
-        serve_with_shutdown(config, shutdown).await
+    // Two waiters on the one signal: the serve body winds itself down on the first, and
+    // `run_until_stopped` bounds how long that is allowed to take on the second.
+    let body_stop = stop_signal.waiter();
+    let supervisor_stop = stop_signal.waiter();
+    let (result, outcome) = rt.block_on(async move {
+        let body = serve_with_shutdown(config, body_stop.wait());
+        run_until_stopped(body, supervisor_stop, GRACEFUL_STOP_DEADLINE).await
     });
 
     // Report stopped regardless of the serve result; carry a non-zero exit on error
     // so the SCM (and `sc query`) reflect a failed run.
-    let exit = if result.is_ok() { 0 } else { 1 };
+    //
+    // A FORCED stop counts as a failed run on purpose (dig_ecosystem#2880): the service
+    // did stop, but its body never wound down, and reporting that as a clean exit would
+    // be the same class of lie as the updater's `Deferred` behind exit code 0.
+    let exit = match (&result, outcome) {
+        (Some(Ok(())), StopOutcome::Graceful) => 0,
+        _ => 1,
+    };
+    if outcome == StopOutcome::Forced {
+        tracing::error!(
+            deadline_secs = GRACEFUL_STOP_DEADLINE.as_secs(),
+            "the service body did not wind down within the graceful-stop deadline; \
+             reporting Stopped anyway so the service manager can always stop this service"
+        );
+    }
     let _ = status_handle.set_service_status(set(
         ServiceState::Stopped,
         ServiceControlAccept::empty(),
         exit,
     ));
-    result
+    // A forced stop has no serve result; the non-zero exit above already carries that
+    // fact to the SCM, so the process itself exits cleanly rather than double-reporting.
+    result.unwrap_or(Ok(()))
 }

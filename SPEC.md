@@ -332,6 +332,42 @@ atomic temp-file + rename in the same directory, and MUST preserve all keys the 
 
 ## 4. HTTP transport
 
+### 4.0a. The DIG loopback allocation (dig_ecosystem#767)
+
+`127.0.0.0/8` is entirely loopback. DIG therefore takes its own addresses out of that range and
+leaves `127.0.0.1` — the address every other program on the machine assumes it can have — alone.
+
+| Address | Owner | Purpose |
+| --- | --- | --- |
+| `127.0.0.1` | **nobody — reserved for the rest of the machine** | MUST NOT be bound by a DIG service |
+| `127.0.0.2` | dig-node | `dig.local` — the local content surface (`:80` plaintext, `:443` TLS) |
+| `127.0.0.5` | dig-dns | the DNS responder (`:53`) and its HTTP gateway (`:80`) |
+
+A new DIG loopback service MUST take a fresh `127.0.0.X` from this table rather than sharing an
+allocated one, and MUST NOT bind `127.0.0.1` or a name that resolves to it. The table is
+byte-identical with the `canonical` skill and `SYSTEM.md`; the three MUST agree.
+
+**Why this is normative and not stylistic.** A DIG port on `127.0.0.1` collides with whatever
+else on the host wants it, and the collision is a race rather than an error a user can read.
+dig-node bound `127.0.0.1:9257` — Sage's own wallet RPC port — so after a reboot whichever
+service won the race broke the other, and the user's symptom was `sslv3 alert handshake failure`
+from a server they believed was Sage. That message names neither DIG nor a port conflict.
+
+**IPv6.** These are IPv4-only control planes by design. §5.2's IPv6-first rule governs PEER
+networking, where address family is a reachability question; a loopback control plane never
+leaves the host, and IPv6 offers no equivalent of `127.0.0.0/8` (`::1` is a single address), so a
+per-service v6 allocation is not expressible. A service MAY additionally bind `::1` as a SECOND
+listener for clients whose resolver prefers v6, but `::1` is never the DIG-owned address.
+
+**Ephemeral binds.** A short-lived local listener MUST attempt the DIG address first and MAY
+fall back to `127.0.0.1` only where the DIG address cannot be bound at all — on macOS a
+`127.0.0.X` alias other than `127.0.0.1` does not exist until `ifconfig lo0 alias` creates it. A
+fall-back MUST be logged; a silent one is indistinguishable from the rule not being applied.
+
+**Enforcement.** `tests/loopback_bind_guard.rs` fails the build on a new literal-loopback bind in
+product source. It reads source text, so a bind of an address computed elsewhere is outside its
+reach; every such site is enumerated in that test's declared-exception list with its reason.
+
 ### 4.1. Loopback listeners (dual-stack default, #91, #288)
 
 The server opens UP TO THREE listeners for the SAME router:
@@ -459,19 +495,30 @@ CORS is not an auth boundary):
   native app consuming `dig-urn-resolver` reach the node-first content tier. A desktop app runs on
   the same machine as the node, so this stays loopback-trust only and broadens no trust surface.
 
-  **Wallet-read exposure (#693).** Reflecting the desktop-app origins on the shared CORS layer grants
-  any local Tauri app cross-origin READ access to the OPEN wallet-read methods (§7.2 / §18 `get_*`,
-  which carry no token) reachable over the same CORS-covered HTTP surface (`POST /` JSON-RPC and
-  `POST /{method}`). This is deliberately within the same-machine trust model — a program already
-  running as the local user could read that data directly — and does NOT extend to custody or
-  signing: every wallet MUTATION and every `control.*` call stays token-gated (§7.12), and the
-  bidirectional wallet transport (`/ws`, §4.5/§4.8) validates `Origin` against only the local
-  web/extension subset above, NEVER the desktop-app origins. Narrowing the wallet-read reflection to
-  the app-origin allowlist WITHOUT also narrowing content reads is not currently cheap: both share
-  one router-wide `CorsLayer` and the `POST /` endpoint multiplexes content and wallet reads by
-  method, so a clean split would require per-method CORS evaluation the layer does not offer. It is
-  therefore documented here rather than enforced; a future route/method-scoped CORS split can gate it
-  without broadening any origin.
+**CORS is scoped by route AND method (#702).** The reflection is decided per request, not once for
+the router, and the two origin families have deliberately different reach:
+
+- **Local web/extension origins** are reflected on the WHOLE HTTP surface.
+- **Desktop-app origins** are reflected for **content reads ONLY** — a `GET` or `HEAD` to any route
+  other than `/ws` and `/ws/status`. They MUST NOT be reflected for any other method on any route.
+
+A preflight (`OPTIONS`) MUST be judged against the method declared in
+`Access-Control-Request-Method`, not against `OPTIONS` itself, so the preflight answer matches the
+answer the real request will receive. A preflight that declares no method MUST fail closed for the
+desktop-app family.
+
+Scoping by route alone MUST NOT be used, because it cannot express this policy: `POST /`
+multiplexes content reads and the open wallet-read methods onto one JSON-RPC endpoint, and
+`/{method}` serves the Sage-parity wallet RPC on `POST` and content on `GET`, so a route-keyed
+decision must answer both traffic classes identically.
+
+**Wallet-read exposure (#693) — now closed.** The open wallet-read methods (§7.2 / §18 `get_*`,
+which carry no token) are reachable only by `POST`, so the split above removes desktop-app
+cross-origin READ access to balances, addresses and coins. Custody was never in scope for it:
+every wallet MUTATION and every `control.*` call stays token-gated (§7.12), and the bidirectional
+wallet transport (`/ws`, §4.5/§4.8) validates `Origin` against only the local web/extension
+subset, NEVER the desktop-app origins. The #669 contract is unchanged — a desktop app still
+reaches the node-first content tier and still reads the exposed `X-Dig-*` provenance headers.
 
 Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Type` and
 `X-Dig-Control-Token`.
@@ -2508,6 +2555,22 @@ Numeric values and symbolic names are a stable contract and MUST NOT be renumber
 ---
 
 ## 9. OS-service contract
+
+9.0. **The service MUST always be stoppable (dig_ecosystem#2880).** A running service MUST answer
+a service-manager stop request promptly and MUST reach a stopped state, whatever the state of its
+internals.
+
+- Raising a stop from the control handler MUST NOT block, MUST NOT fail, and MUST NOT depend on
+  any bounded shared resource — in particular NOT on the async runtime's blocking-thread pool,
+  which the wallet replica's synchronous database work also draws from. A stop delivered onto a
+  saturated pool is accepted and then never acted on, which leaves the service `Running` and
+  serving HTTP while the service manager reports `1061`
+  (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`) — a node the user cannot turn off.
+- Graceful shutdown MUST be BOUNDED. If the serve body has not wound down within the deadline the
+  service MUST report itself stopped anyway, and MUST report that run as failed rather than as a
+  clean exit — a forced stop reported as graceful is a false claim about whether shutdown worked.
+- Deadline: 20s, inside the Windows SCM's own 30s stop timeout, so the service manager learns the
+  outcome from the service rather than inferring a hang.
 
 9.1. **Service scope (`--scope`, #526).** A registration lives in exactly ONE of two scopes, and
 `install`, `uninstall`, `start` and `stop` all accept `--scope <auto|system|user>`, default `auto`.

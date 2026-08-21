@@ -191,10 +191,20 @@ pub fn router(state: AppState) -> Router {
     // loopback-only by default (a non-loopback DIG_NODE_HOST is refused unless
     // DIG_NODE_ALLOW_REMOTE=1, #1662), so reflecting these local origins is not a
     // public-exposure risk.
+    // #702: the predicate is evaluated per REQUEST, not once for the router, so the app-origin
+    // family can be scoped to content reads while the local web/extension family keeps the whole
+    // surface. `parts` carries the path and the method (and, on a preflight, the method the
+    // browser is asking about) — everything `reflects_origin` needs to decide.
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _req| {
-            origin.to_str().map(is_allowed_origin).unwrap_or(false)
-        }))
+        .allow_origin(AllowOrigin::predicate(
+            |origin: &HeaderValue, parts: &axum::http::request::Parts| {
+                let method = effective_method(parts);
+                origin
+                    .to_str()
+                    .map(|o| reflects_origin(o, &method, parts.uri.path()))
+                    .unwrap_or(false)
+            },
+        ))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         // CONTENT_TYPE for the JSON body; the control-token header so a same-host
         // controller (the DIG Browser "My Node" UI) can authorize control.* calls.
@@ -285,19 +295,92 @@ const EXPOSED_DIG_HEADERS: [&str; 11] = [
     "x-dig-generation",
 ];
 
-/// Whether a CORS `Origin` is one this loopback node reflects. Two families, both loopback-only
-/// trust (the node binds loopback only — a non-loopback DIG_NODE_HOST is refused unless
-/// DIG_NODE_ALLOW_REMOTE=1, #1662; CORS is not an auth boundary):
+/// Whether this node reflects `origin` for a request carrying `method` to `path`.
+///
+/// CORS here is **scoped by route AND method** (#702), not router-wide. Two origin families with
+/// deliberately different reach, both loopback-only trust (the node binds loopback only — a
+/// non-loopback `DIG_NODE_HOST` is refused unless `DIG_NODE_ALLOW_REMOTE=1`, #1662; CORS is not an
+/// auth boundary):
 ///
 /// - **Same-machine web/extension origins** ([`is_local_origin`]) — the extension's
 ///   `chrome-extension://` scheme + `http://` pages served from a canonical local name (#91).
-/// - **Desktop-app origins** ([`is_app_origin`]) — Tauri's `tauri://localhost` /
-///   `https://tauri.localhost` + any origin in the operator-configured [`APP_ORIGINS_ENV`]
-///   allowlist (#669), so a native app consuming dig-urn-resolver reaches the node-first tier.
+///   Reflected on the WHOLE surface, unchanged: this is the subset the extension and the local
+///   `/ws` trust surface already share.
+/// - **Desktop-app origins** ([`is_app_origin`]) — Tauri's origins + the operator's
+///   [`APP_ORIGINS_ENV`] allowlist (#669). Reflected for **content reads ONLY**.
 ///
-/// PURE so the policy is unit-testable.
-fn is_allowed_origin(origin: &str) -> bool {
-    is_local_origin(origin) || is_app_origin(origin)
+/// # Why the split is by method and not by route alone
+///
+/// A route-scoped split cannot express this policy, because two routes serve both families of
+/// traffic: `POST /` multiplexes content reads AND the open wallet-read methods onto one JSON-RPC
+/// endpoint, and `/{method}` is a method-router serving the Sage-parity wallet RPC on `POST` and
+/// content on `GET`. Reflecting an app origin on either route as a whole would hand a local
+/// browser-reachable program cross-origin READ access to wallet data (balances, addresses, coins),
+/// which is exactly the exposure #693 documented and deferred.
+///
+/// So the discriminator is the **effective method**: an app origin is reflected for read-only
+/// content verbs and for nothing else. Every wallet-read method the node exposes is reached by
+/// `POST` (`POST /` JSON-RPC and `POST /{method}`), and every content read a cross-origin browser
+/// client makes — dig-urn-resolver's node-first tier, which is the whole reason #669 widened the
+/// origin set — is a `GET`/`HEAD` that carries the `X-Dig-*` provenance headers. The split
+/// therefore preserves #669 intact while removing the wallet-read reach.
+///
+/// `/ws` and `/ws/status` are excluded from the app family for the same reason and independently of
+/// their own `Origin` check (§4.5/§4.8): a WebSocket handshake is not gated by CORS, so the socket
+/// validates `Origin` itself against the local subset. Denying it here as well keeps the two
+/// statements of the same policy from drifting apart.
+///
+/// PURE so the policy is unit-testable without binding a port.
+fn reflects_origin(origin: &str, method: &Method, path: &str) -> bool {
+    if is_local_origin(origin) {
+        return true;
+    }
+    is_app_origin(origin) && is_content_read(method, path)
+}
+
+/// Whether a request is a **content read** — the only traffic class desktop-app origins are
+/// reflected for (#702).
+///
+/// Read-only by verb (`GET`/`HEAD`), and not the WebSocket upgrade paths. `HEAD` is included
+/// because axum dispatches it to the registered `GET` handler, so a `HEAD /s/...` is the same
+/// content read with the body stripped — and it still carries the `X-Dig-*` provenance headers a
+/// resolver reads.
+fn is_content_read(method: &Method, path: &str) -> bool {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return false;
+    }
+    !is_websocket_path(path)
+}
+
+/// The `/ws` and `/ws/status` upgrade paths, which no desktop-app origin reaches (§4.5/§4.8).
+///
+/// Matched on the exact paths the router registers rather than a prefix, so an unrelated future
+/// route beginning with those bytes is not silently swept into the WebSocket trust carve-out.
+fn is_websocket_path(path: &str) -> bool {
+    matches!(path, "/ws" | "/ws/status")
+}
+
+/// The method a CORS decision must be made against.
+///
+/// For a real request that is the request's own method. For a **preflight** (`OPTIONS`) the real
+/// request has not been sent yet, so the browser declares its intent in
+/// `Access-Control-Request-Method` — and THAT is what the policy must judge, or a preflight for a
+/// wallet `POST` would be evaluated as a harmless `OPTIONS`, pass, and only then be refused on the
+/// actual request. Judging the declared method keeps the preflight answer and the real answer the
+/// same.
+///
+/// A preflight with no declared method is not a preflight a browser sends; it is judged as
+/// `OPTIONS` itself, which is not a content read, so it fails CLOSED for the app family.
+fn effective_method(parts: &axum::http::request::Parts) -> Method {
+    if parts.method != Method::OPTIONS {
+        return parts.method.clone();
+    }
+    parts
+        .headers
+        .get(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| Method::from_bytes(v.as_bytes()).ok())
+        .unwrap_or(Method::OPTIONS)
 }
 
 /// Environment allowlist of extra desktop-app CORS origins (#669) — a comma/semicolon-separated
@@ -2334,12 +2417,12 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        chat_call_authorized, control_ingress_admits, is_allowed_origin, is_app_origin,
-        is_gated_chat_method, is_local_origin, peer_tier_status, provenance_for, read_origin_for,
+        chat_call_authorized, control_ingress_admits, is_app_origin, is_gated_chat_method,
+        is_local_origin, peer_tier_status, provenance_for, read_origin_for, reflects_origin,
         requestor_for, served_response, ws_token, ServeProvenance, StorePath, APP_ORIGINS_ENV,
         EXPOSED_DIG_HEADERS,
     };
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, Method};
     use dig_node_core::content_serve::{PeerTier, ServeSource};
     use dig_node_core::download::{ReadOrigin, RequestProvenance};
     use dig_node_core::rate_limit::{MissRateLimiter, RequestorId};
@@ -2684,8 +2767,8 @@ mod tests {
                 "{ok:?} (Tauri) must be an allowed app origin"
             );
             assert!(
-                is_allowed_origin(ok),
-                "{ok:?} must pass the CORS allow predicate"
+                reflects_origin(ok, &Method::GET, "/health"),
+                "{ok:?} must pass the CORS allow predicate for a content read"
             );
         }
     }

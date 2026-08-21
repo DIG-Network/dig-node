@@ -347,6 +347,132 @@ async fn health_reports_ok_version_mode_and_cache() {
     assert!(methods.iter().any(|m| m == &json!("rpc.discover")));
 }
 
+/// **Proves (#702):** the CORS reflection of desktop-app origins is scoped by ROUTE **and**
+/// METHOD — an app origin reads content cross-origin but cannot reach a wallet-read method.
+///
+/// # Why this fixture is shaped the way it is
+///
+/// The property is a *placement* — the same origin is allowed on one request and denied on
+/// another — so asserting only "the app origin is denied" would be satisfied by a policy that
+/// simply dropped the app family altogether, and asserting only "the app origin is allowed"
+/// would be satisfied by today's router-wide layer. The fixture therefore varies ONE actor at a
+/// time against truthful controls:
+///
+/// * **`GET /health` vs `POST /`** — the app origin must be allowed on the first and denied on
+///   the second. A method-blind (router-wide) policy fails the second; a policy that revoked the
+///   app family fails the first, which is #669's contract.
+/// * **`GET /:method` vs `POST /:method` on the SAME PATH** — this is the pair a ROUTE-scoped
+///   split cannot satisfy. `/{method}` is one route serving the Sage-parity wallet RPC on `POST`
+///   and content on `GET`, so a policy keyed on the path alone must answer both identically and
+///   fails here whichever way it answers. Only a method-aware policy passes.
+/// * **the `chrome-extension://` origin on `POST /`** — the honest control. The local
+///   web/extension family keeps the whole surface, so a fix that tightened the method for
+///   EVERY origin (breaking the extension) fails here rather than passing silently.
+/// * **preflights declaring `GET` vs `POST` on the SAME path** — the preflight answer must match
+///   the answer the real request will get, or a browser is told a wallet `POST` is permitted and
+///   only learns otherwise after sending it.
+#[tokio::test]
+async fn cors_scopes_app_origins_to_content_reads_only() {
+    let (upstream, _calls) = start_mock_upstream().await;
+    let (addr, _hold) = start_companion(&upstream).await;
+
+    /// The reflected origin for a request, or `None` when CORS refused to reflect it.
+    async fn reflected(
+        addr: &SocketAddr,
+        method: reqwest::Method,
+        path: &str,
+        origin: &str,
+    ) -> Option<String> {
+        let resp = client()
+            .request(method, format!("http://{addr}{path}"))
+            .header("Origin", origin)
+            // `POST /` and `POST /{method}` want a JSON body; the CORS decision is made by a
+            // layer ABOVE the handler, so the body only has to be well-formed enough to reach it.
+            .header("content-type", "application/json")
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"get_sync_status","params":{}}"#)
+            .send()
+            .await
+            .unwrap();
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    /// The reflected origin for a PREFLIGHT declaring `requested` as the real method.
+    async fn preflighted(
+        addr: &SocketAddr,
+        path: &str,
+        origin: &str,
+        requested: &str,
+    ) -> Option<String> {
+        let resp = client()
+            .request(reqwest::Method::OPTIONS, format!("http://{addr}{path}"))
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", requested)
+            .send()
+            .await
+            .unwrap();
+        resp.headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    }
+
+    let app = "tauri://localhost";
+    let ext = "chrome-extension://abcdefghijklmnop";
+
+    // --- content reads stay open to the app origin (#669 intact) -------------------------------
+    assert_eq!(
+        reflected(&addr, reqwest::Method::GET, "/health", app).await,
+        Some(app.to_owned()),
+        "#669: a desktop-app origin must still reach the node-first CONTENT tier"
+    );
+
+    // --- wallet reads are closed to the app origin (#702, the fix) -----------------------------
+    assert_eq!(
+        reflected(&addr, reqwest::Method::POST, "/", app).await,
+        None,
+        "a desktop-app origin must NOT be reflected on `POST /` — that route multiplexes the open \
+         wallet-read methods, so reflecting it hands a local browser context cross-origin read \
+         access to balances, addresses and coins"
+    );
+    assert_eq!(
+        reflected(&addr, reqwest::Method::POST, "/get_sync_status", app).await,
+        None,
+        "a desktop-app origin must NOT be reflected on the Sage-parity wallet RPC `POST /{{method}}`"
+    );
+
+    // --- the pair a ROUTE-only split cannot answer: one path, two methods ----------------------
+    assert_eq!(
+        reflected(&addr, reqwest::Method::GET, "/get_sync_status", app).await,
+        Some(app.to_owned()),
+        "the SAME path must still serve content to an app origin over GET — a policy that answers \
+         this identically to the POST above is scoped by route, not by route AND method"
+    );
+
+    // --- the honest control: the local family is untouched -------------------------------------
+    assert_eq!(
+        reflected(&addr, reqwest::Method::POST, "/", ext).await,
+        Some(ext.to_owned()),
+        "the extension's origin must KEEP the whole surface — narrowing the method for every \
+         origin would break the extension rather than scope the app family"
+    );
+
+    // --- preflights answer the same way the real request will ----------------------------------
+    assert_eq!(
+        preflighted(&addr, "/get_sync_status", app, "GET").await,
+        Some(app.to_owned()),
+        "a preflight declaring GET must be reflected, matching the real content read"
+    );
+    assert_eq!(
+        preflighted(&addr, "/get_sync_status", app, "POST").await,
+        None,
+        "a preflight declaring POST must be REFUSED — judging the preflight as a harmless OPTIONS \
+         would tell the browser a wallet POST is permitted and refuse it only after it was sent"
+    );
+}
+
 /// #669: a desktop-app (Tauri) cross-origin request to the loopback serve surface must be
 /// reflected by CORS, and the `X-Dig-*` verification headers must be EXPOSED so the browser
 /// dig-urn-resolver can read the "Verified by Chia" attestation instead of failing closed.
