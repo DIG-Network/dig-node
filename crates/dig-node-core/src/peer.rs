@@ -5637,7 +5637,12 @@ pub(crate) mod tests {
 
         let logs = capture_logs(async {
             let answer = node
-                .availability_answer(&held, &[], &crate::rate_limit::RequestorId::Local, crate::download::HopBudget::fresh())
+                .availability_answer(
+                    &held,
+                    &[],
+                    &crate::rate_limit::RequestorId::Local,
+                    crate::download::HopBudget::fresh(),
+                )
                 .await;
             assert_eq!(answer["available"], json!(false));
         })
@@ -5662,8 +5667,13 @@ pub(crate) mod tests {
         });
 
         let logs = capture_logs(async {
-            node.availability_answer(&bogus, &[], &crate::rate_limit::RequestorId::Local, crate::download::HopBudget::fresh())
-                .await;
+            node.availability_answer(
+                &bogus,
+                &[],
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
+            .await;
         })
         .await;
 
@@ -5765,8 +5775,13 @@ pub(crate) mod tests {
         });
 
         let logs = capture_logs(async {
-            node.availability_answer(&item, &[], &crate::rate_limit::RequestorId::Local, crate::download::HopBudget::fresh())
-                .await;
+            node.availability_answer(
+                &item,
+                &[],
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
+            .await;
         })
         .await;
 

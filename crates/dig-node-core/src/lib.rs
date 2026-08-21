@@ -9259,7 +9259,11 @@ mod tests {
             json!({ "store_id": "cc".repeat(32), "root": "dd".repeat(32) }), // a miss
         ];
         let resp = node
-            .availability_batch(&items, &crate::rate_limit::RequestorId::Local, crate::download::HopBudget::fresh())
+            .availability_batch(
+                &items,
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
             .await;
         let arr = resp["items"].as_array().expect("items array");
         assert_eq!(arr.len(), 3, "positionally aligned with the request");
@@ -9276,7 +9280,11 @@ mod tests {
             .map(|_| json!({ "store_id": "ee".repeat(32) }))
             .collect();
         let resp = node
-            .availability_batch(&items, &crate::rate_limit::RequestorId::Local, crate::download::HopBudget::fresh())
+            .availability_batch(
+                &items,
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
             .await;
         assert_eq!(
             resp["items"].as_array().unwrap().len(),
@@ -9554,7 +9562,11 @@ mod tests {
             .await
             .unwrap();
         let resp = node
-            .availability_batch(&[item], &crate::rate_limit::RequestorId::Local, crate::download::HopBudget::fresh())
+            .availability_batch(
+                &[item],
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
             .await;
         assert_eq!(
             resp["items"][0]["available"], false,
@@ -9629,7 +9641,11 @@ mod tests {
 
         let null_root = json!({ "store_id": store.to_hex(), "root": Value::Null });
         let resp = node
-            .availability_batch(&[null_root], &crate::rate_limit::RequestorId::Local, crate::download::HopBudget::fresh())
+            .availability_batch(
+                &[null_root],
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
             .await;
         assert_eq!(
             resp["items"][0]["available"], true,
@@ -9643,7 +9659,11 @@ mod tests {
 
         let numeric_root = json!({ "store_id": store.to_hex(), "root": 1 });
         let resp = node
-            .availability_batch(&[numeric_root], &crate::rate_limit::RequestorId::Local, crate::download::HopBudget::fresh())
+            .availability_batch(
+                &[numeric_root],
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
             .await;
         assert_eq!(
             resp["items"][0]["available"], true,
@@ -13942,7 +13962,11 @@ mod tests {
         let abuser = crate::rate_limit::RequestorId::Peer("aaaa".to_string());
         let control = crate::rate_limit::RequestorId::Peer("bbbb".to_string());
 
-        let abuser_resp = rt.block_on(node.availability_batch(&batch, &abuser, crate::download::HopBudget::fresh()));
+        let abuser_resp = rt.block_on(node.availability_batch(
+            &batch,
+            &abuser,
+            crate::download::HopBudget::fresh(),
+        ));
         let items = abuser_resp["items"].as_array().expect("four answers");
         assert_eq!(items.len(), 4, "one answer per item");
         // The ANSWER itself is unchanged for every item — none is held.
@@ -13979,7 +14003,11 @@ mod tests {
 
         // A DIFFERENT requestor draws from its OWN bucket: its first two items are still enriched,
         // proving the budget is keyed per requestor and the abuser never starved the control.
-        let control_resp = rt.block_on(node.availability_batch(&batch, &control, crate::download::HopBudget::fresh()));
+        let control_resp = rt.block_on(node.availability_batch(
+            &batch,
+            &control,
+            crate::download::HopBudget::fresh(),
+        ));
         let control_items = control_resp["items"].as_array().expect("four answers");
         assert!(
             control_items[0].get("providers").is_some(),
