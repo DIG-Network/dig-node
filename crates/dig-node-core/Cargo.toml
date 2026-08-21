@@ -132,7 +132,7 @@ serde_json = "1"
 # per-method tier) and the mTLS peer-reachability allowlist. dig-node-core reads its
 # method names + the peer allowlist from HERE (never hand-rolled) so the contract
 # cannot drift from the other node implementation or the discovery document (#1075).
-dig-rpc-protocol = "0.6"
+dig-rpc-protocol = "0.10"
 # The directed-message base protocol (epic #793/#796): the e2e seal/open pipeline + the typed envelope
 # the chat subsystem seals into. dig-node is the TRANSPORT — it seals an app-supplied opaque DIGCHAT1
 # envelope to the recipient's 0x0010 BLS identity key and dig-gossip directed-sends the sealed bytes.
@@ -299,7 +299,7 @@ dig-pex = "0.1"
 # `seams/dig_peer/module_anchor.rs` (`ChainAnchoredModuleVerifier`). NOTE the `testkit` feature is
 # deliberately NOT enabled: it is what makes the fail-OPEN `AcceptAnyModuleAnchor` nameable, and this
 # crate's anchor gate is the reshare path's ONLY root of trust.
-dig-download = "0.18"
+dig-download = "0.19"
 # -- The shared peer client (#1283/#1576) -------------------------------------------------------------
 # `DigPeer` — the ONE DIG Network peer client: peer_id-pinned mTLS over the full NAT ladder plus typed
 # RPC. Depended on DIRECTLY (not only transitively through dig-download) because dig-node supplies the
@@ -311,7 +311,7 @@ dig-download = "0.18"
 # module pull's trust boundary — on the fields that drive the whole pull plan. dig-download 0.8.1 is on
 # dig-peer 0.5 too, so exactly ONE dig-rpc-protocol + ONE dig-peer resolve here (asserted by
 # `crates/dig-node-core/tests/dependency_tree.rs`).
-dig-peer = "0.9"
+dig-peer = "0.11"
 # -- Self-optimizing peer selection (#178) ------------------------------------------------------------
 # The decision + learning layer between dig-dht discovery and dig-download execution: it ranks the
 # providers `find_providers` returns (learning throughput/rtt/reliability + a per-class saturation
@@ -402,7 +402,7 @@ rcgen = "0.13"
 #
 # Pinned by the `the_fail_open_anchor_verifier_is_not_reachable_from_a_production_build` test, which
 # fails if `testkit` ever appears on the production entry.
-dig-download = { version = "0.18", features = ["testkit"] }
+dig-download = { version = "0.19", features = ["testkit"] }
 # Captures the peer-facing serve's real emitted tracing records into an in-memory buffer, so the
 # serve-observability tests (#1595) assert what an operator would actually see in the node log —
 # and that no payload byte or proof ever reaches it.
