@@ -4432,6 +4432,106 @@ pub(crate) mod tests {
         srv.await.unwrap().unwrap();
     }
 
+    /// **Proves:** the dig-nat MUX availability shape — which has NO hop counter — forwards NOTHING,
+    /// and that the same node with a readable budget DOES forward.
+    ///
+    /// **Catches a deleted MUST becoming a live defect.** `dig_nat::mux::AvailabilityRequest` carries
+    /// no field that could hold a hop count, so a recursion started from it could not be bounded by
+    /// anything. `handle_availability` therefore declares the budget already SPENT. Nothing in the
+    /// suite guarded that: flipping `HopBudget::spent()` to `fresh()` there left the whole library
+    /// green — and that flip is the SAME failure direction as the `.unwrap_or(0)` defect this branch
+    /// exists to remove, granting full reach to a request whose reach cannot be bounded.
+    ///
+    /// **The control is the load-bearing half.** The fixture is built so the node genuinely WOULD
+    /// forward — empty DHT, a connected pool peer, an installed asker — and the control drives the
+    /// identical content through `availability_batch` with a readable budget and observes an ask go
+    /// out. Without it the assertion cannot tell "the mux leg refuses" from "this fixture never
+    /// forwards at all", which is exactly the fixture that would pass against a broken leg.
+    #[tokio::test]
+    async fn the_hop_counterless_mux_shape_forwards_nothing() {
+        let (node, td) = crate::test_support::test_node_for_peer_surface();
+        let store = [0xA1u8; 32];
+        let root = [0xA2u8; 32];
+        let rk = [0xA3u8; 32];
+        let cid = dig_dht::ContentId::resource(store, root, rk);
+
+        // This node holds nothing and its own DHT walk finds nobody, so any named holder can only
+        // have come from the forwarded ask.
+        let holder = dig_download::ProviderRecord::new(
+            &cid.to_key(),
+            &dig_dht::PeerId::from_bytes([9; 32]),
+            vec![dig_dht::CandidateAddr::direct("10.0.0.9", 9444)],
+            u64::MAX,
+        );
+        let ask = crate::forwarded_ask_tests::RecordingAsk::answering(vec![holder]);
+        let pc = crate::download::NodeContent::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(Vec::new())),
+            Arc::new(dig_download::testkit::MockRangeTransport::new(
+                dig_download::testkit::MockContent::even(4, 1),
+            )),
+            crate::download::MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        {
+            let pool = pc.connected_pool();
+            let mut guard = pool.lock().expect("pool lock");
+            guard.insert(
+                dig_download::testkit::mock_peer_hex(1),
+                vec!["10.0.0.1:9444".parse().expect("test address")],
+            );
+        }
+        pc.set_forwarded_ask(ask.clone(), crate::forwarded_ask_tests::recursion());
+        node.set_p2p_content(pc);
+
+        let items = json!([{
+            "store_id": hex::encode(store),
+            "root": hex::encode(root),
+            "retrieval_key": hex::encode(rk),
+        }]);
+
+        // The MUX leg, over the real peer stream.
+        let responder: Arc<dyn PeerRpcResponder> =
+            Arc::new(NodeResponder::without_pool(node.clone()));
+        let (mut client, server) = tokio::io::duplex(8192);
+        let srv = tokio::spawn(serve_one_stream(server, responder));
+        write_framed(&mut client, &json!({ "items": items }))
+            .await
+            .unwrap();
+        let resp = read_framed(&mut client).await.unwrap().expect("a response");
+        drop(client);
+        let _ = srv.await;
+
+        assert!(
+            ask.asked().is_empty(),
+            "the mux shape cannot carry a hop counter, so it MUST forward nothing; asked {:?}",
+            ask.asked()
+        );
+        assert!(
+            resp["items"][0]["providers"].is_null(),
+            "and it names no forwarded holder: {resp}"
+        );
+
+        // The CONTROL: the same node, the same content, a READABLE budget — this forwards.
+        let answered = node
+            .availability_batch(
+                items.as_array().expect("items"),
+                &crate::rate_limit::RequestorId::Peer("caller".into()),
+                crate::download::HopBudget::fresh(),
+            )
+            .await;
+        assert_eq!(
+            ask.asked().len(),
+            1,
+            "CONTROL: with a budget it CAN read this very node forwards, so the assertion above observed the mux leg's spent budget and not a fixture that never forwards"
+        );
+        assert_eq!(
+            answered["items"][0]["providers"][0]["peer_id"],
+            json!(dig_download::testkit::mock_peer_hex(9)),
+            "and the forwarded holder reaches the answer on that leg"
+        );
+    }
+
     #[tokio::test]
     async fn serve_one_stream_streams_a_range_frame() {
         let (mut client, server) = tokio::io::duplex(8192);
