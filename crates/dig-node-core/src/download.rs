@@ -238,11 +238,18 @@ fn resolve_inbound_demand_cache(v: Option<&str>) -> bool {
 /// Because it is the most amplifying path this node has, and an operator has to be able to say no.
 ///
 /// The relay token is charged on INBOUND admission while one token buys a whole fan-out of OUTBOUND
-/// dials, so the charge is never 1:1. One admitted frame recruits
-/// [`RecursionConfig::worst_case_nodes_recruited`](dig_sex::discovery::RecursionConfig::worst_case_nodes_recruited)
-/// nodes — 9 under the canonical bounds. The per-requestor relay bucket and the node-wide semaphore
-/// bound what THIS node spends and how much of it runs at once; neither bounds the aggregate, because
-/// every downstream node has its own.
+/// dials, so the charge is never 1:1. One admitted frame recruits **12 nodes** under the canonical
+/// bounds (`3 + 3^2`, the SUM over hops), or **48** against a full relay burst of 4.
+///
+/// **That figure is NOT
+/// [`worst_case_nodes_recruited`](dig_sex::discovery::RecursionConfig::worst_case_nodes_recruited),
+/// despite its name.** That function returns `fan_out ^ hop_cap` = 9, which is the LEAF COUNT of the
+/// last hop and omits every intermediate node — nodes that do the same work and learn the same
+/// triple. Quoting it as the recruitment understates the cost by the intermediate hops, and this
+/// exact mistake has now been made twice on this path.
+///
+/// The per-requestor relay bucket and the node-wide semaphore bound what THIS node spends and how
+/// much of it runs at once; neither bounds the aggregate, because every downstream node has its own.
 ///
 /// The precedent decides the default rather than taste. The PROXY leg — `DIG_NODE_ON_MISS=fetch` —
 /// is opt-in, and its cost is one capsule fetch by THIS node: expensive in bytes, but LOCAL and
@@ -1351,8 +1358,9 @@ impl NodeContent {
     ///
     /// Whether to forward, to whom, and with what budget left is decided by the canonical crate —
     /// including the two properties dig-node's own copy got wrong: an unreadable hop budget is
-    /// REFUSED rather than read as a full one, and the bounds are `fan_out ^ hop_cap` = 9 nodes
-    /// rather than the ~1,360 dials the in-tree fan-out of 4 over a cap of 4 produced. Everything
+    /// REFUSED rather than read as a full one, and one admitted frame recruits 12 nodes (`3 + 3^2`,
+    /// 48 against a full relay burst) rather than the ~1,360 dials the in-tree fan-out of 4 over a
+    /// cap of 4 produced — a reduction of about 28x. Everything
     /// below the decision — the opcode, the framing, the dial — stays here, because that is the half
     /// that is genuinely dig-node's.
     ///
@@ -2655,9 +2663,7 @@ pub(crate) mod tests {
     /// the canonical crate's, not a second set defined here.
     ///
     /// **Catches:** the rival's reach silently surviving the consolidation. dig-node's own fan-out was
-    /// 4 over a cap of 4 — about 1,360 dials per admitted frame. The assertion is on
-    /// `worst_case_nodes_recruited` rather than on the two fields separately because that is the
-    /// number an operator actually pays, and it is the one an accidental fan-out bump would move.
+    /// 4 over a cap of 4 — about 1,360 dials per admitted frame against a full relay burst.
     #[test]
     fn recursion_is_off_by_default_and_bounded_by_the_canonical_crate() {
         assert!(
@@ -2670,10 +2676,27 @@ pub(crate) mod tests {
         );
         let on = resolve_recursion_config(Some("true"));
         assert!(on.enabled);
+
+        // Pinned SEPARATELY, because their product does not identify them: a fan-out of 9 over a cap
+        // of 1 satisfies any assertion on the product alone, while being a pool-wide broadcast.
+        assert_eq!(on.fan_out, 3, "breadth");
+        assert_eq!(on.hop_cap, 2, "depth");
+
+        // And the figure that actually matters, computed as the SUM over hops rather than taken from
+        // `worst_case_nodes_recruited()` — which returns `fan_out ^ hop_cap` = 9, the LEAF COUNT of
+        // the last hop, and omits every intermediate node. Those nodes do the same work and learn the
+        // same triple, so quoting the leaf count understates recruitment AND the disclosure radius.
+        let recruited: u64 = (1..=u32::from(on.hop_cap))
+            .map(|hop| u64::from(on.fan_out).saturating_pow(hop))
+            .sum();
+        assert_eq!(
+            recruited, 12,
+            "one admitted frame recruits 3 + 9 nodes, against dig-node's former ~340 per question"
+        );
         assert_eq!(
             on.worst_case_nodes_recruited(),
             9,
-            "3 peers over 2 hops — the canonical bound, not dig-node's former 4 over 4"
+            "the crate's own function is the LEAF COUNT, pinned so the difference stays visible and NOT because it is the recruitment"
         );
     }
 

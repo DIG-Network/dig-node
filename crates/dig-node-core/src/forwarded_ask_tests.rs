@@ -25,7 +25,7 @@ use dig_sex::discovery::RecursionConfig;
 /// `fan_out` or `hop_cap` moves these tests with it instead of leaving them pinning a private copy of
 /// numbers the node no longer uses. Only `enabled` is overridden — the default is OFF, which is the
 /// production posture and is asserted separately in `download.rs`.
-fn recursion() -> RecursionConfig {
+pub(crate) fn recursion() -> RecursionConfig {
     RecursionConfig {
         enabled: true,
         ..Default::default()
@@ -39,13 +39,13 @@ use crate::seams::dig_peer::ForwardedAsk;
 /// It records the `next_depth` it was handed as well as the peer, because the hop budget is the bound
 /// under test in half these cases and a double that could not observe it would leave that assertion
 /// resting on the absence of a call rather than on its content.
-struct RecordingAsk {
+pub(crate) struct RecordingAsk {
     answer: Vec<ProviderRecord>,
     asked: Mutex<Vec<(String, u64)>>,
 }
 
 impl RecordingAsk {
-    fn answering(answer: Vec<ProviderRecord>) -> Arc<Self> {
+    pub(crate) fn answering(answer: Vec<ProviderRecord>) -> Arc<Self> {
         Arc::new(Self {
             answer,
             asked: Mutex::new(Vec::new()),
@@ -56,7 +56,7 @@ impl RecordingAsk {
         Self::answering(Vec::new())
     }
 
-    fn asked(&self) -> Vec<(String, u64)> {
+    pub(crate) fn asked(&self) -> Vec<(String, u64)> {
         self.asked.lock().expect("recorder lock").clone()
     }
 }
@@ -773,6 +773,6 @@ async fn a_holder_two_hops_away_is_reached_through_the_middle_node() {
         a2.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("reader".into()))
             .await
             .is_empty(),
-        "CONTROL: without B recursing to C the holder is unreachable — so the test above observed          the second hop, not the first"
+        "CONTROL: without B recursing to C the holder is unreachable, so the test above observed the second hop and not the first"
     );
 }

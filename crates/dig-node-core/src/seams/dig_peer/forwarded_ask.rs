@@ -55,10 +55,10 @@ use serde_json::{json, Value};
 /// claim a slot simply does not forward, which costs a less-enriched answer and never a stalled
 /// request.
 ///
-/// **It bounds CONCURRENCY, not total work.** The nodes one admitted frame recruits
-/// ([`RecursionConfig::worst_case_nodes_recruited`](dig_sex::discovery::RecursionConfig::worst_case_nodes_recruited))
-/// still happen; they are merely serialized through 32 slots here, and each downstream node has its
-/// own independent 32. Reading this as a cap on the aggregate understates the cost of this path.
+/// **It bounds CONCURRENCY, not total work.** The 12 nodes one admitted frame recruits (`3 + 3^2`,
+/// the sum over hops — NOT `worst_case_nodes_recruited()`, which returns the last hop's leaf count of
+/// 9) still happen; they are merely serialized through 32 slots here, and each downstream node has
+/// its own independent 32. Reading this as a cap on the aggregate understates the cost of this path.
 pub(crate) const MAX_CONCURRENT_FORWARDED_ASKS: usize = 32;
 
 /// Bounds one forwarded ask end to end (dial + stream + answer). A peer that is slow or gone must not

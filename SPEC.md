@@ -2976,6 +2976,12 @@ return `providers` MUST be read as "found nobody", never as an error.
   zero MUST forward nothing (it still answers from the DHT). The budget is `RecursionConfig::hop_cap`
   (= 2), which is distinct from `REDIRECT_HOP_CAP` (= 4): the redirect bounds how far a CALLER is
   bounced, the hop cap bounds how far a QUESTION travels at other nodes' expense.
+- **A request shape that CANNOT CARRY a hop counter MUST be treated as fully spent.** Stated over the
+  CLASS, not over one message type: any inbound shape with no field able to hold a hop count MUST
+  declare its budget already spent and MUST forward nothing. A recursion started from such a shape
+  could not be bounded by anything, so the only safe reading is zero. The dig-nat mux
+  `AvailabilityRequest` is today's instance — it has no such field — but a second hop-counter-less
+  shape MUST inherit this without the clause being rewritten.
 - **An UNREADABLE hop budget MUST be refused, never read as a full one.** A `redirect_depth` that is
   present and cannot be parsed as a hop count MUST yield
   `ForwardRefusal::UnreadableHopBudget` and forward nothing. A request whose hop budget cannot be read
@@ -2987,8 +2993,13 @@ return `providers` MUST be read as "found nobody", never as an error.
   reconciled: forwarding spends OTHER nodes' bandwidth and is therefore gated more tightly.
 - **Breadth.** At most `RecursionConfig::fan_out` (= 3) peers per admitted miss, and at most
   `MAX_CONCURRENT_FORWARDED_ASKS` (= 32) forwarded asks in flight node-wide. The requestor itself and
-  this node's own `peer_id` MUST be excluded from the fan-out. One admitted frame therefore recruits at
-  most `RecursionConfig::worst_case_nodes_recruited()` = 9 nodes.
+  this node's own `peer_id` MUST be excluded from the fan-out.
+
+  **One admitted frame recruits 12 nodes: `3 + 3^2`, the SUM over hops.**
+  `RecursionConfig::worst_case_nodes_recruited()` returns `fan_out ^ hop_cap` = 9, which is the
+  **LEAF COUNT of the last hop only** and MUST NOT be quoted as the recruitment or the disclosure
+  radius — it understates both by the intermediate hops. Against a full relay burst
+  (`DEFAULT_RELAY_ASK_BURST` = 4) the figure for one requestor is `4 x 12` = **48**.
 - **Self MUST be excluded from the ANSWER as well as from the fan-out.** These are two rules, and the
   fan-out exclusion does not imply the other: a peer is free to ANSWER with a record naming this node.
   Every source feeding the merged answer — DHT and forwarded alike — MUST be filtered against this
@@ -3016,9 +3027,9 @@ never have involved:
 
 - Up to `RecursionConfig::fan_out` (= 3) of this node's connected pool peers learn the triple per
   admitted miss, and each of them may disclose it to 3 of ITS peers, recursively to `hop_cap` (= 2).
-  The disclosure radius of one admitted frame is therefore
-  `RecursionConfig::worst_case_nodes_recruited()` = **9 nodes**, none of which the requestor chose,
-  contacted, or can enumerate.
+  The disclosure radius of one admitted frame is therefore `3 + 3^2` = **12 nodes** — the SUM over
+  hops, since an intermediate node learns the triple exactly as a leaf does — none of which the
+  requestor chose, contacted, or can enumerate. Against a full relay burst that is **48**.
 - Those peers are selected by THIS node's pool membership, not by the requestor. A requestor cannot
   predict, restrict, or audit who ends up learning what it asked for.
 - The disclosure happens on a MISS, which is precisely the case where the requestor has not yet
@@ -3049,9 +3060,9 @@ any value it does not recognise — a typo, an empty string, a value from a newe
 disables recursion, because a mistake MUST NOT be able to enable a network-wide amplifier.
 
 The default is OFF because the leg spends OTHER nodes' bandwidth: one admitted frame recruits
-`RecursionConfig::worst_case_nodes_recruited()` = 9 nodes, each of which also runs a DHT walk, while
-the strictly cheaper, node-local `proxy` leg (§10.4.3) is already opt-in. A path that amplifies more
-than an opt-in path MUST NOT be gated less than it.
+**12 nodes** (`3 + 3^2`, the sum over hops — 48 against a full relay burst), each of which also runs a
+DHT walk, while the strictly cheaper, node-local `proxy` leg (§10.4.3) is already opt-in. A path that
+amplifies more than an opt-in path MUST NOT be gated less than it.
 
 ---
 
