@@ -4662,8 +4662,14 @@ mod tests {
     /// entirely. Both are pre-existing and out of this change; adding them is a follow-up that has to
     /// resolve the condition, not the table.
     const LOCAL_WIRE_CODES: &[(i64, &str)] = &[
-        (crate::download::CONTENT_MISS_RATE_LIMITED, "CONTENT_MISS_RATE_LIMITED"),
-        (crate::download::RESOURCE_UNAVAILABLE, "RESOURCE_UNAVAILABLE"),
+        (
+            crate::download::CONTENT_MISS_RATE_LIMITED,
+            "CONTENT_MISS_RATE_LIMITED",
+        ),
+        (
+            crate::download::RESOURCE_UNAVAILABLE,
+            "RESOURCE_UNAVAILABLE",
+        ),
         (RESOURCE_NOT_AVAILABLE, "RESOURCE_UNAVAILABLE"),
         (ROOT_NOT_ANCHORED, "ROOT_NOT_ANCHORED"),
         (crate::download::CONTENT_REDIRECT, "CONTENT_REDIRECT"),
@@ -9598,6 +9604,82 @@ mod tests {
         assert!(
             answer.get("total_length").is_some(),
             "the resource totals come from the same served module the answer agrees with"
+        );
+    }
+
+    /// **Proves:** `absence_established` has THREE states on the wire and the absent one is not a
+    /// `false` in disguise - a node that ran no search makes NO CLAIM, which is different from
+    /// claiming an incomplete search.
+    ///
+    /// **Fixture design - two nodes differing in ONE respect, the presence of a search.** Both miss
+    /// the item, so `available` is `false` in both and cannot be what distinguishes them. The node
+    /// with no P2P engine consulted nothing, so the key MUST be absent; the node with an engine ran a
+    /// conclusive lookup, so it MUST be present. The nearest wrong implementation inserts the key
+    /// unconditionally with `unwrap_or(false)`, and a test that only checked the engine-attached case
+    /// would pass against it - the absent case is the only one that sees it, which is why the
+    /// engine-less control is here rather than an all-miss fixture.
+    ///
+    /// The third state, `Some(false)`, is the `CONTENT_MISS_INCONCLUSIVE` path and is driven from the
+    /// same `LocatedHolders::establishes_absence` flag; it is exercised by the forwarded-ask tests
+    /// where a leg can actually fail to answer.
+    #[tokio::test]
+    async fn absence_established_is_absent_when_no_search_ran_and_present_when_one_did() {
+        let store = Bytes32([0xa7; 32]);
+        let root = Bytes32([0xb8; 32]);
+        let rk = [0x5c; 32];
+        let item = json!({
+            "store_id": store.to_hex(),
+            "root": root.to_hex(),
+            "retrieval_key": hex::encode(rk),
+        });
+
+        // CONTROL: no engine, so no leg was consulted and nothing may be claimed either way.
+        let (silent, _td_a) = test_node(None);
+        let snapshot = silent.cache_list_cached().await;
+        let unsearched = silent
+            .availability_answer(
+                &item,
+                &snapshot,
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
+            .await;
+        assert_eq!(
+            unsearched["available"], false,
+            "precondition: the control node misses the item, so the two cases differ only in search"
+        );
+        assert!(
+            unsearched.get("absence_established").is_none(),
+            "a node that consulted nothing must make NO claim - an inserted `false` would tell the              caller a search ran and came back incomplete, which never happened"
+        );
+
+        // A node that DID search, conclusively: the claim is present and positive.
+        let (searched, td_b) = test_node(None);
+        let searched = Arc::new(searched);
+        searched.set_self_ref(Arc::downgrade(&searched));
+        attach_p2p(
+            &searched,
+            Vec::new(),
+            dig_download::testkit::MockContent::even(10, 1),
+            MissMode::Redirect,
+            &td_b,
+        );
+        let snapshot = searched.cache_list_cached().await;
+        let answered = searched
+            .availability_answer(
+                &item,
+                &snapshot,
+                &crate::rate_limit::RequestorId::Local,
+                crate::download::HopBudget::fresh(),
+            )
+            .await;
+        assert_eq!(
+            answered["available"], false,
+            "precondition: this node misses it too - only the search distinguishes the two answers"
+        );
+        assert_eq!(
+            answered["absence_established"], true,
+            "a lookup where every consulted leg answered establishes the absence, and says so"
         );
     }
 
