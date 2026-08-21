@@ -853,17 +853,32 @@ struct ForwardedAnswers {
 }
 
 impl ForwardedAnswers {
-    /// No peer was asked — recursion is off, the budget refused it, the walk was a duplicate, or no
-    /// slot was free.
+    /// Recursion is SWITCHED OFF on this node, so asking was never part of its answer.
     ///
-    /// **This is CONCLUSIVE, and deliberately so.** Not asking establishes nothing new, so the answer
-    /// stands on the DHT leg exactly as it did before the recursion existed. Reporting it as
-    /// inconclusive would make every miss on every default-configured node inconclusive — recursion
-    /// ships DISABLED — which is a different lie in the opposite direction.
-    fn not_asked() -> Self {
+    /// **This is the one unasked path that is CONCLUSIVE**, and only because nothing was withheld:
+    /// the answer stands on the DHT leg exactly as it did before the recursion existed. Reporting it
+    /// as inconclusive would make every miss on every default-configured node inconclusive —
+    /// recursion ships DISABLED — which is a different lie in the opposite direction.
+    fn recursion_disabled() -> Self {
         Self {
             records: Vec::new(),
             conclusive: true,
+        }
+    }
+
+    /// This node WOULD have asked and could not: a spent hop budget, a spent relay budget, an
+    /// unreadable budget, no eligible peer, a walk already claimed by another path, or no free
+    /// concurrency slot.
+    ///
+    /// **Every one of these is INCONCLUSIVE**, and the distinction from
+    /// [`Self::recursion_disabled`] is the whole of dig-node#273: on a node where the recursive ask
+    /// is part of the answer, a leg that was supposed to run and did not leaves the search cut short.
+    /// Calling that a proven absence tells the reader to stop looking because this node ran out of
+    /// budget — which is a fact about this node, not about the content.
+    fn refused() -> Self {
+        Self {
+            records: Vec::new(),
+            conclusive: false,
         }
     }
 
@@ -1469,13 +1484,25 @@ impl NodeContent {
         // this whole mechanism exists to provide — and, measurably, made the node-wide concurrency
         // ceiling and the per-requestor relay budget both look like they LATCHED. The cache is a
         // discovery shortcut, never an answer.
-        let first_hand = match self.holder_cache.get(content) {
-            Some(cached) => cached,
-            None => {
-                let found = self.find_providers(content).await;
-                self.holder_cache.remember(content, &found);
-                found
-            }
+        let (first_hand, first_hand_conclusive) = match self.holder_cache.get(content) {
+            // A remembered slate is a walk that ALREADY completed, so it carries that walk's
+            // conclusiveness with it. Only non-empty slates are ever remembered, so this is never the
+            // path an absence is claimed on.
+            Some(cached) => (cached, true),
+            None => match self.walk_for_providers(content).await {
+                Ok(found) => {
+                    self.holder_cache.remember(content, &found);
+                    (found, true)
+                }
+                // The walk FAILED — no reachable DHT peer, a transport error, a lookup that never
+                // completed. dig-download's `ProviderLocator` states this distinction in its own
+                // contract, and discarding it here is what turned "I could not look" into "it does
+                // not exist". Nothing is remembered, because there is nothing to remember.
+                Err(error) => {
+                    tracing::debug!(%error, "locate: the DHT walk failed; absence unproven");
+                    (Vec::new(), false)
+                }
+            },
         };
 
         // HEARSAY: what connected peers relayed. Never cached, never asserted (SPEC 10.4.4).
@@ -1506,7 +1533,12 @@ impl NodeContent {
         dedup_by_peer_tagged(&mut records);
         LocatedHolders {
             records,
-            conclusive: forwarded.conclusive,
+            // BOTH legs have to have finished for the emptiness to mean anything. Deriving this from
+            // the forwarded leg alone left the DHT leg with no way to clear the flag at all, which —
+            // since the forwarded leg is not even installed on a stock node — made
+            // `absence_established` a constant `true` and `MissOutcome::Inconclusive` unreachable in
+            // production. A conjunction is what makes the field carry information.
+            conclusive: first_hand_conclusive && forwarded.conclusive,
         }
     }
 
@@ -1595,27 +1627,38 @@ impl NodeContent {
             hops_remaining,
         } = decision
         else {
-            // A refusal means this node did not ASK, so it learned nothing either way and the
-            // conclusiveness of the answer rests on the DHT leg alone — exactly as it did before the
-            // recursion existed. This matters because recursion is DISABLED by default: reporting a
-            // refusal as inconclusive would make every miss on every default-configured node
-            // inconclusive, which is a different lie in the opposite direction.
             tracing::debug!(?decision, "forwarded ask: refused");
-            return ForwardedAnswers::not_asked();
+            // WHICH refusal decides whether the absence may still be claimed. Recursion being off is
+            // not a refusal at all — this node never offered to ask — so the answer rests on the DHT
+            // leg exactly as it did before. Every other reason is a leg that was supposed to run and
+            // did not, and dig-node#273 requires that to be distinguishable from a not-found: a
+            // reader must be able to tell "nobody has it" from "we ran out of budget looking".
+            return match decision {
+                dig_sex::discovery::ForwardDecision::Refuse(
+                    dig_sex::discovery::ForwardRefusal::Disabled,
+                ) => ForwardedAnswers::recursion_disabled(),
+                _ => ForwardedAnswers::refused(),
+            };
         };
 
         // This exact ask has already been walked here, by another path through the graph
         // (dig-node#273). Excluding the requestor stops an immediate echo; it does not stop a DIAMOND,
         // and without this the graph re-walks itself and the real cost far exceeds `fan_out ^ hop_cap`.
         // Not-asked, for the same reason a refusal is: the first walk is answering this question.
-        if !self.ask_seen.claim(budget.ask_id()) {
+        if !self.ask_seen.claim(budget.ask_id(), content) {
             tracing::debug!("forwarded ask: already walked here by another path; not forwarding");
-            return ForwardedAnswers::not_asked();
+            // Inconclusive: the OTHER path through the diamond is answering this question, and its
+            // answer goes to whoever asked IT. This branch's own caller learns nothing from a walk it
+            // cannot see, so it must not be handed an absence on the strength of one.
+            return ForwardedAnswers::refused();
         }
 
         let Ok(_slot) = self.forwarded_ask_slots.clone().try_acquire_owned() else {
             tracing::debug!("forwarded ask: node-wide concurrency ceiling reached; not forwarding");
-            return ForwardedAnswers::not_asked();
+            // The node is saturated, which is a fact about this node's load and never about the
+            // content. Under a burst this is the COMMON path, so claiming absence here would turn
+            // load into manufactured not-founds precisely when the network is busiest.
+            return ForwardedAnswers::refused();
         };
 
         // The wire still carries hops CONSUMED (`redirect_depth`), so the remaining budget the crate
@@ -1642,8 +1685,24 @@ impl NodeContent {
                 answers.conclusive = false;
                 break;
             }
-            match ask.ask(peer, addrs, content, next_depth, remaining).await {
+            // The identity travels WITH the ask, because the far end reads it off the wire: an ask
+            // issued without it makes every hop beyond this one mint a fresh id, and the diamond
+            // dedup that bounds this whole recursion never fires (dig-node#273).
+            let outcome = ask
+                .ask(peer, addrs, content, next_depth, remaining, budget.ask_id())
+                .await;
+            match outcome {
                 AskOutcome::Answered(records) => answers.records.extend(records),
+                // The peer answered and told us its OWN subtree did not finish. Its records are
+                // still candidates — a partial answer beats none — but its uncertainty is ours now.
+                // This is the arm that makes inconclusiveness CASCADE instead of dying one hop from
+                // where it arose, and without it a single stalled node manufactures a not-found for
+                // every reader downstream of the honest peer that reported it.
+                AskOutcome::AnsweredInconclusive(records) => {
+                    tracing::debug!(peer = %peer, "forwarded ask: peer reports its own subtree unproven");
+                    answers.records.extend(records);
+                    answers.conclusive = false;
+                }
                 // The peer did not look, or did not finish looking. Its silence is not an absence,
                 // and saying so is the entire point of dig-node#273.
                 inconclusive => {
@@ -1679,6 +1738,7 @@ impl NodeContent {
     ///
     /// Touches only this node's own cache: it can neither censor a key this node serves nor be
     /// observed by any other peer.
+
     /// [`Self::forget_stale_discovery`], reachable from the tests that drive the caches directly.
     #[cfg(test)]
     pub(crate) async fn forget_stale_discovery_for_test(&self, content: &ContentId) {
@@ -1704,18 +1764,30 @@ impl NodeContent {
         }
     }
 
-    /// Locate the peers holding `content` via the DHT (best-effort: a locate failure is an empty
-    /// set), excluding this node itself — a redirect must never point the caller back at the node
-    /// that just missed.
-    pub async fn find_providers(&self, content: &ContentId) -> Vec<ProviderRecord> {
-        let found = self
-            .locator
-            .find_providers(content)
-            .await
-            .unwrap_or_default();
-        let mut found = found;
+    /// Locate the peers holding `content` via the DHT, excluding this node itself — a redirect must
+    /// never point the caller back at the node that just missed.
+    ///
+    /// **A locate FAILURE stays a failure.** dig-download's `ProviderLocator` contract separates a
+    /// walk that failed from a walk that found nobody, and this is the caller that keeps them apart:
+    /// collapsing them is how a node with no reachable DHT peer came to assert a proven absence for
+    /// every piece of content in existence.
+    async fn walk_for_providers(
+        &self,
+        content: &ContentId,
+    ) -> Result<Vec<ProviderRecord>, dig_download::DownloadError> {
+        let mut found = self.locator.find_providers(content).await?;
         retain_excluding_self(&mut found, self.self_peer_id.as_deref());
-        found
+        Ok(found)
+    }
+
+    /// [`Self::walk_for_providers`] for the callers that genuinely cannot act on the difference — a
+    /// failed walk reads as an empty set.
+    ///
+    /// **Not for anything that reports an ABSENCE.** The only production caller is the debug log in
+    /// [`Self::fetch_resource`], which is counting candidates rather than deciding whether content
+    /// exists; a caller that must tell "found nobody" from "could not look" uses the fallible form.
+    pub async fn find_providers(&self, content: &ContentId) -> Vec<ProviderRecord> {
+        self.walk_for_providers(content).await.unwrap_or_default()
     }
 
     /// The #164 content-acquisition path: multi-source download `content` (locate → confirm → fan
@@ -2495,14 +2567,25 @@ impl HopBudget {
     /// derives the budget from the work it is about to ask for ([`ask_budget`]). Either way the result
     /// is inside [`MAX_FORWARDED_ASK_BUDGET`], so no configuration and no peer can buy unbounded time.
     ///
-    /// **A hop is never granted more than it was given.** That is what makes the budget DECREMENTED
-    /// down the chain rather than restated at each hop — the failure that made the recursion depth-1,
-    /// because a child granted the leaf timeout cannot finish `fan_out` asks of its own inside it.
     /// This ask's identity, for the seen-set and for the outbound request body.
+    ///
+    /// It is the SAME value inbound and outbound — see
+    /// [`forwarded_request`](crate::seams::dig_peer::forwarded_request). A hop that minted a fresh one
+    /// would be asking a new question as far as every node downstream is concerned.
     pub(crate) fn ask_id(&self) -> AskId {
         self.ask_id
     }
 
+    /// The wall clock this ask may spend IN TOTAL, given how far it may still travel.
+    ///
+    /// A hop's granted budget is used when one was carried; otherwise this node is the originator and
+    /// derives the budget from the work it is about to ask for ([`ask_budget`]). Either way the result
+    /// is inside [`MAX_FORWARDED_ASK_BUDGET`], so no configuration and no peer can buy unbounded time.
+    ///
+    /// **A hop is never granted more than it was given.** That is what makes the budget DECREMENTED
+    /// down the chain rather than restated at each hop — the failure that made the recursion depth-1,
+    /// because a child granted the leaf timeout cannot finish `fan_out` asks of its own inside it.
+    ///
     /// No clamp is applied HERE, deliberately: every constructor clamps, so the ceiling is an
     /// invariant of the type rather than a rule each reader must remember. Re-clamping on read would
     /// make the ingress clamp UNTESTABLE — a second guard that silently covers for the first is a
@@ -2587,18 +2670,16 @@ pub(crate) fn redirect_error_object(
     })
 }
 
-/// Drop every repeat of a `peer_id` already present, KEEPING THE FIRST occurrence.
+/// Keep one record per holder, KEEPING THE FIRST occurrence.
 ///
 /// Order is the contract here, not a side effect: the requestor dials in list order and the answer is
 /// truncated at [`MAX_REDIRECT_PROVIDERS`], so keeping the first occurrence is what stops a forwarded
 /// duplicate of a DHT-found holder from displacing the original's position (see
 /// [`NodeContent::locate_holders`]).
-/// Keep one record per holder.
 ///
-/// The FIRST occurrence wins, and because the merge puts first-hand records ahead of hearsay that is
-/// always the stronger claim: a hop echoing a holder this node already knows cannot downgrade that
-/// record to hearsay, which would otherwise be a free way to strip this node's own knowledge of its
-/// standing.
+/// Because the merge puts first-hand records ahead of hearsay, the first occurrence is also always
+/// the stronger claim: a hop echoing a holder this node already knows cannot downgrade that record to
+/// hearsay, which would otherwise be a free way to strip this node's own knowledge of its standing.
 fn dedup_by_peer_tagged(records: &mut Vec<(ProviderRecord, dig_sex::discovery::Provenance)>) {
     let mut seen = std::collections::HashSet::new();
     records.retain(|(record, _)| seen.insert(record.provider_peer_id.clone()));

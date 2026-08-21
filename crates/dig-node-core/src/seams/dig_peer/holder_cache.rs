@@ -38,15 +38,37 @@ use std::time::{Duration, Instant};
 
 use dig_dht::{ContentId, ProviderRecord};
 
-/// How long a first-hand holder record stays usable.
+/// Wall-clock seconds since the epoch — the clock `ProviderRecord::expires_at` is stated against.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// How long a first-hand holder record stays usable, as a CACHE-level ceiling.
 ///
-/// It is [`ADVERTISED_TTL_SECS`](super::holdings::ADVERTISED_TTL_SECS) deliberately, not a number
-/// chosen here: that is already how long this ecosystem treats a holder's own signed holdings
-/// announce as live, so a cached record expires exactly when the claim behind it would have. Choosing
-/// independently would mean this node dials holders the network has already stopped believing in —
-/// the same wasted-dial cost that eviction-without-retraction causes.
-pub(crate) const HOLDER_CACHE_TTL: Duration =
-    Duration::from_secs(super::holdings::ADVERTISED_TTL_SECS);
+/// # Why it is not the signed-announce lifetime
+///
+/// It used to be [`ADVERTISED_TTL_SECS`](super::holdings::ADVERTISED_TTL_SECS) — an hour — on the
+/// reasoning that a cached record should expire when the claim behind it would. That reasoning
+/// borrowed the wrong claim. `ADVERTISED_TTL_SECS` is how long a holder's OWN SIGNED announce is
+/// treated as live; what this cache actually holds is a DHT lookup ANSWER, unsigned, relayed by
+/// whichever node the walk happened to reach first. Pricing the second at the lifetime of the first
+/// lends it a warrant it does not carry.
+///
+/// # What the number bounds is a DISPLACEMENT window
+///
+/// First-hand records are PREPENDED at the merge and the hearsay tail is cut at
+/// `MAX_REDIRECT_PROVIDERS`, so a fabricated first-hand slate does not merely add noise — it evicts
+/// genuine, recursively-discovered holders from the answer for as long as it is remembered, and every
+/// read inside that window renews it. The TTL is therefore the length of that window, and five
+/// minutes cuts it twelvefold while still sparing rediscovery across the repeated lookups a single
+/// download session makes.
+///
+/// It is a CEILING, not the whole rule: [`FirstHandHolderCache::get`] additionally honours each
+/// record's own `expires_at`, so the cache can never outlive the claim it cached.
+pub(crate) const HOLDER_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// The most content keys the holder cache will remember at once.
 ///
@@ -149,7 +171,32 @@ impl FirstHandHolderCache {
 
     /// The first-hand holders remembered for `content`, if any are still fresh.
     pub(crate) fn get(&self, content: &ContentId) -> Option<Vec<ProviderRecord>> {
-        self.holders.get(content, Instant::now())
+        self.get_at(content, Instant::now(), now_secs())
+    }
+
+    /// [`Self::get`] against an explicit clock, so both expiries are testable without sleeping.
+    ///
+    /// Two independent bounds apply, and the record's own is the stronger of the two: the cache
+    /// ceiling ([`HOLDER_CACHE_TTL`]) says how long THIS NODE may reuse a lookup answer, while each
+    /// record's `expires_at` is the expiry the DHT itself already clamps and enforces. Honouring only
+    /// the ceiling would let this node keep dialling a holder the network has stopped believing in;
+    /// honouring only the record would leave a long-lived record's displacement window unbounded.
+    ///
+    /// A slate whose records have ALL expired reads as absent, so the next lookup runs a real walk
+    /// rather than replaying holders nobody else still credits.
+    pub(crate) fn get_at(
+        &self,
+        content: &ContentId,
+        now: Instant,
+        now_secs: u64,
+    ) -> Option<Vec<ProviderRecord>> {
+        let mut records = self.holders.get(content, now)?;
+        records.retain(|record| !record.is_expired(now_secs));
+        if records.is_empty() {
+            self.holders.remove(content);
+            return None;
+        }
+        Some(records)
     }
 
     /// Remember `records` as this node's own first-hand knowledge of who holds `content`.
@@ -183,8 +230,17 @@ impl FirstHandHolderCache {
 /// immediate echo. It cannot stop a DIAMOND: in any graph that is not a tree the same ask reaches one
 /// node by two paths, and without an identity neither arrival recognises the other. The graph then
 /// re-walks itself and the real fan-out cost far exceeds `fan_out ^ hop_cap`.
+///
+/// # The claim is per QUESTION-AND-CONTENT, and that is not a refinement
+///
+/// One request may ask about many items, and it carries ONE identity for all of them. Keying the
+/// claim on the identity alone therefore means the first item consumes it and every item after it is
+/// treated as a duplicate — so a `dig.getAvailability` batch, which is what an ordinary downloading
+/// peer sends, silently stops forwarding after its first item and reports the rest as absences having
+/// asked nobody. No attacker is involved; it is the normal path. The pair is the smallest key that
+/// deduplicates a re-walk of the SAME question while leaving distinct questions distinct.
 pub(crate) struct AskSeenSet {
-    seen: TtlMap<AskId, ()>,
+    seen: TtlMap<(AskId, ContentId), ()>,
 }
 
 /// A request identity: opaque, 16 bytes, minted by the ORIGINATOR and echoed unchanged by every hop.
@@ -208,14 +264,15 @@ impl AskSeenSet {
         }
     }
 
-    /// Claim `id` for this node. `true` means it is new and may be forwarded; `false` means this ask
-    /// has already been walked here and must not be walked again.
-    pub(crate) fn claim(&self, id: AskId) -> bool {
+    /// Claim `id` for `content`. `true` means this question is new here and may be forwarded; `false`
+    /// means it has already been walked and must not be walked again.
+    pub(crate) fn claim(&self, id: AskId, content: &ContentId) -> bool {
+        let key = (id, *content);
         let now = Instant::now();
-        if self.seen.get(&id, now).is_some() {
+        if self.seen.get(&key, now).is_some() {
             return false;
         }
-        self.seen.insert(id, (), now);
+        self.seen.insert(key, (), now);
         true
     }
 }

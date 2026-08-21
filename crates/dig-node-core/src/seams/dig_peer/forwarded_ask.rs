@@ -44,6 +44,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dig_dht::{CandidateAddr, ContentId, PeerId};
+
+use super::holder_cache::AskId;
 use dig_download::ProviderRecord;
 use serde_json::{json, Value};
 
@@ -128,6 +130,18 @@ pub(crate) enum AskOutcome {
     /// The peer looked and reported these providers. **An empty vec here is a real answer** - that
     /// peer, and everyone it could reach, found nobody.
     Answered(Vec<ProviderRecord>),
+    /// The peer answered, and said SO ITSELF that its own subtree did not finish looking
+    /// (`result.absence_established == false`). The providers it did name are real candidates; the
+    /// emptiness of the rest is not an absence.
+    ///
+    /// # This is the variant that makes the distinction CASCADE
+    ///
+    /// Without it a hop's honest "I could not tell" is read by its parent as a conclusive answer of
+    /// nobody, and the parent reports a proven absence upward. An attacker two hops from a reader
+    /// then manufactures a not-found by simply STALLING - no forgery, no path position, one held
+    /// connection - because the honest intermediate between them correctly reports its uncertainty
+    /// and nothing upstream reads it.
+    AnsweredInconclusive(Vec<ProviderRecord>),
     /// The peer answered with a JSON-RPC error frame: it declined to look (its own hop cap, its own
     /// rate limit, recursion switched off there). Absence unproven.
     Refused,
@@ -146,7 +160,7 @@ impl AskOutcome {
     #[cfg(test)]
     pub(crate) fn records(&self) -> &[ProviderRecord] {
         match self {
-            Self::Answered(records) => records,
+            Self::Answered(records) | Self::AnsweredInconclusive(records) => records,
             _ => &[],
         }
     }
@@ -156,6 +170,17 @@ impl AskOutcome {
     #[cfg(test)]
     pub(crate) fn is_conclusive(&self) -> bool {
         matches!(self, Self::Answered(_))
+    }
+
+    /// The providers this outcome named, consumed - `Answered` and `AnsweredInconclusive` alike.
+    ///
+    /// Both carry real candidates: a hop that could not finish looking may still have found someone
+    /// before it ran out, and discarding those would punish the honest report of uncertainty.
+    pub(crate) fn into_records(self) -> Vec<ProviderRecord> {
+        match self {
+            Self::Answered(records) | Self::AnsweredInconclusive(records) => records,
+            Self::Refused | Self::TimedOut | Self::Unreachable => Vec::new(),
+        }
     }
 }
 
@@ -175,6 +200,10 @@ pub(crate) trait ForwardedAsk: Send + Sync {
     ///
     /// `budget` is the time this ask may take IN TOTAL, already decremented by everything the chain
     /// above has spent. An implementation MUST NOT extend it.
+    ///
+    /// `ask_id` is the question's identity, and it is PASSED rather than minted because it must be
+    /// echoed unchanged onto the wire: it is what lets the peer - and every hop beyond it - recognise
+    /// a question that already reached them by another path (dig-node#273).
     async fn ask(
         &self,
         peer: &str,
@@ -182,13 +211,23 @@ pub(crate) trait ForwardedAsk: Send + Sync {
         content: &ContentId,
         next_depth: u64,
         budget: Duration,
+        ask_id: AskId,
     ) -> AskOutcome;
 }
 
 /// The `dig.getAvailability` request body for `content` at hop budget `next_depth` — the SAME shape
 /// any other caller sends, built from the same [`content_id_json`](crate::download::content_id_json)
 /// item renderer the redirect uses, so the forwarded question is byte-identical to a direct one.
-pub(crate) fn forwarded_request(content: &ContentId, next_depth: u64, budget: Duration) -> Value {
+///
+/// `ask_id` rides as hex under `params.ask_id`, the field
+/// [`HopBudget::from_params`](crate::download::HopBudget::from_params) reads at the far end. A peer on
+/// an older build ignores it and mints its own, which is the pre-dedup behaviour and never worse.
+pub(crate) fn forwarded_request(
+    content: &ContentId,
+    next_depth: u64,
+    budget: Duration,
+    ask_id: AskId,
+) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -197,6 +236,10 @@ pub(crate) fn forwarded_request(content: &ContentId, next_depth: u64, budget: Du
             "items": [crate::download::content_id_json(content)],
             "redirect_depth": next_depth,
             "budget_ms": u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
+            // The identity, hex-encoded, echoed exactly as received. THIS is what makes the seen-set
+            // a dedup rather than a random-key generator: with the field absent, every hop's ingress
+            // mints a fresh id, every claim succeeds, and a diamond in the graph re-walks itself.
+            "ask_id": hex::encode(ask_id),
         },
     })
 }
@@ -238,7 +281,9 @@ where
 /// A JSON-RPC **error frame** - what a peer at its hop cap, over its rate limit, or with recursion
 /// switched off returns - is a [`Refused`](AskOutcome::Refused), never an answer of "nobody". A
 /// `result` frame is an [`Answered`](AskOutcome::Answered) even when the provider list is empty,
-/// because there the peer genuinely did look.
+/// because there the peer genuinely did look - UNLESS the peer itself said otherwise, in which case
+/// it is an [`AnsweredInconclusive`](AskOutcome::AnsweredInconclusive). That last case is what makes
+/// a downstream hop's uncertainty TRAVEL: see [`answered_conclusively`].
 ///
 /// A frame that is neither is a peer that did not answer the question it was asked, which establishes
 /// nothing: [`Unreachable`](AskOutcome::Unreachable). Reading it as an empty answer would hand any
@@ -250,7 +295,39 @@ pub(crate) fn parse_forwarded_answer(content: &ContentId, response: &Value) -> A
     if response.get("result").is_none() {
         return AskOutcome::Unreachable;
     }
-    AskOutcome::Answered(parse_forwarded_providers(content, response))
+    let records = parse_forwarded_providers(content, response);
+    if answered_conclusively(response) {
+        AskOutcome::Answered(records)
+    } else {
+        AskOutcome::AnsweredInconclusive(records)
+    }
+}
+
+/// Whether the peer's own answer claims its subtree finished looking.
+///
+/// Reads `result.items[*].absence_established`, the field this node emits on the same verb. **Any
+/// item saying `false` makes the whole answer inconclusive**, and an absent field reads as `true`.
+///
+/// The absent case is deliberately tolerant: a peer on a build predating the field cannot say
+/// anything about its own certainty, and reading its silence as uncertainty would make every miss on
+/// a mixed network inconclusive - the opposite lie, arriving by default rather than by attack.
+///
+/// A hop can of course LIE here, like anything else it tells us (NC-12) - but the value can only ever
+/// WEAKEN the claim this node goes on to make, never strengthen it. Claiming `false` costs the liar a
+/// retry it could have caused anyway by staying silent; claiming `true` is exactly the pre-existing
+/// behaviour. There is no direction in which lying about this field buys reach.
+fn answered_conclusively(response: &Value) -> bool {
+    response
+        .get("result")
+        .and_then(|r| r.get("items"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .all(|item| {
+            item.get("absence_established")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        })
 }
 
 /// Parse the `providers` a `dig.getAvailability` response named for `content`, into records keyed to
@@ -348,6 +425,7 @@ impl ForwardedAsk for NatForwardedAsk {
         content: &ContentId,
         next_depth: u64,
         budget: Duration,
+        ask_id: AskId,
     ) -> AskOutcome {
         let Some(peer_id) = PeerId::from_hex(peer) else {
             return AskOutcome::Unreachable;
@@ -363,7 +441,7 @@ impl ForwardedAsk for NatForwardedAsk {
         // single black-holed address consume the entire question's time.
         let config =
             crate::net::full_nat_config(FORWARDED_ASK_LEAF_TIMEOUT.min(budget), self.stun_server);
-        let request = forwarded_request(content, next_depth, budget);
+        let request = forwarded_request(content, next_depth, budget, ask_id);
 
         let exchange = async {
             let mut conn =

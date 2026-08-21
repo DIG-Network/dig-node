@@ -1339,3 +1339,285 @@ async fn hearsay_is_never_remembered() {
          requests (SPEC 10.4.4 - forwarded records MUST NOT be stored)"
     );
 }
+
+// -- The gate round: the distinction has to exist on the paths that RUN --------------------------
+
+/// A [`dig_download::ProviderLocator`] whose walk FAILS.
+///
+/// **Why this double had to be added.** Every locator double in this file answers `Ok`, so the error
+/// arm of `find_providers` was structurally invisible to the whole suite: no fixture could exhibit a
+/// locate failure, and the code that laundered one into an established absence passed every test.
+/// A double that cannot express the failure cannot witness the fix.
+#[derive(Clone)]
+struct FailingLocator;
+
+#[async_trait]
+impl dig_download::ProviderLocator for FailingLocator {
+    async fn find_providers(
+        &self,
+        _content: &ContentId,
+    ) -> Result<Vec<ProviderRecord>, dig_download::DownloadError> {
+        Err(dig_download::DownloadError::Locate(
+            "the DHT walk reached nobody".into(),
+        ))
+    }
+}
+
+/// An engine over an arbitrary locator, with no forwarded leg — the stock posture (recursion ships
+/// disabled), which is exactly the configuration in which `absence_established` was a constant.
+fn engine_over<L: dig_download::ProviderLocator + 'static>(
+    locator: L,
+) -> (Arc<NodeContent>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let content = NodeContent::new(
+        Arc::new(locator),
+        Arc::new(MockRangeTransport::new(MockContent::even(4, 1))),
+        MissMode::Redirect,
+        None,
+        dir.path(),
+    );
+    (content, dir)
+}
+
+/// A [`ForwardedAsk`] double that answers each peer DIFFERENTLY.
+///
+/// The stock `RecordingAsk` answers every peer identically, which cannot express a merge: a fixture
+/// in which every actor behaves the same way cannot distinguish a parent that merges its children's
+/// outcomes from one that simply echoes the last it saw.
+struct PerPeerAsk {
+    answers: Vec<(String, AskOutcome)>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl PerPeerAsk {
+    fn new(answers: Vec<(String, AskOutcome)>) -> Self {
+        Self {
+            answers,
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ForwardedAsk for PerPeerAsk {
+    async fn ask(
+        &self,
+        peer: &str,
+        _addrs: &[SocketAddr],
+        _content: &ContentId,
+        _next_depth: u64,
+        _budget: Duration,
+    ) -> AskOutcome {
+        self.asked.lock().expect("recorder lock").push(peer.to_string());
+        self.answers
+            .iter()
+            .find(|(known, _)| known == peer)
+            .map(|(_, outcome)| outcome.clone())
+            .unwrap_or(AskOutcome::Unreachable)
+    }
+}
+
+/// **Proves:** a DHT walk that ERRORED does not establish an absence, while a walk that genuinely
+/// returned nobody does.
+///
+/// **Fixture design — ONE actor varies, and there is a truthful control.** Both arms ask about the
+/// same content on a node with no forwarded leg; the only difference is whether the locator returns
+/// `Err` or `Ok(vec![])`. Asserting only the failing arm would pass against an implementation that
+/// reported EVERY miss as inconclusive, which is the opposite lie; the control is what makes the
+/// assertion a distinction rather than a constant.
+///
+/// **On the revert** (restoring `.unwrap_or_default()`), the FIRST assertion fires: the errored walk
+/// reads as an established absence.
+#[tokio::test]
+async fn a_failed_dht_walk_is_not_an_established_absence() {
+    let cid = content();
+
+    let (failing, _d1) = engine_over(FailingLocator);
+    let errored = failing
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(
+        !errored.establishes_absence(),
+        "a locate that FAILED establishes nothing; reporting it as a proven absence tells the \
+         reader to stop looking for content that may well exist"
+    );
+
+    let (honest, _d2) = engine_over(MockProviderLocator::fixed(Vec::new()));
+    let looked = honest
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(
+        looked.establishes_absence(),
+        "a walk that completed and found nobody DID establish the absence - without this control \
+         the assertion above is satisfied by reporting every miss as inconclusive"
+    );
+    assert!(
+        errored.is_empty() && looked.is_empty(),
+        "neither named a holder"
+    );
+}
+
+/// **Proves:** a REFUSAL to forward is distinguishable from a genuine not-found, while recursion
+/// being switched off is not.
+///
+/// **Fixture design — the two refusals differ in ONE property and nothing else.** Both arms have a
+/// dialable peer; the spent-budget arm carries a hop budget with nothing left, the control arm
+/// carries a fresh one against a node whose recursion is not installed at all. Testing only the spent
+/// arm would pass against a node that marked everything inconclusive.
+///
+/// **On the revert** (making every unasked path conclusive again), the FIRST assertion fires.
+#[tokio::test]
+async fn a_refusal_to_forward_leaves_the_absence_unproven() {
+    let cid = content();
+
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+    let refused = pc
+        .locate_holders(&cid, HopBudget::spent(), &RequestorId::Local)
+        .await;
+    assert!(
+        !refused.establishes_absence(),
+        "the hop budget ran out with peers unasked - dig-node#273 requires a refusal to be \
+         distinguishable from a not-found"
+    );
+    assert!(
+        ask.asked().is_empty(),
+        "and it refused by NOT asking, which is what makes the absence unproven"
+    );
+
+    let (disabled, _d2) = engine(Vec::new(), &[1], None);
+    let off = disabled
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(
+        off.establishes_absence(),
+        "recursion switched OFF is not a refusal: asking was never part of this node's answer, so \
+         the DHT leg stands alone exactly as it did before the recursion existed"
+    );
+}
+
+/// **Proves:** one hop reporting an unproven absence stops its PARENT reporting a proven one, even
+/// when a sibling hop answered honestly and found nobody.
+///
+/// **Fixture design — two peers, and only ONE of them is unhelpful.** An all-peers-hostile fixture
+/// would be the blindest possible arrangement here: with no honest answer in the set, a parent that
+/// simply forwards the last outcome it saw looks identical to one that merges correctly. Varying one
+/// actor and keeping a truthful sibling is what makes this test see the MERGE rule rather than a
+/// coincidence.
+///
+/// **On the revert** (classifying any `result` frame as a conclusive answer), the assertion on
+/// `establishes_absence` fires; the sibling assertion on the named holder stays green, which is how
+/// the failure is attributable.
+#[tokio::test]
+async fn one_inconclusive_child_defeats_a_sibling_that_found_nobody() {
+    let cid = content();
+    let ask = Arc::new(PerPeerAsk::new(vec![
+        (mock_peer_hex(1), AskOutcome::Answered(Vec::new())),
+        (
+            mock_peer_hex(2),
+            AskOutcome::AnsweredInconclusive(vec![provider(9, &cid)]),
+        ),
+    ]));
+    let (pc, _dir) = engine(Vec::new(), &[1, 2], Some(ask.clone()));
+
+    let located = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert!(
+        !located.establishes_absence(),
+        "a parent holding one Inconclusive child and one NotFound child MUST NOT report NotFound \
+         upward - a single stalled node two hops away would otherwise manufacture an absence"
+    );
+    assert_eq!(
+        peer_ids(&located.candidates()),
+        vec![mock_peer_hex(9)],
+        "and the records the inconclusive child DID name are still carried, because a partial \
+         answer is more useful than none"
+    );
+}
+
+/// **Proves:** the seen-set is claimed per QUESTION-AND-CONTENT, so a multi-item request forwards for
+/// every item rather than only the first.
+///
+/// **Fixture design — no attacker, and this is the documented normal path.** `availability_batch`
+/// hands ONE `HopBudget` (it is `Copy`) to every item in the batch, so the second item onwards used
+/// to lose the claim and take the not-asked path — emitting an established absence having asked
+/// nobody. Two distinct contents under one identity is the smallest fixture that exhibits it; a
+/// second call with the SAME content must still be deduplicated, which
+/// `the_same_ask_arriving_twice_is_forwarded_once` pins from the other side.
+///
+/// **On the revert** (keying the seen-set on the ask id alone), the first assertion fires: only one
+/// of the two items is ever forwarded for.
+#[tokio::test]
+async fn one_identity_over_two_items_forwards_for_both() {
+    let first = content();
+    let second = ContentId::resource([0xD0; 32], [0xD1; 32], [0xD2; 32]);
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+
+    let batch = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "ask_id": "1111111111111111ffffffffffffffff",
+    }));
+
+    let one = pc.locate_holders(&first, batch, &RequestorId::Local).await;
+    let two = pc.locate_holders(&second, batch, &RequestorId::Local).await;
+
+    assert_eq!(ask.asked().len(), 2, "both items were forwarded for");
+    assert!(
+        one.establishes_absence() && two.establishes_absence(),
+        "and both absences rest on a peer that actually answered, not on a lost claim"
+    );
+}
+
+/// **Proves:** the ask identity this node forwards under is the one it RECEIVED, on the wire, in the
+/// emitted request body.
+///
+/// **Fixture design — the assertion is on the EMITTED frame, not on a literal this test wrote.** The
+/// existing identity tests hand a hex string straight into `HopBudget::from_params` and then observe
+/// the seen-set, which structurally cannot notice that nothing ever put `ask_id` on the wire. Here
+/// the double captures the identity the production code chose to forward under, that identity is
+/// rendered through the real request builder, and the rendered frame is parsed BACK through
+/// `from_params`. Wire out, wire in: an emitter that omits the field cannot survive the round trip.
+///
+/// **On the revert** (dropping `ask_id` from `forwarded_request`), the final assertion fires — the
+/// re-parsed identity is a freshly minted one and does not match.
+#[tokio::test]
+async fn the_identity_a_hop_received_is_the_identity_it_emits() {
+    let cid = content();
+    let ask = RecordingAsk::answering(Vec::new());
+    let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
+
+    let inbound = serde_json::json!({
+        "redirect_depth": 0,
+        "ask_id": "0f0e0d0c0b0a09080706050403020100",
+    });
+    let budget = HopBudget::from_params(&inbound);
+    pc.locate_holders(&cid, budget, &RequestorId::Local).await;
+
+    let forwarded_under = ask
+        .ask_ids()
+        .first()
+        .copied()
+        .expect("the peer was asked, so an identity was chosen");
+    assert_eq!(
+        forwarded_under,
+        budget.ask_id(),
+        "the hop forwards under the identity it was given, not a fresh one"
+    );
+
+    let emitted = crate::seams::dig_peer::forwarded_request(
+        &cid,
+        1,
+        Duration::from_secs(5),
+        forwarded_under,
+    );
+    let reparsed = HopBudget::from_params(emitted.get("params").expect("params"));
+    assert_eq!(
+        reparsed.ask_id(),
+        budget.ask_id(),
+        "and the identity SURVIVES the wire: a request body that omits ask_id makes the next hop \
+         mint a fresh one, and the diamond dedup this whole mechanism rests on never fires"
+    );
+}
