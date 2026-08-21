@@ -128,6 +128,27 @@ impl WarmRegistry {
         })
     }
 
+    /// The generations currently warming, as the [`CapsuleIdentity`] values
+    /// [`dig_sex::acquisition::decide`] reasons over.
+    ///
+    /// Materialising the set is cheap by construction: it is bounded by
+    /// [`Self::max_concurrent`] (4 by default), which is the same bound that stops an unbounded
+    /// number of concurrent pulls. A key that does not parse as `store:root` cannot have been
+    /// written by [`Self::claim`] and is skipped rather than guessed at — omitting it can only make
+    /// the decision say "acquire" for something already in flight, which the atomic `claim` below
+    /// then refuses, so the two answers can never disagree in the unsafe direction.
+    pub(crate) fn in_flight_capsules(&self) -> HashSet<dig_sex::CapsuleIdentity> {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter_map(|key| {
+                let (store, root) = key.split_once(':')?;
+                Some(CapsuleKey::parse(store, root)?.identity())
+            })
+            .collect()
+    }
+
     /// Whether a warm is currently in flight for `key` (diagnostics + tests).
     pub fn is_warming(&self, key: &str) -> bool {
         self.in_flight

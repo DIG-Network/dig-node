@@ -22,6 +22,28 @@ use async_trait::async_trait;
 use dig_dht::ContentId;
 use dig_download::{DownloadError, ProviderLocator, ProviderRecord};
 
+/// Drop every record in `records` whose `provider_peer_id` is `self_peer_id` — the ONE
+/// implementation of "no source can ever offer self" (`SPEC.md` §19.3), shared by every source that
+/// must honour it.
+///
+/// # Why this is a free function and not just the locator's body
+///
+/// The rule is stated of EVERY source, but the sources do not share a type. The DHT walk arrives as a
+/// [`ProviderLocator`] and can be WRAPPED; the forwarded availability ask
+/// ([`crate::download::NodeContent::locate_holders`]) arrives as a plain `Vec` returned by an
+/// untrusted peer and cannot. Before dig-node#261 that difference had produced two hand-written
+/// copies of the filter and one source with none — so a reader who checked the wrapped leg,
+/// found the exclusion, and concluded the invariant held was reading a habit rather than an
+/// invariant. Every caller now spends one line on the same function, which is the only shape in which
+/// "some sources" cannot quietly become the truth again.
+///
+/// A node whose identity is not yet resolved (`None`) has nothing to exclude and filters nothing.
+pub(crate) fn retain_excluding_self(records: &mut Vec<ProviderRecord>, self_peer_id: Option<&str>) {
+    if let Some(me) = self_peer_id {
+        records.retain(|record| record.provider_peer_id != me);
+    }
+}
+
 /// Wraps an inner [`ProviderLocator`] and removes any provider record whose `provider_peer_id` equals
 /// this node's own `self_peer_id` (hex, matching [`ProviderRecord::provider_peer_id`]). See the module
 /// docs for why the reader must never be discovered as its own provider (#1584).
@@ -49,9 +71,7 @@ impl ProviderLocator for SelfExcludingLocator {
         content: &ContentId,
     ) -> Result<Vec<ProviderRecord>, DownloadError> {
         let mut records = self.inner.find_providers(content).await?;
-        if let Some(me) = self.self_peer_id.as_deref() {
-            records.retain(|record| record.provider_peer_id != me);
-        }
+        retain_excluding_self(&mut records, self.self_peer_id.as_deref());
         Ok(records)
     }
 }

@@ -44,6 +44,8 @@
 //! mTLS-verified `PeerObservation::peer_id` — this loop never re-introduces a wire-supplied identity,
 //! never bypasses the probe's caps, and preserves the reconciler's cross-region per-peer dedup.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 
 use crate::dht_sampling::{
@@ -52,7 +54,7 @@ use crate::dht_sampling::{
 };
 use dig_sex::{
     relevance, select_within_capacity, CacheTier, NodeContext, RelevanceInputs, SelectionCandidate,
-    SelectionSeed,
+    SelectionPolicy, SelectionSeed,
 };
 
 // =================================================================================================
@@ -229,6 +231,20 @@ pub trait LoadSignal: Send + Sync {
     fn is_busy(&self) -> bool;
 }
 
+/// The set of capsules this node ALREADY holds, as the DHT content ids a round samples.
+///
+/// A seam, so the residency half of selection is exercised with a fixture instead of a populated
+/// cache directory. The production implementation enumerates `<cache>/modules` and re-derives each
+/// capsule's `ContentId::capsule(store, root).to_key()`, which is the same value the sampler yields
+/// — residency is a fact about this node's own disk, never a peer's claim about it.
+#[async_trait]
+pub trait HeldCapsules: Send + Sync {
+    /// Every held capsule's DHT content id. An unreadable cache yields the EMPTY set, which is the
+    /// under-claiming direction: the node re-fetches something it may already hold (one wasted
+    /// round's bandwidth) rather than skipping content it does not hold (a permanent hole).
+    async fn held_content_ids(&self) -> HashSet<[u8; 32]>;
+}
+
 /// Resolve the on-disk size of a candidate whose DHT snapshot carried no `size_hint`.
 ///
 /// A seam over the concrete metadata probe so the size-resolution governor is testable without a
@@ -317,6 +333,11 @@ pub struct RoundOutcome {
     pub discarded: u32,
     /// Fetches not attempted because the rate limiter was exhausted this window.
     pub rate_limited: u32,
+    /// Selected candidates this node ALREADY held, so nothing was fetched for them.
+    ///
+    /// A non-zero count is the displacement margin doing its job: an incumbent that keeps winning
+    /// selection costs one skipped fetch, not one re-download per round.
+    pub already_held: u32,
     /// Set when the WHOLE round was skipped before sampling (off-switch / busy / small-disk).
     pub skipped: Option<RoundSkip>,
 }
@@ -348,6 +369,14 @@ pub const MAX_SIZE_PROBES_PER_ROUND: usize = 32;
 /// `now_tick` is the caller's logical clock for the rate limiter (a monotonic per-round counter or a
 /// seconds-since-start is fine); `rate` is threaded across rounds by the caller so the window spans
 /// rounds. Returns the round tally (including a `skipped` reason when the whole round short-circuits).
+///
+/// `held` is the set of content ids this node ALREADY holds on disk — the incumbency
+/// [`SelectionCandidate::resident`] is measured from, and the reason a re-sampled capsule costs no
+/// bandwidth. It is threaded in as an argument rather than read from the node, because this function
+/// is deliberately a pure function of its inputs (the #1991 parallel-runner env race is what a
+/// process-global read costs here). Answering it `false` for everything compiles, passes, and
+/// reproduces exactly the churn the displacement margin exists to stop, so the caller MUST answer it
+/// from the cache.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_round<R: KeyspaceRng>(
     enabled: bool,
@@ -357,6 +386,7 @@ pub async fn run_round<R: KeyspaceRng>(
     load: &dyn LoadSignal,
     rng: &mut R,
     node: &NodeContext,
+    held: &HashSet<[u8; 32]>,
     cache_cap_bytes: u64,
     rate: &mut RoundRateLimiter,
     now_tick: u64,
@@ -413,14 +443,19 @@ pub async fn run_round<R: KeyspaceRng>(
             size_bytes: sc.size_bytes,
             score: relevance(&relevance_inputs(sc), node),
             pinned: false,
+            // Incumbency, read from THIS node's own disk. It is what the displacement margin is
+            // measured against: a challenger only unseats a resident by clearing the margin, so a
+            // pair of near-equal capsules stop displacing each other every round.
+            resident: held.contains(&sc.content_id),
         })
         .collect();
     // The tiebreak seed must be node-local and NOT derivable by a peer, or a peer could arrange for
     // its own store to win every tie on every node at once. This node's own peer id is exactly that.
+    // The policy carries the displacement margin at its floor; `DisplacementMargin` cannot be
+    // constructed at zero, so a round without hysteresis is unrepresentable.
     let selected = select_within_capacity(
         &selector_cands,
-        budget,
-        SelectionSeed::from_peer_id(&node.peer_id),
+        SelectionPolicy::new(budget, SelectionSeed::from_peer_id(&node.peer_id)),
     )
     .retained;
 
@@ -428,6 +463,13 @@ pub async fn run_round<R: KeyspaceRng>(
     let mut remaining = budget;
     for idx in selected {
         let sc = &sized[idx];
+        // A retained INCUMBENT is already on disk. Selection retaining it is the margin working —
+        // fetching it again would spend the round's whole budget re-downloading what the hysteresis
+        // just protected, which is the churn loop wearing the shape of a successful round.
+        if held.contains(&sc.content_id) {
+            outcome.already_held += 1;
+            continue;
+        }
         // The hard byte cap: the smaller of the reported size and the remaining sub-budget. The
         // fetcher enforces the TRUE size against this and discards an over-size store.
         let cap = sc.size_bytes.min(remaining);
@@ -498,7 +540,7 @@ async fn resolve_candidate_size(
 mod tests {
     use super::*;
     use crate::dht_sampling::{ObservedCandidate, PeerObservation, SplitMix64};
-    use dig_sex::{evict_key, CacheEntry, RelevanceWeights};
+    use dig_sex::{evict_key, CacheEntry, RelevanceWeights, MIN_DISPLACEMENT_MARGIN};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -606,6 +648,178 @@ mod tests {
         RoundRateLimiter::new(1_000_000, u64::MAX / 2, 1)
     }
 
+    /// The held-set for a node holding nothing — every candidate a challenger, no incumbency.
+    fn nothing_held() -> HashSet<[u8; 32]> {
+        HashSet::new()
+    }
+
+    /// A content id whose XOR proximity to the all-zero test `peer_id` is `1 - hi/2^128`.
+    ///
+    /// `xor_proximity` reads the TOP 16 BYTES only, so this writes `hi` there and leaves the rest
+    /// free to make the id distinguishable in `ScriptedFetcher::seen`. Building the id from the
+    /// proximity it must produce is what lets a fixture place two candidates a CHOSEN distance apart
+    /// — near enough to sit inside the displacement margin, far enough that the outcome is decided by
+    /// the margin rather than by the seeded tiebreak.
+    fn candidate_at(hi: u128, tag: u8) -> [u8; 32] {
+        let mut id = [0u8; 32];
+        id[..16].copy_from_slice(&hi.to_be_bytes());
+        id[31] = tag;
+        id
+    }
+
+    /// The incumbent: proximity exactly `0.5`, the keyspace midpoint. First byte `0x80`.
+    fn incumbent_id() -> [u8; 32] {
+        candidate_at(1u128 << 127, 0xAA)
+    }
+
+    /// A challenger scoring ~0.005 ABOVE the incumbent — strictly better, and strictly INSIDE the
+    /// 0.01 displacement margin. With `xor: 1.0` the score gap is the proximity gap, so this is the
+    /// case the margin exists to decide: a marginally-better newcomer must NOT evict what is held.
+    ///
+    /// Pinned from the margin itself rather than picked: a gap chosen without reference to
+    /// `MIN_DISPLACEMENT_MARGIN` could drift outside it and turn this into a test of ordinary
+    /// score ordering, which passes with no hysteresis at all.
+    fn marginal_challenger_id() -> [u8; 32] {
+        let gap = MIN_DISPLACEMENT_MARGIN / 2.0; // 0.005 — comfortably inside the strict threshold
+        let hi = ((0.5 - gap) * (u128::MAX as f64)) as u128;
+        candidate_at(hi, 0xBB)
+    }
+
+    /// Both candidates fit the budget, so selection retains both and only the FETCH can tell them
+    /// apart: the capsule this node already holds costs no bandwidth, and the one it does not is
+    /// pulled exactly as before.
+    ///
+    /// The unheld candidate is the truthful control. Without it, an implementation that skipped
+    /// EVERY fetch would pass — a round that fetches nothing is not the property under test.
+    #[tokio::test]
+    async fn an_already_held_candidate_is_not_refetched_while_an_unheld_one_still_is() {
+        let held_id = candidate_at(1u128 << 127, 0x01);
+        let fresh_id = candidate_at(1u128 << 127, 0x02);
+        let fetcher = ScriptedFetcher {
+            true_size: 100 * 1024 * 1024,
+            verify_ok: true,
+            seen: Mutex::new(Vec::new()),
+        };
+        let held: HashSet<[u8; 32]> = [held_id].into_iter().collect();
+
+        let out = run_round(
+            true,
+            &QuorumProbe {
+                keys: vec![
+                    (held_id, Some(100 * 1024 * 1024)),
+                    (fresh_id, Some(100 * 1024 * 1024)),
+                ],
+            },
+            &FixedSizeProbe {
+                size: None,
+                calls: AtomicUsize::new(0),
+            },
+            &fetcher,
+            &Idle,
+            &mut SplitMix64::new(1),
+            &node(),
+            &held,
+            BIG_CAP,
+            &mut generous_rate(),
+            0,
+        )
+        .await;
+
+        let seen = fetcher.seen.lock().unwrap().clone();
+        assert_eq!(out.already_held, 1, "the held capsule cost no fetch");
+        assert_eq!(out.cached, 1, "the unheld capsule was still pulled");
+        assert_eq!(seen.len(), 1, "exactly one fetch was issued");
+        assert_eq!(
+            seen[0].0,
+            u32::from(fresh_id[0]),
+            "the fetch that happened was the UNHELD candidate"
+        );
+    }
+
+    /// The displacement margin, observed through a round.
+    ///
+    /// One capsule's worth of budget, two equal-sized candidates, and the challenger scores strictly
+    /// HIGHER — by less than the margin. Residency is the only thing that can decide it, so this
+    /// fails on `resident: false` (the challenger wins and is fetched) and it fails on a skip-the-
+    /// fetch guard that never reaches selection (same outcome). A test asserting only "nothing was
+    /// fetched" would pass under both, which is why the second half runs the SAME round with an empty
+    /// held-set and requires the challenger to win there.
+    #[tokio::test]
+    async fn a_marginally_better_challenger_does_not_displace_the_incumbent() {
+        let incumbent = incumbent_id();
+        let challenger = marginal_challenger_id();
+        let size = 600 * 1024 * 1024; // two of these do NOT fit the 1 GiB tier-0 budget; one does
+        let keys = vec![(incumbent, Some(size)), (challenger, Some(size))];
+
+        let contested = ScriptedFetcher {
+            true_size: size,
+            verify_ok: true,
+            seen: Mutex::new(Vec::new()),
+        };
+        let held: HashSet<[u8; 32]> = [incumbent].into_iter().collect();
+        let out = run_round(
+            true,
+            &QuorumProbe { keys: keys.clone() },
+            &FixedSizeProbe {
+                size: None,
+                calls: AtomicUsize::new(0),
+            },
+            &contested,
+            &Idle,
+            &mut SplitMix64::new(1),
+            &node(),
+            &held,
+            BIG_CAP,
+            &mut generous_rate(),
+            0,
+        )
+        .await;
+        assert_eq!(
+            out.already_held, 1,
+            "the incumbent held the single slot, so nothing was pulled"
+        );
+        assert!(
+            contested.seen.lock().unwrap().is_empty(),
+            "a challenger inside the margin must not cost a fetch"
+        );
+
+        // The control: the SAME two candidates with nothing held. Now there is no incumbent, the
+        // higher score simply wins, and the challenger IS fetched — so the assertion above is about
+        // incumbency and not about the fixture being unable to fetch anything.
+        let uncontested = ScriptedFetcher {
+            true_size: size,
+            verify_ok: true,
+            seen: Mutex::new(Vec::new()),
+        };
+        let control = run_round(
+            true,
+            &QuorumProbe { keys },
+            &FixedSizeProbe {
+                size: None,
+                calls: AtomicUsize::new(0),
+            },
+            &uncontested,
+            &Idle,
+            &mut SplitMix64::new(1),
+            &node(),
+            &nothing_held(),
+            BIG_CAP,
+            &mut generous_rate(),
+            0,
+        )
+        .await;
+        assert_eq!(
+            control.cached, 1,
+            "with nothing held, the better score wins"
+        );
+        let seen = uncontested.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen[0].0,
+            u32::from(challenger[0]),
+            "and the winner is the higher-scoring challenger"
+        );
+    }
+
     // -- Off-switch --------------------------------------------------------------------------------
 
     #[test]
@@ -641,6 +855,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(1),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,
@@ -680,6 +895,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(1),
             &node(),
+            &nothing_held(),
             1000, // 10% = 100 bytes, far below the floor
             &mut generous_rate(),
             0,
@@ -711,6 +927,7 @@ mod tests {
             &Busy,
             &mut SplitMix64::new(1),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,
@@ -747,6 +964,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(1),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,
@@ -779,6 +997,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(1),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,
@@ -816,6 +1035,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(7),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,
@@ -851,6 +1071,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(1),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,
@@ -883,6 +1104,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(1),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,
@@ -910,6 +1132,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(1),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,
@@ -976,6 +1199,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(3),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut rate,
             0,
@@ -1018,6 +1242,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(3),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut rate,
             1,
@@ -1034,6 +1259,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(3),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut rate,
             2,
@@ -1104,6 +1330,7 @@ mod tests {
             &Idle,
             &mut SplitMix64::new(11),
             &node(),
+            &nothing_held(),
             BIG_CAP,
             &mut generous_rate(),
             0,

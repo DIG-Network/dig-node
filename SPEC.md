@@ -2967,21 +2967,43 @@ return `providers` MUST be read as "found nobody", never as an error.
   list order and the list is truncated at `MAX_REDIRECT_PROVIDERS` (§10.4.2), so appending is what
   makes that cap non-displacing: a peer answering with a full slate of fabricated holders spends only
   the tail and can never evict a holder this node found itself.
-- **Depth.** The ask carries `redirect_depth + 1`, and a request at or over `REDIRECT_HOP_CAP` MUST
-  forward nothing (it still answers from the DHT). A request shape that cannot carry a hop counter —
-  the dig-nat mux `AvailabilityRequest`, which has no such field — MUST be treated as having spent the
-  whole budget and MUST NOT forward.
-- **Breadth.** At most `FORWARDED_ASK_FANOUT` (= 4) peers per admitted miss, and at most
+- **The DECISION is `dig_sex::discovery`, not this node.** Whether to forward, to whom, and with what
+  budget remaining MUST be decided by `dig_sex::discovery::decide_forward` against
+  `RecursionConfig`, and the switch MUST be parsed by `dig_sex::discovery::parse_enabled`. This node
+  owns only the WIRE — the verb, the framing and the dial. A second implementation of this decision is
+  forbidden: dig-node carried one, and it disagreed with the canonical crate on both bounds below.
+- **Depth.** The ask carries `redirect_depth + 1` on the wire, and a request whose remaining budget is
+  zero MUST forward nothing (it still answers from the DHT). The budget is `RecursionConfig::hop_cap`
+  (= 2), which is distinct from `REDIRECT_HOP_CAP` (= 4): the redirect bounds how far a CALLER is
+  bounced, the hop cap bounds how far a QUESTION travels at other nodes' expense.
+- **A request shape that CANNOT CARRY a hop counter MUST be treated as fully spent.** Stated over the
+  CLASS, not over one message type: any inbound shape with no field able to hold a hop count MUST
+  declare its budget already spent and MUST forward nothing. A recursion started from such a shape
+  could not be bounded by anything, so the only safe reading is zero. The dig-nat mux
+  `AvailabilityRequest` is today's instance — it has no such field — but a second hop-counter-less
+  shape MUST inherit this without the clause being rewritten.
+- **An UNREADABLE hop budget MUST be refused, never read as a full one.** A `redirect_depth` that is
+  present and cannot be parsed as a hop count MUST yield
+  `ForwardRefusal::UnreadableHopBudget` and forward nothing. A request whose hop budget cannot be read
+  is a request whose reach is unbounded, and the field is attacker-supplied. An ABSENT `redirect_depth`
+  is NOT unreadable — it denotes an originating request and carries the whole budget.
+
+  The REDIRECT leg keeps its tolerant reading of the same field (unreadable counts as depth 0),
+  because it spends only this node's own lookup. The two readings are deliberate and MUST NOT be
+  reconciled: forwarding spends OTHER nodes' bandwidth and is therefore gated more tightly.
+- **Breadth.** At most `RecursionConfig::fan_out` (= 3) peers per admitted miss, and at most
   `MAX_CONCURRENT_FORWARDED_ASKS` (= 32) forwarded asks in flight node-wide. The requestor itself and
   this node's own `peer_id` MUST be excluded from the fan-out.
 
-  **This exclusion governs who is ASKED, not who may be NAMED.** A peer's answer is not yet filtered
-  against this node's own `peer_id`, so a forwarded record naming THIS node can currently reach the
-  merged answer — narrower than §19.3's "NO source — DHT or pool — can ever offer self on the
-  fetch/dial path", which governs the fetch/dial sources rather than the redirect answer. It is
-  bounded by `REDIRECT_HOP_CAP` and only reachable where the answering peer already
-  controls the answer, so it is defense-in-depth rather than a live hole; it is recorded here because a
-  reader MUST NOT infer the stronger property from the sentence above.
+  **One admitted frame recruits 12 nodes: `3 + 3^2`, the SUM over hops.**
+  `RecursionConfig::worst_case_nodes_recruited()` returns `fan_out ^ hop_cap` = 9, which is the
+  **LEAF COUNT of the last hop only** and MUST NOT be quoted as the recruitment or the disclosure
+  radius — it understates both by the intermediate hops. Against a full relay burst
+  (`DEFAULT_RELAY_ASK_BURST` = 4) the figure for one requestor is `4 x 12` = **48**.
+- **Self MUST be excluded from the ANSWER as well as from the fan-out.** These are two rules, and the
+  fan-out exclusion does not imply the other: a peer is free to ANSWER with a record naming this node.
+  Every source feeding the merged answer — DHT and forwarded alike — MUST be filtered against this
+  node's own `peer_id`, satisfying §19.3 on the redirect answer and not only on the fetch/dial path.
 - **A SEPARATE relay budget.** The outbound fan-out MUST be charged to its own per-requestor bucket
   (`DEFAULT_RELAY_ASK_BURST` = 4, `DEFAULT_RELAY_ASK_REFILL_PER_SEC` = 1/s), never the §10.4.1 lookup
   budget. Requestor identity keys the IMMEDIATE caller, so a relaying hop's fan-out is billed to that
@@ -3003,10 +3025,11 @@ already involve (cross-ref dig_ecosystem#2006/#1934 on read-path metadata exposu
 inherited.** Enabling it means a miss discloses the requested triple to parties a direct read would
 never have involved:
 
-- Up to `FORWARDED_ASK_FANOUT` (= 4) of this node's connected pool peers learn the triple per admitted
-  miss, and each of them may disclose it to 4 of ITS peers, recursively to `REDIRECT_HOP_CAP`. The
-  disclosure radius of one admitted frame is therefore **up to ~1,360 nodes**, none of which the
-  requestor chose, contacted, or can enumerate.
+- Up to `RecursionConfig::fan_out` (= 3) of this node's connected pool peers learn the triple per
+  admitted miss, and each of them may disclose it to 3 of ITS peers, recursively to `hop_cap` (= 2).
+  The disclosure radius of one admitted frame is therefore `3 + 3^2` = **12 nodes** — the SUM over
+  hops, since an intermediate node learns the triple exactly as a leaf does — none of which the
+  requestor chose, contacted, or can enumerate. Against a full relay burst that is **48**.
 - Those peers are selected by THIS node's pool membership, not by the requestor. A requestor cannot
   predict, restrict, or audit who ends up learning what it asked for.
 - The disclosure happens on a MISS, which is precisely the case where the requestor has not yet
@@ -3032,11 +3055,14 @@ feature disabled retains the narrower property stated in the first paragraph.
 `on`/`1`/`true`/`yes`, case-insensitive, enables it) governs §10.4.4. It is resolved ONCE at engine
 construction, so a node's amplification posture is fixed for its lifetime. Disabled, a miss answers
 from this node's own DHT lookup and the answer is byte-identical to one produced before the forwarded
-ask existed. The default is OFF because the leg is the most amplifying path the node has — one
-admitted frame at `redirect_depth: 0` fans to roughly 1,360 outbound dials and 1,360 DHT walks (16 →
-64 → 256 → 1024), sustained at about 340 asks/s per requestor identity — and the strictly cheaper,
-node-local `proxy` leg (§10.4.3) is already opt-in. A path that amplifies more than an opt-in path
-MUST NOT be gated less than it.
+ask existed. The switch MUST be parsed by `dig_sex::discovery::parse_enabled`, which FAILS CLOSED:
+any value it does not recognise — a typo, an empty string, a value from a newer config format —
+disables recursion, because a mistake MUST NOT be able to enable a network-wide amplifier.
+
+The default is OFF because the leg spends OTHER nodes' bandwidth: one admitted frame recruits
+**12 nodes** (`3 + 3^2`, the sum over hops — 48 against a full relay burst), each of which also runs a
+DHT walk, while the strictly cheaper, node-local `proxy` leg (§10.4.3) is already opt-in. A path that
+amplifies more than an opt-in path MUST NOT be gated less than it.
 
 ---
 

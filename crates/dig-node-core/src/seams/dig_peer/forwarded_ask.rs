@@ -20,16 +20,17 @@
 //! parses that existing answer. A peer running an older build answers without `providers`, which reads
 //! as "that peer found nobody" — the correct degradation, not an error.
 //!
-//! # Two bounds are structural, not configuration
+//! # This module is the WIRE. The DECISION lives in `dig_sex::discovery`
 //!
-//! * **Depth** rides the SHIPPED [`REDIRECT_HOP_CAP`](crate::download::REDIRECT_HOP_CAP): the ask
-//!   carries `redirect_depth + 1`, and a node at or over the cap forwards nothing. A ring of nodes
-//!   therefore cannot circulate one question forever, which is the same property the redirect leg
-//!   already relies on.
-//! * **Breadth** is [`FORWARDED_ASK_FANOUT`] peers per admitted miss, and the whole node holds at most
-//!   [`MAX_CONCURRENT_FORWARDED_ASKS`] outbound asks at once. Both are needed: the per-miss fan-out
-//!   bounds one question, the global ceiling bounds every question in flight, and without the second a
-//!   burst of admitted misses multiplies into an outbound flood.
+//! Whether to forward at all, to which peers, and with how much budget left is decided by
+//! [`dig_sex::discovery::decide_forward`], called from
+//! [`NodeContent::forwarded_holders`](crate::download::NodeContent) — including the depth bound
+//! (`hop_cap`), the breadth bound (`fan_out`) and the refusal on an unreadable budget. This module
+//! only issues the request the decision asked for and parses the answer.
+//!
+//! The one bound that stays HERE is [`MAX_CONCURRENT_FORWARDED_ASKS`], because it is a property of
+//! this node's own resources rather than of the protocol: it bounds how many asks are in flight at
+//! once, never how many happen in total.
 //!
 //! # The answers are hearsay, and are treated as such
 //!
@@ -46,54 +47,18 @@ use dig_dht::{CandidateAddr, ContentId, PeerId};
 use dig_download::ProviderRecord;
 use serde_json::{json, Value};
 
-/// How many connected pool peers one admitted miss forwards the ask to.
-///
-/// Deliberately small and deliberately NOT the whole pool: **this is an exponent, not a knob.** The
-/// ask is recursive, so raising it does not add work linearly — it raises the base of
-/// `FANOUT ^ REDIRECT_HOP_CAP`.
-///
-/// # The real cost of one admitted frame, stated honestly
-///
-/// A relay token is charged on INBOUND admission, and one token buys [`FORWARDED_ASK_FANOUT`]
-/// OUTBOUND dials — the charge is **1:4, not 1:1**. So a single 64 KiB frame at `redirect_depth: 0`,
-/// against a full relay burst of [`DEFAULT_RELAY_ASK_BURST`](crate::rate_limit::DEFAULT_RELAY_ASK_BURST) (= 4), fans out across the network as:
-///
-/// | hop | outbound asks |
-/// |---|---|
-/// | 1 | 4 tokens x 4 peers = **16** |
-/// | 2 | **64** |
-/// | 3 | **256** |
-/// | 4 | **1024** |
-///
-/// — roughly **1,360 dials and 1,360 DHT walks**, since every ask that lands also drives a
-/// `find_providers` at its receiver (4 asks per requestor per peer sits under that node's own
-/// miss-lookup burst of 16, so none of them are refused). Sustained at the relay refill of 1 token/s
-/// that is about **340 asks/s per attacker identity** (4 + 16 + 64 + 256).
-///
-/// **`4^4 = 256` is the leaf count of ONE question, not the cost of a frame.** Quoting the leaf count
-/// understates the real figure by about 5x, which is exactly the mistake this paragraph exists to stop
-/// the next reader making.
-///
-/// [`MAX_CONCURRENT_FORWARDED_ASKS`] does NOT reduce that total. It bounds how many of this node's
-/// asks are in flight at once; the work still happens, serialized, and every downstream node has its
-/// own independent ceiling. Concurrency is bounded; the aggregate is not.
-///
-/// This is why the leg is **opt-in** ([`forward_on_miss_enabled`](crate::download::forward_on_miss_enabled)):
-/// an amplification path of this size is an operator's decision, not a default.
-pub(crate) const FORWARDED_ASK_FANOUT: usize = 4;
-
 /// The whole-node ceiling on forwarded asks in flight at once, across every requestor and every miss.
 ///
-/// The per-miss [`FORWARDED_ASK_FANOUT`] bounds ONE question; this bounds the node. Without it, a
-/// burst of admitted misses multiplies fan-out into hundreds of concurrent dials — the amplification
-/// the per-requestor buckets cannot see, because each individual requestor stayed inside its budget.
-/// A miss that cannot claim a slot simply does not forward, which costs a less-enriched answer and
-/// never a stalled request.
+/// The crate's `fan_out` bounds ONE question; this bounds the node. Without it, a burst of admitted
+/// misses multiplies fan-out into hundreds of concurrent dials — the amplification the per-requestor
+/// buckets cannot see, because each individual requestor stayed inside its budget. A miss that cannot
+/// claim a slot simply does not forward, which costs a less-enriched answer and never a stalled
+/// request.
 ///
-/// **It bounds CONCURRENCY, not total work.** The ~1,360 dials one admitted frame can cause (see
-/// [`FORWARDED_ASK_FANOUT`]) still happen; they are merely serialized through 32 slots here, and each
-/// downstream node has its own independent 32. Reading this as a cap on the aggregate is the second
-/// way to understate the cost of this path.
+/// **It bounds CONCURRENCY, not total work.** The 12 nodes one admitted frame recruits (`3 + 3^2`,
+/// the sum over hops — NOT `worst_case_nodes_recruited()`, which returns the last hop's leaf count of
+/// 9) still happen; they are merely serialized through 32 slots here, and each downstream node has
+/// its own independent 32. Reading this as a cap on the aggregate understates the cost of this path.
 pub(crate) const MAX_CONCURRENT_FORWARDED_ASKS: usize = 32;
 
 /// Bounds one forwarded ask end to end (dial + stream + answer). A peer that is slow or gone must not

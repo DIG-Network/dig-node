@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-core"
-version = "0.48.0"
+version = "0.49.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3061,7 +3061,7 @@ dependencies = [
 
 [[package]]
 name = "dig-node-service"
-version = "0.133.0"
+version = "0.134.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -3209,9 +3209,9 @@ dependencies = [
 
 [[package]]
 name = "dig-sex"
-version = "0.2.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2c229026507e54d3a0d28f5d11d3d6c02a604973aec3bbe61b89bbf7fbb07be"
+checksum = "383ccdfc613663db2aa39c4c599949f6408988873d4e2c511e4e122efc11458a"
 dependencies = [
  "dig-store-cache",
 ]

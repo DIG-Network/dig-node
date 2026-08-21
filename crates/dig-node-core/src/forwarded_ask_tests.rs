@@ -16,10 +16,21 @@ use dig_dht::{CandidateAddr, ContentId, PeerId};
 use dig_download::testkit::{mock_peer_hex, MockContent, MockProviderLocator, MockRangeTransport};
 use dig_download::ProviderRecord;
 
-use crate::download::{
-    DiscoveryCache, MissMode, NodeContent, FORWARDED_ASK_FANOUT, MAX_REDIRECT_PROVIDERS,
-    REDIRECT_HOP_CAP,
-};
+use crate::download::{DiscoveryCache, HopBudget, MissMode, NodeContent, MAX_REDIRECT_PROVIDERS};
+use dig_sex::discovery::RecursionConfig;
+
+/// The recursion bounds every test here runs under: the canonical crate's, switched ON.
+///
+/// Taken from `RecursionConfig::default()` rather than restated, so a change to the canonical
+/// `fan_out` or `hop_cap` moves these tests with it instead of leaving them pinning a private copy of
+/// numbers the node no longer uses. Only `enabled` is overridden — the default is OFF, which is the
+/// production posture and is asserted separately in `download.rs`.
+pub(crate) fn recursion() -> RecursionConfig {
+    RecursionConfig {
+        enabled: true,
+        ..Default::default()
+    }
+}
 use crate::rate_limit::RequestorId;
 use crate::seams::dig_peer::ForwardedAsk;
 
@@ -28,13 +39,13 @@ use crate::seams::dig_peer::ForwardedAsk;
 /// It records the `next_depth` it was handed as well as the peer, because the hop budget is the bound
 /// under test in half these cases and a double that could not observe it would leave that assertion
 /// resting on the absence of a call rather than on its content.
-struct RecordingAsk {
+pub(crate) struct RecordingAsk {
     answer: Vec<ProviderRecord>,
     asked: Mutex<Vec<(String, u64)>>,
 }
 
 impl RecordingAsk {
-    fn answering(answer: Vec<ProviderRecord>) -> Arc<Self> {
+    pub(crate) fn answering(answer: Vec<ProviderRecord>) -> Arc<Self> {
         Arc::new(Self {
             answer,
             asked: Mutex::new(Vec::new()),
@@ -45,7 +56,7 @@ impl RecordingAsk {
         Self::answering(Vec::new())
     }
 
-    fn asked(&self) -> Vec<(String, u64)> {
+    pub(crate) fn asked(&self) -> Vec<(String, u64)> {
         self.asked.lock().expect("recorder lock").clone()
     }
 }
@@ -117,12 +128,23 @@ fn engine(
     pool_peers: &[u8],
     ask: Option<Arc<dyn ForwardedAsk>>,
 ) -> (Arc<NodeContent>, tempfile::TempDir) {
+    engine_identified(dht_providers, pool_peers, ask, None)
+}
+
+/// As [`engine`], but the node KNOWS its own `peer_id` — the precondition every self-exclusion
+/// assertion needs, since a node with no resolved identity has nothing to exclude.
+fn engine_identified(
+    dht_providers: Vec<ProviderRecord>,
+    pool_peers: &[u8],
+    ask: Option<Arc<dyn ForwardedAsk>>,
+    self_peer_id: Option<String>,
+) -> (Arc<NodeContent>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let content = NodeContent::new(
         Arc::new(MockProviderLocator::fixed(dht_providers)),
         Arc::new(MockRangeTransport::new(MockContent::even(4, 1))),
         MissMode::Redirect,
-        None,
+        self_peer_id,
         dir.path(),
     );
     {
@@ -138,7 +160,7 @@ fn engine(
         }
     }
     if let Some(ask) = ask {
-        content.set_forwarded_ask(ask);
+        content.set_forwarded_ask(ask, recursion());
     }
     (content, dir)
 }
@@ -165,7 +187,11 @@ async fn a_holder_only_a_peer_knows_about_reaches_the_answer() {
     let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
 
     let found = pc
-        .locate_holders(&cid, 0, &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
 
     assert_eq!(
@@ -191,7 +217,11 @@ async fn without_the_leg_the_answer_is_the_shipped_dht_answer() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2, 3], None);
 
     let found = pc
-        .locate_holders(&cid, 0, &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
 
     assert_eq!(peer_ids(&found), vec![mock_peer_hex(1)]);
@@ -221,7 +251,11 @@ async fn a_hostile_slate_of_forwarded_holders_cannot_displace_our_own() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(ask));
 
     let found = pc
-        .locate_holders(&cid, 0, &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
 
     assert_eq!(
@@ -251,7 +285,11 @@ async fn a_forwarded_duplicate_does_not_take_a_second_slot() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(ask));
 
     let found = pc
-        .locate_holders(&cid, 0, &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
 
     assert_eq!(
@@ -274,11 +312,16 @@ async fn a_forwarded_duplicate_does_not_take_a_second_slot() {
 #[tokio::test]
 async fn the_hop_budget_is_pinned_from_both_sides() {
     let cid = content();
+    let cap = u64::from(recursion().hop_cap);
 
     let at_cap = RecordingAsk::answering(vec![provider(9, &cid)]);
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(at_cap.clone()));
     let found = pc
-        .locate_holders(&cid, REDIRECT_HOP_CAP, &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::at_depth(cap),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
     assert!(at_cap.asked().is_empty(), "at the cap: nobody is asked");
     assert_eq!(
@@ -292,25 +335,77 @@ async fn the_hop_budget_is_pinned_from_both_sides() {
     let found = pc
         .locate_holders(
             &cid,
-            REDIRECT_HOP_CAP - 1,
+            HopBudget::at_depth(cap - 1),
             &RequestorId::Peer("caller".into()),
         )
         .await;
     assert_eq!(
         under_cap.asked(),
-        vec![(mock_peer_hex(2), REDIRECT_HOP_CAP)],
+        vec![(mock_peer_hex(2), cap)],
         "one under the cap: the ask goes out carrying the SPENT budget, so the next hop stops"
     );
     assert!(peer_ids(&found).contains(&mock_peer_hex(9)));
 }
 
+/// **Proves:** a request whose hop budget is PRESENT but cannot be read forwards nothing — the
+/// consolidation's headline behaviour change (dig-node#281, dig-node#272).
+///
+/// **Catches:** the exact defect dig-node's own copy had. It parsed the budget with
+/// `.and_then(Value::as_u64).unwrap_or(0)`, so an unreadable value became `0` — *the most permissive
+/// value the field has* — and a request whose reach could not be bounded was granted the whole
+/// budget, at every hop, forever.
+///
+/// **The fixture distinguishes the property from its nearest wrong implementation.** The DHT leg
+/// answers with an honest holder, so "nothing was forwarded" cannot be satisfied by "the whole answer
+/// collapsed" — which is what a fixture with an empty DHT leg would have accepted. And the control
+/// below it is the SAME request with a readable budget, which must forward, so the test cannot pass
+/// against an implementation that simply stopped forwarding altogether.
+#[tokio::test]
+async fn an_unreadable_hop_budget_forwards_nothing_while_a_readable_one_forwards() {
+    let cid = content();
+
+    let unreadable = RecordingAsk::answering(vec![provider(9, &cid)]);
+    let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(unreadable.clone()));
+    let found = pc
+        .locate_holders(
+            &cid,
+            HopBudget::from_params(&serde_json::json!({"redirect_depth": "0"})),
+            &RequestorId::Peer("caller".into()),
+        )
+        .await;
+    assert!(
+        unreadable.asked().is_empty(),
+        "an unreadable budget must be REFUSED, never read as a full one"
+    );
+    assert_eq!(
+        peer_ids(&found),
+        vec![mock_peer_hex(1)],
+        "and the request is still answered from this node's own lookup"
+    );
+
+    let readable = RecordingAsk::answering(vec![provider(9, &cid)]);
+    let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(readable.clone()));
+    pc.locate_holders(
+        &cid,
+        HopBudget::from_params(&serde_json::json!({"redirect_depth": 0})),
+        &RequestorId::Peer("caller".into()),
+    )
+    .await;
+    assert_eq!(
+        readable.asked().len(),
+        1,
+        "the CONTROL: the same request with a readable budget does forward"
+    );
+}
+
 // -- Breadth + loop safety -----------------------------------------------------------------------
 
-/// **Proves:** at most [`FORWARDED_ASK_FANOUT`] peers are asked, however large the connected pool is.
+/// **Proves:** at most the canonical `fan_out` peers are asked, however large the connected pool is.
 ///
 /// **Catches:** the fan-out becoming the pool size, which turns one admitted miss into a pool-wide
-/// broadcast — and, recursively, into `pool_size ^ REDIRECT_HOP_CAP` work.
-///
+/// broadcast — and, recursively, into `pool_size ^ hop_cap` work. It also catches the rival's own
+/// bound surviving the consolidation: dig-node fanned out to 4 over a cap of 4, about 1,360 dials per
+/// admitted frame, against the crate's 9.
 #[tokio::test]
 async fn the_fan_out_is_capped_regardless_of_pool_size() {
     let cid = content();
@@ -318,12 +413,16 @@ async fn the_fan_out_is_capped_regardless_of_pool_size() {
     let pool: Vec<u8> = (1..=20).collect();
     let (pc, _dir) = engine(Vec::new(), &pool, Some(ask.clone()));
 
-    pc.locate_holders(&cid, 0, &RequestorId::Peer("caller".into()))
-        .await;
+    pc.locate_holders(
+        &cid,
+        HopBudget::fresh(),
+        &RequestorId::Peer("caller".into()),
+    )
+    .await;
 
     assert_eq!(
         ask.asked().len(),
-        FORWARDED_ASK_FANOUT,
+        usize::from(recursion().fan_out),
         "the fan-out bounds the ask, not the pool"
     );
 }
@@ -342,8 +441,12 @@ async fn the_asking_peer_is_never_asked_back() {
     let ask = RecordingAsk::silent();
     let (pc, _dir) = engine(Vec::new(), &[1, 2], Some(ask.clone()));
 
-    pc.locate_holders(&cid, 0, &RequestorId::Peer(mock_peer_hex(1)))
-        .await;
+    pc.locate_holders(
+        &cid,
+        HopBudget::fresh(),
+        &RequestorId::Peer(mock_peer_hex(1)),
+    )
+    .await;
 
     let asked: Vec<String> = ask.asked().into_iter().map(|(p, _)| p).collect();
     assert_eq!(
@@ -376,8 +479,8 @@ async fn the_relay_allowance_is_per_requestor_and_separate_from_the_lookup_budge
     pc.set_relay_rate_limit(1.0, 0.0);
 
     let abuser = RequestorId::Peer("abuser".into());
-    pc.locate_holders(&cid, 0, &abuser).await;
-    let second = pc.locate_holders(&cid, 0, &abuser).await;
+    pc.locate_holders(&cid, HopBudget::fresh(), &abuser).await;
+    let second = pc.locate_holders(&cid, HopBudget::fresh(), &abuser).await;
 
     assert_eq!(
         ask.asked().len(),
@@ -391,7 +494,11 @@ async fn the_relay_allowance_is_per_requestor_and_separate_from_the_lookup_budge
     );
 
     let honest = pc
-        .locate_holders(&cid, 0, &RequestorId::Peer("honest".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("honest".into()),
+        )
         .await;
     assert!(
         peer_ids(&honest).contains(&mock_peer_hex(9)),
@@ -419,14 +526,22 @@ async fn the_node_wide_ceiling_refuses_a_forward_when_every_slot_is_held() {
     let held = pc.hold_every_forwarded_ask_slot();
 
     let found = pc
-        .locate_holders(&cid, 0, &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
     assert!(ask.asked().is_empty(), "no forward while the node is full");
     assert_eq!(peer_ids(&found), vec![mock_peer_hex(1)], "still answered");
 
     drop(held);
     let found = pc
-        .locate_holders(&cid, 0, &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
     assert!(
         peer_ids(&found).contains(&mock_peer_hex(9)),
@@ -494,5 +609,170 @@ async fn a_successful_download_forgets_nothing() {
     assert!(
         cache.forgotten().is_empty(),
         "a working candidate set is kept — forgetting it would undo the lookup cache entirely"
+    );
+}
+
+// -- Self-exclusion: the SPEC states it of EVERY source (dig-node#261) ----------------------------
+
+/// **Proves:** a provider record naming THIS node, arriving by the FORWARDED path, never reaches the
+/// merged answer — the rule `SPEC.md` §19.3 states of every source, honoured on the source that did
+/// not honour it.
+///
+/// **This is NOT the exclusion `decide_forward` performs, and the difference is why the test stays.**
+/// The crate excludes self from the peers this node ASKS. Nothing stops a peer from ANSWERING with a
+/// record that names us, and `merge_answers` does not filter one out. The two rules travel in
+/// opposite directions and adopting the crate discharges only one of them.
+///
+/// **The fixture distinguishes the property from its nearest wrong implementation.** The peer answers
+/// with TWO records — self and an honest third party — so "self was excluded" cannot be satisfied by
+/// "the forwarded leg returned nothing", which is what a fixture naming only self would have
+/// accepted. The DHT leg answers EMPTY, so the surviving record can only have come through the
+/// forwarded path.
+#[tokio::test]
+async fn a_forwarded_record_naming_this_node_never_reaches_the_answer() {
+    let cid = content();
+    let me = mock_peer_hex(9);
+    let honest = provider(7, &cid);
+    let ask = RecordingAsk::answering(vec![provider(9, &cid), honest.clone()]);
+    let (pc, _dir) = engine_identified(Vec::new(), &[1], Some(ask), Some(me.clone()));
+
+    let found = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    let ids = peer_ids(&found);
+    assert!(
+        !ids.contains(&me),
+        "a forwarded record naming this node must be dropped, got {ids:?}"
+    );
+    assert_eq!(
+        ids,
+        vec![honest.provider_peer_id.clone()],
+        "and ONLY self is dropped — the honest third party the same answer named survives"
+    );
+}
+
+/// **The control for the test above:** the IDENTICAL record arriving by the DHT leg is dropped too.
+///
+/// Without this, `a_forwarded_record_naming_this_node_never_reaches_the_answer` cannot tell
+/// "self is excluded from every source" apart from "the forwarded leg is broken and drops things", and
+/// it would stay green under a change that silently disabled forwarding altogether.
+#[tokio::test]
+async fn the_same_record_arriving_by_the_dht_leg_is_dropped_by_the_same_rule() {
+    let cid = content();
+    let me = mock_peer_hex(9);
+    let honest = provider(7, &cid);
+    let (pc, _dir) = engine_identified(
+        vec![provider(9, &cid), honest.clone()],
+        &[],
+        None,
+        Some(me.clone()),
+    );
+
+    let found = pc
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+
+    assert_eq!(
+        peer_ids(&found),
+        vec![honest.provider_peer_id.clone()],
+        "self is excluded on the DHT leg as well, and the honest holder survives"
+    );
+}
+
+// -- A to B to C: the capability this epic exists for, observed end to end -------------------------
+
+/// An asker that forwards into a REAL second [`NodeContent`] instead of answering from a fixture —
+/// node B, standing between the requestor and the holder.
+///
+/// This is what makes the round-trip below evidence rather than a restatement: the middle hop runs the
+/// SAME consolidated decision, against its own peers and its own budget, and the answer that comes
+/// back is one it genuinely had to recurse to find.
+struct ChainedAsk {
+    next_hop: Arc<NodeContent>,
+}
+
+#[async_trait]
+impl ForwardedAsk for ChainedAsk {
+    async fn ask(
+        &self,
+        _peer: &str,
+        _addrs: &[SocketAddr],
+        content: &ContentId,
+        next_depth: u64,
+    ) -> Vec<ProviderRecord> {
+        // The wire carries hops CONSUMED, so the receiving node reconstructs its budget from it —
+        // exactly as the real inbound path does via `HopBudget::from_params`.
+        self.next_hop
+            .locate_holders(
+                content,
+                HopBudget::at_depth(next_depth),
+                &RequestorId::Peer("upstream".into()),
+            )
+            .await
+    }
+}
+
+/// **Proves the capability, end to end:** content that NO node in the chain can find on its own is
+/// located by A through B, because B recursed to C. Two real hops, one question, one answer that
+/// comes back.
+///
+/// **Catches:** a consolidation that left the recursion working only one hop deep. Every other test
+/// here drives a single node against a fixture, so a middle hop that answered from its own inventory
+/// but never forwarded would pass all of them. This is the closest thing this epic has to observed
+/// evidence, and it is the reason it is carried rather than dropped.
+///
+/// **The control is the load-bearing half.** The same topology with B's onward leg REMOVED must find
+/// nobody. Without it the test cannot tell "the middle hop recursed" from "the middle hop happened to
+/// know the holder", and it would stay green against an implementation that never forwarded past the
+/// first hop at all.
+#[tokio::test]
+async fn a_holder_two_hops_away_is_reached_through_the_middle_node() {
+    let cid = content();
+    let holder = provider(9, &cid);
+
+    // C answers B. B knows nobody itself; A knows nobody itself.
+    let c = RecordingAsk::answering(vec![holder.clone()]);
+    let (b, _b_dir) = engine(Vec::new(), &[3], Some(c.clone()));
+    let (a, _a_dir) = engine(
+        Vec::new(),
+        &[2],
+        Some(Arc::new(ChainedAsk {
+            next_hop: b.clone(),
+        })),
+    );
+
+    let found = a
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("reader".into()),
+        )
+        .await;
+
+    assert_eq!(
+        peer_ids(&found),
+        vec![holder.provider_peer_id.clone()],
+        "the holder reached A, and it was reachable ONLY through B"
+    );
+    assert_eq!(
+        c.asked(),
+        vec![(mock_peer_hex(3), u64::from(recursion().hop_cap))],
+        "B forwarded on, carrying the budget A spent one hop of — so the chain terminates"
+    );
+
+    // The control: B with no onward leg cannot answer, so A gets nothing.
+    let (b_alone, _b2_dir) = engine(Vec::new(), &[3], None);
+    let (a2, _a2_dir) = engine(
+        Vec::new(),
+        &[2],
+        Some(Arc::new(ChainedAsk { next_hop: b_alone })),
+    );
+
+    assert!(
+        a2.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("reader".into()))
+            .await
+            .is_empty(),
+        "CONTROL: without B recursing to C the holder is unreachable, so the test above observed the second hop and not the first"
     );
 }
