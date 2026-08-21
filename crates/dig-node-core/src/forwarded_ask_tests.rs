@@ -16,9 +16,7 @@ use dig_dht::{CandidateAddr, ContentId, PeerId};
 use dig_download::testkit::{mock_peer_hex, MockContent, MockProviderLocator, MockRangeTransport};
 use dig_download::ProviderRecord;
 
-use crate::download::{
-    DiscoveryCache, HopBudget, MissMode, NodeContent, MAX_REDIRECT_PROVIDERS,
-};
+use crate::download::{DiscoveryCache, HopBudget, MissMode, NodeContent, MAX_REDIRECT_PROVIDERS};
 use dig_sex::discovery::RecursionConfig;
 
 /// The recursion bounds every test here runs under: the canonical crate's, switched ON.
@@ -189,7 +187,11 @@ async fn a_holder_only_a_peer_knows_about_reaches_the_answer() {
     let (pc, _dir) = engine(Vec::new(), &[1], Some(ask.clone()));
 
     let found = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
 
     assert_eq!(
@@ -215,7 +217,11 @@ async fn without_the_leg_the_answer_is_the_shipped_dht_answer() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2, 3], None);
 
     let found = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
 
     assert_eq!(peer_ids(&found), vec![mock_peer_hex(1)]);
@@ -245,7 +251,11 @@ async fn a_hostile_slate_of_forwarded_holders_cannot_displace_our_own() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(ask));
 
     let found = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
 
     assert_eq!(
@@ -275,7 +285,11 @@ async fn a_forwarded_duplicate_does_not_take_a_second_slot() {
     let (pc, _dir) = engine(vec![provider(1, &cid)], &[2], Some(ask));
 
     let found = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
 
     assert_eq!(
@@ -399,8 +413,12 @@ async fn the_fan_out_is_capped_regardless_of_pool_size() {
     let pool: Vec<u8> = (1..=20).collect();
     let (pc, _dir) = engine(Vec::new(), &pool, Some(ask.clone()));
 
-    pc.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("caller".into()))
-        .await;
+    pc.locate_holders(
+        &cid,
+        HopBudget::fresh(),
+        &RequestorId::Peer("caller".into()),
+    )
+    .await;
 
     assert_eq!(
         ask.asked().len(),
@@ -423,8 +441,12 @@ async fn the_asking_peer_is_never_asked_back() {
     let ask = RecordingAsk::silent();
     let (pc, _dir) = engine(Vec::new(), &[1, 2], Some(ask.clone()));
 
-    pc.locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer(mock_peer_hex(1)))
-        .await;
+    pc.locate_holders(
+        &cid,
+        HopBudget::fresh(),
+        &RequestorId::Peer(mock_peer_hex(1)),
+    )
+    .await;
 
     let asked: Vec<String> = ask.asked().into_iter().map(|(p, _)| p).collect();
     assert_eq!(
@@ -472,7 +494,11 @@ async fn the_relay_allowance_is_per_requestor_and_separate_from_the_lookup_budge
     );
 
     let honest = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("honest".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("honest".into()),
+        )
         .await;
     assert!(
         peer_ids(&honest).contains(&mock_peer_hex(9)),
@@ -500,14 +526,22 @@ async fn the_node_wide_ceiling_refuses_a_forward_when_every_slot_is_held() {
     let held = pc.hold_every_forwarded_ask_slot();
 
     let found = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
     assert!(ask.asked().is_empty(), "no forward while the node is full");
     assert_eq!(peer_ids(&found), vec![mock_peer_hex(1)], "still answered");
 
     drop(held);
     let found = pc
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("caller".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("caller".into()),
+        )
         .await;
     assert!(
         peer_ids(&found).contains(&mock_peer_hex(9)),
@@ -709,7 +743,11 @@ async fn a_holder_two_hops_away_is_reached_through_the_middle_node() {
     );
 
     let found = a
-        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Peer("reader".into()))
+        .locate_holders(
+            &cid,
+            HopBudget::fresh(),
+            &RequestorId::Peer("reader".into()),
+        )
         .await;
 
     assert_eq!(
@@ -728,9 +766,7 @@ async fn a_holder_two_hops_away_is_reached_through_the_middle_node() {
     let (a2, _a2_dir) = engine(
         Vec::new(),
         &[2],
-        Some(Arc::new(ChainedAsk {
-            next_hop: b_alone,
-        })),
+        Some(Arc::new(ChainedAsk { next_hop: b_alone })),
     );
 
     assert!(

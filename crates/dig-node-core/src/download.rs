@@ -55,11 +55,11 @@ use dig_sex::BackfillPolicy;
 use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
+pub(crate) use crate::seams::dig_peer::MAX_CONCURRENT_FORWARDED_ASKS;
 use crate::seams::dig_peer::{
     retain_excluding_self, CapsuleFallbackLocator, ConnectedPool, EmptyLocator, ForwardedAsk,
     NatForwardedAsk, PoolProviderLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
 };
-pub(crate) use crate::seams::dig_peer::MAX_CONCURRENT_FORWARDED_ASKS;
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
 /// hold it — the `error.data.redirect` names them (peer_id + candidate addresses) so the caller
@@ -2644,7 +2644,10 @@ pub(crate) mod tests {
     /// "tidying" them into agreement.
     #[test]
     fn the_redirect_leg_keeps_its_tolerant_reading_of_the_same_field() {
-        assert_eq!(HopBudget::from_params(&json!({"redirect_depth": "2"})).used(), 0);
+        assert_eq!(
+            HopBudget::from_params(&json!({"redirect_depth": "2"})).used(),
+            0
+        );
         assert_eq!(redirect_depth(&json!({"redirect_depth": "2"})), 0);
     }
 
