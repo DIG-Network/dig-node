@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.135.0] - 2026-08-21
+
+### Features
+- **node:** Scope CORS per route+method, hold the DIG loopback rule, keep the service stoppable (#291)
+
 ## [0.134.0] - 2026-08-21
 
 ### Features
