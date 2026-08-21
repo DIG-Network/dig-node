@@ -4724,7 +4724,7 @@ mod tests {
             for canonical in dig_rpc_protocol::ErrorCode::ALL {
                 assert!(
                     i64::from(canonical.code()) != *number || canonical.machine_code() == *condition,
-                    "local {condition} = {number} is already canonically {} — a client cannot tell                      the two apart, and they do not mean the same thing",
+                    "local {condition} = {number} is already canonically {}, and the two do not mean the same thing — a client cannot tell them apart",
                     canonical.machine_code()
                 );
             }

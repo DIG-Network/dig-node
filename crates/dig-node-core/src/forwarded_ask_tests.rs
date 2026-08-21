@@ -1103,6 +1103,61 @@ fn a_wire_budget_is_clamped_at_ingress_but_a_modest_one_passes_through() {
     );
 }
 
+/// **Proves:** `budget_ms` carries THREE distinct meanings and none of them is collapsed into
+/// another - absent means unbudgeted, `0` means exhausted, and any other value is the granted
+/// allowance.
+///
+/// **Fixture design - the three states are asserted against DIFFERENT expected values, so no two can
+/// be satisfied by one implementation.** The nearest wrong implementation reads the field with
+/// `unwrap_or(0)`, which makes absent and `0` indistinguishable; that version passes any test that
+/// only exercises a present, non-zero budget. So the absent case is pinned to the DERIVED budget
+/// (which is non-zero) and the `0` case to zero: a collapse in either direction fails one of them.
+///
+/// `Some(0)` being READABLE and zero is the point - it is a granted allowance that has run out, which
+/// `dig_sex` names distinctly from a budget it could not read at all. A hop MUST NOT spend time it was
+/// not given.
+#[test]
+fn budget_ms_keeps_absent_distinct_from_zero_and_from_a_granted_value() {
+    let derived = crate::seams::dig_peer::ask_budget(0, 3);
+    assert!(
+        !derived.is_zero(),
+        "the derived budget must be non-zero or the absent and zero cases below could not differ"
+    );
+
+    let unbudgeted = HopBudget::from_params(&serde_json::json!({"redirect_depth": 0}));
+    assert_eq!(
+        unbudgeted.time_budget(0, 3),
+        derived,
+        "an ABSENT budget is an originating question: this node derives its own allowance"
+    );
+
+    let exhausted = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "budget_ms": 0,
+    }));
+    assert_eq!(
+        exhausted.time_budget(0, 3),
+        Duration::ZERO,
+        "a budget of 0 is EXHAUSTED, not absent - a hop granted no time must not derive itself some"
+    );
+
+    let granted = HopBudget::from_params(&serde_json::json!({
+        "redirect_depth": 0,
+        "budget_ms": 4_000,
+    }));
+    assert_eq!(
+        granted.time_budget(0, 3),
+        Duration::from_millis(4_000),
+        "a readable allowance inside the ceiling is honoured exactly"
+    );
+
+    assert_ne!(
+        unbudgeted.time_budget(0, 3),
+        exhausted.time_budget(0, 3),
+        "absent and exhausted MUST NOT be the same allowance; collapsing them lets a spent budget          silently buy a fresh one at every hop"
+    );
+}
+
 // -- The same ask is walked once (dig-node#273) ----------------------------------------------------
 
 /// **Proves:** the same ask arriving twice by different paths is forwarded only once.
