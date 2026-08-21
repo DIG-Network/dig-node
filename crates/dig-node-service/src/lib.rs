@@ -57,6 +57,10 @@ pub mod hosts;
 /// file + human stderr) at the serve entrypoints and expose the runtime level-reload handle
 /// the `control.log.setLevel` method + `logs level` verb drive. See [`logging`].
 pub mod logging;
+/// The DIG loopback allocation (dig_ecosystem#767): the one place that answers which loopback
+/// address a DIG service binds, so no call site re-derives it and no DIG service takes
+/// `127.0.0.1` from the rest of the machine. See [`loopback`].
+pub mod loopback;
 pub mod meta;
 /// `dig-node open <chia://… | urn:dig:chia:…>` (#389): the OS scheme-handler target the
 /// installer registers for `chia://` + `urn:dig:chia:`. Strictly validates the untrusted
@@ -85,6 +89,10 @@ pub mod security;
 pub mod self_heal;
 pub mod server;
 pub mod service;
+/// Stopping the service reliably (dig_ecosystem#2880): a stop signal that does not depend on
+/// tokio's blocking pool, plus a bounded graceful-shutdown deadline, so a wedged internal can
+/// never leave a service the OS is unable to stop. See [`service_control`].
+pub mod service_control;
 /// The machine-wide, identity-independent daemon STATE dir (#501): where the control token +
 /// paired-token store live so the daemon (which may run as a service under a different OS
 /// account) and the operator CLI resolve the SAME files. See [`state`].
