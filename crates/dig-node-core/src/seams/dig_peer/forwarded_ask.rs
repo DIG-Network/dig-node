@@ -508,11 +508,23 @@ mod tests {
         ContentId::resource([1; 32], [2; 32], [3; 32])
     }
 
+    /// A miss answer from a peer that DID complete its search, naming `providers`.
+    ///
+    /// `absence_established: true` is stated rather than omitted, because omitting it means
+    /// something else entirely: a peer that describes its search not at all, which this node reads
+    /// as unproven. A fixture that left the field out would be testing the compatibility case while
+    /// claiming to test a peer that looked — see
+    /// [`absence_established_is_read_as_three_states_and_absent_is_not_true`] for the case that
+    /// genuinely exercises the absent field.
     fn answer_with(providers: Value) -> Value {
         json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "result": { "items": [{ "available": false, "providers": providers }] },
+            "result": { "items": [{
+                "available": false,
+                "providers": providers,
+                "absence_established": true,
+            }] },
         })
     }
 
