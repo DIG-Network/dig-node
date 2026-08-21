@@ -159,6 +159,34 @@ where
     }
 }
 
+/// Release the serve runtime once shutdown has been declared, choosing the teardown the
+/// outcome actually permits.
+///
+/// # Why a forced stop must NOT drop the runtime
+///
+/// `Runtime::drop` joins the blocking pool with **no timeout** (tokio's
+/// `runtime/blocking/pool.rs` calls `shutdown(None)`), so it returns only once every blocking
+/// task has finished. A [`StopOutcome::Forced`] stop is by definition the case where something
+/// blocking has *not* finished — the saturated pool that produced the 1061 wedge in the first
+/// place. Dropping the runtime there blocks forever, and it blocks *after* the SCM has already
+/// been told `Stopped`.
+///
+/// That is the worst shape available: `sc stop` reports success, the service is marked stopped,
+/// and the process is still alive holding its binary image locked — which is precisely the
+/// symptom this module exists to remove, and a privileged action reporting success without
+/// taking effect. It also leaves a state the SCM believes is stopped, so a `StartService` can
+/// bring up a second process against the same wallet replica.
+///
+/// So a forced stop **abandons** the pool: the wedged thread is leaked deliberately and the
+/// process is free to exit. A graceful stop wound its body down and has nothing to wait on, so
+/// it drops the runtime normally and joins its threads.
+pub fn release_runtime(rt: tokio::runtime::Runtime, outcome: StopOutcome) {
+    match outcome {
+        StopOutcome::Graceful => drop(rt),
+        StopOutcome::Forced => rt.shutdown_background(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +371,63 @@ mod tests {
             result,
             Some(7),
             "a graceful stop must carry the body's own result through"
+        );
+    }
+
+    /// **Proves the SEC-1 fix:** releasing the runtime after a FORCED stop returns promptly even
+    /// though a blocking task is still wedged.
+    ///
+    /// # Why the fixture is built this way
+    ///
+    /// The property under test is a *placement*, not an outcome: both the correct and the
+    /// incorrect version report `Stopped` to the SCM and return the same status, so no assertion
+    /// on a returned value can tell them apart. What distinguishes them is whether the teardown
+    /// call ever **comes back**. So the teardown runs on its own thread and the assertion is that
+    /// it finished — the pre-fix `drop(rt)` blocks in `BlockingPool::shutdown(None)` forever and
+    /// this never completes.
+    ///
+    /// The saturation must be genuine and it must still be in force at teardown time, or the test
+    /// passes for the wrong reason: `max_blocking_threads(1)` makes one parked task the whole
+    /// pool, and `release` is flipped only AFTER the assertion, so the wedge outlives the call
+    /// being measured. Against the default pool of 512 this would need 512 parked tasks and any
+    /// miscount would turn it green.
+    ///
+    /// The 5s bound is far above the measured 50ms for a released pool and far below "forever";
+    /// the mutated version does not fail slowly, it fails permanently.
+    #[test]
+    fn a_forced_stop_releases_the_runtime_without_joining_the_wedged_pool() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let release = Arc::new(AtomicBool::new(false));
+        let hog_release = release.clone();
+        // Occupy the ONLY blocking thread, exactly as the frozen wallet replica did.
+        rt.spawn_blocking(move || {
+            while !hog_release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        // Let the hog actually take the thread before the pool is torn down.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            release_runtime(rt, StopOutcome::Forced);
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        release.store(true, Ordering::SeqCst);
+
+        assert!(
+            returned,
+            "releasing the runtime after a forced stop must not join the blocking pool: the \
+             SCM has already been told `Stopped`, so a teardown that blocks leaves a service \
+             reported as stopped while the process is still alive holding its binary image \
+             locked"
         );
     }
 }

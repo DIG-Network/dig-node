@@ -25,7 +25,9 @@ use windows_service::{define_windows_service, service_dispatcher};
 use crate::config::Config;
 use crate::server::serve_with_shutdown;
 use crate::service::SERVICE_LABEL;
-use crate::service_control::{run_until_stopped, StopOutcome, StopSignal, GRACEFUL_STOP_DEADLINE};
+use crate::service_control::{
+    release_runtime, run_until_stopped, StopOutcome, StopSignal, GRACEFUL_STOP_DEADLINE,
+};
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
@@ -158,6 +160,18 @@ fn run_service() -> std::io::Result<()> {
         ServiceControlAccept::empty(),
         exit,
     ));
+    // Release the runtime in the way this outcome allows (dig_ecosystem#2880). A forced stop
+    // MUST NOT drop it: `Runtime::drop` joins the blocking pool with no timeout, and the whole
+    // definition of a forced stop is that something blocking never finished — so dropping here
+    // would block forever, after the SCM has already been told `Stopped`.
+    release_runtime(rt, outcome);
+    if outcome == StopOutcome::Forced {
+        // The abandoned pool still holds a live OS thread, so leave by the one exit that cannot
+        // be held up by it. The SCM already has the status and the exit code above; unwinding
+        // back through the dispatcher would only give that leaked thread another chance to
+        // outlive the stop the user asked for.
+        std::process::exit(exit as i32);
+    }
     // A forced stop has no serve result; the non-zero exit above already carries that
     // fact to the SCM, so the process itself exits cleanly rather than double-reporting.
     result.unwrap_or(Ok(()))

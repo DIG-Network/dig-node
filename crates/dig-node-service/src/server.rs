@@ -31,7 +31,7 @@ use dig_wallet::sage::rpc::WalletBackend;
 use dig_wallet::sage::service::WalletService;
 use dig_wallet::sage::transport::{SharedCert, DEFAULT_MTLS_PORT};
 use serde_json::{json, Value};
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::{AllowMethods, AllowOrigin, CorsLayer};
 
 use crate::config::{host_is_allowed, Config};
 use crate::content::{
@@ -205,7 +205,14 @@ pub fn router(state: AppState) -> Router {
                     .unwrap_or(false)
             },
         ))
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        // MIRROR the requested method rather than declaring a static set. tower-http emits
+        // `Access-Control-Allow-Methods` on EVERY preflight, independent of the origin verdict, so
+        // a static `[GET, POST, OPTIONS]` answers a legitimately-approved GET preflight from an
+        // app origin by ALSO advertising `POST` — seeding the browser's preflight cache with a
+        // `POST` entry that lets a later `POST /` skip its preflight entirely and reach the node.
+        // Mirroring keeps the advertised method equal to the one the origin predicate actually
+        // judged (#702).
+        .allow_methods(AllowMethods::mirror_request())
         // CONTENT_TYPE for the JSON body; the control-token header so a same-host
         // controller (the DIG Browser "My Node" UI) can authorize control.* calls.
         .allow_headers([

@@ -501,6 +501,9 @@ the router, and the two origin families have deliberately different reach:
 - **Local web/extension origins** are reflected on the WHOLE HTTP surface.
 - **Desktop-app origins** are reflected for **content reads ONLY** — a `GET` or `HEAD` to any route
   other than `/ws` and `/ws/status`. They MUST NOT be reflected for any other method on any route.
+  This scoping governs `Access-Control-Allow-Origin` specifically, not the whole response: the
+  remaining `Access-Control-*` headers are emitted by the CORS layer on any preflight it answers,
+  independent of the origin verdict.
 
 A preflight (`OPTIONS`) MUST be judged against the method declared in
 `Access-Control-Request-Method`, not against `OPTIONS` itself, so the preflight answer matches the
@@ -520,8 +523,13 @@ wallet transport (`/ws`, §4.5/§4.8) validates `Origin` against only the local 
 subset, NEVER the desktop-app origins. The #669 contract is unchanged — a desktop app still
 reaches the node-first content tier and still reads the exposed `X-Dig-*` provenance headers.
 
-Allowed methods: `GET`, `POST`, `OPTIONS`. Allowed request headers: `Content-Type` and
-`X-Dig-Control-Token`.
+`Access-Control-Allow-Methods` MUST MIRROR the method the preflight declared, and MUST NOT
+advertise a static method set. A static set is emitted on every answered preflight regardless of the
+origin verdict, so an approved `GET` preflight from a desktop-app origin would also advertise
+`POST` — seeding the browser's preflight cache with a `POST` entry that a later `POST /` then uses
+to skip its preflight. Mirroring keeps the advertised method equal to the one the origin predicate
+judged. The methods the router serves remain `GET`, `POST` and `OPTIONS`; allowed request headers
+are `Content-Type` and `X-Dig-Control-Token`.
 
 **Exposed response headers (#669).** The CORS layer MUST set `Access-Control-Expose-Headers` for the
 `X-Dig-*` verification/provenance headers so a CROSS-ORIGIN browser client (dig-urn-resolver's

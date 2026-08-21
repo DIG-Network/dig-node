@@ -279,9 +279,15 @@ fn bind_ephemeral_on_dig_loopback() -> std::io::Result<TcpListener> {
 /// The bytes NEVER touch disk, so no Mark-of-the-Web-less executable can be OS-opened.
 ///
 /// The address is `127.0.0.2`, not `127.0.0.1`: a DIG service does not take the address the rest
-/// of the machine assumes it can have. It also earns a real property here — the served page gets
-/// a browser ORIGIN distinct from every other local development server, so the sandboxed blob
-/// shares no origin with anything else the user happens to be running. On a macOS host with no
+/// of the machine assumes it can have. It also earns a real property here — the served page gets a
+/// browser ORIGIN distinct from every other local server, so it can neither script nor read a page
+/// served from `127.0.0.1` or from another capsule's port, and each capsule lands on its own
+/// ephemeral-port origin instead of sharing one `dig.local` origin with every other capsule.
+///
+/// This is ORIGIN isolation and nothing wider — in particular NOT cookie isolation, because
+/// cookies ignore port and are keyed by host: the blob shares the `127.0.0.2` cookie jar with the
+/// bare-IP content surface. Strictly less reach than the shared origin it replaces, so read the
+/// sentence above as the separation it names, never as a general sandbox guarantee. On a macOS host with no
 /// `lo0` alias the DIG address cannot be bound at all, so the bind walks
 /// [`crate::loopback::ephemeral_bind_candidates`] and takes the first that succeeds.
 pub struct RealLocalServer;
