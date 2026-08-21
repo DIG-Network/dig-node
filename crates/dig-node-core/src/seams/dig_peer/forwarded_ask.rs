@@ -284,7 +284,7 @@ where
 /// `result` frame is an [`Answered`](AskOutcome::Answered) even when the provider list is empty,
 /// because there the peer genuinely did look - UNLESS the peer itself said otherwise, in which case
 /// it is an [`AnsweredInconclusive`](AskOutcome::AnsweredInconclusive). That last case is what makes
-/// a downstream hop's uncertainty TRAVEL: see [`answered_conclusively`].
+/// a downstream hop's uncertainty TRAVEL: see [`subtree_claim`].
 ///
 /// A frame that is neither is a peer that did not answer the question it was asked, which establishes
 /// nothing: [`Unreachable`](AskOutcome::Unreachable). Reading it as an empty answer would hand any
@@ -297,37 +297,77 @@ pub(crate) fn parse_forwarded_answer(content: &ContentId, response: &Value) -> A
         return AskOutcome::Unreachable;
     }
     let records = parse_forwarded_providers(content, response);
-    if answered_conclusively(response) {
-        AskOutcome::Answered(records)
-    } else {
-        AskOutcome::AnsweredInconclusive(records)
+    match subtree_claim(response) {
+        SubtreeClaim::Established => AskOutcome::Answered(records),
+        // A peer that cannot describe its search has not told this node the search succeeded, so
+        // this node may not report a proven absence on the strength of it.
+        SubtreeClaim::NotEstablished | SubtreeClaim::NoClaim => {
+            AskOutcome::AnsweredInconclusive(records)
+        }
     }
 }
 
-/// Whether the peer's own answer claims its subtree finished looking.
+/// What a peer's answer claims about its OWN subtree, kept as the THREE states the wire carries.
 ///
-/// Reads `result.items[*].absence_established`, the field this node emits on the same verb. **Any
-/// item saying `false` makes the whole answer inconclusive**, and an absent field reads as `true`.
+/// `dig_rpc_protocol::AvailabilityAnswer::absence_established_or_unknown` is an `Option<bool>` and
+/// says there is no safe collapse to `bool`. This enum is that `Option` named, so the three cases
+/// have to be handled where they are read rather than defaulted at the edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubtreeClaim {
+    /// `Some(true)` — the peer reached everything it meant to reach and asserts the absence.
+    Established,
+    /// `Some(false)` — the peer looked and says its OWN search was incomplete.
+    NotEstablished,
+    /// Absent — the peer predates the field and describes its search not at all.
+    NoClaim,
+}
+
+/// Read `result.items[*].absence_established` as a [`SubtreeClaim`]. **The weakest item decides**,
+/// because one unproven item in a batch leaves the batch unproven.
 ///
-/// The absent case is deliberately tolerant: a peer on a build predating the field cannot say
-/// anything about its own certainty, and reading its silence as uncertainty would make every miss on
-/// a mixed network inconclusive - the opposite lie, arriving by default rather than by attack.
+/// # Why absent is NOT read as `true`
 ///
-/// A hop can of course LIE here, like anything else it tells us (NC-12) - but the value can only ever
-/// WEAKEN the claim this node goes on to make, never strengthen it. Claiming `false` costs the liar a
-/// retry it could have caused anyway by staying silent; claiming `true` is exactly the pre-existing
-/// behaviour. There is no direction in which lying about this field buys reach.
-fn answered_conclusively(response: &Value) -> bool {
-    response
+/// It used to be, via `unwrap_or(true)`, and the taxonomy owner names that exact collapse as the
+/// wrong one: it *turns an unknown into an assertion of absence*. A peer that says nothing about
+/// its search has not told this node the search succeeded — so treating its silence as a proven
+/// absence lets a stale hop manufacture the very not-found dig-node#273 exists to prevent, arriving
+/// through the compatibility door rather than through an attack.
+///
+/// The old rationale was that tolerance keeps a mixed network from reading as inconclusive
+/// everywhere. That cost is real and it is the RIGHT one to pay, for two reasons. The harms are not
+/// symmetric — an over-reported inconclusive costs a retry, an over-reported absence costs content
+/// that exists and cannot be found. And it does not arrive by default: the forwarded leg ships
+/// DISABLED, so a node that never asks a peer never reaches this function at all, and the cost falls
+/// only on nodes that opted into recursion.
+///
+/// A hop can of course LIE here, like anything else it tells us (NC-12) — but the value can only
+/// ever WEAKEN the claim this node goes on to make, never strengthen it. There is no direction in
+/// which lying about this field buys reach.
+fn subtree_claim(response: &Value) -> SubtreeClaim {
+    let items = response
         .get("result")
         .and_then(|r| r.get("items"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .all(|item| {
-            item.get("absence_established")
-                .and_then(Value::as_bool)
-                .unwrap_or(true)
+        .and_then(Value::as_array);
+    let Some(items) = items else {
+        return SubtreeClaim::NoClaim;
+    };
+    items
+        .iter()
+        .map(
+            |item| match item.get("absence_established").and_then(Value::as_bool) {
+                Some(true) => SubtreeClaim::Established,
+                Some(false) => SubtreeClaim::NotEstablished,
+                None => SubtreeClaim::NoClaim,
+            },
+        )
+        // The weakest wins: an explicit "not established" is the strongest report of incompleteness,
+        // and a silent item is still not an establishment.
+        .fold(SubtreeClaim::Established, |acc, item| match (acc, item) {
+            (SubtreeClaim::NotEstablished, _) | (_, SubtreeClaim::NotEstablished) => {
+                SubtreeClaim::NotEstablished
+            }
+            (SubtreeClaim::NoClaim, _) | (_, SubtreeClaim::NoClaim) => SubtreeClaim::NoClaim,
+            _ => SubtreeClaim::Established,
         })
 }
 
@@ -770,5 +810,100 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].addresses.len(), 1, "only the well-formed address");
         assert_eq!(found[0].addresses[0].host, "10.0.0.5");
+    }
+
+    /// One `dig.getAvailability` answer frame naming no providers, with `absence_established` set
+    /// however the caller asks. `None` OMITS the key, which is the whole point — a key present with
+    /// a null is a different wire fact from a key that is not there.
+    fn miss_answer(absence_established: Option<bool>) -> Value {
+        let mut item = json!({ "available": false });
+        if let Some(claim) = absence_established {
+            item["absence_established"] = json!(claim);
+        }
+        json!({ "jsonrpc": "2.0", "id": 1, "result": { "items": [item] } })
+    }
+
+    /// **Proves:** `absence_established` is read as THREE states, and the absent one is not read as
+    /// `true`. Only an explicit `Some(true)` lets this node carry a peer's absence forward as proven.
+    ///
+    /// **Fixture design — the three frames differ in ONE respect and it is the field under test.**
+    /// Every arm names zero providers and misses, so the provider list cannot be what distinguishes
+    /// them; `available: false` is identical in all three. The nearest wrong implementation is the
+    /// `unwrap_or(true)` this replaced, and it is invisible to any fixture that omits the ABSENT arm
+    /// — which is exactly why the absent arm is the middle assertion rather than an afterthought.
+    /// The `Some(true)` arm is the truthful control: without it an implementation that called
+    /// everything inconclusive would pass, and that implementation never proves an absence at all.
+    #[test]
+    fn absence_established_is_read_as_three_states_and_absent_is_not_true() {
+        // Side effect first: the frames genuinely differ in the field, so the arms below are not
+        // three spellings of one input.
+        assert!(
+            miss_answer(Some(true)).pointer("/result/items/0/absence_established") == Some(&json!(true))
+                && miss_answer(Some(false)).pointer("/result/items/0/absence_established")
+                    == Some(&json!(false))
+                && miss_answer(None)
+                    .pointer("/result/items/0/absence_established")
+                    .is_none(),
+            "fixture precondition: the three frames must differ in absence_established, and the              absent one must OMIT the key rather than carry a null"
+        );
+
+        assert_eq!(
+            subtree_claim(&miss_answer(Some(true))),
+            SubtreeClaim::Established,
+            "a peer that says it reached everything it meant to reach asserts the absence"
+        );
+        assert_eq!(
+            subtree_claim(&miss_answer(None)),
+            SubtreeClaim::NoClaim,
+            "a peer that says NOTHING about its search has not said the search succeeded; reading              its silence as an establishment is the unwrap_or(true) the taxonomy owner names as wrong"
+        );
+        assert_eq!(
+            subtree_claim(&miss_answer(Some(false))),
+            SubtreeClaim::NotEstablished,
+            "and a peer reporting its own incompleteness is distinct from one that is merely silent"
+        );
+
+        // The consequence the three states exist for: only Established may become a conclusive
+        // answer this node is willing to relay as proof.
+        assert!(
+            parse_forwarded_answer(&content(), &miss_answer(Some(true))).is_conclusive(),
+            "an established absence is the ONE case a not-found may be built on"
+        );
+        assert!(
+            !parse_forwarded_answer(&content(), &miss_answer(None)).is_conclusive(),
+            "an unknown must not become a proven absence"
+        );
+        assert!(
+            !parse_forwarded_answer(&content(), &miss_answer(Some(false))).is_conclusive(),
+            "nor may a search the peer itself called incomplete"
+        );
+    }
+
+    /// **Proves:** the weakest item in a BATCH decides, so one unproven item cannot ride out on the
+    /// back of a proven sibling.
+    ///
+    /// **Fixture design:** each arm pairs an ESTABLISHED item with one weaker item, and the
+    /// established item is first — so an implementation that reads only `items[0]`, or that folds
+    /// with the strongest rather than the weakest, comes back `Established` and fails here.
+    #[test]
+    fn one_unproven_item_makes_the_whole_batch_unproven() {
+        let with = |second: Value| {
+            json!({"jsonrpc":"2.0","id":1,"result":{"items":[
+                json!({"available": false, "absence_established": true}),
+                second,
+            ]}})
+        };
+        assert_eq!(
+            subtree_claim(&with(json!({ "available": false }))),
+            SubtreeClaim::NoClaim,
+            "a silent item leaves the batch unproven even beside an established one"
+        );
+        assert_eq!(
+            subtree_claim(&with(
+                json!({"available": false, "absence_established": false})
+            )),
+            SubtreeClaim::NotEstablished,
+            "and an explicitly incomplete item is the strongest report of incompleteness"
+        );
     }
 }
