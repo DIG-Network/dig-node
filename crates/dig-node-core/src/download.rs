@@ -56,10 +56,10 @@ use digstore_core::codec::Decode;
 
 use crate::dht::hex64;
 use crate::seams::dig_peer::{
-    CapsuleFallbackLocator, ConnectedPool, EmptyLocator, ForwardedAsk, NatForwardedAsk,
-    PoolProviderLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
+    retain_excluding_self, CapsuleFallbackLocator, ConnectedPool, EmptyLocator, ForwardedAsk,
+    NatForwardedAsk, PoolProviderLocator, SelectorAdapter, SelfExcludingLocator, UnionLocator,
 };
-pub(crate) use crate::seams::dig_peer::{FORWARDED_ASK_FANOUT, MAX_CONCURRENT_FORWARDED_ASKS};
+pub(crate) use crate::seams::dig_peer::MAX_CONCURRENT_FORWARDED_ASKS;
 
 /// JSON-RPC error code: the content is NOT held by this node, but the DHT located peers that DO
 /// hold it — the `error.data.redirect` names them (peer_id + candidate addresses) so the caller
@@ -237,12 +237,12 @@ fn resolve_inbound_demand_cache(v: Option<&str>) -> bool {
 ///
 /// Because it is the most amplifying path this node has, and an operator has to be able to say no.
 ///
-/// The relay token is charged on INBOUND admission while one token buys
-/// [`FORWARDED_ASK_FANOUT`](crate::seams::dig_peer::FORWARDED_ASK_FANOUT) OUTBOUND dials, so ONE
-/// admitted frame at `redirect_depth: 0` fans to roughly **1,360 dials and 1,360 DHT walks** across
-/// the network (16 → 64 → 256 → 1024), sustained at about 340 asks/s per attacker identity. The
-/// per-requestor relay bucket and the node-wide semaphore bound what THIS node spends and how much of
-/// it runs at once; neither bounds the aggregate, because every downstream node has its own.
+/// The relay token is charged on INBOUND admission while one token buys a whole fan-out of OUTBOUND
+/// dials, so the charge is never 1:1. One admitted frame recruits
+/// [`RecursionConfig::worst_case_nodes_recruited`](dig_sex::discovery::RecursionConfig::worst_case_nodes_recruited)
+/// nodes — 9 under the canonical bounds. The per-requestor relay bucket and the node-wide semaphore
+/// bound what THIS node spends and how much of it runs at once; neither bounds the aggregate, because
+/// every downstream node has its own.
 ///
 /// The precedent decides the default rather than taste. The PROXY leg — `DIG_NODE_ON_MISS=fetch` —
 /// is opt-in, and its cost is one capsule fetch by THIS node: expensive in bytes, but LOCAL and
@@ -254,17 +254,28 @@ fn resolve_inbound_demand_cache(v: Option<&str>) -> bool {
 /// Off, the miss answers from this node's own DHT lookup — byte-identical to what shipped before the
 /// feature existed, which is what makes enabling it a decision rather than a discovery.
 pub fn forward_on_miss_enabled() -> bool {
-    resolve_forward_on_miss(std::env::var("DIG_NODE_FORWARD_ON_MISS").ok().as_deref())
+    recursion_config().enabled
 }
 
-/// Pure core of [`forward_on_miss_enabled`]: default OFF; only an explicit truthy value
-/// (`on`/`1`/`true`/`yes`, case-insensitive) enables it. Pure so the policy is unit-tested without
-/// touching process-global env.
-fn resolve_forward_on_miss(v: Option<&str>) -> bool {
-    matches!(
-        v.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("on") | Some("1") | Some("true") | Some("yes")
-    )
+/// The recursion switch and its bounds for THIS node: the canonical
+/// [`RecursionConfig`](dig_sex::discovery::RecursionConfig), enabled by `DIG_NODE_FORWARD_ON_MISS`.
+pub(crate) fn recursion_config() -> dig_sex::discovery::RecursionConfig {
+    resolve_recursion_config(std::env::var("DIG_NODE_FORWARD_ON_MISS").ok().as_deref())
+}
+
+/// Pure core of [`recursion_config`], so the policy is unit-tested without touching process-global
+/// env.
+///
+/// The switch is parsed by [`dig_sex::discovery::parse_enabled`] rather than by a local matcher.
+/// That is the whole point of the consolidation and not a stylistic preference: the crate's parser
+/// FAILS CLOSED — anything it does not recognise disables recursion — and a second copy of a
+/// fail-closed rule is a second chance to get it wrong. The bounds come from the crate's own
+/// defaults for the same reason.
+fn resolve_recursion_config(raw: Option<&str>) -> dig_sex::discovery::RecursionConfig {
+    dig_sex::discovery::RecursionConfig {
+        enabled: dig_sex::discovery::parse_enabled(raw),
+        ..Default::default()
+    }
 }
 
 // -- Where a read request came from — the reshare trigger's ONLY gate ------------------------------
@@ -726,7 +737,7 @@ pub struct NodeContent {
     /// The whole-node ceiling on forwarded asks in flight, across every requestor and every miss.
     ///
     /// The per-requestor buckets cannot see this: each requestor can stay inside its own budget while
-    /// their SUM multiplies by [`FORWARDED_ASK_FANOUT`] into hundreds of concurrent dials. Permits are
+    /// their SUM multiplies by the recursion fan-out into many concurrent dials. Permits are
     /// taken with `try_acquire`, never awaited — a miss that cannot claim one answers without
     /// forwarding, which costs a less-enriched answer and never a stalled request.
     forwarded_ask_slots: Arc<tokio::sync::Semaphore>,
@@ -1305,81 +1316,116 @@ impl NodeContent {
     pub(crate) async fn locate_holders(
         &self,
         content: &ContentId,
-        hops_used: u64,
+        budget: HopBudget,
         requestor: &crate::rate_limit::RequestorId,
     ) -> Vec<ProviderRecord> {
         let mut providers = self.find_providers(content).await;
-        providers.extend(self.forwarded_holders(content, hops_used, requestor).await);
+        providers.extend(self.forwarded_holders(content, &budget, requestor).await);
+        // Both sources, one rule (dig-node#261). The DHT leg already excludes self at its own source,
+        // but the FORWARDED leg is an untrusted peer's `Vec` and had no exclusion at all — so the
+        // filter belongs HERE, at the merge, where it covers every source this answer will ever draw
+        // from including any added later. Applying it per-leg is what left one leg uncovered.
+        //
+        // `decide_forward` excludes self from the peers this node ASKS; that is a different rule and
+        // does not imply this one. A peer is perfectly free to ANSWER with a record naming us.
+        retain_excluding_self(&mut providers, self.self_peer_id.as_deref());
         dedup_by_peer(&mut providers);
         providers
     }
 
-    /// Ask up to [`FORWARDED_ASK_FANOUT`] connected pool peers whether they can locate `content`, and
-    /// return every holder they name (dig_ecosystem#3128). Empty whenever any bound refuses.
+    /// Ask the peers [`dig_sex::discovery::decide_forward`] names whether they can locate `content`,
+    /// and return every holder they name (dig_ecosystem#3128). Empty whenever the decision refuses.
     ///
-    /// Four gates stand in front of the outbound work, and each answers a different question:
+    /// # dig-sex owns the DECISION; this node owns the WIRE
     ///
-    /// 1. **Is there a leg at all?** No installed [`ForwardedAsk`] (the FFI/base path) forwards nothing.
-    /// 2. **Is there budget to recurse?** `hops_used >= REDIRECT_HOP_CAP` stops here, exactly as the
-    ///    redirect leg does — this is what stops a ring of nodes circulating one question forever.
-    /// 3. **Has THIS requestor spent its relay allowance?** [`Self::relay_rate_limiter`], a bucket of
-    ///    its own, because `RequestorId` keys by the immediate caller and a relayed fan-out would
-    ///    otherwise be billed to a victim's budget at every peer this node holds.
-    /// 4. **Has the NODE got a slot?** [`Self::forwarded_ask_slots`], the ceiling the per-requestor
-    ///    buckets structurally cannot see, since each requestor may stay inside its own budget while
-    ///    their sum multiplies by the fan-out.
+    /// Whether to forward, to whom, and with what budget left is decided by the canonical crate —
+    /// including the two properties dig-node's own copy got wrong: an unreadable hop budget is
+    /// REFUSED rather than read as a full one, and the bounds are `fan_out ^ hop_cap` = 9 nodes
+    /// rather than the ~1,360 dials the in-tree fan-out of 4 over a cap of 4 produced. Everything
+    /// below the decision — the opcode, the framing, the dial — stays here, because that is the half
+    /// that is genuinely dig-node's.
     ///
-    /// The chosen peers are the fan-out prefix of the connected pool. Self is excluded — asking
-    /// ourselves is a guaranteed miss that spends a slot — and so is the requestor, because forwarding
-    /// a peer's own question straight back to it is the tightest loop this path can form and the hop
-    /// counter alone would let it run to the cap.
+    /// # Two dig-node resources still gate the work, and neither belongs in the crate
+    ///
+    /// * [`Self::relay_rate_limiter`] — this requestor's allowance for work done on OTHERS' behalf,
+    ///   kept separate from its own lookup budget because `RequestorId` keys by the immediate caller,
+    ///   so a relayed fan-out would otherwise be billed to a victim at every peer this node holds. It
+    ///   is passed IN as `relay_budget_available` rather than checked around the decision, so the
+    ///   crate's `RelayBudgetSpent` arm stays reachable instead of being shadowed by a local guard.
+    /// * [`Self::forwarded_ask_slots`] — the node-wide ceiling on asks in flight, which the
+    ///   per-requestor buckets structurally cannot see because each requestor may stay inside its own
+    ///   budget while their sum multiplies. It bounds CONCURRENCY, never total work.
     async fn forwarded_holders(
         &self,
         content: &ContentId,
-        hops_used: u64,
+        budget: &HopBudget,
         requestor: &crate::rate_limit::RequestorId,
     ) -> Vec<ProviderRecord> {
         let Some(ask) = self.forwarded_ask.get() else {
             return Vec::new();
         };
-        if hops_used >= REDIRECT_HOP_CAP {
+        let config = recursion_config();
+        let pool = self.dialable_pool();
+
+        // `decide_forward` compares peers by identity, and both exclusions are stated over the SAME
+        // hex-string space the pool is keyed by. A requestor that is not a peer (a local caller) and
+        // an unresolved self-identity have no such string; the empty string stands in for both,
+        // because no pool key is ever empty and so it excludes nothing — which is the honest reading
+        // of "there is nobody here to exclude".
+        let asker = match requestor {
+            crate::rate_limit::RequestorId::Peer(id) => id.as_str(),
+            _ => "",
+        };
+        let me = self.self_peer_id.as_deref().unwrap_or("");
+        let peer_keys: Vec<&str> = pool.iter().map(|(peer, _)| peer.as_str()).collect();
+
+        let decision = dig_sex::discovery::decide_forward(
+            &config,
+            &dig_sex::discovery::InboundAsk {
+                requestor: asker,
+                hops_remaining: budget.remaining(config.hop_cap),
+            },
+            &me,
+            &peer_keys,
+            self.relay_rate_limiter.check(requestor),
+        );
+
+        let dig_sex::discovery::ForwardDecision::Forward {
+            peers,
+            hops_remaining,
+        } = decision
+        else {
+            tracing::debug!(?decision, "forwarded ask: refused");
             return Vec::new();
-        }
-        if !self.relay_rate_limiter.check(requestor) {
-            return Vec::new();
-        }
+        };
+
         let Ok(_slot) = self.forwarded_ask_slots.clone().try_acquire_owned() else {
             tracing::debug!("forwarded ask: node-wide concurrency ceiling reached; not forwarding");
             return Vec::new();
         };
 
-        let peers = self.forwardable_peers(requestor);
-        let next_depth = hops_used.saturating_add(1);
+        // The wire still carries hops CONSUMED (`redirect_depth`), so the remaining budget the crate
+        // decided is converted back at the boundary. One field, one meaning on the wire.
+        let next_depth = u64::from(config.hop_cap.saturating_sub(hops_remaining));
         let mut found = Vec::new();
-        for (peer, addrs) in peers {
-            found.extend(ask.ask(&peer, &addrs, content, next_depth).await);
+        for peer in peers {
+            let Some((_, addrs)) = pool.iter().find(|(known, _)| known == peer) else {
+                continue;
+            };
+            found.extend(ask.ask(peer, addrs, content, next_depth).await);
         }
         found
     }
 
-    /// The connected pool peers this node may forward a question to, capped at
-    /// [`FORWARDED_ASK_FANOUT`]: everyone except this node itself and the peer that asked.
-    fn forwardable_peers(
-        &self,
-        requestor: &crate::rate_limit::RequestorId,
-    ) -> Vec<(String, Vec<std::net::SocketAddr>)> {
-        let asker = match requestor {
-            crate::rate_limit::RequestorId::Peer(id) => Some(id.as_str()),
-            _ => None,
-        };
+    /// Every connected pool peer this node could actually dial, with its addresses — the raw material
+    /// the forwarding decision selects from. No policy here: an addressless entry is dropped because
+    /// it is not dialable, not because of any rule about who may be asked.
+    fn dialable_pool(&self) -> Vec<(String, Vec<std::net::SocketAddr>)> {
         self.connected_pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .filter(|(peer, _)| Some(peer.as_str()) != asker)
-            .filter(|(peer, _)| Some(*peer) != self.self_peer_id.as_ref())
             .filter(|(_, addrs)| !addrs.is_empty())
-            .take(FORWARDED_ASK_FANOUT)
             .map(|(peer, addrs)| (peer.clone(), addrs.clone()))
             .collect()
     }
@@ -1417,13 +1463,9 @@ impl NodeContent {
             .find_providers(content)
             .await
             .unwrap_or_default();
-        match &self.self_peer_id {
-            Some(me) => found
-                .into_iter()
-                .filter(|p| &p.provider_peer_id != me)
-                .collect(),
-            None => found,
-        }
+        let mut found = found;
+        retain_excluding_self(&mut found, self.self_peer_id.as_deref());
+        found
     }
 
     /// The #164 content-acquisition path: multi-source download `content` (locate → confirm → fan
@@ -1874,7 +1916,7 @@ impl crate::Node {
     pub(crate) async fn miss_outcome(
         &self,
         content: &ContentId,
-        depth: u64,
+        budget: HopBudget,
         proxy: bool,
         origin: ReadOrigin,
         requestor: &crate::rate_limit::RequestorId,
@@ -1916,6 +1958,7 @@ impl crate::Node {
         // the plain not-found instead of another redirect, so nodes can never bounce a caller in a
         // loop. (The check is here, not on the providers, so an exhausted budget short-circuits the
         // DHT lookup too.)
+        let depth = budget.used();
         if depth >= REDIRECT_HOP_CAP {
             return MissOutcome::NotFound;
         }
@@ -1923,7 +1966,7 @@ impl crate::Node {
         // peers name in reply to the same question, so a holder two hops away through connections we
         // already hold is reachable even when no DHT record here can point at it. `depth` is the
         // budget the caller echoed, and it bounds the recursion exactly as it bounds the redirect.
-        let providers = pc.locate_holders(content, depth, requestor).await;
+        let providers = pc.locate_holders(content, budget, requestor).await;
         if providers.is_empty() {
             // No provider anywhere → a genuine not-found (the caller's -32004 stands).
             return MissOutcome::NotFound;
@@ -1942,7 +1985,7 @@ impl crate::Node {
         &self,
         id: &Value,
         content: &ContentId,
-        depth: u64,
+        budget: HopBudget,
         offset: usize,
         length: usize,
         proxy: bool,
@@ -1950,7 +1993,7 @@ impl crate::Node {
         requestor: &crate::rate_limit::RequestorId,
     ) -> Option<Value> {
         match self
-            .miss_outcome(content, depth, proxy, origin, requestor)
+            .miss_outcome(content, budget, proxy, origin, requestor)
             .await
         {
             MissOutcome::Fetched(f) => Some(match f.range_frame(offset, length) {
@@ -1980,7 +2023,7 @@ impl crate::Node {
         &self,
         id: &Value,
         content: &ContentId,
-        depth: u64,
+        budget: HopBudget,
         offset: usize,
         pinned_root_hex: Option<&str>,
         proxy: bool,
@@ -1988,7 +2031,7 @@ impl crate::Node {
         requestor: &crate::rate_limit::RequestorId,
     ) -> Option<Value> {
         match self
-            .miss_outcome(content, depth, proxy, origin, requestor)
+            .miss_outcome(content, budget, proxy, origin, requestor)
             .await
         {
             MissOutcome::Fetched(f) => {
@@ -2035,6 +2078,71 @@ pub(crate) fn redirect_depth(params: &Value) -> u64 {
         .get("redirect_depth")
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+/// The hop budget a request carries, read ONCE and kept in the three states its two consumers need
+/// to tell apart.
+///
+/// # Why one field has two readings, on purpose
+///
+/// `params.redirect_depth` bounds two different things, and they do not deserve the same tolerance:
+///
+/// * the **redirect** leg spends only THIS node's DHT lookup, so an unreadable value keeps the
+///   shipped tolerant reading ([`Self::used`] → `0`) and the caller still gets an answer;
+/// * the **forwarded ask** spends OTHER nodes' bandwidth, so an unreadable value is refused outright
+///   ([`Self::remaining`] → `None`, which [`dig_sex::discovery::decide_forward`] turns into
+///   [`ForwardRefusal::UnreadableHopBudget`](dig_sex::discovery::ForwardRefusal::UnreadableHopBudget)).
+///
+/// Collapsing an unreadable budget to `0` on the forwarding side — which is what shipped — reads a
+/// malformed, attacker-supplied field as *the most permissive value the field has*, at every hop.
+/// A request whose hop budget cannot be read is a request whose reach is unbounded (dig-node#281).
+///
+/// Absent is NOT unreadable: a request with no `redirect_depth` is an originating one, and gets the
+/// whole budget because that is what an originator honestly has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HopBudget(Option<u64>);
+
+impl HopBudget {
+    /// Read the budget out of a request's `params`. `None` inside means the field was PRESENT and
+    /// could not be read as a hop count.
+    pub(crate) fn from_params(params: &Value) -> Self {
+        match params.get("redirect_depth") {
+            None | Some(Value::Null) => Self(Some(0)),
+            Some(value) => Self(value.as_u64()),
+        }
+    }
+
+    /// A question this node is asking for the first time — nothing spent.
+    pub(crate) fn fresh() -> Self {
+        Self(Some(0))
+    }
+
+    /// A budget with nothing left: this leg must not forward at all. Readable and zero — which is a
+    /// refusal the crate names [`HopBudgetSpent`](dig_sex::discovery::ForwardRefusal::HopBudgetSpent),
+    /// deliberately distinct from an unreadable budget.
+    pub(crate) fn spent() -> Self {
+        Self(Some(u64::from(u8::MAX)))
+    }
+
+    /// A question that has already travelled `depth` hops. For tests and for the internal legs that
+    /// carry a depth rather than a request body.
+    #[cfg(test)]
+    pub(crate) fn at_depth(depth: u64) -> Self {
+        Self(Some(depth))
+    }
+
+    /// Hops already consumed, for the redirect cap and the depth echoed back to the caller. Keeps
+    /// the shipped tolerant reading; see the type docs for why this one does not fail closed.
+    pub(crate) fn used(&self) -> u64 {
+        self.0.unwrap_or(0)
+    }
+
+    /// Hops left to FORWARD with, against a recursion `hop_cap` — or `None` when the budget could not
+    /// be read, which refuses the forward rather than granting it.
+    pub(crate) fn remaining(&self, hop_cap: u8) -> Option<u8> {
+        let used = u8::try_from(self.0?).unwrap_or(u8::MAX);
+        Some(hop_cap.saturating_sub(used))
+    }
 }
 
 /// Whether the request opts into the bounded PROXY fallback (dig_ecosystem#2007): `params.proxy ==
@@ -2478,6 +2586,79 @@ pub(crate) mod tests {
         assert_eq!(redirect_depth(&json!({})), 0);
         assert_eq!(redirect_depth(&json!({"redirect_depth": 3})), 3);
         assert_eq!(redirect_depth(&json!({"redirect_depth": "x"})), 0);
+    }
+
+    /// **Proves:** the hop budget carried in a request is read into the THREE states the forwarding
+    /// decision needs to tell apart — a fresh question, a partly-spent one, and one whose budget
+    /// could not be read at all.
+    ///
+    /// **Catches:** the defect this consolidation exists to remove (dig-node#281). The shipped
+    /// `redirect_depth` parser collapsed an unreadable value to `0` — *the most permissive value there
+    /// is* — so an attacker-supplied `redirect_depth` that failed to parse read as a brand-new
+    /// question with the whole budget intact, at every hop, forever. The fixture uses a STRING where a
+    /// number belongs, because that is the shape a hostile or mis-serialised frame actually takes;
+    /// asserting only on absent-vs-present could not see it.
+    #[test]
+    fn an_unreadable_hop_budget_is_distinguishable_from_a_fresh_one() {
+        assert_eq!(
+            HopBudget::from_params(&json!({})).remaining(2),
+            Some(2),
+            "no field at all is an ORIGINATING request, and gets the whole budget"
+        );
+        assert_eq!(
+            HopBudget::from_params(&json!({"redirect_depth": 1})).remaining(2),
+            Some(1),
+            "a partly-spent budget carries what is left"
+        );
+        assert_eq!(
+            HopBudget::from_params(&json!({"redirect_depth": 2})).remaining(2),
+            Some(0),
+            "a spent budget is readable and zero, NOT unreadable"
+        );
+        assert_eq!(
+            HopBudget::from_params(&json!({"redirect_depth": "2"})).remaining(2),
+            None,
+            "PRESENT BUT UNREADABLE — the one state that must never read as budget to spend"
+        );
+    }
+
+    /// **Proves:** the unreadable budget leaves the SHIPPED redirect leg exactly as it was.
+    ///
+    /// **Catches:** widening the fix past the defect. Forwarding spends OTHER nodes' bandwidth and is
+    /// gated tightly; the redirect spends only this node's and keeps its tolerant reading, so a client
+    /// that sends a sloppy `redirect_depth` still gets a redirect rather than a silent not-found. The
+    /// two readings of one field are deliberate, and this test is what stops the next reader
+    /// "tidying" them into agreement.
+    #[test]
+    fn the_redirect_leg_keeps_its_tolerant_reading_of_the_same_field() {
+        assert_eq!(HopBudget::from_params(&json!({"redirect_depth": "2"})).used(), 0);
+        assert_eq!(redirect_depth(&json!({"redirect_depth": "2"})), 0);
+    }
+
+    /// **Proves:** recursion is OFF unless explicitly enabled, and the bounds it carries when on are
+    /// the canonical crate's, not a second set defined here.
+    ///
+    /// **Catches:** the rival's reach silently surviving the consolidation. dig-node's own fan-out was
+    /// 4 over a cap of 4 — about 1,360 dials per admitted frame. The assertion is on
+    /// `worst_case_nodes_recruited` rather than on the two fields separately because that is the
+    /// number an operator actually pays, and it is the one an accidental fan-out bump would move.
+    #[test]
+    fn recursion_is_off_by_default_and_bounded_by_the_canonical_crate() {
+        assert!(
+            !resolve_recursion_config(None).enabled,
+            "DEFAULT IS OFF — an unconfigured node must never forward"
+        );
+        assert!(
+            !resolve_recursion_config(Some("enable")).enabled,
+            "an unrecognised value must fail CLOSED, never enable an amplifier"
+        );
+        let on = resolve_recursion_config(Some("true"));
+        assert!(on.enabled);
+        assert_eq!(
+            on.worst_case_nodes_recruited(),
+            9,
+            "3 peers over 2 hops — the canonical bound, not dig-node's former 4 over 4"
+        );
     }
 
     #[test]

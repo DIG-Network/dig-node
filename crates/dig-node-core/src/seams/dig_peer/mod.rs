@@ -46,7 +46,7 @@ pub mod union_locator;
 
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;
 pub(crate) use forwarded_ask::{
-    ForwardedAsk, NatForwardedAsk, FORWARDED_ASK_FANOUT, MAX_CONCURRENT_FORWARDED_ASKS,
+    ForwardedAsk, NatForwardedAsk, MAX_CONCURRENT_FORWARDED_ASKS,
 };
 pub use module_anchor::ChainAnchoredModuleVerifier;
 pub(crate) use module_reshare::DEFAULT_MAX_CONCURRENT_WARMS;
@@ -58,5 +58,5 @@ pub use module_transport::NatModuleTransport;
 pub use peer_network::PeerNetwork;
 pub(crate) use pool_locator::{ConnectedPool, PoolProviderLocator};
 pub(crate) use selector_adapter::SelectorAdapter;
-pub(crate) use self_excluding_locator::SelfExcludingLocator;
+pub(crate) use self_excluding_locator::{retain_excluding_self, SelfExcludingLocator};
 pub(crate) use union_locator::{EmptyLocator, UnionLocator};
