@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.134.0] - 2026-08-21
+
+### Features
+- **exchange:** Adopt dig-sex for selection residency, acquisition and recursive discovery (#289)
+
 ## [0.133.0] - 2026-08-20
 
 ### Bug Fixes
