@@ -46,6 +46,10 @@ pub mod store_melted;
 pub mod union_locator;
 
 pub(crate) use capsule_fallback::CapsuleFallbackLocator;
+/// Test-only: production builds the request inside `NatForwardedAsk::ask`, so nothing outside this
+/// module may construct one — a second construction site is a second place the wire shape can drift.
+#[cfg(test)]
+pub(crate) use forwarded_ask::forwarded_request;
 pub(crate) use forwarded_ask::{
     ask_budget, AskOutcome, ForwardedAsk, NatForwardedAsk, MAX_CONCURRENT_FORWARDED_ASKS,
     MAX_FORWARDED_ASK_BUDGET,

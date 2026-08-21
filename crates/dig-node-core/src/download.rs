@@ -90,26 +90,21 @@ pub const CONTENT_MISS_RATE_LIMITED: i64 = -32003;
 /// not-found means the answer is settled and the caller should stop; this means the answer is
 /// unknown and a retry is meaningful. A caller that cannot tell them apart treats one slow peer as
 /// proof of absence.
-/// # Why this number, and why it is PROVISIONAL
 ///
-/// The taxonomy this code belongs to is owned by `dig-rpc-protocol`, not by this crate
-/// (`SYSTEM.md`: the error-code taxonomy is defined ONCE there, release-first, then adopted). This
-/// const exists only until that crate declares the condition and this node can name
-/// `ErrorCode::ContentMissInconclusive` instead. It is asserted against the canonical taxonomy by
-/// `no_local_wire_code_collides_with_a_different_canonical_code`.
+/// # The number is NOT declared here
 ///
-/// Two numbers were tried and both were already assigned, which is the whole reason the guard test
-/// exists:
+/// The taxonomy is owned by `dig-rpc-protocol` (`SYSTEM.md`: defined ONCE there, release-first,
+/// then adopted), and 0.10 declares this condition. This function names the canonical variant
+/// rather than repeating its number, so the two cannot drift: a node that restates a number it
+/// does not own is one release away from disagreeing with the taxonomy it is claiming to speak.
 ///
-/// * `-32009` is `RangeMetadataUnrepresentable`, which a client MUST treat as holder-fatal. That is
-///   the OPPOSITE instruction to this code, so a client receiving it cannot choose correctly: it
-///   either blacklists a holder that was merely uncertain, or re-asks one that can never serve.
-/// * `-32015` — the code `dig-rpc-protocol` 0.9.0 assigns, reading only its own list — is
-///   `METADATA_TOO_LARGE`, a released, docs.dig.net-catalogued
-///   dig-node code. Same collision, one number to the right.
-///
-/// `-32017` is the first code free in BOTH taxonomies and unused anywhere in the ecosystem.
-pub const CONTENT_MISS_INCONCLUSIVE: i64 = -32017;
+/// The provisional local const that stood here reached `-32017` only after two collisions — with
+/// `RangeMetadataUnrepresentable` (`-32009`, holder-fatal, the OPPOSITE instruction) and with
+/// dig-node's own released `METADATA_TOO_LARGE` (`-32015`). `-32017` is what the owner ultimately
+/// assigned, so adoption changes no byte on the wire; it changes who gets to change it.
+pub(crate) fn content_miss_inconclusive() -> i64 {
+    i64::from(dig_rpc_protocol::ErrorCode::ContentMissInconclusive.code())
+}
 
 /// The hard cap on how many holder candidates a single [`CONTENT_REDIRECT`] names
 /// (dig_ecosystem#2007). A redirect NAMES candidates; this node does NOT dial/probe them
@@ -1592,7 +1587,11 @@ impl NodeContent {
         requestor: &crate::rate_limit::RequestorId,
     ) -> ForwardedAnswers {
         let Some(ask) = self.forwarded_ask.get() else {
-            return ForwardedAnswers::not_asked();
+            // No asker is installed, so the forwarded leg is not part of this node's answer at all —
+            // the same standing as recursion being switched off, and CONCLUSIVE for the same reason:
+            // nothing was withheld. This is the stock-node path, so reading it as inconclusive would
+            // make every miss on every default build unprovable and drain the field of meaning.
+            return ForwardedAnswers::recursion_disabled();
         };
         // Installed with the leg, so a node that has an asker always has the bounds that asker was
         // admitted under; the fallback is the crate's DISABLED default, which forwards nothing.
@@ -1727,6 +1726,12 @@ impl NodeContent {
             .collect()
     }
 
+    /// [`Self::forget_stale_discovery`], reachable from the tests that drive the caches directly.
+    #[cfg(test)]
+    pub(crate) async fn forget_stale_discovery_for_test(&self, content: &ContentId) {
+        self.forget_stale_discovery(content).await;
+    }
+
     /// Honour dig-dht SPEC §6.8: having reached NONE of the candidates located for `content`, forget
     /// the cached lookup answer so the next attempt runs a real walk instead of replaying the same
     /// unreachable set for the rest of the cache's 15-minute life.
@@ -1738,13 +1743,6 @@ impl NodeContent {
     ///
     /// Touches only this node's own cache: it can neither censor a key this node serves nor be
     /// observed by any other peer.
-
-    /// [`Self::forget_stale_discovery`], reachable from the tests that drive the caches directly.
-    #[cfg(test)]
-    pub(crate) async fn forget_stale_discovery_for_test(&self, content: &ContentId) {
-        self.forget_stale_discovery(content).await;
-    }
-
     async fn forget_stale_discovery(&self, content: &ContentId) {
         // The first-hand holder cache remembers the SAME unreachable slate (dig-node#275), so it must
         // forget it at the same moment. Leaving it behind would re-supply the exact candidates that
@@ -2191,7 +2189,7 @@ pub(crate) enum MissOutcome {
     /// No providers were found AND the search could not establish that there are none: a hop timed
     /// out, refused, or was unreachable (dig-node#273).
     ///
-    /// Answered with [`CONTENT_MISS_INCONCLUSIVE`] rather than a not-found, because the two mean
+    /// Answered with [`content_miss_inconclusive`] rather than a not-found, because the two mean
     /// opposite things to a caller: a not-found says stop looking, and this says the question was not
     /// answered. Collapsing them let ONE slow peer manufacture an authoritative absence for content
     /// that exists — and, since a hop's answer is itself relayed, propagate that absence downwards.
@@ -2400,7 +2398,7 @@ impl crate::Node {
 
 // -- Redirect shaping (pure) --------------------------------------------------------------------------
 
-/// The human message on a [`CONTENT_MISS_INCONCLUSIVE`] error. It states plainly that the answer is
+/// The human message on a [`content_miss_inconclusive`] error. It states plainly that the answer is
 /// UNKNOWN rather than negative, because a caller that reads it as a not-found is back to treating one
 /// slow peer as proof of absence.
 pub(crate) const MISS_INCONCLUSIVE_MESSAGE: &str =
@@ -2545,6 +2543,17 @@ impl HopBudget {
         }
     }
 
+    /// The same budget carrying an explicit ask identity, as a hop on the wire would have received
+    /// it. Test-only: production reads it from `params.ask_id` via [`Self::from_params`].
+    ///
+    /// Needed because a relaying double must ECHO the id it was handed; a double that could only
+    /// mint a fresh one would satisfy the dedup assertion by accident at depth one and never
+    /// exhibit the diamond re-walk the seen-set exists to stop.
+    #[cfg(test)]
+    pub(crate) fn with_ask_id(self, ask_id: AskId) -> Self {
+        Self { ask_id, ..self }
+    }
+
     /// The same budget with an explicit wall-clock allowance, as a hop on the wire would have granted
     /// it. Test-only: production reads it from `params.budget_ms` via [`Self::from_params`].
     #[cfg(test)]
@@ -2622,7 +2631,7 @@ pub(crate) fn proxy_requested(params: &Value) -> bool {
 /// # Why this is one function and not an arm in each verb
 ///
 /// A refusal's code and message must be IDENTICAL whichever verb provoked it: a caller that learns to
-/// retry on [`CONTENT_MISS_INCONCLUSIVE`] from `dig.fetchRange` and gets a plain not-found for the
+/// retry on [`content_miss_inconclusive`] from `dig.fetchRange` and gets a plain not-found for the
 /// same condition from `dig.getContent` has been taught a rule that does not hold. The two verbs
 /// previously carried duplicate arms, which is exactly how one of them would come to disagree.
 pub(crate) fn miss_refusal_envelope(id: &Value, outcome: &MissOutcome) -> Option<Value> {
@@ -2636,7 +2645,7 @@ pub(crate) fn miss_refusal_envelope(id: &Value, outcome: &MissOutcome) -> Option
         // not-found says stop looking and this says try again (dig-node#273).
         MissOutcome::Inconclusive => Some(crate::rpc_err(
             id,
-            CONTENT_MISS_INCONCLUSIVE,
+            content_miss_inconclusive(),
             MISS_INCONCLUSIVE_MESSAGE,
         )),
         // Not refusals: shaped by the caller, or deliberately silent.

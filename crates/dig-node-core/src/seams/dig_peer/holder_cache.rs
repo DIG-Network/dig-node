@@ -421,14 +421,22 @@ mod tests {
     fn an_ask_id_is_claimable_once_and_a_different_id_is_unaffected() {
         let seen = AskSeenSet::new();
 
-        assert!(seen.claim([7u8; 16]), "first arrival walks");
+        assert!(seen.claim([7u8; 16], &content(1)), "first arrival walks");
         assert!(
-            !seen.claim([7u8; 16]),
+            !seen.claim([7u8; 16], &content(1)),
             "the diamond's second arrival does not"
         );
         assert!(
-            seen.claim([8u8; 16]),
+            seen.claim([8u8; 16], &content(1)),
             "an unrelated ask is not collateral damage"
+        );
+        // The claim is keyed by (id, content), not by id alone. A batch names several items and an
+        // originator may carry ONE id across them, so keying on the id alone would let the first
+        // item in a batch suppress the walk for every other item in it — a self-inflicted absence
+        // that grows with batch size and looks exactly like a not-found.
+        assert!(
+            seen.claim([7u8; 16], &content(2)),
+            "the same ask asking about DIFFERENT content is a different question"
         );
     }
 }

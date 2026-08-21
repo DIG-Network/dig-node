@@ -171,17 +171,6 @@ impl AskOutcome {
     pub(crate) fn is_conclusive(&self) -> bool {
         matches!(self, Self::Answered(_))
     }
-
-    /// The providers this outcome named, consumed - `Answered` and `AnsweredInconclusive` alike.
-    ///
-    /// Both carry real candidates: a hop that could not finish looking may still have found someone
-    /// before it ran out, and discarding those would punish the honest report of uncertainty.
-    pub(crate) fn into_records(self) -> Vec<ProviderRecord> {
-        match self {
-            Self::Answered(records) | Self::AnsweredInconclusive(records) => records,
-            Self::Refused | Self::TimedOut | Self::Unreachable => Vec::new(),
-        }
-    }
 }
 
 /// Issue one `dig.getAvailability` to one connected peer and report the providers it named.
@@ -219,28 +208,40 @@ pub(crate) trait ForwardedAsk: Send + Sync {
 /// any other caller sends, built from the same [`content_id_json`](crate::download::content_id_json)
 /// item renderer the redirect uses, so the forwarded question is byte-identical to a direct one.
 ///
-/// `ask_id` rides as hex under `params.ask_id`, the field
-/// [`HopBudget::from_params`](crate::download::HopBudget::from_params) reads at the far end. A peer on
-/// an older build ignores it and mints its own, which is the pre-dedup behaviour and never worse.
+/// # The params are the OWNER'S type, not a hand-written object
+///
+/// `dig_rpc_protocol::GetAvailabilityParams` declares `budget_ms` and `ask_id`, so this builds and
+/// serializes that type rather than naming the fields itself. A hand-written object spells the
+/// field names a second time, and the second spelling is the one that silently stops matching when
+/// the owner renames or re-shapes a field — a mismatch no test in THIS repo can see, because both
+/// sides of a local round-trip would agree with each other while disagreeing with every other node.
+///
+/// `ask_id` rides as hex, the field
+/// [`HopBudget::from_params`](crate::download::HopBudget::from_params) reads at the far end. A peer
+/// on an older build ignores it and mints its own, which is the pre-dedup behaviour and never worse.
+///
+/// `budget_ms` is set UNCONDITIONALLY, including at zero: `Some(0)` means *exhausted, do not ask
+/// onward*, which is a live instruction and not the same as the field being absent (absent means
+/// unbudgeted — the responder's own policy applies). Omitting a zero would upgrade an exhausted ask
+/// into an unbounded one at every hop that read it.
 pub(crate) fn forwarded_request(
     content: &ContentId,
     next_depth: u64,
     budget: Duration,
     ask_id: AskId,
 ) -> Value {
+    let item: dig_rpc_protocol::types::AvailabilityQuery =
+        serde_json::from_value(crate::download::content_id_json(content))
+            .expect("content_id_json renders exactly an AvailabilityQuery");
+    let params = dig_rpc_protocol::types::GetAvailabilityParams::new(vec![item])
+        .with_redirect_depth(next_depth)
+        .with_budget_ms(u64::try_from(budget.as_millis()).unwrap_or(u64::MAX))
+        .with_ask_id(hex::encode(ask_id));
     json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "dig.getAvailability",
-        "params": {
-            "items": [crate::download::content_id_json(content)],
-            "redirect_depth": next_depth,
-            "budget_ms": u64::try_from(budget.as_millis()).unwrap_or(u64::MAX),
-            // The identity, hex-encoded, echoed exactly as received. THIS is what makes the seen-set
-            // a dedup rather than a random-key generator: with the field absent, every hop's ingress
-            // mints a fresh id, every claim succeeds, and a diamond in the graph re-walks itself.
-            "ask_id": hex::encode(ask_id),
-        },
+        "params": params,
     })
 }
 
@@ -483,7 +484,7 @@ mod tests {
     /// see depth 0 forever and the hop cap would stop bounding anything.
     #[test]
     fn the_request_is_the_shipped_verb_carrying_the_shipped_budget_field() {
-        let request = forwarded_request(&content(), 3, Duration::from_millis(12_500));
+        let request = forwarded_request(&content(), 3, Duration::from_millis(12_500), [9u8; 16]);
 
         assert_eq!(request["method"], "dig.getAvailability");
         assert_eq!(request["params"]["redirect_depth"], json!(3));

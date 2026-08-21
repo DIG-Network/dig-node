@@ -4678,10 +4678,6 @@ mod tests {
             crate::seams::capsule::push_capsule::PUSH_PENDING_LIMITED,
             "PUSH_PENDING_LIMITED",
         ),
-        (
-            crate::download::CONTENT_MISS_INCONCLUSIVE,
-            "CONTENT_MISS_INCONCLUSIVE",
-        ),
         (CONTROL_UNAUTHORIZED, "UNAUTHORIZED"),
         (CONTROL_NOT_SUPPORTED, "NOT_SUPPORTED"),
         (CONTROL_ERROR, "CONTROL_ERROR"),
@@ -4712,14 +4708,24 @@ mod tests {
         // Side effects first: a table that has silently shrunk to nothing, or lost the code under
         // review, would make every assertion below vacuously true.
         assert!(
-            LOCAL_WIRE_CODES.len() >= 11,
+            LOCAL_WIRE_CODES.len() >= 10,
             "the local wire-code table lost entries; a shrinking table makes this guard vacuous"
         );
+        // `CONTENT_MISS_INCONCLUSIVE` deliberately LEFT this table: `dig-rpc-protocol` 0.10 declares
+        // it, so it is no longer a local number and the owner answers the collision question for it.
+        // What is asserted instead is that this node still emits the OWNER'S number — the property
+        // the table entry was standing in for, now checked against the source of truth rather than
+        // against a copy of it.
         assert!(
-            LOCAL_WIRE_CODES
+            !LOCAL_WIRE_CODES
                 .iter()
                 .any(|(_, name)| *name == "CONTENT_MISS_INCONCLUSIVE"),
-            "the code this guard exists for is absent from the table"
+            "a canonical code is being re-declared locally; that is the drift this adoption removed"
+        );
+        assert_eq!(
+            crate::download::content_miss_inconclusive(),
+            i64::from(dig_rpc_protocol::ErrorCode::ContentMissInconclusive.code()),
+            "this node must emit the taxonomy owner's number, never its own copy of it"
         );
         assert!(
             dig_rpc_protocol::ErrorCode::ALL.len() >= 20,

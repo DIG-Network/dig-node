@@ -1641,7 +1641,7 @@ impl PeerRpcResponder for NodeResponder {
                             // nothing here established.
                             crate::download::MissOutcome::Inconclusive => {
                                 let errf = json!({"error": {
-                                    "code": crate::download::CONTENT_MISS_INCONCLUSIVE,
+                                    "code": crate::download::content_miss_inconclusive(),
                                     "message": crate::download::MISS_INCONCLUSIVE_MESSAGE,
                                 }});
                                 return write_framed(out, &errf).await;

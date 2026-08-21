@@ -35,7 +35,7 @@ pub(crate) fn recursion() -> RecursionConfig {
     }
 }
 use crate::rate_limit::RequestorId;
-use crate::seams::dig_peer::{AskOutcome, ForwardedAsk, MAX_FORWARDED_ASK_BUDGET};
+use crate::seams::dig_peer::{AskId, AskOutcome, ForwardedAsk, MAX_FORWARDED_ASK_BUDGET};
 
 /// A [`ForwardedAsk`] double that answers every peer with `answer`, recording each ask it received.
 ///
@@ -49,6 +49,8 @@ pub(crate) struct RecordingAsk {
     /// budget a hop HANDS DOWN rather than only that it asked. Without this the budget arithmetic
     /// would rest on a call's absence instead of its content.
     budgets: Mutex<Vec<Duration>>,
+    /// The ask identity each ask was forwarded under, in arrival order.
+    ask_ids: Mutex<Vec<AskId>>,
 }
 
 impl RecordingAsk {
@@ -57,6 +59,7 @@ impl RecordingAsk {
             answer,
             asked: Mutex::new(Vec::new()),
             budgets: Mutex::new(Vec::new()),
+            ask_ids: Mutex::new(Vec::new()),
         })
     }
 
@@ -72,6 +75,13 @@ impl RecordingAsk {
     fn budgets(&self) -> Vec<Duration> {
         self.budgets.lock().expect("recorder lock").clone()
     }
+
+    /// The ask identities forwarded under, in arrival order. Recorded because the identity is the
+    /// one field a hop must ECHO rather than choose, and a hop that mints a fresh one is
+    /// indistinguishable from a correct hop at every other observation point.
+    fn ask_ids(&self) -> Vec<AskId> {
+        self.ask_ids.lock().expect("recorder lock").clone()
+    }
 }
 
 #[async_trait]
@@ -83,8 +93,10 @@ impl ForwardedAsk for RecordingAsk {
         _content: &ContentId,
         next_depth: u64,
         budget: Duration,
+        ask_id: AskId,
     ) -> AskOutcome {
         self.budgets.lock().expect("recorder lock").push(budget);
+        self.ask_ids.lock().expect("recorder lock").push(ask_id);
         self.asked
             .lock()
             .expect("recorder lock")
@@ -786,6 +798,7 @@ impl ForwardedAsk for ChainedAsk {
         content: &ContentId,
         next_depth: u64,
         budget: Duration,
+        ask_id: AskId,
     ) -> AskOutcome {
         // The wire carries hops CONSUMED and the time budget separately, so the receiving node
         // reconstructs both — exactly as the real inbound path does via `HopBudget::from_params`.
@@ -799,7 +812,9 @@ impl ForwardedAsk for ChainedAsk {
         let upstream = RequestorId::Peer("upstream".into());
         let onward = self.next_hop.locate_holders(
             content,
-            HopBudget::at_depth(next_depth).with_time(budget),
+            HopBudget::at_depth(next_depth)
+                .with_time(budget)
+                .with_ask_id(ask_id),
             &upstream,
         );
         match tokio::time::timeout(budget, onward).await {
@@ -831,6 +846,7 @@ impl ForwardedAsk for StallingAsk {
         _content: &ContentId,
         _next_depth: u64,
         budget: Duration,
+        _ask_id: AskId,
     ) -> AskOutcome {
         tokio::time::sleep(budget + Duration::from_secs(1)).await;
         AskOutcome::TimedOut
@@ -995,7 +1011,7 @@ fn an_inconclusive_outcome_answers_with_its_own_wire_code_and_a_not_found_stays_
         .expect("an inconclusive miss must be reported, not swallowed");
     assert_eq!(
         inconclusive["error"]["code"],
-        serde_json::json!(crate::download::CONTENT_MISS_INCONCLUSIVE),
+        serde_json::json!(crate::download::content_miss_inconclusive()),
         "a caller must be able to tell 'unanswered' from 'not found': the first is worth retrying          and the second is not"
     );
 
@@ -1357,9 +1373,14 @@ impl dig_download::ProviderLocator for FailingLocator {
         &self,
         _content: &ContentId,
     ) -> Result<Vec<ProviderRecord>, dig_download::DownloadError> {
-        Err(dig_download::DownloadError::Locate(
-            "the DHT walk reached nobody".into(),
-        ))
+        // A locate FAILURE, not an empty result: `ProviderLocator` states the two are different and
+        // this double exists to produce the one dig-node used to discard. `Transport` is the walk's
+        // own failure shape - no reachable DHT peer answered - and the sentinel provider says the
+        // failure belongs to the walk rather than to any one holder.
+        Err(dig_download::DownloadError::Transport {
+            provider: "dht".into(),
+            reason: "the DHT walk reached nobody".into(),
+        })
     }
 }
 
@@ -1407,8 +1428,12 @@ impl ForwardedAsk for PerPeerAsk {
         _content: &ContentId,
         _next_depth: u64,
         _budget: Duration,
+        _ask_id: AskId,
     ) -> AskOutcome {
-        self.asked.lock().expect("recorder lock").push(peer.to_string());
+        self.asked
+            .lock()
+            .expect("recorder lock")
+            .push(peer.to_string());
         self.answers
             .iter()
             .find(|(known, _)| known == peer)
@@ -1607,12 +1632,8 @@ async fn the_identity_a_hop_received_is_the_identity_it_emits() {
         "the hop forwards under the identity it was given, not a fresh one"
     );
 
-    let emitted = crate::seams::dig_peer::forwarded_request(
-        &cid,
-        1,
-        Duration::from_secs(5),
-        forwarded_under,
-    );
+    let emitted =
+        crate::seams::dig_peer::forwarded_request(&cid, 1, Duration::from_secs(5), forwarded_under);
     let reparsed = HopBudget::from_params(emitted.get("params").expect("params"));
     assert_eq!(
         reparsed.ask_id(),
