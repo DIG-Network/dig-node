@@ -538,7 +538,9 @@ mod tests {
     }
 
     /// The same ordering + wrapping the production path applies, over a supplied resolution.
-    fn dial_candidates_from(resolved: Vec<std::net::SocketAddr>) -> Vec<Option<std::net::SocketAddr>> {
+    fn dial_candidates_from(
+        resolved: Vec<std::net::SocketAddr>,
+    ) -> Vec<Option<std::net::SocketAddr>> {
         order_ipv6_first(resolved).into_iter().map(Some).collect()
     }
 
