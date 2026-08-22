@@ -10329,13 +10329,14 @@ mod tests {
     async fn a_refused_bundle_reserves_nothing() {
         let mut refused = spendable_row(0xa1, 100);
         let (bundle_hex, _) = a_bundle_spending(&mut refused);
+        let refusing = FakePusher::answering(Ok(PushOutcome {
+            accepted: false,
+            transaction_id: None,
+            rejection: Some("mempool said no".into()),
+        }));
         let be = backend_with(vec![refused.clone()], true)
             .await
-            .with_pusher(FakePusher::answering(Ok(PushOutcome {
-                accepted: false,
-                transaction_id: None,
-                rejection: Some("mempool said no".into()),
-            })));
+            .with_pusher(refusing);
 
         let outcome = be.push_signed_bundle(&bundle_hex).await.unwrap();
         assert!(!outcome.accepted);
