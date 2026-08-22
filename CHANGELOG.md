@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.137.0] - 2026-08-22
+
+### Bug Fixes
+- **wallet:** Honest peak sync flag, adaptive derivation window, coin reservation, real pending set (#295)- **download:** Distinguish not-found from timed-out and cache first-hand holders (#292)- **wallet:** Normalise stored hex at the writer and gate token balances on replica coverage (#300)
+
+### Documentation
+- **deps:** Correct the retired-patch comment and record the chia-0.36 cascade blocker (#301)
+
 ## [0.135.0] - 2026-08-21
 
 ### Features
