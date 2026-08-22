@@ -7058,6 +7058,150 @@ mod tests {
         assert_eq!(decoded.bytes, bytes[100..150]);
     }
 
+    /// Wire node `b` as a RELAY for `(store, root)`: a P2P content engine with the relay gate open,
+    /// plus a capsule warmer whose only holder serves `module`.
+    ///
+    /// `b` holds nothing of its own — the capsule can reach its cache only through the relay leg, so
+    /// every assertion below about what `b` serves is an assertion about the relay and nothing else.
+    fn wire_relay_hop(
+        b: &Node,
+        store: &str,
+        root: &str,
+        module: Vec<u8>,
+        td: &tempfile::TempDir,
+    ) -> Arc<NodeContent> {
+        let pc = NodeContent::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(Vec::new())),
+            Arc::new(dig_download::testkit::MockRangeTransport::new(
+                dig_download::testkit::MockContent::even(8, 1),
+            )),
+            MissMode::Redirect,
+            None,
+            td.path(),
+        );
+        let content = dig_download::module_content_id(store, root)
+            .expect("canonical ids yield a content id");
+        pc.set_capsule_warmer(crate::seams::dig_peer::CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                store, root, module, 8,
+            )),
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            MockResolver::one(store, Bytes32::from_hex(root).expect("64-hex root")),
+            crate::seams::dig_peer::WarmPaths {
+                staging_dir: td.path().join("relay-staging"),
+                cache_dir: b.cache_dir.clone(),
+            },
+            Arc::new(SilentAnnounce),
+            Arc::new(crate::seams::dig_peer::WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        ));
+        b.set_p2p_content(Arc::clone(&pc));
+        pc
+    }
+
+    /// One `dig.getModuleInfo` against `node`, with or without the relay opt-in.
+    async fn ask_module_info(node: &Node, store: &str, root: &str, proxy: bool) -> Value {
+        let mut params = json!({"store_id": store, "root": root});
+        if proxy {
+            params["proxy"] = json!(true);
+        }
+        handle_rpc(
+            node,
+            json!({"jsonrpc":"2.0","id":1,"method":"dig.getModuleInfo","params":params}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await
+    }
+
+    /// **Proves (dig-node#276, units 1-3):** a node that holds NOTHING answers a relay-flagged
+    /// `dig.getModuleInfo` + `dig.fetchModuleRange` with the real capsule — pulled through the hop from
+    /// the only holder — and the served window is byte-identical to what that holder would have served.
+    /// And it refuses, exactly as it did before this leg existed, when EITHER gate is shut: the operator
+    /// has not opted in, or the requestor did not ask for a relay.
+    ///
+    /// **Catches:** the two failure directions that matter in opposite ways. A relay that never fires
+    /// leaves requirement 4 of the recursive-download epic unimplemented at the granularity a `.dig`
+    /// download actually uses — which is the state this ticket found. A relay that fires REGARDLESS of
+    /// the gates turns every stock node into a capsule-scale amplifier a stranger can aim at a third
+    /// party, which is strictly worse than the gap.
+    ///
+    /// **Why all three cases run against the SAME node and the SAME wiring:** a refusal asserted on a
+    /// separately-built node is satisfied identically by a working gate and by a fixture whose holder
+    /// never answers, whose chain never confirms, or whose warmer was never wired — and each of those
+    /// would also silence a legitimate relay. Here the ONLY thing that varies between the refusals and
+    /// the success is one boolean on the request and one boolean on the node, and the success case runs
+    /// LAST, so it proves the same fixture that just refused twice is fully capable of answering.
+    #[tokio::test]
+    async fn a_relay_serves_a_capsule_it_does_not_hold_only_when_both_gates_are_open() {
+        let (b, _bd) = test_node(None);
+        let staging = tempfile::tempdir().unwrap();
+        let store_raw = [0x7au8; 32];
+        let (module, root) = chain_anchored_module(store_raw, [0x7bu8; 32]);
+        let (store, root) = (hex::encode(store_raw), root.to_hex());
+        let pc = wire_relay_hop(&b, &store, &root, module.clone(), &staging);
+
+        let held_path = module_path(&b.cache_dir, &store, &root);
+        assert!(
+            !held_path.exists(),
+            "the relay hop must start out holding nothing, or it is not relaying anything"
+        );
+
+        // GATE 1 SHUT — the operator has not opted in. The default posture of every stock node.
+        pc.set_onion_relay(false);
+        assert_eq!(
+            ask_module_info(&b, &store, &root, true).await["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "a node whose operator did not opt in must answer exactly as it did before this leg"
+        );
+        assert!(
+            !held_path.exists(),
+            "a refused relay must not have pulled the capsule anyway"
+        );
+
+        // GATE 2 SHUT — the operator opted in, but this requestor did not ask for a relay. Relaying is
+        // never automatic: a requestor that can reach holders itself should, and does.
+        pc.set_onion_relay(true);
+        assert_eq!(
+            ask_module_info(&b, &store, &root, false).await["error"]["code"],
+            json!(download::RESOURCE_UNAVAILABLE),
+            "an unflagged request is answered from local holdings only"
+        );
+        assert!(
+            !held_path.exists(),
+            "an unflagged request must not provoke a capsule pull"
+        );
+
+        // BOTH OPEN — the capsule arrives THROUGH the hop.
+        let described = ask_module_info(&b, &store, &root, true).await;
+        assert_eq!(
+            described["result"]["total_size"],
+            json!(module.len() as u64),
+            "the relayed descriptor describes the real capsule, not a placeholder"
+        );
+
+        let framed = handle_rpc(
+            &b,
+            json!({"jsonrpc":"2.0","id":2,"method":"dig.fetchModuleRange",
+                   "params":{"store_id":store,"root":root,"offset":16,"length":32,"proxy":true}}),
+            crate::download::ReadOrigin::Local,
+            crate::download::RequestProvenance::FirstParty,
+        )
+        .await;
+        let decoded: dig_nat::RangeFrame = serde_json::from_value(framed["result"].clone())
+            .expect("a relayed window decodes as a RangeFrame, exactly like a held one");
+        assert_eq!(
+            decoded.bytes,
+            module[16..48],
+            "the relayed window is byte-identical to the holder's own bytes — the requestor cannot \
+             tell it was relayed, and so needs no second code path"
+        );
+    }
+
     /// **Proves:** a non-canonical id on either module method is a -32602 that never reaches the
     /// filesystem — a store id concatenated into a path would be a traversal primitive.
     #[tokio::test]
