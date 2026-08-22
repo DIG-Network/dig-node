@@ -2961,7 +2961,7 @@ method runs, and it MUST NOT be conflated with the wallet's own `-32043` egress 
 | -32009 | `RANGE_METADATA_UNREPRESENTABLE` | node | A holder cannot frame a conforming range stream for this resource (an inclusion proof over `MAX_INCLUSION_PROOF_B64` is the real case): the resource's own range metadata cannot fit a conforming frame, so this holder can NEVER serve the range. Named explicitly on the peer range-stream serve instead of truncating the stream with a bare `Err`. Matches `dig_rpc_protocol::ErrorCode::RangeMetadataUnrepresentable` (`-32009`). |
 | -32010 | `UPSTREAM_ERROR` | shell | The blind-passthrough relay failed (unreachable / non-JSON). |
 | -32015 | `METADATA_TOO_LARGE` | node | `dig.getMetadata` refused: the publisher metadata section is too large or too complex to render safely. Refused when the ENCODED section exceeds `METADATA_SECTION_MAX_BYTES` (3 MiB) or its `custom` exceeds `MAX_CUSTOM_ENTRIES`/`MAX_CUSTOM_JSON_DEPTH`/`MAX_CUSTOM_JSON_ELEMENTS` (both checked BEFORE decode, #2160), or the RENDERED body exceeds `METADATA_RESPONSE_MAX_BYTES` (3 MiB, #2145). This section is rendered WHOLE — it cannot be windowed like `dig.getCapsule` — and `custom`/`links` are publisher-controlled, so an oversized/hostile capsule is refused with this bounded error rather than expanded ~16× in memory or blasted into a ~100 MB response (§5.5.1). A normal (kilobyte) metadata section is served unchanged. |
-| -32017 | `CONTENT_MISS_INCONCLUSIVE` | node | No holder was named AND the search could not establish that there is none: a consulted leg timed out, was unreachable, or refused uninformatively (§10.4.5). The OPPOSITE instruction to a plain not-found — a not-found says stop looking, this says the question was not answered and the request MAY be retried. Collapsing the two let ONE slow peer manufacture an authoritative absence and, since a hop relays its answer, propagate it downwards. Owned by `dig-rpc-protocol`; `-32017` is provisional pending its declaration, and is the first number free of both that taxonomy and this table. |
+| -32017 | `CONTENT_MISS_INCONCLUSIVE` | peer | No holder was named AND the search could not establish that there is none: a consulted leg timed out, was unreachable, or refused uninformatively (§10.4.5). The OPPOSITE instruction to a plain not-found — a not-found says stop looking, this says the question was not answered and the request MAY be retried. Collapsing the two let ONE slow peer manufacture an authoritative absence and, since a hop relays its answer, propagate it downwards. DEFINED by `dig-rpc-protocol` as `ErrorCode::ContentMissInconclusive` with origin `Peer` — the failure arises in the discovery layer from an unconsultable hop, mirroring `PeerUnreachable`. dig-node adopts the variant and does not assign the number. |
 | -32020 | *(reserved: onion `onion_circuit_unavailable`)* | — | Reserved for the onion-routing contract; NOT minted by the control plane. |
 | -32021 | *(reserved: onion `privacy_requires_local_node`)* | — | Reserved for the onion-routing contract. |
 | -32022 | *(reserved: onion `onion_hops_out_of_range`)* | — | Reserved for the onion-routing contract. |
@@ -3102,20 +3102,52 @@ can point at it. No new verb, address struct or result type is introduced — th
   - `-32017` `CONTENT_MISS_INCONCLUSIVE`, when any consulted leg timed out, refused, or was
     unreachable — the absence is unproven and the request MAY be retried.
 
-  The error-code taxonomy is owned by the `dig-rpc-protocol` crate, not by this document: this repo
-  RESTATES the number for readability and MUST NOT be read as assigning it. `-32017` is provisional
-  until that crate declares the condition, because both numbers proposed before it were already
-  assigned — `-32009` to `RANGE_METADATA_UNREPRESENTABLE` (holder-fatal, the opposite instruction) and
-  `-32015` to this node's own released `METADATA_TOO_LARGE`. `no_local_wire_code_collides_with_a_different_canonical_code` holds the property mechanically.
+  **The condition, its number and its semantics are DEFINED BY `dig-rpc-protocol`**
+  (`ErrorCode::ContentMissInconclusive`, origin `Peer`), not by this document. dig-node ADOPTS it and
+  names the variant rather than the integer; the number above is reproduced for readability only and
+  the crate is authoritative if the two ever differ. A repo SPEC that re-declares a contract it does
+  not own is how the two silently drift apart.
 
-  A node that consulted NO peer (recursion disabled, budget refused, no slot free, a duplicate walk)
-  MUST answer the plain not-found: not asking establishes nothing new, so the answer stands on the DHT
-  leg exactly as it did before the recursion existed. Reporting a refusal as inconclusive would make
-  every miss on every default-configured node inconclusive, since the feature ships OFF.
+  **WHICH unasked path it was decides whether the absence may still be claimed.** A node that
+  consulted no peer is not one case but two, and they carry opposite answers:
 
-  `dig.getAvailability` additionally carries `absence_established` (boolean) on its miss answer. It is
-  ADDITIVE: a peer running an older build omits it, and a reader finding it absent MUST fall back to
-  the tolerant reading rather than treat the answer as unproven.
+  - **Recursion is DISABLED on this node** (including: no forwarded leg installed at all) — the plain
+    not-found. Asking was never part of this node's answer, so nothing was withheld and the answer
+    stands on the DHT leg exactly as it did before the recursion existed. This is the stock posture,
+    and reporting it as inconclusive would make every miss on every default build unprovable — a
+    different lie, in the opposite direction, arriving by default rather than by attack.
+  - **Every other reason** — a spent hop budget, a spent or unreadable time budget, a spent relay
+    allowance, no eligible peer, no free concurrency slot, a walk already claimed by another path —
+    `CONTENT_MISS_INCONCLUSIVE`. On a node where the recursive ask IS part of the answer, a leg that
+    was supposed to run and did not leaves the search cut short. Calling that a proven absence tells
+    the reader to stop looking because this node ran out of budget, which is a fact about this node
+    and not about the content. Under a burst the saturation cases are the COMMON path, so collapsing
+    them would turn load into manufactured not-founds exactly when the network is busiest.
+
+  The DHT leg is subject to the same rule: a provider walk that FAILED (no reachable DHT peer, a
+  transport error) is not a walk that found nobody, and the absence is unproven. `absence_established`
+  is the CONJUNCTION of both legs having finished — deriving it from the forwarded leg alone left the
+  DHT leg with no way to clear it, which on a stock node made the field a constant `true`.
+
+  `dig.getAvailability` additionally carries `absence_established` on its miss answer, defined by
+  `dig-rpc-protocol` (`AvailabilityAnswer::absence_established`). It has **THREE** states and dig-node
+  MUST NOT collapse them:
+
+  | state | meaning | dig-node's reading |
+  |---|---|---|
+  | `true` | the responder reached everything it meant to reach | the absence is established |
+  | `false` | the responder looked and its own search was incomplete | unproven; keep looking |
+  | ABSENT | the responder makes NO claim — it cannot describe its search at all | unproven; keep looking |
+
+  ABSENT is **not** `false` and MUST NOT be defaulted. Reading it as `true` turns an unknown into an
+  assertion of absence, which is the manufactured not-found this clause exists to prevent, arriving
+  through the compatibility door rather than through an attack. The cost — a mixed network reporting
+  more retries — is the right one, because an over-reported inconclusive costs a retry while an
+  over-reported absence costs content that exists and cannot be found. It does not arrive by default
+  either: the forwarded leg ships DISABLED, so a node that asks no peer never reads the field.
+
+  A node emits the field only when a search actually ran; a node that consulted nothing OMITS it,
+  because inserting `false` would report an incomplete search that never happened.
 - **The TIME budget MUST be carried DOWN and DECREMENTED, never restated (dig-node#273).** A hop asks
   its peers SEQUENTIALLY, so a hop with `h` hops remaining needs `leaf + fan_out x work(h - 1)`. A
   parent that grants each child a fixed per-ask timeout grants it LESS TIME THAN THE WORK IT IS ASKING
@@ -3126,8 +3158,14 @@ can point at it. No new verb, address struct or result type is introduced — th
   - The budget rides its OWN field, `params.budget_ms`, and MUST NOT be folded into
     `redirect_depth`: the time budget is monotone DECREASING and the depth monotone INCREASING, so one
     integer cannot carry both, and overloading it would let a hop buy itself hops by claiming time.
-  - An ABSENT `budget_ms` denotes an originating request; the originator derives its own budget from
-    the work it is about to authorise.
+  - `budget_ms` likewise has THREE states, defined by `dig-rpc-protocol`
+    (`GetAvailabilityParams::budget_ms`), and dig-node MUST NOT collapse them:
+    - **ABSENT** — unbudgeted. The responder applies its own policy; an originator derives its budget
+      from the work it is about to authorise.
+    - **`0`** — EXHAUSTED. The hop MUST NOT ask onward at all, and MUST NOT claim the absence, having
+      established nothing. Reading a zero as absent would let a spent budget silently buy a fresh one
+      at every hop, which is the unbounded reach the field exists to bound.
+    - **any other value** — the granted allowance, honoured exactly up to the ceiling below.
   - It MUST be CLAMPED at ingress to `MAX_FORWARDED_ASK_BUDGET` (= 65s, the derived worst case at the
     default bounds). The field is attacker-supplied, and without a ceiling one hop naming a ten-minute
     budget holds an inbound request — and one of the 32 concurrency slots — open for ten minutes.

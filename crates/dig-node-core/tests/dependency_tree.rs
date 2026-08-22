@@ -78,8 +78,10 @@ fn locked_versions(crate_name: &str) -> Vec<&str> {
         .collect()
 }
 
-/// **Proves:** exactly ONE `dig-rpc-protocol` resolves in the workspace, and it is the 0.6 line that
-/// defines the module wire (`ModuleInfo` / `GetModuleInfoParams` / `FetchModuleRangeParams`).
+/// **Proves:** exactly ONE `dig-rpc-protocol` resolves in the workspace, and it is the 0.10 line that
+/// defines the module wire (`ModuleInfo` / `GetModuleInfoParams` / `FetchModuleRangeParams`) AND the
+/// recursive-ask contract this node adopted (`GetAvailabilityParams::budget_ms` / `::ask_id`,
+/// `AvailabilityAnswer::absence_established`, `ErrorCode::ContentMissInconclusive`).
 ///
 /// **Catches:** the obligation-8 skew directly. Before the #1576 cascade, dig-download consumed
 /// dig-rpc-protocol 0.5 while dig-peer 0.4 pulled 0.3.1, so a tree containing both held TWO `ModuleInfo`
@@ -97,8 +99,8 @@ fn the_workspace_carries_exactly_one_module_wire_crate() {
          majors means two `ModuleInfo` shapes across the module pull's trust boundary"
     );
     assert!(
-        versions[0].starts_with("0.6."),
-        "the module wire ships in dig-rpc-protocol 0.6; the workspace resolved {}",
+        versions[0].starts_with("0.10."),
+        "the availability contract this node adopted ships in dig-rpc-protocol 0.10; the workspace          resolved {} — on an earlier line the canonical items simply do not exist and this node          would be back to declaring its own",
         versions[0]
     );
 }
