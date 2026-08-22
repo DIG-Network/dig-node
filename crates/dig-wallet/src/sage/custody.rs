@@ -1812,7 +1812,7 @@ mod tests {
     /// hand-edited manifest cannot ask for more either.
     #[test]
     fn the_window_is_bounded() {
-        assert!(DEFAULT_DERIVATION_COUNT <= MAX_DERIVATION_COUNT);
+        const { assert!(DEFAULT_DERIVATION_COUNT <= MAX_DERIVATION_COUNT) };
         let (c, dir) = custody_with_window(MAX_DERIVATION_COUNT + 10_000);
         assert_eq!(
             c.derivation_count.min(MAX_DERIVATION_COUNT),
@@ -1825,10 +1825,12 @@ mod tests {
     /// pins the floor so a future "make tests faster" edit cannot quietly reintroduce it.
     #[test]
     fn the_default_window_is_wide_enough_to_find_an_imported_wallets_history() {
-        assert!(
-            DEFAULT_DERIVATION_COUNT >= 500,
-            "a 50-index window silently under-reported an imported wallet's balance (#2762)"
-        );
+        const {
+            assert!(
+                DEFAULT_DERIVATION_COUNT >= 500,
+                "a 50-index window silently under-reported an imported wallet's balance (#2762)"
+            )
+        };
     }
 
     /// **The oracle test.** The unhardened tree is derived here with the intermediate form, for

@@ -7042,7 +7042,6 @@ mod tests {
         );
     }
 
-
     /// **Proves:** an UNOBSERVABLE peer tier is not a licence to claim currency — a node with no
     /// chain peer that has announced a height serves its figure labelled stale.
     ///
@@ -10116,7 +10115,7 @@ mod tests {
         be.db
             .reserve_spend(&pending_row(
                 "tx1",
-                &[a.coin_id.clone()],
+                std::slice::from_ref(&a.coin_id),
                 Some("7"),
                 far_future,
             ))
@@ -10149,7 +10148,7 @@ mod tests {
         be.db
             .reserve_spend(&pending_row(
                 "tx1",
-                &[a.coin_id.clone()],
+                std::slice::from_ref(&a.coin_id),
                 Some("7"),
                 far_future,
             ))
@@ -10175,7 +10174,12 @@ mod tests {
         let be = backend_with(vec![a.clone()], true).await;
         let far_future = super::super::custody::now_ms() as i64 + 600_000;
         be.db
-            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], None, far_future))
+            .reserve_spend(&pending_row(
+                "tx1",
+                std::slice::from_ref(&a.coin_id),
+                None,
+                far_future,
+            ))
             .await
             .unwrap();
 
@@ -10195,7 +10199,12 @@ mod tests {
         let a = spendable_row(0xa1, 100);
         let be = backend_with(vec![a.clone()], true).await;
         be.db
-            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], Some("7"), 1))
+            .reserve_spend(&pending_row(
+                "tx1",
+                std::slice::from_ref(&a.coin_id),
+                Some("7"),
+                1,
+            ))
             .await
             .unwrap();
 
