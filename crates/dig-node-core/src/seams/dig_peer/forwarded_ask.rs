@@ -560,6 +560,15 @@ mod tests {
         assert_eq!(items[0]["store_id"], json!(hex::encode([1u8; 32])));
         assert_eq!(items[0]["root"], json!(hex::encode([2u8; 32])));
         assert_eq!(items[0]["retrieval_key"], json!(hex::encode([3u8; 32])));
+        // The ask's IDENTITY has to reach the wire, or the diamond dedup at the far end is inert:
+        // each hop mints a fresh id, the same question arrives twice by two paths, and both are
+        // answered. Nothing else in this repo can see that — a local round-trip agrees with itself
+        // while disagreeing with every other node — so the emission is pinned HERE, at the bytes.
+        assert_eq!(
+            request["params"]["ask_id"],
+            json!(hex::encode([9u8; 16])),
+            "the caller's ask_id rides the request as hex; minting a new one per hop, or dropping              the field, silently disables the dedup the id exists for"
+        );
     }
 
     /// **Proves:** a well-formed answer's providers are parsed into records keyed to the content asked
