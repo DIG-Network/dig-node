@@ -4515,14 +4515,26 @@ mod tests {
             .await
             .unwrap();
 
-        // The parent, as the chain source handed it over: upper-case.
+        // BOTH directions of the mismatch, because they are repaired by DIFFERENT normalisations
+        // and a fixture carrying only one cannot tell them apart. Parent stored upper / child
+        // pointing lower is fixed by normalising the stored `coin_id`; parent stored lower / child
+        // pointing upper is fixed by normalising the stored `parent_coin_info`. With only the
+        // first, an implementation that normalises `coin_id` alone passes — which is exactly what
+        // the first version of this test did.
         db.upsert_coin(&coin("AABB", 500, Some(50), Some(101)))
             .await
             .unwrap();
-        // Its child — our own change — naming that parent in lower-case hex.
-        let mut change = coin("change", 400, Some(101), None);
-        change.parent_coin_info = "aabb".into();
-        db.upsert_coin(&change).await.unwrap();
+        let mut change_lower = coin("change_lower", 400, Some(101), None);
+        change_lower.parent_coin_info = "aabb".into();
+        db.upsert_coin(&change_lower).await.unwrap();
+
+        db.upsert_coin(&coin("ccdd", 500, Some(50), Some(101)))
+            .await
+            .unwrap();
+        let mut change_upper = coin("change_upper", 300, Some(101), None);
+        change_upper.parent_coin_info = "CCDD".into();
+        db.upsert_coin(&change_upper).await.unwrap();
+
         // CONTROL: a coin at our address from a parent we genuinely do not hold.
         db.upsert_coin(&incoming("paid", 700, 101)).await.unwrap();
 
