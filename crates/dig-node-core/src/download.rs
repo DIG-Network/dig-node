@@ -2570,12 +2570,6 @@ impl HopBudget {
         self.hops.unwrap_or(0)
     }
 
-    /// The wall clock this ask may spend IN TOTAL, given how far it may still travel.
-    ///
-    /// A hop's granted budget is used when one was carried; otherwise this node is the originator and
-    /// derives the budget from the work it is about to ask for ([`ask_budget`]). Either way the result
-    /// is inside [`MAX_FORWARDED_ASK_BUDGET`], so no configuration and no peer can buy unbounded time.
-    ///
     /// This ask's identity, for the seen-set and for the outbound request body.
     ///
     /// It is the SAME value inbound and outbound — see
