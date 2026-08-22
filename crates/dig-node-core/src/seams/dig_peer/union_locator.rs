@@ -11,8 +11,17 @@
 //! Today only the dig-dht source is live. PEX-as-a-provider-source and the relay-introducer are
 //! DORMANT: they are present as [`EmptyLocator`] placeholders so the union shape is in place and a
 //! later change (#1440 part B) swaps in the real source with NO wiring churn. An empty (or erroring)
-//! source contributes nothing — the union is strictly best-effort, so a dormant or failing source can
-//! never reduce the holder set the DHT already found.
+//! source contributes nothing — the union is best-effort for FINDING, so a dormant or failing source
+//! can never reduce the holder set the DHT already found.
+//!
+//! # Best-effort for finding, STRICT for absence (dig-node#273)
+//!
+//! Best-effort must not extend to the EMPTY answer. A union that found nobody because every source
+//! COMPLETED and had nothing is a proven negative; a union that found nobody because a source FAILED
+//! is an answer nobody finished computing. Downstream the difference becomes `absence_established`,
+//! which tells a reader it may stop searching — so an empty union carrying a source failure reports
+//! that failure instead. A NON-empty union is not an absence claim, so a failure beside it is
+//! immaterial and never costs the caller a holder.
 //!
 //! # Untrusted address hints — no dial amplification (#1490)
 //!
@@ -68,9 +77,15 @@ impl ProviderLocator for UnionLocator {
         let mut index_of: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut merged: Vec<ProviderRecord> = Vec::new();
+        // The first source failure seen, kept in case the merged set turns out EMPTY (see below).
+        let mut failure: Option<DownloadError> = None;
         for result in results {
-            let Ok(records) = result else {
-                continue; // best-effort: skip a failed source
+            let records = match result {
+                Ok(records) => records,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue; // best-effort for FINDING: a failed source contributes no records
+                }
             };
             for record in records {
                 match index_of.get(&record.provider_peer_id).copied() {
@@ -101,6 +116,19 @@ impl ProviderLocator for UnionLocator {
                         merged.push(record);
                     }
                 }
+            }
+        }
+        // ...but NOT best-effort for ABSENCE (dig-node#273). An empty union whose sources all
+        // COMPLETED is a genuine negative; an empty union that had a source FAIL is an answer nobody
+        // finished computing, and reporting the two identically is what let a node with a broken DHT
+        // walk claim `absence_established: true` for content that exists. Reporting the failure only
+        // when the set is empty is deliberate: a non-empty union is not an absence claim, so failing
+        // it would discard genuine holders and undo the union's whole purpose (#1443/#1580) to
+        // sharpen a distinction that no longer matters. One failing leg out of three therefore
+        // WEAKENS the answer, and only when it could have been the leg that had something to say.
+        if merged.is_empty() {
+            if let Some(error) = failure {
+                return Err(error);
             }
         }
         Ok(merged)
@@ -206,9 +234,11 @@ mod tests {
         );
     }
 
-    /// An empty (or dormant) source contributes nothing but never removes what another source found.
+    /// A dormant source contributes nothing but never removes what another source found. (The
+    /// FAILING-source cases are `a_failed_source_makes_an_empty_union_an_error_but_never_hides_a_holder`
+    /// — this fixture holds no erroring source, and its old name claimed otherwise.)
     #[tokio::test]
-    async fn empty_and_erroring_source_is_skipped() {
+    async fn a_dormant_source_is_skipped() {
         let cid = mock_content_id();
         let dht = Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)]));
         let union = UnionLocator::new(vec![dht, Arc::new(EmptyLocator)]);
@@ -219,6 +249,73 @@ mod tests {
             "the DHT holder survives a dormant sibling source"
         );
         assert_eq!(got[0].provider_peer_id, mock_peer_hex(1));
+    }
+
+    /// A source whose walk FAILED (as opposed to finding nobody).
+    ///
+    /// Every other double in this module answers `Ok`, so the error arm of a source was
+    /// unexpressible here and the `let Ok(..) else { continue }` that laundered a failure into an
+    /// empty union passed the whole suite. A double that cannot fail cannot witness the fix.
+    struct FailingSource;
+
+    #[async_trait]
+    impl ProviderLocator for FailingSource {
+        async fn find_providers(
+            &self,
+            _content: &ContentId,
+        ) -> Result<Vec<ProviderRecord>, DownloadError> {
+            Err(DownloadError::Transport {
+                provider: "dht".into(),
+                reason: "the DHT walk reached nobody".into(),
+            })
+        }
+    }
+
+    /// dig-node#273: an EMPTY union that had a source FAIL is an error, not a proven negative.
+    ///
+    /// The union stays best-effort for FINDING — the sibling arm proves a failing leg never removes
+    /// what another leg found — but an empty set nobody finished computing must not read as "nobody
+    /// holds it". Downstream that value becomes `absence_established`, which tells a reader it may
+    /// stop searching.
+    #[tokio::test]
+    async fn a_failed_source_makes_an_empty_union_an_error_but_never_hides_a_holder() {
+        let cid = mock_content_id();
+
+        // ARM 1 - the failing leg is the only one with anything to say: empty, so unproven.
+        let union = UnionLocator::new(vec![Arc::new(FailingSource), Arc::new(EmptyLocator)]);
+        assert!(
+            union.find_providers(&cid).await.is_err(),
+            "a union whose source failed and which found nobody must report the failure;              Ok(vec![]) here is what a caller reads as a proven absence"
+        );
+
+        // ARM 2 - a healthy leg found a holder: the failure is immaterial, the holder survives.
+        let with_holder = UnionLocator::new(vec![
+            Arc::new(FailingSource),
+            Arc::new(MockProviderLocator::fixed(vec![mock_provider(1, &cid)])),
+        ]);
+        let got = with_holder
+            .find_providers(&cid)
+            .await
+            .expect("a non-empty union is not an absence claim, so it is not failed");
+        assert_eq!(
+            got.len(),
+            1,
+            "one failing leg out of two must not poison an answer another leg supplied"
+        );
+        assert_eq!(got[0].provider_peer_id, mock_peer_hex(1));
+
+        // ARM 3 - the CONTROL. Every source completed and found nobody: a genuine negative, and it
+        // must stay Ok. Without this the fix is satisfied by erroring on every empty union, which
+        // trades a false absence for an absence that can never be established at all.
+        let honest = UnionLocator::new(vec![
+            Arc::new(MockProviderLocator::fixed(Vec::new())),
+            Arc::new(EmptyLocator),
+        ]);
+        assert!(honest
+            .find_providers(&cid)
+            .await
+            .expect("a completed walk that found nobody is a real negative")
+            .is_empty());
     }
 
     /// With no sources (or all empty) the union is an empty set, never an error.

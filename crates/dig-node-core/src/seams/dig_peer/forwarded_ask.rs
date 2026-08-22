@@ -351,6 +351,14 @@ fn subtree_claim(response: &Value) -> SubtreeClaim {
     let Some(items) = items else {
         return SubtreeClaim::NoClaim;
     };
+    // An EMPTY `items` array has no item to establish anything, so folding it would return the
+    // identity — `Established` — and hand a responder a proven absence for the price of `[]`. The
+    // owner's contract says an establishment MUST come from an item that carries it. (`dispatch.rs`
+    // already rejects a malformed `items` param with an error frame, so this is the narrow remaining
+    // door rather than the main one.)
+    if items.is_empty() {
+        return SubtreeClaim::NoClaim;
+    }
     items
         .iter()
         .map(
@@ -916,6 +924,36 @@ mod tests {
             )),
             SubtreeClaim::NotEstablished,
             "and an explicitly incomplete item is the strongest report of incompleteness"
+        );
+    }
+
+    /// **Proves:** an EMPTY `items` array claims nothing — it does not fold to the identity.
+    ///
+    /// **Fixture design — the control is the one-item frame, not another empty one.** The fold seeds
+    /// with `Established`, so `items: []` returned it untouched: a responder could assert a proven
+    /// absence by sending no item at all, which is the cheapest possible message on the wire. The
+    /// present-and-established arm is what keeps this from being satisfied by an implementation that
+    /// simply never establishes anything.
+    ///
+    /// **On the revert** (deleting the `is_empty` guard), the first assertion fires.
+    #[test]
+    fn an_empty_items_array_establishes_nothing() {
+        let empty = json!({"jsonrpc":"2.0","id":1,"result":{"items":[]}});
+        assert_eq!(
+            subtree_claim(&empty),
+            SubtreeClaim::NoClaim,
+            "an absence must be ESTABLISHED by an item that carries it; folding [] to the identity              hands a responder absence_established for free"
+        );
+        assert_eq!(
+            subtree_claim(&json!({"jsonrpc":"2.0","id":1,"result":{"items":[
+                json!({"available": false, "absence_established": true})
+            ]}})),
+            SubtreeClaim::Established,
+            "the control: a real established item still establishes, so the guard above narrowed              the empty case and nothing else"
+        );
+        assert!(
+            !parse_forwarded_answer(&content(), &empty).is_conclusive(),
+            "and the consequence - an empty batch may not become a not-found this node relays"
         );
     }
 }

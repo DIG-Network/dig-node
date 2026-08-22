@@ -1455,6 +1455,22 @@ fn engine_over<L: dig_download::ProviderLocator + 'static>(
     (content, dir)
 }
 
+/// [`engine_over`] for a locator chain that is already an `Arc<dyn ProviderLocator>` — the shape
+/// [`crate::download::NodeContent::provider_locator_chain`] returns, which the generic form cannot take.
+fn engine_over_chain(
+    locator: Arc<dyn dig_download::ProviderLocator>,
+) -> (Arc<NodeContent>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let content = NodeContent::new(
+        locator,
+        Arc::new(MockRangeTransport::new(MockContent::even(4, 1))),
+        MissMode::Redirect,
+        None,
+        dir.path(),
+    );
+    (content, dir)
+}
+
 /// A [`ForwardedAsk`] double that answers each peer DIFFERENTLY.
 ///
 /// The stock `RecordingAsk` answers every peer identically, which cannot express a merge: a fixture
@@ -1533,6 +1549,61 @@ async fn a_failed_dht_walk_is_not_an_established_absence() {
     );
     assert!(
         errored.is_empty() && looked.is_empty(),
+        "neither named a holder"
+    );
+}
+
+/// **Proves:** a failed DHT walk stays unproven THROUGH THE PRODUCTION LOCATOR CHAIN — the union,
+/// the self-exclusion and the capsule fallback that `NodeContent::for_dht` actually installs.
+///
+/// **Why this test and not the one above.** `a_failed_dht_walk_is_not_an_established_absence` hands
+/// its double straight to `NodeContent::new`, so it drives a one-layer locator production never
+/// builds. Two layers below it, [`UnionLocator`] skipped a failed source (`let Ok(records) = result
+/// else { continue }`) and [`CapsuleFallbackLocator`] called `.unwrap_or_default()` twice — so a
+/// failed walk reached `walk_for_providers` as `Ok(vec![])`, `first_hand_conclusive` was `true`, and
+/// the round-1 fix at the `Err` arm was unreachable code in production. On a stock node, where
+/// recursion ships OFF, that broken conjunct is the WHOLE search: a start-up, a partition or an
+/// eclipsed routing table answered `absence_established: true` for content that exists, and a hop
+/// relays that answer onward. No forged message required.
+///
+/// **Fixture design — the chain is the subject, so the chain is what is built.** Both arms go
+/// through [`crate::download::NodeContent::provider_locator_chain`]; the ONLY difference is whether its DHT leg
+/// errors or honestly returns nobody. The control is load-bearing twice over: it proves the chain
+/// still reports a genuine negative (collapsing every empty result to inconclusive would trade this
+/// bug for a never-conclusive one), and it proves the failing arm's verdict comes from the FAILURE
+/// rather than from the emptiness.
+///
+/// **On the revert** (restoring either swallow), the first assertion fires while the control stays
+/// green — which is what makes the failure attributable to the layer that swallowed.
+#[tokio::test]
+async fn a_failed_dht_walk_stays_unproven_through_the_production_locator_chain() {
+    let cid = content();
+
+    let chain =
+        crate::download::NodeContent::provider_locator_chain(Arc::new(FailingLocator), None);
+    let (failing, _d1) = engine_over_chain(chain);
+    let errored = failing
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(
+        !errored.establishes_absence(),
+        "the union and the capsule fallback swallowed the walk failure into Ok(vec![]), so the          node claimed a proven absence for content it never managed to look for"
+    );
+
+    let honest = crate::download::NodeContent::provider_locator_chain(
+        Arc::new(MockProviderLocator::fixed(Vec::new())),
+        None,
+    );
+    let (looked, _d2) = engine_over_chain(honest);
+    let negative = looked
+        .locate_holders(&cid, HopBudget::fresh(), &RequestorId::Local)
+        .await;
+    assert!(
+        negative.establishes_absence(),
+        "a chain whose every source completed and found nobody STILL establishes the absence -          without this the fix above is satisfied by never concluding anything"
+    );
+    assert!(
+        errored.is_empty() && negative.is_empty(),
         "neither named a holder"
     );
 }

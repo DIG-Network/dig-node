@@ -1268,6 +1268,37 @@ impl NodeContent {
         self.miss_rate_limiter.check(requestor)
     }
 
+    /// Assemble the PRODUCTION provider-locator chain over `dht_locator` — the exact stack
+    /// [`NodeContent::for_dht`] installs, and the only place it is built.
+    ///
+    /// The layers, innermost first:
+    ///
+    /// 1. [`UnionLocator`] over the live DHT source plus the DORMANT PEX + relay-introducer
+    ///    [`EmptyLocator`] placeholders (#1443), so swapping a real source in needs no wiring churn.
+    /// 2. [`SelfExcludingLocator`] (#1584), so a self-`peer_id` record from ANY source — a stale
+    ///    self-published DHT record, a future PEX source, a replay — is dropped at the innermost point
+    ///    rather than per-consumer; otherwise the reader self-dials and dead-ends the read.
+    /// 3. [`CapsuleFallbackLocator`] (#1580), because holders announce at STORE/CAPSULE granularity while
+    ///    a `/s` read locates by RESOURCE key; without the bridge a discoverable holder is invisible.
+    ///
+    /// **Extracted so a test can drive the REAL chain.** Every locator double in the suite used to be
+    /// handed straight to [`NodeContent::new`], which skips layers 1–3 entirely — so a defect living
+    /// INSIDE them (a swallowed walk failure, dig-node#273 round 2) was structurally invisible to every
+    /// test while being on the only path production takes. A fixture that builds its own locator cannot
+    /// witness this stack; it has to be this function.
+    pub(crate) fn provider_locator_chain(
+        dht_locator: Arc<dyn ProviderLocator>,
+        self_peer_id: Option<String>,
+    ) -> Arc<dyn ProviderLocator> {
+        let union: Arc<dyn ProviderLocator> = UnionLocator::new(vec![
+            dht_locator,
+            Arc::new(EmptyLocator), // PEX-as-provider-source (dormant)
+            Arc::new(EmptyLocator), // relay-introducer (dormant)
+        ]);
+        let union = SelfExcludingLocator::new(union, self_peer_id);
+        CapsuleFallbackLocator::new(union)
+    }
+
     /// The PRODUCTION constructor — wire the engine from the live DHT + the node's mTLS identity,
     /// exactly as dig-download's implementers' note prescribes. Discovery is a [`UnionLocator`] (#1443)
     /// over the live [`DhtProviderLocator`] plus DORMANT PEX + relay-introducer placeholders, so a
@@ -1288,26 +1319,8 @@ impl NodeContent {
         stun_server: Option<std::net::SocketAddr>,
         runtime: Arc<dig_nat::NatRuntime>,
     ) -> Arc<Self> {
-        // The provider union: dig-dht is live today; PEX + relay-introducer are wired-but-empty seams
-        // (#1443, real sources land in #1440 part B). Best-effort — a dormant source adds nothing.
         let dht_locator: Arc<dyn ProviderLocator> = Arc::new(DhtProviderLocator::new(dht.clone()));
-        let union: Arc<dyn ProviderLocator> = UnionLocator::new(vec![
-            dht_locator,
-            Arc::new(EmptyLocator), // PEX-as-provider-source (dormant)
-            Arc::new(EmptyLocator), // relay-introducer (dormant)
-        ]);
-        // #1584 belt-and-suspenders: never discover THIS node as its own provider. dig-gossip is the
-        // authoritative guard (no self entry enters the pool → selector), but a self-`peer_id` record
-        // could still reach discovery from another source (a stale self-published DHT `add_provider`
-        // record, a future PEX/relay-introducer source, a replay). Filter it at the INNERMOST source so
-        // the exclusion covers every granularity, including CapsuleFallbackLocator's non-resource
-        // pass-through — otherwise the reader self-dials (own IP → refused) and dead-ends the read (404).
-        let union = SelfExcludingLocator::new(union, self_peer_id.clone());
-        // #1580: holders announce STORE + CAPSULE granularity only (never per-resource — see
-        // `dht::inventory_content_ids`), but a `/s` resource read locates by a RESOURCE content id.
-        // Bridge the two so a resource lookup also resolves the announced parent capsule holder;
-        // otherwise Tier-2 peer fetch finds nobody and the read 404s despite a discoverable holder.
-        let locator = CapsuleFallbackLocator::new(union);
+        let locator = Self::provider_locator_chain(dht_locator, self_peer_id.clone());
         let nat_config =
             crate::net::full_nat_config(crate::dht::default_rpc_timeout(), stun_server);
         // The fetch leg composes the SAME NAT ladder as the DHT dial from the shared runtime (#1439):
