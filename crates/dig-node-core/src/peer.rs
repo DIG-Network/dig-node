@@ -1426,13 +1426,37 @@ impl PeerRpcResponder for NodeResponder {
         // node's neighbourhood wants the store — tag it Tier1Demand + (opt-in) trigger a tier-1 cache.
         self.node.note_inbound_demand(&store, &root);
 
-        let cache = self.node.cache_dir_path().to_path_buf();
-        let (s, r) = (store.clone(), root.clone());
-        let window = tokio::task::spawn_blocking(move || {
-            module_serve::read_module_window(&cache, &s, &r, offset, length)
-        })
-        .await
-        .unwrap_or(None);
+        let read_window = || {
+            let cache = self.node.cache_dir_path().to_path_buf();
+            let (s, r) = (store.clone(), root.clone());
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    module_serve::read_module_window(&cache, &s, &r, offset, length)
+                })
+                .await
+                .unwrap_or(None)
+            }
+        };
+        let mut window = read_window().await;
+
+        // MISS -> the RELAY leg (dig-node#276). This is the peer-facing half: a requestor that cannot
+        // reach the holder itself asks US, with `proxy: true`, and — if the operator opted in and the
+        // requestor is inside its proxy allowance — this node pulls the whole capsule from a holder
+        // and serves the window from its own cache. All three gates live in `relay_capsule`; a refusal
+        // leaves the not-held frame below exactly as it was, so the requestor stays free to ask
+        // another hop (NC-12: a hop's "not found" may be a lie, including ours).
+        if window.is_none()
+            && crate::seams::dig_peer::module_relay::relay_capsule(
+                &self.node,
+                &store,
+                &root,
+                &params,
+                &crate::rate_limit::RequestorId::Peer(conn_key.to_string()),
+            )
+            .await
+        {
+            window = read_window().await;
+        }
 
         let Some(window) = window else {
             module_serve::module_range_outcome(conn_key, &store, &root, offset, None);
