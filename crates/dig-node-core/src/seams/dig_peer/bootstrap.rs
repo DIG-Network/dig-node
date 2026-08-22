@@ -48,9 +48,10 @@ pub fn bootstrap_targets_from_env() -> Vec<BootstrapTarget> {
 
 /// Pure: resolve the bootstrap targets from an optional `DIG_BOOTSTRAP_PEERS` value.
 ///
-/// An explicit `off`/`disabled` yields NO targets, and so — for now — does an unset value: see
-/// [`compiled_in_targets`]. Malformed entries and entries with no identity are dropped, so the
-/// result is exactly the set that can be dialed.
+/// An explicit `off`/`disabled` yields NO targets. An UNSET value yields the canonical compiled-in
+/// set — see [`compiled_in_targets`] — which is the whole point of dig_ecosystem#923: a node with no
+/// configuration must still have an anchor to dial. Malformed entries and entries with no identity
+/// are dropped, so the result is exactly the set that can be dialed.
 pub fn resolve_bootstrap_targets(env: Option<&str>) -> Vec<BootstrapTarget> {
     let configured = env.map(str::trim).filter(|s| !s.is_empty());
     match configured {
@@ -143,11 +144,18 @@ pub fn spawn_bootstrap_dials(
             if handle.is_pool_peer(&peer_id) {
                 return;
             }
-            let addr = resolve_authority(&target.authority);
-            match handle
-                .connect_via_nat(peer_id, addr, &methods, BOOTSTRAP_DIAL_TIMEOUT)
-                .await
-            {
+            let candidates = dial_candidates(&target.authority);
+            let outcome = first_successful_dial(candidates, |addr| {
+                let handle = handle.clone();
+                let methods = methods.clone();
+                async move {
+                    handle
+                        .connect_via_nat(peer_id, addr, &methods, BOOTSTRAP_DIAL_TIMEOUT)
+                        .await
+                }
+            })
+            .await;
+            match outcome {
                 Ok(conn) => {
                     // Re-check membership now the dial has resolved: it ran for up to
                     // BOOTSTRAP_DIAL_TIMEOUT, in which the identity may have joined the pool by
@@ -166,19 +174,67 @@ pub fn spawn_bootstrap_dials(
     }
 }
 
-/// Resolve a `host:port` authority to ONE socket address, IPv6-first (§5.2).
+/// The dial candidates for a `host:port` authority, IPv6-first and IPv4-FALLBACK (§5.2).
 ///
-/// `None` when the host does not resolve; the ladder can still reach the peer over the relay tier
-/// using the pinned identity alone, so an unresolvable name is a lost direct path rather than a lost
-/// peer.
-fn resolve_authority(authority: &str) -> Option<std::net::SocketAddr> {
+/// §5.2 is IPv6-*first*, not IPv6-only, and the difference is load-bearing here. `node-rpc.dig.net`
+/// publishes an AAAA record, so a host with IPv6 configured but not actually routable resolves to a
+/// v6 address, dials into a black hole, and — if that were the only candidate — ends with zero peers
+/// while a perfectly good IPv4 path sat unused. That is the exact outcome dig_ecosystem#923 exists to
+/// prevent, so every resolved address is a candidate and the families are merely ORDERED.
+///
+/// The list always has at least one element: an unresolvable name yields `[None]`, which still runs
+/// the traversal ladder — the relay tier can reach the peer from the pinned identity alone, so an
+/// unresolvable name is a lost direct path rather than a lost peer.
+fn dial_candidates(authority: &str) -> Vec<Option<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
-    let resolved: Vec<_> = authority.to_socket_addrs().ok()?.collect();
-    resolved
-        .iter()
-        .find(|a| a.is_ipv6())
-        .or_else(|| resolved.first())
-        .copied()
+    let resolved: Vec<_> = authority
+        .to_socket_addrs()
+        .map(|addrs| addrs.collect())
+        .unwrap_or_default();
+    let ordered = order_ipv6_first(resolved);
+    if ordered.is_empty() {
+        return vec![None];
+    }
+    ordered.into_iter().map(Some).collect()
+}
+
+/// Pure: every address, IPv6 ones first, each family keeping its resolver-given relative order.
+///
+/// Nothing is discarded — an implementation that returned only the v6 addresses would satisfy
+/// "IPv6-first" while deleting the fallback this function exists to preserve.
+fn order_ipv6_first(resolved: Vec<std::net::SocketAddr>) -> Vec<std::net::SocketAddr> {
+    let (v6, v4): (Vec<_>, Vec<_>) = resolved.into_iter().partition(|a| a.is_ipv6());
+    v6.into_iter().chain(v4).collect()
+}
+
+/// Run `dial` against each candidate in turn and return the first success, else the LAST failure.
+///
+/// Sequential rather than concurrent: a bootstrap dial adopts a session into the connected-peer pool,
+/// and two racing dials to one identity would have the winner supersede and tear down the other.
+///
+/// An empty candidate list is dialled once with `None` rather than returning an error, so a caller
+/// that resolved nothing still reaches the relay tier.
+async fn first_successful_dial<T, E, F, Fut>(
+    candidates: Vec<Option<std::net::SocketAddr>>,
+    mut dial: F,
+) -> Result<T, E>
+where
+    F: FnMut(Option<std::net::SocketAddr>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let candidates = if candidates.is_empty() {
+        vec![None]
+    } else {
+        candidates
+    };
+    let mut last_error = None;
+    for candidate in candidates {
+        match dial(candidate).await {
+            Ok(connected) => return Ok(connected),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("the candidate list is non-empty, so at least one dial ran"))
 }
 
 /// Parse a 64-hex identity into a dig-gossip [`PeerId`](dig_gossip::PeerId).
@@ -398,27 +454,92 @@ mod tests {
         }
     }
 
-    /// Resolution prefers IPv6 when the host offers both families (§5.2).
+    // -- IPv6-first WITH IPv4 fallback (§5.2) -------------------------------------------------------
+
+    fn v6(last: u16) -> std::net::SocketAddr {
+        format!("[2001:db8::{last:x}]:9444").parse().expect("v6")
+    }
+
+    fn v4(last: u8) -> std::net::SocketAddr {
+        format!("192.0.2.{last}:9444").parse().expect("v4")
+    }
+
+    /// Ordering puts IPv6 first and KEEPS every IPv4 address as a fallback candidate.
     ///
-    /// `localhost` is used because it is the one name guaranteed to resolve without a network, and
-    /// the assertion is conditional on it actually offering both families so the test cannot pass
-    /// vacuously on a host that publishes only one.
+    /// The fixture is synthetic and interleaved rather than a `localhost` lookup, because the
+    /// resolver-backed version of this test is conditional on the host publishing both families and
+    /// goes vacuous where it does not. Two addresses per family, interleaved, so the assertion
+    /// distinguishes "IPv6 first" from all three nearest wrong implementations: returning only the
+    /// v6 addresses (length would drop to 2), returning only the first address, and reversing the
+    /// within-family order.
     #[test]
-    fn authority_resolution_prefers_ipv6() {
-        use std::net::ToSocketAddrs;
-        let all: Vec<_> = "localhost:9444"
-            .to_socket_addrs()
-            .map(|i| i.collect())
-            .unwrap_or_default();
-        if all.iter().any(|a| a.is_ipv6()) && all.iter().any(|a| a.is_ipv4()) {
-            assert!(
-                resolve_authority("localhost:9444")
-                    .expect("resolves")
-                    .is_ipv6(),
-                "IPv6 must win when both families are available"
-            );
-        }
-        assert_eq!(resolve_authority("no-such-host.invalid:9778"), None);
+    fn ordering_puts_ipv6_first_without_discarding_ipv4() {
+        let resolved = vec![v4(1), v6(1), v4(2), v6(2)];
+        assert_eq!(
+            order_ipv6_first(resolved),
+            vec![v6(1), v6(2), v4(1), v4(2)],
+            "IPv6 must lead, and every IPv4 address must survive as a fallback"
+        );
+    }
+
+    /// An unresolvable name still yields exactly one candidate — `None`, the relay-tier dial.
+    #[test]
+    fn an_unresolvable_authority_still_yields_one_relay_tier_candidate() {
+        assert_eq!(dial_candidates("no-such-host.invalid:9778"), vec![None]);
+    }
+
+    /// A host offering both families is dialled v6 first and v4 SECOND, when v6 is unreachable.
+    ///
+    /// This is the property the preference test could not see: preference says which address is
+    /// tried first, and says nothing about whether the other family is tried AT ALL. The fixture is
+    /// built so those two answers differ — the v6 candidate always fails (an unroutable-v6 host, the
+    /// common shape where IPv6 is configured but has no egress) while the v4 candidate succeeds — so
+    /// an implementation that dials only the preferred address returns Err here, and an
+    /// implementation that dials v4 FIRST fails the recorded order.
+    #[tokio::test]
+    async fn an_unreachable_ipv6_candidate_is_followed_by_an_ipv4_attempt() {
+        let attempted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let candidates = dial_candidates_from(vec![v6(1), v4(1)]);
+
+        let recorder = attempted.clone();
+        let outcome: Result<&str, &str> = first_successful_dial(candidates, move |addr| {
+            let recorder = recorder.clone();
+            async move {
+                let addr = addr.expect("both candidates are resolved addresses");
+                recorder.lock().expect("lock").push(addr);
+                if addr.is_ipv6() {
+                    Err("network unreachable")
+                } else {
+                    Ok("connected")
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            outcome,
+            Ok("connected"),
+            "a working IPv4 path must not be wasted because IPv6 resolved and failed"
+        );
+        assert_eq!(
+            *attempted.lock().expect("lock"),
+            vec![v6(1), v4(1)],
+            "the v6 candidate must be tried first, and the v4 candidate must actually be tried"
+        );
+    }
+
+    /// Every candidate failing surfaces an error rather than reporting a connection.
+    #[tokio::test]
+    async fn a_dial_that_fails_on_every_candidate_reports_failure() {
+        let candidates = dial_candidates_from(vec![v6(1), v4(1)]);
+        let outcome: Result<&str, &str> =
+            first_successful_dial(candidates, |_| async { Err("unreachable") }).await;
+        assert_eq!(outcome, Err("unreachable"));
+    }
+
+    /// The same ordering + wrapping the production path applies, over a supplied resolution.
+    fn dial_candidates_from(resolved: Vec<std::net::SocketAddr>) -> Vec<Option<std::net::SocketAddr>> {
+        order_ipv6_first(resolved).into_iter().map(Some).collect()
     }
 
     /// The dial timeout is a real bound, not an accidental zero.
