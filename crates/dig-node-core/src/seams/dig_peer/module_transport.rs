@@ -211,6 +211,118 @@ impl NatModuleTransport {
     }
 }
 
+/// The largest framed JSON body accepted for a module DESCRIPTOR answer.
+///
+/// The generic peer-request reader ([`crate::peer::read_framed`]) caps at 64 KiB, which is right for
+/// a REQUEST and too small for this RESPONSE: a descriptor declares one 32-byte hash and one length
+/// per chunk, so the largest permitted module runs to a few hundred kilobytes of JSON. This is still
+/// a hard bound — a peer cannot make this node buffer an arbitrary body by declaring one.
+const MAX_DESCRIPTOR_FRAME: usize = 8 * 1024 * 1024;
+
+/// Ask `stream` a whole-`.dig` question as a framed JSON-RPC request carrying the RELAY opt-in
+/// (dig-node#276).
+///
+/// # Why this node frames the request itself instead of calling dig-peer's typed method
+///
+/// `GetModuleInfoParams` / `FetchModuleRangeParams` live in `dig-rpc-protocol` and carry no `proxy`
+/// field. Adding one is a level-00 crate change and a release-first cascade through `dig-peer` ->
+/// `dig-download` -> this repo, for a single boolean on a request this repo both sends and serves.
+/// dig-peer's own [`DigPeer::open_stream`] is the documented escape hatch for exactly this — a
+/// consumer carrying its own wire shape over the authenticated mux — and the typed method it replaces
+/// is itself only a `build_request` plus a framed write over that same stream.
+///
+/// The flag is ADDITIVE: a peer that does not implement the relay ignores an unknown params key and
+/// answers precisely as it does today, so this is safe to send to every holder unconditionally.
+async fn ask_with_relay(
+    stream: &mut dig_nat::PeerStream,
+    method: dig_rpc_protocol::Method,
+    mut params: serde_json::Value,
+) -> std::io::Result<()> {
+    if let Some(object) = params.as_object_mut() {
+        // A whole-`.dig` download defaults to ONION mode per the recursive-download epic: if the
+        // holder we reached does not hold it, we would rather it fetched the capsule for us than tell
+        // us "not found" while sitting one hop from someone who has it. Individual RESOURCE requests
+        // are unaffected and still default to DIRECT (NC-4).
+        object.insert("proxy".to_string(), serde_json::Value::Bool(true));
+    }
+    crate::peer::write_framed(
+        stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method.name(),
+            "params": params,
+        }),
+    )
+    .await
+}
+
+/// Read one framed JSON-RPC response body from `stream`, bounded by [`MAX_DESCRIPTOR_FRAME`].
+async fn read_response_frame(
+    stream: &mut dig_nat::PeerStream,
+) -> std::io::Result<serde_json::Value> {
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_DESCRIPTOR_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "module descriptor frame too large",
+        ));
+    }
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await?;
+    serde_json::from_slice(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// One `dig.getModuleInfo` over `peer`, carrying the relay opt-in, decoded into a [`ModuleInfo`].
+///
+/// `None` for every failure — a refused stream, an unwritable request, an unreadable frame, an error
+/// envelope, or a body that is not a descriptor. The caller turns that into one transport error whose
+/// text is this node's own, so a peer can never author what this node logs (#1603).
+async fn descriptor_over(peer: &mut DigPeer, store_id: &str, root: &str) -> Option<ModuleInfo> {
+    let params = serde_json::to_value(GetModuleInfoParams {
+        store_id: store_id.to_string(),
+        root: root.to_string(),
+    })
+    .ok()?;
+    let mut stream = peer.open_stream().await.ok()?;
+    ask_with_relay(&mut stream, dig_rpc_protocol::Method::GetModuleInfo, params)
+        .await
+        .ok()?;
+    let response = read_response_frame(&mut stream).await.ok()?;
+    serde_json::from_value(response.get("result")?.clone()).ok()
+}
+
+/// Open a `dig.fetchModuleRange` frame stream over `peer`, carrying the relay opt-in.
+async fn window_stream_over(
+    peer: &mut DigPeer,
+    store_id: &str,
+    root: &str,
+    offset: u64,
+    length: u64,
+) -> Option<dig_nat::PeerStream> {
+    let params = serde_json::to_value(FetchModuleRangeParams {
+        store_id: store_id.to_string(),
+        root: root.to_string(),
+        offset: Some(offset),
+        length,
+    })
+    .ok()?;
+    let mut stream = peer.open_stream().await.ok()?;
+    ask_with_relay(
+        &mut stream,
+        dig_rpc_protocol::Method::FetchModuleRange,
+        params,
+    )
+    .await
+    .ok()?;
+    Some(stream)
+}
+
 #[async_trait]
 impl ModuleTransport for NatModuleTransport {
     async fn get_module_info(
@@ -220,16 +332,11 @@ impl ModuleTransport for NatModuleTransport {
         root: &str,
     ) -> Result<ModuleInfo, DownloadError> {
         let mut peer = self.connect(provider_peer_id, store_id, root).await?;
-        let result = peer
-            .get_module_info(&GetModuleInfoParams {
-                store_id: store_id.to_string(),
-                root: root.to_string(),
-            })
-            .await;
+        let result = descriptor_over(&mut peer, store_id, root).await;
         peer.disconnect().await;
         // The reason names the STEP and the sentinelled peer; the peer's own answer text is never
         // embedded (#1603) — the crate sanitizes at its Display layer and upstream must not defeat it.
-        result.map_err(|_| DownloadError::transport(provider_peer_id, "getModuleInfo failed"))
+        result.ok_or_else(|| DownloadError::transport(provider_peer_id, "getModuleInfo failed"))
     }
 
     async fn fetch_module_range(
@@ -241,17 +348,9 @@ impl ModuleTransport for NatModuleTransport {
         length: u64,
     ) -> Result<Vec<u8>, DownloadError> {
         let mut peer = self.connect(provider_peer_id, store_id, root).await?;
-        let stream = peer
-            .fetch_module_range(&FetchModuleRangeParams {
-                store_id: store_id.to_string(),
-                root: root.to_string(),
-                offset: Some(offset),
-                length,
-            })
-            .await;
-        let bytes = match stream {
-            Ok(mut stream) => read_module_window(&mut stream, provider_peer_id, length).await,
-            Err(_) => Err(DownloadError::transport(
+        let bytes = match window_stream_over(&mut peer, store_id, root, offset, length).await {
+            Some(mut stream) => read_module_window(&mut stream, provider_peer_id, length).await,
+            None => Err(DownloadError::transport(
                 provider_peer_id,
                 "fetchModuleRange stream refused",
             )),

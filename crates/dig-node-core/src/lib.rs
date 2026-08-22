@@ -2723,6 +2723,47 @@ impl Node {
         }
     }
 
+    /// The transfer descriptor for a `.dig` module at the CACHE path, or `None` if this node does not
+    /// hold it. The blocking read + per-chunk hashing runs on a `spawn_blocking` thread (a `.dig` is
+    /// large; hashing it must never stall the async runtime).
+    ///
+    /// Extracted because the relay leg (dig-node#276) reads the SAME cache TWICE — once to discover
+    /// the miss, once after the relayed pull has landed — and a relayed answer that came from a second
+    /// reader would be a second thing to keep byte-identical with the held one.
+    async fn describe_held_module(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+    ) -> Option<dig_rpc_protocol::types::ModuleInfo> {
+        let cache_dir = self.cache_dir.clone();
+        let (store, root) = (store_hex.to_string(), root_hex.to_string());
+        tokio::task::spawn_blocking(move || {
+            seams::dig_peer::module_serve::describe_module(&cache_dir, &store, &root)
+        })
+        .await
+        .unwrap_or(None)
+    }
+
+    /// One window of a `.dig` module at the CACHE path, or `None` if this node does not hold it. The
+    /// companion of [`Self::describe_held_module`]; see there for why it is its own function.
+    async fn read_held_module_window(
+        &self,
+        store_hex: &str,
+        root_hex: &str,
+        offset: u64,
+        length: u64,
+    ) -> Option<Vec<u8>> {
+        let cache_dir = self.cache_dir.clone();
+        let (store, root) = (store_hex.to_string(), root_hex.to_string());
+        tokio::task::spawn_blocking(move || {
+            seams::dig_peer::module_serve::read_module_window(
+                &cache_dir, &store, &root, offset, length,
+            )
+        })
+        .await
+        .unwrap_or(None)
+    }
+
     /// `dig.getModuleInfo` (#1576, the reshare leg): the transfer descriptor for a whole `.dig` module
     /// this node HOLDS — the handshake a peer reads before range-pulling the entire capsule so it can
     /// become a resharer of it.
@@ -2735,7 +2776,12 @@ impl Node {
     /// - Module NOT held (or a 0-byte file, which is not a module) → the same
     ///   `RESOURCE_UNAVAILABLE` code `dig.fetchRange` reports on a miss. Declining is the honest answer:
     ///   describing a module this node cannot serve would advertise a capsule it does not have.
-    async fn get_module_info(&self, params: &Value, id: Value) -> Value {
+    async fn get_module_info(
+        &self,
+        params: &Value,
+        id: Value,
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Value {
         let store_hex = params
             .get("store_id")
             .and_then(Value::as_str)
@@ -2753,13 +2799,19 @@ impl Node {
                 "dig.getModuleInfo requires store_id + root (64-hex each)",
             );
         }
-        let cache_dir = self.cache_dir.clone();
-        let (store, root) = (store_hex.clone(), root_hex.clone());
-        let info = tokio::task::spawn_blocking(move || {
-            seams::dig_peer::module_serve::describe_module(&cache_dir, &store, &root)
-        })
-        .await
-        .unwrap_or(None);
+        let mut info = self.describe_held_module(&store_hex, &root_hex).await;
+        // MISS -> the RELAY leg (dig-node#276). A requestor that asked for a relay, on a node whose
+        // operator opted in and within its proxy allowance, makes this node pull the whole capsule
+        // from a holder and describe it from its own cache. Every gate is inside `relay_capsule`; a
+        // refusal simply leaves `info` as `None` and the honest not-held answer below stands.
+        if info.is_none()
+            && seams::dig_peer::module_relay::relay_capsule(
+                self, &store_hex, &root_hex, params, requestor,
+            )
+            .await
+        {
+            info = self.describe_held_module(&store_hex, &root_hex).await;
+        }
         // The serve log records both outcomes with sentinelled ids, so "was this holder asked for the
         // descriptor, and did it have it?" is answerable from the log alone (#1595).
         seams::dig_peer::module_serve::module_info_answered(
@@ -2792,7 +2844,12 @@ impl Node {
     ///
     /// Params `{store_id, root, offset?, length}`; the window is clamped to the serve cap. A module this
     /// node does not hold answers the same `RESOURCE_UNAVAILABLE` code the streaming form reports.
-    async fn fetch_module_range_frame(&self, params: &Value, id: Value) -> Value {
+    async fn fetch_module_range_frame(
+        &self,
+        params: &Value,
+        id: Value,
+        requestor: &crate::rate_limit::RequestorId,
+    ) -> Value {
         use seams::dig_peer::module_serve;
 
         let store_hex = params
@@ -2818,13 +2875,22 @@ impl Node {
             .and_then(Value::as_u64)
             .unwrap_or(module_serve::MAX_MODULE_WINDOW);
 
-        let cache_dir = self.cache_dir.clone();
-        let (store, root) = (store_hex.clone(), root_hex.clone());
-        let window = tokio::task::spawn_blocking(move || {
-            module_serve::read_module_window(&cache_dir, &store, &root, offset, length)
-        })
-        .await
-        .unwrap_or(None);
+        let mut window = self
+            .read_held_module_window(&store_hex, &root_hex, offset, length)
+            .await;
+        // MISS -> the RELAY leg (dig-node#276), exactly as on the descriptor above: a relayed window
+        // is read from the same cache, through the same reader, so it is byte-identical to the one a
+        // genuine holder would have served and the requestor needs no second code path.
+        if window.is_none()
+            && seams::dig_peer::module_relay::relay_capsule(
+                self, &store_hex, &root_hex, params, requestor,
+            )
+            .await
+        {
+            window = self
+                .read_held_module_window(&store_hex, &root_hex, offset, length)
+                .await;
+        }
 
         match window {
             Some(bytes) => {

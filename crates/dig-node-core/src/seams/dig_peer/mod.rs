@@ -24,6 +24,7 @@ pub mod forwarded_ask;
 pub mod holder_cache;
 pub mod holdings;
 pub mod module_anchor;
+pub mod module_relay;
 pub mod module_reshare;
 pub mod module_serve;
 pub mod module_transport;

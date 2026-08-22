@@ -230,7 +230,7 @@ impl RpcDispatch for Node {
             }
             Some(Method::GetModuleInfo) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
-                return node.get_module_info(&params, id).await;
+                return node.get_module_info(&params, id, &requestor).await;
             }
             // dig.fetchModuleRange (#1576): one window of a held `.dig` module.
             //
@@ -242,7 +242,9 @@ impl RpcDispatch for Node {
             // (§6.2) without implementing the frame protocol.
             Some(Method::FetchModuleRange) => {
                 let params = req.get("params").cloned().unwrap_or(json!({}));
-                return node.fetch_module_range_frame(&params, id).await;
+                return node
+                    .fetch_module_range_frame(&params, id, &requestor)
+                    .await;
             }
             // dig.stage (#95 Pass C): turn a local folder into a capsule (.dig module) IN
             // PROCESS — the staging/compile half of a local deploy. The DIG Browser's
