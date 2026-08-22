@@ -257,6 +257,26 @@ dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4
 # the release-first cascade on #2072. Do NOT pin this BACK to widen a window: the fix is upstream
 # moving forward, never dig-node drifting backward.
 dig-constants = "0.9"
+# The canonical bootstrap peer anchors (`DIG_BOOTSTRAP_PEERS`, dig_ecosystem#923), read from the
+# CURRENT dig-constants line under an alias while `dig-constants = "0.9"` above stays on dig-node's
+# chia line.
+#
+# Why an alias rather than bumping the dep above: the 0.9 pin exists because `DIG_MAINNET` is a
+# `Bytes32`, and on 0.10+ that type arrives from chia-protocol 0.36 while the rest of this workspace
+# reads `Bytes32` from 0.26 via dig-gossip — the unification split the pin comment describes. That
+# argument is specific to the chia-typed constants. `DIG_BOOTSTRAP_PEERS` is a `&[&str]` and carries
+# no chia type across the boundary at all, so it can be read from the current line with no
+# unification surface.
+#
+# This adds NO new version to the graph: chia-protocol 0.36.1 is already resolved here through
+# digstore-chain (see the dig-gossip entry above), which is exactly why the 0.36 migration is a
+# cascade rather than a version-string edit.
+#
+# This is NOT pinning back to widen a window -- the anti-pattern that comment warns about. It pins
+# FORWARD for one chia-free constant so the value is read from the SSOT instead of being hardcoded
+# here, which is the drift class dig-constants exists to prevent. Collapse this alias into the dep
+# above the moment the chia-0.36 cascade (#2761) lands; nothing else may use it.
+dig-constants-net = { package = "dig-constants", version = "0.11" }
 # -- Portable profile body format (DPB) — epic #3008 W6 -----------------------------------------------
 #
 # `default-features = false` deliberately: the default `chia` feature pulls dig-did/dig-store/

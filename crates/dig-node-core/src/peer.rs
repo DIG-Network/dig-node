@@ -2802,6 +2802,21 @@ async fn run_peer_network(node: Arc<crate::Node>) -> Result<(), String> {
 
     // The served responder carries the LIVE pool handle so `dig.getPeers` reflects connected peers,
     // and the DHT so inbound DHT RPCs are answered.
+    // Bootstrap dials (#923): a fresh install knows no peers — peer exchange and the DHT can only
+    // spread peers this node already has, and a relay reservation only makes this node reachable.
+    // Dial the canonical anchors so `connected_peers` has a floor above zero on a node that can
+    // reach the internet.
+    //
+    // SPAWNED, never awaited, and deliberately placed AFTER every other bring-up step: a fresh node
+    // must start and keep working with every anchor unreachable. Making this blocking or fallible
+    // would turn one host into a single point of failure for every fresh node in the network, which
+    // is the opposite of what the anchors are for.
+    crate::bootstrap::spawn_bootstrap_dials(
+        handle.clone(),
+        crate::bootstrap::bootstrap_targets_from_env(),
+        stun_server,
+    );
+
     let mut node_responder = NodeResponder::with_pool(node, handle);
     if let Some(dht) = dht {
         node_responder = node_responder.with_dht(dht);
@@ -3497,6 +3512,79 @@ pub(crate) mod tests {
         // Both listeners are up simultaneously — no port clash.
         assert!(peer_port != 0);
         let _ = handle.pool_stats();
+    }
+
+    /// #923: a node whose bootstrap anchors are ALL unreachable still starts and still works.
+    ///
+    /// This is the property that matters most about the bootstrap set, because getting it wrong is
+    /// invisible in the happy path and catastrophic in aggregate: if bring-up awaited or failed on an
+    /// anchor dial, one unreachable host would become a single point of failure for every fresh node
+    /// in the network — the exact opposite of what an anchor is for.
+    ///
+    /// # Why the fixture is an UNROUTABLE address and not a closed local port
+    ///
+    /// The nearest wrong implementation is awaiting the dial instead of spawning it. A closed
+    /// loopback port cannot see that: the kernel refuses instantly, so awaited and spawned both
+    /// return in microseconds and the test passes either way. `203.0.113.0/24` (RFC 5737 TEST-NET-3)
+    /// is not routable, so a dial to it HANGS until the module's own 10s `BOOTSTRAP_DIAL_TIMEOUT`.
+    /// That turns the distinction into a wall-clock one this test can actually observe, which is why
+    /// the elapsed budget below is well under that timeout rather than merely "fast".
+    ///
+    /// # Why the anchor is well-formed
+    ///
+    /// A malformed entry would be dropped by the parser and never dialled at all, so the test would
+    /// assert survival of an event that never happened. The identity is valid 64-hex and the
+    /// authority parses; the ONLY thing wrong with this anchor is that nothing answers there.
+    #[tokio::test]
+    async fn a_node_survives_every_bootstrap_anchor_being_unreachable() {
+        let dir = std::env::temp_dir().join(format!("dig-node-bootstrap-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg = dig_gossip::GossipConfig {
+            network_id: chia_protocol::Bytes32::new([3u8; 32]),
+            cert_path: dir.join("node.cert").display().to_string(),
+            key_path: dir.join("node.key").display().to_string(),
+            peers_file_path: dir.join("peers.json"),
+            peer_pool: Some(dig_gossip::PeerPoolConfig::default()),
+            listen_addr: fresh_pool_listen_addr().await,
+            ..Default::default()
+        };
+        let handle = dig_gossip::GossipService::new(cfg)
+            .expect("gossip config")
+            .start()
+            .await
+            .expect("gossip start");
+
+        let unreachable = crate::bootstrap::resolve_bootstrap_targets(Some(&format!(
+            "{}@203.0.113.1:9444,{}@203.0.113.2:9444",
+            "a".repeat(64),
+            "b".repeat(64)
+        )));
+        assert_eq!(
+            unreachable.len(),
+            2,
+            "the fixture must actually produce anchors to dial, else survival is vacuous"
+        );
+
+        let started = std::time::Instant::now();
+        crate::bootstrap::spawn_bootstrap_dials(handle.clone(), unreachable, None);
+        let elapsed = started.elapsed();
+
+        // Bring-up did not wait on the network. An awaited dial would sit here for the full 10s
+        // BOOTSTRAP_DIAL_TIMEOUT per anchor before returning.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "bring-up blocked on an unreachable anchor for {elapsed:?}"
+        );
+
+        // ...and the node is still a working node afterwards: the pool is queryable and the service
+        // is still running. Asserted AFTER a pause long enough for the dial tasks to have failed and
+        // logged, so this observes the post-failure state rather than a state that merely predates it.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = handle.pool_stats();
+        assert!(
+            handle.health_check().await.is_ok(),
+            "the node must still be healthy after every bootstrap anchor failed"
+        );
     }
 
     // #870 + #872: the node shares ONE `Arc<RelayStatus>` between the relay-reservation loop and the
