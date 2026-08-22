@@ -179,6 +179,38 @@ fn resolve_miss_mode(v: Option<&str>) -> MissMode {
     }
 }
 
+/// The environment variable an operator opts the MODULE-GRANULARITY RELAY in with (dig-node#276).
+pub const ONION_RELAY_ENV: &str = "DIG_NODE_ONION_RELAY";
+
+/// Whether this node is willing to RELAY a whole `.dig` capsule on a requestor's behalf — pull it
+/// from a holder the requestor cannot reach, then serve the requestor's module windows from the
+/// result (dig-node#276). Resolved from [`ONION_RELAY_ENV`]; **unset means OFF**.
+///
+/// Off by default because this leg spends OTHER nodes' bandwidth, not only this one's: an admitted
+/// relay makes this node pull an entire capsule from a third party for a stranger. A path with that
+/// reach is not gated more loosely than the ones that spend only local egress, so the operator opts
+/// in explicitly or the leg does not exist.
+pub fn onion_relay_from_env() -> bool {
+    resolve_onion_relay(std::env::var(ONION_RELAY_ENV).ok().as_deref())
+}
+
+/// Pure core of [`onion_relay_from_env`]: `1` / `true` / `on` / `yes` (case-insensitive, trimmed)
+/// enables the relay; **everything else, including unset and anything unreadable, is OFF**.
+///
+/// The failure direction is deliberate and is the whole point of the gate: an unreadable value must
+/// never be read as consent to spend the network's bandwidth. Pure so the policy is tested without
+/// process-global env.
+fn resolve_onion_relay(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some(s)
+            if s.eq_ignore_ascii_case("1")
+                || s.eq_ignore_ascii_case("true")
+                || s.eq_ignore_ascii_case("on")
+                || s.eq_ignore_ascii_case("yes")
+    )
+}
+
 /// The [`BackfillPolicy`] this node acquires under (§5.6): when a resource read is satisfied FROM
 /// ANOTHER NODE (a redirect or a fetch-through miss for a concrete `(store, root)`), the node ALSO
 /// pulls the whole `.dig` capsule for that generation in the background and caches it, so the NEXT
@@ -786,6 +818,11 @@ pub struct NodeContent {
     /// The asks already walked here, so the same question arriving by two paths through the graph is
     /// forwarded once (dig-node#273). See [`AskSeenSet`].
     ask_seen: AskSeenSet,
+    /// Whether the operator opted this node into RELAYING whole capsules for requestors that cannot
+    /// reach a holder themselves (dig-node#276). Read from [`ONION_RELAY_ENV`] ONCE, at construction,
+    /// for the same reason the recursion config is passed in rather than re-read at decision time: the
+    /// amplification posture of a running node must not change underneath an in-flight request.
+    onion_relay: std::sync::atomic::AtomicBool,
 }
 
 /// What a holder search ESTABLISHED — the records it found AND whether an empty result is a fact.
@@ -1179,6 +1216,7 @@ impl NodeContent {
             discovery_cache: std::sync::OnceLock::new(),
             holder_cache: FirstHandHolderCache::new(),
             ask_seen: AskSeenSet::new(),
+            onion_relay: std::sync::atomic::AtomicBool::new(onion_relay_from_env()),
         })
     }
 
@@ -1361,6 +1399,33 @@ impl NodeContent {
     /// The configured miss behavior (redirect by default; fetch-through when opted in).
     pub fn miss_mode(&self) -> MissMode {
         self.miss_mode
+    }
+
+    /// Whether this node will RELAY a whole capsule on a requestor's behalf (dig-node#276) — the
+    /// operator gate resolved once at construction. See [`onion_relay_from_env`].
+    pub(crate) fn onion_relay_enabled(&self) -> bool {
+        self.onion_relay.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Flip the relay gate. **Test-only**: production resolves it once from the environment at
+    /// construction, so a running node's amplification posture is fixed. Exposing the switch here —
+    /// rather than having the relay leg read `std::env` at decision time — is what lets the leg be
+    /// exercised in BOTH directions without a process-global mutation two parallel tests would race on.
+    #[cfg(test)]
+    pub(crate) fn set_onion_relay(&self, enabled: bool) {
+        self.onion_relay
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Admit one PROXY-class fetch for `requestor` against its separate, tighter allowance
+    /// (dig_ecosystem#2189), or refuse it. The relay leg (dig-node#276) admits through this rather
+    /// than the cheap-lookup budget: relaying a whole capsule is the costliest thing a stranger can
+    /// ask this node to do, so it draws from the bucket sized for expensive egress.
+    ///
+    /// A LOCAL requestor is exempt, mirroring [`Self::miss_outcome`]'s proxy leg — the bound targets
+    /// remote callers, and the operator's own reads are not an amplification vector.
+    pub(crate) fn allow_proxy_fetch(&self, requestor: &crate::rate_limit::RequestorId) -> bool {
+        requestor.is_local() || self.proxy_rate_limiter.check(requestor)
     }
 
     /// The staging directory downloads run in (`<cache>/downloads`).
@@ -2971,6 +3036,27 @@ pub(crate) mod tests {
     }
 
     // -- miss-mode resolution --------------------------------------------------------------------
+
+    /// **Proves (dig-node#276):** the capsule-relay operator gate is OFF unless the operator wrote a
+    /// recognised affirmative, and is ON for each of the four accepted spellings.
+    /// **Catches:** the failure direction being inverted — an unset, empty, or unreadable value read
+    /// as consent. This leg spends OTHER nodes' bandwidth, so "I could not tell" must mean OFF; a
+    /// default-on relay would make every stock node a capsule-scale amplifier for strangers.
+    #[test]
+    fn the_capsule_relay_gate_is_off_unless_explicitly_enabled() {
+        assert!(!resolve_onion_relay(None), "unset → OFF (opt-in)");
+        assert!(!resolve_onion_relay(Some("")), "empty → OFF");
+        assert!(!resolve_onion_relay(Some("0")));
+        assert!(!resolve_onion_relay(Some("false")));
+        assert!(!resolve_onion_relay(Some("off")));
+        assert!(
+            !resolve_onion_relay(Some("maybe")),
+            "an unreadable value is not consent"
+        );
+        for enabled in ["1", "true", "TRUE", " on ", "Yes"] {
+            assert!(resolve_onion_relay(Some(enabled)), "{enabled}");
+        }
+    }
 
     #[test]
     fn miss_mode_defaults_to_redirect_and_opts_into_fetch_through() {

@@ -216,6 +216,31 @@ pub enum WarmOutcome {
     AlreadyHeld,
 }
 
+/// Whether a completed warm makes this node a DISCOVERABLE holder of what it just pulled.
+///
+/// The two callers of a warm want opposite answers, and the difference is a security boundary rather
+/// than a preference (dig-node#276):
+///
+/// * A warm this node's OWN operator provoked — a local read — SHOULD announce. That is the reshare
+///   flywheel: every read leaves the content more available than it found it.
+/// * A warm a STRANGER provoked, by asking this node to relay a capsule it does not hold, MUST NOT.
+///   Announcing it would let any peer drive this node into advertising capsules of the ATTACKER's
+///   choosing — a few hundred request bytes in, an attacker-shaped holder inventory out, and eviction
+///   pressure on the operator's own content. That is precisely the hole
+///   [`crate::download::NodeContent`]'s `origin != Local` reshare refusal exists to close, and
+///   relaying reopens it one level up unless the announce is suppressed here.
+///
+/// An enum rather than a `bool` so the call site names which of the two it is, and so a future third
+/// caller has to CHOOSE rather than inherit whichever default was in the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolderClaim {
+    /// Announce the capsule: this node pulled it for ITSELF and is a genuine, willing holder.
+    Announce,
+    /// Cache the capsule but announce NOTHING: this node pulled it on a stranger's behalf and is a
+    /// relay, not a holder.
+    Suppress,
+}
+
 /// Where a capsule warm stages + promotes to, and how it announces.
 ///
 /// A struct rather than a long argument list so the call site reads as one intention, and so the
@@ -376,8 +401,35 @@ impl CapsuleWarmer {
     /// Callers on the read path use [`spawn_capsule_warm`] instead; this is the awaitable core so the
     /// behaviour is testable without a background task.
     pub async fn warm(self: &Arc<Self>, store_hex: &str, root_hex: &str) -> WarmOutcome {
+        self.warm_claiming(store_hex, root_hex, HolderClaim::Announce)
+            .await
+    }
+
+    /// [`warm`](Self::warm) for a capsule pulled on ANOTHER node's behalf (dig-node#276): identical in
+    /// every trust step — chain anchor, merkle verification, promote-recheck, cache bound — except that
+    /// this node does **not** announce itself as a holder of the result.
+    ///
+    /// The capsule still lands in the cache, because that is what lets the relayed module windows be
+    /// served from the same code path a genuine holder serves from, byte-identically. What it does not
+    /// do is make a stranger's choice of content into this node's advertised inventory.
+    pub async fn warm_relayed(
+        self: &Arc<Self>,
+        store_hex: &str,
+        root_hex: &str,
+    ) -> WarmOutcome {
+        self.warm_claiming(store_hex, root_hex, HolderClaim::Suppress)
+            .await
+    }
+
+    /// The shared body of [`warm`](Self::warm) and [`warm_relayed`](Self::warm_relayed).
+    async fn warm_claiming(
+        self: &Arc<Self>,
+        store_hex: &str,
+        root_hex: &str,
+        claim: HolderClaim,
+    ) -> WarmOutcome {
         let outcome = self
-            .warm_with_config(store_hex, root_hex, self.config.clone())
+            .warm_with_config(store_hex, root_hex, self.config.clone(), claim)
             .await;
         // #2053: the tier-aware `<cache>/modules` size-cap sweep, run ONLY after a land that actually
         // grew the cache (`Held`) — a refusal wrote nothing, so there is nothing new to bound. This
@@ -414,7 +466,8 @@ impl CapsuleWarmer {
         // tier-0 round can never pull more than its remaining sub-budget even if the node default is
         // larger.
         config.max_module_size = config.max_module_size.min(max_bytes);
-        self.warm_with_config(store_hex, root_hex, config).await
+        self.warm_with_config(store_hex, root_hex, config, HolderClaim::Announce)
+            .await
     }
 
     /// The awaitable core of [`warm`](Self::warm) / [`warm_capped`](Self::warm_capped), parameterized by
@@ -424,6 +477,7 @@ impl CapsuleWarmer {
         store_hex: &str,
         root_hex: &str,
         config: dig_download::ModuleDownloadConfig,
+        claim: HolderClaim,
     ) -> WarmOutcome {
         // Already a holder → nothing to pull, nothing to announce again. Checked BEFORE claiming a
         // registry slot: a burst of reads across an already-cached capsule should cost one stat call
@@ -492,13 +546,19 @@ impl CapsuleWarmer {
         match promote_into_cache(&staged, &cached, &verifier) {
             Ok(promoted) => {
                 discard_staging(&staged);
-                self.announce.announce_inventory().await;
+                // The ONE step a relayed warm skips. Everything above it — the chain anchor, the
+                // merkle verification, the promote-recheck — ran identically, so the bytes are equally
+                // trustworthy; what differs is whether this node CLAIMS them (see [`HolderClaim`]).
+                if claim == HolderClaim::Announce {
+                    self.announce.announce_inventory().await;
+                }
                 tracing::info!(
                     store = %super::serve_log::SafeId::new(store_hex),
                     root = %super::serve_log::SafeId::new(root_hex),
                     outcome = "held",
                     bytes = promoted,
-                    "capsule warm: whole capsule verified + cached; announced as a holder"
+                    announced = claim == HolderClaim::Announce,
+                    "capsule warm: whole capsule verified + cached"
                 );
                 WarmOutcome::Held { bytes: promoted }
             }
@@ -1019,6 +1079,118 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a warmer over a REAL, answering holder for `(STORE, chain_root())`, staging + caching
+    /// under `dir`, announcing through `spy`.
+    ///
+    /// Extracted so the relay pair below can hold every input constant and vary exactly ONE thing —
+    /// which entry point is called. Two independently-constructed warmers would leave "the relayed one
+    /// simply had no working holder" as an untested explanation for its silence.
+    fn serving_warmer(dir: &Path, spy: &Arc<AnnounceSpy>, module: Vec<u8>) -> Arc<CapsuleWarmer> {
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let content = dig_download::module_content_id(&store_hex, &root_hex)
+            .expect("canonical ids yield a content id");
+        CapsuleWarmer::new(
+            Arc::new(dig_download::testkit::MockProviderLocator::fixed(
+                dig_download::testkit::mock_providers(1, &content),
+            )),
+            Arc::new(dig_download::testkit::MockModuleTransport::serving(
+                &store_hex, &root_hex, module, 8,
+            )),
+            Arc::new(dig_download::InMemoryStateStore::new()),
+            Arc::new(ConfirmingResolver),
+            WarmPaths {
+                staging_dir: dir.join("staging"),
+                cache_dir: dir.join("cache"),
+            },
+            Arc::clone(spy) as Arc<dyn AnnounceHolder>,
+            Arc::new(WarmRegistry::new()),
+            dig_download::ModuleDownloadConfig::default(),
+            Arc::new(crate::tier0_live::NoopModulesEvictor),
+        )
+    }
+
+    /// The cache path whose EXISTENCE is this node's holder claim, under `dir`.
+    fn cached_module_path(dir: &Path) -> std::path::PathBuf {
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        dir.join("cache")
+            .join("modules")
+            .join(&store_hex)
+            .join(format!("{root_hex}.dig"))
+    }
+
+    /// **Proves (dig-node#276, unit 4):** a capsule pulled ON A STRANGER'S BEHALF lands in the cache —
+    /// so the relayed windows can be served from it — and announces NOTHING, while the *same pull,
+    /// through the same holder, of the same bytes*, driven for this node's OWN sake announces exactly
+    /// once.
+    ///
+    /// **Catches:** the amplification hole the relay leg would otherwise reopen one level up. The
+    /// `origin != Local` reshare refusal exists so a stranger cannot drive this node into caching AND
+    /// DHT-announcing capsules of the attacker's choosing; a relay that pulls a whole capsule for a
+    /// stranger and then announces it hands that exact primitive back, with no forged message and no
+    /// privileged access required.
+    ///
+    /// **Why BOTH halves, and why they share `serving_warmer`:** an assertion that the relayed pull
+    /// announces zero times is satisfied identically by a suppression that works and by a warmer whose
+    /// announce is broken, whose holder never answers, or whose chain never confirms — every one of
+    /// which would also make a legitimate reshare silent. The `Announce` half is the truthful control
+    /// that distinguishes them: it is the same code, the same fixture and the same holder, differing
+    /// only in the [`HolderClaim`] the entry point names.
+    #[tokio::test]
+    async fn a_relayed_capsule_is_cached_without_announcing_while_a_local_one_announces() {
+        let (store_hex, root_hex) = (hex32(STORE), hex32(chain_root()));
+        let module = module_committing(STORE, chain_root());
+
+        // RELAYED — pulled for a stranger.
+        let relay_dir = temp_dir("relayed-warm");
+        let relay_spy = Arc::new(AnnounceSpy::default());
+        let relayed = serving_warmer(&relay_dir, &relay_spy, module.clone())
+            .warm_relayed(&store_hex, &root_hex)
+            .await;
+
+        // LOCAL — the identical pull, for this node's own sake. The control.
+        let local_dir = temp_dir("local-warm");
+        let local_spy = Arc::new(AnnounceSpy::default());
+        let local = serving_warmer(&local_dir, &local_spy, module.clone())
+            .warm(&store_hex, &root_hex)
+            .await;
+
+        let held = WarmOutcome::Held {
+            bytes: module.len() as u64,
+        };
+        assert_eq!(
+            local, held,
+            "the control must genuinely succeed, or its announce count proves nothing"
+        );
+        assert_eq!(
+            relayed, held,
+            "a relayed pull still verifies and caches — it is the holder CLAIM that is withheld"
+        );
+
+        assert_eq!(
+            local_spy.calls.load(Ordering::SeqCst),
+            1,
+            "a warm this node drove for itself announces exactly once"
+        );
+        assert_eq!(
+            relay_spy.calls.load(Ordering::SeqCst),
+            0,
+            "a warm driven by a stranger must never advertise this node as a holder of it"
+        );
+
+        // The bytes ARE cached in both cases: the relay serves its requestor's windows from the same
+        // artifact a holder serves from, byte-identically, so the requestor needs no second code path.
+        for dir in [&relay_dir, &local_dir] {
+            assert_eq!(
+                std::fs::read(cached_module_path(dir)).expect("module is at the cache path"),
+                module,
+                "the verified capsule is cached whether or not it was announced"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&relay_dir);
+        let _ = std::fs::remove_dir_all(&local_dir);
     }
 
     /// A [`ModulesCacheEvictor`](crate::tier0_live::ModulesCacheEvictor) that counts sweeps, so
