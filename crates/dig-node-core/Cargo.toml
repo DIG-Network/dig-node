@@ -217,17 +217,33 @@ dig-nat = "0.18"
 # Also on 0.17: the outbound /16+AS diversity caps (#1710/#1716) apply to the adoption path, so a
 # test fixture adopting two peers must place them in DIFFERENT /16 groups.
 # Pulled rustls-only (no native-tls) -- note `--all-features` is NOT a runnable configuration for
-# dig-gossip: with both `ring` and `aws-lc-rs` reachable rustls cannot pick a provider. Its dig-nat/dig-tls/dig-constants come from crates.io (same versions as here), so the
-# graph still unifies to ONE of each. The vendored chia-protocol/chia-sdk-client forks it path-patches
-# are re-declared at this SAME rev in the workspace `[patch.crates-io]` (a git dep's own patches do not
-# apply transitively — the #1529 3-rev lockstep: this dep rev + the two patch revs move together).
+# dig-gossip: with both `ring` and `aws-lc-rs` reachable rustls cannot pick a provider. Its
+# dig-nat/dig-tls/dig-constants come from crates.io (same versions as here), so the graph still
+# unifies to ONE of each.
+#
+# There are no vendored chia-protocol/chia-sdk-client forks to patch any more: dig-gossip 0.23.0
+# deleted both (dig_ecosystem#2228) and the workspace `[patch.crates-io]` section is RETIRED (see the
+# root manifest). The #1529 three-rev lockstep is retired with it. An earlier version of this comment
+# still described those patches as live; it was wrong, and a false manifest comment is how the next
+# lane reasons wrongly about the version line.
+#
+# THIS DEP IS THE CHIA-0.36 MIGRATION BLOCKER (dig_ecosystem#2761 WU4), measured 2026-08-22.
+# dig-gossip depends on `dig-peer-protocol = "0.6"`, whose ONLY published 0.6.x is 0.6.0, and that
+# declares `chia-protocol 0.26` + `chia-sdk-client 0.28` (which itself resolves chia-protocol 0.26).
+# So `chia-protocol 0.26.0` enters this graph through a path no dig-node manifest can edit, and NO
+# assignment of versions here removes it. dig-peer-protocol `main` and dig-gossip `main` are both
+# still on the 0.26 line, so the uplift is a release-first cascade (dig-peer-protocol, then
+# dig-gossip, then this workspace), not a dig-node-local edit. Uplifting dig-node alone would leave
+# `Bytes32` arriving from dig_gossip on 0.26 while `digstore-chain`/`chia-protocol` hand this crate
+# 0.36.1, splitting the store-melt authorization path in `seams/dig_peer/store_melted.rs` across two
+# chia-protocol versions: the exact byte-drift the migration exists to remove.
 dig-gossip = { git = "https://github.com/DIG-Network/dig-gossip", rev = "51054a4132ee51b7cee2cba1768b75ade5360f9c", default-features = false, features = ["rustls", "relay"] }
 # The canonical DIG network id (genesis challenge) for the gossip handshake / introducer scope.
 #
 # 0.9 is the TIP OF DIG-NODE'S CHIA LINE, and that — not 0.10 — is the correct target here (#2072).
 # dig-constants 0.10.0 moved to chia-protocol 0.36.1 / chia-wallet-sdk 0.34, while this workspace
-# builds against 0.26 / 0.30 including the chia-protocol fork dig-gossip vendors via
-# `[patch.crates-io]` above. Depending on 0.10 links a SECOND chia_protocol and every `Bytes32` this
+# builds against 0.26 / 0.30, which dig-gossip pins there via dig-peer-protocol 0.6 (see the
+# dig-gossip entry above). Depending on 0.10 links a SECOND chia_protocol and every `Bytes32` this
 # crate reads off `DIG_MAINNET` stops unifying with the rest of the workspace. Being current on
 # dig-constants is therefore downstream of the chia 0.36 migration, not a version-string edit.
 #
