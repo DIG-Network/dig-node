@@ -1011,8 +1011,24 @@ impl WalletBackend {
     /// `is_following` itself is deliberately left ALONE. Its permissive `_ => true` is correct for
     /// the sync-phase reporting it was written for, where an unmeasured tier must not be spent as
     /// evidence against a replica; narrowing it there would change a phase machine owned by another
-    /// family. The narrowing is a property of the MONEY read, so it lives at this call site, which
-    /// is the single gate every read that can produce `synced: true` already passes through.
+    /// family. The narrowing is a property of the MONEY read, so it lives at this call site.
+    ///
+    /// That placement has a LIMIT, and it is stated here rather than left to be rediscovered:
+    /// this method is the single gate for every read served by [`WalletBackend`] — each one either
+    /// passes through here or writes the literal `false` — but it is NOT the only producer of a
+    /// `synced` claim in the crate. [`super::sync_supervisor::SyncHandle::status`] reaches
+    /// `SyncPhase::Synced` through its own `is_following` call and pairs it with the replica's raw
+    /// `peak_height`, so `control.wallet.sync-status` can still emit
+    /// `{phase: "synced", peak_height: null}` — the exact pairing this gate abolishes on the money
+    /// reads. That path is deliberately out of scope: it is a status endpoint rather than a
+    /// currency claim, and the phase machine belongs to another family (dig_ecosystem#2761).
+    ///
+    /// The asymmetry worth carrying into that work: `is_following`'s own doc justifies its
+    /// permissive arm ENTIRELY in terms of an unmeasured PEER tier, and offers no justification at
+    /// all for the unmeasured-REPLICA arm. Those are different things. An absent peer height is a
+    /// missing second opinion, which is fairly read as no accusation; an absent replica height is
+    /// the subject of the claim having no measurement whatsoever, which supports no verdict in
+    /// either direction.
     async fn replica_answer_is_current(&self, peak_height: Option<u32>) -> bool {
         let Some(replica_peak) = peak_height else {
             return false;

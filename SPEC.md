@@ -4834,6 +4834,14 @@ Reservation MUST affect spend-input selection ONLY. Balance and display reads MU
 reserved coin, because the chain has not said it is spent. "What do I own" and "what may I spend
 next" are different questions.
 
+**Hex identity storage.** Every hex identity the replica stores for a coin — its `coin_id` and its
+`parent_coin_info` — MUST be normalised to LOWER-CASE hex at the point of WRITE, and every lookup that
+binds a caller-supplied coin id MUST normalise it the same way. The chain source is free to hand over
+either case, so a replica that stores it verbatim makes case a hidden axis of every equality test over
+identities: the node MUST NOT compare two stored identities, or a stored identity against a supplied
+one, in a way whose answer depends on the case the chain source chose. A replica written by an earlier
+build MUST be normalised in place before it is read.
+
 Every reservation MUST expire. Release is normally observational — the coin is seen spent, or the
 bundle is definitively refused — and the expiry is the backstop that keeps a release path which never
 runs from stranding a coin permanently. Failing to record a reservation MUST NOT fail a push that the

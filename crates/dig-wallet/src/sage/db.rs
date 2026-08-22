@@ -561,8 +561,11 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
 /// than by a value derived from the offered coin set.
 const OFFERS_KEYED_BY_CANONICAL_ID: i64 = 1;
 
+/// Ladder step 2: every hex identity in `coins` is stored lower-case (dig-node#293).
+const COINS_STORED_LOWER_CASE: i64 = 2;
+
 /// The highest ladder step this build knows how to apply.
-const SCHEMA_VERSION: i64 = OFFERS_KEYED_BY_CANONICAL_ID;
+const SCHEMA_VERSION: i64 = COINS_STORED_LOWER_CASE;
 
 /// Indexes that depend on a column [`ADD_COLUMN_MIGRATIONS`] may only just have added, so they
 /// cannot live in [`SCHEMA`]: on a legacy DB the index would be created against a column that does
@@ -783,6 +786,9 @@ impl WalletDb {
         if applied < OFFERS_KEYED_BY_CANONICAL_ID {
             self.rekey_offers_to_canonical_ids().await?;
         }
+        if applied < COINS_STORED_LOWER_CASE {
+            self.normalise_stored_coin_hex().await?;
+        }
 
         // Marked only after every step above SUCCEEDED, so a migration that failed part-way is
         // retried on the next open rather than being recorded as done.
@@ -791,6 +797,48 @@ impl WalletDb {
                 .execute(&self.pool)
                 .await?;
         }
+        Ok(())
+    }
+
+    /// Lower-case the hex identities of coins written before the writer normalised (dig-node#293).
+    ///
+    /// Fixing [`Self::upsert_coin`] does nothing for rows already on disk, and those rows are
+    /// precisely the ones the defect was found on: a wallet that has been running is the only kind
+    /// that can hold an upper-case id. Without this step the fix would appear to work on a fresh
+    /// database and leave every existing one broken.
+    ///
+    /// Nothing is at risk. `coins` is a REPLICA of chain state, so even total loss is recoverable
+    /// by re-syncing — the opposite of the offers table, whose contents are not derivable from
+    /// chain and whose migration is correspondingly careful.
+    ///
+    /// The DELETE is the collision case and it has to come first. `AABB` and `aabb` are the same
+    /// coin, and `coin_id` is a `PRIMARY KEY`, so lower-casing the first into the second is a
+    /// uniqueness violation that would abort the whole step. The upper-case row is the one dropped
+    /// because a lower-case twin can only have been written by the fixed code, making it the
+    /// fresher observation of the two. `LOWER(coin_id) IN (SELECT coin_id FROM coins)` cannot
+    /// match a row against itself: an upper-case row never equals its own lower-casing.
+    ///
+    /// One transaction, so a failure part-way leaves every row under its original key for the next
+    /// open to retry — the ladder mark is written only after this returns.
+    async fn normalise_stored_coin_hex(&self) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM coins
+             WHERE coin_id <> LOWER(coin_id)
+               AND LOWER(coin_id) IN (SELECT coin_id FROM coins)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE coins SET coin_id = LOWER(coin_id) WHERE coin_id <> LOWER(coin_id)")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "UPDATE coins SET parent_coin_info = LOWER(parent_coin_info)
+             WHERE parent_coin_info <> LOWER(parent_coin_info)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1116,8 +1164,33 @@ impl WalletDb {
 
     // ---- coins ------------------------------------------------------------
 
+    /// **The `coins` table stores hex identities LOWER-CASE, and this is the property every
+    /// lookup by id depends on** (dig-node#293).
+    ///
+    /// The chain source hands over whatever case it likes, and the read layer was already written
+    /// as though it did not: `reserve_spend` normalises the ids it writes, `reserved_coin_ids`
+    /// lower-cases what it reads back, and `unspent_coins_scoped` lower-cases the puzzle hash it
+    /// binds before comparing it against the stored column. Every one of those is correct ONLY if
+    /// the writer normalised first, and the writer did not.
+    ///
+    /// Three raw comparisons were reachable because of it, and they failed in different
+    /// directions: a settled bundle never retired and stranded its own inputs for a full TTL;
+    /// `are_coins_spendable` reported a genuinely spendable coin unspendable to a Sage-parity
+    /// caller; and `record_arrivals` failed to recognise the wallet's own parent coin, so its own
+    /// change was announced to the user as an incoming payment.
+    ///
+    /// Normalising HERE rather than at each of the three readers is what makes that class closed
+    /// rather than enumerated — a fourth reader added later inherits the guarantee instead of
+    /// having to remember it. It also keeps the reads on their indexes: `coin_id` is the table's
+    /// `PRIMARY KEY`, and a `LOWER()` wrapped around it in a predicate makes that index unusable.
+    fn normalise_hex(s: &str) -> String {
+        s.to_ascii_lowercase()
+    }
+
     /// Insert or update a coin's chain state (the `coin_state_update` upsert). A coin is
     /// keyed by `coin_id`; a later update (e.g. a spend) overwrites the mutable fields.
+    ///
+    /// `coin_id` and `parent_coin_info` are normalised on the way in — see [`Self::normalise_hex`].
     pub async fn upsert_coin(&self, c: &CoinRow) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT INTO coins
@@ -1132,8 +1205,8 @@ impl WalletDb {
                 asset_id = COALESCE(excluded.asset_id, coins.asset_id),
                 hint = COALESCE(excluded.hint, coins.hint)",
         )
-        .bind(&c.coin_id)
-        .bind(&c.parent_coin_info)
+        .bind(Self::normalise_hex(&c.coin_id))
+        .bind(Self::normalise_hex(&c.parent_coin_info))
         .bind(&c.puzzle_hash)
         .bind(&c.amount)
         .bind(c.created_height)
@@ -1164,8 +1237,8 @@ impl WalletDb {
                     asset_id = COALESCE(excluded.asset_id, coins.asset_id),
                     hint = COALESCE(excluded.hint, coins.hint)",
             )
-            .bind(&c.coin_id)
-            .bind(&c.parent_coin_info)
+            .bind(Self::normalise_hex(&c.coin_id))
+            .bind(Self::normalise_hex(&c.parent_coin_info))
             .bind(&c.puzzle_hash)
             .bind(&c.amount)
             .bind(c.created_height)
@@ -1664,13 +1737,16 @@ impl WalletDb {
     }
 
     /// Whether every given coin id is currently unspent (confirmed, `spent_height IS NULL`).
+    ///
+    /// The ids come from the caller (the Sage-parity `get_are_coins_spendable` endpoint), so they
+    /// are normalised to the case the table stores — see [`Self::normalise_hex`].
     pub async fn are_coins_spendable(&self, ids: &[String]) -> sqlx::Result<bool> {
         for id in ids {
             let row = sqlx::query(
                 "SELECT 1 AS ok FROM coins
                  WHERE coin_id = ? AND spent_height IS NULL AND created_height IS NOT NULL",
             )
-            .bind(id)
+            .bind(Self::normalise_hex(id))
             .fetch_optional(&self.pool)
             .await?;
             if row.is_none() {
@@ -1769,18 +1845,22 @@ impl WalletDb {
     /// They are named separately because they are different events and a reader should not have to
     /// infer that the code treats them alike on purpose.
     ///
-    /// The join LOWER-cases the coin side because the two tables do not agree on case:
-    /// [`Self::reserve_spend`] normalises every id it writes, while `coins` stores whatever hex the
-    /// chain source handed over. A raw `c.coin_id = r.coin_id` therefore silently matched nothing
-    /// for a coin recorded in upper-case hex — its bundle would never retire on settlement and
-    /// would strand its inputs for the whole TTL. The selection path already normalises both sides
-    /// ([`Self::unreserved_unspent_coins`]), so this is the one place that still compared raw.
+    /// The join compares the two ids RAW, and that is now correct rather than a latent bug: both
+    /// sides are normalised by their writers ([`Self::reserve_spend`] and [`Self::normalise_hex`]),
+    /// so there is no case left for the predicate to disagree about.
+    ///
+    /// The first version of this fix wrapped the coin side in `LOWER()` instead. That worked, but
+    /// it was a normaliser applied to a `PRIMARY KEY`: SQLite cannot use an index through a
+    /// function call, so the join degraded to a full scan of `coins` for every reservation row,
+    /// and it repaired exactly one of the three readers that compared raw. Normalising at the
+    /// writer fixes all three AND leaves the key usable, so keeping the `LOWER()` beside it would
+    /// buy nothing but the scan. It is deliberately NOT retained as belt-and-braces.
     pub async fn prune_reservations(&self, now_ms: i64) -> sqlx::Result<u64> {
         let n = sqlx::query(
             "DELETE FROM pending_transactions WHERE expires_at <= ?
              OR transaction_id IN (
                 SELECT r.transaction_id FROM coin_reservations r
-                JOIN coins c ON LOWER(c.coin_id) = r.coin_id
+                JOIN coins c ON c.coin_id = r.coin_id
                 WHERE c.spent_height IS NOT NULL
              )",
         )
@@ -2163,7 +2243,7 @@ impl WalletDb {
         sqlx::query("UPDATE coins SET asset_id = ?, hint = COALESCE(?, hint) WHERE coin_id = ?")
             .bind(asset_id)
             .bind(hint)
-            .bind(coin_id)
+            .bind(Self::normalise_hex(coin_id))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -4374,6 +4454,156 @@ mod tests {
             db.unreserved_unspent_coins(None).await.unwrap().len(),
             1,
             "the settled bundle's other input stayed stranded until its TTL"
+        );
+    }
+
+    // ---- the `coins` table stores lower-case hex (dig-node#293 round 2) ----
+    //
+    // These three cover the three raw `coin_id` comparisons that survived the first fix. Each
+    // varies ONE axis — the case the chain source happened to hand over — and each carries a
+    // control that a blanket "match everything" implementation would fail, so none of them can be
+    // satisfied by a comparison that stopped discriminating.
+
+    /// **A coin stored in upper-case hex is still spendable when asked about in lower case.**
+    ///
+    /// `are_coins_spendable` backs the Sage-parity `get_are_coins_spendable` endpoint, whose ids
+    /// come straight from the caller. Comparing raw made an upper-case row invisible, so a
+    /// genuinely spendable coin was reported unspendable. It fails CLOSED — a refusal, not a
+    /// theft — but it is still a wrong answer about money given to a parity consumer.
+    ///
+    /// CONTROL: an id that names no coin at all must still answer `false`. Without it the
+    /// assertion would also hold for an implementation that answered `true` unconditionally.
+    #[tokio::test]
+    async fn a_coin_stored_upper_case_is_spendable_under_a_lower_case_id() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("AABB", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        assert!(
+            db.are_coins_spendable(&["aabb".to_string()]).await.unwrap(),
+            "a spendable coin read as unspendable because its stored hex was upper-case"
+        );
+        assert!(
+            db.are_coins_spendable(&["AABB".to_string()]).await.unwrap(),
+            "the same coin stopped being found under the exact hex it was written with"
+        );
+        assert!(
+            !db.are_coins_spendable(&["ffff".to_string()]).await.unwrap(),
+            "CONTROL: an unknown coin id was reported spendable"
+        );
+    }
+
+    /// **The wallet's own change is not announced as an incoming payment when the two sides of the
+    /// parent link disagree on case.**
+    ///
+    /// `record_arrivals` answers `parent_is_ours` with `SELECT 1 FROM coins WHERE coin_id = ?`
+    /// bound to the child's `parent_coin_info`. Compared raw, a parent written `AABB` does not
+    /// match a child pointing at `aabb`, `classify` sees a foreign parent, and the wallet's own
+    /// change comes back to the user as money that arrived from someone else — the same family of
+    /// money-display lie as dig-node#293 itself.
+    ///
+    /// FIXTURE DESIGN. The two sides are written in DIFFERENT cases on purpose: a fixture where
+    /// both are upper-case matches raw and cannot see this defect at all, and a fix applied to
+    /// only one of the two comparison sides would satisfy it. The foreign-parent coin beside it is
+    /// the control — it must STILL be announced, so the test cannot be passed by a recorder that
+    /// has simply stopped announcing arrivals.
+    #[tokio::test]
+    async fn own_change_is_not_announced_as_incoming_across_a_case_mismatch() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
+            .await
+            .unwrap();
+
+        // The parent, as the chain source handed it over: upper-case.
+        db.upsert_coin(&coin("AABB", 500, Some(50), Some(101)))
+            .await
+            .unwrap();
+        // Its child — our own change — naming that parent in lower-case hex.
+        let mut change = coin("change", 400, Some(101), None);
+        change.parent_coin_info = "aabb".into();
+        db.upsert_coin(&change).await.unwrap();
+        // CONTROL: a coin at our address from a parent we genuinely do not hold.
+        db.upsert_coin(&incoming("paid", 700, 101)).await.unwrap();
+
+        assert_eq!(
+            db.record_arrivals(&watched(), 101).await.unwrap(),
+            1,
+            "the wallet's own change was announced as an incoming payment"
+        );
+        let announced: Vec<String> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.coin_id)
+            .collect();
+        assert_eq!(
+            announced,
+            vec!["paid".to_string()],
+            "CONTROL: the genuinely foreign payment stopped being announced"
+        );
+    }
+
+    /// **A database written before the writer normalised is repaired on open.**
+    ///
+    /// Fixing the writer does nothing for rows already on disk, and those rows are exactly the
+    /// ones the three defects above were found on. The ladder step lower-cases them once.
+    ///
+    /// The duplicate pair is the case that would otherwise abort the migration: `AABB` and `aabb`
+    /// are the same coin under a `PRIMARY KEY` that cannot hold both, so the stale upper-case row
+    /// is dropped in favour of the canonical one rather than colliding with it.
+    #[tokio::test]
+    async fn a_legacy_database_has_its_coin_hex_normalised_on_open() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        // Write past the normalising accessors, exactly as the old build did.
+        for (id, parent) in [("CCDD", "EEFF"), ("AABB", "0011"), ("aabb", "0011")] {
+            sqlx::query(
+                "INSERT OR REPLACE INTO coins
+                    (coin_id, parent_coin_info, puzzle_hash, amount, created_height)
+                 VALUES (?, ?, 'ph', '1', 10)",
+            )
+            .bind(id)
+            .bind(parent)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        // Re-arm the ladder so the step runs again on this already-open database.
+        sqlx::query(&format!(
+            "PRAGMA user_version = {}",
+            COINS_STORED_LOWER_CASE - 1
+        ))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let ids: Vec<String> = sqlx::query("SELECT coin_id FROM coins ORDER BY coin_id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("coin_id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["aabb".to_string(), "ccdd".to_string()],
+            "legacy upper-case coin ids survived the migration"
+        );
+        let parents: Vec<String> =
+            sqlx::query("SELECT parent_coin_info FROM coins ORDER BY coin_id")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("parent_coin_info"))
+                .collect();
+        assert_eq!(
+            parents,
+            vec!["0011".to_string(), "eeff".to_string()],
+            "legacy upper-case parent links survived the migration"
         );
     }
 
