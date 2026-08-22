@@ -41,6 +41,7 @@ use dig_download::{
 use dig_peer::DigPeer;
 use dig_rpc_protocol::types::{FetchModuleRangeParams, GetModuleInfoParams, ModuleInfo};
 
+use crate::download::BestEffort;
 use super::pool_locator::ConnectedPool;
 
 /// The peer-RPC transport the module pull rides.
@@ -103,7 +104,11 @@ impl NatModuleTransport {
         })?;
 
         let mut record_addrs: Vec<CandidateAddr> = self.pool_candidates(peer_hex);
-        record_addrs.extend(self.discovered_candidates(peer_hex, store_id, root).await);
+        record_addrs.extend(
+            self.discovered_candidates(peer_hex, store_id, root)
+                .await
+                .for_finding(),
+        );
 
         // Order + cap the merged candidate set through dig-download's ONE resolver: IPv6 before IPv4
         // (§5.2), and each socket CONSTRUCTED from a parsed IpAddr rather than a formatted string
@@ -153,25 +158,34 @@ impl NatModuleTransport {
             .unwrap_or_default()
     }
 
-    /// The peer's advertised addresses from capsule-granularity discovery (empty on any failure —
-    /// discovery is best-effort; the pool addresses above must never be lost to a DHT error).
+    /// The peer's advertised addresses from capsule-granularity discovery.
+    ///
+    /// Best-effort by design: the live pool addresses this enriches must never be lost to a DHT
+    /// error. But the emptiness it can produce is ambiguous — a walk that failed and a walk that
+    /// found no advertisement look identical as a bare `Vec` — so the failure is carried out in a
+    /// [`BestEffort`] rather than discarded, and a caller can only read an absence from it through
+    /// `absence_established()` (dig-node#296).
     async fn discovered_candidates(
         &self,
         peer_hex: &str,
         store_id: &str,
         root: &str,
-    ) -> Vec<CandidateAddr> {
+    ) -> BestEffort<CandidateAddr> {
         let Some(content) = module_content_id(store_id, root) else {
-            return Vec::new();
+            // A non-canonical id was never asked about, so nothing was found AND nothing failed:
+            // this is a genuine "no advertisement", not an unreachable source.
+            return BestEffort::found(Vec::new());
         };
         let Ok(records) = self.locator.find_providers(&content).await else {
-            return Vec::new();
+            return BestEffort::source_failed();
         };
-        records
-            .into_iter()
-            .find(|r| r.provider_peer_id == peer_hex)
-            .map(|r| r.addresses)
-            .unwrap_or_default()
+        BestEffort::found(
+            records
+                .into_iter()
+                .find(|r| r.provider_peer_id == peer_hex)
+                .map(|r| r.addresses)
+                .unwrap_or_default(),
+        )
     }
 
     /// Dial `peer_hex`, trying every candidate in order and reporting the LAST failure with the address
