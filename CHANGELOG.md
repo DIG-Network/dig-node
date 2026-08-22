@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.138.0] - 2026-08-22
+
+### Features
+- **bootstrap:** Dial always-on bootstrap peers so a fresh node has a dialable peer (#245)
+
 ## [0.137.0] - 2026-08-22
 
 ### Bug Fixes
