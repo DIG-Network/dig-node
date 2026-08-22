@@ -4229,8 +4229,14 @@ byte-for-byte:
   order equals declaration order.
 
 18.4. **Error model.** `ErrorKind` → HTTP status: `api` → `400`, `not_found` → `404`, `unauthorized` →
-`401`, `wallet`/`internal` → `500`. An unknown/unsupported method is `404`; a malformed request body is
-`400`.
+`401`, `unavailable` → `503`, `wallet`/`internal` → `500`. An unknown/unsupported method is `404`; a
+malformed request body is `400`.
+
+`unavailable` is distinct from `internal` and the distinction is normative: `internal` means the node
+tried and something broke, while `unavailable` means the node is working correctly and is NOT ENTITLED
+to the answer. A read that cannot be honestly answered MUST return `unavailable`; it MUST NOT return a
+figure, because the only figure available to it is `0` and the caller cannot distinguish that from
+holding nothing.
 
 18.5. **Local wallet database (SQLite).** The sync loop persists the wallet's chain state to a local
 SQLite database (via `sqlx`), mirroring `sage-wallet`'s relational store: coins/CATs/derivations (and
@@ -4894,6 +4900,27 @@ hashes/addresses).
   hash and is hinted to the owner p2). Absent a session identity, reads fall back to the node's own
   configured puzzle hashes (legacy); when BOTH are empty the node is tracking no wallet and scoped reads
   return nothing.
+- **A balance is never reported for a scope the replica does not cover.** Every balance-bearing read
+  — `get_sync_status`, `get_token`, `get_cats`, `get_all_cats`, `get_coins` — MUST first establish that
+  the completed catch-up COVERS the session identity's addresses. The replica is only ever asked to
+  follow the addresses a catch-up ran over, so querying it for an uncovered identity returns nothing,
+  and nothing is reported downstream as a chain-confirmed zero. Note that `login` does NOT enrol: a
+  client that logs in without `control.wallet.watch` is never covered, so this state is permanent
+  rather than transient and cannot be waited out.
+
+  An uncovered scope MUST be answered by one of exactly two shapes, and never by a zero. Where the
+  chain can be asked directly — XCH coins, which sit AT the identity's puzzle hashes — the read is
+  ROUTED to the chain source, and its confirmed-and-unspent predicate MUST be re-applied to that
+  answer, since a chain read returns recently-spent coins too. Where the chain cannot answer — a CAT,
+  which is only HINTED to its owner and needs puzzle uncurrying the fallback tier does not perform, and
+  the CAT LIST, which is itself a replica read — the node MUST REFUSE with `unavailable`. The gate on
+  the list is required independently of the gate on each token: an uncovered scope yields no asset ids,
+  so a per-token gate is never reached and the caller is told it owns no CATs.
+
+  The predicate MUST be containment of the CLIENT's scope, never whether the replica is authoritative
+  over its own followed set: under the node-holds-no-custody rule that followed set may be empty, every
+  recording trivially contains it, and the gate would pass for every client while changing nothing.
+
 - **Honest sync state (never a silent synced-zero).** `get_sync_status` reports `synced_coins`/
   `total_coins` TRUTHFULLY. A client derives "synced" as `synced_coins >= total_coins` (treating
   `total_coins == 0` as synced). The node reports synced ONLY when it is tracking the identity AND the
@@ -4996,20 +5023,32 @@ Reservation MUST affect spend-input selection ONLY. Balance and display reads MU
 reserved coin, because the chain has not said it is spent. "What do I own" and "what may I spend
 next" are different questions.
 
-**Hex identity storage.** Every hex identity the replica stores for a coin — its `coin_id` and its
-`parent_coin_info` — MUST be normalised to LOWER-CASE hex at the point of WRITE, and every lookup that
-binds a caller-supplied coin id MUST normalise it the same way. The chain source is free to hand over
-either case, so a replica that stores it verbatim makes case a hidden axis of every equality test over
-those identities: the node MUST NOT compare two stored coin identities, or a stored coin identity
-against a supplied one, in a way whose answer depends on the case the chain source chose. A replica
-written by an earlier build MUST be normalised in place before it is read, and every table that keys
-a row by a coin id MUST be normalised in the SAME transaction as the coin table, since those keys are
-compared against it raw. Where several stored spellings of one coin id would collide under that
-normalisation, the node MUST reduce them to one deterministically rather than fail the migration.
+**Hex storage.** Every hex value the replica stores and later compares — a coin's `coin_id` and
+`parent_coin_info`, the three values a wallet read is SCOPED by (`puzzle_hash`, `asset_id`, `hint`),
+and the hex columns keyed on outside the coin table (a derivation's `puzzle_hash`, a CAT's
+`asset_id`) — MUST be normalised to LOWER-CASE hex at the point of WRITE, and every lookup that binds
+a caller-supplied value against one of them MUST normalise it the same way. The chain source and the
+calling client are each free to hand over either case, so a replica that stores it verbatim makes case
+a hidden axis of every equality test: the node MUST NOT compare two stored hex values, or a stored
+value against a supplied one, in a way whose answer depends on the case its source chose.
 
-This requirement is scoped to the two coin identities and does NOT presently extend to the other hex
-columns a coin row carries (`puzzle_hash`, `asset_id`, `hint`), which are stored as the chain source
-spelled them.
+The consequence is not cosmetic and is stated as a requirement in its own right: **a coin the wallet
+holds MUST count toward the reported balance regardless of the case its puzzle hash, asset id or hint
+was spelled in.** A scoped read that misses such a coin reports the user a balance of zero, which is
+indistinguishable from holding nothing.
+
+Normalisation MUST be performed at the WRITER rather than by wrapping the stored column in a
+case-folding function at each reader. Those columns are indexed or are primary keys, and a function
+applied to a column makes its index unusable, so a reader-side fix degrades every scoped balance read
+to a full table scan while repairing only the readers that remembered.
+
+A replica written by an earlier build MUST be normalised in place before it is read, in ONE
+transaction, and every table that keys or scopes a row by one of these values MUST be normalised in
+that same transaction, since those values are compared against each other raw. Where several stored
+spellings of one value would collide under that normalisation, the node MUST reduce them to one
+deterministically rather than fail the migration — a migration that aborts is retried identically on
+the next open and leaves the wallet permanently unopenable. Where the colliding rows carry state that
+is NOT derivable from chain, that state MUST be merged onto the surviving row rather than dropped.
 
 Every reservation MUST expire. Release is normally observational — the coin is seen spent, or the
 bundle is definitively refused — and the expiry is the backstop that keeps a release path which never

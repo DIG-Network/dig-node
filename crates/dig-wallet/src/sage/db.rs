@@ -572,8 +572,35 @@ const COINS_STORED_LOWER_CASE: i64 = 2;
 /// raw, so normalising one table without the others is a desync, not a partial fix.
 const COIN_ID_TABLES: [&str; 3] = ["coins", "arrival_pending", "arrivals"];
 
+/// Ladder step 3: every hex value the wallet SCOPES or KEYS on is stored lower-case
+/// (dig-node#298) — the three `coins` scoping columns and the two hex columns outside it.
+const SCOPED_HEX_STORED_LOWER_CASE: i64 = 3;
+
+/// Every `(table, column)` holding a hex value that a lower-cased bind is compared against, and
+/// which [`SCOPED_HEX_STORED_LOWER_CASE`] therefore normalises.
+///
+/// **None of these columns is a key**, which is what makes them a plain `UPDATE`: two spellings
+/// of one puzzle hash are two legitimate rows, not a uniqueness violation, so there is nothing to
+/// collide and nothing to drop. `cats.asset_id` is the sole exception and is handled separately
+/// by [`WalletDb::merge_cat_case_collisions`], because it IS a `PRIMARY KEY`.
+///
+/// `arrivals` and the two chain caches are included even though their own writers copy already-
+/// normalised values out of `coins`: a row written by a PRE-fix build is on disk regardless of
+/// what the current writer does, and `arrivals.puzzle_hash` is reported to the user as the
+/// address a payment landed at.
+const SCOPED_HEX_COLUMNS: [(&str, &str); 8] = [
+    ("coins", "puzzle_hash"),
+    ("coins", "asset_id"),
+    ("coins", "hint"),
+    ("derivations", "puzzle_hash"),
+    ("arrivals", "puzzle_hash"),
+    ("arrivals", "asset_id"),
+    ("chain_read_cache", "puzzle_hash"),
+    ("chain_spend_cache", "puzzle_hash"),
+];
+
 /// The highest ladder step this build knows how to apply.
-const SCHEMA_VERSION: i64 = COINS_STORED_LOWER_CASE;
+const SCHEMA_VERSION: i64 = SCOPED_HEX_STORED_LOWER_CASE;
 
 /// Indexes that depend on a column [`ADD_COLUMN_MIGRATIONS`] may only just have added, so they
 /// cannot live in [`SCHEMA`]: on a legacy DB the index would be created against a column that does
@@ -797,6 +824,9 @@ impl WalletDb {
         if applied < COINS_STORED_LOWER_CASE {
             self.normalise_stored_coin_hex().await?;
         }
+        if applied < SCOPED_HEX_STORED_LOWER_CASE {
+            self.normalise_stored_scoped_hex().await?;
+        }
 
         // Marked only after every step above SUCCEEDED, so a migration that failed part-way is
         // retried on the next open rather than being recorded as done.
@@ -903,15 +933,7 @@ impl WalletDb {
         .map(|r| r.get::<String, _>("coin_id"))
         .collect();
 
-        let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-        for spelling in spellings {
-            groups
-                .entry(spelling.to_ascii_lowercase())
-                .or_default()
-                .push(spelling);
-        }
-
-        for (canonical, group) in &groups {
+        for (canonical, group) in &Self::case_groups(spellings) {
             let Some(survivor) = Self::surviving_spelling(group) else {
                 continue;
             };
@@ -948,6 +970,147 @@ impl WalletDb {
             .find(|s| !s.bytes().any(|b| b.is_ascii_uppercase()))
             .or_else(|| group.iter().min())
             .map(String::as_str)
+    }
+
+    /// Lower-case every hex value the wallet SCOPES or KEYS on, for rows written before the
+    /// writer normalised (dig-node#298).
+    ///
+    /// Fixing the writers does nothing for rows already on disk, and a populated replica is
+    /// exactly the one holding the user's coins — so without this step the fix would appear to
+    /// work on a fresh database and leave every existing one reporting a balance of zero.
+    ///
+    /// # dig-node#293's warrant does NOT transfer, which is why this is not defence-in-depth
+    ///
+    /// The identity migration could argue that every in-tree writer already emitted `hex::encode`
+    /// output, so the statements matched zero rows on any wallet this ecosystem had written, and
+    /// the step defended only against a third-party `ChainFallback`/`CoinPeer` implementation.
+    ///
+    /// That argument holds for the three `coins` scoping columns and for `derivations`, whose
+    /// writers are the same `hex::encode` paths. **It fails for `cats.asset_id`**:
+    /// [`super::actions::update_cat`] persists a CALLER-SUPPLIED `TokenRecord`, so the
+    /// `update_cat` RPC is an in-tree, shipped, reachable way to write a shouted asset id today,
+    /// with no out-of-tree implementation required. A `cats` row written that way is unreachable
+    /// by every canonical lookup, and its name, ticker and icon are not derivable from chain.
+    ///
+    /// So this step is a genuine repair for at least one column, not a belt-and-braces pass.
+    ///
+    /// # Eight plain updates and one collision
+    ///
+    /// None of [`SCOPED_HEX_COLUMNS`] is a key, so two spellings of one value are two legitimate
+    /// rows and the update has nothing to collide with. `cats.asset_id` is a `PRIMARY KEY` and is
+    /// therefore resolved first, by [`Self::merge_cat_case_collisions`].
+    ///
+    /// `<> LOWER(col)` is NULL-safe: for a NULL `asset_id` or `hint` the predicate evaluates to
+    /// NULL, the row is not matched, and absence survives as absence. That matters more than it
+    /// looks — `asset_id IS NULL` is how an XCH coin is told from a CAT coin.
+    ///
+    /// One transaction, so any failure rolls every table back together and the ladder mark —
+    /// written only after this returns — stays unset for the next open to retry.
+    async fn normalise_stored_scoped_hex(&self) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (table, column) in SCOPED_HEX_COLUMNS {
+            // Both identifiers are compile-time constants from `SCOPED_HEX_COLUMNS`, never caller
+            // input, so interpolating them is not an injection surface. SQLite cannot bind an
+            // identifier.
+            sqlx::query(&format!(
+                "UPDATE {table} SET {column} = LOWER({column}) WHERE {column} <> LOWER({column})"
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
+        Self::merge_cat_case_collisions(&mut tx).await?;
+        sqlx::query("UPDATE cats SET asset_id = LOWER(asset_id) WHERE asset_id <> LOWER(asset_id)")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reduce every set of CAT asset ids that differ only in case to ONE row, carrying the losers'
+    /// metadata onto the survivor, so the lower-casing that follows cannot violate the primary key.
+    ///
+    /// The alternative is not "a slightly wrong row survives" — it is a `UNIQUE` violation that
+    /// rolls the migration back, deterministically, on every subsequent open, leaving the wallet
+    /// permanently unopenable.
+    ///
+    /// # Merged, not dropped
+    ///
+    /// [`Self::drop_case_collisions`] deletes its losers outright, and justifies that by all three
+    /// of its tables being derived from chain state: the worst case is a coin re-observed on the
+    /// next sync. **A `cats` row is not derived from chain.** Its name, ticker, description, icon
+    /// and visibility come from a token registry or from the user, and nothing on chain would put
+    /// them back — so the losers' non-NULL fields are COALESCEd onto the survivor before the row
+    /// goes. `precision` and `visible` are NOT NULL, so the survivor's own values stand.
+    ///
+    /// The group is the COMPLETE lower-value equivalence class, for any number of spellings rather
+    /// than the two-spelling case alone — a merge scoped to "rows whose lower-casing already
+    /// exists" would leave `AAbb` and `aAbb` untouched and collide them a statement later.
+    async fn merge_cat_case_collisions(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    ) -> sqlx::Result<()> {
+        // Normally zero rows: only asset ids that have a case-twin are read back.
+        let spellings: Vec<String> = sqlx::query(
+            "SELECT asset_id FROM cats
+             WHERE LOWER(asset_id) IN (
+                 SELECT LOWER(asset_id) FROM cats
+                 GROUP BY LOWER(asset_id) HAVING COUNT(*) > 1
+             )",
+        )
+        .fetch_all(&mut **tx)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>("asset_id"))
+        .collect();
+
+        for (canonical, group) in Self::case_groups(spellings) {
+            let Some(survivor) = Self::surviving_spelling(&group) else {
+                continue;
+            };
+            let survivor = survivor.to_string();
+            for loser in group.iter().filter(|s| **s != survivor) {
+                sqlx::query(
+                    "UPDATE cats SET
+                        name = COALESCE(name, (SELECT name FROM cats WHERE asset_id = ?1)),
+                        ticker = COALESCE(ticker, (SELECT ticker FROM cats WHERE asset_id = ?1)),
+                        description = COALESCE(
+                            description, (SELECT description FROM cats WHERE asset_id = ?1)),
+                        icon_url = COALESCE(
+                            icon_url, (SELECT icon_url FROM cats WHERE asset_id = ?1))
+                     WHERE asset_id = ?2",
+                )
+                .bind(loser)
+                .bind(&survivor)
+                .execute(&mut **tx)
+                .await?;
+                sqlx::query("DELETE FROM cats WHERE asset_id = ?")
+                    .bind(loser)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            tracing::warn!(
+                asset_id = %canonical,
+                kept = %survivor,
+                merged = group.len() - 1,
+                "legacy replica held one CAT under several hex spellings; merging into one"
+            );
+        }
+        Ok(())
+    }
+
+    /// Group hex spellings by the canonical value they all lower-case to.
+    ///
+    /// Shared by both collision resolvers so they cannot come to disagree about what a collision
+    /// IS. The group must be the complete equivalence class, not a pair — that is the property
+    /// that keeps a three-way collision from surviving the resolver and aborting the update.
+    fn case_groups(spellings: Vec<String>) -> std::collections::BTreeMap<String, Vec<String>> {
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for spelling in spellings {
+            groups
+                .entry(spelling.to_ascii_lowercase())
+                .or_default()
+                .push(spelling);
+        }
+        groups
     }
 
     /// Re-key stored offers onto the canonical offer id (dig-node#283).
@@ -1181,7 +1344,7 @@ impl WalletDb {
         .bind(d.hardened)
         .bind(d.index)
         .bind(&d.public_key)
-        .bind(&d.puzzle_hash)
+        .bind(Self::normalise_hex(&d.puzzle_hash))
         .bind(&d.address)
         .execute(&self.pool)
         .await?;
@@ -1272,38 +1435,70 @@ impl WalletDb {
 
     // ---- coins ------------------------------------------------------------
 
-    /// **The `coins` table stores its two COIN IDENTITIES — `coin_id` and `parent_coin_info` —
-    /// LOWER-CASE, and this is the property every lookup by id depends on** (dig-node#293).
+    /// **Every hex value the `coins` table stores is stored LOWER-CASE, and this is the property
+    /// every lookup and every scope comparison depends on** (dig-node#293, widened by #298).
     ///
-    /// The scope is exactly those two columns. `puzzle_hash`, `asset_id` and `hint` are still
-    /// stored VERBATIM as the chain source spelled them, here and in `attribute_cat_coin`, while
-    /// `unspent_coins_scoped` lower-cases the values it binds against them — so the guarantee
-    /// below must not be read as covering them. That mismatch is a separate defect (dig-node#298),
-    /// not a claim this function makes.
+    /// The scope is now all five hex columns the wallet keys or scopes on: the two COIN
+    /// IDENTITIES `coin_id` and `parent_coin_info`, and the three SCOPING values `puzzle_hash`,
+    /// `asset_id` and `hint` — here, in [`Self::upsert_coins`] and in
+    /// [`Self::attribute_cat_coin`] — plus `derivations.puzzle_hash` and `cats.asset_id`, which
+    /// are compared against the same values from their own tables.
     ///
     /// The chain source hands over whatever case it likes, and the read layer was already written
-    /// as though it did not: `reserve_spend` normalises the ids it writes and `reserved_coin_ids`
-    /// lower-cases what it reads back. Both are correct ONLY if the writer normalised first, and
-    /// the writer did not.
+    /// as though it did not. #293 closed the identity half: `reserve_spend` normalises the ids it
+    /// writes and `reserved_coin_ids` lower-cases what it reads back, and both are correct ONLY
+    /// if the writer normalised first.
     ///
-    /// Three raw comparisons were reachable because of it, and they failed in different
-    /// directions: a settled bundle never retired and stranded its own inputs for a full TTL;
-    /// `are_coins_spendable` reported a genuinely spendable coin unspendable to a Sage-parity
-    /// caller; and `record_arrivals` failed to recognise the wallet's own parent coin, so its own
-    /// change was announced to the user as an incoming payment.
+    /// Three raw comparisons were reachable through the identity columns, and they failed in
+    /// different directions: a settled bundle never retired and stranded its own inputs for a
+    /// full TTL; `are_coins_spendable` reported a genuinely spendable coin unspendable to a
+    /// Sage-parity caller; and `record_arrivals` failed to recognise the wallet's own parent coin,
+    /// so its own change was announced to the user as an incoming payment.
     ///
-    /// Normalising HERE rather than at each of the three readers is what makes that class closed
-    /// rather than enumerated — a fourth reader added later inherits the guarantee instead of
-    /// having to remember it. It also keeps the reads on their indexes: `coin_id` is the table's
-    /// `PRIMARY KEY`, and a `LOWER()` wrapped around it in a predicate makes that index unusable.
+    /// # The scoping half is the user's BALANCE (dig-node#298)
+    ///
+    /// The three scoping columns failed more simply and more visibly. Six readers —
+    /// [`Self::unspent_coins_scoped`], [`Self::balance_scoped`], [`Self::pending_scoped`],
+    /// [`Self::coins_scoped`], [`Self::coin_count_scoped`] and
+    /// [`Self::owned_cat_asset_ids_scoped`] — bind a lower-cased value against these columns, so
+    /// a coin whose puzzle hash, asset id or hint arrived shouted matched NOTHING and the wallet
+    /// reported a balance of zero. That is the same "have 0 $DIG" failure recorded at
+    /// `fallback.rs`, arriving through the scope instead of through the identity.
+    ///
+    /// Normalising HERE rather than at each reader is what makes the class closed rather than
+    /// enumerated — a seventh reader added later inherits the guarantee instead of having to
+    /// remember it.
+    ///
+    /// # It also keeps every index usable, which the alternative does not
+    ///
+    /// The tempting shape is `LOWER(column)` in each predicate. It is the wrong one twice over:
+    /// `coin_id` and `cats.asset_id` are PRIMARY KEYs and `puzzle_hash`, `asset_id` and
+    /// `derivations.puzzle_hash` are INDEXED (`idx_coins_ph`, `idx_coins_asset`,
+    /// `idx_coins_unspent`, `idx_derivations_ph`), and SQLite cannot use an index through a
+    /// function call — so every scoped balance read would degrade to a full scan of `coins`. The
+    /// binds already lower-case the VALUE, which costs nothing and reads straight down the index.
+    /// Normalising the writer therefore fixes all six readers AND leaves every index intact.
     fn normalise_hex(s: &str) -> String {
         s.to_ascii_lowercase()
+    }
+
+    /// [`Self::normalise_hex`] for an optional column.
+    ///
+    /// `asset_id` and `hint` are nullable, and their NULL is load-bearing: `asset_id IS NULL` is
+    /// how an XCH coin is told from a CAT coin, and both upsert statements `COALESCE` an incoming
+    /// NULL onto the stored value rather than erasing it. So absence must survive normalisation
+    /// unchanged — a helper that turned `None` into `Some("")` would silently reclassify every
+    /// XCH coin as a CAT of the empty asset.
+    fn normalise_hex_opt(s: Option<&str>) -> Option<String> {
+        s.map(Self::normalise_hex)
     }
 
     /// Insert or update a coin's chain state (the `coin_state_update` upsert). A coin is
     /// keyed by `coin_id`; a later update (e.g. a spend) overwrites the mutable fields.
     ///
-    /// `coin_id` and `parent_coin_info` are normalised on the way in — see [`Self::normalise_hex`].
+    /// `coin_id`, `parent_coin_info`, `puzzle_hash`, `asset_id` and `hint` are all normalised on
+    /// the way in — see [`Self::normalise_hex`]. The last three are what every scoped balance read
+    /// compares against, so storing them verbatim reported a funded wallet as empty (#298).
     pub async fn upsert_coin(&self, c: &CoinRow) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT INTO coins
@@ -1320,12 +1515,12 @@ impl WalletDb {
         )
         .bind(Self::normalise_hex(&c.coin_id))
         .bind(Self::normalise_hex(&c.parent_coin_info))
-        .bind(&c.puzzle_hash)
+        .bind(Self::normalise_hex(&c.puzzle_hash))
         .bind(&c.amount)
         .bind(c.created_height)
         .bind(c.spent_height)
-        .bind(&c.asset_id)
-        .bind(&c.hint)
+        .bind(Self::normalise_hex_opt(c.asset_id.as_deref()))
+        .bind(Self::normalise_hex_opt(c.hint.as_deref()))
         .bind(c.created_timestamp)
         .bind(c.spent_timestamp)
         .execute(&self.pool)
@@ -1352,12 +1547,12 @@ impl WalletDb {
             )
             .bind(Self::normalise_hex(&c.coin_id))
             .bind(Self::normalise_hex(&c.parent_coin_info))
-            .bind(&c.puzzle_hash)
+            .bind(Self::normalise_hex(&c.puzzle_hash))
             .bind(&c.amount)
             .bind(c.created_height)
             .bind(c.spent_height)
-            .bind(&c.asset_id)
-            .bind(&c.hint)
+            .bind(Self::normalise_hex_opt(c.asset_id.as_deref()))
+            .bind(Self::normalise_hex_opt(c.hint.as_deref()))
             .bind(c.created_timestamp)
             .bind(c.spent_timestamp)
             .execute(&mut *tx)
@@ -1828,7 +2023,7 @@ impl WalletDb {
                     "SELECT * FROM coins WHERE spent_height IS NULL
                      AND created_height IS NOT NULL AND asset_id = ?",
                 )
-                .bind(a)
+                .bind(Self::normalise_hex(a))
                 .fetch_all(&self.pool)
                 .await?
             }
@@ -2260,7 +2455,7 @@ impl WalletDb {
                 precision = excluded.precision, description = excluded.description,
                 icon_url = excluded.icon_url, visible = excluded.visible",
         )
-        .bind(&c.asset_id)
+        .bind(Self::normalise_hex(&c.asset_id))
         .bind(&c.name)
         .bind(&c.ticker)
         .bind(c.precision)
@@ -2295,7 +2490,7 @@ impl WalletDb {
     /// One CAT's metadata by asset id.
     pub async fn cat(&self, asset_id: &str) -> sqlx::Result<Option<CatRow>> {
         Ok(sqlx::query("SELECT * FROM cats WHERE asset_id = ?")
-            .bind(asset_id)
+            .bind(Self::normalise_hex(asset_id))
             .fetch_optional(&self.pool)
             .await?
             .as_ref()
@@ -2323,7 +2518,7 @@ impl WalletDb {
             "SELECT 1 AS ok FROM coins
              WHERE asset_id = ? AND spent_height IS NULL AND created_height IS NOT NULL LIMIT 1",
         )
-        .bind(asset_id)
+        .bind(Self::normalise_hex(asset_id))
         .fetch_optional(&self.pool)
         .await?;
         if coin.is_some() {
@@ -2354,8 +2549,8 @@ impl WalletDb {
         hint: Option<&str>,
     ) -> sqlx::Result<()> {
         sqlx::query("UPDATE coins SET asset_id = ?, hint = COALESCE(?, hint) WHERE coin_id = ?")
-            .bind(asset_id)
-            .bind(hint)
+            .bind(Self::normalise_hex(asset_id))
+            .bind(Self::normalise_hex_opt(hint))
             .bind(Self::normalise_hex(coin_id))
             .execute(&self.pool)
             .await?;
@@ -2670,7 +2865,7 @@ impl WalletDb {
             "UPDATE cats SET name = NULL, ticker = NULL, description = NULL, icon_url = NULL
              WHERE asset_id = ?",
         )
-        .bind(asset_id)
+        .bind(Self::normalise_hex(asset_id))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -2695,7 +2890,7 @@ impl WalletDb {
                 description = excluded.description, icon_url = excluded.icon_url,
                 visible = excluded.visible",
         )
-        .bind(asset_id)
+        .bind(Self::normalise_hex(asset_id))
         .bind(name)
         .bind(ticker)
         .bind(description)
@@ -4944,5 +5139,630 @@ mod tests {
         assert_eq!(pending[0].fee.as_deref(), Some("10"));
         assert_eq!(pending[0].submitted_at, 1_000);
         assert_eq!(pending[0].bundle_hex, "bundle-of-earlier");
+    }
+}
+
+/// **Hex CASE is not part of a stored value's identity** (dig-node#298).
+///
+/// dig-node#293 normalised the two COIN IDENTITIES at the writer and deliberately left the three
+/// SCOPING columns — `coins.puzzle_hash`, `coins.asset_id`, `coins.hint` — plus the two hex
+/// columns keyed on elsewhere (`derivations.puzzle_hash`, `cats.asset_id`) storing whatever case
+/// their source spelled. Every scoped reader binds a lower-cased value against them, so an
+/// upper-case spelling made a coin invisible and reported the user a balance of ZERO.
+///
+/// # Why every writer gets its OWN test
+///
+/// `upsert_coin` and `upsert_coins` are two independent statements with two independent sets of
+/// binds, and `attribute_cat_coin` is a third. #293's fix was very nearly shipped with one of its
+/// binds unnormalised, because a fixture that varied SEVERAL fields at once stayed green when a
+/// single bind was reverted — the other mismatched field kept the row invisible for the wrong
+/// reason, and the assertion could not tell the two apart.
+///
+/// So each test below varies the case of EXACTLY ONE column and spells every other column
+/// canonically. Reverting the normalisation on that one bind is then the only change that can
+/// turn it red, which is what makes it a proof rather than a coincidence.
+#[cfg(test)]
+mod stored_hex_is_case_insensitive {
+    use super::*;
+
+    /// A lower-case 32-byte hex puzzle hash and a lower-case 32-byte asset id. Both are spelled
+    /// canonically here; each test shouts exactly one of them at exactly one writer.
+    const PH: &str = "aa11bb22cc33dd44ee55ff6600778899aa11bb22cc33dd44ee55ff6600778899";
+    const ASSET: &str = "1234abcd5678ef901234abcd5678ef901234abcd5678ef901234abcd5678ef90";
+
+    fn upper(s: &str) -> String {
+        s.to_ascii_uppercase()
+    }
+
+    /// A confirmed, unspent coin — the only shape `balance_scoped` counts.
+    fn spendable(id: &str, amount: u64) -> CoinRow {
+        CoinRow {
+            coin_id: id.into(),
+            parent_coin_info: "00".repeat(32),
+            puzzle_hash: PH.into(),
+            amount: amount.to_string(),
+            created_height: Some(10),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    // ---- `upsert_coin`: one test per bind ---------------------------------
+
+    /// The headline failure: an XCH coin at a shouted puzzle hash reads as no money at all.
+    #[tokio::test]
+    async fn an_upper_case_puzzle_hash_still_counts_toward_the_xch_balance() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 1_599_000_000_000);
+        c.puzzle_hash = upper(PH);
+        db.upsert_coin(&c).await.unwrap();
+
+        assert_eq!(
+            db.balance_scoped(None, &[PH.to_string()]).await.unwrap(),
+            1_599_000_000_000,
+            "a funded wallet read as empty because its puzzle hash was spelled in upper case"
+        );
+    }
+
+    /// The asset bind alone: hint and puzzle hash are canonical, so only `asset_id = ?` can miss.
+    #[tokio::test]
+    async fn an_upper_case_asset_id_still_counts_toward_the_cat_balance() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 300);
+        c.asset_id = Some(upper(ASSET));
+        c.hint = Some(PH.into());
+        db.upsert_coin(&c).await.unwrap();
+
+        assert_eq!(
+            db.balance_scoped(Some(ASSET), &[PH.to_string()])
+                .await
+                .unwrap(),
+            300,
+            "a CAT balance read as zero because its asset id was spelled in upper case"
+        );
+    }
+
+    /// The hint bind alone: the CAT scope column, with asset id and puzzle hash canonical.
+    #[tokio::test]
+    async fn an_upper_case_hint_still_counts_toward_the_cat_balance() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 300);
+        c.asset_id = Some(ASSET.into());
+        c.hint = Some(upper(PH));
+        db.upsert_coin(&c).await.unwrap();
+
+        assert_eq!(
+            db.balance_scoped(Some(ASSET), &[PH.to_string()])
+                .await
+                .unwrap(),
+            300,
+            "a CAT balance read as zero because its owner hint was spelled in upper case"
+        );
+    }
+
+    // ---- `upsert_coins`: the SAME three binds, in a different statement ----
+    //
+    // The batch writer is the one the subscription loop actually uses, and it repeats every bind
+    // rather than delegating to the single-coin writer. Normalising one statement and not the
+    // other is a live defect that the three tests above cannot see.
+
+    #[tokio::test]
+    async fn the_batch_writer_also_normalises_an_upper_case_puzzle_hash() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 4_200);
+        c.puzzle_hash = upper(PH);
+        db.upsert_coins(&[c]).await.unwrap();
+
+        assert_eq!(
+            db.balance_scoped(None, &[PH.to_string()]).await.unwrap(),
+            4_200,
+            "the batch writer stored a puzzle hash verbatim while the single writer normalised"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_batch_writer_also_normalises_an_upper_case_asset_id() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 300);
+        c.asset_id = Some(upper(ASSET));
+        c.hint = Some(PH.into());
+        db.upsert_coins(&[c]).await.unwrap();
+
+        assert_eq!(
+            db.balance_scoped(Some(ASSET), &[PH.to_string()])
+                .await
+                .unwrap(),
+            300,
+            "the batch writer stored an asset id verbatim while the single writer normalised"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_batch_writer_also_normalises_an_upper_case_hint() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 300);
+        c.asset_id = Some(ASSET.into());
+        c.hint = Some(upper(PH));
+        db.upsert_coins(&[c]).await.unwrap();
+
+        assert_eq!(
+            db.balance_scoped(Some(ASSET), &[PH.to_string()])
+                .await
+                .unwrap(),
+            300,
+            "the batch writer stored a hint verbatim while the single writer normalised"
+        );
+    }
+
+    // ---- `attribute_cat_coin`: the sync loop's own two binds ---------------
+    //
+    // This is the path a CAT coin really acquires its asset id on: the coin lands unattributed,
+    // and the uncurrying pass writes both columns afterwards. A fix confined to the two upsert
+    // statements leaves this third writer storing verbatim.
+
+    #[tokio::test]
+    async fn cat_attribution_normalises_an_upper_case_asset_id() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&spendable("c1", 300)).await.unwrap();
+        db.attribute_cat_coin("c1", &upper(ASSET), Some(PH))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.balance_scoped(Some(ASSET), &[PH.to_string()])
+                .await
+                .unwrap(),
+            300,
+            "the CAT uncurrying pass stored its asset id verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn cat_attribution_normalises_an_upper_case_hint() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&spendable("c1", 300)).await.unwrap();
+        db.attribute_cat_coin("c1", ASSET, Some(&upper(PH)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.balance_scoped(Some(ASSET), &[PH.to_string()])
+                .await
+                .unwrap(),
+            300,
+            "the CAT uncurrying pass stored its owner hint verbatim"
+        );
+    }
+
+    // ---- the two hex columns OUTSIDE `coins` ------------------------------
+
+    /// `derivation_exists` is the `scoped_to_wallet` axis of the routing gate, so a false answer
+    /// sends a read this replica could serve to a third-party oracle instead.
+    #[tokio::test]
+    async fn an_upper_case_derivation_puzzle_hash_is_still_recognised_as_ours() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_derivation(&DerivationRow {
+            hardened: false,
+            index: 0,
+            public_key: "bb".repeat(48),
+            puzzle_hash: upper(PH),
+            address: "xch1example".into(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            db.derivation_exists(PH).await.unwrap(),
+            "the wallet stopped recognising its own address because the row shouted it"
+        );
+    }
+
+    /// `cats.asset_id` is a PRIMARY KEY, and `update_cat` writes it from a CALLER-SUPPLIED
+    /// `TokenRecord` — so unlike the `coins` columns this one has a reachable non-canonical
+    /// source in-tree today, with no third-party implementation required.
+    #[tokio::test]
+    async fn cat_metadata_written_under_an_upper_case_asset_id_is_still_found() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_cat(&CatRow {
+            asset_id: upper(ASSET),
+            name: Some("Test CAT".into()),
+            ticker: Some("TST".into()),
+            precision: 3,
+            description: None,
+            icon_url: None,
+            visible: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.cat(ASSET).await.unwrap().and_then(|c| c.ticker),
+            Some("TST".to_string()),
+            "CAT metadata written under a shouted asset id became unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn cat_metadata_updated_under_an_upper_case_asset_id_is_still_found() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.update_cat_metadata(&upper(ASSET), Some("Renamed"), None, None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.cat(ASSET).await.unwrap().and_then(|c| c.name),
+            Some("Renamed".to_string()),
+            "`update_cat` wrote a row that no canonical lookup can reach"
+        );
+    }
+
+    /// The unscoped asset reader takes its asset id from the CALLER and bound it verbatim. Once
+    /// the column is canonical, a caller that shouts must still be answered.
+    #[tokio::test]
+    async fn an_upper_case_asset_id_from_a_caller_still_reads_its_coins() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 300);
+        c.asset_id = Some(ASSET.into());
+        db.upsert_coin(&c).await.unwrap();
+
+        assert_eq!(
+            db.balance(Some(&upper(ASSET))).await.unwrap(),
+            300,
+            "a caller asking for its CAT in upper case was told it holds none"
+        );
+    }
+
+    /// **CONTROL.** Every assertion above is also satisfied by a reader that ignores its scope
+    /// and counts everything — which would be a far worse defect than the one being fixed, since
+    /// it would report one wallet another wallet's money. This is the test that refuses that
+    /// shortcut.
+    #[tokio::test]
+    async fn a_coin_at_a_genuinely_foreign_puzzle_hash_still_counts_for_nothing() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 1_599_000_000_000);
+        c.puzzle_hash = "ff".repeat(32);
+        db.upsert_coin(&c).await.unwrap();
+
+        assert_eq!(
+            db.balance_scoped(None, &[PH.to_string()]).await.unwrap(),
+            0,
+            "case-insensitivity was bought by making the scope match anything"
+        );
+    }
+
+    // ---- the reader binds a CALLER supplies -------------------------------
+    //
+    // Normalising the writer is only half of a case-insensitive column. Every reader that takes
+    // its key from the CALLER rather than from the scope list bound that key verbatim, so once
+    // the column is canonical a caller that shouts is answered "not found" about a row that is
+    // sitting right there. The tests above cannot see this: they all shout at the WRITER and then
+    // read back canonically, which is exactly the direction a verbatim reader bind still gets
+    // right. These three shout at the reader instead.
+
+    #[tokio::test]
+    async fn a_caller_asking_for_cat_metadata_in_upper_case_is_still_answered() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_cat(&CatRow {
+            asset_id: ASSET.into(),
+            name: Some("Test CAT".into()),
+            ticker: Some("TST".into()),
+            precision: 3,
+            description: None,
+            icon_url: None,
+            visible: true,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.cat(&upper(ASSET)).await.unwrap().and_then(|c| c.ticker),
+            Some("TST".to_string()),
+            "a caller that spelled its asset id in upper case was told the CAT is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_clearing_cat_metadata_in_upper_case_still_clears_it() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_cat(&CatRow {
+            asset_id: ASSET.into(),
+            name: Some("Stale".into()),
+            ticker: Some("TST".into()),
+            precision: 3,
+            description: None,
+            icon_url: None,
+            visible: true,
+        })
+        .await
+        .unwrap();
+
+        db.clear_cat_metadata(&upper(ASSET)).await.unwrap();
+
+        assert_eq!(
+            db.cat(ASSET).await.unwrap().and_then(|c| c.name),
+            None,
+            "`resync_cat` silently cleared nothing because the caller shouted the asset id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_asking_whether_an_upper_case_asset_is_owned_is_still_answered() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        let mut c = spendable("c1", 300);
+        c.asset_id = Some(ASSET.into());
+        db.upsert_coin(&c).await.unwrap();
+
+        assert!(
+            db.is_asset_owned(&upper(ASSET)).await.unwrap(),
+            "a held CAT reported as not owned because the caller shouted its asset id"
+        );
+    }
+
+    // ---- rows already on disk (the ladder step) ---------------------------
+    //
+    // Fixing the writer does nothing for a replica that is already populated, and a wallet that
+    // has been running is exactly the one holding the coins. Everything below drives the ladder
+    // step over rows inserted PAST the normalising accessors, the way a pre-fix build wrote them.
+
+    /// Insert past every normalising accessor, exactly as a pre-#298 build did.
+    async fn insert_legacy(db: &WalletDb, sql: &str) {
+        sqlx::query(sql).execute(&db.pool).await.unwrap();
+    }
+
+    /// Re-arm the ladder so the scoped-hex step runs again on an already-open database.
+    async fn rearm(db: &WalletDb) {
+        sqlx::query(&format!(
+            "PRAGMA user_version = {}",
+            SCOPED_HEX_STORED_LOWER_CASE - 1
+        ))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn column(db: &WalletDb, sql: &str) -> Vec<String> {
+        sqlx::query(sql)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>(0))
+            .collect()
+    }
+
+    /// **A wallet written before the writer normalised is repaired on open, in EVERY column.**
+    ///
+    /// Asserted column by column rather than by a single balance read: a balance assertion is
+    /// satisfied by normalising `coins` alone, and would leave `derivations`, `arrivals` and the
+    /// two chain caches shouting — with `derivations` deciding whether a read routes to the local
+    /// replica or to a third-party oracle, and `arrivals.puzzle_hash` shown to the user as the
+    /// address a payment landed at.
+    #[tokio::test]
+    async fn a_legacy_database_has_every_scoped_hex_column_normalised_on_open() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy(
+            &db,
+            "INSERT INTO coins (coin_id, parent_coin_info, puzzle_hash, amount, created_height, \
+             asset_id, hint) VALUES ('c1', 'pp', 'AABB', '300', 10, 'CCDD', 'EEFF')",
+        )
+        .await;
+        insert_legacy(
+            &db,
+            "INSERT INTO derivations (hardened, idx, public_key, puzzle_hash, address) \
+             VALUES (0, 0, 'pk', 'AABB', 'xch1x')",
+        )
+        .await;
+        insert_legacy(
+            &db,
+            "INSERT INTO arrivals (coin_id, puzzle_hash, amount, asset_id, confirmed_height, \
+             recorded_at) VALUES ('c1', 'AABB', '300', 'CCDD', 10, 0)",
+        )
+        .await;
+        insert_legacy(
+            &db,
+            "INSERT INTO chain_read_cache (coin_id, parent_coin_info, puzzle_hash, amount, \
+             cached_at, last_used_at) VALUES ('c1', 'pp', 'AABB', '300', 0, 0)",
+        )
+        .await;
+        insert_legacy(
+            &db,
+            "INSERT INTO chain_spend_cache (coin_id, parent_coin_info, puzzle_hash, amount, \
+             puzzle_reveal, solution) VALUES ('c1', 'pp', 'AABB', '300', 'ff', 'ff')",
+        )
+        .await;
+        rearm(&db).await;
+
+        db.migrate().await.unwrap();
+
+        assert_eq!(
+            column(&db, "SELECT puzzle_hash FROM coins").await,
+            vec!["aabb".to_string()],
+            "coins.puzzle_hash"
+        );
+        assert_eq!(
+            column(&db, "SELECT asset_id FROM coins").await,
+            vec!["ccdd".to_string()],
+            "coins.asset_id"
+        );
+        assert_eq!(
+            column(&db, "SELECT hint FROM coins").await,
+            vec!["eeff".to_string()],
+            "coins.hint"
+        );
+        assert_eq!(
+            column(&db, "SELECT puzzle_hash FROM derivations").await,
+            vec!["aabb".to_string()],
+            "derivations.puzzle_hash"
+        );
+        assert_eq!(
+            column(&db, "SELECT puzzle_hash FROM arrivals").await,
+            vec!["aabb".to_string()],
+            "arrivals.puzzle_hash"
+        );
+        assert_eq!(
+            column(&db, "SELECT asset_id FROM arrivals").await,
+            vec!["ccdd".to_string()],
+            "arrivals.asset_id"
+        );
+        assert_eq!(
+            column(&db, "SELECT puzzle_hash FROM chain_read_cache").await,
+            vec!["aabb".to_string()],
+            "chain_read_cache.puzzle_hash"
+        );
+        assert_eq!(
+            column(&db, "SELECT puzzle_hash FROM chain_spend_cache").await,
+            vec!["aabb".to_string()],
+            "chain_spend_cache.puzzle_hash"
+        );
+    }
+
+    /// **A NULL asset id or hint survives the migration as NULL.**
+    ///
+    /// `asset_id IS NULL` is how an XCH coin is told from a CAT coin, so a migration that
+    /// coerced NULL to the empty string would reclassify every XCH coin the user holds — a
+    /// larger balance failure than the one being fixed. `<> LOWER(col)` is NULL-safe, and this
+    /// test is what says so out loud.
+    #[tokio::test]
+    async fn the_migration_leaves_a_null_asset_id_and_hint_null() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy(
+            &db,
+            "INSERT INTO coins (coin_id, parent_coin_info, puzzle_hash, amount, created_height) \
+             VALUES ('c1', 'pp', 'AABB', '300', 10)",
+        )
+        .await;
+        rearm(&db).await;
+
+        db.migrate().await.unwrap();
+
+        assert_eq!(
+            db.balance_scoped(None, &["aabb".to_string()])
+                .await
+                .unwrap(),
+            300,
+            "a legacy XCH coin stopped being XCH, or stopped being found"
+        );
+    }
+
+    /// **Two case spellings of one CAT do not brick the wallet, and lose no metadata.**
+    ///
+    /// `cats.asset_id` is a `PRIMARY KEY`, so lower-casing two spellings into each other is a
+    /// uniqueness violation that aborts the step — and because the retry on the next open is
+    /// byte-for-byte identical, an aborted step means `WalletDb::open` returns `Err` FOREVER.
+    /// That is the failure dig-node#293's first version shipped.
+    ///
+    /// The `coins` rule of "delete the losers" is deliberately NOT reused here. It is justified
+    /// there by the table being derived from chain state, so a dropped row is re-observed on the
+    /// next sync. A `cats` row is not: its name, ticker, icon and visibility come from a token
+    /// registry or from the user, and nothing on chain would put them back. So the losers are
+    /// MERGED into the survivor first.
+    #[tokio::test]
+    async fn colliding_cat_spellings_neither_brick_the_wallet_nor_lose_metadata() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy(
+            &db,
+            "INSERT INTO cats (asset_id, name, ticker, precision, visible) \
+             VALUES ('aabb', 'Canonical', NULL, 3, 1)",
+        )
+        .await;
+        insert_legacy(
+            &db,
+            "INSERT INTO cats (asset_id, name, ticker, precision, visible) \
+             VALUES ('AABB', 'Shouted', 'TST', 3, 1)",
+        )
+        .await;
+        rearm(&db).await;
+
+        db.migrate()
+            .await
+            .expect("a case collision on the CAT primary key must not fail the migration");
+
+        let cat = db.cat("aabb").await.unwrap().expect("the CAT survived");
+        assert_eq!(
+            cat.name.as_deref(),
+            Some("Canonical"),
+            "the ALREADY-CANONICAL spelling is the one that survives"
+        );
+        assert_eq!(
+            cat.ticker.as_deref(),
+            Some("TST"),
+            "the loser's ticker was DROPPED rather than merged; nothing on chain restores it"
+        );
+        assert_eq!(
+            column(&db, "SELECT asset_id FROM cats").await,
+            vec!["aabb".to_string()],
+            "the collided spellings were reduced to exactly one canonical row"
+        );
+    }
+
+    /// **Several NON-canonical spellings also do not brick the wallet.**
+    ///
+    /// The case a two-spelling collision rule cannot see: `AAbb` and `aAbb` are both unequal to
+    /// their own lower-casing, so a fix scoped to "rows whose lower-casing already exists"
+    /// removes neither, and the `UPDATE` then collides them onto one key. The collision group
+    /// must be the COMPLETE lower-value equivalence class, so the update has nothing left to
+    /// collide with.
+    #[tokio::test]
+    async fn many_non_canonical_cat_spellings_do_not_brick_the_wallet() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        for (spelling, name) in [("AAbb", "first"), ("aAbb", "second"), ("AAbB", "third")] {
+            insert_legacy(
+                &db,
+                &format!(
+                    "INSERT INTO cats (asset_id, name, precision, visible) \
+                     VALUES ('{spelling}', '{name}', 3, 1)"
+                ),
+            )
+            .await;
+        }
+        rearm(&db).await;
+
+        db.migrate()
+            .await
+            .expect("a three-way collision between non-canonical spellings must not fail");
+
+        assert_eq!(
+            column(&db, "SELECT asset_id FROM cats").await,
+            vec!["aabb".to_string()],
+            "three spellings were not reduced to one canonical row"
+        );
+        assert_eq!(
+            db.cat("aabb")
+                .await
+                .unwrap()
+                .and_then(|c| c.name)
+                .as_deref(),
+            Some("third"),
+            "with no canonical spelling present the survivor is the lexicographically smallest \
+             by BYTE, which puts `AAbB` ahead of `AAbb` because upper-case sorts first. That \
+             choice is arbitrary; being TOTAL and DETERMINISTIC is the whole of the point"
+        );
+    }
+
+    /// **The ladder mark stops the step running again.**
+    ///
+    /// A data migration reads and rewrites rows, so re-running it on every open is unbounded work
+    /// on a hot path for a job that only ever needs doing once.
+    #[tokio::test]
+    async fn the_ladder_mark_stops_the_scoped_hex_step_running_again() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.migrate().await.unwrap();
+        insert_legacy(
+            &db,
+            "INSERT INTO coins (coin_id, parent_coin_info, puzzle_hash, amount, created_height) \
+             VALUES ('c1', 'pp', 'AABB', '300', 10)",
+        )
+        .await;
+
+        db.migrate().await.unwrap();
+
+        assert_eq!(
+            column(&db, "SELECT puzzle_hash FROM coins").await,
+            vec!["AABB".to_string()],
+            "the step ran a second time on an already-marked database"
+        );
     }
 }
