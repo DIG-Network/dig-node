@@ -2337,12 +2337,44 @@ impl WalletBackend {
         Ok(GetAreCoinsSpendableResponse { spendable })
     }
 
+    /// One token's metadata and the connected client's balance in it (`get_token`, `get_cats`,
+    /// `get_all_cats`), gated on the replica actually COVERING that client's scope (dig-node#247).
+    ///
+    /// # A zero that means "I did not look" must not be spelled like a zero that means "empty"
+    ///
+    /// This read answered `db.balance_scoped` with no gate at all — not even the bare `synced()`
+    /// flag its sibling had. A client whose addresses the catch-up never ran over queries a
+    /// replica that holds none of its coins, gets `0`, and `TokenRecord` carries no completeness
+    /// field for that zero to stand beside. And `login` does not enrol — enrolment is
+    /// `control.wallet.watch` — so a client that logs in without enrolling is never covered and
+    /// its balance stays `0` indefinitely. No amount of waiting fixes it.
+    ///
+    /// The gate is [`Self::replica_covers_client_scope`], the SAME predicate `get_coins` and
+    /// `get_sync_status` route on (dig_ecosystem#2878), so the balance and the coin list cannot
+    /// come to disagree about whether the view is complete. It is deliberately NOT
+    /// `replica_is_authoritative`, which is VACUOUS here: under §908 the node holds no custody
+    /// and may hold no registrations, so its followed set is empty, every recording contains it,
+    /// and an uncovered client would be served the same confident zero as before.
+    ///
+    /// # The two assets take different remedies, because only one of them HAS the XCH remedy
+    ///
+    /// **XCH** falls to the chain, exactly as `get_coins` now does: the coins sit AT the client's
+    /// puzzle hashes, so the fallback tier can be asked directly and the answer is real.
+    ///
+    /// **A CAT is REFUSED.** A CAT coin does not sit at its owner's puzzle hash — it is hinted to
+    /// it — and telling which asset a hinted coin belongs to needs puzzle uncurrying, which the
+    /// fallback tier does not perform. So routing a CAT read to the chain returns an EMPTY set,
+    /// which is the same confident zero arriving through a different door. `TokenRecord` cannot
+    /// spell "unknown" without a `dig-node-control-interface` contract change, and a contract
+    /// change publishes first; refusing is the smallest honest option available today, and unlike
+    /// a zero it is a shape no caller can mistake for a figure.
     async fn token_record(&self, asset_id: Option<&str>) -> Result<TokenRecord> {
         // Balances are scoped to the connected client's PUBLIC identity (#407).
         let identity = self.scoped_identity();
+        let covered = self.replica_covers_client_scope(&identity).await?;
         match asset_id {
             None => {
-                let bal = self.db.balance_scoped(None, &identity).await?;
+                let bal = self.scoped_xch_balance(&identity, covered).await?;
                 Ok(TokenRecord {
                     asset_id: None,
                     name: Some("Chia".into()),
@@ -2357,6 +2389,9 @@ impl WalletBackend {
                 })
             }
             Some(a) => {
+                if !covered {
+                    return Err(Self::uncovered_scope_error("this CAT balance"));
+                }
                 let bal = self.db.balance_scoped(Some(a), &identity).await?;
                 let meta = self.db.cat(a).await?;
                 Ok(TokenRecord {
@@ -2375,13 +2410,51 @@ impl WalletBackend {
         }
     }
 
+    /// The client's confirmed unspent XCH, taken from whichever tier is entitled to answer.
+    ///
+    /// The chain arm re-applies `balance_scoped`'s own predicate — confirmed and unspent — rather
+    /// than summing whatever the fallback returned. `coin_records_by_puzzle_hashes` includes
+    /// RECENTLY SPENT coins by design, so summing it raw would report money the user has already
+    /// spent as money they still hold, which is a falsehood in the opposite direction and a worse
+    /// one to act on.
+    async fn scoped_xch_balance(&self, identity: &[String], covered: bool) -> Result<u128> {
+        if covered {
+            return Ok(self.db.balance_scoped(None, identity).await?);
+        }
+        if !self.fallback.is_live() {
+            return Err(Self::uncovered_scope_error("this balance"));
+        }
+        let coins = self
+            .fallback
+            .coin_records_by_puzzle_hashes(identity)
+            .await?;
+        Ok(coins
+            .iter()
+            .filter(|c| c.spent_height.is_none() && c.created_height.is_some())
+            .map(|c| u128::from(c.amount))
+            .sum())
+    }
+
+    /// The one refusal message every uncovered token read shares, so an operator reading a 503
+    /// learns the ACTIONABLE fact — that enrolment, not waiting, is what fixes it.
+    fn uncovered_scope_error(subject: &str) -> Error {
+        Error::unavailable(format!(
+            "the wallet replica does not cover this client's addresses, so {subject} is unknown \
+             rather than zero; enrol the address with control.wallet.watch"
+        ))
+    }
+
     async fn get_cats(&self) -> Result<GetCatsResponse> {
         // Scope to the connected client's PUBLIC identity (#407): the CATs whose coins are
         // hinted to the client's puzzle hashes, not every CAT in the node's DB.
-        let ids = self
-            .db
-            .owned_cat_asset_ids_scoped(&self.scoped_identity())
-            .await?;
+        let identity = self.scoped_identity();
+        // Gated here as well as in `token_record`, because the LIST is itself a replica read: an
+        // uncovered scope yields no asset ids at all, so every per-token gate downstream is
+        // skipped and the caller is told it owns no CATs (dig-node#247).
+        if !self.replica_covers_client_scope(&identity).await? {
+            return Err(Self::uncovered_scope_error("the CATs this wallet owns"));
+        }
+        let ids = self.db.owned_cat_asset_ids_scoped(&identity).await?;
         let mut cats = Vec::with_capacity(ids.len());
         for id in ids {
             cats.push(self.token_record(Some(&id)).await?);
@@ -9430,6 +9503,14 @@ mod tests {
 
         // Login as the CAT owner → get_cats returns the real tail + scoped balance.
         let owner_ph = hex::encode(alice.puzzle_hash);
+        // Record the catch-up this fixture implies. It writes the replica directly and predates
+        // the coverage model, so it described a node holding the owner's coins while claiming to
+        // follow no address at all — a state no real sync produces, and one `get_cats` must now
+        // refuse rather than answer (dig-node#247).
+        db.record_coverage(&CoveredSet::from_hex([owner_ph.as_str()]))
+            .await
+            .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -10177,6 +10258,171 @@ mod tests {
             (1, 1),
             "a covered scope must still report a complete view"
         );
+    }
+
+    // ---- the token reads are gated on coverage too (dig-node#247) ---------
+    //
+    // dig-node#246 gave `get_coins` and `get_sync_status` the containment gate. `token_record`
+    // never got it, and THREE more RPCs reach it -- `get_token`, `get_cats`, `get_all_cats` --
+    // so the same client that #246 was written for still saw a confident `0` on whichever of
+    // those surfaces dig-app happened to read. `TokenRecord` carries no completeness field, so
+    // its zero has nothing standing beside it to qualify it.
+    //
+    // Every fixture below reuses `uncovered_but_funded_client`, which holds the three properties
+    // that make the defect visible at all: the money is on the CHAIN and not in the replica, the
+    // coverage that WAS recorded is over a DIFFERENT address, and `db.is_synced()` is true. Drop
+    // any one and the test can no longer tell "zero because unscoped" from "zero because empty".
+
+    /// **Regression (dig-node#247): the XCH token balance falls to the chain for an uncovered
+    /// scope rather than answering a confident zero.**
+    #[tokio::test]
+    async fn an_uncovered_client_scope_is_never_told_its_xch_token_balance_is_zero() {
+        let client_ph = "aa".repeat(32);
+        let (be, _fb) = uncovered_but_funded_client(&client_ph).await;
+
+        let (status, body) = be.dispatch("get_token", r#"{"asset_id":null}"#).await;
+        assert_eq!(status, 200, "{body}");
+        let r: GetTokenResponse = serde_json::from_str(&body).unwrap();
+        let token = r.token.expect("XCH is always a token");
+        assert_eq!(
+            token.balance.to_u64(),
+            Some(1_599_000_000_000),
+            "an uncovered scope was served the replica's zero instead of the chain's balance"
+        );
+        assert_eq!(
+            token.selectable_balance.to_u64(),
+            Some(1_599_000_000_000),
+            "`selectable_balance` kept the confident zero that `balance` no longer reports"
+        );
+    }
+
+    /// **Regression (dig-node#247): a CAT balance is REFUSED for an uncovered scope.**
+    ///
+    /// The CAT case cannot take the XCH remedy. Attributing a CAT coin to its asset id needs
+    /// puzzle uncurrying, which the fallback tier does not do, so routing a CAT read to the chain
+    /// would return an empty set — the same confident zero through a different door. Refusing is
+    /// the only honest answer this wire type can currently express, and it is a NON-200 the caller
+    /// cannot mistake for a figure.
+    #[tokio::test]
+    async fn an_uncovered_client_scope_refuses_to_answer_a_cat_token_balance() {
+        let client_ph = "aa".repeat(32);
+        let (be, _fb) = uncovered_but_funded_client(&client_ph).await;
+
+        let (status, body) = be
+            .dispatch(
+                "get_token",
+                &format!(r#"{{"asset_id":"{}"}}"#, "cc".repeat(32)),
+            )
+            .await;
+        assert_eq!(
+            status, 503,
+            "an uncovered CAT balance was ANSWERED rather than refused; body was {body}"
+        );
+    }
+
+    /// **Regression (dig-node#247): `get_cats` is refused for an uncovered scope.**
+    ///
+    /// Left ungated it returns an empty LIST, which reads as "you own no CATs" — a falsehood of
+    /// exactly the same class as the zero, and one that no per-token gate downstream can repair,
+    /// because the list it iterates is itself read out of the replica.
+    #[tokio::test]
+    async fn an_uncovered_client_scope_refuses_to_list_its_cats() {
+        let client_ph = "aa".repeat(32);
+        let (be, _fb) = uncovered_but_funded_client(&client_ph).await;
+
+        let (status, body) = be.dispatch("get_cats", "{}").await;
+        assert_eq!(
+            status, 503,
+            "an uncovered scope was told it owns no CATs; body was {body}"
+        );
+    }
+
+    /// **An uncovered scope with NO live chain source refuses rather than reporting zero.**
+    ///
+    /// The XCH remedy above is a ROUTE, and a route needs somewhere to go. With the replica not
+    /// covering the scope and no chain source attached, nothing in the node knows the balance —
+    /// so the one answer it must not give is a number.
+    #[tokio::test]
+    async fn an_uncovered_scope_with_no_chain_source_refuses_rather_than_reporting_zero() {
+        let client_ph = "aa".repeat(32);
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.record_coverage(&CoveredSet::from_hex(["bb".repeat(32).as_str()]))
+            .await
+            .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default().offline()),
+            WalletConfig::default(),
+        );
+        let addr = encode_address(&client_ph, "xch").unwrap();
+        be.dispatch(
+            "login",
+            &format!(r#"{{"fingerprint":1,"addresses":["{addr}"]}}"#),
+        )
+        .await;
+
+        let (status, body) = be.dispatch("get_token", r#"{"asset_id":null}"#).await;
+        assert_eq!(
+            status, 503,
+            "a node with no replica coverage and no chain source still reported a balance; \
+             body was {body}"
+        );
+    }
+
+    /// **CONTROL: a COVERED scope still answers from the replica, for XCH and for a CAT.**
+    ///
+    /// Without this, all four assertions above are satisfied by an implementation that refuses
+    /// every token read — honest, and useless. It is also what makes the CAT refusal a statement
+    /// about COVERAGE rather than about CATs.
+    #[tokio::test]
+    async fn a_covered_client_scope_still_reads_its_token_balances_from_the_replica() {
+        let client_ph = "aa".repeat(32);
+        let asset = "cc".repeat(32);
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coins(&[coin_at("c1", &client_ph, 4_200)])
+            .await
+            .unwrap();
+        let mut cat = coin_at("c2", &"dd".repeat(32), 300);
+        cat.asset_id = Some(asset.clone());
+        cat.hint = Some(client_ph.clone());
+        db.upsert_coins(&[cat]).await.unwrap();
+        db.record_coverage(&CoveredSet::from_hex([client_ph.as_str()]))
+            .await
+            .unwrap();
+        db.set_initial_sync_complete(true).await.unwrap();
+        let be = WalletBackend::new(
+            db,
+            Arc::new(MockFallback::default()),
+            WalletConfig::default(),
+        );
+        let addr = encode_address(&client_ph, "xch").unwrap();
+        be.dispatch(
+            "login",
+            &format!(r#"{{"fingerprint":1,"addresses":["{addr}"]}}"#),
+        )
+        .await;
+
+        let (status, body) = be.dispatch("get_token", r#"{"asset_id":null}"#).await;
+        assert_eq!(status, 200, "{body}");
+        let r: GetTokenResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(r.token.unwrap().balance.to_u64(), Some(4_200));
+
+        let (status, body) = be
+            .dispatch("get_token", &format!(r#"{{"asset_id":"{asset}"}}"#))
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let r: GetTokenResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            r.token.unwrap().balance.to_u64(),
+            Some(300),
+            "a covered scope must still be answered its CAT balance"
+        );
+
+        let (status, body) = be.dispatch("get_cats", "{}").await;
+        assert_eq!(status, 200, "{body}");
+        let r: GetCatsResponse = serde_json::from_str(&body).unwrap();
+        assert_eq!(r.cats.len(), 1, "a covered scope must still list its CATs");
     }
 
     // ---- in-flight coin reservation + real pending set (#2763 / #2764) ------

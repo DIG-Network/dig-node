@@ -100,6 +100,18 @@ pub enum ErrorKind {
     NotFound,
     /// Not authorized (secret-touching endpoint from a non-authorized origin) → `401`.
     Unauthorized,
+    /// The node cannot HONESTLY answer this read right now → `503` (dig-node#247).
+    ///
+    /// Distinct from [`Self::Internal`], and the distinction is the point: `Internal` means the
+    /// node tried and something broke, while this means the node is working correctly and simply
+    /// is not entitled to the answer — the replica was never asked to follow this client's
+    /// addresses, and no chain source is reachable to ask instead.
+    ///
+    /// It exists because the alternative is worse than an error. A balance read that cannot be
+    /// answered has exactly one wrong reply available to it, and that reply is `0` — a figure the
+    /// caller cannot distinguish from "you hold nothing", and which a wallet UI renders as an
+    /// empty account. A non-200 is the one shape a Sage-parity client cannot mistake for money.
+    Unavailable,
     /// Wallet/internal/database failure → `500`.
     Internal,
 }
@@ -111,6 +123,7 @@ impl ErrorKind {
             ErrorKind::Api => 400,
             ErrorKind::NotFound => 404,
             ErrorKind::Unauthorized => 401,
+            ErrorKind::Unavailable => 503,
             ErrorKind::Internal => 500,
         }
     }
@@ -145,6 +158,14 @@ impl Error {
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::Unauthorized,
+            message: message.into(),
+        }
+    }
+    /// A `503 Service Unavailable`: the node cannot honestly answer this read — see
+    /// [`ErrorKind::Unavailable`] for why an error beats the only number available.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Unavailable,
             message: message.into(),
         }
     }
