@@ -278,12 +278,12 @@ mod tests {
         let short_id = "b".repeat(63);
         let non_hex_id = "z".repeat(64);
         let malformed = [
-            "anchor.invalid:9444".to_string(),               // no identity at all
-            format!("{}@anchor.invalid", peer_id_b()),       // no port
+            "anchor.invalid:9444".to_string(),         // no identity at all
+            format!("{}@anchor.invalid", peer_id_b()), // no port
             format!("{}@anchor.invalid:99999", peer_id_b()), // port out of range
-            format!("{}@:9778", peer_id_b()),             // empty host
-            format!("{short_id}@anchor.invalid:9444"),       // identity too short
-            format!("{non_hex_id}@anchor.invalid:9444"),     // identity not hex
+            format!("{}@:9778", peer_id_b()),          // empty host
+            format!("{short_id}@anchor.invalid:9444"), // identity too short
+            format!("{non_hex_id}@anchor.invalid:9444"), // identity not hex
         ];
         for bad in malformed {
             let targets = resolve_bootstrap_targets(Some(&format!("{bad},{good}")));
