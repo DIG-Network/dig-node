@@ -4838,9 +4838,16 @@ next" are different questions.
 `parent_coin_info` — MUST be normalised to LOWER-CASE hex at the point of WRITE, and every lookup that
 binds a caller-supplied coin id MUST normalise it the same way. The chain source is free to hand over
 either case, so a replica that stores it verbatim makes case a hidden axis of every equality test over
-identities: the node MUST NOT compare two stored identities, or a stored identity against a supplied
-one, in a way whose answer depends on the case the chain source chose. A replica written by an earlier
-build MUST be normalised in place before it is read.
+those identities: the node MUST NOT compare two stored coin identities, or a stored coin identity
+against a supplied one, in a way whose answer depends on the case the chain source chose. A replica
+written by an earlier build MUST be normalised in place before it is read, and every table that keys
+a row by a coin id MUST be normalised in the SAME transaction as the coin table, since those keys are
+compared against it raw. Where several stored spellings of one coin id would collide under that
+normalisation, the node MUST reduce them to one deterministically rather than fail the migration.
+
+This requirement is scoped to the two coin identities and does NOT presently extend to the other hex
+columns a coin row carries (`puzzle_hash`, `asset_id`, `hint`), which are stored as the chain source
+spelled them.
 
 Every reservation MUST expire. Release is normally observational — the coin is seen spent, or the
 bundle is definitively refused — and the expiry is the backstop that keeps a release path which never

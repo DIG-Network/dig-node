@@ -561,8 +561,16 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
 /// than by a value derived from the offered coin set.
 const OFFERS_KEYED_BY_CANONICAL_ID: i64 = 1;
 
-/// Ladder step 2: every hex identity in `coins` is stored lower-case (dig-node#293).
+/// Ladder step 2: every hex identity in `coins` is stored lower-case (dig-node#293), and the
+/// tables that key rows by a coin id agree with it.
 const COINS_STORED_LOWER_CASE: i64 = 2;
+
+/// Every table whose rows are keyed by a coin id, and which [`COINS_STORED_LOWER_CASE`] must
+/// therefore normalise together.
+///
+/// `arrival_pending` and `arrivals` hold copies of `coins.coin_id` and are compared against it
+/// raw, so normalising one table without the others is a desync, not a partial fix.
+const COIN_ID_TABLES: [&str; 3] = ["coins", "arrival_pending", "arrivals"];
 
 /// The highest ladder step this build knows how to apply.
 const SCHEMA_VERSION: i64 = COINS_STORED_LOWER_CASE;
@@ -802,36 +810,59 @@ impl WalletDb {
 
     /// Lower-case the hex identities of coins written before the writer normalised (dig-node#293).
     ///
-    /// Fixing [`Self::upsert_coin`] does nothing for rows already on disk, and those rows are
-    /// precisely the ones the defect was found on: a wallet that has been running is the only kind
-    /// that can hold an upper-case id. Without this step the fix would appear to work on a fresh
-    /// database and leave every existing one broken.
+    /// Fixing [`Self::upsert_coin`] does nothing for rows already on disk, so a fix without this
+    /// step would appear to work on a fresh database and leave every existing one untouched.
     ///
-    /// Nothing is at risk. `coins` is a REPLICA of chain state, so even total loss is recoverable
-    /// by re-syncing — the opposite of the offers table, whose contents are not derivable from
-    /// chain and whose migration is correspondingly careful.
+    /// # No in-tree writer can have produced an upper-case identity
     ///
-    /// The DELETE is the collision case and it has to come first. `AABB` and `aabb` are the same
-    /// coin, and `coin_id` is a `PRIMARY KEY`, so lower-casing the first into the second is a
-    /// uniqueness violation that would abort the whole step. The upper-case row is the one dropped
-    /// because a lower-case twin can only have been written by the fixed code, making it the
-    /// fresher observation of the two. `LOWER(coin_id) IN (SELECT coin_id FROM coins)` cannot
-    /// match a row against itself: an upper-case row never equals its own lower-casing.
+    /// Every path that reaches the `coins` table already emits lower-case hex and did so before
+    /// this migration existed: the subscription writer builds ids with `hex::encode`
+    /// (`sync.rs::coin_state_to_row`), the coinset fallback normalises in `map_record`
+    /// (`fallback.rs`), the dialled-peer read uses `hex::encode` (`peer_reads/dialed.rs`), and the
+    /// read cache replays whatever those three stored (`peer_reads.rs::coin_from_cache`). So on
+    /// any wallet this ecosystem has ever written, the statements below match ZERO rows.
     ///
-    /// One transaction, so a failure part-way leaves every row under its original key for the next
-    /// open to retry — the ladder mark is written only after this returns.
+    /// What they defend against is a THIRD-PARTY implementation. `ChainFallback` and `CoinPeer`
+    /// are public traits, and `refresh_tracked_coins` passes a `FallbackCoin` into the table
+    /// verbatim (`rpc.rs::fallback_coin_to_row`), so an out-of-tree impl that emits upper-case hex
+    /// is the one way such a row can exist. That is also why the collision rule below does NOT
+    /// claim to keep the fresher row: the verbatim path is the point-read used precisely BECAUSE
+    /// the subscription replica is behind, so an upper-case row would be the fresher observation,
+    /// not the staler one. Case carries no recency information at all, in either direction.
+    ///
+    /// # The collision rule
+    ///
+    /// `coin_id` is unique in all three tables, so lower-casing several spellings of one id into
+    /// each other is a uniqueness violation that aborts the whole step — and because the retry on
+    /// the next open is byte-for-byte identical, an aborted step means [`Self::migrate`] fails
+    /// forever and the wallet never opens again. Collisions are therefore resolved BEFORE the
+    /// update, by [`Self::drop_case_collisions`], for any number of spellings rather than the
+    /// two-spelling case alone.
+    ///
+    /// # Dependent tables move with it
+    ///
+    /// `arrival_pending.coin_id` and `arrivals.coin_id` are copies of `coins.coin_id` and are
+    /// compared against it raw. Normalising `coins` alone would desync them, and both shipped
+    /// consequences lose money-visible state: `record_arrivals` prunes every `arrival_pending` row
+    /// whose id is no longer in `coins`, and a pruned hold stops exempting a deferred coin from
+    /// the baseline watermark, so an arrival is swallowed; and `INSERT OR IGNORE INTO arrivals`
+    /// stops recognising an id it already recorded, so a coin is announced to the user twice.
+    ///
+    /// One transaction, so any failure rolls every table back together and the ladder mark — which
+    /// is written only after this returns — stays unset for the next open to retry.
     async fn normalise_stored_coin_hex(&self) -> sqlx::Result<()> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "DELETE FROM coins
-             WHERE coin_id <> LOWER(coin_id)
-               AND LOWER(coin_id) IN (SELECT coin_id FROM coins)",
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE coins SET coin_id = LOWER(coin_id) WHERE coin_id <> LOWER(coin_id)")
+        for table in COIN_ID_TABLES {
+            Self::drop_case_collisions(&mut tx, table).await?;
+            // `table` is a compile-time constant from `COIN_ID_TABLES`, never caller input, so
+            // interpolating it is not an injection surface. SQLite cannot bind an identifier.
+            sqlx::query(&format!(
+                "UPDATE {table} SET coin_id = LOWER(coin_id) WHERE coin_id <> LOWER(coin_id)"
+            ))
             .execute(&mut *tx)
             .await?;
+        }
+        // `parent_coin_info` is not a key of anything, so it cannot collide.
         sqlx::query(
             "UPDATE coins SET parent_coin_info = LOWER(parent_coin_info)
              WHERE parent_coin_info <> LOWER(parent_coin_info)",
@@ -840,6 +871,83 @@ impl WalletDb {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Reduce every set of coin ids that differ only in case to ONE row, so the lower-casing that
+    /// follows cannot violate the table's unique coin id.
+    ///
+    /// The alternative is not "a slightly wrong row survives" — it is a `UNIQUE` violation that
+    /// rolls the migration back, deterministically, on every subsequent open, leaving the wallet
+    /// permanently unopenable. Any deterministic survivor beats that.
+    ///
+    /// Deletion is safe here in a way it would not be elsewhere: all three tables are derived from
+    /// chain state, so the worst case is a coin re-observed on the next sync. The dropped rows are
+    /// logged at WARN with the id and the surviving spelling, because in this codebase a collision
+    /// can only mean a non-conforming `ChainFallback`/`CoinPeer` implementation wrote to the
+    /// replica — a fact worth surfacing rather than silently repairing.
+    async fn drop_case_collisions(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        table: &str,
+    ) -> sqlx::Result<()> {
+        // Normally zero rows: only ids that have a case-twin are read back.
+        let spellings: Vec<String> = sqlx::query(&format!(
+            "SELECT coin_id FROM {table}
+             WHERE LOWER(coin_id) IN (
+                 SELECT LOWER(coin_id) FROM {table}
+                 GROUP BY LOWER(coin_id) HAVING COUNT(*) > 1
+             )"
+        ))
+        .fetch_all(&mut **tx)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>("coin_id"))
+        .collect();
+
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for spelling in spellings {
+            groups
+                .entry(spelling.to_ascii_lowercase())
+                .or_default()
+                .push(spelling);
+        }
+
+        for (canonical, group) in &groups {
+            let Some(survivor) = Self::surviving_spelling(group) else {
+                continue;
+            };
+            for loser in group.iter().filter(|s| s.as_str() != survivor) {
+                sqlx::query(&format!("DELETE FROM {table} WHERE coin_id = ?"))
+                    .bind(loser)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            tracing::warn!(
+                table,
+                coin_id = %canonical,
+                kept = %survivor,
+                dropped = group.len() - 1,
+                "legacy replica held one coin id under several hex spellings; keeping one"
+            );
+        }
+        Ok(())
+    }
+
+    /// Which spelling of one coin id survives a case collision.
+    ///
+    /// Prefer the spelling that is ALREADY canonical, because it is the one every conforming
+    /// writer produces and the one every reader will look for; a group can hold at most one such
+    /// spelling, since two would be the same string. Failing that — two or more mixed-case
+    /// spellings and no lower-case one — take the lexicographically smallest, which is arbitrary
+    /// but total and stable, and is chosen for exactly that reason.
+    ///
+    /// Recency is deliberately NOT a tie-break: the columns are identical apart from case, so the
+    /// table carries no evidence of which spelling was written last.
+    fn surviving_spelling(group: &[String]) -> Option<&str> {
+        group
+            .iter()
+            .find(|s| !s.bytes().any(|b| b.is_ascii_uppercase()))
+            .or_else(|| group.iter().min())
+            .map(String::as_str)
     }
 
     /// Re-key stored offers onto the canonical offer id (dig-node#283).
@@ -1164,14 +1272,19 @@ impl WalletDb {
 
     // ---- coins ------------------------------------------------------------
 
-    /// **The `coins` table stores hex identities LOWER-CASE, and this is the property every
-    /// lookup by id depends on** (dig-node#293).
+    /// **The `coins` table stores its two COIN IDENTITIES — `coin_id` and `parent_coin_info` —
+    /// LOWER-CASE, and this is the property every lookup by id depends on** (dig-node#293).
+    ///
+    /// The scope is exactly those two columns. `puzzle_hash`, `asset_id` and `hint` are still
+    /// stored VERBATIM as the chain source spelled them, here and in `attribute_cat_coin`, while
+    /// `unspent_coins_scoped` lower-cases the values it binds against them — so the guarantee
+    /// below must not be read as covering them. That mismatch is a separate defect (dig-node#296),
+    /// not a claim this function makes.
     ///
     /// The chain source hands over whatever case it likes, and the read layer was already written
-    /// as though it did not: `reserve_spend` normalises the ids it writes, `reserved_coin_ids`
-    /// lower-cases what it reads back, and `unspent_coins_scoped` lower-cases the puzzle hash it
-    /// binds before comparing it against the stored column. Every one of those is correct ONLY if
-    /// the writer normalised first, and the writer did not.
+    /// as though it did not: `reserve_spend` normalises the ids it writes and `reserved_coin_ids`
+    /// lower-cases what it reads back. Both are correct ONLY if the writer normalised first, and
+    /// the writer did not.
     ///
     /// Three raw comparisons were reachable because of it, and they failed in different
     /// directions: a settled bundle never retired and stranded its own inputs for a full TTL;
@@ -4557,31 +4670,24 @@ mod tests {
         );
     }
 
-    /// **A database written before the writer normalised is repaired on open.**
-    ///
-    /// Fixing the writer does nothing for rows already on disk, and those rows are exactly the
-    /// ones the three defects above were found on. The ladder step lower-cases them once.
-    ///
-    /// The duplicate pair is the case that would otherwise abort the migration: `AABB` and `aabb`
-    /// are the same coin under a `PRIMARY KEY` that cannot hold both, so the stale upper-case row
-    /// is dropped in favour of the canonical one rather than colliding with it.
-    #[tokio::test]
-    async fn a_legacy_database_has_its_coin_hex_normalised_on_open() {
-        let db = WalletDb::open_in_memory().await.unwrap();
-        // Write past the normalising accessors, exactly as the old build did.
-        for (id, parent) in [("CCDD", "EEFF"), ("AABB", "0011"), ("aabb", "0011")] {
-            sqlx::query(
-                "INSERT OR REPLACE INTO coins
-                    (coin_id, parent_coin_info, puzzle_hash, amount, created_height)
-                 VALUES (?, ?, 'ph', '1', 10)",
-            )
-            .bind(id)
-            .bind(parent)
-            .execute(&db.pool)
-            .await
-            .unwrap();
-        }
-        // Re-arm the ladder so the step runs again on this already-open database.
+    /// Insert a coin row past the normalising accessors, exactly as a pre-#293 build did.
+    /// `amount` is the tag that tells otherwise-identical case twins apart.
+    async fn insert_legacy_coin(db: &WalletDb, coin_id: &str, parent: &str, amount: &str) {
+        sqlx::query(
+            "INSERT OR REPLACE INTO coins
+                (coin_id, parent_coin_info, puzzle_hash, amount, created_height)
+             VALUES (?, ?, 'ph', ?, 10)",
+        )
+        .bind(coin_id)
+        .bind(parent)
+        .bind(amount)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Re-arm the ladder so the coin-hex step runs again on an already-open database.
+    async fn rearm_coin_hex_migration(db: &WalletDb) {
         sqlx::query(&format!(
             "PRAGMA user_version = {}",
             COINS_STORED_LOWER_CASE - 1
@@ -4589,20 +4695,55 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
+    }
 
-        db.migrate().await.unwrap();
-
-        let ids: Vec<String> = sqlx::query("SELECT coin_id FROM coins ORDER BY coin_id")
+    async fn coin_ids(db: &WalletDb) -> Vec<String> {
+        sqlx::query("SELECT coin_id FROM coins ORDER BY coin_id")
             .fetch_all(&db.pool)
             .await
             .unwrap()
             .iter()
             .map(|r| r.get::<String, _>("coin_id"))
-            .collect();
+            .collect()
+    }
+
+    async fn amount_of(db: &WalletDb, coin_id: &str) -> String {
+        sqlx::query("SELECT amount FROM coins WHERE coin_id = ?")
+            .bind(coin_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get::<String, _>("amount")
+    }
+
+    /// **A database written before the writer normalised is repaired on open.**
+    ///
+    /// Fixing the writer does nothing for rows already on disk, and those rows are exactly the
+    /// ones the three defects above were found on. The ladder step lower-cases them once.
+    ///
+    /// The duplicate pair is the case that would otherwise abort the migration: `AABB` and `aabb`
+    /// are the same coin under a unique coin id that cannot hold both. The two twins are given
+    /// DIFFERENT amounts so the assertion can name WHICH one survived — with identical rows a
+    /// migration that kept the wrong twin would pass this test unchanged.
+    #[tokio::test]
+    async fn a_legacy_database_has_its_coin_hex_normalised_on_open() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy_coin(&db, "CCDD", "EEFF", "1").await;
+        insert_legacy_coin(&db, "AABB", "0011", "upper").await;
+        insert_legacy_coin(&db, "aabb", "0011", "lower").await;
+        rearm_coin_hex_migration(&db).await;
+
+        db.migrate().await.unwrap();
+
         assert_eq!(
-            ids,
+            coin_ids(&db).await,
             vec!["aabb".to_string(), "ccdd".to_string()],
             "legacy upper-case coin ids survived the migration"
+        );
+        assert_eq!(
+            amount_of(&db, "aabb").await,
+            "lower",
+            "the ALREADY-CANONICAL spelling is the one that survives a case collision"
         );
         let parents: Vec<String> =
             sqlx::query("SELECT parent_coin_info FROM coins ORDER BY coin_id")
@@ -4617,6 +4758,82 @@ mod tests {
             vec!["0011".to_string(), "eeff".to_string()],
             "legacy upper-case parent links survived the migration"
         );
+    }
+
+    /// **A coin id stored under several NON-canonical spellings does not brick the wallet.**
+    ///
+    /// This is the failure the two-spelling collision rule could not see. `AAbb` and `aAbb` are
+    /// both unequal to their own lower-casing, so a DELETE scoped to "upper-case rows whose
+    /// lower-casing already exists" removes neither, and the UPDATE then collides them onto one
+    /// unique key. The transaction rolls back, `migrate` returns `Err`, `WalletDb::open` returns
+    /// `Err` — and the retry on the next open is byte-for-byte identical, so the wallet never
+    /// opens again. A rollback is only a safe failure when the retry can succeed.
+    ///
+    /// The survivor is the lexicographically smallest spelling, `AAbb`, since neither is
+    /// canonical. That choice is arbitrary; being TOTAL and DETERMINISTIC is the point.
+    #[tokio::test]
+    async fn a_coin_id_stored_under_many_case_twins_does_not_brick_the_wallet() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy_coin(&db, "AAbb", "0011", "first").await;
+        insert_legacy_coin(&db, "aAbb", "0011", "second").await;
+        rearm_coin_hex_migration(&db).await;
+
+        db.migrate()
+            .await
+            .expect("a collision between non-canonical spellings must not fail the migration");
+
+        assert_eq!(
+            coin_ids(&db).await,
+            vec!["aabb".to_string()],
+            "the collided spellings were reduced to exactly one canonical row"
+        );
+        assert_eq!(
+            amount_of(&db, "aabb").await,
+            "first",
+            "with no canonical spelling present, the smallest survives"
+        );
+    }
+
+    /// **The tables that key rows by a coin id are normalised WITH it, in the same open.**
+    ///
+    /// `arrival_pending` and `arrivals` hold copies of `coins.coin_id` and are compared against it
+    /// raw. Left behind, a held row is pruned by `record_arrivals` — and losing the hold is how a
+    /// deferred coin falls below the baseline watermark and is never announced — while an
+    /// already-recorded arrival stops matching its `INSERT OR IGNORE` and is announced twice.
+    #[tokio::test]
+    async fn the_dependent_coin_id_tables_are_normalised_with_the_coin_table() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy_coin(&db, "AABB", "0011", "1").await;
+        sqlx::query("INSERT INTO arrival_pending (coin_id, created_height) VALUES ('AABB', 10)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO arrivals
+                (coin_id, puzzle_hash, amount, asset_id, confirmed_height, recorded_at)
+             VALUES ('AABB', 'ph', '1', NULL, 10, 0)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        rearm_coin_hex_migration(&db).await;
+
+        db.migrate().await.unwrap();
+
+        for table in ["arrival_pending", "arrivals"] {
+            let ids: Vec<String> = sqlx::query(&format!("SELECT coin_id FROM {table}"))
+                .fetch_all(&db.pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("coin_id"))
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["aabb".to_string()],
+                "{table} still keys its row by the un-normalised coin id"
+            );
+        }
     }
 
     /// **Retiring a bundle leaves NO orphan reservation.** The `coin_reservations` rows go with it,
