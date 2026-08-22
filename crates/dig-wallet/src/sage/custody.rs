@@ -96,8 +96,19 @@ pub const DEFAULT_DERIVATION_COUNT: u32 = 500;
 /// milliseconds of key derivation and the cost of under-covering is money the user cannot see.
 pub const DERIVATION_GAP_LIMIT: u32 = 250;
 
-/// The ceiling on the covered window, so a corrupt or hostile `derivation_count` in a hand-edited
-/// manifest cannot turn an unlock into an unbounded key derivation.
+/// The ceiling on the covered window, so a hostile COIN SET cannot turn an unlock into unbounded
+/// key derivation.
+///
+/// The gap-limit scan in [`WalletCustody::build_signer`] widens the window to follow observed
+/// usage, and what it observes is the replica's coin set — which anyone can add to by paying the
+/// wallet. Without a stop, coins planted at ever-higher indices would drive derivation as far as an
+/// attacker cared to pay for it.
+///
+/// The starting `derivation_count` is NOT a second channel: it arrives as a `u32` argument to
+/// [`WalletCustody::new`], not from any file. The non-secret manifest (`index.json`,
+/// [`ManifestEntry`]) has no such field, so editing it cannot reach this value. `.min()` is still
+/// applied to that argument, because a ceiling that only bounds one of its two inputs is not a
+/// ceiling.
 pub const MAX_DERIVATION_COUNT: u32 = 25_000;
 
 /// The reserved id of the adopted LEGACY single wallet (`<config_dir>/wallet-seed.bin`, the #370
@@ -939,8 +950,9 @@ impl WalletCustody {
     /// ([`WalletCustody::observe_occupied_puzzle_hashes`]). While the highest such index is within
     /// [`DERIVATION_GAP_LIMIT`] of the edge, derive another chunk and look again — the standard
     /// gap-limit scan, so the window follows usage instead of standing still. It terminates at
-    /// [`MAX_DERIVATION_COUNT`], because a hand-edited manifest or a hostile coin set must not be
-    /// able to turn an unlock into unbounded key derivation.
+    /// [`MAX_DERIVATION_COUNT`], because the coin set it follows is ATTACKER-EXTENSIBLE — anyone
+    /// can pay the wallet at a higher index — and an unbounded scan would let them dictate how much
+    /// key derivation an unlock performs.
     ///
     /// With nothing observed (a fresh node, or every test that does not opt in) the scan finds no
     /// occupied index and the window is exactly the default — the same shape as before, just wider.

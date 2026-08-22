@@ -1751,16 +1751,6 @@ impl WalletDb {
         Ok(())
     }
 
-    /// Drop a pushed bundle and every coin it reserved — the definitive-outcome release (a mempool
-    /// refusal, or a settled spend). The cascade on `coin_reservations` frees the coins.
-    pub async fn release_spend(&self, transaction_id: &str) -> sqlx::Result<()> {
-        sqlx::query("DELETE FROM pending_transactions WHERE transaction_id = ?")
-            .bind(transaction_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
     /// Drop every reservation whose bundle has lapsed, settled, or become unspendable, and return
     /// how many bundles were retired.
     ///
@@ -1778,12 +1768,19 @@ impl WalletDb {
     /// Conditions 2 and 3 are the same SQL: any reserved coin observed spent retires the bundle.
     /// They are named separately because they are different events and a reader should not have to
     /// infer that the code treats them alike on purpose.
+    ///
+    /// The join LOWER-cases the coin side because the two tables do not agree on case:
+    /// [`Self::reserve_spend`] normalises every id it writes, while `coins` stores whatever hex the
+    /// chain source handed over. A raw `c.coin_id = r.coin_id` therefore silently matched nothing
+    /// for a coin recorded in upper-case hex — its bundle would never retire on settlement and
+    /// would strand its inputs for the whole TTL. The selection path already normalises both sides
+    /// ([`Self::unreserved_unspent_coins`]), so this is the one place that still compared raw.
     pub async fn prune_reservations(&self, now_ms: i64) -> sqlx::Result<u64> {
         let n = sqlx::query(
             "DELETE FROM pending_transactions WHERE expires_at <= ?
              OR transaction_id IN (
                 SELECT r.transaction_id FROM coin_reservations r
-                JOIN coins c ON c.coin_id = r.coin_id
+                JOIN coins c ON LOWER(c.coin_id) = r.coin_id
                 WHERE c.spent_height IS NOT NULL
              )",
         )
@@ -4333,11 +4330,65 @@ mod tests {
             "c2 stayed stranded behind a bundle that can never be included"
         );
     }
-
-    /// An explicit release (a definitive mempool refusal) frees the coins at once, without waiting
-    /// for the expiry.
+    /// **A coin recorded in UPPER-case hex retires its bundle like any other.**
+    ///
+    /// `reserve_spend` normalises the ids it writes; `coins` stores whatever hex the chain source
+    /// handed over. The retirement join compared the two RAW, so an upper-case coin never matched
+    /// its own reservation: the settled bundle stayed pending and held its other inputs out of
+    /// selection for the entire TTL — a self-inflicted freeze on money the chain had already moved.
+    ///
+    /// FIXTURE DESIGN. Case is the ONLY axis varied from
+    /// [`observing_a_reserved_coin_spent_retires_its_bundle`], which stays green as the lower-case
+    /// control; both coins here are upper-case, so the assertion cannot be satisfied by a
+    /// normalisation applied to only one of the two comparison sides. The second coin is what makes
+    /// the stranding visible: with one coin, "retired" and "nothing was ever reserved" look alike.
     #[tokio::test]
-    async fn releasing_a_refused_bundle_frees_its_coins_at_once() {
+    async fn an_upper_case_coin_id_still_retires_its_settled_bundle() {
+        const UPPER: &str = "AABB";
+        const OTHER: &str = "CCDD";
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin(UPPER, 100, Some(10), None))
+            .await
+            .unwrap();
+        db.upsert_coin(&coin(OTHER, 50, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &[UPPER, OTHER], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        db.upsert_coin(&coin(UPPER, 100, Some(10), Some(11)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.prune_reservations(2_000).await.unwrap(),
+            1,
+            "a settled bundle whose coin id is upper-case was never retired"
+        );
+        assert!(
+            db.pending_transactions().await.unwrap().is_empty(),
+            "the bundle stayed in flight after the chain settled it"
+        );
+        assert_eq!(
+            db.unreserved_unspent_coins(None).await.unwrap().len(),
+            1,
+            "the settled bundle's other input stayed stranded until its TTL"
+        );
+    }
+
+    /// **Retiring a bundle leaves NO orphan reservation.** The `coin_reservations` rows go with it,
+    /// via the foreign-key cascade rather than a second delete a future caller could forget.
+    ///
+    /// This is the property `release_spend` used to prove. That method was removed because it had
+    /// no production caller and could never gain a correct one: a refusal reserves nothing
+    /// ([`WalletBackend::push_signed_bundle`] guards on `accepted`), and a settlement is retired by
+    /// [`WalletDb::prune_reservations`] — so every definitive outcome was already covered, and a
+    /// third release path on a custody-adjacent table was reachable only by mistake. The cascade it
+    /// depended on is real and still load-bearing, so it is asserted here through the retirement
+    /// path that actually runs.
+    #[tokio::test]
+    async fn retiring_a_bundle_cascades_away_its_reservations() {
         let db = WalletDb::open_in_memory().await.unwrap();
         db.upsert_coin(&coin("c1", 100, Some(10), None))
             .await
@@ -4345,8 +4396,13 @@ mod tests {
         db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
             .await
             .unwrap();
+        assert_eq!(
+            db.reserved_coin_ids().await.unwrap().len(),
+            1,
+            "the fixture must start with a live reservation, or the assertions below are vacuous"
+        );
 
-        db.release_spend("tx1").await.unwrap();
+        assert_eq!(db.prune_reservations(60_000).await.unwrap(), 1);
 
         assert_eq!(db.unreserved_unspent_coins(None).await.unwrap().len(), 1);
         assert!(
