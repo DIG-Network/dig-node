@@ -982,6 +982,13 @@ impl WalletBackend {
     /// `control.wallet.syncStatus` reports its phase from — so a client cannot be told `synced` by
     /// one endpoint and `syncing` by the other about the same moment.
     ///
+    /// That agreement is STRUCTURAL rather than asserted, and it was not always: this method is
+    /// now the only way any read produces `synced: true`. Every other site writes the literal
+    /// `false`, on a fallback-tier answer, where a third party's height says nothing about the
+    /// replica. `chain_peak` used to be the exception — it computed its flag from
+    /// `db.is_synced()` directly and so could, and on a live node did, report `synced: true`
+    /// about the same replica this method was calling stale (dig-node#293).
+    ///
     /// It narrows that predicate in ONE direction, and only here: `is_following` answers `true` on
     /// an UNOBSERVABLE peer tier, because on a status endpoint an absent second opinion is not an
     /// accusation. On a money read it is the opposite — with no peer height to compare against,
@@ -1866,7 +1873,6 @@ impl WalletBackend {
     /// height. `peak_height: None` means UNKNOWN and MUST NOT be read as height zero.
     pub async fn chain_peak(&self) -> std::result::Result<ChainPeak, BalanceError> {
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
-        let synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
         let replica_peak = self
             .db
             .sync_state()
@@ -1876,7 +1882,12 @@ impl WalletBackend {
         if let Some(peak_height) = replica_peak {
             return Ok(ChainPeak {
                 peak_height: Some(peak_height),
-                synced,
+                // The SAME measured predicate the balance and coin reads use
+                // (dig_ecosystem#2869), not `db.is_synced()`. That flag is
+                // `initial_sync_complete`: it latches once and is cleared only by a backwards
+                // chain move, so a replica hundreds of blocks behind still satisfied it and this
+                // endpoint still called its height current (dig-node#293).
+                synced: self.replica_answer_is_current(Some(peak_height)).await,
             });
         }
         // The replica has no height, so answering means an OUTBOUND call to the third-party tier.
@@ -6955,6 +6966,83 @@ mod tests {
         assert_eq!(result.peak_height, Some(REPLICA_PEAK));
     }
 
+    /// **Proves:** `chain_peak` cannot report `synced: true` about a replica that
+    /// `control.wallet.syncStatus` is simultaneously calling `syncing` (dig-node#293).
+    ///
+    /// THE DEFECT THIS PINS. dig_ecosystem#2869 replaced the latched `initial_sync_complete` with
+    /// a MEASURED freshness predicate at the balance and coin reads, and `chain_peak` was left
+    /// behind on `db.is_synced()`. Measured on a running node: `sync-status` said `syncing` while
+    /// `peak` said `synced: true`, in the same process at the same moment, on a replica 1,875
+    /// blocks behind. `peak` is the endpoint a client uses to bound a confirmation, so the
+    /// falsehood lands on exactly the read that decides whether money has settled.
+    ///
+    /// FIXTURE DESIGN. The replica must satisfy `initial_sync_complete` AND lag past
+    /// `FOLLOWING_TOLERANCE`, because the latch is what the defect trusts: a fresh replica fails
+    /// the latch and a caught-up one is genuinely current, so neither can exhibit the defect. The
+    /// gap is `PEERS_AHEAD_BY` (530), drawn from the live measurement rather than invented, and far
+    /// past the four-block tolerance.
+    ///
+    /// It asserts AGREEMENT with the balance read rather than just `!synced`: the two endpoints
+    /// disagreeing is the reported bug, and a fix applied to one site while the other keeps its own
+    /// predicate would satisfy a lone `!synced` assertion and re-open the same class of defect.
+    #[tokio::test]
+    async fn the_peak_is_not_reported_current_while_the_balance_read_calls_the_same_replica_stale()
+    {
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        assert!(
+            db.is_synced().await.unwrap(),
+            "the fixture must satisfy the latch the defect trusted; otherwise it proves nothing"
+        );
+        db.upsert_coin(&coin_at_ph("aa", &owned_ph(), 42, Some(1), None))
+            .await
+            .unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_ahead_of_the_replica());
+
+        let peak = be.chain_peak().await.unwrap();
+        let balance = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            peak.peak_height,
+            Some(REPLICA_PEAK),
+            "a stale peak must still say WHAT height it is, or a client loses its only bound"
+        );
+        assert!(
+            !peak.synced,
+            "`peak` called a replica {PEERS_AHEAD_BY} blocks behind current"
+        );
+        assert_eq!(
+            peak.synced, balance.synced,
+            "`peak` and the balance read disagreed about the freshness of one replica at one moment"
+        );
+    }
+
+    /// **The control for the test above:** a replica level with its peers still reports
+    /// `synced: true` from `chain_peak`.
+    ///
+    /// Without it, `synced: false` hardcoded in place of `synced: true` satisfies the test above —
+    /// trading one literal for another, and telling every client that no reading this node ever
+    /// gives is current.
+    #[tokio::test]
+    async fn a_replica_level_with_its_peers_still_reports_a_synced_peak() {
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(REPLICA_PEAK));
+
+        assert_eq!(
+            be.chain_peak().await.unwrap(),
+            ChainPeak {
+                peak_height: Some(REPLICA_PEAK),
+                synced: true,
+            },
+            "a replica at the tip was reported as stale"
+        );
+    }
+
+
     /// **Proves:** an UNOBSERVABLE peer tier is not a licence to claim currency — a node with no
     /// chain peer that has announced a height serves its figure labelled stale.
     ///
@@ -7098,10 +7186,17 @@ mod tests {
     }
 
     /// The peak comes from the node's own replica when it has one.
+    ///
+    /// The peer tier is fixed level with the replica because `synced` is now MEASURED against it
+    /// (dig-node#293). This fixture previously ran with an UNOBSERVABLE tier and still asserted
+    /// `synced: true` — which is the falsehood #293 removes, so leaving it would have pinned the
+    /// defect in place. The subject here is the HEIGHT's provenance; the freshness flag has its
+    /// own tests beside the balance reads.
     #[tokio::test]
     async fn the_peak_is_the_replicas_when_the_replica_has_one() {
         let db = db_with_owned_derivation(true, Some(5_000_000)).await;
-        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(5_000_000));
         assert_eq!(
             be.chain_peak().await.unwrap(),
             ChainPeak {
