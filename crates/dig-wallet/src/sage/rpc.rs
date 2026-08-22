@@ -989,19 +989,38 @@ impl WalletBackend {
     /// `db.is_synced()` directly and so could, and on a live node did, report `synced: true`
     /// about the same replica this method was calling stale (dig-node#293).
     ///
-    /// It narrows that predicate in ONE direction, and only here: `is_following` answers `true` on
-    /// an UNOBSERVABLE peer tier, because on a status endpoint an absent second opinion is not an
-    /// accusation. On a money read it is the opposite — with no peer height to compare against,
-    /// nothing has established that the replica's figure is current, and `synced: true` would then
-    /// rest on the latched `initial_sync_complete` this method exists to stop trusting. So an
-    /// unobservable tier answers `false`: the figure is still SERVED, with its real `peak_height`,
-    /// labelled stale. `is_following` itself is deliberately left alone so the two endpoints keep
-    /// agreeing wherever a peer height exists.
+    /// It narrows that predicate on BOTH of its unobservable arms, and only here. `is_following`
+    /// answers `true` whenever EITHER height is missing, because on a status endpoint an absent
+    /// measurement is not an accusation against the replica. On a money read it is the opposite:
+    /// currency is a claim, and nothing that was never measured can establish one. Either arm left
+    /// unnarrowed leaves `synced: true` resting on the latched `initial_sync_complete` this method
+    /// exists to stop trusting.
+    ///
+    /// - **No PEER height** — there is no second opinion to compare the replica against.
+    /// - **No REPLICA height** — there is no figure to compare, and `synced: true` would then be
+    ///   paired with `peak_height: null`, telling a client a reading is current while refusing to
+    ///   say what it is a reading OF. That arm is production-reachable, not hypothetical:
+    ///   `refresh_tracked_coins` latches the replica authoritative without ever writing a peak.
+    ///   `chain_peak` escapes it only by construction (it calls this inside `if let Some(peak)`);
+    ///   the balance and coin reads pass their `Option` straight through, so the arm landed on
+    ///   exactly the money reads (dig-node#293).
+    ///
+    /// Either way the figure is still SERVED, with whatever `peak_height` is actually known,
+    /// labelled stale — never withheld.
+    ///
+    /// `is_following` itself is deliberately left ALONE. Its permissive `_ => true` is correct for
+    /// the sync-phase reporting it was written for, where an unmeasured tier must not be spent as
+    /// evidence against a replica; narrowing it there would change a phase machine owned by another
+    /// family. The narrowing is a property of the MONEY read, so it lives at this call site, which
+    /// is the single gate every read that can produce `synced: true` already passes through.
     async fn replica_answer_is_current(&self, peak_height: Option<u32>) -> bool {
+        let Some(replica_peak) = peak_height else {
+            return false;
+        };
         let Some(peer_peak) = self.chain_peer_tier().await.peak_height else {
             return false;
         };
-        super::sync_supervisor::is_following(peak_height, Some(peer_peak))
+        super::sync_supervisor::is_following(Some(replica_peak), Some(peer_peak))
     }
 
     /// The chain-sync supervisor's handle, if one is running.
@@ -5923,9 +5942,17 @@ mod tests {
     }
 
     /// A synced, wallet-owned, EMPTY address is a SUCCESS with a zero figure — never an error.
+    ///
+    /// The replica is given a REAL peak, level with its peers. Its subject is the zero-versus-error
+    /// distinction, but it also asserts `synced`, and it used to do so over a replica with NO peak
+    /// of its own — pinning the precise pairing (`synced: true` beside an unknown height) that
+    /// [`WalletBackend::replica_answer_is_current`] now refuses. A fixture holding a value its own
+    /// rule forbids reads as a passing control while making the defect unfixable, so the fixture is
+    /// what changed here, not the assertion: an honestly caught-up replica knows its own height,
+    /// and this stays the suite's positive control against hardcoding `synced: false`.
     #[tokio::test]
     async fn synced_empty_address_is_zero_success_not_error() {
-        let db = db_with_owned_derivation(true, None).await;
+        let db = db_with_owned_derivation(true, Some(500)).await;
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -7088,6 +7115,78 @@ mod tests {
         assert!(
             !result.synced,
             "a figure no peer height could corroborate was reported as current"
+        );
+    }
+    /// **Proves:** an UNKNOWN REPLICA height is never reported as current either — the other
+    /// `None` arm of the same predicate, on the endpoint where it actually reaches production.
+    ///
+    /// [`super::sync_supervisor::is_following`] answers `true` when EITHER side is `None`, and
+    /// [`WalletBackend::replica_answer_is_current`] narrowed only the peer side. `chain_peak`
+    /// escapes the remaining arm by construction — it calls the gate inside `if let Some(peak)`,
+    /// so it can never hand it a `None` replica. The balance and coin reads do not: they read
+    /// `sync_state().peak_height` as an `Option` and pass it straight through. So the money reads,
+    /// and only the money reads, still paired `synced: true` with `peak_height: null`.
+    ///
+    /// The state is production-reachable rather than hypothetical: `refresh_tracked_coins` latches
+    /// the replica authoritative (`record_coverage` + `set_initial_sync_complete(true)`) WITHOUT
+    /// ever writing a peak, which is exactly what `db_with_owned_derivation(true, None)` builds.
+    ///
+    /// FIXTURE DESIGN. The peer tier is deliberately HONEST and OBSERVABLE — level with the
+    /// replica's neighbours, the same tier the passing control uses — so the missing REPLICA peak
+    /// is the only axis varied and is the only thing that can explain a verdict. A hostile or
+    /// unobservable tier would answer `false` for its own reasons and could not see this arm at
+    /// all. Asserting AGREEMENT with `chain_peak` rather than a bare `!synced` is what makes the
+    /// test load-bearing: the two endpoints disagreeing in one process at one moment is the
+    /// reported defect, and `chain_peak` here takes its honest fallback arm (`synced: false`,
+    /// height unknown), so a fix that hardcoded either literal on one side alone would show up as
+    /// a disagreement rather than pass.
+    #[tokio::test]
+    async fn an_unknown_replica_height_is_never_reported_as_current() {
+        let db = db_with_owned_derivation(true, None).await;
+        assert!(
+            db.is_synced().await.unwrap(),
+            "the fixture must satisfy the latch the defect trusts; otherwise it proves nothing"
+        );
+        assert_eq!(
+            db.sync_state().await.unwrap().peak_height,
+            None,
+            "the fixture's whole point is a latched replica that never wrote a peak"
+        );
+        db.upsert_coin(&coin_at_ph("aa", &owned_ph(), 42, Some(1), None))
+            .await
+            .unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(REPLICA_PEAK));
+
+        let balance = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        let coins = be
+            .coins_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        let peak = be.chain_peak().await.unwrap();
+
+        assert_eq!(
+            balance.peak_height, None,
+            "an unknown height must stay unknown; `None` is not height zero"
+        );
+        assert_eq!(
+            balance.balance, 42,
+            "the figure is served labelled stale, never withheld"
+        );
+        assert!(
+            !balance.synced,
+            "the balance read claimed currency for a replica whose own height it does not know"
+        );
+        assert_eq!(
+            balance.synced, peak.synced,
+            "the balance read and `peak` disagreed about one replica at one moment"
+        );
+        assert_eq!(
+            coins.synced, balance.synced,
+            "the coin read is the same answer reduced differently and must make the same claim"
         );
     }
 
@@ -10134,6 +10233,125 @@ mod tests {
             be.db.unspent_coins(None).await.unwrap().len(),
             2,
             "reserving a coin must not remove it from what the wallet owns"
+        );
+    }
+    /// A bundle spending exactly the coin `spendable_row(id_byte, amount)` describes, in the hex
+    /// form the wire carries — returned alongside the ids the production path will derive from it.
+    ///
+    /// The row and the bundle MUST agree on the coin's identity or the reservation writes an id
+    /// nothing selects on, and a test built that way passes while reserving the wrong coin.
+    /// Deriving the row's `coin_id` FROM the same `Coin` the bundle spends is what makes that
+    /// agreement structural instead of a matching pair of literals.
+    fn a_bundle_spending(row: &mut CoinRow) -> (String, String) {
+        use chia_protocol::{Bytes32, Coin, CoinSpend, Program, SpendBundle};
+        let coin = Coin::new(
+            Bytes32::new(hex_32(&row.parent_coin_info)),
+            Bytes32::new(hex_32(&row.puzzle_hash)),
+            row.amount.parse().unwrap(),
+        );
+        row.coin_id = hex::encode(coin.coin_id());
+        let spend = CoinSpend::new(coin, Program::from(vec![0x01]), Program::from(vec![0x80]));
+        let bundle = SpendBundle::new(vec![spend], Default::default());
+        (
+            super::super::chain::encode_signed_bundle(&bundle).unwrap(),
+            hex::encode(bundle.name()),
+        )
+    }
+
+    fn hex_32(s: &str) -> [u8; 32] {
+        hex::decode(s).unwrap().try_into().unwrap()
+    }
+
+    /// **Proves the WIRING, at the only seam that has it (#251).** A bundle the mempool accepted
+    /// leaves its inputs reserved — reached by PUSHING, not by calling `reserve_spend` directly.
+    ///
+    /// Every other reservation test drives `db.reserve_spend(...)` itself, so all of them pass
+    /// with the `push -> reserve` call deleted: mutating the seam to `if false && outcome.accepted`
+    /// left the whole suite green. That is the same argument this module already makes for #250 —
+    /// the defect is that the wiring did not exist, so a test stopping at the DB layer cannot see
+    /// it — applied to the half that was still only tested from below.
+    ///
+    /// FIXTURE DESIGN. Two spendable coins, and the bundle spends exactly ONE of them. A single
+    /// coin cannot distinguish "the pushed bundle's input was reserved" from "selection was
+    /// emptied", which a mis-scoped reservation would satisfy identically; the untouched control
+    /// coin must survive, and it is what turns the assertion from a count into a claim about
+    /// WHICH coin. Both observations go through the PRODUCTION reads (`spendable_coins`,
+    /// `get_pending_transactions`) rather than the DB primitives beneath them, and the recorded
+    /// transaction id is checked against the bundle's own name so a reservation filed under some
+    /// other id cannot pass.
+    #[tokio::test]
+    async fn a_pushed_bundle_reserves_its_inputs_through_the_production_path() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, transaction_id) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(FakePusher::accepting());
+
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            2,
+            "the fixture must start with BOTH coins selectable, or the assertion below is vacuous"
+        );
+
+        let outcome = be.push_signed_bundle(&bundle_hex).await.unwrap();
+        assert!(outcome.accepted, "the fixture's pusher accepts");
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "an accepted push recorded nothing in flight; the reserve call is not wired to it"
+        );
+        assert_eq!(
+            pending[0].transaction_id, transaction_id,
+            "the in-flight record is filed under an id that is not the bundle's"
+        );
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(
+            selectable.len(),
+            1,
+            "the pushed bundle's input is still offered to a second spend"
+        );
+        assert_eq!(
+            selectable[0].amount, 500,
+            "the wrong coin was reserved: the untouched control left selection"
+        );
+    }
+
+    /// **The control:** a mempool REFUSAL reserves nothing.
+    ///
+    /// Without it, reserving unconditionally — dropping the `outcome.accepted` guard rather than
+    /// the call — satisfies the test above while stranding a user's coins over a spend that will
+    /// never happen. It pins the guard, not just the wiring.
+    #[tokio::test]
+    async fn a_refused_bundle_reserves_nothing() {
+        let mut refused = spendable_row(0xa1, 100);
+        let (bundle_hex, _) = a_bundle_spending(&mut refused);
+        let be = backend_with(vec![refused.clone()], true)
+            .await
+            .with_pusher(FakePusher::answering(Ok(PushOutcome {
+                accepted: false,
+                transaction_id: None,
+                rejection: Some("mempool said no".into()),
+            })));
+
+        let outcome = be.push_signed_bundle(&bundle_hex).await.unwrap();
+        assert!(!outcome.accepted);
+
+        assert!(
+            be.get_pending_transactions()
+                .await
+                .unwrap()
+                .transactions
+                .is_empty(),
+            "a refused bundle was recorded as in flight"
+        );
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            1,
+            "a refused bundle stranded the coins it never committed"
         );
     }
 
