@@ -1278,7 +1278,7 @@ impl WalletDb {
     /// The scope is exactly those two columns. `puzzle_hash`, `asset_id` and `hint` are still
     /// stored VERBATIM as the chain source spelled them, here and in `attribute_cat_coin`, while
     /// `unspent_coins_scoped` lower-cases the values it binds against them — so the guarantee
-    /// below must not be read as covering them. That mismatch is a separate defect (dig-node#296),
+    /// below must not be read as covering them. That mismatch is a separate defect (dig-node#298),
     /// not a claim this function makes.
     ///
     /// The chain source hands over whatever case it likes, and the read layer was already written
