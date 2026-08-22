@@ -228,6 +228,32 @@ peer network) and `DIG_RELAY_URL` (override or disable the relay), which gate th
 Parsed as `u16`; unparsable/unset ⇒ the default **`9444`** (`peer::DEFAULT_P2P_PORT`).
 Bound dual-stack IPv6-first with an IPv4 fallback, per §5.2.
 
+**`DIG_BOOTSTRAP_PEERS`** — the always-on peer anchors dialled at startup, as a comma-separated
+`peer_id@host:port` list; `off`/`disabled` (case-insensitive) opts out entirely, and blank/unset falls
+back to the canonical compiled-in set.
+
+The canonical set is `dig_constants::DIG_BOOTSTRAP_PEERS` and MUST NOT be re-declared here. It names
+the PEER interface host `node-rpc.dig.net:9444` — NOT `rpc.dig.net`, which is a CloudFront
+distribution that terminates HTTPS, cannot carry the mTLS peer protocol, and whose peer ports are
+closed. `rpc.dig.net` appears in this system only as the §5.3 client→node READ gateway
+(`RPC_DIG_NET_URL`); the two roles MUST NOT be collapsed.
+
+A bootstrap anchor exists because every other peer input presupposes a peer the node already has:
+peer exchange spreads what a live link's far end knows, the DHT answers through peers already in the
+table, and a relay reservation only makes this node reachable. Normative properties:
+
+- Each entry MUST carry a 64-hex `peer_id`, pinned as `SHA-256(TLS SPKI DER)`. An entry without one
+  is SKIPPED, never dialled unpinned — dialling unpinned would accept whatever identity answered at
+  that address, which is what the pinning exists to deny. A malformed entry is dropped without
+  discarding its well-formed neighbours.
+- Dials are IPv6-first with an IPv4 fallback, per §5.2, and run the full traversal ladder.
+- An anchor is an UNTRUSTED peer (NC-12). Being well-known is not being trusted: it acquires no trust
+  flag, bypasses no corroboration, and counts as exactly one voice — identical in every respect to a
+  peer learned by exchange.
+- Bring-up MUST NOT block on or fail from a bootstrap dial. A node whose anchors are all unreachable
+  MUST still start and still operate from relay- and exchange-discovered peers; a hard dependency
+  would make one host a single point of failure for every fresh node in the network.
+
 **`DIG_GOSSIP_PORT`** — the gossip pool listen port (distinct from the mTLS peer-RPC port above, #871).
 Parsed as `u16`; unparsable/unset ⇒ the default **`9445`** (`peer::DEFAULT_GOSSIP_PORT`).
 The peer-RPC (9444) is the node's advertised peer-network identity and the route peers dial to fetch
