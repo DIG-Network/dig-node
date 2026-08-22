@@ -88,7 +88,7 @@ pub use seams::content::{bandwidth, verification_ledger, ContentServer};
 /// The `PeerNetwork` trait is seam 2's public surface (#1285 W1b-2) — bring it into scope to
 /// call `peer_status`/`set_inventory_refresher`/`set_gossip_handle`/`gossip_handle`/
 /// `refresh_dht_inventory` on a `Node`.
-pub use seams::dig_peer::{address_book, dht, net, pex, session, PeerNetwork};
+pub use seams::dig_peer::{address_book, bootstrap, dht, net, pex, session, PeerNetwork};
 /// The `RpcDispatch` trait is seam 4's public surface (#1285 W1b-5) — the crate-root
 /// `handle_rpc`/`handle_rpc_json` free functions delegate to it; most callers keep using those
 /// stable entry points and never need this trait in scope directly.
