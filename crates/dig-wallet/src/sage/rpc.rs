@@ -497,6 +497,23 @@ const DEFAULT_FALLBACK_BURST: f64 = 16.0;
 /// node's own quorum. Two sustains a walk without sustaining a sweep.
 const DEFAULT_FALLBACK_REFILL_PER_SEC: f64 = 2.0;
 
+/// How long a pushed bundle holds its input coins out of further selection
+/// (dig_ecosystem#2763): ten minutes.
+///
+/// A reservation ALWAYS expires, and the TTL is the backstop rather than the normal path. The
+/// normal releases are observational — the coin is seen spent, or the bundle is definitively
+/// refused — and this only decides how long a coin stays held when NEITHER of those ever arrives
+/// (the node restarts mid-flight, the peer that would have reported the update is dropped, the
+/// bundle is silently evicted from the mempool).
+///
+/// Sized by which failure is worse. Too SHORT re-exposes the defect: the coin is offered again
+/// while the original bundle can still be included, and the second spend is refused. Too LONG
+/// strands spendable money in a wallet that looks like it has none. Chia blocks are ~52s apart, so
+/// ten minutes is roughly a dozen chances for the spend to land — well past the point where a
+/// still-unconfirmed bundle is more likely dropped than pending, and short enough that a stranded
+/// coin returns on a timescale a user waits out rather than reports as lost.
+const RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
+
 /// The Sage-parity wallet backend.
 #[derive(Clone)]
 pub struct WalletBackend {
@@ -1919,10 +1936,56 @@ impl WalletBackend {
             return Err(PushError::NodeCustodiedSpend);
         }
         let pusher = self.pusher.as_ref().ok_or(PushError::NoChainSource)?;
-        pusher
+        let outcome = pusher
             .push(&bundle)
             .await
-            .map_err(|e| PushError::Unreachable(e.to_string()))
+            .map_err(|e| PushError::Unreachable(e.to_string()))?;
+
+        // Reserve the bundle's inputs ONLY once the mempool has accepted it
+        // (dig_ecosystem#2763). A refusal reserves nothing: those coins were never committed, and
+        // holding them would strand the user's money over a spend that will never happen.
+        //
+        // A reservation failure does not fail the push. The bundle is already in a public mempool
+        // by this point, and reporting a push that did happen as an error would be a worse lie
+        // than the double-selection this guards against.
+        if outcome.accepted {
+            if let Err(e) = self.reserve_pushed_bundle(&bundle).await {
+                tracing::warn!(
+                    error = %e,
+                    "pushed bundle accepted but its coins could not be reserved; a second send \
+                     inside the confirmation window may reselect them"
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Record an accepted bundle as in-flight and hold its inputs out of further selection.
+    ///
+    /// The fee is recovered by running the spends through `dig-clvm`. That is BEST-EFFORT and
+    /// deliberately does not gate anything: this node relays bundles it did not build and did not
+    /// sign (§908), so a validation failure here says nothing about whether the bundle is
+    /// legitimate — the mempool has already accepted it. An uncomputable fee is stored as `None`
+    /// and reported as `null`, never as zero.
+    async fn reserve_pushed_bundle(&self, bundle: &SpendBundle) -> Result<()> {
+        let now = super::custody::now_ms() as i64;
+        let row = super::db::PendingTransactionRow {
+            transaction_id: hex::encode(bundle.name()),
+            bundle_hex: super::chain::encode_signed_bundle(bundle)?,
+            fee: spend::run_and_validate(&bundle.coin_spends)
+                .ok()
+                .map(|r| r.fee.to_string()),
+            submitted_at: now,
+            expires_at: now + RESERVATION_TTL_MS,
+            attempts: 1,
+            reserved_coin_ids: bundle
+                .coin_spends
+                .iter()
+                .map(|cs| hex::encode(cs.coin.coin_id()))
+                .collect(),
+        };
+        self.db.reserve_spend(&row).await?;
+        Ok(())
     }
 
     /// Whether this node could have signed any part of `bundle` itself.
@@ -2446,11 +2509,47 @@ impl WalletBackend {
         })
     }
 
-    async fn get_pending_transactions(&self) -> GetPendingTransactionsResponse {
-        // This PR has no spend/submission path, so there are no pending transactions.
-        GetPendingTransactionsResponse {
-            transactions: Vec::new(),
+    /// The bundles this node has pushed and not yet observed settling
+    /// (dig_ecosystem#2764).
+    ///
+    /// This returned a hardcoded empty list, under a comment explaining that no spend path
+    /// existed. The comment was true when written and had been false since `push_signed_bundle`
+    /// landed: a caller that pushed a bundle and polled here was told, as a measured fact, that
+    /// nothing was in flight.
+    ///
+    /// Lapsed reservations are retired before reading, so a bundle whose expiry has passed is not
+    /// reported as live. That is done here, on the read, because it is the moment the answer has
+    /// to be true — a sweep on some other schedule would leave a window where this surface
+    /// reported a bundle the wallet had already stopped holding coins for.
+    ///
+    /// Returns `Err` on a database failure rather than an empty list. An empty list is a CLAIM —
+    /// "nothing is in flight" — and this surface must never make one it cannot support.
+    async fn get_pending_transactions(&self) -> Result<GetPendingTransactionsResponse> {
+        self.db
+            .prune_reservations(super::custody::now_ms() as i64)
+            .await?;
+        let mut transactions = Vec::new();
+        for t in self.db.pending_transactions().await? {
+            // An absent fee stays absent, and a fee that will not parse is an ERROR rather than a
+            // zero. A stored fee was written from a `u64`, so an unparseable one means the table
+            // is corrupt; reporting "fee: 0" for it would be the confident-wrong-number-about-
+            // money failure this ticket exists to remove.
+            let fee = match &t.fee {
+                None => None,
+                Some(raw) => Some(Amount::u64(raw.parse::<u64>().map_err(|e| {
+                    Error::internal(format!(
+                        "pending transaction {} has an unreadable fee {raw:?}: {e}",
+                        t.transaction_id
+                    ))
+                })?)),
+            };
+            transactions.push(PendingTransactionRecord {
+                transaction_id: t.transaction_id,
+                fee,
+                submitted_at: Some(t.submitted_at.max(0) as u64),
+            });
         }
+        Ok(GetPendingTransactionsResponse { transactions })
     }
 
     /// Group the wallet's coins into per-height transaction records (created vs spent).
@@ -2666,9 +2765,22 @@ impl WalletBackend {
     ///
     /// Gated on [`Self::require_authoritative_coins`] — this is a spend-input read, not a
     /// display read.
+    ///
+    /// Reads the UNRESERVED unspent set (dig_ecosystem#2763): a coin already committed to a
+    /// bundle this node pushed is not offered again. Without that, two sends inside the
+    /// confirmation window selected the same coin — the replica only learns a coin is spent when
+    /// a peer pushes a `coin_state_update`, tens of seconds later — and the second was a
+    /// guaranteed mempool refusal surfacing as an opaque `push failed`.
+    ///
+    /// This is deliberately the only read that changes. Balance and display reads keep counting a
+    /// coin whose spend has not settled, because the chain has not said otherwise yet; "what do I
+    /// own" and "what may I spend next" are different questions.
     async fn spendable_coins(&self, asset_id: Option<&str>) -> Result<Vec<Coin>> {
         self.require_authoritative_coins().await?;
-        let rows = self.db.unspent_coins(asset_id).await?;
+        self.db
+            .prune_reservations(super::custody::now_ms() as i64)
+            .await?;
+        let rows = self.db.unreserved_unspent_coins(asset_id).await?;
         rows.iter().map(singleton::coin_from_row).collect()
     }
 
@@ -3048,7 +3160,15 @@ impl WalletBackend {
             .lineage
             .as_deref()
             .ok_or_else(|| Error::internal("CAT send requires a lineage source"))?;
-        let rows = select_cat_rows(self.db.unspent_coins(Some(asset_id)).await?, amount)?;
+        // The unreserved set, for the same reason as `spendable_coins` (dig_ecosystem#2763): a CAT
+        // coin committed to an in-flight bundle must not be selected into a second one.
+        self.db
+            .prune_reservations(super::custody::now_ms() as i64)
+            .await?;
+        let rows = select_cat_rows(
+            self.db.unreserved_unspent_coins(Some(asset_id)).await?,
+            amount,
+        )?;
         let mut cats = Vec::with_capacity(rows.len());
         for row in &rows {
             let created = row
@@ -3992,7 +4112,7 @@ impl WalletBackend {
             }
             "get_pending_transactions" => {
                 let _r = req!(GetPendingTransactions);
-                json(self.get_pending_transactions().await)?
+                json(self.get_pending_transactions().await?)?
             }
             "is_asset_owned" => {
                 let r = req!(IsAssetOwned);
@@ -4213,11 +4333,17 @@ impl WalletBackend {
             // The node-custodied seed lifecycle (#370/#368): create/import/restore/unlock/lock/
             // status/delete. Reachable only when custody is attached ([`Self::with_custody`]);
             // authorization is the transport's concern (the paired-token gate, SPEC §7.12).
-            m if m.starts_with("wallet.") => self.dispatch_custody(m, body)?,
+            m if m.starts_with("wallet.") => {
+                self.refresh_observed_derivations(m).await;
+                self.dispatch_custody(m, body)?
+            }
             // The node-managed unlock authority (#431/#432, §18.24): status/get_method/set_method/
             // set_mode/enroll_totp/enroll_passkey_*/unlock/sign_unlock/lock. Reachable only when auth
             // is attached ([`Self::with_auth`]); every `auth.*` method is paired-token gated (§7.12).
-            m if m.starts_with("auth.") => self.dispatch_auth(m, body)?,
+            m if m.starts_with("auth.") => {
+                self.refresh_observed_derivations(m).await;
+                self.dispatch_auth(m, body)?
+            }
             other => {
                 return Err(Error::not_found(format!(
                     "unknown or unsupported method: {other}"
@@ -4243,6 +4369,60 @@ impl WalletBackend {
             // Until a chain tip is separately tracked, the best-known target is the synced peak.
             target_height: st.peak_height,
         })
+    }
+
+    /// Hand custody the p2 puzzle hashes this replica has seen coins at, so the gap-limit scan can
+    /// size the derivation window from real usage (dig_ecosystem#2762).
+    ///
+    /// Called immediately before the methods that actually load keys, because an unlock is the only
+    /// moment the seed is in hand and therefore the only moment the covered window can grow. Doing
+    /// it here rather than inside custody keeps the DB out of `custody.rs`, which holds no database
+    /// handle and should not acquire one to answer a question about coins.
+    ///
+    /// # What this does NOT do
+    ///
+    /// The scan extends from usage it can SEE, and the node only sees coins at addresses it has
+    /// already subscribed — which is the window itself. So it reliably follows a wallet outgrowing its
+    /// window from inside (used index 480 of 500 → extends to 730), and it CANNOT discover history
+    /// that starts beyond the window (a wallet whose only coins sit at index 5000 is invisible, and
+    /// stays invisible). That case is covered by [`DEFAULT_DERIVATION_COUNT`] being wide enough to
+    /// begin with, not by this scan. Closing it properly means asking the chain which addresses are
+    /// used before subscribing, which is a chain read and so owed the NC-12 corroborated path —
+    /// tracked separately rather than half-built here.
+    ///
+    /// Failure is logged and ignored: a database hiccup must not make a wallet unopenable. The
+    /// window then stays at its floor, which is the conservative direction.
+    async fn refresh_observed_derivations(&self, method: &str) {
+        // Only the key-loading methods. Every other `wallet.*`/`auth.*` call is a status or config
+        // read that cannot change the window, and scanning the coin table on each would be work
+        // that provably cannot alter the outcome.
+        const KEY_LOADING: &[&str] = &[
+            "wallet.unlock",
+            "wallet.import",
+            "wallet.restore",
+            "auth.unlock",
+            "auth.sign_unlock",
+        ];
+        if !KEY_LOADING.contains(&method) {
+            return;
+        }
+        let Some(custody) = self.custody.as_ref() else {
+            return;
+        };
+        match self.db.occupied_puzzle_hashes().await {
+            Ok(hexes) => {
+                custody.observe_occupied_puzzle_hashes(
+                    hexes
+                        .iter()
+                        .filter_map(|h| singleton::bytes32_from_hex(h).ok())
+                        .collect(),
+                );
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not read observed puzzle hashes; the derivation window stays at its floor"
+            ),
+        }
     }
 
     /// Dispatch a `wallet.*` MULTI-wallet custody-lifecycle method to the attached [`WalletCustody`]
@@ -4729,6 +4909,7 @@ fn paginate(coins: Vec<CoinRecord>, offset: u32, limit: u32) -> Vec<CoinRecord> 
 #[cfg(test)]
 mod tests {
     use super::super::db::DerivationRow;
+    use super::super::db::PendingTransactionRow;
     use super::super::db::WalletDb;
     use super::super::fallback::mock::MockFallback;
     use super::super::fallback::EmptyFallback;
@@ -9786,6 +9967,155 @@ mod tests {
             (r.synced_coins, r.total_coins),
             (1, 1),
             "a covered scope must still report a complete view"
+        );
+    }
+
+    // ---- in-flight coin reservation + real pending set (#2763 / #2764) ------
+    //
+    // These drive the PRODUCTION reads (`spendable_coins`, `get_pending_transactions`), not the
+    // database primitives underneath them. The primitives already have their own tests in `db.rs`
+    // and passed while nothing called them: the defect these close is that the wiring did not
+    // exist, so a test that stops at the DB layer cannot see it.
+
+    /// A coin row with real hex, so `singleton::coin_from_row` can parse it.
+    fn spendable_row(id_byte: u8, amount: u64) -> CoinRow {
+        CoinRow {
+            coin_id: format!("{id_byte:02x}").repeat(32),
+            parent_coin_info: "11".repeat(32),
+            puzzle_hash: test_ph(),
+            amount: amount.to_string(),
+            created_height: Some(1),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    fn pending_row(
+        tx: &str,
+        coin_ids: &[String],
+        fee: Option<&str>,
+        expires_at: i64,
+    ) -> PendingTransactionRow {
+        PendingTransactionRow {
+            transaction_id: tx.into(),
+            bundle_hex: "00".into(),
+            fee: fee.map(Into::into),
+            submitted_at: 1_000,
+            expires_at,
+            attempts: 1,
+            reserved_coin_ids: coin_ids.to_vec(),
+        }
+    }
+
+    /// **The defect (#2763), at the seam that actually selects.** A coin committed to a pushed,
+    /// unsettled bundle must not be offered to the next spend — while still counting as money the
+    /// wallet owns, because the chain has not said otherwise yet.
+    #[tokio::test]
+    async fn a_reserved_coin_leaves_selection_but_not_the_balance() {
+        let (a, b) = (spendable_row(0xa1, 100), spendable_row(0xb2, 500));
+        let be = backend_with(vec![a.clone(), b.clone()], true).await;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row(
+                "tx1",
+                &[a.coin_id.clone()],
+                Some("7"),
+                far_future,
+            ))
+            .await
+            .unwrap();
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(
+            selectable.len(),
+            1,
+            "the reserved coin was offered to a second spend"
+        );
+        assert_eq!(selectable[0].amount, 500);
+
+        assert_eq!(
+            be.db.unspent_coins(None).await.unwrap().len(),
+            2,
+            "reserving a coin must not remove it from what the wallet owns"
+        );
+    }
+
+    /// **The defect (#2764).** `get_pending_transactions` returned a hardcoded empty list. A
+    /// caller that pushed a bundle and polled was told, as a measured fact, that nothing was in
+    /// flight.
+    #[tokio::test]
+    async fn pending_transactions_reports_an_in_flight_bundle() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row(
+                "tx1",
+                &[a.coin_id.clone()],
+                Some("7"),
+                far_future,
+            ))
+            .await
+            .unwrap();
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "a pushed bundle was reported as nothing in flight"
+        );
+        assert_eq!(pending[0].transaction_id, "tx1");
+        assert_eq!(pending[0].fee, Some(Amount::u64(7)));
+    }
+
+    /// A fee this node could not compute is reported as `null`, NEVER as zero. The node relays
+    /// bundles it did not build (§908), and a confident zero would be a claim about someone
+    /// else's money.
+    #[tokio::test]
+    async fn an_uncomputable_fee_is_reported_as_null_not_zero() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], None, far_future))
+            .await
+            .unwrap();
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending[0].fee, None,
+            "an unknown fee was flattened to a number"
+        );
+    }
+
+    /// A reservation ALWAYS lapses, and both surfaces observe the lapse: the bundle stops being
+    /// reported in flight, and its coin returns to selection. This is the failure direction that
+    /// would otherwise be worse than the bug — a release path that never runs must not be able to
+    /// strand the user's money permanently.
+    #[tokio::test]
+    async fn an_expired_reservation_stops_being_pending_and_frees_its_coin() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        be.db
+            .reserve_spend(&pending_row("tx1", &[a.coin_id.clone()], Some("7"), 1))
+            .await
+            .unwrap();
+
+        assert!(
+            be.get_pending_transactions()
+                .await
+                .unwrap()
+                .transactions
+                .is_empty(),
+            "a lapsed bundle was still reported in flight"
+        );
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            1,
+            "a lapsed reservation stranded the coin"
         );
     }
 }

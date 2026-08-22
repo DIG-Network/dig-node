@@ -4795,6 +4795,44 @@ answered, and MUST derive every freshness field from that tier.
   path, and logging every local read at `info` would turn an OPEN unauthenticated loopback endpoint
   into a log-volume lever.
 
+18.7a. **Derivation coverage — both trees, and the window follows use.** A custodied wallet MUST
+cover BOTH the unhardened and the hardened HD tree. Chia farmer and pool rewards are paid to
+HARDENED derivations, so a wallet covering only the unhardened tree cannot see them at ANY index.
+
+The covered window MUST have a floor of at least 500 indices per tree, and MUST NOT be a constant: a
+wallet observed using an index within a gap limit of the window's edge MUST extend past it, so the
+addresses it is about to be paid at are both watched and spendable. Extension MUST be bounded, so a
+corrupt or hostile persisted count cannot turn an unlock into unbounded key derivation.
+
+The signer and the watched set MUST widen TOGETHER. Widening only the watched set converts "the user
+cannot see their coin" into "the user can see their coin and cannot spend it", which is worse — it
+reads as a send bug rather than a coverage bug.
+
+Evidence of use is the p2 puzzle hashes the local replica has seen ANY coin at, SPENT coins included:
+a coin that arrived at an index and was later spent is still proof that index was handed out. The
+scan can therefore only follow a wallet outgrowing its window from INSIDE; history that begins beyond
+the window is not discoverable this way, and is covered by the floor.
+
+A wallet whose coins lie outside the covered window MUST NOT be reported as `synced` over a balance
+that omits them — a confidently wrong, lower balance is the failure this clause exists to prevent.
+
+18.9a. **In-flight coin reservation.** A spend bundle this node pushes and that the mempool ACCEPTS
+MUST have its input coins reserved: recorded as committed and withheld from subsequent spend-input
+selection. Without it, two sends inside the confirmation window select the same coin — the replica
+only learns a coin is spent when a peer reports it, tens of seconds later — and the second is a
+guaranteed mempool refusal the caller cannot act on.
+
+A REFUSED push MUST reserve nothing; those coins were never committed.
+
+Reservation MUST affect spend-input selection ONLY. Balance and display reads MUST keep counting a
+reserved coin, because the chain has not said it is spent. "What do I own" and "what may I spend
+next" are different questions.
+
+Every reservation MUST expire. Release is normally observational — the coin is seen spent, or the
+bundle is definitively refused — and the expiry is the backstop that keeps a release path which never
+runs from stranding a coin permanently. Failing to record a reservation MUST NOT fail a push that the
+mempool already accepted.
+
 18.8. **Method surface — reads (served).** `login`, `logout`, `get_version`,
 `get_sync_status`, `check_address`, `get_derivations`, `get_are_coins_spendable`,
 `get_spendable_coin_count`, `get_coins`, `get_coins_by_ids`, `get_cats`, `get_all_cats`, `get_token`,
@@ -4802,7 +4840,11 @@ answered, and MUST derive every freshness field from that tier.
 `get_transactions`, `get_transaction`, `get_pending_transactions`, `is_asset_owned`, `get_key`,
 `get_keys`. Coins and CAT balances/records are fully synced and served; transactions are derived from the
 coin table grouped by created/spent height; NFT/DID/collection reads return the rows the sync
-reconstruction populates (§18.11). `get_pending_transactions` is empty (no pending-tracking store yet).
+reconstruction populates (§18.11). `get_pending_transactions` MUST report the bundles this node has
+pushed and not yet observed settling, read from the in-flight reservation store (§18.9a). A database
+failure MUST be an error, never an empty list — an empty list is the positive claim that nothing is in
+flight. Each record's `fee` MAY be `null` when the node could not compute it; a fee it does not know
+MUST NOT be reported as `0`.
 
 18.9. **Method surface — send/spend group (served, #216).** `send_xch`, `bulk_send_xch`, `send_cat`,
 `bulk_send_cat`, `combine`, `split`, `multi_send`, `sign_coin_spends`, `view_coin_spends`,
@@ -4953,8 +4995,9 @@ unit wires the LIVE path, gated so it is OFF by default (money-safe) and ON only
 
   The custodied set is the union of the loaded signer, every signer this process has loaded (the
   §18.24 per-transaction grant is already gone by push time), and the custody manifest's PERSISTED
-  public keys — non-secret, readable while every wallet is locked, and covering the whole
-  `0..derivation_count` range rather than the index-0 receive address alone. Merely WATCHED puzzle
+  public keys — non-secret, readable while every wallet is locked, and covering the whole covered
+  window in BOTH the unhardened and hardened trees rather than the index-0 receive address alone.
+  The window is sized by §18.7a, so it is not a constant. Merely WATCHED puzzle
   hashes are NOT in it: the node holds no key for those, and refusing them would block a legitimate
   third-party push. Without this check the flag would be decorative on the one path that matters.
 
