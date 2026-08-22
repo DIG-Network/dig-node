@@ -174,6 +174,44 @@ pub struct DerivationRow {
     pub address: String,
 }
 
+/// A spend bundle this node pushed that has not yet been observed settling, together with the
+/// coins it committed (dig_ecosystem#2763).
+///
+/// This is the record the wallet previously did not keep. Without it a broadcast marked nothing,
+/// so a second send inside the confirmation window re-selected the same coin and was refused by
+/// the mempool for a reason the caller could not act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTransactionRow {
+    /// The spend bundle's id (`SpendBundle::name`, hex) — the transaction id a caller polls by.
+    pub transaction_id: String,
+    /// The complete signed bundle, hex-encoded, so a bundle accepted and then dropped from the
+    /// mempool can be re-pushed BYTE-IDENTICALLY rather than rebuilt (a rebuild would be a
+    /// different transaction, and the node cannot rebuild a bundle it did not sign).
+    ///
+    /// Not a secret: these exact bytes were broadcast to a public mempool. Storing them adds no
+    /// disclosure, and a bundle whose push was definitively refused is deleted rather than kept.
+    pub bundle_hex: String,
+    /// The bundle's fee in mojos, as the consensus computes it (inputs minus outputs), or `None`
+    /// when this node could not compute it.
+    ///
+    /// Optional because the node relays bundles it did not build and did not sign (§908). The fee
+    /// is recovered by running the spends through `dig-clvm`, which can legitimately fail for a
+    /// bundle that is still perfectly valid to relay. `None` is then the honest answer, and it is
+    /// kept as `None` all the way to the caller rather than being flattened to zero — a fee of
+    /// zero is a claim about money, and this row exists because the surface above it was making
+    /// claims it could not support (dig_ecosystem#2764).
+    pub fee: Option<String>,
+    /// When the bundle was first pushed, ms since the Unix epoch.
+    pub submitted_at: i64,
+    /// When the reservation lapses, ms since the Unix epoch. A reservation ALWAYS expires: a
+    /// release path that fails to run must not be able to strand a coin permanently.
+    pub expires_at: i64,
+    /// How many times this bundle has been pushed (1 on first broadcast).
+    pub attempts: i64,
+    /// The coin ids the bundle spends — the coins held out of further selection while it is live.
+    pub reserved_coin_ids: Vec<String>,
+}
+
 /// A reconstructed NFT row: filter columns + the full serialized `NftRecord` wire JSON.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NftDbRow {
@@ -417,6 +455,22 @@ CREATE TABLE IF NOT EXISTS options (
     record_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS pending_transactions (
+    transaction_id TEXT PRIMARY KEY,
+    bundle_hex TEXT NOT NULL,
+    fee TEXT,
+    submitted_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS coin_reservations (
+    coin_id TEXT PRIMARY KEY,
+    transaction_id TEXT NOT NULL
+        REFERENCES pending_transactions (transaction_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_coin_reservations_tx ON coin_reservations (transaction_id);
+
 CREATE TABLE IF NOT EXISTS peers (
     ip_addr TEXT PRIMARY KEY,
     port INTEGER NOT NULL,
@@ -507,8 +561,19 @@ const ADD_COLUMN_MIGRATIONS: &[&str] = &[
 /// than by a value derived from the offered coin set.
 const OFFERS_KEYED_BY_CANONICAL_ID: i64 = 1;
 
+/// Ladder step 2: every hex identity in `coins` is stored lower-case (dig-node#293), and the
+/// tables that key rows by a coin id agree with it.
+const COINS_STORED_LOWER_CASE: i64 = 2;
+
+/// Every table whose rows are keyed by a coin id, and which [`COINS_STORED_LOWER_CASE`] must
+/// therefore normalise together.
+///
+/// `arrival_pending` and `arrivals` hold copies of `coins.coin_id` and are compared against it
+/// raw, so normalising one table without the others is a desync, not a partial fix.
+const COIN_ID_TABLES: [&str; 3] = ["coins", "arrival_pending", "arrivals"];
+
 /// The highest ladder step this build knows how to apply.
-const SCHEMA_VERSION: i64 = OFFERS_KEYED_BY_CANONICAL_ID;
+const SCHEMA_VERSION: i64 = COINS_STORED_LOWER_CASE;
 
 /// Indexes that depend on a column [`ADD_COLUMN_MIGRATIONS`] may only just have added, so they
 /// cannot live in [`SCHEMA`]: on a legacy DB the index would be created against a column that does
@@ -729,6 +794,9 @@ impl WalletDb {
         if applied < OFFERS_KEYED_BY_CANONICAL_ID {
             self.rekey_offers_to_canonical_ids().await?;
         }
+        if applied < COINS_STORED_LOWER_CASE {
+            self.normalise_stored_coin_hex().await?;
+        }
 
         // Marked only after every step above SUCCEEDED, so a migration that failed part-way is
         // retried on the next open rather than being recorded as done.
@@ -738,6 +806,148 @@ impl WalletDb {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Lower-case the hex identities of coins written before the writer normalised (dig-node#293).
+    ///
+    /// Fixing [`Self::upsert_coin`] does nothing for rows already on disk, so a fix without this
+    /// step would appear to work on a fresh database and leave every existing one untouched.
+    ///
+    /// # No in-tree writer can have produced an upper-case identity
+    ///
+    /// Every path that reaches the `coins` table already emits lower-case hex and did so before
+    /// this migration existed: the subscription writer builds ids with `hex::encode`
+    /// (`sync.rs::coin_state_to_row`), the coinset fallback normalises in `map_record`
+    /// (`fallback.rs`), the dialled-peer read uses `hex::encode` (`peer_reads/dialed.rs`), and the
+    /// read cache replays whatever those three stored (`peer_reads.rs::coin_from_cache`). So on
+    /// any wallet this ecosystem has ever written, the statements below match ZERO rows.
+    ///
+    /// What they defend against is a THIRD-PARTY implementation. `ChainFallback` and `CoinPeer`
+    /// are public traits, and `refresh_tracked_coins` passes a `FallbackCoin` into the table
+    /// verbatim (`rpc.rs::fallback_coin_to_row`), so an out-of-tree impl that emits upper-case hex
+    /// is the one way such a row can exist. That is also why the collision rule below does NOT
+    /// claim to keep the fresher row: the verbatim path is the point-read used precisely BECAUSE
+    /// the subscription replica is behind, so an upper-case row would be the fresher observation,
+    /// not the staler one. Case carries no recency information at all, in either direction.
+    ///
+    /// # The collision rule
+    ///
+    /// `coin_id` is unique in all three tables, so lower-casing several spellings of one id into
+    /// each other is a uniqueness violation that aborts the whole step — and because the retry on
+    /// the next open is byte-for-byte identical, an aborted step means [`Self::migrate`] fails
+    /// forever and the wallet never opens again. Collisions are therefore resolved BEFORE the
+    /// update, by [`Self::drop_case_collisions`], for any number of spellings rather than the
+    /// two-spelling case alone.
+    ///
+    /// # Dependent tables move with it
+    ///
+    /// `arrival_pending.coin_id` and `arrivals.coin_id` are copies of `coins.coin_id` and are
+    /// compared against it raw. Normalising `coins` alone would desync them, and both shipped
+    /// consequences lose money-visible state: `record_arrivals` prunes every `arrival_pending` row
+    /// whose id is no longer in `coins`, and a pruned hold stops exempting a deferred coin from
+    /// the baseline watermark, so an arrival is swallowed; and `INSERT OR IGNORE INTO arrivals`
+    /// stops recognising an id it already recorded, so a coin is announced to the user twice.
+    ///
+    /// One transaction, so any failure rolls every table back together and the ladder mark — which
+    /// is written only after this returns — stays unset for the next open to retry.
+    async fn normalise_stored_coin_hex(&self) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for table in COIN_ID_TABLES {
+            Self::drop_case_collisions(&mut tx, table).await?;
+            // `table` is a compile-time constant from `COIN_ID_TABLES`, never caller input, so
+            // interpolating it is not an injection surface. SQLite cannot bind an identifier.
+            sqlx::query(&format!(
+                "UPDATE {table} SET coin_id = LOWER(coin_id) WHERE coin_id <> LOWER(coin_id)"
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
+        // `parent_coin_info` is not a key of anything, so it cannot collide.
+        sqlx::query(
+            "UPDATE coins SET parent_coin_info = LOWER(parent_coin_info)
+             WHERE parent_coin_info <> LOWER(parent_coin_info)",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reduce every set of coin ids that differ only in case to ONE row, so the lower-casing that
+    /// follows cannot violate the table's unique coin id.
+    ///
+    /// The alternative is not "a slightly wrong row survives" — it is a `UNIQUE` violation that
+    /// rolls the migration back, deterministically, on every subsequent open, leaving the wallet
+    /// permanently unopenable. Any deterministic survivor beats that.
+    ///
+    /// Deletion is safe here in a way it would not be elsewhere: all three tables are derived from
+    /// chain state, so the worst case is a coin re-observed on the next sync. The dropped rows are
+    /// logged at WARN with the id and the surviving spelling, because in this codebase a collision
+    /// can only mean a non-conforming `ChainFallback`/`CoinPeer` implementation wrote to the
+    /// replica — a fact worth surfacing rather than silently repairing.
+    async fn drop_case_collisions(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        table: &str,
+    ) -> sqlx::Result<()> {
+        // Normally zero rows: only ids that have a case-twin are read back.
+        let spellings: Vec<String> = sqlx::query(&format!(
+            "SELECT coin_id FROM {table}
+             WHERE LOWER(coin_id) IN (
+                 SELECT LOWER(coin_id) FROM {table}
+                 GROUP BY LOWER(coin_id) HAVING COUNT(*) > 1
+             )"
+        ))
+        .fetch_all(&mut **tx)
+        .await?
+        .iter()
+        .map(|r| r.get::<String, _>("coin_id"))
+        .collect();
+
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for spelling in spellings {
+            groups
+                .entry(spelling.to_ascii_lowercase())
+                .or_default()
+                .push(spelling);
+        }
+
+        for (canonical, group) in &groups {
+            let Some(survivor) = Self::surviving_spelling(group) else {
+                continue;
+            };
+            for loser in group.iter().filter(|s| s.as_str() != survivor) {
+                sqlx::query(&format!("DELETE FROM {table} WHERE coin_id = ?"))
+                    .bind(loser)
+                    .execute(&mut **tx)
+                    .await?;
+            }
+            tracing::warn!(
+                table,
+                coin_id = %canonical,
+                kept = %survivor,
+                dropped = group.len() - 1,
+                "legacy replica held one coin id under several hex spellings; keeping one"
+            );
+        }
+        Ok(())
+    }
+
+    /// Which spelling of one coin id survives a case collision.
+    ///
+    /// Prefer the spelling that is ALREADY canonical, because it is the one every conforming
+    /// writer produces and the one every reader will look for; a group can hold at most one such
+    /// spelling, since two would be the same string. Failing that — two or more mixed-case
+    /// spellings and no lower-case one — take the lexicographically smallest, which is arbitrary
+    /// but total and stable, and is chosen for exactly that reason.
+    ///
+    /// Recency is deliberately NOT a tie-break: the columns are identical apart from case, so the
+    /// table carries no evidence of which spelling was written last.
+    fn surviving_spelling(group: &[String]) -> Option<&str> {
+        group
+            .iter()
+            .find(|s| !s.bytes().any(|b| b.is_ascii_uppercase()))
+            .or_else(|| group.iter().min())
+            .map(String::as_str)
     }
 
     /// Re-key stored offers onto the canonical offer id (dig-node#283).
@@ -1062,8 +1272,38 @@ impl WalletDb {
 
     // ---- coins ------------------------------------------------------------
 
+    /// **The `coins` table stores its two COIN IDENTITIES — `coin_id` and `parent_coin_info` —
+    /// LOWER-CASE, and this is the property every lookup by id depends on** (dig-node#293).
+    ///
+    /// The scope is exactly those two columns. `puzzle_hash`, `asset_id` and `hint` are still
+    /// stored VERBATIM as the chain source spelled them, here and in `attribute_cat_coin`, while
+    /// `unspent_coins_scoped` lower-cases the values it binds against them — so the guarantee
+    /// below must not be read as covering them. That mismatch is a separate defect (dig-node#298),
+    /// not a claim this function makes.
+    ///
+    /// The chain source hands over whatever case it likes, and the read layer was already written
+    /// as though it did not: `reserve_spend` normalises the ids it writes and `reserved_coin_ids`
+    /// lower-cases what it reads back. Both are correct ONLY if the writer normalised first, and
+    /// the writer did not.
+    ///
+    /// Three raw comparisons were reachable because of it, and they failed in different
+    /// directions: a settled bundle never retired and stranded its own inputs for a full TTL;
+    /// `are_coins_spendable` reported a genuinely spendable coin unspendable to a Sage-parity
+    /// caller; and `record_arrivals` failed to recognise the wallet's own parent coin, so its own
+    /// change was announced to the user as an incoming payment.
+    ///
+    /// Normalising HERE rather than at each of the three readers is what makes that class closed
+    /// rather than enumerated — a fourth reader added later inherits the guarantee instead of
+    /// having to remember it. It also keeps the reads on their indexes: `coin_id` is the table's
+    /// `PRIMARY KEY`, and a `LOWER()` wrapped around it in a predicate makes that index unusable.
+    fn normalise_hex(s: &str) -> String {
+        s.to_ascii_lowercase()
+    }
+
     /// Insert or update a coin's chain state (the `coin_state_update` upsert). A coin is
     /// keyed by `coin_id`; a later update (e.g. a spend) overwrites the mutable fields.
+    ///
+    /// `coin_id` and `parent_coin_info` are normalised on the way in — see [`Self::normalise_hex`].
     pub async fn upsert_coin(&self, c: &CoinRow) -> sqlx::Result<()> {
         sqlx::query(
             "INSERT INTO coins
@@ -1078,8 +1318,8 @@ impl WalletDb {
                 asset_id = COALESCE(excluded.asset_id, coins.asset_id),
                 hint = COALESCE(excluded.hint, coins.hint)",
         )
-        .bind(&c.coin_id)
-        .bind(&c.parent_coin_info)
+        .bind(Self::normalise_hex(&c.coin_id))
+        .bind(Self::normalise_hex(&c.parent_coin_info))
         .bind(&c.puzzle_hash)
         .bind(&c.amount)
         .bind(c.created_height)
@@ -1110,8 +1350,8 @@ impl WalletDb {
                     asset_id = COALESCE(excluded.asset_id, coins.asset_id),
                     hint = COALESCE(excluded.hint, coins.hint)",
             )
-            .bind(&c.coin_id)
-            .bind(&c.parent_coin_info)
+            .bind(Self::normalise_hex(&c.coin_id))
+            .bind(Self::normalise_hex(&c.parent_coin_info))
             .bind(&c.puzzle_hash)
             .bind(&c.amount)
             .bind(c.created_height)
@@ -1610,13 +1850,16 @@ impl WalletDb {
     }
 
     /// Whether every given coin id is currently unspent (confirmed, `spent_height IS NULL`).
+    ///
+    /// The ids come from the caller (the Sage-parity `get_are_coins_spendable` endpoint), so they
+    /// are normalised to the case the table stores — see [`Self::normalise_hex`].
     pub async fn are_coins_spendable(&self, ids: &[String]) -> sqlx::Result<bool> {
         for id in ids {
             let row = sqlx::query(
                 "SELECT 1 AS ok FROM coins
                  WHERE coin_id = ? AND spent_height IS NULL AND created_height IS NOT NULL",
             )
-            .bind(id)
+            .bind(Self::normalise_hex(id))
             .fetch_optional(&self.pool)
             .await?;
             if row.is_none() {
@@ -1633,6 +1876,192 @@ impl WalletDb {
             .iter()
             .filter_map(|c| c.amount.parse::<u128>().ok())
             .sum())
+    }
+
+    // ---- in-flight spends (dig_ecosystem#2763) ----------------------------
+    //
+    // A broadcast used to mark nothing. The DB only learned a coin was spent when a peer pushed a
+    // `coin_state_update`, tens of seconds later, and every selection inside that window re-picked
+    // the same coin. These four methods are the record that closes it: what was pushed, which
+    // coins it committed, and when the commitment lapses.
+    //
+    // Three properties are deliberate:
+    //
+    // * **The reservation always expires.** `expires_at` is not a tidy-up convenience — it is the
+    //   guarantee that a release path which never runs (a crash between push and confirmation, a
+    //   bundle the mempool silently dropped) cannot strand the user's coin forever. The failure
+    //   direction that matters here is "the wallet refuses to spend money it owns", and only an
+    //   unconditional expiry rules it out.
+    // * **Reservation narrows SELECTION, never BALANCE.** A reserved coin is still the user's
+    //   money until the spend confirms, so [`Self::balance`] and [`Self::unspent_coins`] are left
+    //   exactly as they were and only [`Self::unreserved_unspent_coins`] is new. Netting an
+    //   in-flight send out of the balance would report money as gone before the chain says so,
+    //   which is the same class of lie in the opposite direction.
+    // * **A reserved coin that is already observed spent is not held.** Release is driven by the
+    //   coin's own `spent_height`, so confirmation retires the reservation without anything having
+    //   to remember to call a release.
+
+    /// Record a pushed bundle and reserve the coins it spends.
+    ///
+    /// Idempotent on the transaction id: re-pushing the same bundle updates its expiry and attempt
+    /// count rather than duplicating it, because a resubmission is the same transaction.
+    pub async fn reserve_spend(&self, tx: &PendingTransactionRow) -> sqlx::Result<()> {
+        let mut conn = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO pending_transactions
+                (transaction_id, bundle_hex, fee, submitted_at, expires_at, attempts)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(transaction_id) DO UPDATE SET
+                expires_at = excluded.expires_at,
+                attempts = pending_transactions.attempts + 1",
+        )
+        .bind(&tx.transaction_id)
+        .bind(&tx.bundle_hex)
+        .bind(&tx.fee)
+        .bind(tx.submitted_at)
+        .bind(tx.expires_at)
+        .bind(tx.attempts)
+        .execute(&mut *conn)
+        .await?;
+        for coin_id in &tx.reserved_coin_ids {
+            // A coin can only back ONE in-flight bundle. `INSERT OR REPLACE` would silently move
+            // the reservation to a newer transaction; `DO NOTHING` keeps the first claim, which is
+            // the one the mempool will honour.
+            sqlx::query(
+                "INSERT INTO coin_reservations (coin_id, transaction_id) VALUES (?, ?)
+                 ON CONFLICT(coin_id) DO NOTHING",
+            )
+            .bind(coin_id.to_ascii_lowercase())
+            .bind(&tx.transaction_id)
+            .execute(&mut *conn)
+            .await?;
+        }
+        conn.commit().await?;
+        Ok(())
+    }
+
+    /// Drop every reservation whose bundle has lapsed, settled, or become unspendable, and return
+    /// how many bundles were retired.
+    ///
+    /// `now_ms` is passed in rather than read from the clock so a test can drive the expiry edge
+    /// exactly instead of sleeping through it.
+    ///
+    /// Three retirement conditions, all of which mean the reservation no longer protects anything:
+    ///
+    /// 1. `expires_at <= now_ms` — the unconditional lapse.
+    /// 2. every reserved coin is now recorded spent — the spend settled, which is the outcome the
+    ///    reservation was waiting for.
+    /// 3. a reserved coin is recorded spent by SOMETHING ELSE while others are not — the bundle
+    ///    can never be included now, so holding its remaining inputs only strands them.
+    ///
+    /// Conditions 2 and 3 are the same SQL: any reserved coin observed spent retires the bundle.
+    /// They are named separately because they are different events and a reader should not have to
+    /// infer that the code treats them alike on purpose.
+    ///
+    /// The join compares the two ids RAW, and that is now correct rather than a latent bug: both
+    /// sides are normalised by their writers ([`Self::reserve_spend`] and [`Self::normalise_hex`]),
+    /// so there is no case left for the predicate to disagree about.
+    ///
+    /// The first version of this fix wrapped the coin side in `LOWER()` instead. That worked, but
+    /// it was a normaliser applied to a `PRIMARY KEY`: SQLite cannot use an index through a
+    /// function call, so the join degraded to a full scan of `coins` for every reservation row,
+    /// and it repaired exactly one of the three readers that compared raw. Normalising at the
+    /// writer fixes all three AND leaves the key usable, so keeping the `LOWER()` beside it would
+    /// buy nothing but the scan. It is deliberately NOT retained as belt-and-braces.
+    pub async fn prune_reservations(&self, now_ms: i64) -> sqlx::Result<u64> {
+        let n = sqlx::query(
+            "DELETE FROM pending_transactions WHERE expires_at <= ?
+             OR transaction_id IN (
+                SELECT r.transaction_id FROM coin_reservations r
+                JOIN coins c ON c.coin_id = r.coin_id
+                WHERE c.spent_height IS NOT NULL
+             )",
+        )
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
+    }
+
+    /// Every live in-flight bundle, oldest submission first, with the coins it reserved.
+    pub async fn pending_transactions(&self) -> sqlx::Result<Vec<PendingTransactionRow>> {
+        let rows = sqlx::query(
+            "SELECT transaction_id, bundle_hex, fee, submitted_at, expires_at, attempts
+             FROM pending_transactions ORDER BY submitted_at ASC, transaction_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let transaction_id: String = r.get("transaction_id");
+            let coins = sqlx::query(
+                "SELECT coin_id FROM coin_reservations WHERE transaction_id = ? ORDER BY coin_id",
+            )
+            .bind(&transaction_id)
+            .fetch_all(&self.pool)
+            .await?;
+            out.push(PendingTransactionRow {
+                transaction_id,
+                bundle_hex: r.get("bundle_hex"),
+                fee: r.get("fee"),
+                submitted_at: r.get("submitted_at"),
+                expires_at: r.get("expires_at"),
+                attempts: r.get("attempts"),
+                reserved_coin_ids: coins.into_iter().map(|c| c.get("coin_id")).collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The unspent coins for an asset MINUS any coin committed to a live in-flight bundle — the
+    /// set a new spend may select from (dig_ecosystem#2763).
+    ///
+    /// Deliberately a SEPARATE method from [`Self::unspent_coins`] rather than a filter added to
+    /// it: the two answer different questions. "What do I own" must keep counting a coin whose
+    /// spend has not settled; "what may I spend next" must not.
+    pub async fn unreserved_unspent_coins(
+        &self,
+        asset_id: Option<&str>,
+    ) -> sqlx::Result<Vec<CoinRow>> {
+        let coins = self.unspent_coins(asset_id).await?;
+        let reserved = self.reserved_coin_ids().await?;
+        Ok(coins
+            .into_iter()
+            .filter(|c| !reserved.contains(&c.coin_id.to_ascii_lowercase()))
+            .collect())
+    }
+
+    /// Every coin id currently committed to a live in-flight bundle, lower-cased.
+    pub async fn reserved_coin_ids(&self) -> sqlx::Result<std::collections::HashSet<String>> {
+        let rows = sqlx::query("SELECT coin_id FROM coin_reservations")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("coin_id").to_ascii_lowercase())
+            .collect())
+    }
+
+    /// Every p2 puzzle hash the replica has seen ANY coin at — the gap-limit scan's evidence that
+    /// an HD index is in use (dig_ecosystem#2762).
+    ///
+    /// Deliberately includes SPENT coins. A coin that arrived at index 400 and was then spent is
+    /// still proof the wallet handed out index 400, and the addresses the user is about to be paid
+    /// at are the ones just past it. Restricting this to unspent coins would let a wallet that had
+    /// swept itself collapse its own window back to the default and lose sight of its next
+    /// receive addresses.
+    ///
+    /// Returns PUBLIC puzzle hashes only. Nothing here is a key and nothing here widens what the
+    /// node may sign — it decides only how far a wallet looks for its own money.
+    pub async fn occupied_puzzle_hashes(&self) -> sqlx::Result<std::collections::HashSet<String>> {
+        let rows = sqlx::query("SELECT DISTINCT puzzle_hash FROM coins")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| r.get::<String, _>("puzzle_hash").to_ascii_lowercase())
+            .collect())
     }
 
     // ---- identity-scoped reads (#407) -------------------------------------
@@ -1927,7 +2356,7 @@ impl WalletDb {
         sqlx::query("UPDATE coins SET asset_id = ?, hint = COALESCE(?, hint) WHERE coin_id = ?")
             .bind(asset_id)
             .bind(hint)
-            .bind(coin_id)
+            .bind(Self::normalise_hex(coin_id))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -3952,5 +4381,568 @@ mod tests {
                 .expect("every row must have landed under its canonical id");
             assert_eq!(row.summary_json, format!("{{\"requested\":{requested}}}"));
         }
+    }
+
+    // ---- in-flight spend reservations (dig_ecosystem#2763) ----------------
+
+    /// A reservation over `coin_ids`, submitted at `submitted_at` and lapsing at `expires_at`.
+    fn reservation(
+        tx: &str,
+        coin_ids: &[&str],
+        submitted_at: i64,
+        expires_at: i64,
+    ) -> PendingTransactionRow {
+        PendingTransactionRow {
+            transaction_id: tx.into(),
+            bundle_hex: format!("bundle-of-{tx}"),
+            fee: Some("10".into()),
+            submitted_at,
+            expires_at,
+            attempts: 1,
+            reserved_coin_ids: coin_ids.iter().map(|c| (*c).to_string()).collect(),
+        }
+    }
+
+    /// **The defect, at the DB layer.** A coin committed to a pushed, unsettled bundle must not be
+    /// offered to the next selection — while still counting as money the wallet owns, because the
+    /// chain has not said otherwise yet.
+    #[tokio::test]
+    async fn a_reserved_coin_leaves_selection_but_not_the_balance() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.upsert_coin(&coin("c2", 50, Some(10), None))
+            .await
+            .unwrap();
+
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        let selectable: Vec<String> = db
+            .unreserved_unspent_coins(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.coin_id)
+            .collect();
+        assert_eq!(
+            selectable,
+            vec!["c2".to_string()],
+            "a coin already in flight was offered for selection again"
+        );
+        assert_eq!(
+            db.balance(None).await.unwrap(),
+            150,
+            "an in-flight spend has not settled, so the coin is still the user's money"
+        );
+    }
+
+    /// Coin ids compare case-insensitively, as every other hex column here does. A caller that
+    /// reserves an upper-case id must not get the coin back from selection.
+    #[tokio::test]
+    async fn reservation_matching_is_case_insensitive() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("abcd", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        db.reserve_spend(&reservation("tx1", &["ABCD"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        assert!(
+            db.unreserved_unspent_coins(None).await.unwrap().is_empty(),
+            "an upper-case reservation failed to hold its coin"
+        );
+    }
+
+    /// **The reservation ALWAYS lapses.** This keeps a release path that never runs from stranding
+    /// the user's coin permanently — the failure direction that would be worse than the bug.
+    #[tokio::test]
+    async fn an_expired_reservation_releases_its_coin() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.prune_reservations(59_999).await.unwrap(),
+            0,
+            "pruned before the deadline"
+        );
+        assert!(db.unreserved_unspent_coins(None).await.unwrap().is_empty());
+
+        assert_eq!(
+            db.prune_reservations(60_000).await.unwrap(),
+            1,
+            "the deadline itself must lapse"
+        );
+        assert_eq!(db.unreserved_unspent_coins(None).await.unwrap().len(), 1);
+        assert!(db.pending_transactions().await.unwrap().is_empty());
+    }
+
+    /// Settlement retires the reservation without anything having to remember to release it: the
+    /// coin's own `spent_height` is the signal.
+    #[tokio::test]
+    async fn observing_a_reserved_coin_spent_retires_its_bundle() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.upsert_coin(&coin("c2", 50, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1", "c2"], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        db.upsert_coin(&coin("c1", 100, Some(10), Some(11)))
+            .await
+            .unwrap();
+
+        assert_eq!(db.prune_reservations(2_000).await.unwrap(), 1);
+        assert!(
+            db.pending_transactions().await.unwrap().is_empty(),
+            "a bundle whose input is spent can never be included, so it must stop holding the rest"
+        );
+        let selectable: Vec<String> = db
+            .unreserved_unspent_coins(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.coin_id)
+            .collect();
+        assert_eq!(
+            selectable,
+            vec!["c2".to_string()],
+            "c2 stayed stranded behind a bundle that can never be included"
+        );
+    }
+    /// **A coin recorded in UPPER-case hex retires its bundle like any other.**
+    ///
+    /// `reserve_spend` normalises the ids it writes; `coins` stores whatever hex the chain source
+    /// handed over. The retirement join compared the two RAW, so an upper-case coin never matched
+    /// its own reservation: the settled bundle stayed pending and held its other inputs out of
+    /// selection for the entire TTL — a self-inflicted freeze on money the chain had already moved.
+    ///
+    /// FIXTURE DESIGN. Case is the ONLY axis varied from
+    /// [`observing_a_reserved_coin_spent_retires_its_bundle`], which stays green as the lower-case
+    /// control; both coins here are upper-case, so the assertion cannot be satisfied by a
+    /// normalisation applied to only one of the two comparison sides. The second coin is what makes
+    /// the stranding visible: with one coin, "retired" and "nothing was ever reserved" look alike.
+    #[tokio::test]
+    async fn an_upper_case_coin_id_still_retires_its_settled_bundle() {
+        const UPPER: &str = "AABB";
+        const OTHER: &str = "CCDD";
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin(UPPER, 100, Some(10), None))
+            .await
+            .unwrap();
+        db.upsert_coin(&coin(OTHER, 50, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &[UPPER, OTHER], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        db.upsert_coin(&coin(UPPER, 100, Some(10), Some(11)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.prune_reservations(2_000).await.unwrap(),
+            1,
+            "a settled bundle whose coin id is upper-case was never retired"
+        );
+        assert!(
+            db.pending_transactions().await.unwrap().is_empty(),
+            "the bundle stayed in flight after the chain settled it"
+        );
+        assert_eq!(
+            db.unreserved_unspent_coins(None).await.unwrap().len(),
+            1,
+            "the settled bundle's other input stayed stranded until its TTL"
+        );
+    }
+
+    // ---- the `coins` table stores lower-case hex (dig-node#293 round 2) ----
+    //
+    // These three cover the three raw `coin_id` comparisons that survived the first fix. Each
+    // varies ONE axis — the case the chain source happened to hand over — and each carries a
+    // control that a blanket "match everything" implementation would fail, so none of them can be
+    // satisfied by a comparison that stopped discriminating.
+
+    /// **A coin stored in upper-case hex is still spendable when asked about in lower case.**
+    ///
+    /// `are_coins_spendable` backs the Sage-parity `get_are_coins_spendable` endpoint, whose ids
+    /// come straight from the caller. Comparing raw made an upper-case row invisible, so a
+    /// genuinely spendable coin was reported unspendable. It fails CLOSED — a refusal, not a
+    /// theft — but it is still a wrong answer about money given to a parity consumer.
+    ///
+    /// CONTROL: an id that names no coin at all must still answer `false`. Without it the
+    /// assertion would also hold for an implementation that answered `true` unconditionally.
+    #[tokio::test]
+    async fn a_coin_stored_upper_case_is_spendable_under_a_lower_case_id() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("AABB", 100, Some(10), None))
+            .await
+            .unwrap();
+
+        assert!(
+            db.are_coins_spendable(&["aabb".to_string()]).await.unwrap(),
+            "a spendable coin read as unspendable because its stored hex was upper-case"
+        );
+        assert!(
+            db.are_coins_spendable(&["AABB".to_string()]).await.unwrap(),
+            "the same coin stopped being found under the exact hex it was written with"
+        );
+        assert!(
+            !db.are_coins_spendable(&["ffff".to_string()]).await.unwrap(),
+            "CONTROL: an unknown coin id was reported spendable"
+        );
+    }
+
+    /// **The wallet's own change is not announced as an incoming payment when the two sides of the
+    /// parent link disagree on case.**
+    ///
+    /// `record_arrivals` answers `parent_is_ours` with `SELECT 1 FROM coins WHERE coin_id = ?`
+    /// bound to the child's `parent_coin_info`. Compared raw, a parent written `AABB` does not
+    /// match a child pointing at `aabb`, `classify` sees a foreign parent, and the wallet's own
+    /// change comes back to the user as money that arrived from someone else — the same family of
+    /// money-display lie as dig-node#293 itself.
+    ///
+    /// FIXTURE DESIGN. The two sides are written in DIFFERENT cases on purpose: a fixture where
+    /// both are upper-case matches raw and cannot see this defect at all, and a fix applied to
+    /// only one of the two comparison sides would satisfy it. The foreign-parent coin beside it is
+    /// the control — it must STILL be announced, so the test cannot be passed by a recorder that
+    /// has simply stopped announcing arrivals.
+    #[tokio::test]
+    async fn own_change_is_not_announced_as_incoming_across_a_case_mismatch() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.complete_catch_up(&CatchUpReplay::finished_at(None, 100, "hh", &[]).unwrap())
+            .await
+            .unwrap();
+
+        // BOTH directions of the mismatch, because they are repaired by DIFFERENT normalisations
+        // and a fixture carrying only one cannot tell them apart. Parent stored upper / child
+        // pointing lower is fixed by normalising the stored `coin_id`; parent stored lower / child
+        // pointing upper is fixed by normalising the stored `parent_coin_info`. With only the
+        // first, an implementation that normalises `coin_id` alone passes — which is exactly what
+        // the first version of this test did.
+        db.upsert_coin(&coin("AABB", 500, Some(50), Some(101)))
+            .await
+            .unwrap();
+        let mut change_lower = coin("change_lower", 400, Some(101), None);
+        change_lower.parent_coin_info = "aabb".into();
+        db.upsert_coin(&change_lower).await.unwrap();
+
+        db.upsert_coin(&coin("ccdd", 500, Some(50), Some(101)))
+            .await
+            .unwrap();
+        let mut change_upper = coin("change_upper", 300, Some(101), None);
+        change_upper.parent_coin_info = "CCDD".into();
+        db.upsert_coin(&change_upper).await.unwrap();
+
+        // CONTROL: a coin at our address from a parent we genuinely do not hold.
+        db.upsert_coin(&incoming("paid", 700, 101)).await.unwrap();
+
+        assert_eq!(
+            db.record_arrivals(&watched(), 101).await.unwrap(),
+            1,
+            "the wallet's own change was announced as an incoming payment"
+        );
+        let announced: Vec<String> = db
+            .arrivals_since(0, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.coin_id)
+            .collect();
+        assert_eq!(
+            announced,
+            vec!["paid".to_string()],
+            "CONTROL: the genuinely foreign payment stopped being announced"
+        );
+    }
+
+    /// Insert a coin row past the normalising accessors, exactly as a pre-#293 build did.
+    /// `amount` is the tag that tells otherwise-identical case twins apart.
+    async fn insert_legacy_coin(db: &WalletDb, coin_id: &str, parent: &str, amount: &str) {
+        sqlx::query(
+            "INSERT OR REPLACE INTO coins
+                (coin_id, parent_coin_info, puzzle_hash, amount, created_height)
+             VALUES (?, ?, 'ph', ?, 10)",
+        )
+        .bind(coin_id)
+        .bind(parent)
+        .bind(amount)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Re-arm the ladder so the coin-hex step runs again on an already-open database.
+    async fn rearm_coin_hex_migration(db: &WalletDb) {
+        sqlx::query(&format!(
+            "PRAGMA user_version = {}",
+            COINS_STORED_LOWER_CASE - 1
+        ))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+
+    async fn coin_ids(db: &WalletDb) -> Vec<String> {
+        sqlx::query("SELECT coin_id FROM coins ORDER BY coin_id")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("coin_id"))
+            .collect()
+    }
+
+    async fn amount_of(db: &WalletDb, coin_id: &str) -> String {
+        sqlx::query("SELECT amount FROM coins WHERE coin_id = ?")
+            .bind(coin_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+            .get::<String, _>("amount")
+    }
+
+    /// **A database written before the writer normalised is repaired on open.**
+    ///
+    /// Fixing the writer does nothing for rows already on disk, and those rows are exactly the
+    /// ones the three defects above were found on. The ladder step lower-cases them once.
+    ///
+    /// The duplicate pair is the case that would otherwise abort the migration: `AABB` and `aabb`
+    /// are the same coin under a unique coin id that cannot hold both. The two twins are given
+    /// DIFFERENT amounts so the assertion can name WHICH one survived — with identical rows a
+    /// migration that kept the wrong twin would pass this test unchanged.
+    #[tokio::test]
+    async fn a_legacy_database_has_its_coin_hex_normalised_on_open() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy_coin(&db, "CCDD", "EEFF", "1").await;
+        insert_legacy_coin(&db, "AABB", "0011", "upper").await;
+        insert_legacy_coin(&db, "aabb", "0011", "lower").await;
+        rearm_coin_hex_migration(&db).await;
+
+        db.migrate().await.unwrap();
+
+        assert_eq!(
+            coin_ids(&db).await,
+            vec!["aabb".to_string(), "ccdd".to_string()],
+            "legacy upper-case coin ids survived the migration"
+        );
+        assert_eq!(
+            amount_of(&db, "aabb").await,
+            "lower",
+            "the ALREADY-CANONICAL spelling is the one that survives a case collision"
+        );
+        let parents: Vec<String> =
+            sqlx::query("SELECT parent_coin_info FROM coins ORDER BY coin_id")
+                .fetch_all(&db.pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("parent_coin_info"))
+                .collect();
+        assert_eq!(
+            parents,
+            vec!["0011".to_string(), "eeff".to_string()],
+            "legacy upper-case parent links survived the migration"
+        );
+    }
+
+    /// **A coin id stored under several NON-canonical spellings does not brick the wallet.**
+    ///
+    /// This is the failure the two-spelling collision rule could not see. `AAbb` and `aAbb` are
+    /// both unequal to their own lower-casing, so a DELETE scoped to "upper-case rows whose
+    /// lower-casing already exists" removes neither, and the UPDATE then collides them onto one
+    /// unique key. The transaction rolls back, `migrate` returns `Err`, `WalletDb::open` returns
+    /// `Err` — and the retry on the next open is byte-for-byte identical, so the wallet never
+    /// opens again. A rollback is only a safe failure when the retry can succeed.
+    ///
+    /// The survivor is the lexicographically smallest spelling, `AAbb`, since neither is
+    /// canonical. That choice is arbitrary; being TOTAL and DETERMINISTIC is the point.
+    #[tokio::test]
+    async fn a_coin_id_stored_under_many_case_twins_does_not_brick_the_wallet() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy_coin(&db, "AAbb", "0011", "first").await;
+        insert_legacy_coin(&db, "aAbb", "0011", "second").await;
+        rearm_coin_hex_migration(&db).await;
+
+        db.migrate()
+            .await
+            .expect("a collision between non-canonical spellings must not fail the migration");
+
+        assert_eq!(
+            coin_ids(&db).await,
+            vec!["aabb".to_string()],
+            "the collided spellings were reduced to exactly one canonical row"
+        );
+        assert_eq!(
+            amount_of(&db, "aabb").await,
+            "first",
+            "with no canonical spelling present, the smallest survives"
+        );
+    }
+
+    /// **The tables that key rows by a coin id are normalised WITH it, in the same open.**
+    ///
+    /// `arrival_pending` and `arrivals` hold copies of `coins.coin_id` and are compared against it
+    /// raw. Left behind, a held row is pruned by `record_arrivals` — and losing the hold is how a
+    /// deferred coin falls below the baseline watermark and is never announced — while an
+    /// already-recorded arrival stops matching its `INSERT OR IGNORE` and is announced twice.
+    #[tokio::test]
+    async fn the_dependent_coin_id_tables_are_normalised_with_the_coin_table() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        insert_legacy_coin(&db, "AABB", "0011", "1").await;
+        sqlx::query("INSERT INTO arrival_pending (coin_id, created_height) VALUES ('AABB', 10)")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO arrivals
+                (coin_id, puzzle_hash, amount, asset_id, confirmed_height, recorded_at)
+             VALUES ('AABB', 'ph', '1', NULL, 10, 0)",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        rearm_coin_hex_migration(&db).await;
+
+        db.migrate().await.unwrap();
+
+        for table in ["arrival_pending", "arrivals"] {
+            let ids: Vec<String> = sqlx::query(&format!("SELECT coin_id FROM {table}"))
+                .fetch_all(&db.pool)
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| r.get::<String, _>("coin_id"))
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["aabb".to_string()],
+                "{table} still keys its row by the un-normalised coin id"
+            );
+        }
+    }
+
+    /// **Retiring a bundle leaves NO orphan reservation.** The `coin_reservations` rows go with it,
+    /// via the foreign-key cascade rather than a second delete a future caller could forget.
+    ///
+    /// This is the property `release_spend` used to prove. That method was removed because it had
+    /// no production caller and could never gain a correct one: a refusal reserves nothing
+    /// ([`WalletBackend::push_signed_bundle`] guards on `accepted`), and a settlement is retired by
+    /// [`WalletDb::prune_reservations`] — so every definitive outcome was already covered, and a
+    /// third release path on a custody-adjacent table was reachable only by mistake. The cascade it
+    /// depended on is real and still load-bearing, so it is asserted here through the retirement
+    /// path that actually runs.
+    #[tokio::test]
+    async fn retiring_a_bundle_cascades_away_its_reservations() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.reserved_coin_ids().await.unwrap().len(),
+            1,
+            "the fixture must start with a live reservation, or the assertions below are vacuous"
+        );
+
+        assert_eq!(db.prune_reservations(60_000).await.unwrap(), 1);
+
+        assert_eq!(db.unreserved_unspent_coins(None).await.unwrap().len(), 1);
+        assert!(
+            db.reserved_coin_ids().await.unwrap().is_empty(),
+            "the cascade left an orphan reservation"
+        );
+    }
+
+    /// A resubmission is the SAME transaction: it refreshes the expiry and counts the attempt,
+    /// never appearing twice and never moving a coin's reservation onto a new row.
+    #[tokio::test]
+    async fn resubmitting_the_same_bundle_updates_it_in_place() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 120_000))
+            .await
+            .unwrap();
+
+        let pending = db.pending_transactions().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].attempts, 2);
+        assert_eq!(pending[0].expires_at, 120_000);
+        assert_eq!(
+            pending[0].submitted_at, 1_000,
+            "the FIRST submission time is what a caller has been polling against"
+        );
+        assert_eq!(pending[0].reserved_coin_ids, vec!["c1".to_string()]);
+    }
+
+    /// A coin already committed to one in-flight bundle keeps that commitment. The first claim is
+    /// the one the mempool will honour, so a later bundle must not silently take the coin over.
+    #[tokio::test]
+    async fn a_coin_backs_only_the_first_bundle_that_claimed_it() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.upsert_coin(&coin("c1", 100, Some(10), None))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx1", &["c1"], 1_000, 60_000))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("tx2", &["c1"], 2_000, 60_000))
+            .await
+            .unwrap();
+
+        let pending = db.pending_transactions().await.unwrap();
+        assert_eq!(
+            pending.len(),
+            2,
+            "both bundles were pushed, so both are in flight"
+        );
+        let tx1 = pending.iter().find(|p| p.transaction_id == "tx1").unwrap();
+        let tx2 = pending.iter().find(|p| p.transaction_id == "tx2").unwrap();
+        assert_eq!(tx1.reserved_coin_ids, vec!["c1".to_string()]);
+        assert!(
+            tx2.reserved_coin_ids.is_empty(),
+            "the second bundle took over the first bundle's coin"
+        );
+    }
+
+    /// The pending set is what `get_pending_transactions` reports, so its ORDER and fields must be
+    /// stable: oldest submission first, carrying the fee and submission time a caller displays.
+    #[tokio::test]
+    async fn pending_transactions_report_oldest_first_with_fee_and_submission_time() {
+        let db = WalletDb::open_in_memory().await.unwrap();
+        db.reserve_spend(&reservation("later", &[], 5_000, 60_000))
+            .await
+            .unwrap();
+        db.reserve_spend(&reservation("earlier", &[], 1_000, 60_000))
+            .await
+            .unwrap();
+
+        let pending = db.pending_transactions().await.unwrap();
+        let ids: Vec<&str> = pending.iter().map(|p| p.transaction_id.as_str()).collect();
+        assert_eq!(ids, vec!["earlier", "later"]);
+        assert_eq!(pending[0].fee.as_deref(), Some("10"));
+        assert_eq!(pending[0].submitted_at, 1_000);
+        assert_eq!(pending[0].bundle_hex, "bundle-of-earlier");
     }
 }

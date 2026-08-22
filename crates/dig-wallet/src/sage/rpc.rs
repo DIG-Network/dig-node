@@ -497,6 +497,23 @@ const DEFAULT_FALLBACK_BURST: f64 = 16.0;
 /// node's own quorum. Two sustains a walk without sustaining a sweep.
 const DEFAULT_FALLBACK_REFILL_PER_SEC: f64 = 2.0;
 
+/// How long a pushed bundle holds its input coins out of further selection
+/// (dig_ecosystem#2763): ten minutes.
+///
+/// A reservation ALWAYS expires, and the TTL is the backstop rather than the normal path. The
+/// normal releases are observational — the coin is seen spent, or the bundle is definitively
+/// refused — and this only decides how long a coin stays held when NEITHER of those ever arrives
+/// (the node restarts mid-flight, the peer that would have reported the update is dropped, the
+/// bundle is silently evicted from the mempool).
+///
+/// Sized by which failure is worse. Too SHORT re-exposes the defect: the coin is offered again
+/// while the original bundle can still be included, and the second spend is refused. Too LONG
+/// strands spendable money in a wallet that looks like it has none. Chia blocks are ~52s apart, so
+/// ten minutes is roughly a dozen chances for the spend to land — well past the point where a
+/// still-unconfirmed bundle is more likely dropped than pending, and short enough that a stranded
+/// coin returns on a timescale a user waits out rather than reports as lost.
+const RESERVATION_TTL_MS: i64 = 10 * 60 * 1000;
+
 /// The Sage-parity wallet backend.
 #[derive(Clone)]
 pub struct WalletBackend {
@@ -965,19 +982,61 @@ impl WalletBackend {
     /// `control.wallet.syncStatus` reports its phase from — so a client cannot be told `synced` by
     /// one endpoint and `syncing` by the other about the same moment.
     ///
-    /// It narrows that predicate in ONE direction, and only here: `is_following` answers `true` on
-    /// an UNOBSERVABLE peer tier, because on a status endpoint an absent second opinion is not an
-    /// accusation. On a money read it is the opposite — with no peer height to compare against,
-    /// nothing has established that the replica's figure is current, and `synced: true` would then
-    /// rest on the latched `initial_sync_complete` this method exists to stop trusting. So an
-    /// unobservable tier answers `false`: the figure is still SERVED, with its real `peak_height`,
-    /// labelled stale. `is_following` itself is deliberately left alone so the two endpoints keep
-    /// agreeing wherever a peer height exists.
+    /// That agreement is STRUCTURAL rather than asserted, and it was not always: this method is
+    /// now the only way any read produces `synced: true`. Every other site writes the literal
+    /// `false`, on a fallback-tier answer, where a third party's height says nothing about the
+    /// replica. `chain_peak` used to be the exception — it computed its flag from
+    /// `db.is_synced()` directly and so could, and on a live node did, report `synced: true`
+    /// about the same replica this method was calling stale (dig-node#293).
+    ///
+    /// It narrows that predicate on BOTH of its unobservable arms, and only here. `is_following`
+    /// answers `true` whenever EITHER height is missing, because on a status endpoint an absent
+    /// measurement is not an accusation against the replica. On a money read it is the opposite:
+    /// currency is a claim, and nothing that was never measured can establish one. Either arm left
+    /// unnarrowed leaves `synced: true` resting on the latched `initial_sync_complete` this method
+    /// exists to stop trusting.
+    ///
+    /// - **No PEER height** — there is no second opinion to compare the replica against.
+    /// - **No REPLICA height** — there is no figure to compare, and `synced: true` would then be
+    ///   paired with `peak_height: null`, telling a client a reading is current while refusing to
+    ///   say what it is a reading OF. That arm is production-reachable, not hypothetical:
+    ///   `refresh_tracked_coins` latches the replica authoritative without ever writing a peak.
+    ///   `chain_peak` escapes it only by construction (it calls this inside `if let Some(peak)`);
+    ///   the balance and coin reads pass their `Option` straight through, so the arm landed on
+    ///   exactly the money reads (dig-node#293).
+    ///
+    /// Either way the figure is still SERVED, with whatever `peak_height` is actually known,
+    /// labelled stale — never withheld.
+    ///
+    /// `is_following` itself is deliberately left ALONE. Its permissive `_ => true` is correct for
+    /// the sync-phase reporting it was written for, where an unmeasured tier must not be spent as
+    /// evidence against a replica; narrowing it there would change a phase machine owned by another
+    /// family. The narrowing is a property of the MONEY read, so it lives at this call site.
+    ///
+    /// That placement has a LIMIT, and it is stated here rather than left to be rediscovered:
+    /// this method is the single gate for every read served by [`WalletBackend`] — each one either
+    /// passes through here or writes the literal `false` — but it is NOT the only producer of a
+    /// `synced` claim in the crate. [`super::sync_supervisor::SyncHandle::status`] reaches
+    /// `SyncPhase::Synced` through its own `is_following` call and pairs it with the replica's raw
+    /// `peak_height`, so `control.wallet.sync-status` can still emit
+    /// `{phase: "synced", peak_height: null}` — the exact pairing this gate abolishes on the money
+    /// reads. That path is deliberately out of scope: it is a status endpoint rather than a
+    /// currency claim, and the phase machine belongs to another family (dig_ecosystem#2761).
+    ///
+    /// The asymmetry worth carrying into that work: `is_following`'s own doc justifies its
+    /// permissive arm ENTIRELY in terms of an unmeasured PEER tier, and offers no justification at
+    /// all for the unmeasured-REPLICA arm. Those are different things. An absent peer height is a
+    /// missing second opinion, which is fairly read as no accusation; an absent replica height is
+    /// the subject of the claim having no measurement whatsoever, which supports no verdict in
+    /// either direction.
     async fn replica_answer_is_current(&self, peak_height: Option<u32>) -> bool {
+        let Some(replica_peak) = peak_height else {
+            return false;
+        };
         let Some(peer_peak) = self.chain_peer_tier().await.peak_height else {
             return false;
         };
-        super::sync_supervisor::is_following(peak_height, Some(peer_peak))
+        super::sync_supervisor::is_following(Some(replica_peak), Some(peer_peak))
     }
 
     /// The chain-sync supervisor's handle, if one is running.
@@ -1849,7 +1908,6 @@ impl WalletBackend {
     /// height. `peak_height: None` means UNKNOWN and MUST NOT be read as height zero.
     pub async fn chain_peak(&self) -> std::result::Result<ChainPeak, BalanceError> {
         let read_err = |e: Error| BalanceError::ReadFailed(e.to_string());
-        let synced = self.db.is_synced().await.map_err(|e| read_err(e.into()))?;
         let replica_peak = self
             .db
             .sync_state()
@@ -1859,7 +1917,12 @@ impl WalletBackend {
         if let Some(peak_height) = replica_peak {
             return Ok(ChainPeak {
                 peak_height: Some(peak_height),
-                synced,
+                // The SAME measured predicate the balance and coin reads use
+                // (dig_ecosystem#2869), not `db.is_synced()`. That flag is
+                // `initial_sync_complete`: it latches once and is cleared only by a backwards
+                // chain move, so a replica hundreds of blocks behind still satisfied it and this
+                // endpoint still called its height current (dig-node#293).
+                synced: self.replica_answer_is_current(Some(peak_height)).await,
             });
         }
         // The replica has no height, so answering means an OUTBOUND call to the third-party tier.
@@ -1919,10 +1982,56 @@ impl WalletBackend {
             return Err(PushError::NodeCustodiedSpend);
         }
         let pusher = self.pusher.as_ref().ok_or(PushError::NoChainSource)?;
-        pusher
+        let outcome = pusher
             .push(&bundle)
             .await
-            .map_err(|e| PushError::Unreachable(e.to_string()))
+            .map_err(|e| PushError::Unreachable(e.to_string()))?;
+
+        // Reserve the bundle's inputs ONLY once the mempool has accepted it
+        // (dig_ecosystem#2763). A refusal reserves nothing: those coins were never committed, and
+        // holding them would strand the user's money over a spend that will never happen.
+        //
+        // A reservation failure does not fail the push. The bundle is already in a public mempool
+        // by this point, and reporting a push that did happen as an error would be a worse lie
+        // than the double-selection this guards against.
+        if outcome.accepted {
+            if let Err(e) = self.reserve_pushed_bundle(&bundle).await {
+                tracing::warn!(
+                    error = %e,
+                    "pushed bundle accepted but its coins could not be reserved; a second send \
+                     inside the confirmation window may reselect them"
+                );
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Record an accepted bundle as in-flight and hold its inputs out of further selection.
+    ///
+    /// The fee is recovered by running the spends through `dig-clvm`. That is BEST-EFFORT and
+    /// deliberately does not gate anything: this node relays bundles it did not build and did not
+    /// sign (§908), so a validation failure here says nothing about whether the bundle is
+    /// legitimate — the mempool has already accepted it. An uncomputable fee is stored as `None`
+    /// and reported as `null`, never as zero.
+    async fn reserve_pushed_bundle(&self, bundle: &SpendBundle) -> Result<()> {
+        let now = super::custody::now_ms() as i64;
+        let row = super::db::PendingTransactionRow {
+            transaction_id: hex::encode(bundle.name()),
+            bundle_hex: super::chain::encode_signed_bundle(bundle)?,
+            fee: spend::run_and_validate(&bundle.coin_spends)
+                .ok()
+                .map(|r| r.fee.to_string()),
+            submitted_at: now,
+            expires_at: now + RESERVATION_TTL_MS,
+            attempts: 1,
+            reserved_coin_ids: bundle
+                .coin_spends
+                .iter()
+                .map(|cs| hex::encode(cs.coin.coin_id()))
+                .collect(),
+        };
+        self.db.reserve_spend(&row).await?;
+        Ok(())
     }
 
     /// Whether this node could have signed any part of `bundle` itself.
@@ -2446,11 +2555,47 @@ impl WalletBackend {
         })
     }
 
-    async fn get_pending_transactions(&self) -> GetPendingTransactionsResponse {
-        // This PR has no spend/submission path, so there are no pending transactions.
-        GetPendingTransactionsResponse {
-            transactions: Vec::new(),
+    /// The bundles this node has pushed and not yet observed settling
+    /// (dig_ecosystem#2764).
+    ///
+    /// This returned a hardcoded empty list, under a comment explaining that no spend path
+    /// existed. The comment was true when written and had been false since `push_signed_bundle`
+    /// landed: a caller that pushed a bundle and polled here was told, as a measured fact, that
+    /// nothing was in flight.
+    ///
+    /// Lapsed reservations are retired before reading, so a bundle whose expiry has passed is not
+    /// reported as live. That is done here, on the read, because it is the moment the answer has
+    /// to be true — a sweep on some other schedule would leave a window where this surface
+    /// reported a bundle the wallet had already stopped holding coins for.
+    ///
+    /// Returns `Err` on a database failure rather than an empty list. An empty list is a CLAIM —
+    /// "nothing is in flight" — and this surface must never make one it cannot support.
+    async fn get_pending_transactions(&self) -> Result<GetPendingTransactionsResponse> {
+        self.db
+            .prune_reservations(super::custody::now_ms() as i64)
+            .await?;
+        let mut transactions = Vec::new();
+        for t in self.db.pending_transactions().await? {
+            // An absent fee stays absent, and a fee that will not parse is an ERROR rather than a
+            // zero. A stored fee was written from a `u64`, so an unparseable one means the table
+            // is corrupt; reporting "fee: 0" for it would be the confident-wrong-number-about-
+            // money failure this ticket exists to remove.
+            let fee = match &t.fee {
+                None => None,
+                Some(raw) => Some(Amount::u64(raw.parse::<u64>().map_err(|e| {
+                    Error::internal(format!(
+                        "pending transaction {} has an unreadable fee {raw:?}: {e}",
+                        t.transaction_id
+                    ))
+                })?)),
+            };
+            transactions.push(PendingTransactionRecord {
+                transaction_id: t.transaction_id,
+                fee,
+                submitted_at: Some(t.submitted_at.max(0) as u64),
+            });
         }
+        Ok(GetPendingTransactionsResponse { transactions })
     }
 
     /// Group the wallet's coins into per-height transaction records (created vs spent).
@@ -2666,9 +2811,22 @@ impl WalletBackend {
     ///
     /// Gated on [`Self::require_authoritative_coins`] — this is a spend-input read, not a
     /// display read.
+    ///
+    /// Reads the UNRESERVED unspent set (dig_ecosystem#2763): a coin already committed to a
+    /// bundle this node pushed is not offered again. Without that, two sends inside the
+    /// confirmation window selected the same coin — the replica only learns a coin is spent when
+    /// a peer pushes a `coin_state_update`, tens of seconds later — and the second was a
+    /// guaranteed mempool refusal surfacing as an opaque `push failed`.
+    ///
+    /// This is deliberately the only read that changes. Balance and display reads keep counting a
+    /// coin whose spend has not settled, because the chain has not said otherwise yet; "what do I
+    /// own" and "what may I spend next" are different questions.
     async fn spendable_coins(&self, asset_id: Option<&str>) -> Result<Vec<Coin>> {
         self.require_authoritative_coins().await?;
-        let rows = self.db.unspent_coins(asset_id).await?;
+        self.db
+            .prune_reservations(super::custody::now_ms() as i64)
+            .await?;
+        let rows = self.db.unreserved_unspent_coins(asset_id).await?;
         rows.iter().map(singleton::coin_from_row).collect()
     }
 
@@ -3048,7 +3206,15 @@ impl WalletBackend {
             .lineage
             .as_deref()
             .ok_or_else(|| Error::internal("CAT send requires a lineage source"))?;
-        let rows = select_cat_rows(self.db.unspent_coins(Some(asset_id)).await?, amount)?;
+        // The unreserved set, for the same reason as `spendable_coins` (dig_ecosystem#2763): a CAT
+        // coin committed to an in-flight bundle must not be selected into a second one.
+        self.db
+            .prune_reservations(super::custody::now_ms() as i64)
+            .await?;
+        let rows = select_cat_rows(
+            self.db.unreserved_unspent_coins(Some(asset_id)).await?,
+            amount,
+        )?;
         let mut cats = Vec::with_capacity(rows.len());
         for row in &rows {
             let created = row
@@ -3992,7 +4158,7 @@ impl WalletBackend {
             }
             "get_pending_transactions" => {
                 let _r = req!(GetPendingTransactions);
-                json(self.get_pending_transactions().await)?
+                json(self.get_pending_transactions().await?)?
             }
             "is_asset_owned" => {
                 let r = req!(IsAssetOwned);
@@ -4213,11 +4379,17 @@ impl WalletBackend {
             // The node-custodied seed lifecycle (#370/#368): create/import/restore/unlock/lock/
             // status/delete. Reachable only when custody is attached ([`Self::with_custody`]);
             // authorization is the transport's concern (the paired-token gate, SPEC §7.12).
-            m if m.starts_with("wallet.") => self.dispatch_custody(m, body)?,
+            m if m.starts_with("wallet.") => {
+                self.refresh_observed_derivations(m).await;
+                self.dispatch_custody(m, body)?
+            }
             // The node-managed unlock authority (#431/#432, §18.24): status/get_method/set_method/
             // set_mode/enroll_totp/enroll_passkey_*/unlock/sign_unlock/lock. Reachable only when auth
             // is attached ([`Self::with_auth`]); every `auth.*` method is paired-token gated (§7.12).
-            m if m.starts_with("auth.") => self.dispatch_auth(m, body)?,
+            m if m.starts_with("auth.") => {
+                self.refresh_observed_derivations(m).await;
+                self.dispatch_auth(m, body)?
+            }
             other => {
                 return Err(Error::not_found(format!(
                     "unknown or unsupported method: {other}"
@@ -4243,6 +4415,60 @@ impl WalletBackend {
             // Until a chain tip is separately tracked, the best-known target is the synced peak.
             target_height: st.peak_height,
         })
+    }
+
+    /// Hand custody the p2 puzzle hashes this replica has seen coins at, so the gap-limit scan can
+    /// size the derivation window from real usage (dig_ecosystem#2762).
+    ///
+    /// Called immediately before the methods that actually load keys, because an unlock is the only
+    /// moment the seed is in hand and therefore the only moment the covered window can grow. Doing
+    /// it here rather than inside custody keeps the DB out of `custody.rs`, which holds no database
+    /// handle and should not acquire one to answer a question about coins.
+    ///
+    /// # What this does NOT do
+    ///
+    /// The scan extends from usage it can SEE, and the node only sees coins at addresses it has
+    /// already subscribed — which is the window itself. So it reliably follows a wallet outgrowing its
+    /// window from inside (used index 480 of 500 → extends to 730), and it CANNOT discover history
+    /// that starts beyond the window (a wallet whose only coins sit at index 5000 is invisible, and
+    /// stays invisible). That case is covered by [`DEFAULT_DERIVATION_COUNT`] being wide enough to
+    /// begin with, not by this scan. Closing it properly means asking the chain which addresses are
+    /// used before subscribing, which is a chain read and so owed the NC-12 corroborated path —
+    /// tracked separately rather than half-built here.
+    ///
+    /// Failure is logged and ignored: a database hiccup must not make a wallet unopenable. The
+    /// window then stays at its floor, which is the conservative direction.
+    async fn refresh_observed_derivations(&self, method: &str) {
+        // Only the key-loading methods. Every other `wallet.*`/`auth.*` call is a status or config
+        // read that cannot change the window, and scanning the coin table on each would be work
+        // that provably cannot alter the outcome.
+        const KEY_LOADING: &[&str] = &[
+            "wallet.unlock",
+            "wallet.import",
+            "wallet.restore",
+            "auth.unlock",
+            "auth.sign_unlock",
+        ];
+        if !KEY_LOADING.contains(&method) {
+            return;
+        }
+        let Some(custody) = self.custody.as_ref() else {
+            return;
+        };
+        match self.db.occupied_puzzle_hashes().await {
+            Ok(hexes) => {
+                custody.observe_occupied_puzzle_hashes(
+                    hexes
+                        .iter()
+                        .filter_map(|h| singleton::bytes32_from_hex(h).ok())
+                        .collect(),
+                );
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                "could not read observed puzzle hashes; the derivation window stays at its floor"
+            ),
+        }
     }
 
     /// Dispatch a `wallet.*` MULTI-wallet custody-lifecycle method to the attached [`WalletCustody`]
@@ -4729,6 +4955,7 @@ fn paginate(coins: Vec<CoinRecord>, offset: u32, limit: u32) -> Vec<CoinRecord> 
 #[cfg(test)]
 mod tests {
     use super::super::db::DerivationRow;
+    use super::super::db::PendingTransactionRow;
     use super::super::db::WalletDb;
     use super::super::fallback::mock::MockFallback;
     use super::super::fallback::EmptyFallback;
@@ -5731,9 +5958,17 @@ mod tests {
     }
 
     /// A synced, wallet-owned, EMPTY address is a SUCCESS with a zero figure — never an error.
+    ///
+    /// The replica is given a REAL peak, level with its peers. Its subject is the zero-versus-error
+    /// distinction, but it also asserts `synced`, and it used to do so over a replica with NO peak
+    /// of its own — pinning the precise pairing (`synced: true` beside an unknown height) that
+    /// [`WalletBackend::replica_answer_is_current`] now refuses. A fixture holding a value its own
+    /// rule forbids reads as a passing control while making the defect unfixable, so the fixture is
+    /// what changed here, not the assertion: an honestly caught-up replica knows its own height,
+    /// and this stays the suite's positive control against hardcoding `synced: false`.
     #[tokio::test]
     async fn synced_empty_address_is_zero_success_not_error() {
-        let db = db_with_owned_derivation(true, None).await;
+        let db = db_with_owned_derivation(true, Some(500)).await;
         let be = WalletBackend::new(
             db,
             Arc::new(MockFallback::default()),
@@ -6774,6 +7009,82 @@ mod tests {
         assert_eq!(result.peak_height, Some(REPLICA_PEAK));
     }
 
+    /// **Proves:** `chain_peak` cannot report `synced: true` about a replica that
+    /// `control.wallet.syncStatus` is simultaneously calling `syncing` (dig-node#293).
+    ///
+    /// THE DEFECT THIS PINS. dig_ecosystem#2869 replaced the latched `initial_sync_complete` with
+    /// a MEASURED freshness predicate at the balance and coin reads, and `chain_peak` was left
+    /// behind on `db.is_synced()`. Measured on a running node: `sync-status` said `syncing` while
+    /// `peak` said `synced: true`, in the same process at the same moment, on a replica 1,875
+    /// blocks behind. `peak` is the endpoint a client uses to bound a confirmation, so the
+    /// falsehood lands on exactly the read that decides whether money has settled.
+    ///
+    /// FIXTURE DESIGN. The replica must satisfy `initial_sync_complete` AND lag past
+    /// `FOLLOWING_TOLERANCE`, because the latch is what the defect trusts: a fresh replica fails
+    /// the latch and a caught-up one is genuinely current, so neither can exhibit the defect. The
+    /// gap is `PEERS_AHEAD_BY` (530), drawn from the live measurement rather than invented, and far
+    /// past the four-block tolerance.
+    ///
+    /// It asserts AGREEMENT with the balance read rather than just `!synced`: the two endpoints
+    /// disagreeing is the reported bug, and a fix applied to one site while the other keeps its own
+    /// predicate would satisfy a lone `!synced` assertion and re-open the same class of defect.
+    #[tokio::test]
+    async fn the_peak_is_not_reported_current_while_the_balance_read_calls_the_same_replica_stale()
+    {
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        assert!(
+            db.is_synced().await.unwrap(),
+            "the fixture must satisfy the latch the defect trusted; otherwise it proves nothing"
+        );
+        db.upsert_coin(&coin_at_ph("aa", &owned_ph(), 42, Some(1), None))
+            .await
+            .unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_ahead_of_the_replica());
+
+        let peak = be.chain_peak().await.unwrap();
+        let balance = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            peak.peak_height,
+            Some(REPLICA_PEAK),
+            "a stale peak must still say WHAT height it is, or a client loses its only bound"
+        );
+        assert!(
+            !peak.synced,
+            "`peak` called a replica {PEERS_AHEAD_BY} blocks behind current"
+        );
+        assert_eq!(
+            peak.synced, balance.synced,
+            "`peak` and the balance read disagreed about the freshness of one replica at one moment"
+        );
+    }
+
+    /// **The control for the test above:** a replica level with its peers still reports
+    /// `synced: true` from `chain_peak`.
+    ///
+    /// Without it, `synced: false` hardcoded in place of `synced: true` satisfies the test above —
+    /// trading one literal for another, and telling every client that no reading this node ever
+    /// gives is current.
+    #[tokio::test]
+    async fn a_replica_level_with_its_peers_still_reports_a_synced_peak() {
+        let db = db_with_owned_derivation(true, Some(REPLICA_PEAK)).await;
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(REPLICA_PEAK));
+
+        assert_eq!(
+            be.chain_peak().await.unwrap(),
+            ChainPeak {
+                peak_height: Some(REPLICA_PEAK),
+                synced: true,
+            },
+            "a replica at the tip was reported as stale"
+        );
+    }
+
     /// **Proves:** an UNOBSERVABLE peer tier is not a licence to claim currency — a node with no
     /// chain peer that has announced a height serves its figure labelled stale.
     ///
@@ -6820,6 +7131,78 @@ mod tests {
         assert!(
             !result.synced,
             "a figure no peer height could corroborate was reported as current"
+        );
+    }
+    /// **Proves:** an UNKNOWN REPLICA height is never reported as current either — the other
+    /// `None` arm of the same predicate, on the endpoint where it actually reaches production.
+    ///
+    /// [`super::sync_supervisor::is_following`] answers `true` when EITHER side is `None`, and
+    /// [`WalletBackend::replica_answer_is_current`] narrowed only the peer side. `chain_peak`
+    /// escapes the remaining arm by construction — it calls the gate inside `if let Some(peak)`,
+    /// so it can never hand it a `None` replica. The balance and coin reads do not: they read
+    /// `sync_state().peak_height` as an `Option` and pass it straight through. So the money reads,
+    /// and only the money reads, still paired `synced: true` with `peak_height: null`.
+    ///
+    /// The state is production-reachable rather than hypothetical: `refresh_tracked_coins` latches
+    /// the replica authoritative (`record_coverage` + `set_initial_sync_complete(true)`) WITHOUT
+    /// ever writing a peak, which is exactly what `db_with_owned_derivation(true, None)` builds.
+    ///
+    /// FIXTURE DESIGN. The peer tier is deliberately HONEST and OBSERVABLE — level with the
+    /// replica's neighbours, the same tier the passing control uses — so the missing REPLICA peak
+    /// is the only axis varied and is the only thing that can explain a verdict. A hostile or
+    /// unobservable tier would answer `false` for its own reasons and could not see this arm at
+    /// all. Asserting AGREEMENT with `chain_peak` rather than a bare `!synced` is what makes the
+    /// test load-bearing: the two endpoints disagreeing in one process at one moment is the
+    /// reported defect, and `chain_peak` here takes its honest fallback arm (`synced: false`,
+    /// height unknown), so a fix that hardcoded either literal on one side alone would show up as
+    /// a disagreement rather than pass.
+    #[tokio::test]
+    async fn an_unknown_replica_height_is_never_reported_as_current() {
+        let db = db_with_owned_derivation(true, None).await;
+        assert!(
+            db.is_synced().await.unwrap(),
+            "the fixture must satisfy the latch the defect trusts; otherwise it proves nothing"
+        );
+        assert_eq!(
+            db.sync_state().await.unwrap().peak_height,
+            None,
+            "the fixture's whole point is a latched replica that never wrote a peak"
+        );
+        db.upsert_coin(&coin_at_ph("aa", &owned_ph(), 42, Some(1), None))
+            .await
+            .unwrap();
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(REPLICA_PEAK));
+
+        let balance = be
+            .balance_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        let coins = be
+            .coins_for_address(&owned_address(), BalanceAsset::Xch)
+            .await
+            .unwrap();
+        let peak = be.chain_peak().await.unwrap();
+
+        assert_eq!(
+            balance.peak_height, None,
+            "an unknown height must stay unknown; `None` is not height zero"
+        );
+        assert_eq!(
+            balance.balance, 42,
+            "the figure is served labelled stale, never withheld"
+        );
+        assert!(
+            !balance.synced,
+            "the balance read claimed currency for a replica whose own height it does not know"
+        );
+        assert_eq!(
+            balance.synced, peak.synced,
+            "the balance read and `peak` disagreed about one replica at one moment"
+        );
+        assert_eq!(
+            coins.synced, balance.synced,
+            "the coin read is the same answer reduced differently and must make the same claim"
         );
     }
 
@@ -6917,10 +7300,17 @@ mod tests {
     }
 
     /// The peak comes from the node's own replica when it has one.
+    ///
+    /// The peer tier is fixed level with the replica because `synced` is now MEASURED against it
+    /// (dig-node#293). This fixture previously ran with an UNOBSERVABLE tier and still asserted
+    /// `synced: true` — which is the falsehood #293 removes, so leaving it would have pinned the
+    /// defect in place. The subject here is the HEIGHT's provenance; the freshness flag has its
+    /// own tests beside the balance reads.
     #[tokio::test]
     async fn the_peak_is_the_replicas_when_the_replica_has_one() {
         let db = db_with_owned_derivation(true, Some(5_000_000)).await;
-        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default());
+        let be = WalletBackend::new(db, Arc::new(EmptyFallback), WalletConfig::default())
+            .with_chain_peer_tier_for_tests(peers_level_at(5_000_000));
         assert_eq!(
             be.chain_peak().await.unwrap(),
             ChainPeak {
@@ -9786,6 +10176,285 @@ mod tests {
             (r.synced_coins, r.total_coins),
             (1, 1),
             "a covered scope must still report a complete view"
+        );
+    }
+
+    // ---- in-flight coin reservation + real pending set (#2763 / #2764) ------
+    //
+    // These drive the PRODUCTION reads (`spendable_coins`, `get_pending_transactions`), not the
+    // database primitives underneath them. The primitives already have their own tests in `db.rs`
+    // and passed while nothing called them: the defect these close is that the wiring did not
+    // exist, so a test that stops at the DB layer cannot see it.
+
+    /// A coin row with real hex, so `singleton::coin_from_row` can parse it.
+    fn spendable_row(id_byte: u8, amount: u64) -> CoinRow {
+        CoinRow {
+            coin_id: format!("{id_byte:02x}").repeat(32),
+            parent_coin_info: "11".repeat(32),
+            puzzle_hash: test_ph(),
+            amount: amount.to_string(),
+            created_height: Some(1),
+            spent_height: None,
+            asset_id: None,
+            hint: None,
+            created_timestamp: None,
+            spent_timestamp: None,
+        }
+    }
+
+    fn pending_row(
+        tx: &str,
+        coin_ids: &[String],
+        fee: Option<&str>,
+        expires_at: i64,
+    ) -> PendingTransactionRow {
+        PendingTransactionRow {
+            transaction_id: tx.into(),
+            bundle_hex: "00".into(),
+            fee: fee.map(Into::into),
+            submitted_at: 1_000,
+            expires_at,
+            attempts: 1,
+            reserved_coin_ids: coin_ids.to_vec(),
+        }
+    }
+
+    /// **The defect (#2763), at the seam that actually selects.** A coin committed to a pushed,
+    /// unsettled bundle must not be offered to the next spend — while still counting as money the
+    /// wallet owns, because the chain has not said otherwise yet.
+    #[tokio::test]
+    async fn a_reserved_coin_leaves_selection_but_not_the_balance() {
+        let (a, b) = (spendable_row(0xa1, 100), spendable_row(0xb2, 500));
+        let be = backend_with(vec![a.clone(), b.clone()], true).await;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row(
+                "tx1",
+                std::slice::from_ref(&a.coin_id),
+                Some("7"),
+                far_future,
+            ))
+            .await
+            .unwrap();
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(
+            selectable.len(),
+            1,
+            "the reserved coin was offered to a second spend"
+        );
+        assert_eq!(selectable[0].amount, 500);
+
+        assert_eq!(
+            be.db.unspent_coins(None).await.unwrap().len(),
+            2,
+            "reserving a coin must not remove it from what the wallet owns"
+        );
+    }
+    /// A bundle spending exactly the coin `spendable_row(id_byte, amount)` describes, in the hex
+    /// form the wire carries — returned alongside the ids the production path will derive from it.
+    ///
+    /// The row and the bundle MUST agree on the coin's identity or the reservation writes an id
+    /// nothing selects on, and a test built that way passes while reserving the wrong coin.
+    /// Deriving the row's `coin_id` FROM the same `Coin` the bundle spends is what makes that
+    /// agreement structural instead of a matching pair of literals.
+    fn a_bundle_spending(row: &mut CoinRow) -> (String, String) {
+        use chia_protocol::{Bytes32, Coin, CoinSpend, Program, SpendBundle};
+        let coin = Coin::new(
+            Bytes32::new(hex_32(&row.parent_coin_info)),
+            Bytes32::new(hex_32(&row.puzzle_hash)),
+            row.amount.parse().unwrap(),
+        );
+        row.coin_id = hex::encode(coin.coin_id());
+        let spend = CoinSpend::new(coin, Program::from(vec![0x01]), Program::from(vec![0x80]));
+        let bundle = SpendBundle::new(vec![spend], Default::default());
+        (
+            super::super::chain::encode_signed_bundle(&bundle).unwrap(),
+            hex::encode(bundle.name()),
+        )
+    }
+
+    fn hex_32(s: &str) -> [u8; 32] {
+        hex::decode(s).unwrap().try_into().unwrap()
+    }
+
+    /// **Proves the WIRING, at the only seam that has it (#251).** A bundle the mempool accepted
+    /// leaves its inputs reserved — reached by PUSHING, not by calling `reserve_spend` directly.
+    ///
+    /// Every other reservation test drives `db.reserve_spend(...)` itself, so all of them pass
+    /// with the `push -> reserve` call deleted: mutating the seam to `if false && outcome.accepted`
+    /// left the whole suite green. That is the same argument this module already makes for #250 —
+    /// the defect is that the wiring did not exist, so a test stopping at the DB layer cannot see
+    /// it — applied to the half that was still only tested from below.
+    ///
+    /// FIXTURE DESIGN. Two spendable coins, and the bundle spends exactly ONE of them. A single
+    /// coin cannot distinguish "the pushed bundle's input was reserved" from "selection was
+    /// emptied", which a mis-scoped reservation would satisfy identically; the untouched control
+    /// coin must survive, and it is what turns the assertion from a count into a claim about
+    /// WHICH coin. Both observations go through the PRODUCTION reads (`spendable_coins`,
+    /// `get_pending_transactions`) rather than the DB primitives beneath them, and the recorded
+    /// transaction id is checked against the bundle's own name so a reservation filed under some
+    /// other id cannot pass.
+    #[tokio::test]
+    async fn a_pushed_bundle_reserves_its_inputs_through_the_production_path() {
+        let mut spent_by_the_bundle = spendable_row(0xa1, 100);
+        let (bundle_hex, transaction_id) = a_bundle_spending(&mut spent_by_the_bundle);
+        let untouched = spendable_row(0xb2, 500);
+        let be = backend_with(vec![spent_by_the_bundle.clone(), untouched.clone()], true)
+            .await
+            .with_pusher(FakePusher::accepting());
+
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            2,
+            "the fixture must start with BOTH coins selectable, or the assertion below is vacuous"
+        );
+
+        let outcome = be.push_signed_bundle(&bundle_hex).await.unwrap();
+        assert!(outcome.accepted, "the fixture's pusher accepts");
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "an accepted push recorded nothing in flight; the reserve call is not wired to it"
+        );
+        assert_eq!(
+            pending[0].transaction_id, transaction_id,
+            "the in-flight record is filed under an id that is not the bundle's"
+        );
+
+        let selectable = be.spendable_coins(None).await.unwrap();
+        assert_eq!(
+            selectable.len(),
+            1,
+            "the pushed bundle's input is still offered to a second spend"
+        );
+        assert_eq!(
+            selectable[0].amount, 500,
+            "the wrong coin was reserved: the untouched control left selection"
+        );
+    }
+
+    /// **The control:** a mempool REFUSAL reserves nothing.
+    ///
+    /// Without it, reserving unconditionally — dropping the `outcome.accepted` guard rather than
+    /// the call — satisfies the test above while stranding a user's coins over a spend that will
+    /// never happen. It pins the guard, not just the wiring.
+    #[tokio::test]
+    async fn a_refused_bundle_reserves_nothing() {
+        let mut refused = spendable_row(0xa1, 100);
+        let (bundle_hex, _) = a_bundle_spending(&mut refused);
+        let refusing = FakePusher::answering(Ok(PushOutcome {
+            accepted: false,
+            transaction_id: None,
+            rejection: Some("mempool said no".into()),
+        }));
+        let be = backend_with(vec![refused.clone()], true)
+            .await
+            .with_pusher(refusing);
+
+        let outcome = be.push_signed_bundle(&bundle_hex).await.unwrap();
+        assert!(!outcome.accepted);
+
+        assert!(
+            be.get_pending_transactions()
+                .await
+                .unwrap()
+                .transactions
+                .is_empty(),
+            "a refused bundle was recorded as in flight"
+        );
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            1,
+            "a refused bundle stranded the coins it never committed"
+        );
+    }
+
+    /// **The defect (#2764).** `get_pending_transactions` returned a hardcoded empty list. A
+    /// caller that pushed a bundle and polled was told, as a measured fact, that nothing was in
+    /// flight.
+    #[tokio::test]
+    async fn pending_transactions_reports_an_in_flight_bundle() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row(
+                "tx1",
+                std::slice::from_ref(&a.coin_id),
+                Some("7"),
+                far_future,
+            ))
+            .await
+            .unwrap();
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending.len(),
+            1,
+            "a pushed bundle was reported as nothing in flight"
+        );
+        assert_eq!(pending[0].transaction_id, "tx1");
+        assert_eq!(pending[0].fee, Some(Amount::u64(7)));
+    }
+
+    /// A fee this node could not compute is reported as `null`, NEVER as zero. The node relays
+    /// bundles it did not build (§908), and a confident zero would be a claim about someone
+    /// else's money.
+    #[tokio::test]
+    async fn an_uncomputable_fee_is_reported_as_null_not_zero() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        let far_future = super::super::custody::now_ms() as i64 + 600_000;
+        be.db
+            .reserve_spend(&pending_row(
+                "tx1",
+                std::slice::from_ref(&a.coin_id),
+                None,
+                far_future,
+            ))
+            .await
+            .unwrap();
+
+        let pending = be.get_pending_transactions().await.unwrap().transactions;
+        assert_eq!(
+            pending[0].fee, None,
+            "an unknown fee was flattened to a number"
+        );
+    }
+
+    /// A reservation ALWAYS lapses, and both surfaces observe the lapse: the bundle stops being
+    /// reported in flight, and its coin returns to selection. This is the failure direction that
+    /// would otherwise be worse than the bug — a release path that never runs must not be able to
+    /// strand the user's money permanently.
+    #[tokio::test]
+    async fn an_expired_reservation_stops_being_pending_and_frees_its_coin() {
+        let a = spendable_row(0xa1, 100);
+        let be = backend_with(vec![a.clone()], true).await;
+        be.db
+            .reserve_spend(&pending_row(
+                "tx1",
+                std::slice::from_ref(&a.coin_id),
+                Some("7"),
+                1,
+            ))
+            .await
+            .unwrap();
+
+        assert!(
+            be.get_pending_transactions()
+                .await
+                .unwrap()
+                .transactions
+                .is_empty(),
+            "a lapsed bundle was still reported in flight"
+        );
+        assert_eq!(
+            be.spendable_coins(None).await.unwrap().len(),
+            1,
+            "a lapsed reservation stranded the coin"
         );
     }
 }
